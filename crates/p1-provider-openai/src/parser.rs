@@ -58,11 +58,9 @@ impl CodexResponseParser {
     /// terminal envelope. `stop` is computed from the blocks for `completed` and
     /// supplied for `incomplete`.
     fn completed(&mut self, response: Option<&Value>, stop: StopReason) -> Vec<StreamEvent> {
-        let model = response
-            .and_then(|response| response.get("model"))
-            .and_then(Value::as_str)
-            .unwrap_or(self.model.as_str())
-            .to_string();
+        // Origin is ALWAYS the configured model, never the (dated alias) name the
+        // response echoes: replay is gated on origin equality (providers.md ruling).
+        let model = self.model.clone();
         let usage = response.and_then(parse_usage);
         let stop = match stop {
             StopReason::EndTurn if self.blocks.iter().any(is_tool_call) => StopReason::ToolUse,
@@ -798,13 +796,13 @@ mod tests {
     }
 
     #[test]
-    fn completed_uses_response_model_when_present() {
+    fn completed_keeps_the_configured_model_as_origin() {
         let mut parser = CodexResponseParser::new("configured-model");
         let events = feed(
             &mut parser,
             r#"{"type":"response.completed","response":{"model":"wire-model"}}"#,
         );
-        assert_eq!(completed(&events).item.origin.model, "wire-model");
+        assert_eq!(completed(&events).item.origin.model, "configured-model");
     }
 
     #[test]

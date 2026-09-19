@@ -827,6 +827,7 @@ version = "0.0.1"
 dependencies = [
  "futures-util",
  "p1-contracts",
+ "p1-provider-conformance",
  "p1-provider-http",
  "serde_json",
  "tempfile",
