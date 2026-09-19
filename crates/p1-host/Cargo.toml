@@ -1,0 +1,63 @@
+[package]
+name = "p1-host"
+description = "The p1 composition root: the binary `p1`, headless run and plain terminal prompt loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "p1"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Delegation tools and the in-process worker service. Off => the four
+# `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
+default = ["delegation"]
+delegation = ["dep:p1-workers", "dep:p1-tool-delegate"]
+
+[dependencies]
+p1-assembly = { path = "../p1-assembly" }
+p1-contracts = { path = "../p1-contracts" }
+p1-core = { path = "../p1-core" }
+p1-journal = { path = "../p1-journal" }
+p1-workspace = { path = "../p1-workspace" }
+p1-tool-read = { path = "../p1-tool-read" }
+p1-tool-edit = { path = "../p1-tool-edit" }
+p1-tool-write = { path = "../p1-tool-write" }
+p1-tool-search = { path = "../p1-tool-search" }
+p1-tool-shell = { path = "../p1-tool-shell" }
+p1-tool-patch = { path = "../p1-tool-patch" }
+p1-provider-anthropic = { path = "../p1-provider-anthropic" }
+p1-provider-openai = { path = "../p1-provider-openai" }
+p1-provider-http = { path = "../p1-provider-http" }
+p1-workers = { path = "../p1-workers", optional = true }
+p1-tool-delegate = { path = "../p1-tool-delegate", optional = true }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+    "signal",
+    "io-util",
+    "io-std",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+p1-testkit = { path = "../p1-testkit" }
+p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+    "signal",
+    "io-util",
+    "io-std",
+    "sync",
+    "time",
+    "test-util",
+] }
