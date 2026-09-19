@@ -1,0 +1,1073 @@
+//! The shared retrying request driver.
+//!
+//! Both provider adapters translate their wire format into a [`ResponseParser`]
+//! and call [`drive`]; everything policy-shaped (credential refresh, the shared
+//! transient budget, backoff, cancellation) lives here. [`drive`] never returns
+//! `Err`: the returned stream always ends with exactly one terminal
+//! [`StreamEvent::Finished`].
+//!
+//! The driver does not spawn a task. It is a hand-written state machine wrapped
+//! in `futures_util::stream::unfold`, so dropping the returned stream drops the
+//! in-flight request, the body read and the backoff sleep with it. A spawned task
+//! would need a channel and an explicit shutdown path for the same guarantee.
+
+use std::collections::VecDeque;
+use std::future::Future;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use futures_util::future::{Either, select};
+use p1_contracts::{
+    CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream, StreamEvent,
+};
+
+use crate::credential::{Credential, CredentialSource};
+use crate::http::{ByteStream, HttpRequest, Transport, TransportError};
+use crate::retry::{HttpClass, RetryPolicy, classify_status, retry_after};
+use crate::sse::{SseDecoder, SseEvent};
+
+/// Turns route-native SSE events into contract stream events. Pure and
+/// synchronous, so it can be unit-tested without a transport.
+pub trait ResponseParser: Send {
+    /// Feed one SSE event. Returned events are forwarded in order. A returned
+    /// `StreamEvent::Finished` ends the stream.
+    fn on_event(&mut self, event: SseEvent) -> Vec<StreamEvent>;
+
+    /// The body ended. Return the terminal outcome (normally a Transport failure
+    /// "stream ended without a terminal event" unless the parser already
+    /// finished).
+    fn on_end(&mut self) -> Outcome;
+
+    /// Map a non-2xx response to an error. `body` is for CLASSIFICATION ONLY
+    /// (e.g. spotting a context-window error type) and must never be copied into
+    /// the message.
+    fn on_http_error(
+        &self,
+        status: u16,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> ProviderError;
+}
+
+/// Everything [`drive`] needs for one request, including how to rebuild it for a
+/// refreshed credential.
+pub struct DriveRequest {
+    pub transport: std::sync::Arc<dyn Transport>,
+    pub credentials: std::sync::Arc<dyn CredentialSource>,
+    /// Builds the HTTP request for a credential (called again after a refresh).
+    pub build: Box<dyn Fn(&Credential) -> HttpRequest + Send + Sync>,
+    /// A fresh parser per attempt.
+    pub new_parser: Box<dyn Fn() -> Box<dyn ResponseParser> + Send + Sync>,
+    pub retry: RetryPolicy,
+    pub cancel: CancellationToken,
+}
+
+/// Drive one request to a terminal event. The returned stream obeys the five
+/// stream rules in `p1-contracts/src/provider.rs`.
+pub fn drive(request: DriveRequest) -> ProviderStream {
+    let stream = futures_util::stream::unfold(State::new(request), |state| async move {
+        let (event, state) = step(state).await;
+        event.map(|event| (event, state))
+    })
+    // `unfold` panics if polled after it has ended; `fuse` makes the terminal
+    // poll idempotent, as rule 1's "nothing after Finished" requires.
+    .fuse();
+    Box::pin(stream)
+}
+
+/// What the driver is waiting on next.
+enum Phase {
+    /// Fetch the credential for the next attempt.
+    NeedCredential,
+    /// Build and send the request, then either start reading or apply policy.
+    Post,
+    /// Read the streaming body of a 2xx response.
+    Read {
+        parser: Box<dyn ResponseParser>,
+        decoder: SseDecoder,
+        body: ByteStream,
+    },
+    /// Wait out a backoff, racing cancellation.
+    Wait { delay: Duration },
+    /// The terminal event has been queued; the next poll ends the stream.
+    Done,
+}
+
+struct State {
+    request: DriveRequest,
+    phase: Phase,
+    /// Events produced by the current step, forwarded one per poll in order.
+    pending: VecDeque<StreamEvent>,
+    credential: Option<Credential>,
+    transient_retries: u32,
+    reauth_used: bool,
+    /// Whether any content delta (text/reasoning/tool input) has been forwarded
+    /// during the current attempt. Once true, a broken body is terminal.
+    visible: bool,
+}
+
+impl State {
+    fn new(request: DriveRequest) -> Self {
+        Self {
+            request,
+            phase: Phase::NeedCredential,
+            pending: VecDeque::new(),
+            credential: None,
+            transient_retries: 0,
+            reauth_used: false,
+            visible: false,
+        }
+    }
+
+    /// Queue the single terminal event and stop.
+    fn finish(mut self, outcome: Outcome) -> Self {
+        self.pending.push_back(StreamEvent::Finished(outcome));
+        self.phase = Phase::Done;
+        self
+    }
+
+    /// A transient failure: retry inside the shared budget, or fail. Grants no
+    /// retry once visible output has been forwarded.
+    fn transient_or_fail(mut self, error: ProviderError, hint: Option<Duration>) -> Self {
+        if self.transient_retries >= self.request.retry.max_retries {
+            return self.finish(Outcome::Failed(error));
+        }
+        self.transient_retries += 1;
+        let delay = self.request.retry.delay(self.transient_retries, hint);
+        // Rule 4: a back-off yields Activity so the consumer sees life before the
+        // first content event of the next attempt.
+        self.pending.push_back(StreamEvent::Activity);
+        self.phase = Phase::Wait { delay };
+        self
+    }
+}
+
+/// One step of the state machine: await at most one I/O operation, then return
+/// the next event (or `None` when the stream is over).
+async fn step(mut state: State) -> (Option<StreamEvent>, State) {
+    loop {
+        if let Some(event) = state.pending.pop_front() {
+            return (Some(event), state);
+        }
+        state = match std::mem::replace(&mut state.phase, Phase::Done) {
+            Phase::Done => return (None, state),
+            Phase::NeedCredential => obtain_credential(state).await,
+            Phase::Post => post_once(state).await,
+            Phase::Read {
+                parser,
+                decoder,
+                body,
+            } => read_body(state, parser, decoder, body).await,
+            Phase::Wait { delay } => wait(state, delay).await,
+        };
+    }
+}
+
+async fn obtain_credential(mut state: State) -> State {
+    if state.request.cancel.is_cancelled() {
+        return state.finish(Outcome::Cancelled);
+    }
+    let credentials = state.request.credentials.clone();
+    let cancel = state.request.cancel.clone();
+    match race(cancel, credentials.access()).await {
+        Raced::Cancelled => state.finish(Outcome::Cancelled),
+        Raced::Done(Ok(credential)) => {
+            state.credential = Some(credential);
+            state.phase = Phase::Post;
+            state
+        }
+        Raced::Done(Err(error)) => state.finish(Outcome::Failed(error)),
+    }
+}
+
+async fn post_once(mut state: State) -> State {
+    if state.request.cancel.is_cancelled() {
+        return state.finish(Outcome::Cancelled);
+    }
+    let parser = (state.request.new_parser)();
+    let credential = state
+        .credential
+        .clone()
+        .expect("a credential is obtained before the first attempt");
+    let request = (state.request.build)(&credential);
+    let transport = state.request.transport.clone();
+    let cancel = state.request.cancel.clone();
+    let response = match race(cancel.clone(), transport.post(request)).await {
+        Raced::Cancelled => return state.finish(Outcome::Cancelled),
+        Raced::Done(Err(error)) => {
+            let error = ProviderError::new(
+                ProviderErrorKind::Transport,
+                format!("request failed: {}", error.0),
+            );
+            return state.transient_or_fail(error, None);
+        }
+        Raced::Done(Ok(response)) => response,
+    };
+
+    let status = response.status;
+    let headers = response.headers;
+    match classify_status(status) {
+        HttpClass::Success => {
+            state.visible = false;
+            state.phase = Phase::Read {
+                parser,
+                decoder: SseDecoder::new(),
+                body: response.body,
+            };
+            state
+        }
+        HttpClass::Fatal => {
+            let body = match drain_body(&cancel, response.body).await {
+                Raced::Cancelled => return state.finish(Outcome::Cancelled),
+                Raced::Done(bytes) => bytes,
+            };
+            let error = parser.on_http_error(status, &headers, &body);
+            state.finish(Outcome::Failed(error))
+        }
+        HttpClass::Retry => {
+            let body = match drain_body(&cancel, response.body).await {
+                Raced::Cancelled => return state.finish(Outcome::Cancelled),
+                Raced::Done(bytes) => bytes,
+            };
+            let error = parser.on_http_error(status, &headers, &body);
+            state.transient_or_fail(error, retry_after(&headers))
+        }
+        HttpClass::Reauth => {
+            let body = match drain_body(&cancel, response.body).await {
+                Raced::Cancelled => return state.finish(Outcome::Cancelled),
+                Raced::Done(bytes) => bytes,
+            };
+            let error = parser.on_http_error(status, &headers, &body);
+            if state.reauth_used {
+                // Rule 1: a second 401/403 after the one refresh is terminal and
+                // is always an authentication failure.
+                let error = ProviderError::new(ProviderErrorKind::Authentication, error.message);
+                return state.finish(Outcome::Failed(error));
+            }
+            state.reauth_used = true;
+            let credentials = state.request.credentials.clone();
+            let rejected = credential;
+            let cancel = state.request.cancel.clone();
+            match race(cancel, credentials.refresh(&rejected)).await {
+                Raced::Cancelled => state.finish(Outcome::Cancelled),
+                Raced::Done(Ok(credential)) => {
+                    state.credential = Some(credential);
+                    state.phase = Phase::Post;
+                    state
+                }
+                Raced::Done(Err(error)) => state.finish(Outcome::Failed(error)),
+            }
+        }
+    }
+}
+
+async fn read_body(
+    mut state: State,
+    mut parser: Box<dyn ResponseParser>,
+    mut decoder: SseDecoder,
+    mut body: ByteStream,
+) -> State {
+    let cancel = state.request.cancel.clone();
+    match next_chunk(&cancel, &mut body).await {
+        Raced::Cancelled => state.finish(Outcome::Cancelled),
+        Raced::Done(Some(Ok(chunk))) => {
+            let events = decoder.push(&chunk);
+            if let Some(outcome) = feed(&mut state, parser.as_mut(), events) {
+                state.pending.push_back(StreamEvent::Finished(outcome));
+                state.phase = Phase::Done;
+                return state;
+            }
+            state.phase = Phase::Read {
+                parser,
+                decoder,
+                body,
+            };
+            state
+        }
+        Raced::Done(Some(Err(error))) => {
+            let failure = ProviderError::new(
+                ProviderErrorKind::Transport,
+                format!("provider stream broke: {}", error.0),
+            );
+            if state.visible {
+                // Rule 3: never retry once the consumer has seen output.
+                state.finish(Outcome::Failed(failure))
+            } else {
+                state.transient_or_fail(failure, None)
+            }
+        }
+        Raced::Done(None) => {
+            // A final event that lacks its trailing blank line is still an event:
+            // flush it before deciding that the body ended without a terminal.
+            let last = decoder.finish().into_iter().collect();
+            if let Some(outcome) = feed(&mut state, parser.as_mut(), last) {
+                return state.finish(outcome);
+            }
+            let outcome = parser.on_end();
+            match outcome {
+                Outcome::Failed(error) if !state.visible => state.transient_or_fail(error, None),
+                other => state.finish(other),
+            }
+        }
+    }
+}
+
+/// Run SSE events through the parser, queueing what it yields. Returns the terminal
+/// outcome if the parser finished; nothing a parser returns after its own `Finished`
+/// is forwarded.
+fn feed(
+    state: &mut State,
+    parser: &mut dyn ResponseParser,
+    events: Vec<SseEvent>,
+) -> Option<Outcome> {
+    for event in events {
+        for stream_event in parser.on_event(event) {
+            if let StreamEvent::Finished(outcome) = stream_event {
+                return Some(outcome);
+            }
+            if is_visible(&stream_event) {
+                state.visible = true;
+            }
+            state.pending.push_back(stream_event);
+        }
+    }
+    None
+}
+
+async fn wait(mut state: State, delay: Duration) -> State {
+    let cancel = state.request.cancel.clone();
+    match race(cancel, tokio::time::sleep(delay)).await {
+        Raced::Cancelled => state.finish(Outcome::Cancelled),
+        Raced::Done(()) => {
+            state.phase = Phase::Post;
+            state
+        }
+    }
+}
+
+/// Drain a non-2xx body for classification. Body bytes never leave `post_once`
+/// except into `ResponseParser::on_http_error`.
+async fn drain_body(cancel: &CancellationToken, mut body: ByteStream) -> Raced<Vec<u8>> {
+    let mut collected = Vec::new();
+    loop {
+        match next_chunk(cancel, &mut body).await {
+            Raced::Cancelled => return Raced::Cancelled,
+            Raced::Done(None) => return Raced::Done(collected),
+            Raced::Done(Some(Ok(chunk))) => {
+                // Classification needs the error type, not the whole body: an
+                // unbounded error body must not be buffered.
+                let room = ERROR_BODY_LIMIT.saturating_sub(collected.len());
+                collected.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                if room == 0 {
+                    return Raced::Done(collected);
+                }
+            }
+            // A body error after a non-2xx status does not change the status
+            // policy; classify what arrived.
+            Raced::Done(Some(Err(_))) => return Raced::Done(collected),
+        }
+    }
+}
+
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
+
+fn is_visible(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::TextDelta { .. }
+            | StreamEvent::ReasoningDelta { .. }
+            | StreamEvent::ToolInputDelta { .. }
+    )
+}
+
+enum Raced<T> {
+    Done(T),
+    Cancelled,
+}
+
+/// Await `future`, but stop as soon as `cancel` fires.
+async fn race<T>(cancel: CancellationToken, future: impl Future<Output = T>) -> Raced<T> {
+    let cancelled = cancel.cancelled();
+    let future = std::pin::pin!(future);
+    let cancelled = std::pin::pin!(cancelled);
+    match select(future, cancelled).await {
+        Either::Left((value, _)) => Raced::Done(value),
+        Either::Right(((), _)) => Raced::Cancelled,
+    }
+}
+
+async fn next_chunk(
+    cancel: &CancellationToken,
+    body: &mut ByteStream,
+) -> Raced<Option<Result<Vec<u8>, TransportError>>> {
+    let cancelled = cancel.cancelled();
+    let next = body.next();
+    let next = std::pin::pin!(next);
+    let cancelled = std::pin::pin!(cancelled);
+    match select(next, cancelled).await {
+        Either::Left((item, _)) => Raced::Done(item),
+        Either::Right(((), _)) => Raced::Cancelled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use p1_contracts::{
+        AssistantBlock, AssistantItem, BoxFuture, CompletedResponse, Origin, ProviderErrorKind,
+        StopReason, StreamEvent,
+    };
+
+    use super::*;
+    use crate::http::{HttpRequest, HttpResponse};
+    use crate::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
+
+    fn completed_response() -> CompletedResponse {
+        CompletedResponse {
+            item: AssistantItem {
+                origin: Origin {
+                    route: "test-route".to_string(),
+                    model: "test-model".to_string(),
+                },
+                blocks: vec![AssistantBlock::Text {
+                    text: "Hello world".to_string(),
+                }],
+            },
+            stop: StopReason::EndTurn,
+            usage: None,
+        }
+    }
+
+    /// A minimal adapter-side parser. It understands a small command vocabulary
+    /// so the driver's policy is what is under test.
+    #[derive(Default)]
+    struct TestParser;
+
+    impl ResponseParser for TestParser {
+        fn on_event(&mut self, event: SseEvent) -> Vec<StreamEvent> {
+            match event.data.trim() {
+                "delta" => vec![StreamEvent::TextDelta {
+                    block: 0,
+                    text: "Hello world".to_string(),
+                }],
+                "activity" => vec![StreamEvent::Activity],
+                "done" => vec![StreamEvent::Finished(Outcome::Completed(
+                    completed_response(),
+                ))],
+                "finish-then-delta" => vec![
+                    StreamEvent::Finished(Outcome::Completed(completed_response())),
+                    StreamEvent::TextDelta {
+                        block: 0,
+                        text: "AFTER".to_string(),
+                    },
+                ],
+                "after" => vec![StreamEvent::TextDelta {
+                    block: 0,
+                    text: "AFTER".to_string(),
+                }],
+                "error" => vec![StreamEvent::Finished(Outcome::Failed(ProviderError::new(
+                    ProviderErrorKind::Protocol,
+                    "provider error event",
+                )))],
+                _ => Vec::new(),
+            }
+        }
+
+        fn on_end(&mut self) -> Outcome {
+            Outcome::Failed(ProviderError::new(
+                ProviderErrorKind::Transport,
+                "stream ended without a terminal event",
+            ))
+        }
+
+        fn on_http_error(
+            &self,
+            status: u16,
+            _headers: &[(String, String)],
+            _body: &[u8],
+        ) -> ProviderError {
+            let kind = match status {
+                401 | 403 => ProviderErrorKind::Authentication,
+                408 | 425 | 429 | 500..=599 => ProviderErrorKind::Transport,
+                _ => ProviderErrorKind::InvalidRequest,
+            };
+            ProviderError::new(kind, format!("http status {status}"))
+        }
+    }
+
+    struct ScriptedCredentials {
+        initial: Credential,
+        refreshed: Credential,
+        refresh_calls: Mutex<Vec<Credential>>,
+        access_calls: AtomicUsize,
+    }
+
+    impl ScriptedCredentials {
+        fn new(initial: &str, refreshed: &str) -> Self {
+            Self {
+                initial: Credential {
+                    bearer: initial.to_string(),
+                    account_id: None,
+                },
+                refreshed: Credential {
+                    bearer: refreshed.to_string(),
+                    account_id: None,
+                },
+                refresh_calls: Mutex::new(Vec::new()),
+                access_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CredentialSource for ScriptedCredentials {
+        fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+            Box::pin(async move {
+                self.access_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.initial.clone())
+            })
+        }
+
+        fn refresh<'a>(
+            &'a self,
+            rejected: &'a Credential,
+        ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+            Box::pin(async move {
+                self.refresh_calls.lock().unwrap().push(rejected.clone());
+                Ok(self.refreshed.clone())
+            })
+        }
+    }
+
+    struct Harness {
+        transport: ScriptedTransport,
+        credentials: Arc<ScriptedCredentials>,
+        cancel: CancellationToken,
+        retry: RetryPolicy,
+        builds: Arc<AtomicUsize>,
+    }
+
+    impl Harness {
+        fn new(responses: Vec<ScriptedResponse>) -> Self {
+            Self::custom(responses, RetryPolicy::default(), "OLD", "NEW")
+        }
+
+        fn custom(
+            responses: Vec<ScriptedResponse>,
+            retry: RetryPolicy,
+            initial: &str,
+            refreshed: &str,
+        ) -> Self {
+            Self {
+                transport: ScriptedTransport::new(responses),
+                credentials: Arc::new(ScriptedCredentials::new(initial, refreshed)),
+                cancel: CancellationToken::new(),
+                retry,
+                builds: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn start(&self) -> ProviderStream {
+            let transport: Arc<dyn Transport> = Arc::new(self.transport.clone());
+            let credentials: Arc<dyn CredentialSource> = self.credentials.clone();
+            let builds = self.builds.clone();
+            drive(DriveRequest {
+                transport,
+                credentials,
+                build: Box::new(move |credential: &Credential| {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    HttpRequest {
+                        url: "https://provider.test/v1/stream?secret=in-the-query".to_string(),
+                        headers: vec![(
+                            "authorization".to_string(),
+                            format!("Bearer {}", credential.bearer),
+                        )],
+                        body: br#"{"stream":true,"prompt":"body text"}"#.to_vec(),
+                    }
+                }),
+                new_parser: Box::new(|| Box::new(TestParser) as Box<dyn ResponseParser>),
+                retry: self.retry,
+                cancel: self.cancel.clone(),
+            })
+        }
+    }
+
+    fn status_response(status: u16) -> ScriptedResponse {
+        ScriptedResponse {
+            status,
+            headers: Vec::new(),
+            chunks: Vec::new(),
+            end: BodyEnd::Eof,
+        }
+    }
+
+    fn ok(text: &str) -> ScriptedResponse {
+        ScriptedResponse::ok_sse(text)
+    }
+
+    fn text_turn() -> &'static str {
+        "data: delta\n\ndata: done\n\n"
+    }
+
+    async fn collect(mut stream: ProviderStream) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn finished_count(events: &[StreamEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::Finished(_)))
+            .count()
+    }
+
+    fn terminal(events: &[StreamEvent]) -> &Outcome {
+        match events.last() {
+            Some(StreamEvent::Finished(outcome)) => outcome,
+            other => panic!("stream did not end with Finished: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_status_retries_then_succeeds() {
+        let harness = Harness::new(vec![
+            status_response(500),
+            status_response(500),
+            ok(text_turn()),
+        ]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 3);
+        assert_eq!(finished_count(&events), 1);
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+        let first_content = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::TextDelta { .. }))
+            .expect("content delta");
+        let first_activity = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::Activity))
+            .expect("back-off activity");
+        assert!(
+            first_activity < first_content,
+            "activity must precede the first content event: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_status_exhausts_the_budget_then_fails_transport() {
+        let harness = Harness::new(vec![
+            status_response(500),
+            status_response(500),
+            status_response(500),
+            status_response(500),
+        ]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 4);
+        assert_eq!(finished_count(&events), 1);
+        match terminal(&events) {
+            Outcome::Failed(error) => assert_eq!(error.kind, ProviderErrorKind::Transport),
+            other => panic!("expected a transport failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reauth_refreshes_once_with_the_rejected_credential() {
+        let harness = Harness::new(vec![status_response(401), ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        let requests = harness.transport.requests();
+        assert_eq!(requests.len(), 2);
+        let refresh_calls = harness.credentials.refresh_calls.lock().unwrap();
+        assert_eq!(refresh_calls.len(), 1);
+        assert_eq!(refresh_calls[0].bearer, "OLD");
+        assert_eq!(harness.credentials.access_calls.load(Ordering::SeqCst), 1);
+        assert!(requests[1].headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer NEW"
+        }));
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_reauth_is_authentication() {
+        let harness = Harness::new(vec![status_response(401), status_response(401)]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 2);
+        match terminal(&events) {
+            Outcome::Failed(error) => assert_eq!(error.kind, ProviderErrorKind::Authentication),
+            other => panic!("expected an authentication failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reauth_does_not_consume_the_transient_budget() {
+        let harness = Harness::new(vec![
+            status_response(401),
+            status_response(500),
+            ok(text_turn()),
+        ]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 3);
+        assert_eq!(harness.credentials.refresh_calls.lock().unwrap().len(), 1);
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_hint_sets_the_wait() {
+        let mut throttled = status_response(429);
+        throttled
+            .headers
+            .push(("Retry-After".to_string(), "7".to_string()));
+        let harness = Harness::new(vec![throttled, ok(text_turn())]);
+
+        let start = tokio::time::Instant::now();
+        let events = collect(harness.start()).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(harness.transport.requests().len(), 2);
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+        assert_eq!(
+            elapsed,
+            Duration::from_secs(7),
+            "the Retry-After hint, not the 2 s base, sets the wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fatal_status_fails_without_retrying() {
+        let mut invalid = status_response(400);
+        invalid.chunks.push(b"{\"error\":\"bad request\"}".to_vec());
+        let harness = Harness::new(vec![invalid]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        match terminal(&events) {
+            Outcome::Failed(error) => {
+                assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+                assert!(error.message.contains("400"), "{}", error.message);
+            }
+            other => panic!("expected a fatal failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_error_after_visible_output_is_not_retried() {
+        let broken = ScriptedResponse {
+            status: 200,
+            headers: Vec::new(),
+            chunks: vec![b"data: delta\n\n".to_vec()],
+            end: BodyEnd::Error("connection reset".to_string()),
+        };
+        let harness = Harness::new(vec![broken, ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        assert!(matches!(
+            terminal(&events),
+            Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_error_before_content_is_retried() {
+        let broken = ScriptedResponse {
+            status: 200,
+            headers: Vec::new(),
+            chunks: Vec::new(),
+            end: BodyEnd::Error("connection reset".to_string()),
+        };
+        let harness = Harness::new(vec![broken, ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 2);
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_content_events_do_not_block_a_retry() {
+        let broken = ScriptedResponse {
+            status: 200,
+            headers: Vec::new(),
+            chunks: vec![b"data: activity\n\n".to_vec()],
+            end: BodyEnd::Error("connection reset".to_string()),
+        };
+        let harness = Harness::new(vec![broken, ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 2);
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_after_visible_content_is_not_retried() {
+        let harness = Harness::new(vec![ok("data: delta\n\n"), ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        // The first body ends after a visible delta, so it is NOT retried: rule 3
+        // wins over the missing terminal event.
+        assert_eq!(harness.transport.requests().len(), 1);
+        assert!(matches!(
+            terminal(&events),
+            Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_without_content_is_retried() {
+        let harness = Harness::new(vec![ok(": keep-alive\n\n"), ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 2);
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_backoff_stops_without_a_second_request() {
+        let harness = Harness::new(vec![status_response(500), ok(text_turn())]);
+        let mut stream = harness.start();
+
+        let first = stream.next().await.expect("an event");
+        assert_eq!(first, StreamEvent::Activity);
+        harness.cancel.cancel();
+
+        let events = collect(stream).await;
+        assert_eq!(harness.transport.requests().len(), 1);
+        assert_eq!(finished_count(&events), 1);
+        assert!(matches!(terminal(&events), Outcome::Cancelled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_while_the_body_hangs() {
+        let hanging = ScriptedResponse {
+            status: 200,
+            headers: Vec::new(),
+            chunks: vec![b"data: delta\n\n".to_vec()],
+            end: BodyEnd::Hang,
+        };
+        let harness = Harness::new(vec![hanging]);
+        let mut stream = harness.start();
+
+        let mut saw_delta = false;
+        while let Some(event) = stream.next().await {
+            if matches!(event, StreamEvent::TextDelta { .. }) {
+                saw_delta = true;
+                break;
+            }
+        }
+        assert!(saw_delta);
+        harness.cancel.cancel();
+
+        let events = collect(stream).await;
+        assert_eq!(finished_count(&events), 1);
+        assert!(matches!(terminal(&events), Outcome::Cancelled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_before_the_first_byte() {
+        let harness = Harness::new(vec![ok(text_turn())]);
+        harness.cancel.cancel();
+
+        let events = collect(harness.start()).await;
+        assert_eq!(harness.transport.requests().len(), 0);
+        assert_eq!(finished_count(&events), 1);
+        assert!(matches!(terminal(&events), Outcome::Cancelled));
+    }
+
+    // Lead regression: the body's last event has no trailing blank line. It must be
+    // flushed and parsed, not lost and reported as a broken stream.
+    #[tokio::test(start_paused = true)]
+    async fn a_final_event_without_a_trailing_blank_line_still_terminates_the_stream() {
+        let harness = Harness::new(vec![ScriptedResponse::ok_sse("data: delta\n\ndata: done")]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        assert_eq!(finished_count(&events), 1);
+        assert!(
+            matches!(terminal(&events), Outcome::Completed(_)),
+            "{events:?}"
+        );
+    }
+
+    // Lead regression: an endless error body is not buffered without bound.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_error_body_is_cut_off_before_classification() {
+        let chunk = vec![b'x'; 40 * 1024];
+        let harness = Harness::new(vec![ScriptedResponse {
+            status: 400,
+            headers: Vec::new(),
+            chunks: vec![chunk.clone(), chunk.clone(), chunk],
+            end: BodyEnd::Hang,
+        }]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        assert!(
+            matches!(terminal(&events), Outcome::Failed(_)),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn events_a_parser_returns_after_its_finished_are_not_forwarded() {
+        let harness = Harness::new(vec![ok("data: finish-then-delta\n\ndata: after\n\n")]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(finished_count(&events), 1);
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta { text, .. } if text == "AFTER"
+            )),
+            "events after Finished must be dropped: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_stream_is_done_after_the_terminal_event() {
+        let harness = Harness::new(vec![ok(text_turn())]);
+        let mut stream = harness.start();
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        assert_eq!(finished_count(&events), 1);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunk_boundaries_do_not_change_the_stream() {
+        let body = text_turn();
+        let expected = collect(Harness::new(vec![ok(body)]).start()).await;
+        for at in 0..=body.len() {
+            let harness = Harness::new(vec![ScriptedResponse::ok_sse_split(body, at)]);
+            let events = collect(harness.start()).await;
+            assert_eq!(events, expected, "split at byte offset {at}");
+        }
+    }
+
+    /// A transport whose `post` never resolves, to prove the send wait races the
+    /// cancellation token like the body and back-off waits do.
+    struct HangingTransport;
+
+    impl Transport for HangingTransport {
+        fn post<'a>(
+            &'a self,
+            _request: HttpRequest,
+        ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_while_the_request_is_in_flight() {
+        let credentials = Arc::new(ScriptedCredentials::new("OLD", "NEW"));
+        let cancel = CancellationToken::new();
+        let mut stream = drive(DriveRequest {
+            transport: Arc::new(HangingTransport),
+            credentials,
+            build: Box::new(|_credential: &Credential| HttpRequest {
+                url: "https://provider.test/v1/stream".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+            new_parser: Box::new(|| Box::new(TestParser) as Box<dyn ResponseParser>),
+            retry: RetryPolicy::default(),
+            cancel: cancel.clone(),
+        });
+
+        {
+            let poll = stream.next();
+            let yield_now = std::pin::pin!(tokio::task::yield_now());
+            match futures_util::future::select(poll, yield_now).await {
+                futures_util::future::Either::Left(_) => panic!("the transport must not resolve"),
+                futures_util::future::Either::Right(_) => {}
+            }
+        }
+        cancel.cancel();
+
+        let events = collect(stream).await;
+        assert_eq!(finished_count(&events), 1);
+        assert!(matches!(terminal(&events), Outcome::Cancelled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credentials_and_bodies_never_reach_an_error_or_debug() {
+        let mut rejected = status_response(400);
+        rejected
+            .headers
+            .push(("x-secret".to_string(), "SENTINEL-SECRET-123".to_string()));
+        rejected.chunks.push(b"SENTINEL-BODY-456".to_vec());
+        let harness = Harness::custom(
+            vec![rejected],
+            RetryPolicy::default(),
+            "SENTINEL-SECRET-123",
+            "NEW",
+        );
+        let events = collect(harness.start()).await;
+
+        let error = match terminal(&events) {
+            Outcome::Failed(error) => error.clone(),
+            other => panic!("expected failure, got {other:?}"),
+        };
+        let request_debug = format!("{:?}", harness.transport.requests()[0]);
+        let event_debug = format!("{events:?}");
+        for text in [
+            request_debug.clone(),
+            event_debug,
+            format!("{error:?}"),
+            error.to_string(),
+        ] {
+            assert!(
+                !text.contains("SENTINEL-SECRET-123"),
+                "leaked bearer: {text}"
+            );
+            assert!(!text.contains("SENTINEL-BODY-456"), "leaked body: {text}");
+        }
+        assert!(
+            !request_debug.contains("in-the-query"),
+            "leaked query: {request_debug}"
+        );
+        assert!(
+            !request_debug.contains("body text"),
+            "leaked body: {request_debug}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_error_on_the_first_attempt_is_retried() {
+        let harness = Harness::new(vec![
+            ScriptedResponse::connect_error("connection refused"),
+            ok(text_turn()),
+        ]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 2);
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_errors_exhaust_the_budget_then_fail_transport() {
+        let harness = Harness::new(vec![
+            ScriptedResponse::connect_error("connection refused"),
+            ScriptedResponse::connect_error("connection refused"),
+            ScriptedResponse::connect_error("connection refused"),
+            ScriptedResponse::connect_error("connection refused"),
+        ]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 4);
+        assert!(matches!(
+            terminal(&events),
+            Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport
+        ));
+    }
+}

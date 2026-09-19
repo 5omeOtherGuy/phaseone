@@ -19,4 +19,6 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 | `tools.md` | Tool modules and the shared workspace helper |
 | `providers.md` | Provider modules, shared HTTP/SSE/retry helper, the ONE conformance suite |
 | `assembly.md` | Environment files, catalog, fail-fast assembly, host CLI |
+| `journal.md` | Memory/JSONL stores, sync guarantee, truncated tail, projection, resume, interrupted calls |
+| `delegation.md` | Optional worker service and delegation tools |
 | `core.md` | Agent core behaviour specification (authoritative for `p1-core`) |
