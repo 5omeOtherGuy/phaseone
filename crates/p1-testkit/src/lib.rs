@@ -93,6 +93,7 @@ pub enum Step {
 struct ProviderState {
     script: VecDeque<Step>,
     requests: Vec<ProviderRequest>,
+    validated: Vec<ProviderRequest>,
 }
 
 /// A provider that replays a script and records every request it was given.
@@ -111,6 +112,7 @@ impl ScriptedProvider {
             state: Arc::new(Mutex::new(ProviderState {
                 script: script.into(),
                 requests: Vec::new(),
+                validated: Vec::new(),
             })),
             drained: Arc::new(Notify::new()),
             reject_validation: None,
@@ -125,6 +127,11 @@ impl ScriptedProvider {
 
     pub fn requests(&self) -> Vec<ProviderRequest> {
         self.state.lock().unwrap().requests.clone()
+    }
+
+    /// Every request `validate` was asked about, in order.
+    pub fn validated(&self) -> Vec<ProviderRequest> {
+        self.state.lock().unwrap().validated.clone()
     }
 
     pub fn remaining_steps(&self) -> usize {
@@ -142,7 +149,8 @@ impl Provider for ScriptedProvider {
         }
     }
 
-    fn validate(&self, _request: &ProviderRequest) -> Result<(), ProviderError> {
+    fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
+        self.state.lock().unwrap().validated.push(request.clone());
         match &self.reject_validation {
             Some(error) => Err(error.clone()),
             None => Ok(()),
@@ -335,10 +343,14 @@ impl Tool for FakeTool {
 // ---------------------------------------------------------------- journal
 
 /// In-memory commit sink that records everything and can be told to fail.
+type CommitHook = Arc<dyn Fn(&JournalRecord) + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct RecordingJournal {
     records: Arc<Mutex<Vec<JournalRecord>>>,
     fail_at_seq: Arc<Mutex<Option<u64>>>,
+    fail_once_at_seq: Arc<Mutex<Option<u64>>>,
+    hook: Option<CommitHook>,
 }
 
 impl RecordingJournal {
@@ -349,6 +361,25 @@ impl RecordingJournal {
     /// The commit of the record with this `seq` (and every later commit) fails.
     pub fn failing_at(self, seq: u64) -> Self {
         *self.fail_at_seq.lock().unwrap() = Some(seq);
+        self
+    }
+
+    /// Only the FIRST commit attempt of the record with this `seq` fails; later
+    /// attempts (of any record) succeed.
+    pub fn failing_once_at(self, seq: u64) -> Self {
+        *self.fail_once_at_seq.lock().unwrap() = Some(seq);
+        self
+    }
+
+    /// Run `hook` synchronously inside every SUCCESSFUL commit, after the record is
+    /// stored and before `commit` returns. A deterministic way to act at an exact
+    /// boundary: e.g. send an inbox message or cancel the turn right after
+    /// `AssistantCompleted` is committed.
+    pub fn with_commit_hook(
+        mut self,
+        hook: impl Fn(&JournalRecord) + Send + Sync + 'static,
+    ) -> Self {
+        self.hook = Some(Arc::new(hook));
         self
     }
 
@@ -365,7 +396,20 @@ impl CommitSink for RecordingJournal {
             {
                 return Err(CommitError(format!("scripted failure at seq {seq}")));
             }
+            {
+                let mut once = self.fail_once_at_seq.lock().unwrap();
+                if *once == Some(record.seq) {
+                    *once = None;
+                    return Err(CommitError(format!(
+                        "scripted one-time failure at seq {}",
+                        record.seq
+                    )));
+                }
+            }
             self.records.lock().unwrap().push(record.clone());
+            if let Some(hook) = &self.hook {
+                hook(record);
+            }
             Ok(())
         })
     }
