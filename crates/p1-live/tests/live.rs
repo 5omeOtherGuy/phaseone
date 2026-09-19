@@ -1,0 +1,255 @@
+//! Bounded live smoke checks of the two real routes. They use the owner's existing CLI
+//! logins, cost a few hundred tokens each, print no credential and no request body, and
+//! do NOTHING unless `P1_LIVE=1` (an env flag alone is not authorization: only the lead
+//! runs these). Not part of the gate.
+//!
+//!   P1_LIVE=1 cargo test -p p1-live -- --nocapture --test-threads 1
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use p1_contracts::{
+    AssistantBlock, CancellationToken, CompletedResponse, DeclarationKind, Effort, Grammar, Item,
+    ModelOptions, Outcome, Provider, ProviderRequest, StopReason, StreamEvent, ToolDeclaration,
+    ToolInput, ToolResultItem, ToolStatus,
+};
+use p1_provider_anthropic::{AnthropicProvider, ClaudeCodeCredentials};
+use p1_provider_http::ReqwestTransport;
+use p1_provider_openai::{CodexCliCredentials, OpenAiCodexProvider};
+
+fn live() -> bool {
+    std::env::var("P1_LIVE").as_deref() == Ok("1")
+}
+
+fn model(var: &str, default: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+/// `P1_LIVE_EFFORT=low|medium|high` (default low). High makes the models reason, which
+/// exercises reasoning replay on the follow-up request.
+fn effort() -> Option<Effort> {
+    match std::env::var("P1_LIVE_EFFORT").as_deref() {
+        Ok("high") => Some(Effort::High),
+        Ok("medium") => Some(Effort::Medium),
+        _ => Some(Effort::Low),
+    }
+}
+
+fn read_tool() -> ToolDeclaration {
+    ToolDeclaration {
+        name: "read".into(),
+        description: "Read a file from the repository. Always use this to look at files.".into(),
+        kind: DeclarationKind::Function {
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "File path"}},
+                "required": ["path"]
+            }),
+        },
+    }
+}
+
+/// Run one request to its terminal event; print a compact, secret-free trace.
+async fn respond(provider: &dyn Provider, request: ProviderRequest) -> CompletedResponse {
+    provider.validate(&request).expect("request validates");
+    let mut stream = provider
+        .stream(request, CancellationToken::new())
+        .await
+        .expect("stream starts");
+    let (mut text, mut reasoning, mut tool_deltas) = (0usize, 0usize, 0usize);
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(180), stream.next())
+            .await
+            .expect("provider went silent for 180 s")
+            .expect("stream ended without a terminal event");
+        match event {
+            StreamEvent::TextDelta { text: t, .. } => text += t.len(),
+            StreamEvent::ReasoningDelta { text: t, .. } => reasoning += t.len(),
+            StreamEvent::ToolInputDelta { .. } => tool_deltas += 1,
+            StreamEvent::Activity => {}
+            StreamEvent::Finished(Outcome::Completed(done)) => {
+                println!(
+                    "  deltas: text {text} B, reasoning {reasoning} B, tool-input {tool_deltas}; stop {:?}; usage {:?}",
+                    done.stop, done.usage
+                );
+                for block in &done.item.blocks {
+                    match block {
+                        AssistantBlock::Text { text } => {
+                            println!("  text: {:?}", text.chars().take(80).collect::<String>())
+                        }
+                        AssistantBlock::Reasoning { text, replay } => println!(
+                            "  reasoning: {} B shown, replay data: {}",
+                            text.len(),
+                            replay.as_ref().map_or("none".to_string(), |r| format!(
+                                "v{} for {}",
+                                r.version, r.origin.model
+                            ))
+                        ),
+                        AssistantBlock::ToolCall(call) => println!(
+                            "  call: {} id-len {} input {:?}",
+                            call.name,
+                            call.call_id.len(),
+                            call.input.raw().chars().take(120).collect::<String>()
+                        ),
+                    }
+                }
+                return done;
+            }
+            StreamEvent::Finished(other) => panic!("live request did not complete: {other:?}"),
+        }
+    }
+}
+
+/// Text turn, then a tool-call round trip whose follow-up replays the reasoning.
+async fn round_trip(provider: &dyn Provider, tools: Vec<ToolDeclaration>, effort: Option<Effort>) {
+    let options = ModelOptions {
+        reasoning_effort: effort,
+        ..ModelOptions::default()
+    };
+    println!("- text turn");
+    let done = respond(
+        provider,
+        ProviderRequest {
+            system_prompt: "You are a terse test assistant.".into(),
+            history: vec![Item::User {
+                text: "Reply with exactly: pong".into(),
+            }],
+            tools: Vec::new(),
+            options: options.clone(),
+        },
+    )
+    .await;
+    assert!(
+        done.item.text().to_lowercase().contains("pong"),
+        "unexpected text"
+    );
+    assert!(
+        done.usage.is_some(),
+        "a completed live response should report usage"
+    );
+
+    println!("- tool call");
+    let mut history = vec![Item::User {
+        text: "What is the secret word in the file notes.txt? Use the read tool.".into(),
+    }];
+    let first = respond(
+        provider,
+        ProviderRequest {
+            system_prompt: "You are a coding agent. Use your tools.".into(),
+            history: history.clone(),
+            tools: tools.clone(),
+            options: options.clone(),
+        },
+    )
+    .await;
+    assert_eq!(first.stop, StopReason::ToolUse);
+    let call = first.item.tool_calls().next().expect("a tool call").clone();
+    assert_eq!(call.name, "read");
+    assert!(matches!(call.input, ToolInput::Json(_)));
+
+    println!("- follow-up with the result (replays reasoning data if any)");
+    history.push(Item::Assistant(first.item.clone()));
+    history.push(Item::ToolResult(ToolResultItem {
+        call_id: call.call_id,
+        name: call.name,
+        status: ToolStatus::Ok,
+        content: "     1\tthe secret word is: marzipan".into(),
+    }));
+    let second = respond(
+        provider,
+        ProviderRequest {
+            system_prompt: "You are a coding agent. Use your tools.".into(),
+            history,
+            tools,
+            options,
+        },
+    )
+    .await;
+    assert!(
+        second.item.text().to_lowercase().contains("marzipan"),
+        "the model did not use the tool result"
+    );
+}
+
+#[tokio::test]
+async fn claude_subscription_route() {
+    if !live() {
+        return;
+    }
+    let model = model("P1_LIVE_CLAUDE_MODEL", "claude-sonnet-5");
+    println!("== anthropic-messages/claude-subscription · {model}");
+    let provider = AnthropicProvider::new(
+        &model,
+        Arc::new(ReqwestTransport::new()),
+        Arc::new(ClaudeCodeCredentials::from_default_location().expect("Claude Code login")),
+    );
+    round_trip(&provider, vec![read_tool()], effort()).await;
+}
+
+#[tokio::test]
+async fn codex_subscription_route() {
+    if !live() {
+        return;
+    }
+    let model = model("P1_LIVE_GPT_MODEL", "gpt-5.6-sol");
+    println!("== openai-responses/codex-subscription · {model}");
+    let provider = OpenAiCodexProvider::new(
+        &model,
+        Arc::new(ReqwestTransport::new()),
+        Arc::new(CodexCliCredentials::from_default_location().expect("Codex CLI login")),
+    );
+    round_trip(&provider, vec![read_tool()], effort()).await;
+}
+
+/// routes.md [todo-live]: does the Codex subscription route accept a freeform/grammar
+/// tool, and does the model answer with a `custom_tool_call` carrying raw patch text?
+#[tokio::test]
+async fn codex_route_accepts_a_freeform_patch_tool() {
+    if !live() {
+        return;
+    }
+    let model = model("P1_LIVE_GPT_MODEL", "gpt-5.6-sol");
+    println!("== freeform apply_patch on openai-responses/codex-subscription · {model}");
+    let provider = OpenAiCodexProvider::new(
+        &model,
+        Arc::new(ReqwestTransport::new()),
+        Arc::new(CodexCliCredentials::from_default_location().expect("Codex CLI login")),
+    );
+    let grammar = "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n%import common.LF\n";
+    let patch_tool = ToolDeclaration {
+        name: "apply_patch".into(),
+        description: "Create, change or delete files with a patch in the V4A format.".into(),
+        kind: DeclarationKind::Freeform {
+            grammar: Some(Grammar {
+                syntax: "lark".into(),
+                definition: grammar.into(),
+            }),
+        },
+    };
+    let done = respond(
+        &provider,
+        ProviderRequest {
+            system_prompt: "You are a coding agent. apply_patch is the only way to create files."
+                .into(),
+            history: vec![Item::User {
+                text: "Create the file hello.txt containing the single line: hello".into(),
+            }],
+            tools: vec![patch_tool],
+            options: ModelOptions {
+                reasoning_effort: Some(Effort::Low),
+                ..ModelOptions::default()
+            },
+        },
+    )
+    .await;
+    let call = done.item.tool_calls().next().expect("a tool call");
+    assert_eq!(call.name, "apply_patch");
+    match &call.input {
+        ToolInput::Text(raw) => assert!(
+            raw.contains("*** Begin Patch") && raw.contains("hello.txt"),
+            "{raw:?}"
+        ),
+        other => panic!("expected freeform text input, got {other:?}"),
+    }
+}
