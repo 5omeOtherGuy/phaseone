@@ -21,7 +21,9 @@ Compiles are serialised machine-wide by cargo's lock on the shared target dir
 (scripts/local-cargo-config.sh). A worker process itself costs ~120-190 MB resident
 (measured), so the pool is bounded twice: at most --max-parallel live workers
 (default 6) and no new worker starts while MemAvailable is below --min-free-mb
-(default 1500; the first job always starts). The job list may be much longer than
+(default 1500). Both bounds count EVERY pi-worker on the machine, not only this
+batch's; a job starts regardless only when no worker is running anywhere (so a
+batch can never wait forever on memory that nothing will free). The job list may be much longer than
 the pool — queue 20 jobs, run 6 at a time.
 """
 import argparse
@@ -64,6 +66,12 @@ def mem_available_mb():
         if line.startswith("MemAvailable:"):
             return int(line.split()[1]) // 1024
     return 0
+
+
+def workers_alive():
+    """pi-worker processes on the whole machine (other batches and sessions included)."""
+    out = subprocess.run(["pgrep", "-fc", "scripts/pi-worker "], capture_output=True, text=True).stdout
+    return int(out.strip() or 0)
 
 
 def command_for(job, worker):
@@ -110,8 +118,9 @@ def main():
             if failed:
                 results[label] = {"label": label, "profile": job["profile"], "skipped": f"dependency failed: {failed}"}
                 del pending[label]
-            elif (len(running) < a.max_parallel and all(d in results for d in deps)
-                  and (not running or mem_available_mb() >= a.min_free_mb)):
+            elif all(d in results for d in deps) and (
+                    workers_alive() == 0
+                    or (workers_alive() < a.max_parallel and mem_available_mb() >= a.min_free_mb)):
                 out_path = os.path.join(out_dir, f"{label}.out")
                 out = open(out_path, "w")
                 proc = subprocess.Popen(command_for(job, worker), stdin=subprocess.DEVNULL, stdout=out,
@@ -132,7 +141,7 @@ def main():
             results[label] = record
             del running[label]
             print(f"fanout: finished {label} exit {record.get('exit', proc.returncode)}", file=sys.stderr, flush=True)
-        if running:
+        if running or pending:
             time.sleep(5 if pending else 2)
 
     print(json.dumps([results[label] for label in labels], indent=2))
