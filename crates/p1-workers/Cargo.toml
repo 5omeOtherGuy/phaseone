@@ -1,0 +1,21 @@
+[package]
+name = "p1-workers"
+description = "Optional delegation: the typed worker service and its in-process implementation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-core = { path = "../p1-core" }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
+
+[dev-dependencies]
+p1-testkit = { path = "../p1-testkit" }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "test-util"] }
