@@ -1,0 +1,15 @@
+[package]
+name = "p1-testkit"
+description = "Scripted fakes for testing against the p1 contracts (test dependency only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+futures-core = "0.3"
+tokio = { version = "1", default-features = false, features = ["sync"] }

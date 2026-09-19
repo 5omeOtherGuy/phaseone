@@ -15,4 +15,5 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 
 | Note | Seam |
 |---|---|
-| `routes.md` | Verified wire shapes of the two real provider routes (not written yet) |
+| `routes.md` | Verified wire shapes of the two real provider routes |
+| `core.md` | Agent core behaviour specification (authoritative for `p1-core`) |
