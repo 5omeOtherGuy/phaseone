@@ -831,6 +831,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-tool-delegate"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-core",
+ "p1-testkit",
+ "p1-workers",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "p1-tool-edit"
 version = "0.0.1"
 dependencies = [
@@ -918,6 +931,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "p1-workers"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-core",
+ "p1-testkit",
+ "serde_json",
+ "thiserror",
  "tokio",
 ]
 
