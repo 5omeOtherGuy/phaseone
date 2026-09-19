@@ -1,0 +1,19 @@
+[package]
+name = "p1-tool-tests"
+description = "Lead-owned cross-tool acceptance tests (test-only crate; nothing depends on it)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-workspace = { path = "../p1-workspace" }
+p1-tool-read = { path = "../p1-tool-read" }
+p1-tool-edit = { path = "../p1-tool-edit" }
+p1-tool-write = { path = "../p1-tool-write" }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

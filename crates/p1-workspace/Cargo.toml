@@ -1,0 +1,16 @@
+[package]
+name = "p1-workspace"
+description = "Workspace path confinement, atomic writes, observed-file registry and output bounding for the p1 file tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
