@@ -43,8 +43,7 @@ module = "shell"
 # optional per tool:  name = "…"  description_file = "…"  variant = "…"   → ToolFace override
 ```
 `environments/gpt/environment.toml`: provider `openai-codex-subscription`, model
-`gpt-5.6-sol`, tools `shell`, `apply_patch` (+ `grep`, `read` only if the live check shows
-the model works better with them — default is the Codex-native pair plus `read`).
+`gpt-5.6-sol`, tools `shell` and `apply_patch` — the Codex-native pair, nothing else.
 
 `prompt.md` is a WHOLE prompt file per family. The only substitutions, `{{…}}`:
 `{{workspace}}`, `{{date}}`, `{{os}}`, `{{tool_names}}` (comma-separated, in order),
