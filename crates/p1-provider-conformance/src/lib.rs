@@ -432,6 +432,16 @@ pub fn chunking_is_irrelevant(route: &RouteUnderTest) {
     }
 }
 
+/// Byte offset just after the SSE event that carries the first visible text ("Hello",
+/// which every route's `text_turn` must contain). Cutting after the FIRST event is not
+/// route-independent: a route's opening events may carry no contract event at all.
+fn end_of_first_visible_event(body: &str) -> usize {
+    let hello = body.find("Hello").unwrap_or(0);
+    body[hello..]
+        .find("\n\n")
+        .map_or(body.len(), |index| hello + index + 2)
+}
+
 async fn cancelled_events(
     route: &RouteUnderTest,
     response: ScriptedResponse,
@@ -445,11 +455,18 @@ async fn cancelled_events(
         .map_err(|e| format!("setup error ({:?})", e.kind))?;
     let mut events = Vec::new();
     if mid {
-        let first = bounded(stream.next())
-            .await
-            .map_err(str::to_string)?
-            .ok_or("stream ended before mid-stream cancellation")?;
-        events.push(first);
+        // Read up to and including the first visible delta, then cancel.
+        loop {
+            let event = bounded(stream.next())
+                .await
+                .map_err(str::to_string)?
+                .ok_or("stream ended before mid-stream cancellation")?;
+            let visible = matches!(event, StreamEvent::TextDelta { .. });
+            events.push(event);
+            if visible {
+                break;
+            }
+        }
     } else {
         let pending = stream.next();
         tokio::pin!(pending);
@@ -497,7 +514,7 @@ pub fn cancel_before_first_byte(route: &RouteUnderTest) {
 pub fn cancel_mid_stream(route: &RouteUnderTest) {
     const NAME: &str = "cancel_mid_stream";
     let body = route.fixtures.text_turn;
-    let at = body.find("\n\n").map_or(body.len(), |index| index + 2);
+    let at = end_of_first_visible_event(body);
     let response = ScriptedResponse {
         status: 200,
         headers: Vec::new(),
@@ -640,7 +657,7 @@ pub fn http_400_is_invalid_request_without_retry(route: &RouteUnderTest) {
 pub fn no_retry_after_visible_output(route: &RouteUnderTest) {
     const NAME: &str = "no_retry_after_visible_output";
     let body = route.fixtures.text_turn;
-    let at = body.find("\n\n").map_or(body.len(), |index| index + 2);
+    let at = end_of_first_visible_event(body);
     let broken = ScriptedResponse {
         status: 200,
         headers: Vec::new(),

@@ -330,13 +330,11 @@ impl AnthropicParser {
 
     fn on_message_start(&mut self, value: &Value) {
         let message = value.get("message");
-        if let Some(model) = message
-            .and_then(|message| message.get("model"))
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
-        {
-            self.origin_model = model.to_string();
-        }
+        // The item's origin is ALWAYS the configured route + model, never the model
+        // name echoed by the response: responses report dated aliases of the model
+        // that was asked for, and replay data is gated on origin equality — keying
+        // on the echoed name would make every thinking block "foreign" on the next
+        // request (routes.md §A Replay, ruling in providers.md).
         if let Some(usage) = message.and_then(|message| message.get("usage")) {
             self.merge_usage(usage);
         }
