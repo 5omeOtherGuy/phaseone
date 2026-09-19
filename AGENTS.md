@@ -11,7 +11,7 @@ make that fast and conflict-free.
 
 - **One worktree per task.** Never run two agents in one checkout.
   `scripts/new-worktree.sh <task-slug>` creates `../phaseone-<task-slug>` on a fresh
-  `task/<task-slug>` branch and points it at the shared cargo target dir.
+  `task/<task-slug>` branch with its own seeded cargo target dir (see Build).
 - **Work items are issues.** Claim one by assigning yourself and moving the label
   `ready` → `in-progress`. Stuck? Add `blocked` and say what you need in a comment.
   Only owner decisions carry the `owner` label.
@@ -51,13 +51,14 @@ It must be green before a merge; it is not required for every intermediate commi
 
 ## Build
 
-- Small SSD, 7 GB RAM: every checkout and worktree uses ONE shared target dir
-  (`../phaseone-target`, set by the untracked `.cargo/config.toml` that
-  `scripts/local-cargo-config.sh` writes; `jobs = 2`, incremental off). Never create a
-  per-worktree `target/` and never override `CARGO_TARGET_DIR`.
-- Cargo's lock on that directory serialises compilation across all agents. "Blocking
-  waiting for file lock on build directory" means another agent is compiling: wait,
-  do not kill it, do not work around it. Only one compile runs at a time, by design.
+- Small SSD, 7 GB RAM. `scripts/new-worktree.sh` sets each worktree up with
+  `scripts/local-cargo-config.sh` (untracked `.cargo/config.toml`): its OWN `target/`,
+  seeded with hardlinks of the already-built third-party dependencies (no extra disk, no
+  rebuild), and `scripts/rustc-serial` as rustc wrapper — a machine-wide semaphore that lets
+  at most two rustc processes run at once, however many agents build. A build that seems to
+  hang is waiting for a slot: wait, do not kill it, do not work around it.
+- Never point a worktree at another checkout's target dir and never set `CARGO_TARGET_DIR`:
+  cargo cannot tell two worktrees' `p1-*` crates apart and links stale artifacts (D20).
 - Build as little as possible: `cargo check -p <crate>` / `cargo test -p <crate> <filter>`
   while iterating; the full gate once, at the end. No `cargo build --release`, no
   `cargo install`, no extra toolchains or targets unless your task says so.
