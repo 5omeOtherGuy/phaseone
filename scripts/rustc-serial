@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# cargo `rustc-wrapper`: a machine-wide semaphore around every real compilation.
+# 7 GB RAM: however many agents and worktrees build at once, at most P1_RUSTC_SLOTS
+# (default 2) rustc processes run. The lock is held through `exec`, i.e. until rustc exits.
+# Probes (`rustc -vV`, `--print …`) are not compilations and pass straight through.
+case " $* " in *" --crate-name "*) ;; *) exec "$@" ;; esac
+dir="${P1_BUILD_LOCK_DIR:-/tmp/p1-build-locks-$(id -u)}"
+mkdir -p "$dir"
+slots="${P1_RUSTC_SLOTS:-2}"
+for ((s = 0; s < slots; s++)); do
+  exec {fd}>"$dir/slot$s"
+  if flock -n "$fd"; then exec "$@"; fi
+  exec {fd}>&-
+done
+exec {fd}>"$dir/slot$((RANDOM % slots))"
+flock "$fd"
+exec "$@"
