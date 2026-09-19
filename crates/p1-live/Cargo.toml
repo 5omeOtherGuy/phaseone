@@ -1,0 +1,19 @@
+[package]
+name = "p1-live"
+description = "Lead-only live smoke checks of the real provider routes (run only with P1_LIVE=1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-provider-http = { path = "../p1-provider-http" }
+p1-provider-anthropic = { path = "../p1-provider-anthropic" }
+p1-provider-openai = { path = "../p1-provider-openai" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }

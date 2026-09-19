@@ -786,6 +786,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-live"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "p1-contracts",
+ "p1-provider-anthropic",
+ "p1-provider-http",
+ "p1-provider-openai",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "p1-provider-anthropic"
 version = "0.0.1"
 dependencies = [

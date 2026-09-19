@@ -84,14 +84,12 @@ The public `api.openai.com/v1/responses` API-key route is a different route, not
 **Hard constraints** [donor]: `max_output_tokens` is rejected (400 `Unsupported parameter`);
 no `tool_choice`, no `parallel_tool_calls`, no `previous_response_id` over HTTP.
 - Function tool: `{"type":"function","name","description","parameters"}`.
-- **[todo-live]** Freeform patch tool. The donor never declared one. The GPT environment needs
-  `apply_patch` as a custom/freeform tool — `{"type":"custom","name":"apply_patch","description",
-  "format":{"type":"grammar","syntax":"lark","definition":…}}` — arriving as a `custom_tool_call`
-  output item `{call_id,name,input:<raw text>}` and answered with
-  `{"type":"custom_tool_call_output","call_id","output"}`. Whether this subscription route
-  accepts it, and whether `instructions` is constrained, is the first live check. Fallback if
-  rejected: the same patch tool behind a function declaration with one string argument
-  (a wrapper variant of the same tool module — seams §4 variant rule).
+- **[live 2026-09-20]** Freeform patch tool. The donor never declared one; p1 does:
+  `{"type":"custom","name":"apply_patch","description","format":{"type":"grammar","syntax":"lark","definition":…}}`.
+  The subscription route ACCEPTS it, accepts free-form `instructions`, and `gpt-5.6-sol`
+  answered with a `custom_tool_call` whose `input` was a raw V4A patch
+  (`*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n`). No function-face
+  fallback is needed on this route (the face stays for routes without freeform tools).
 
 **Stream** [donor] `response.created` (id) · `response.output_item.added` ·
 `response.output_text.delta` · `response.reasoning_summary_text.delta` /
@@ -110,7 +108,7 @@ no `tool_choice`, no `parallel_tool_calls`, no `previous_response_id` over HTTP.
 `{"type":"function_call","call_id","name","arguments"}`,
 `{"type":"function_call_output","call_id","output"}`,
 `{"type":"reasoning","encrypted_content","summary":[]}` (same route + model only),
-and for the patch tool `custom_tool_call` / `custom_tool_call_output` [todo-live].
+and for the patch tool `custom_tool_call` / `custom_tool_call_output`.
 
 **Usage** [donor] `input_tokens` (INCLUDES cached), `input_tokens_details.cached_tokens`,
 `output_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens`; only on
@@ -142,3 +140,14 @@ Shared, from the donor: SSE chunk decoder (split chunks, multi-line `data:`), st
 classification, retry policy (3 retries, 2 s doubling, 60 s cap, jitter). Dropped: WebSocket
 transport, native compaction, structured summaries, server-side model fallback,
 context-management edits, login flows.
+
+## D. Live smoke checks (lead only: `P1_LIVE=1 cargo test -p p1-live -- --nocapture --test-threads 1`)
+
+2026-09-20, both routes, through `ReqwestTransport` and the owner's existing CLI logins:
+text turn, streamed function tool call (`read`), follow-up request carrying the tool result —
+all pass on `claude-sonnet-5` and `gpt-5.6-sol`; usage is reported, cost stays unknown.
+Observed: Claude `input_tokens` 50/504/571 with cache fields 0 (prompts below the cache
+minimum); Codex reports `reasoning_tokens: 0` explicitly.
+NOT yet proven live: reasoning replay — neither model produced reasoning on these trivial
+prompts even at high effort. It is covered by fixtures + conformance check 8 and will be
+exercised by the first real coding tasks through the host.
