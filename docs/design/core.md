@@ -19,9 +19,9 @@ Construction commits nothing and emits nothing.
 
 ## 2. Records and sequence numbers
 
-`seq` starts at 0 and increases by exactly 1 per committed record, across turns. A record
-whose commit FAILED consumes no sequence number that a later record could reuse — after a
-failed commit the agent commits nothing more in that turn (§7).
+`seq` starts at 0 and increases by exactly 1 per SUCCESSFULLY committed record, across
+turns: a store never sees a gap or a repeat. After a failed commit the agent commits nothing
+more in that turn (§7); see Ruling R2 for the next turn.
 
 The first committed record of an agent's life is `Environment` (seq 0), committed at the
 start of the first turn, BEFORE that turn's `UserInput`/`Inbox` record. It carries
@@ -130,4 +130,19 @@ Parallel tool execution; retries (adapters retry, the core does not); turn-compl
 policies; after-tool interception; resuming from journal records (increment 5).
 
 ## Rulings
-_None yet._
+
+- **R1 (cancellation precedence).** Whenever the core is about to wait on the provider or to
+  start a tool call, it checks `cancel` FIRST. If `cancel` has fired, cancellation wins even
+  when a stream event (including a terminal `Finished(Completed)`) is ready at the same
+  moment: that response is recorded as `AssistantInterrupted{Cancelled}` and adds nothing to
+  the history. Once `{AssistantCompleted}` is committed the response stands; cancellation
+  then takes effect at the tool-call boundary (§4 row 1).
+- **R2 (the turn after a commit failure).** The failed record was never stored and its state
+  change never happened (no history push, no side effect). The agent stays usable: the next
+  turn's first record gets the `seq` the failed record would have had. If the failed record
+  was `Environment`, the next turn commits `Environment` again, at seq 0, before its input.
+- **R3 (validation request).** `Agent::new` calls `provider.validate` exactly once, with the
+  empty-history request described in §1.
+- **R4 (inbox arriving after the response).** A message that arrives after a tool-less
+  response completed but before the turn would end is seen by the pending-inbox check of
+  step 3f: the turn continues at 3a. (Test with `RecordingJournal::with_commit_hook`.)

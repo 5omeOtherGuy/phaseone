@@ -1,0 +1,11 @@
+family   = "gpt"
+provider = "openai-codex-subscription"
+model    = "gpt-5.6-sol"
+
+[options]
+reasoning_effort = "medium"
+
+[[tools]]
+module = "shell"
+[[tools]]
+module = "apply_patch"

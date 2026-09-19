@@ -1,0 +1,17 @@
+family   = "claude"
+provider = "anthropic-subscription"
+model    = "claude-sonnet-5"
+
+[options]
+reasoning_effort = "medium"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
