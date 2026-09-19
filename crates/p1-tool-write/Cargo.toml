@@ -1,0 +1,21 @@
+[package]
+name = "p1-tool-write"
+description = "The p1 `write` tool: atomic create-or-replace of a workspace file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-workspace = { path = "../p1-workspace" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
