@@ -364,3 +364,171 @@ async fn block_order_of_a_mixed_response_is_preserved_in_history_and_request() {
     }
     assert!(matches!(second_request.history[2], Item::ToolResult(_)));
 }
+
+const UNKNOWN_OUTCOME: &str = "Interrupted: this call was started before the session stopped and its outcome is unknown. Check the current state before retrying.";
+
+fn results(agent: &Agent) -> Vec<(String, ToolStatus, String)> {
+    agent
+        .history()
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolResult(result) => Some((
+                result.call_id.clone(),
+                result.status,
+                result.content.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+// R5: ToolStarted failed to commit → the call never ran; the next turn resolves it as
+// cancelled BEFORE its own input, and the request it sends is well-formed.
+#[tokio::test(start_paused = true)]
+async fn a_call_left_unresolved_by_a_failed_tool_started_commit_is_cancelled_next_turn() {
+    // seq 0 env, 1 user, 2 assistant, 3 = ToolStarted(c1) fails once.
+    let journal = RecordingJournal::new().failing_once_at(3);
+    let tool = Arc::new(FakeTool::new("work"));
+    let (mut agent, rig) = build(
+        vec![
+            tool_call_response(vec![
+                json_call("c1", "work", "{}"),
+                json_call("c2", "work", "{}"),
+            ]),
+            text_response("recovered"),
+        ],
+        vec![tool.clone()],
+        journal,
+    );
+
+    let first = turn(&mut agent, "one", CancellationToken::new()).await;
+    assert!(matches!(first, TurnEnd::CommitFailed { .. }), "{first:?}");
+    assert!(tool.calls().is_empty());
+
+    let second = turn(&mut agent, "two", CancellationToken::new()).await;
+    assert_eq!(
+        second,
+        TurnEnd::Completed {
+            stop: StopReason::EndTurn
+        }
+    );
+    assert!(
+        tool.calls().is_empty(),
+        "nothing is executed by reconciliation"
+    );
+    assert_eq!(
+        kinds(&rig.journal),
+        vec![
+            "environment",
+            "user_input",
+            "assistant_completed",
+            "tool_finished",
+            "tool_finished",
+            "user_input",
+            "assistant_completed"
+        ]
+    );
+    assert_eq!(seqs(&rig.journal), vec![0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(
+        results(&agent),
+        vec![
+            (
+                "c1".into(),
+                ToolStatus::Cancelled,
+                "Cancelled before execution.".into()
+            ),
+            (
+                "c2".into(),
+                ToolStatus::Cancelled,
+                "Cancelled before execution.".into()
+            ),
+        ]
+    );
+    let sent = &rig.provider.requests()[1].history;
+    assert!(matches!(sent[2], Item::ToolResult(_)) && matches!(sent[3], Item::ToolResult(_)));
+    assert_eq!(sent[4], Item::User { text: "two".into() });
+    assert_eq!(rig.authorization.seen().len(), 0);
+}
+
+// R5: the tool RAN but its ToolFinished failed to commit → outcome unknown, never re-run.
+#[tokio::test(start_paused = true)]
+async fn a_call_whose_result_was_not_committed_is_reported_unknown_and_never_rerun() {
+    // seq 0 env, 1 user, 2 assistant, 3 ToolStarted, 4 = ToolFinished fails once.
+    let journal = RecordingJournal::new().failing_once_at(4);
+    let tool = Arc::new(FakeTool::new("work"));
+    let (mut agent, rig) = build(
+        vec![
+            tool_call_response(vec![
+                json_call("c1", "work", "{}"),
+                json_call("c2", "work", "{}"),
+            ]),
+            text_response("recovered"),
+        ],
+        vec![tool.clone()],
+        journal,
+    );
+
+    let first = turn(&mut agent, "one", CancellationToken::new()).await;
+    assert!(matches!(first, TurnEnd::CommitFailed { .. }), "{first:?}");
+    assert_eq!(tool.calls().len(), 1);
+    assert_eq!(rig.provider.requests().len(), 1);
+
+    let second = turn(&mut agent, "two", CancellationToken::new()).await;
+    assert_eq!(
+        second,
+        TurnEnd::Completed {
+            stop: StopReason::EndTurn
+        }
+    );
+    assert_eq!(
+        tool.calls().len(),
+        1,
+        "an unknown outcome is never re-executed"
+    );
+    assert_eq!(
+        results(&agent),
+        vec![
+            ("c1".into(), ToolStatus::Unknown, UNKNOWN_OUTCOME.into()),
+            (
+                "c2".into(),
+                ToolStatus::Cancelled,
+                "Cancelled before execution.".into()
+            ),
+        ]
+    );
+    assert_eq!(
+        kinds(&rig.journal),
+        vec![
+            "environment",
+            "user_input",
+            "assistant_completed",
+            "tool_started",
+            "tool_finished",
+            "tool_finished",
+            "user_input",
+            "assistant_completed"
+        ]
+    );
+    // R6: the failed ToolFinished announced nothing; reconciliation announced both.
+    let finished = rig
+        .events
+        .events()
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolFinished { .. }))
+        .count();
+    assert_eq!(finished, 2);
+}
+
+// R6: a failed AssistantCompleted commit announces no ResponseCompleted.
+#[tokio::test(start_paused = true)]
+async fn a_failed_assistant_completed_commit_emits_no_response_completed() {
+    let journal = RecordingJournal::new().failing_once_at(2);
+    let (mut agent, rig) = build(vec![text_response("lost")], vec![], journal);
+    turn(&mut agent, "one", CancellationToken::new()).await;
+    assert!(
+        !rig.events
+            .events()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ResponseCompleted { .. }))
+    );
+}
