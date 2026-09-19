@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# One worktree per task, so parallel agents never share a checkout or a target dir.
+# One worktree per task, so parallel agents never share a checkout. All worktrees share
+# ONE cargo target dir (small SSD, 7 GB RAM) — see scripts/local-cargo-config.sh.
 #
 #   scripts/new-worktree.sh 12-jsonl-journal        # -> ../phaseone-12-jsonl-journal
 #
@@ -25,12 +26,12 @@ else
 fi
 
 git -C "$root" worktree add "$worktree" -b "task/$slug" "$start"
+"$root/scripts/local-cargo-config.sh" "$worktree"
 
 cat <<EOF
 worktree: $worktree
 branch:   task/$slug
 
   cd $worktree
-  export CARGO_BUILD_JOBS=2
   scripts/gate.sh
 EOF

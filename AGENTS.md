@@ -2,6 +2,7 @@
 
 p1 is a lean, modular Rust coding harness. Direction: `docs/design/` (start at
 `README.md`). Settled choices: `DECISIONS.md`. Work items: GitHub Issues.
+`STATUS.md` is the lead session's resume record — only the lead edits it.
 
 Several agents work in this repository at the same time. Everything below exists to
 make that fast and conflict-free.
@@ -10,8 +11,7 @@ make that fast and conflict-free.
 
 - **One worktree per task.** Never run two agents in one checkout.
   `scripts/new-worktree.sh <task-slug>` creates `../phaseone-<task-slug>` on a fresh
-  `task/<task-slug>` branch. Each worktree has its own `target/`, so builds never
-  collide and no shared `CARGO_TARGET_DIR` is ever needed.
+  `task/<task-slug>` branch and points it at the shared cargo target dir.
 - **Work items are issues.** Claim one by assigning yourself and moving the label
   `ready` → `in-progress`. Stuck? Add `blocked` and say what you need in a comment.
   Only owner decisions carry the `owner` label.
@@ -51,8 +51,17 @@ It must be green before a merge; it is not required for every intermediate commi
 
 ## Build
 
-- 7 GB laptop: `CARGO_BUILD_JOBS=2` (the gate sets it), one build at a time per
-  worktree. Prefer focused runs: `cargo test -p <crate> <filter>`.
+- Small SSD, 7 GB RAM: every checkout and worktree uses ONE shared target dir
+  (`../phaseone-target`, set by the untracked `.cargo/config.toml` that
+  `scripts/local-cargo-config.sh` writes; `jobs = 2`, incremental off). Never create a
+  per-worktree `target/` and never override `CARGO_TARGET_DIR`.
+- Cargo's lock on that directory serialises compilation across all agents. "Blocking
+  waiting for file lock on build directory" means another agent is compiling: wait,
+  do not kill it, do not work around it. Only one compile runs at a time, by design.
+- Build as little as possible: `cargo check -p <crate>` / `cargo test -p <crate> <filter>`
+  while iterating; the full gate once, at the end. No `cargo build --release`, no
+  `cargo install`, no extra toolchains or targets unless your task says so.
+- Remove a finished worktree with `git worktree remove <path>`.
 
 ## Architecture (owner decisions — do not bend)
 

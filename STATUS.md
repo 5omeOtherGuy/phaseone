@@ -2,10 +2,13 @@
 
 Handoff: `/home/phaseonebig/projects/phaseone-collab/fable-orchestrator-prompt.md`.
 After any context compaction: re-read this file and `DECISIONS.md` first.
-Branch: `slice-1` (integration). Started 2026-09-19.
+Remote: github.com/5omeOtherGuy/phaseone (PUBLIC). Trunk-based: `task/*` branches, merge to
+`main` when the gate is green, push (D6, D11). Shared target dir, one compile at a time (D12).
+Only the lead edits this file (D13). Started 2026-09-19.
 
 ## Done
-- (0) Repo, workspace, `AGENTS.md`, gate script, core-isolation check, docs skeleton.
+- (0) Repo, workspace, `AGENTS.md`, gate script, core-isolation check, docs skeleton,
+  shared-target build policy. GitHub repo + CI + swarm workflow set up by a separate session.
 
 ## In progress
 - (1) Verify the two real routes (Anthropic subscription, OpenAI Codex subscription):
