@@ -517,6 +517,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-provider-openai"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "p1-contracts",
+ "p1-provider-http",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "p1-testkit"
 version = "0.0.1"
 dependencies = [

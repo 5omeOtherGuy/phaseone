@@ -1,0 +1,21 @@
+[package]
+name = "p1-provider-openai"
+description = "ChatGPT/Codex subscription route of the OpenAI Responses API (HTTPS + SSE)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-provider-http = { path = "../p1-provider-http" }
+serde_json = "1"
+
+[dev-dependencies]
+p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time", "test-util"] }
