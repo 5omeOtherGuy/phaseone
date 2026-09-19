@@ -505,6 +505,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-journal"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-core",
+ "p1-testkit",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "p1-provider-http"
 version = "0.0.1"
 dependencies = [
