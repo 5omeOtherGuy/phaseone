@@ -4,12 +4,13 @@
 //! cancellation boundary between tool rounds. Same determinism rules as the frozen
 //! suites: paused time, explicit timeouts, no sleeps, no network, no filesystem.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use p1_contracts::{
-    AgentEvent, CancellationToken, Effect, InboxKind, InterruptionReason, Item, JournalRecord,
-    ModelOptions, RecordBody, StopReason, Tool, ToolOutcome, ToolStatus, TurnEnd,
+    AgentEvent, BoxFuture, CancellationToken, CommitError, CommitSink, Effect, InboxKind,
+    InterruptionReason, Item, JournalRecord, ModelOptions, RecordBody, StopReason, Tool,
+    ToolOutcome, ToolStatus, TurnEnd,
 };
 use p1_core::{Agent, AgentParts};
 use p1_testkit::{
@@ -19,6 +20,7 @@ use p1_testkit::{
 use tokio::time::timeout;
 
 const LIMIT: Duration = Duration::from_secs(5);
+const UNKNOWN_OUTCOME: &str = "Interrupted: this call was started before the session stopped and its outcome is unknown. Check the current state before retrying.";
 
 struct Fixture {
     provider: Arc<ScriptedProvider>,
@@ -422,5 +424,262 @@ async fn authorization_sees_the_effect_for_existing_tools_only() {
     assert_eq!(
         authorization.seen(),
         vec![("w".into(), Effect::WritesFiles)]
+    );
+}
+
+// R5: reconciliation also runs at the start of an inbox-only turn, before its
+// Inbox record, and never re-executes the unresolved call.
+#[tokio::test(start_paused = true)]
+async fn reconciliation_runs_at_the_start_of_an_inbox_only_turn() {
+    let tool = Arc::new(FakeTool::new("work"));
+    // seq 0 env, 1 user, 2 assistant, 3 ToolStarted, 4 = ToolFinished fails once.
+    let journal = RecordingJournal::new().failing_once_at(4);
+    let (mut agent, fixture) = agent_with_tools(
+        vec![
+            tool_call_response(vec![json_call("c1", "work", "{}")]),
+            text_response("done"),
+        ],
+        vec![tool.clone()],
+        journal,
+    );
+
+    let first = run(&mut agent, "one", CancellationToken::new()).await;
+    assert!(matches!(first, TurnEnd::CommitFailed { .. }), "{first:?}");
+    assert_eq!(tool.calls().len(), 1);
+    assert!(agent.inbox().send(InboxKind::Notification, "ping"));
+
+    let second = run_inbox(&mut agent, CancellationToken::new()).await;
+    assert_eq!(
+        second,
+        Some(TurnEnd::Completed {
+            stop: StopReason::EndTurn
+        })
+    );
+    assert_eq!(
+        tool.calls().len(),
+        1,
+        "reconciliation never re-executes the call"
+    );
+
+    let kinds: Vec<&str> = fixture
+        .journal
+        .records()
+        .iter()
+        .map(|record| match record.body {
+            RecordBody::Environment { .. } => "environment",
+            RecordBody::UserInput { .. } => "user_input",
+            RecordBody::Inbox { .. } => "inbox",
+            RecordBody::AssistantCompleted { .. } => "assistant_completed",
+            RecordBody::AssistantInterrupted { .. } => "assistant_interrupted",
+            RecordBody::ToolStarted { .. } => "tool_started",
+            RecordBody::ToolFinished { .. } => "tool_finished",
+            RecordBody::ContextReplaced { .. } => "context_replaced",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "environment",
+            "user_input",
+            "assistant_completed",
+            "tool_started",
+            "tool_finished",
+            "inbox",
+            "assistant_completed",
+        ]
+    );
+    assert_eq!(
+        fixture
+            .journal
+            .records()
+            .iter()
+            .map(|record| record.seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5, 6]
+    );
+    let result = agent
+        .history()
+        .iter()
+        .find_map(|item| match item {
+            Item::ToolResult(result) => Some(result.clone()),
+            _ => None,
+        })
+        .expect("a reconciled result");
+    assert_eq!(result.status, ToolStatus::Unknown);
+    assert_eq!(result.content, UNKNOWN_OUTCOME);
+}
+
+/// A commit sink that rejects the first two `ToolFinished` commits, so a failure
+/// can be injected *inside* reconciliation rather than in the turn that leaves the
+/// call unresolved.
+#[derive(Clone)]
+struct FailFirstTwoToolFinished {
+    inner: RecordingJournal,
+    attempts: Arc<Mutex<u32>>,
+}
+
+impl CommitSink for FailFirstTwoToolFinished {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        Box::pin(async move {
+            if matches!(&record.body, RecordBody::ToolFinished { .. }) {
+                let mut attempts = self.attempts.lock().unwrap();
+                if *attempts < 2 {
+                    *attempts += 1;
+                    return Err(CommitError("reconciliation failed".into()));
+                }
+            }
+            self.inner.commit(record).await
+        })
+    }
+}
+
+// R5: a commit failure *during* reconciliation ends that turn like any other, the
+// in-memory started set is not lost, and a third turn finishes the reconciliation.
+#[tokio::test(start_paused = true)]
+async fn a_commit_failure_during_reconciliation_is_retried_by_the_next_turn() {
+    let tool = Arc::new(FakeTool::new("work"));
+    let inner = RecordingJournal::new();
+    let journal = FailFirstTwoToolFinished {
+        inner: inner.clone(),
+        attempts: Arc::new(Mutex::new(0)),
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "work", "{}")]),
+        text_response("done"),
+    ]));
+    let parts = AgentParts {
+        provider: provider.clone(),
+        tools: vec![tool.clone()],
+        system_prompt: "impl prompt".into(),
+        options: ModelOptions::default(),
+        context: Arc::new(PassthroughContext),
+        authorization: Arc::new(ScriptedAuthorization::permit_all()),
+        journal: Arc::new(journal),
+        events: Arc::new(RecordingEvents::new()),
+    };
+    let mut agent = Agent::new(parts).expect("agent builds");
+
+    // Turn 1: ToolFinished of the real execution fails, leaving c1 unresolved.
+    let first = run(&mut agent, "one", CancellationToken::new()).await;
+    assert!(matches!(first, TurnEnd::CommitFailed { .. }), "{first:?}");
+    assert_eq!(tool.calls().len(), 1);
+
+    // Turn 2: reconciliation itself fails.
+    let second = run(&mut agent, "two", CancellationToken::new()).await;
+    assert!(matches!(second, TurnEnd::CommitFailed { .. }), "{second:?}");
+    assert_eq!(
+        inner.records().len(),
+        4,
+        "env, user, assistant, tool_started"
+    );
+    assert_eq!(tool.calls().len(), 1, "no re-execution on retry");
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "no provider request in a failed turn"
+    );
+
+    // Turn 3: reconciliation finally commits, then the turn proceeds.
+    let third = run(&mut agent, "three", CancellationToken::new()).await;
+    assert_eq!(
+        third,
+        TurnEnd::Completed {
+            stop: StopReason::EndTurn
+        }
+    );
+    assert_eq!(tool.calls().len(), 1);
+    assert_eq!(
+        inner
+            .records()
+            .iter()
+            .map(|record| record.seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5, 6]
+    );
+    let kinds: Vec<&str> = inner
+        .records()
+        .iter()
+        .map(|record| match record.body {
+            RecordBody::Environment { .. } => "environment",
+            RecordBody::UserInput { .. } => "user_input",
+            RecordBody::Inbox { .. } => "inbox",
+            RecordBody::AssistantCompleted { .. } => "assistant_completed",
+            RecordBody::AssistantInterrupted { .. } => "assistant_interrupted",
+            RecordBody::ToolStarted { .. } => "tool_started",
+            RecordBody::ToolFinished { .. } => "tool_finished",
+            RecordBody::ContextReplaced { .. } => "context_replaced",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "environment",
+            "user_input",
+            "assistant_completed",
+            "tool_started",
+            "tool_finished",
+            "user_input",
+            "assistant_completed",
+        ]
+    );
+    let result = agent
+        .history()
+        .iter()
+        .find_map(|item| match item {
+            Item::ToolResult(result) => Some(result.clone()),
+            _ => None,
+        })
+        .expect("a reconciled result");
+    assert_eq!(result.status, ToolStatus::Unknown);
+    assert_eq!(result.content, UNKNOWN_OUTCOME);
+}
+
+// R5: reconciliation resolves leftover calls without asking authorization or
+// re-executing anything. Turn 1 legitimately asked once, for c1, BEFORE its
+// ToolStarted commit failed; that single entry is the expected full history.
+#[tokio::test(start_paused = true)]
+async fn reconciliation_asks_no_authorization_and_never_re_executes() {
+    let tool = Arc::new(FakeTool::new("work"));
+    let authorization = Arc::new(ScriptedAuthorization::permit_all());
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_call_response(vec![
+            json_call("c1", "work", "{}"),
+            json_call("c2", "work", "{}"),
+        ]),
+        text_response("recovered"),
+    ]));
+    let parts = AgentParts {
+        provider,
+        tools: vec![tool.clone()],
+        system_prompt: "impl prompt".into(),
+        options: ModelOptions::default(),
+        context: Arc::new(PassthroughContext),
+        authorization: authorization.clone(),
+        // seq 3 = ToolStarted(c1) fails once, leaving both calls unresolved.
+        journal: Arc::new(RecordingJournal::new().failing_once_at(3)),
+        events: Arc::new(RecordingEvents::new()),
+    };
+    let mut agent = Agent::new(parts).expect("agent builds");
+
+    let first = run(&mut agent, "one", CancellationToken::new()).await;
+    assert!(matches!(first, TurnEnd::CommitFailed { .. }), "{first:?}");
+    assert_eq!(authorization.seen(), vec![("c1".into(), Effect::ReadOnly)]);
+
+    let second = run(&mut agent, "two", CancellationToken::new()).await;
+    assert_eq!(
+        second,
+        TurnEnd::Completed {
+            stop: StopReason::EndTurn
+        }
+    );
+    assert_eq!(
+        authorization.seen(),
+        vec![("c1".into(), Effect::ReadOnly)],
+        "reconciliation asks no new authorization"
+    );
+    assert_eq!(
+        tool.calls().len(),
+        0,
+        "nothing is executed by reconciliation"
     );
 }

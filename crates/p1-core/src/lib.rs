@@ -17,6 +17,10 @@ use p1_contracts::{
 };
 use tokio::sync::Notify;
 
+/// R5: exact model-visible content for a call whose `ToolStarted` was committed but
+/// whose outcome was never recorded.
+const UNKNOWN_OUTCOME: &str = "Interrupted: this call was started before the session stopped and its outcome is unknown. Check the current state before retrying.";
+
 /// Everything one agent is assembled from. The agent owns exactly these tools:
 /// a tool that is not in `tools` does not exist for it.
 pub struct AgentParts {
@@ -73,6 +77,10 @@ pub struct Agent {
     next_seq: u64,
     /// False until the first `Environment` record has been committed successfully.
     environment_committed: bool,
+    /// R5: call ids whose `ToolStarted` was committed but whose `ToolFinished` has
+    /// not been. Used to tell a never-started call (`Cancelled`) from one that ran
+    /// with an unrecorded outcome (`Unknown`) when a later turn reconciles them.
+    started_calls: HashSet<String>,
     inbox: Arc<InboxShared>,
 }
 
@@ -127,6 +135,7 @@ impl Agent {
             history: Vec::new(),
             next_seq: 0,
             environment_committed: false,
+            started_calls: HashSet::new(),
             inbox: Arc::new(InboxShared {
                 queue: Mutex::new(VecDeque::new()),
                 notify: Notify::new(),
@@ -197,6 +206,11 @@ impl Agent {
         // §2 / R2: the first turn commits `Environment` at seq 0 before its input.
         if let Err(message) = self.commit_environment_if_needed().await {
             return TurnEnd::CommitFailed { message };
+        }
+        // R5: resolve calls left without a result by an earlier failed commit,
+        // before this turn's own records, so every request history is well-formed.
+        if let Err(end) = self.reconcile_unresolved_calls().await {
+            return end;
         }
         if let Some(text) = input {
             let body = RecordBody::UserInput { text: text.clone() };
@@ -348,6 +362,7 @@ impl Agent {
         // 3g: tool calls, strictly sequentially, in block order.
         for call in &calls {
             // Invariant 5d: each call gets its result here, before the next request.
+            // If a commit inside fails, R5 reconciles the leftovers next turn.
             if let Err(end) = self.run_tool_call(call, cancel).await {
                 return Flow::End(end);
             }
@@ -517,6 +532,9 @@ impl Agent {
                 if let Err(error) = self.commit(body).await {
                     return Err(TurnEnd::CommitFailed { message: error.0 });
                 }
+                // R5: remember this call started, so a later turn can report its
+                // outcome as `Unknown` if the result never commits.
+                self.started_calls.insert(call.call_id.clone());
                 self.parts
                     .events
                     .emit(AgentEvent::ToolStarted { call: call.clone() });
@@ -539,11 +557,73 @@ impl Agent {
                 {
                     return Err(TurnEnd::CommitFailed { message: error.0 });
                 }
+                self.started_calls.remove(&call.call_id);
                 self.history.push(Item::ToolResult(result.clone()));
                 self.parts.events.emit(AgentEvent::ToolFinished { result });
                 Ok(())
             }
         }
+    }
+
+    // ------------------------------------------------- R5 reconciliation
+
+    /// R5: every tool call of the history's last assistant item that has no result
+    /// yet is resolved here, in block order, before the turn's own records. Nothing
+    /// is re-executed and authorization is never asked. A commit failure ends the
+    /// turn exactly like any other commit failure.
+    async fn reconcile_unresolved_calls(&mut self) -> Result<(), TurnEnd> {
+        for call in self.unresolved_calls_of_last_assistant() {
+            let started = self.started_calls.contains(&call.call_id);
+            let (status, content) = if started {
+                (ToolStatus::Unknown, UNKNOWN_OUTCOME.to_string())
+            } else {
+                (
+                    ToolStatus::Cancelled,
+                    "Cancelled before execution.".to_string(),
+                )
+            };
+            let result = ToolResultItem {
+                call_id: call.call_id,
+                name: call.name,
+                status,
+                content,
+            };
+            if let Err(error) = self
+                .commit(RecordBody::ToolFinished {
+                    result: result.clone(),
+                })
+                .await
+            {
+                return Err(TurnEnd::CommitFailed { message: error.0 });
+            }
+            self.history.push(Item::ToolResult(result.clone()));
+            self.parts.events.emit(AgentEvent::ToolFinished { result });
+        }
+        // The resolved calls have all been answered; nothing is left to track.
+        self.started_calls.clear();
+        Ok(())
+    }
+
+    /// The tool calls of the history's last assistant item that have no result.
+    fn unresolved_calls_of_last_assistant(&self) -> Vec<ToolCall> {
+        let resolved: HashSet<&str> = self
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                Item::ToolResult(result) => Some(result.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let Some(item) = self.history.iter().rev().find_map(|item| match item {
+            Item::Assistant(item) => Some(item),
+            _ => None,
+        }) else {
+            return Vec::new();
+        };
+        item.tool_calls()
+            .filter(|call| !resolved.contains(call.call_id.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// §4 rows 2/3 and the pre-execution cancellation result: record and emit a

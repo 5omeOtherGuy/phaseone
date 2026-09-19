@@ -287,7 +287,7 @@ async fn construction_commits_nothing_and_emits_nothing() {
 async fn sequence_numbers_are_dense_across_two_turns() {
     let alpha = FakeTool::new("alpha");
     let call = json_call("c1", "alpha", "{}");
-    let item0 = calls_item(&[call.clone()]);
+    let item0 = calls_item(std::slice::from_ref(&call));
     let result0 = tool_result("c1", "alpha", ToolStatus::Ok, "alpha ok");
     let mut h = harness(
         vec![
@@ -339,6 +339,11 @@ async fn sequence_numbers_are_dense_across_two_turns() {
         vec![
             AgentEvent::TurnStarted,
             AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
             AgentEvent::ToolStarted { call: call.clone() },
             AgentEvent::ToolFinished {
                 result: result0.clone()
@@ -807,6 +812,11 @@ async fn tool_input_delta_is_emitted_but_never_executed_or_stored() {
                 call_id: "c1".into(),
                 text: "{\"x\":".into()
             },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
             AgentEvent::ToolStarted {
                 call: full_call.clone()
             },
@@ -1021,7 +1031,12 @@ async fn context_replacement_is_journalled_and_sent() {
         vec![
             environment_record(&h, 0),
             user_input_record(1, "go"),
-            assistant_record(2, calls_item(&[call.clone()]), StopReason::ToolUse, None),
+            assistant_record(
+                2,
+                calls_item(std::slice::from_ref(&call)),
+                StopReason::ToolUse,
+                None
+            ),
             tool_started_record(3, "c1", alpha.identity().clone()),
             tool_finished_record(4, tool_result("c1", "alpha", ToolStatus::Ok, "alpha ok")),
             rec(
@@ -1117,7 +1132,12 @@ async fn unavailable_tool_gets_exact_status_and_content() {
         vec![
             environment_record(&h, 0),
             user_input_record(1, "hi"),
-            assistant_record(2, calls_item(&[ghost.clone()]), StopReason::ToolUse, None),
+            assistant_record(
+                2,
+                calls_item(std::slice::from_ref(&ghost)),
+                StopReason::ToolUse,
+                None
+            ),
             tool_finished_record(3, result.clone()),
             assistant_record(4, text_item("done"), StopReason::EndTurn, None),
         ]
@@ -1127,6 +1147,11 @@ async fn unavailable_tool_gets_exact_status_and_content() {
         vec![
             AgentEvent::TurnStarted,
             AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
             AgentEvent::ToolFinished {
                 result: result.clone()
             },
@@ -1187,7 +1212,12 @@ async fn denied_tool_is_never_executed_and_reports_reason() {
         vec![
             environment_record(&h, 0),
             user_input_record(1, "hi"),
-            assistant_record(2, calls_item(&[call.clone()]), StopReason::ToolUse, None),
+            assistant_record(
+                2,
+                calls_item(std::slice::from_ref(&call)),
+                StopReason::ToolUse,
+                None
+            ),
             tool_finished_record(3, result.clone()),
             assistant_record(4, text_item("done"), StopReason::EndTurn, None),
         ]
@@ -1197,6 +1227,11 @@ async fn denied_tool_is_never_executed_and_reports_reason() {
         vec![
             AgentEvent::TurnStarted,
             AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
             AgentEvent::ToolFinished { result },
             AgentEvent::RequestStarted { request_index: 1 },
             AgentEvent::TextDelta {
@@ -1249,7 +1284,12 @@ async fn permitted_tool_runs_with_started_before_finished() {
         vec![
             environment_record(&h, 0),
             user_input_record(1, "hi"),
-            assistant_record(2, calls_item(&[call.clone()]), StopReason::ToolUse, None),
+            assistant_record(
+                2,
+                calls_item(std::slice::from_ref(&call)),
+                StopReason::ToolUse,
+                None
+            ),
             tool_started_record(3, "c1", alpha.identity().clone()),
             tool_finished_record(4, result.clone()),
             assistant_record(5, text_item("done"), StopReason::EndTurn, None),
@@ -1260,6 +1300,11 @@ async fn permitted_tool_runs_with_started_before_finished() {
         vec![
             AgentEvent::TurnStarted,
             AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
             AgentEvent::ToolStarted { call: call.clone() },
             AgentEvent::ToolFinished {
                 result: result.clone()
@@ -1331,6 +1376,11 @@ async fn tool_calls_run_sequentially_in_block_order() {
         vec![
             AgentEvent::TurnStarted,
             AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
             AgentEvent::ToolStarted {
                 call: first.clone()
             },
@@ -1426,6 +1476,11 @@ async fn mixed_calls_in_one_response_follow_the_table() {
         vec![
             AgentEvent::TurnStarted,
             AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
             AgentEvent::ToolStarted {
                 call: call_a.clone()
             },
@@ -1533,7 +1588,12 @@ async fn tool_names_from_history_or_nobody_are_not_dispatchable() {
         vec![
             environment_record(&h, 0),
             user_input_record(1, "hi"),
-            assistant_record(2, calls_item(&[ghost1.clone()]), StopReason::ToolUse, None),
+            assistant_record(
+                2,
+                calls_item(std::slice::from_ref(&ghost1)),
+                StopReason::ToolUse,
+                None
+            ),
             tool_finished_record(
                 3,
                 tool_result(
@@ -1543,7 +1603,12 @@ async fn tool_names_from_history_or_nobody_are_not_dispatchable() {
                     "Tool `ghost` is not available."
                 ),
             ),
-            assistant_record(4, calls_item(&[ghost2.clone()]), StopReason::ToolUse, None),
+            assistant_record(
+                4,
+                calls_item(std::slice::from_ref(&ghost2)),
+                StopReason::ToolUse,
+                None
+            ),
             tool_finished_record(
                 5,
                 tool_result(
@@ -1735,6 +1800,11 @@ async fn cancel_while_tool_runs_awaits_result_and_cancels_rest() {
         vec![
             AgentEvent::TurnStarted,
             AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
             AgentEvent::ToolStarted {
                 call: first.clone()
             },
@@ -2192,18 +2262,10 @@ async fn commit_failure_at_user_input() {
 async fn commit_failure_at_assistant_completed() {
     let (mut h, alpha, auth) = commit_failure_harness(2);
     run_failing_turn(&mut h, 2).await;
+    // The failed commit stores nothing: only seq 0 and 1 are in the journal.
     assert_eq!(
         h.journal.records(),
-        vec![
-            environment_record(&h, 0),
-            user_input_record(1, "hi"),
-            assistant_record(
-                2,
-                calls_item(&[json_call("c1", "alpha", "{}")]),
-                StopReason::ToolUse,
-                None
-            ),
-        ]
+        vec![environment_record(&h, 0), user_input_record(1, "hi")]
     );
     assert_eq!(
         h.events.events(),
@@ -2250,25 +2312,38 @@ async fn commit_failure_at_tool_started() {
         alpha.calls().is_empty(),
         "the tool must not execute when ToolStarted fails to commit"
     );
-    let events = h.events.events();
-    assert_eq!(events.first(), Some(&AgentEvent::TurnStarted));
-    assert!(matches!(
-        events.last(),
-        Some(AgentEvent::TurnFinished { .. })
-    ));
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolFinished { .. })),
-        "no ToolFinished event without an executed tool"
+    // R6: the failed ToolStarted record announces no event; the committed
+    // AssistantCompleted does.
+    assert_eq!(
+        h.events.events(),
+        vec![
+            AgentEvent::TurnStarted,
+            AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
+            AgentEvent::TurnFinished {
+                end: TurnEnd::CommitFailed {
+                    message: "scripted failure at seq 3".into()
+                }
+            },
+        ]
     );
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::RequestStarted { request_index: 1 })),
+        h.provider.requests().len() == 1,
         "no further provider request"
     );
-    assert_eq!(h.agent.history(), [user_item("hi")]);
+    // AssistantCompleted (seq 2) committed before ToolStarted failed, so the
+    // assistant item IS in the history.
+    assert_eq!(
+        h.agent.history(),
+        [
+            user_item("hi"),
+            Item::Assistant(calls_item(&[json_call("c1", "alpha", "{}")]))
+        ]
+    );
 }
 
 // §7: a failed ToolFinished commit ends the turn; the tool DID run, but no
@@ -2283,7 +2358,12 @@ async fn commit_failure_at_tool_finished() {
         vec![
             environment_record(&h, 0),
             user_input_record(1, "hi"),
-            assistant_record(2, calls_item(&[call.clone()]), StopReason::ToolUse, None),
+            assistant_record(
+                2,
+                calls_item(std::slice::from_ref(&call)),
+                StopReason::ToolUse,
+                None
+            ),
             tool_started_record(3, "c1", alpha.identity().clone()),
         ]
     );
@@ -2292,23 +2372,27 @@ async fn commit_failure_at_tool_finished() {
         vec![call],
         "the tool ran (ToolStarted committed)"
     );
-    let events = h.events.events();
-    assert_eq!(events.first(), Some(&AgentEvent::TurnStarted));
-    assert!(matches!(
-        events.last(),
-        Some(AgentEvent::TurnFinished { .. })
-    ));
-    assert!(
-        events.contains(&AgentEvent::ToolStarted {
-            call: json_call("c1", "alpha", "{}")
-        }),
-        "ToolStarted was committed and observed"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::RequestStarted { request_index: 1 })),
-        "no further provider request after the failed commit"
+    // R6: ToolFinished's commit failed, so no ToolFinished event; the tool's
+    // result push is skipped — history stays [User, Assistant].
+    assert_eq!(
+        h.events.events(),
+        vec![
+            AgentEvent::TurnStarted,
+            AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
+            AgentEvent::ToolStarted {
+                call: json_call("c1", "alpha", "{}")
+            },
+            AgentEvent::TurnFinished {
+                end: TurnEnd::CommitFailed {
+                    message: "scripted failure at seq 4".into()
+                }
+            },
+        ]
     );
     assert_eq!(h.provider.requests().len(), 1);
     assert_eq!(

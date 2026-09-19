@@ -447,7 +447,9 @@ async fn a_call_left_unresolved_by_a_failed_tool_started_commit_is_cancelled_nex
     let sent = &rig.provider.requests()[1].history;
     assert!(matches!(sent[2], Item::ToolResult(_)) && matches!(sent[3], Item::ToolResult(_)));
     assert_eq!(sent[4], Item::User { text: "two".into() });
-    assert_eq!(rig.authorization.seen().len(), 0);
+    // c1 was authorized once in turn one (before its ToolStarted commit failed);
+    // reconciliation itself never asks.
+    assert_eq!(rig.authorization.seen().len(), 1);
 }
 
 // R5: the tool RAN but its ToolFinished failed to commit → outcome unknown, never re-run.
