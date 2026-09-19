@@ -1,0 +1,26 @@
+[package]
+name = "p1-provider-http"
+description = "Provider HTTP seam: transport, SSE decoder, status classification and the shared retrying driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes `ScriptedTransport` to other crates (the conformance suite and the
+# provider adapters). This crate's own tests always see it via `cfg(test)`.
+testing = []
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt", "test-util"] }
