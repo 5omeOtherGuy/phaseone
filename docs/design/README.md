@@ -16,4 +16,6 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 | Note | Seam |
 |---|---|
 | `routes.md` | Verified wire shapes of the two real provider routes |
+| `tools.md` | Tool modules and the shared workspace helper |
+| `providers.md` | Provider modules, shared HTTP/SSE/retry helper, the ONE conformance suite |
 | `core.md` | Agent core behaviour specification (authoritative for `p1-core`) |
