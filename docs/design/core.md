@@ -146,3 +146,20 @@ policies; after-tool interception; resuming from journal records (increment 5).
 - **R4 (inbox arriving after the response).** A message that arrives after a tool-less
   response completed but before the turn would end is seen by the pending-inbox check of
   step 3f: the turn continues at 3a. (Test with `RecordingJournal::with_commit_hook`.)
+- **R5 (unresolved calls when a turn starts).** A commit failure at `ToolStarted` or
+  `ToolFinished` ends the turn while the history's last assistant item still has tool calls
+  without results. Sending that history would be malformed, and R2 says the agent stays
+  usable. So every turn, right after `[TurnStarted]` (and after `{Environment}` if that is
+  still due) and BEFORE its `UserInput`/inbox records, resolves those calls in block order:
+  a call whose `{ToolStarted}` WAS committed → `{ToolFinished}` + `[ToolFinished]` with status
+  `Unknown` and content `Interrupted: this call was started before the session stopped and its
+  outcome is unknown. Check the current state before retrying.`; any other unresolved call →
+  status `Cancelled`, content `Cancelled before execution.` Nothing is re-executed and
+  authorization is not asked. A commit failure here ends the turn `CommitFailed` like any
+  other. This is the same rule resume uses (journal.md), so there is one reconciliation
+  behaviour, not two.
+- **R6 (events at a failed boundary).** The event that announces a record is emitted only
+  AFTER that record's commit succeeded: a failed `{AssistantCompleted}` emits no
+  `[ResponseCompleted]`, a failed `{ToolStarted}` no `[ToolStarted]`, a failed `{ToolFinished}`
+  no `[ToolFinished]`. `[ResponseCompleted]` IS emitted for every committed response,
+  including one that requests tools (§3e).

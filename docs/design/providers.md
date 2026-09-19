@@ -75,6 +75,10 @@ pub struct Credential { pub bearer: String, pub account_id: Option<String> }   /
 - Replay: `ReplayData{origin, version: 1, payload}` is emitted per reasoning block and sent
   back byte-exact ONLY when `origin` equals this provider's origin; foreign reasoning blocks
   are dropped from the request (their text is not converted into assistant text).
+- **Origin is the CONFIGURED route + model**, for the item and for its replay data — never the
+  model name a response echoes (providers answer with dated aliases; gating replay on the
+  echoed name would drop every reasoning block on the next request and break tool use with
+  thinking). Found by conformance check 8 on the first adapter.
 - Usage mapping is in `routes.md`; absent fields stay `None`; `cost_micro_usd` is `None` on
   subscription routes.
 

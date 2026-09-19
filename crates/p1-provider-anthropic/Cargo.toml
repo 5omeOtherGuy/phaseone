@@ -1,0 +1,24 @@
+[package]
+name = "p1-provider-anthropic"
+description = "Claude subscription (OAuth) route of the Anthropic Messages API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-provider-http = { path = "../p1-provider-http" }
+serde_json = "1"
+# Draining the streaming body of the OAuth token-refresh response needs
+# `StreamExt`; the crate is already in the workspace tree.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+p1-provider-conformance = { path = "../p1-provider-conformance" }
+p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time", "test-util"] }
