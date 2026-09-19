@@ -92,6 +92,16 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
 /// environment as JSON. Credentials are never read and the network is never used
 /// because provider construction is lazy.
 fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
+    // Showing an environment starts no worker, but a delegating environment must still
+    // assemble: bind the worker tools to a service that can never start one.
+    #[cfg(feature = "delegation")]
+    let catalog = {
+        let inert: p1_workers::AgentFactory =
+            Arc::new(|_| Err("`p1 env show` does not start workers".to_string()));
+        let service: Arc<dyn p1_workers::WorkerService> = InProcessWorkers::new(inert, 1);
+        crate::catalog::build_catalog_with_workers(deps, Some(service))
+    };
+    #[cfg(not(feature = "delegation"))]
     let catalog = build_catalog(deps);
     let environment = match load_environment(name, &deps.environment_dirs) {
         Ok(environment) => environment,
@@ -169,8 +179,9 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         let _ = catalog_slot.set(catalog.clone());
     }
 
-    let environment = load_environment(&options.env, &deps.environment_dirs)
+    let mut environment = load_environment(&options.env, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
+    ensure_cache_key(&mut environment, &workspace);
     let substitutions = substitutions(deps, &workspace);
     let assembled =
         assemble(&catalog, &environment, &workspace, &substitutions).map_err(|e| e.to_string())?;
@@ -532,6 +543,8 @@ fn make_child_factory(
             date: date.clone(),
             os: std::env::consts::OS.to_string(),
         };
+        let mut environment = environment;
+        ensure_cache_key(&mut environment, &workspace);
         let assembled = assemble(&catalog, &environment, &workspace, &substitutions)
             .map_err(|e| e.to_string())?;
         let route = assembled.resolved.route.origin.route.clone();
@@ -564,4 +577,26 @@ fn make_child_factory(
         *label.lock().unwrap() = format!("[w{id}] ");
         Ok(ChildAgent { agent, description })
     })
+}
+
+/// Give the agent a stable provider-side prompt-cache key for its lifetime when the
+/// environment sets none. Without one the Codex route served 0 cached tokens across a
+/// whole task (measured 2026-09-20); routes without such a key ignore it.
+fn ensure_cache_key(environment: &mut p1_assembly::EnvironmentFile, workspace: &std::path::Path) {
+    use std::hash::{Hash, Hasher};
+    if environment.options.cache_key.is_some() {
+        return;
+    }
+    static AGENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    workspace.hash(&mut hasher);
+    environment.name.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    AGENTS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .hash(&mut hasher);
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        now.as_nanos().hash(&mut hasher);
+    }
+    environment.options.cache_key = Some(format!("p1-{:016x}", hasher.finish()));
 }

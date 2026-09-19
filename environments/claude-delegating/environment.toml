@@ -1,0 +1,25 @@
+family   = "claude"
+provider = "anthropic-subscription"
+model    = "claude-sonnet-5"
+
+[options]
+reasoning_effort = "medium"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "worker_start"
+[[tools]]
+module = "worker_result"
+[[tools]]
+module = "worker_continue"
+[[tools]]
+module = "worker_cancel"

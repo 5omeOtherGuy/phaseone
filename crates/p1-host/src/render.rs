@@ -194,9 +194,9 @@ impl Renderer {
                 inner.cost_unknown = true;
             }
             Some(usage) => {
-                match (usage.input_uncached, usage.cache_read, usage.cache_write) {
-                    (Some(a), Some(b), Some(c)) => inner.in_total += a + b + c,
-                    _ => inner.in_unknown = true,
+                match input_total(&usage) {
+                    Some(total) => inner.in_total += total,
+                    None => inner.in_unknown = true,
                 }
                 match usage.cache_read {
                     Some(value) => inner.cached_total += value,
@@ -302,10 +302,7 @@ pub fn usage_line(route: &str, model: &str, usage: Option<Usage>) -> String {
             "unknown".to_string(),
         ),
         Some(usage) => (
-            match (usage.input_uncached, usage.cache_read, usage.cache_write) {
-                (Some(a), Some(b), Some(c)) => (a + b + c).to_string(),
-                _ => "?".to_string(),
-            },
+            input_total(&usage).map_or("?".to_string(), |total| total.to_string()),
             option_count(usage.cache_read),
             option_count(usage.output),
             cost_string(usage.cost_micro_usd),
@@ -345,6 +342,15 @@ pub fn status_name(status: ToolStatus) -> &'static str {
     }
 }
 
+/// Total input tokens of one response. Known as soon as the uncached part is known:
+/// the cache parts are ADDED when the route reports them, and a route that has no such
+/// concept (the Codex route never reports cache writes) does not make the total unknown.
+fn input_total(usage: &Usage) -> Option<u64> {
+    usage
+        .input_uncached
+        .map(|uncached| uncached + usage.cache_read.unwrap_or(0) + usage.cache_write.unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,7 +386,18 @@ mod tests {
         };
         assert_eq!(
             usage_line("r", "m", Some(partial)),
-            "model r/m · in ? (cached ?) · out ? · cost unknown"
+            "model r/m · in 10 (cached ?) · out ? · cost unknown"
+        );
+        // The Codex route: cached reads reported, cache writes not a concept.
+        let codex = Usage {
+            input_uncached: Some(84),
+            cache_read: Some(16),
+            output: Some(18),
+            ..Usage::default()
+        };
+        assert_eq!(
+            usage_line("r", "m", Some(codex)),
+            "model r/m · in 100 (cached 16) · out 18 · cost unknown"
         );
     }
 }

@@ -77,12 +77,35 @@ macro_rules! apply_delegate_face {
 /// resolved lazily on the first `access`. Tools are constructed per agent with
 /// that agent's fresh [`ToolServices`].
 pub fn build_catalog(deps: &HostDeps) -> Catalog {
+    #[cfg(feature = "delegation")]
+    return build_catalog_with_workers(deps, deps.worker_service.clone());
+    #[cfg(not(feature = "delegation"))]
+    build_catalog_inner(deps)
+}
+
+/// As [`build_catalog`], with the worker tools bound to `service` instead of
+/// `deps.worker_service` (used by `p1 env show`, which starts no workers).
+#[cfg(feature = "delegation")]
+pub fn build_catalog_with_workers(
+    deps: &HostDeps,
+    service: Option<Arc<dyn p1_workers::WorkerService>>,
+) -> Catalog {
+    let mut catalog = Catalog::new();
+    register_providers(&mut catalog, deps);
+    register_standard_tools(&mut catalog);
+    register_delegation_tools(&mut catalog, service);
+    if let Some(hook) = &deps.catalog_hook {
+        hook(&mut catalog);
+    }
+    catalog
+}
+
+#[cfg(not(feature = "delegation"))]
+fn build_catalog_inner(deps: &HostDeps) -> Catalog {
     let mut catalog = Catalog::new();
 
     register_providers(&mut catalog, deps);
     register_standard_tools(&mut catalog);
-    #[cfg(feature = "delegation")]
-    register_delegation_tools(&mut catalog, deps);
 
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
@@ -186,10 +209,13 @@ fn register_standard_tools(catalog: &mut Catalog) {
 }
 
 #[cfg(feature = "delegation")]
-fn register_delegation_tools(catalog: &mut Catalog, deps: &HostDeps) {
-    // Without a service (e.g. `env show`), the keys are not registered at all, so
-    // an environment naming one gets the ordinary `UnknownToolModule`.
-    let Some(service) = deps.worker_service.clone() else {
+fn register_delegation_tools(
+    catalog: &mut Catalog,
+    service: Option<Arc<dyn p1_workers::WorkerService>>,
+) {
+    // Without a service the keys are not registered at all, so an environment naming
+    // one gets the ordinary `UnknownToolModule`.
+    let Some(service) = service else {
         return;
     };
 
