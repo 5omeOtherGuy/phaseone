@@ -1,0 +1,727 @@
+//! The `shell` tool: one-shot `bash -lc <command>` execution.
+//!
+//! Runs from the workspace root with stdin closed and its own process group, so
+//! a timeout or cancellation can terminate the whole group (SIGTERM, then
+//! SIGKILL) instead of leaving backgrounded children behind. stdout and stderr
+//! are captured interleaved in arrival order while the command runs, and the
+//! captured bytes are bounded as they are collected so a flooding command cannot
+//! exhaust memory. Output bounding and the workspace live in `p1-workspace`.
+
+use std::collections::VecDeque;
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+use p1_contracts::{
+    BoxFuture, CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
+};
+use p1_workspace::{ToolFace, Workspace, bound_output};
+use serde::Deserialize;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+
+const NAME: &str = "shell";
+const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.";
+const DEFAULT_TIMEOUT_SECONDS: i64 = 120;
+const MIN_TIMEOUT_SECONDS: i64 = 1;
+const MAX_TIMEOUT_SECONDS: i64 = 3_600;
+const MAX_OUTPUT_BYTES: usize = 50_000;
+const MAX_OUTPUT_LINES: usize = 2_000;
+/// Bytes of the beginning of the output kept in memory.
+const HEAD_BYTES: usize = 25_000;
+/// Bytes of the end of the output kept in memory.
+const TAIL_BYTES: usize = 25_000;
+/// Lines kept of the head/tail. The collector also bounds by bytes; the line
+/// bound keeps the rendered content inside `bound_output`'s line cap so the
+/// omission notice is never what gets cut away.
+const HEAD_LINES: usize = 990;
+const TAIL_LINES: usize = 990;
+/// How long the group is given to exit after SIGTERM before SIGKILL.
+const SIGTERM_GRACE: Duration = Duration::from_secs(2);
+const READ_BUFFER_BYTES: usize = 16 * 1024;
+
+/// The `shell` tool. Holds one agent's workspace.
+pub struct ShellTool {
+    workspace: Workspace,
+    declaration: ToolDeclaration,
+    identity: ToolIdentity,
+}
+
+impl ShellTool {
+    /// Build the tool with the default (`shell`, Claude-family) face.
+    pub fn new(workspace: Workspace) -> Self {
+        Self {
+            workspace,
+            declaration: declaration(default_face()),
+            identity: identity("claude"),
+        }
+    }
+
+    /// Present the same implementation under another name/description and
+    /// variant. The input schema and the semantics do not change.
+    pub fn with_face(self, face: ToolFace, variant: &str) -> Self {
+        Self {
+            workspace: self.workspace,
+            declaration: declaration(face),
+            identity: identity(variant),
+        }
+    }
+}
+
+fn default_face() -> ToolFace {
+    ToolFace::new(NAME, DESCRIPTION)
+}
+
+fn declaration(face: ToolFace) -> ToolDeclaration {
+    ToolDeclaration {
+        name: face.name,
+        description: face.description,
+        kind: DeclarationKind::Function {
+            input_schema: input_schema(),
+        },
+    }
+}
+
+fn identity(variant: &str) -> ToolIdentity {
+    ToolIdentity {
+        implementation: env!("CARGO_PKG_NAME").to_string(),
+        variant: variant.to_string(),
+    }
+}
+
+fn input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Command line, run with `bash -lc` from the workspace root."
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3600,
+                "default": 120,
+                "description": "Seconds before the command and its process group are killed."
+            }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellInput {
+    command: String,
+    #[serde(default)]
+    timeout_seconds: Option<i64>,
+}
+
+impl Tool for ShellTool {
+    fn declaration(&self) -> &ToolDeclaration {
+        &self.declaration
+    }
+
+    fn identity(&self) -> &ToolIdentity {
+        &self.identity
+    }
+
+    fn effect(&self, _call: &ToolCall) -> Effect {
+        Effect::Executes
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: ToolContext,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            // Cancellation before any work: no process is started.
+            if context.cancel.is_cancelled() {
+                return ToolOutcome {
+                    status: ToolStatus::Cancelled,
+                    content: String::new(),
+                };
+            }
+            let input = match parse_input(&self.declaration.name, call) {
+                Ok(input) => input,
+                Err(message) => return ToolOutcome::error(message),
+            };
+            let timeout = Duration::from_secs(
+                input
+                    .timeout_seconds
+                    .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+                    .unsigned_abs(),
+            );
+            run(
+                self.workspace.root(),
+                &input.command,
+                timeout,
+                &context.cancel,
+            )
+            .await
+        })
+    }
+}
+
+fn parse_input(tool: &str, call: &ToolCall) -> Result<ShellInput, String> {
+    let raw = match &call.input {
+        ToolInput::Json(raw) => raw,
+        ToolInput::Text(_) => {
+            return Err(invalid(
+                tool,
+                "expected a JSON object input, got freeform text",
+            ));
+        }
+    };
+    let input: ShellInput =
+        serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
+    if matches!(
+        input.timeout_seconds,
+        Some(seconds) if !(MIN_TIMEOUT_SECONDS..=MAX_TIMEOUT_SECONDS).contains(&seconds)
+    ) {
+        return Err(invalid(
+            tool,
+            "`timeout_seconds` must be between 1 and 3600",
+        ));
+    }
+    Ok(input)
+}
+
+fn invalid(tool: &str, reason: &str) -> String {
+    format!("Invalid input for {tool}: {reason}")
+}
+
+/// How the waiting loop ended.
+enum End {
+    /// Both output streams reached EOF; the shell may still be running.
+    Closed,
+    TimedOut,
+    Cancelled,
+}
+
+async fn run(
+    root: &Path,
+    command: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> ToolOutcome {
+    let mut builder = Command::new("bash");
+    builder
+        .arg("-lc")
+        .arg(command)
+        .current_dir(root)
+        // No terminal and no input: a command that reads stdin sees EOF.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = match builder.spawn() {
+        Ok(child) => child,
+        Err(error) => return ToolOutcome::error(format!("failed to start bash: {error}")),
+    };
+    let pgid = child.id().map(|id| id as i32).unwrap_or(0);
+
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate(&mut child, pgid).await;
+        return ToolOutcome::error("failed to capture bash stdout");
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        terminate(&mut child, pgid).await;
+        return ToolOutcome::error("failed to capture bash stderr");
+    };
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut capture = Capture::default();
+    let mut out_buffer = [0u8; READ_BUFFER_BYTES];
+    let mut err_buffer = [0u8; READ_BUFFER_BYTES];
+    let mut out_open = true;
+    let mut err_open = true;
+
+    // Drain both pipes concurrently. Each ready half wakes the task, so chunks
+    // are appended in arrival order. Cancellation and the timeout are checked
+    // in the same select, so they interrupt a blocked read promptly.
+    let end = loop {
+        if !out_open && !err_open {
+            break End::Closed;
+        }
+        // Unbiased so neither stream is starved; whichever pipe has data is
+        // appended as it arrives. Cancellation and the timeout are polled in
+        // the same round and fire on the next loop iteration.
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                terminate(&mut child, pgid).await;
+                break End::Cancelled;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                terminate(&mut child, pgid).await;
+                break End::TimedOut;
+            }
+            read = stdout.read(&mut out_buffer), if out_open => match read {
+                Ok(0) | Err(_) => out_open = false,
+                Ok(count) => capture.push(&out_buffer[..count]),
+            },
+            read = stderr.read(&mut err_buffer), if err_open => match read {
+                Ok(0) | Err(_) => err_open = false,
+                Ok(count) => capture.push(&err_buffer[..count]),
+            },
+        }
+    };
+
+    let timed_out_footer = format!("[timed out after {} s]", timeout.as_secs());
+    match end {
+        End::Cancelled => return render(capture, "[cancelled]", ToolStatus::Cancelled),
+        End::TimedOut => return render(capture, &timed_out_footer, ToolStatus::Error),
+        End::Closed => {}
+    }
+
+    // The pipes are done; the shell itself may still run (it closed its output)
+    // or may have exited. Wait for it, still honouring cancel/timeout.
+    let status = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            terminate(&mut child, pgid).await;
+            return render(capture, "[cancelled]", ToolStatus::Cancelled);
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            terminate(&mut child, pgid).await;
+            return render(capture, &timed_out_footer, ToolStatus::Error);
+        }
+        status = child.wait() => status,
+    };
+
+    match status {
+        Ok(status) => {
+            if let Some(code) = status.code() {
+                render(capture, &format!("[exit code: {code}]"), ToolStatus::Ok)
+            } else if let Some(signal) = status.signal() {
+                render(
+                    capture,
+                    &format!("[terminated by signal {signal}]"),
+                    ToolStatus::Error,
+                )
+            } else {
+                render(
+                    capture,
+                    "[terminated by an unknown signal]",
+                    ToolStatus::Error,
+                )
+            }
+        }
+        Err(error) => ToolOutcome::error(format!("failed to wait for bash: {error}")),
+    }
+}
+
+/// Terminate the child's whole process group and reap the child.
+///
+/// SIGTERM first so cooperative children can exit; if the group is still alive
+/// after [`SIGTERM_GRACE`], SIGKILL it. The child is always reaped.
+async fn terminate(child: &mut Child, pgid: i32) {
+    if pgid > 0 {
+        let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
+    }
+    if tokio::time::timeout(SIGTERM_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        if pgid > 0 {
+            let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+        }
+        let _ = child.wait().await;
+    }
+}
+
+/// Render captured output plus a footer as the model-visible content.
+fn render(capture: Capture, footer: &str, status: ToolStatus) -> ToolOutcome {
+    let bytes = capture.into_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    // The footer goes on its own line without an extra blank line after the
+    // command's usual trailing newline.
+    let body = text.trim_end_matches('\n');
+    let content = if body.is_empty() {
+        footer.to_string()
+    } else {
+        format!("{body}\n{footer}")
+    };
+    ToolOutcome {
+        status,
+        content: bound_output(&content, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES),
+    }
+}
+
+/// Keeps the first [`HEAD_BYTES`]/[`HEAD_LINES`] and the last
+/// [`TAIL_BYTES`]/[`TAIL_LINES`] of the captured output, no matter how much the
+/// command prints.
+#[derive(Default)]
+struct Capture {
+    head: Vec<u8>,
+    head_newlines: usize,
+    tail: VecDeque<u8>,
+    tail_newlines: usize,
+    total: u64,
+}
+
+impl Capture {
+    fn push(&mut self, chunk: &[u8]) {
+        self.total += chunk.len() as u64;
+        let mut rest = chunk;
+        if self.head.len() < HEAD_BYTES && self.head_newlines < HEAD_LINES {
+            let mut taken = 0;
+            for &byte in rest {
+                if self.head.len() >= HEAD_BYTES || self.head_newlines >= HEAD_LINES {
+                    break;
+                }
+                if byte == b'\n' {
+                    self.head_newlines += 1;
+                }
+                self.head.push(byte);
+                taken += 1;
+            }
+            rest = &rest[taken..];
+        }
+        for &byte in rest {
+            self.tail.push_back(byte);
+            if byte == b'\n' {
+                self.tail_newlines += 1;
+            }
+            while self.tail.len() > TAIL_BYTES || self.tail_newlines > TAIL_LINES {
+                if !self.pop_tail_front() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn pop_tail_front(&mut self) -> bool {
+        match self.tail.pop_front() {
+            Some(b'\n') => {
+                self.tail_newlines -= 1;
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    fn dropped(&self) -> u64 {
+        self.total - (self.head.len() + self.tail.len()) as u64
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        let dropped = self.dropped();
+        let mut out = self.head;
+        if dropped > 0 {
+            out.extend_from_slice(format!("\n[… {dropped} bytes omitted …]\n").as_bytes());
+        }
+        out.extend(self.tail);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ShellTool, parse_input};
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use p1_contracts::{
+        CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput,
+        ToolOutcome, ToolStatus,
+    };
+    use p1_workspace::{ToolFace, Workspace};
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    fn tool(root: &Path) -> ShellTool {
+        ShellTool::new(Workspace::new(root).unwrap())
+    }
+
+    fn call(arguments: &str) -> ToolCall {
+        ToolCall {
+            call_id: "call-1".into(),
+            name: "shell".into(),
+            input: ToolInput::Json(arguments.to_string()),
+        }
+    }
+
+    async fn execute(tool: &ShellTool, arguments: &str) -> ToolOutcome {
+        let call = call(arguments);
+        let context = ToolContext {
+            cancel: CancellationToken::new(),
+        };
+        tool.execute(&call, context).await
+    }
+
+    fn schema(tool: &ShellTool) -> serde_json::Value {
+        match &tool.declaration().kind {
+            DeclarationKind::Function { input_schema } => input_schema.clone(),
+            other => panic!("expected a function declaration, got {other:?}"),
+        }
+    }
+
+    fn pid_file(root: &Path, name: &str) -> Option<i32> {
+        let text = std::fs::read_to_string(root.join(name)).ok()?;
+        text.trim().parse().ok()
+    }
+
+    /// Wait (bounded) until `pid` is gone.
+    fn wait_for_gone(pid: i32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if kill(Pid::from_raw(pid), None::<Signal>).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("process {pid} is still alive");
+    }
+
+    #[tokio::test]
+    async fn echo_reports_output_and_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"command": "echo hi"}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert_eq!(outcome.content, "hi\n[exit code: 0]");
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_are_captured_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"command": "echo out; echo err >&2; exit 3"}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert!(outcome.content.contains("out"), "{outcome:?}");
+        assert!(outcome.content.contains("err"), "{outcome:?}");
+        assert!(outcome.content.contains("[exit code: 3]"), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn commands_run_from_the_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let tool = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"command": "pwd"}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert_eq!(
+            outcome.content,
+            format!("{}\n[exit code: 0]", root.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn stdin_is_closed_so_cat_returns_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        let started = Instant::now();
+
+        let outcome = execute(&tool, r#"{"command": "cat"}"#).await;
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert_eq!(outcome.content, "[exit code: 0]");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        let started = Instant::now();
+
+        let outcome = execute(
+            &tool,
+            r#"{"command": "sleep 30 & echo $! > pid; wait", "timeout_seconds": 1}"#,
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(
+            outcome.content.contains("[timed out after 1 s]"),
+            "{outcome:?}"
+        );
+        let pid = pid_file(dir.path(), "pid").expect("the child wrote its pid");
+        wait_for_gone(pid);
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        let cancel = CancellationToken::new();
+        let control = cancel.clone();
+        let script = "sleep 300 & echo $! > pid1; sleep 300 & echo $! > pid2; wait";
+
+        // Cancel only once both background sleeps are running, so the group
+        // really has children to kill.
+        let root = dir.path().to_path_buf();
+        let stopper = async move {
+            for _ in 0..500 {
+                if pid_file(&root, "pid1").is_some() && pid_file(&root, "pid2").is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            control.cancel();
+        };
+        let call = call(&serde_json::json!({ "command": script }).to_string());
+        let context = ToolContext {
+            cancel: cancel.clone(),
+        };
+        let (outcome, ()) = tokio::join!(tool.execute(&call, context), stopper);
+
+        assert_eq!(outcome.status, ToolStatus::Cancelled);
+        assert!(outcome.content.contains("[cancelled]"), "{outcome:?}");
+        let first = pid_file(dir.path(), "pid1").expect("pid1 was written");
+        let second = pid_file(dir.path(), "pid2").expect("pid2 was written");
+        wait_for_gone(first);
+        wait_for_gone(second);
+    }
+
+    #[tokio::test]
+    async fn high_volume_output_is_bounded_while_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"command": "yes | head -c 5000000"}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert!(
+            outcome.content.len() < 60_000,
+            "len={}",
+            outcome.content.len()
+        );
+        assert!(outcome.content.contains("bytes omitted"), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_signal_termination_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"command": "kill -TERM $$"}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(
+            outcome.content.contains("[terminated by signal 15]"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn declaration_is_a_function_with_the_spec_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+
+        assert_eq!(tool.declaration().name, "shell");
+        let schema = schema(&tool);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["command"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["command"]["type"], "string");
+        assert_eq!(schema["properties"]["timeout_seconds"]["minimum"], 1);
+        assert_eq!(schema["properties"]["timeout_seconds"]["maximum"], 3600);
+        assert_eq!(schema["properties"]["timeout_seconds"]["default"], 120);
+    }
+
+    #[test]
+    fn identity_defaults_to_claude_and_survives_a_face_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        assert_eq!(tool.identity().implementation, "p1-tool-shell");
+        assert_eq!(tool.identity().variant, "claude");
+
+        let reshaped = tool.with_face(ToolFace::new("Run", "custom"), "gpt");
+        assert_eq!(reshaped.declaration().name, "Run");
+        assert_eq!(reshaped.declaration().description, "custom");
+        assert_eq!(reshaped.identity().implementation, "p1-tool-shell");
+        assert_eq!(reshaped.identity().variant, "gpt");
+    }
+
+    #[test]
+    fn effect_is_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        assert_eq!(tool.effect(&call("{}")), Effect::Executes);
+    }
+
+    #[tokio::test]
+    async fn invalid_input_reports_a_prefix_and_never_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        let garbage = [
+            "",
+            "null",
+            "[]",
+            "{}",
+            "{\"command\": 5}",
+            "{\"command\":\"echo hi\",\"unknown\":1}",
+            "{\"command\":\"echo hi\",\"timeout_seconds\":0}",
+            "{\"command\":\"echo hi\",\"timeout_seconds\":3601}",
+            "{\"command\":\"echo hi\",\"timeout_seconds\":-1}",
+            "\u{0}\u{1}{\"command\" garbage",
+        ];
+        for arguments in garbage {
+            let outcome = execute(&tool, arguments).await;
+            assert_eq!(outcome.status, ToolStatus::Error, "input: {arguments:?}");
+            assert!(
+                outcome.content.starts_with("Invalid input for shell: "),
+                "input: {arguments:?} -> {outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn text_input_is_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        let call = ToolCall {
+            call_id: "call-1".into(),
+            name: "shell".into(),
+            input: ToolInput::Text("echo hi".into()),
+        };
+        let context = ToolContext {
+            cancel: CancellationToken::new(),
+        };
+
+        let outcome = tool.execute(&call, context).await;
+
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(outcome.content.starts_with("Invalid input for shell: "));
+    }
+
+    #[tokio::test]
+    async fn execute_returns_cancelled_without_starting_a_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        let call = call(r#"{"command": "touch started"}"#);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = tool.execute(&call, ToolContext { cancel }).await;
+
+        assert_eq!(outcome.status, ToolStatus::Cancelled);
+        assert_eq!(outcome.content, "");
+        assert!(!dir.path().join("started").exists());
+    }
+
+    #[test]
+    fn parse_input_rejects_a_freeform_text_call() {
+        let call = ToolCall {
+            call_id: "c".into(),
+            name: "shell".into(),
+            input: ToolInput::Text("anything".into()),
+        };
+        assert!(parse_input("shell", &call).is_err());
+    }
+}
