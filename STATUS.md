@@ -19,23 +19,13 @@ Only the lead edits this file (D13). Started 2026-09-19.
 - `environments/{claude,gpt}`: config + family prompts, coherence-tested.
 
 ## In progress
-- `host` deepseek: `crates/p1-host`, binary `p1` (worktree `../phaseone-host`, brief
-  `../phaseone-briefs/host.md`). It is the composition root; after it lands the lead runs the
-  REAL end-to-end tasks.
+- nothing. The first slice is DONE (2026-09-20): every seams.md §10 acceptance item is
+  demonstrated by a command in `docs/SLICE-REPORT.md`, including live runs on both routes,
+  live cross-route delegation and live resume.
 
-## Next (lead)
-1. Accept the host: rerun its tests (both feature sets), read the wiring, `p1 env show`.
-2. Slice acceptance per seams.md §10, each as a command the owner can run — write them into
-   `docs/SLICE-REPORT.md`: core isolation; a real coding task on EACH route with only its own
-   prompt/tools (use a scratch repo under /tmp, `--yes`); swap/remove a tool or provider by
-   composition (`--no-default-features`, an environment without a tool); conformance for both
-   adapters; memory vs JSONL consistency + crash-resume property test; delegation: child on
-   the OTHER route completes and wakes the parent, harness works without delegation; repair
-   keeps child state.
-3. Measure: RSS (`/usr/bin/time -v`), startup (`p1 --version`, `p1 env show`), tokens per task
-   from the usage lines, cost (unknown on subscriptions — say so). Release build ONCE for this.
-4. Live reasoning replay is still unproven (routes.md §D) — watch the first real tasks.
-5. `docs/SLICE-REPORT.md`, final STATUS/DECISIONS, evidence, brain notes. Then stop and report.
+## Next (owner's call — see `docs/SLICE-REPORT.md` "What should come next")
+- Use it for real work and collect failures; context-control policy module; T1 comparison;
+  granular authorization; turn-completion policy.
 
 ## Blocked
 - nothing
@@ -63,4 +53,4 @@ commit explicit paths on the task branch, merge to main, gate, push, log evidenc
 | 09-20 | deepseek/high | assembly | see evidence.jsonl | ACCEPTED first pass, $0.07 |
 | 09-20 | deepseek/high | delegation | see evidence.jsonl | ACCEPTED first pass, $0.12 |
 | 09-20 | deepseek/high | codex adapter | see evidence.jsonl | ACCEPTED (same brief error fixed), $0.11 |
-| 09-20 | deepseek/high | host | `phaseone-briefs/host.out` | running |
+| 09-20 | deepseek/high | host | `.worker-runs/20260920-010944-1597843` | ACCEPTED, lead fixed 3 from live runs, $0.32 |

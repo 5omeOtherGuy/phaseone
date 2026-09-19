@@ -6,8 +6,11 @@ You type a prompt and the agent works. One small agent core (loop + API); everyt
 else — providers, tools, sessions, frontends, delegation — is a module around it,
 composed with ordinary constructors.
 
-**Status: pre-alpha.** The workspace, the gate and the design baseline exist. The
-first usable slice (`docs/design/seams.md` §10) is being built.
+**Status: pre-alpha, first usable slice done (2026-09-20).** `p1 --env claude|gpt "prompt"`
+runs a real coding task on the Claude and Codex subscription routes, each with its own
+prompt and tools; sessions resume from a JSONL journal; an agent can delegate to a worker
+on the other route and is woken when it finishes. What was built, measured and what is
+weak: `docs/SLICE-REPORT.md`.
 
 ## What makes it different
 
@@ -27,7 +30,8 @@ first usable slice (`docs/design/seams.md` §10) is being built.
 | Path | What |
 |---|---|
 | `crates/p1-contracts` | Shared contracts between the core and its modules |
-| `crates/p1-*` | One crate per module boundary, added increment by increment |
+| `crates/p1-*` | One crate per module boundary: core, providers, tools, assembly, journal, workers, host |
+| `environments/` | Per-model environment files: route, tools, whole prompt |
 | `docs/design/` | Design baseline: pillars, one-page design, seams + acceptance |
 | `DECISIONS.md` | Why things are the way they are |
 | `AGENTS.md` | How humans and agents work in this repo |
