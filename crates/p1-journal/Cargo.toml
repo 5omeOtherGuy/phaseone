@@ -1,0 +1,22 @@
+[package]
+name = "p1-journal"
+description = "The p1 session journal stores: in-memory and JSONL commit sinks with truncated-tail recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+p1-core = { path = "../p1-core" }
+p1-testkit = { path = "../p1-testkit" }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time", "test-util"] }

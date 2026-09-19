@@ -1,0 +1,21 @@
+[package]
+name = "p1-tool-delegate"
+description = "The p1 delegation tools: start, inspect, continue and cancel workers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-workers = { path = "../p1-workers" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+p1-core = { path = "../p1-core" }
+p1-testkit = { path = "../p1-testkit" }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "test-util"] }

@@ -17,6 +17,9 @@ use p1_contracts::{
 };
 use tokio::sync::Notify;
 
+mod resume;
+pub use resume::{Projection, ResumeError, ResumeReport, UnresolvedCall, project};
+
 /// R5: exact model-visible content for a call whose `ToolStarted` was committed but
 /// whose outcome was never recorded.
 const UNKNOWN_OUTCOME: &str = "Interrupted: this call was started before the session stopped and its outcome is unknown. Check the current state before retrying.";
@@ -107,6 +110,19 @@ enum StreamStep {
 impl Agent {
     /// Fails before anything runs if the environment is incoherent.
     pub fn new(parts: AgentParts) -> Result<Self, BuildError> {
+        Self::assemble(parts, Vec::new(), 0, false, HashSet::new())
+    }
+
+    /// Validate the parts (exactly as [`Agent::new`] does) and install `history`,
+    /// `next_seq`, `environment_committed` and `started_calls`. Shared with
+    /// `resume`, so construction and its `BuildError`s exist once.
+    pub(crate) fn assemble(
+        parts: AgentParts,
+        history: Vec<Item>,
+        next_seq: u64,
+        environment_committed: bool,
+        started_calls: HashSet<String>,
+    ) -> Result<Self, BuildError> {
         // §1: reject duplicate assembled call names before anything else runs.
         let mut names = HashSet::new();
         for tool in &parts.tools {
@@ -132,10 +148,10 @@ impl Agent {
             .map_err(BuildError::ProviderRejected)?;
         Ok(Self {
             parts,
-            history: Vec::new(),
-            next_seq: 0,
-            environment_committed: false,
-            started_calls: HashSet::new(),
+            history,
+            next_seq,
+            environment_committed,
+            started_calls,
             inbox: Arc::new(InboxShared {
                 queue: Mutex::new(VecDeque::new()),
                 notify: Notify::new(),
