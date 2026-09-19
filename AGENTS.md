@@ -1,34 +1,65 @@
-# Phaseone (p1) — repository rules for agents
+# p1 — instructions for agents and humans
 
-p1 is a lean, modular Rust coding harness that adapts itself to the model it runs.
-Design baseline: `docs/design/` (start at `docs/design/README.md`). Decisions:
-`DECISIONS.md`. Current state: `STATUS.md`.
+p1 is a lean, modular Rust coding harness. Direction: `docs/design/` (start at
+`README.md`). Settled choices: `DECISIONS.md`. Work items: GitHub Issues.
+
+Several agents work in this repository at the same time. Everything below exists to
+make that fast and conflict-free.
+
+## Swarm protocol
+
+- **One worktree per task.** Never run two agents in one checkout.
+  `scripts/new-worktree.sh <task-slug>` creates `../phaseone-<task-slug>` on a fresh
+  `task/<task-slug>` branch. Each worktree has its own `target/`, so builds never
+  collide and no shared `CARGO_TARGET_DIR` is ever needed.
+- **Work items are issues.** Claim one by assigning yourself and moving the label
+  `ready` → `in-progress`. Stuck? Add `blocked` and say what you need in a comment.
+  Only owner decisions carry the `owner` label.
+- **Own your paths.** Change only the paths your task owns. Do not reformat, rename
+  or "tidy" anything else — another agent owns it.
+- **Trunk-based.** Commit often on `task/<issue>-<slug>`, push it, and merge into
+  `main` as soon as `scripts/gate.sh` is green. A pull request with auto-merge is the
+  default route (`gh pr create --fill && gh pr merge --auto --squash --delete-branch`);
+  merging locally and pushing `main` is equally fine. No review gate, no long-lived
+  branches, no branch protection.
+- **A small diff is a mergeable diff.** If a conflict needs a judgement call, keep
+  both sides working and re-run the gate.
+- **Shared files** (`AGENTS.md`, `DECISIONS.md`, `Cargo.toml`, `Cargo.lock`,
+  `scripts/`, `.github/`): keep edits minimal and merge `main` immediately before
+  touching them. `DECISIONS.md` is append-only — never rewrite an existing row.
+- **Never `git add -A`; commit by explicit path.** Never force-push `main`.
+
+## Gate
+
+`scripts/gate.sh` is the only required check: `cargo fmt --check`,
+`clippy -D warnings`, all tests, core isolation. CI runs exactly the same script.
+It must be green before a merge; it is not required for every intermediate commit.
 
 ## Hard rules
-- No sudo. No package installs. No commits, pushes, branch switches, `git stash`,
-  `git add -A`, rebases or git config changes — the lead commits by explicit path.
-- Work only inside the workspace/worktree named in your brief and its owned paths.
-- Never read, print, log, store or put into fixtures any credential, token,
+
+- No sudo, no package installs. Ask in an issue.
+- Never read, print, log, commit or put into fixtures any credential, token,
   Authorization header, private prompt or raw authenticated traffic.
-- Never modify `/home/phaseonebig/projects/iris-agent` or `iris-agent-clean`
-  (read-only donors). Copy code into p1 and adapt it; note the donor path in your handoff.
-- No live network in unit/conformance tests. No real user data directories; use
-  `tempfile`/scratch dirs. No sleep-based timing assertions — use fake time or
+- No live network in unit/conformance tests. No real user data directories — use
+  `tempfile`/scratch dirs. No sleep-based timing assertions; use fake time or
   explicit synchronisation.
-- Never delete, weaken, skip or bend a frozen acceptance test or its fixtures. If a
-  check contradicts the spec, leave it failing and explain.
+- `/home/phaseonebig/projects/iris-agent` and `iris-agent-clean` are read-only donors.
+  Copy code into p1 and adapt it; name the donor path in the commit message.
+- Never delete, weaken or skip a frozen acceptance test or its fixtures. If a check
+  contradicts the spec, leave it failing and explain.
+- Keep dependencies few. Ask before adding a crate that is not already in the workspace.
 
 ## Build
-- 7 GB laptop: `CARGO_BUILD_JOBS=2`, one build at a time per worktree, never a shared
-  `CARGO_TARGET_DIR`. Prefer focused runs: `cargo test -p <crate> <filter>`.
-- Gate (must be green for a finished increment): `scripts/gate.sh`
-  (fmt check, clippy `-D warnings`, all tests, core isolation).
 
-## Architecture rules (owner decisions — do not bend)
+- 7 GB laptop: `CARGO_BUILD_JOBS=2` (the gate sets it), one build at a time per
+  worktree. Prefer focused runs: `cargo test -p <crate> <filter>`.
+
+## Architecture (owner decisions — do not bend)
+
 - One small agent core (`p1-core`): loop + API. It depends only on `p1-contracts`.
   It never names a provider, tool, file format, prompt template or UI.
 - Every tool is its own module (crate). Providers only translate wire behaviour and
-  contain no tools. Tools contain no provider wire formats and no terminal/UI types.
+  contain no tools. Tools contain no provider wire formats and no UI types.
 - An agent sees only the prompt and tools assembled for it; an unassembled tool
   cannot be dispatched.
 - Delegation is an optional tool module. No mandatory coordinating agent.
@@ -36,9 +67,9 @@ Design baseline: `docs/design/` (start at `docs/design/README.md`). Decisions:
   locator, global registry or DI framework.
 - Public async interfaces are `Send`-capable. One owner per agent's mutable state.
 - Unknown usage/cost is `None`, never zero.
-- Clear descriptive names. No mythology names (no Nexus, Mimir, Wayland…).
+- Rust 2024, `unsafe` forbidden, errors via `thiserror` in libraries. Clear
+  descriptive names — no mythology names.
 
 ## Style
-- Rust 2024, `unsafe` forbidden, errors via `thiserror` in libraries. Keep dependencies
-  few; ask in the handoff before adding one that is not already in the workspace.
-- Comments explain why, not what. No speculative abstractions or unused generality.
+
+Comments explain why, not what. No speculative abstractions or unused generality.
