@@ -792,7 +792,11 @@ fn locate(lines: &[String], group: &UpdateGroup, running: usize) -> Option<usize
             .map(|_| position);
     }
     if pattern.is_empty() {
-        return Some(start.min(lines.len()));
+        // Codex semantics, which GPT models are trained on: a hunk with nothing to
+        // match (additions only) is appended at the END of the file, with or without
+        // a header. (Lead ruling; the first implementation inserted at the search
+        // position.)
+        return Some(lines.len());
     }
     if start + pattern.len() > lines.len() {
         return None;
@@ -1168,9 +1172,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plain_addition_without_context_inserts_at_the_search_position() {
-        // Without `*** End of File` the hunk has no anchor, so it goes at the
-        // current search position (the start of the file for the first hunk).
+    async fn a_plain_addition_without_context_appends_like_codex() {
+        // A hunk with nothing to match has no anchor: Codex appends it at the end
+        // of the file, and so does p1.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "f.txt", "a\nb\n");
         let (tool, _) = tool(dir.path());
@@ -1182,7 +1186,7 @@ mod tests {
         .await;
 
         assert_eq!(outcome.status, ToolStatus::Ok, "{outcome:?}");
-        assert_eq!(read(dir.path(), "f.txt"), "x\na\nb\n");
+        assert_eq!(read(dir.path(), "f.txt"), "a\nb\nx\n");
     }
 
     #[tokio::test]

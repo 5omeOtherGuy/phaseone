@@ -19,7 +19,7 @@ use p1_contracts::{
     BoxFuture, CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
-use p1_workspace::{ToolFace, Workspace, bound_output};
+use p1_workspace::{ToolFace, Workspace};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -30,7 +30,6 @@ const DEFAULT_TIMEOUT_SECONDS: i64 = 120;
 const MIN_TIMEOUT_SECONDS: i64 = 1;
 const MAX_TIMEOUT_SECONDS: i64 = 3_600;
 const MAX_OUTPUT_BYTES: usize = 50_000;
-const MAX_OUTPUT_LINES: usize = 2_000;
 /// Bytes of the beginning of the output kept in memory.
 const HEAD_BYTES: usize = 25_000;
 /// Bytes of the end of the output kept in memory.
@@ -343,15 +342,41 @@ fn render(capture: Capture, footer: &str, status: ToolStatus) -> ToolOutcome {
     // The footer goes on its own line without an extra blank line after the
     // command's usual trailing newline.
     let body = text.trim_end_matches('\n');
+    // Lossy decoding can TRIPLE the size of binary output (each bad byte becomes
+    // U+FFFD), pushing already-capped bytes past the content bound. Squeeze the body
+    // — head and tail kept, like the collector — and never bound the footer: the exit
+    // code must survive however noisy the output was.
+    let body = squeeze(body, MAX_OUTPUT_BYTES - FOOTER_RESERVE);
     let content = if body.is_empty() {
         footer.to_string()
     } else {
         format!("{body}\n{footer}")
     };
-    ToolOutcome {
-        status,
-        content: bound_output(&content, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES),
+    ToolOutcome { status, content }
+}
+
+const FOOTER_RESERVE: usize = 2_000;
+
+/// Keep the first and last halves of `text` (cut on char boundaries) when it exceeds `max`.
+fn squeeze(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if text.len() <= max {
+        return std::borrow::Cow::Borrowed(text);
     }
+    let half = max / 2;
+    let mut head_end = half;
+    while !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len() - half;
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}\n[… {} bytes omitted …]\n{}",
+        &text[..head_end],
+        tail_start - head_end,
+        &text[tail_start..]
+    ))
 }
 
 /// Keeps the first [`HEAD_BYTES`]/[`HEAD_LINES`] and the last

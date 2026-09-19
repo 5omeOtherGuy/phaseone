@@ -849,7 +849,10 @@ version = "0.0.1"
 dependencies = [
  "p1-contracts",
  "p1-tool-edit",
+ "p1-tool-patch",
  "p1-tool-read",
+ "p1-tool-search",
+ "p1-tool-shell",
  "p1-tool-write",
  "p1-workspace",
  "tempfile",

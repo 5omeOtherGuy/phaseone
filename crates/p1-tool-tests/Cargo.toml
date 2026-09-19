@@ -15,5 +15,8 @@ p1-workspace = { path = "../p1-workspace" }
 p1-tool-read = { path = "../p1-tool-read" }
 p1-tool-edit = { path = "../p1-tool-edit" }
 p1-tool-write = { path = "../p1-tool-write" }
+p1-tool-search = { path = "../p1-tool-search" }
+p1-tool-shell = { path = "../p1-tool-shell" }
+p1-tool-patch = { path = "../p1-tool-patch" }
 tempfile = "3"
-tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }
