@@ -43,6 +43,7 @@ anywhere (so a batch can never wait forever on memory that nothing will free). T
 list may be much longer than the pool — queue 20 jobs, run 6 at a time.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -305,7 +306,8 @@ def launch(job, worker, binary, out_dir):
                                            sandbox_read_paths(job["dir"])),
                                 stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
                                 start_new_session=True)
-        return {"proc": proc, "job": job, "started": started, "stdout": stdout, "stderr": stderr,
+        return {"proc": proc, "job": job, "started": started, "identity": build_identity(binary),
+                "stdout": stdout, "stderr": stderr,
                 "stdout_path": stdout_path, "stderr_path": stderr_path,
                 "run_dir": run_dir, "session": session}
     out_path = os.path.join(out_dir, f"{job['label']}.out")
@@ -316,14 +318,30 @@ def launch(job, worker, binary, out_dir):
             "out_path": out_path}
 
 
-def run_report(session, run_dir, label, elapsed, exit_code):
+def build_identity(binary):
+    """(repository HEAD, sha256 of the p1 binary) — either is None when it cannot be read."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    head = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True)
+    digest = None
+    try:
+        with open(binary, "rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    except OSError:
+        pass
+    return (head.stdout.strip() or None) if head.returncode == 0 else None, digest
+
+
+def run_report(session, run_dir, label, elapsed, exit_code, identity=(None, None)):
     """scripts/run-report.py once per p1 job; its JSON lands in the run directory.
 
     Acceptance is the lead's call — run-report defaults it to `unknown`.
     """
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run-report.py")
     done = subprocess.run([sys.executable, script, session, "--label", label,
-                           "--elapsed", str(elapsed), "--exit-code", str(exit_code)],
+                           "--elapsed", str(elapsed), "--exit-code", str(exit_code)]
+                          + [part for flag, value in zip(("--harness-head", "--binary-sha256"), identity)
+                             if value for part in (flag, value)],
                           capture_output=True, text=True)
     report_path = os.path.join(run_dir, "report.json")
     with open(report_path, "w", encoding="utf-8") as handle:
@@ -336,7 +354,8 @@ def run_report(session, run_dir, label, elapsed, exit_code):
 def p1_record(state, process_exit):
     job = state["job"]
     wall_s = round(time.time() - state["started"])
-    report, _, error = run_report(state["session"], state["run_dir"], job["label"], wall_s, process_exit)
+    report, _, error = run_report(state["session"], state["run_dir"], job["label"], wall_s, process_exit,
+                                  state.get("identity", (None, None)))
     record = {
         "runner": "p1",
         "label": job["label"],

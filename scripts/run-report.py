@@ -58,6 +58,11 @@ least one worker file was read (no worker file means no workers — a child sess
 the evidence `worker_usage_known` reads. A worker started without `--session` is listed
 here and nowhere else.
 
+Which build ran. A journal does not know the binary that wrote it, so the caller says:
+`harness_head` (the p1 repository's revision when the run started — a hint, the binary may be
+older) and `binary_sha256` (the hash of the p1 binary — two runs with the same hash ran the same
+build). Both are null when not passed; never guessed.
+
 `stalled_on_summaries` is derived from the journal (completion.md §3c): the longest run of
 `context_replaced` records after the last `tool_finished` that was a mutating tool (`write`,
 `edit`, `apply_patch`) or `finish`, AND the journal's last response is an interrupted one.
@@ -311,6 +316,8 @@ def main():
                         help="result accepted after INDEPENDENT verification")
     parser.add_argument("--interventions", type=int, help="times the operator had to step in")
     parser.add_argument("--note")
+    parser.add_argument("--harness-head", help="the p1 repository's revision when the run started")
+    parser.add_argument("--binary-sha256", help="hash of the p1 binary that ran (identifies the build)")
     parser.add_argument("--max-idle-summaries", type=int, default=DEFAULT_MAX_IDLE_SUMMARIES,
                         help="the run's --max-idle-summaries (default: 6); only used for "
                              "stalled_on_summaries")
@@ -320,7 +327,8 @@ def main():
     record = report(args.session, args.max_idle_summaries)
     record.update({"label": args.label, "elapsed_seconds": args.elapsed,
                    "exit_code": args.exit_code, "accepted": args.accepted,
-                   "operator_interventions": args.interventions, "note": args.note})
+                   "operator_interventions": args.interventions, "note": args.note,
+                   "harness_head": args.harness_head, "binary_sha256": args.binary_sha256})
     line = json.dumps(record, ensure_ascii=False, sort_keys=True)
     print(line)
     if args.append:
