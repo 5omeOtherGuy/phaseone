@@ -20,6 +20,7 @@ pub mod catalog;
 pub mod cli;
 pub mod policy;
 pub mod render;
+pub mod routes;
 pub mod run;
 pub mod session;
 

@@ -30,8 +30,8 @@ fn write_environment(root: &Path, name: &str, toml: &str) {
     std::fs::write(dir.join("prompt.md"), "prompt").unwrap();
 }
 
-/// A synthetic environments root whose `../profiles` holds the shipped GLM
-/// profile, so a routed environment resolves exactly like a shipped one.
+/// A synthetic environments root whose `../profiles` and `../routes` hold the shipped
+/// GLM profile and route, so a routed environment resolves exactly like a shipped one.
 fn routed_root() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     let profiles = root.path().join("profiles");
@@ -39,6 +39,13 @@ fn routed_root() -> tempfile::TempDir {
     std::fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/glm-5.3.toml"),
         profiles.join("glm-5.3.toml"),
+    )
+    .unwrap();
+    let routes = root.path().join("routes");
+    std::fs::create_dir_all(&routes).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../routes/glm-subscription.toml"),
+        routes.join("glm-subscription.toml"),
     )
     .unwrap();
     root
