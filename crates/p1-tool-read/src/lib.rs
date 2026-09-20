@@ -83,7 +83,7 @@ fn input_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "path": {
+            "file_path": {
                 "type": "string",
                 "description": "File path, relative to the workspace root or absolute inside it."
             },
@@ -100,7 +100,7 @@ fn input_schema() -> serde_json::Value {
                 "description": "Maximum number of lines to return."
             }
         },
-        "required": ["path"],
+        "required": ["file_path"],
         "additionalProperties": false
     })
 }
@@ -108,7 +108,7 @@ fn input_schema() -> serde_json::Value {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadInput {
-    path: String,
+    file_path: String,
     #[serde(default)]
     offset: Option<i64>,
     #[serde(default)]
@@ -191,7 +191,7 @@ fn run(
     input: &ReadInput,
 ) -> Result<String, String> {
     let resolved = workspace
-        .resolve(&input.path)
+        .resolve(&input.file_path)
         .map_err(|error| error.to_string())?;
     let display = workspace.display(&resolved);
 
@@ -560,9 +560,9 @@ mod tests {
         assert_eq!(tool.declaration().name, "read");
         let schema = schema(&tool);
         assert_eq!(schema["type"], "object");
-        assert_eq!(schema["required"], serde_json::json!(["path"]));
+        assert_eq!(schema["required"], serde_json::json!(["file_path"]));
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert_eq!(schema["properties"]["file_path"]["type"], "string");
         assert_eq!(schema["properties"]["offset"]["minimum"], 1);
         assert_eq!(schema["properties"]["offset"]["default"], 1);
         assert_eq!(schema["properties"]["limit"]["minimum"], 1);
@@ -599,7 +599,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
         let (tool, _) = tool(dir.path());
 
-        let outcome = execute(&tool, r#"{"path": "a.txt"}"#).await;
+        let outcome = execute(&tool, r#"{"file_path": "a.txt"}"#).await;
 
         assert_eq!(outcome.status, ToolStatus::Ok);
         assert_eq!(
@@ -615,7 +615,7 @@ mod tests {
         std::fs::write(dir.path().join("b.txt"), body).unwrap();
         let (tool, _) = tool(dir.path());
 
-        let outcome = execute(&tool, r#"{"path": "b.txt", "offset": 3, "limit": 2}"#).await;
+        let outcome = execute(&tool, r#"{"file_path": "b.txt", "offset": 3, "limit": 2}"#).await;
 
         assert_eq!(
             outcome.content,
@@ -629,7 +629,7 @@ mod tests {
         std::fs::write(dir.path().join("c.txt"), "one\ntwo\n").unwrap();
         let (tool, _) = tool(dir.path());
 
-        let outcome = execute(&tool, r#"{"path": "c.txt", "limit": 1}"#).await;
+        let outcome = execute(&tool, r#"{"file_path": "c.txt", "limit": 1}"#).await;
 
         assert_eq!(
             outcome.content,
@@ -643,7 +643,7 @@ mod tests {
         std::fs::write(dir.path().join("empty.txt"), "").unwrap();
         let (tool, observed) = tool(dir.path());
 
-        let outcome = execute(&tool, r#"{"path": "empty.txt"}"#).await;
+        let outcome = execute(&tool, r#"{"file_path": "empty.txt"}"#).await;
 
         assert_eq!(outcome.status, ToolStatus::Ok);
         assert_eq!(outcome.content, "empty.txt is empty.");
@@ -661,11 +661,11 @@ mod tests {
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
         let (tool, _) = tool(dir.path());
 
-        let missing = execute(&tool, r#"{"path": "nope.txt"}"#).await;
+        let missing = execute(&tool, r#"{"file_path": "nope.txt"}"#).await;
         assert_eq!(missing.status, ToolStatus::Error);
         assert_eq!(missing.content, "nope.txt does not exist.");
 
-        let directory = execute(&tool, r#"{"path": "subdir"}"#).await;
+        let directory = execute(&tool, r#"{"file_path": "subdir"}"#).await;
         assert_eq!(directory.status, ToolStatus::Error);
         assert_eq!(directory.content, "subdir is not a regular file.");
     }
@@ -676,7 +676,7 @@ mod tests {
         std::fs::write(dir.path().join("nul.dat"), b"alpha\0beta").unwrap();
         let (tool, _) = tool(dir.path());
 
-        let outcome = execute(&tool, r#"{"path": "nul.dat"}"#).await;
+        let outcome = execute(&tool, r#"{"file_path": "nul.dat"}"#).await;
 
         assert_eq!(outcome.status, ToolStatus::Error);
         assert_eq!(outcome.content, "nul.dat is a binary file.");
@@ -688,7 +688,7 @@ mod tests {
         std::fs::write(dir.path().join("binary.dat"), [b'a', 0xFF, b'b']).unwrap();
         let (tool, _) = tool(dir.path());
 
-        let outcome = execute(&tool, r#"{"path": "binary.dat"}"#).await;
+        let outcome = execute(&tool, r#"{"file_path": "binary.dat"}"#).await;
 
         assert_eq!(outcome.status, ToolStatus::Error);
         assert_eq!(outcome.content, "binary.dat is not valid UTF-8.");
@@ -702,7 +702,7 @@ mod tests {
         let (tool, observed) = tool(dir.path());
 
         // A windowed read still observes the whole file.
-        execute(&tool, r#"{"path": "a.txt", "limit": 1}"#).await;
+        execute(&tool, r#"{"file_path": "a.txt", "limit": 1}"#).await;
 
         assert_eq!(
             observed.check_unchanged(&dir.path().join("a.txt"), contents.as_bytes()),
@@ -717,14 +717,14 @@ mod tests {
         std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
         let (tool, _) = tool(dir.path());
 
-        let escaped = execute(&tool, r#"{"path": "../secret.txt"}"#).await;
+        let escaped = execute(&tool, r#"{"file_path": "../secret.txt"}"#).await;
         assert_eq!(escaped.status, ToolStatus::Error);
         assert!(escaped.content.contains("escapes workspace"), "{escaped:?}");
 
         let absolute = outside.path().join("secret.txt");
         let absolute = execute(
             &tool,
-            &serde_json::json!({ "path": absolute.to_str().unwrap() }).to_string(),
+            &serde_json::json!({ "file_path": absolute.to_str().unwrap() }).to_string(),
         )
         .await;
         assert_eq!(absolute.status, ToolStatus::Error);
@@ -743,7 +743,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
         let (tool, _) = tool(dir.path());
 
-        let outcome = execute(&tool, r#"{"path": "link/secret.txt"}"#).await;
+        let outcome = execute(&tool, r#"{"file_path": "link/secret.txt"}"#).await;
 
         assert_eq!(outcome.status, ToolStatus::Error);
         assert!(outcome.content.contains("escapes workspace"), "{outcome:?}");
@@ -755,7 +755,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
         let (tool, _) = tool(dir.path());
 
-        let outcome = execute(&tool, r#"{"path": "a.txt", "offset": 9}"#).await;
+        let outcome = execute(&tool, r#"{"file_path": "a.txt", "offset": 9}"#).await;
 
         assert_eq!(outcome.status, ToolStatus::Error);
         assert!(outcome.content.contains("beyond the end"), "{outcome:?}");
@@ -767,7 +767,7 @@ mod tests {
         std::fs::write(dir.path().join("long.txt"), "x".repeat(60_000)).unwrap();
         let (tool, _) = tool(dir.path());
 
-        let outcome = execute(&tool, r#"{"path": "long.txt"}"#).await;
+        let outcome = execute(&tool, r#"{"file_path": "long.txt"}"#).await;
 
         assert_eq!(outcome.status, ToolStatus::Ok);
         assert!(outcome.content.contains("[output truncated: showing"));
@@ -786,11 +786,11 @@ mod tests {
             "",
             "null",
             "[]",
-            "{\"path\": 5}",
-            "{\"path\":\"a.txt\",\"unknown\":1}",
-            "{\"path\":\"a.txt\",\"offset\":0}",
-            "{\"path\":\"a.txt\",\"limit\":0}",
-            "\u{0}\u{1}{\"path\" garbage",
+            "{\"file_path\": 5}",
+            "{\"file_path\":\"a.txt\",\"unknown\":1}",
+            "{\"file_path\":\"a.txt\",\"offset\":0}",
+            "{\"file_path\":\"a.txt\",\"limit\":0}",
+            "\u{0}\u{1}{\"file_path\" garbage",
         ];
         for arguments in garbage {
             let outcome = execute(&tool, arguments).await;
@@ -825,7 +825,7 @@ mod tests {
     async fn execute_returns_cancelled_without_touching_the_filesystem() {
         let dir = tempfile::tempdir().unwrap();
         let (tool, _) = tool(dir.path());
-        let call = call(r#"{"path": "new.txt"}"#);
+        let call = call(r#"{"file_path": "new.txt"}"#);
         let cancel = p1_contracts::CancellationToken::new();
         cancel.cancel();
 
@@ -845,7 +845,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
         let (tool, _) = tool(dir.path());
-        let call = call(r#"{"path": "a.txt"}"#);
+        let call = call(r#"{"file_path": "a.txt"}"#);
         let context = ToolContext {
             cancel: p1_contracts::CancellationToken::new(),
         };
@@ -960,7 +960,7 @@ mod tests {
         let path = dir.path().join("huge.txt");
         let observed = ObservedFiles::new();
         let input = ReadInput {
-            path: "huge.txt".into(),
+            file_path: "huge.txt".into(),
             offset: Some(1),
             limit: Some(2),
         };
@@ -1010,7 +1010,7 @@ mod tests {
         let path = dir.path().join("split.txt");
         let observed = ObservedFiles::new();
         let input = ReadInput {
-            path: "split.txt".into(),
+            file_path: "split.txt".into(),
             offset: Some(1),
             limit: Some(1),
         };
@@ -1037,7 +1037,7 @@ mod tests {
         let path = dir.path().join("invalid.txt");
         let observed = ObservedFiles::new();
         let input = ReadInput {
-            path: "invalid.txt".into(),
+            file_path: "invalid.txt".into(),
             offset: Some(1),
             limit: Some(1),
         };
@@ -1063,7 +1063,7 @@ mod tests {
         let streamed = ObservedFiles::new();
         let whole = ObservedFiles::new();
         let input = ReadInput {
-            path: "long.txt".into(),
+            file_path: "long.txt".into(),
             offset: Some(1),
             limit: Some(1),
         };

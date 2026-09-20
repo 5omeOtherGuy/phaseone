@@ -190,7 +190,11 @@ async fn headless_without_yes_permits_read() {
     );
     std::fs::write(workspace.path().join("input.txt"), "hello file").unwrap();
     let provider = ScriptedProvider::new(vec![
-        tool_call_response(vec![json_call("c1", "read", "{\"path\":\"input.txt\"}")]),
+        tool_call_response(vec![json_call(
+            "c1",
+            "read",
+            "{\"file_path\":\"input.txt\"}",
+        )]),
         text_response("done"),
     ]);
     let handle = provider.clone();
