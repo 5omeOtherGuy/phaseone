@@ -58,57 +58,77 @@ OWNER DECISIONS 2026-09-20 (ADR-0039, ADR-0040; note `docs/design/notes/2026-09-
 - Credentials: `~/.config/p1/auth.json` keyed by route, env var wins, borrow other tools' logins
   for now, no login command yet, macOS later.
 
-PROGRESS 2026-09-20 late (all merged, CI green on the exact commit):
-- Astra's step 2 merged (511e7b4, #9 closed): `p1-provider-openai-chat` (ChatRoute, ChatDialect
-  by behaviour, separate `p1-model-profile`), host `auth.rs`, envs `deepseek` and `glm`.
-- DOGFOODING IS LIVE: lead jobs run as `"runner": "p1"` (env deepseek; glm quota ran out after
-  one 21M-token job). Every run recorded in `docs/dogfood/runs.jsonl`.
-- Split step 1 (characterization tests), 3a (profiles as files, env `route`+`profile`, spec
-  `docs/design/routes-and-profiles.md`), 3c (RouteDescription.cache_key, one assembly, foreign
-  native option = error, Anthropic cap conflict = error, empty OpenAI cache key = error).
-- #11 / ADR-0041: headless runs wait and continue after Transport/RateLimited turn ends
-  (`--provider-retries`). `deepseek` env has first measured `[context]` values — proven in real
-  work (171 requests, 3 summarizations, accepted first round).
-- Also merged since: 3b route files, `--sandbox-read`, summary-quality fix (#6: truncated
-  summaries never accepted, `[context] summary_output_tokens`, `## Files` section), fanout p1
-  runner = FULL ACCESS by default (`"sandbox": true` opts in; owner authorised). Step-4 spec =
-  `docs/design/routes-and-profiles.md` §7. Owner switched Claude Code to bypassPermissions
-  (no classifier any more): AGENTS.md rules are the only guard — work carefully.
-- IN FLIGHT when this was written (2026-09-20 ~18:45):
-  * split 4a (Anthropic policy → profiles/route file): p1 run, shell task `bem0itt96`,
-    worktree `../phaseone-split4a-anthropic`, run dir `../phaseone-briefs/runs/split4a-20260920-174449/`
-    (brief `../phaseone-briefs/split4a.md`). If the notification is lost: check
-    `pgrep -af "debug/p1"`, then `report.json`/`stdout.txt` there; review diff, merge main,
-    independent gate, merge, `scripts/push-main.sh`, record in `docs/dogfood/runs.jsonl`.
-  * TUI: separate interactive Kimi K3 session (tmux window `kimi-tui`, pane %48, worktree
-    `../phaseone-12-tui`), coordination ONLY via issue #12; its plan is accepted. LEAD OWES
-    (promised on #12, do right after 4a merges): generalise `make_child_factory` to
-    `Arc<dyn AuthorizationPolicy>` + per-child `EventSink` factory, and ONE front-end branch
-    point in `run_agent` (`tui::run` vs `run_interactive`); later a small spec+ADR for
-    `ContextStats` (observation-only context budget numbers). Lead never edits `crates/p1-tui*`
-    or `docs/design/tui/`.
+STATE 2026-09-20 ~22:00 — READ THIS FIRST. main = CI green on 61f0a84 (+ local docs commits:
+p1-auth spec, ADR-0044 proposed, login spec — push them with the next gated merge).
 
-- 2026-09-20 ~21:00: the PRIMARY opencode-go subscription ran out of credit (401 CreditsError).
-  Owner rule: use the second account, DeepSeek V4.1 Flash ONLY — `pi-worker deepseek2 …`, and in
-  p1 `--env deepseek2` (route `opencode-go-2-subscription`, a data-only addition). p1 jobs need
-  the key in the environment: dispatch with
-  `OPENCODE_GO_2_API_KEY="$(tr -d '\n' < ~/.config/keys/opencode-go-2.key)" scripts/fanout.py …`
-  (never print it). The z.ai GLM plan is small (5-hour quota) — use `--env glm` sparingly.
-  Steps done since: 4a-1, 4a-2 (Anthropic from route file + profile), FrontEnd seam (#12),
-  stall guard (ADR-0042), chat-parser tool-type fix. In flight: 4b (OpenAI Responses) as
-  `split4b-glm` in `../phaseone-split4b-openai`; if it dies, re-dispatch the same brief
-  (`../phaseone-briefs/split4b.md`) with env `deepseek2`.
+DONE TODAY (all merged, CI green on the exact commit): Astra's chat adapter + routes (#9);
+provider split ADR-0039 steps 1–4 COMPLETE — every shipped provider is wire adapter × route file
+× profile file, `WHOLE_PROVIDERS` empty (fakes only), environments name `route`+`profile`;
+ADR-0041 turn-level retry (Transport/RateLimited/Protocol); ADR-0042 stall guard
+(`--max-idle-summaries`); summary-quality fix; chat-parser tool-type fix; `--sandbox-read`;
+fanout p1 runner = full access by default; FrontEnd seam for the TUI (`p1-host/src/frontend.rs`);
+agentdash shows p1 runs (brain-tools). Owner set Claude Code to bypassPermissions — no
+classifier: AGENTS.md rules are the only guard.
+
+ACCOUNTS: primary opencode-go is OUT OF CREDIT. Use `pi-worker deepseek2 …` and p1
+`--env deepseek2` (route `opencode-go-2-subscription`, DeepSeek V4.1 Flash ONLY — owner rule).
+p1 jobs need the key in the environment at dispatch:
+`OPENCODE_GO_2_API_KEY="$(tr -d '\n' < ~/.config/keys/opencode-go-2.key)" scripts/fanout.py <jobs.json>`
+(never print it). z.ai GLM plan is small — `--env glm` sparingly. Context values: deepseek/
+deepseek2 summarize at 300k of 1M; glm 150k of 260k. NEVER size [context] from one run's peak
+(run split4a thrashed 96 min, 0 edits, under a 90k threshold).
+
+IN FLIGHT:
+* `p1-auth` (step 5, spec `docs/design/credentials.md` §1–5): p1 job on deepseek2, shell task
+  `bu3cvc4hh`, worktree `../phaseone-p1-auth`, run dir `../phaseone-briefs/runs/p1-auth-*`, brief
+  `../phaseone-briefs/p1-auth.md`. When done: review diff (NO credential lookup left in the
+  adapters; adapter characterization/conformance expectations untouched; no real credential
+  file read), merge main into it, independent `scripts/gate.sh`, merge, `scripts/push-main.sh`,
+  record in `docs/dogfood/runs.jsonl`. If the notification is lost: `pgrep -af "debug/p1"`, then
+  `report.json` / `stdout.txt` in the run dir.
+* QUEUED behind it: `p1 login` (owner decision, ADR-0044 proposed → set accepted when merged;
+  spec `credentials.md` §6): brief `../phaseone-briefs/p1-login.md`, jobs file
+  `p1-login-jobs.json`; create worktree `scripts/new-worktree.sh p1-login` AFTER p1-auth is on
+  main, dispatch with the env var above. After it lands tell the owner:
+  `p1 login opencode-go-2-subscription < ~/.config/keys/opencode-go-2.key`, then drop the env var.
+* TUI: separate Kimi K3 session (tmux window `kimi-tui`, pane %48, worktree `../phaseone-12-tui`),
+  coordination ONLY via issue #12. It has merged M1–M4a itself; the seam it needed is on main and
+  it may edit exactly two spots of mine: `impl FrontEnd` in its `tui.rs`, the 5-line `--tui`
+  branch in `run_agent`. Still owed by the lead, not urgent: a small spec + ADR for
+  `ContextStats` (observation-only context budget numbers for the ledger). Check #12 between jobs.
+
+* FAN-OUT PROGRAM (owner request 2026-09-20, issue #25): DECIDED — ADR-0045 (proposed) +
+  `docs/design/research-program.md`. Research item = issue labelled `research` + one
+  `research:queued|active|decision|implement|used|discarded`; every item ends USED or DISCARDED;
+  caps 3 active / 2 in decision / 1 in implement. Curator organises research, NEVER development
+  (owner); development, specs, briefs, review, merges stay with the lead.
+  BATCH 1 (offline, no build, no live experiment calls): #26 measurement + failure audit,
+  #27 context capacity inventory, #28 finish-nudge experiment design. Curator = ONE
+  Opus run as a Claude Code subagent (`pi-worker opus` FAILED: tool_calls 0, it wrote tool
+  calls as text and invented results — never use it for tool work) (brief `../phaseone-briefs/research-curator-batch1.md`, output
+  `../phaseone-briefs/research/curator-batch1.out`, memos `research/<n>/memo.md`), leaves =
+  `pi-worker deepseek2`. NEXT: `gh issue list --label research:decision`, decide each memo
+  (accept -> lead-owned brief, label `research:implement`; else discard with reopening
+  condition). Dev slice A (run-report.py usage aggregation + `scripts/test_run_report.py`)
+  enters as #26's implementation. Set ADR-0045 accepted after batch 1 ran under it. After two
+  batches: keep the curator layer only if it saves lead effort. Said no for now: websocket,
+  benchmark grids, new profile capabilities. Astra's full answer:
+  `../phaseone-briefs/fanout-program.answer.md`.
+
+HOW JOBS GO (what worked today): small briefs with a SHORT read-first list and "work in this
+order, start editing early"; one job ≈ one crate; p1 runner for implementation, pi-worker for
+harness-guard work and other repos; lead reviews the diff, runs the gate independently, merges.
+A journal cannot move between routes (ADR-0033): when a run dies, a fresh session continues
+from the WORKSPACE — put a "NOTE ON STATE" in the brief.
 
 NEXT, in order:
-1. Review + merge 4a; then the host seam for the TUI (above); then 4b = the same for
-   `p1-provider-openai` (brief not written yet; mirror `split4a.md`).
-2. Split step 4 (spec §7): first-party policy extraction (Claude classification/budgets, GPT defaults →
-   profiles; claude/gpt envs to `route`+`profile`; characterization tests must stay byte-equal).
-   Step 5: `p1-auth` per ADR-0040 (borrow-only, write-back to the source).
-3. `[context]` for glm/claude/gpt envs from runs (glm grew to 203k/request without it) — #6.
-   Small harness debts from dogfooding (#6): a run with zero responses prints `in 0 … cost
-   $0.0000` instead of unknown; run-report `elapsed_seconds` null when called by hand.
-4. T1 measurement (fixed task set, repeated), host cleanup around the state transitions, model
+1. Land p1-auth, then p1 login (above).
+2. `[context]` for the claude/gpt environments (no values yet) — #6. Harness debts on #6: the
+   chat adapter reports a 401 CreditsError as "key rejected" (surface the error type; distinct
+   no-balance message); a run with zero responses prints `in 0 … cost $0.0000`; stall guard
+   does not cover delegated workers; `--no-default-features` fails one host test
+   (claude-delegating names worker tools).
+3. T1 measurement (fixed task set, repeated), host cleanup around the state transitions, model
    cards from `~/.agents/skills/model-cards/evidence.jsonl`.
 Known small debts: `codex exec` needs `< /dev/null`; owner's opencode auth.json may hold a
 `zai` entry opencode ignores (told the owner); local branch cleanup uses `git branch -D` after
