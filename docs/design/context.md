@@ -127,8 +127,11 @@ limits, time estimates or instructions that are not in the transcript (owner fai
 
 **Failure and cancellation.**
 - `input.cancel` fires → the provider stream is dropped, `Err(ContextError::Cancelled)`. No partial summary is ever returned.
-- The summarization fails (provider error, empty answer, replacement not smaller than the
-  original by estimate): if `next_input < window_tokens - output_headroom_tokens` → `Ok(None)`
+- **Nothing to summarize** — outside the tail and the kept user messages there is nothing, or
+  only a previous summary: NO request is made. Below the wall → `Ok(None)`; at the wall →
+  `Err(Failed("context is full (<next_input> of <window> tokens) and nothing is left to summarize"))`.
+  Without this rule one oversized unit would buy a useless summarization before every request.
+- The summarization fails (provider error, empty answer): if `next_input < window_tokens - output_headroom_tokens` → `Ok(None)`
   — the turn goes on with the full history and the next request tries again; otherwise
   `Err(Failed("context is full (<next_input> of <window> tokens) and summarizing failed: <reason>"))`.
 - After a successful replacement the estimate of the new history must be below
@@ -145,6 +148,9 @@ are separated by ONE blank line. `<status>` in a result heading is the snake_cas
 journal uses (`ok`, `error`, `unavailable`, `denied`, `cancelled`, `unknown`). "Under the wall"
 is inclusive (`<=`). `User`/`Inbox` items after the last unit belong to the tail and are always
 kept. Validation and soft-failure reason texts are free, except the `Failed` message at the wall.
+The first draft also called a replacement "not smaller than the original" a failure; that
+contradicted the frozen suite (a forced single-unit tail makes the replacement larger by
+construction) and is withdrawn — the "nothing to summarize" rule is what prevents the loop.
 
 ## 3. Assembly and host
 
