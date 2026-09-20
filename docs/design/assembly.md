@@ -106,9 +106,14 @@ p1 env show <name>                                                              
   start/finish with status; reasoning dimmed only if stdout is a TTY). Diagnostics to stderr.
 - After every response and at exit: `model <route>/<model> · in <n|?> (cached <n|?>) · out <n|?> · cost <amount|unknown>`.
   Unknown is printed as `?`/`unknown`, never as 0.
-- Authorization policy: `--yes` permits everything. Without it, headless mode permits
-  `ReadOnly` and denies the rest with reason
-  `Not permitted in headless mode without --yes.`; the interactive prompt asks
+- Authorization policy: FULL ACCESS IS THE DEFAULT (owner decision 2026-09-20, ADR-0038): every
+  tool call is permitted, headless and interactive, without any flag — development must never
+  be blocked by a permission question nobody is there to answer. `--ask` opts into the
+  restrictive policy: headless permits `ReadOnly` and denies the rest with reason
+  `Not permitted in headless mode with --ask.`; the interactive prompt asks
   `allow <tool> <one-line summary>? [y]es / [n]o / [a]lways for this tool` on the terminal.
+  `--yes` is still accepted and means the default (so existing scripts keep working);
+  `--yes` together with `--ask` is a usage error. Confinement of the FILE tools to the
+  workspace is not a permission and stays always on; the shell sandbox stays opt-in.
 - Journal: memory by default; `--session FILE` uses the JSONL store.
 - No TUI, no colours beyond dim, no config beyond the environment files.
