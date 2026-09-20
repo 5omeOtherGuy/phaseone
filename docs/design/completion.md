@@ -132,6 +132,33 @@ a success between failures resets the count; `InvalidRequest` is never retried; 
 wait exits as cancelled without a further request; `--provider-retries 0` behaves as before;
 interactive mode is unchanged.
 
+## 3c. Stall guard: summarizing without progress (dogfood run split4a)
+
+A headless run that keeps replacing its context without ever changing the workspace is not
+working, it is forgetting: run split4a made 855 requests and 40 replacements, read 698 files and
+edited none. The host already owns "progress" (§3: the activity log records file changes and
+successful `finish` calls), so it owns this guard too.
+
+- The host counts CONSECUTIVE `ContextReplaced` events since the last progress (a workspace
+  mutation recorded in the activity log, or a `finish` call of any status). Progress resets it.
+- When the count reaches `--max-idle-summaries N` (default 6; 0 disables) the host cancels the
+  turn and the run ends **stalled, exit 4**, printing
+  `stalled: <N> context summaries without a change to the workspace — the task does not fit the
+  configured context (see [context] in the environment), or it is too large for one job`.
+- Headless only; an interactive user sees the summaries and decides. Read-only tasks are rare in
+  unattended runs and have the flag.
+- `run-report.py` reports `stalled_on_summaries: true|false`.
+- §3b amendment: `Protocol` failures join the transient kinds with the `Transport` schedule — a
+  malformed response (split4a ended on `unsupported chat tool type`) is the model's or the
+  route's one-off, and the interrupted response is discarded as for any other failure.
+
+Must-pass (scripted provider + scripted context policy that always replaces): N replacements with
+no mutation → exit 4 and the message, no further provider request after the Nth; a mutation
+between them resets the count (2N-1 replacements with one mutation in the middle → no stall); a
+`finish` call resets it; `--max-idle-summaries 0` never stalls; interactive mode unchanged; the
+count survives nothing — a resumed run starts at 0; Protocol failure then success → run completes
+with one retry message.
+
 ## 4. Environments
 
 `finish` joins the shipped environments' tool lists, and each family prompt gets a short
