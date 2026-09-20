@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 /// The default environment when `--env` is not given.
 pub const DEFAULT_ENV: &str = "claude";
 
+/// Headless continuation budget when `--max-continuations` is not given.
+pub const DEFAULT_MAX_CONTINUATIONS: usize = 3;
+
 /// Whether `shell` commands run inside the bubblewrap sandbox.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SandboxMode {
@@ -54,6 +57,9 @@ pub struct Options {
     /// Extra environment variable NAMES the `shell` tool passes on, on top of
     /// its built-in allow-list. Repeatable; a name never contains `=`.
     pub env_pass: Vec<String>,
+    /// At most this many continuations after a premature stop in an unattended
+    /// run. `0` disables continuation.
+    pub max_continuations: usize,
 }
 
 impl Options {
@@ -103,6 +109,9 @@ pub fn usage() -> String {
     out.push_str(
         "  --env-pass NAME   pass NAME from p1's environment to shell commands\n                    (repeatable; NAME must not contain `=`)\n",
     );
+    out.push_str(
+        "  --max-continuations N\n                    most continuations after a premature stop in an unattended\n                    run (default: 3; 0 disables)\n",
+    );
     out
 }
 
@@ -150,9 +159,10 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             }
             "--resume" => resume = true,
             "--yes" => yes = true,
-            // Validated by `parse_sandbox`/`parse_env_pass` after the loop; the
-            // values are consumed here so they are not mistaken for prompt words.
-            "--sandbox" | "--sandbox-write" | "--env-pass" => {
+            // Validated by `parse_sandbox`/`parse_env_pass`/`parse_max_continuations`
+            // after the loop; the values are consumed here so they are not mistaken
+            // for prompt words.
+            "--sandbox" | "--sandbox-write" | "--env-pass" | "--max-continuations" => {
                 take_value(args, &mut index, arg)?;
             }
             other if other.starts_with('-') && other != "-" => {
@@ -174,6 +184,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     // options.
     let (sandbox, sandbox_write) = parse_sandbox(args)?;
     let env_pass = parse_env_pass(args)?;
+    let max_continuations = parse_max_continuations(args)?;
 
     let prompt = if prompt_words.is_empty() {
         None
@@ -191,6 +202,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         sandbox,
         sandbox_write,
         env_pass,
+        max_continuations,
     })
 }
 
@@ -236,6 +248,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         sandbox,
         sandbox_write,
         env_pass,
+        max_continuations: DEFAULT_MAX_CONTINUATIONS,
     })
 }
 
@@ -344,6 +357,28 @@ fn take_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, 
     Ok(value.clone())
 }
 
+/// Parse `--max-continuations N` out of any argument list. A missing or
+/// non-numeric value is a usage error.
+fn parse_max_continuations(args: &[String]) -> Result<usize, CliError> {
+    let mut value = DEFAULT_MAX_CONTINUATIONS;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--max-continuations" {
+            index += 1;
+            let Some(raw) = args.get(index) else {
+                return Err(CliError {
+                    message: "--max-continuations requires a value".to_string(),
+                });
+            };
+            value = raw.parse::<usize>().map_err(|_| CliError {
+                message: format!("--max-continuations takes a non-negative integer, got `{raw}`"),
+            })?;
+        }
+        index += 1;
+    }
+    Ok(value)
+}
+
 fn defaults(command: Command) -> Options {
     Options {
         command,
@@ -355,6 +390,7 @@ fn defaults(command: Command) -> Options {
         sandbox: SandboxMode::Off,
         sandbox_write: Vec::new(),
         env_pass: Vec::new(),
+        max_continuations: DEFAULT_MAX_CONTINUATIONS,
     }
 }
 
@@ -452,6 +488,29 @@ mod tests {
         assert!(parse(&args(&["--env-pass", "A=B"])).is_err());
         assert!(parse(&args(&["--env-pass", ""])).is_err());
         assert!(parse(&args(&["--env-pass"])).is_err());
+    }
+
+    #[test]
+    fn parses_max_continuations_and_rejects_a_non_numeric_value() {
+        let options = parse(&args(&["--max-continuations", "5", "go"])).unwrap();
+        assert_eq!(options.max_continuations, 5);
+        assert_eq!(
+            options.command,
+            Command::Run {
+                prompt: Some("go".to_string())
+            }
+        );
+        assert_eq!(parse(&args(&[])).unwrap().max_continuations, 3);
+        assert_eq!(
+            parse(&args(&["--max-continuations", "0"]))
+                .unwrap()
+                .max_continuations,
+            0
+        );
+
+        assert!(parse(&args(&["--max-continuations", "many"])).is_err());
+        assert!(parse(&args(&["--max-continuations"])).is_err());
+        assert!(usage().contains("--max-continuations N"));
     }
 
     #[test]

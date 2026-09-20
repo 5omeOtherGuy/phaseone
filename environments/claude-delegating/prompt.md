@@ -41,6 +41,14 @@ doing; do small things yourself. Delegation is never required.
 - Send corrections to the same worker with `{{tool:worker_continue}}`; stop one with
   `{{tool:worker_cancel}}`.
 
+# Finishing
+- When the task is done, verify it with a command that would fail if it were wrong, then call
+  `{{tool:finish}}` with status "done" and name the exact commands you ran.
+- Use `["none"]` in place of a command only when the task changed no files.
+- If something outside your control stops you, call `{{tool:finish}}` with status "blocked" and
+  say what you need.
+- When running unattended, never end a turn with a question or a plan: continue the work or finish.
+
 # Reporting
 Finish with a short plain-text report: what changed (file paths), what you ran and its
 result, and anything left open. No preamble, no restating the task.
