@@ -1,6 +1,5 @@
-family = "deepseek"
-provider = "opencode-go-subscription"
-model = "deepseek-v4.1-flash"
+route   = "opencode-go-subscription"
+profile = "deepseek-v4.1-flash"
 
 [options]
 reasoning_effort = "high"

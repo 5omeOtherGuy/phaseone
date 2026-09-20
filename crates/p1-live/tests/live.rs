@@ -5,6 +5,7 @@
 //!
 //!   P1_LIVE=1 cargo test -p p1-live -- --nocapture --test-threads 1
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,13 @@ fn live() -> bool {
 
 fn model(var: &str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+/// The shipped profile file, so a live check runs the model policy the host runs.
+fn profile(id: &str) -> Arc<p1_model_profile::ModelProfile> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../profiles/{id}.toml"));
+    let text = std::fs::read_to_string(&path).expect("the shipped profile is readable");
+    Arc::new(p1_model_profile::ModelProfile::from_toml(id, &text).expect("valid profile file"))
 }
 
 /// `P1_LIVE_EFFORT=low|medium|high` (default low). High makes the models reason, which
@@ -272,6 +280,7 @@ async fn deepseek_subscription_route() {
     }
     let provider = p1_host::catalog::deepseek_subscription(
         &model("P1_LIVE_DEEPSEEK_MODEL", "deepseek-v4.1-flash"),
+        profile("deepseek-v4.1-flash"),
         Arc::new(ReqwestTransport::new()),
     )
     .expect("valid route/profile binding");
@@ -285,6 +294,7 @@ async fn glm_subscription_route() {
     }
     let provider = p1_host::catalog::glm_subscription(
         &model("P1_LIVE_GLM_MODEL", "glm-5.3"),
+        profile("glm-5.3"),
         Arc::new(ReqwestTransport::new()),
     )
     .expect("valid route/profile binding");

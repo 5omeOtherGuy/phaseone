@@ -56,7 +56,10 @@ fn config(retained: bool) -> (ChatRoute, Arc<ModelProfile>) {
             limits: ChatLimits::default(),
         },
         Arc::new(ModelProfile {
+            id: "canonical-model".into(),
+            revision: 1,
             model_id: "canonical-model".into(),
+            family: "test".into(),
             thinking: if retained {
                 ThinkingPolicy::Preserved
             } else {
@@ -68,6 +71,7 @@ fn config(retained: bool) -> (ChatRoute, Arc<ModelProfile>) {
                 vec![Effort::High, Effort::Max]
             },
             default_effort: Effort::High,
+            context_tokens: None,
             max_output_tokens: retained.then_some(131_072),
         }),
     )

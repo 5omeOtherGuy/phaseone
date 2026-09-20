@@ -1,6 +1,5 @@
-family = "glm"
-provider = "glm-subscription"
-model = "glm-5.3"
+route   = "glm-subscription"
+profile = "glm-5.3"
 
 [options]
 reasoning_effort = "high"

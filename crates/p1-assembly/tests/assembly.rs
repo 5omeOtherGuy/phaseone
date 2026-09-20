@@ -113,6 +113,7 @@ fn name_override_becomes_the_model_facing_name() {
         family: "test".into(),
         provider: "test-provider".into(),
         model: "test-model".into(),
+        profile: None,
         options: ModelOptions::default(),
         tools: vec![ToolSpec {
             module: "shell".into(),

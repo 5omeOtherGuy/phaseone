@@ -52,6 +52,7 @@ pub fn environment_file(
         family: "test".into(),
         provider: provider.into(),
         model: "test-model".into(),
+        profile: None,
         options: ModelOptions::default(),
         tools: tools
             .iter()

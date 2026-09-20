@@ -1,0 +1,195 @@
+# Routes and profiles — selecting what a provider is composed from
+
+Status: spec for step 3 of ADR-0039 (profile selection, data-driven routes, assembly
+validation). Step 2 (the chat adapter takes injected route data and a profile) is its
+precondition; step 4 (the first-party adapters give up their model policy) follows it.
+Background and the ownership table: `notes/2026-09-20-provider-split.md`.
+
+## 1. Three kinds of file
+
+```
+environments/<name>/environment.toml   prompt + exact tools + options      (exists)
+profiles/<id>.toml                     what a MODEL is                     (new)
+routes/<id>.toml                       how an ACCOUNT/ENDPOINT is reached  (new)
+```
+
+All three are data. None of them can name code that is not compiled in: a route names an
+ADAPTER KEY registered in `p1-host::catalog`, a profile names a compiled policy variant (`ThinkingPolicy` today), and an
+unknown value of either is a load error that lists the known ones.
+
+Lookup order for `profiles/` and `routes/` is the one environments already use (the directory
+next to the environments directory that was selected; shipped files live in the repository
+root). A later store under `$XDG_CONFIG_HOME/p1/` is not part of this step.
+
+### 1.1 Profile file
+
+```toml
+id        = "deepseek-v4.1-flash"     # must equal the file stem
+revision  = 1
+model_id  = "deepseek-v4.1-flash"     # canonical identity, NOT a wire name
+family    = "deepseek"
+thinking  = "enabled"                 # ThinkingPolicy: enabled | preserved
+efforts        = ["high", "max"]
+default_effort = "high"               # optional; must be one of `efforts`
+context_tokens    = 128000            # optional = unknown
+max_output_tokens = 32000             # optional = unknown
+```
+
+`p1-model-profile` owns the struct, its `Deserialize`, and `validate()`. Unknown keys are
+rejected (`deny_unknown_fields`). `thinking` is the compiled-strategy selector step 2
+introduced; it grows into the ADR's `ModelBehavior` when step 4 brings models whose difference
+is more than their thinking policy — not before. Fields the split note lists but nothing consumes yet
+(`tool_forms`, `cache`) are NOT added in this step — a field arrives with its first consumer.
+
+### 1.2 Route file
+
+```toml
+id       = "opencode-go-subscription"  # must equal the file stem; the key environments name
+origin_route = "openai-chat/opencode-go-subscription"  # Origin.route, explicit so it never drifts
+adapter  = "openai-chat"               # catalog adapter key
+endpoint = "https://…/v1"
+
+[credential]                           # a REFERENCE, never a value
+kind   = "api-key"
+env    = "OPENCODE_API_KEY"
+borrow = ["opencode:opencode-go", "pi:opencode-go"]   # tried in this order, after env
+
+[headers]                              # non-secret, static
+# name = "value"
+
+[adapter_settings]                     # typed by the adapter named above
+dialect        = "thinking-with-reasoning-alias"   # a ChatDialect variant
+session_header = "x-opencode-session"
+
+[models."deepseek-v4.1-flash"]         # key = profile id
+wire_model    = "deepseek-v4.1-flash"
+context_limit = 128000                 # optional; lowers the profile's ceiling, never raises it
+output_limit  = 32000                  # optional; same rule
+```
+
+- `credential.kind` is a closed enum: `api-key` (above), `claude-code-oauth`, `codex-oauth`.
+  The two OAuth kinds take no further keys; their sources stay the compiled ones.
+  A header whose name is `authorization`, `x-api-key`, `cookie` or starts with `x-auth` is
+  rejected in `[headers]`: a route file must not be able to hold a secret by accident.
+- `[adapter_settings]` is deserialized by the adapter's own typed struct with
+  `deny_unknown_fields`; the host passes it through as a `toml::Value` and never interprets it.
+- A profile that has no `[models.<profile id>]` entry is NOT served by that route. There is no
+  pass-through of unknown model names: an aggregator serving 200 models gets entries for the
+  ones we have profiles for.
+- Changing `endpoint`, `adapter` or the account behind `credential` under an unchanged
+  `origin_route` changes what `Origin.route` means and breaks ADR-0033 silently. Rule: do not; add a new id. (Not
+  machine-checked in this step.)
+
+### 1.3 Environment file
+
+```toml
+route   = "opencode-go-subscription"
+profile = "deepseek-v4.1-flash"
+```
+
+replaces `provider`, `model` and `family`. `family` is taken from the profile.
+
+The old form stays valid for ONE purpose: a catalog key that is registered as a whole provider
+and consumes no profile — the first-party adapters until step 4 moves them, and test fakes
+permanently. Rules, all load errors otherwise:
+
+| keys present | meaning |
+|---|---|
+| `route` + `profile` | new form. `provider`, `model`, `family` must be absent. |
+| `provider` + `model` + `family` | old form. `route`, `profile` must be absent. |
+| anything else | error naming both valid forms |
+
+A `provider` key that is actually a route id (or a `route` that is actually a whole-provider
+key) is an error that says which form to use — no fallback from one to the other.
+The shipped `deepseek` and `glm` environments move to the new form in this step; `claude`,
+`gpt`, `claude-delegating` move in step 4.
+
+## 2. Resolution
+
+`p1-assembly` stays free of file formats for routes and of any provider crate. It gains:
+
+```rust
+pub struct ProviderSpec {
+    pub key: String,                        // whole-provider key, or route id
+    pub model: String,                      // old form: configured model; new form: wire model
+    pub profile: Option<Arc<ModelProfile>>, // Some exactly in the new form
+    pub limits: EffectiveLimits,            // min(profile, binding); None = unknown
+}
+```
+
+The HOST resolves, before calling `assemble`:
+
+1. load the environment; if new form → load `profiles/<profile>.toml`, `routes/<route>.toml`;
+2. `binding = route.models[profile.id]` or error
+   `route "<r>" does not serve profile "<p>" (it serves: …)`;
+3. `limits = min` of profile ceiling and binding limit per field (unknown + known = known);
+4. register/lookup the adapter constructor for `route.adapter`, handing it the typed route
+   data, the binding, the profile and a credential source built from `route.credential`.
+
+The catalog keeps ONE map of provider factories. `register_providers` registers, for every
+route file found, a factory under the route id whose closure captured that route's data and
+calls the compiled constructor for its adapter key. A route id that collides with a
+whole-provider key is a start-up error.
+
+## 3. Validation by lowering
+
+"Same lowering logic" means: the adapter exposes the pure function it already uses to build a
+request's model-dependent part, and both `Provider::validate` and the constructor call it.
+Nothing is validated by a second, parallel table of booleans.
+
+Constructor time (profile × dialect × binding), error = assembly fails:
+- the profile's thinking policy has no encoding in this adapter/dialect;
+- the behaviour needs an extension the binding does not declare (e.g. retained thinking).
+
+`validate(request)` time, as today but against the RESOLVED instance:
+- effort not in `profile.efforts` → error listing them; absent effort → `default_effort`;
+- explicit `max_output_tokens` above `limits.output` → error (never silently clamped);
+- tool declaration kinds the resolved instance cannot carry;
+- native options: an option in ANOTHER adapter's namespace is now an ERROR
+  (`option "anthropic.x" is not consumed by route "<r>" (adapter openai-chat)`), because
+  silently dropping an explicit preference when switching routes is exactly the portability
+  trap this split exists to remove. Options without a namespace keep their meaning.
+
+`RouteDescription` describes the resolved instance and gains:
+
+```rust
+pub cache_key: CacheKeySupport,   // Unsupported | Optional
+```
+
+The host generates a cache key iff `Optional` and none was configured, and assembles ONCE.
+An explicitly configured key on an `Unsupported` instance stays an error.
+`assemble_with_cache_key`'s retry-after-any-error is deleted. Because the description is only
+available from a built provider, assembly builds the provider first, reads the description,
+then finalises options — the tools are still built once.
+
+## 4. Origin, replay, journal
+
+Unchanged: `Origin { route: <route.origin_route>, model: <binding.wire_model> }`. The existing origin
+strings of the two chat routes are kept byte-for-byte, so sessions recorded by the pre-split
+adapter stay resumable. The session header additionally records `profile` (id + revision) for
+reproducibility; it takes no part in the resume decision (ADR-0033 compares origin only).
+
+## 5. Tests that define done
+
+- `p1-model-profile`: parse/validate table (unknown key, default not in efforts, stem ≠ id).
+- host route loading: secret-looking header rejected; unknown adapter key lists known ones;
+  unknown `credential.kind`; settings with an unknown key rejected by the adapter's struct.
+- environment forms: every row of the table in 1.3, incl. the two "wrong form" errors.
+- **two routes, one profile** (the point of the split): two synthetic chat routes with
+  different endpoint, headers, wire model name and session header, same dialect, same profile,
+  scripted transport. Assert: the model-related body fields are IDENTICAL after removing
+  `model`; the declared route differences appear and nothing else differs; the origins differ;
+  a journal from one is refused by the other (`RouteChanged`).
+- a profile whose behaviour the dialect cannot encode → assembly error naming both.
+- effort/limit/native-option errors of section 3, each through `assemble`, not only the adapter.
+- cache key: `Optional` + none configured → generated, one assembly (count factory calls);
+  `Unsupported` + none → absent; `Unsupported` + explicit → error.
+- the conformance suite runs against the two shipped COMPOSED chat routes, built from the
+  shipped files through the same host resolution (no hand-made constructor arguments).
+- the characterization tests of step 1 stay green and untouched.
+
+## 6. Not in this step
+
+Moving Claude/GPT policy into profiles (step 4); `p1-auth` and the p1 credential store
+(ADR-0040); user-level route/profile directories; `tool_forms` and cache policy in profiles;
+a replay codec envelope (added when a second layout exists within one route).

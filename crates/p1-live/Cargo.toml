@@ -12,6 +12,7 @@ workspace = true
 [dev-dependencies]
 p1-host = { path = "../p1-host" }
 p1-contracts = { path = "../p1-contracts" }
+p1-model-profile = { path = "../p1-model-profile" }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-provider-anthropic = { path = "../p1-provider-anthropic" }
 p1-provider-openai = { path = "../p1-provider-openai" }

@@ -258,7 +258,10 @@ mod test_config {
     }
     pub fn profile(retained: bool) -> ModelProfile {
         ModelProfile {
+            id: "canonical-model".into(),
+            revision: 1,
             model_id: "canonical-model".into(),
+            family: "test".into(),
             thinking: if retained {
                 ThinkingPolicy::Preserved
             } else {
@@ -270,6 +273,7 @@ mod test_config {
                 vec![Effort::High, Effort::Max]
             },
             default_effort: Effort::High,
+            context_tokens: None,
             max_output_tokens: retained.then_some(131_072),
         }
     }

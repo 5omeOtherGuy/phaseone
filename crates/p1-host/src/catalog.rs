@@ -102,6 +102,11 @@ macro_rules! apply_finish_face {
 /// the `delegation` feature and a worker service present — the four `worker_*`
 /// tools.
 ///
+/// The two chat routes (`opencode-go-subscription`, `glm-subscription`) are
+/// selected with `route` + `profile` and refuse the whole-provider form; the whole
+/// providers above refuse a profile. Route files will register the chat routes
+/// under their own ids in a later step.
+///
 /// Provider construction reads no credential file; the credential sources are
 /// resolved lazily on the first `access`. Tools are constructed per agent with
 /// that agent's fresh [`ToolServices`].
@@ -184,6 +189,7 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
     catalog.provider(
         "anthropic-subscription",
         Box::new(move |spec: &ProviderSpec| {
+            reject_profile(spec)?;
             let credentials = p1_provider_anthropic::ClaudeCodeCredentials::from_default_location()
                 .map_err(|error| error.to_string())?;
             let provider = p1_provider_anthropic::AnthropicProvider::new(
@@ -199,6 +205,7 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
     catalog.provider(
         "openai-codex-subscription",
         Box::new(move |spec: &ProviderSpec| {
+            reject_profile(spec)?;
             let credentials = p1_provider_openai::CodexCliCredentials::from_default_location()
                 .map_err(|error| error.to_string())?;
             let provider = p1_provider_openai::OpenAiCodexProvider::new(
@@ -213,7 +220,8 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
     catalog.provider(
         "opencode-go-subscription",
         Box::new(move |spec: &ProviderSpec| {
-            deepseek_subscription(&spec.model, transport.clone())
+            let profile = require_profile(spec)?;
+            deepseek_subscription(&spec.model, profile, transport.clone())
                 .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
                 .map_err(|error| error.to_string())
         }),
@@ -222,20 +230,46 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
     catalog.provider(
         "glm-subscription",
         Box::new(move |spec: &ProviderSpec| {
-            glm_subscription(&spec.model, transport.clone())
+            let profile = require_profile(spec)?;
+            glm_subscription(&spec.model, profile, transport.clone())
                 .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
                 .map_err(|error| error.to_string())
         }),
     );
 }
 
+/// The profile an environment selected, for a key that is a chat route. The old
+/// form on such a key is a load error that says which form to write instead: a
+/// route's model policy lives in a profile, and there is no fallback.
+fn require_profile(spec: &ProviderSpec) -> Result<Arc<p1_model_profile::ModelProfile>, String> {
+    spec.profile.clone().ok_or_else(|| {
+        format!(
+            "`{}` is a chat route and needs a model profile: write `route` and `profile` in the \
+             environment file instead of `provider`, `model` and `family`",
+            spec.key
+        )
+    })
+}
+
+/// A whole provider that consumes no profile. The new form on such a key is a load
+/// error that says which form to write instead; there is no fallback.
+fn reject_profile(spec: &ProviderSpec) -> Result<(), String> {
+    if spec.profile.is_some() {
+        return Err(format!(
+            "`{}` is a whole provider and takes no profile: write `provider`, `model` and \
+             `family` in the environment file instead of `route` and `profile`",
+            spec.key
+        ));
+    }
+    Ok(())
+}
+
 /// Shipped route binding, reused by live checks. Credential access remains lazy.
 pub fn deepseek_subscription(
     model: &str,
+    profile: Arc<p1_model_profile::ModelProfile>,
     transport: Arc<dyn p1_provider_http::Transport>,
 ) -> Result<p1_provider_openai_chat::ChatProvider, p1_contracts::ProviderError> {
-    use p1_contracts::Effort;
-    use p1_model_profile::{ModelProfile, ThinkingPolicy};
     use p1_provider_openai_chat::{ChatDialect, ChatLimits, ChatProvider, ChatRoute};
     let route = ChatRoute {
         origin_route: "openai-chat/opencode-go-subscription".into(),
@@ -248,17 +282,10 @@ pub fn deepseek_subscription(
         dialect: ChatDialect::ThinkingWithReasoningAlias,
         limits: ChatLimits::default(),
     };
-    let profile = ModelProfile {
-        model_id: model.into(),
-        thinking: ThinkingPolicy::Enabled,
-        efforts: vec![Effort::High, Effort::Max],
-        default_effort: Effort::High,
-        max_output_tokens: None,
-    };
     ChatProvider::new(
         route,
         model,
-        Arc::new(profile),
+        profile,
         transport,
         Arc::new(crate::auth::SubscriptionCredentials::opencode_go()),
     )
@@ -267,10 +294,9 @@ pub fn deepseek_subscription(
 /// GLM model policy and the Z.ai coding route are separate constructor inputs.
 pub fn glm_subscription(
     model: &str,
+    profile: Arc<p1_model_profile::ModelProfile>,
     transport: Arc<dyn p1_provider_http::Transport>,
 ) -> Result<p1_provider_openai_chat::ChatProvider, p1_contracts::ProviderError> {
-    use p1_contracts::Effort;
-    use p1_model_profile::{ModelProfile, ThinkingPolicy};
     use p1_provider_openai_chat::{ChatDialect, ChatLimits, ChatProvider, ChatRoute};
     let route = ChatRoute {
         origin_route: "openai-chat/glm-subscription".into(),
@@ -283,17 +309,10 @@ pub fn glm_subscription(
         dialect: ChatDialect::RetainedThinking,
         limits: ChatLimits::default(),
     };
-    let profile = ModelProfile {
-        model_id: model.into(),
-        thinking: ThinkingPolicy::Preserved,
-        efforts: vec![Effort::Low, Effort::High, Effort::Max],
-        default_effort: Effort::High,
-        max_output_tokens: Some(131_072),
-    };
     ChatProvider::new(
         route,
         model,
-        Arc::new(profile),
+        profile,
         transport,
         Arc::new(crate::auth::SubscriptionCredentials::glm()),
     )
