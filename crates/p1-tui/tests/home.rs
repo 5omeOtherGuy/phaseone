@@ -18,29 +18,22 @@ fn text(buffer: &Buffer) -> String {
         .join("\n")
 }
 fn has_dots(buffer: &Buffer) -> bool {
-    buffer.content.iter().any(|cell| {
-        cell.symbol()
-            .chars()
-            .any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
-    })
+    buffer
+        .content
+        .iter()
+        .any(|cell| cell.symbol().chars().any(|ch| ch == '●'))
 }
 #[test]
-fn welcome_animates_and_wraps_without_changing_the_composer() {
+fn welcome_is_static_without_changing_the_composer() {
     let mut screen = Screen::new(false);
     let first = render(&mut screen, 120, 40, 0);
     let middle = render(&mut screen, 120, 40, 12_000);
     assert!(has_dots(&first));
-    assert_ne!(first, middle);
+    assert_eq!(first, middle);
     assert_eq!(first, render(&mut screen, 120, 40, 24_000));
     assert_eq!(&first.content[38 * 120..], &middle.content[38 * 120..]);
     assert!(text(&first).contains("phaseone"));
-    assert!(text(&first).contains("we love Pi"));
-}
-#[test]
-fn easter_eggs_are_real_text_even_at_eighty_columns() {
-    let mut screen = Screen::new(false);
-    assert!(text(&render(&mut screen, 80, 24, 6_000)).contains("10841"));
-    assert!(text(&render(&mut screen, 80, 24, 14_000)).contains("[big]"));
+    assert!(text(&first).contains("We love pie"));
 }
 #[test]
 fn reduced_motion_freezes_the_whole_scene() {

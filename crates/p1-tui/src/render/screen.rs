@@ -160,8 +160,6 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
                 ..transcript_area
             },
             buf,
-            now_ms,
-            screen.reduced_motion,
         );
     }
 
