@@ -148,6 +148,8 @@ text turn, streamed function tool call (`read`), follow-up request carrying the 
 all pass on `claude-sonnet-5` and `gpt-5.6-sol`; usage is reported, cost stays unknown.
 Observed: Claude `input_tokens` 50/504/571 with cache fields 0 (prompts below the cache
 minimum); Codex reports `reasoning_tokens: 0` explicitly.
-NOT yet proven live: reasoning replay — neither model produced reasoning on these trivial
-prompts even at high effort. It is covered by fixtures + conformance check 8 and will be
-exercised by the first real coding tasks through the host.
+Reasoning replay: not exercised by these smoke prompts (neither model reasoned on them, even
+at high effort). PROVEN LIVE the same day by the end-to-end coding tasks through the host:
+both models produced reasoning blocks (Claude `thinking` + signature, Codex
+`encrypted_content`) that were replayed across follow-up requests, and across a JSONL
+`--resume`, without a rejected request (`docs/SLICE-REPORT.md`).

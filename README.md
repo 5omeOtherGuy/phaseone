@@ -33,6 +33,7 @@ weak: `docs/SLICE-REPORT.md`.
 | `crates/p1-*` | One crate per module boundary: core, providers, tools, assembly, journal, workers, host |
 | `environments/` | Per-model environment files: route, tools, whole prompt |
 | `docs/design/` | Design baseline: pillars, one-page design, seams + acceptance |
+| `docs/adr/` | Architecture Decision Records: the settled decisions and their evidence |
 | `DECISIONS.md` | Why things are the way they are |
 | `AGENTS.md` | How humans and agents work in this repo |
 | `scripts/gate.sh` | The only required check: fmt, clippy `-D warnings`, tests, core isolation |
