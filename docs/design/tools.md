@@ -113,9 +113,17 @@ applies. Success: `Wrote <path> (<bytes> bytes).`
 
 ## `grep` — `{"pattern": string, "path"?: string, "glob"?: string, "mode"?: "content"|"files", "case_insensitive"?: bool, "context"?: int 0..=10}`
 Regex search honouring `.gitignore` (ripgrep library crates, as the donor). `mode:"content"`
-(default): `<path>:<line>:<text>` grouped by file. `mode:"files"`: matching file paths only;
-with `pattern:""` and a `glob` it lists files by glob. No matches → Ok, `No matches.`
-Invalid regex → error.
+(default): grouped by file — one block per file, the path on its own line, then `<line>:<text>`
+for a match and `<line>-<text>` for a context line, blocks separated by a blank line, files in
+bytewise path order. `mode:"files"`: matching file paths only; with `pattern:""` and a `glob`
+it lists files by glob. No matches → Ok, `No matches.` Invalid regex → error.
+**Bounding (research #36).** A result over the shared output bound is cut by `grep` itself, never
+mid-block: whole file blocks (in `files` mode: whole paths) are kept while they fit, and the
+footer says what is missing and how to get it:
+`[truncated after <last path shown>; <n> more matching files not shown; narrow with path or glob]`.
+If even the first block does not fit, that block is cut at a line boundary and the footer reads
+`[truncated inside <path> after line <line>; <n> more matching files not shown; narrow with path, glob or a stricter pattern]`.
+The schema does not change.
 
 ## `shell` — `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120)}`
 Runs `bash -lc <command>` with the workspace root as cwd, stdin closed, in its own process
