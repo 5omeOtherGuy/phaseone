@@ -18,6 +18,14 @@ struct Inner {
     /// True when the next stdout character begins a line (so it needs the prefix).
     line_start: bool,
     last_model: String,
+    usage: UsageSums,
+}
+
+/// Running sums of the usage fields, one unknown flag per part. Shared by the
+/// parent's totals line and the workers' aggregate so that "sums of known parts,
+/// unknown is `?`" has exactly one implementation.
+#[derive(Debug, Default, Clone, Copy)]
+struct UsageSums {
     in_total: u64,
     in_unknown: bool,
     cached_total: u64,
@@ -26,6 +34,108 @@ struct Inner {
     out_unknown: bool,
     cost_total: u64,
     cost_unknown: bool,
+}
+
+impl UsageSums {
+    /// Add one response. `None` means the response reported no usage at all, so
+    /// every part becomes unknown.
+    fn record(&mut self, usage: Option<Usage>) {
+        match usage {
+            None => {
+                self.in_unknown = true;
+                self.cached_unknown = true;
+                self.out_unknown = true;
+                self.cost_unknown = true;
+            }
+            Some(usage) => {
+                match input_total(&usage) {
+                    Some(total) => self.in_total += total,
+                    None => self.in_unknown = true,
+                }
+                match usage.cache_read {
+                    Some(value) => self.cached_total += value,
+                    None => self.cached_unknown = true,
+                }
+                match usage.output {
+                    Some(value) => self.out_total += value,
+                    None => self.out_unknown = true,
+                }
+                match usage.cost_micro_usd {
+                    Some(value) => self.cost_total += value,
+                    None => self.cost_unknown = true,
+                }
+            }
+        }
+    }
+
+    /// The four displayed parts, `?`/`unknown` for anything not known everywhere.
+    fn parts(&self) -> (String, String, String, String) {
+        (
+            unknown_or(self.in_total, self.in_unknown),
+            unknown_or(self.cached_total, self.cached_unknown),
+            unknown_or(self.out_total, self.out_unknown),
+            if self.cost_unknown {
+                "unknown".to_string()
+            } else {
+                cost_string(Some(self.cost_total))
+            },
+        )
+    }
+}
+
+fn unknown_or(value: u64, unknown: bool) -> String {
+    if unknown {
+        "?".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// The aggregate the host prints after the parent's `total` line. ONE owner: the
+/// host creates it and hands a clone to every child's renderer, which feeds it
+/// each committed response. `workers` counts children that actually started, so a
+/// run in which no worker ran prints no line at all.
+#[cfg(feature = "delegation")]
+#[derive(Debug, Default)]
+pub(crate) struct WorkerUsage {
+    inner: Mutex<WorkerUsageInner>,
+}
+
+#[cfg(feature = "delegation")]
+#[derive(Debug, Default)]
+struct WorkerUsageInner {
+    workers: u64,
+    sums: UsageSums,
+}
+
+#[cfg(feature = "delegation")]
+impl WorkerUsage {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// One child was built and is running now.
+    pub(crate) fn worker_started(&self) {
+        self.inner.lock().unwrap().workers += 1;
+    }
+
+    /// One child response completed with this usage.
+    pub(crate) fn record(&self, usage: Option<Usage>) {
+        self.inner.lock().unwrap().sums.record(usage);
+    }
+
+    /// The line to print at exit, or `None` when no worker ran.
+    pub(crate) fn line(&self) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        if inner.workers == 0 {
+            return None;
+        }
+        let (input, cached, output, cost) = inner.sums.parts();
+        Some(format!(
+            "workers total ({}) · in {input} (cached {cached}) · out {output} · cost {cost}",
+            inner.workers
+        ))
+    }
 }
 
 /// Renders agent events to the injected writers. One renderer is shared by the
@@ -37,6 +147,9 @@ pub struct Renderer {
     route: String,
     model: String,
     prefix: Arc<Mutex<String>>,
+    /// Set on a child renderer so the run can print a workers aggregate.
+    #[cfg(feature = "delegation")]
+    worker_usage: Option<Arc<WorkerUsage>>,
     inner: Mutex<Inner>,
 }
 
@@ -56,19 +169,22 @@ impl Renderer {
             route,
             model,
             prefix,
+            #[cfg(feature = "delegation")]
+            worker_usage: None,
             inner: Mutex::new(Inner {
                 line_start: true,
                 last_model: String::new(),
-                in_total: 0,
-                in_unknown: false,
-                cached_total: 0,
-                cached_unknown: false,
-                out_total: 0,
-                out_unknown: false,
-                cost_total: 0,
-                cost_unknown: false,
+                usage: UsageSums::default(),
             }),
         }
+    }
+
+    /// Feed every committed response of this renderer into `usage`. Used by the
+    /// host on a child's renderer so the run can print the workers aggregate.
+    #[cfg(feature = "delegation")]
+    pub(crate) fn with_worker_usage(mut self, usage: Arc<WorkerUsage>) -> Self {
+        self.worker_usage = Some(usage);
+        self
     }
 
     /// Print the totals line to stderr. Called once, at exit.
@@ -80,26 +196,7 @@ impl Renderer {
         } else {
             inner.last_model.clone()
         };
-        let input = if inner.in_unknown {
-            "?".to_string()
-        } else {
-            inner.in_total.to_string()
-        };
-        let cached = if inner.cached_unknown {
-            "?".to_string()
-        } else {
-            inner.cached_total.to_string()
-        };
-        let output = if inner.out_unknown {
-            "?".to_string()
-        } else {
-            inner.out_total.to_string()
-        };
-        let cost = if inner.cost_unknown {
-            "unknown".to_string()
-        } else {
-            cost_string(Some(inner.cost_total))
-        };
+        let (input, cached, output, cost) = inner.usage.parts();
         let line = format!(
             "total model {}/{model} · in {input} (cached {cached}) · out {output} · cost {cost}",
             self.route
@@ -186,31 +283,10 @@ impl Renderer {
     }
 
     fn record_usage(&self, inner: &mut Inner, usage: Option<Usage>) {
-        match usage {
-            None => {
-                inner.in_unknown = true;
-                inner.cached_unknown = true;
-                inner.out_unknown = true;
-                inner.cost_unknown = true;
-            }
-            Some(usage) => {
-                match input_total(&usage) {
-                    Some(total) => inner.in_total += total,
-                    None => inner.in_unknown = true,
-                }
-                match usage.cache_read {
-                    Some(value) => inner.cached_total += value,
-                    None => inner.cached_unknown = true,
-                }
-                match usage.output {
-                    Some(value) => inner.out_total += value,
-                    None => inner.out_unknown = true,
-                }
-                match usage.cost_micro_usd {
-                    Some(value) => inner.cost_total += value,
-                    None => inner.cost_unknown = true,
-                }
-            }
+        inner.usage.record(usage);
+        #[cfg(feature = "delegation")]
+        if let Some(workers) = &self.worker_usage {
+            workers.record(usage);
         }
     }
 }

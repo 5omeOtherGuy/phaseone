@@ -217,6 +217,10 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
     #[cfg(feature = "delegation")]
     let child_counter = Arc::new(AtomicUsize::new(0));
+    // One owner for the worker usage aggregate: the host creates it and every
+    // child renderer feeds it, so the exit line is a plain read at the end.
+    #[cfg(feature = "delegation")]
+    let worker_usage = Arc::new(crate::render::WorkerUsage::new());
     #[cfg(feature = "delegation")]
     let service: Option<Arc<InProcessWorkers>> = {
         let factory = make_child_factory(
@@ -226,6 +230,10 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
             catalog_slot.clone(),
             child_counter.clone(),
             completion_hub.clone(),
+            WorkerJournals {
+                session: options.session.clone(),
+                usage: worker_usage.clone(),
+            },
         );
         let service = InProcessWorkers::new(factory, 2);
         deps.worker_service = Some(service.clone());
@@ -328,6 +336,11 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     }
 
     renderer.finish();
+    // After the parent's own total, and only when a worker actually ran.
+    #[cfg(feature = "delegation")]
+    if let Some(line) = worker_usage.line() {
+        write_stderr(deps, &format!("{line}\n"));
+    }
     Ok(code)
 }
 
@@ -769,10 +782,21 @@ async fn running_children(deps: &HostDeps) -> usize {
     }
 }
 
+/// What a child factory needs beyond the catalog: where worker journals go and
+/// the run's shared usage aggregate. (Kept as one argument so the factory's
+/// signature stays legible.)
+#[cfg(feature = "delegation")]
+struct WorkerJournals {
+    /// The parent's `--session FILE`; worker `w<N>` writes `FILE.w<N>.jsonl`.
+    /// `None` keeps a child's journal in memory.
+    session: Option<PathBuf>,
+    usage: Arc<crate::render::WorkerUsage>,
+}
+
 /// Build the child `Agent` through the SAME load + assemble path the top-level
 /// agent uses. The child gets its own fresh `ToolServices` (inside `assemble`),
 /// the parent's workspace unless the spec overrides it, the parent's
-/// authorization policy, a memory journal, and a prefixed renderer.
+/// authorization policy, its own session journal, and a prefixed renderer.
 #[cfg(feature = "delegation")]
 fn make_child_factory(
     deps: &HostDeps,
@@ -781,6 +805,7 @@ fn make_child_factory(
     catalog_slot: Arc<OnceLock<Arc<Catalog>>>,
     counter: Arc<AtomicUsize>,
     completion_hub: Arc<CompletionHub>,
+    journals: WorkerJournals,
 ) -> AgentFactory {
     let environment_dirs = deps.environment_dirs.clone();
     let date = deps.date.clone();
@@ -816,6 +841,12 @@ fn make_child_factory(
         ensure_cache_key(&mut environment, &workspace);
         let assembled = assemble(&catalog, &environment, &workspace, &substitutions)
             .map_err(|e| e.to_string())?;
+        // `InProcessWorkers` assigns `w{n}` after a SUCCESSFUL factory call and
+        // factory calls are serialised, so this is the id the service will hand
+        // out. The counter is only advanced at the very end: a start that fails
+        // (bad environment, an existing worker session file, a failed build) must
+        // not desynchronise it from the service's own numbering.
+        let id = counter.load(Ordering::SeqCst) + 1;
         // The child gets its OWN activity log and outcome, issued by the shared
         // catalog for this assembly. The worker service does not read the
         // outcome: a child's turn end is its completion, the parent verifies.
@@ -826,14 +857,17 @@ fn make_child_factory(
         let description = format!("{route}/{model}");
 
         let label = Arc::new(Mutex::new(String::new()));
-        let renderer: Arc<dyn EventSink> = Arc::new(Renderer::new(
-            stdout.clone(),
-            stderr.clone(),
-            tty,
-            route,
-            model,
-            label.clone(),
-        ));
+        let renderer: Arc<dyn EventSink> = Arc::new(
+            Renderer::new(
+                stdout.clone(),
+                stderr.clone(),
+                tty,
+                route,
+                model,
+                label.clone(),
+            )
+            .with_worker_usage(journals.usage.clone()),
+        );
         let events: Arc<dyn EventSink> = match &child_completion {
             Some(completion) => Arc::new(ActivityTee::new(
                 renderer.clone(),
@@ -842,6 +876,23 @@ fn make_child_factory(
             )),
             None => renderer,
         };
+        // With `--session`, worker `w{n}` gets its OWN new JSONL file next to the
+        // parent's (`FILE.w{n}.jsonl`). Without one it stays in memory like before.
+        // Created last among the fallible steps so a later failure cannot leave a
+        // stray file behind — and if `Agent::new` still fails, remove what we made.
+        let created_file = journals
+            .session
+            .as_ref()
+            .map(|session| crate::session::worker_path(session, id));
+        let journal: Arc<dyn CommitSink> = match &journals.session {
+            Some(session) => crate::session::worker(session, id).map_err(|error| {
+                format!(
+                    "cannot create worker session file {}: {error}",
+                    crate::session::worker_path(session, id).display()
+                )
+            })?,
+            None => Arc::new(MemoryJournal::new()),
+        };
         let parts = AgentParts {
             provider: assembled.provider,
             tools: assembled.tools,
@@ -849,14 +900,21 @@ fn make_child_factory(
             options: assembled.options,
             context,
             authorization: policy.clone(),
-            journal: Arc::new(MemoryJournal::new()),
+            journal,
             events,
         };
-        let agent = Agent::new(parts).map_err(|error| error.to_string())?;
-        // `InProcessWorkers` assigns `w{n}` after a successful factory call, and
-        // factory calls are serialised, so this counter stays aligned with it.
-        let id = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let agent = match Agent::new(parts) {
+            Ok(agent) => agent,
+            Err(error) => {
+                if let Some(path) = &created_file {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(error.to_string());
+            }
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
         *label.lock().unwrap() = format!("[w{id}] ");
+        journals.usage.worker_started();
         Ok(ChildAgent { agent, description })
     })
 }

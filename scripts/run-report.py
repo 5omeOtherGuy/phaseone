@@ -10,13 +10,21 @@ after independent verification, how often a human had to step in) is passed in. 
 stays null — never zero. A non-zero shell exit is NOT a failed tool call (the tool ran and
 reported it), so it is counted separately: a run with "0 failed tool calls" can still be full
 of failing commands.
+
+With `--session FILE`, each worker `w<N>` writes its own `FILE.w<N>.jsonl`; those files are
+discovered automatically and reported under `workers`, with `usage_with_workers` and
+`input_total_with_workers` adding them to the parent's numbers. `includes_worker_usage` is
+true exactly when at least one worker file was read (no worker file means no workers — a
+child session without `--session` stays in memory and cannot be read back).
 """
 import argparse
+import glob
 import json
 import re
 import sys
 
 EXIT_CODE = re.compile(r"\[exit code: (-?\d+)\]\s*$")
+WORKER_FILE = re.compile(r"\.w(\d+)\.jsonl$")
 SHELL_IMPLEMENTATION = "p1-tool-shell"
 
 
@@ -27,7 +35,8 @@ def add(total, value):
     return value if total is None else total + value
 
 
-def report(path):
+def analyze(path):
+    """Every metric of ONE journal file (the parent's, or one worker's)."""
     with open(path, encoding="utf-8") as handle:
         lines = handle.read().splitlines()
     header = json.loads(lines[0])
@@ -93,7 +102,6 @@ def report(path):
         input_total = usage["input_uncached"] + (usage["cache_read"] or 0) + (usage["cache_write"] or 0)
     total_calls = sum(tool_calls.values())
     return {
-        "session": path,
         "origin": origin,
         "records": len(records),
         **counts,
@@ -108,8 +116,50 @@ def report(path):
         "cache_read_share": (round(usage["cache_read"] / input_total, 3)
                              if input_total and usage["cache_read"] is not None else None),
         "responses_without_usage": responses_without_usage,
-        # Workers keep in-memory journals: their tokens are NOT in this file.
-        "includes_worker_usage": False,
+    }
+
+
+def worker_files(path):
+    """The `FILE.w<N>.jsonl` worker journals next to a session, ordered by number."""
+    found = []
+    for candidate in glob.glob(glob.escape(path) + ".w*.jsonl"):
+        match = WORKER_FILE.search(candidate)
+        if match is not None:
+            found.append((int(match.group(1)), candidate))
+    found.sort()
+    return found
+
+
+def report(path):
+    parent = analyze(path)
+    workers = []
+    for number, worker_path in worker_files(path):
+        stats = analyze(worker_path)
+        workers.append({
+            "id": f"w{number}",
+            "origin": stats["origin"],
+            "requests": stats["requests"],
+            "tool_calls": stats["tool_calls"],
+            "usage": stats["usage"],
+            "input_total": stats["input_total"],
+        })
+    # Parent plus workers; a part is null only when it is unknown everywhere.
+    usage_with_workers = dict(parent["usage"])
+    for worker in workers:
+        for key in usage_with_workers:
+            usage_with_workers[key] = add(usage_with_workers[key], worker["usage"][key])
+    input_total_with_workers = None
+    if usage_with_workers["input_uncached"] is not None:
+        input_total_with_workers = (usage_with_workers["input_uncached"]
+                                    + (usage_with_workers["cache_read"] or 0)
+                                    + (usage_with_workers["cache_write"] or 0))
+    return {
+        "session": path,
+        **parent,
+        "workers": workers,
+        "usage_with_workers": usage_with_workers,
+        "input_total_with_workers": input_total_with_workers,
+        "includes_worker_usage": bool(workers),
     }
 
 
