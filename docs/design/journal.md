@@ -73,9 +73,15 @@ do, with the truth in front of it.
 **Environment on resume.** The journalled tool identities are compared with the newly
 assembled ones. A call name whose `ToolIdentity` changed, or that no longer exists, is fine
 for completed history (results are just history) and is reported in `ResumeReport`; nothing
-old is ever dispatched. If the route origin differs from the journalled one, replay data of
-the old origin is dropped by the adapter (providers.md) — `ResumeReport` says so. A new
-`Environment` record is committed when the resolved environment differs.
+old is ever dispatched. If the route origin (route or model) differs from the journalled one,
+the resume is REJECTED with `ResumeError::RouteChanged` before anything is committed
+(ADR-0033): no translation exists, so nothing establishes that the transcript is a valid
+continuation elsewhere. A new `Environment` record is committed when the resolved environment
+differs in any other way (prompt, tools, options).
+
+**Workers on resume.** Child sessions are not restored (ADR-0034). The host tells the user
+and — through the inbox — the model which workers of the earlier process are gone, and the
+new worker service never reuses their ids.
 
 **Ownership.** Every writer holds an exclusive advisory lock on the session file itself. A
 second process fails with `Locked` WITHOUT having modified the file — this includes resume

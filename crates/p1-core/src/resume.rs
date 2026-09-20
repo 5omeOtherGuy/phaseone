@@ -11,7 +11,9 @@
 
 use std::collections::HashSet;
 
-use p1_contracts::{Item, JournalRecord, RecordBody, ToolCall, ToolDeclaration, ToolIdentity};
+use p1_contracts::{
+    Item, JournalRecord, Origin, RecordBody, ToolCall, ToolDeclaration, ToolIdentity,
+};
 
 use crate::{Agent, AgentParts, BuildError};
 
@@ -45,6 +47,18 @@ pub enum ResumeError {
     UnknownCall { call_id: String },
     #[error("the resumed environment is invalid: {0}")]
     Build(#[from] BuildError),
+    /// Nothing establishes that a transcript produced on one route and model is a
+    /// valid continuation on another (tool names and call shapes, replay data), and
+    /// no translation exists — so a changed origin is rejected, never guessed around.
+    #[error(
+        "this session was recorded on {}/{} and cannot continue on {}/{}; \
+         resume it with the environment it was recorded with, or start a new session",
+        journalled.route, journalled.model, assembled.route, assembled.model
+    )]
+    RouteChanged {
+        journalled: Origin,
+        assembled: Origin,
+    },
 }
 
 /// What changed between the journalled environment and the newly assembled parts.
@@ -55,8 +69,6 @@ pub struct ResumeReport {
     pub changed_tools: Vec<String>,
     /// Tool names that were journalled but are no longer assembled.
     pub missing_tools: Vec<String>,
-    /// The route origin differs, so old-origin replay data must be dropped.
-    pub route_changed: bool,
     /// The resolved environment differs and the next turn must commit it again.
     pub environment_changed: bool,
 }
@@ -185,7 +197,7 @@ impl Agent {
             .filter(|call| call.started.is_some())
             .map(|call| call.call.call_id.clone())
             .collect();
-        let report = compare_environment(&parts, records, unresolved_calls);
+        let report = compare_environment(&parts, records, unresolved_calls)?;
         // A changed environment is re-committed at the next turn's start, before
         // its input, exactly like the first turn of a new agent (spec §2).
         let environment_committed = environment_committed && !report.environment_changed;
@@ -205,7 +217,7 @@ fn compare_environment(
     parts: &AgentParts,
     records: &[JournalRecord],
     unresolved_calls: Vec<UnresolvedCall>,
-) -> ResumeReport {
+) -> Result<ResumeReport, ResumeError> {
     let new_route = parts.provider.describe();
     let new_tools: Vec<(ToolDeclaration, ToolIdentity)> = parts
         .tools
@@ -235,23 +247,27 @@ fn compare_environment(
                     None => missing_tools.push(declaration.name.clone()),
                 }
             }
-            return ResumeReport {
+            if route.origin != new_route.origin {
+                return Err(ResumeError::RouteChanged {
+                    journalled: route.origin.clone(),
+                    assembled: new_route.origin,
+                });
+            }
+            return Ok(ResumeReport {
                 unresolved_calls,
                 changed_tools,
                 missing_tools,
-                route_changed: route.origin != new_route.origin,
                 environment_changed: *route != new_route
                     || *system_prompt != parts.system_prompt
                     || *tools != new_tools
                     || *options != parts.options,
-            };
+            });
         }
     }
-    ResumeReport {
+    Ok(ResumeReport {
         unresolved_calls,
         changed_tools: Vec::new(),
         missing_tools: Vec::new(),
-        route_changed: false,
         environment_changed: false,
-    }
+    })
 }

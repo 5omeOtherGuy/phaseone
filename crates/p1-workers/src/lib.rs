@@ -186,6 +186,14 @@ impl InProcessWorkers {
         })
     }
 
+    /// Never hand out the first `used` ids (`w1`…`w<used>`). A resumed session's
+    /// history already talks about the workers of the process that ended; a new
+    /// worker must not answer to one of their names.
+    pub fn reserve_ids(&self, used: usize) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.next_id = state.next_id.max(used);
+    }
+
     /// Where completion notifications go. Called once the parent agent exists.
     /// A completion with no parent inbox set is still retained.
     pub fn set_parent_inbox(&self, inbox: Inbox) {

@@ -63,6 +63,11 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
   description and the prompt still tell the model not to give overlapping files to workers.
   Isolation (a worktree per child) is later.
 
+- Workers do not survive the process. When the parent session is resumed, the host declares
+  the journalled workers gone (stderr + an inbox notification to the model) and reserves
+  their ids, so an old id answers `No worker <id>.` and is never given to a new worker
+  (ADR-0034).
+
 ## Model-facing tools (`p1-tool-delegate`, effect `Delegates`)
 
 | Tool | Input | Output content |

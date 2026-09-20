@@ -113,7 +113,6 @@ async fn crash_after_tool_started_resumes_as_unknown() {
     assert!(report.unresolved_calls[0].started.is_some());
     assert!(report.changed_tools.is_empty());
     assert!(report.missing_tools.is_empty());
-    assert!(!report.route_changed);
     assert!(!report.environment_changed);
     // The projection is the assistant call with no result yet.
     assert_eq!(resumed.history().len(), 2);
@@ -333,7 +332,6 @@ async fn resume_with_no_records_behaves_like_new() {
     assert!(report.unresolved_calls.is_empty());
     assert!(report.changed_tools.is_empty());
     assert!(report.missing_tools.is_empty());
-    assert!(!report.route_changed);
     assert!(!report.environment_changed);
     assert!(resumed.history().is_empty());
 
