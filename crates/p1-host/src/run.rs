@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use p1_assembly::Catalog;
 use p1_assembly::{Substitutions, assemble, load_environment};
 use p1_contracts::{
-    BoxFuture, CancellationToken, CommitSink, ContextError, ContextPolicy, EventSink, Item,
-    JournalRecord, TurnEnd,
+    BoxFuture, CancellationToken, CommitSink, ContextError, ContextInput, ContextPolicy, EventSink,
+    JournalRecord, Prepared, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, ResumeReport};
 #[cfg(feature = "delegation")]
@@ -51,8 +51,8 @@ pub struct DefaultContext;
 impl ContextPolicy for DefaultContext {
     fn prepare<'a>(
         &'a self,
-        _history: &'a [Item],
-    ) -> BoxFuture<'a, Result<Option<Vec<Item>>, ContextError>> {
+        _input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Option<Prepared>, ContextError>> {
         Box::pin(async { Ok(None) })
     }
 }

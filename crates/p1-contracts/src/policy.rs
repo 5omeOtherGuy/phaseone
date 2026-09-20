@@ -5,23 +5,45 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::BoxFuture;
 use crate::history::{Item, ToolCall, ToolResultItem};
 use crate::provider::{ProviderError, StopReason, Usage};
 use crate::tool::{Effect, ToolIdentity};
+use crate::{BoxFuture, CancellationToken};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("context preparation failed: {0}")]
-pub struct ContextError(pub String);
+pub enum ContextError {
+    #[error("context preparation was cancelled")]
+    Cancelled,
+    #[error("context preparation failed: {0}")]
+    Failed(String),
+}
+
+/// Everything a context policy sees for one preparation.
+pub struct ContextInput<'a> {
+    /// The current model-visible history (the journal's projection).
+    pub history: &'a [Item],
+    /// Usage of this agent's most recent COMPLETED response, if it reported any.
+    /// After a resume: the last journalled `AssistantCompleted.usage`.
+    pub last_usage: Option<&'a Usage>,
+    /// The turn's cancellation token. `prepare` must stop waiting when it fires.
+    pub cancel: &'a CancellationToken,
+}
+
+/// A replacement history plus what preparing it cost.
+pub struct Prepared {
+    pub items: Vec<Item>,
+    /// What preparing cost (e.g. a summarization request). `None` = unknown, never zero.
+    pub usage: Option<Usage>,
+}
 
 /// Decision point 1: build the model-visible history for the next request.
 pub trait ContextPolicy: Send + Sync {
-    /// `history` is the current projection. Return `None` to send it unchanged, or
-    /// `Some(items)` to REPLACE it from now on (journalled as `ContextReplaced`).
+    /// Return `None` to send the history unchanged, or `Some(prepared)` to REPLACE
+    /// it from now on (journalled as `ContextReplaced`).
     fn prepare<'a>(
         &'a self,
-        history: &'a [Item],
-    ) -> BoxFuture<'a, Result<Option<Vec<Item>>, ContextError>>;
+        input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Option<Prepared>, ContextError>>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +116,13 @@ pub enum AgentEvent {
     /// Inbox messages were delivered to the model at this boundary.
     InboxDelivered {
         count: usize,
+    },
+    /// The context policy replaced the model-visible history. Emitted only AFTER
+    /// the `ContextReplaced` record was committed (core ruling R6).
+    ContextReplaced {
+        items_before: usize,
+        items_after: usize,
+        usage: Option<Usage>,
     },
     ToolStarted {
         call: ToolCall,

@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use p1_contracts::{
-    Item, JournalRecord, Origin, RecordBody, ToolCall, ToolDeclaration, ToolIdentity,
+    Item, JournalRecord, Origin, RecordBody, ToolCall, ToolDeclaration, ToolIdentity, Usage,
 };
 
 use crate::{Agent, AgentParts, BuildError};
@@ -34,6 +34,9 @@ pub struct Projection {
     pub next_seq: u64,
     pub environment_committed: bool,
     pub unresolved_calls: Vec<UnresolvedCall>,
+    /// Usage of the last journalled `AssistantCompleted`, or `None` when there was
+    /// none or it reported no usage. Supplied to the context policy on resume.
+    pub last_usage: Option<Usage>,
 }
 
 /// Why a journal cannot be the output of a core session.
@@ -88,6 +91,7 @@ pub fn project(records: &[JournalRecord]) -> Result<Projection, ResumeError> {
     let mut history: Vec<Item> = Vec::new();
     let mut last_assistant_record: Option<usize> = None;
     let mut last_assistant_calls: Vec<ToolCall> = Vec::new();
+    let mut last_usage: Option<Usage> = None;
     for (index, record) in records.iter().enumerate() {
         if record.seq != index as u64 {
             return Err(ResumeError::Sequence {
@@ -101,9 +105,11 @@ pub fn project(records: &[JournalRecord]) -> Result<Projection, ResumeError> {
                 kind: *kind,
                 text: text.clone(),
             }),
-            RecordBody::AssistantCompleted { item, .. } => {
+            RecordBody::AssistantCompleted { item, usage, .. } => {
                 last_assistant_calls = item.tool_calls().cloned().collect();
                 last_assistant_record = Some(index);
+                // The most recent completed response wins, and `None` resets it.
+                last_usage = *usage;
                 history.push(Item::Assistant(item.clone()));
             }
             RecordBody::ToolFinished { result } => {
@@ -118,7 +124,7 @@ pub fn project(records: &[JournalRecord]) -> Result<Projection, ResumeError> {
                 }
                 history.push(Item::ToolResult(result.clone()));
             }
-            RecordBody::ContextReplaced { items } => history = items.clone(),
+            RecordBody::ContextReplaced { items, .. } => history = items.clone(),
             RecordBody::AssistantInterrupted { .. }
             | RecordBody::ToolStarted { .. }
             | RecordBody::Environment { .. } => {}
@@ -130,6 +136,7 @@ pub fn project(records: &[JournalRecord]) -> Result<Projection, ResumeError> {
         next_seq: records.last().map_or(0, |record| record.seq + 1),
         environment_committed: !records.is_empty(),
         unresolved_calls,
+        last_usage,
     })
 }
 
@@ -191,6 +198,7 @@ impl Agent {
             next_seq,
             environment_committed,
             unresolved_calls,
+            last_usage,
         } = project(records)?;
         let started_calls: HashSet<String> = unresolved_calls
             .iter()
@@ -207,6 +215,7 @@ impl Agent {
             next_seq,
             environment_committed,
             started_calls,
+            last_usage,
         )?;
         Ok((agent, report))
     }

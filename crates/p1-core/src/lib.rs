@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex, Weak};
 use futures_util::StreamExt;
 use p1_contracts::{
     AgentEvent, AuthorizationPolicy, AuthorizationRequest, CancellationToken, CommitError,
-    CommitSink, CompletedResponse, ContextPolicy, Decision, EventSink, InboxKind,
-    InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Provider, ProviderError,
-    ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody, StopReason, StreamEvent, Tool,
-    ToolCall, ToolContext, ToolResultItem, ToolStatus, TurnEnd,
+    CommitSink, CompletedResponse, ContextError, ContextInput, ContextPolicy, Decision, EventSink,
+    InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Prepared, Provider,
+    ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody, StopReason,
+    StreamEvent, Tool, ToolCall, ToolContext, ToolResultItem, ToolStatus, TurnEnd, Usage,
 };
 use tokio::sync::Notify;
 
@@ -84,6 +84,9 @@ pub struct Agent {
     /// not been. Used to tell a never-started call (`Cancelled`) from one that ran
     /// with an unrecorded outcome (`Unknown`) when a later turn reconciles them.
     started_calls: HashSet<String>,
+    /// Usage of the most recent COMMITTED response, `None` when it reported none.
+    /// Handed to the context policy and restored by `resume` (§3b, context.md §1).
+    last_usage: Option<Usage>,
     inbox: Arc<InboxShared>,
 }
 
@@ -110,18 +113,19 @@ enum StreamStep {
 impl Agent {
     /// Fails before anything runs if the environment is incoherent.
     pub fn new(parts: AgentParts) -> Result<Self, BuildError> {
-        Self::assemble(parts, Vec::new(), 0, false, HashSet::new())
+        Self::assemble(parts, Vec::new(), 0, false, HashSet::new(), None)
     }
 
     /// Validate the parts (exactly as [`Agent::new`] does) and install `history`,
-    /// `next_seq`, `environment_committed` and `started_calls`. Shared with
-    /// `resume`, so construction and its `BuildError`s exist once.
+    /// `next_seq`, `environment_committed`, `started_calls` and `last_usage`.
+    /// Shared with `resume`, so construction and its `BuildError`s exist once.
     pub(crate) fn assemble(
         parts: AgentParts,
         history: Vec<Item>,
         next_seq: u64,
         environment_committed: bool,
         started_calls: HashSet<String>,
+        last_usage: Option<Usage>,
     ) -> Result<Self, BuildError> {
         // §1: reject duplicate assembled call names before anything else runs.
         let mut names = HashSet::new();
@@ -152,6 +156,7 @@ impl Agent {
             next_seq,
             environment_committed,
             started_calls,
+            last_usage,
             inbox: Arc::new(InboxShared {
                 queue: Mutex::new(VecDeque::new()),
                 notify: Notify::new(),
@@ -276,22 +281,63 @@ impl Agent {
             return Flow::End(TurnEnd::CommitFailed { message });
         }
         // 3b: context preparation. `Ok(Some)` replaces the history from now on.
+        // R1: cancellation is checked FIRST and wins even when `prepare` is ready at
+        // the same moment, so a turned cancelled mid-preparation stops waiting here.
+        let context = self.parts.context.clone();
         let prepared = {
-            let context = self.parts.context.clone();
-            context.prepare(&self.history).await
+            let input = ContextInput {
+                history: &self.history,
+                last_usage: self.last_usage.as_ref(),
+                cancel,
+            };
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                result = context.prepare(input) => Some(result),
+            }
         };
+        let items_before = self.history.len();
         match prepared {
-            Ok(None) => {}
-            Ok(Some(items)) => {
+            // Cancel fired before `prepare` returned: same records as a cancel
+            // before the request, and nothing abandoned is committed.
+            None => {
+                let end = self
+                    .end_interrupted(InterruptionReason::Cancelled, String::new(), None)
+                    .await;
+                return Flow::End(end);
+            }
+            Some(Ok(None)) => {}
+            Some(Ok(Some(Prepared { items, usage }))) => {
+                // A policy bug must not become a provider 400 three requests later.
+                if let Err(message) = validate_replacement(&items) {
+                    return Flow::End(TurnEnd::ContextFailed { message });
+                }
+                let items_after = items.len();
                 let body = RecordBody::ContextReplaced {
                     items: items.clone(),
+                    usage,
                 };
                 if let Err(error) = self.commit(body).await {
                     return Flow::End(TurnEnd::CommitFailed { message: error.0 });
                 }
                 self.history = items;
+                // R6: the event announces the committed record, so it comes after.
+                self.parts.events.emit(AgentEvent::ContextReplaced {
+                    items_before,
+                    items_after,
+                    usage,
+                });
             }
-            Err(error) => return Flow::End(TurnEnd::ContextFailed { message: error.0 }),
+            // The policy itself gave up, with or without the turn's token firing.
+            Some(Err(ContextError::Cancelled)) => {
+                let end = self
+                    .end_interrupted(InterruptionReason::Cancelled, String::new(), None)
+                    .await;
+                return Flow::End(end);
+            }
+            Some(Err(ContextError::Failed(message))) => {
+                return Flow::End(TurnEnd::ContextFailed { message });
+            }
         }
         // 3c: request. R1: check `cancel` before waiting on the provider at all.
         self.parts
@@ -361,6 +407,9 @@ impl Agent {
             return Flow::End(TurnEnd::CommitFailed { message: error.0 });
         }
         self.history.push(Item::Assistant(item));
+        // §3b: remember this response's usage for the next preparation, resetting to
+        // `None` when the response reported none.
+        self.last_usage = usage;
         // Invariant 5g: `usage: None` is forwarded verbatim, never turned into zeros.
         self.parts
             .events
@@ -733,4 +782,44 @@ impl Agent {
             options: self.parts.options.clone(),
         }
     }
+}
+
+/// §3b: a replacement must be a well-formed transcript BEFORE it becomes history.
+/// Every `ToolResult` belongs to a `ToolCall` of an EARLIER `Assistant` item, and
+/// every call of a non-final `Assistant` item has its result. A final `Assistant`
+/// item may keep unresolved calls (the request loop answers them next). Returns the
+/// exact `ContextFailed` message naming the offending call id.
+fn validate_replacement(items: &[Item]) -> Result<(), String> {
+    let last = items.len().checked_sub(1);
+    let mut calls_seen: HashSet<&str> = HashSet::new();
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            Item::Assistant(assistant) => {
+                let calls: Vec<&ToolCall> = assistant.tool_calls().collect();
+                for call in &calls {
+                    calls_seen.insert(call.call_id.as_str());
+                }
+                if Some(index) != last {
+                    for call in calls {
+                        let resolved = items[index + 1..].iter().any(|later| match later {
+                            Item::ToolResult(result) => result.call_id == call.call_id,
+                            _ => false,
+                        });
+                        if !resolved {
+                            return Err(unpaired_message(&call.call_id));
+                        }
+                    }
+                }
+            }
+            Item::ToolResult(result) if !calls_seen.contains(result.call_id.as_str()) => {
+                return Err(unpaired_message(&result.call_id));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn unpaired_message(call_id: &str) -> String {
+    format!("context policy returned an unpaired tool call or result: {call_id}")
 }

@@ -613,7 +613,8 @@ async fn context_replacement_is_journalled_and_is_the_history_sent() {
         record(
             2,
             RecordBody::ContextReplaced {
-                items: replacement.clone()
+                items: replacement.clone(),
+                usage: None,
             }
         )
     );

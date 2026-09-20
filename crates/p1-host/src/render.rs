@@ -242,6 +242,20 @@ impl EventSink for Renderer {
                     &format!("• {count} notification(s) delivered"),
                 );
             }
+            AgentEvent::ContextReplaced {
+                items_before,
+                items_after,
+                usage,
+            } => {
+                self.close_line(&mut inner);
+                let model = if inner.last_model.is_empty() {
+                    self.model.clone()
+                } else {
+                    inner.last_model.clone()
+                };
+                let line = context_line(&self.route, &model, items_before, items_after, usage);
+                self.write_line(&mut inner, true, &line);
+            }
             AgentEvent::ToolStarted { call } => {
                 self.close_line(&mut inner);
                 let summary = summarize_input(call.input.raw());
@@ -290,6 +304,24 @@ impl EventSink for Renderer {
             }
         }
     }
+}
+
+/// The line for a committed context replacement: the item counts, plus the usage
+/// line when preparing reported a cost. Unknown usage is left off entirely rather
+/// than printed as a made-up zero.
+fn context_line(
+    route: &str,
+    model: &str,
+    items_before: usize,
+    items_after: usize,
+    usage: Option<Usage>,
+) -> String {
+    let mut line = format!("context: summarized {items_before} → {items_after} items");
+    if usage.is_some() {
+        line.push_str(" · ");
+        line.push_str(&usage_line(route, model, usage));
+    }
+    line
 }
 
 /// The exact usage line, `?`/`unknown` for anything not reported.
@@ -354,6 +386,55 @@ fn input_total(usage: &Usage) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer that keeps what it was given so a test can read it back.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn renders_a_context_replacement_line_with_and_without_usage() {
+        let stderr = Capture::default();
+        let stdout: SharedWriter = Arc::new(Mutex::new(Box::new(Capture::default())));
+        let stderr_writer: SharedWriter = Arc::new(Mutex::new(Box::new(stderr.clone())));
+        let renderer = Renderer::new(
+            stdout,
+            stderr_writer,
+            false,
+            "r".into(),
+            "m".into(),
+            Arc::new(Mutex::new(String::new())),
+        );
+        let usage = Usage {
+            input_uncached: Some(10),
+            ..Usage::default()
+        };
+        renderer.emit(AgentEvent::ContextReplaced {
+            items_before: 9,
+            items_after: 3,
+            usage: Some(usage),
+        });
+        renderer.emit(AgentEvent::ContextReplaced {
+            items_before: 4,
+            items_after: 4,
+            usage: None,
+        });
+        assert_eq!(
+            String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap(),
+            "context: summarized 9 → 3 items · model r/m · in 10 (cached ?) · out ? · cost unknown\n\
+             context: summarized 4 → 4 items\n"
+        );
+    }
 
     #[test]
     fn summarizes_and_bounds_the_input() {
