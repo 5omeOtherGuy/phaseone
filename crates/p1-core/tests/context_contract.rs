@@ -60,6 +60,7 @@ fn env_record(seq: u64) -> JournalRecord {
                 supports_freeform_tools: true,
                 mandatory_prompt_prefix: None,
                 reports_cost: false,
+                cache_key: p1_contracts::CacheKeySupport::Unsupported,
             },
             system_prompt: PROMPT.into(),
             tools: Vec::new(),

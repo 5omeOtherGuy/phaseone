@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use p1_contracts::{
-    BoxFuture, CancellationToken, Origin, Provider, ProviderError, ProviderErrorKind,
-    ProviderRequest, ProviderStream, RouteDescription,
+    BoxFuture, CacheKeySupport, CancellationToken, Origin, Provider, ProviderError,
+    ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription,
 };
 use p1_provider_http::{
     Credential, CredentialSource, DriveRequest, HttpRequest, ResponseParser, RetryPolicy,
@@ -16,6 +16,15 @@ use crate::request::{
     DEFAULT_BASE_URL, ROUTE, build_headers, build_request, clamped_cache_key, resolve_base_url,
     validate as validate_options,
 };
+
+/// Namespaces the OTHER compiled adapters own inside `ModelOptions::native`. An
+/// explicit option from one of them was silently dropped on a route switch
+/// before; it is now an error naming the option, this route and this adapter
+/// (ADR-0039). Keys in no adapter's namespace keep their meaning: ignored.
+const FOREIGN_NATIVE_PREFIXES: &[&str] = &["anthropic-messages.", "openai-chat."];
+
+/// The adapter half of this route's identity, for error messages.
+const ADAPTER: &str = "openai-responses";
 
 /// The ChatGPT/Codex subscription route as a provider.
 pub struct OpenAiCodexProvider {
@@ -69,10 +78,33 @@ impl Provider for OpenAiCodexProvider {
             supports_freeform_tools: true,
             mandatory_prompt_prefix: None,
             reports_cost: false,
+            // The request builder sends `options.cache_key` as the body's
+            // `prompt_cache_key` and the session identity headers.
+            cache_key: CacheKeySupport::Optional,
         }
     }
 
     fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
+        for key in request.options.native.keys() {
+            if FOREIGN_NATIVE_PREFIXES
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+            {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    format!(
+                        "option \"{key}\" is not consumed by route \"{ROUTE}\" \
+                         (adapter {ADAPTER}): it belongs to another adapter's namespace"
+                    ),
+                ));
+            }
+        }
+        if request.options.cache_key.as_deref() == Some("") {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "cache_key must not be empty: set a stable nonempty key or leave it unset",
+            ));
+        }
         validate_options(&request.options)
     }
 
@@ -222,6 +254,7 @@ mod tests {
         assert!(description.supports_freeform_tools);
         assert!(description.mandatory_prompt_prefix.is_none());
         assert!(!description.reports_cost);
+        assert_eq!(description.cache_key, CacheKeySupport::Optional);
     }
 
     #[test]
@@ -240,6 +273,63 @@ mod tests {
             provider().validate(&request).unwrap_err().kind,
             ProviderErrorKind::InvalidRequest
         );
+    }
+
+    #[test]
+    fn an_empty_explicit_cache_key_is_rejected_not_sent() {
+        let options = ModelOptions {
+            cache_key: Some(String::new()),
+            ..ModelOptions::default()
+        };
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            history: Vec::new(),
+            tools: Vec::new(),
+            options,
+        };
+        let error = provider().validate(&request).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(error.message.contains("cache_key"), "{}", error);
+    }
+
+    #[test]
+    fn a_native_option_in_another_adapters_namespace_is_an_error() {
+        for key in ["anthropic-messages.thinking", "openai-chat.future_flag"] {
+            let mut options = ModelOptions::default();
+            options
+                .native
+                .insert(key.to_string(), serde_json::json!(true));
+            let request = ProviderRequest {
+                system_prompt: String::new(),
+                history: Vec::new(),
+                tools: Vec::new(),
+                options,
+            };
+            let error = provider().validate(&request).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{key}");
+            for part in [
+                format!("option \"{key}\""),
+                format!("route \"{ROUTE}\""),
+                format!("(adapter {ADAPTER})"),
+            ] {
+                assert!(error.message.contains(&part), "{}: {}", error, part);
+            }
+        }
+    }
+
+    #[test]
+    fn a_native_option_in_no_adapters_namespace_keeps_its_meaning() {
+        let mut options = ModelOptions::default();
+        options
+            .native
+            .insert("unrelated.option".to_string(), serde_json::json!(1));
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            history: Vec::new(),
+            tools: Vec::new(),
+            options,
+        };
+        assert!(provider().validate(&request).is_ok());
     }
 
     #[tokio::test]

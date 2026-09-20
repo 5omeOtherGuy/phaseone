@@ -23,8 +23,9 @@ pub use policy::{
     ContextPolicy, Decision, EventSink, Prepared, TurnEnd,
 };
 pub use provider::{
-    CompletedResponse, Effort, ModelOptions, Outcome, Provider, ProviderError, ProviderErrorKind,
-    ProviderRequest, ProviderStream, RouteDescription, StopReason, StreamEvent, Usage,
+    CacheKeySupport, CompletedResponse, Effort, ModelOptions, Outcome, Provider, ProviderError,
+    ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription, StopReason, StreamEvent,
+    Usage,
 };
 pub use tool::{
     DeclarationKind, Effect, Grammar, Tool, ToolContext, ToolDeclaration, ToolIdentity, ToolOutcome,

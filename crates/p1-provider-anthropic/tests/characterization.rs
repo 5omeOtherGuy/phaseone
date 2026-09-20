@@ -114,16 +114,20 @@ fn model_effort_matrix_pins_thinking_output_config_max_tokens_and_beta() {
     }
 }
 
-/// An explicit output cap that the thinking budget would violate is silently
-/// raised, not rejected, and the budget is never reduced.
+/// An EXPLICIT output cap that the manual thinking budget meets or exceeds is
+/// rejected — with cap, budget and the minimum workable cap — while every other
+/// explicit/derived cap keeps its pinned value.
 ///
-/// NOTE: ADR-0039 schedules this raise to become an assembly/validation error
-/// ("the Anthropic adapter silently raises an explicit output cap (it will
-/// reject the conflict)"). When that lands this test is changed deliberately to
-/// assert the error; until then the raise is the pinned behaviour.
+/// NOTE: ADR-0039 replaces the adapter's silent raise of an explicit output cap
+/// with this rejection.
+/// One matrix row: `(model, effort, cap, thinking, max_tokens)`. `max_tokens` is
+/// `None` exactly for the caps that were silently RAISED before and are rejected
+/// now; the thinking value still names the budget the rejection message cites.
+type CapCase = (&'static str, Option<Effort>, u32, Value, Option<u64>);
+
 #[test]
-fn explicit_output_cap_and_thinking_pin_the_silent_raise() {
-    let cases: Vec<(&str, Option<Effort>, u32, Value, u64)> = vec![
+fn explicit_output_cap_below_the_thinking_budget_is_rejected() {
+    let cases: Vec<CapCase> = vec![
         // Manual budget: the cap is raised to budget + 8192 only when the
         // budget would otherwise meet or exceed it.
         (
@@ -131,78 +135,100 @@ fn explicit_output_cap_and_thinking_pin_the_silent_raise() {
             Some(Effort::Low),
             1_000,
             json!({ "type": "enabled", "budget_tokens": 4_096 }),
-            12_288,
+            None,
         ),
         (
             "claude-opus-4-6",
             Some(Effort::Low),
             4_096,
             json!({ "type": "enabled", "budget_tokens": 4_096 }),
-            12_288,
+            None,
         ),
         (
             "claude-opus-4-6",
             Some(Effort::Low),
             4_097,
             json!({ "type": "enabled", "budget_tokens": 4_096 }),
-            4_097,
+            Some(4_097),
         ),
         (
             "claude-opus-4-6",
             Some(Effort::Low),
             10_000,
             json!({ "type": "enabled", "budget_tokens": 4_096 }),
-            10_000,
+            Some(10_000),
         ),
         (
             "claude-opus-4-6",
             Some(Effort::High),
             20_480,
             json!({ "type": "enabled", "budget_tokens": 20_480 }),
-            28_672,
+            None,
         ),
         (
             "claude-opus-4-6",
             Some(Effort::ExtraHigh),
             32_768,
             json!({ "type": "enabled", "budget_tokens": 32_768 }),
-            40_960,
+            None,
         ),
         (
             "claude-opus-4-6",
             Some(Effort::ExtraHigh),
             40_000,
             json!({ "type": "enabled", "budget_tokens": 32_768 }),
-            40_000,
+            Some(40_000),
         ),
         // No thinking: the cap is used verbatim.
-        ("claude-opus-4-6", None, 4_242, Value::Null, 4_242),
+        ("claude-opus-4-6", None, 4_242, Value::Null, Some(4_242)),
         // Adaptive thinking never raises the cap.
         (
             "claude-sonnet-5",
             Some(Effort::High),
             1_234,
             json!({ "type": "adaptive", "display": "summarized" }),
-            1_234,
+            Some(1_234),
         ),
-        ("claude-sonnet-5", None, 1_234, Value::Null, 1_234),
+        ("claude-sonnet-5", None, 1_234, Value::Null, Some(1_234)),
     ];
 
     for (model, effort, cap, expected_thinking, expected_max) in cases {
         let mut req = request();
         req.options.reasoning_effort = effort;
         req.options.max_output_tokens = Some(cap);
-        let body = build_request(model, &req).unwrap();
-        let actual_thinking = body.get("thinking").cloned().unwrap_or(Value::Null);
-        assert_eq!(
-            actual_thinking, expected_thinking,
-            "{model} {effort:?} cap {cap}"
-        );
-        assert_eq!(
-            body["max_tokens"],
-            json!(expected_max),
-            "{model} {effort:?} cap {cap}"
-        );
+        match expected_max {
+            // A cap at or below the manual budget is rejected, with the cap,
+            // the budget and the smallest cap that would work in the message.
+            None => {
+                let error = build_request(model, &req).unwrap_err();
+                assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+                let budget = expected_thinking["budget_tokens"].as_u64().unwrap();
+                for part in [
+                    format!("max_output_tokens {cap}"),
+                    format!("thinking budget {budget}"),
+                    format!("is {}", budget + 1),
+                ] {
+                    assert!(
+                        error.message.contains(&part),
+                        "{model} {effort:?} cap {cap}: {} (wanted `{part}`)",
+                        error
+                    );
+                }
+            }
+            Some(expected_max) => {
+                let body = build_request(model, &req).unwrap();
+                let actual_thinking = body.get("thinking").cloned().unwrap_or(Value::Null);
+                assert_eq!(
+                    actual_thinking, expected_thinking,
+                    "{model} {effort:?} cap {cap}"
+                );
+                assert_eq!(
+                    body["max_tokens"],
+                    json!(expected_max),
+                    "{model} {effort:?} cap {cap}"
+                );
+            }
+        }
     }
 }
 
@@ -434,6 +460,7 @@ fn describe_matches_every_shipped_model() {
             supports_freeform_tools: false,
             mandatory_prompt_prefix: Some(IDENTITY.to_string()),
             reports_cost: false,
+            cache_key: p1_contracts::CacheKeySupport::Unsupported,
         };
         assert_eq!(provider(model).describe(), expected, "{model}");
     }

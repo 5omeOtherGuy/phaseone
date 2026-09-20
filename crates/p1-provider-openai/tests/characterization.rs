@@ -236,22 +236,26 @@ fn extra_high_and_max_are_rejected_for_every_model() {
     }
 }
 
-/// An explicit EMPTY cache key is treated as a key, not as "no caching": the
-/// body gets `prompt_cache_key: ""` and the wire gets empty `session_id` /
-/// `conversation_id` headers. SUSPECTED DEFECT: an empty key is preserved rather
-/// than normalised to `None`; whether the route accepts it is unverified. Pinned
-/// so a future normalisation is a visible, deliberate change.
+/// An explicit EMPTY cache key is rejected by `validate` (and so never reaches
+/// the wire): an empty `prompt_cache_key` and empty `session_id` /
+/// `conversation_id` headers are not a usable cache identity. The pure builders
+/// are unchanged — the provider's `validate` is the gate (ADR-0039).
 #[test]
-fn empty_cache_key_is_sent_as_an_empty_key_not_absent() {
+fn empty_cache_key_is_rejected_by_validate_not_sent_as_an_empty_key() {
     let options = ModelOptions {
         cache_key: Some(String::new()),
         ..ModelOptions::default()
     };
-    let body = build_request("gpt-5.6-sol", &request_for(options, vec![user("hi")])).unwrap();
-    assert_eq!(body["prompt_cache_key"], json!(""));
-    let headers = build_headers(&test_credential(), Some("")).unwrap();
-    assert_eq!(header(&headers, "session_id"), Some(""));
-    assert_eq!(header(&headers, "conversation_id"), Some(""));
+    let error = OpenAiCodexProvider::new(
+        "gpt-5.6-sol",
+        Arc::new(ScriptedTransport::new(Vec::new())),
+        Arc::new(FixedCredentials),
+    )
+    .validate(&request_for(options, vec![user("hi")]))
+    .unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(error.message.contains("cache_key"), "{}", error);
+    assert!(error.message.contains("empty"), "{}", error);
 }
 
 /// The cache-key identity headers are appended after the static set, in this
@@ -396,6 +400,7 @@ fn describe_matches_every_shipped_model() {
             supports_freeform_tools: true,
             mandatory_prompt_prefix: None,
             reports_cost: false,
+            cache_key: p1_contracts::CacheKeySupport::Optional,
         };
         assert_eq!(provider(model).describe(), expected, "{model}");
     }

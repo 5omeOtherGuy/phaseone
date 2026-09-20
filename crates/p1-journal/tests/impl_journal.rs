@@ -187,6 +187,7 @@ fn sample_records() -> Vec<JournalRecord> {
                     supports_freeform_tools: true,
                     mandatory_prompt_prefix: Some("pre\nfix".into()),
                     reports_cost: false,
+                    cache_key: p1_contracts::CacheKeySupport::Unsupported,
                 },
                 system_prompt: "sys\nprompt ✓".into(),
                 tools: vec![(

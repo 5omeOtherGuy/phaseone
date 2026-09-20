@@ -620,11 +620,35 @@ struct ToolToml {
 /// tools (in file order, sharing ONE fresh [`ToolServices`]), duplicate-name
 /// check, prompt substitution, `Provider::validate` on the empty-history
 /// first request. Fails before a run starts.
+///
+/// The final [`ModelOptions`] are the environment file's own; a composition
+/// root that must decide options FROM the resolved route (the host's cache-key
+/// policy) uses [`assemble_with_route_options`] instead, which still builds the
+/// provider and the tools exactly once.
 pub fn assemble(
     catalog: &Catalog,
     environment: &EnvironmentFile,
     workspace: &Path,
     substitutions: &Substitutions,
+) -> Result<Assembled, AssemblyError> {
+    let options = environment.options.clone();
+    assemble_with_route_options(catalog, environment, workspace, substitutions, move |_| {
+        options
+    })
+}
+
+/// As [`assemble`], with the final options supplied by `route_options` once the
+/// provider is built and its [`RouteDescription`] is known. The provider and the
+/// tools are each built ONCE: the description is read before anything else is
+/// constructed, so a caller can finalise options (e.g. generate a cache key)
+/// without a second assembly attempt. `p1-assembly` knows nothing about what the
+/// caller does with the description.
+pub fn assemble_with_route_options(
+    catalog: &Catalog,
+    environment: &EnvironmentFile,
+    workspace: &Path,
+    substitutions: &Substitutions,
+    route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
 ) -> Result<Assembled, AssemblyError> {
     let workspace = Workspace::new(workspace)
         .map_err(|error| AssemblyError::InvalidWorkspace {
@@ -655,6 +679,8 @@ pub fn assemble(
             what: format!("provider `{provider_key}`"),
             message,
         })?;
+    let route = provider.describe();
+    let options = route_options(&route);
 
     // `modules` maps a catalog key to its assembled model-facing name for
     // `{{tool:<module>}}`. If a key appears twice, the first occurrence wins.
@@ -700,7 +726,6 @@ pub fn assemble(
         .iter()
         .map(|(_, tool)| tool.declaration().clone())
         .collect();
-    let options = environment.options.clone();
 
     // Fail fast on anything this route cannot carry, against the exact first
     // request the core would send: prompt, declarations in order, options, no history.
@@ -726,7 +751,7 @@ pub fn assemble(
     let resolved = ResolvedEnvironment {
         environment: environment.name.clone(),
         family: environment.family.clone(),
-        route: provider.describe(),
+        route,
         system_prompt: system_prompt.clone(),
         tools: resolved_tools,
         options: options.clone(),

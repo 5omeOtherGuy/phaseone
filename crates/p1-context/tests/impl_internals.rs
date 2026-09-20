@@ -258,6 +258,7 @@ fn origin_route() -> RouteDescription {
         supports_freeform_tools: true,
         mandatory_prompt_prefix: None,
         reports_cost: false,
+        cache_key: p1_contracts::CacheKeySupport::Unsupported,
     }
 }
 
