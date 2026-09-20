@@ -46,10 +46,14 @@ pub struct ToolRow {
     pub status: RowStatus,
     /// Full output exactly as the model saw it, when a result arrived. The
     /// fold decision is renderable from this plus the status.
+    /// Set on FAILED rows (the evidence block reads it); Ok rows keep no
+    /// copy — oversized output lives only behind its fold handle.
     pub output: Option<String>,
+    /// Output line count, settled once (the renderer never rescans content).
+    pub line_count: usize,
+    /// The fold handle when the output was registered (the `^O open` hint).
+    pub fold: Option<crate::fold::FoldId>,
     pub elapsed_ms: Option<u64>,
-    /// Delegation indents ONCE and never more (SPEC §3).
-    pub depth: u8,
 }
 
 /// The lifecycle of a call row: running, then settled with the tool's status.
@@ -140,6 +144,15 @@ impl Transcript {
     }
 
     fn text_delta(&mut self, text: &str) {
+        // Text after reasoning within one response is a NEW block: the
+        // transcript's order is the model's output order.
+        if self.open_reasoning.is_some()
+            && self.open_text.is_some_and(
+                |i| !matches!(self.blocks.last(), Some(b) if std::ptr::eq(b, &self.blocks[i])),
+            )
+        {
+            self.open_text = None;
+        }
         let index = match self.open_text {
             Some(index) => index,
             None => {
@@ -178,8 +191,9 @@ impl Transcript {
             summary: summarize_call(&call.name, call.input.raw()),
             status: RowStatus::Running,
             output: None,
+            line_count: 0,
+            fold: None,
             elapsed_ms: None,
-            depth: 0,
         }));
         self.running
             .insert(call.call_id.clone(), self.blocks.len() - 1);
@@ -188,6 +202,7 @@ impl Transcript {
     fn tool_finished(&mut self, result: &ToolResultItem, elapsed_ms: Option<u64>) {
         self.settle(
             &result.call_id,
+            &result.name,
             RowStatus::Settled(result.status),
             &result.content,
             elapsed_ms,
@@ -195,22 +210,57 @@ impl Transcript {
     }
 
     /// Settle the row a call started, wherever the outcome came from (live
-    /// event or journal replay).
-    fn settle(&mut self, call_id: &str, status: RowStatus, content: &str, elapsed_ms: Option<u64>) {
-        let Some(index) = self.running.remove(call_id) else {
-            return;
+    /// event or journal replay). An orphan result — no row ever opened for its
+    /// call id — still renders (SPEC §4.9: nothing disappears).
+    fn settle(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        status: RowStatus,
+        content: &str,
+        elapsed_ms: Option<u64>,
+    ) {
+        let index = match self.running.remove(call_id) {
+            Some(index) => index,
+            None => {
+                self.blocks.push(Block::Call(ToolRow {
+                    name: name.to_string(),
+                    summary: String::new(),
+                    status,
+                    output: None,
+                    line_count: 0,
+                    fold: None,
+                    elapsed_ms: None,
+                }));
+                self.blocks.len() - 1
+            }
         };
         let Block::Call(row) = &mut self.blocks[index] else {
             return;
         };
         row.status = status;
         row.elapsed_ms = elapsed_ms;
+        row.line_count = content.lines().count();
         if !content.is_empty() {
-            if let Fold::Folded { id, .. } = Fold::present(content) {
-                self.latest_fold = Some(id.clone());
-                self.outputs.insert(id, content.to_string());
+            match status {
+                // Failures keep the output on the row (the evidence block reads
+                // it); successes store oversized output only behind the handle.
+                RowStatus::Settled(ToolStatus::Ok) => {
+                    if let Fold::Folded { id, .. } = Fold::present(content) {
+                        row.fold = Some(id.clone());
+                        self.latest_fold = Some(id.clone());
+                        self.outputs.insert(id, content.to_string());
+                    }
+                }
+                _ => {
+                    if let Fold::Folded { id, .. } = Fold::present(content) {
+                        row.fold = Some(id.clone());
+                        self.latest_fold = Some(id.clone());
+                        self.outputs.insert(id, content.to_string());
+                    }
+                    row.output = Some(content.to_string());
+                }
             }
-            row.output = Some(content.to_string());
         }
     }
 
@@ -262,6 +312,7 @@ impl Transcript {
                 }
                 Item::ToolResult(result) => self.settle(
                     &result.call_id,
+                    &result.name,
                     RowStatus::Settled(result.status),
                     &result.content,
                     None,
@@ -272,6 +323,18 @@ impl Transcript {
 
     fn turn_finished(&mut self, end: &TurnEnd) {
         self.close_streams();
+        // Calls left running at the turn's end are reconciled, not left
+        // spinning: their outcome is unknown by definition.
+        let leftover: Vec<String> = self.running.keys().cloned().collect();
+        for call_id in leftover {
+            self.settle(
+                &call_id,
+                "?",
+                RowStatus::Settled(ToolStatus::Unknown),
+                "",
+                None,
+            );
+        }
         let lines = match end {
             TurnEnd::Completed { .. } | TurnEnd::Cancelled => None,
             TurnEnd::ProviderFailed { error } => Some(vec![format!("provider failed: {error}")]),
@@ -335,7 +398,7 @@ fn json_string_field<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
     let rest = raw[start..].trim_start_matches([' ', ':']);
     let rest = rest.strip_prefix('"')?;
     // Find the closing quote, skipping \-escaped characters.
-    let mut end = 0;
+    let mut end = None;
     let mut escaped = false;
     for (i, c) in rest.char_indices() {
         if escaped {
@@ -345,16 +408,13 @@ fn json_string_field<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
         match c {
             '\\' => escaped = true,
             '"' => {
-                end = i;
+                end = Some(i);
                 break;
             }
             _ => {}
         }
     }
-    if end == 0 {
-        return None;
-    }
-    Some(&rest[..end])
+    Some(&rest[..end?])
 }
 
 #[cfg(test)]

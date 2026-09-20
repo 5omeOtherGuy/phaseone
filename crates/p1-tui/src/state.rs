@@ -236,6 +236,11 @@ pub struct Screen {
     pub composer: Composer,
     pub pane_width: PaneWidth,
     pub pane_mode: PaneMode,
+    /// The width the operator held before a live worker forced the pane open
+    /// (`Off` → `Ch56`); the demotion gives it back. `None` when no such
+    /// promotion is outstanding, or when a pin or an operator change owns the
+    /// width instead.
+    pub promotion_saved_width: Option<PaneWidth>,
     /// `^P`: no event may swap a pinned mode (SPEC §5).
     pub pinned: bool,
     pub promotion: Promotion,
@@ -401,11 +406,21 @@ impl Screen {
             if !self.pinned && self.pane_mode != PaneMode::Workers {
                 self.pane_mode = PaneMode::Workers;
             }
-            if matches!(self.pane_width, PaneWidth::Off) {
+            // The width force is a promotion and a pin always wins it. Save
+            // what the operator had so the demotion can restore it.
+            if !self.pinned && matches!(self.pane_width, PaneWidth::Off) {
+                self.promotion_saved_width = Some(self.pane_width);
                 self.pane_width = PaneWidth::Ch56;
             }
         } else if self.pane_mode == PaneMode::Workers && !self.pinned {
             self.pane_mode = PaneMode::Ledger;
+            // Give back the operator's width only while it is still the one
+            // this promotion set: a `^W` since then is their choice to keep.
+            if let Some(saved) = self.promotion_saved_width.take()
+                && self.pane_width == PaneWidth::Ch56
+            {
+                self.pane_width = saved;
+            }
         }
     }
     /// Open a fold handle in the OUTPUT pane (`^O`): switches the pane to
@@ -604,5 +619,43 @@ mod tests {
         }));
         assert_eq!(spend.input, Some(15));
         assert_eq!(spend.cost_micro_usd, None);
+    }
+
+    #[test]
+    fn a_live_worker_promotes_the_width_and_restores_the_operator_width() {
+        use crate::render::workers::{WorkerRow, WorkerState};
+        let row = |state| WorkerRow {
+            id: "w1".into(),
+            summary: "w1".into(),
+            route: "deepseek/v4.1-flash".into(),
+            state,
+            elapsed: None,
+            cost_micro_usd: None,
+            details: vec![],
+        };
+        // Pinned: the width force never overrides the operator.
+        let mut s = Screen::new(false);
+        s.pinned = true;
+        s.pane_width = PaneWidth::Off;
+        s.sync_workers(vec![row(WorkerState::Running)]);
+        assert_eq!(s.pane_width, PaneWidth::Off, "pinning wins over the force");
+        assert_eq!(s.promotion_saved_width, None, "a pin saves nothing");
+        // Unpinned Off: force to Ch56, remember Off, restore it on demotion.
+        let mut s = Screen::new(false);
+        s.pane_width = PaneWidth::Off;
+        s.sync_workers(vec![row(WorkerState::Running)]);
+        assert_eq!(s.pane_width, PaneWidth::Ch56);
+        assert_eq!(s.promotion_saved_width, Some(PaneWidth::Off));
+        s.sync_workers(vec![row(WorkerState::Done)]);
+        assert_eq!(s.pane_width, PaneWidth::Off);
+        assert_eq!(s.promotion_saved_width, None);
+        // A `^W` during the promotion is the operator's; demotion keeps it.
+        let mut s = Screen::new(false);
+        s.pane_width = PaneWidth::Off;
+        s.sync_workers(vec![row(WorkerState::Running)]);
+        s.pane_width = PaneWidth::Ch40;
+        s.sync_workers(vec![row(WorkerState::Done)]);
+        assert_eq!(s.pane_width, PaneWidth::Ch40, "an operator change survives");
+        assert_eq!(s.promotion_saved_width, None);
     }
 }

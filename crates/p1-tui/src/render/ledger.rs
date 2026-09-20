@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use crate::grid;
 use crate::palette;
 
-use super::{UNKNOWN, tokens};
+use super::{UNKNOWN, cost_string, tokens};
 
 /// The LEDGER content grid: 32 columns inside the 40-ch pane (the difference
 /// is the pane's padding, SPEC §5).
@@ -194,9 +194,7 @@ fn spend_lines(spend: &SpendView, out: &mut Vec<Line<'static>>) {
     out.push(grid::row(
         LEDGER_GRID,
         "  cost",
-        &or_unknown(spend.cost_micro_usd, |micro| {
-            format!("${}.{:04}", micro / 1_000_000, (micro % 1_000_000) / 100)
-        }),
+        &or_unknown(spend.cost_micro_usd, cost_string),
     ));
 }
 

@@ -140,9 +140,9 @@ fn mid_stream_working_indicator_and_running_call() {
     // The LED chase is alive: the same cell's brightness differs between two
     // fake times (0 = floor, 275 = cell 0's peak).
     let styled_early =
-        p1_tui::render::transcript::lines(&s.transcript, 80, Some("shell"), 0, false);
+        p1_tui::render::transcript::lines(&s.transcript, 80, usize::MAX, Some("shell"), 0, false);
     let styled_later =
-        p1_tui::render::transcript::lines(&s.transcript, 80, Some("shell"), 275, false);
+        p1_tui::render::transcript::lines(&s.transcript, 80, usize::MAX, Some("shell"), 275, false);
     let last = styled_early.len() - 1;
     assert_ne!(
         styled_early[last].spans[0].style.fg, styled_later[last].spans[0].style.fg,

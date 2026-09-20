@@ -10,8 +10,8 @@
 //! wiring: it owns the terminal, the agent task, and the render tick.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use p1_contracts::{
@@ -44,7 +44,9 @@ pub enum UiEvent {
 pub struct TuiSink {
     epoch: Instant,
     /// Compensates for clock granularity collisions so ordering survives.
-    tick: AtomicU64,
+    /// Shared with every child sink: one clock, one claim order, so an
+    /// interleaved parent/child stream keeps a single monotonic sequence.
+    tick: Arc<AtomicU64>,
     worker: Option<String>,
     tx: mpsc::UnboundedSender<UiEvent>,
 }
@@ -55,7 +57,7 @@ impl TuiSink {
         (
             Self {
                 epoch: Instant::now(),
-                tick: AtomicU64::new(0),
+                tick: Arc::new(AtomicU64::new(0)),
                 worker: None,
                 tx,
             },
@@ -67,7 +69,9 @@ impl TuiSink {
     pub fn child(&self, worker_id: &str) -> Self {
         Self {
             epoch: self.epoch,
-            tick: AtomicU64::new(0),
+            // The parent's tick, not a fresh one: a child's events share the
+            // parent's arrival-order sequence (the epoch already is shared).
+            tick: self.tick.clone(),
             worker: Some(worker_id.to_string()),
             tx: self.tx.clone(),
         }
@@ -89,10 +93,19 @@ impl TuiSink {
 impl EventSink for TuiSink {
     fn emit(&self, event: AgentEvent) {
         let now = self.epoch.elapsed().as_millis() as u64;
-        // Monotonic even for concurrent emits (a sink is Send+Sync): the stamp
-        // is max(now, previous+1), via fetch_max — no add-then-store window.
-        let prev = self.tick.fetch_max(now + 1, Ordering::Relaxed);
-        let at_ms = now.max(prev + 1);
+        // Monotonic even for concurrent emits (a sink is Send+Sync): claim a
+        // stamp strictly greater than every earlier claim. `fetch_update`
+        // retries its compare-exchange until it publishes `max(now, prev+1)`,
+        // so no two events — parent or child — ever share a stamp.
+        let at_ms = match self
+            .tick
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(now.max(prev + 1))
+            }) {
+            Ok(previous) => now.max(previous + 1),
+            // Unreachable: the closure above always returns `Some`.
+            Err(_) => now,
+        };
         // Unbounded: observation must never block the agent loop (contract).
         let _ = self.tx.send(UiEvent::Agent(Stamped {
             at_ms,
@@ -340,5 +353,31 @@ mod tests {
             .await;
         assert_eq!(decision, Decision::Permit);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn parent_and_child_sinks_share_one_strictly_increasing_clock() {
+        let (parent, mut rx) = TuiSink::new();
+        let child = parent.child("w1");
+        // Interleave the two sinks; one shared claim clock must keep the
+        // combined emission order and the stamp order identical.
+        for _ in 0..16 {
+            parent.emit(AgentEvent::TurnStarted);
+            child.emit(AgentEvent::TurnStarted);
+        }
+        let mut last: Option<u64> = None;
+        let mut seen = 0;
+        while let Ok(UiEvent::Agent(stamped)) = rx.try_recv() {
+            if let Some(previous) = last {
+                assert!(
+                    stamped.at_ms > previous,
+                    "stamp {} did not increase past {previous}",
+                    stamped.at_ms
+                );
+            }
+            last = Some(stamped.at_ms);
+            seen += 1;
+        }
+        assert_eq!(seen, 32, "every emit reached the channel");
     }
 }
