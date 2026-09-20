@@ -49,7 +49,7 @@ impl std::fmt::Debug for HttpRequest {
 
 /// A URL with everything after `?` removed, so a `Debug` never prints a query
 /// string. Userinfo (`user:pass@`) is stripped too, defensively.
-struct RedactedUrl<'a>(&'a str);
+pub(crate) struct RedactedUrl<'a>(pub(crate) &'a str);
 
 impl std::fmt::Debug for RedactedUrl<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

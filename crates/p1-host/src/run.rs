@@ -333,7 +333,13 @@ pub async fn run_with_front_end(
         .map_err(|error| error.to_string())?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
     let substitutions = substitutions(deps, &workspace);
-    let assembled = assemble_with_cache_key(&catalog, &environment, &workspace, &substitutions)?;
+    let assembled = assemble_with_cache_key(
+        &catalog,
+        &environment,
+        &workspace,
+        &substitutions,
+        PARENT_ORDINAL,
+    )?;
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
     let completion = completion_hub.take();
@@ -1173,8 +1179,13 @@ fn make_child_factory(
             os: std::env::consts::OS.to_string(),
         };
         crate::catalog::resolve_environment(&mut environment, &environment_dirs)?;
-        let assembled =
-            assemble_with_cache_key(&catalog, &environment, &workspace, &substitutions)?;
+        let assembled = assemble_with_cache_key(
+            &catalog,
+            &environment,
+            &workspace,
+            &substitutions,
+            next_agent_ordinal(),
+        )?;
         // `InProcessWorkers` assigns `w{n}` after a SUCCESSFUL factory call and
         // factory calls are serialised, so this is the id the service will hand
         // out. The counter is only advanced at the very end: a start that fails
@@ -1251,11 +1262,14 @@ fn make_child_factory(
 /// does. Exactly ONE assembly runs — the provider and the tools are each built
 /// once — and an assembly error is reported as it is: there is no second attempt
 /// to drop a key, because the description already said whether one is taken.
+/// `agent_ordinal` is the agent's position in the cache-key scheme: 0 for the
+/// parent, the worker's own ordinal otherwise.
 fn assemble_with_cache_key(
     catalog: &Catalog,
     environment: &p1_assembly::EnvironmentFile,
     workspace: &std::path::Path,
     substitutions: &Substitutions,
+    agent_ordinal: u64,
 ) -> Result<p1_assembly::Assembled, String> {
     let name = environment.name.clone();
     let configured = environment.options.clone();
@@ -1267,7 +1281,7 @@ fn assemble_with_cache_key(
         |route| {
             let mut options = configured.clone();
             if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {
-                options.cache_key = Some(generated_cache_key(&name, workspace));
+                options.cache_key = Some(generated_cache_key(workspace, &name, agent_ordinal));
             }
             options
         },
@@ -1275,21 +1289,73 @@ fn assemble_with_cache_key(
     .map_err(|error| error.to_string())
 }
 
-/// A fresh provider-side prompt-cache key for one agent. Without one the Codex
-/// route served 0 cached tokens across a whole task (measured 2026-09-20);
+/// A STABLE provider-side prompt-cache key for one agent: a pure function of the
+/// workspace, the environment name and the agent's ordinal — no process id and
+/// no clock. Stability is the point: a resume and a re-run in the same workspace
+/// keep their provider-side cache routing, and the journalled environment no
+/// longer changes on resume. Ordinal 0 is the parent agent ([`PARENT_ORDINAL`]);
+/// workers get 1, 2, … in start order ([`next_agent_ordinal`]). Without a key the
+/// Codex route served 0 cached tokens across a whole task (measured 2026-09-20);
 /// routes without such a key never see it.
-fn generated_cache_key(environment: &str, workspace: &std::path::Path) -> String {
+fn generated_cache_key(
+    workspace: &std::path::Path,
+    environment: &str,
+    agent_ordinal: u64,
+) -> String {
     use std::hash::{Hash, Hasher};
-    static AGENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     workspace.hash(&mut hasher);
     environment.hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    AGENTS
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .hash(&mut hasher);
-    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        now.as_nanos().hash(&mut hasher);
-    }
+    agent_ordinal.hash(&mut hasher);
     format!("p1-{:016x}", hasher.finish())
+}
+
+/// The parent agent's ordinal. It is passed literally at the parent's assembly
+/// call site, never taken from the shared counter, so no worker that assembled
+/// earlier can shift it off 0.
+const PARENT_ORDINAL: u64 = 0;
+
+/// The next worker ordinal: 1, 2, … in start order, so each worker gets its own
+/// key while every worker of a given start order keeps it across processes.
+fn next_agent_ordinal() -> u64 {
+    static AGENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    AGENTS.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The key is a pure function of its three inputs: same inputs, same key —
+    /// in another process too, because nothing process-local (a pid, a clock, a
+    /// counter) enters it. Each input on its own still changes the key.
+    #[test]
+    fn the_generated_cache_key_is_pure_and_depends_on_every_input() {
+        let workspace = Path::new("/tmp/one-workspace");
+        let key = generated_cache_key(workspace, "plain", PARENT_ORDINAL);
+        assert_eq!(key, generated_cache_key(workspace, "plain", PARENT_ORDINAL));
+        assert!(key.starts_with("p1-"), "{key}");
+        assert_eq!(key.len(), "p1-".len() + 16, "{key}");
+        assert_ne!(
+            key,
+            generated_cache_key(Path::new("/tmp/other"), "plain", 0)
+        );
+        assert_ne!(key, generated_cache_key(workspace, "other", 0));
+        assert_ne!(key, generated_cache_key(workspace, "plain", 1));
+    }
+
+    /// The parent's ordinal is the constant 0 — not a draw from the counter — and
+    /// the counter never hands 0 out, so a worker cannot collide with its parent.
+    #[test]
+    fn the_parent_ordinal_is_zero_and_worker_ordinals_start_at_one() {
+        assert_eq!(PARENT_ORDINAL, 0);
+        let first = next_agent_ordinal();
+        let second = next_agent_ordinal();
+        assert!(first >= 1, "a worker never gets the parent's ordinal");
+        assert_eq!(second, first + 1);
+        assert_ne!(
+            generated_cache_key(Path::new("/tmp/ws"), "plain", PARENT_ORDINAL),
+            generated_cache_key(Path::new("/tmp/ws"), "plain", first)
+        );
+    }
 }

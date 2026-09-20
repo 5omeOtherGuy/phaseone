@@ -10,18 +10,22 @@ publish.workspace = true
 workspace = true
 
 [features]
-# Exposes `ScriptedTransport` to other crates (the conformance suite and the
-# provider adapters). This crate's own tests always see it via `cfg(test)`.
+# Exposes `ScriptedTransport` and `ScriptedWsConnector` to other crates (the
+# conformance suite and the provider adapters). This crate's own tests always see
+# them via `cfg(test)`.
 testing = []
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 futures-core = "0.3"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 thiserror = "2"
-tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["sync", "time", "net"] }
+# The WebSocket seam (`ws`) is the only user. rustls + webpki roots, no default
+# features; `connect` also supplies the handshake and the tokio/net socket.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt", "test-util"] }
+tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt", "test-util", "net", "io-util"] }
