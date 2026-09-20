@@ -6,13 +6,32 @@ mod fixtures;
 use std::sync::Arc;
 
 use p1_contracts::{BoxFuture, Item, ModelOptions, Provider, ProviderError, ProviderRequest};
+use p1_model_profile::ModelProfile;
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource};
-use p1_provider_openai::{OpenAiCodexProvider, build_request};
+use p1_provider_openai::{
+    OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesRoute, build_request,
+};
 
 const MODEL: &str = "gpt-5.6-sol";
 const BEARER: &str = "CONFORMANCE-FAKE-BEARER";
+
+/// The shipped route and profile of the model this suite runs: `MODEL` is what
+/// `routes/openai-codex-subscription.toml` binds `profiles/gpt-5.6-sol.toml` to,
+/// so these expectations are the adapter's own, only obtained through the files.
+fn route() -> ResponsesRoute {
+    ResponsesRoute {
+        origin_route: ROUTE.to_string(),
+        endpoint: "https://chatgpt.com/backend-api".to_string(),
+        account: ResponsesAccount::CodexSubscription,
+    }
+}
+
+fn profile() -> Arc<ModelProfile> {
+    let text = include_str!("../../../profiles/gpt-5.6-sol.toml");
+    Arc::new(ModelProfile::from_toml(MODEL, text).expect("the shipped profile is valid"))
+}
 
 struct FixedCredentials;
 
@@ -40,15 +59,20 @@ impl CredentialSource for FixedCredentials {
 }
 
 fn build(transport: ScriptedTransport) -> Arc<dyn Provider> {
-    Arc::new(OpenAiCodexProvider::new(
-        MODEL,
-        Arc::new(transport),
-        Arc::new(FixedCredentials),
-    ))
+    Arc::new(
+        OpenAiCodexProvider::new(
+            route(),
+            MODEL,
+            profile(),
+            Arc::new(transport),
+            Arc::new(FixedCredentials),
+        )
+        .expect("shipped route and profile compose"),
+    )
 }
 
 fn follow_up_request(request: &ProviderRequest) -> serde_json::Value {
-    build_request(MODEL, request).expect("follow-up request builds")
+    build_request(&route(), MODEL, &profile(), request).expect("follow-up request builds")
 }
 
 /// This route rejects an explicit output cap (`max_output_tokens` is a 400 on the wire).

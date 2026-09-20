@@ -174,11 +174,30 @@ fn a_chat_key_in_the_old_form_is_refused_and_says_which_form_to_write() {
     }
 }
 
+/// A whole provider registered OUTSIDE the route files: the mechanism ADR-0039 step 4b
+/// keeps for a test fake's key (or the next whole provider, which registers exactly
+/// like this). Its factory refuses the new form through the same helper.
+fn whole_provider_hook(key: &'static str) -> p1_host::catalog::CatalogHook {
+    Box::new(move |catalog: &mut Catalog| {
+        catalog.provider(
+            key,
+            Box::new(move |spec: &p1_assembly::ProviderSpec| {
+                p1_host::catalog::reject_profile(spec)?;
+                Ok(Arc::new(p1_testkit::ScriptedProvider::new(Vec::new()))
+                    as Arc<dyn p1_contracts::Provider>)
+            }),
+        );
+    })
+}
+
 #[test]
 fn a_whole_provider_in_the_new_form_is_refused_and_says_which_form_to_write() {
-    // `anthropic-subscription` left this list in ADR-0039 step 4: it is a route file
-    // now, and `crates/p1-host/tests/anthropic_route.rs` covers its new form.
-    for key in p1_host::catalog::WHOLE_PROVIDERS {
+    // No shipped key is whole any more (`anthropic-subscription` left in ADR-0039 step
+    // 4, `openai-codex-subscription` in step 4b; both are route files, covered by
+    // `tests/anthropic_route.rs` and `tests/openai_route.rs`), so the shipped list is
+    // empty and the mechanism is exercised through a fake registered by the hook.
+    assert!(p1_host::catalog::WHOLE_PROVIDERS.is_empty());
+    for key in ["fake-whole"] {
         let root = tempdir().unwrap();
         let environments = root.path().join("environments");
         std::fs::create_dir_all(&environments).unwrap();
@@ -195,7 +214,8 @@ fn a_whole_provider_in_the_new_form_is_refused_and_says_which_form_to_write() {
             &format!("route = \"{key}\"\nprofile = \"deepseek-v4.1-flash\"\n"),
         );
 
-        let harness = Harness::new(vec![environments.clone()], &[]);
+        let mut harness = Harness::new(vec![environments.clone()], &[]);
+        harness.deps.catalog_hook = Some(whole_provider_hook(key));
         let catalog = catalog(&harness);
         let environment = load_environment("routed", &[environments]).unwrap();
         let workspace = tempdir().unwrap();

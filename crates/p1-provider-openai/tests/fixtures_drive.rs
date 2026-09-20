@@ -8,15 +8,42 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use p1_contracts::history::{AssistantBlock, Item, ToolInput};
 use p1_contracts::{
-    BoxFuture, CancellationToken, CompletedResponse, ModelOptions, Outcome, Provider,
+    BoxFuture, CancellationToken, CompletedResponse, Effort, ModelOptions, Outcome, Provider,
     ProviderError, ProviderErrorKind, ProviderRequest, StopReason, StreamEvent, ToolDeclaration,
 };
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource, RetryPolicy};
-use p1_provider_openai::{OpenAiCodexProvider, ROUTE};
+use p1_provider_openai::{OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesRoute};
 
 const MODEL: &str = "gpt-test";
 const BEARER: &str = "SENTINEL-ACCESS";
+
+/// The route data these fixtures were recorded with (spec §7.2).
+fn route() -> ResponsesRoute {
+    ResponsesRoute {
+        origin_route: ROUTE.to_string(),
+        endpoint: "https://chatgpt.com/backend-api".to_string(),
+        account: ResponsesAccount::CodexSubscription,
+    }
+}
+
+/// The model policy these fixtures were recorded with: any model name took an
+/// effort level, and only `low`/`medium`/`high` (spec §7.1).
+fn profile() -> Arc<ModelProfile> {
+    Arc::new(ModelProfile {
+        id: MODEL.to_string(),
+        revision: 1,
+        model_id: MODEL.to_string(),
+        family: "gpt".to_string(),
+        thinking: ThinkingPolicy::EffortLevel,
+        efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+        default_effort: None,
+        thinking_budgets: std::collections::BTreeMap::new(),
+        context_tokens: None,
+        max_output_tokens: None,
+    })
+}
 
 struct FixedCredentials;
 
@@ -46,10 +73,13 @@ impl CredentialSource for FixedCredentials {
 fn provider_with(body: &'static str) -> (OpenAiCodexProvider, ScriptedTransport) {
     let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(body)]);
     let provider = OpenAiCodexProvider::new(
+        route(),
         MODEL,
+        profile(),
         Arc::new(transport.clone()),
         Arc::new(FixedCredentials),
-    );
+    )
+    .expect("the route and the profile compose");
     (provider, transport)
 }
 
@@ -390,10 +420,13 @@ async fn with_retry_bounds_transient_failures() {
         ScriptedResponse::ok_sse(fixtures::NO_USAGE),
     ]);
     let provider = OpenAiCodexProvider::new(
+        route(),
         MODEL,
+        profile(),
         Arc::new(transport.clone()),
         Arc::new(FixedCredentials),
     )
+    .expect("the route and the profile compose")
     .with_retry(RetryPolicy {
         max_retries: 0,
         ..RetryPolicy::default()

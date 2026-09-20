@@ -16,7 +16,6 @@ use p1_contracts::{
     ToolInput, ToolResultItem, ToolStatus,
 };
 use p1_provider_http::ReqwestTransport;
-use p1_provider_openai::{CodexCliCredentials, OpenAiCodexProvider};
 
 fn live() -> bool {
     std::env::var("P1_LIVE").as_deref() == Ok("1")
@@ -207,14 +206,11 @@ async fn codex_subscription_route() {
     if !live() {
         return;
     }
-    let model = model("P1_LIVE_GPT_MODEL", "gpt-5.6-sol");
-    println!("== openai-responses/codex-subscription · {model}");
-    let provider = OpenAiCodexProvider::new(
-        &model,
-        Arc::new(ReqwestTransport::new()),
-        Arc::new(CodexCliCredentials::from_default_location().expect("Codex CLI login")),
-    );
-    round_trip(&provider, vec![read_tool()], effort()).await;
+    let wire_model = model("P1_LIVE_GPT_MODEL", "gpt-5.6-sol");
+    println!("== openai-responses/codex-subscription · {wire_model}");
+    // The shipped route and profile, exactly as the host composes them.
+    let provider = live_route("openai-codex-subscription", "gpt-5.6-sol", &wire_model);
+    round_trip(&*provider, vec![read_tool()], effort()).await;
 }
 
 /// routes.md [todo-live]: does the Codex subscription route accept a freeform/grammar
@@ -224,13 +220,9 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
     if !live() {
         return;
     }
-    let model = model("P1_LIVE_GPT_MODEL", "gpt-5.6-sol");
-    println!("== freeform apply_patch on openai-responses/codex-subscription · {model}");
-    let provider = OpenAiCodexProvider::new(
-        &model,
-        Arc::new(ReqwestTransport::new()),
-        Arc::new(CodexCliCredentials::from_default_location().expect("Codex CLI login")),
-    );
+    let wire_model = model("P1_LIVE_GPT_MODEL", "gpt-5.6-sol");
+    println!("== freeform apply_patch on openai-responses/codex-subscription · {wire_model}");
+    let provider = live_route("openai-codex-subscription", "gpt-5.6-sol", &wire_model);
     let grammar = "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n%import common.LF\n";
     let patch_tool = ToolDeclaration {
         name: "apply_patch".into(),
@@ -243,7 +235,7 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
         },
     };
     let done = respond(
-        &provider,
+        &*provider,
         ProviderRequest {
             system_prompt: "You are a coding agent. apply_patch is the only way to create files."
                 .into(),

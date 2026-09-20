@@ -97,11 +97,12 @@ macro_rules! apply_finish_face {
 
 /// Build the catalog from the injected dependencies.
 ///
-/// Provider keys: `openai-codex-subscription`, plus one key per route file found in
-/// `<environments dir>/../routes` (`docs/design/routes-and-profiles.md` §2) — the
-/// Messages adapter's `anthropic-subscription` route among them. Tool keys: `read`,
-/// `edit`, `write`, `grep`, `shell`, `apply_patch`, and — with the `delegation`
-/// feature and a worker service present — the four `worker_*` tools.
+/// Provider keys: one key per route file found in `<environments dir>/../routes`
+/// (`docs/design/routes-and-profiles.md` §2) — the Messages adapter's
+/// `anthropic-subscription` and the Responses adapter's `openai-codex-subscription`
+/// routes among them. Tool keys: `read`, `edit`, `write`, `grep`, `shell`,
+/// `apply_patch`, and — with the `delegation` feature and a worker service present —
+/// the four `worker_*` tools.
 ///
 /// A routed key is selected with `route` + `profile` and refuses the whole-provider
 /// form; a whole provider refuses a profile. A route file whose id collides with a
@@ -199,27 +200,14 @@ fn build_catalog_inner(
 
 /// The compiled whole-provider keys: a catalog key that consumes no profile. A route
 /// file may not take one of these ids, and a `route` naming one is the wrong-form
-/// error the whole provider itself reports. `anthropic-subscription` left this list
-/// in ADR-0039 step 4: it is a route file now.
-pub const WHOLE_PROVIDERS: [&str; 1] = ["openai-codex-subscription"];
+/// error the whole provider itself reports. The list is EMPTY since ADR-0039 step 4b:
+/// `anthropic-subscription` and `openai-codex-subscription` are route files now. The
+/// MECHANISM stays for test fakes and the next whole provider: a key registered
+/// outside the route files still reports its wrong form through [`reject_profile`],
+/// which is why that helper is kept.
+pub const WHOLE_PROVIDERS: [&str; 0] = [];
 
 fn register_providers(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
-    let transport = deps.transport.clone();
-    catalog.provider(
-        WHOLE_PROVIDERS[0],
-        Box::new(move |spec: &ProviderSpec| {
-            reject_profile(spec)?;
-            let credentials = p1_provider_openai::CodexCliCredentials::from_default_location()
-                .map_err(|error| error.to_string())?;
-            let provider = p1_provider_openai::OpenAiCodexProvider::new(
-                &spec.model,
-                transport.clone(),
-                Arc::new(credentials),
-            );
-            Ok(Arc::new(provider) as Arc<dyn Provider>)
-        }),
-    );
-
     register_routes(catalog, deps)
 }
 
@@ -287,8 +275,11 @@ fn require_profile(spec: &ProviderSpec) -> Result<Arc<p1_model_profile::ModelPro
 }
 
 /// A whole provider that consumes no profile. The new form on such a key is a load
-/// error that says which form to write instead; there is no fallback.
-fn reject_profile(spec: &ProviderSpec) -> Result<(), String> {
+/// error that says which form to write instead; there is no fallback. No shipped key
+/// is whole any more (see [`WHOLE_PROVIDERS`]); this stays PUBLIC because it is the
+/// half of the whole-provider mechanism a test fake's factory composes with — the
+/// next whole provider registers exactly like the fakes do.
+pub fn reject_profile(spec: &ProviderSpec) -> Result<(), String> {
     if spec.profile.is_some() {
         return Err(format!(
             "`{}` is a whole provider and takes no profile: write `provider`, `model` and \
@@ -326,6 +317,17 @@ pub fn route_provider(
         AdapterSettings::AnthropicMessages(settings) => {
             let provider = p1_provider_anthropic::AnthropicProvider::new(
                 messages_route_from(route, settings),
+                &binding.wire_model,
+                profile,
+                transport,
+                credentials,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(Arc::new(provider) as Arc<dyn Provider>)
+        }
+        AdapterSettings::OpenAiResponses(settings) => {
+            let provider = p1_provider_openai::OpenAiCodexProvider::new(
+                responses_route_from(route, settings),
                 &binding.wire_model,
                 profile,
                 transport,
@@ -409,6 +411,33 @@ fn messages_route_from(
     settings: p1_provider_anthropic::MessagesAdapterSettings,
 ) -> p1_provider_anthropic::MessagesRoute {
     p1_provider_anthropic::MessagesRoute {
+        origin_route: route.origin_route.clone(),
+        endpoint: route.endpoint.clone(),
+        account: settings.account,
+    }
+}
+
+/// The Responses adapter's view of one route file: the recorded origin route, the
+/// endpoint and the account behaviour the file names (spec §7.2). Like a Messages
+/// route it carries no static headers today, so a `[headers]` table on such a route
+/// is empty in every shipped file; nothing else about a Responses route is data.
+pub fn responses_route(
+    route: &crate::routes::RouteFile,
+) -> Result<p1_provider_openai::ResponsesRoute, String> {
+    let crate::routes::AdapterSettings::OpenAiResponses(settings) = route.settings()? else {
+        return Err(format!(
+            "route \"{}\" names adapter \"{}\", not openai-responses",
+            route.id, route.adapter
+        ));
+    };
+    Ok(responses_route_from(route, settings))
+}
+
+fn responses_route_from(
+    route: &crate::routes::RouteFile,
+    settings: p1_provider_openai::ResponsesAdapterSettings,
+) -> p1_provider_openai::ResponsesRoute {
+    p1_provider_openai::ResponsesRoute {
         origin_route: route.origin_route.clone(),
         endpoint: route.endpoint.clone(),
         account: settings.account,

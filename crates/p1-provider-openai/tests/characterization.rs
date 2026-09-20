@@ -15,6 +15,7 @@
 //! `tests/fixtures_drive.rs::headers_and_request_body_are_sent_exactly` and
 //! `tests/fixtures_drive.rs::reasoning_turn_round_trips_replay`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -23,14 +24,75 @@ use p1_contracts::{
     BoxFuture, CancellationToken, Effort, ModelOptions, Provider, ProviderError, ProviderErrorKind,
     ProviderRequest, RouteDescription,
 };
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource, Transport};
-use p1_provider_openai::{OpenAiCodexProvider, ROUTE, build_headers, build_request};
+use p1_provider_openai::{
+    OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesRoute, build_headers, build_request,
+};
 use serde_json::{Value, json};
 
 mod fixtures;
 
 const CASES: &str = include_str!("fixtures/characterization/request_cases.json");
+
+/// The route data these expectations were recorded with: today's origin route,
+/// endpoint and account (spec §7.2). ADR-0039 step 4 moved them into
+/// `routes/openai-codex-subscription.toml` without changing a byte of what the
+/// adapter sends.
+fn route() -> ResponsesRoute {
+    ResponsesRoute {
+        origin_route: ROUTE.to_string(),
+        endpoint: "https://chatgpt.com/backend-api".to_string(),
+        account: ResponsesAccount::CodexSubscription,
+    }
+}
+
+/// The account these expectations were recorded with.
+fn account() -> ResponsesAccount {
+    ResponsesAccount::CodexSubscription
+}
+
+/// The profile the OLD rule selected — which for this adapter was NO rule at all:
+/// every model name took an effort level, and only `low`/`medium`/`high`; an
+/// effort-less request carried no reasoning fields. This mapping documents what
+/// the explicit `profiles/gpt-*.toml` records replaced; the fixture's expected
+/// values are untouched.
+fn profile_for(model: &str) -> ModelProfile {
+    ModelProfile {
+        id: model.to_string(),
+        revision: 1,
+        model_id: model.to_string(),
+        family: "gpt".to_string(),
+        thinking: ThinkingPolicy::EffortLevel,
+        efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+        default_effort: None,
+        thinking_budgets: BTreeMap::new(),
+        context_tokens: None,
+        max_output_tokens: None,
+    }
+}
+
+/// `build_request` over the route and the profile `model` selects.
+fn build(model: &str, request: &ProviderRequest) -> Result<Value, ProviderError> {
+    build_request(&route(), model, &profile_for(model), request)
+}
+
+/// The adapter composed with the route and the profile `model` selects.
+fn provider_with(
+    model: &str,
+    transport: Arc<dyn Transport>,
+    credentials: Arc<dyn CredentialSource>,
+) -> OpenAiCodexProvider {
+    OpenAiCodexProvider::new(
+        route(),
+        model,
+        Arc::new(profile_for(model)),
+        transport,
+        credentials,
+    )
+    .expect("the profile is expressible on the Responses wire")
+}
 
 fn user(text: &str) -> Item {
     Item::User {
@@ -160,11 +222,11 @@ fn request_cases_pin_the_exact_body_and_cache_headers() {
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let (model, options, history) = case_request(name);
-        let body = build_request(model, &request_for(options, history)).unwrap();
+        let body = build(model, &request_for(options, history)).unwrap();
         assert_eq!(body, case["body"], "body: {name}");
 
         let sent_cache_key = case["sent_cache_key"].as_str();
-        let headers = build_headers(&test_credential(), sent_cache_key).unwrap();
+        let headers = build_headers(account(), &test_credential(), sent_cache_key).unwrap();
         assert_eq!(
             header(&headers, "session_id"),
             case["session_id"].as_str(),
@@ -200,12 +262,12 @@ fn model_name_changes_only_the_model_field() {
         reasoning_effort: Some(Effort::Medium),
         ..ModelOptions::default()
     };
-    let sol = build_request(
+    let sol = build(
         "gpt-5.6-sol",
         &request_for(options.clone(), vec![user("hi")]),
     )
     .unwrap();
-    let mini = build_request("gpt-5.6-sol-mini", &request_for(options, vec![user("hi")])).unwrap();
+    let mini = build("gpt-5.6-sol-mini", &request_for(options, vec![user("hi")])).unwrap();
 
     assert_eq!(sol["model"], json!("gpt-5.6-sol"));
     assert_eq!(mini["model"], json!("gpt-5.6-sol-mini"));
@@ -226,7 +288,7 @@ fn extra_high_and_max_are_rejected_for_every_model() {
                 reasoning_effort: Some(effort),
                 ..ModelOptions::default()
             };
-            let error = build_request(model, &request_for(options, vec![user("hi")])).unwrap_err();
+            let error = build(model, &request_for(options, vec![user("hi")])).unwrap_err();
             assert_eq!(
                 error.kind,
                 ProviderErrorKind::InvalidRequest,
@@ -246,7 +308,7 @@ fn empty_cache_key_is_rejected_by_validate_not_sent_as_an_empty_key() {
         cache_key: Some(String::new()),
         ..ModelOptions::default()
     };
-    let error = OpenAiCodexProvider::new(
+    let error = provider_with(
         "gpt-5.6-sol",
         Arc::new(ScriptedTransport::new(Vec::new())),
         Arc::new(FixedCredentials),
@@ -264,6 +326,7 @@ fn empty_cache_key_is_rejected_by_validate_not_sent_as_an_empty_key() {
 #[test]
 fn cache_key_header_list_is_appended_in_order() {
     let headers = build_headers(
+        account(),
         &test_credential(),
         Some("0123456789012345678901234567890123456789012345678901234567890123"),
     )
@@ -332,7 +395,7 @@ impl CredentialSource for FixedCredentials {
 #[tokio::test]
 async fn provider_stream_sends_the_clamped_cache_key_in_the_body_and_headers() {
     let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
-    let provider = OpenAiCodexProvider::new(
+    let provider = provider_with(
         "gpt-5.6-sol",
         Arc::new(transport.clone()),
         Arc::new(FixedCredentials),
@@ -371,18 +434,26 @@ async fn provider_stream_sends_the_clamped_cache_key_in_the_body_and_headers() {
 
 fn provider(model: &str) -> OpenAiCodexProvider {
     let transport: Arc<dyn Transport> = Arc::new(ScriptedTransport::new(Vec::new()));
-    OpenAiCodexProvider::new(model, transport, Arc::new(FixedCredentials))
+    provider_with(model, transport, Arc::new(FixedCredentials))
 }
 
-/// Every shipped model name in the environments that use this adapter.
+/// Every shipped model name in the environments that use this adapter, read from
+/// the environment's profile and the route binding that profile carries.
 fn shipped_models() -> Vec<&'static str> {
     const ENVIRONMENTS: &[&str] = &[include_str!("../../../environments/gpt/environment.toml")];
+    const SHIPPED_ROUTE: &str = include_str!("../../../routes/openai-codex-subscription.toml");
     ENVIRONMENTS
         .iter()
         .map(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("model")?.split('"').nth(1))
-                .expect("a shipped environment names a model")
+            let profile = text
+                .lines()
+                .find_map(|line| line.strip_prefix("profile")?.split('"').nth(1))
+                .expect("a shipped environment names a profile");
+            SHIPPED_ROUTE
+                .lines()
+                .skip_while(|line| !line.trim().starts_with(&format!("[models.\"{profile}\"]")))
+                .find_map(|line| line.strip_prefix("wire_model")?.split('"').nth(1))
+                .expect("the shipped route binds the profile it serves")
         })
         .collect()
 }
