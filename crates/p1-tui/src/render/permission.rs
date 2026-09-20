@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use crate::grid;
 use crate::palette;
 
-use super::fill;
+use super::{FLOOR_REASON, decision_key, fill};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionView {
@@ -41,38 +41,19 @@ pub fn lines(view: &PermissionView, width: usize) -> Vec<Line<'static>> {
 /// the destructive floor the grant keys move to their OWN lines, greyed, with
 /// the reason inline (SPEC §4.5's layout).
 fn decision_lines(grantable: bool) -> Vec<Line<'static>> {
-    fn key(spans: &mut Vec<Span<'static>>, k: &str, label: &str, available: bool) {
-        let key_fg = if available {
-            palette::INK
-        } else {
-            palette::FAINT
-        };
-        spans.push(Span::styled(format!(" {k}  "), Style::new().fg(key_fg)));
-        spans.push(Span::styled(
-            format!("{label}     "),
-            Style::new().fg(if available {
-                palette::DIM
-            } else {
-                palette::FAINT
-            }),
-        ));
-    }
     let mut first = Vec::new();
-    key(&mut first, "y", "allow once", true);
+    decision_key(&mut first, "y", "allow once", true);
     if grantable {
-        key(&mut first, "a", "session", true);
-        key(&mut first, "p", "project", true);
+        decision_key(&mut first, "a", "session", true);
+        decision_key(&mut first, "p", "project", true);
     }
-    key(&mut first, "n", "deny", true);
+    decision_key(&mut first, "n", "deny", true);
     let mut out = vec![Line::from(first)];
     if !grantable {
         for (k, label) in [("a", "session"), ("p", "project")] {
             let mut spans = Vec::new();
-            key(&mut spans, k, label, false);
-            spans.push(Span::styled(
-                "not grantable — destructive floor",
-                Style::new().fg(palette::FAINT),
-            ));
+            decision_key(&mut spans, k, label, false);
+            spans.push(Span::styled(FLOOR_REASON, Style::new().fg(palette::FAINT)));
             out.push(Line::from(spans));
         }
     }

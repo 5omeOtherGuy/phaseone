@@ -13,6 +13,8 @@ use ratatui::text::{Line, Span};
 use crate::glyphs;
 use crate::palette;
 
+use super::{FLOOR_REASON, decision_key};
+
 /// One row of the diff body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffRow {
@@ -164,41 +166,26 @@ fn diff_row(row: &DiffRow, width: usize) -> Line<'static> {
 /// The decision footer (SPEC §4.4): single characters, spelled out. The
 /// destructive floor greys the grant rows with the reason inline (§4.5).
 fn footer(grantable: bool, multi: bool) -> Vec<Line<'static>> {
-    let key = |k: &str, label: &str, available: bool| {
-        let fg = if available {
-            palette::INK
-        } else {
-            palette::FAINT
-        };
-        vec![
-            Span::styled(format!(" {k}  "), Style::new().fg(fg)),
-            Span::styled(
-                format!("{label}     "),
-                Style::new().fg(if available {
-                    palette::DIM
-                } else {
-                    palette::FAINT
-                }),
-            ),
-        ]
-    };
-    let mut first = key("y", "allow once", true);
+    let mut first = Vec::new();
+    decision_key(&mut first, "y", "allow once", true);
     if grantable {
-        first.extend(key("a", "session", true));
-        first.extend(key("p", "project", true));
+        decision_key(&mut first, "a", "session", true);
+        decision_key(&mut first, "p", "project", true);
     } else {
-        first.extend(key(
+        decision_key(
+            &mut first,
             "a",
-            "session      not grantable — destructive floor",
+            &format!("session      {FLOOR_REASON}"),
             false,
-        ));
-        first.extend(key(
+        );
+        decision_key(
+            &mut first,
             "p",
-            "project      not grantable — destructive floor",
+            &format!("project      {FLOOR_REASON}"),
             false,
-        ));
+        );
     }
-    first.extend(key("n", "deny", true));
+    decision_key(&mut first, "n", "deny", true);
     let second = if multi {
         Line::styled(
             "                            ^D next file   ^A all files",

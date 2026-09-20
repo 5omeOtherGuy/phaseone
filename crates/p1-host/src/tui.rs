@@ -583,7 +583,11 @@ where
         if let Some(text) = prompt.take() {
             let child = cancel.child_token();
             driver.policy.set_turn(Some(child.clone()));
-            let end = pump(
+            // Bind mutably: the drain loop below can run more than one
+            // inbox sub-turn, and the end that decides whether to stop is
+            // the LAST one. A `let` inside the loop would shadow this and
+            // the check would read the first turn's end instead.
+            let mut end = pump(
                 terminal,
                 driver,
                 &mut keys,
@@ -596,7 +600,7 @@ where
             .await;
             driver.note_turn_end(&end);
             while !child.is_cancelled() && agent.has_pending_inbox() {
-                let end = pump(
+                end = pump(
                     terminal,
                     driver,
                     &mut keys,

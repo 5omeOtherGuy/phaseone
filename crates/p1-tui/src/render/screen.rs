@@ -115,26 +115,56 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     };
 
     // The transcript pins to the bottom: the newest rows are always visible.
+    let width = transcript_area.width as usize;
+    let fits = transcript_area.height as usize;
+    // The full transcript height keeps the scroll math in absolute row
+    // numbers (state.rs scroll_by) and locates a scrolled window from the end.
+    let total_rows = transcript::count_rows(&screen.transcript, width);
+    // Build only what the viewport can show. The live tail is `fits` rows;
+    // scrolled back to absolute row `s`, every row from `s` to the end is the
+    // window's material. (This is the correct form of `fits + scroll`; the
+    // absolute scroll_top is measured from the top, not the bottom.)
+    let max_rows = match screen.scroll_top {
+        Some(s) => total_rows.saturating_sub(s),
+        None => fits,
+    };
     let working_label = screen.working.as_ref().map(|w| w.label.as_str());
     let mut body = transcript::lines(
         &screen.transcript,
-        transcript_area.width as usize,
+        width,
+        max_rows,
         working_label,
         now_ms,
         screen.reduced_motion,
     );
+    let tail_rows = total_rows.min(max_rows);
     // A docked overlay reserves rows above the composer; it never floats.
     if let Some(p) = &screen.picker {
         body.push(Line::default());
-        body.extend(picker::lines(p, transcript_area.width as usize));
+        body.extend(picker::lines(p, width));
     }
     if let Some(groups) = &screen.status {
         body.push(Line::default());
-        body.extend(status::lines(groups, transcript_area.width as usize));
+        body.extend(status::lines(groups, width));
     }
-    // Record the rendered shape for the scroll math (state.rs scroll_by).
-    screen.last_rendered = (body.len(), transcript_area.height as usize);
-    draw_lines_bottom(&body, transcript_area, buf, screen.scroll_top);
+    // Record the rendered shape for the scroll math (state.rs scroll_by). The
+    // body is a suffix of a full render: `total_rows` transcript rows plus the
+    // working/overlay rows appended after the tail.
+    let appended = body.len().saturating_sub(tail_rows);
+    screen.last_rendered = (total_rows + appended, fits);
+    match screen.scroll_top {
+        // The live tail is bottom-anchored: the working line and overlays sit
+        // at the bottom, exactly as a full render would draw them.
+        None => draw_lines_bottom(&body, transcript_area, buf, None),
+        // Scrolled: the built tail starts at the window's top row, so the
+        // window is the first `fits` rows of the body.
+        Some(s) => {
+            let offset = total_rows - tail_rows;
+            let start = s.saturating_sub(offset).min(body.len());
+            let end = (start + fits).min(body.len());
+            draw_lines(&body[start..end], transcript_area, buf);
+        }
+    }
 
     let composer_area = Rect {
         x: area.x,

@@ -413,3 +413,19 @@ parts to treat as fixed — they are the vocabulary everything else is built fro
 - OUTPUT pane: scroll only; `yank` waits on a clipboard seam, filter on pane
   input focus. `^T` (timeline) and `^D` (next file in batched approvals) are
   unwired — approvals arrive one call at a time, so there is nothing to page.
+- §3: the mock's two-line failure form (call row keeps `▸`, evidence indented
+  below) is implemented as the `✗` glyph plus evidence right-aligned on the
+  call row itself — one line, same information. Owner's call whether the mock
+  or this is canonical; recorded here per the refinement rule.
+- §4.1: `/resume`, `/env`, `/access` remain host-side commands; the TUI prelude
+  shows them but they are not TUI slash commands yet (a `/`-command reports it).
+- Fold handles are 32-bit hex (`h-7c21ab90`), not the mock's 4-hex `h-7c21`:
+  at 16 bits a long session's folds collide by birthday, and `^O` would open
+  the wrong output.
+- §5 pickers: the picker exists and is tested, but no production command opens
+  one yet (route switching is a host seam); §4.6 ships when that lands.
+- The `p` (project) grant scope shares the in-memory session set until a trust
+  store exists; §4.5's destructive floor waits on a tool-provided
+  destructiveness classification (not a UI-side pattern match).
+- `AgentEvent` has no usage-seeding on resume: the ledger's SPEND starts fresh
+  after `--resume` (the seam does not expose the restored `last_usage`).
