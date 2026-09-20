@@ -247,6 +247,82 @@ fn sandbox_usage_errors_exit_2_and_help_lists_the_flags() {
     assert!(help.contains("--sandbox-write PATH"), "help: {help}");
 }
 
+/// The host fills `Sandbox::runtime_dir` from `XDG_RUNTIME_DIR`, so a socket in
+/// the real runtime directory is not visible inside the sandbox.
+#[tokio::test]
+async fn the_host_replaces_the_runtime_dir_inside_the_sandbox() {
+    if !bwrap_usable() {
+        eprintln!("SKIP: bwrap unusable here");
+        return;
+    }
+    let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else {
+        eprintln!("SKIP: no usable XDG_RUNTIME_DIR here");
+        return;
+    };
+    let Ok(runtime) = tempfile::Builder::new()
+        .prefix("p1-sandbox-rt-")
+        .tempdir_in(&base)
+    else {
+        eprintln!("SKIP: no usable XDG_RUNTIME_DIR here");
+        return;
+    };
+    std::fs::write(runtime.path().join("agent.sock"), "socket").unwrap();
+    let home = tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["shell"],
+        "test",
+    );
+    let read_socket = serde_json::json!({
+        "command": format!("cat '{}/agent.sock'", runtime.path().display())
+    })
+    .to_string();
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "shell", &read_socket)]),
+        text_response("done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.home = Some(home.path().to_path_buf());
+    harness.deps.runtime_dir = Some(runtime.path().to_path_buf());
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--sandbox",
+            "workspace",
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let requests = handle.requests();
+    let results = tool_results(&requests.last().unwrap().history);
+    assert!(
+        !results.iter().any(|content| content.contains("socket")),
+        "the runtime socket must not be visible: {results:?}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|content| content.contains("[exit code: 0]")),
+        "reading the socket must fail: {results:?}"
+    );
+}
+
 /// A `SandboxError` fails assembly — exit 1, before any provider request — with a
 /// message that names the remedy. Workspace == home is the cheapest such error
 /// and needs no `bwrap`.

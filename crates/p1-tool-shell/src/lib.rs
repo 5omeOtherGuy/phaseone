@@ -68,12 +68,16 @@ pub const DEFAULT_HOME_VISIBLE: &[&str] = &[
 /// this; [`ShellTool::sandboxed`] turns it into a `bwrap` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sandbox {
-    /// The home directory to hide behind a `tmpfs`.
+    /// The home directory to hide behind a `tmpfs` (canonical once sandboxed).
     pub home: PathBuf,
     /// Paths relative to `home` that stay visible (read-only) if they exist.
     pub home_visible: Vec<PathBuf>,
     /// Extra absolute paths that stay writable if they exist.
     pub writable: Vec<PathBuf>,
+    /// A private runtime directory to replace (an empty `tmpfs`), when set and
+    /// existing. The host fills it from `XDG_RUNTIME_DIR`; `for_home` leaves it
+    /// `None`.
+    pub runtime_dir: Option<PathBuf>,
 }
 
 impl Sandbox {
@@ -83,6 +87,7 @@ impl Sandbox {
             home: home.into(),
             home_visible: DEFAULT_HOME_VISIBLE.iter().map(PathBuf::from).collect(),
             writable: Vec::new(),
+            runtime_dir: None,
         }
     }
 }
@@ -158,11 +163,13 @@ impl ShellTool {
     /// `+sandbox` variant survive later `with_face` calls and vice versa.
     pub fn sandboxed(self, sandbox: Sandbox) -> Result<Self, SandboxError> {
         let workspace = self.workspace.root().to_path_buf();
+        // One canonical home for BOTH the containment check and the mounts: a home
+        // reached through a symlink must be hidden at the path bwrap is told about.
         let home = std::fs::canonicalize(&sandbox.home).unwrap_or_else(|_| sandbox.home.clone());
-        // Hiding the home would hide the workspace with it.
         if home == workspace || home.starts_with(&workspace) {
             return Err(SandboxError::WorkspaceContainsHome { workspace, home });
         }
+        let sandbox = Sandbox { home, ..sandbox };
         let private_tmp = tempfile::Builder::new()
             .prefix("p1-shell-sandbox-")
             .tempdir()
@@ -221,10 +228,10 @@ impl ShellTool {
 ///
 /// Pure, and the ORDER is part of the contract: a later mount covers an earlier
 /// one, so the private `/tmp` is mounted before the home and the workspace (a
-/// workspace may itself live under `/tmp` or under the home), the writable paths
-/// are bound back before the home is made read-only, and the workspace bind comes
-/// after the home's `tmpfs` but before `--remount-ro`. `bwrap` creates missing
-/// mount points itself.
+/// workspace may itself live under `/tmp` or under the home), the token masks are
+/// emitted AFTER every writable bind so no writable directory can uncover them,
+/// and the workspace bind comes after the home's `tmpfs` but before
+/// `--remount-ro`. `bwrap` creates missing mount points itself.
 pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Vec<OsString> {
     let home = &sandbox.home;
     let mut args: Vec<OsString> = Vec::new();
@@ -239,7 +246,8 @@ pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) 
     for arg in ["--setenv", "TMPDIR", "/tmp"] {
         args.push(arg.into());
     }
-    // 3. Hide the home behind a tmpfs, then put back only what stays visible.
+    // 3. Hide the home behind a tmpfs, then put back only what stays visible,
+    //    and replace the runtime directory (agent sockets and keyrings).
     args.push("--tmpfs".into());
     args.push(home.into());
     for entry in &sandbox.home_visible {
@@ -248,21 +256,27 @@ pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) 
             push_ro_bind(&mut args, &path);
         }
     }
-    // A visible `.cargo` must not leak a registry token.
+    if let Some(runtime_dir) = &sandbox.runtime_dir
+        && runtime_dir.exists()
+    {
+        args.push("--tmpfs".into());
+        args.push(runtime_dir.into());
+    }
+    // 4. Extra writable paths, if they exist; THEN the token masks, so a writable
+    //    bind (e.g. `--sandbox-write ~/.cargo`) cannot uncover a credential file.
+    for writable in &sandbox.writable {
+        if writable.exists() {
+            args.push("--bind".into());
+            args.push(writable.into());
+            args.push(writable.into());
+        }
+    }
     for name in ["credentials.toml", "credentials"] {
         let path = home.join(".cargo").join(name);
         if path.exists() {
             args.push("--ro-bind".into());
             args.push("/dev/null".into());
             args.push(path.into());
-        }
-    }
-    // 4. Extra writable paths, if they exist.
-    for writable in &sandbox.writable {
-        if writable.exists() {
-            args.push("--bind".into());
-            args.push(writable.into());
-            args.push(writable.into());
         }
     }
     // 5. The workspace, after the mounts that could cover it.

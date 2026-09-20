@@ -139,6 +139,7 @@ pub struct Sandbox {
     pub home: PathBuf,               // the home directory to hide
     pub home_visible: Vec<PathBuf>,  // RELATIVE to `home`; visible read-only if they exist
     pub writable: Vec<PathBuf>,      // extra absolute paths that stay writable if they exist
+    pub runtime_dir: Option<PathBuf>, // e.g. $XDG_RUNTIME_DIR: hidden behind a tmpfs (agent sockets, keyrings)
 }
 impl Sandbox {
     /// `home_visible` = the entries of `DEFAULT_HOME_VISIBLE` — `.cargo`, `.rustup`,

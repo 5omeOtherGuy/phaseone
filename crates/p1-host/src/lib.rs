@@ -138,6 +138,8 @@ pub struct HostDeps {
     pub stdout_is_tty: bool,
     /// The home directory the sandbox hides, from `HOME`. Tests inject a fake one.
     pub home: Option<std::path::PathBuf>,
+    /// The runtime directory the sandbox replaces, from `XDG_RUNTIME_DIR`.
+    pub runtime_dir: Option<std::path::PathBuf>,
     /// Test-only hook: called with the fully built catalog, after the built-in
     /// providers and tools are registered, so a test can add or replace entries.
     pub catalog_hook: Option<CatalogHook>,
@@ -149,9 +151,9 @@ pub struct HostDeps {
 
 impl HostDeps {
     /// Construct the injected dependencies. `catalog_hook` and, under the
-    /// delegation feature, `worker_service` start empty; `home` is read from
-    /// `HOME` (tests inject a fake one). The sandbox selection is NOT here: it is
-    /// parsed command-line state on [`cli::Options`].
+    /// delegation feature, `worker_service` start empty; `home` and `runtime_dir`
+    /// are read from `HOME` and `XDG_RUNTIME_DIR` (tests inject fakes). The sandbox
+    /// selection is NOT here: it is parsed command-line state on [`cli::Options`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         stdout: SharedWriter,
@@ -173,6 +175,7 @@ impl HostDeps {
             environment_dirs,
             stdout_is_tty,
             home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+            runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
             catalog_hook: None,
             #[cfg(feature = "delegation")]
             worker_service: None,

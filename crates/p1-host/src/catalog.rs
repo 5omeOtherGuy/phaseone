@@ -201,6 +201,7 @@ fn register_standard_tools(
     let choice = sandbox;
     let writable = sandbox_write.to_vec();
     let home = deps.home.clone();
+    let runtime_dir = deps.runtime_dir.clone();
     catalog.tool(
         "shell",
         Box::new(move |spec: &ToolSpec, services: &ToolServices| {
@@ -219,6 +220,7 @@ fn register_standard_tools(
                     };
                     let mut sandbox = p1_tool_shell::Sandbox::for_home(home);
                     sandbox.writable = writable.clone();
+                    sandbox.runtime_dir = runtime_dir.clone();
                     tool.sandboxed(sandbox).map_err(|error| error.to_string())?
                 }
             };

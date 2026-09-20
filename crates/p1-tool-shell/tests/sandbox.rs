@@ -331,8 +331,15 @@ fn h_a_workspace_that_contains_the_home_is_refused() {
 // ------------------------------------------------------------------------ (i)
 
 /// The argument vector exactly as the mount plan lists it: `/tmp` before the
-/// home, the home before the workspace, `--remount-ro` after every bind.
-fn expected_args(home: &Path, workspace: &Path, tmp: &Path, writable: &[&Path]) -> Vec<String> {
+/// home, the runtime dir right after the visible entries, the token masks AFTER
+/// every writable bind, the workspace last before `--remount-ro`.
+fn expected_args(
+    home: &Path,
+    workspace: &Path,
+    tmp: &Path,
+    writable: &[&Path],
+    runtime_dir: Option<&Path>,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--ro-bind".into(),
         "/".into(),
@@ -360,21 +367,26 @@ fn expected_args(home: &Path, workspace: &Path, tmp: &Path, writable: &[&Path]) 
             ]);
         }
     }
-    for name in ["credentials.toml", "credentials"] {
-        let path = home.join(".cargo").join(name);
-        if path.exists() {
-            args.extend([
-                "--ro-bind".into(),
-                "/dev/null".into(),
-                path.display().to_string(),
-            ]);
-        }
+    if let Some(runtime_dir) = runtime_dir
+        && runtime_dir.exists()
+    {
+        args.extend(["--tmpfs".into(), runtime_dir.display().to_string()]);
     }
     for path in writable {
         if path.exists() {
             args.extend([
                 "--bind".into(),
                 path.display().to_string(),
+                path.display().to_string(),
+            ]);
+        }
+    }
+    for name in ["credentials.toml", "credentials"] {
+        let path = home.join(".cargo").join(name);
+        if path.exists() {
+            args.extend([
+                "--ro-bind".into(),
+                "/dev/null".into(),
                 path.display().to_string(),
             ]);
         }
@@ -393,7 +405,8 @@ fn expected_args(home: &Path, workspace: &Path, tmp: &Path, writable: &[&Path]) 
     args
 }
 
-/// A workspace under `/tmp` (the common case for `tempfile`-based callers).
+/// A workspace under `/tmp` (the common case for `tempfile`-based callers), with
+/// a writable path, a nonexistent writable path and a runtime dir.
 #[test]
 fn i_bwrap_args_order_for_a_workspace_under_tmp() {
     let home = tempfile::tempdir().unwrap();
@@ -403,16 +416,19 @@ fn i_bwrap_args_order_for_a_workspace_under_tmp() {
     std::fs::create_dir_all(&workspace).unwrap();
     let extra = tempfile::tempdir().unwrap();
     let private_tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
     let missing = home.path().join("does-not-exist");
 
     let mut sandbox = Sandbox::for_home(home.path());
     sandbox.writable = vec![extra.path().to_path_buf(), missing.clone()];
+    sandbox.runtime_dir = Some(runtime_dir.path().to_path_buf());
     let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
     let expected = expected_args(
         home.path(),
         &workspace,
         private_tmp.path(),
         &[extra.path(), &missing],
+        Some(runtime_dir.path()),
     );
 
     assert_eq!(os_args(&args), expected);
@@ -430,9 +446,51 @@ fn i_bwrap_args_order_for_a_workspace_under_the_home() {
 
     let sandbox = Sandbox::for_home(home.path());
     let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
-    let expected = expected_args(home.path(), &workspace, private_tmp.path(), &[]);
+    let expected = expected_args(home.path(), &workspace, private_tmp.path(), &[], None);
 
     assert_eq!(os_args(&args), expected);
+}
+
+/// The masks must come AFTER the writable binds: a `--sandbox-write ~/.cargo`
+/// must not cover the `/dev/null` mask and expose the token.
+#[test]
+fn i_token_masks_come_after_the_writable_binds() {
+    let home = tempfile::tempdir().unwrap();
+    let cargo = home.path().join(".cargo");
+    std::fs::create_dir_all(&cargo).unwrap();
+    std::fs::write(cargo.join("credentials.toml"), "TOKEN-CANARY").unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let private_tmp = tempfile::tempdir().unwrap();
+
+    let mut sandbox = Sandbox::for_home(home.path());
+    sandbox.writable = vec![cargo.clone()];
+    let args = os_args(&bwrap_args(&sandbox, &workspace, private_tmp.path()));
+
+    let writable = args
+        .windows(3)
+        .position(|window| window[0] == "--bind" && window[1] == cargo.display().to_string())
+        .expect("the writable .cargo bind must be present");
+    let mask = args
+        .windows(3)
+        .position(|window| {
+            window[0] == "--ro-bind"
+                && window[1] == "/dev/null"
+                && window[2] == cargo.join("credentials.toml").display().to_string()
+        })
+        .expect("the credentials mask must be present");
+    assert!(
+        mask > writable,
+        "the mask must come after the writable bind"
+    );
+    let workspace_bind = args
+        .windows(3)
+        .position(|window| window[0] == "--bind" && window[1] == workspace.display().to_string())
+        .expect("the workspace bind must be present");
+    assert!(
+        mask < workspace_bind,
+        "the mask must come before the workspace bind"
+    );
 }
 
 /// Requirement 4: `with_face` after `sandboxed` and `sandboxed` after
@@ -515,4 +573,155 @@ fn the_default_visible_entries_are_exactly_the_spec_list() {
             ".config/git"
         ]
     );
+}
+
+// ------------------------------------------------------- token masks (real bwrap)
+
+const CANARY: &str = "TOKEN-CANARY";
+
+/// A fake home whose `.cargo/credentials.toml` holds [`CANARY`], plus the
+/// workspace `H/ws`.
+struct CargoHome {
+    home: tempfile::TempDir,
+    workspace: PathBuf,
+}
+
+impl CargoHome {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let cargo = home.path().join(".cargo");
+        std::fs::create_dir_all(cargo.join("bin")).unwrap();
+        std::fs::write(cargo.join("credentials.toml"), CANARY).unwrap();
+        let workspace = home.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        Self { home, workspace }
+    }
+}
+
+/// A writable `.cargo` bind must not uncover the `/dev/null` token mask.
+#[tokio::test]
+async fn the_token_mask_survives_a_writable_cargo_bind() {
+    require_bwrap!();
+    let fixture = CargoHome::new();
+    let tool = sandboxed(
+        fixture.home.path(),
+        &fixture.workspace,
+        vec![fixture.home.path().join(".cargo")],
+    );
+
+    let read = execute(
+        &tool,
+        &format!(
+            "cat '{}/.cargo/credentials.toml'",
+            fixture.home.path().display()
+        ),
+    )
+    .await;
+    assert!(!read.content.contains(CANARY), "the token leaked: {read:?}");
+
+    // The rest of the writable directory is really writable.
+    let touch = execute(
+        &tool,
+        &format!("touch '{}/.cargo/ok'", fixture.home.path().display()),
+    )
+    .await;
+    assert!(exited_zero(&touch), "{touch:?}");
+    assert!(fixture.home.path().join(".cargo/ok").exists());
+}
+
+/// The same home without a writable entry: the mask still hides the token.
+#[tokio::test]
+async fn the_token_mask_hides_the_token_without_a_writable_entry() {
+    require_bwrap!();
+    let fixture = CargoHome::new();
+    let tool = sandboxed(fixture.home.path(), &fixture.workspace, Vec::new());
+
+    let read = execute(
+        &tool,
+        &format!(
+            "cat '{}/.cargo/credentials.toml'",
+            fixture.home.path().display()
+        ),
+    )
+    .await;
+    assert!(!read.content.contains(CANARY), "the token leaked: {read:?}");
+
+    let touch = execute(
+        &tool,
+        &format!("touch '{}/.cargo/z'", fixture.home.path().display()),
+    )
+    .await;
+    assert!(
+        !exited_zero(&touch),
+        "the visible .cargo is read-only: {touch:?}"
+    );
+}
+
+// ------------------------------------------------------ canonical home (symlink)
+
+/// A home reached through a symlink is hidden at BOTH paths: the containment
+/// check and the mounts use the same canonical path. The link lives in the
+/// workspace (which is visible), so the canonical home really must be the one
+/// hidden.
+#[tokio::test]
+async fn a_symlinked_home_is_hidden_at_both_paths() {
+    require_bwrap!();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".secret")).unwrap();
+    std::fs::write(home.path().join(".secret/token"), CANARY).unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let link = workspace.join("H-link");
+    std::os::unix::fs::symlink(home.path(), &link).unwrap();
+
+    let tool = sandboxed(&link, &workspace, Vec::new());
+
+    for path in [home.path(), &link] {
+        let read = execute(&tool, &format!("cat '{}/.secret/token'", path.display())).await;
+        assert!(!read.content.contains(CANARY), "{path:?} leaked: {read:?}");
+        assert!(!exited_zero(&read), "{path:?} must not be readable");
+    }
+}
+
+// --------------------------------------------------------- runtime dir (XDG)
+
+/// `XDG_RUNTIME_DIR` is replaced by an empty tmpfs: agent sockets and keyrings
+/// are not visible inside the sandbox.
+#[tokio::test]
+async fn the_runtime_directory_is_not_visible_inside_the_sandbox() {
+    require_bwrap!();
+    let home = tempfile::tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // The runtime dir must live outside /tmp and the home for the test to be
+    // meaningful: both are shadowed anyway, so a socket there proves nothing.
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let Some(base) = base.filter(|base| base.is_dir()) else {
+        eprintln!("SKIP: no usable XDG_RUNTIME_DIR here");
+        return;
+    };
+    let Ok(runtime) = tempfile::Builder::new()
+        .prefix("p1-sandbox-rt-")
+        .tempdir_in(&base)
+    else {
+        eprintln!("SKIP: no usable XDG_RUNTIME_DIR here");
+        return;
+    };
+    std::fs::write(runtime.path().join("agent.sock"), "socket").unwrap();
+
+    let mut sandbox = Sandbox::for_home(home.path());
+    sandbox.runtime_dir = Some(runtime.path().to_path_buf());
+    let tool = ShellTool::new(Workspace::new(&workspace).unwrap())
+        .sandboxed(sandbox)
+        .expect("the bwrap probe must succeed");
+
+    let listing = execute(&tool, &format!("ls -a '{}'", runtime.path().display())).await;
+    assert!(!listing.content.contains("agent.sock"), "{listing:?}");
+    let read = execute(
+        &tool,
+        &format!("cat '{}/agent.sock'", runtime.path().display()),
+    )
+    .await;
+    assert!(!read.content.contains("socket"), "{read:?}");
+    assert!(!exited_zero(&read), "{read:?}");
 }
