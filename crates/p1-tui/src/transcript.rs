@@ -35,6 +35,8 @@ pub enum Block {
     Info { lines: Vec<String> },
     /// A turn-level notice (§4.9): what broke, what it cost, what is intact.
     Notice { lines: Vec<String> },
+    /// A quiet meta line (context replacement, inbox delivery): DIM, one row.
+    Meta { text: String },
 }
 
 /// One tool call row of the §3 column grid.
@@ -80,6 +82,8 @@ impl ToolRow {
 pub struct Transcript {
     pub blocks: Vec<Block>,
     outputs: HashMap<FoldId, String>,
+    /// The most recently registered fold — what `^O` opens.
+    pub latest_fold: Option<FoldId>,
     /// Index of the block streaming text deltas land in, while it is open.
     open_text: Option<usize>,
     open_reasoning: Option<usize>,
@@ -114,7 +118,23 @@ impl Transcript {
             AgentEvent::ReasoningDelta { text } => self.reasoning_delta(text),
             AgentEvent::ToolInputDelta { .. } => {}
             AgentEvent::ResponseCompleted { .. } => self.close_streams(),
-            AgentEvent::InboxDelivered { .. } | AgentEvent::ContextReplaced { .. } => {}
+            AgentEvent::InboxDelivered { count } => {
+                self.blocks.push(Block::Meta {
+                    text: format!(
+                        "{} {count} notification(s) delivered",
+                        crate::glyphs::PENDING
+                    ),
+                });
+            }
+            AgentEvent::ContextReplaced {
+                items_before,
+                items_after,
+                ..
+            } => {
+                self.blocks.push(Block::Meta {
+                    text: format!("context: summarized {items_before} → {items_after} items"),
+                });
+            }
             AgentEvent::ToolStarted { call } => self.tool_started(call),
             AgentEvent::ToolFinished { result } => self.tool_finished(result, elapsed_ms),
             AgentEvent::TurnFinished { end } => self.turn_finished(end),
@@ -172,19 +192,79 @@ impl Transcript {
     }
 
     fn tool_finished(&mut self, result: &ToolResultItem, elapsed_ms: Option<u64>) {
-        let Some(index) = self.running.remove(&result.call_id) else {
+        self.settle(
+            &result.call_id,
+            RowStatus::Settled(result.status),
+            &result.content,
+            elapsed_ms,
+        );
+    }
+
+    /// Settle the row a call started, wherever the outcome came from (live
+    /// event or journal replay).
+    fn settle(&mut self, call_id: &str, status: RowStatus, content: &str, elapsed_ms: Option<u64>) {
+        let Some(index) = self.running.remove(call_id) else {
             return;
         };
         let Block::Call(row) = &mut self.blocks[index] else {
             return;
         };
-        row.status = RowStatus::Settled(result.status);
+        row.status = status;
         row.elapsed_ms = elapsed_ms;
-        if !result.content.is_empty() {
-            if let Some(Fold::Folded { id, .. }) = row.fold_for(&result.content) {
-                self.outputs.insert(id, result.content.clone());
+        if !content.is_empty() {
+            if let Some(Fold::Folded { id, .. }) = row.fold_for(content) {
+                self.latest_fold = Some(id.clone());
+                self.outputs.insert(id, content.to_string());
             }
-            row.output = Some(result.content.clone());
+            row.output = Some(content.to_string());
+        }
+    }
+
+    /// A quiet meta line from the driver (`· …`), e.g. an unknown command.
+    pub fn note(&mut self, text: &str) {
+        self.blocks.push(Block::Meta {
+            text: text.to_string(),
+        });
+    }
+
+    /// Paint a resumed journal's projected history into transcript blocks, so
+    /// a resumed session shows where it stands (the same shapes, unelapsed).
+    pub fn paint_history(&mut self, items: &[p1_contracts::Item]) {
+        use p1_contracts::{AssistantBlock, Item};
+        for item in items {
+            match item {
+                Item::User { text } => self.operator(text.clone()),
+                Item::Inbox { text, .. } => self.blocks.push(Block::Meta { text: text.clone() }),
+                Item::Assistant(assistant) => {
+                    for block in &assistant.blocks {
+                        match block {
+                            AssistantBlock::Text { text } => {
+                                self.close_streams();
+                                self.blocks.push(Block::Prose {
+                                    lines: text.lines().map(str::to_string).collect(),
+                                    open: false,
+                                });
+                            }
+                            AssistantBlock::Reasoning { text, .. } => {
+                                self.close_streams();
+                                self.blocks.push(Block::Reasoning {
+                                    lines: text.lines().map(str::to_string).collect(),
+                                    open: false,
+                                    expanded: false,
+                                    elapsed_ms: None,
+                                });
+                            }
+                            AssistantBlock::ToolCall(call) => self.tool_started(call),
+                        }
+                    }
+                }
+                Item::ToolResult(result) => self.settle(
+                    &result.call_id,
+                    RowStatus::Settled(result.status),
+                    &result.content,
+                    None,
+                ),
+            }
         }
     }
 

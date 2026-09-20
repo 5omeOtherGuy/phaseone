@@ -9,8 +9,10 @@
 pub mod fold;
 pub mod glyphs;
 pub mod grid;
+pub mod input;
 pub mod palette;
 pub mod render;
+pub mod runtime;
 pub mod state;
 pub mod transcript;
 pub mod wrap;

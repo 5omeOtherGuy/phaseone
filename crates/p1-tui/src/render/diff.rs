@@ -36,6 +36,71 @@ pub struct DiffView {
     pub grantable: bool,
 }
 
+impl DiffView {
+    /// Build the review for an `edit`-shaped call (JSON `{file_path,
+    /// old_string, new_string}`). `current` is the file's content now; when
+    /// the string is not found (the file moved on) the review still shows the
+    /// change, unnumbered. Context is two lines around the change.
+    ///
+    /// This is a presentation adapter (seams: renderers never parse wire
+    /// formats; the caller parses the tool's input and reads the file).
+    pub fn from_edit(
+        tool: &str,
+        path: &str,
+        old: &str,
+        new: &str,
+        current: Option<&str>,
+        position: (usize, usize),
+    ) -> Self {
+        let old_lines: Vec<&str> = old.lines().collect();
+        let new_lines: Vec<&str> = new.lines().collect();
+        let current_lines: Vec<&str> = current.map(|c| c.lines().collect()).unwrap_or_default();
+        // Locate old_string: exact match of the first line anchors the hunk.
+        let anchor = old_lines.first().and_then(|first| {
+            current_lines
+                .iter()
+                .position(|l| l.trim_end() == first.trim_end())
+        });
+        let mut rows = Vec::new();
+        // Up to two context lines immediately before the anchor.
+        if let Some(anchor) = anchor {
+            let from = anchor.saturating_sub(2);
+            for (n, line) in current_lines
+                .iter()
+                .enumerate()
+                .skip(from)
+                .take(anchor - from)
+            {
+                rows.push(DiffRow::Context {
+                    line: n as u32 + 1,
+                    text: line.to_string(),
+                });
+            }
+        }
+        let first_line = anchor.map(|a| a as u32 + 1).unwrap_or(0);
+        for (n, line) in old_lines.iter().enumerate() {
+            rows.push(DiffRow::Del {
+                line: first_line + n as u32,
+                text: line.to_string(),
+            });
+        }
+        for (n, line) in new_lines.iter().enumerate() {
+            rows.push(DiffRow::Add {
+                line: first_line + n as u32,
+                text: line.to_string(),
+            });
+        }
+        Self {
+            tool: tool.to_string(),
+            file: path.to_string(),
+            summary: format!("replace exact string · {} line(s)", old_lines.len()),
+            position,
+            rows,
+            grantable: true,
+        }
+    }
+}
+
 const LINE_NUM_WIDTH: usize = 4;
 
 /// The review fills the width; the pane is hidden while it is up (SPEC §4.4).
@@ -194,6 +259,26 @@ mod tests {
         let footer = &text[text.len() - 2];
         assert!(footer.contains("y  allow once"));
         assert!(footer.contains("n  deny"));
+    }
+
+    #[test]
+    fn the_edit_adapter_anchors_and_marks() {
+        let current = "fn a() {}\nlet ready = worker.take_summary();\nlet old = true;\nfn b() {}\n";
+        let view = DiffView::from_edit(
+            "edit",
+            "src/x.rs",
+            "let old = true;",
+            "let old = false;",
+            Some(current),
+            (1, 1),
+        );
+        assert!(matches!(view.rows[0], DiffRow::Context { line: 1, .. }));
+        assert!(matches!(view.rows[1], DiffRow::Context { line: 2, .. }));
+        assert!(matches!(view.rows[2], DiffRow::Del { line: 3, .. }));
+        assert!(matches!(view.rows[3], DiffRow::Add { line: 3, .. }));
+        // Unfindable anchors still review, unnumbered.
+        let view = DiffView::from_edit("edit", "src/x.rs", "gone", "new", Some(current), (1, 1));
+        assert!(matches!(view.rows[0], DiffRow::Del { line: 0, .. }));
     }
 
     #[test]

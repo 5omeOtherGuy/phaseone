@@ -18,11 +18,13 @@ pub mod activity;
 pub mod auth;
 pub mod catalog;
 pub mod cli;
+pub mod frontend;
 pub mod policy;
 pub mod render;
 pub mod routes;
 pub mod run;
 pub mod session;
+pub mod tui;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
