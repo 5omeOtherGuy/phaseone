@@ -129,6 +129,18 @@ impl ContextPolicy for SummarizingContext {
             // What is summarized is everything outside the verbatim tail.
             let segments = plan::segments(history);
             let tail_start = plan::tail_start(history, &segments, self.config.keep_recent_tokens);
+
+            // "Nothing to summarize": when everything outside the kept tail units
+            // is a previous summary, a request could only buy the same summary back
+            // (context.md "Nothing to summarize"). Unit-less histories (a lone user
+            // message) still count as material.
+            let has_material = history.iter().enumerate().any(|(index, item)| {
+                !plan::in_tail_unit(index, tail_start, &segments) && !plan::is_summary_item(item)
+            });
+            if !has_material {
+                return nothing_to_summarize(next_input, wall);
+            }
+
             let render_budget = wall.saturating_sub(4_000);
             let rendered = render::transcript(
                 &history[..tail_start],
@@ -203,9 +215,9 @@ impl ContextPolicy for SummarizingContext {
             let summary = Item::User {
                 text: format!("{SUMMARY_MARKER}\n{answer}"),
             };
-            // The tail is the new history's floor. Shrink it while the estimate is
-            // still at or above the useful point; a one-unit tail cannot shrink, so
-            // that is accepted as the best possible replacement.
+            // The tail is the new history's floor and the spec halves
+            // `keep_recent_tokens` no lower than one unit. A one-unit tail cannot
+            // shrink, so the replacement is returned as it is instead of looping.
             let mut keep = self.config.keep_recent_tokens;
             let mut tail_start = plan::tail_start(history, &segments, keep);
             let mut items = plan::build_replacement(
@@ -271,6 +283,18 @@ fn failure(next_input: u64, wall: u64, reason: String) -> Result<Option<Prepared
     } else {
         Err(ContextError::Failed(format!(
             "context is full ({next_input} of {wall} tokens) and summarizing failed: {reason}"
+        )))
+    }
+}
+
+/// The "nothing to summarize" outcome: no request is made, and only a full
+/// context is a hard failure.
+fn nothing_to_summarize(next_input: u64, wall: u64) -> Result<Option<Prepared>, ContextError> {
+    if next_input < wall {
+        Ok(None)
+    } else {
+        Err(ContextError::Failed(format!(
+            "context is full ({next_input} of {wall} tokens) and nothing is left to summarize"
         )))
     }
 }

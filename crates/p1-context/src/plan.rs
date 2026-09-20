@@ -82,6 +82,14 @@ pub(crate) fn tail_units(segments: &Segments, tail_start: usize) -> usize {
         .count()
 }
 
+/// True when item `index` belongs to one of the units kept in the tail. Trailing
+/// user/inbox items after the last unit are NOT part of a unit and count as
+/// material for the "nothing to summarize" check.
+pub(crate) fn in_tail_unit(index: usize, tail_start: usize, segments: &Segments) -> bool {
+    let end = segments.units.last().map_or(tail_start, |(_, end)| *end);
+    index >= tail_start && index < end
+}
+
 /// Build `[summary] + kept user messages + tail`.
 ///
 /// The first user message (the task) is always kept; then the newest ones that fit

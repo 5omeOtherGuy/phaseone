@@ -279,3 +279,125 @@ async fn below_the_threshold_no_provider_call_is_made() {
     .await;
     assert!(answer.unwrap().is_none());
 }
+
+// ----------------------------------------------- nothing to summarize
+
+/// A config that always passes the threshold but stays below the wall.
+fn nothing_config(history: &[Item]) -> ContextConfig {
+    let total = estimate_tokens(history);
+    ContextConfig {
+        window_tokens: total + 5_000,
+        output_headroom_tokens: 1_000,
+        summarize_at_tokens: total.max(2) - 1,
+        keep_recent_tokens: 80,
+        user_verbatim_tokens: 100,
+        tool_result_excerpt_chars: 2_000,
+    }
+}
+
+// (a) one oversized unit: the tail covers everything, so there is nothing outside
+// it but the unit itself — and that unit is kept. No request, on either call.
+#[tokio::test(start_paused = true)]
+async fn a_single_oversized_unit_has_nothing_to_summarize() {
+    let history = vec![assistant_text("x".repeat(2_000))];
+    let provider = Arc::new(ScriptedProvider::new(vec![]));
+    let policy = policy(provider.clone(), nothing_config(&history));
+    assert!(prepare(&policy, &history).await.unwrap().is_none());
+    assert!(prepare(&policy, &history).await.unwrap().is_none());
+    assert!(provider.requests().is_empty());
+}
+
+// (b) the loop case: a real replacement leaves `[summary, single big unit]`; the
+// next prepare has nothing left to summarize and makes no further request.
+#[tokio::test(start_paused = true)]
+async fn after_a_replacement_the_loop_stops_with_no_further_request() {
+    let history = vec![
+        assistant_text("older ".repeat(500)),
+        assistant_text("y".repeat(200)),
+    ];
+    let mut cfg = config();
+    cfg.keep_recent_tokens = 1;
+    cfg.summarize_at_tokens = 100;
+
+    let first = Arc::new(ScriptedProvider::new(vec![text_response("prior")]));
+    let prepared = prepare(&policy(first.clone(), cfg.clone()), &history)
+        .await
+        .unwrap()
+        .expect("the older unit is summarized");
+    assert_eq!(first.requests().len(), 1);
+    assert_eq!(prepared.items.len(), 2);
+    assert!(
+        matches!(&prepared.items[0], Item::User { text } if text.starts_with(SUMMARY_MARKER)),
+        "the replacement starts with the summary item: {:?}",
+        prepared.items[0]
+    );
+
+    // The replacement is `[summary, single big unit]`: nothing is left to render.
+    let second = Arc::new(ScriptedProvider::new(vec![]));
+    let policy = policy(second.clone(), cfg);
+    assert!(prepare(&policy, &prepared.items).await.unwrap().is_none());
+    assert!(prepare(&policy, &prepared.items).await.unwrap().is_none());
+    assert!(second.requests().is_empty());
+}
+
+// (c) the same shape at the wall: no request, and the exact failure message.
+#[tokio::test(start_paused = true)]
+async fn nothing_to_summarize_at_the_wall_has_the_exact_message() {
+    let history = vec![assistant_text("x".repeat(2_000))];
+    let next = estimate_tokens(&history);
+    let cfg = ContextConfig {
+        window_tokens: next + 1_000,
+        output_headroom_tokens: 1_000,
+        summarize_at_tokens: 100,
+        keep_recent_tokens: 80,
+        user_verbatim_tokens: 100,
+        tool_result_excerpt_chars: 2_000,
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![]));
+    let answer = prepare(&policy(provider.clone(), cfg), &history).await;
+    let Err(ContextError::Failed(message)) = answer else {
+        panic!("expected ContextError::Failed");
+    };
+    assert_eq!(
+        message,
+        format!("context is full ({next} of {next} tokens) and nothing is left to summarize")
+    );
+    assert!(provider.requests().is_empty());
+}
+
+// (d) a previous summary plus new older material still rolls: one request.
+#[tokio::test(start_paused = true)]
+async fn a_previous_summary_plus_new_older_material_still_summarizes() {
+    let history = vec![
+        user(format!("{SUMMARY_MARKER}\nprior")),
+        assistant_text("older ".repeat(100)),
+        assistant_text("tail"),
+    ];
+    let mut cfg = config();
+    cfg.keep_recent_tokens = 80;
+    cfg.summarize_at_tokens = 100;
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response("rolled")]));
+    let prepared = prepare(&policy(provider.clone(), cfg), &history)
+        .await
+        .unwrap();
+    assert!(prepared.is_some());
+    assert_eq!(provider.requests().len(), 1);
+    let rendered = transcript(&provider);
+    assert!(rendered.contains("## Previous summary"));
+    assert!(rendered.contains("older"));
+}
+
+// A history with no units (a lone user message) is material: it is not a previous
+// summary, so it is still summarized.
+#[tokio::test(start_paused = true)]
+async fn a_unitless_history_is_still_material() {
+    let history = vec![user("only the user's words")];
+    let mut cfg = config();
+    cfg.summarize_at_tokens = 1;
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response("s")]));
+    let prepared = prepare(&policy(provider.clone(), cfg), &history)
+        .await
+        .unwrap();
+    assert!(prepared.is_some());
+    assert_eq!(provider.requests().len(), 1);
+}

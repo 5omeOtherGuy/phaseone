@@ -1,8 +1,8 @@
 //! Token estimation over the model-visible history.
 //!
 //! The estimate is deliberately crude and deterministic: `ceil(chars / 3.5)` over
-//! every character the model can see. It decides WHEN to summarize and whether a
-//! replacement is smaller, never how a provider bills.
+//! every character the model can see. It decides WHEN to summarize and whether the
+//! tail fits its budget, never how a provider bills.
 
 use p1_contracts::{AssistantBlock, Item};
 
