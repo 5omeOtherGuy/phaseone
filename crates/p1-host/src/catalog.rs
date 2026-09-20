@@ -2,12 +2,14 @@
 //! provider and tool crates. An environment file can only select keys registered
 //! here, so configuration can never load a module that was not compiled in.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use p1_assembly::{Catalog, ProviderSpec, ToolServices, ToolSpec};
 use p1_contracts::{Provider, Tool};
 
 use crate::HostDeps;
+use crate::cli::SandboxMode;
 
 /// Test-only hook run after the built-in catalog is populated. A test registers
 /// its fake provider factory here, replacing a real provider key.
@@ -76,11 +78,11 @@ macro_rules! apply_delegate_face {
 /// Provider construction reads no credential file; the credential sources are
 /// resolved lazily on the first `access`. Tools are constructed per agent with
 /// that agent's fresh [`ToolServices`].
-pub fn build_catalog(deps: &HostDeps) -> Catalog {
+pub fn build_catalog(deps: &HostDeps, sandbox: SandboxMode, sandbox_write: &[PathBuf]) -> Catalog {
     #[cfg(feature = "delegation")]
-    return build_catalog_with_workers(deps, deps.worker_service.clone());
+    return build_catalog_with_workers(deps, deps.worker_service.clone(), sandbox, sandbox_write);
     #[cfg(not(feature = "delegation"))]
-    build_catalog_inner(deps)
+    build_catalog_inner(deps, sandbox, sandbox_write)
 }
 
 /// As [`build_catalog`], with the worker tools bound to `service` instead of
@@ -89,10 +91,12 @@ pub fn build_catalog(deps: &HostDeps) -> Catalog {
 pub fn build_catalog_with_workers(
     deps: &HostDeps,
     service: Option<Arc<dyn p1_workers::WorkerService>>,
+    sandbox: SandboxMode,
+    sandbox_write: &[PathBuf],
 ) -> Catalog {
     let mut catalog = Catalog::new();
     register_providers(&mut catalog, deps);
-    register_standard_tools(&mut catalog);
+    register_standard_tools(&mut catalog, deps, sandbox, sandbox_write);
     register_delegation_tools(&mut catalog, service);
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
@@ -101,11 +105,15 @@ pub fn build_catalog_with_workers(
 }
 
 #[cfg(not(feature = "delegation"))]
-fn build_catalog_inner(deps: &HostDeps) -> Catalog {
+fn build_catalog_inner(
+    deps: &HostDeps,
+    sandbox: SandboxMode,
+    sandbox_write: &[PathBuf],
+) -> Catalog {
     let mut catalog = Catalog::new();
 
     register_providers(&mut catalog, deps);
-    register_standard_tools(&mut catalog);
+    register_standard_tools(&mut catalog, deps, sandbox, sandbox_write);
 
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
@@ -145,7 +153,12 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
     );
 }
 
-fn register_standard_tools(catalog: &mut Catalog) {
+fn register_standard_tools(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    sandbox: SandboxMode,
+    sandbox_write: &[PathBuf],
+) {
     catalog.tool(
         "read",
         Box::new(|spec: &ToolSpec, services: &ToolServices| {
@@ -185,13 +198,33 @@ fn register_standard_tools(catalog: &mut Catalog) {
             ))
         }),
     );
+    let choice = sandbox;
+    let writable = sandbox_write.to_vec();
+    let home = deps.home.clone();
+    let runtime_dir = deps.runtime_dir.clone();
     catalog.tool(
         "shell",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_shell::ShellTool::new(services.workspace.clone()),
-                spec
-            ))
+        Box::new(move |spec: &ToolSpec, services: &ToolServices| {
+            let tool = p1_tool_shell::ShellTool::new(services.workspace.clone());
+            // The sandbox is applied BEFORE `apply_face!`, so a face override keeps
+            // the sandbox paragraph and the `+sandbox` variant.
+            let tool = match choice {
+                SandboxMode::Off => tool,
+                SandboxMode::Workspace => {
+                    let Some(home) = home.clone() else {
+                        return Err(
+                            "--sandbox workspace needs HOME to know which home to hide: set HOME, \
+                             or pass --sandbox off"
+                                .to_string(),
+                        );
+                    };
+                    let mut sandbox = p1_tool_shell::Sandbox::for_home(home);
+                    sandbox.writable = writable.clone();
+                    sandbox.runtime_dir = runtime_dir.clone();
+                    tool.sandboxed(sandbox).map_err(|error| error.to_string())?
+                }
+            };
+            Ok(apply_face!(tool, spec))
         }),
     );
     catalog.tool(

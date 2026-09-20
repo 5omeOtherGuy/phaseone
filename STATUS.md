@@ -38,8 +38,21 @@ reviewer's AMENDMENTS to the lead's plan — authoritative, in full at
    additionally reproduced by the lead. Table: `docs/review-2026-09-20-dispositions.md`.
    ADR-0031 (session file owned before read). Open departures are issues #1 (workspace
    ownership), #2 (changed-route resume), #3 (child sessions not restored).
-1. NEXT → issue #1. Workspace ownership: serialize or isolate conflicting parent/child writes BEFORE any
-   concurrent dogfooding; first real tasks run in disposable task worktrees.
+1. DONE 2026-09-20: issue #1 workspace ownership (ADR-0032, shared WriteGate — file tools only,
+   shell NOT covered); issues #2/#3 resume decisions (ADR-0033 changed origin rejected in the
+   core; ADR-0034 workers not restored, ids reserved, user+model told). All on main, CI green.
+1b. IN FLIGHT (workers, deepseek high, via scripts/fanout.py — owner wants implementation
+   delegated by default, see memory `prefer-workers-for-implementation`):
+   - `../phaseone-shell-sandbox` (task/shell-sandbox): bubblewrap execution boundary for `shell`,
+     spec in tools.md on that branch, brief `../phaseone-briefs/shell-sandbox.md`, output
+     `shell-sandbox.out`. Lead afterwards: adversarial tests, diff read, ADR, merge. Needed
+     BEFORE dogfooding with --yes. Dogfood in disposable CLONES (a worktree's .git is outside it).
+   - `../phaseone-context-control` (task/context-control): spec `docs/design/context.md` on that
+     branch; job 1 = contract/core/testkit changes (§1), brief `context-contract.md`. THEN:
+     independent test author (sol, medium) for `p1-context` §2/§4 → deepseek implements →
+     assembly/host wiring (§3) → lead live canary check (repeated replacements).
+   - `../phaseone-run-report` (task/run-report): `scripts/run-report.py` + host test +
+     `docs/dogfood/`; gate running, then merge.
 2. Dogfood under supervision; run-level evidence grouped into issues; shell non-zero exits
    recorded separately from tool failures; look at Codex caching here.
 3. Context-control policy module (spec requirements listed in the amendments, item 4).

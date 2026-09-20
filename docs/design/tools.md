@@ -127,6 +127,83 @@ at once, and the tool returns only when the group is empty. Content:
 Non-zero exit is `ToolStatus::Ok` (the command ran; the model reads the code). The timeout is a
 tool parameter the MODEL chooses — not a harness-imposed limit on the agent.
 
+### `shell` sandbox — the execution boundary (optional; the HOST chooses it)
+
+Authorization decides WHETHER a command may run; it cannot constrain what a running command
+does. The sandbox is that constraint: with it, a `shell` command can write only inside the
+workspace and a private `/tmp`, and sees of the user's home only what is listed. It uses
+bubblewrap (`bwrap`, unprivileged user namespaces); nothing is installed or run as root.
+
+```rust
+pub struct Sandbox {
+    pub home: PathBuf,               // the home directory to hide
+    pub home_visible: Vec<PathBuf>,  // RELATIVE to `home`; visible read-only if they exist
+    pub writable: Vec<PathBuf>,      // extra absolute paths that stay writable if they exist
+    pub runtime_dir: Option<PathBuf>, // e.g. $XDG_RUNTIME_DIR: hidden behind a tmpfs (agent sockets, keyrings)
+}
+impl Sandbox {
+    /// `home_visible` = the entries of `DEFAULT_HOME_VISIBLE` — `.cargo`, `.rustup`,
+    /// `.local/bin`, `.local/lib`, `.nvm`, `.gitconfig`, `.config/git` — nothing else.
+    pub fn for_home(home: impl Into<PathBuf>) -> Self;
+}
+pub enum SandboxError { NotInstalled, Unavailable(String), WorkspaceContainsHome }
+impl ShellTool {
+    /// Probes ONCE (`bwrap <args> true`), so an unusable sandbox fails assembly, not the
+    /// first command. `NotInstalled`: no `bwrap` on PATH. `Unavailable(stderr)`: it cannot
+    /// run here (user namespaces disabled). `WorkspaceContainsHome`: the workspace root is
+    /// the home directory or an ancestor of it — hiding the home would hide the workspace.
+    pub fn sandboxed(self, sandbox: Sandbox) -> Result<Self, SandboxError>;
+}
+/// Pure, unit-tested: the argument vector before `bash -lc <command>`.
+pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Vec<OsString>;
+```
+
+The command becomes `bwrap <args> bash -lc <command>`; process group, timeout, cancellation,
+output capture and footers are exactly those of the unsandboxed tool. Mount plan — the ORDER
+is part of the contract, because a later mount covers an earlier one and a workspace may
+itself live under `/tmp` or under the home:
+1. `--ro-bind / /`, `--dev /dev`, `--proc /proc`;
+2. `--bind <private_tmp> /tmp` — a fresh directory per `ShellTool`, created under
+   `std::env::temp_dir()` and removed when the tool is dropped; `--setenv TMPDIR /tmp`;
+3. `--tmpfs <home>` (`<home>` CANONICAL — the same path the containment check used), then
+   `--ro-bind <home>/<entry> <home>/<entry>` for every existing `home_visible` entry;
+   `--tmpfs $XDG_RUNTIME_DIR` when that variable names an existing directory — agent sockets
+   and keyrings live there;
+4. `--bind <path> <path>` for every existing `writable` path; THEN the masks, so that no
+   writable bind can uncover them: `--ro-bind /dev/null <home>/.cargo/credentials.toml` (and
+   `…/credentials`) if that file exists — a visible or writable directory must not leak a token;
+5. `--bind <workspace root> <workspace root>`;
+6. `--remount-ro <home>` — writes to the hidden home fail loudly (`Read-only file system`)
+   instead of vanishing into a tmpfs;
+7. `--unshare-pid --die-with-parent --chdir <workspace root>`.
+The network stays shared (fetching dependencies is normal work). The PID namespace closes the
+hole the unsandboxed tool has: a process that leaves the process group (`setsid`, double
+fork) still dies with the sandbox when the command is cancelled or times out.
+
+Model-facing: the description gets one more paragraph — `Commands run in a sandbox: only the
+workspace and /tmp are writable, the rest of the filesystem is read-only, and most of the home
+directory is not visible. Do not try to install software outside the workspace.` — and the
+identity variant becomes `<variant>+sandbox`.
+
+Host: `--sandbox workspace|off` (default `off` in this increment; the default is revisited
+after dogfooding) and repeatable `--sandbox-write PATH` (a usage error without
+`--sandbox workspace`). The sandbox applies to the parent's AND every worker's `shell`. A
+`SandboxError` fails assembly — exit 1 before any model call — with a message that names the
+remedy (`install bubblewrap, or pass --sandbox off`).
+
+Must-pass (real `bwrap`; a test returns early with a printed `SKIP: bwrap unusable here` when
+the probe fails — CI runners may forbid user namespaces): fake home `H` containing
+`.secret/token`, `.cargo/bin/`, and the workspace `H/ws`; (a) `echo x > a.txt` works and the
+file exists on the host; (b) `echo x > ../outside.txt` fails, exit code ≠ 0, nothing created
+on the host; (c) `cat ~/.secret/token` (with `HOME=H`) fails and the content never appears in
+the output; (d) `ls H/.cargo` works, `touch H/.cargo/z` fails; (e) `echo t > /tmp/t` works and
+the host's real temp dir has no `t`; (f) a path listed in `writable` is writable; (g)
+`setsid sleep 300 & echo $! > pid; wait` cancelled → that pid is gone when the tool returns
+(PID namespace numbers differ: have the child write its HOST-visible identity another way —
+e.g. `sleep 300` with a unique argument such as `sleep 300.0731`, then look for that command
+line in `/proc/*/cmdline` on the host); (h) workspace == home → `WorkspaceContainsHome`;
+(i) `bwrap_args` order exactly as listed, for a workspace under `/tmp` and one under the home.
+
 ## `apply_patch` (GPT family) — freeform, `ToolInput::Text`
 Declaration kind `Freeform` with the V4A lark grammar. Input:
 ```
