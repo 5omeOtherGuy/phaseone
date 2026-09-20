@@ -63,7 +63,12 @@ the interactive prompt never continues on its own (the user is there). After eve
 - `TurnEnd` other than `Completed` → as today.
 - `FinishOutcome` holds `Done` → exit 0. `Blocked` → print `blocked: <needs>` (and the tried
   list) to stderr, exit `EXIT_BLOCKED = 3`.
-- Otherwise it is a premature stop. If BOTH bounds allow, send ONE user-role message and run
+- Otherwise, FIRST the things a turn end legitimately waits for: pending inbox messages → run an
+  inbox turn; else workers still running → wait for the inbox (cancellable), then run the
+  inbox turn. A parent that ended its turn while its worker runs is WAITING, not stopping —
+  the worker's completion notification wakes it, exactly as without `finish`. Each such turn
+  end is judged again from the top of this list.
+- Only with an empty inbox and no running worker is it a premature stop. If BOTH bounds allow, send ONE user-role message and run
   another turn; else print `stalled: the agent stopped <n> times without finishing` and exit
   `EXIT_STALLED = 4`:
   - at most `max_continuations` in the whole run (default 3; `--max-continuations N`, 0 disables);
@@ -76,7 +81,9 @@ the interactive prompt never continues on its own (the user is there). After eve
   unchanged in this increment (a child's turn end is its completion, the parent verifies).
 The host implements `SessionActivity` from the event stream it already receives
 (`ToolStarted`/`ToolFinished`), looking up each call's `effect` on the assembled tool and
-parsing the shell footer `[exit code: N]`. No new core or contract surface.
+parsing the shell footer `[exit code: N]`. No new core or contract surface. On `--resume` the
+log is REBUILT from the journal's `ToolStarted`/`ToolFinished` records, so a verification run
+before the restart still counts and a file change before it still invalidates.
 
 ## 4. Environments
 
@@ -86,6 +93,8 @@ what you need; never end a turn with a question when running unattended.
 
 ## 5. Must-pass (observable behaviour, scripted providers, no phrase matching)
 
+a0. (delegation) the parent ends its turn while its worker is still running → NO continuation
+   message; the worker's notification wakes it; it then calls `finish(done)` → exit 0.
 a. Model ends the turn with text only → exactly one continuation `UserInput` with the exact
    message; the next turn calls `finish(done)` validly → exit 0; journal shows both inputs.
 b. Text-only turn ends, 4 times, with a (non-finish) tool call between each → 3 continuations,
