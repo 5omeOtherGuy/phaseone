@@ -33,32 +33,42 @@ pub fn lines(view: &PermissionView, width: usize) -> Vec<Line<'static>> {
         out.push(grid::row(width.min(60), &format!("  {label}"), value));
     }
     out.push(Line::default());
-    out.push(decision_line(view.grantable));
+    out.extend(decision_lines(view.grantable));
     out
 }
 
-/// `y  allow once     a  session     p  project     n  deny` — with the
-/// destructive floor, the grant keys grey out and carry their reason.
-fn decision_line(grantable: bool) -> Line<'static> {
-    let mut spans = Vec::new();
-    let mut key = |k: &str, label: &str, available: bool, reason: Option<&str>| {
+/// `y  allow once     a  session     p  project     n  deny` on one line; with
+/// the destructive floor the grant keys move to their OWN lines, greyed, with
+/// the reason inline (SPEC §4.5's layout).
+fn decision_lines(grantable: bool) -> Vec<Line<'static>> {
+    fn key(spans: &mut Vec<Span<'static>>, k: &str, label: &str, available: bool) {
         let key_fg = if available { palette::INK } else { palette::FAINT };
         spans.push(Span::styled(format!(" {k}  "), Style::new().fg(key_fg)));
-        let text = match reason {
-            Some(reason) => format!("{label}      {reason}"),
-            None => label.to_string(),
-        };
         spans.push(Span::styled(
-            format!("{text}     "),
+            format!("{label}     "),
             Style::new().fg(if available { palette::DIM } else { palette::FAINT }),
         ));
-    };
-    key("y", "allow once", true, None);
-    let floor = (!grantable).then_some("not grantable — destructive floor");
-    key("a", "session", grantable, floor);
-    key("p", "project", grantable, floor);
-    key("n", "deny", true, None);
-    Line::from(spans)
+    }
+    let mut first = Vec::new();
+    key(&mut first, "y", "allow once", true);
+    if grantable {
+        key(&mut first, "a", "session", true);
+        key(&mut first, "p", "project", true);
+    }
+    key(&mut first, "n", "deny", true);
+    let mut out = vec![Line::from(first)];
+    if !grantable {
+        for (k, label) in [("a", "session"), ("p", "project")] {
+            let mut spans = Vec::new();
+            key(&mut spans, k, label, false);
+            spans.push(Span::styled(
+                "not grantable — destructive floor",
+                Style::new().fg(palette::FAINT),
+            ));
+            out.push(Line::from(spans));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -87,11 +97,15 @@ mod tests {
         assert_eq!(lines[0].spans[0].style.bg, Some(palette::BLOCK_PLUS));
         let text: Vec<String> = lines.iter().map(|l| Text::from(l.clone()).to_string()).collect();
         assert_eq!(text[2], grid_line("  cwd", "~/dev/phaseone"));
-        let last = &text[text.len() - 1];
-        assert!(last.contains("not grantable — destructive floor"));
-        // y and n stay live; a and p grey out.
-        let decision = &lines[lines.len() - 1];
-        assert_eq!(decision.spans[0].style.fg, Some(palette::INK));
-        assert_eq!(decision.spans[2].style.fg, Some(palette::FAINT));
+        // y and n share the decision line; the greyed grants sit on their own
+        // lines below it, reason inline.
+        let decision = &text[text.len() - 3];
+        assert!(decision.contains("y  allow once"));
+        assert!(decision.contains("n  deny"));
+        assert!(!decision.contains("session"));
+        assert!(text[text.len() - 2].contains("not grantable — destructive floor"));
+        assert!(text[text.len() - 1].contains("not grantable — destructive floor"));
+        let grant_line = &lines[lines.len() - 2];
+        assert_eq!(grant_line.spans[0].style.fg, Some(palette::FAINT));
     }
 }

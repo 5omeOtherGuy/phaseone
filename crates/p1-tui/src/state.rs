@@ -245,6 +245,10 @@ pub struct Screen {
     pub picker: Option<Picker>,
     /// The `/status` overlay (SPEC §4.6).
     pub status: Option<Vec<StatusGroup>>,
+    /// Ledger context/task views, filled by the driver (the context breakdown
+    /// arrives with the host's stats seam; until then these stay `None`).
+    pub context_view: Option<crate::render::ledger::Context>,
+    pub task_view: Option<crate::render::ledger::Task>,
 }
 
 impl Default for PaneWidth {
@@ -341,8 +345,8 @@ impl Screen {
     pub fn ledger(&self) -> crate::render::ledger::Ledger {
         crate::render::ledger::Ledger {
             goal: self.goal.clone(),
-            context: None,
-            task: None,
+            context: self.context_view.clone(),
+            task: self.task_view.clone(),
             spend: crate::render::ledger::SpendView {
                 responses: self.spend.responses,
                 input: self.spend.input,

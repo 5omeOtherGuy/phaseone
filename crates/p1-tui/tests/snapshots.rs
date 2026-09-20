@@ -238,7 +238,8 @@ fn permission_prompt_with_destructive_floor() {
     let text = render(&s, 120, 40, 0);
     assert_palette_law(&s, 120, 40);
     assert_eq!(text[0], "  rm -rf target/");
-    assert!(text[6].contains("not grantable — destructive floor"));
+    assert!(text[6].contains("y  allow once"));
+    assert!(text[7].contains("not grantable — destructive floor"));
 }
 
 #[test]

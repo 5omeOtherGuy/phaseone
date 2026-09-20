@@ -91,9 +91,13 @@ pub fn lines(ledger: &Ledger) -> Vec<Line<'static>> {
         task_lines(task, &mut section);
         sections.push(section);
     }
-    let mut spend = Vec::new();
-    spend_lines(&ledger.spend, &mut spend);
-    sections.push(spend);
+    // Before the first response there is no spend to report: the section is
+    // absent, not a column of `—` (absence is not unknownness).
+    if ledger.spend.responses > 0 {
+        let mut spend = Vec::new();
+        spend_lines(&ledger.spend, &mut spend);
+        sections.push(spend);
+    }
     let mut out = Vec::new();
     for (n, section) in sections.into_iter().enumerate() {
         if n > 0 {
@@ -238,16 +242,13 @@ mod tests {
     }
 
     #[test]
-    fn zero_responses_is_unknown_not_zero() {
-        let ledger = Ledger::default();
-        let lines = lines(&ledger);
-        let text: Vec<String> = lines.iter().map(plain).collect();
-        assert_eq!(text, vec![
-            "SPEND",
-            "  in                           —",
-            "  out                          —",
-            "  cache hit                    —",
-            "  cost                         —",
-        ]);
+    fn zero_responses_omits_spend_and_unknown_cost_renders_dash() {
+        let empty = Ledger::default();
+        assert!(lines(&empty).is_empty(), "no sections have data yet");
+        let mut ledger = Ledger::default();
+        ledger.spend.responses = 1;
+        let text: Vec<String> = lines(&ledger).iter().map(plain).collect();
+        assert_eq!(text[0], "SPEND");
+        assert_eq!(text[4], "  cost                         —");
     }
 }
