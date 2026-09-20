@@ -183,28 +183,35 @@ fn reasoning_summary_text(item: &Value) -> String {
 }
 
 /// Usage mapping from the terminal envelope. Absent fields stay `None`; a
-/// missing usage object yields `None` rather than zeros.
+/// missing usage object yields `None` rather than zeros. `input_tokens` is the
+/// TOTAL input, so the cached and cache-written parts are subtracted out of it
+/// to get `input_uncached`: an absent part counts as 0 in that subtraction
+/// only, never in the reported value, and the subtraction saturates so that
+/// uncached + read + write still adds up to the vendor's `input_tokens`.
 fn parse_usage(response: &Value) -> Option<Usage> {
     let usage = response.get("usage")?;
     let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
-    let cached_tokens = usage
-        .get("input_tokens_details")
+    let details = usage.get("input_tokens_details");
+    let cached_tokens = details
         .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64);
+    let cache_write_tokens = details
+        .and_then(|details| details.get("cache_write_tokens"))
         .and_then(Value::as_u64);
     let output = usage.get("output_tokens").and_then(Value::as_u64);
     let reasoning = usage
         .get("output_tokens_details")
         .and_then(|details| details.get("reasoning_tokens"))
         .and_then(Value::as_u64);
-    let input_uncached = match (input_tokens, cached_tokens) {
-        (Some(input), Some(cached)) => Some(input.saturating_sub(cached)),
-        (Some(input), None) => Some(input),
-        (None, _) => None,
-    };
+    let input_uncached = input_tokens.map(|input| {
+        input
+            .saturating_sub(cached_tokens.unwrap_or(0))
+            .saturating_sub(cache_write_tokens.unwrap_or(0))
+    });
     Some(Usage {
         input_uncached,
         cache_read: cached_tokens,
-        cache_write: None,
+        cache_write: cache_write_tokens,
         output,
         reasoning_output: reasoning,
         cost_micro_usd: None,
@@ -758,14 +765,30 @@ mod tests {
         assert_eq!(
             usage,
             Usage {
-                input_uncached: Some(36),
+                input_uncached: Some(0),
                 cache_read: Some(64),
-                cache_write: None,
+                cache_write: Some(36),
                 output: Some(20),
                 reasoning_output: Some(7),
                 cost_micro_usd: None,
             }
         );
+        // The three input parts still add up to the vendor's TOTAL `input_tokens`.
+        let parts =
+            usage.input_uncached.unwrap() + usage.cache_read.unwrap() + usage.cache_write.unwrap();
+        assert_eq!(parts, 100);
+
+        // `cache_write_tokens` absent: `cache_write` stays `None`, not 0, and only
+        // `cached_tokens` comes off the total.
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
+        let events = feed(
+            &mut parser,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":64}}}}"#,
+        );
+        let usage = completed(&events).usage.unwrap();
+        assert_eq!(usage.input_uncached, Some(36));
+        assert_eq!(usage.cache_read, Some(64));
+        assert_eq!(usage.cache_write, None);
 
         let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         let events = feed(
@@ -775,6 +798,7 @@ mod tests {
         let usage = completed(&events).usage.unwrap();
         assert_eq!(usage.input_uncached, Some(10));
         assert_eq!(usage.cache_read, None);
+        assert_eq!(usage.cache_write, None);
         assert_eq!(usage.output, None);
 
         let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
@@ -793,6 +817,16 @@ mod tests {
             r#"{"type":"response.completed","response":{"usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":9}}}}"#,
         );
         assert_eq!(completed(&events).usage.unwrap().input_uncached, Some(0));
+
+        // Cached plus cache-write exceeding the total also saturates at 0.
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
+        let events = feed(
+            &mut parser,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":4,"cache_write_tokens":9}}}}"#,
+        );
+        let usage = completed(&events).usage.unwrap();
+        assert_eq!(usage.input_uncached, Some(0));
+        assert_eq!(usage.cache_write, Some(9));
     }
 
     #[test]

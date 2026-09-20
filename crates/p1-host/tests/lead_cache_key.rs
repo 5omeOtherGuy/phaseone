@@ -219,6 +219,44 @@ async fn an_optional_route_with_no_configured_key_gets_a_generated_key_and_build
     assert_eq!(builds_of(&builds), (1, 1));
 }
 
+/// The generated key is a pure function of (workspace, environment, ordinal), so
+/// a re-run — or a resume — in the same workspace keeps the SAME key and with it
+/// the provider-side cache routing. The old key mixed in a pid, a per-process
+/// counter and the clock, which this test would fail on.
+#[tokio::test]
+async fn the_generated_key_survives_a_second_run_in_the_same_workspace() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(environments.path(), "plain", "cached", "m", &[], "prompt");
+    let inner = ScriptedProvider::new(vec![text_response("hello"), text_response("hello")]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook_arc(vec![(
+        "cached",
+        Arc::new(TakesCacheKey(inner.clone())) as Arc<dyn Provider>,
+    )]));
+
+    assert_eq!(
+        run_one_turn(&mut harness, &workspace, "plain").await,
+        0,
+        "stderr: {}",
+        harness.stderr.text()
+    );
+    assert_eq!(
+        run_one_turn(&mut harness, &workspace, "plain").await,
+        0,
+        "stderr: {}",
+        harness.stderr.text()
+    );
+
+    let keys: Vec<String> = inner
+        .requests()
+        .iter()
+        .filter_map(|request| request.options.cache_key.clone())
+        .collect();
+    assert_eq!(keys.len(), 2, "both runs sent a generated key");
+    assert_eq!(keys[0], keys[1], "a re-run keeps the same cache key");
+}
+
 #[tokio::test]
 async fn an_unsupported_route_is_built_once_and_never_offered_a_key() {
     let workspace = tempdir().unwrap();
