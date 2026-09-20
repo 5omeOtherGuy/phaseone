@@ -193,3 +193,79 @@ reproducibility; it takes no part in the resume decision (ADR-0033 compares orig
 Moving Claude/GPT policy into profiles (step 4); `p1-auth` and the p1 credential store
 (ADR-0040); user-level route/profile directories; `tool_forms` and cache policy in profiles;
 a replay codec envelope (added when a second layout exists within one route).
+
+## 7. Step 4 — the first-party adapters give up their model policy
+
+After this step every shipped environment uses `route` + `profile`; the whole-provider form
+remains for test fakes only, and no adapter decides anything from a model NAME.
+
+### 7.1 Profile: thinking policy becomes the behaviour selector
+
+`thinking` (kebab-case in files) gains two variants; the enum is what the ADR calls the
+compiled behaviour strategies:
+
+| variant | meaning | who encodes it today |
+|---|---|---|
+| `effort-level` | the model takes an effort level; the server decides how much to think | Messages: `thinking {adaptive, summarized}` + `output_config.effort`; Responses: `reasoning {effort, summary: auto}` |
+| `budget` | the model takes a token budget per effort; the profile carries the table | Messages: `thinking {enabled, budget_tokens}` |
+| `enabled`, `preserved` | (step 2) | Chat dialects |
+
+- `budget` requires `[thinking_budgets]` with one entry per listed effort (tokens, ≥ 1024); any
+  other variant forbids the table. The numbers move out of the Anthropic adapter unchanged
+  (low 4096, medium 10240, high 20480, extra-high and max 32768).
+- `default_effort` becomes OPTIONAL. Absent + no effort requested = the request carries no
+  thinking/reasoning fields at all — that is today's first-party behaviour and it must stay
+  byte-identical. The two chat profiles keep theirs.
+- An adapter that has no encoding for a variant refuses at construction (as the chat adapter
+  does): Responses × `budget`, Messages × `enabled`/`preserved`, Chat × `effort-level`/`budget`.
+- Effort SPELLING on the wire (`xhigh`) and wire constants that are protocol requirements
+  (Messages needs `max_tokens`: default 32_000, margin 8_192 over a budget) stay in the adapter.
+  `text.verbosity` stays in the Responses adapter until a second consumer exists.
+- Model-name prefix matching (`is_adaptive`) is deleted. Profiles are explicit records:
+  `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5` (`effort-level`, all five efforts);
+  `claude-opus-4-6`, `claude-sonnet-4-6` (`budget`); `gpt-5.6-sol` and every other GPT model a
+  shipped file or test names (`effort-level`, efforts low/medium/high — which is what makes
+  `extra_high`/`max` an error there, replacing the adapter's hard-coded rejection with the same
+  error kind). A dated snapshot is a BINDING (`wire_model`), not a profile.
+
+### 7.2 Route files for the two subscriptions
+
+```toml
+id           = "anthropic-subscription"
+origin_route = "<today's Origin.route string, byte for byte>"
+adapter      = "anthropic-messages"
+endpoint     = "https://api.anthropic.com"
+[credential]
+kind = "claude-code-oauth"
+[adapter_settings]
+account = "claude-code-subscription"   # a finite enum of IMPLEMENTED account behaviours
+```
+
+`account` selects what the adapter already implements for this kind of account — the Claude Code
+identity prefix, the OAuth beta/version header set — exactly as `dialect` does for Chat: named by
+behaviour, compiled, never free-form headers. Responses likewise: `account = "codex-subscription"`
+(`store:false`, no output-cap field, account-id header, session/conversation headers).
+The two OAuth credential kinds become constructible from a route file (3b rejected them with
+"not yet data-driven"); their sources stay the compiled ones, unchanged.
+
+### 7.3 Constructors and lowering
+
+`AnthropicProvider::new(route: MessagesRoute, wire_model, profile, transport, credentials)` and
+the same shape for Responses; `build_request(wire_model, &profile, &request)`. `validate` and
+`build_request` share one pure lowering function per adapter (profile × options → thinking
+fields / error). Native-option namespaces and `describe()` facts are unchanged.
+
+### 7.4 What proves it
+
+- Every characterization test (step 1) passes with its EXPECTED VALUES AND FIXTURES BYTE-IDENTICAL.
+  Only call sites may change (a test-local helper may map the matrix's model names to profiles by
+  the OLD prefix rule — that mapping documents what the explicit records replaced).
+  The near-miss and unanchored-prefix cases keep their expected bodies through that helper.
+- Conformance suites of both adapters run against providers composed from the SHIPPED route and
+  profile files through the host's loading path.
+- Negative assembly tests for each refused adapter × variant pair, through `assemble`.
+- `claude`, `gpt`, `claude-delegating` environments use the new form; their journals' origin
+  strings are unchanged (a session recorded before this step resumes after it — test with a
+  recorded header).
+- `WHOLE_PROVIDERS` in the host is empty or gone; the old environment form is exercised only by
+  fakes registered through the test hook.
