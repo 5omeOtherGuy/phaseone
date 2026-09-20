@@ -181,7 +181,7 @@ impl Transcript {
         self.close_streams();
         self.blocks.push(Block::Call(ToolRow {
             name: call.name.clone(),
-            summary: summarize_input(call.input.raw()),
+            summary: summarize_call(&call.name, call.input.raw()),
             status: RowStatus::Running,
             output: None,
             elapsed_ms: None,
@@ -324,10 +324,62 @@ fn append_text(lines: &mut Vec<String>, text: &str) {
     }
 }
 
-/// The one-line input summary for a call row: newlines become `␤`, at most
-/// 100 characters (same rule as the host's line renderer).
+/// The one-line input summary for a call row (SPEC §3). Raw JSON is not a
+/// summary: a structured call shows its salient field (the command, the
+/// path, the pattern); anything else falls back to the bounded raw form.
 pub fn summarize_input(raw: &str) -> String {
     raw.replace('\n', "␤").chars().take(100).collect()
+}
+
+/// The display summary for a call: the salient field when the input is JSON
+/// with one, else the bounded raw input.
+pub fn summarize_call(name: &str, raw: &str) -> String {
+    let key = match name {
+        "shell" => "command",
+        "edit" | "patch" | "write" | "read" => "file_path",
+        "search" => "pattern",
+        "finish" => "status",
+        "worker_start" => "task",
+        _ => "",
+    };
+    if let Some(value) = json_string_field(raw, key) {
+        return summarize_input(value);
+    }
+    summarize_input(raw)
+}
+
+/// Extract a string field's value from flat JSON, for DISPLAY only: this is a
+/// summary, not a parse — a miss or an escape edge case shows the raw input
+/// instead. p1-tui carries no JSON dependency for a display hint.
+fn json_string_field<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
+    if key.is_empty() {
+        return None;
+    }
+    let needle = format!("\"{key}\"");
+    let start = raw.find(&needle)? + needle.len();
+    let rest = raw[start..].trim_start_matches([' ', ':']);
+    let rest = rest.strip_prefix('"')?;
+    // Find the closing quote, skipping \-escaped characters.
+    let mut end = 0;
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    Some(&rest[..end])
 }
 
 #[cfg(test)]
@@ -354,6 +406,36 @@ mod tests {
                 content: content.into(),
             },
         }
+    }
+
+    #[test]
+    fn summarize_call_shows_the_salient_field() {
+        assert_eq!(
+            summarize_call("shell", r#"{"command":"cargo test -p p1-tui"}"#),
+            "cargo test -p p1-tui"
+        );
+        assert_eq!(
+            summarize_call("edit", r#"{"file_path":"src/lib.rs","old_string":"a"}"#),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            summarize_call("search", r#"{"pattern":"block_until_ready"}"#),
+            "block_until_ready"
+        );
+    }
+
+    #[test]
+    fn summarize_call_falls_back_to_the_raw_input() {
+        // An unmapped tool, or a miss on the salient key, shows the bounded
+        // raw input rather than nothing.
+        assert_eq!(
+            summarize_call("worker_stop", r#"{"id":"w1"}"#),
+            r#"{"id":"w1"}"#
+        );
+        assert_eq!(
+            summarize_call("shell", r#"{"cmd":"ls"}"#),
+            r#"{"cmd":"ls"}"#
+        );
     }
 
     #[test]

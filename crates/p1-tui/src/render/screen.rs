@@ -143,7 +143,7 @@ fn draw_pane(screen: &Screen, area: Rect, buf: &mut Buffer, cols: usize, _now_ms
                 break;
             }
             let banner = super::fill(
-                Line::styled(line.clone(), Style::new().fg(palette::INK)),
+                Line::styled(ellipsize(line, grid), Style::new().fg(palette::INK)),
                 grid,
                 palette::BLOCK_PLUS,
             );
@@ -196,4 +196,15 @@ fn draw_lines_bottom(
     let start = lines.len().saturating_sub(fits + scroll);
     let end = lines.len().saturating_sub(scroll).max(start);
     draw_lines(&lines[start..end], area, buf, bg);
+}
+
+/// Cut a banner line at the grid edge with `…` — a hard cut mid-word reads as
+/// a rendering bug, an ellipsis as a folded fact.
+fn ellipsize(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
