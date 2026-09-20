@@ -271,6 +271,11 @@ pub struct Screen {
     /// Steering/follow-up text queued for the next boundary, shown above the
     /// composer hints so the operator sees what will land.
     pub queued: VecDeque<Queued>,
+    /// When each running call started (the event stamp), for the elapsed
+    /// column. Cleared as results arrive. (Private: callers use `apply`.)
+    /// Public only so struct-update tests can build a Screen literally.
+    #[doc(hidden)]
+    pub call_started: std::collections::HashMap<String, u64>,
     /// Rows scrolled up from the bottom of the transcript; 0 pins to the
     /// newest. Any new event or edit resets it — attention is on the live tail.
     pub scroll: usize,
@@ -308,8 +313,21 @@ impl Screen {
     }
 
     /// Observe one agent event: transcript first, then the state the event
-    /// moves (working indicator, spend, promotion).
+    /// moves (working indicator, spend, promotion). `now_ms` times the call
+    /// rows: a result's elapsed is measured from its start's stamp.
     pub fn apply(&mut self, event: &AgentEvent, now_ms: u64) {
+        let elapsed = match event {
+            AgentEvent::ToolStarted { call } => {
+                self.call_started.insert(call.call_id.clone(), now_ms);
+                None
+            }
+            AgentEvent::ToolFinished { result } => self
+                .call_started
+                .remove(&result.call_id)
+                .map(|started| now_ms.saturating_sub(started)),
+            _ => None,
+        };
+        self.transcript.apply(event, elapsed);
         match event {
             AgentEvent::TurnStarted => {
                 self.working = Some(Working {
@@ -347,7 +365,6 @@ impl Screen {
         }
         // New output pins the view to the live tail.
         self.scroll = 0;
-        self.transcript.apply(event, None);
     }
 
     /// Queue operator input for the next boundary (SPEC §4.2).

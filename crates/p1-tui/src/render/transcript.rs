@@ -147,23 +147,49 @@ fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
         Span::styled(name, Style::new().fg(palette::DIM)),
         Span::styled(row.summary.clone(), Style::new().fg(palette::DIM)),
     ];
-    // The right-aligned result: status word + evidence, never FAINT.
+    // The right-aligned result: status word + evidence, never FAINT. A failed
+    // call's first output line is part of the evidence (SPEC §3's
+    // `✗ 11.4s · 12 passed, 1 failed · 94 lines`).
     if let RowStatus::Settled(status) = row.status {
-        let mut result = String::new();
+        let mut parts: Vec<String> = Vec::new();
         if let Some(ms) = row.elapsed_ms {
-            result.push_str(&elapsed(ms));
+            parts.push(elapsed(ms));
+        }
+        if status != ToolStatus::Ok
+            && let Some(first) = row
+                .output
+                .as_deref()
+                .map(str::lines)
+                .and_then(|mut lines| lines.next())
+                .filter(|line| !line.is_empty())
+        {
+            parts.push(first.to_string());
         }
         if let Some(output) = &row.output {
-            if !result.is_empty() {
-                result.push_str(" · ");
-            }
-            result.push_str(&format!("{} lines", output.lines().count()));
+            let n = output.lines().count();
+            parts.push(if n == 1 {
+                "1 line".into()
+            } else {
+                format!("{n} lines")
+            });
         }
+        let mut result = parts.join(" · ");
         if result.is_empty() {
             result.push_str(status_word(status));
         }
         if status == ToolStatus::Denied {
             result = format!("denied · {result}");
+        }
+        // The result wins the row's right edge; the summary truncates with `…`
+        // until the row fits (the grid rule: nothing overflows).
+        let fixed: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let budget = width.saturating_sub(fixed + result.chars().count() + 1);
+        if row.summary.chars().count() > budget {
+            let keep = budget.saturating_sub(1);
+            let mut cut: String = row.summary.chars().take(keep).collect();
+            cut.push('…');
+            let span = spans.last_mut().expect("the summary span exists");
+            *span = Span::styled(cut, span.style);
         }
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let pad = width.saturating_sub(used + result.chars().count() + 1);
@@ -210,10 +236,14 @@ fn fold_lines(fold: &Fold, width: usize, depth: u8, out: &mut Vec<Line<'static>>
         ),
     };
     for line in head {
-        let shown: String = line
-            .chars()
-            .take(width.saturating_sub(indent.len()))
-            .collect();
+        let room = width.saturating_sub(indent.len());
+        let shown = if line.chars().count() > room {
+            let mut cut: String = line.chars().take(room.saturating_sub(1)).collect();
+            cut.push('\u{2026}');
+            cut
+        } else {
+            line.clone()
+        };
         out.push(fill(
             Line::styled(format!("{indent}{shown}"), Style::new().fg(palette::DIM)),
             width,
@@ -359,6 +389,43 @@ mod tests {
             Some(palette::BLOCK),
             "tool output earns chrome"
         );
+    }
+
+    #[test]
+    fn a_long_summary_truncates_so_the_result_never_overflows() {
+        let mut t = Transcript::new();
+        t.apply(
+            &AgentEvent::ToolStarted {
+                call: ToolCall {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    input: ToolInput::Json(
+                        r#"{"command":"cargo test -p p1-provider-http --all-features -- --nocapture"}"#
+                            .into(),
+                    ),
+                },
+            },
+            None,
+        );
+        t.apply(
+            &AgentEvent::ToolFinished {
+                result: ToolResultItem {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    status: ToolStatus::Ok,
+                    content: "ok".into(),
+                },
+            },
+            Some(120),
+        );
+        let width = 40;
+        let lines = lines(&t, width, None, 0, true);
+        let text = plain(&lines);
+        // The row never exceeds the grid width and ends in the truncation
+        // mark before the right-aligned result.
+        assert!(text[0].chars().count() < width, "never overflows the grid");
+        assert!(text[0].contains('…'));
+        assert!(text[0].trim_end().ends_with("120ms · 1 line"));
     }
 
     #[test]
