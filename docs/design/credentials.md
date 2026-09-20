@@ -3,7 +3,7 @@
 Status: spec. Credentials belong to the ROUTE. After the provider split the lookup code still
 sits in three places (`p1-provider-anthropic/src/credentials.rs`, `p1-provider-openai/src/credentials.rs`,
 `p1-host/src/auth.rs`); this step moves it into one crate and adds the precedence chain and the
-"which source" report. Borrowing stays the default; §6 adds `p1 login` for pasted API keys (ADR-0043).
+"which source" report. Borrowing stays the default; §6 adds `p1 login` for pasted API keys (ADR-0044).
 
 ## 1. Crate and dependencies
 
@@ -76,7 +76,7 @@ f. No test touches the real home or the real process environment.
 g. Behaviour on the wire is unchanged: every adapter's characterization and conformance test
    passes with its expectations untouched.
 
-## 6. `p1 login` — pasted keys into p1's own store (ADR-0043)
+## 6. `p1 login` — pasted keys into p1's own store (ADR-0044)
 
 Owner, 2026-09-20: "Keep the store. You can dispatch a worker to work on the login
 implementation." Scope: API KEYS. Browser/OAuth logins stay borrowed from the official tools.

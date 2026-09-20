@@ -59,7 +59,7 @@ OWNER DECISIONS 2026-09-20 (ADR-0039, ADR-0040; note `docs/design/notes/2026-09-
   for now, no login command yet, macOS later.
 
 STATE 2026-09-20 ~22:00 — READ THIS FIRST. main = CI green on 61f0a84 (+ local docs commits:
-p1-auth spec, ADR-0043 proposed, login spec — push them with the next gated merge).
+p1-auth spec, ADR-0044 proposed, login spec — push them with the next gated merge).
 
 DONE TODAY (all merged, CI green on the exact commit): Astra's chat adapter + routes (#9);
 provider split ADR-0039 steps 1–4 COMPLETE — every shipped provider is wire adapter × route file
@@ -86,7 +86,7 @@ IN FLIGHT:
   file read), merge main into it, independent `scripts/gate.sh`, merge, `scripts/push-main.sh`,
   record in `docs/dogfood/runs.jsonl`. If the notification is lost: `pgrep -af "debug/p1"`, then
   `report.json` / `stdout.txt` in the run dir.
-* QUEUED behind it: `p1 login` (owner decision, ADR-0043 proposed → set accepted when merged;
+* QUEUED behind it: `p1 login` (owner decision, ADR-0044 proposed → set accepted when merged;
   spec `credentials.md` §6): brief `../phaseone-briefs/p1-login.md`, jobs file
   `p1-login-jobs.json`; create worktree `scripts/new-worktree.sh p1-login` AFTER p1-auth is on
   main, dispatch with the env var above. After it lands tell the owner:

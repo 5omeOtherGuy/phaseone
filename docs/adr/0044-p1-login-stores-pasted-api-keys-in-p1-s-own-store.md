@@ -1,5 +1,5 @@
 ---
-adr: 43
+adr: 44
 title: p1 login stores pasted API keys in p1's own store
 status: proposed
 date: 2026-09-20
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [docs/design/credentials.md, docs/adr/0040-p1-keeps-logins-in-one-file-keyed-by-route-environment-variables-win-other-tools-logins-are-borrowed.md]
 ---
-# ADR-0043: p1 login stores pasted API keys in p1's own store
+# ADR-0044: p1 login stores pasted API keys in p1's own store
 
 ## Context
 
