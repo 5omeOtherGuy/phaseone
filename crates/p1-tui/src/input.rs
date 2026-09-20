@@ -14,8 +14,15 @@ pub enum Command {
     Submit(String),
     /// `⏎` while working: queue the text as steering for the next boundary.
     QueueSteering(String),
-    /// `⌥⏎`: queue a follow-up, injected only when the agent would stop.
+    /// `⌥⏎` while working: queue a follow-up, injected only when the agent
+    /// would stop (SPEC §7: idle `⌥⏎` is a plain newline instead).
     QueueFollowUp(String),
+    /// Composer editing.
+    Insert(char),
+    Newline,
+    Backspace,
+    Left,
+    Right,
     /// `^C`: cancel the turn; quit when idle.
     CancelOrQuit,
     /// Approval decisions (SPEC §4.4/§4.5).
@@ -43,6 +50,9 @@ pub enum Command {
     /// `PageUp` / `PageDown`: scroll the transcript.
     ScrollUp,
     ScrollDown,
+    /// `Up` / `Down` with the OUTPUT pane open: scroll the pane.
+    PaneUp,
+    PaneDown,
 }
 
 /// Map one key event to commands, given the screen state. Modal layers win in
@@ -85,8 +95,13 @@ pub fn handle(screen: &Screen, key: KeyEvent) -> Option<Command> {
             }
         }
         (KeyCode::Enter, false, true) => {
-            let text = screen.composer.text.clone();
-            (!text.trim().is_empty()).then_some(Command::QueueFollowUp(text))
+            // SPEC §7: ⌥⏎ is `newline` idle, `queue follow-up` while working.
+            if screen.working.is_some() {
+                let text = screen.composer.text.clone();
+                (!text.trim().is_empty()).then_some(Command::QueueFollowUp(text))
+            } else {
+                Some(Command::Newline)
+            }
         }
         (KeyCode::Char('c'), true, false) => Some(Command::CancelOrQuit),
         (KeyCode::Char('o'), true, false) => Some(Command::OpenFold),
@@ -97,6 +112,13 @@ pub fn handle(screen: &Screen, key: KeyEvent) -> Option<Command> {
         (KeyCode::Tab, true, false) => Some(Command::CyclePaneMode),
         (KeyCode::PageUp, false, false) => Some(Command::ScrollUp),
         (KeyCode::PageDown, false, false) => Some(Command::ScrollDown),
+        (KeyCode::Up, false, false) if screen.output.is_some() => Some(Command::PaneUp),
+        (KeyCode::Down, false, false) if screen.output.is_some() => Some(Command::PaneDown),
+        (KeyCode::Char(c), false, false) => Some(Command::Insert(c)),
+        (KeyCode::Char(c), false, true) => Some(Command::Insert(c)),
+        (KeyCode::Backspace, false, false) => Some(Command::Backspace),
+        (KeyCode::Left, false, false) => Some(Command::Left),
+        (KeyCode::Right, false, false) => Some(Command::Right),
         _ => None,
     }
 }
@@ -130,10 +152,15 @@ mod tests {
             handle(&s, key(KeyCode::Enter)),
             Some(Command::QueueSteering("fix it".into()))
         );
-        // Alt+Enter queues a follow-up in either state.
+        // ⌥⏎ idle is a plain newline; while working it queues a follow-up.
         assert_eq!(
             handle(&s, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
             Some(Command::QueueFollowUp("fix it".into()))
+        );
+        s.working = None;
+        assert_eq!(
+            handle(&s, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Some(Command::Newline)
         );
         // An empty composer never sends.
         s.composer.text.clear();

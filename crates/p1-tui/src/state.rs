@@ -202,6 +202,16 @@ impl Composer {
         self.cursor -= 1;
     }
 
+    pub fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn right(&mut self) {
+        if self.cursor < self.text.chars().count() {
+            self.cursor += 1;
+        }
+    }
+
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         self.revealed = false;
@@ -242,6 +252,8 @@ pub struct Screen {
     pub reduced_motion: bool,
     /// Forced ledger overlay at narrow widths (`^L`).
     pub ledger_overlay: bool,
+    /// The OUTPUT pane's open fold, if any (SPEC §5 OUTPUT mode).
+    pub output: Option<crate::render::output::OutputView>,
     /// A pending approval: the blocking, full-width review (SPEC §4.4/§4.5).
     /// While this is `Some` the pane is hidden and the transcript waits.
     pub approval: Option<Approval>,
@@ -343,6 +355,23 @@ impl Screen {
     /// Scroll the transcript `delta` rows up (positive) or down (negative).
     pub fn scroll_by(&mut self, delta: isize) {
         self.scroll = self.scroll.saturating_add_signed(delta);
+    }
+
+    /// Open a fold handle in the OUTPUT pane (`^O`): switches the pane to
+    /// OUTPUT mode and widens it if it is hidden.
+    pub fn open_output(&mut self, view: crate::render::output::OutputView) {
+        self.output = Some(view);
+        self.pane_mode = PaneMode::Output;
+        if matches!(self.pane_width, PaneWidth::Off) {
+            self.pane_width = PaneWidth::Ch56;
+        }
+    }
+
+    /// Scroll the OUTPUT pane's content.
+    pub fn scroll_output_by(&mut self, delta: isize) {
+        if let Some(output) = &mut self.output {
+            output.scroll = output.scroll.saturating_add_signed(delta);
+        }
     }
 
     /// A PEEK is a two-line banner that never moves the ledger and never

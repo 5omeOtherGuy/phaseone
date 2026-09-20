@@ -97,6 +97,9 @@ fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
                 out.push(Line::styled(shown, Style::new().fg(palette::INK)));
             }
         }
+        Block::Meta { text } => {
+            out.push(Line::styled(text.clone(), Style::new().fg(palette::DIM)));
+        }
         Block::Notice { lines } => {
             // §4.9: state what broke, no banner. The first line is INK — it is
             // the fact; the rest are DIM detail.
@@ -166,6 +169,14 @@ fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
         let pad = width.saturating_sub(used + result.chars().count() + 1);
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(result, Style::new().fg(palette::DIM)));
+        // An output big enough to fold is addressable: `^O open` (FAINT hint).
+        if row
+            .output
+            .as_deref()
+            .is_some_and(|o| o.lines().count() > crate::fold::FULL_BLOCK_MAX_LINES)
+        {
+            spans.push(Span::styled("   ^O open", Style::new().fg(palette::FAINT)));
+        }
     }
     Line::from(spans)
 }
