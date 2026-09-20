@@ -15,6 +15,7 @@ use serde_json::Value;
 /// `p1 env show NAME` is synchronous inside `run`: drive it on a fresh runtime.
 fn show_env(name: &str) -> (i32, String, String) {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    common::isolated_environment(&mut harness);
     let code = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
@@ -105,6 +106,7 @@ fn codex_root() -> tempfile::TempDir {
 /// `env show` against a synthetic root: `(code, stderr)`.
 fn show_in(root: &Path, name: &str) -> (i32, String) {
     let mut harness = Harness::new(vec![root.join("environments")], &[]);
+    common::isolated_environment(&mut harness);
     let code = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
@@ -119,7 +121,7 @@ fn every_shipped_environment_still_assembles() {
     for name in ["claude", "claude-delegating", "gpt", "deepseek", "glm"] {
         let (code, stdout, stderr) = show_env(name);
         assert_eq!(code, 0, "{name}: {stderr}");
-        let resolved: Value = serde_json::from_str(stdout.trim()).unwrap();
+        let resolved: Value = common::env_show_json(&stdout);
         assert_eq!(
             resolved["environment"], name,
             "{name}: the resolved environment must be its own"
@@ -142,7 +144,7 @@ fn every_shipped_route_reports_its_own_cache_key_support() {
     for (name, support) in expected {
         let (code, stdout, stderr) = show_env(name);
         assert_eq!(code, 0, "{name}: {stderr}");
-        let resolved: Value = serde_json::from_str(stdout.trim()).unwrap();
+        let resolved: Value = common::env_show_json(&stdout);
         let wire = match support {
             CacheKeySupport::Unsupported => "unsupported",
             CacheKeySupport::Optional => "optional",

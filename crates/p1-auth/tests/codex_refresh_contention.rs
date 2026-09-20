@@ -6,10 +6,10 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use p1_auth::CodexCliCredentials;
 use p1_contracts::BoxFuture;
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{CredentialSource, HttpRequest, HttpResponse, Transport, TransportError};
-use p1_provider_openai::CodexCliCredentials;
 use serde_json::json;
 use tokio::sync::Notify;
 

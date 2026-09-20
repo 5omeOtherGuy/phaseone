@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use p1_auth::ClaudeCodeCredentials;
 use p1_contracts::ProviderErrorKind;
-use p1_provider_anthropic::ClaudeCodeCredentials;
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 use serde_json::{Value, json};
@@ -353,10 +353,16 @@ async fn a_flat_file_stays_flat_and_defaults_scopes_on_refresh() {
     assert_eq!(written["refreshToken"], json!("R"));
 }
 
-#[tokio::test]
-async fn from_default_location_constructs_without_reading_the_file() {
-    // Construction must never open the real credential file; `access` is
-    // deliberately not called here.
-    let credentials = ClaudeCodeCredentials::from_default_location();
-    assert!(credentials.is_ok(), "HOME is set, so a path resolves");
+#[test]
+fn construction_does_not_open_or_create_the_credential_file() {
+    // Construction must never touch the real credential file, and `access` is
+    // deliberately not called here. Which file it WOULD read is `Locations`'
+    // business (`tests/locations.rs`), which no test points at a real home.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".credentials.json");
+    let _ = ClaudeCodeCredentials::at(path.clone(), Arc::new(ScriptedTransport::new(Vec::new())));
+    assert!(
+        !path.exists(),
+        "construction must never create the credentials file"
+    );
 }

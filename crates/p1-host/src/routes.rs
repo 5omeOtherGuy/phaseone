@@ -1,8 +1,9 @@
 //! Route files (`routes/<id>.toml`): how an ACCOUNT and ENDPOINT are reached, as
 //! data (`docs/design/routes-and-profiles.md` §1.2). A route file names an ADAPTER
 //! KEY that `p1-host::catalog` has compiled in, and it holds a credential
-//! REFERENCE, never a value. The lookup directory is the one profiles use:
-//! `<environments dir>/../routes`.
+//! REFERENCE, never a value: the reference is `p1_auth::CredentialSpec`, the one
+//! crate that knows where a credential is read from (ADR-0040). The lookup
+//! directory is the one profiles use: `<environments dir>/../routes`.
 //!
 //! Loading is total: a file stem that disagrees with `id`, a secret-looking header,
 //! an unknown adapter, an unknown credential kind, a credential kind whose source is
@@ -13,113 +14,12 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use p1_auth::CredentialSpec;
 use serde::Deserialize;
 
 /// The adapter keys a route file may name. `catalog` dispatches on exactly this set;
 /// an unknown `adapter` is a load error listing these.
 pub const ADAPTER_KEYS: &[&str] = &["openai-chat", "anthropic-messages", "openai-responses"];
-
-/// The credential kinds a route file may name (spec 1.2). Each kind names the
-/// compiled source that reads it (spec §7.2): the two OAuth logins are the CLIs'
-/// own files, never written by a login flow here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CredentialKind {
-    /// An API key: `env` and/or `borrow` say where it is read from.
-    ApiKey,
-    /// The Claude Code CLI login (its source stays the compiled one).
-    ClaudeCodeOauth,
-    /// The Codex CLI login (its source stays the compiled one).
-    CodexOauth,
-}
-
-/// A credential file a route borrows a key from, in the order the file lists them.
-/// Parsed from `"<store>:<key>"`. The paths behind each store live in `auth`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BorrowSource {
-    pub store: BorrowStore,
-    /// The provider key inside that store's credential file.
-    pub key: String,
-}
-
-impl CredentialKind {
-    /// The spelling a route file uses for this kind.
-    pub fn name(self) -> &'static str {
-        match self {
-            CredentialKind::ApiKey => "api-key",
-            CredentialKind::ClaudeCodeOauth => "claude-code-oauth",
-            CredentialKind::CodexOauth => "codex-oauth",
-        }
-    }
-}
-
-/// The credential files a route may borrow from (ADR-0040: read-only reuse of an
-/// existing CLI login).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BorrowStore {
-    /// The OpenCode CLI's shared data directory.
-    Opencode,
-    /// The Pi CLI's agent directory.
-    Pi,
-}
-
-impl<'de> Deserialize<'de> for BorrowSource {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        let text = String::deserialize(deserializer)?;
-        let (store, key) = text.split_once(':').ok_or_else(|| {
-            D::Error::custom(format!(
-                "borrow source \"{text}\" is not `<store>:<key>`; the stores are {}",
-                known_stores()
-            ))
-        })?;
-        let store = match store {
-            "opencode" => BorrowStore::Opencode,
-            "pi" => BorrowStore::Pi,
-            other => {
-                return Err(D::Error::custom(format!(
-                    "unknown borrow store \"{other}\" in \"{text}\"; the stores are {}",
-                    known_stores()
-                )));
-            }
-        };
-        if key.is_empty() {
-            return Err(D::Error::custom(format!(
-                "borrow source \"{text}\" names no key"
-            )));
-        }
-        Ok(Self {
-            store,
-            key: key.to_string(),
-        })
-    }
-}
-
-/// The `[credential]` table: a reference to a key, never the key itself. A route
-/// cannot hold a secret, only the name of the place a secret is read from.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialRef {
-    pub kind: CredentialKind,
-    /// The environment variable that precedes every borrowed file.
-    #[serde(default)]
-    pub env: Option<String>,
-    /// Borrowed store entries, tried in this order after `env`.
-    #[serde(default)]
-    pub borrow: Vec<BorrowSource>,
-}
-
-impl CredentialRef {
-    /// A kind with a compiled source a route file may point at. Both OAuth logins
-    /// became data-driven in ADR-0039 step 4 (4a and 4b).
-    pub fn validate_source(&self) -> Result<(), String> {
-        match self.kind {
-            CredentialKind::ApiKey
-            | CredentialKind::ClaudeCodeOauth
-            | CredentialKind::CodexOauth => Ok(()),
-        }
-    }
-}
 
 /// One `[models.<profile id>]` entry: the wire model this route reaches that profile
 /// by, plus the route's own ceilings on it.
@@ -152,7 +52,7 @@ pub struct RouteFile {
     /// A compiled adapter key ([`ADAPTER_KEYS`]).
     pub adapter: String,
     pub endpoint: String,
-    pub credential: CredentialRef,
+    pub credential: CredentialSpec,
     /// Static, non-secret headers. Authentication comes exclusively from
     /// `[credential]`, so a secret-looking name here is a load error.
     #[serde(default)]
@@ -265,7 +165,7 @@ impl RouteFile {
                 "`[credential]` env \"{env}\" is not an environment variable name"
             ));
         }
-        self.credential.validate_source()?;
+        self.credential.validate()?;
         for (id, binding) in &self.models {
             if id.trim().is_empty() || binding.wire_model.trim().is_empty() {
                 return Err(
@@ -387,10 +287,6 @@ pub fn load_route(path: &Path) -> Result<RouteFile, String> {
 
 fn known_adapters() -> String {
     ADAPTER_KEYS.join(", ")
-}
-
-fn known_stores() -> &'static str {
-    "opencode, pi"
 }
 
 /// A header name that must never appear in a route file: it could hold a secret by

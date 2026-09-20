@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
+use p1_auth::ClaudeCodeCredentials;
 use p1_contracts::BoxFuture;
-use p1_provider_anthropic::ClaudeCodeCredentials;
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{CredentialSource, HttpRequest, HttpResponse, Transport, TransportError};
 use serde_json::json;
