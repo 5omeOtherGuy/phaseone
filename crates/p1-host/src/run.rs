@@ -128,6 +128,11 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
             EXIT_OK
         }
         Command::EnvShow { name } => env_show(deps, &options, &name),
+        // The login surface (ADR-0044, spec §6): no catalog, no provider and no
+        // network — the store is written and the "which source" report is printed.
+        Command::Login { route } => crate::login::login(deps, &route).await,
+        Command::LoginList => crate::login::list(deps),
+        Command::Logout { route } => crate::login::logout(deps, &route).await,
         Command::Run { .. } => {
             if options.resume && options.session.is_none() {
                 write_stderr(deps, "error: --resume requires --session\n");

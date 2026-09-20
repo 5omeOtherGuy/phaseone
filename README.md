@@ -12,6 +12,23 @@ prompt and tools; sessions resume from a JSONL journal; an agent can delegate to
 on the other route and is woken when it finishes. What was built, measured and what is
 weak: `docs/SLICE-REPORT.md`.
 
+## Logging in
+
+API-key routes take one key from stdin — never from an argument, which would land in
+shell history and in `ps`:
+
+```sh
+p1 login opencode-go-2-subscription     # reads one key, hidden on a terminal
+p1 login --list                         # every route, its credential kind and its source
+p1 logout opencode-go-2-subscription    # removes that route's entry
+```
+
+The key is written to `~/.config/p1/auth.json` (0600 in a 0700 directory); a store
+anyone but the owner can read is refused. Piped input works as well:
+`p1 login <route> < keyfile`. A documented environment variable still wins over the
+store, and `login` says so when it does. Browser logins stay borrowed from the Claude
+Code and Codex CLIs (`docs/design/credentials.md` §6).
+
 ## What makes it different
 
 - **The harness reshapes itself around the model.** An agent gets the prompt, tool
