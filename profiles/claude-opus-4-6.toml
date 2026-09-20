@@ -1,0 +1,18 @@
+# What the model is, independent of the route that reaches it (ADR-0039).
+id       = "claude-opus-4-6"
+revision = 1
+model_id = "claude-opus-4-6"
+family   = "claude"
+thinking = "budget"
+
+efforts = ["low", "medium", "high", "extra_high", "max"]
+
+[thinking_budgets]
+low        = 4096
+medium     = 10240
+high       = 20480
+extra_high = 32768
+max        = 32768
+
+# default_effort: absent — an effort-less request carries no thinking fields.
+# context_tokens and max_output_tokens: unknown for this model, so stated nowhere.

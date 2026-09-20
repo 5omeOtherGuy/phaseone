@@ -144,10 +144,19 @@ pub fn build_request(
             }
         }
     }
-    let mut body = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"reasoning_effort":match profile.resolve_effort(request.options.reasoning_effort)? {Effort::Max=>"max", Effort::Low=>"low", _=>"high"}});
+    let reasoning_effort = match profile.resolve_effort(request.options.reasoning_effort)? {
+        Some(Effort::Max) => "max",
+        Some(Effort::Low) => "low",
+        Some(_) => "high",
+        None => return Err(invalid("chat profile has no default reasoning effort")),
+    };
+    let mut body = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"reasoning_effort":reasoning_effort});
     body["thinking"] = match profile.thinking {
         ThinkingPolicy::Enabled => json!({"type":"enabled"}),
         ThinkingPolicy::Preserved => json!({"type":"enabled","clear_thinking":false}),
+        ThinkingPolicy::EffortLevel | ThinkingPolicy::Budget => {
+            return Err(invalid("chat dialect cannot express this thinking policy"));
+        }
     };
     if let Some(cap) = request.options.max_output_tokens {
         body["max_tokens"] = json!(cap);
