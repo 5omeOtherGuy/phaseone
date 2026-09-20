@@ -4,7 +4,7 @@
 //! (refusing to overwrite). `--resume` takes the file over under its writer lock:
 //! load, cut off a truncated tail, continue appending.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use p1_contracts::CommitSink;
@@ -64,4 +64,24 @@ pub fn resume(path: &Path) -> Result<(Arc<JsonlJournal>, Resumed), SessionError>
 /// The `CommitSink` behind a JSONL store, as the agent wants it.
 pub fn sink(store: &Arc<JsonlJournal>) -> Arc<dyn CommitSink> {
     store.clone()
+}
+
+/// The path of worker `<id>`'s own session file: a sibling of the parent
+/// `--session` file. `session.jsonl` gives `session.jsonl.w1.jsonl`.
+pub fn worker_path(session: &Path, id: usize) -> PathBuf {
+    let mut path = session.as_os_str().to_os_string();
+    path.push(format!(".w{id}.jsonl"));
+    PathBuf::from(path)
+}
+
+/// Create the NEW JSONL journal for worker `<id>` next to its parent session.
+/// Same store and durability as [`create`], and the same refusal to overwrite: a
+/// worker's file is never truncated or appended to. It bypasses [`create`]'s
+/// `--resume` hint, which would be wrong advice for a worker's own file.
+pub fn worker(session: &Path, id: usize) -> Result<Arc<dyn CommitSink>, SessionError> {
+    let store = Arc::new(JsonlJournal::create(
+        &worker_path(session, id),
+        SyncPolicy::EveryRecord,
+    )?);
+    Ok(sink(&store))
 }
