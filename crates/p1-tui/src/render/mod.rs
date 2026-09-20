@@ -12,6 +12,7 @@ pub mod picker;
 pub mod screen;
 pub mod status;
 pub mod transcript;
+pub mod workers;
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};

@@ -11,7 +11,7 @@ use ratatui::text::Line;
 use crate::palette;
 use crate::state::{PANE_FLOOR_COLS, PaneMode, Promotion, Screen};
 
-use super::{composer, diff, ledger, output, permission, picker, status, transcript};
+use super::{composer, diff, ledger, output, permission, picker, status, transcript, workers};
 
 /// The pane's padding: the content grid is the pane width minus 4 on each
 /// side (SPEC §5: LEDGER grid 32 in a 40-ch pane; recorded as a refinement —
@@ -129,7 +129,8 @@ fn draw_pane(screen: &Screen, area: Rect, buf: &mut Buffer, cols: usize, _now_ms
             Some(view) => output::lines(view, grid),
             None => vec![],
         },
-        // DIFF / WORKERS land with their features; the pane still earns its place.
+        PaneMode::Workers => workers::lines(&screen.workers, grid),
+        // DIFF lands with its pane mode; the pane still earns its place.
         _ => vec![],
     };
     draw_lines(&lines, content, buf, palette::BLOCK);

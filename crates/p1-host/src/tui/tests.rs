@@ -39,6 +39,7 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             pending_auth: None,
             follow_ups: VecDeque::new(),
             submit_pending: None,
+            worker_rows: Arc::new(Mutex::new(Vec::new())),
             pending_calls: HashMap::new(),
             task_files: HashSet::new(),
             task_added: 0,
@@ -199,4 +200,34 @@ fn worker_events_stay_out_of_the_parent_transcript_but_mark_start_and_end() {
             .iter()
             .any(|b| matches!(b, p1_tui::transcript::Block::Prose { .. }))
     );
+}
+
+#[test]
+fn a_live_worker_promotes_the_pane_and_a_finished_one_releases_it() {
+    use p1_tui::render::workers::{WorkerRow, WorkerState};
+    use p1_tui::state::{PaneMode, PaneWidth};
+    let (mut d, _auth) = driver();
+    let row = |state: WorkerState| WorkerRow {
+        id: "w1".into(),
+        summary: "w1".into(),
+        route: "deepseek/v4.1-flash".into(),
+        state,
+        elapsed: None,
+        cost_micro_usd: None,
+        details: vec![],
+    };
+    d.screen.pane_width = PaneWidth::Off;
+    d.screen.sync_workers(vec![row(WorkerState::Running)]);
+    assert_eq!(d.screen.pane_mode, PaneMode::Workers);
+    assert_eq!(d.screen.pane_width, PaneWidth::Ch56);
+    // All done: an unpinned WORKERS pane falls back to the ledger.
+    d.screen.sync_workers(vec![row(WorkerState::Done)]);
+    assert_eq!(d.screen.pane_mode, PaneMode::Ledger);
+    // …unless it is pinned.
+    d.screen.pane_mode = PaneMode::Workers;
+    d.screen.pinned = true;
+    d.screen.sync_workers(vec![row(WorkerState::Running)]);
+    assert_eq!(d.screen.pane_mode, PaneMode::Workers);
+    d.screen.sync_workers(vec![row(WorkerState::Done)]);
+    assert_eq!(d.screen.pane_mode, PaneMode::Workers, "pinning always wins");
 }
