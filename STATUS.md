@@ -49,9 +49,16 @@ reviewer's AMENDMENTS to the lead's plan — authoritative, in full at
      LIVE canary passed (constraint only inside the summary obeyed after 8 replacements).
      Shipped environments still WITHOUT `[context]` — pick values from dogfooding.
    - Run evidence: `scripts/run-report.py`, `scripts/dogfood.sh`, `docs/dogfood/`.
-1c. IN FLIGHT: first dogfood run `../phaseone-dogfood/read-streaming-claude-1` (+ `.run/` with
-   session, diff, report). Lead must verify INDEPENDENTLY (tests, clippy, diff read), then
-   append the record with --accepted to `docs/dogfood/runs.jsonl`; good diffs may be merged.
+1c. DONE: dogfood runs 1 (claude, accepted) and 2 (gpt, accepted after one repair turn — the
+   lead's diff read found a UTF-8 chunk-boundary bug the agent's own tests missed); both are
+   p1's own changes to p1 (read tool streams; long lines capped). Records: docs/dogfood/runs.jsonl.
+   Shell env allow-list (#4) merged. `scripts/push-main.sh` = push + wait for CI on that SHA
+   (CI was red twice after local-green merges: bwrap and login-profile differences).
+1d. IN FLIGHT (deepseek workers): `../phaseone-7-codex-cache` (issue #7: session_id /
+   conversation_id headers; LEAD then measures cache share live before/after, same task);
+   `../phaseone-completion` (spec docs/design/completion.md: finish tool + bounded continuation;
+   LEAD then: review, ADR, live check of both must-show behaviours, merge).
+   Open issues: #6 grouped dogfood findings (pick [context] values; path vs file_path).
 2. Dogfood under supervision; run-level evidence grouped into issues; shell non-zero exits
    recorded separately from tool failures; look at Codex caching here.
 3. Context-control policy module (spec requirements listed in the amendments, item 4).
