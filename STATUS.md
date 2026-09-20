@@ -92,13 +92,23 @@ IN FLIGHT:
 * OWNER RAN `p1 login opencode-go-2-subscription` (2026-09-21): the key is in the p1 store —
   dispatch deepseek2 jobs WITHOUT the `OPENCODE_GO_2_API_KEY=…` prefix from now on (fall back
   to it only if a run cannot find the key, then investigate p1-auth).
-* OWNER DIRECTIVES 2026-09-21 ~00:45 (owner asleep, work on): (1) WebSocket support wherever
-  possible (Codex first) — a DECISION, overrides the earlier 'no websocket for now'; (2) inventory
-  iris-agent for code worth taking (Rust token optimizer first); (3) prompt-caching optimisation
-  for the Anthropic and ChatGPT routes. = RESEARCH BATCH 3: #41, #42, #43, Opus subagent curator,
-  brief `../phaseone-briefs/research-curator-batch3.md`, memos `research/<n>/memo.md` (cap of two
-  lifted for this batch). NEXT: decide the memos; WebSocket needs lead spec + ADR (transport seam)
-  then p1 jobs; caching needs a small lead-run LIVE probe (few requests) before changing builders.
+* OWNER DIRECTIVES 2026-09-21 ~00:45 (owner asleep, work on) = RESEARCH BATCH 3, ALL ACCEPTED
+  (memos `../phaseone-briefs/research/{41,42,43}/memo.md`; implement cap lifted for this batch,
+  at most two p1 jobs at a time; no batch 4 before these are used):
+  - #41 WebSocket: ADR-0047 (proposed) + `docs/design/websocket.md`. Codex route only (no vendor
+    documents WS for the others). Stage A connector seam = job `ws-seam` RUNNING
+    (`../phaseone-ws-seam`); then stage B framing (brief NOT yet written: spec §1,§3,§4,§5 in
+    `p1-provider-openai` + host route parsing of `transport`), stage C continuation (§6), then
+    the LEAD's live probe (§8) before the shipped route switches to `websocket`.
+  - #43 caching: job `cache-fixes` RUNNING (`../phaseone-cache-fixes`): parser reads
+    `cache_write_tokens`; cache key = hash(workspace, environment, agent ordinal). AFTER merge:
+    lead-run live probe, ~4 short gpt runs: header names `session_id`/`conversation_id` (ours)
+    vs `session-id`/`thread-id` (upstream Codex). Anthropic: nothing to change.
+  - #42 iris: E1 shell output filters — spec in tools.md, brief
+    `../phaseone-briefs/shell-filters.md` READY, dispatch when a lane frees
+    (`scripts/new-worktree.sh shell-filters`, `shell-filters-jobs.json`); then measure on p1;
+    then E2 `read` skim. TOML engine rejected. There is no "token optimizer" in iris — tell the owner.
+  Both running jobs authenticate from the p1 store (no env var) — the login chain works live.
 * RESEARCH BATCH 2 DECIDED (2026-09-21): #36 grep bounding — USED, merged. #37 summarizer prompt —
   USED as a negative result (prompt unchanged); by-product merged: run records carry
   `harness_head` + `binary_sha256`. #35 out-of-credit diagnosis — USED, merged (ADR-0046 accepted).
