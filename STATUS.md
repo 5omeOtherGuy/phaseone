@@ -81,14 +81,11 @@ deepseek2 summarize at 300k of 1M; glm 150k of 260k. NEVER size [context] from o
 IN FLIGHT:
 * `p1-auth` (ADR-0039 step 5): DONE, merged (`bb36fc8`), run recorded. `p1 env show` prints a
   `credential  <source>` line.
-* `p1 login` (ADR-0044 proposed -> set accepted when merged; spec `credentials.md` §6): p1 job on
-  deepseek2 RUNNING, worktree `../phaseone-p1-login`, brief `../phaseone-briefs/p1-login.md`, run
-  dir `../phaseone-briefs/runs/p1-login-*`. Land like every job (review: sentinel test, no key in
-  any output, never ran against the real home). Then tell the owner:
-  `p1 login opencode-go-2-subscription < ~/.config/keys/opencode-go-2.key`, then drop the env var.
-* `run-report-usage` (research #26 -> implement): p1 job on deepseek2 RUNNING, worktree
-  `../phaseone-run-report-usage`, brief `../phaseone-briefs/run-report-usage.md`. Python only.
-  When merged: label #26 `research:used`, close it.
+* `p1 login` / `p1 logout` (ADR-0044 accepted): DONE, merged. OWNER TO RUN ONCE:
+  `p1 login opencode-go-2-subscription < ~/.config/keys/opencode-go-2.key`; after that the
+  `OPENCODE_GO_2_API_KEY=…` prefix at dispatch can go (until then keep it).
+* `run-report-usage` (research #26): DONE, merged, #26 closed as used. Research batch 1 is fully
+  dispositioned (26 used, 27 used, 28 discarded); ADR-0045 accepted. No research item open.
 * NEW bug #30 (from research #28): `finish` accepts masked checks (`cmd; echo done`,
   `cmd || true`). Lead-owned, one crate, needs a spec line in completion.md §2 first. Also seen
   in the p1-auth run: `finish` names ONE missing verification command per rejection (5 rounds).
