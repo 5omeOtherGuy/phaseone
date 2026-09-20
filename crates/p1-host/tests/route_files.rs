@@ -405,7 +405,7 @@ fn assemble_scratch(scratch: &Scratch, name: &str) -> Result<Assembled, String> 
     let dirs = scratch.environment_dirs();
     let harness = Harness::new(dirs.clone(), &[]);
     let completion = Arc::new(CompletionHub::new());
-    let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &completion)?;
+    let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)?;
     let mut environment = load_environment(name, &dirs).map_err(|error| error.to_string())?;
     resolve_environment(&mut environment, &dirs)?;
     let workspace = tempdir().unwrap();
@@ -848,7 +848,8 @@ fn a_route_id_that_collides_with_a_whole_provider_key_is_a_start_up_error() {
         );
         let harness = Harness::new(scratch.environment_dirs(), &[]);
         let completion = Arc::new(CompletionHub::new());
-        let error = match build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &completion) {
+        let error = match build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
+        {
             Ok(_) => panic!("a route id that shadows a whole provider must not build"),
             Err(error) => error,
         };

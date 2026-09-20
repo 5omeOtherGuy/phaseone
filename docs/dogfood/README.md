@@ -2,8 +2,10 @@
 
 One JSON record per supervised run in `runs.jsonl`, written by
 `scripts/run-report.py SESSION.jsonl --append docs/dogfood/runs.jsonl …`. The journal supplies
-the counts; the operator supplies what only they know: `--accepted` (after INDEPENDENT
-verification — re-run the checks yourself), `--interventions`, `--elapsed`, `--exit-code`.
+the counts (including `provider_retries`, the host's own messages after a transient provider
+failure, §3b of `docs/design/completion.md`); the operator supplies what only they know:
+`--accepted` (after INDEPENDENT verification — re-run the checks yourself), `--interventions`,
+`--elapsed`, `--exit-code`.
 
 Rules (review 2026-09-20, plan amendments 3 and 6):
 - Real tasks run in a disposable clone or worktree, never in a checkout someone works in.

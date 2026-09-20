@@ -1153,8 +1153,10 @@ async fn usage_errors_exit_2() {
         ask: false,
         sandbox: p1_host::cli::SandboxMode::Off,
         sandbox_write: Vec::new(),
+        sandbox_read: Vec::new(),
         env_pass: Vec::new(),
         max_continuations: 3,
+        provider_retries: 3,
     };
     let code = p1_host::run::run(&mut harness.deps, options).await;
 

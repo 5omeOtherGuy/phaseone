@@ -114,6 +114,7 @@ pub fn build_catalog(
     deps: &HostDeps,
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
+    sandbox_read: &[PathBuf],
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) -> Result<Catalog, String> {
@@ -123,11 +124,19 @@ pub fn build_catalog(
         deps.worker_service.clone(),
         sandbox,
         sandbox_write,
+        sandbox_read,
         env_pass,
         completion,
     );
     #[cfg(not(feature = "delegation"))]
-    build_catalog_inner(deps, sandbox, sandbox_write, env_pass, completion)
+    build_catalog_inner(
+        deps,
+        sandbox,
+        sandbox_write,
+        sandbox_read,
+        env_pass,
+        completion,
+    )
 }
 
 /// As [`build_catalog`], with the worker tools bound to `service` instead of
@@ -138,6 +147,7 @@ pub fn build_catalog_with_workers(
     service: Option<Arc<dyn p1_workers::WorkerService>>,
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
+    sandbox_read: &[PathBuf],
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) -> Result<Catalog, String> {
@@ -148,6 +158,7 @@ pub fn build_catalog_with_workers(
         deps,
         sandbox,
         sandbox_write,
+        sandbox_read,
         env_pass,
         completion,
     );
@@ -163,6 +174,7 @@ fn build_catalog_inner(
     deps: &HostDeps,
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
+    sandbox_read: &[PathBuf],
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) -> Result<Catalog, String> {
@@ -174,6 +186,7 @@ fn build_catalog_inner(
         deps,
         sandbox,
         sandbox_write,
+        sandbox_read,
         env_pass,
         completion,
     );
@@ -381,6 +394,7 @@ fn register_standard_tools(
     deps: &HostDeps,
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
+    sandbox_read: &[PathBuf],
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) {
@@ -425,6 +439,7 @@ fn register_standard_tools(
     );
     let choice = sandbox;
     let writable = sandbox_write.to_vec();
+    let readable = sandbox_read.to_vec();
     let home = deps.home.clone();
     let runtime_dir = deps.runtime_dir.clone();
     let shell_env = deps.shell_env.clone();
@@ -450,6 +465,7 @@ fn register_standard_tools(
                         );
                     };
                     let mut sandbox = p1_tool_shell::Sandbox::for_home(home);
+                    sandbox.readable = readable.clone();
                     sandbox.writable = writable.clone();
                     sandbox.runtime_dir = runtime_dir.clone();
                     tool.sandboxed(sandbox).map_err(|error| error.to_string())?

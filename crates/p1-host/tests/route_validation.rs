@@ -1,0 +1,181 @@
+//! Section 3 of `docs/design/routes-and-profiles.md`, through the host: the
+//! native-option policy, the Anthropic output-cap conflict and the empty cache
+//! key all fail ASSEMBLY (via the resolved provider's `validate`), and every
+//! shipped `environments/*/environment.toml` still assembles. No network and no
+//! credential is touched: provider construction is lazy.
+
+mod common;
+
+use std::path::Path;
+
+use common::{Harness, run_args, shipped_environments};
+use p1_contracts::CacheKeySupport;
+use serde_json::Value;
+
+/// `p1 env show NAME` is synchronous inside `run`: drive it on a fresh runtime.
+fn show_env(name: &str) -> (i32, String, String) {
+    let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    let code = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(run_args(&mut harness, &["env", "show", name]));
+    (code, harness.stdout.text(), harness.stderr.text())
+}
+
+/// Write `<root>/environments/<name>/` with `environment.toml` + `prompt.md`.
+fn write_environment(root: &Path, name: &str, toml: &str) {
+    let dir = root.join("environments").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("environment.toml"), toml).unwrap();
+    std::fs::write(dir.join("prompt.md"), "prompt").unwrap();
+}
+
+/// A synthetic environments root whose `../profiles` holds the shipped GLM
+/// profile, so a routed environment resolves exactly like a shipped one.
+fn routed_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let profiles = root.path().join("profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/glm-5.3.toml"),
+        profiles.join("glm-5.3.toml"),
+    )
+    .unwrap();
+    root
+}
+
+/// `env show` against a synthetic root: `(code, stderr)`.
+fn show_in(root: &Path, name: &str) -> (i32, String) {
+    let mut harness = Harness::new(vec![root.join("environments")], &[]);
+    let code = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(run_args(&mut harness, &["env", "show", name]));
+    (code, harness.stderr.text())
+}
+
+// ------------------------------------------------------ the shipped environments
+
+#[test]
+fn every_shipped_environment_still_assembles() {
+    for name in ["claude", "claude-delegating", "gpt", "deepseek", "glm"] {
+        let (code, stdout, stderr) = show_env(name);
+        assert_eq!(code, 0, "{name}: {stderr}");
+        let resolved: Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(
+            resolved["environment"], name,
+            "{name}: the resolved environment must be its own"
+        );
+    }
+}
+
+/// Point 1 through the host: each shipped route reports the truth about its own
+/// cache-key consumption (read from its request builder).
+#[test]
+fn every_shipped_route_reports_its_own_cache_key_support() {
+    let expected = [
+        ("claude", CacheKeySupport::Unsupported),
+        ("gpt", CacheKeySupport::Optional),
+        // The OpenCode route carries the key as its session header; GLM's route
+        // has no session header and takes no key at all.
+        ("deepseek", CacheKeySupport::Optional),
+        ("glm", CacheKeySupport::Unsupported),
+    ];
+    for (name, support) in expected {
+        let (code, stdout, stderr) = show_env(name);
+        assert_eq!(code, 0, "{name}: {stderr}");
+        let resolved: Value = serde_json::from_str(stdout.trim()).unwrap();
+        let wire = match support {
+            CacheKeySupport::Unsupported => "unsupported",
+            CacheKeySupport::Optional => "optional",
+        };
+        assert_eq!(
+            resolved["route"]["cache_key"], wire,
+            "{name}: cache key support must match the request builder"
+        );
+    }
+}
+
+// ------------------------------------------------------ native options (section 3)
+
+#[test]
+fn a_native_option_in_another_adapters_namespace_fails_assembly() {
+    let root = routed_root();
+    write_environment(
+        root.path(),
+        "foreign",
+        "route = \"glm-subscription\"\nprofile = \"glm-5.3\"\n\n\
+         [options.native]\n\"anthropic-messages.thinking\" = true\n",
+    );
+    let (code, stderr) = show_in(root.path(), "foreign");
+    assert_eq!(code, 1, "{stderr}");
+    for part in [
+        "option \"anthropic-messages.thinking\"",
+        "route \"openai-chat/glm-subscription\"",
+        "(adapter openai-chat)",
+    ] {
+        assert!(stderr.contains(part), "{stderr}: wanted `{part}`");
+    }
+}
+
+#[test]
+fn a_native_option_in_no_adapters_namespace_keeps_its_meaning() {
+    let root = routed_root();
+    write_environment(
+        root.path(),
+        "plain",
+        "route = \"glm-subscription\"\nprofile = \"glm-5.3\"\n\n\
+         [options.native]\n\"unrelated.option\" = 1\nbare = 2\n",
+    );
+    let (code, stderr) = show_in(root.path(), "plain");
+    assert_eq!(code, 0, "{stderr}");
+}
+
+// ------------------------------------------------------ the Anthropic output cap
+
+#[test]
+fn an_explicit_output_cap_below_the_anthropic_thinking_budget_fails_assembly() {
+    let root = tempfile::tempdir().unwrap();
+    write_environment(
+        root.path(),
+        "capped",
+        "family = \"claude\"\nprovider = \"anthropic-subscription\"\n\
+         model = \"claude-opus-4-6\"\n\n\
+         [options]\nreasoning_effort = \"low\"\nmax_output_tokens = 4096\n",
+    );
+    let (code, stderr) = show_in(root.path(), "capped");
+    assert_eq!(code, 1, "{stderr}");
+    for part in ["max_output_tokens 4096", "thinking budget 4096", "is 4097"] {
+        assert!(stderr.contains(part), "{stderr}: wanted `{part}`");
+    }
+}
+
+// ------------------------------------------------------ the cache-key rules
+
+#[test]
+fn an_empty_explicit_cache_key_fails_assembly_on_the_codex_route() {
+    let root = tempfile::tempdir().unwrap();
+    write_environment(
+        root.path(),
+        "emptykey",
+        "family = \"gpt\"\nprovider = \"openai-codex-subscription\"\n\
+         model = \"gpt-5.6-sol\"\n\n[options]\ncache_key = \"\"\n",
+    );
+    let (code, stderr) = show_in(root.path(), "emptykey");
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("cache_key must not be empty"), "{stderr}");
+}
+
+#[test]
+fn an_explicit_cache_key_on_an_anthropic_route_fails_assembly() {
+    let root = tempfile::tempdir().unwrap();
+    write_environment(
+        root.path(),
+        "keyed",
+        "family = \"claude\"\nprovider = \"anthropic-subscription\"\n\
+         model = \"claude-sonnet-5\"\n\n[options]\ncache_key = \"mine\"\n",
+    );
+    let (code, stderr) = show_in(root.path(), "keyed");
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("takes no cache key"), "{stderr}");
+}

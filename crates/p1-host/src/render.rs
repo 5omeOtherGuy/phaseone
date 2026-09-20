@@ -8,8 +8,9 @@
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use p1_contracts::{AgentEvent, EventSink, ToolStatus, TurnEnd, Usage};
+use p1_contracts::{AgentEvent, EventSink, ProviderErrorKind, ToolStatus, TurnEnd, Usage};
 
 use crate::SharedWriter;
 
@@ -19,6 +20,9 @@ struct Inner {
     line_start: bool,
     last_model: String,
     usage: UsageSums,
+    /// Responses that completed. The host reads it to tell whether a turn that
+    /// ended `ProviderFailed` made any progress (completion.md §3b).
+    responses: u64,
 }
 
 /// Running sums of the usage fields, one unknown flag per part. Shared by the
@@ -175,6 +179,7 @@ impl Renderer {
                 line_start: true,
                 last_model: String::new(),
                 usage: UsageSums::default(),
+                responses: 0,
             }),
         }
     }
@@ -200,6 +205,31 @@ impl Renderer {
         let line = format!(
             "total model {}/{model} · in {input} (cached {cached}) · out {output} · cost {cost}",
             self.route
+        );
+        self.write_line(&mut inner, true, &line);
+    }
+
+    /// How many provider responses this agent completed. The host reads it around
+    /// a turn: a turn in which at least one response completed resets the count of
+    /// consecutive transient provider failures (completion.md §3b).
+    pub fn responses_completed(&self) -> u64 {
+        self.inner.lock().unwrap().responses
+    }
+
+    /// One line per provider retry, naming the failure kind and the wait
+    /// (completion.md §3b).
+    pub fn provider_retry(
+        &self,
+        kind: ProviderErrorKind,
+        retry: usize,
+        max: usize,
+        wait: Duration,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        self.close_line(&mut inner);
+        let line = format!(
+            "provider failed ({kind:?}): retry {retry}/{max} in {} s",
+            wait.as_secs()
         );
         self.write_line(&mut inner, true, &line);
     }
@@ -309,6 +339,7 @@ impl EventSink for Renderer {
                 self.write_line(&mut inner, true, &line);
                 self.record_usage(&mut inner, usage);
                 inner.last_model = model;
+                inner.responses += 1;
             }
             AgentEvent::InboxDelivered { count } => {
                 self.close_line(&mut inner);

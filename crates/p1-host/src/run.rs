@@ -9,6 +9,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[cfg(feature = "delegation")]
 use std::sync::OnceLock;
@@ -19,8 +20,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use p1_assembly::Catalog;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
-    BoxFuture, CancellationToken, CommitSink, ContextError, ContextInput, ContextPolicy, EventSink,
-    JournalRecord, Prepared, TurnEnd,
+    BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError, ContextInput,
+    ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, ResumeReport};
 #[cfg(feature = "delegation")]
@@ -54,6 +55,11 @@ pub const EXIT_STALLED: i32 = 4;
 /// Committed as a normal `UserInput` record, so the journal shows every
 /// continuation.
 pub const CONTINUATION_MESSAGE: &str = "You ended your turn without calling finish. You are running unattended: nobody will answer a question or confirm a plan, and this task authorizes you to continue on your own. Continue the work now. When it is complete and verified, call finish with status \"done\"; if something outside your control stops you, call finish with status \"blocked\".";
+
+/// The ONE message the host sends after a transient provider failure in an
+/// unattended run (completion.md §3b). Committed as a normal `UserInput` record,
+/// so the journal shows every provider retry.
+pub const PROVIDER_RETRY_MESSAGE: &str = "The connection to the model failed and the last response was lost; nothing else changed. Continue the work now.";
 
 /// The default context policy: the history is sent unchanged.
 #[derive(Clone, Copy, Default)]
@@ -148,6 +154,7 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             Some(service),
             options.sandbox,
             &options.sandbox_write,
+            &options.sandbox_read,
             &options.env_pass,
             &completion,
         )
@@ -157,6 +164,7 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
         deps,
         options.sandbox,
         &options.sandbox_write,
+        &options.sandbox_read,
         &options.env_pass,
         &completion,
     );
@@ -261,6 +269,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         deps,
         options.sandbox,
         &options.sandbox_write,
+        &options.sandbox_read,
         &options.env_pass,
         &completion_hub,
     )?);
@@ -273,13 +282,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         .map_err(|error| error.to_string())?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
     let substitutions = substitutions(deps, &workspace);
-    let assembled = assemble_with_cache_key(
-        &catalog,
-        &mut environment,
-        &workspace,
-        &substitutions,
-        &completion_hub,
-    )?;
+    let assembled = assemble_with_cache_key(&catalog, &environment, &workspace, &substitutions)?;
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
     let completion = completion_hub.take();
@@ -347,7 +350,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     }
 
     let code = if headless {
-        run_headless(deps, &mut agent, options, &cancel, completion).await
+        run_headless(deps, &mut agent, options, &cancel, completion, &renderer).await
     } else {
         run_interactive(deps, &mut agent, &cancel).await
     };
@@ -396,6 +399,7 @@ async fn run_headless(
     options: &Options,
     cancel: &CancellationToken,
     completion: Option<Completion>,
+    renderer: &Renderer,
 ) -> i32 {
     let second = Arc::new(tokio::sync::Notify::new());
     spawn_interrupt(deps.interrupt.clone(), cancel.clone(), second.clone());
@@ -409,7 +413,7 @@ async fn run_headless(
 
     // No `finish` in the assembled environment: the run behaves exactly as before.
     let Some(completion) = completion else {
-        return run_headless_plain(deps, agent, cancel, &second, prompt).await;
+        return run_headless_plain(deps, agent, cancel, &second, prompt, renderer, options).await;
     };
 
     let log = completion.log.clone();
@@ -417,9 +421,9 @@ async fn run_headless(
     let max_continuations = options.max_continuations;
 
     outcome.clear();
-    let mut end = match race_turn(agent.run_turn(prompt, cancel.clone()), &second).await {
-        Some(end) => end,
-        None => return EXIT_CANCELLED,
+    let mut end = match prompt_turn(deps, agent, renderer, cancel, &second, options, prompt).await {
+        TurnOutcome::End(end) => end,
+        TurnOutcome::Cancelled => return EXIT_CANCELLED,
     };
 
     let mut continuations = 0usize;
@@ -450,7 +454,7 @@ async fn run_headless(
         // running worker. A parent that stopped while its worker runs is WAITING,
         // not stopping (completion.md §3, must-pass a0).
         outcome.clear();
-        match wait_for_work(deps, agent, cancel, &second).await {
+        match wait_for_work(deps, agent, cancel, &second, renderer, options).await {
             WaitOutcome::Turn(next) => {
                 end = next;
                 continue;
@@ -475,14 +479,19 @@ async fn run_headless(
         continuations += 1;
         last_marker = Some(progress);
         outcome.clear();
-        end = match race_turn(
-            agent.run_turn(CONTINUATION_MESSAGE.to_string(), cancel.clone()),
+        end = match prompt_turn(
+            deps,
+            agent,
+            renderer,
+            cancel,
             &second,
+            options,
+            CONTINUATION_MESSAGE.to_string(),
         )
         .await
         {
-            Some(end) => end,
-            None => return EXIT_CANCELLED,
+            TurnOutcome::End(end) => end,
+            TurnOutcome::Cancelled => return EXIT_CANCELLED,
         };
     }
 }
@@ -495,17 +504,19 @@ async fn run_headless_plain(
     cancel: &CancellationToken,
     second: &Arc<tokio::sync::Notify>,
     prompt: String,
+    renderer: &Renderer,
+    options: &Options,
 ) -> i32 {
-    let mut code = match race_turn(agent.run_turn(prompt, cancel.clone()), second).await {
-        Some(end) => end_code(&end),
-        None => return EXIT_CANCELLED,
+    let mut code = match prompt_turn(deps, agent, renderer, cancel, second, options, prompt).await {
+        TurnOutcome::End(end) => end_code(&end),
+        TurnOutcome::Cancelled => return EXIT_CANCELLED,
     };
 
     loop {
         if cancel.is_cancelled() {
             return EXIT_CANCELLED;
         }
-        match wait_for_work(deps, agent, cancel, second).await {
+        match wait_for_work(deps, agent, cancel, second, renderer, options).await {
             WaitOutcome::Turn(end) => {
                 code = end_code(&end);
                 if code == EXIT_CANCELLED {
@@ -538,13 +549,11 @@ async fn wait_for_work(
     agent: &mut Agent,
     cancel: &CancellationToken,
     second: &Arc<tokio::sync::Notify>,
+    renderer: &Renderer,
+    options: &Options,
 ) -> WaitOutcome {
     if agent.has_pending_inbox() {
-        return match race_inbox(agent.run_inbox_turn(cancel.clone()), second).await {
-            Some(Some(end)) => WaitOutcome::Turn(end),
-            Some(None) => WaitOutcome::Idle,
-            None => WaitOutcome::Cancelled,
-        };
+        return inbox_turn(_deps, agent, cancel, second, renderer, options).await;
     }
     #[cfg(feature = "delegation")]
     {
@@ -557,14 +566,32 @@ async fn wait_for_work(
             }
             // `inbox_ready` only resolves with a message pending, so this turn is
             // the worker's completion notification.
-            return match race_inbox(agent.run_inbox_turn(cancel.clone()), second).await {
-                Some(Some(end)) => WaitOutcome::Turn(end),
-                Some(None) => WaitOutcome::Idle,
-                None => WaitOutcome::Cancelled,
-            };
+            return inbox_turn(_deps, agent, cancel, second, renderer, options).await;
         }
     }
     WaitOutcome::Idle
+}
+
+/// One inbox turn, with the same transient-provider policy as any other turn
+/// (completion.md §3b).
+async fn inbox_turn(
+    deps: &HostDeps,
+    agent: &mut Agent,
+    cancel: &CancellationToken,
+    second: &Arc<tokio::sync::Notify>,
+    renderer: &Renderer,
+    options: &Options,
+) -> WaitOutcome {
+    match race_inbox(agent.run_inbox_turn(cancel.clone()), second).await {
+        Some(Some(end)) => {
+            match wait_out_transient(deps, agent, renderer, cancel, second, options, end).await {
+                TurnOutcome::End(end) => WaitOutcome::Turn(end),
+                TurnOutcome::Cancelled => WaitOutcome::Cancelled,
+            }
+        }
+        Some(None) => WaitOutcome::Idle,
+        None => WaitOutcome::Cancelled,
+    }
 }
 
 async fn run_interactive(deps: &HostDeps, agent: &mut Agent, cancel: &CancellationToken) -> i32 {
@@ -685,6 +712,154 @@ where
         biased;
         _ = second.notified() => None,
         end = future => Some(end),
+    }
+}
+
+// ------------------------------------------------------ transient provider ends
+
+/// The fixed waits for a dropped connection, in order (completion.md §3b).
+const TRANSPORT_RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+];
+
+/// The fixed waits for a rate limit, in order (completion.md §3b).
+const RATE_LIMITED_RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(900),
+];
+
+/// The transient kind of a turn end, if it is one (completion.md §3b): only a
+/// dropped transport and a rate limit are worth waiting out. Everything else
+/// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`, `Protocol`) ends
+/// the run as it always did.
+fn transient_kind(end: &TurnEnd) -> Option<ProviderErrorKind> {
+    match end {
+        TurnEnd::ProviderFailed { error } => match error.kind {
+            kind @ (ProviderErrorKind::Transport | ProviderErrorKind::RateLimited) => Some(kind),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The fixed wait schedule of a transient kind (completion.md §3b): a dropped
+/// connection is retried quickly, a quota window slowly. The schedules are not
+/// computed.
+fn retry_schedule(kind: ProviderErrorKind) -> &'static [Duration] {
+    match kind {
+        ProviderErrorKind::Transport => &TRANSPORT_RETRY_WAITS,
+        ProviderErrorKind::RateLimited => &RATE_LIMITED_RETRY_WAITS,
+        _ => &[],
+    }
+}
+
+/// The wait before retry `retry` (1-based) of a transient failure. The last entry
+/// repeats when `--provider-retries` outlasts the schedule.
+fn retry_wait(kind: ProviderErrorKind, retry: usize) -> Duration {
+    let schedule = retry_schedule(kind);
+    schedule
+        .get(retry - 1)
+        .or_else(|| schedule.last())
+        .copied()
+        .unwrap_or(Duration::ZERO)
+}
+
+/// What a turn — and the retries it needed — ended with.
+enum TurnOutcome {
+    /// The turn ended for a reason other than a transient provider failure.
+    End(TurnEnd),
+    /// The run was cancelled while a turn ran or while waiting to retry.
+    Cancelled,
+}
+
+/// Run one prompt turn and wait out its transient provider failures.
+async fn prompt_turn(
+    deps: &HostDeps,
+    agent: &mut Agent,
+    renderer: &Renderer,
+    cancel: &CancellationToken,
+    second: &Arc<tokio::sync::Notify>,
+    options: &Options,
+    prompt: String,
+) -> TurnOutcome {
+    let end = match race_turn(agent.run_turn(prompt, cancel.clone()), second).await {
+        Some(end) => end,
+        None => return TurnOutcome::Cancelled,
+    };
+    wait_out_transient(deps, agent, renderer, cancel, second, options, end).await
+}
+
+/// completion.md §3b: a turn that ended `ProviderFailed` transiently is not the
+/// end of the run. The host WAITS on the fixed schedule, then continues with ONE
+/// [`PROVIDER_RETRY_MESSAGE`] — while `--provider-retries` CONSECUTIVE transient
+/// ends allow it. The count resets in a turn where at least one provider response
+/// completed. Cancel wins during a wait, and the wait itself is injected through
+/// [`HostDeps::wait`], so no test sleeps.
+async fn wait_out_transient(
+    deps: &HostDeps,
+    agent: &mut Agent,
+    renderer: &Renderer,
+    cancel: &CancellationToken,
+    second: &Arc<tokio::sync::Notify>,
+    options: &Options,
+    end: TurnEnd,
+) -> TurnOutcome {
+    let mut end = end;
+    let mut consecutive = 0usize;
+    loop {
+        let Some(kind) = transient_kind(&end) else {
+            return TurnOutcome::End(end);
+        };
+        if consecutive >= options.provider_retries {
+            // Exhausted: the run ends as it does today, with the last error
+            // already printed by the renderer.
+            return TurnOutcome::End(end);
+        }
+        consecutive += 1;
+        let wait = retry_wait(kind, consecutive);
+        renderer.provider_retry(kind, consecutive, options.provider_retries, wait);
+        if wait_for_retry(deps, cancel, second, wait).await == WaitEnd::Cancelled {
+            return TurnOutcome::Cancelled;
+        }
+        let completed_before = renderer.responses_completed();
+        end = match race_turn(
+            agent.run_turn(PROVIDER_RETRY_MESSAGE.to_string(), cancel.clone()),
+            second,
+        )
+        .await
+        {
+            Some(end) => end,
+            None => return TurnOutcome::Cancelled,
+        };
+        if renderer.responses_completed() > completed_before {
+            consecutive = 0;
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum WaitEnd {
+    Ready,
+    Cancelled,
+}
+
+/// Wait out one retry delay, raced against cancellation: cancel wins immediately
+/// during a wait (completion.md §3b).
+async fn wait_for_retry(
+    deps: &HostDeps,
+    cancel: &CancellationToken,
+    second: &Arc<tokio::sync::Notify>,
+    wait: Duration,
+) -> WaitEnd {
+    let sleep = (deps.wait)(wait);
+    tokio::select! {
+        biased;
+        _ = second.notified() => WaitEnd::Cancelled,
+        _ = cancel.cancelled() => WaitEnd::Cancelled,
+        _ = sleep => WaitEnd::Ready,
     }
 }
 
@@ -860,13 +1035,8 @@ fn make_child_factory(
             os: std::env::consts::OS.to_string(),
         };
         crate::catalog::resolve_environment(&mut environment, &environment_dirs)?;
-        let assembled = assemble_with_cache_key(
-            &catalog,
-            &mut environment,
-            &workspace,
-            &substitutions,
-            &completion_hub,
-        )?;
+        let assembled =
+            assemble_with_cache_key(&catalog, &environment, &workspace, &substitutions)?;
         // `InProcessWorkers` assigns `w{n}` after a SUCCESSFUL factory call and
         // factory calls are serialised, so this is the id the service will hand
         // out. The counter is only advanced at the very end: a start that fails
@@ -945,43 +1115,47 @@ fn make_child_factory(
     })
 }
 
-/// Assemble with a host-generated prompt-cache key where the route takes one. Whether it
-/// does is the ROUTE's knowledge, not the host's: the key is offered, and if the assembled
-/// provider's `validate` refuses the environment with it, the environment is assembled again
-/// without it. A key the environment file sets EXPLICITLY is never dropped — a route that
-/// rejects it fails assembly, as any explicit option it cannot carry does.
+/// Assemble one agent under the host's explicit cache-key policy (ADR-0039): the
+/// RESOLVED route decides. A key is generated only when the environment sets
+/// none and the resolved provider reports [`CacheKeySupport::Optional`]; a key
+/// the environment file sets EXPLICITLY is passed through untouched, and a route
+/// that cannot carry it fails assembly, as any explicit option it cannot carry
+/// does. Exactly ONE assembly runs — the provider and the tools are each built
+/// once — and an assembly error is reported as it is: there is no second attempt
+/// to drop a key, because the description already said whether one is taken.
 fn assemble_with_cache_key(
     catalog: &Catalog,
-    environment: &mut p1_assembly::EnvironmentFile,
+    environment: &p1_assembly::EnvironmentFile,
     workspace: &std::path::Path,
     substitutions: &Substitutions,
-    completion_hub: &CompletionHub,
 ) -> Result<p1_assembly::Assembled, String> {
-    if environment.options.cache_key.is_some() {
-        return assemble(catalog, environment, workspace, substitutions).map_err(|e| e.to_string());
-    }
-    ensure_cache_key(environment, workspace);
-    if let Ok(assembled) = assemble(catalog, environment, workspace, substitutions) {
-        return Ok(assembled);
-    }
-    // The failed attempt may already have issued per-agent completion state.
-    let _ = completion_hub.take();
-    environment.options.cache_key = None;
-    assemble(catalog, environment, workspace, substitutions).map_err(|e| e.to_string())
+    let name = environment.name.clone();
+    let configured = environment.options.clone();
+    p1_assembly::assemble_with_route_options(
+        catalog,
+        environment,
+        workspace,
+        substitutions,
+        |route| {
+            let mut options = configured.clone();
+            if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {
+                options.cache_key = Some(generated_cache_key(&name, workspace));
+            }
+            options
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
-/// Give the agent a stable provider-side prompt-cache key for its lifetime when the
-/// environment sets none. Without one the Codex route served 0 cached tokens across a
-/// whole task (measured 2026-09-20); routes without such a key ignore it.
-fn ensure_cache_key(environment: &mut p1_assembly::EnvironmentFile, workspace: &std::path::Path) {
+/// A fresh provider-side prompt-cache key for one agent. Without one the Codex
+/// route served 0 cached tokens across a whole task (measured 2026-09-20);
+/// routes without such a key never see it.
+fn generated_cache_key(environment: &str, workspace: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
-    if environment.options.cache_key.is_some() {
-        return;
-    }
     static AGENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     workspace.hash(&mut hasher);
-    environment.name.hash(&mut hasher);
+    environment.hash(&mut hasher);
     std::process::id().hash(&mut hasher);
     AGENTS
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -989,5 +1163,5 @@ fn ensure_cache_key(environment: &mut p1_assembly::EnvironmentFile, workspace: &
     if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         now.as_nanos().hash(&mut hasher);
     }
-    environment.options.cache_key = Some(format!("p1-{:016x}", hasher.finish()));
+    format!("p1-{:016x}", hasher.finish())
 }

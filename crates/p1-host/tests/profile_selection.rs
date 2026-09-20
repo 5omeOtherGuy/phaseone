@@ -56,7 +56,7 @@ fn substitutions(workspace: &Path) -> Substitutions {
 /// The real catalog with the real providers; nothing here reads a credential.
 fn catalog(harness: &Harness) -> Catalog {
     let completion = Arc::new(CompletionHub::new());
-    p1_host::catalog::build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &completion)
+    p1_host::catalog::build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
         .expect("the routes the harness can see are valid")
 }
 

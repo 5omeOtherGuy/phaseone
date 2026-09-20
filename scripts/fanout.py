@@ -19,7 +19,10 @@ an evidence record (scripts/run-report.py) in a run directory:
      "dir": "/abs/worktree", "session": "<run>/session.jsonl",
      "prompt_file": "/abs/defects.md"}
   optional "sandbox_write": ["/abs/path", ...] and "max_continuations": N reach the
-  matching p1 flags; `profile`/`effort` are unused by this runner.
+  matching p1 flags; `profile`/`effort` are unused by this runner. When `dir` is a git
+  WORKTREE (its `--git-common-dir` is outside `dir`) the common directory is passed as
+  `--sandbox-read` so the agent can inspect (never commit) the git metadata that lives in
+  the main checkout.
 
 Every job also accepts "after": ["label", ...] — start only when those jobs finished
 successfully (exit 0 / outcome done).
@@ -159,8 +162,44 @@ def build_locks_dir():
     return f"/tmp/p1-build-locks-{os.getuid()}"
 
 
-def p1_command(job, binary, session_path, brief, locks_dir):
-    """The exact p1 argv for one job (pure; the resume flag follows the session)."""
+def git_common_dir(workdir):
+    """The git common dir of `workdir`, absolute, or None when it is not a repo.
+
+    A worktree's common dir is the main checkout's `.git/`; a plain clone's is its own
+    `.git`, which the sandbox already makes visible inside the workspace.
+    """
+    try:
+        done = subprocess.run(["git", "-C", workdir, "rev-parse", "--git-common-dir"],
+                              capture_output=True, text=True)
+    except OSError:
+        return None
+    if done.returncode != 0:
+        return None
+    path = done.stdout.strip()
+    if not path:
+        return None
+    if not os.path.isabs(path):
+        path = os.path.join(workdir, path)
+    return os.path.realpath(path)
+
+
+def sandbox_read_paths(workdir):
+    """The `--sandbox-read` paths for a job dir: the git common dir when `workdir` is a
+    worktree (the common dir is OUTSIDE the dir), so `git status`/`git diff` work.
+    Read-only on purpose: the agent may inspect, never commit.
+    """
+    common = git_common_dir(workdir)
+    if common is None:
+        return []
+    root = os.path.realpath(workdir)
+    if common == root or common.startswith(root + os.sep):
+        return []
+    return [common]
+
+
+def p1_command(job, binary, session_path, brief, locks_dir, readable=()):
+    """The exact p1 argv for one job (pure; the resume flag follows the session and the
+    read-only paths are injected by the caller)."""
     cmd = [binary, "--env", job["env"], "--workspace", job["dir"], "--session", session_path]
     if job.get("session"):
         cmd.append("--resume")
@@ -170,6 +209,8 @@ def p1_command(job, binary, session_path, brief, locks_dir):
             "--sandbox-write", locks_dir]
     for path in job.get("sandbox_write", []):
         cmd += ["--sandbox-write", path]
+    for path in readable:
+        cmd += ["--sandbox-read", path]
     if job.get("max_continuations") is not None:
         cmd += ["--max-continuations", str(job["max_continuations"])]
     cmd.append(brief)
@@ -250,7 +291,8 @@ def launch(job, worker, binary, out_dir):
             handle.write(brief)
         stdout = open(stdout_path, "w")
         stderr = open(stderr_path, "w")
-        proc = subprocess.Popen(p1_command(job, binary, session, brief, build_locks_dir()),
+        proc = subprocess.Popen(p1_command(job, binary, session, brief, build_locks_dir(),
+                                           sandbox_read_paths(job["dir"])),
                                 stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
                                 start_new_session=True)
         return {"proc": proc, "job": job, "started": started, "stdout": stdout, "stderr": stderr,

@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use catalog::CatalogHook;
+use p1_contracts::BoxFuture;
 use p1_provider_http::Transport;
 
 /// Whether the crate was compiled with the `delegation` cargo feature.
@@ -56,6 +57,10 @@ pub trait LineSource: Send + Sync {
 pub trait InterruptSource: Send + Sync {
     fn recv<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 }
+
+/// A wait of the given duration, as a future. Production sleeps; tests substitute
+/// one they release themselves, so no test ever sleeps (completion.md §3b).
+pub type WaitFn = Arc<dyn Fn(std::time::Duration) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Lines from any async reader, newline trimmed.
 ///
@@ -151,6 +156,9 @@ pub struct HostDeps {
     /// Test-only hook: called with the fully built catalog, after the built-in
     /// providers and tools are registered, so a test can add or replace entries.
     pub catalog_hook: Option<CatalogHook>,
+    /// The wait before retrying a transient provider failure in a headless run
+    /// (completion.md §3b). Production sleeps; a test injects a future it controls.
+    pub wait: WaitFn,
     /// The delegation service. `run` sets this before building the catalog; the
     /// catalog registers the `worker_*` tools only when it is present.
     #[cfg(feature = "delegation")]
@@ -186,6 +194,7 @@ impl HostDeps {
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
             shell_env: None,
             catalog_hook: None,
+            wait: Arc::new(|duration| Box::pin(tokio::time::sleep(duration))),
             #[cfg(feature = "delegation")]
             worker_service: None,
         }

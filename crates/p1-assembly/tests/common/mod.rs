@@ -137,6 +137,7 @@ fn route(supports_freeform_tools: bool) -> RouteDescription {
         supports_freeform_tools,
         mandatory_prompt_prefix: None,
         reports_cost: false,
+        cache_key: p1_contracts::CacheKeySupport::Unsupported,
     }
 }
 

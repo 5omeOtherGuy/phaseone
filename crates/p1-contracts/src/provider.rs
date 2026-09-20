@@ -40,7 +40,9 @@ pub struct ModelOptions {
     /// Stable key for provider-side prompt caching, where the route has one.
     pub cache_key: Option<String>,
     /// Route-native options, namespaced by route id (`"anthropic-messages.…"`).
-    /// An adapter rejects keys in its namespace it does not know and ignores others.
+    /// An adapter rejects keys in its own namespace it does not know, rejects
+    /// keys in another adapter's namespace (a route switch must not silently
+    /// drop an explicit preference), and ignores un-namespaced keys.
     pub native: BTreeMap<String, serde_json::Value>,
 }
 
@@ -56,6 +58,19 @@ pub struct ProviderRequest {
     pub options: ModelOptions,
 }
 
+/// Whether this provider instance consumes [`ModelOptions::cache_key`]. The
+/// truth about the instance itself, read from its request builder: a route that
+/// has no provider-side cache key (`Unsupported`) must not be handed one, and
+/// an explicit key on such a route is an error, not a silent drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheKeySupport {
+    /// The route has no provider-side cache key; an explicit one is rejected.
+    Unsupported,
+    /// The route takes a stable cache key when one is supplied or generated.
+    Optional,
+}
+
 /// What this provider instance actually is. Safe to log: never contains credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteDescription {
@@ -66,6 +81,8 @@ pub struct RouteDescription {
     pub mandatory_prompt_prefix: Option<String>,
     /// Whether the route bills per request (false for subscriptions: cost unknown).
     pub reports_cost: bool,
+    /// Whether this instance consumes [`ModelOptions::cache_key`].
+    pub cache_key: CacheKeySupport,
 }
 
 /// Token usage with provider fields kept distinct: the two routes disagree on

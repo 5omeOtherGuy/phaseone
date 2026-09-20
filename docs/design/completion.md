@@ -103,6 +103,35 @@ parsing the shell footer `[exit code: N]`. No new core or contract surface. On `
 log is REBUILT from the journal's `ToolStarted`/`ToolFinished` records, so a verification run
 before the restart still counts and a file change before it still invalidates.
 
+## 3b. Provider failures in a headless run (issue #11)
+
+A turn that ends `ProviderFailed` with kind `Transport` or `RateLimited` is a TRANSIENT end: the
+adapter's own retries (seconds, before the stream starts) are already spent, or the stream broke
+after it began. Dogfooding lost two long jobs to exactly this in one afternoon. Every other kind
+(`InvalidRequest`, `Authentication`, `ContextWindowExceeded`, `Protocol`) ends the run as before.
+
+Policy, headless only (an interactive user is present and decides):
+- The host WAITS, then continues with one fixed user-role message (`PROVIDER_RETRY_MESSAGE`:
+  the connection to the model failed, the last response was lost, nothing else changed,
+  continue). The interrupted response stays in the journal as the core recorded it; the host
+  adds nothing to history except that message.
+- Waits are fixed schedules, not computed: `Transport` 5 s, 30 s, 120 s; `RateLimited` 60 s,
+  300 s, 900 s. `--provider-retries N` (default 3, 0 disables) bounds CONSECUTIVE transient ends;
+  a turn in which at least one provider response completed resets the count. Exhausted → exit 1
+  as today, the last error printed.
+- Cancel wins immediately during a wait (exit code as for any cancel).
+- The wait is injected as a future (as the shell tool's `expiry`), so tests never sleep.
+- Provider retries and continuations after a premature stop are separate budgets; a provider
+  retry is not "progress" and not a continuation.
+- Visible: the renderer prints `provider failed (<kind>): retry <n>/<max> in <s> s`. Countable:
+  `run-report.py` reports `provider_retries` (the journalled `PROVIDER_RETRY_MESSAGE` inputs).
+
+Must-pass (scripted provider, injected wait): Transport failure then success → the run completes,
+one retry message in history, exit 0; three consecutive failures with N=3 → four attempts, exit 1;
+a success between failures resets the count; `InvalidRequest` is never retried; cancel during the
+wait exits as cancelled without a further request; `--provider-retries 0` behaves as before;
+interactive mode is unchanged.
+
 ## 4. Environments
 
 `finish` joins the shipped environments' tool lists, and each family prompt gets a short
