@@ -1,0 +1,25 @@
+# How the OpenCode Go subscription is reached (ADR-0039 step 3, spec §1.2 of
+# docs/design/routes-and-profiles.md). Everything the host used to hard-code for this
+# route lives here. `user-agent` does NOT: it carries this crate's version, so it stays
+# compiled in `p1_host::catalog` where `env!("CARGO_PKG_VERSION")` is available, and a
+# route file cannot stale it. There are no other static headers on this route, so there
+# is no `[headers]` table.
+id           = "opencode-go-subscription"
+origin_route = "openai-chat/opencode-go-subscription"
+adapter      = "openai-chat"
+endpoint     = "https://opencode.ai/zen/go/v1/chat/completions"
+
+[credential]
+# A reference, never a value: the environment variable first, then the two CLI logins
+# that hold this subscription's key.
+kind   = "api-key"
+env    = "OPENCODE_API_KEY"
+borrow = ["opencode:opencode-go", "pi:opencode-go"]
+
+[adapter_settings]
+dialect        = "thinking-with-reasoning-alias"
+session_header = "x-opencode-session"
+
+# Only profiles the host ships a policy for; any other profile is refused.
+[models."deepseek-v4.1-flash"]
+wire_model = "deepseek-v4.1-flash"

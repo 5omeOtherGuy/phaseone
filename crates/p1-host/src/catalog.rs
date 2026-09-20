@@ -97,15 +97,15 @@ macro_rules! apply_finish_face {
 
 /// Build the catalog from the injected dependencies.
 ///
-/// Provider keys: `anthropic-subscription`, `openai-codex-subscription`.
-/// Tool keys: `read`, `edit`, `write`, `grep`, `shell`, `apply_patch`, and — with
-/// the `delegation` feature and a worker service present — the four `worker_*`
-/// tools.
+/// Provider keys: `anthropic-subscription`, `openai-codex-subscription`, plus one
+/// key per route file found in `<environments dir>/../routes`
+/// (`docs/design/routes-and-profiles.md` §2). Tool keys: `read`, `edit`, `write`,
+/// `grep`, `shell`, `apply_patch`, and — with the `delegation` feature and a worker
+/// service present — the four `worker_*` tools.
 ///
-/// The two chat routes (`opencode-go-subscription`, `glm-subscription`) are
-/// selected with `route` + `profile` and refuse the whole-provider form; the whole
-/// providers above refuse a profile. Route files will register the chat routes
-/// under their own ids in a later step.
+/// A routed key is selected with `route` + `profile` and refuses the whole-provider
+/// form; the whole providers above refuse a profile. A route file whose id collides
+/// with a whole-provider key is a start-up error, reported here before any run.
 ///
 /// Provider construction reads no credential file; the credential sources are
 /// resolved lazily on the first `access`. Tools are constructed per agent with
@@ -117,7 +117,7 @@ pub fn build_catalog(
     sandbox_read: &[PathBuf],
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
-) -> Catalog {
+) -> Result<Catalog, String> {
     #[cfg(feature = "delegation")]
     return build_catalog_with_workers(
         deps,
@@ -150,9 +150,9 @@ pub fn build_catalog_with_workers(
     sandbox_read: &[PathBuf],
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
-) -> Catalog {
+) -> Result<Catalog, String> {
     let mut catalog = Catalog::new();
-    register_providers(&mut catalog, deps);
+    register_providers(&mut catalog, deps)?;
     register_standard_tools(
         &mut catalog,
         deps,
@@ -166,7 +166,7 @@ pub fn build_catalog_with_workers(
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
-    catalog
+    Ok(catalog)
 }
 
 #[cfg(not(feature = "delegation"))]
@@ -177,10 +177,10 @@ fn build_catalog_inner(
     sandbox_read: &[PathBuf],
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
-) -> Catalog {
+) -> Result<Catalog, String> {
     let mut catalog = Catalog::new();
 
-    register_providers(&mut catalog, deps);
+    register_providers(&mut catalog, deps)?;
     register_standard_tools(
         &mut catalog,
         deps,
@@ -194,13 +194,18 @@ fn build_catalog_inner(
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
-    catalog
+    Ok(catalog)
 }
 
-fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
+/// The compiled whole-provider keys: a catalog key that consumes no profile. A route
+/// file may not take one of these ids, and a `route` naming one is the wrong-form
+/// error the whole provider itself reports.
+pub const WHOLE_PROVIDERS: [&str; 2] = ["anthropic-subscription", "openai-codex-subscription"];
+
+fn register_providers(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
     let transport = deps.transport.clone();
     catalog.provider(
-        "anthropic-subscription",
+        WHOLE_PROVIDERS[0],
         Box::new(move |spec: &ProviderSpec| {
             reject_profile(spec)?;
             let credentials = p1_provider_anthropic::ClaudeCodeCredentials::from_default_location()
@@ -216,7 +221,7 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
 
     let transport = deps.transport.clone();
     catalog.provider(
-        "openai-codex-subscription",
+        WHOLE_PROVIDERS[1],
         Box::new(move |spec: &ProviderSpec| {
             reject_profile(spec)?;
             let credentials = p1_provider_openai::CodexCliCredentials::from_default_location()
@@ -229,26 +234,66 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
             Ok(Arc::new(provider) as Arc<dyn Provider>)
         }),
     );
-    let transport = deps.transport.clone();
-    catalog.provider(
-        "opencode-go-subscription",
-        Box::new(move |spec: &ProviderSpec| {
-            let profile = require_profile(spec)?;
-            deepseek_subscription(&spec.model, profile, transport.clone())
+
+    register_routes(catalog, deps)
+}
+
+/// Register one factory per route file, under the route id. The closure owns that
+/// route's data and calls the compiled constructor for its adapter key; nothing about
+/// a route is compiled into this crate (spec §2).
+fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
+    for route in crate::routes::load_all_routes(&deps.environment_dirs)? {
+        if WHOLE_PROVIDERS.contains(&route.id.as_str()) {
+            return Err(format!(
+                "route `{}` collides with the compiled whole-provider key of the same name; \
+                 rename the route file, a route cannot shadow a whole provider",
+                route.id
+            ));
+        }
+        let transport = deps.transport.clone();
+        let route = Arc::new(route);
+        let data = route.clone();
+        catalog.provider(
+            &route.id,
+            Box::new(move |spec: &ProviderSpec| {
+                let profile = require_profile(spec)?;
+                let binding = data.binding(&profile.id)?;
+                let credentials = crate::auth::SubscriptionCredentials::from_ref(&data.credential)?;
+                route_provider(
+                    &data,
+                    binding,
+                    profile,
+                    transport.clone(),
+                    Arc::new(credentials),
+                )
                 .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
                 .map_err(|error| error.to_string())
-        }),
-    );
-    let transport = deps.transport.clone();
-    catalog.provider(
-        "glm-subscription",
-        Box::new(move |spec: &ProviderSpec| {
-            let profile = require_profile(spec)?;
-            glm_subscription(&spec.model, profile, transport.clone())
-                .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
-                .map_err(|error| error.to_string())
-        }),
-    );
+            }),
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a loaded environment against the route files, before `assemble` is
+/// called (spec §2 steps 1–3): the route file it names must exist and must bind the
+/// profile the environment selected, and the environment's model becomes that
+/// binding's WIRE model. A whole-provider environment is left alone — the provider
+/// factory reports the wrong form.
+pub fn resolve_environment(
+    environment: &mut p1_assembly::EnvironmentFile,
+    environment_dirs: &[PathBuf],
+) -> Result<(), String> {
+    if environment.profile.is_none() || WHOLE_PROVIDERS.contains(&environment.provider.as_str()) {
+        return Ok(());
+    }
+    let route = crate::routes::load_route_by_id(environment_dirs, &environment.provider)?;
+    let profile = environment
+        .profile
+        .as_ref()
+        .ok_or_else(|| format!("`{}` needs a model profile", environment.provider))?;
+    let binding = route.binding(&profile.id)?;
+    environment.model = binding.wire_model.clone();
+    Ok(())
 }
 
 /// The profile an environment selected, for a key that is a chat route. The old
@@ -277,58 +322,71 @@ fn reject_profile(spec: &ProviderSpec) -> Result<(), String> {
     Ok(())
 }
 
-/// Shipped route binding, reused by live checks. Credential access remains lazy.
-pub fn deepseek_subscription(
-    model: &str,
+/// The composition of one route file with one profile binding: the adapter key the
+/// file names builds its provider from the file's own data (spec §2 step 4). The
+/// catalog factory, the live checks and the tests all come through here, so a route
+/// has exactly one construction path.
+pub fn route_provider(
+    route: &crate::routes::RouteFile,
+    binding: &crate::routes::ModelBinding,
     profile: Arc<p1_model_profile::ModelProfile>,
     transport: Arc<dyn p1_provider_http::Transport>,
-) -> Result<p1_provider_openai_chat::ChatProvider, p1_contracts::ProviderError> {
-    use p1_provider_openai_chat::{ChatDialect, ChatLimits, ChatProvider, ChatRoute};
-    let route = ChatRoute {
-        origin_route: "openai-chat/opencode-go-subscription".into(),
-        endpoint: "https://opencode.ai/zen/go/v1/chat/completions".into(),
-        headers: vec![(
-            "user-agent".into(),
-            concat!("p1/", env!("CARGO_PKG_VERSION")).into(),
-        )],
-        session_header: Some("x-opencode-session".into()),
-        dialect: ChatDialect::ThinkingWithReasoningAlias,
-        limits: ChatLimits::default(),
-    };
-    ChatProvider::new(
-        route,
-        model,
+    credentials: Arc<dyn p1_provider_http::CredentialSource>,
+) -> Result<p1_provider_openai_chat::ChatProvider, String> {
+    p1_provider_openai_chat::ChatProvider::new(
+        chat_route(route, binding, &profile)?,
+        &binding.wire_model,
         profile,
         transport,
-        Arc::new(crate::auth::SubscriptionCredentials::opencode_go()),
+        credentials,
     )
+    .map_err(|error| error.to_string())
 }
 
-/// GLM model policy and the Z.ai coding route are separate constructor inputs.
-pub fn glm_subscription(
-    model: &str,
-    profile: Arc<p1_model_profile::ModelProfile>,
-    transport: Arc<dyn p1_provider_http::Transport>,
-) -> Result<p1_provider_openai_chat::ChatProvider, p1_contracts::ProviderError> {
-    use p1_provider_openai_chat::{ChatDialect, ChatLimits, ChatProvider, ChatRoute};
-    let route = ChatRoute {
-        origin_route: "openai-chat/glm-subscription".into(),
-        endpoint: "https://api.z.ai/api/coding/paas/v4/chat/completions".into(),
-        headers: vec![(
-            "user-agent".into(),
-            concat!("p1/", env!("CARGO_PKG_VERSION")).into(),
-        )],
-        session_header: None,
-        dialect: ChatDialect::RetainedThinking,
-        limits: ChatLimits::default(),
-    };
-    ChatProvider::new(
-        route,
-        model,
-        profile,
-        transport,
-        Arc::new(crate::auth::SubscriptionCredentials::glm()),
-    )
+/// The chat adapter's view of one route file: the file's endpoint and static headers,
+/// the settings the adapter parses for itself, and the profile's output ceiling
+/// lowered by the binding's.
+pub fn chat_route(
+    route: &crate::routes::RouteFile,
+    binding: &crate::routes::ModelBinding,
+    profile: &p1_model_profile::ModelProfile,
+) -> Result<p1_provider_openai_chat::ChatRoute, String> {
+    use p1_provider_openai_chat::{ChatLimits, ChatRoute};
+    // One adapter key today, so the pattern is irrefutable; a second variant turns
+    // this into a compile error rather than a silent wrong adapter.
+    let crate::routes::AdapterSettings::OpenAiChat(settings) = route.settings()?;
+    // `user-agent` stays compiled: it carries this crate's version, so a route file
+    // cannot stale it. The file's own headers follow, sorted by name (a `BTreeMap`,
+    // so the order is stable), and a file cannot name a secret-looking one.
+    let mut headers = vec![(
+        "user-agent".to_string(),
+        concat!("p1/", env!("CARGO_PKG_VERSION")).to_string(),
+    )];
+    headers.extend(
+        route
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    Ok(ChatRoute {
+        origin_route: route.origin_route.clone(),
+        endpoint: route.endpoint.clone(),
+        headers,
+        session_header: settings.session_header,
+        dialect: settings.dialect,
+        limits: ChatLimits {
+            max_output_tokens: lower_ceiling(profile.max_output_tokens, binding.output_limit),
+        },
+    })
+}
+
+/// A route may restrict a profile's ceiling, never enlarge it. Unknown on one side
+/// keeps the known one; unknown on both stays unknown.
+fn lower_ceiling(profile: Option<u32>, route: Option<u32>) -> Option<u32> {
+    match (profile, route) {
+        (Some(profile), Some(route)) => Some(profile.min(route)),
+        (profile, route) => profile.or(route),
+    }
 }
 
 fn register_standard_tools(

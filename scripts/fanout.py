@@ -10,8 +10,9 @@ jobs.json is a list of jobs. A `pi-worker` job (the default runner) is:
     {"label": "core-fix", "profile": "deepseek", "effort": "high",
      "dir": "/abs/worktree", "session": "<id>", "prompt_file": "/abs/defects.md"}
 
-A `p1` job runs the work with p1 ITSELF, sandboxed, and keeps the session journal and
-an evidence record (scripts/run-report.py) in a run directory:
+A `p1` job runs the work with p1 ITSELF — with full access by default, like p1 (ADR-0038);
+"sandbox": true confines the agent's shell to the workspace — and keeps the session journal
+and an evidence record (scripts/run-report.py) in a run directory:
     {"label": "core-tests", "runner": "p1", "env": "claude",
      "dir": "/abs/worktree", "brief_file": "/abs/brief.md"}
   repair round — resume an earlier run's journal:
@@ -19,7 +20,8 @@ an evidence record (scripts/run-report.py) in a run directory:
      "dir": "/abs/worktree", "session": "<run>/session.jsonl",
      "prompt_file": "/abs/defects.md"}
   optional "sandbox_write": ["/abs/path", ...] and "max_continuations": N reach the
-  matching p1 flags; `profile`/`effort` are unused by this runner. When `dir` is a git
+  matching p1 flags ("sandbox_write" only with "sandbox": true); `profile`/`effort` are
+  unused by this runner. When a SANDBOXED job's `dir` is a git
   WORKTREE (its `--git-common-dir` is outside `dir`) the common directory is passed as
   `--sandbox-read` so the agent can inspect (never commit) the git metadata that lives in
   the main checkout.
@@ -203,14 +205,18 @@ def p1_command(job, binary, session_path, brief, locks_dir, readable=()):
     cmd = [binary, "--env", job["env"], "--workspace", job["dir"], "--session", session_path]
     if job.get("session"):
         cmd.append("--resume")
-    cmd += ["--yes", "--sandbox", "workspace",
-            "--sandbox-write", os.path.expanduser("~/.cargo/registry"),
-            "--sandbox-write", os.path.expanduser("~/.cargo/git"),
-            "--sandbox-write", locks_dir]
-    for path in job.get("sandbox_write", []):
-        cmd += ["--sandbox-write", path]
-    for path in readable:
-        cmd += ["--sandbox-read", path]
+    cmd.append("--yes")
+    # Owner decision 2026-09-20: full access is the default here as in p1 itself (ADR-0038);
+    # a job opts INTO the workspace sandbox with "sandbox": true.
+    if job.get("sandbox", False):
+        cmd += ["--sandbox", "workspace",
+                "--sandbox-write", os.path.expanduser("~/.cargo/registry"),
+                "--sandbox-write", os.path.expanduser("~/.cargo/git"),
+                "--sandbox-write", locks_dir]
+        for path in job.get("sandbox_write", []):
+            cmd += ["--sandbox-write", path]
+        for path in readable:
+            cmd += ["--sandbox-read", path]
     if job.get("max_continuations") is not None:
         cmd += ["--max-continuations", str(job["max_continuations"])]
     cmd.append(brief)
@@ -268,6 +274,10 @@ def validate_jobs(jobs):
                 raise JobError(f"fanout: job {label}: prompt file missing: {job['prompt_file']}")
         elif not os.path.isfile(job.get("brief_file") or ""):
             raise JobError(f"fanout: job {label}: brief file missing: {job.get('brief_file')}")
+        if not isinstance(job.get("sandbox", False), bool):
+            raise JobError(f"fanout: job {label}: sandbox must be true or false")
+        if job.get("sandbox_write") and not job.get("sandbox", False):
+            raise JobError(f"fanout: job {label}: sandbox_write needs \"sandbox\": true")
         for path in job.get("sandbox_write", []):
             if not os.path.isabs(path):
                 raise JobError(f"fanout: job {label}: sandbox_write must be absolute: {path}")

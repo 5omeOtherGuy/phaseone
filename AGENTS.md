@@ -33,7 +33,7 @@ make that fast and conflict-free.
 
 Jobs are dispatched with `scripts/fanout.py <jobs.json>`; it starts them up to a machine-wide
 pool bound and prints one JSON summary when the batch ends. `"runner": "p1"` runs the job
-with p1 itself, sandboxed, and leaves a run directory holding the session journal, the
+with p1 itself — full access by default, `"sandbox": true` to confine its shell — and leaves a run directory holding the session journal, the
 agent's stdout/stderr and `report.json` (from `scripts/run-report.py`). The lead still
 verifies independently and records accepted runs in `docs/dogfood/runs.jsonl`.
 

@@ -15,12 +15,27 @@ pub use request::build_request;
 use std::sync::Arc;
 
 /// Implemented encodings, not service names. Unknown extensions require an implementation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The names are the kebab-case spellings a route file's `[adapter_settings]` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ChatDialect {
     /// Enabled thinking, replayable reasoning_content plus the equivalent reasoning alias.
     ThinkingWithReasoningAlias,
     /// Enabled/preserved thinking, reasoning_content replay, and streaming function inputs.
     RetainedThinking,
+}
+
+/// The `[adapter_settings]` table of a route whose `adapter` is `openai-chat`: fields
+/// this adapter owns, parsed by this adapter (`docs/design/routes-and-profiles.md`
+/// §1.2). A key this struct does not name is rejected rather than ignored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatAdapterSettings {
+    pub dialect: ChatDialect,
+    /// The header a cache/session key travels in. `None`: the route carries none, so
+    /// an explicit cache key is an error for this route.
+    #[serde(default)]
+    pub session_header: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
