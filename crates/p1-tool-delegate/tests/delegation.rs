@@ -897,3 +897,33 @@ async fn invalid_environment_and_describe_are_reported() {
         "Started worker w1 on openai-codex-responses/gpt-5.6-sol. You will be notified when it finishes."
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn review_continuation_obeys_global_limit() {
+    let (factory, _) = scripted_factory("child", vec![], vec![
+        vec![text_response("first"), Step::EventsThenAwaitCancel(vec![])],
+        vec![Step::EventsThenAwaitCancel(vec![])],
+    ], "r/m");
+    let workers = InProcessWorkers::new(factory, 1);
+    let first = workers.start(spec()).await.unwrap();
+    workers.wait(&first, CancellationToken::new()).await.unwrap();
+    let _second = workers.start(spec()).await.unwrap();
+    let result = workers.continue_child(&first, "repair".into()).await;
+    tokio::task::yield_now().await;
+    let running = workers.list().await.into_iter().filter(|(_, s)| matches!(s, ChildStatus::Running)).count();
+    workers.shutdown().await;
+    assert_eq!(result, Err(WorkerError::LimitReached { max: 1 }), "running count {running}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn review_cancel_immediately_after_continue_is_retained() {
+    let (factory, _) = scripted_factory("child", vec![], vec![vec![text_response("first"), Step::EventsThenAwaitCancel(vec![])]], "r/m");
+    let workers = InProcessWorkers::new(factory, 1);
+    let id = workers.start(spec()).await.unwrap();
+    workers.wait(&id, CancellationToken::new()).await.unwrap();
+    workers.continue_child(&id, "repair".into()).await.unwrap();
+    workers.cancel(&id).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(1), workers.wait(&id, CancellationToken::new())).await;
+    workers.shutdown().await;
+    assert!(matches!(result, Ok(Ok(ChildStatus::Cancelled))), "immediate cancellation was lost: {result:?}");
+}

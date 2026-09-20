@@ -987,3 +987,61 @@ async fn cancellation_exits_130_and_renders_turn_finished() {
         harness.stderr.text()
     );
 }
+
+#[cfg(feature = "delegation")]
+#[tokio::test(start_paused = true)]
+async fn review_interactive_idle_parent_wakes_on_child_completion() {
+    struct Lines {
+        first: std::sync::atomic::AtomicBool,
+        idle: Arc<tokio::sync::Notify>,
+        exit: Arc<tokio::sync::Notify>,
+    }
+    impl p1_host::LineSource for Lines {
+        fn next_line<'a>(&'a self) -> BoxFuture<'a, Option<String>> {
+            Box::pin(async move {
+                if !self.first.swap(true, std::sync::atomic::Ordering::SeqCst) { return Some("go".into()); }
+                self.idle.notify_one();
+                self.exit.notified().await;
+                Some("/exit".into())
+            })
+        }
+    }
+    struct Parent {
+        inner: ScriptedProvider,
+        woke: Arc<tokio::sync::Notify>,
+    }
+    impl Provider for Parent {
+        fn describe(&self) -> RouteDescription { self.inner.describe() }
+        fn validate(&self, r: &ProviderRequest) -> Result<(), ProviderError> { self.inner.validate(r) }
+        fn stream<'a>(&'a self, r: ProviderRequest, c: CancellationToken) -> BoxFuture<'a, Result<ProviderStream, ProviderError>> {
+            if self.inner.requests().len() == 2 { self.woke.notify_one(); }
+            self.inner.stream(r, c)
+        }
+    }
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(environments.path(), "a", "fake-a", "a", &["worker_start"], "parent");
+    write_environment(environments.path(), "b", "fake-b", "b", &[], "child");
+    let woke = Arc::new(tokio::sync::Notify::new());
+    let parent = Arc::new(Parent { inner: ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "worker_start", r#"{"environment":"b","task":"work"}"#)]),
+        text_response("started"), text_response("verified"),
+    ]), woke: woke.clone() });
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let child = Arc::new(GateProvider { inner: ScriptedProvider::new(vec![text_response("done")]), gate: gate.clone() });
+    let idle = Arc::new(tokio::sync::Notify::new());
+    let exit = Arc::new(tokio::sync::Notify::new());
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.lines = Arc::new(Lines { first: std::sync::atomic::AtomicBool::new(false), idle: idle.clone(), exit: exit.clone() });
+    harness.deps.catalog_hook = Some(provider_hook_arc(vec![("fake-a", parent.clone()), ("fake-b", child)]));
+    let driver = async {
+        idle.notified().await;
+        gate.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), woke.notified()).await;
+        exit.notify_one();
+        result
+    };
+    let args = ["--yes", "--env", "a", "--workspace", workspace.path().to_str().unwrap()];
+    let (_, result) = tokio::join!(run_args(&mut harness, &args), driver);
+    assert!(result.is_ok(), "idle parent did not wake; requests = {}", parent.inner.requests().len());
+}
