@@ -247,8 +247,8 @@ fn open_session(deps: &HostDeps, options: &Options) -> Result<OpenedSession, Str
         None => Ok((session::memory(), None)),
         Some(path) => {
             if options.resume {
-                let loaded = session::load(path).map_err(|e| e.to_string())?;
-                if let Some(tail) = &loaded.truncated_tail {
+                let (store, resumed) = session::resume(path).map_err(|e| e.to_string())?;
+                if let Some(tail) = &resumed.repaired_tail {
                     write_stderr(
                         deps,
                         &format!(
@@ -256,11 +256,8 @@ fn open_session(deps: &HostDeps, options: &Options) -> Result<OpenedSession, Str
                             tail.bytes
                         ),
                     );
-                    session::repair(path, tail).map_err(|e| e.to_string())?;
                 }
-                let next_seq = loaded.records.len() as u64;
-                let store = session::append(path, next_seq).map_err(|e| e.to_string())?;
-                Ok((session::sink(&store), Some(loaded.records)))
+                Ok((session::sink(&store), Some(resumed.records)))
             } else {
                 let store = session::create(path).map_err(|e| e.to_string())?;
                 Ok((session::sink(&store), None))
@@ -329,11 +326,29 @@ async fn run_interactive(deps: &HostDeps, agent: &mut Agent, cancel: &Cancellati
 
     loop {
         write_stderr(deps, "p1> ");
-        let line = tokio::select! {
-            biased;
-            _ = second.notified() => return EXIT_CANCELLED,
-            _ = cancel.cancelled() => return EXIT_CANCELLED,
-            line = deps.lines.next_line() => line,
+        // Waiting for the user is also waiting for the inbox: a worker finishing
+        // while the prompt is idle must reach the agent now, not at the next
+        // keystroke. The pending line read is dropped for the inbox turn (the
+        // line source is cancel-safe) so that turn's authorization questions can
+        // have the terminal; then the prompt is shown again.
+        let line = loop {
+            let woken = tokio::select! {
+                biased;
+                _ = second.notified() => return EXIT_CANCELLED,
+                _ = cancel.cancelled() => return EXIT_CANCELLED,
+                line = deps.lines.next_line() => Some(line),
+                _ = agent.inbox_ready() => None,
+            };
+            match woken {
+                Some(line) => break line,
+                None => {
+                    write_stderr(deps, "\n");
+                    if !drain_inbox(agent, cancel, &second).await {
+                        return EXIT_CANCELLED;
+                    }
+                    write_stderr(deps, "p1> ");
+                }
+            }
         };
         let Some(line) = line else {
             break;
@@ -352,24 +367,8 @@ async fn run_interactive(deps: &HostDeps, agent: &mut Agent, cancel: &Cancellati
         if matches!(end, TurnEnd::Cancelled) {
             return EXIT_CANCELLED;
         }
-        // Drain inbox turns without blocking on running children.
-        loop {
-            if cancel.is_cancelled() {
-                return EXIT_CANCELLED;
-            }
-            if agent.has_pending_inbox() {
-                match race_inbox(agent.run_inbox_turn(cancel.clone()), &second).await {
-                    Some(Some(end)) => {
-                        if matches!(end, TurnEnd::Cancelled) {
-                            return EXIT_CANCELLED;
-                        }
-                    }
-                    Some(None) => {}
-                    None => return EXIT_CANCELLED,
-                }
-                continue;
-            }
-            break;
+        if !drain_inbox(agent, cancel, &second).await {
+            return EXIT_CANCELLED;
         }
         #[cfg(feature = "delegation")]
         {
@@ -380,6 +379,25 @@ async fn run_interactive(deps: &HostDeps, agent: &mut Agent, cancel: &Cancellati
         }
     }
     EXIT_OK
+}
+
+/// Run inbox turns until the inbox is empty, without blocking on running
+/// children. `false` means the run was cancelled.
+async fn drain_inbox(
+    agent: &mut Agent,
+    cancel: &CancellationToken,
+    second: &Arc<tokio::sync::Notify>,
+) -> bool {
+    while agent.has_pending_inbox() {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        match race_inbox(agent.run_inbox_turn(cancel.clone()), second).await {
+            Some(Some(TurnEnd::Cancelled)) | None => return false,
+            Some(_) => {}
+        }
+    }
+    !cancel.is_cancelled()
 }
 
 /// Spawn the Ctrl-C pump. The first interrupt cancels the run; the second
