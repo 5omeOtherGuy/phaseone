@@ -202,6 +202,16 @@ impl Composer {
         self.cursor -= 1;
     }
 
+    pub fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn right(&mut self) {
+        if self.cursor < self.text.chars().count() {
+            self.cursor += 1;
+        }
+    }
+
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         self.revealed = false;

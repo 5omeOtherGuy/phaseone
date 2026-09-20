@@ -1151,6 +1151,7 @@ async fn usage_errors_exit_2() {
         session: None,
         resume: true,
         ask: false,
+        tui: false,
         sandbox: p1_host::cli::SandboxMode::Off,
         sandbox_write: Vec::new(),
         sandbox_read: Vec::new(),

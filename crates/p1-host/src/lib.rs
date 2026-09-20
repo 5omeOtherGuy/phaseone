@@ -23,6 +23,7 @@ pub mod render;
 pub mod routes;
 pub mod run;
 pub mod session;
+pub mod tui;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
