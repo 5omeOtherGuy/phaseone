@@ -11,6 +11,9 @@ stays null — never zero. A non-zero shell exit is NOT a failed tool call (the 
 reported it), so it is counted separately: a run with "0 failed tool calls" can still be full
 of failing commands.
 
+The host's own user-role messages are counted too: `provider_retries` counts the journalled
+`PROVIDER_RETRY_MESSAGE` inputs (completion.md §3b), which are also part of `user_inputs`.
+
 With `--session FILE`, each worker `w<N>` writes its own `FILE.w<N>.jsonl`; those files are
 discovered automatically and reported under `workers`, with `usage_with_workers` and
 `input_total_with_workers` adding them to the parent's numbers. `includes_worker_usage` is
@@ -26,6 +29,10 @@ import sys
 EXIT_CODE = re.compile(r"\[exit code: (-?\d+)\]\s*$")
 WORKER_FILE = re.compile(r"\.w(\d+)\.jsonl$")
 SHELL_IMPLEMENTATION = "p1-tool-shell"
+# The host's ONE retry message after a transient provider failure (completion.md
+# §3b). A `user_input` with exactly this text is a provider retry.
+PROVIDER_RETRY_MESSAGE = ("The connection to the model failed and the last response was lost; "
+                          "nothing else changed. Continue the work now.")
 
 
 def add(total, value):
@@ -50,7 +57,7 @@ def analyze(path):
               "cost_micro_usd")}
     responses_without_usage = 0
     counts = {"requests": 0, "interrupted_responses": 0, "user_inputs": 0, "inbox_messages": 0,
-              "context_replacements": 0, "environment_records": 0}
+              "context_replacements": 0, "environment_records": 0, "provider_retries": 0}
     tool_calls = {}                     # status -> count
     by_tool = {}                        # tool name -> count
     shell_calls = set()
@@ -65,6 +72,8 @@ def analyze(path):
             origin = record["route"]["origin"]
         elif kind == "user_input":
             counts["user_inputs"] += 1
+            if record["text"] == PROVIDER_RETRY_MESSAGE:
+                counts["provider_retries"] += 1
         elif kind == "inbox":
             counts["inbox_messages"] += 1
         elif kind == "assistant_completed":
