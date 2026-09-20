@@ -1,7 +1,7 @@
 ---
 adr: 41
 title: A headless run waits and continues after a transient provider failure
-status: proposed
+status: accepted
 date: 2026-09-20
 deciders: lead
 supersedes: []

@@ -54,7 +54,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0038 | [Full access is the default; asking is opt-in](0038-full-access-is-the-default-asking-is-opt-in.md) | accepted | 2026-09-20 | owner |
 | ADR-0039 | [A provider is composed from a wire adapter, a route and a model profile](0039-a-provider-is-composed-from-a-wire-adapter-a-route-and-a-model-profile.md) | accepted | 2026-09-20 | owner |
 | ADR-0040 | [p1 keeps logins in one file keyed by route; environment variables win; other tools' logins are borrowed](0040-p1-keeps-logins-in-one-file-keyed-by-route-environment-variables-win-other-tools-logins-are-borrowed.md) | accepted | 2026-09-20 | owner |
-| ADR-0041 | [A headless run waits and continues after a transient provider failure](0041-a-headless-run-waits-and-continues-after-a-transient-provider-failure.md) | proposed | 2026-09-20 | lead |
+| ADR-0041 | [A headless run waits and continues after a transient provider failure](0041-a-headless-run-waits-and-continues-after-a-transient-provider-failure.md) | accepted | 2026-09-20 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
