@@ -89,6 +89,13 @@ IN FLIGHT:
 * #30 DONE: `finish` rejects masked checks (`;`, `||`, newline, backgrounding `&`; `2>&1` is
   fine) and reports EVERY failing named command in one error (completion.md §2, last revision).
 * `[context]` tables for claude / claude-delegating / gpt: DONE (200k/120k, operational values).
+* MAIN WAS RED 23:38–00:05 (2026-09-20): the TUI session merged #32 while red (duplicate
+  `ellipsize` in `p1-tui/src/render/screen.rs`); its hotfix #33 (`8a873ec`, 11 deleted lines,
+  nothing else) is green. Second red TUI merge that night (#23 before). Rule posted on #12:
+  merge only after `gh pr checks --watch` passed on the final head. Before pushing, ALWAYS
+  re-gate or at least `cargo check --workspace` after merging origin/main — my 23:45 push went
+  out on a main I had not built. Several sessions now edit `p1-tui` (worktrees `12-tui`,
+  `12-tui-block-spec`, `neural-home-*`): stay out of those paths.
 * TUI: separate Kimi K3 session (tmux window `kimi-tui`, pane %48, worktree `../phaseone-12-tui`),
   coordination ONLY via issue #12. It has merged M1–M4a itself; the seam it needed is on main and
   it may edit exactly two spots of mine: `impl FrontEnd` in its `tui.rs`, the 5-line `--tui`
