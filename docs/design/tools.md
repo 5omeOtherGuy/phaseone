@@ -135,6 +135,27 @@ at once, and the tool returns only when the group is empty. Content:
 Non-zero exit is `ToolStatus::Ok` (the command ran; the model reads the code). The timeout is a
 tool parameter the MODEL chooses — not a harness-imposed limit on the agent.
 
+### `shell` output filters (research #42, donor `iris-agent` `src/tools/bash/filter/structured/`)
+
+The schema gains `"raw"?: bool` (default false). With `raw` false, the captured output of a
+RECOGNISED command is summarised after the command exits and before the byte bound: passing
+`cargo test`/`cargo build`/`cargo check`/`cargo clippy` logs lose their progress lines and keep
+results, warnings and errors; `git status`, `git log`, `git diff` and `npm`/`pnpm test` get the
+donor's summaries. Recognition works on the effective command (a leading `cd <path> &&`, env
+assignments and wrappers are looked through, as the donor's `effective_command` does).
+Fail-safe contract — every line is a test:
+- an unrecognised command, a filter that declines, errors or panics, a filter result that is not
+  SHORTER than its input, and a filter that empties non-empty output all yield the RAW output;
+- the output of a FAILING command (non-zero exit) keeps every error and failure line verbatim;
+- the `[exit code: <n>]` / timeout footer is appended after filtering and is never touched;
+- `raw: true` bypasses filtering entirely; the tool description says so in one sentence, and a
+  filtered result ends with the line `[output filtered; pass raw:true for the full log]`;
+- the head/tail byte bound stays as the backstop after the filter.
+Filters are pure `(&str, bool) -> Option<String>` functions in a private module of
+`p1-tool-shell`: no provider or UI type, no global registry, no build script, no usage
+accounting. The donor's declarative TOML engine and its vendored third-party filter files are
+NOT taken. `regex` becomes a direct dependency of `p1-tool-shell` (already in the lock tree).
+
 ### `shell` environment — an allow-list, always
 
 A command does NOT inherit the environment of the p1 process. The user's shell usually exports
