@@ -43,6 +43,7 @@
     }
     $('#logo-sheet').append(card);
   }
+  document.querySelectorAll('[data-egg]').forEach(button=>button.onclick=()=>{neural.pause();neural.setVariant('awakening');window.playground.setSettings({...settings,view:'network',agents:true,easterEggs:true,motion:true});neural.setMode('fine');neural.draw(+button.dataset.egg);$('#art').scrollIntoView({behavior:'smooth',block:'center'});});
   $('#reset').onclick=()=>{activeWord='p1';window.playground.setSettings(defaults);};
   $('#share').onclick=()=>{const url=new URL(location.href);url.searchParams.set('variant',neural.variant);url.searchParams.set('t',neural.time.toFixed(2));url.searchParams.set('cycle',neural.cycle);url.searchParams.set('mode',neural.mode);url.searchParams.set('settings',JSON.stringify(settings));$('#share-url').hidden=false;$('#share-url').value=url.href;$('#share-url').select();};
   const desktop=matchMedia('(min-width:851px)'),controls=$('.playground');

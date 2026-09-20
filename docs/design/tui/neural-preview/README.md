@@ -15,6 +15,9 @@ of the loop phase. The p1 core stays steady and readable throughout.
 Three small agent networks orbit the cortex and exchange travelling signals on
 curved threads. Optional `10841` and `[big]` labels appear very faintly beside two
 foreground agents for part of their orbits; they never enter the main branding.
+The preview-only Find the easter eggs guide pauses at 6 seconds for 10841 or
+14 seconds for [big], enabling fine rendering, agent visibility and motion. Labels
+use 10 logical pixels and a wider, smooth fade for discoverability.
 The scene controls include cortex/sphere morphing, agents, message threads, orbital
 filaments, easter eggs, core logo, neuron and edge visibility, firing, motion,
 wordmark, prompt, tribute, brightness, speed and core-logo size.
