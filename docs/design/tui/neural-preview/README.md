@@ -1,11 +1,43 @@
-# Neural home / identity playground
+# Phaseone / awakening
+
+## Selected direction (2026-09-20)
+
+The default `awakening` study uses the selected Synapse p1 mark permanently inside
+an evolving 3D cortex. The Synapse phaseone wordmark sits below, then `we love Pi`.
+There is no logo pulse. All earlier motion studies remain in the collapsed archive.
+
+`awakening.js` owns a closed 24-second cycle. Yaw advances through one complete
+revolution without reversing. The same XYZ neurons interpolate between a folded
+cortical shell and a sphere, reaching the sphere halfway through and returning to
+the cortex at the seam with matching velocity. Neural firing uses integer harmonics
+of the loop phase. The p1 core stays steady and readable throughout.
+
+Three small agent networks orbit the cortex and exchange travelling signals on
+curved threads. Optional `10841` and `[big]` labels appear very faintly beside two
+foreground agents for part of their orbits; they never enter the main branding.
+The scene controls include cortex/sphere morphing, agents, message threads, orbital
+filaments, easter eggs, core logo, neuron and edge visibility, firing, motion,
+wordmark, prompt, tribute, brightness, speed and core-logo size.
+
+The artistic cue is agents finding one another and coordinating work. The owner
+explicitly referenced PHASEONE / PHASEONE[BIG]. Background consulted:
+https://www.redwoodresearch.org/research/hugging-face-incident (the report identifies
+PHASEONE[big] as a successor to PHASEONE10841 and describes their coordination).
+This is a visual theme, not an incident reconstruction.
+
+Verified in the browser: forward yaw, brain/sphere/brain poses, exact wrapped frame,
+continuous geometry at the seam, steady p1 through the loop, toggles, mobile layout,
+and pixel-exact feedback/link replay at 18.37 seconds. The local feedback schema now
+accepts the full 24-second timeline and preserves the new toggles.
+
+## Running the playground
 
 Run `python3 server.py` here, then open http://127.0.0.1:8765.
 The running workstation preview uses the transient user unit
 `p1-neural-preview.service`; `systemctl --user restart p1-neural-preview` reloads
 server changes. No dependencies, remote fonts or build step.
 
-## Studies
+## Archived studies
 
 - Cortex: compact top-down brain, close hemispheres and a narrow fissure.
 - Neural field: overlapping dendritic trees without an anatomical outline.
@@ -55,8 +87,8 @@ Link to this combination creates a selectable local URL with the variant, time,
 cycle, rendering mode and settings. This URL is for the same workstation, not a
 public hosted preview. Page loads with `?t=6.6` pause at the pulse for visual checks.
 
-The deterministic animation cycle is 12 seconds; alternate lettering spans two
-cycles. Fine mode draws the graph; terminal mode samples to 240 × 160 dots (the
+Archived animations retain their 12-second cycle; alternate lettering spans two
+cycles. The selected awakening study uses 24 seconds and a permanent p1 core. Fine mode draws the graph; terminal mode samples to 240 × 160 dots (the
 budget of 120 × 40 Braille cells). This approximates terminal density, not exact
 glyph metrics or per-cell colour. Browser playback is capped at 30 FPS and starts
 paused for reduced-motion users. Rust integration and performance remain separate.

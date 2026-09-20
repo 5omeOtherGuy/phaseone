@@ -1,5 +1,6 @@
 /* Each study has its own seeded geometry. No raster assets or external libraries. */
 window.neuralStudies = [
+  {id:'awakening',name:'Living cortex / awakening',detail:'Selected direction · continuous 3D loop',description:'A cortex becomes a sphere. Agents find each other, exchange signals and keep turning together.'},
   {id:'cortex',name:'01 / Cortex',detail:'Compact · top-down',description:'A close-set oval cortex. Fine winding folds and a narrow central fissure; the brain reads as one compact form.'},
   {id:'field',name:'02 / Neural field',detail:'Abstract · living filaments',description:'No anatomical silhouette. Dendrites, branching signals and synchronised firing suggest an intelligence without drawing a brain.'},
   {id:'cortex3d',name:'03 / Living cortex',detail:'3D · turning volume',description:'A compact cortical volume turns and breathes. Near and far neurons separate through perspective, brightness and motion.'},

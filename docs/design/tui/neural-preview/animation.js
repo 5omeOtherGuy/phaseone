@@ -10,7 +10,7 @@
   gradient.addColorStop(0,'rgba(240,240,240,.3)');gradient.addColorStop(1,'rgba(240,240,240,0)');gc.fillStyle=gradient;gc.fillRect(0,0,16,16);
   const clamp=x=>Math.max(0,Math.min(1,x));
   const smooth=(a,b,x)=>{const t=clamp((x-a)/(b-a));return t*t*(3-2*t);};
-  let time=0,playing=!matchMedia('(prefers-reduced-motion: reduce)').matches,mode='fine',variant='cortex',network,last=0,cycle=0,assignmentKey='',assignment=new Map();
+  let time=0,playing=!matchMedia('(prefers-reduced-motion: reduce)').matches,mode='fine',variant='awakening',network,last=0,cycle=0,assignmentKey='',assignment=new Map();
   function project(n,t,p){
     const x=n.x-500,y=n.y-315,z=n.z||0,phase=t*Math.PI/6;
     if(variant==='cortex3d'||variant==='nebula'){
@@ -48,9 +48,11 @@
     }
   }
   function draw(t){
-    if(t>=12)cycle=(cycle+Math.floor(t/12))%2;
-    time=((t%12)+12)%12;
+    const duration=variant==='awakening'?24:12;
+    if(t>=duration)cycle=(cycle+Math.floor(t/duration))%2;
+    time=((t%duration)+duration)%duration;
     const settings=playground.settings;playground.setActiveWord(cycle);
+    if(variant==='awakening'){awakening.draw(fctx,time,settings);present(settings);$('#time').textContent=time.toFixed(2)+' s';$('#scrub').value=time;$('#phase').textContent='CONNECTED · CONTINUOUS';return;}
     const {nodes,edges}=network,p=settings.pulse?smooth(4.4,5.7,time)*(1-smooth(8,10.3,time)):0;
     const spatial=variant==='cortex3d'||variant==='nebula';
     const points=nodes.map(n=>project(n,settings.motion?time:0,p));
@@ -98,6 +100,11 @@
     });
     fctx.globalAlpha=1;
     dots.forEach((path,i)=>{fctx.fillStyle=`rgba(240,240,240,${(i+.5)/20})`;fctx.fill(path);});
+    present(settings);
+    $('#time').textContent=time.toFixed(2)+' s';$('#scrub').value=time;
+    $('#phase').textContent=settings.view==='logo'?'IDENTITY STUDY':!settings.pulse?'SPONTANEOUS ACTIVITY':time<4.4?'SPONTANEOUS ACTIVITY':time<5.8?'SYNCHRONISING':time<8?'IDENTITY PULSE':time<10.3?'RELEASING':'SPONTANEOUS ACTIVITY';
+  }
+  function present(settings){
     ctx.fillStyle='#0a0a0a';ctx.fillRect(0,0,W,H);
     if(settings.view==='logo')ctx.drawImage(playground.mask,0,0);
     else if(mode==='fine')ctx.drawImage(field,0,0);
@@ -109,20 +116,19 @@
         if(v<16)continue;const c=Math.round(10+v*.91);ctx.fillStyle=`rgb(${c},${c},${c})`;ctx.fillRect(x*W/240,y*H/160,1.8,1.8);
       }
     }
-    $('#time').textContent=time.toFixed(2)+' s';$('#scrub').value=time;
-    $('#phase').textContent=settings.view==='logo'?'IDENTITY STUDY':!settings.pulse?'SPONTANEOUS ACTIVITY':time<4.4?'SPONTANEOUS ACTIVITY':time<5.8?'SYNCHRONISING':time<8?'IDENTITY PULSE':time<10.3?'RELEASING':'SPONTANEOUS ACTIVITY';
   }
   function pause(){playing=false;$('#play').textContent='Play';}
   function setVariant(id){
-    if(!neuralStudies.some(s=>s.id===id))id='cortex';
-    variant=id;assignmentKey='';if(!cache.has(id))cache.set(id,createNeuralNetwork(id));network=cache.get(id);
+    if(!neuralStudies.some(s=>s.id===id))id='awakening';
+    variant=id;assignmentKey='';if(!cache.has(id))cache.set(id,id==='awakening'?{nodes:[],edges:[]}:createNeuralNetwork(id));network=cache.get(id);
     const study=neuralStudies.find(s=>s.id===id);$('#study-description').textContent=study.description;
-    $('#study-name').textContent=study.name;$('#network-count').textContent=`${network.nodes.length.toLocaleString()} neurons · ${network.edges.length.toLocaleString()} connections`;
+    $('#study-name').textContent=study.name;$('#network-count').textContent=id==='awakening'?'One continuous orbit · cortex ↔ sphere · agents in conversation':`${network.nodes.length.toLocaleString()} neurons · ${network.edges.length.toLocaleString()} connections`;
     document.querySelectorAll('[data-variant]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.variant===id));
     const url=new URL(location.href);url.searchParams.set('variant',id);history.replaceState(null,'',url);
-    draw(time);document.dispatchEvent(new Event('variantchange'));
+    document.body.classList.toggle('awakening',id==='awakening');$('#scrub').max=id==='awakening'?'23.99':'11.99';$('#duration').textContent=id==='awakening'?'24 s':'12 s';
+    playground.setScene(id);draw(time);document.dispatchEvent(new Event('variantchange'));
   }
-  window.neural={get cycle(){return cycle;},setCycle(v){cycle=v===1?1:0;},get time(){return time;},get mode(){return mode;},get variant(){return variant;},get nodes(){return network.nodes.length;},get edges(){return network.edges.length;},pause,draw,setVariant,setMode(v){mode=v;$('#mode').value=v;draw(time);}};
+  window.neural={get cycle(){return cycle;},setCycle(v){cycle=v===1?1:0;},get time(){return time;},get mode(){return mode;},get variant(){return variant;},get nodes(){return variant==='awakening'?awakening.nodes:network.nodes.length;},get edges(){return variant==='awakening'?awakening.edges:network.edges.length;},pause,draw,setVariant,setMode(v){mode=v;$('#mode').value=v;draw(time);}};
   for(const study of neuralStudies){
     const b=document.createElement('button');b.dataset.variant=study.id;b.setAttribute('aria-pressed','false');
     const name=document.createElement('strong'),detail=document.createElement('small');name.textContent=study.name;detail.textContent=study.detail;b.append(name,detail);
@@ -137,7 +143,7 @@
   if(params.get('mode')==='terminal')mode='terminal';$('#mode').value=mode;
   cycle=params.get('cycle')==='1'?1:0;
   document.addEventListener('settingschange',()=>{assignmentKey='';draw(time);});document.addEventListener('maskready',()=>{assignmentKey='';draw(time);});
-  setVariant(params.get('variant')||'cortex');if(!playing)pause();
+  setVariant(params.get('variant')||'awakening');if(!playing)pause();
   function tick(now){if(now-last>=1000/30){if(playing&&!document.hidden)draw(time+Math.min((now-last)/1000,.1)*playground.settings.speed);last=now;}requestAnimationFrame(tick);}
   requestAnimationFrame(tick);
 })();

@@ -1,6 +1,6 @@
 (() => {
   const $=s=>document.querySelector(s);
-  const defaults={view:'network',word:'p1',family:'stepped',pulse:true,gather:true,neurons:true,connections:true,signals:true,motion:true,heading:true,prompt:true,tribute:'love',strength:1,speed:1,logoScale:1};
+  const defaults={view:'network',word:'p1',family:'synapse',identity:true,easterEggs:true,morph:true,agents:true,threads:true,halo:true,pulse:false,gather:true,neurons:true,connections:true,signals:true,motion:true,heading:true,prompt:true,tribute:'love',strength:1,speed:1,logoScale:1};
   const choices={view:['network','logo'],word:['p1','phaseone','alternate'],family:['stepped','contour','synapse'],tribute:['love','pie','portal','inspired','off']};
   function normalise(next){
     const out={...defaults};
@@ -9,7 +9,7 @@
     for(const [key,low,high] of [['strength',.4,2],['speed',.25,2],['logoScale',.65,1.4]])out[key]=Number.isFinite(out[key])?Math.max(low,Math.min(high,out[key])):defaults[key];
     return out;
   }
-  let settings={...defaults};
+  let settings={...defaults},scene='awakening';
   const mask=document.createElement('canvas');mask.width=1000;mask.height=660;
   const ctx=mask.getContext('2d',{willReadFrequently:true});
   let maskData=null,maskKey='',maskVersion=0,loadedVersion=0,activeWord='p1',targets=[];
@@ -24,22 +24,22 @@
     $('.intro').hidden=!settings.heading;$('.prompt').hidden=!settings.prompt;
     const tribute=$('#tribute');tribute.hidden=settings.tribute==='off';
     tribute.textContent={love:'we love Pi',pie:'we love 🥧',portal:'there is no pie',inspired:'inspired by Pi · made for phaseone'}[settings.tribute]||'';
-    $('#identity-preview').innerHTML=phaseoneLogos.svg(settings.family,settings.word==='alternate'?'p1':settings.word);
+    $('#identity-preview').innerHTML=phaseoneLogos.svg(scene==='awakening'?'synapse':settings.family,scene==='awakening'?'phaseone':settings.word==='alternate'?'p1':settings.word);
     refreshMask();document.dispatchEvent(new Event('settingschange'));
   }
   const params=new URLSearchParams(location.search);
   try{settings=normalise(JSON.parse(params.get('settings')||'null'));}catch{}
-  window.playground={get ready(){return loadedVersion===maskVersion&&maskData!==null;},get mask(){return mask;},get targets(){return targets;},get maskVersion(){return maskVersion;},get settings(){return {...settings};},setSettings(next){settings=normalise(next);activeWord=settings.word==='alternate'?'p1':settings.word;maskKey='';update();},setActiveWord(cycle){const word=settings.word==='alternate'?(cycle%2?'phaseone':'p1'):settings.word;if(word!==activeWord){activeWord=word;refreshMask();}},contains(x,y){const ix=Math.round(x),iy=Math.round(y);return ix>=0&&ix<1000&&iy>=0&&iy<660&&maskData&&maskData[(iy*1000+ix)*4+3]>100;}};
+  window.playground={setScene(value){scene=value;update();},get ready(){return loadedVersion===maskVersion&&maskData!==null;},get mask(){return mask;},get targets(){return targets;},get maskVersion(){return maskVersion;},get settings(){return {...settings};},setSettings(next){settings=normalise(next);activeWord=settings.word==='alternate'?'p1':settings.word;maskKey='';update();},setActiveWord(cycle){const word=settings.word==='alternate'?(cycle%2?'phaseone':'p1'):settings.word;if(word!==activeWord){activeWord=word;refreshMask();}},contains(x,y){const ix=Math.round(x),iy=Math.round(y);return ix>=0&&ix<1000&&iy>=0&&iy<660&&maskData&&maskData[(iy*1000+ix)*4+3]>100;}};
   document.querySelectorAll('[data-setting]').forEach(el=>el.addEventListener('input',()=>{settings[el.dataset.setting]=el.type==='checkbox'?el.checked:el.type==='range'?+el.value:el.value;activeWord=settings.word==='alternate'?'p1':settings.word;update();}));
-  const descriptions={stepped:'Pi homage / modular steps, reversed height hierarchy',contour:'Contour / open geometric strokes, rising numeral',synapse:'Synapse / connected nodes, a mark built like its network'};
-  for(const family of ['stepped','contour','synapse']){
+  const descriptions={stepped:'Pi homage / modular steps, reversed height hierarchy',contour:'Contour / open geometric strokes, rising numeral',synapse:'Selected / Synapse · connected dots'};
+  for(const family of ['synapse','stepped','contour']){
     const card=document.createElement('article');card.className='logo-card';
     const title=document.createElement('h3');title.textContent=descriptions[family];card.append(title);
     for(const word of ['p1','phaseone']){
       const block=document.createElement('div');block.className='logo-option';block.innerHTML=phaseoneLogos.svg(family,word);
       const actions=document.createElement('div'),use=document.createElement('button'),download=document.createElement('a');
-      use.textContent=`Inspect ${word}`;use.onclick=()=>{settings.view='logo';settings.family=family;settings.word=word;activeWord=word;update();neural.pause();neural.draw(6.6);$('#art').scrollIntoView({behavior:'smooth',block:'center'});};
-      download.textContent='SVG ↓';download.href=`logos/${family}-${word}.svg`;download.download=`phaseone-${family}-${word}.svg`;const animate=document.createElement('button');animate.textContent='Animate';animate.onclick=()=>{settings.view='network';settings.family=family;settings.word=word;activeWord=word;update();neural.pause();neural.draw(6.6);$('#art').scrollIntoView({behavior:'smooth',block:'center'});};actions.append(use,animate,download);block.append(actions);card.append(block);
+      use.textContent=`Inspect ${word}`;use.onclick=()=>{settings.view='logo';settings.family=family;settings.word=word;activeWord=word;update();neural.pause();neural.draw(neural.variant==='awakening'?0:6.6);$('#art').scrollIntoView({behavior:'smooth',block:'center'});};
+      download.textContent='SVG ↓';download.href=`logos/${family}-${word}.svg`;download.download=`phaseone-${family}-${word}.svg`;const animate=document.createElement('button');animate.textContent='Animate';animate.onclick=()=>{settings.view='network';settings.family=family;settings.word=word;activeWord=word;update();neural.pause();neural.draw(neural.variant==='awakening'?0:6.6);$('#art').scrollIntoView({behavior:'smooth',block:'center'});};actions.append(use,animate,download);block.append(actions);card.append(block);
     }
     $('#logo-sheet').append(card);
   }

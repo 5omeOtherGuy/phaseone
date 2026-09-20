@@ -3,7 +3,7 @@
   const $=s=>document.querySelector(s),art=$('#art'),form=$('#composer');
   let pending=null,comments=[];
   function compose(x,y){
-    neural.pause();pending={x,y,time:neural.time,mode:neural.mode,variant:neural.variant,revision:3,cycle:neural.cycle,settings:playground.settings,screenshot:$('#brain').toDataURL('image/png')};
+    neural.pause();pending={x,y,time:neural.time,mode:neural.mode,variant:neural.variant,revision:4,cycle:neural.cycle,settings:playground.settings,screenshot:$('#brain').toDataURL('image/png')};
     form.querySelector('label').textContent=`Feedback · ${neural.variant} · ${neural.time.toFixed(2)} s`;
     form.hidden=false;form.style.left=Math.min(x*art.clientWidth,Math.max(0,art.clientWidth-300))+'px';
     form.style.top=Math.min(y*art.clientHeight,Math.max(0,art.clientHeight-205))+'px';$('#note').focus();

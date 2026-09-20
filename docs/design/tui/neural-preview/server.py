@@ -51,13 +51,13 @@ class Handler(SimpleHTTPRequestHandler):
             text = data['text']
             if not isinstance(text, str) or not text.strip() or len(text) > 4000:
                 raise ValueError('Invalid note')
-            for key, limit in [('x', 1), ('y', 1), ('time', 12)]:
+            for key, limit in [('x', 1), ('y', 1), ('time', 24)]:
                 if not isinstance(data[key], (int, float)) or not math.isfinite(data[key]) or not 0 <= data[key] <= limit:
                     raise ValueError('Invalid frame position')
             if data['mode'] not in ('fine', 'terminal'):
                 raise ValueError('Invalid rendering mode')
             variant = data.get('variant', 'original')
-            if variant not in ('original', 'cortex', 'field', 'cortex3d', 'nebula', 'web', 'lightning'):
+            if variant not in ('awakening', 'original', 'cortex', 'field', 'cortex3d', 'nebula', 'web', 'lightning'):
                 raise ValueError('Invalid variant')
             settings = data.get('settings', {})
             if not isinstance(settings, dict):
@@ -66,13 +66,13 @@ class Handler(SimpleHTTPRequestHandler):
             for key, values in choices.items():
                 if key in settings and settings[key] not in values:
                     raise ValueError('Invalid setting')
-            for key in ('pulse', 'gather', 'neurons', 'connections', 'signals', 'motion', 'heading', 'prompt'):
+            for key in ('identity', 'easterEggs', 'morph', 'agents', 'threads', 'halo', 'pulse', 'gather', 'neurons', 'connections', 'signals', 'motion', 'heading', 'prompt'):
                 if key in settings and not isinstance(settings[key], bool):
                     raise ValueError('Invalid toggle')
             for key, low, high in [('strength', .4, 2), ('speed', .25, 2), ('logoScale', .65, 1.4)]:
                 if key in settings and (not isinstance(settings[key], (int, float)) or not math.isfinite(settings[key]) or not low <= settings[key] <= high):
                     raise ValueError('Invalid slider')
-            allowed = set(choices) | {'pulse', 'gather', 'neurons', 'connections', 'signals', 'motion', 'heading', 'prompt', 'strength', 'speed', 'logoScale'}
+            allowed = set(choices) | {'identity', 'easterEggs', 'morph', 'agents', 'threads', 'halo', 'pulse', 'gather', 'neurons', 'connections', 'signals', 'motion', 'heading', 'prompt', 'strength', 'speed', 'logoScale'}
             if set(settings) - allowed or data.get('cycle', 0) not in (0, 1):
                 raise ValueError('Unknown setting')
             prefix = 'data:image/png;base64,'
@@ -86,7 +86,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         ident = uuid.uuid4().hex[:12]
         row = {key: data[key] for key in ('x', 'y', 'time', 'mode', 'text')}
-        row.update(settings=settings, cycle=data.get('cycle', 0), variant=variant, revision=3, id=ident, created=datetime.now(timezone.utc).isoformat(), screenshot=f'feedback/{ident}.png')
+        row.update(settings=settings, cycle=data.get('cycle', 0), variant=variant, revision=4, id=ident, created=datetime.now(timezone.utc).isoformat(), screenshot=f'feedback/{ident}.png')
         FEEDBACK.mkdir(exist_ok=True)
         (ROOT / row['screenshot']).write_bytes(png)
         with (FEEDBACK / 'comments.jsonl').open('a') as stream:
