@@ -1591,6 +1591,7 @@ dependencies = [
  "nix",
  "p1-contracts",
  "p1-workspace",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
