@@ -140,6 +140,11 @@ pub struct HostDeps {
     pub home: Option<std::path::PathBuf>,
     /// The runtime directory the sandbox replaces, from `XDG_RUNTIME_DIR`.
     pub runtime_dir: Option<std::path::PathBuf>,
+    /// A snapshot of the environment `shell` commands are rebuilt from (the
+    /// allow-list still filters it). `None` means the shell tool reads the
+    /// process environment at construction; tests inject a fixture here instead
+    /// of mutating the process environment.
+    pub shell_env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     /// Test-only hook: called with the fully built catalog, after the built-in
     /// providers and tools are registered, so a test can add or replace entries.
     pub catalog_hook: Option<CatalogHook>,
@@ -176,6 +181,7 @@ impl HostDeps {
             stdout_is_tty,
             home: std::env::var_os("HOME").map(std::path::PathBuf::from),
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
+            shell_env: None,
             catalog_hook: None,
             #[cfg(feature = "delegation")]
             worker_service: None,

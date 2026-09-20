@@ -127,6 +127,33 @@ at once, and the tool returns only when the group is empty. Content:
 Non-zero exit is `ToolStatus::Ok` (the command ran; the model reads the code). The timeout is a
 tool parameter the MODEL chooses — not a harness-imposed limit on the agent.
 
+### `shell` environment — an allow-list, always
+
+A command does NOT inherit the environment of the p1 process. The user's shell usually exports
+API keys and tokens, and agent sockets are named by variables (`SSH_AUTH_SOCK`,
+`DBUS_SESSION_BUS_ADDRESS`); none of that is the agent's business. The child's environment is
+cleared and rebuilt from an allow-list, sandboxed or not:
+- by exact name: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `TERM`, `TZ`,
+  `COLORTERM`, `NO_COLOR`, `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `RUSTFLAGS`,
+  `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `P1_BUILD_LOCK_DIR`, `P1_RUSTC_SLOTS`,
+  `VIRTUAL_ENV`, `NVM_DIR`, `JAVA_HOME`, `GOPATH`, `GOROOT`;
+- by prefix: `LC_`;
+- plus the names the host was given with repeatable `--env-pass NAME` (a name containing `=`
+  or an empty name is a usage error, exit 2).
+`ShellTool::with_env_pass(self, names: Vec<String>) -> Self` adds to the list; the built-in
+list is `pub const ENV_ALLOW: &[&str]` and `pub const ENV_ALLOW_PREFIXES: &[&str]`. The
+environment is read from an injected snapshot (`ShellTool::with_env_snapshot(Vec<(OsString, OsString)>)`,
+default: the process environment at construction) so tests never mutate the process
+environment. In the sandbox `TMPDIR=/tmp` is still set by bubblewrap, after the allow-list.
+Stated limit: `bash -lc` is a login shell; WITHOUT the sandbox it sources the user's profile,
+which may export secrets again, and the files are readable anyway — the allow-list is a
+boundary only together with the sandbox (which hides the profile files).
+Must-pass: a snapshot with `CANARY_TOKEN=secret-1`, `SSH_AUTH_SOCK=/x`, `PATH`, `LC_ALL=C`,
+`MY_TOOL_HOME=/opt/t`: `env` inside the command shows no `CANARY_TOKEN`, no `SSH_AUTH_SOCK`,
+shows `PATH` and `LC_ALL`; `MY_TOOL_HOME` only with `with_env_pass(["MY_TOOL_HOME"])`; the same
+through the sandbox (real bwrap, SKIP rule as for the other sandbox tests); through the host
+with `--env-pass MY_TOOL_HOME`; `--env-pass A=B` exits 2.
+
 ### `shell` sandbox — the execution boundary (optional; the HOST chooses it)
 
 Authorization decides WHETHER a command may run; it cannot constrain what a running command
