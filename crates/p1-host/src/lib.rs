@@ -18,6 +18,7 @@ pub mod activity;
 pub mod auth;
 pub mod catalog;
 pub mod cli;
+pub mod frontend;
 pub mod policy;
 pub mod render;
 pub mod routes;

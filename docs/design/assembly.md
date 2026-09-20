@@ -117,3 +117,13 @@ p1 env show <name>                                                              
   workspace is not a permission and stays always on; the shell sandbox stays opt-in.
 - Journal: memory by default; `--session FILE` uses the JSONL store.
 - No TUI, no colours beyond dim, no config beyond the environment files.
+
+Composition seam: the host drives an agent through a `FrontEnd`
+(`crates/p1-host/src/frontend.rs`) — an ordinary value passed down, not a registry or a plugin.
+It supplies the parent's event sink (the host still wraps it in its `ActivityTee`), the labelled
+sink for each delegated worker, the authorization policy shared by the parent and every worker,
+and the run loop (`Agent` + `CancellationToken` + the optional worker service → exit code, then
+a one-shot `finish`). The default `LineFrontEnd` keeps the `HostPolicy` and line `Renderer` and
+the existing headless/interactive drivers exactly as before, so line and delegation behaviour is
+byte-identical. `run.rs` constructs the line front end at one branch point; a session that owns
+its own terminal UI implements the same trait and calls `run_with_front_end` instead.
