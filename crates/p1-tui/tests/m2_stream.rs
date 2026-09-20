@@ -193,7 +193,7 @@ fn the_80_column_floor_keeps_everything_readable() {
     // Same glyphs, same shapes — nothing reflows into a different shape (§6).
     assert!(
         text.iter()
-            .any(|l| l.starts_with("✗ shell     cargo test -p p1-context"))
+            .any(|l| { l.starts_with("✗ shell") && l.contains("test case 0") })
     );
     assert!(text.iter().any(|l| l.contains("· 42 more lines folded")));
     // The floor line appears under the composer; the pane is gone.
