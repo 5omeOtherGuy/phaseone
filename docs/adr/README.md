@@ -51,6 +51,9 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0035 | [The shell tool can run inside a bubblewrap execution boundary](0035-the-shell-tool-can-run-inside-a-bubblewrap-execution-boundary.md) | accepted | 2026-09-20 | lead |
 | ADR-0036 | [Context control is a summarizing policy module with a durable, validated replacement](0036-context-control-is-a-summarizing-policy-module-with-a-durable-validated-replacement.md) | accepted | 2026-09-20 | lead |
 | ADR-0037 | [Unattended runs end by an observable finish call, with bounded continuation](0037-unattended-runs-end-by-an-observable-finish-call-with-bounded-continuation.md) | accepted | 2026-09-20 | lead |
+| ADR-0038 | [Full access is the default; asking is opt-in](0038-full-access-is-the-default-asking-is-opt-in.md) | accepted | 2026-09-20 | owner |
+| ADR-0039 | [A provider is composed from a wire adapter, a route and a model profile](0039-a-provider-is-composed-from-a-wire-adapter-a-route-and-a-model-profile.md) | accepted | 2026-09-20 | owner |
+| ADR-0040 | [p1 keeps logins in one file keyed by route; environment variables win; other tools' logins are borrowed](0040-p1-keeps-logins-in-one-file-keyed-by-route-environment-variables-win-other-tools-logins-are-borrowed.md) | accepted | 2026-09-20 | owner |
 <!-- adr-index:end -->
 
 ## Writing one
