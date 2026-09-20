@@ -145,6 +145,12 @@ impl FrontEnd for TuiFrontEnd {
             // A resumed session shows where it stands (issue #12, seam note).
             screen.transcript.paint_history(agent.history());
             let (route, model) = self.labels.lock().unwrap().clone().unwrap_or_default();
+            let worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            #[cfg(feature = "delegation")]
+            if let Some(service) = &workers {
+                spawn_worker_refresher(service.clone(), worker_rows.clone(), cancel.child_token());
+            }
             let mut driver = Driver {
                 screen,
                 env: self.options.env.clone(),
@@ -161,6 +167,7 @@ impl FrontEnd for TuiFrontEnd {
                 task_removed: 0,
                 exit: None,
                 inbox: agent.inbox(),
+                worker_rows,
                 _workers: workers,
             };
 
@@ -219,6 +226,8 @@ pub(crate) struct Driver {
     /// A submitted prompt waiting for the loop to start the turn (the agent
     /// borrow lives in the loop, not in the driver).
     submit_pending: Option<String>,
+    /// The worker snapshot the refresher task maintains (delegation only).
+    worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>>,
     inbox: p1_core::Inbox,
     _workers: Option<Arc<dyn WorkerService>>,
 }
@@ -392,6 +401,12 @@ impl Driver {
         self.screen.approval = None;
         self.screen.pinned = false;
         self.screen.promotion = Promotion::None;
+    }
+
+    /// Pull the refresher's snapshot into the screen (SPEC §5 promotion).
+    fn sync_workers(&mut self) {
+        let rows = self.worker_rows.lock().unwrap().clone();
+        self.screen.sync_workers(rows);
     }
 
     /// One UI event: an agent event (parent or a tagged worker) or a marker.
@@ -599,12 +614,12 @@ where
                     driver.on_auth(request);
                 }
             }
+            _ = tick.tick() => { driver.sync_workers(); }
             _ = agent.inbox_ready() => {
                 // A worker's completion arrived at idle: run it as a turn so
                 // the same pump handles keys and approvals.
                 prompt = Some(String::new());
             }
-            _ = tick.tick() => {}
         }
     }
 }
@@ -654,9 +669,63 @@ where
                     driver.on_auth(request);
                 }
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => { driver.sync_workers(); }
         }
     }
+}
+
+/// Poll the worker service into the shared snapshot the driver draws from.
+/// Workers carry no usage tap yet, so cost renders `—` (issue #12).
+#[cfg(feature = "delegation")]
+fn spawn_worker_refresher(
+    service: Arc<dyn WorkerService>,
+    rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>>,
+    cancel: CancellationToken,
+) {
+    use p1_tui::render::workers::{WorkerRow, WorkerState};
+    use p1_workers::ChildStatus;
+    tokio::spawn(async move {
+        let mut started: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            let list = service.list().await;
+            let mut next = Vec::with_capacity(list.len());
+            for (id, status) in list {
+                let description = service.describe(&id).await.unwrap_or_default();
+                let elapsed = match &status {
+                    ChildStatus::Running => {
+                        let at = started
+                            .entry(id.0.clone())
+                            .or_insert_with(std::time::Instant::now);
+                        let secs = at.elapsed().as_secs();
+                        Some(format!("{}m{:02}s", secs / 60, secs % 60))
+                    }
+                    _ => None,
+                };
+                let (state, details) = match &status {
+                    ChildStatus::Running => (WorkerState::Running, Vec::new()),
+                    ChildStatus::Finished(_) => (WorkerState::Done, Vec::new()),
+                    ChildStatus::Cancelled => (WorkerState::Done, vec!["cancelled".into()]),
+                    ChildStatus::Failed(e) => (WorkerState::Done, vec![format!("failed: {e}")]),
+                };
+                next.push(WorkerRow {
+                    id: id.0.clone(),
+                    summary: id.0.clone(),
+                    route: description,
+                    state,
+                    elapsed,
+                    cost_micro_usd: None,
+                    details,
+                });
+            }
+            *rows.lock().unwrap() = next;
+        }
+    });
 }
 
 /// `^C`: cancel during a turn, quit at idle.
