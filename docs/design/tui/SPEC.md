@@ -413,3 +413,31 @@ parts to treat as fixed — they are the vocabulary everything else is built fro
 - OUTPUT pane: scroll only; `yank` waits on a clipboard seam, filter on pane
   input focus. `^T` (timeline) and `^D` (next file in batched approvals) are
   unwired — approvals arrive one call at a time, so there is nothing to page.
+
+
+## 9. Awakening home (owner selection, 2026-09-20)
+
+The unused transcript space on a fresh session contains the dotted awakening
+animation: a continuously rotating cortex morphs into a sphere and back over
+24 seconds. The small-p/tall-1 synapse mark remains inside it; `phaseone` and
+`we love Pi` are centered beneath it. Three orbiting agent clusters exchange
+signals. This implementation uses only Braille cells and ordinary terminal text;
+no graphics protocols, image frames, browser runtime or additional dependencies.
+
+The welcome prelude, right pane and composer keep their existing positions.
+Conversation content, working state, focus mode, pickers and status overlays
+suppress the animation. At very small sizes, only the centered wordmark and
+tribute remain. `P1_REDUCED_MOTION` freezes the entire scene at its initial pose.
+
+`10841` and `[big]` appear briefly beneath foreground agents, as DIM ordinary text
+drawn after the dot raster. They must never become clusters of Braille dots.
+The decorative neuron field uses the existing RULE/FAINT/DIM/INK brightness steps;
+this does not expand the permitted palette for content or ordinary UI labels.
+
+Geometry is immutable and initialized once. The host's existing 50 ms idle tick
+advances rendering; elapsed time determines the phase, so skipped frames do not
+change the loop. The renderer has no independent timer or tasks.
+
+Inspect actual cells without credentials or a provider:
+`cargo run -p p1-tui --example home_preview -- 120 40 6000 > /tmp/home.svg`.
+Use `80 24 14000` for the floor-size frame with the other easter egg.
