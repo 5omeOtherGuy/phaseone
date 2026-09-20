@@ -136,6 +136,8 @@ pub struct HostDeps {
     pub environment_dirs: Vec<std::path::PathBuf>,
     /// Whether stdout is a terminal (reasoning dimming is only for a TTY).
     pub stdout_is_tty: bool,
+    /// The home directory the sandbox hides, from `HOME`. Tests inject a fake one.
+    pub home: Option<std::path::PathBuf>,
     /// Test-only hook: called with the fully built catalog, after the built-in
     /// providers and tools are registered, so a test can add or replace entries.
     pub catalog_hook: Option<CatalogHook>,
@@ -147,7 +149,9 @@ pub struct HostDeps {
 
 impl HostDeps {
     /// Construct the injected dependencies. `catalog_hook` and, under the
-    /// delegation feature, `worker_service` start empty.
+    /// delegation feature, `worker_service` start empty; `home` is read from
+    /// `HOME` (tests inject a fake one). The sandbox selection is NOT here: it is
+    /// parsed command-line state on [`cli::Options`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         stdout: SharedWriter,
@@ -168,6 +172,7 @@ impl HostDeps {
             interrupt,
             environment_dirs,
             stdout_is_tty,
+            home: std::env::var_os("HOME").map(std::path::PathBuf::from),
             catalog_hook: None,
             #[cfg(feature = "delegation")]
             worker_service: None,

@@ -8,9 +8,11 @@
 //! exhaust memory. Output bounding and the workspace live in `p1-workspace`.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, killpg};
@@ -46,9 +48,80 @@ const SIGKILL_WAIT: Duration = Duration::from_secs(2);
 const GROUP_POLL: Duration = Duration::from_millis(10);
 const READ_BUFFER_BYTES: usize = 16 * 1024;
 
-/// The `shell` tool. Holds one agent's workspace.
+/// The paragraph the model sees when the host turned the sandbox on. Appended to
+/// whatever face the environment gave the tool, so a `with_face` override keeps it.
+const SANDBOX_PARAGRAPH: &str = "Commands run in a sandbox: only the workspace and /tmp are writable, the rest of the filesystem is read-only, and most of the home directory is not visible. Do not try to install software outside the workspace.";
+
+/// Home entries the sandbox leaves visible (read-only) even though it hides the
+/// rest of the home directory.
+pub const DEFAULT_HOME_VISIBLE: &[&str] = &[
+    ".cargo",
+    ".rustup",
+    ".local/bin",
+    ".local/lib",
+    ".nvm",
+    ".gitconfig",
+    ".config/git",
+];
+
+/// What the sandbox hides, keeps visible and keeps writable. The host chooses
+/// this; [`ShellTool::sandboxed`] turns it into a `bwrap` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox {
+    /// The home directory to hide behind a `tmpfs`.
+    pub home: PathBuf,
+    /// Paths relative to `home` that stay visible (read-only) if they exist.
+    pub home_visible: Vec<PathBuf>,
+    /// Extra absolute paths that stay writable if they exist.
+    pub writable: Vec<PathBuf>,
+}
+
+impl Sandbox {
+    /// A sandbox that hides `home` except for [`DEFAULT_HOME_VISIBLE`].
+    pub fn for_home(home: impl Into<PathBuf>) -> Self {
+        Self {
+            home: home.into(),
+            home_visible: DEFAULT_HOME_VISIBLE.iter().map(PathBuf::from).collect(),
+            writable: Vec::new(),
+        }
+    }
+}
+
+/// Why a sandbox cannot be used. Every message names the remedy: the caller has
+/// to be able to act on it, and `--sandbox off` always works.
+#[derive(Debug, thiserror::Error)]
+pub enum SandboxError {
+    #[error("bubblewrap (`bwrap`) is not installed: install bubblewrap, or pass --sandbox off")]
+    NotInstalled,
+    #[error(
+        "bubblewrap cannot run here ({0}): enable unprivileged user namespaces, or pass --sandbox off"
+    )]
+    Unavailable(String),
+    #[error(
+        "the workspace root {} contains the home directory {}: choose a workspace outside the home, or pass --sandbox off",
+        .workspace.display(),
+        .home.display()
+    )]
+    WorkspaceContainsHome { workspace: PathBuf, home: PathBuf },
+}
+
+/// The live sandbox: its configuration plus the private `/tmp` the tool owns.
+/// The `Arc` keeps the directory alive across `with_face` and any clone.
+struct SandboxRuntime {
+    sandbox: Sandbox,
+    private_tmp: tempfile::TempDir,
+}
+
+/// The `shell` tool. Holds one agent's workspace and, when the host chose it,
+/// the bubblewrap sandbox around every command.
 pub struct ShellTool {
     workspace: Workspace,
+    /// The face BEFORE the sandbox paragraph and the variant BEFORE the
+    /// `+sandbox` suffix, so `with_face` and `sandboxed` compose in either order
+    /// without stacking (requirement 4).
+    face: ToolFace,
+    variant: String,
+    sandbox: Option<Arc<SandboxRuntime>>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
@@ -58,20 +131,160 @@ impl ShellTool {
     pub fn new(workspace: Workspace) -> Self {
         Self {
             workspace,
+            face: default_face(),
+            variant: "claude".to_string(),
+            sandbox: None,
             declaration: declaration(default_face()),
             identity: identity("claude"),
         }
+        .composed()
     }
 
     /// Present the same implementation under another name/description and
     /// variant. The input schema and the semantics do not change.
     pub fn with_face(self, face: ToolFace, variant: &str) -> Self {
         Self {
-            workspace: self.workspace,
-            declaration: declaration(face),
-            identity: identity(variant),
+            face,
+            variant: variant.to_string(),
+            ..self
+        }
+        .composed()
+    }
+
+    /// Put every command in a bubblewrap sandbox.
+    ///
+    /// Probes ONCE (`bwrap <args> true`), so an unusable sandbox fails assembly,
+    /// not the first command. The sandbox's description paragraph and
+    /// `+sandbox` variant survive later `with_face` calls and vice versa.
+    pub fn sandboxed(self, sandbox: Sandbox) -> Result<Self, SandboxError> {
+        let workspace = self.workspace.root().to_path_buf();
+        let home = std::fs::canonicalize(&sandbox.home).unwrap_or_else(|_| sandbox.home.clone());
+        // Hiding the home would hide the workspace with it.
+        if home == workspace || home.starts_with(&workspace) {
+            return Err(SandboxError::WorkspaceContainsHome { workspace, home });
+        }
+        let private_tmp = tempfile::Builder::new()
+            .prefix("p1-shell-sandbox-")
+            .tempdir()
+            .map_err(|error| {
+                SandboxError::Unavailable(format!("could not create a private /tmp: {error}"))
+            })?;
+        let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
+        let mut probe = std::process::Command::new("bwrap");
+        probe
+            .args(&args)
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        match probe.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SandboxError::NotInstalled);
+            }
+            Err(error) => return Err(SandboxError::Unavailable(error.to_string())),
+            Ok(output) if !output.status.success() => {
+                return Err(SandboxError::Unavailable(
+                    String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                ));
+            }
+            Ok(_) => {}
+        }
+        Ok(Self {
+            sandbox: Some(Arc::new(SandboxRuntime {
+                sandbox,
+                private_tmp,
+            })),
+            ..self
+        }
+        .composed())
+    }
+
+    /// Recompute the declaration and identity from the face, the variant and
+    /// whether a sandbox is on. Called by every constructor, so composing the
+    /// sandbox and a face in either order never doubles the paragraph or suffix.
+    fn composed(mut self) -> Self {
+        let description = match &self.sandbox {
+            Some(_) => format!("{}\n{SANDBOX_PARAGRAPH}", self.face.description),
+            None => self.face.description.clone(),
+        };
+        let variant = match &self.sandbox {
+            Some(_) => format!("{}+sandbox", self.variant),
+            None => self.variant.clone(),
+        };
+        self.declaration = declaration(ToolFace::new(self.face.name.clone(), description));
+        self.identity = identity(&variant);
+        self
+    }
+}
+
+/// The argument vector passed to `bwrap` before `bash -lc <command>`.
+///
+/// Pure, and the ORDER is part of the contract: a later mount covers an earlier
+/// one, so the private `/tmp` is mounted before the home and the workspace (a
+/// workspace may itself live under `/tmp` or under the home), the writable paths
+/// are bound back before the home is made read-only, and the workspace bind comes
+/// after the home's `tmpfs` but before `--remount-ro`. `bwrap` creates missing
+/// mount points itself.
+pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Vec<OsString> {
+    let home = &sandbox.home;
+    let mut args: Vec<OsString> = Vec::new();
+    // 1. The host filesystem, read-only, with fresh /dev and /proc.
+    for arg in ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"] {
+        args.push(arg.into());
+    }
+    // 2. A fresh, private /tmp; TMPDIR points every command at it.
+    args.push("--bind".into());
+    args.push(private_tmp.into());
+    args.push("/tmp".into());
+    for arg in ["--setenv", "TMPDIR", "/tmp"] {
+        args.push(arg.into());
+    }
+    // 3. Hide the home behind a tmpfs, then put back only what stays visible.
+    args.push("--tmpfs".into());
+    args.push(home.into());
+    for entry in &sandbox.home_visible {
+        let path = home.join(entry);
+        if path.exists() {
+            push_ro_bind(&mut args, &path);
         }
     }
+    // A visible `.cargo` must not leak a registry token.
+    for name in ["credentials.toml", "credentials"] {
+        let path = home.join(".cargo").join(name);
+        if path.exists() {
+            args.push("--ro-bind".into());
+            args.push("/dev/null".into());
+            args.push(path.into());
+        }
+    }
+    // 4. Extra writable paths, if they exist.
+    for writable in &sandbox.writable {
+        if writable.exists() {
+            args.push("--bind".into());
+            args.push(writable.into());
+            args.push(writable.into());
+        }
+    }
+    // 5. The workspace, after the mounts that could cover it.
+    args.push("--bind".into());
+    args.push(workspace_root.into());
+    args.push(workspace_root.into());
+    // 6. Only now make the home read-only: writes fail loudly instead of
+    //    vanishing into the tmpfs. Child mounts (the workspace) stay writable.
+    args.push("--remount-ro".into());
+    args.push(home.into());
+    // 7. A pid namespace so a detached process still dies with the sandbox.
+    for arg in ["--unshare-pid", "--die-with-parent", "--chdir"] {
+        args.push(arg.into());
+    }
+    args.push(workspace_root.into());
+    args
+}
+
+fn push_ro_bind(args: &mut Vec<OsString>, path: &Path) {
+    args.push("--ro-bind".into());
+    args.push(path.into());
+    args.push(path.into());
 }
 
 fn default_face() -> ToolFace {
@@ -166,6 +379,7 @@ impl Tool for ShellTool {
                 timeout,
                 tokio::time::sleep(timeout),
                 &context.cancel,
+                self.sandbox.as_deref(),
             )
             .await
         })
@@ -217,12 +431,32 @@ async fn run(
     timeout: Duration,
     expiry: impl Future<Output = ()>,
     cancel: &CancellationToken,
+    sandbox: Option<&SandboxRuntime>,
 ) -> ToolOutcome {
     let mut expiry = std::pin::pin!(expiry);
-    let mut builder = Command::new("bash");
+    // The sandboxed and unsandboxed paths differ only in the spawned program;
+    // process group, stdin, capture, timeout, kill and footers are shared.
+    let mut builder = match sandbox {
+        Some(runtime) => {
+            let mut bwrap = Command::new("bwrap");
+            bwrap
+                .args(bwrap_args(
+                    &runtime.sandbox,
+                    root,
+                    runtime.private_tmp.path(),
+                ))
+                .arg("bash")
+                .arg("-lc")
+                .arg(command);
+            bwrap
+        }
+        None => {
+            let mut bash = Command::new("bash");
+            bash.arg("-lc").arg(command);
+            bash
+        }
+    };
     builder
-        .arg("-lc")
-        .arg(command)
         .current_dir(root)
         // No terminal and no input: a command that reads stdin sees EOF.
         .stdin(Stdio::null())
@@ -231,7 +465,10 @@ async fn run(
         .process_group(0);
     let mut child = match builder.spawn() {
         Ok(child) => child,
-        Err(error) => return ToolOutcome::error(format!("failed to start bash: {error}")),
+        Err(error) => {
+            let program = if sandbox.is_some() { "bwrap" } else { "bash" };
+            return ToolOutcome::error(format!("failed to start {program}: {error}"));
+        }
     };
     let pgid = child.id().map(|id| id as i32).unwrap_or(0);
 
@@ -605,6 +842,7 @@ mod tests {
             Duration::from_secs(1),
             published,
             &CancellationToken::new(),
+            None,
         )
         .await;
 

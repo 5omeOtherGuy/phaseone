@@ -5,10 +5,21 @@
 //! `p1 env show NAME`
 //! `p1 --help` / `p1 --version`
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The default environment when `--env` is not given.
 pub const DEFAULT_ENV: &str = "claude";
+
+/// Whether `shell` commands run inside the bubblewrap sandbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SandboxMode {
+    /// No sandbox: the shell runs directly (the default).
+    #[default]
+    Off,
+    /// Every `shell` command runs under `bwrap` with only the workspace and a
+    /// private `/tmp` writable.
+    Workspace,
+}
 
 /// What the process should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +46,11 @@ pub struct Options {
     pub session: Option<PathBuf>,
     pub resume: bool,
     pub yes: bool,
+    /// Whether `shell` commands run in the bubblewrap sandbox.
+    pub sandbox: SandboxMode,
+    /// Extra paths the sandbox keeps writable, absolute and canonicalised when
+    /// they exist.
+    pub sandbox_write: Vec<PathBuf>,
 }
 
 impl Options {
@@ -75,6 +91,12 @@ pub fn usage() -> String {
     out.push_str("  --session FILE    write the session journal to FILE as JSONL\n");
     out.push_str("  --resume          continue an existing --session file\n");
     out.push_str("  --yes             permit every tool call without asking\n");
+    out.push_str(
+        "  --sandbox MODE    run shell commands in a bubblewrap sandbox: `workspace` or\n                    `off` (default: off)\n",
+    );
+    out.push_str(
+        "  --sandbox-write PATH\n                    keep PATH writable in the sandbox (repeatable;\n                    requires --sandbox workspace)\n",
+    );
     out
 }
 
@@ -122,6 +144,11 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             }
             "--resume" => resume = true,
             "--yes" => yes = true,
+            // Validated by `parse_sandbox` after the loop; the values are consumed
+            // here so they are not mistaken for prompt words.
+            "--sandbox" | "--sandbox-write" => {
+                take_value(args, &mut index, arg)?;
+            }
             other if other.starts_with('-') && other != "-" => {
                 return Err(CliError {
                     message: format!("unknown flag `{other}`"),
@@ -137,6 +164,8 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             message: "--resume requires --session".to_string(),
         });
     }
+    // Validate the sandbox flags and keep their parsed state on the options.
+    let (sandbox, sandbox_write) = parse_sandbox(args)?;
 
     let prompt = if prompt_words.is_empty() {
         None
@@ -151,26 +180,42 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         session,
         resume,
         yes,
+        sandbox,
+        sandbox_write,
     })
 }
 
 fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
-    // Exactly `env show NAME`; no flags, no extra arguments.
-    let [_, show, name] = args else {
-        return Err(CliError {
-            message: "usage: p1 env show NAME".to_string(),
-        });
-    };
-    if show != "show" {
+    // `env show NAME`, followed only by the sandbox flags.
+    if args.get(1).map(String::as_str) != Some("show") {
+        let show = args.get(1).map(String::as_str).unwrap_or("");
         return Err(CliError {
             message: format!("unknown env subcommand `{show}`"),
         });
     }
+    let Some(name) = args.get(2) else {
+        return Err(CliError {
+            message: "usage: p1 env show NAME".to_string(),
+        });
+    };
     if name.starts_with('-') {
         return Err(CliError {
             message: "usage: p1 env show NAME".to_string(),
         });
     }
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--sandbox" | "--sandbox-write" => index += 1,
+            other => {
+                return Err(CliError {
+                    message: format!("unexpected argument `{other}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    let (sandbox, sandbox_write) = parse_sandbox(args)?;
     Ok(Options {
         command: Command::EnvShow { name: name.clone() },
         env: name.clone(),
@@ -178,7 +223,76 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         session: None,
         resume: false,
         yes: false,
+        sandbox,
+        sandbox_write,
     })
+}
+
+/// Parse the sandbox flags out of any argument list, ignoring everything else.
+///
+/// `parse` and `parse_env_show` both use it, so the flag grammar and its usage
+/// errors exist once.
+fn parse_sandbox(args: &[String]) -> Result<(SandboxMode, Vec<PathBuf>), CliError> {
+    let mut mode = SandboxMode::Off;
+    let mut writable: Vec<PathBuf> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--sandbox" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError {
+                        message: "--sandbox requires a value".to_string(),
+                    });
+                };
+                mode = match value.as_str() {
+                    "off" => SandboxMode::Off,
+                    "workspace" => SandboxMode::Workspace,
+                    other => {
+                        return Err(CliError {
+                            message: format!(
+                                "unknown sandbox mode `{other}`; expected `workspace` or `off`"
+                            ),
+                        });
+                    }
+                };
+            }
+            "--sandbox-write" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError {
+                        message: "--sandbox-write requires a value".to_string(),
+                    });
+                };
+                writable.push(resolve_writable(value)?);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if !writable.is_empty() && mode == SandboxMode::Off {
+        return Err(CliError {
+            message: "--sandbox-write requires --sandbox workspace".to_string(),
+        });
+    }
+    Ok((mode, writable))
+}
+
+/// A `--sandbox-write` value: absolute, or relative to the current directory;
+/// canonicalised when the path exists. A path that does not exist is kept as an
+/// absolute path and simply not bound (see `bwrap_args`).
+fn resolve_writable(value: &str) -> Result<PathBuf, CliError> {
+    let path = Path::new(value);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| CliError {
+                message: format!("cannot resolve --sandbox-write `{value}`: {error}"),
+            })?
+            .join(path)
+    };
+    Ok(std::fs::canonicalize(&absolute).unwrap_or(absolute))
 }
 
 fn take_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, CliError> {
@@ -199,6 +313,8 @@ fn defaults(command: Command) -> Options {
         session: None,
         resume: false,
         yes: false,
+        sandbox: SandboxMode::Off,
+        sandbox_write: Vec::new(),
     }
 }
 
@@ -254,5 +370,41 @@ mod tests {
         assert!(parse(&args(&["--resume"])).is_err());
         assert!(parse(&args(&["env", "show"])).is_err());
         assert!(parse(&args(&["env", "list"])).is_err());
+    }
+
+    #[test]
+    fn parses_the_sandbox_flags_and_keeps_the_prompt() {
+        let options = parse(&args(&["--sandbox", "workspace"])).unwrap();
+        assert_eq!(options.sandbox, SandboxMode::Workspace);
+        assert!(options.sandbox_write.is_empty());
+
+        assert_eq!(
+            parse(&args(&["--sandbox", "off"])).unwrap().sandbox,
+            SandboxMode::Off
+        );
+        // A relative --sandbox-write is canonicalised against the current dir.
+        let options = parse(&args(&["--sandbox", "workspace", "--sandbox-write", "."])).unwrap();
+        assert_eq!(
+            options.sandbox_write,
+            vec![std::env::current_dir().unwrap().canonicalize().unwrap()]
+        );
+        let options = parse(&args(&["--sandbox", "workspace", "--yes", "do", "it"])).unwrap();
+        assert_eq!(
+            options.command,
+            Command::Run {
+                prompt: Some("do it".to_string())
+            }
+        );
+        assert!(options.yes);
+    }
+
+    #[test]
+    fn sandbox_flag_misuse_is_a_usage_error() {
+        assert!(parse(&args(&["--sandbox-write", "/tmp", "go"])).is_err());
+        assert!(parse(&args(&["--sandbox", "bogus"])).is_err());
+        assert!(parse(&args(&["--sandbox"])).is_err());
+        assert!(parse(&args(&["env", "show", "claude", "--sandbox-write", "/tmp"])).is_err());
+        assert!(parse(&args(&["env", "show", "claude", "--bogus"])).is_err());
+        assert!(parse(&args(&["env", "show", "claude", "--sandbox", "workspace"])).is_ok());
     }
 }
