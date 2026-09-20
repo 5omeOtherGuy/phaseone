@@ -86,9 +86,9 @@ IN FLIGHT:
   `OPENCODE_GO_2_API_KEY=…` prefix at dispatch can go (until then keep it).
 * `run-report-usage` (research #26): DONE, merged, #26 closed as used. Research batch 1 is fully
   dispositioned (26 used, 27 used, 28 discarded); ADR-0045 accepted. No research item open.
-* NEW bug #30 (from research #28): `finish` accepts masked checks (`cmd; echo done`,
-  `cmd || true`). Lead-owned, one crate, needs a spec line in completion.md §2 first. Also seen
-  in the p1-auth run: `finish` names ONE missing verification command per rejection (5 rounds).
+* #30 DONE: `finish` rejects masked checks (`;`, `||`, newline, backgrounding `&`; `2>&1` is
+  fine) and reports EVERY failing named command in one error (completion.md §2, last revision).
+* `[context]` tables for claude / claude-delegating / gpt: DONE (200k/120k, operational values).
 * TUI: separate Kimi K3 session (tmux window `kimi-tui`, pane %48, worktree `../phaseone-12-tui`),
   coordination ONLY via issue #12. It has merged M1–M4a itself; the seam it needed is on main and
   it may edit exactly two spots of mine: `impl FrontEnd` in its `tui.rs`, the 5-line `--tui`
