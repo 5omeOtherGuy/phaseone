@@ -189,6 +189,12 @@ async fn sandbox_write_keeps_a_path_writable_end_to_end() {
 /// `+sandbox` identity variant.
 #[tokio::test]
 async fn env_show_with_sandbox_workspace_shows_the_sandbox_face() {
+    // Assembly probes bwrap, so without it this exits 1 by design (covered by
+    // `a_sandbox_error_fails_assembly_before_any_provider_request`).
+    if !bwrap_usable() {
+        eprintln!("SKIP: bwrap unusable here");
+        return;
+    }
     let home = tempdir().unwrap();
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     harness.deps.home = Some(home.path().to_path_buf());

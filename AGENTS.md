@@ -34,6 +34,9 @@ make that fast and conflict-free.
 `scripts/gate.sh` is the only required check: `cargo fmt --check`,
 `clippy -D warnings`, all tests, core isolation. CI runs exactly the same script.
 It must be green before a merge; it is not required for every intermediate commit.
+After merging into `main`, push with `scripts/push-main.sh`: it waits for the CI run of exactly
+that commit. CI differs from a workstation (no bubblewrap, slower start-up) — a green local gate
+is not a green CI.
 
 ## Decisions
 
