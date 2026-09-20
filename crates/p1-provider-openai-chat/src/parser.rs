@@ -89,11 +89,12 @@ impl ChatParser {
             }
             let mut ids = std::collections::BTreeSet::new();
             for block in &self.blocks {
-                if let AssistantBlock::ToolCall(call) = block {
-                    if call.call_id.is_empty() || call.name.is_empty() || !ids.insert(&call.call_id)
-                    {
-                        return self.fail("incomplete or duplicate tool identity");
-                    }
+                if let AssistantBlock::ToolCall(call) = block
+                    && (call.call_id.is_empty()
+                        || call.name.is_empty()
+                        || !ids.insert(&call.call_id))
+                {
+                    return self.fail("incomplete or duplicate tool identity");
                 }
             }
         } else if !self.calls.is_empty() {
@@ -177,15 +178,14 @@ impl ResponseParser for ChatParser {
                 .get("reasoning_content")
                 .and_then(Value::as_str)
                 .or_else(|| delta.get("reasoning").and_then(Value::as_str))
+                && !part.is_empty()
             {
-                if !part.is_empty() {
-                    events.push(self.delta(part, true));
-                }
+                events.push(self.delta(part, true));
             }
-            if let Some(part) = delta.get("content").and_then(Value::as_str) {
-                if !part.is_empty() {
-                    events.push(self.delta(part, false));
-                }
+            if let Some(part) = delta.get("content").and_then(Value::as_str)
+                && !part.is_empty()
+            {
+                events.push(self.delta(part, false));
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {

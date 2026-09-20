@@ -116,10 +116,10 @@ impl Provider for ChatProvider {
                             format!("Bearer {}", credential.bearer),
                         ),
                     ];
-                    if route == SubscriptionRoute::OpenCodeGo {
-                        if let Some(key) = &cache_key {
-                            headers.push(("x-opencode-session".into(), key.clone()));
-                        }
+                    if route == SubscriptionRoute::OpenCodeGo
+                        && let Some(key) = &cache_key
+                    {
+                        headers.push(("x-opencode-session".into(), key.clone()));
                     }
                     HttpRequest {
                         url: route.endpoint().into(),
