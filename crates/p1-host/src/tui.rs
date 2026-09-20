@@ -120,6 +120,28 @@ impl FrontEnd for TuiFrontEnd {
             };
 
             let mut screen = Screen::new(std::env::var_os("P1_REDUCED_MOTION").is_some());
+            // The §4.1 idle prelude: version line, one sentence of state, the
+            // four affordances — then the transcript takes over.
+            screen
+                .transcript
+                .blocks
+                .push(p1_tui::transcript::Block::Info {
+                    lines: vec![
+                        format!(
+                            "p1 {}   {}",
+                            env!("CARGO_PKG_VERSION"),
+                            self.options.workspace.display()
+                        ),
+                        String::new(),
+                        "  /resume     reopen a previous session".into(),
+                        format!("  /env        {}", self.options.env),
+                        format!(
+                            "  /access     {}",
+                            if self.options.ask { "ask" } else { "full" }
+                        ),
+                        "  /goal       set the session objective".into(),
+                    ],
+                });
             // A resumed session shows where it stands (issue #12, seam note).
             screen.transcript.paint_history(agent.history());
             let (route, model) = self.labels.lock().unwrap().clone().unwrap_or_default();
