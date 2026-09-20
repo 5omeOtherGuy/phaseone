@@ -58,7 +58,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0042 | [A headless run that only summarizes ends as stalled](0042-a-headless-run-that-only-summarizes-ends-as-stalled.md) | accepted | 2026-09-20 | lead |
 | ADR-0043 | [TUI: pure state machine in p1-tui, terminal driver in p1-host](0043-tui-pure-state-machine-in-p1-tui-terminal-driver-in-p1-host.md) | accepted | 2026-09-20 | lead |
 | ADR-0044 | [p1 login stores pasted API keys in p1's own store](0044-p1-login-stores-pasted-api-keys-in-p1-s-own-store.md) | proposed | 2026-09-20 | owner |
-| ADR-0045 | [Research items are issues that end used or discarded; a curator organises research, the lead alone develops](0045-research-items-are-issues-that-end-used-or-discarded-a-curator-organises-research-the-lead-alone-develops.md) | proposed | 2026-09-20 | owner+lead |
+| ADR-0045 | [Research items are issues that end used or discarded; a curator organises research, the lead alone develops](0045-research-items-are-issues-that-end-used-or-discarded-a-curator-organises-research-the-lead-alone-develops.md) | accepted | 2026-09-20 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
