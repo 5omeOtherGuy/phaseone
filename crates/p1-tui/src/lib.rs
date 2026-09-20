@@ -8,6 +8,7 @@
 
 pub mod fold;
 pub mod glyphs;
+pub mod input;
 pub mod grid;
 pub mod palette;
 pub mod render;
