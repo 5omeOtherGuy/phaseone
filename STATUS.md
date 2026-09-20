@@ -97,6 +97,17 @@ IN FLIGHT:
   branch in `run_agent`. Still owed by the lead, not urgent: a small spec + ADR for
   `ContextStats` (observation-only context budget numbers for the ledger). Check #12 between jobs.
 
+* FAN-OUT PROGRAM (owner request 2026-09-20, issue #25): organised parallel research +
+  development within this machine's build limits; every research item is evaluated and then USED
+  or DISCARDED. Astra (pane %39, read-only oracle) is writing the proposed structure to
+  `../phaseone-briefs/fanout-program.answer.md` (request: `fanout-program-request.md` there) and
+  will comment on #25. NEXT for the lead: read it, decide the structure (ADR if it changes a
+  workflow rule), set up a RESEARCH ORCHESTRATOR (owner: e.g. Opus 5 — it may orchestrate and
+  curate research, NEVER development; development, specs, briefs, review and merges stay with
+  the lead), start the first build-free items. Owner's themes: model/provider-specific tools,
+  prompting + model cards per model, evidence-based system-prompt nudges, compaction/context per
+  provider, websocket vs http, tool outputs / tool-call formats, effort levels.
+
 HOW JOBS GO (what worked today): small briefs with a SHORT read-first list and "work in this
 order, start editing early"; one job ≈ one crate; p1 runner for implementation, pi-worker for
 harness-guard work and other repos; lead reviews the diff, runs the gate independently, merges.
