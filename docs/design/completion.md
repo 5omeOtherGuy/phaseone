@@ -74,6 +74,22 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
   `Call finish again with "verification": ["<one of the commands below>"].`
 - The tool description says the same in two sentences (no pipe; name the command as you ran it).
 
+**Revision after research #28 and the p1-auth run (2026-09-20, issue #30).** Two more holes:
+`cmd; echo done` and `cmd || true` exit 0 whatever `cmd` did, and a model that named five
+commands was told about ONE missing run per call — five rejected calls for one mistake. Therefore:
+- **A masked exit status is not a verification.** A recorded command never counts when, outside
+  quotes (the same simple scan), it contains `;`, `||`, a newline, or a single `&` that is not
+  part of `&&`. `&&` chains stay honest and stay accepted. Naming such a run →
+  Error `\`<command>\` continues after a failure (\`;\`, \`||\`, \`&\` or a new line), so its exit code says nothing about the check. Run the check on its own, then finish.`
+  The normalisation's one leading `cd <path> &&` is dropped BEFORE this test, as before.
+  The trailer's list and its wording "(successful, not piped, after the last file change)" are
+  unchanged; masked runs are simply never listed.
+- **One call reports every named command that fails.** Rules 2, 3, the pipe rule and the masked
+  rule are evaluated for EVERY named command. The error is each failing command's message, in
+  the order named, one per line, then the trailer ONCE. With exactly one failing command the
+  text is byte-identical to before. Nothing is stored unless every named command passes.
+- The tool description gains at most one short sentence (no `;`, `||` or `&` after a check).
+
 ## 3. Host policy (headless runs only)
 
 Active when the assembled environment contains the `finish` tool AND the run is headless;
