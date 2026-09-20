@@ -56,6 +56,24 @@ Rules, each with its exact model-visible text:
    is stored in `FinishOutcome` (last accepted call wins). A rejected call stores nothing.
 An Error is an ordinary tool result: the model reads it and keeps working in the same turn.
 
+**Revision after dogfood run 3 (2026-09-20).** A real model needed TEN `finish` calls: seven
+omitted `verification` although the error asked for it, two named a command in a different
+spelling than it had run (`cargo fmt --check` vs `cd <dir> && cargo fmt --check`). And the
+journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fail. Therefore:
+- **Matching is normalised**, on both sides: trim, collapse runs of whitespace, and drop ONE
+  leading `cd <path> &&` segment. Equality after that.
+- **A pipeline is not a verification.** A recorded command containing an unquoted `|` that is
+  not part of `||` never counts (its exit code is the last command's). Naming such a run →
+  Error `\`<command>\` was run through a pipe, so its exit code says nothing about it. Run it without a pipe, then finish.`
+  (stated limit: quoting is judged by a simple scan for `'…'` and `"…"`, not a shell parser).
+- **Every rejection shows what WOULD be accepted.** Errors 1–3 end with a blank line and
+  `Runs that count right now (successful, not piped, after the last file change):` followed by
+  up to 5 normalised commands, newest last, one per line prefixed `- `; or
+  `No run counts right now: run your checks (without a pipe) after your last file change.`
+  Error 1 additionally shows the shape:
+  `Call finish again with "verification": ["<one of the commands below>"].`
+- The tool description says the same in two sentences (no pipe; name the command as you ran it).
+
 ## 3. Host policy (headless runs only)
 
 Active when the assembled environment contains the `finish` tool AND the run is headless;

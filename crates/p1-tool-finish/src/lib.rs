@@ -10,6 +10,7 @@
 //! reads after the turn; a rejected call stores nothing. Invalid input is an
 //! ordinary tool result the model can act on — never a panic.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use p1_contracts::{
@@ -93,13 +94,22 @@ impl ToolFace {
 }
 
 const NAME: &str = "finish";
-const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.";
+const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.";
 
 /// The three exact rule texts, model-visible.
 const ERR_MISSING_VERIFICATION: &str = "Name the commands you ran to verify the work in \"verification\". If nothing can be verified by a command, say why in \"summary\" and pass [\"none\"].";
 const ERR_NONE_CHANGED_FILES: &str =
     "This session changed files; verify the result with a command before finishing.";
 const ERR_NEEDS: &str = "Say what you need in \"needs\".";
+
+/// Error 1 additionally shows the call shape, so the model has a template.
+const CALL_SHAPE: &str =
+    "Call finish again with \"verification\": [\"<one of the commands below>\"].";
+/// Every verification rejection ends with what would be accepted right now.
+const TRAILER_HEADING: &str =
+    "Runs that count right now (successful, not piped, after the last file change):";
+const TRAILER_NONE: &str =
+    "No run counts right now: run your checks (without a pipe) after your last file change.";
 
 /// The `finish` tool. Holds the session view and the outcome cell.
 pub struct FinishTool {
@@ -262,11 +272,11 @@ impl FinishTool {
             Status::Done => {
                 let verification = input.verification.unwrap_or_default();
                 if verification.is_empty() {
-                    return Err(ERR_MISSING_VERIFICATION.to_string());
+                    return Err(self.error_one(ERR_MISSING_VERIFICATION));
                 }
                 if verification.len() == 1 && verification[0].trim() == "none" {
                     if self.activity.last_file_change().is_some() {
-                        return Err(ERR_NONE_CHANGED_FILES.to_string());
+                        return Err(self.with_trailer(ERR_NONE_CHANGED_FILES));
                     }
                 } else {
                     self.verify(&verification)?;
@@ -291,29 +301,167 @@ impl FinishTool {
         }
     }
 
-    /// Every named command must match the LAST recorded run of that command, and
-    /// that run must be a success newer than the last file change.
+    /// Every named command must match, after normalisation, the LAST recorded
+    /// run of that command, and that run must be a success newer than the last
+    /// file change.
     fn verify(&self, verification: &[String]) -> Result<(), String> {
         let last_change = self.activity.last_file_change();
         let runs = self.activity.shell_runs();
         for named in verification {
-            let trimmed = named.trim();
-            let run = runs.iter().rev().find(|run| run.command.trim() == trimmed);
-            let successful = run.is_some_and(|run| run.exit_code == Some(0));
-            if !successful {
-                return Err(format!(
-                    "No successful run of `{named}` is recorded in this session. Run it, read the result, then finish."
-                ));
+            let wanted = normalise_command(named);
+            let run = runs
+                .iter()
+                .rev()
+                .find(|run| normalise_command(&run.command) == wanted);
+            let Some(run) = run else {
+                return Err(self.with_trailer(no_successful_run(named)));
+            };
+            // A pipe hides the check's exit code behind its last stage's, so the
+            // recorded status says nothing even when it is zero.
+            if is_piped(&run.command) {
+                return Err(self.with_trailer(pipe_error(named)));
             }
-            let run = run.expect("checked above");
+            if run.exit_code != Some(0) {
+                return Err(self.with_trailer(no_successful_run(named)));
+            }
             if let Some(change) = last_change
                 && run.order < change
             {
-                return Err(format!(
+                return Err(self.with_trailer(format!(
                     "You changed files after running `{named}`. Run it again, then finish."
-                ));
+                )));
             }
         }
         Ok(())
+    }
+
+    /// Error 1 additionally shows the call shape before the trailer.
+    fn error_one(&self, message: &str) -> String {
+        format!("{message}\n\n{CALL_SHAPE}\n\n{}", self.trailer())
+    }
+
+    /// Errors 1–3 end with a blank line and the runs that would be accepted now.
+    fn with_trailer(&self, message: impl AsRef<str>) -> String {
+        format!("{}\n\n{}", message.as_ref(), self.trailer())
+    }
+
+    fn trailer(&self) -> String {
+        let commands = self.counting_commands();
+        if commands.is_empty() {
+            return TRAILER_NONE.to_string();
+        }
+        let mut text = String::from(TRAILER_HEADING);
+        for command in commands {
+            text.push_str("\n- ");
+            text.push_str(&command);
+        }
+        text
+    }
+
+    /// The commands `finish` would accept right now: one entry per normalised
+    /// spelling (the LAST run decides), successful, unpiped and newer than the
+    /// last file change; newest last, at most five.
+    fn counting_commands(&self) -> Vec<String> {
+        let last_change = self.activity.last_file_change();
+        let mut last: HashMap<String, ShellRun> = HashMap::new();
+        for run in self.activity.shell_runs() {
+            last.insert(normalise_command(&run.command), run);
+        }
+        let mut counting: Vec<(u64, String)> = last
+            .into_iter()
+            .filter(|(_, run)| {
+                run.exit_code == Some(0)
+                    && !is_piped(&run.command)
+                    && last_change.is_none_or(|change| run.order > change)
+            })
+            .map(|(command, run)| (run.order, command))
+            .collect();
+        counting.sort();
+        let keep_from = counting.len().saturating_sub(5);
+        counting
+            .into_iter()
+            .skip(keep_from)
+            .map(|(_, command)| command)
+            .collect()
+    }
+}
+
+fn no_successful_run(named: &str) -> String {
+    format!(
+        "No successful run of `{named}` is recorded in this session. Run it, read the result, then finish."
+    )
+}
+
+fn pipe_error(named: &str) -> String {
+    format!(
+        "`{named}` was run through a pipe, so its exit code says nothing about it. Run it without a pipe, then finish."
+    )
+}
+
+/// Normalise a command for comparison: trim, collapse every run of whitespace to
+/// one space, and drop ONE leading `cd <path> &&` segment. Applied to both the
+/// recorded command and the named one, so matching is symmetric.
+fn normalise_command(command: &str) -> String {
+    let collapsed = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    match collapsed.find(" && ") {
+        // `at > 3` keeps the path between `cd ` and ` && ` non-empty.
+        Some(at) if collapsed.starts_with("cd ") && at > 3 => collapsed[at + 4..].to_string(),
+        _ => collapsed,
+    }
+}
+
+/// True when the command contains an unquoted `|` that is not part of `||`.
+/// Quoting is a simple scan for `'…'` and `"…"`, not a shell parser (a stated
+/// limit in `docs/design/completion.md` §2).
+fn is_piped(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut quote: Option<char> = None;
+    for (index, &character) in chars.iter().enumerate() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            Some(_) => {}
+            None => match character {
+                '\'' => quote = Some('\''),
+                '"' => quote = Some('"'),
+                '|' => {
+                    let previous = index.checked_sub(1).map(|i| chars[i]);
+                    let next = chars.get(index + 1).copied();
+                    if previous != Some('|') && next != Some('|') {
+                        return true;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalise_trims_collapses_and_drops_one_leading_cd() {
+        assert_eq!(normalise_command("  cargo   test  "), "cargo test");
+        assert_eq!(
+            normalise_command("cd /w/x && cargo fmt --check"),
+            "cargo fmt --check"
+        );
+        assert_eq!(normalise_command("cargo fmt --check"), "cargo fmt --check");
+        assert_eq!(normalise_command("cd a && cd b && x"), "cd b && x");
+        assert_eq!(normalise_command("cd a &&  cd b && x"), "cd b && x");
+        assert_eq!(normalise_command("cdx a && b"), "cdx a && b");
+        assert_eq!(normalise_command("cd && b"), "cd && b");
+    }
+
+    #[test]
+    fn pipe_detection_ignores_quoted_and_double_pipes() {
+        assert!(is_piped("cargo test 2>&1 | tail -5"));
+        assert!(is_piped("grep x f | wc -l"));
+        assert!(!is_piped("a || b"));
+        assert!(!is_piped("echo 'a|b'"));
+        assert!(!is_piped("echo \"a|b\""));
+        assert!(!is_piped("cargo test"));
     }
 }
