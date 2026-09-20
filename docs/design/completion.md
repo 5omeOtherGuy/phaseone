@@ -112,3 +112,15 @@ i. Cancellation during a continuation turn → 130, as any turn.
 Live evidence (lead, `P1_LIVE=1`-style, reported not assumed): a task phrased so that models
 typically stop to ask ("…let me know if I should proceed") runs to `finish(done)` without an
 operator; and a task that cannot be done (needs a credential that is not there) ends `blocked`.
+
+**Live result, 2026-09-20 (lead; both routes, sandboxed, `--yes`).** Task 1 ("…First tell me
+your plan. Then let me know if I should proceed."): `claude-sonnet-5` and `gpt-5.6-sol` both
+did the work and ended with an accepted `finish(done)`, exit 0, 0 continuations. On the Claude
+route the first `finish` was REJECTED — it named `python3 -m unittest test_temperature -v`,
+which it had not run in that form — the model then ran it and finished: the verification rule
+worked on a real model. Task 2 (publish with a token that is not there, to an unreachable
+host): both routes ended `finish(blocked)`, exit 3, naming what they need; neither invented
+another destination. NOT shown live: the continuation path — with the Finishing prompt section
+neither model stopped early, so continuation is proven by the scripted tests only. One run per
+route and task.
+
