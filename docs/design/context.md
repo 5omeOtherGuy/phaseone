@@ -75,6 +75,7 @@ impl SummarizingContext {
     pub fn new(provider: Arc<dyn Provider>, options: ModelOptions, config: ContextConfig, prompt: String) -> Result<Self, String>;
 }
 pub const DEFAULT_SUMMARIZER_PROMPT: &str;
+pub const SUMMARY_MARKER: &str;            // first line of every summary item, see Replacement
 pub fn estimate_tokens(items: &[Item]) -> u64;   // ceil(chars / 3.5) over all model-visible text incl. tool inputs; replay payloads count too
 ```
 
