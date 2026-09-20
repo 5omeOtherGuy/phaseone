@@ -58,19 +58,31 @@ OWNER DECISIONS 2026-09-20 (ADR-0039, ADR-0040; note `docs/design/notes/2026-09-
 - Credentials: `~/.config/p1/auth.json` keyed by route, env var wins, borrow other tools' logins
   for now, no login command yet, macOS later.
 
+PROGRESS 2026-09-20 late (all merged, CI green on the exact commit):
+- Astra's step 2 merged (511e7b4, #9 closed): `p1-provider-openai-chat` (ChatRoute, ChatDialect
+  by behaviour, separate `p1-model-profile`), host `auth.rs`, envs `deepseek` and `glm`.
+- DOGFOODING IS LIVE: lead jobs run as `"runner": "p1"` (env deepseek; glm quota ran out after
+  one 21M-token job). Every run recorded in `docs/dogfood/runs.jsonl`.
+- Split step 1 (characterization tests), 3a (profiles as files, env `route`+`profile`, spec
+  `docs/design/routes-and-profiles.md`), 3c (RouteDescription.cache_key, one assembly, foreign
+  native option = error, Anthropic cap conflict = error, empty OpenAI cache key = error).
+- #11 / ADR-0041: headless runs wait and continue after Transport/RateLimited turn ends
+  (`--provider-retries`). `deepseek` env has first measured `[context]` values — proven in real
+  work (171 requests, 3 summarizations, accepted first round).
+- IN FLIGHT when this was written: 3b route files (`../phaseone-split3b-route-files`, p1 run
+  dir `../phaseone-briefs/runs/split3b-*`); `--sandbox-read` so git works in a sandboxed worktree
+  (`../phaseone-sandbox-read`, repair 1: reject ANCESTORS of credential dirs).
+
 NEXT, in order:
-1. When Astra's step 2 lands: build p1, smoke `--env deepseek` / `--env glm` in a sandboxed
-   clone (`scripts/dogfood.sh`), then move lead jobs to `"runner": "p1"`.
-2. Provider split step 1 (lead/worker): characterization tests of today's first-party request/
-   replay behaviour. Step 3: profile selection + data-driven routes + assembly validation
-   (spec first; includes replacing `assemble_with_cache_key`'s retry-on-any-error with an
-   explicit cache-key policy on the resolved route, and rejecting the Anthropic adapter's
-   silent raise of an explicit output cap). Step 4: first-party policy extraction. Step 5:
-   credential module (`p1-auth`), precedence env → store → borrowed; write-back to the source.
-3. Choose `[context]` values for shipped environments from dogfood numbers (runs grew to
-   ~90k tokens, 2.8M input/run, 97 % cached on Claude) — issue #6.
-4. T1 measurement (fixed task set, repeated, parent+worker tokens now available), host
-   cleanup around the state transitions, model cards from `~/.agents/skills/model-cards/evidence.jsonl`.
+1. Review + merge 3b and sandbox-read (independent gate each, `scripts/push-main.sh`).
+2. Split step 4: first-party policy extraction (Claude classification/budgets, GPT defaults →
+   profiles; claude/gpt envs to `route`+`profile`; characterization tests must stay byte-equal).
+   Step 5: `p1-auth` per ADR-0040 (borrow-only, write-back to the source).
+3. `[context]` for glm/claude/gpt envs from runs (glm grew to 203k/request without it) — #6.
+   Small harness debts from dogfooding (#6): a run with zero responses prints `in 0 … cost
+   $0.0000` instead of unknown; run-report `elapsed_seconds` null when called by hand.
+4. T1 measurement (fixed task set, repeated), host cleanup around the state transitions, model
+   cards from `~/.agents/skills/model-cards/evidence.jsonl`.
 Known small debts: `codex exec` needs `< /dev/null`; owner's opencode auth.json may hold a
 `zai` entry opencode ignores (told the owner); local branch cleanup uses `git branch -D` after
 merge (tracking makes `-d` refuse).
