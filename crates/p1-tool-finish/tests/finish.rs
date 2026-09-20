@@ -35,6 +35,18 @@ fn no_successful_run(named: &str) -> String {
     )
 }
 
+fn pipe_error(named: &str) -> String {
+    format!(
+        "`{named}` was run through a pipe, so its exit code says nothing about it. Run it without a pipe, then finish."
+    )
+}
+
+fn masked_error(named: &str) -> String {
+    format!(
+        "`{named}` continues after a failure (`;`, `||`, `&` or a new line), so its exit code says nothing about the check. Run the check on its own, then finish."
+    )
+}
+
 #[derive(Default)]
 struct FakeActivity {
     last_file_change: Mutex<Option<u64>>,
@@ -390,12 +402,24 @@ async fn an_unquoted_pipe_is_detected() {
 }
 
 #[tokio::test]
-async fn a_double_pipe_is_not_a_pipe() {
+async fn a_double_pipe_is_not_a_pipe_but_masks_the_status() {
     let activity = FakeActivity::new();
     activity.ran("a || b", Some(0), 1);
     let (finish, _) = tool(activity);
 
-    assert_eq!(done(&finish, r#"["a || b"]"#).await.content, "Finished.");
+    let result = done(&finish, r#"["a || b"]"#).await;
+
+    // `||` is not a pipe...
+    assert!(
+        !result.content.contains("was run through a pipe"),
+        "{}",
+        result.content
+    );
+    // ...but `b` runs when `a` fails, so the status is masked (revision #30).
+    assert_eq!(
+        result.content,
+        format!("{}\n\n{TRAILER_NONE}", masked_error("a || b"))
+    );
 }
 
 #[tokio::test]
@@ -412,6 +436,254 @@ async fn quoted_pipes_are_not_pipes() {
     assert_eq!(
         done(&finish, r#"["echo \"a|b\""]"#).await.content,
         "Finished."
+    );
+}
+
+// ------------------------------------- revision #30: masked status + every failure
+
+#[tokio::test]
+async fn a_masked_run_is_rejected_with_the_masked_error_and_is_never_listed() {
+    // Every case names the command exactly as it was recorded, so the message quotes it.
+    let masked = [
+        ("cargo test; echo done", r#"["cargo test; echo done"]"#),
+        ("cargo test || true", r#"["cargo test || true"]"#),
+        ("cargo test &", r#"["cargo test &"]"#),
+        ("cargo test & echo x", r#"["cargo test & echo x"]"#),
+        (
+            "cargo test\ncargo fmt --check",
+            r#"["cargo test\ncargo fmt --check"]"#,
+        ),
+    ];
+    for (recorded, json) in masked {
+        let activity = FakeActivity::new();
+        activity.ran(recorded, Some(0), 1);
+        let (finish, outcome) = tool(activity);
+
+        let result = done(&finish, json).await;
+
+        assert_eq!(result.status, ToolStatus::Error, "recorded: {recorded:?}");
+        assert_eq!(
+            result.content,
+            format!("{}\n\n{TRAILER_NONE}", masked_error(recorded)),
+            "recorded: {recorded:?}"
+        );
+        assert_eq!(outcome.get(), None, "recorded: {recorded:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_trailer_excludes_masked_runs() {
+    let activity = FakeActivity::new();
+    activity.ran("cargo test; echo done", Some(0), 1);
+    activity.ran("cargo fmt --check", Some(0), 2);
+    let (finish, _) = tool(activity);
+
+    let result = execute(&finish, r#"{"status":"done","summary":"s"}"#).await;
+
+    assert_eq!(
+        result.content,
+        format!(
+            "{MISSING_VERIFICATION}\n\n{CALL_SHAPE}\n\n{}",
+            trailer(&["cargo fmt --check"])
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_redirected_stream_counts_and_is_listed() {
+    // `2>&1`, `>&2`, `&>file` and `&>>file` are redirections, not backgrounding: the
+    // check itself decides the exit code, so these runs count.
+    let cases = [
+        ("cargo test 2>&1", r#"["cargo test 2>&1"]"#),
+        ("cargo test >&2", r#"["cargo test >&2"]"#),
+        ("cargo build &> log.txt", r#"["cargo build &> log.txt"]"#),
+        ("cargo build &>> log.txt", r#"["cargo build &>> log.txt"]"#),
+    ];
+    for (recorded, json) in cases {
+        let activity = FakeActivity::new();
+        activity.ran(recorded, Some(0), 1);
+        let (finish, outcome) = tool(activity);
+
+        let result = done(&finish, json).await;
+
+        assert_eq!(
+            result.status,
+            ToolStatus::Ok,
+            "recorded: {recorded:?} -> {}",
+            result.content
+        );
+        assert_eq!(result.content, "Finished.");
+        assert_eq!(
+            outcome.get(),
+            Some(Accepted::Done {
+                summary: "s".to_string()
+            })
+        );
+
+        // ...and they are offered in the trailer, unlike a backgrounded run.
+        let activity = FakeActivity::new();
+        activity.ran(recorded, Some(0), 1);
+        activity.ran("cargo test &", Some(0), 2);
+        let (finish, _) = tool(activity);
+        let result = execute(&finish, r#"{"status":"done","summary":"s"}"#).await;
+        assert_eq!(
+            result.content,
+            format!(
+                "{MISSING_VERIFICATION}\n\n{CALL_SHAPE}\n\n{}",
+                trailer(&[recorded])
+            ),
+            "recorded: {recorded:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn honest_and_quoted_sequencing_is_not_masked() {
+    let cases = [
+        // The `cd <path> &&` prefix is dropped for matching, and `&&` is honest anyway.
+        ("cd /w && cargo test", r#"["cargo test"]"#),
+        (
+            "cargo fmt --check && cargo test",
+            r#"["cargo fmt --check && cargo test"]"#,
+        ),
+        ("echo \"a;b\"", r#"["echo \"a;b\""]"#),
+        ("echo 'x || y'", r#"["echo 'x || y'"]"#),
+    ];
+    for (recorded, json) in cases {
+        let activity = FakeActivity::new();
+        activity.ran(recorded, Some(0), 1);
+        let (finish, outcome) = tool(activity);
+
+        let result = done(&finish, json).await;
+
+        assert_eq!(
+            result.status,
+            ToolStatus::Ok,
+            "recorded: {recorded:?} -> {}",
+            result.content
+        );
+        assert_eq!(result.content, "Finished.");
+        assert_eq!(
+            outcome.get(),
+            Some(Accepted::Done {
+                summary: "s".to_string()
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_run_that_is_both_piped_and_masked_reports_the_pipe_error() {
+    let activity = FakeActivity::new();
+    activity.ran("cargo test | tail; echo done", Some(0), 1);
+    let (finish, _) = tool(activity);
+
+    let result = done(&finish, r#"["cargo test | tail; echo done"]"#).await;
+
+    assert_eq!(
+        result.content,
+        format!(
+            "{}\n\n{TRAILER_NONE}",
+            pipe_error("cargo test | tail; echo done")
+        )
+    );
+}
+
+#[tokio::test]
+async fn one_error_reports_two_failing_commands_in_the_order_named() {
+    let activity = FakeActivity::new();
+    activity.ran("cargo test", Some(0), 1);
+    activity.ran("cargo fmt --check | tail -1", Some(0), 2);
+    let (finish, outcome) = tool(activity);
+
+    let result = done(
+        &finish,
+        r#"["cargo test","cargo clippy","cargo fmt --check | tail -1"]"#,
+    )
+    .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(
+        result.content,
+        format!(
+            "{}\n{}\n\n{}",
+            no_successful_run("cargo clippy"),
+            pipe_error("cargo fmt --check | tail -1"),
+            trailer(&["cargo test"])
+        )
+    );
+    assert_eq!(outcome.get(), None);
+}
+
+#[tokio::test]
+async fn one_error_reports_three_failing_commands_with_one_trailer() {
+    let activity = FakeActivity::new();
+    activity.ran("cargo test", Some(0), 1);
+    activity.changed_at(2);
+    activity.ran("cargo build; echo ok", Some(0), 3);
+    activity.ran("cargo clippy", Some(1), 4);
+    let (finish, outcome) = tool(activity);
+
+    let result = done(
+        &finish,
+        r#"["cargo build; echo ok","cargo test","cargo clippy"]"#,
+    )
+    .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(
+        result.content,
+        format!(
+            "{}\n{}\n{}\n\n{TRAILER_NONE}",
+            masked_error("cargo build; echo ok"),
+            "You changed files after running `cargo test`. Run it again, then finish.",
+            no_successful_run("cargo clippy")
+        )
+    );
+    assert_eq!(outcome.get(), None);
+}
+
+#[tokio::test]
+async fn one_failing_command_among_passing_ones_keeps_todays_text() {
+    let activity = FakeActivity::new();
+    activity.ran("cargo test", Some(0), 1);
+    activity.ran("cargo fmt --check", Some(0), 2);
+    let (finish, outcome) = tool(activity);
+
+    let result = done(&finish, r#"["cargo test","cargo clippy"]"#).await;
+
+    assert_eq!(
+        result.content,
+        format!(
+            "{}\n\n{}",
+            no_successful_run("cargo clippy"),
+            trailer(&["cargo test", "cargo fmt --check"])
+        )
+    );
+    assert_eq!(outcome.get(), None);
+}
+
+#[tokio::test]
+async fn every_named_command_passing_is_still_accepted() {
+    let activity = FakeActivity::new();
+    activity.ran("cargo test", Some(0), 1);
+    activity.ran("cargo fmt --check", Some(0), 2);
+    activity.ran("cargo clippy -- -D warnings", Some(0), 3);
+    let (finish, outcome) = tool(activity);
+
+    let result = done(
+        &finish,
+        r#"["cargo test","cargo fmt --check","cargo clippy -- -D warnings"]"#,
+    )
+    .await;
+
+    assert_eq!(result.status, ToolStatus::Ok);
+    assert_eq!(result.content, "Finished.");
+    assert_eq!(
+        outcome.get(),
+        Some(Accepted::Done {
+            summary: "s".to_string()
+        })
     );
 }
 

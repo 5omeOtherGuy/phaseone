@@ -94,7 +94,7 @@ impl ToolFace {
 }
 
 const NAME: &str = "finish";
-const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.";
+const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.";
 
 /// The three exact rule texts, model-visible.
 const ERR_MISSING_VERIFICATION: &str = "Name the commands you ran to verify the work in \"verification\". If nothing can be verified by a command, say why in \"summary\" and pass [\"none\"].";
@@ -303,36 +303,20 @@ impl FinishTool {
 
     /// Every named command must match, after normalisation, the LAST recorded
     /// run of that command, and that run must be a success newer than the last
-    /// file change.
+    /// file change. EVERY failing command is reported in one error, in the order
+    /// named, so one mistake costs one call.
     fn verify(&self, verification: &[String]) -> Result<(), String> {
         let last_change = self.activity.last_file_change();
         let runs = self.activity.shell_runs();
-        for named in verification {
-            let wanted = normalise_command(named);
-            let run = runs
-                .iter()
-                .rev()
-                .find(|run| normalise_command(&run.command) == wanted);
-            let Some(run) = run else {
-                return Err(self.with_trailer(no_successful_run(named)));
-            };
-            // A pipe hides the check's exit code behind its last stage's, so the
-            // recorded status says nothing even when it is zero.
-            if is_piped(&run.command) {
-                return Err(self.with_trailer(pipe_error(named)));
-            }
-            if run.exit_code != Some(0) {
-                return Err(self.with_trailer(no_successful_run(named)));
-            }
-            if let Some(change) = last_change
-                && run.order < change
-            {
-                return Err(self.with_trailer(format!(
-                    "You changed files after running `{named}`. Run it again, then finish."
-                )));
-            }
+        let failures: Vec<String> = verification
+            .iter()
+            .filter_map(|named| failure_of(named, &runs, last_change))
+            .collect();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(self.with_trailer(failures.join("\n")))
         }
-        Ok(())
     }
 
     /// Error 1 additionally shows the call shape before the trailer.
@@ -359,8 +343,8 @@ impl FinishTool {
     }
 
     /// The commands `finish` would accept right now: one entry per normalised
-    /// spelling (the LAST run decides), successful, unpiped and newer than the
-    /// last file change; newest last, at most five.
+    /// spelling (the LAST run decides), successful, unpiped, unmasked and newer than
+    /// the last file change; newest last, at most five.
     fn counting_commands(&self) -> Vec<String> {
         let last_change = self.activity.last_file_change();
         let mut last: HashMap<String, ShellRun> = HashMap::new();
@@ -372,6 +356,7 @@ impl FinishTool {
             .filter(|(_, run)| {
                 run.exit_code == Some(0)
                     && !is_piped(&run.command)
+                    && !is_masked(&run.command)
                     && last_change.is_none_or(|change| run.order > change)
             })
             .map(|(command, run)| (run.order, command))
@@ -398,6 +383,46 @@ fn pipe_error(named: &str) -> String {
     )
 }
 
+fn masked_error(named: &str) -> String {
+    format!(
+        "`{named}` continues after a failure (`;`, `||`, `&` or a new line), so its exit code says nothing about the check. Run the check on its own, then finish."
+    )
+}
+
+/// `None` when the named command passes rules 2, 3, the pipe rule and the masked rule;
+/// `Some` with the model-visible message of the FIRST rule it breaks.
+fn failure_of(named: &str, runs: &[ShellRun], last_change: Option<u64>) -> Option<String> {
+    let wanted = normalise_command(named);
+    let Some(run) = runs
+        .iter()
+        .rev()
+        .find(|run| normalise_command(&run.command) == wanted)
+    else {
+        return Some(no_successful_run(named));
+    };
+    // A pipe hides the check's exit code behind its last stage's, so the recorded
+    // status says nothing even when it is zero.
+    if is_piped(&run.command) {
+        return Some(pipe_error(named));
+    }
+    // `;`, `||`, a newline or a single `&` lets something else run last, with the
+    // same effect.
+    if is_masked(&run.command) {
+        return Some(masked_error(named));
+    }
+    if run.exit_code != Some(0) {
+        return Some(no_successful_run(named));
+    }
+    if let Some(change) = last_change
+        && run.order < change
+    {
+        return Some(format!(
+            "You changed files after running `{named}`. Run it again, then finish."
+        ));
+    }
+    None
+}
+
 /// Normalise a command for comparison: trim, collapse every run of whitespace to
 /// one space, and drop ONE leading `cd <path> &&` segment. Applied to both the
 /// recorded command and the named one, so matching is symmetric.
@@ -410,11 +435,13 @@ fn normalise_command(command: &str) -> String {
     }
 }
 
-/// True when the command contains an unquoted `|` that is not part of `||`.
-/// Quoting is a simple scan for `'…'` and `"…"`, not a shell parser (a stated
-/// limit in `docs/design/completion.md` §2).
-fn is_piped(command: &str) -> bool {
+/// Every character of `command` that sits OUTSIDE `'…'`/`"…"`, with the characters
+/// on either side of it (quoted or not). Quoting is a simple scan for quotes, not a
+/// shell parser (a stated limit in `docs/design/completion.md` §2); the pipe and the
+/// masking test share this one scan.
+fn outside_quotes(command: &str) -> Vec<(char, Option<char>, Option<char>)> {
     let chars: Vec<char> = command.chars().collect();
+    let mut unquoted = Vec::new();
     let mut quote: Option<char> = None;
     for (index, &character) in chars.iter().enumerate() {
         match quote {
@@ -423,18 +450,40 @@ fn is_piped(command: &str) -> bool {
             None => match character {
                 '\'' => quote = Some('\''),
                 '"' => quote = Some('"'),
-                '|' => {
-                    let previous = index.checked_sub(1).map(|i| chars[i]);
-                    let next = chars.get(index + 1).copied();
-                    if previous != Some('|') && next != Some('|') {
-                        return true;
-                    }
-                }
-                _ => {}
+                _ => unquoted.push((
+                    character,
+                    index.checked_sub(1).map(|i| chars[i]),
+                    chars.get(index + 1).copied(),
+                )),
             },
         }
     }
-    false
+    unquoted
+}
+
+/// True when the command contains an unquoted `|` that is not part of `||`.
+fn is_piped(command: &str) -> bool {
+    outside_quotes(command)
+        .into_iter()
+        .any(|(character, previous, next)| {
+            character == '|' && previous != Some('|') && next != Some('|')
+        })
+}
+
+/// True when the exit status is masked: outside quotes the command contains `;`, `||`,
+/// a newline, or a single `&` that is not part of `&&`. Each of those runs something
+/// else afterwards, which decides the exit code, so the recorded status says nothing
+/// about the check that ran first. `&&` chains stay honest, and so does an `&` that
+/// belongs to a redirection (`2>&1`, `>&2` after the `>`, `&>file` before it).
+fn is_masked(command: &str) -> bool {
+    outside_quotes(command)
+        .into_iter()
+        .any(|(character, previous, next)| match character {
+            ';' | '\n' => true,
+            '|' => next == Some('|'),
+            '&' => !matches!(previous, Some('&' | '>')) && !matches!(next, Some('&' | '>')),
+            _ => false,
+        })
 }
 
 #[cfg(test)]
@@ -463,5 +512,32 @@ mod tests {
         assert!(!is_piped("echo 'a|b'"));
         assert!(!is_piped("echo \"a|b\""));
         assert!(!is_piped("cargo test"));
+    }
+
+    #[test]
+    fn masked_detection_sees_sequencing_and_background_runs() {
+        assert!(is_masked("cargo test; echo done"));
+        assert!(is_masked("cargo test || true"));
+        assert!(is_masked("cargo test &"));
+        assert!(is_masked("cargo test\ncargo fmt --check"));
+        assert!(is_masked("cd /w && cargo test; echo done"));
+        assert!(!is_masked("cargo fmt --check && cargo test"));
+        assert!(!is_masked("cd /w && cargo test"));
+        assert!(!is_masked("echo \"a;b\""));
+        assert!(!is_masked("echo 'x || y'"));
+        assert!(!is_masked("cargo test"));
+    }
+
+    #[test]
+    fn a_redirected_stream_is_not_backgrounding() {
+        // An `&` that belongs to a redirection leaves the exit code to the check.
+        assert!(!is_masked("cargo test 2>&1"));
+        assert!(!is_masked("cargo test >&2"));
+        assert!(!is_masked("cargo test &> log.txt"));
+        assert!(!is_masked("cargo test &>> log.txt"));
+        assert!(!is_masked("cargo test 2>&1 | tail -5"));
+        // Backgrounding still masks.
+        assert!(is_masked("cargo test &"));
+        assert!(is_masked("cargo test & echo x"));
     }
 }
