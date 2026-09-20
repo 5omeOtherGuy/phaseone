@@ -30,8 +30,13 @@ pub fn lines(
     }
     let mut first = true;
     // The marker owns the gutter; continuation lines hang under the text.
+    // ⌥⏎ newlines are real line breaks; each segment wraps on its own.
     let body_width = width.saturating_sub(2);
-    for part in crate::wrap::wrap(&composer.text, body_width) {
+    for part in composer
+        .text
+        .split('\n')
+        .flat_map(|segment| crate::wrap::wrap(segment, body_width))
+    {
         if first {
             out.push(Line::from(vec![
                 Span::styled(format!("{} ", glyphs::OPERATOR), ink),
@@ -49,6 +54,27 @@ pub fn lines(
     };
     out.push(Line::styled(hints, Style::new().fg(palette::FAINT)));
     out
+}
+
+/// The cursor's cell: (column, row within the composer's lines), accounting
+/// for the gutter, wrapping and newline segments.
+pub fn cursor_cell(composer: &Composer, queued_rows: usize, width: usize) -> (usize, usize) {
+    let body_width = width.saturating_sub(2).max(1);
+    let before: String = composer.text.chars().take(composer.cursor).collect();
+    let segments: Vec<&str> = before.split('\n').collect();
+    let last = segments.len() - 1;
+    let mut row = queued_rows;
+    let mut col = 2;
+    for (n, segment) in segments.iter().enumerate() {
+        let w = crate::wrap::cell_width(segment);
+        col = 2 + w % body_width;
+        row += w / body_width;
+        if n < last {
+            row += 1; // the newline starts a new row
+            col = 2;
+        }
+    }
+    (col, row)
 }
 
 /// The one dim line under the composer at the 80-column floor (SPEC §6): the
@@ -83,6 +109,29 @@ mod tests {
             Text::from(working[1].clone()).to_string(),
             "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel"
         );
+    }
+
+    #[test]
+    fn the_cursor_tracks_edits_across_wraps_and_newlines() {
+        let mut c = Composer {
+            text: "abcd".into(),
+            cursor: 2,
+            revealed: false,
+        };
+        assert_eq!(cursor_cell(&c, 0, 10), (4, 0));
+        c = Composer {
+            text: "ab\ncd".into(),
+            cursor: 4, // before the 'd'
+            revealed: false,
+        };
+        assert_eq!(cursor_cell(&c, 0, 10), (3, 1));
+        // Wrapping: width 6 -> body 4; "abcdef" wraps after 4.
+        c = Composer {
+            text: "abcdef".into(),
+            cursor: 6,
+            revealed: false,
+        };
+        assert_eq!(cursor_cell(&c, 0, 6), (4, 1));
     }
 
     #[test]

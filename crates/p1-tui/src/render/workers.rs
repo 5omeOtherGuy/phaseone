@@ -51,6 +51,15 @@ impl WorkerState {
         }
     }
 
+    /// The glyph's colour per the fixed §2 colour column.
+    fn fg(self) -> ratatui::style::Color {
+        match self {
+            Self::Review | Self::Running => palette::INK,
+            Self::Done => palette::DIM,
+            Self::Queued => palette::FAINT,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Review => "needs review",
@@ -99,11 +108,15 @@ pub fn lines(workers: &[WorkerRow], grid: usize) -> Vec<Line<'static>> {
 fn worker_lines(worker: &WorkerRow, grid: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     // Line 1: glyph + name, state right-aligned.
-    let left = format!("{}  {}", worker.state.glyph(), worker.summary);
+    let name = format!("  {}", worker.summary);
     let state = worker.state.label();
-    let pad = grid.saturating_sub(left.chars().count() + state.len());
+    let pad = grid.saturating_sub(1 + name.chars().count() + state.len());
     out.push(Line::from(vec![
-        Span::styled(left, Style::new().fg(palette::INK)),
+        Span::styled(
+            worker.state.glyph().to_string(),
+            Style::new().fg(worker.state.fg()),
+        ),
+        Span::styled(name, Style::new().fg(palette::INK)),
         Span::raw(" ".repeat(pad)),
         Span::styled(state, Style::new().fg(palette::DIM)),
     ]));

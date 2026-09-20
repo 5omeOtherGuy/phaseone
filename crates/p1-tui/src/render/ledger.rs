@@ -61,8 +61,8 @@ pub struct Task {
     pub journal: Option<String>,
 }
 
-/// The spend section. `None` renders `—`; `responses == 0` renders the whole
-/// section as `—` rows rather than a fake zero (SPEC §5 product contract).
+/// The spend section. `None` renders `—`, never 0 (SPEC §5 product contract);
+/// before the first response the whole section is omitted instead.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpendView {
     pub responses: u64,
@@ -171,15 +171,11 @@ fn task_lines(task: &Task, out: &mut Vec<Line<'static>>) {
 }
 
 fn spend_lines(spend: &SpendView, out: &mut Vec<Line<'static>>) {
+    // Called only once at least one response landed (the section is omitted
+    // before); a None part is a KNOWN-unknown — render `—`.
     out.push(header("SPEND"));
-    let known = spend.responses > 0;
-    let or_unknown = |value: Option<u64>, format: fn(u64) -> String| {
-        if known {
-            value.map(format).unwrap_or(UNKNOWN.into())
-        } else {
-            UNKNOWN.into()
-        }
-    };
+    let or_unknown =
+        |value: Option<u64>, format: fn(u64) -> String| value.map(format).unwrap_or(UNKNOWN.into());
     out.push(grid::row(
         LEDGER_GRID,
         "  in",

@@ -124,7 +124,7 @@ pub fn lines(view: &DiffView, width: usize) -> Vec<Line<'static>> {
         out.push(diff_row(row, width));
     }
     out.push(Line::default());
-    out.extend(footer(view.grantable));
+    out.extend(footer(view.grantable, view.position.1 > 1));
     out
 }
 
@@ -148,7 +148,7 @@ fn diff_row(row: &DiffRow, width: usize) -> Line<'static> {
             palette::DIFF_DEL_BG,
         ),
     };
-    let room = width.saturating_sub(LINE_NUM_WIDTH + 2);
+    let room = width.saturating_sub(LINE_NUM_WIDTH + 3); // 4 + space + marker + space
     let text: String = text.chars().take(room).collect();
     let pad = room.saturating_sub(text.chars().count());
     let style = Style::new().fg(fg).bg(bg);
@@ -163,7 +163,7 @@ fn diff_row(row: &DiffRow, width: usize) -> Line<'static> {
 
 /// The decision footer (SPEC §4.4): single characters, spelled out. The
 /// destructive floor greys the grant rows with the reason inline (§4.5).
-fn footer(grantable: bool) -> Vec<Line<'static>> {
+fn footer(grantable: bool, multi: bool) -> Vec<Line<'static>> {
     let key = |k: &str, label: &str, available: bool| {
         let fg = if available {
             palette::INK
@@ -199,10 +199,17 @@ fn footer(grantable: bool) -> Vec<Line<'static>> {
         ));
     }
     first.extend(key("n", "deny", true));
-    let second = Line::styled(
-        "                            ^D next file   ^A all files",
-        Style::new().fg(palette::FAINT),
-    );
+    let second = if multi {
+        Line::styled(
+            "                            ^D next file   ^A all files",
+            Style::new().fg(palette::FAINT),
+        )
+    } else {
+        Line::styled(
+            "                            ^A all files",
+            Style::new().fg(palette::FAINT),
+        )
+    };
     vec![Line::from(first), second]
 }
 

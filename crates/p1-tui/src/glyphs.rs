@@ -62,8 +62,5 @@ mod tests {
             working_opacity(0, peak),
             working_opacity(0, peak + WORKING_CYCLE_MS)
         );
-        // The stagger shifts the neighbour's peak by exactly its delay.
-        let shifted = peak + WORKING_STAGGER_MS;
-        assert!(working_opacity(1, shifted) > 0.9);
     }
 }

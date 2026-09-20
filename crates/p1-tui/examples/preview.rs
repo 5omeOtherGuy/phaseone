@@ -282,7 +282,7 @@ fn main() {
     let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| draw(&screen, frame.area(), frame.buffer_mut(), 900))
+        .draw(|frame| draw(&mut screen, frame.area(), frame.buffer_mut(), 900))
         .unwrap();
     let buf = terminal.backend().buffer().clone();
 

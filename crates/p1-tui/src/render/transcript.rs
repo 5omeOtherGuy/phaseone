@@ -137,10 +137,12 @@ fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
         RowStatus::Settled(ToolStatus::Denied) => (glyphs::FAILED, palette::INK),
         RowStatus::Settled(_) => (glyphs::PENDING, palette::FAINT),
     };
-    let mut name: String = row.name.chars().take(NAME_FIELD).collect();
-    while name.chars().count() < NAME_FIELD {
-        name.push(' ');
-    }
+    // The name field is exactly NAME_FIELD cells; a name that would fill it
+    // completely still gets one blank separator before the argument.
+    let name = {
+        let cut: String = row.name.chars().take(NAME_FIELD - 1).collect();
+        format!("{cut:<NAME_FIELD$}")
+    };
     let mut spans = vec![
         Span::styled(indent.clone(), Style::new().fg(palette::DIM)),
         Span::styled(format!("{glyph} "), Style::new().fg(glyph_fg)),
@@ -163,7 +165,11 @@ fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
                 .and_then(|mut lines| lines.next())
                 .filter(|line| !line.is_empty())
         {
-            parts.push(first.to_string());
+            let mut first: String = first.chars().take(40).collect();
+            if first.chars().count() == 40 {
+                first.push('\u{2026}');
+            }
+            parts.push(first);
         }
         if let Some(output) = &row.output {
             let n = output.lines().count();
@@ -177,7 +183,7 @@ fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
         if result.is_empty() {
             result.push_str(status_word(status));
         }
-        if status == ToolStatus::Denied {
+        if status == ToolStatus::Denied && result != status_word(status) {
             result = format!("denied · {result}");
         }
         // The result wins the row's right edge; the summary truncates with `…`
@@ -278,8 +284,7 @@ fn working_line(label: &str, width: usize, now_ms: u64, reduced_motion: bool) ->
         format!(" {label}"),
         Style::new().fg(palette::DIM),
     ));
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let _ = width.saturating_sub(used);
+    let _ = width;
     Line::from(spans)
 }
 

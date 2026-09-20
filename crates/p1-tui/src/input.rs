@@ -41,6 +41,8 @@ pub enum Command {
     CyclePaneWidth,
     TogglePin,
     ToggleLedgerOverlay,
+    /// `^G`: edit the goal (prefills `/goal ` in the composer).
+    EditGoal,
     /// `esc`: dismiss the topmost overlay.
     Dismiss,
     /// Picker movement and choice.
@@ -77,7 +79,10 @@ pub fn handle(screen: &Screen, key: KeyEvent) -> Option<Command> {
         return match (key.code, ctrl) {
             (KeyCode::Up, false) => Some(Command::PickerUp),
             (KeyCode::Down, false) => Some(Command::PickerDown),
-            (KeyCode::Enter, false) => Some(Command::PickerAccept),
+            // Enter accepts a picker's selection; on a status overlay there is
+            // nothing to accept, so it dismisses (like esc).
+            (KeyCode::Enter, false) if screen.picker.is_some() => Some(Command::PickerAccept),
+            (KeyCode::Enter, false) => Some(Command::Dismiss),
             (KeyCode::Esc, false) => Some(Command::Dismiss),
             (KeyCode::Char('c'), true) => Some(Command::CancelOrQuit),
             _ => None,
@@ -109,6 +114,7 @@ pub fn handle(screen: &Screen, key: KeyEvent) -> Option<Command> {
         (KeyCode::Char('w'), true, false) => Some(Command::CyclePaneWidth),
         (KeyCode::Char('p'), true, false) => Some(Command::TogglePin),
         (KeyCode::Char('l'), true, false) => Some(Command::ToggleLedgerOverlay),
+        (KeyCode::Char('g'), true, false) => Some(Command::EditGoal),
         (KeyCode::Tab, true, false) => Some(Command::CyclePaneMode),
         (KeyCode::PageUp, false, false) => Some(Command::ScrollUp),
         (KeyCode::PageDown, false, false) => Some(Command::ScrollDown),

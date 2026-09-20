@@ -91,8 +91,8 @@ pub enum Promotion {
     None,
     /// A two-line PEEK banner over the ledger, expires `until_ms`.
     Peek { lines: [String; 2], until_ms: u64 },
-    /// An approval or a worker review: self-pinning until decided.
-    Blocked,
+    // An approval is its own state (`Screen::approval`); a peek never
+    // displaces it (checked there).
 }
 
 /// Running totals for the LEDGER spend section. Each part starts at a known
@@ -128,11 +128,7 @@ impl Spend {
         let add = |slot: &mut Option<u64>, part: Option<u64>| {
             *slot = match (*slot, part) {
                 (Some(total), Some(part)) => Some(total + part),
-                (slot @ Some(_), None) => {
-                    let _ = slot;
-                    None
-                }
-                (None, _) => None,
+                _ => None,
             };
         };
         match usage {
@@ -243,13 +239,20 @@ pub struct Screen {
     /// `^P`: no event may swap a pinned mode (SPEC §5).
     pub pinned: bool,
     pub promotion: Promotion,
-    /// Focus mode: passive chrome folds away (see SPEC §"Focus mode").
+    /// Focus mode override: `Some` after `/focus on|off`, `None` = automatic
+    /// (on at terminal heights of 12 rows or fewer). SPEC §4.3a.
+    pub focus_explicit: Option<bool>,
+    /// The effective focus mode this frame; the driver sets it from the
+    /// frame height and `focus_explicit`.
     pub focus: bool,
     pub working: Option<Working>,
     pub spend: Spend,
     /// The goal, host-owned and shown as a quotation (SPEC §4.7).
     pub goal: Option<String>,
     pub reduced_motion: bool,
+    /// The §6 floor line's values (filled by the driver at startup).
+    pub env: String,
+    pub route: String,
     /// Forced ledger overlay at narrow widths (`^L`).
     pub ledger_overlay: bool,
     /// The OUTPUT pane's open fold, if any (SPEC §5 OUTPUT mode).
@@ -276,9 +279,13 @@ pub struct Screen {
     /// Public only so struct-update tests can build a Screen literally.
     #[doc(hidden)]
     pub call_started: std::collections::HashMap<String, u64>,
-    /// Rows scrolled up from the bottom of the transcript; 0 pins to the
-    /// newest. Any new event or edit resets it — attention is on the live tail.
-    pub scroll: usize,
+    /// The transcript's pinned top row; `None` follows the live tail.
+    /// New output never yanks a scrolled view back down.
+    pub scroll_top: Option<usize>,
+    /// The last rendered transcript size (rows, visible rows) — the scroll
+    /// math needs it; the renderer records it each frame.
+    #[doc(hidden)]
+    pub last_rendered: (usize, usize),
 }
 
 /// One queued operator input (SPEC §4.2 hints: steering vs follow-up).
@@ -343,8 +350,9 @@ impl Screen {
                 working.label.clone_from(&call.name);
             }
             AgentEvent::ToolFinished { result } => {
-                self.working = None;
-                // A failed tool promotes a 3s peek (SPEC §5 promotion table).
+                // The working indicator clears only at TurnFinished: a turn
+                // that streams after a tool call is still working (and ⏎
+                // must keep meaning "queue steering").
                 if !matches!(result.status, p1_contracts::ToolStatus::Ok) {
                     self.peek(
                         [
@@ -363,8 +371,6 @@ impl Screen {
             }
             _ => {}
         }
-        // New output pins the view to the live tail.
-        self.scroll = 0;
     }
 
     /// Queue operator input for the next boundary (SPEC §4.2).
@@ -373,8 +379,13 @@ impl Screen {
     }
 
     /// Scroll the transcript `delta` rows up (positive) or down (negative).
+    /// Scrolling to the newest rows releases the pin back to the live tail.
     pub fn scroll_by(&mut self, delta: isize) {
-        self.scroll = self.scroll.saturating_add_signed(delta);
+        let (len, fits) = self.last_rendered;
+        let max_top = len.saturating_sub(fits);
+        let top = self.scroll_top.unwrap_or(max_top);
+        let next = top.saturating_add_signed(-delta).min(max_top);
+        self.scroll_top = (next < max_top).then_some(next);
     }
 
     /// Sync the WORKERS pane from a fresh snapshot, handling the promotion
@@ -417,7 +428,7 @@ impl Screen {
     /// A PEEK is a two-line banner that never moves the ledger and never
     /// displaces a pin or an operator-blocked state (SPEC §5).
     pub fn peek(&mut self, lines: [String; 2], now_ms: u64) {
-        if self.pinned || matches!(self.promotion, Promotion::Blocked) {
+        if self.pinned || self.approval.is_some() {
             return;
         }
         self.promotion = Promotion::Peek {
@@ -504,9 +515,16 @@ mod tests {
         s.tick(4_000);
         assert_eq!(s.promotion, Promotion::None);
 
-        s.promotion = Promotion::Blocked;
+        // An approval on screen blocks peeks exactly like a pin.
+        s.approval = Some(crate::state::Approval::Permission(
+            crate::render::permission::PermissionView {
+                command: "rm -rf /".into(),
+                rows: vec![],
+                grantable: false,
+            },
+        ));
         s.peek(["a".into(), "b".into()], 5_000);
-        assert_eq!(s.promotion, Promotion::Blocked);
+        assert_eq!(s.promotion, Promotion::None);
         s.promotion = Promotion::None;
         s.pinned = true;
         s.peek(["a".into(), "b".into()], 5_000);
@@ -537,6 +555,23 @@ mod tests {
             200,
         );
         assert!(matches!(s.promotion, Promotion::Peek { .. }));
+        // Working clears only at TurnFinished, not at the tool's end.
+        assert!(s.working.is_some());
+    }
+
+    #[test]
+    fn working_clears_at_turn_finished_not_at_tool_finished() {
+        let mut s = Screen::new(false);
+        s.apply(&AgentEvent::TurnStarted, 0);
+        assert!(s.working.is_some());
+        s.apply(
+            &AgentEvent::TurnFinished {
+                end: p1_contracts::TurnEnd::Completed {
+                    stop: p1_contracts::StopReason::EndTurn,
+                },
+            },
+            100,
+        );
         assert!(s.working.is_none());
     }
 

@@ -3,6 +3,31 @@
 //! Kept deliberately small — identifiers and paths are never reordered, only
 //! broken when they cannot fit alone on a line.
 
+use unicode_width::UnicodeWidthStr;
+
+/// Display width in cells. Layout math NEVER counts chars: a wide grapheme
+/// occupies two cells (CJK, emoji), and a row that fits by chars overflows by
+/// cells.
+pub fn cell_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// The longest prefix of `s` fitting `cells` display cells (never splits a
+/// char — a too-wide char simply doesn't fit).
+pub fn fit_cells(s: &str, cells: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > cells {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
 /// Wrap `text` to `width` columns, returning the lines. Empty input yields one
 /// empty line so a block always occupies its row. Leading indentation is
 /// preserved and hangs: continuation lines keep the same indent.
@@ -19,8 +44,8 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         if word.is_empty() {
             continue;
         }
-        let word_len = word.chars().count();
-        let current_len = current.chars().count();
+        let word_len = cell_width(word);
+        let current_len = cell_width(&current);
         if current_len > 0 && current_len + 1 + word_len > body_width {
             lines.push(std::mem::take(&mut current));
         } else if current_len > 0 {
@@ -29,8 +54,8 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         if word_len > body_width {
             // A word that cannot fit alone breaks hard at the cell edge.
             let mut rest = word;
-            while rest.chars().count() > body_width {
-                let cut: String = rest.chars().take(body_width).collect();
+            while cell_width(rest) > body_width {
+                let cut = fit_cells(rest, body_width);
                 current.push_str(&cut);
                 lines.push(std::mem::take(&mut current));
                 rest = &rest[cut.len()..];
@@ -60,6 +85,14 @@ mod tests {
     #[test]
     fn indentation_is_preserved_and_hangs() {
         assert_eq!(wrap("  aa bb cc", 7), vec!["  aa bb", "  cc"]);
+    }
+
+    #[test]
+    fn wide_chars_never_exceed_the_cell_width() {
+        for line in wrap("你好 你好 你好", 5) {
+            assert!(cell_width(&line) <= 5, "{line:?}");
+        }
+        assert!(wrap("你好你好", 5).iter().all(|l| cell_width(l) <= 5));
     }
 
     #[test]
