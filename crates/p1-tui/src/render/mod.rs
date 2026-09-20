@@ -3,6 +3,13 @@
 //! placement) is the caller's one mechanical step. Keeping renderers line-
 //! shaped makes every screen snapshot-testable against `TestBackend`.
 
+pub mod composer;
+pub mod diff;
+pub mod ledger;
+pub mod permission;
+pub mod picker;
+pub mod screen;
+pub mod status;
 pub mod transcript;
 
 use ratatui::style::{Color, Style};
@@ -37,12 +44,16 @@ pub fn elapsed(ms: u64) -> String {
     }
 }
 
-/// A token count as the ledger shows it: `846` under a thousand, then `12.4k`.
+/// A token count as the ledger shows it: `846` under a thousand, one decimal
+/// below 100k (`12.4k`), whole thousands at and above (`120k`, `200k`). The
+/// SPEC mock-up mixed `120.0k` with `200k`; one rule wins over both.
 pub fn tokens(count: u64) -> String {
     if count < 1_000 {
         count.to_string()
-    } else {
+    } else if count < 100_000 {
         format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        format!("{}k", count / 1_000)
     }
 }
 
@@ -64,5 +75,7 @@ mod tests {
     fn tokens_scale() {
         assert_eq!(tokens(846), "846");
         assert_eq!(tokens(12_400), "12.4k");
+        assert_eq!(tokens(120_000), "120k");
+        assert_eq!(tokens(200_000), "200k");
     }
 }

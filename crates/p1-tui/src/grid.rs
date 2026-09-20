@@ -26,7 +26,9 @@ pub fn styled_row(width: usize, label: &str, label_fg: Color, value: &str, value
     let pad = width.saturating_sub(label.chars().count() + value.chars().count());
     Line::from(vec![
         Span::styled(label, Style::new().fg(label_fg)),
-        Span::raw(" ".repeat(pad)),
+        // The pad shares the label's colour so a "whole row FAINT" rule holds
+        // for every span, not just the visible ones.
+        Span::styled(" ".repeat(pad), Style::new().fg(label_fg)),
         Span::styled(value.to_string(), Style::new().fg(value_fg)),
     ])
 }

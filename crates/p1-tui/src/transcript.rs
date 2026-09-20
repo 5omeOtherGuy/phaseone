@@ -30,6 +30,9 @@ pub enum Block {
     },
     /// One tool call, from `▸ name arg` to its settled one-line result.
     Call(ToolRow),
+    /// Verbatim host text (the §4.1 idle prelude): exact spacing, never
+    /// wrapped — these are aligned affordance rows, not prose.
+    Info { lines: Vec<String> },
     /// A turn-level notice (§4.9): what broke, what it cost, what is intact.
     Notice { lines: Vec<String> },
 }
@@ -57,16 +60,14 @@ pub enum RowStatus {
 }
 
 impl ToolRow {
-    /// The fold presentation of a settled row's output, when it earns one:
-    /// failed calls show the evidence; successful calls fold only past the
-    /// full-block limit, and then behind a handle rather than inline.
+    /// The fold presentation of a settled row's output, when it earns one.
+    /// Only a FAILED call expands its evidence inline (SPEC §4.3: a settled
+    /// call collapses to one line); a successful call's oversized output is
+    /// registered under its handle and opened with `^O`, never shown.
     pub fn fold(&self) -> Option<Fold> {
         let output = self.output.as_deref()?;
         match self.status {
-            RowStatus::Settled(ToolStatus::Ok) => match Fold::present(output) {
-                fold @ Fold::Folded { .. } => Some(fold),
-                Fold::Full { .. } => None,
-            },
+            RowStatus::Settled(ToolStatus::Ok) => None,
             RowStatus::Settled(_) => Some(Fold::present(output)),
             RowStatus::Running => None,
         }

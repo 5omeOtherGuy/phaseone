@@ -88,6 +88,12 @@ fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
             }
         }
         Block::Call(row) => call_lines(row, width, out),
+        Block::Info { lines } => {
+            for line in lines {
+                let shown: String = line.chars().take(width).collect();
+                out.push(Line::styled(shown, Style::new().fg(palette::INK)));
+            }
+        }
         Block::Notice { lines } => {
             // §4.9: state what broke, no banner. The first line is INK — it is
             // the fact; the rest are DIM detail.

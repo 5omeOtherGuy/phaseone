@@ -8,7 +8,17 @@
 
 use p1_contracts::{AgentEvent, Usage};
 
+use crate::render::picker::Picker;
+use crate::render::status::StatusGroup;
 use crate::transcript::Transcript;
+
+/// A pending approval: the blocking view that owns the screen until decided
+/// (SPEC §4.4 diff review, §4.5 permission prompt).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Approval {
+    Diff(crate::render::diff::DiffView),
+    Permission(crate::render::permission::PermissionView),
+}
 
 /// Pane width states, in `^W` cycle order (SPEC §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,10 +169,61 @@ pub struct Working {
     pub started_ms: u64,
 }
 
+/// The composer: the operator's multiline input. In focus mode it hides while
+/// empty; the first edit reveals it (input drives disclosure).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Composer {
+    pub text: String,
+    /// Cursor as a CHAR index into `text`.
+    pub cursor: usize,
+    /// Revealed while focus mode would hide it (an edit, a paste, `esc` down).
+    pub revealed: bool,
+}
+
+impl Composer {
+    pub fn insert(&mut self, ch: char) {
+        let byte = self.byte_index();
+        self.text.insert(byte, ch);
+        self.cursor += 1;
+        self.revealed = true;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let byte = self.byte_index();
+        let prev = self.text[..byte].chars().last().unwrap();
+        self.text.replace_range(byte - prev.len_utf8()..byte, "");
+        self.cursor -= 1;
+    }
+
+    pub fn take(&mut self) -> String {
+        self.cursor = 0;
+        self.revealed = false;
+        std::mem::take(&mut self.text)
+    }
+
+    /// Whether the composer occupies rows right now: always outside focus
+    /// mode; inside, only once revealed or while it holds text.
+    pub fn visible(&self, focus: bool) -> bool {
+        !focus || self.revealed || !self.text.is_empty()
+    }
+
+    fn byte_index(&self) -> usize {
+        self.text
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.text.len())
+    }
+}
+
 /// The whole screen. Renderers borrow it; the driver owns it.
 #[derive(Debug, Default)]
 pub struct Screen {
     pub transcript: Transcript,
+    pub composer: Composer,
     pub pane_width: PaneWidth,
     pub pane_mode: PaneMode,
     /// `^P`: no event may swap a pinned mode (SPEC §5).
@@ -177,6 +238,13 @@ pub struct Screen {
     pub reduced_motion: bool,
     /// Forced ledger overlay at narrow widths (`^L`).
     pub ledger_overlay: bool,
+    /// A pending approval: the blocking, full-width review (SPEC §4.4/§4.5).
+    /// While this is `Some` the pane is hidden and the transcript waits.
+    pub approval: Option<Approval>,
+    /// A docked picker overlay above the composer (SPEC §4.6).
+    pub picker: Option<Picker>,
+    /// The `/status` overlay (SPEC §4.6).
+    pub status: Option<Vec<StatusGroup>>,
 }
 
 impl Default for PaneWidth {
@@ -266,6 +334,23 @@ impl Screen {
             lines,
             until_ms: now_ms + PEEK_MS,
         };
+    }
+
+    /// The LEDGER view, built from screen state. The context breakdown stays
+    /// `None` until the host's context-stats seam lands (issue #12 plan).
+    pub fn ledger(&self) -> crate::render::ledger::Ledger {
+        crate::render::ledger::Ledger {
+            goal: self.goal.clone(),
+            context: None,
+            task: None,
+            spend: crate::render::ledger::SpendView {
+                responses: self.spend.responses,
+                input: self.spend.input,
+                output: self.spend.output,
+                cache_hit_percent: self.spend.cache_hit_percent(),
+                cost_micro_usd: self.spend.cost_micro_usd,
+            },
+        }
     }
 
     /// Expire a peek whose time has passed. Driven by the render tick's clock.
