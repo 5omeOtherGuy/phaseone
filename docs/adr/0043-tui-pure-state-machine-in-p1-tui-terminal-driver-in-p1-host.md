@@ -3,7 +3,7 @@ adr: 43
 title: TUI: pure state machine in p1-tui, terminal driver in p1-host
 status: proposed
 date: 2026-09-20
-deciders: lead + Kimi TUI session (issue #12)
+deciders: lead
 supersedes: []
 superseded_by: []
 sources: [issue #12 plan comment and lead acceptance]
