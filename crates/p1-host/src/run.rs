@@ -166,7 +166,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
             &workspace,
             policy.clone(),
             catalog_slot.clone(),
-            child_counter,
+            child_counter.clone(),
         );
         let service = InProcessWorkers::new(factory, 2);
         deps.worker_service = Some(service.clone());
@@ -214,6 +214,10 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     let (mut agent, report): (Agent, Option<ResumeReport>) = match records {
         Some(records) => {
             let (agent, report) = Agent::resume(parts, &records).map_err(|e| e.to_string())?;
+            #[cfg(feature = "delegation")]
+            if let Some(service) = &service {
+                announce_lost_workers(deps, &agent, service, &child_counter, &records);
+            }
             (agent, Some(report))
         }
         None => (Agent::new(parts).map_err(|e| e.to_string())?, None),
@@ -451,6 +455,47 @@ fn end_code(end: &TurnEnd) -> i32 {
     }
 }
 
+/// Workers live in the process that started them: their sessions are in memory and
+/// are NOT restored with the parent's (ADR-0034). A resumed history that mentions
+/// workers is therefore talking about agents that no longer exist. Say so — to the
+/// user and, through the inbox, to the model — and keep their ids from being reused.
+#[cfg(feature = "delegation")]
+fn announce_lost_workers(
+    deps: &HostDeps,
+    agent: &Agent,
+    service: &InProcessWorkers,
+    child_counter: &AtomicUsize,
+    records: &[p1_contracts::JournalRecord],
+) {
+    let earlier = p1_tool_delegate::workers_started_in(records);
+    if earlier.is_empty() {
+        return;
+    }
+    let used = earlier
+        .iter()
+        .filter_map(|id| id.strip_prefix('w')?.parse::<usize>().ok())
+        .max()
+        .unwrap_or(earlier.len());
+    service.reserve_ids(used);
+    child_counter.store(used, Ordering::SeqCst);
+    let names = earlier.join(", ");
+    write_stderr(
+        deps,
+        &format!(
+            "resume: worker(s) {names} belonged to the earlier process and are not restored\n"
+        ),
+    );
+    agent.inbox().send(
+        p1_contracts::InboxKind::Notification,
+        format!(
+            "This session was resumed in a new process. Workers started before the resume \
+             ({names}) no longer exist: they cannot be continued or asked for results, and \
+             work they had not finished was not saved. Check the files for what they left \
+             behind before relying on it, and start a new worker if the work is still needed."
+        ),
+    );
+}
+
 fn print_resume_report(deps: &HostDeps, report: &ResumeReport) {
     let mut lines: Vec<String> = Vec::new();
     if !report.unresolved_calls.is_empty() {
@@ -466,9 +511,6 @@ fn print_resume_report(deps: &HostDeps, report: &ResumeReport) {
     }
     for name in &report.missing_tools {
         lines.push(format!("resume: tool `{name}` is no longer available"));
-    }
-    if report.route_changed {
-        lines.push("resume: model route changed; old-origin replay data is dropped".to_string());
     }
     if report.environment_changed {
         lines.push("resume: environment changed; it is re-committed at the next turn".to_string());
