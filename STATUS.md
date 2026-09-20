@@ -89,6 +89,12 @@ IN FLIGHT:
 * #30 DONE: `finish` rejects masked checks (`;`, `||`, newline, backgrounding `&`; `2>&1` is
   fine) and reports EVERY failing named command in one error (completion.md §2, last revision).
 * `[context]` tables for claude / claude-delegating / gpt: DONE (200k/120k, operational values).
+* RESEARCH BATCH 2 RUNNING (2026-09-21 ~00:00): #35 CreditsError diagnosis through the refresh
+  path, #36 tool-output shapes that cause re-reading, #37 what a summary must keep for DeepSeek.
+  Curator = Opus Claude Code subagent, brief `../phaseone-briefs/research-curator-batch2.md`,
+  memos `../phaseone-briefs/research/<n>/memo.md`. Then: `gh issue list --label
+  research:decision`, decide each (used / discarded / implement via lead brief). After this
+  batch: review whether the curator layer saves lead effort (ADR-0045, program §8).
 * MAIN WAS RED 23:38–00:05 (2026-09-20): the TUI session merged #32 while red (duplicate
   `ellipsize` in `p1-tui/src/render/screen.rs`); its hotfix #33 (`8a873ec`, 11 deleted lines,
   nothing else) is green. Second red TUI merge that night (#23 before). Rule posted on #12:
