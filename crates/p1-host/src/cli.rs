@@ -78,6 +78,9 @@ pub struct Options {
     /// At most this many CONSECUTIVE context replacements without a workspace
     /// change before an unattended run stalls. `0` disables the guard.
     pub max_idle_summaries: usize,
+    /// Run the interactive session in the TUI (issue #12). Interactive only:
+    /// headless runs and non-TTY stdout keep the line renderer forever.
+    pub tui: bool,
 }
 
 impl Options {
@@ -171,6 +174,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut session: Option<PathBuf> = None;
     let mut resume = false;
     let mut ask = false;
+    let mut tui = false;
     let mut yes = false;
     let mut prompt_words: Vec<String> = Vec::new();
 
@@ -193,6 +197,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             "--resume" => resume = true,
             "--ask" => ask = true,
             "--yes" => yes = true,
+            "--tui" => tui = true,
             // Validated by `parse_sandbox`/`parse_env_pass`/`parse_max_continuations`
             // /`parse_provider_retries` after the loop; the values are consumed here
             // so they are not mistaken for prompt words.
@@ -247,6 +252,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         session,
         resume,
         ask,
+        tui,
         sandbox,
         sandbox_write,
         sandbox_read,
@@ -296,6 +302,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         session: None,
         resume: false,
         ask: false,
+        tui: false,
         sandbox,
         sandbox_write,
         sandbox_read,
@@ -500,6 +507,7 @@ fn defaults(command: Command) -> Options {
         session: None,
         resume: false,
         ask: false,
+        tui: false,
         sandbox: SandboxMode::Off,
         sandbox_write: Vec::new(),
         sandbox_read: Vec::new(),

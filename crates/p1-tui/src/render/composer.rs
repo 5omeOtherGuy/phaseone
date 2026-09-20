@@ -8,12 +8,26 @@ use ratatui::text::{Line, Span};
 
 use crate::glyphs;
 use crate::palette;
-use crate::state::Composer;
+use crate::state::{Composer, Queued};
 
-/// The composer's rows: input line, then the hint line.
-pub fn lines(composer: &Composer, working: bool, width: usize) -> Vec<Line<'static>> {
+/// The composer's rows: queued-input lines (FAINT, so the operator sees what
+/// will land), the input line, then the hint line.
+pub fn lines(
+    composer: &Composer,
+    queued: &std::collections::VecDeque<Queued>,
+    working: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
     let ink = Style::new().fg(palette::INK);
     let mut out = Vec::new();
+    for q in queued {
+        let kind = if q.follow_up { "follow-up" } else { "steering" };
+        let text: String = q.text.chars().take(width.saturating_sub(14)).collect();
+        out.push(Line::styled(
+            format!("{} {kind}: {text}", glyphs::PENDING),
+            Style::new().fg(palette::FAINT),
+        ));
+    }
     let mut first = true;
     // The marker owns the gutter; continuation lines hang under the text.
     let body_width = width.saturating_sub(2);
@@ -59,12 +73,12 @@ mod tests {
     #[test]
     fn hints_follow_the_run_state() {
         let composer = Composer::default();
-        let idle = lines(&composer, false, 80);
+        let idle = lines(&composer, &Default::default(), false, 80);
         assert_eq!(
             Text::from(idle[1].clone()).to_string(),
             "⏎ send   ⌥⏎ newline   ^C quit"
         );
-        let working = lines(&composer, true, 80);
+        let working = lines(&composer, &Default::default(), true, 80);
         assert_eq!(
             Text::from(working[1].clone()).to_string(),
             "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel"

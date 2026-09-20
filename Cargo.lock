@@ -260,6 +260,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix",
@@ -1351,6 +1352,7 @@ dependencies = [
 name = "p1-host"
 version = "0.0.1"
 dependencies = [
+ "crossterm",
  "futures-util",
  "p1-assembly",
  "p1-context",
@@ -1372,8 +1374,10 @@ dependencies = [
  "p1-tool-search",
  "p1-tool-shell",
  "p1-tool-write",
+ "p1-tui",
  "p1-workers",
  "p1-workspace",
+ "ratatui",
  "serde",
  "serde_json",
  "tempfile",
@@ -1613,6 +1617,7 @@ dependencies = [
  "crossterm",
  "p1-contracts",
  "ratatui",
+ "tokio",
 ]
 
 [[package]]
