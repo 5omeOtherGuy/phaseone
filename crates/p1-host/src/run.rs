@@ -202,7 +202,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
 
     let cancel = CancellationToken::new();
     let policy: Arc<HostPolicy> = Arc::new(HostPolicy::new(
-        options.yes,
+        options.ask,
         headless,
         deps.lines.clone(),
         deps.stderr.clone(),

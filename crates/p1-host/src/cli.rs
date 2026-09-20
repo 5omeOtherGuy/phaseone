@@ -1,7 +1,7 @@
 //! Hand-written argument parsing. No clap: the surface is tiny and the error
 //! messages are part of the interface.
 //!
-//! `p1 [--env NAME] [--workspace DIR] [--session FILE] [--resume] [--yes] [PROMPT…]`
+//! `p1 [--env NAME] [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
 //! `p1 env show NAME`
 //! `p1 --help` / `p1 --version`
 
@@ -48,7 +48,9 @@ pub struct Options {
     pub workspace: Option<PathBuf>,
     pub session: Option<PathBuf>,
     pub resume: bool,
-    pub yes: bool,
+    /// Ask before permitting a call: the restrictive policy (ADR-0038). The
+    /// default is full access; `--yes` is accepted and means the default.
+    pub ask: bool,
     /// Whether `shell` commands run in the bubblewrap sandbox.
     pub sandbox: SandboxMode,
     /// Extra paths the sandbox keeps writable, absolute and canonicalised when
@@ -89,7 +91,7 @@ pub fn usage() -> String {
     out.push_str("p1 — a lean, model-shaped coding harness\n\n");
     out.push_str("usage:\n");
     out.push_str(
-        "  p1 [--env NAME] [--workspace DIR] [--session FILE] [--resume] [--yes] [PROMPT…]\n",
+        "  p1 [--env NAME] [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]\n",
     );
     out.push_str("  p1 env show NAME\n");
     out.push_str("  p1 --help\n");
@@ -99,7 +101,12 @@ pub fn usage() -> String {
     out.push_str("  --workspace DIR   workspace root (default: current directory)\n");
     out.push_str("  --session FILE    write the session journal to FILE as JSONL\n");
     out.push_str("  --resume          continue an existing --session file\n");
-    out.push_str("  --yes             permit every tool call without asking\n");
+    out.push_str(
+        "  --ask             ask before permitting a tool call; headless permits only\n                    read-only calls (default: full access, no questions)\n",
+    );
+    out.push_str(
+        "  --yes             permit every tool call without asking (the default; kept for\n                    compatibility; cannot be combined with --ask)\n",
+    );
     out.push_str(
         "  --sandbox MODE    run shell commands in a bubblewrap sandbox: `workspace` or\n                    `off` (default: off)\n",
     );
@@ -138,6 +145,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut workspace: Option<PathBuf> = None;
     let mut session: Option<PathBuf> = None;
     let mut resume = false;
+    let mut ask = false;
     let mut yes = false;
     let mut prompt_words: Vec<String> = Vec::new();
 
@@ -158,6 +166,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
                 session = Some(PathBuf::from(value));
             }
             "--resume" => resume = true,
+            "--ask" => ask = true,
             "--yes" => yes = true,
             // Validated by `parse_sandbox`/`parse_env_pass`/`parse_max_continuations`
             // after the loop; the values are consumed here so they are not mistaken
@@ -180,6 +189,12 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             message: "--resume requires --session".to_string(),
         });
     }
+    // `--yes` is the default, so combining it with `--ask` names two policies at once.
+    if yes && ask {
+        return Err(CliError {
+            message: "--yes and --ask cannot be combined: --yes is the default".to_string(),
+        });
+    }
     // Validate the sandbox and env-pass flags and keep their parsed state on the
     // options.
     let (sandbox, sandbox_write) = parse_sandbox(args)?;
@@ -198,7 +213,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         workspace,
         session,
         resume,
-        yes,
+        ask,
         sandbox,
         sandbox_write,
         env_pass,
@@ -244,7 +259,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         workspace: None,
         session: None,
         resume: false,
-        yes: false,
+        ask: false,
         sandbox,
         sandbox_write,
         env_pass,
@@ -386,7 +401,7 @@ fn defaults(command: Command) -> Options {
         workspace: None,
         session: None,
         resume: false,
-        yes: false,
+        ask: false,
         sandbox: SandboxMode::Off,
         sandbox_write: Vec::new(),
         env_pass: Vec::new(),
@@ -471,7 +486,23 @@ mod tests {
                 prompt: Some("do it".to_string())
             }
         );
-        assert!(options.yes);
+        assert!(!options.ask, "--yes means the default, so no asking");
+    }
+
+    #[test]
+    fn ask_opts_into_the_restrictive_policy() {
+        let options = parse(&args(&["--ask", "do", "it"])).unwrap();
+        assert!(options.ask);
+        assert!(!parse(&args(&["do", "it"])).unwrap().ask);
+        assert!(usage().contains("--ask"));
+        assert!(usage().contains("default: full access"));
+    }
+
+    #[test]
+    fn yes_with_ask_is_a_usage_error() {
+        let error = parse(&args(&["--yes", "--ask", "go"])).unwrap_err();
+        assert!(error.message.contains("--ask"), "{}", error.message);
+        assert!(parse(&args(&["--ask", "--yes", "go"])).is_err());
     }
 
     #[test]

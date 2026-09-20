@@ -24,6 +24,26 @@ fn help_version_and_unknown_flag() {
 }
 
 #[test]
+fn yes_with_ask_is_a_usage_error() {
+    let output = p1().args(["--yes", "--ask", "go"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--ask"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Each flag on its own parses; `--yes` is the default and `--ask` opts in.
+    let output = p1().args(["--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--ask"), "help must document --ask: {help}");
+    assert!(
+        help.contains("kept for") && help.contains("default"),
+        "help must say --yes is the default and kept for compatibility: {help}"
+    );
+}
+
+#[test]
 fn env_show_runs_without_credentials_or_network() {
     for name in ["claude", "gpt"] {
         let output = p1().args(["env", "show", name]).output().unwrap();
