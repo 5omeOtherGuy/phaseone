@@ -41,18 +41,17 @@ reviewer's AMENDMENTS to the lead's plan — authoritative, in full at
 1. DONE 2026-09-20: issue #1 workspace ownership (ADR-0032, shared WriteGate — file tools only,
    shell NOT covered); issues #2/#3 resume decisions (ADR-0033 changed origin rejected in the
    core; ADR-0034 workers not restored, ids reserved, user+model told). All on main, CI green.
-1b. IN FLIGHT (workers, deepseek high, via scripts/fanout.py — owner wants implementation
-   delegated by default, see memory `prefer-workers-for-implementation`):
-   - `../phaseone-shell-sandbox` (task/shell-sandbox): bubblewrap execution boundary for `shell`,
-     spec in tools.md on that branch, brief `../phaseone-briefs/shell-sandbox.md`, output
-     `shell-sandbox.out`. Lead afterwards: adversarial tests, diff read, ADR, merge. Needed
-     BEFORE dogfooding with --yes. Dogfood in disposable CLONES (a worktree's .git is outside it).
-   - `../phaseone-context-control` (task/context-control): spec `docs/design/context.md` on that
-     branch; job 1 = contract/core/testkit changes (§1), brief `context-contract.md`. THEN:
-     independent test author (sol, medium) for `p1-context` §2/§4 → deepseek implements →
-     assembly/host wiring (§3) → lead live canary check (repeated replacements).
-   - `../phaseone-run-report` (task/run-report): `scripts/run-report.py` + host test +
-     `docs/dogfood/`; gate running, then merge.
+1b. DONE 2026-09-20 (workers deepseek/sol via scripts/fanout.py; lead: specs, review, live checks):
+   - Shell sandbox (ADR-0035): `--sandbox workspace`, `--sandbox-write PATH`; bubblewrap; default
+     still off. Open follow-up: issue #4 (commands inherit the host environment).
+   - Context control (ADR-0036, spec `docs/design/context.md`): new ContextPolicy contract, core
+     validation, `p1-context` (28 frozen sol tests), `[context]` + `summarize.md` per environment.
+     LIVE canary passed (constraint only inside the summary obeyed after 8 replacements).
+     Shipped environments still WITHOUT `[context]` — pick values from dogfooding.
+   - Run evidence: `scripts/run-report.py`, `scripts/dogfood.sh`, `docs/dogfood/`.
+1c. IN FLIGHT: first dogfood run `../phaseone-dogfood/read-streaming-claude-1` (+ `.run/` with
+   session, diff, report). Lead must verify INDEPENDENTLY (tests, clippy, diff read), then
+   append the record with --accepted to `docs/dogfood/runs.jsonl`; good diffs may be merged.
 2. Dogfood under supervision; run-level evidence grouped into issues; shell non-zero exits
    recorded separately from tool failures; look at Codex caching here.
 3. Context-control policy module (spec requirements listed in the amendments, item 4).
