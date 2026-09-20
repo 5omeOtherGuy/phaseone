@@ -50,6 +50,10 @@ pub struct ActivityLog {
     /// The model-facing name of this agent's `finish` tool, set once the catalog
     /// built it. Progress counts every OTHER finished call.
     finish_name: Mutex<Option<String>>,
+    /// Committed `ContextReplaced` events, and how many had been committed at the
+    /// last progress. The difference is the host's §3c idle-summary count.
+    replacements: AtomicU64,
+    replacements_at_progress: AtomicU64,
 }
 
 impl ActivityLog {
@@ -86,6 +90,36 @@ impl ActivityLog {
             command,
             exit_code,
         });
+        // §3c progress: a workspace mutation, or a `finish` call of any status.
+        let is_finish = self
+            .finish_name
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|name| name == result.name);
+        if is_finish || (effect == Effect::WritesFiles && result.status == ToolStatus::Ok) {
+            self.note_progress();
+        }
+    }
+
+    /// One committed context replacement (completion.md §3c). Counted by the host
+    /// as it sees the `ContextReplaced` event; a resumed run rebuilds nothing here,
+    /// so its counter starts at zero.
+    pub fn record_replacement(&self) {
+        self.replacements.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The replacements committed since the last progress (completion.md §3c).
+    pub fn consecutive_replacements(&self) -> u64 {
+        self.replacements
+            .load(Ordering::SeqCst)
+            .saturating_sub(self.replacements_at_progress.load(Ordering::SeqCst))
+    }
+
+    fn note_progress(&self) {
+        let replacements = self.replacements.load(Ordering::SeqCst);
+        self.replacements_at_progress
+            .store(replacements, Ordering::SeqCst);
     }
 
     /// The model-facing name of this agent's `finish` tool.
@@ -468,5 +502,38 @@ mod tests {
         );
         log.record_finished(&result("r", "read", ToolStatus::Ok, "contents"));
         assert_eq!(log.non_finish_finishes(), 1);
+    }
+
+    /// §3c: replacements accumulate until progress — a successful write or a
+    /// `finish` call of any status — resets them. A failed write is not progress.
+    #[test]
+    fn replacements_reset_on_a_mutation_or_finish_and_survive_a_failed_write() {
+        let log = ActivityLog::default();
+        log.set_finish_name("finish".into());
+        log.record_replacement();
+        log.record_replacement();
+        assert_eq!(log.consecutive_replacements(), 2);
+
+        log.record_started(
+            &call("w", "write", r#"{"file_path":"a","content":"x"}"#),
+            Effect::WritesFiles,
+        );
+        log.record_finished(&result("w", "write", ToolStatus::Ok, "Wrote a (1 bytes)."));
+        assert_eq!(log.consecutive_replacements(), 0);
+
+        log.record_replacement();
+        assert_eq!(log.consecutive_replacements(), 1);
+        // A finish call of ANY status is progress.
+        log.record_started(&call("f", "finish", "{}"), Effect::ReadOnly);
+        log.record_finished(&result("f", "finish", ToolStatus::Error, "nope"));
+        assert_eq!(log.consecutive_replacements(), 0);
+
+        log.record_replacement();
+        log.record_started(
+            &call("w2", "write", r#"{"file_path":"a","content":"x"}"#),
+            Effect::WritesFiles,
+        );
+        log.record_finished(&result("w2", "write", ToolStatus::Error, "denied"));
+        assert_eq!(log.consecutive_replacements(), 1);
     }
 }

@@ -129,6 +129,7 @@ async fn the_report_counts_what_the_journal_holds() {
     assert_eq!(report["accepted"], "yes");
     assert_eq!(report["elapsed_seconds"], 1.5);
     assert_eq!(report["includes_worker_usage"], false);
+    assert_eq!(report["stalled_on_summaries"], false);
 }
 
 /// §3b: the host's provider retries are journalled as ordinary user inputs, and the
@@ -191,6 +192,79 @@ async fn the_report_counts_journalled_provider_retries() {
     assert_eq!(report["user_inputs"], 2, "the prompt and the retry message");
     assert_eq!(report["requests"], 2);
     assert_eq!(report["interrupted_responses"], 1);
+}
+
+/// §3c: a run the stall guard cancelled ends on an `assistant_interrupted`, with
+/// six consecutive `context_replaced` records since the last progress. The report
+/// derives `stalled_on_summaries: true` from exactly that shape.
+#[tokio::test]
+async fn the_report_flags_a_run_stalled_on_summaries() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    let dir = environments.path().join("ctx");
+    std::fs::create_dir_all(&dir).unwrap();
+    let toml = "family = \"ctx\"\nprovider = \"fake\"\nmodel = \"fake-model\"\n\n\
+                [context]\nwindow_tokens = 1000000\noutput_headroom_tokens = 1\n\
+                summarize_at_tokens = 100\nkeep_recent_tokens = 1\nuser_verbatim_tokens = 1\n\n\
+                [[tools]]\nmodule = \"read\"\n[[tools]]\nmodule = \"finish\"\n";
+    std::fs::write(dir.join("environment.toml"), toml).unwrap();
+    std::fs::write(dir.join("prompt.md"), "test").unwrap();
+    let session = workspace.path().join("session.jsonl");
+
+    // Six replacements, each produced by a summarizer request; five model requests
+    // between them, all read-only. The sixth replacement cancels the turn, so the
+    // sixth model request never happens.
+    let mut script = Vec::new();
+    for index in 0..6 {
+        script.push(p1_testkit::text_response("SUMMARY"));
+        if index < 5 {
+            script.push(tool_call_response(vec![json_call(
+                &format!("r{index}"),
+                "read",
+                r#"{"file_path":"missing.txt"}"#,
+            )]));
+        }
+    }
+    let provider = ScriptedProvider::new(script);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let prompt = "x".repeat(400);
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "ctx",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
+            &prompt,
+        ],
+    )
+    .await;
+    assert_eq!(
+        code,
+        p1_host::run::EXIT_STALLED,
+        "stderr: {}",
+        harness.stderr.text()
+    );
+
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/run-report.py");
+    let output = std::process::Command::new("python3")
+        .arg(script)
+        .arg(&session)
+        .output()
+        .expect("python3 runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("one JSON record");
+
+    assert_eq!(report["context_replacements"], 6);
+    assert_eq!(report["stalled_on_summaries"], true);
 }
 
 /// A child provider whose response waits for `gate`: the test can hold the worker

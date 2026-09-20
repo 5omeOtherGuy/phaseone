@@ -456,7 +456,6 @@ async fn a_non_transient_failure_ends_the_run_as_today() {
         ProviderErrorKind::Authentication,
         ProviderErrorKind::InvalidRequest,
         ProviderErrorKind::ContextWindowExceeded,
-        ProviderErrorKind::Protocol,
     ] {
         let workspace = tempdir().unwrap();
         let environments = tempdir().unwrap();
@@ -492,6 +491,56 @@ async fn a_non_transient_failure_ends_the_run_as_today() {
         );
         assert_eq!(failure_lines(&harness.stderr.text()).len(), 1, "{kind:?}");
     }
+}
+
+// ------------------------------------------------------------------ protocol
+
+/// §3c amendment to §3b: a `Protocol` failure (a malformed response) is the
+/// model's or the route's one-off and joins the transient kinds on the Transport
+/// schedule. Previously this exact case ended the run; the assertion that
+/// `Protocol` is never retried was removed from
+/// `a_non_transient_failure_ends_the_run_as_today`.
+#[tokio::test]
+async fn a_protocol_failure_waits_then_retries_on_the_transport_schedule() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    let mut harness = retry_environment(environments.path());
+    let wait = WaitLog::default();
+    harness.deps.wait = wait.hook();
+    let mut script = vec![Step::SetupError(ProviderError::new(
+        ProviderErrorKind::Protocol,
+        "unsupported chat tool type",
+    ))];
+    script.extend(finish_turn());
+    let provider = ScriptedProvider::new(script);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider.clone())]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "finish-env",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert_eq!(
+        secs(&wait.asked()),
+        vec![5],
+        "§3c: Protocol uses the Transport schedule"
+    );
+    assert_eq!(provider.requests().len(), 4);
+    assert_eq!(
+        retry_lines(&harness.stderr.text()),
+        vec!["provider failed (Protocol): retry 1/3 in 5 s".to_string()],
+        "stderr: {}",
+        harness.stderr.text()
+    );
 }
 
 #[tokio::test]
