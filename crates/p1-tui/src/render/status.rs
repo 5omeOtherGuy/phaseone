@@ -7,8 +7,10 @@ use ratatui::text::Line;
 use crate::grid;
 use crate::palette;
 
-/// The overlay's content grid (SPEC §4.6).
+/// The overlay's content grid (SPEC §4.6 fixes 40; widened to the caller's
+/// width up to 60 so long route ids do not eat their own labels).
 pub const STATUS_GRID: usize = 40;
+pub const STATUS_GRID_MAX: usize = 60;
 
 /// One group of rows under a DIM header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +26,8 @@ pub struct StatusRow {
     pub available: bool,
 }
 
-pub fn lines(groups: &[StatusGroup]) -> Vec<Line<'static>> {
+pub fn lines(groups: &[StatusGroup], width: usize) -> Vec<Line<'static>> {
+    let grid = width.clamp(STATUS_GRID, STATUS_GRID_MAX);
     let mut out = Vec::new();
     for (n, group) in groups.iter().enumerate() {
         if n > 0 {
@@ -37,15 +40,9 @@ pub fn lines(groups: &[StatusGroup]) -> Vec<Line<'static>> {
         for row in &group.rows {
             let label = format!("  {}", row.label);
             out.push(if row.available {
-                grid::row(STATUS_GRID, &label, &row.value)
+                grid::row(grid, &label, &row.value)
             } else {
-                grid::styled_row(
-                    STATUS_GRID,
-                    &label,
-                    palette::FAINT,
-                    &row.value,
-                    palette::FAINT,
-                )
+                grid::styled_row(grid, &label, palette::FAINT, &row.value, palette::FAINT)
             });
         }
     }
@@ -94,7 +91,7 @@ mod tests {
                 }],
             },
         ];
-        let lines = lines(&groups);
+        let lines = lines(&groups, 40);
         let text: Vec<String> = lines
             .iter()
             .map(|l| Text::from(l.clone()).to_string())

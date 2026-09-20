@@ -402,3 +402,14 @@ parts to treat as fixed — they are the vocabulary everything else is built fro
   than pushes — all recorded at the grid rule.
 - §4.1: the idle prelude (version line, affordances) is verbatim host text with
   exact spacing, not wrapped prose.
+- §4.6: `/status` widens its grid to at most 60 columns when the transcript is
+  wider, so a long route id never eats its own label.
+- §5 WORKERS: "needs review" maps to a finished worker only once a worktree-apply
+  flow exists; until then finished workers show `done`. The worker service does
+  not retain the task text, so rows carry the worker id as their summary; per-
+  worker cost renders `—` until the usage tap lands.
+- §5 DIFF pane: deferred — a non-blocking session diff needs before-images of
+  the touched files, which neither the journal nor a git seam provides yet.
+- OUTPUT pane: scroll only; `yank` waits on a clipboard seam, filter on pane
+  input focus. `^T` (timeline) and `^D` (next file in batched approvals) are
+  unwired — approvals arrive one call at a time, so there is nothing to page.

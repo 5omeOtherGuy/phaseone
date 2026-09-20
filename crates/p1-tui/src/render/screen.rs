@@ -89,7 +89,7 @@ pub fn draw(screen: &Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     }
     if let Some(groups) = &screen.status {
         body.push(Line::default());
-        body.extend(status::lines(groups));
+        body.extend(status::lines(groups, transcript_area.width as usize));
     }
     draw_lines_bottom(&body, transcript_area, buf, palette::GROUND, screen.scroll);
 

@@ -327,7 +327,7 @@ impl Driver {
                     });
                 }
             }
-            Command::ExpandReasoning => {}
+            Command::ExpandReasoning => self.screen.transcript.toggle_reasoning(),
             Command::CyclePaneMode => self.screen.cycle_mode(),
             Command::CyclePaneWidth => self.screen.cycle_width(),
             Command::TogglePin => self.screen.toggle_pin(),
