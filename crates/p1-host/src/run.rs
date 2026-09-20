@@ -100,7 +100,8 @@ fn agent_context(assembled: &Assembled) -> Result<Arc<dyn ContextPolicy>, String
         assembled.options.clone(),
         config,
         prompt,
-    )?;
+    )?
+    .with_summary_output_tokens(settings.summary_output_tokens)?;
     Ok(Arc::new(policy))
 }
 

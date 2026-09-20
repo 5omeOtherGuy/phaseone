@@ -7,7 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use p1_context::{ContextConfig, SUMMARY_MARKER, SummarizingContext, estimate_tokens};
+use p1_context::{
+    ContextConfig, DEFAULT_SUMMARY_OUTPUT_TOKENS, SUMMARY_MARKER, SummarizingContext,
+    estimate_tokens,
+};
 use p1_contracts::{
     AssistantBlock, AssistantItem, BoxFuture, CancellationToken, ContextError, ContextInput,
     ContextPolicy, Item, ModelOptions, Prepared, Provider, RouteDescription, ToolResultItem,
@@ -228,6 +231,40 @@ fn validate_rejects_a_zero_window_and_a_threshold_at_the_wall() {
     assert!(cfg.validate().is_ok());
     cfg.window_tokens = 0;
     assert!(cfg.validate().is_err());
+}
+
+// The summary-output cap of "Revision 2026-09-20": the compiled-in default, what
+// the setting may be, and the fact that an untouched policy sends the default.
+#[tokio::test(start_paused = true)]
+async fn the_summary_output_cap_setting_is_validated_and_defaults_to_the_compiled_in_one() {
+    assert_eq!(DEFAULT_SUMMARY_OUTPUT_TOKENS, 4_000);
+    let cfg = config();
+    let wall = cfg.window_tokens - cfg.output_headroom_tokens;
+    assert!(cfg.validate_summary_output_tokens(1).is_ok());
+    assert!(cfg.validate_summary_output_tokens(wall - 1).is_ok());
+    assert!(cfg.validate_summary_output_tokens(wall).is_err());
+    assert!(cfg.validate_summary_output_tokens(0).is_err());
+
+    // The setting is refused by the policy too, and an untouched policy sends the
+    // compiled-in cap.
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response("s")]));
+    let untouched = policy(provider.clone(), cfg.clone());
+    assert!(untouched.with_summary_output_tokens(0).is_err());
+    let refused = policy(provider.clone(), cfg.clone())
+        .with_summary_output_tokens(wall)
+        .is_err();
+    assert!(refused);
+    let history = vec![assistant_text("x".repeat(500)), assistant_text("tail")];
+    let mut cfg = cfg;
+    cfg.summarize_at_tokens = 1;
+    let prepared = prepare(&policy(provider.clone(), cfg), &history)
+        .await
+        .unwrap();
+    assert!(prepared.is_some());
+    assert_eq!(
+        provider.requests()[0].options.max_output_tokens,
+        Some(DEFAULT_SUMMARY_OUTPUT_TOKENS as u32)
+    );
 }
 
 // A `Provider` that is never reached: the threshold check runs first.

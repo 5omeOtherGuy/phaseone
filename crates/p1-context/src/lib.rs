@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use p1_contracts::{
-    BoxFuture, ContextError, ContextInput, ContextPolicy, Item, ModelOptions, Outcome, Prepared,
-    Provider, ProviderRequest, StreamEvent, Usage,
+    BoxFuture, CancellationToken, CompletedResponse, ContextError, ContextInput, ContextPolicy,
+    Item, ModelOptions, Outcome, Prepared, Provider, ProviderRequest, StopReason, StreamEvent,
+    Usage,
 };
 
 pub use estimate::estimate_tokens;
@@ -35,6 +36,9 @@ What was decided and why, including decisions carried forward from a previous su
 ## State of the work
 What is done, what is in progress and what has not started, with the file paths involved.
 
+## Files
+For every file that was read or changed and still matters: its path and, in a few words each, the symbols and line ranges that matter in it, so the work can continue with ranged reads instead of reading whole files again. Copied forward from a previous summary while the file still matters.
+
 ## Verified facts
 Commands that were run and their results, and other facts checked against a source, that still matter.
 
@@ -45,6 +49,11 @@ What is unresolved, broken or uncertain, and what was already tried.
 The single most useful next action.
 
 Do not invent limits, time estimates or instructions that are not in the transcript. If something is not there, leave it out.";
+
+/// Cap on one summary's output tokens, sent as `max_output_tokens` (context.md
+/// "Revision 2026-09-20"): the `[context] summary_output_tokens` setting's default,
+/// and the reserve the rendered transcript is measured against.
+pub const DEFAULT_SUMMARY_OUTPUT_TOKENS: u64 = 4_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextConfig {
@@ -67,9 +76,7 @@ impl ContextConfig {
         if self.window_tokens == 0 {
             return Err("window_tokens must be greater than zero".to_string());
         }
-        let wall = self
-            .window_tokens
-            .saturating_sub(self.output_headroom_tokens);
+        let wall = self.wall();
         if self.summarize_at_tokens >= wall {
             return Err(format!(
                 "summarize_at_tokens ({}) must be below window_tokens - output_headroom_tokens ({wall})",
@@ -78,6 +85,27 @@ impl ContextConfig {
         }
         Ok(())
     }
+
+    /// Rejects a summary output cap that cannot be sent: zero, or so large that it
+    /// leaves no room under the wall for the request that carries it.
+    pub fn validate_summary_output_tokens(&self, tokens: u64) -> Result<(), String> {
+        if tokens == 0 {
+            return Err("summary_output_tokens must be greater than zero".to_string());
+        }
+        let wall = self.wall();
+        if tokens >= wall {
+            return Err(format!(
+                "summary_output_tokens ({tokens}) must be below window_tokens - output_headroom_tokens ({wall})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The wall: the capacity left for the request once the next response is reserved.
+    fn wall(&self) -> u64 {
+        self.window_tokens
+            .saturating_sub(self.output_headroom_tokens)
+    }
 }
 
 pub struct SummarizingContext {
@@ -85,6 +113,7 @@ pub struct SummarizingContext {
     options: ModelOptions,
     config: ContextConfig,
     prompt: String,
+    summary_output_tokens: u64,
 }
 
 impl SummarizingContext {
@@ -103,7 +132,20 @@ impl SummarizingContext {
             options,
             config,
             prompt,
+            summary_output_tokens: DEFAULT_SUMMARY_OUTPUT_TOKENS,
         })
+    }
+
+    /// Sets the cap on one summary's output tokens (context.md "Revision
+    /// 2026-09-20"), the `[context] summary_output_tokens` setting. It is a policy
+    /// setting rather than a [`ContextConfig`] field because the frozen acceptance
+    /// suite builds that struct with full literals. Defaults to
+    /// [`DEFAULT_SUMMARY_OUTPUT_TOKENS`]; [`ContextConfig::validate_summary_output_tokens`]
+    /// rejects what cannot be sent.
+    pub fn with_summary_output_tokens(mut self, tokens: u64) -> Result<Self, String> {
+        self.config.validate_summary_output_tokens(tokens)?;
+        self.summary_output_tokens = tokens;
+        Ok(self)
     }
 }
 
@@ -117,10 +159,7 @@ impl ContextPolicy for SummarizingContext {
             if history.is_empty() {
                 return Ok(None);
             }
-            let wall = self
-                .config
-                .window_tokens
-                .saturating_sub(self.config.output_headroom_tokens);
+            let wall = self.config.wall();
             let next_input = next_input(history, input.last_usage);
             if next_input < self.config.summarize_at_tokens {
                 return Ok(None);
@@ -141,7 +180,12 @@ impl ContextPolicy for SummarizingContext {
                 return nothing_to_summarize(next_input, wall);
             }
 
-            let render_budget = wall.saturating_sub(4_000);
+            // The cap is this request's output limit and the room the transcript is
+            // measured against (context.md "Revision 2026-09-20"). The wire field is
+            // a `u32`, so a cap beyond it is clamped.
+            let cap = self.summary_output_tokens;
+            let limit = u32::try_from(cap).unwrap_or(u32::MAX);
+            let render_budget = wall.saturating_sub(cap);
             let rendered = render::transcript(
                 &history[..tail_start],
                 self.config.tool_result_excerpt_chars,
@@ -149,59 +193,73 @@ impl ContextPolicy for SummarizingContext {
             );
 
             let mut options = self.options.clone();
-            options.max_output_tokens = Some(options.max_output_tokens.unwrap_or(4_000).min(4_000));
+            options.max_output_tokens = Some(options.max_output_tokens.unwrap_or(limit).min(limit));
             let mut request = ProviderRequest {
                 system_prompt: self.prompt.clone(),
                 history: vec![Item::User { text: rendered }],
                 tools: Vec::new(),
                 options,
             };
+            // Whether this request still carries a cap: the route below may refuse it.
+            let mut capped = true;
             if let Err(first) = self.provider.validate(&request) {
                 if request.options.max_output_tokens.is_none() {
                     return failure(next_input, wall, first.to_string());
                 }
                 // The Codex route refuses `max_output_tokens`: retry once without it.
                 request.options.max_output_tokens = None;
+                capped = false;
                 if let Err(second) = self.provider.validate(&request) {
                     return failure(next_input, wall, second.to_string());
                 }
             }
 
-            // The setup future itself races `cancel`, exactly like the core's
-            // provider call: a cancel before the stream exists is `Cancelled`.
-            let stream = tokio::select! {
-                biased;
-                _ = input.cancel.cancelled() => return Err(ContextError::Cancelled),
-                result = self.provider.stream(request, input.cancel.clone()) => result,
-            };
-            let mut stream = match stream {
-                Ok(stream) => stream,
-                Err(error) => return failure(next_input, wall, error.to_string()),
-            };
-            let (answer, usage) = loop {
-                let event = tokio::select! {
-                    biased;
-                    _ = input.cancel.cancelled() => return Err(ContextError::Cancelled),
-                    event = stream.next() => event,
+            // A summary whose stop is not `EndTurn` is never accepted. A truncated
+            // one (`MaxOutputTokens`) gets one retry with the cap doubled, and the
+            // usage of both requests is reported.
+            let mut usage: Option<Usage> = None;
+            let mut attempts = 0u32;
+            let answer = loop {
+                attempts += 1;
+                let response = match self.ask(&request, input.cancel).await {
+                    Ok(response) => response,
+                    Err(Ask::Cancelled) => return Err(ContextError::Cancelled),
+                    Err(Ask::Failed(reason)) => return failure(next_input, wall, reason),
                 };
-                let Some(event) = event else {
-                    return failure(
-                        next_input,
-                        wall,
-                        "the summarization stream ended without a terminal event".to_string(),
-                    );
-                };
-                match event {
-                    StreamEvent::Finished(Outcome::Completed(response)) => {
-                        break (response.item.text(), response.usage);
+                usage = sum_usage(usage, response.usage);
+                match response.stop {
+                    StopReason::EndTurn => break response.item.text(),
+                    // The cap actually sent, doubled: an agent's own lower limit
+                    // would otherwise be sent again unchanged.
+                    StopReason::MaxOutputTokens if attempts == 1 && capped => {
+                        let sent = request.options.max_output_tokens.unwrap_or(limit);
+                        request.options.max_output_tokens = Some(sent.saturating_mul(2));
+                        if let Err(error) = self.provider.validate(&request) {
+                            return failure(next_input, wall, error.to_string());
+                        }
                     }
-                    StreamEvent::Finished(Outcome::Failed(error)) => {
-                        return failure(next_input, wall, error.to_string());
+                    StopReason::MaxOutputTokens if !capped => {
+                        return failure(
+                            next_input,
+                            wall,
+                            "the summary was truncated and the route carries no cap to double"
+                                .to_string(),
+                        );
                     }
-                    StreamEvent::Finished(Outcome::Cancelled) => {
-                        return Err(ContextError::Cancelled);
+                    StopReason::MaxOutputTokens => {
+                        return failure(
+                            next_input,
+                            wall,
+                            "the summary was truncated twice".to_string(),
+                        );
                     }
-                    _ => {}
+                    stop => {
+                        return failure(
+                            next_input,
+                            wall,
+                            format!("the summary stopped before the end ({stop:?})"),
+                        );
+                    }
                 }
             };
             if answer.is_empty() {
@@ -253,6 +311,78 @@ impl ContextPolicy for SummarizingContext {
             Ok(Some(Prepared { items, usage }))
         })
     }
+}
+
+impl SummarizingContext {
+    /// One summarization request, streamed to its terminal event. The setup future
+    /// itself races `cancel`, exactly like the core's provider call: a cancel before
+    /// the stream exists is `Cancelled`.
+    async fn ask(
+        &self,
+        request: &ProviderRequest,
+        cancel: &CancellationToken,
+    ) -> Result<CompletedResponse, Ask> {
+        let stream = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Ask::Cancelled),
+            result = self.provider.stream(request.clone(), cancel.clone()) => result,
+        };
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => return Err(Ask::Failed(error.to_string())),
+        };
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Ask::Cancelled),
+                event = stream.next() => event,
+            };
+            let Some(event) = event else {
+                return Err(Ask::Failed(
+                    "the summarization stream ended without a terminal event".to_string(),
+                ));
+            };
+            match event {
+                StreamEvent::Finished(Outcome::Completed(response)) => return Ok(response),
+                StreamEvent::Finished(Outcome::Failed(error)) => {
+                    return Err(Ask::Failed(error.to_string()));
+                }
+                StreamEvent::Finished(Outcome::Cancelled) => return Err(Ask::Cancelled),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// How one summarization request ended without a completed response.
+enum Ask {
+    /// The stream failed to start, or reported a failure.
+    Failed(String),
+    /// The caller cancelled.
+    Cancelled,
+}
+
+/// The usage of two requests of one summarization, summed per part. A part either
+/// request reported is summed — the one the other omitted counts as zero, as the
+/// missing cache parts do everywhere else — and usage stays unknown only when
+/// neither request reported any.
+fn sum_usage(first: Option<Usage>, second: Option<Usage>) -> Option<Usage> {
+    if first.is_none() && second.is_none() {
+        return None;
+    }
+    let (a, b) = (first.unwrap_or_default(), second.unwrap_or_default());
+    let part = |x: Option<u64>, y: Option<u64>| match (x, y) {
+        (None, None) => None,
+        (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+    };
+    Some(Usage {
+        input_uncached: part(a.input_uncached, b.input_uncached),
+        cache_read: part(a.cache_read, b.cache_read),
+        cache_write: part(a.cache_write, b.cache_write),
+        output: part(a.output, b.output),
+        reasoning_output: part(a.reasoning_output, b.reasoning_output),
+        cost_micro_usd: part(a.cost_micro_usd, b.cost_micro_usd),
+    })
 }
 
 /// `known` usage plus the estimate of everything after the last assistant; the

@@ -25,3 +25,5 @@ output_headroom_tokens = 16000
 summarize_at_tokens = 90000
 keep_recent_tokens = 25000
 user_verbatim_tokens = 8000
+# A thinking model: the cap includes reasoning tokens.
+summary_output_tokens = 12000
