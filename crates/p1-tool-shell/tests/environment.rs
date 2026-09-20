@@ -162,27 +162,10 @@ async fn env_pass_adds_a_name_to_the_allow_list() {
     assert_eq!(value(&outcome.content, CANARY_TOKEN), None, "{outcome:?}");
 }
 
-/// A snapshot with no `PATH` gets no `PATH` invented for it. A login `bash`
-/// finds commands with a default path of its own, but does not export one, so
-/// the child's environment simply has no `PATH`.
-#[tokio::test]
-async fn a_missing_path_is_not_invented() {
-    let dir = tempfile::tempdir().unwrap();
-    let tool = ShellTool::new(Workspace::new(dir.path()).unwrap())
-        .with_env_snapshot(vec![(OsString::from("LC_ALL"), OsString::from("C"))]);
-
-    // `env` is found and run through bash's own default path...
-    let outcome = execute(&tool, "env").await;
-    assert_eq!(outcome.status, ToolStatus::Ok, "{outcome:?}");
-    // ...but no `PATH` reaches the environment we passed on.
-    assert_eq!(
-        value(&outcome.content, "PATH"),
-        None,
-        "the missing PATH must not be invented: {outcome:?}"
-    );
-    assert_eq!(value(&outcome.content, "LC_ALL"), Some("C"), "{outcome:?}");
-}
-
+// Whether a command SEES a `PATH` when the snapshot has none is not ours to promise: a login
+// shell's system profile may export one (CI's does, this workstation's does not). What p1
+// guarantees — the filter never invents a value — is asserted on the filter itself in the
+// crate's unit test `a_missing_path_is_not_invented`.
 // ---------------------------------------------------------------- (sandbox)
 
 /// The same allow-list through the real sandbox: `TMPDIR=/tmp` from bubblewrap
