@@ -274,8 +274,7 @@ fn live_route(route_id: &str, profile_id: &str, wire_model: &str) -> Arc<dyn Pro
         .expect("the route serves this profile")
         .clone();
     binding.wire_model = wire_model.to_string();
-    let credentials = p1_host::auth::credential_source(&route.credential)
-        .expect("the route's credential reference");
+    let credentials = p1_host::auth::credential_source(&route, Arc::new(ReqwestTransport::new()));
     p1_host::catalog::route_provider(
         &route,
         &binding,

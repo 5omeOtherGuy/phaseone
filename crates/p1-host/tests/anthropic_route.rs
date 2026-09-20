@@ -22,7 +22,7 @@ use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
 use p1_host::catalog::{build_catalog, messages_route, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
-use p1_host::routes::{AdapterSettings, CredentialKind, RouteFile, load_route_by_id};
+use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_anthropic::{MessagesAccount, MessagesAdapterSettings, ROUTE, build_request};
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
@@ -174,7 +174,10 @@ fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
     );
     assert_eq!(route.adapter, "anthropic-messages");
     assert_eq!(route.endpoint, "https://api.anthropic.com");
-    assert_eq!(route.credential.kind, CredentialKind::ClaudeCodeOauth);
+    assert_eq!(
+        route.credential.kind,
+        p1_auth::CredentialKind::ClaudeCodeOauth
+    );
     assert_eq!(
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::AnthropicMessages(MessagesAdapterSettings {
@@ -279,6 +282,7 @@ fn the_shipped_messages_route_passes_the_conformance_suite() {
 /// needs the `env show` worker stub, so both shipped environments go this way.
 fn show_env(name: &str) -> (i32, String, String) {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    common::isolated_environment(&mut harness);
     let code = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
@@ -291,7 +295,7 @@ fn the_two_shipped_claude_environments_assemble_through_the_catalog_unchanged() 
     for name in ["claude", "claude-delegating"] {
         let (code, stdout, stderr) = show_env(name);
         assert_eq!(code, 0, "{name}: {stderr}");
-        let resolved: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        let resolved: serde_json::Value = common::env_show_json(&stdout);
         assert_eq!(resolved["environment"], name, "{name}");
         assert_eq!(resolved["family"], "claude", "{name}");
         assert_eq!(

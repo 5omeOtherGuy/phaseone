@@ -215,6 +215,9 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), Stri
 /// route's data and calls the compiled constructor for its adapter key; nothing about
 /// a route is compiled into this crate (spec §2).
 fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
+    // Composed once per catalog: the credential chain reads no file until a source
+    // is accessed, so this stays cheap and touches no login.
+    let locations = crate::auth::locations(deps);
     for route in crate::routes::load_all_routes(&deps.environment_dirs)? {
         if WHOLE_PROVIDERS.contains(&route.id.as_str()) {
             return Err(format!(
@@ -224,6 +227,7 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
             ));
         }
         let transport = deps.transport.clone();
+        let locations = locations.clone();
         let route = Arc::new(route);
         let data = route.clone();
         catalog.provider(
@@ -231,12 +235,29 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
             Box::new(move |spec: &ProviderSpec| {
                 let profile = require_profile(spec)?;
                 let binding = data.binding(&profile.id)?;
-                let credentials = crate::auth::credential_source(&data.credential)?;
+                let credentials =
+                    crate::auth::credential_source_at(&data, transport.clone(), &locations);
                 route_provider(&data, binding, profile, transport.clone(), credentials)
             }),
         );
     }
     Ok(())
+}
+
+/// The one line `p1 env show` prints for a route's credential (spec §4): WHICH
+/// source it would come from, never a value. `None` for an environment that names
+/// no route (a whole provider, which has no `[credential]` table).
+pub fn credential_line(
+    environment: &p1_assembly::EnvironmentFile,
+    environment_dirs: &[PathBuf],
+    locations: &p1_auth::Locations,
+) -> Result<Option<String>, String> {
+    if environment.profile.is_none() {
+        return Ok(None);
+    }
+    let route = crate::routes::load_route_by_id(environment_dirs, &environment.provider)?;
+    let report = p1_auth::describe(&route.id, &route.credential, locations);
+    Ok(Some(report.line()))
 }
 
 /// Resolve a loaded environment against the route files, before `assemble` is

@@ -1042,15 +1042,21 @@ async fn plain_environment_works_without_delegation() {
 #[tokio::test]
 async fn env_show_claude_has_declarations_and_no_secret() {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    common::isolated_environment(&mut harness);
     let code = run_args(&mut harness, &["env", "show", "claude"]).await;
 
     assert_eq!(code, 0);
-    let json = harness.stdout.text();
+    let stdout = harness.stdout.text();
+    let line = stdout.lines().next().unwrap_or_default();
+    assert!(
+        line.starts_with("credential  "),
+        "env show names the credential source first: {stdout}"
+    );
     for name in ["read", "edit", "write", "grep", "shell"] {
-        assert!(json.contains(&format!("\"{name}\"")), "missing {name}");
+        assert!(stdout.contains(&format!("\"{name}\"")), "missing {name}");
     }
     for secret in ["accessToken", "refreshToken", "Bearer", "sk-"] {
-        assert!(!json.contains(secret), "environment leaked {secret}");
+        assert!(!stdout.contains(secret), "environment leaked {secret}");
     }
 }
 

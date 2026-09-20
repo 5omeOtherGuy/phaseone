@@ -384,6 +384,7 @@ async fn env_show_with_sandbox_workspace_shows_the_sandbox_face() {
     let home = tempdir().unwrap();
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     harness.deps.home = Some(home.path().to_path_buf());
+    common::isolated_environment(&mut harness);
 
     let code = run_args(
         &mut harness,
@@ -584,6 +585,7 @@ async fn sandbox_off_keeps_the_plain_shell_description() {
     let home = tempdir().unwrap();
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     harness.deps.home = Some(home.path().to_path_buf());
+    common::isolated_environment(&mut harness);
 
     let code = run_args(&mut harness, &["env", "show", "claude"]).await;
 

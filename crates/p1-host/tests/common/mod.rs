@@ -162,7 +162,7 @@ impl Harness {
         let (stderr_writer, stderr) = Capture::new();
         let lines = ScriptedLines::new(lines);
         let interrupt = ChannelInterrupt::new();
-        let deps = HostDeps::new(
+        let mut deps = HostDeps::new(
             stdout_writer,
             stderr_writer,
             lines.clone(),
@@ -172,6 +172,9 @@ impl Harness {
             environment_dirs,
             false,
         );
+        // No test touches the real home: the credential chain resolves its locations
+        // from this field, and a test that needs a home (the sandbox ones) injects one.
+        deps.home = None;
         Self {
             deps,
             stdout,
@@ -180,6 +183,21 @@ impl Harness {
             interrupt,
         }
     }
+}
+
+/// The host sees NO ambient environment: an injected empty snapshot replaces the
+/// process environment, so no credential path can point outside the scratch
+/// directories a test wrote. Every `env show` test calls this — `env show` reports
+/// which credential source a route would use, and that probe must never reach a real
+/// login.
+pub fn isolated_environment(harness: &mut Harness) {
+    harness.deps.shell_env = Some(Vec::new());
+}
+
+/// The resolved environment `env show` printed, after its `credential  …` line.
+pub fn env_show_json(stdout: &str) -> serde_json::Value {
+    let json = stdout.split_once('\n').map_or(stdout, |(_, rest)| rest);
+    serde_json::from_str(json.trim()).expect("env show prints the resolved environment as JSON")
 }
 
 /// Parse `args` and run the host. Panics on a usage error so a typo in a test is

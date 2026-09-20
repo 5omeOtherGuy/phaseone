@@ -13,6 +13,7 @@ use std::time::Duration;
 use common::Harness;
 use futures_util::StreamExt;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
+use p1_auth::{BorrowSource, BorrowStore, CredentialKind};
 use p1_contracts::{
     BoxFuture, CancellationToken, Effort, Item, JournalRecord, ModelOptions, Origin, Outcome,
     Provider, ProviderError, ProviderRequest, StreamEvent, TurnEnd,
@@ -21,10 +22,7 @@ use p1_core::{Agent, AgentParts, ResumeError};
 use p1_host::activity::CompletionHub;
 use p1_host::catalog::{build_catalog, chat_route, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
-use p1_host::routes::{
-    AdapterSettings, BorrowSource, BorrowStore, CredentialKind, RouteFile, load_all_routes,
-    load_route, load_route_by_id,
-};
+use p1_host::routes::{AdapterSettings, RouteFile, load_all_routes, load_route, load_route_by_id};
 use p1_model_profile::ModelProfile;
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
