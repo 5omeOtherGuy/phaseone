@@ -252,3 +252,14 @@ fn ellipsize(text: &str, width: usize) -> String {
     out.push('\u{2026}');
     out
 }
+
+/// Cut a banner line at the grid edge with `…` — a hard cut mid-word reads as
+/// a rendering bug, an ellipsis as a folded fact.
+fn ellipsize(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}

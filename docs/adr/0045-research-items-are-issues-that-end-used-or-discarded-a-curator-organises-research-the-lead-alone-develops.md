@@ -1,7 +1,7 @@
 ---
 adr: 45
 title: Research items are issues that end used or discarded; a curator organises research, the lead alone develops
-status: proposed
+status: accepted
 date: 2026-09-20
 deciders: owner+lead
 supersedes: []

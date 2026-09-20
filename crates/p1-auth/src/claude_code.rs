@@ -1,4 +1,5 @@
-//! File-based credentials: reuse the owner's existing Claude Code login.
+//! The Claude Code login as a credential source: the third source of the
+//! `claude-code-oauth` chain (spec §2).
 //!
 //! The credential file layout, expiry unit, refresh request, token URL, client
 //! id and scopes are taken from the donor's `src/mimir/auth/anthropic.rs`
@@ -10,7 +11,8 @@
 //!
 //! A missing, unreadable or malformed file is an [`ProviderErrorKind::Authentication`]
 //! error telling the user to log in with Claude Code. File contents are never
-//! printed, logged or copied into an error.
+//! printed, logged or copied into an error. Where the file IS comes from
+//! [`crate::Locations`]; this source never reads the process environment.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,19 +20,20 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::{
-    ByteStream, Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, ReqwestTransport,
-    Transport, lock_exclusive,
+    ByteStream, Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, Transport, lock_exclusive,
 };
 use serde_json::{Value, json};
 
-const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const OAUTH_BETA: &str = "oauth-2025-04-20";
-const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+use crate::resolve::{Entry, Presence, SourceName};
+
+pub(crate) const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+pub(crate) const OAUTH_BETA: &str = "oauth-2025-04-20";
+pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// Scopes requested when a stored credential records none (the runtime scopes
 /// Claude Code itself uses on refresh; the login-only `org:create_api_key` scope
 /// is deliberately not part of a refresh).
-const DEFAULT_SCOPES: &str =
+pub(crate) const DEFAULT_SCOPES: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 /// Refresh this far ahead of expiry so an in-flight request never races a token
@@ -46,15 +49,8 @@ pub struct ClaudeCodeCredentials {
 }
 
 impl ClaudeCodeCredentials {
-    /// Resolve `$CLAUDE_CONFIG_DIR/.credentials.json` (else
-    /// `$HOME/.claude/.credentials.json`) and use the real HTTP transport for
-    /// token refresh. Construction touches no credential file.
-    pub fn from_default_location() -> Result<Self, ProviderError> {
-        Ok(Self::at(default_path()?, Arc::new(ReqwestTransport::new())))
-    }
-
     /// Read and refresh credentials at an explicit path through an explicit
-    /// transport (tests use a scripted transport).
+    /// transport (the chain supplies both). Construction touches no file.
     pub fn at(path: PathBuf, transport: Arc<dyn Transport>) -> Self {
         Self {
             path,
@@ -285,6 +281,49 @@ impl CredentialSource for ClaudeCodeCredentials {
     }
 }
 
+/// Whether Claude Code's login file has an entry the chain can use. Reading the
+/// file is unavoidable (a route's entry may be absent); no value is kept.
+pub(crate) fn presence_at(path: &Path) -> Presence {
+    match std::fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
+        Err(_) => Presence::Unusable(format!(
+            "Claude Code credentials at {} could not be read; run Claude Code login",
+            path.display()
+        )),
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Err(_) => Presence::Unusable(format!(
+                "Claude Code credentials at {} are malformed; run Claude Code login",
+                path.display()
+            )),
+            Ok(document) => match parse_credentials(&document, path) {
+                Ok(_) => Presence::Present,
+                Err(error) => Presence::Unusable(error.message),
+            },
+        },
+    }
+}
+
+impl Entry for ClaudeCodeCredentials {
+    fn name(&self) -> SourceName {
+        SourceName::ClaudeCodeLogin
+    }
+
+    fn presence(&self) -> Presence {
+        presence_at(&self.path)
+    }
+
+    fn current<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        CredentialSource::access(self)
+    }
+
+    fn rotated<'a>(
+        &'a self,
+        rejected: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        CredentialSource::refresh(self, rejected)
+    }
+}
+
 struct StoredCredentials {
     access: String,
     refresh: Option<String>,
@@ -305,23 +344,6 @@ fn bearer(access: String) -> Credential {
         bearer: access,
         account_id: None,
     }
-}
-
-fn default_path() -> Result<PathBuf, ProviderError> {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        let dir = dir.trim();
-        if !dir.is_empty() {
-            return Ok(Path::new(dir).join(".credentials.json"));
-        }
-    }
-    let home = std::env::var("HOME").map_err(|_| {
-        ProviderError::new(
-            ProviderErrorKind::Authentication,
-            "cannot locate Claude Code credentials because HOME is not set. \
-             Run Claude Code login first",
-        )
-    })?;
-    Ok(Path::new(&home).join(".claude/.credentials.json"))
 }
 
 fn auth_error(path: &Path, reason: &str) -> ProviderError {
@@ -495,7 +517,8 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     path.with_extension(format!("tmp-{}-{nanos:09}-{counter}", std::process::id()))
 }
 
-fn system_clock() -> u64 {
+/// The default clock: milliseconds since the Unix epoch.
+pub(crate) fn system_clock() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)

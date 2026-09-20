@@ -1,7 +1,7 @@
 ---
 adr: 44
 title: p1 login stores pasted API keys in p1's own store
-status: proposed
+status: accepted
 date: 2026-09-20
 deciders: owner
 supersedes: []

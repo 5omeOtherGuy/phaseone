@@ -128,6 +128,11 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
             EXIT_OK
         }
         Command::EnvShow { name } => env_show(deps, &options, &name),
+        // The login surface (ADR-0044, spec §6): no catalog, no provider and no
+        // network — the store is written and the "which source" report is printed.
+        Command::Login { route } => crate::login::login(deps, &route).await,
+        Command::LoginList => crate::login::list(deps),
+        Command::Logout { route } => crate::login::logout(deps, &route).await,
         Command::Run { .. } => {
             if options.resume && options.session.is_none() {
                 write_stderr(deps, "error: --resume requires --session\n");
@@ -200,6 +205,19 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     {
         write_stderr(deps, &format!("{message}\n"));
         return EXIT_FAILURE;
+    }
+    // Which source this route's credential comes from — never a value (spec §4).
+    match crate::catalog::credential_line(
+        &environment,
+        &deps.environment_dirs,
+        &crate::auth::locations(deps),
+    ) {
+        Ok(Some(line)) => write_stdout(deps, &format!("credential  {line}\n")),
+        Ok(None) => {}
+        Err(message) => {
+            write_stderr(deps, &format!("{message}\n"));
+            return EXIT_FAILURE;
+        }
     }
     let workspace = match resolve_workspace(options) {
         Ok(workspace) => workspace,

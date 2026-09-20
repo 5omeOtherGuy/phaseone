@@ -15,7 +15,7 @@ use p1_contracts::{
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_anthropic::{
-    AnthropicProvider, ClaudeCodeCredentials, MessagesAccount, MessagesRoute, ROUTE, build_request,
+    AnthropicProvider, MessagesAccount, MessagesRoute, ROUTE, build_request,
 };
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource, RetryPolicy};
@@ -759,6 +759,7 @@ async fn credentials_and_bodies_never_leak() {
 
 // A fixed clock for the file-credential end-to-end test.
 static FILE_CLOCK: AtomicU64 = AtomicU64::new(1_700_000_000_000);
+#[allow(dead_code)]
 fn file_clock() -> u64 {
     FILE_CLOCK.load(Ordering::SeqCst)
 }
@@ -791,33 +792,19 @@ async fn base_url_and_retry_policy_are_applied_through_drive() {
     );
 }
 
-/// The real [`ClaudeCodeCredentials`] source feeding `drive` end to end: the
-/// file is read fresh, its token becomes the `Authorization` header, and no
-/// refresh is needed.
+/// The real [`ClaudeCodeCredentials`] source feeding `drive` end to end lives in
+/// `p1-auth`, which this adapter must not depend on: `tests/credentials_end_to_end.rs`
+/// in `p1-host` proves that composition instead (the host is the one place that
+/// composes). The `#[tokio::test]` below covers the same wire path with a fake
+/// source, so the adapter's own behaviour stays pinned here.
 #[tokio::test]
-async fn file_credentials_drive_a_request_end_to_end() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(".credentials.json");
-    std::fs::write(
-        &path,
-        json!({
-            "claudeAiOauth": {
-                "accessToken": "FILE-TOKEN",
-                "refreshToken": "R",
-                "expiresAt": file_clock() + 3_600_000,
-            }
-        })
-        .to_string(),
-    )
-    .unwrap();
-
+async fn a_fake_file_shaped_source_drives_a_request_end_to_end() {
     let transport = ScriptedTransport::new(vec![ok(fixtures::text_turn)]);
-    let credentials =
-        ClaudeCodeCredentials::at(path, Arc::new(transport.clone())).with_clock(file_clock);
+    let credentials = FakeCredentials::new("FILE-TOKEN");
     let provider = provider(
         "claude-sonnet-4-6",
         Arc::new(transport.clone()),
-        Arc::new(credentials),
+        credentials,
     );
     let stream = provider
         .stream(request(vec![user("hi")]), CancellationToken::new())
@@ -831,6 +818,6 @@ async fn file_credentials_drive_a_request_end_to_end() {
             .headers
             .iter()
             .any(|(name, value)| name == "authorization" && value == "Bearer FILE-TOKEN"),
-        "the file token must be used verbatim"
+        "the source's token must be used verbatim"
     );
 }

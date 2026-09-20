@@ -10,21 +10,20 @@
 //! model. Wire facts are `docs/design/routes.md` §A; the adapter shape is
 //! `docs/design/providers.md`.
 //!
-//! The crate owns no tools and no prompt policy: [`build_request`] and
-//! [`build_headers`] are pure functions over the contracts, the SSE parser is a
-//! pure state machine, and [`AnthropicProvider`] wires both onto the shared
-//! [`p1_provider_http::drive`] loop. Credentials are reused from the existing
-//! Claude Code login by [`ClaudeCodeCredentials`]; p1 has no login flow.
+//! The crate owns no tools, no prompt policy and no credential lookup:
+//! [`build_request`] and [`build_headers`] are pure functions over the contracts,
+//! the SSE parser is a pure state machine, and [`AnthropicProvider`] wires both onto
+//! the shared [`p1_provider_http::drive`] loop. Where a credential comes from is
+//! `p1-auth`'s business; this adapter only ever sees an
+//! [`Arc<dyn CredentialSource>`](p1_provider_http::CredentialSource).
 //!
 //! No credential value, header value or response-body text ever reaches a
 //! [`p1_contracts::ProviderError`], a `Debug` output or a panic message.
 
-mod credentials;
 mod parser;
 mod provider;
 mod request;
 
-pub use credentials::ClaudeCodeCredentials;
 pub use provider::AnthropicProvider;
 pub use request::{build_headers, build_request};
 

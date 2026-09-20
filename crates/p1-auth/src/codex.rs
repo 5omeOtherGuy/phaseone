@@ -1,13 +1,13 @@
-//! A file-based credential source over the Codex CLI's own login.
+//! The Codex CLI's own login as a credential source: the third source of the
+//! `codex-oauth` chain (spec §2).
 //!
-//! p1 builds no login flow: it reuses `$CODEX_HOME/auth.json` (else
-//! `$HOME/.codex/auth.json`), exactly as the donor reused the CLI login. The
-//! refresh token rotates, so a refresh is single-flight: an advisory lock on a
-//! sibling `.lock` file, a re-read under the lock, an atomic 0600 write-back and
-//! an untouched file when the refresh fails. `docs/design/providers.md`
-//! "Credentials" is the spec.
+//! p1 builds no login flow: it reuses the auth file [`crate::Locations`] points at,
+//! exactly as the donor reused the CLI login. The refresh token rotates, so a
+//! refresh is single-flight: an advisory lock on a sibling `.lock` file, a re-read
+//! under the lock, an atomic 0600 write-back and an untouched file when the refresh
+//! fails. `docs/design/providers.md` "Credentials" is the spec. This source never
+//! reads the process environment.
 
-use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,14 +16,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::{
-    ByteStream, Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, ReqwestTransport,
-    Transport, TransportError, lock_exclusive,
+    ByteStream, Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, Transport,
+    TransportError, lock_exclusive,
 };
 use serde_json::Value;
 
-const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+use crate::resolve::{Entry, Presence, SourceName};
+
+pub(crate) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// The Codex CLI's public OAuth client id (from its source; never a secret).
-const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ACCOUNT_ID_CLAIM: &str = "https://api.openai.com/auth";
 /// Refresh this long before the token actually expires.
 const EXPIRY_MARGIN_SECS: u64 = 300;
@@ -49,20 +51,7 @@ pub struct CodexCliCredentials {
 }
 
 impl CodexCliCredentials {
-    /// The default location: `$CODEX_HOME/auth.json` or `$HOME/.codex/auth.json`.
-    /// Construction does not open the file.
-    pub fn from_default_location() -> Result<Self, ProviderError> {
-        let path = default_path_from(std::env::var_os("CODEX_HOME"), std::env::var_os("HOME"))
-            .ok_or_else(|| {
-                ProviderError::new(
-                    ProviderErrorKind::Authentication,
-                    "cannot locate the Codex auth file: set CODEX_HOME or HOME",
-                )
-            })?;
-        Ok(Self::at(path, Arc::new(ReqwestTransport::new())))
-    }
-
-    /// A source over an explicit auth file and transport (tests, custom hosts).
+    /// A source over an explicit auth file and transport (the chain supplies both).
     pub fn at(path: PathBuf, transport: Arc<dyn Transport>) -> Self {
         Self {
             path,
@@ -229,6 +218,49 @@ impl CredentialSource for CodexCliCredentials {
     }
 }
 
+/// Whether the Codex auth file has an entry the chain can use. Reading the file is
+/// unavoidable (a route's entry may be absent); no value is kept.
+pub(crate) fn presence_at(path: &Path) -> Presence {
+    match fs::read(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
+        Err(_) => Presence::Unusable(format!(
+            "the Codex auth file {} could not be read; run `codex login`",
+            path.display()
+        )),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Err(_) => Presence::Unusable(format!(
+                "the Codex auth file {} is not valid JSON; run `codex login`",
+                path.display()
+            )),
+            Ok(document) => match tokens_from(&document) {
+                Ok(_) => Presence::Present,
+                Err(error) => Presence::Unusable(error.message),
+            },
+        },
+    }
+}
+
+impl Entry for CodexCliCredentials {
+    fn name(&self) -> SourceName {
+        SourceName::CodexLogin
+    }
+
+    fn presence(&self) -> Presence {
+        presence_at(&self.path)
+    }
+
+    fn current<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        CredentialSource::access(self)
+    }
+
+    fn rotated<'a>(
+        &'a self,
+        rejected: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        CredentialSource::refresh(self, rejected)
+    }
+}
+
 /// A parsed view of the parts of the auth file this adapter uses. Unknown fields
 /// stay in the [`Value`] document and are written back untouched.
 struct Tokens {
@@ -241,14 +273,6 @@ struct RefreshedTokens {
     access_token: String,
     refresh_token: String,
     id_token: Option<String>,
-}
-
-fn default_path_from(codex_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    if let Some(codex_home) = codex_home.filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(codex_home).join("auth.json"));
-    }
-    home.filter(|value| !value.is_empty())
-        .map(|home| PathBuf::from(home).join(".codex").join("auth.json"))
 }
 
 fn read_document(path: &Path) -> Result<Value, ProviderError> {
@@ -592,23 +616,6 @@ mod tests {
     ) -> CodexCliCredentials {
         CodexCliCredentials::at(path.to_path_buf(), Arc::new(transport.clone()))
             .with_clock(Arc::new(FixedClock(clock)))
-    }
-
-    #[test]
-    fn resolves_the_default_path_from_env_values() {
-        assert_eq!(
-            default_path_from(Some("/tmp/codex".into()), Some("/home/me".into())),
-            Some(PathBuf::from("/tmp/codex/auth.json"))
-        );
-        assert_eq!(
-            default_path_from(None, Some("/home/me".into())),
-            Some(PathBuf::from("/home/me/.codex/auth.json"))
-        );
-        assert_eq!(
-            default_path_from(Some("".into()), Some("/home/me".into())),
-            Some(PathBuf::from("/home/me/.codex/auth.json"))
-        );
-        assert_eq!(default_path_from(None, None), None);
     }
 
     #[test]

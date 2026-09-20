@@ -1313,6 +1313,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-auth"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "p1-contracts",
+ "p1-provider-http",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "p1-context"
 version = "0.0.1"
 dependencies = [
@@ -1355,6 +1368,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "p1-assembly",
+ "p1-auth",
  "p1-context",
  "p1-contracts",
  "p1-core",
@@ -1433,7 +1447,6 @@ dependencies = [
  "p1-provider-http",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
@@ -1472,7 +1485,6 @@ dependencies = [
  "p1-provider-http",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
