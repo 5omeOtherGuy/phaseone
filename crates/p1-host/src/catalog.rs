@@ -9,6 +9,7 @@ use p1_assembly::{Catalog, ProviderSpec, ToolServices, ToolSpec};
 use p1_contracts::{Provider, Tool};
 
 use crate::HostDeps;
+use crate::activity::CompletionHub;
 use crate::cli::SandboxMode;
 
 /// Test-only hook run after the built-in catalog is populated. A test registers
@@ -68,6 +69,32 @@ macro_rules! apply_delegate_face {
     }};
 }
 
+/// Same override rules as [`apply_face`], for the `finish` tool's own `ToolFace`
+/// type.
+macro_rules! apply_finish_face {
+    ($tool:expr, $spec:expr) => {{
+        let tool = $tool;
+        if $spec.name.is_none() && $spec.description.is_none() && $spec.variant.is_none() {
+            Arc::new(tool) as Arc<dyn Tool>
+        } else {
+            let name = $spec
+                .name
+                .clone()
+                .unwrap_or_else(|| tool.declaration().name.clone());
+            let description = $spec
+                .description
+                .clone()
+                .unwrap_or_else(|| tool.declaration().description.clone());
+            let variant = $spec
+                .variant
+                .clone()
+                .unwrap_or_else(|| tool.identity().variant.clone());
+            Arc::new(tool.with_face(p1_tool_finish::ToolFace::new(name, description), &variant))
+                as Arc<dyn Tool>
+        }
+    }};
+}
+
 /// Build the catalog from the injected dependencies.
 ///
 /// Provider keys: `anthropic-subscription`, `openai-codex-subscription`.
@@ -83,6 +110,7 @@ pub fn build_catalog(
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
     env_pass: &[String],
+    completion: &Arc<CompletionHub>,
 ) -> Catalog {
     #[cfg(feature = "delegation")]
     return build_catalog_with_workers(
@@ -91,9 +119,10 @@ pub fn build_catalog(
         sandbox,
         sandbox_write,
         env_pass,
+        completion,
     );
     #[cfg(not(feature = "delegation"))]
-    build_catalog_inner(deps, sandbox, sandbox_write, env_pass)
+    build_catalog_inner(deps, sandbox, sandbox_write, env_pass, completion)
 }
 
 /// As [`build_catalog`], with the worker tools bound to `service` instead of
@@ -105,10 +134,18 @@ pub fn build_catalog_with_workers(
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
     env_pass: &[String],
+    completion: &Arc<CompletionHub>,
 ) -> Catalog {
     let mut catalog = Catalog::new();
     register_providers(&mut catalog, deps);
-    register_standard_tools(&mut catalog, deps, sandbox, sandbox_write, env_pass);
+    register_standard_tools(
+        &mut catalog,
+        deps,
+        sandbox,
+        sandbox_write,
+        env_pass,
+        completion,
+    );
     register_delegation_tools(&mut catalog, service);
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
@@ -122,11 +159,19 @@ fn build_catalog_inner(
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
     env_pass: &[String],
+    completion: &Arc<CompletionHub>,
 ) -> Catalog {
     let mut catalog = Catalog::new();
 
     register_providers(&mut catalog, deps);
-    register_standard_tools(&mut catalog, deps, sandbox, sandbox_write, env_pass);
+    register_standard_tools(
+        &mut catalog,
+        deps,
+        sandbox,
+        sandbox_write,
+        env_pass,
+        completion,
+    );
 
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
@@ -172,6 +217,7 @@ fn register_standard_tools(
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
     env_pass: &[String],
+    completion: &Arc<CompletionHub>,
 ) {
     catalog.tool(
         "read",
@@ -257,6 +303,23 @@ fn register_standard_tools(
                 ),
                 spec
             ))
+        }),
+    );
+    // `finish` owns no files or processes: it reads the session through the log
+    // the host feeds from the event stream. Each assembly gets its own pair.
+    let hub = completion.clone();
+    catalog.tool(
+        "finish",
+        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
+            let completion = hub.issue();
+            let tool = apply_finish_face!(
+                p1_tool_finish::FinishTool::new(completion.log.clone(), completion.outcome.clone()),
+                spec
+            );
+            completion
+                .log
+                .set_finish_name(tool.declaration().name.clone());
+            Ok(tool)
         }),
     );
 }

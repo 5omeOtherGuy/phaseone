@@ -8,13 +8,14 @@ use std::path::PathBuf;
 
 use p1_assembly::load_environment;
 
-const ALL_TOOL_MODULES: [&str; 10] = [
+const ALL_TOOL_MODULES: [&str; 11] = [
     "read",
     "edit",
     "write",
     "grep",
     "shell",
     "apply_patch",
+    "finish",
     "worker_start",
     "worker_result",
     "worker_continue",

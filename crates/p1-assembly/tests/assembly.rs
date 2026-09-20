@@ -20,6 +20,7 @@ fn shipped_claude_environment_assembles() {
     let mut catalog = Catalog::new();
     let probe = register_scripted_provider(&mut catalog, "anthropic-subscription");
     register_fake_tools(&mut catalog, &TOOL_KEYS);
+    register_fake_tools(&mut catalog, &["finish"]);
 
     let environment = load_environment("claude", &[shipped_environments()]).unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -31,13 +32,13 @@ fn shipped_claude_environment_assembles() {
     );
     assert_eq!(
         tool_names(&assembled.tools),
-        ["read", "edit", "write", "grep", "shell"]
+        ["read", "edit", "write", "grep", "shell", "finish"]
     );
     assert!(
         assembled
             .system_prompt
-            .contains("read, edit, write, grep, shell"),
-        "{{tool_names}} did not render the five tools in file order"
+            .contains("read, edit, write, grep, shell, finish"),
+        "{{tool_names}} did not render the tools in file order"
     );
 
     let validated = probe.validated();
@@ -53,7 +54,10 @@ fn shipped_claude_environment_assembles() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect();
-    assert_eq!(declared, ["read", "edit", "write", "grep", "shell"]);
+    assert_eq!(
+        declared,
+        ["read", "edit", "write", "grep", "shell", "finish"]
+    );
     assert_eq!(assembled.resolved.route.origin.model, "fake-model");
 }
 
@@ -69,10 +73,14 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
     let mut gpt_catalog = Catalog::new();
     register_scripted_provider(&mut gpt_catalog, "openai-codex-subscription");
     register_fake_tools(&mut gpt_catalog, &["shell", "apply_patch"]);
+    register_fake_tools(&mut gpt_catalog, &["finish"]);
 
     let gpt = load_environment("gpt", &[shipped_environments()]).unwrap();
     let gpt_assembled = assemble(&gpt_catalog, &gpt, workspace.path(), &substitutions()).unwrap();
-    assert_eq!(tool_names(&gpt_assembled.tools), ["shell", "apply_patch"]);
+    assert_eq!(
+        tool_names(&gpt_assembled.tools),
+        ["shell", "apply_patch", "finish"]
+    );
     assert!(!gpt_assembled.system_prompt.contains("`edit`"));
     assert!(!gpt_assembled.system_prompt.contains("`write`"));
     assert_prompt_coherent(&gpt_catalog, &gpt_assembled);
@@ -83,6 +91,7 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
         &mut claude_catalog,
         &["read", "edit", "write", "grep", "shell"],
     );
+    register_fake_tools(&mut claude_catalog, &["finish"]);
 
     let claude = load_environment("claude", &[shipped_environments()]).unwrap();
     let claude_assembled =

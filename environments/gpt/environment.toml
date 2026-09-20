@@ -9,3 +9,6 @@ reasoning_effort = "medium"
 module = "shell"
 [[tools]]
 module = "apply_patch"
+
+[[tools]]
+module = "finish"

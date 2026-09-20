@@ -28,12 +28,14 @@ use p1_journal::MemoryJournal;
 
 #[cfg(feature = "delegation")]
 use crate::SharedWriter;
+use crate::activity::{ActivityTee, Completion, CompletionHub};
 use crate::catalog::build_catalog;
 use crate::cli::{self, Command, Options};
 use crate::policy::HostPolicy;
 use crate::render::Renderer;
 use crate::session;
 use crate::{HostDeps, InterruptSource};
+use p1_tool_finish::Accepted;
 
 #[cfg(feature = "delegation")]
 use p1_workers::{AgentFactory, ChildAgent, ChildSpec, ChildStatus, InProcessWorkers};
@@ -43,6 +45,15 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_FAILURE: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_CANCELLED: i32 = 130;
+/// The model called `finish` with `status: "blocked"`.
+pub const EXIT_BLOCKED: i32 = 3;
+/// The model kept stopping without finishing and the continuation budget ran out.
+pub const EXIT_STALLED: i32 = 4;
+
+/// The ONE message the host sends after a premature stop in an unattended run.
+/// Committed as a normal `UserInput` record, so the journal shows every
+/// continuation.
+pub const CONTINUATION_MESSAGE: &str = "You ended your turn without calling finish. You are running unattended: nobody will answer a question or confirm a plan, and this task authorizes you to continue on your own. Continue the work now. When it is complete and verified, call finish with status \"done\"; if something outside your control stops you, call finish with status \"blocked\".";
 
 /// The default context policy: the history is sent unchanged.
 #[derive(Clone, Copy, Default)]
@@ -124,6 +135,9 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
 fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     // Showing an environment starts no worker, but a delegating environment must still
     // assemble: bind the worker tools to a service that can never start one.
+    // `env show` only prints the resolved environment; the completion state it
+    // issues is dropped with the catalog.
+    let completion = Arc::new(CompletionHub::new());
     #[cfg(feature = "delegation")]
     let catalog = {
         let inert: p1_workers::AgentFactory =
@@ -135,6 +149,7 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             options.sandbox,
             &options.sandbox_write,
             &options.env_pass,
+            &completion,
         )
     };
     #[cfg(not(feature = "delegation"))]
@@ -143,6 +158,7 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
         options.sandbox,
         &options.sandbox_write,
         &options.env_pass,
+        &completion,
     );
     let environment = match load_environment(name, &deps.environment_dirs) {
         Ok(environment) => environment,
@@ -196,6 +212,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     // The delegation service must exist before the catalog so the `worker_*`
     // tools can be registered; the child factory reaches the catalog lazily,
     // breaking the cycle (children never assemble delegation tools).
+    let completion_hub = Arc::new(CompletionHub::new());
     #[cfg(feature = "delegation")]
     let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
     #[cfg(feature = "delegation")]
@@ -208,6 +225,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
             policy.clone(),
             catalog_slot.clone(),
             child_counter.clone(),
+            completion_hub.clone(),
         );
         let service = InProcessWorkers::new(factory, 2);
         deps.worker_service = Some(service.clone());
@@ -219,6 +237,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         options.sandbox,
         &options.sandbox_write,
         &options.env_pass,
+        &completion_hub,
     ));
     #[cfg(feature = "delegation")]
     {
@@ -231,11 +250,20 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     let substitutions = substitutions(deps, &workspace);
     let assembled =
         assemble(&catalog, &environment, &workspace, &substitutions).map_err(|e| e.to_string())?;
+    // The `finish` factory issued this agent's completion state during `assemble`.
+    // `None` when the environment does not assemble `finish`.
+    let completion = completion_hub.take();
     let context = agent_context(&assembled)?;
     let route = assembled.resolved.route.origin.route.clone();
     let model = assembled.resolved.route.origin.model.clone();
 
     let (journal, records): OpenedSession = open_session(deps, options)?;
+    // On resume the journal holds the earlier turns; rebuild this agent's activity
+    // from them so a verification run before the restart still counts and a file
+    // change before it still invalidates (completion.md §3).
+    if let (Some(completion), Some(records)) = (&completion, &records) {
+        completion.log.replay(&assembled.tools, records);
+    }
 
     let renderer = Arc::new(Renderer::new(
         deps.stdout.clone(),
@@ -245,7 +273,17 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         model,
         Arc::new(Mutex::new(String::new())),
     ));
-    let events: Arc<dyn EventSink> = renderer.clone();
+    // The activity tee forwards every event to the renderer unchanged and feeds
+    // this agent's log the effects and exit codes a later `finish` reads. Without
+    // `finish` there is nothing to feed: install the renderer directly.
+    let events: Arc<dyn EventSink> = match &completion {
+        Some(completion) => Arc::new(ActivityTee::new(
+            renderer.clone(),
+            completion.log.clone(),
+            &assembled.tools,
+        )),
+        None => renderer.clone(),
+    };
 
     let parts = AgentParts {
         provider: assembled.provider,
@@ -279,7 +317,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     }
 
     let code = if headless {
-        run_headless(deps, &mut agent, options, &cancel).await
+        run_headless(deps, &mut agent, options, &cancel, completion).await
     } else {
         run_interactive(deps, &mut agent, &cancel).await
     };
@@ -322,6 +360,7 @@ async fn run_headless(
     agent: &mut Agent,
     options: &Options,
     cancel: &CancellationToken,
+    completion: Option<Completion>,
 ) -> i32 {
     let second = Arc::new(tokio::sync::Notify::new());
     spawn_interrupt(deps.interrupt.clone(), cancel.clone(), second.clone());
@@ -333,7 +372,96 @@ async fn run_headless(
         _ => String::new(),
     };
 
-    let mut code = match race_turn(agent.run_turn(prompt, cancel.clone()), &second).await {
+    // No `finish` in the assembled environment: the run behaves exactly as before.
+    let Some(completion) = completion else {
+        return run_headless_plain(deps, agent, cancel, &second, prompt).await;
+    };
+
+    let log = completion.log.clone();
+    let outcome = completion.outcome.clone();
+    let max_continuations = options.max_continuations;
+
+    outcome.clear();
+    let mut end = match race_turn(agent.run_turn(prompt, cancel.clone()), &second).await {
+        Some(end) => end,
+        None => return EXIT_CANCELLED,
+    };
+
+    let mut continuations = 0usize;
+    let mut last_marker: Option<u64> = None;
+    let mut stops = 0usize;
+
+    loop {
+        if cancel.is_cancelled() {
+            return EXIT_CANCELLED;
+        }
+        // A turn that did not complete (cancelled, provider failure, …) is
+        // handled exactly as before.
+        if !matches!(end, TurnEnd::Completed { .. }) {
+            return end_code(&end);
+        }
+        match outcome.get() {
+            Some(Accepted::Done { .. }) => return EXIT_OK,
+            Some(Accepted::Blocked { needs, tried, .. }) => {
+                write_stderr(deps, &format!("blocked: {needs}\n"));
+                if !tried.is_empty() {
+                    write_stderr(deps, &format!("tried: {}\n", tried.join("; ")));
+                }
+                return EXIT_BLOCKED;
+            }
+            None => {}
+        }
+        // FIRST the things a turn end legitimately waits for: a pending inbox or a
+        // running worker. A parent that stopped while its worker runs is WAITING,
+        // not stopping (completion.md §3, must-pass a0).
+        outcome.clear();
+        match wait_for_work(deps, agent, cancel, &second).await {
+            WaitOutcome::Turn(next) => {
+                end = next;
+                continue;
+            }
+            WaitOutcome::Cancelled => return EXIT_CANCELLED,
+            WaitOutcome::Idle => {}
+        }
+        // Premature stop. It is allowed while BOTH bounds hold: the whole-run
+        // count and at least one non-finish call finished since the last
+        // continuation.
+        stops += 1;
+        let progress = log.non_finish_finishes();
+        let allowed =
+            continuations < max_continuations && last_marker.is_none_or(|marker| progress > marker);
+        if !allowed {
+            write_stderr(
+                deps,
+                &format!("stalled: the agent stopped {stops} times without finishing\n"),
+            );
+            return EXIT_STALLED;
+        }
+        continuations += 1;
+        last_marker = Some(progress);
+        outcome.clear();
+        end = match race_turn(
+            agent.run_turn(CONTINUATION_MESSAGE.to_string(), cancel.clone()),
+            &second,
+        )
+        .await
+        {
+            Some(end) => end,
+            None => return EXIT_CANCELLED,
+        };
+    }
+}
+
+/// The pre-completion headless driver: one turn, then inbox turns and a wait for
+/// running children. Used verbatim when the environment does not assemble `finish`.
+async fn run_headless_plain(
+    deps: &HostDeps,
+    agent: &mut Agent,
+    cancel: &CancellationToken,
+    second: &Arc<tokio::sync::Notify>,
+    prompt: String,
+) -> i32 {
+    let mut code = match race_turn(agent.run_turn(prompt, cancel.clone()), second).await {
         Some(end) => end_code(&end),
         None => return EXIT_CANCELLED,
     };
@@ -342,33 +470,66 @@ async fn run_headless(
         if cancel.is_cancelled() {
             return EXIT_CANCELLED;
         }
-        if agent.has_pending_inbox() {
-            match race_inbox(agent.run_inbox_turn(cancel.clone()), &second).await {
-                Some(Some(end)) => {
-                    code = end_code(&end);
-                    if code == EXIT_CANCELLED {
-                        return code;
-                    }
-                }
-                Some(None) => {}
-                None => return EXIT_CANCELLED,
-            }
-            continue;
-        }
-        #[cfg(feature = "delegation")]
-        {
-            if running_children(deps).await > 0 {
-                tokio::select! {
-                    biased;
-                    _ = second.notified() => return EXIT_CANCELLED,
-                    _ = cancel.cancelled() => return EXIT_CANCELLED,
-                    _ = agent.inbox_ready() => continue,
+        match wait_for_work(deps, agent, cancel, second).await {
+            WaitOutcome::Turn(end) => {
+                code = end_code(&end);
+                if code == EXIT_CANCELLED {
+                    return code;
                 }
             }
+            WaitOutcome::Idle => break,
+            WaitOutcome::Cancelled => return EXIT_CANCELLED,
         }
-        break;
     }
     code
+}
+
+/// What the host found when a turn ended and it looked for legitimate work.
+enum WaitOutcome {
+    /// An inbox turn ran and ended with this end; judge it from the top.
+    Turn(TurnEnd),
+    /// The inbox is empty and no worker is running: there is nothing to wait for.
+    Idle,
+    /// The run was cancelled while waiting.
+    Cancelled,
+}
+
+/// The ONE place a turn end waits instead of stopping: a pending inbox message,
+/// or a running worker whose completion notification will arrive on the inbox.
+/// Shared by the plain and the `finish`-aware headless drivers so waiting has one
+/// meaning in both. `_deps` is only read under the delegation feature.
+async fn wait_for_work(
+    _deps: &HostDeps,
+    agent: &mut Agent,
+    cancel: &CancellationToken,
+    second: &Arc<tokio::sync::Notify>,
+) -> WaitOutcome {
+    if agent.has_pending_inbox() {
+        return match race_inbox(agent.run_inbox_turn(cancel.clone()), second).await {
+            Some(Some(end)) => WaitOutcome::Turn(end),
+            Some(None) => WaitOutcome::Idle,
+            None => WaitOutcome::Cancelled,
+        };
+    }
+    #[cfg(feature = "delegation")]
+    {
+        if running_children(_deps).await > 0 {
+            tokio::select! {
+                biased;
+                _ = second.notified() => return WaitOutcome::Cancelled,
+                _ = cancel.cancelled() => return WaitOutcome::Cancelled,
+                _ = agent.inbox_ready() => {}
+            }
+            // `inbox_ready` only resolves with a message pending, so this turn is
+            // the worker's completion notification.
+            return match race_inbox(agent.run_inbox_turn(cancel.clone()), second).await {
+                Some(Some(end)) => WaitOutcome::Turn(end),
+                Some(None) => WaitOutcome::Idle,
+                None => WaitOutcome::Cancelled,
+            };
+        }
+    }
+    WaitOutcome::Idle
 }
 
 async fn run_interactive(deps: &HostDeps, agent: &mut Agent, cancel: &CancellationToken) -> i32 {
@@ -619,6 +780,7 @@ fn make_child_factory(
     policy: Arc<HostPolicy>,
     catalog_slot: Arc<OnceLock<Arc<Catalog>>>,
     counter: Arc<AtomicUsize>,
+    completion_hub: Arc<CompletionHub>,
 ) -> AgentFactory {
     let environment_dirs = deps.environment_dirs.clone();
     let date = deps.date.clone();
@@ -654,6 +816,10 @@ fn make_child_factory(
         ensure_cache_key(&mut environment, &workspace);
         let assembled = assemble(&catalog, &environment, &workspace, &substitutions)
             .map_err(|e| e.to_string())?;
+        // The child gets its OWN activity log and outcome, issued by the shared
+        // catalog for this assembly. The worker service does not read the
+        // outcome: a child's turn end is its completion, the parent verifies.
+        let child_completion = completion_hub.take();
         let context = agent_context(&assembled)?;
         let route = assembled.resolved.route.origin.route.clone();
         let model = assembled.resolved.route.origin.model.clone();
@@ -668,6 +834,14 @@ fn make_child_factory(
             model,
             label.clone(),
         ));
+        let events: Arc<dyn EventSink> = match &child_completion {
+            Some(completion) => Arc::new(ActivityTee::new(
+                renderer.clone(),
+                completion.log.clone(),
+                &assembled.tools,
+            )),
+            None => renderer,
+        };
         let parts = AgentParts {
             provider: assembled.provider,
             tools: assembled.tools,
@@ -676,7 +850,7 @@ fn make_child_factory(
             context,
             authorization: policy.clone(),
             journal: Arc::new(MemoryJournal::new()),
-            events: renderer,
+            events,
         };
         let agent = Agent::new(parts).map_err(|error| error.to_string())?;
         // `InProcessWorkers` assigns `w{n}` after a successful factory call, and

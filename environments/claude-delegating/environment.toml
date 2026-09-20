@@ -23,3 +23,6 @@ module = "worker_result"
 module = "worker_continue"
 [[tools]]
 module = "worker_cancel"
+
+[[tools]]
+module = "finish"

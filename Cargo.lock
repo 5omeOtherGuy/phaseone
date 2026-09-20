@@ -800,6 +800,7 @@ dependencies = [
  "p1-testkit",
  "p1-tool-delegate",
  "p1-tool-edit",
+ "p1-tool-finish",
  "p1-tool-patch",
  "p1-tool-read",
  "p1-tool-search",
@@ -919,6 +920,16 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "p1-tool-finish"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

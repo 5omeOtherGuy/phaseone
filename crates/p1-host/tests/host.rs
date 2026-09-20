@@ -266,8 +266,22 @@ async fn headless_with_yes_writes_the_file() {
 #[tokio::test]
 async fn environments_expose_only_their_own_tools_and_prompt() {
     let workspace = tempdir().unwrap();
-    let claude = ScriptedProvider::new(vec![text_response("claude done")]);
-    let gpt = ScriptedProvider::new(vec![text_response("gpt done")]);
+    let claude = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "f1",
+            "finish",
+            r#"{"status":"done","summary":"looked","verification":["none"]}"#,
+        )]),
+        text_response("claude done"),
+    ]);
+    let gpt = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "f1",
+            "finish",
+            r#"{"status":"done","summary":"looked","verification":["none"]}"#,
+        )]),
+        text_response("gpt done"),
+    ]);
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     harness.deps.catalog_hook = Some(provider_hook(vec![
         ("anthropic-subscription", claude.clone()),
@@ -292,7 +306,7 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         .iter()
         .map(|t| t.name.as_str())
         .collect();
-    assert_eq!(names, ["read", "edit", "write", "grep", "shell"]);
+    assert_eq!(names, ["read", "edit", "write", "grep", "shell", "finish"]);
     assert!(claude_request.system_prompt.contains("`edit`"));
     assert!(!claude_request.system_prompt.contains("apply_patch"));
 
@@ -310,7 +324,7 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
     assert_eq!(code, 0);
     let gpt_request = &gpt.requests()[0];
     let names: Vec<&str> = gpt_request.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, ["shell", "apply_patch"]);
+    assert_eq!(names, ["shell", "apply_patch", "finish"]);
     assert!(gpt_request.system_prompt.contains("apply_patch"));
     assert!(!gpt_request.system_prompt.contains("`edit`"));
     assert!(!gpt_request.system_prompt.contains("`write`"));
@@ -935,6 +949,7 @@ async fn usage_errors_exit_2() {
         sandbox: p1_host::cli::SandboxMode::Off,
         sandbox_write: Vec::new(),
         env_pass: Vec::new(),
+        max_continuations: 3,
     };
     let code = p1_host::run::run(&mut harness.deps, options).await;
 

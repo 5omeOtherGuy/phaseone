@@ -50,6 +50,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0034 | [Workers are not restored when their parent session resumes](0034-workers-are-not-restored-when-their-parent-session-resumes.md) | accepted | 2026-09-20 | lead |
 | ADR-0035 | [The shell tool can run inside a bubblewrap execution boundary](0035-the-shell-tool-can-run-inside-a-bubblewrap-execution-boundary.md) | accepted | 2026-09-20 | lead |
 | ADR-0036 | [Context control is a summarizing policy module with a durable, validated replacement](0036-context-control-is-a-summarizing-policy-module-with-a-durable-validated-replacement.md) | accepted | 2026-09-20 | lead |
+| ADR-0037 | [Unattended runs end by an observable finish call, with bounded continuation](0037-unattended-runs-end-by-an-observable-finish-call-with-bounded-continuation.md) | accepted | 2026-09-20 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

@@ -20,6 +20,7 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 | `routes.md` | Verified wire shapes of the two real provider routes |
 | `tools.md` | Tool modules and the shared workspace helper |
 | `context.md` | Context control: contract and the summarizing policy module |
+| `completion.md` | Turn completion for unattended runs: finish tool, bounded continuation |
 | `providers.md` | Provider modules, shared HTTP/SSE/retry helper, the ONE conformance suite |
 | `assembly.md` | Environment files, catalog, fail-fast assembly, host CLI |
 | `journal.md` | Memory/JSONL stores, sync guarantee, truncated tail, projection, resume, interrupted calls |
