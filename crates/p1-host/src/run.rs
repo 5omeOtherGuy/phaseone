@@ -202,7 +202,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
 
     let cancel = CancellationToken::new();
     let policy: Arc<HostPolicy> = Arc::new(HostPolicy::new(
-        options.yes,
+        options.ask,
         headless,
         deps.lines.clone(),
         deps.stderr.clone(),
@@ -254,10 +254,14 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
 
     let mut environment = load_environment(&options.env, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
-    ensure_cache_key(&mut environment, &workspace);
     let substitutions = substitutions(deps, &workspace);
-    let assembled =
-        assemble(&catalog, &environment, &workspace, &substitutions).map_err(|e| e.to_string())?;
+    let assembled = assemble_with_cache_key(
+        &catalog,
+        &mut environment,
+        &workspace,
+        &substitutions,
+        &completion_hub,
+    )?;
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
     let completion = completion_hub.take();
@@ -838,9 +842,13 @@ fn make_child_factory(
             os: std::env::consts::OS.to_string(),
         };
         let mut environment = environment;
-        ensure_cache_key(&mut environment, &workspace);
-        let assembled = assemble(&catalog, &environment, &workspace, &substitutions)
-            .map_err(|e| e.to_string())?;
+        let assembled = assemble_with_cache_key(
+            &catalog,
+            &mut environment,
+            &workspace,
+            &substitutions,
+            &completion_hub,
+        )?;
         // `InProcessWorkers` assigns `w{n}` after a SUCCESSFUL factory call and
         // factory calls are serialised, so this is the id the service will hand
         // out. The counter is only advanced at the very end: a start that fails
@@ -917,6 +925,31 @@ fn make_child_factory(
         journals.usage.worker_started();
         Ok(ChildAgent { agent, description })
     })
+}
+
+/// Assemble with a host-generated prompt-cache key where the route takes one. Whether it
+/// does is the ROUTE's knowledge, not the host's: the key is offered, and if the assembled
+/// provider's `validate` refuses the environment with it, the environment is assembled again
+/// without it. A key the environment file sets EXPLICITLY is never dropped — a route that
+/// rejects it fails assembly, as any explicit option it cannot carry does.
+fn assemble_with_cache_key(
+    catalog: &Catalog,
+    environment: &mut p1_assembly::EnvironmentFile,
+    workspace: &std::path::Path,
+    substitutions: &Substitutions,
+    completion_hub: &CompletionHub,
+) -> Result<p1_assembly::Assembled, String> {
+    if environment.options.cache_key.is_some() {
+        return assemble(catalog, environment, workspace, substitutions).map_err(|e| e.to_string());
+    }
+    ensure_cache_key(environment, workspace);
+    if let Ok(assembled) = assemble(catalog, environment, workspace, substitutions) {
+        return Ok(assembled);
+    }
+    // The failed attempt may already have issued per-agent completion state.
+    let _ = completion_hub.take();
+    environment.options.cache_key = None;
+    assemble(catalog, environment, workspace, substitutions).map_err(|e| e.to_string())
 }
 
 /// Give the agent a stable provider-side prompt-cache key for its lifetime when the

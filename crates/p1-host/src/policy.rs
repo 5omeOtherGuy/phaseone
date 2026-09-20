@@ -1,8 +1,9 @@
 //! The host's execution authorization policy.
 //!
-//! `--yes` permits everything. Headless without `--yes` permits `ReadOnly` and
-//! denies the rest. Interactive without `--yes` permits `ReadOnly` silently and
-//! asks on the terminal for anything else, racing the turn's cancellation.
+//! Full access is the DEFAULT: without `--ask` every call is permitted, headless
+//! and interactive (ADR-0038). `--ask` opts into the restrictive policy: headless
+//! permits `ReadOnly` and denies the rest; interactive permits `ReadOnly` silently
+//! and asks on the terminal for anything else, racing the turn's cancellation.
 //!
 //! "Ask" lives HERE, inside the policy, so the core never sees UI (D18).
 
@@ -20,7 +21,7 @@ use crate::SharedWriter;
 use crate::render::summarize_input;
 
 /// The exact headless refusal.
-pub const HEADLESS_DENY: &str = "Not permitted in headless mode without --yes.";
+pub const HEADLESS_DENY: &str = "Not permitted in headless mode with --ask.";
 /// The exact interactive refusal for anything but `y`/`a`.
 pub const USER_DENY: &str = "Denied by the user.";
 /// Returned when the turn is cancelled while an ask is outstanding.
@@ -28,7 +29,7 @@ pub const CANCEL_DENY: &str = "Cancelled while awaiting authorization.";
 
 /// The interactive/headless authorization policy.
 pub struct HostPolicy {
-    yes: bool,
+    ask: bool,
     headless: bool,
     lines: Arc<dyn LineSource>,
     stderr: SharedWriter,
@@ -40,14 +41,14 @@ pub struct HostPolicy {
 
 impl HostPolicy {
     pub fn new(
-        yes: bool,
+        ask: bool,
         headless: bool,
         lines: Arc<dyn LineSource>,
         stderr: SharedWriter,
         cancel: CancellationToken,
     ) -> Self {
         Self {
-            yes,
+            ask,
             headless,
             lines,
             stderr,
@@ -67,7 +68,7 @@ impl HostPolicy {
 impl AuthorizationPolicy for HostPolicy {
     fn authorize<'a>(&'a self, request: AuthorizationRequest<'a>) -> BoxFuture<'a, Decision> {
         Box::pin(async move {
-            if self.yes {
+            if !self.ask {
                 return Decision::Permit;
             }
             if request.effect == Effect::ReadOnly {

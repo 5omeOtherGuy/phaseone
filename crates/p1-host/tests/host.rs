@@ -130,7 +130,102 @@ async fn headless_text_turn_known_usage() {
 // ------------------------------------------------------------- (b) policy
 
 #[tokio::test]
-async fn headless_without_yes_denies_write() {
+async fn headless_ask_denies_write() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["read", "write"],
+        "test",
+    );
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "write",
+            "{\"file_path\":\"out.txt\",\"content\":\"hi\"}",
+        )]),
+        text_response("done"),
+    ]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--ask",
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0);
+    assert!(!workspace.path().join("out.txt").exists());
+    assert!(
+        harness
+            .stdout
+            .text()
+            .contains("Not permitted in headless mode with --ask."),
+        "stdout: {}",
+        harness.stdout.text()
+    );
+}
+
+#[tokio::test]
+async fn headless_ask_permits_read() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["read", "write"],
+        "test",
+    );
+    std::fs::write(workspace.path().join("input.txt"), "hello file").unwrap();
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "read",
+            "{\"file_path\":\"input.txt\"}",
+        )]),
+        text_response("done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--ask",
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0);
+    assert!(
+        handle.requests()[1].history.iter().any(
+            |item| matches!(item, Item::ToolResult(result) if result.content.contains("hello file"))
+        ),
+        "the read call must have run"
+    );
+}
+
+#[tokio::test]
+async fn headless_without_flags_runs_write() {
     let workspace = tempdir().unwrap();
     let environments = tempdir().unwrap();
     write_environment(
@@ -165,60 +260,10 @@ async fn headless_without_yes_denies_write() {
     .await;
 
     assert_eq!(code, 0);
-    assert!(!workspace.path().join("out.txt").exists());
-    assert!(
-        harness
-            .stdout
-            .text()
-            .contains("Not permitted in headless mode without --yes."),
-        "stdout: {}",
-        harness.stdout.text()
-    );
-}
-
-#[tokio::test]
-async fn headless_without_yes_permits_read() {
-    let workspace = tempdir().unwrap();
-    let environments = tempdir().unwrap();
-    write_environment(
-        environments.path(),
-        "plain",
-        "fake",
-        "fake-model",
-        &["read", "write"],
-        "test",
-    );
-    std::fs::write(workspace.path().join("input.txt"), "hello file").unwrap();
-    let provider = ScriptedProvider::new(vec![
-        tool_call_response(vec![json_call(
-            "c1",
-            "read",
-            "{\"file_path\":\"input.txt\"}",
-        )]),
-        text_response("done"),
-    ]);
-    let handle = provider.clone();
-    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
-    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
-
-    let code = run_args(
-        &mut harness,
-        &[
-            "--env",
-            "plain",
-            "--workspace",
-            workspace.path().to_str().unwrap(),
-            "go",
-        ],
-    )
-    .await;
-
-    assert_eq!(code, 0);
-    assert!(
-        handle.requests()[1].history.iter().any(
-            |item| matches!(item, Item::ToolResult(result) if result.content.contains("hello file"))
-        ),
-        "the read call must have run"
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("out.txt")).unwrap(),
+        "hi",
+        "full access is the default: no flag means no question"
     );
 }
 
@@ -547,6 +592,7 @@ async fn interactive_always_answer_is_remembered() {
     let code = run_args(
         &mut harness,
         &[
+            "--ask",
             "--env",
             "plain",
             "--workspace",
@@ -560,6 +606,55 @@ async fn interactive_always_answer_is_remembered() {
         std::fs::read_to_string(workspace.path().join("out.txt")).unwrap(),
         "two",
         "the second write must run without a second ask"
+    );
+}
+
+#[tokio::test]
+async fn interactive_without_flags_does_not_ask() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["write"],
+        "test",
+    );
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "write",
+            "{\"file_path\":\"out.txt\",\"content\":\"one\"}",
+        )]),
+        text_response("ok"),
+    ]);
+    // Only the user's prompt: if the policy asked, it would consume this line (or
+    // read EOF) instead of running the call.
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &["go"]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("out.txt")).unwrap(),
+        "one",
+        "full access is the default: the call runs without a question"
+    );
+    assert!(
+        !harness.stderr.text().contains("allow "),
+        "stderr: {}",
+        harness.stderr.text()
     );
 }
 
@@ -703,6 +798,112 @@ async fn delegation_end_to_end_with_fakes() {
         "child output must carry its id prefix; stdout: {}",
         harness.stdout.text()
     );
+}
+
+/// Run one parent that starts a `write`-capable child, with or without `--ask`.
+/// Returns the exit code, whether the child's file exists, the parent's requests
+/// and the child's requests.
+#[cfg(feature = "delegation")]
+async fn run_worker_write(ask: bool) -> (i32, bool, Vec<ProviderRequest>, Vec<ProviderRequest>) {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "parent",
+        "fake-a",
+        "model-a",
+        &["worker_start", "worker_result"],
+        "PARENT",
+    );
+    write_environment(
+        environments.path(),
+        "child",
+        "fake-b",
+        "model-b",
+        &["write"],
+        "CHILD",
+    );
+    let parent = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "worker_start",
+            "{\"environment\":\"child\",\"task\":\"work\"}",
+        )]),
+        // `wait` makes the child finish before the parent continues, so the test
+        // needs no gate and no timing assumption.
+        tool_call_response(vec![json_call(
+            "c2",
+            "worker_result",
+            "{\"id\":\"w1\",\"wait\":true}",
+        )]),
+        text_response("parent done"),
+        text_response("parent notified"),
+    ]);
+    let child = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "write",
+            "{\"file_path\":\"out.txt\",\"content\":\"hi\"}",
+        )]),
+        text_response("child done"),
+    ]);
+    let child_handle = child.clone();
+    let parent_handle = parent.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake-a", parent), ("fake-b", child)]));
+
+    let mut args: Vec<&str> = Vec::new();
+    if ask {
+        args.push("--ask");
+    }
+    args.extend([
+        "--env",
+        "parent",
+        "--workspace",
+        workspace.path().to_str().unwrap(),
+        "go",
+    ]);
+    let code = run_args(&mut harness, &args).await;
+    let exists = workspace.path().join("out.txt").exists();
+    (
+        code,
+        exists,
+        parent_handle.requests(),
+        child_handle.requests(),
+    )
+}
+
+#[cfg(feature = "delegation")]
+#[tokio::test]
+async fn headless_ask_blocks_worker_writes() {
+    // The spec denies EVERYTHING but `ReadOnly` in headless `--ask` runs, and
+    // `worker_start` has `Effect::Delegates`, so a worker cannot even start. This
+    // is the strongest form the criterion's "a worker's write is denied" can take
+    // without bending the spec: no worker write can happen, because no worker runs.
+    let (code, exists, parent_requests, child_requests) = run_worker_write(true).await;
+    assert_eq!(code, 0);
+    assert!(!exists, "the worker's write must not run under --ask");
+    assert!(
+        parent_requests
+            .iter()
+            .any(|request| request.history.iter().any(|item| matches!(
+                item,
+                Item::ToolResult(result) if result.content.contains(p1_host::policy::HEADLESS_DENY)
+            ))),
+        "the parent's worker_start must be denied with the exact headless reason"
+    );
+    assert!(
+        child_requests.is_empty(),
+        "worker_start is denied under --ask headless, so the worker never runs"
+    );
+}
+
+#[cfg(feature = "delegation")]
+#[tokio::test]
+async fn workers_run_writes_without_ask() {
+    let (code, exists, _, _) = run_worker_write(false).await;
+    assert_eq!(code, 0);
+    assert!(exists, "without --ask the worker's write runs");
 }
 
 #[cfg(feature = "delegation")]
@@ -949,7 +1150,7 @@ async fn usage_errors_exit_2() {
         workspace: Some(workspace.path().to_path_buf()),
         session: None,
         resume: true,
-        yes: false,
+        ask: false,
         sandbox: p1_host::cli::SandboxMode::Off,
         sandbox_write: Vec::new(),
         env_pass: Vec::new(),
