@@ -69,13 +69,29 @@ PROGRESS 2026-09-20 late (all merged, CI green on the exact commit):
 - #11 / ADR-0041: headless runs wait and continue after Transport/RateLimited turn ends
   (`--provider-retries`). `deepseek` env has first measured `[context]` values — proven in real
   work (171 requests, 3 summarizations, accepted first round).
-- IN FLIGHT when this was written: 3b route files (`../phaseone-split3b-route-files`, p1 run
-  dir `../phaseone-briefs/runs/split3b-*`); `--sandbox-read` so git works in a sandboxed worktree
-  (`../phaseone-sandbox-read`, repair 1: reject ANCESTORS of credential dirs).
+- Also merged since: 3b route files, `--sandbox-read`, summary-quality fix (#6: truncated
+  summaries never accepted, `[context] summary_output_tokens`, `## Files` section), fanout p1
+  runner = FULL ACCESS by default (`"sandbox": true` opts in; owner authorised). Step-4 spec =
+  `docs/design/routes-and-profiles.md` §7. Owner switched Claude Code to bypassPermissions
+  (no classifier any more): AGENTS.md rules are the only guard — work carefully.
+- IN FLIGHT when this was written (2026-09-20 ~18:45):
+  * split 4a (Anthropic policy → profiles/route file): p1 run, shell task `bem0itt96`,
+    worktree `../phaseone-split4a-anthropic`, run dir `../phaseone-briefs/runs/split4a-20260920-174449/`
+    (brief `../phaseone-briefs/split4a.md`). If the notification is lost: check
+    `pgrep -af "debug/p1"`, then `report.json`/`stdout.txt` there; review diff, merge main,
+    independent gate, merge, `scripts/push-main.sh`, record in `docs/dogfood/runs.jsonl`.
+  * TUI: separate interactive Kimi K3 session (tmux window `kimi-tui`, pane %48, worktree
+    `../phaseone-12-tui`), coordination ONLY via issue #12; its plan is accepted. LEAD OWES
+    (promised on #12, do right after 4a merges): generalise `make_child_factory` to
+    `Arc<dyn AuthorizationPolicy>` + per-child `EventSink` factory, and ONE front-end branch
+    point in `run_agent` (`tui::run` vs `run_interactive`); later a small spec+ADR for
+    `ContextStats` (observation-only context budget numbers). Lead never edits `crates/p1-tui*`
+    or `docs/design/tui/`.
 
 NEXT, in order:
-1. Review + merge 3b and sandbox-read (independent gate each, `scripts/push-main.sh`).
-2. Split step 4: first-party policy extraction (Claude classification/budgets, GPT defaults →
+1. Review + merge 4a; then the host seam for the TUI (above); then 4b = the same for
+   `p1-provider-openai` (brief not written yet; mirror `split4a.md`).
+2. Split step 4 (spec §7): first-party policy extraction (Claude classification/budgets, GPT defaults →
    profiles; claude/gpt envs to `route`+`profile`; characterization tests must stay byte-equal).
    Step 5: `p1-auth` per ADR-0040 (borrow-only, write-back to the source).
 3. `[context]` for glm/claude/gpt envs from runs (glm grew to 203k/request without it) — #6.
