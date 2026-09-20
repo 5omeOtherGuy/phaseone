@@ -48,6 +48,7 @@ pub fn draw(screen: &Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     let mut composer_lines = if screen.composer.visible(focus) {
         composer::lines(
             &screen.composer,
+            &screen.queued,
             screen.working.is_some(),
             area.width as usize,
         )
@@ -90,7 +91,7 @@ pub fn draw(screen: &Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
         body.push(Line::default());
         body.extend(status::lines(groups));
     }
-    draw_lines_bottom(&body, transcript_area, buf, palette::GROUND);
+    draw_lines_bottom(&body, transcript_area, buf, palette::GROUND, screen.scroll);
 
     let composer_area = Rect {
         x: area.x,
@@ -184,8 +185,10 @@ fn draw_lines_bottom(
     area: Rect,
     buf: &mut Buffer,
     bg: ratatui::style::Color,
+    scroll: usize,
 ) {
     let fits = area.height as usize;
-    let start = lines.len().saturating_sub(fits);
-    draw_lines(&lines[start..], area, buf, bg);
+    let start = lines.len().saturating_sub(fits + scroll);
+    let end = lines.len().saturating_sub(scroll).max(start);
+    draw_lines(&lines[start..end], area, buf, bg);
 }

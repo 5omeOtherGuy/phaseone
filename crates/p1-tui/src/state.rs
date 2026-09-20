@@ -6,6 +6,8 @@
 //! direction, carried over from the iris TUI) folds passive chrome away so
 //! the transcript owns the screen; the first edit reveals the composer again.
 
+use std::collections::VecDeque;
+
 use p1_contracts::{AgentEvent, Usage};
 
 use crate::render::picker::Picker;
@@ -251,6 +253,19 @@ pub struct Screen {
     /// arrives with the host's stats seam; until then these stay `None`).
     pub context_view: Option<crate::render::ledger::Context>,
     pub task_view: Option<crate::render::ledger::Task>,
+    /// Steering/follow-up text queued for the next boundary, shown above the
+    /// composer hints so the operator sees what will land.
+    pub queued: VecDeque<Queued>,
+    /// Rows scrolled up from the bottom of the transcript; 0 pins to the
+    /// newest. Any new event or edit resets it — attention is on the live tail.
+    pub scroll: usize,
+}
+
+/// One queued operator input (SPEC §4.2 hints: steering vs follow-up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queued {
+    pub follow_up: bool,
+    pub text: String,
 }
 
 impl Screen {
@@ -315,7 +330,19 @@ impl Screen {
             }
             _ => {}
         }
+        // New output pins the view to the live tail.
+        self.scroll = 0;
         self.transcript.apply(event, None);
+    }
+
+    /// Queue operator input for the next boundary (SPEC §4.2).
+    pub fn queue(&mut self, follow_up: bool, text: String) {
+        self.queued.push_back(Queued { follow_up, text });
+    }
+
+    /// Scroll the transcript `delta` rows up (positive) or down (negative).
+    pub fn scroll_by(&mut self, delta: isize) {
+        self.scroll = self.scroll.saturating_add_signed(delta);
     }
 
     /// A PEEK is a two-line banner that never moves the ledger and never
