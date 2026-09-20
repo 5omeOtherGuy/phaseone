@@ -134,10 +134,16 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             Some(service),
             options.sandbox,
             &options.sandbox_write,
+            &options.env_pass,
         )
     };
     #[cfg(not(feature = "delegation"))]
-    let catalog = build_catalog(deps, options.sandbox, &options.sandbox_write);
+    let catalog = build_catalog(
+        deps,
+        options.sandbox,
+        &options.sandbox_write,
+        &options.env_pass,
+    );
     let environment = match load_environment(name, &deps.environment_dirs) {
         Ok(environment) => environment,
         Err(error) => {
@@ -208,7 +214,12 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         Some(service)
     };
 
-    let catalog = Arc::new(build_catalog(deps, options.sandbox, &options.sandbox_write));
+    let catalog = Arc::new(build_catalog(
+        deps,
+        options.sandbox,
+        &options.sandbox_write,
+        &options.env_pass,
+    ));
     #[cfg(feature = "delegation")]
     {
         let _ = catalog_slot.set(catalog.clone());

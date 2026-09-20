@@ -6,9 +6,13 @@
 //! are captured interleaved in arrival order while the command runs, and the
 //! captured bytes are bounded as they are collected so a flooding command cannot
 //! exhaust memory. Output bounding and the workspace live in `p1-workspace`.
+//!
+//! The child never inherits p1's environment: it is cleared and rebuilt from an
+//! injected snapshot by [`ENV_ALLOW`], [`ENV_ALLOW_PREFIXES`] and the names added
+//! with [`ShellTool::with_env_pass`], sandboxed or not.
 
 use std::collections::VecDeque;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -47,6 +51,39 @@ const SIGTERM_GRACE: Duration = Duration::from_secs(2);
 const SIGKILL_WAIT: Duration = Duration::from_secs(2);
 const GROUP_POLL: Duration = Duration::from_millis(10);
 const READ_BUFFER_BYTES: usize = 16 * 1024;
+
+/// Variable names every command keeps from the snapshot. Everything else the p1
+/// process holds (`API` keys, tokens, agent sockets) is dropped: the shell never
+/// inherits p1's environment.
+pub const ENV_ALLOW: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TERM",
+    "TZ",
+    "COLORTERM",
+    "NO_COLOR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTFLAGS",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_JOBS",
+    "P1_BUILD_LOCK_DIR",
+    "P1_RUSTC_SLOTS",
+    "VIRTUAL_ENV",
+    "NVM_DIR",
+    "JAVA_HOME",
+    "GOPATH",
+    "GOROOT",
+];
+
+/// Variable-name PREFIXES every command keeps from the snapshot.
+pub const ENV_ALLOW_PREFIXES: &[&str] = &["LC_"];
 
 /// The paragraph the model sees when the host turned the sandbox on. Appended to
 /// whatever face the environment gave the tool, so a `with_face` override keeps it.
@@ -127,6 +164,13 @@ pub struct ShellTool {
     face: ToolFace,
     variant: String,
     sandbox: Option<Arc<SandboxRuntime>>,
+    /// The environment a command is rebuilt from. Injected so tests never touch
+    /// the process environment; the default is the process environment at
+    /// construction.
+    env_snapshot: Vec<(OsString, OsString)>,
+    /// Extra variable NAMES the host added on top of [`ENV_ALLOW`] and
+    /// [`ENV_ALLOW_PREFIXES`].
+    env_pass: Vec<String>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
@@ -139,10 +183,53 @@ impl ShellTool {
             face: default_face(),
             variant: "claude".to_string(),
             sandbox: None,
+            env_snapshot: std::env::vars_os().collect(),
+            env_pass: Vec::new(),
             declaration: declaration(default_face()),
             identity: identity("claude"),
         }
         .composed()
+    }
+
+    /// Replace the environment snapshot the command is rebuilt from. The default
+    /// is the process environment at construction; tests inject a snapshot so
+    /// they never mutate the process environment. Composes with `with_face` and
+    /// `sandboxed` in any order.
+    pub fn with_env_snapshot(mut self, snapshot: Vec<(OsString, OsString)>) -> Self {
+        self.env_snapshot = snapshot;
+        self
+    }
+
+    /// Add variable NAMES to the allow-list, on top of [`ENV_ALLOW`] and
+    /// [`ENV_ALLOW_PREFIXES`]. Composes with `with_face` and `sandboxed` in any
+    /// order.
+    pub fn with_env_pass(mut self, names: Vec<String>) -> Self {
+        self.env_pass.extend(names);
+        self
+    }
+
+    /// The child environment: the snapshot filtered by [`ENV_ALLOW`],
+    /// [`ENV_ALLOW_PREFIXES`] and the names added with
+    /// [`ShellTool::with_env_pass`]. A name the snapshot does not hold is simply
+    /// absent; nothing is invented for it.
+    fn allowed_env(&self) -> Vec<(OsString, OsString)> {
+        self.env_snapshot
+            .iter()
+            .filter(|(name, _)| self.allows(name))
+            .cloned()
+            .collect()
+    }
+
+    fn allows(&self, name: &OsStr) -> bool {
+        // A non-UTF-8 name cannot match the (UTF-8) allow-list, so it is dropped.
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        ENV_ALLOW.contains(&name)
+            || ENV_ALLOW_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            || self.env_pass.iter().any(|passed| passed.as_str() == name)
     }
 
     /// Present the same implementation under another name/description and
@@ -394,6 +481,7 @@ impl Tool for ShellTool {
                 tokio::time::sleep(timeout),
                 &context.cancel,
                 self.sandbox.as_deref(),
+                &self.allowed_env(),
             )
             .await
         })
@@ -446,6 +534,7 @@ async fn run(
     expiry: impl Future<Output = ()>,
     cancel: &CancellationToken,
     sandbox: Option<&SandboxRuntime>,
+    env: &[(OsString, OsString)],
 ) -> ToolOutcome {
     let mut expiry = std::pin::pin!(expiry);
     // The sandboxed and unsandboxed paths differ only in the spawned program;
@@ -470,7 +559,13 @@ async fn run(
             bash
         }
     };
+    // The command NEVER inherits p1's environment: the child's is cleared and
+    // rebuilt from the snapshot's allow-list. For bwrap this is the bwrap
+    // process's environment, which it passes on; its `--setenv TMPDIR /tmp` is
+    // still applied inside, after the allow-list.
     builder
+        .env_clear()
+        .envs(env.iter().cloned())
         .current_dir(root)
         // No terminal and no input: a command that reads stdin sees EOF.
         .stdin(Stdio::null())
@@ -731,7 +826,7 @@ impl Capture {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellTool, parse_input, run};
+    use super::{ENV_ALLOW, ENV_ALLOW_PREFIXES, ShellTool, parse_input, run};
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     use p1_contracts::{
@@ -739,6 +834,7 @@ mod tests {
         ToolOutcome, ToolStatus,
     };
     use p1_workspace::{ToolFace, Workspace};
+    use std::ffi::OsString;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -857,6 +953,7 @@ mod tests {
             published,
             &CancellationToken::new(),
             None,
+            &[(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
         )
         .await;
 
@@ -1044,6 +1141,79 @@ mod tests {
         assert_eq!(outcome.status, ToolStatus::Cancelled);
         assert_eq!(outcome.content, "");
         assert!(!dir.path().join("started").exists());
+    }
+
+    /// The allow-list is exactly the spec's list; a later change has to update
+    /// this test rather than widen the boundary silently.
+    #[test]
+    fn env_allow_is_exactly_the_spec_list() {
+        assert_eq!(
+            ENV_ALLOW,
+            &[
+                "PATH",
+                "HOME",
+                "USER",
+                "LOGNAME",
+                "SHELL",
+                "LANG",
+                "LANGUAGE",
+                "TERM",
+                "TZ",
+                "COLORTERM",
+                "NO_COLOR",
+                "CARGO_HOME",
+                "RUSTUP_HOME",
+                "RUSTUP_TOOLCHAIN",
+                "RUSTFLAGS",
+                "CARGO_TARGET_DIR",
+                "CARGO_BUILD_JOBS",
+                "P1_BUILD_LOCK_DIR",
+                "P1_RUSTC_SLOTS",
+                "VIRTUAL_ENV",
+                "NVM_DIR",
+                "JAVA_HOME",
+                "GOPATH",
+                "GOROOT",
+            ]
+        );
+        assert_eq!(ENV_ALLOW_PREFIXES, &["LC_"]);
+    }
+
+    /// Requirement 4: a snapshot with no `PATH` passes nothing for it. The
+    /// filter is the only place that decides, so it is asserted directly here;
+    /// the integration test observes bash's own default instead.
+    #[test]
+    fn a_missing_path_is_not_invented() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellTool::new(Workspace::new(dir.path()).unwrap())
+            .with_env_snapshot(vec![(OsString::from("LC_ALL"), OsString::from("C"))]);
+
+        assert_eq!(
+            tool.allowed_env(),
+            vec![(OsString::from("LC_ALL"), OsString::from("C"))]
+        );
+    }
+
+    #[test]
+    fn the_allow_list_keeps_names_prefixes_and_passed_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = vec![
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("LC_MESSAGES"), OsString::from("C")),
+            (OsString::from("CANARY_TOKEN"), OsString::from("secret-1")),
+            (OsString::from("SSH_AUTH_SOCK"), OsString::from("/x")),
+            (OsString::from("MY_TOOL_HOME"), OsString::from("/opt/t")),
+        ];
+        let tool = ShellTool::new(Workspace::new(dir.path()).unwrap())
+            .with_env_snapshot(snapshot)
+            .with_env_pass(vec!["MY_TOOL_HOME".to_string()]);
+
+        let names: Vec<String> = tool
+            .allowed_env()
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["PATH", "LC_MESSAGES", "MY_TOOL_HOME"]);
     }
 
     #[test]

@@ -51,6 +51,9 @@ pub struct Options {
     /// Extra paths the sandbox keeps writable, absolute and canonicalised when
     /// they exist.
     pub sandbox_write: Vec<PathBuf>,
+    /// Extra environment variable NAMES the `shell` tool passes on, on top of
+    /// its built-in allow-list. Repeatable; a name never contains `=`.
+    pub env_pass: Vec<String>,
 }
 
 impl Options {
@@ -96,6 +99,9 @@ pub fn usage() -> String {
     );
     out.push_str(
         "  --sandbox-write PATH\n                    keep PATH writable in the sandbox (repeatable;\n                    requires --sandbox workspace)\n",
+    );
+    out.push_str(
+        "  --env-pass NAME   pass NAME from p1's environment to shell commands\n                    (repeatable; NAME must not contain `=`)\n",
     );
     out
 }
@@ -144,9 +150,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             }
             "--resume" => resume = true,
             "--yes" => yes = true,
-            // Validated by `parse_sandbox` after the loop; the values are consumed
-            // here so they are not mistaken for prompt words.
-            "--sandbox" | "--sandbox-write" => {
+            // Validated by `parse_sandbox`/`parse_env_pass` after the loop; the
+            // values are consumed here so they are not mistaken for prompt words.
+            "--sandbox" | "--sandbox-write" | "--env-pass" => {
                 take_value(args, &mut index, arg)?;
             }
             other if other.starts_with('-') && other != "-" => {
@@ -164,8 +170,10 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             message: "--resume requires --session".to_string(),
         });
     }
-    // Validate the sandbox flags and keep their parsed state on the options.
+    // Validate the sandbox and env-pass flags and keep their parsed state on the
+    // options.
     let (sandbox, sandbox_write) = parse_sandbox(args)?;
+    let env_pass = parse_env_pass(args)?;
 
     let prompt = if prompt_words.is_empty() {
         None
@@ -182,6 +190,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         yes,
         sandbox,
         sandbox_write,
+        env_pass,
     })
 }
 
@@ -206,7 +215,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
     let mut index = 3;
     while index < args.len() {
         match args[index].as_str() {
-            "--sandbox" | "--sandbox-write" => index += 1,
+            "--sandbox" | "--sandbox-write" | "--env-pass" => index += 1,
             other => {
                 return Err(CliError {
                     message: format!("unexpected argument `{other}`"),
@@ -216,6 +225,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         index += 1;
     }
     let (sandbox, sandbox_write) = parse_sandbox(args)?;
+    let env_pass = parse_env_pass(args)?;
     Ok(Options {
         command: Command::EnvShow { name: name.clone() },
         env: name.clone(),
@@ -225,6 +235,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         yes: false,
         sandbox,
         sandbox_write,
+        env_pass,
     })
 }
 
@@ -278,6 +289,34 @@ fn parse_sandbox(args: &[String]) -> Result<(SandboxMode, Vec<PathBuf>), CliErro
     Ok((mode, writable))
 }
 
+/// Parse the repeatable `--env-pass NAME` flags out of any argument list.
+///
+/// `parse` and `parse_env_show` both use it, so the flag grammar and its usage
+/// errors exist once. `A=B` is a value, not a name, and an empty name is
+/// meaningless, so both are usage errors.
+fn parse_env_pass(args: &[String]) -> Result<Vec<String>, CliError> {
+    let mut names: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--env-pass" {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return Err(CliError {
+                    message: "--env-pass requires a value".to_string(),
+                });
+            };
+            if value.is_empty() || value.contains('=') {
+                return Err(CliError {
+                    message: format!("--env-pass takes a variable NAME without `=`, got `{value}`"),
+                });
+            }
+            names.push(value.clone());
+        }
+        index += 1;
+    }
+    Ok(names)
+}
+
 /// A `--sandbox-write` value: absolute, or relative to the current directory;
 /// canonicalised when the path exists. A path that does not exist is kept as an
 /// absolute path and simply not bound (see `bwrap_args`).
@@ -315,6 +354,7 @@ fn defaults(command: Command) -> Options {
         yes: false,
         sandbox: SandboxMode::Off,
         sandbox_write: Vec::new(),
+        env_pass: Vec::new(),
     }
 }
 
@@ -396,6 +436,22 @@ mod tests {
             }
         );
         assert!(options.yes);
+    }
+
+    #[test]
+    fn parses_env_pass_and_rejects_a_malformed_name() {
+        let options = parse(&args(&["--env-pass", "A", "--env-pass", "B", "go"])).unwrap();
+        assert_eq!(options.env_pass, ["A", "B"]);
+        assert_eq!(
+            options.command,
+            Command::Run {
+                prompt: Some("go".to_string())
+            }
+        );
+
+        assert!(parse(&args(&["--env-pass", "A=B"])).is_err());
+        assert!(parse(&args(&["--env-pass", ""])).is_err());
+        assert!(parse(&args(&["--env-pass"])).is_err());
     }
 
     #[test]

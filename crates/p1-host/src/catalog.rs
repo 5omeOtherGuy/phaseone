@@ -78,11 +78,22 @@ macro_rules! apply_delegate_face {
 /// Provider construction reads no credential file; the credential sources are
 /// resolved lazily on the first `access`. Tools are constructed per agent with
 /// that agent's fresh [`ToolServices`].
-pub fn build_catalog(deps: &HostDeps, sandbox: SandboxMode, sandbox_write: &[PathBuf]) -> Catalog {
+pub fn build_catalog(
+    deps: &HostDeps,
+    sandbox: SandboxMode,
+    sandbox_write: &[PathBuf],
+    env_pass: &[String],
+) -> Catalog {
     #[cfg(feature = "delegation")]
-    return build_catalog_with_workers(deps, deps.worker_service.clone(), sandbox, sandbox_write);
+    return build_catalog_with_workers(
+        deps,
+        deps.worker_service.clone(),
+        sandbox,
+        sandbox_write,
+        env_pass,
+    );
     #[cfg(not(feature = "delegation"))]
-    build_catalog_inner(deps, sandbox, sandbox_write)
+    build_catalog_inner(deps, sandbox, sandbox_write, env_pass)
 }
 
 /// As [`build_catalog`], with the worker tools bound to `service` instead of
@@ -93,10 +104,11 @@ pub fn build_catalog_with_workers(
     service: Option<Arc<dyn p1_workers::WorkerService>>,
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
+    env_pass: &[String],
 ) -> Catalog {
     let mut catalog = Catalog::new();
     register_providers(&mut catalog, deps);
-    register_standard_tools(&mut catalog, deps, sandbox, sandbox_write);
+    register_standard_tools(&mut catalog, deps, sandbox, sandbox_write, env_pass);
     register_delegation_tools(&mut catalog, service);
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
@@ -109,11 +121,12 @@ fn build_catalog_inner(
     deps: &HostDeps,
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
+    env_pass: &[String],
 ) -> Catalog {
     let mut catalog = Catalog::new();
 
     register_providers(&mut catalog, deps);
-    register_standard_tools(&mut catalog, deps, sandbox, sandbox_write);
+    register_standard_tools(&mut catalog, deps, sandbox, sandbox_write, env_pass);
 
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
@@ -158,6 +171,7 @@ fn register_standard_tools(
     deps: &HostDeps,
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
+    env_pass: &[String],
 ) {
     catalog.tool(
         "read",
@@ -202,10 +216,16 @@ fn register_standard_tools(
     let writable = sandbox_write.to_vec();
     let home = deps.home.clone();
     let runtime_dir = deps.runtime_dir.clone();
+    let shell_env = deps.shell_env.clone();
+    let env_pass = env_pass.to_vec();
     catalog.tool(
         "shell",
         Box::new(move |spec: &ToolSpec, services: &ToolServices| {
-            let tool = p1_tool_shell::ShellTool::new(services.workspace.clone());
+            let mut tool = p1_tool_shell::ShellTool::new(services.workspace.clone());
+            if let Some(snapshot) = &shell_env {
+                tool = tool.with_env_snapshot(snapshot.clone());
+            }
+            let tool = tool.with_env_pass(env_pass.clone());
             // The sandbox is applied BEFORE `apply_face!`, so a face override keeps
             // the sandbox paragraph and the `+sandbox` variant.
             let tool = match choice {
