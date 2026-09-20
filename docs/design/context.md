@@ -202,3 +202,13 @@ Evidence that cannot be scripted — that a real model's summary carries constra
 repeated replacements — is a lead-run live check (`P1_LIVE=1`): a canary constraint stated
 once, three forced replacements (tiny `summarize_at_tokens`), then a question only the
 constraint answers. Its result is reported, not assumed.
+
+**Live result, 2026-09-20 (lead, Claude subscription route, `claude-sonnet-5`, medium).** Five
+resumed headless turns with `summarize_at_tokens = 2500`, `keep_recent_tokens = 400`,
+`user_verbatim_tokens = 60`; the rule "every file you create must start with the exact line
+`# zebra-7`" was given in the SECOND user message, so the verbatim budget dropped it and it
+lived only in the summary's `## Constraints and instructions`. After 8 committed replacements
+(rolling, across 4 process restarts) the agent was asked to create a file: its first line was
+`# zebra-7`, and the facts gathered in earlier turns were correct. One run on one route: it
+shows the mechanism works, not how often. Summaries cost 150–480 output tokens each.
+
