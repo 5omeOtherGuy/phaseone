@@ -27,51 +27,53 @@ Only the lead edits this file (D13). Started 2026-09-19.
   checked in the gate. New decisions are ADRs; `DECISIONS.md` is the frozen ledger (ADR-0030).
 
 ## Next — READ FIRST after compaction
-An independent REVIEW of the first slice exists and is the first thing to tackle:
-`/home/phaseonebig/projects/phaseone-review-2026-09-20/REVIEW.md` (+ `reproductions.patch`
-with five reproduction tests, `ci.log`, `gate.log`, other logs). The owner also passed on the
-reviewer's AMENDMENTS to the lead's plan — authoritative, in full at
-`../phaseone-briefs/plan-amendments-from-reviewer-2026-09-20.md`. Order:
-0. HARDENING CHECKPOINT — DONE 2026-09-20 (merge `ec2ae81`, gate green 573 tests, CI green
-   on that exact commit). All seven findings R1-R7 valid and fixed; the reviewer's five
-   reproductions are in the suites with assertions unchanged; R2 (refresh deadlock) was
-   additionally reproduced by the lead. Table: `docs/review-2026-09-20-dispositions.md`.
-   ADR-0031 (session file owned before read). Open departures are issues #1 (workspace
-   ownership), #2 (changed-route resume), #3 (child sessions not restored).
-1. DONE 2026-09-20: issue #1 workspace ownership (ADR-0032, shared WriteGate — file tools only,
-   shell NOT covered); issues #2/#3 resume decisions (ADR-0033 changed origin rejected in the
-   core; ADR-0034 workers not restored, ids reserved, user+model told). All on main, CI green.
-1b. DONE 2026-09-20 (workers deepseek/sol via scripts/fanout.py; lead: specs, review, live checks):
-   - Shell sandbox (ADR-0035): `--sandbox workspace`, `--sandbox-write PATH`; bubblewrap; default
-     still off. Open follow-up: issue #4 (commands inherit the host environment).
-   - Context control (ADR-0036, spec `docs/design/context.md`): new ContextPolicy contract, core
-     validation, `p1-context` (28 frozen sol tests), `[context]` + `summarize.md` per environment.
-     LIVE canary passed (constraint only inside the summary obeyed after 8 replacements).
-     Shipped environments still WITHOUT `[context]` — pick values from dogfooding.
-   - Run evidence: `scripts/run-report.py`, `scripts/dogfood.sh`, `docs/dogfood/`.
-1c. DONE: dogfood runs 1 (claude, accepted) and 2 (gpt, accepted after one repair turn — the
-   lead's diff read found a UTF-8 chunk-boundary bug the agent's own tests missed); both are
-   p1's own changes to p1 (read tool streams; long lines capped). Records: docs/dogfood/runs.jsonl.
-   Shell env allow-list (#4) merged. `scripts/push-main.sh` = push + wait for CI on that SHA
-   (CI was red twice after local-green merges: bwrap and login-profile differences).
-1d. DONE 2026-09-20: Codex caching (#7: session_id/conversation_id headers; live A/B 9-27 % →
-   57-69 % cached, routes.md); turn completion (ADR-0037, docs/design/completion.md: `finish`
-   tool in all shipped environments, exit 3 blocked / 4 stalled, `--max-continuations`; live on
-   both routes; the continuation path itself only proven by scripted tests).
-NEXT (plan order): more supervised dogfood runs on real p1 issues (now WITH finish; record
-   each in docs/dogfood/runs.jsonl; group findings in #6) → choose `[context]` values for the
-   shipped environments from those numbers → T1 measurement (fixed task set, repeated, parent+
-   child tokens — child usage is still not summed: make that a worker job first) → host
-   cleanup around the state transitions → model cards for sol / deepseek from evidence.jsonl.
-2. Dogfood under supervision; run-level evidence grouped into issues; shell non-zero exits
-   recorded separately from tool failures; look at Codex caching here.
-3. Context-control policy module (spec requirements listed in the amendments, item 4).
-4. Turn-completion policy with the narrowed promise (item 5); explicit resume decisions as
-   ADRs (item 7: changed-route resume; child sessions are not restored).
-5. T1 measurement (item 6). Host cleanup after the correctness work; model cards for sol/glm-5.3.
-Disk: the owner handles disk space (55 GB free after their cleanup on 2026-09-20). Never touch
-`~/brain-tools-wt`; remove own worktrees promptly.
-Rule learned (R7): before reporting "CI green", check the run whose headSha is the FINAL commit.
+State 2026-09-20 evening: main = green gate + green CI on the exact commit (always push with
+`scripts/push-main.sh`). ADRs 0031–0040. No lead worktree open; only Astra's
+`../phaseone-9-subscription-routes`. Owner messages arrive mid-turn; Astra sits in tmux pane %39 (codex).
+
+HOW THE LEAD WORKS NOW (owner instructions, also in memory):
+- Implementation goes to deepseek workers by default (`scripts/fanout.py <jobs.json>`, briefs and
+  outputs in `../phaseone-briefs/`); same-session repairs via `session` + `prompt_file`. Lead
+  keeps: specs, ADRs, diff review, adversarial tests, live checks, merges. Typical job: $0.01–0.15.
+- Full access is the DEFAULT in p1 (ADR-0038, `--ask` opts out). The auto-mode classifier
+  BLOCKED dispatching a change that makes fanout's p1 runner unsandboxed by default — not worked
+  around; the runner sandboxes always; owner may authorise explicitly.
+- Goal (owner): as soon as the cheap routes exist, run development jobs THROUGH p1
+  (`"runner": "p1"` in a fanout job) and watch the harness closely; every job is a dogfood run
+  → record in `docs/dogfood/runs.jsonl` (`scripts/run-report.py`), group findings in issue #6.
+
+DONE since the review (all merged): review R1–R7 + dispositions; write gate (#1); resume
+decisions (#2/#3); shell sandbox (ADR-0035); context control (ADR-0036, live canary ok, shipped
+envs still WITHOUT `[context]`); shell env allow-list (#4); read tool streams + long lines +
+`file_path` (dogfood runs 1–3, all p1's own changes, all accepted, run 2 after a repair turn);
+Codex cache headers (#7: 9–27 % → 57–69 %); turn completion = `finish` tool + bounded
+continuation (ADR-0037) and its usability revision; worker usage files (#8); fanout p1 runner;
+full-access default + cache key OFFERED not imposed.
+
+OWNER DECISIONS 2026-09-20 (ADR-0039, ADR-0040; note `docs/design/notes/2026-09-20-provider-split.md`):
+- Provider = wire adapter × route (data) × model profile (data + few compiled strategies, new
+  crate `p1-model-profile`), ONE runtime `Provider`; environment names `route` + `profile`.
+- RESHAPE FIRST: Astra reshapes `p1-provider-openai-chat` (note's step 2) BEFORE merging; told
+  so on issue #9 — CHECK #9 between jobs, Astra only talks there.
+- Credentials: `~/.config/p1/auth.json` keyed by route, env var wins, borrow other tools' logins
+  for now, no login command yet, macOS later.
+
+NEXT, in order:
+1. When Astra's step 2 lands: build p1, smoke `--env deepseek` / `--env glm` in a sandboxed
+   clone (`scripts/dogfood.sh`), then move lead jobs to `"runner": "p1"`.
+2. Provider split step 1 (lead/worker): characterization tests of today's first-party request/
+   replay behaviour. Step 3: profile selection + data-driven routes + assembly validation
+   (spec first; includes replacing `assemble_with_cache_key`'s retry-on-any-error with an
+   explicit cache-key policy on the resolved route, and rejecting the Anthropic adapter's
+   silent raise of an explicit output cap). Step 4: first-party policy extraction. Step 5:
+   credential module (`p1-auth`), precedence env → store → borrowed; write-back to the source.
+3. Choose `[context]` values for shipped environments from dogfood numbers (runs grew to
+   ~90k tokens, 2.8M input/run, 97 % cached on Claude) — issue #6.
+4. T1 measurement (fixed task set, repeated, parent+worker tokens now available), host
+   cleanup around the state transitions, model cards from `~/.agents/skills/model-cards/evidence.jsonl`.
+Known small debts: `codex exec` needs `< /dev/null`; owner's opencode auth.json may hold a
+`zai` entry opencode ignores (told the owner); local branch cleanup uses `git branch -D` after
+merge (tracking makes `-d` refuse).
 
 ## Blocked
 - nothing
