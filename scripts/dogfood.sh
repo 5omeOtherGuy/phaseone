@@ -20,7 +20,10 @@ clone=$root/$label run=$root/$label.run
 mkdir -p "$run"
 git clone -q --local "$repo" "$clone"
 git -C "$clone" checkout -q --detach "$base"
-if [ -x "$clone/scripts/local-cargo-config.sh" ]; then (cd "$clone" && scripts/local-cargo-config.sh >/dev/null 2>&1 || true); fi
+# A p1 clone builds into its OWN target/ (inside the sandbox's writable area), seeded with
+# hardlinks from the shared target. Run THIS checkout's script: run from inside the clone it
+# would take the clone for the main checkout and point the target dir outside of it.
+if [ -f "$clone/scripts/local-cargo-config.sh" ]; then "$here/scripts/local-cargo-config.sh" "$clone" >/dev/null; fi
 p1=${P1_BIN:-$here/../phaseone-target/debug/p1}
 [ -x "$p1" ] || { echo "no p1 binary at $p1 — run: cargo build -p p1-host" >&2; exit 2; }
 locks=/tmp/p1-build-locks-$(id -u); mkdir -p "$locks"
