@@ -64,7 +64,7 @@ async fn a_write_landing_before_a_queued_edit_is_seen_not_overwritten() {
     fs::write(&file, "one\n").unwrap();
     let gate = WriteGate::new();
     let worker = agent(dir.path(), &gate);
-    let read = json(&worker.read, serde_json::json!({"path": "notes.txt"})).await;
+    let read = json(&worker.read, serde_json::json!({"file_path": "notes.txt"})).await;
     assert_eq!(read.status, ToolStatus::Ok, "{read:?}");
 
     // Another agent is in the middle of a mutation…
@@ -97,7 +97,7 @@ async fn a_write_landing_before_a_queued_edit_is_seen_not_overwritten() {
 async fn add_line_with_edit(tools: &AgentTools, line: &str) -> usize {
     let mut rereads = 0;
     loop {
-        let read = json(&tools.read, serde_json::json!({"path": "log.txt"})).await;
+        let read = json(&tools.read, serde_json::json!({"file_path": "log.txt"})).await;
         assert_eq!(read.status, ToolStatus::Ok, "{read:?}");
         let outcome = json(
             &tools.edit,

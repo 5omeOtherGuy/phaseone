@@ -56,7 +56,7 @@ async fn the_report_counts_what_the_journal_holds() {
         tool_call_response(vec![
             json_call("c1", "shell", r#"{"command":"echo fine"}"#),
             json_call("c2", "shell", r#"{"command":"echo broken >&2; exit 3"}"#),
-            json_call("c3", "read", r#"{"path":"missing.txt"}"#),
+            json_call("c3", "read", r#"{"file_path":"missing.txt"}"#),
             json_call("c4", "write", r#"{"file_path":"out.txt","content":"hi"}"#),
             json_call("c5", "no_such_tool", "{}"),
         ]),

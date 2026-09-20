@@ -63,7 +63,7 @@ async fn edit_requires_a_read_then_consecutive_edits_need_no_reread() {
     );
 
     assert_eq!(
-        call(&t.read, r#"{"path":"a.rs"}"#).await.status,
+        call(&t.read, r#"{"file_path":"a.rs"}"#).await.status,
         ToolStatus::Ok
     );
     let first = call(
@@ -93,7 +93,7 @@ async fn a_file_changed_behind_the_agents_back_must_be_read_again() {
     let path = dir.path().join("notes.txt");
     fs::write(&path, "one\n").unwrap();
     let t = tools(dir.path());
-    call(&t.read, r#"{"path":"notes.txt"}"#).await;
+    call(&t.read, r#"{"file_path":"notes.txt"}"#).await;
     fs::write(&path, "one\nadded by someone else\n").unwrap();
 
     let edit = call(
@@ -164,11 +164,11 @@ async fn no_tool_escapes_the_workspace_by_any_route() {
     let abs = outside.path().join("secret.txt");
 
     for json in [
-        r#"{"path":"../secret.txt"}"#.to_string(),
-        r#"{"path":"link/secret.txt"}"#.to_string(),
-        r#"{"path":"file_link"}"#.to_string(),
-        r#"{"path":"a/../../secret.txt"}"#.to_string(),
-        format!(r#"{{"path":"{}"}}"#, abs.display()),
+        r#"{"file_path":"../secret.txt"}"#.to_string(),
+        r#"{"file_path":"link/secret.txt"}"#.to_string(),
+        r#"{"file_path":"file_link"}"#.to_string(),
+        r#"{"file_path":"a/../../secret.txt"}"#.to_string(),
+        format!(r#"{{"file_path":"{}"}}"#, abs.display()),
     ] {
         let out = call(&t.read, &json).await;
         assert_eq!(out.status, ToolStatus::Error, "{json} -> {}", out.content);
@@ -201,7 +201,7 @@ async fn a_read_file_swapped_for_an_outside_symlink_is_refused() {
     let inside = dir.path().join("f.txt");
     fs::write(&inside, "same text\n").unwrap();
     let t = tools(dir.path());
-    call(&t.read, r#"{"path":"f.txt"}"#).await;
+    call(&t.read, r#"{"file_path":"f.txt"}"#).await;
 
     fs::remove_file(&inside).unwrap();
     symlink(outside.path().join("target.txt"), &inside).unwrap();
@@ -224,7 +224,7 @@ async fn crlf_and_missing_final_newline_survive_an_edit() {
     let path = dir.path().join("win.txt");
     fs::write(&path, "alpha\r\nbeta\r\ngamma").unwrap();
     let t = tools(dir.path());
-    call(&t.read, r#"{"path":"win.txt"}"#).await;
+    call(&t.read, r#"{"file_path":"win.txt"}"#).await;
     let out = call(
         &t.edit,
         r#"{"file_path":"win.txt","old_string":"beta","new_string":"BETA"}"#,
@@ -240,7 +240,7 @@ async fn ambiguous_and_missing_matches_change_nothing() {
     let path = dir.path().join("dup.txt");
     fs::write(&path, "x = 1\nx = 1\n").unwrap();
     let t = tools(dir.path());
-    call(&t.read, r#"{"path":"dup.txt"}"#).await;
+    call(&t.read, r#"{"file_path":"dup.txt"}"#).await;
 
     let twice = call(
         &t.edit,
@@ -335,7 +335,7 @@ async fn large_files_are_windowed_and_bounded() {
     fs::write(dir.path().join("big.txt"), &body).unwrap();
     let t = tools(dir.path());
 
-    let first = call(&t.read, r#"{"path":"big.txt"}"#).await;
+    let first = call(&t.read, r#"{"file_path":"big.txt"}"#).await;
     assert!(
         first.content.starts_with("     1\tline 1\n"),
         "{:?}",
@@ -347,7 +347,11 @@ async fn large_files_are_windowed_and_bounded() {
             .contains("[3000 more lines; continue with offset=2001]"),
         "missing trailer"
     );
-    let window = call(&t.read, r#"{"path":"big.txt","offset":4999,"limit":10}"#).await;
+    let window = call(
+        &t.read,
+        r#"{"file_path":"big.txt","offset":4999,"limit":10}"#,
+    )
+    .await;
     assert_eq!(
         window.content.trim_end(),
         "  4999\tline 4999\n  5000\tline 5000"
@@ -362,7 +366,7 @@ async fn a_byte_bounded_window_still_tells_the_model_where_to_continue() {
     fs::write(dir.path().join("wide.txt"), &body).unwrap();
     let t = tools(dir.path());
 
-    let out = call(&t.read, r#"{"path":"wide.txt"}"#).await;
+    let out = call(&t.read, r#"{"file_path":"wide.txt"}"#).await;
     assert!(out.content.len() < 51_000, "{} bytes", out.content.len());
     let trailer = out.content.lines().last().unwrap().to_string();
     let shown = out.content.lines().count() - 1;
@@ -376,7 +380,7 @@ async fn a_byte_bounded_window_still_tells_the_model_where_to_continue() {
     );
     let next = call(
         &t.read,
-        &format!(r#"{{"path":"wide.txt","offset":{}}}"#, shown + 1),
+        &format!(r#"{{"file_path":"wide.txt","offset":{}}}"#, shown + 1),
     )
     .await;
     assert!(
