@@ -93,7 +93,7 @@ what it wrote.
   take a `ToolFace { name, description }` override so another family can present the same
   implementation differently (seams §4 variant rule); schema stays with the implementation.
 
-## `read`  — `{"path": string, "offset"?: int>=1 (default 1), "limit"?: int>=1 (default 2000)}`
+## `read`  — `{"file_path": string, "offset"?: int>=1 (default 1), "limit"?: int>=1 (default 2000)}`
 Returns lines `offset..offset+limit` formatted `<line number right-aligned to 6>\t<text>`
 (donor format). Records the FULL file contents as observed. Errors: missing file, directory,
 binary file (contains NUL in the first 8 KiB: `<path> is a binary file.`), outside workspace.

@@ -11,7 +11,7 @@ async fn read(root: &std::path::Path, name: &str) -> p1_contracts::ToolOutcome {
     let call = ToolCall {
         call_id: "c".into(),
         name: "read".into(),
-        input: ToolInput::Json(format!(r#"{{"path":"{name}"}}"#)),
+        input: ToolInput::Json(format!(r#"{{"file_path":"{name}"}}"#)),
     };
     tool.execute(
         &call,
