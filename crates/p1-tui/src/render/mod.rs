@@ -5,14 +5,12 @@
 
 pub mod transcript;
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-
-use crate::palette;
 
 /// Pad a line to exactly `width` cells with spaces on `bg`, so a background
 /// block (fold output, peek banner) reads as one surface, not stripes.
-pub fn fill(line: Line<'static>, width: usize, bg: ratatui::style::Color) -> Line<'static> {
+pub fn fill(line: Line<'static>, width: usize, bg: Color) -> Line<'static> {
     let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
     let mut line = line;
     if used < width {

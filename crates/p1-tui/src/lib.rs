@@ -11,5 +11,6 @@ pub mod glyphs;
 pub mod grid;
 pub mod palette;
 pub mod render;
+pub mod state;
 pub mod transcript;
 pub mod wrap;
