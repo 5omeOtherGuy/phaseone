@@ -49,6 +49,16 @@ impl ObservedFiles {
 }
 pub enum Observation { NeverObserved, Unchanged, ChangedSinceObserved }
 
+/// One writer at a time among the agents that SHARE it (a parent and its workers; wired by
+/// `p1-assembly`, one per catalog). Every mutating file tool holds it from reading the file's
+/// current contents until its write is recorded, so the staleness check and the write are one
+/// step across agents (ADR-0032). Not held by `shell`.
+pub struct WriteGate;
+impl Workspace {
+    pub fn with_write_gate(self, gate: WriteGate) -> Self;
+    pub fn begin_mutation(&self) -> Mutation<'_>;           // guard; synchronous, blocking-thread only
+}
+
 /// Bound text shown to the model: at most `max_bytes` (cut on a char boundary) and
 /// `max_lines`; when cut, append `\n[output truncated: showing <shown> of <total> bytes]`.
 pub fn bound_output(text: &str, max_bytes: usize, max_lines: usize) -> String;

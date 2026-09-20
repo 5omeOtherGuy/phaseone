@@ -19,4 +19,4 @@ p1-tool-search = { path = "../p1-tool-search" }
 p1-tool-shell = { path = "../p1-tool-shell" }
 p1-tool-patch = { path = "../p1-tool-patch" }
 tempfile = "3"
-tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }

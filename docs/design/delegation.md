@@ -56,8 +56,12 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
 - Cancelling the parent's service (`shutdown()`) cancels every running child and joins the
   tasks; dropping it does the same best-effort. Child authorization: the parent's policy
   object is shared, so `--yes` or an "always" grant applies and a headless deny stays a deny.
-- Children share the parent's workspace by default. Concurrent writers are the model's
-  responsibility in this slice (stated in the tool description); worktree isolation is later.
+- Children share the parent's workspace by default. Their FILE-TOOL mutations are serialized
+  with the parent's and each other's (one `WriteGate` per catalog, ADR-0032): check-and-write
+  is one step across agents, so nobody silently overwrites a change they have not seen — the
+  later writer gets the ordinary stale-file error. Shell commands are not covered: the tool
+  description and the prompt still tell the model not to give overlapping files to workers.
+  Isolation (a worktree per child) is later.
 
 ## Model-facing tools (`p1-tool-delegate`, effect `Delegates`)
 

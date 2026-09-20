@@ -6,12 +6,14 @@
 //! root *after* symlink resolution (see [`Workspace::resolve`]). This is an
 //! invariant of the tools, not a policy the host may relax.
 
+mod gate;
 mod observe;
 mod path;
 mod text;
 
 use std::path::{Path, PathBuf};
 
+pub use gate::{Mutation, WriteGate};
 pub use observe::{Observation, ObservedFiles};
 pub use text::{bound_output, write_atomic};
 
@@ -59,6 +61,7 @@ pub enum WorkspaceError {
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    writes: WriteGate,
 }
 
 impl Workspace {
@@ -73,11 +76,32 @@ impl Workspace {
         if !canonical.is_dir() {
             return Err(WorkspaceError::NotADirectory(canonical));
         }
-        Ok(Self { root: canonical })
+        Ok(Self {
+            root: canonical,
+            writes: WriteGate::new(),
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Serialize this workspace's mutations with everyone else holding `gate` —
+    /// the other agents of the same process. A fresh workspace has a gate of its
+    /// own, which is right for a single agent.
+    pub fn with_write_gate(mut self, gate: WriteGate) -> Self {
+        self.writes = gate;
+        self
+    }
+
+    pub fn write_gate(&self) -> &WriteGate {
+        &self.writes
+    }
+
+    /// Take the write gate for one mutation: from reading the file's current
+    /// contents until the write is recorded. See [`WriteGate`].
+    pub fn begin_mutation(&self) -> Mutation<'_> {
+        self.writes.begin_mutation()
     }
 
     /// Resolve a model-supplied path (workspace-relative, or absolute) to a
