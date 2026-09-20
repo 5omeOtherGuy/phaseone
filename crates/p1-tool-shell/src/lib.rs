@@ -11,6 +11,8 @@
 //! injected snapshot by [`ENV_ALLOW`], [`ENV_ALLOW_PREFIXES`] and the names added
 //! with [`ShellTool::with_env_pass`], sandboxed or not.
 
+mod filter;
+
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::ExitStatusExt;
@@ -31,7 +33,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 const NAME: &str = "shell";
-const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.";
+const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test) is summarised unless `raw: true` is passed.";
 const DEFAULT_TIMEOUT_SECONDS: i64 = 120;
 const MIN_TIMEOUT_SECONDS: i64 = 1;
 const MAX_TIMEOUT_SECONDS: i64 = 3_600;
@@ -550,6 +552,11 @@ fn input_schema() -> serde_json::Value {
                 "maximum": 3600,
                 "default": 120,
                 "description": "Seconds before the command and its process group are killed."
+            },
+            "raw": {
+                "type": "boolean",
+                "default": false,
+                "description": "Return the full, unfiltered output instead of the summary."
             }
         },
         "required": ["command"],
@@ -563,6 +570,9 @@ struct ShellInput {
     command: String,
     #[serde(default)]
     timeout_seconds: Option<i64>,
+    /// Skip the structured output filter: the model asked for the full log.
+    #[serde(default)]
+    raw: bool,
 }
 
 impl Tool for ShellTool {
@@ -607,8 +617,11 @@ impl Tool for ShellTool {
                 timeout,
                 tokio::time::sleep(timeout),
                 &context.cancel,
-                self.sandbox.as_deref(),
-                &self.allowed_env(),
+                Spawn {
+                    sandbox: self.sandbox.as_deref(),
+                    env: &self.allowed_env(),
+                },
+                input.raw,
             )
             .await
         })
@@ -651,6 +664,13 @@ enum End {
     Cancelled,
 }
 
+/// How the command's process is spawned: the environment it is rebuilt from
+/// and, when the host turned it on, the sandbox around it.
+struct Spawn<'a> {
+    sandbox: Option<&'a SandboxRuntime>,
+    env: &'a [(OsString, OsString)],
+}
+
 /// `expiry` is the timeout as a future, so a test can fire it on an observed
 /// condition instead of racing the shell's start-up against a wall clock;
 /// `timeout` is only what the footer reports.
@@ -660,13 +680,13 @@ async fn run(
     timeout: Duration,
     expiry: impl Future<Output = ()>,
     cancel: &CancellationToken,
-    sandbox: Option<&SandboxRuntime>,
-    env: &[(OsString, OsString)],
+    spawn: Spawn<'_>,
+    raw: bool,
 ) -> ToolOutcome {
     let mut expiry = std::pin::pin!(expiry);
     // The sandboxed and unsandboxed paths differ only in the spawned program;
     // process group, stdin, capture, timeout, kill and footers are shared.
-    let mut builder = match sandbox {
+    let mut builder = match spawn.sandbox {
         Some(runtime) => {
             let mut bwrap = Command::new("bwrap");
             bwrap
@@ -692,7 +712,7 @@ async fn run(
     // still applied inside, after the allow-list.
     builder
         .env_clear()
-        .envs(env.iter().cloned())
+        .envs(spawn.env.iter().cloned())
         .current_dir(root)
         // No terminal and no input: a command that reads stdin sees EOF.
         .stdin(Stdio::null())
@@ -702,7 +722,11 @@ async fn run(
     let mut child = match builder.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let program = if sandbox.is_some() { "bwrap" } else { "bash" };
+            let program = if spawn.sandbox.is_some() {
+                "bwrap"
+            } else {
+                "bash"
+            };
             return ToolOutcome::error(format!("failed to start {program}: {error}"));
         }
     };
@@ -754,9 +778,11 @@ async fn run(
     };
 
     let timed_out_footer = format!("[timed out after {} s]", timeout.as_secs());
+    // A cancelled or timed-out command is an incomplete run with no exit
+    // status: its output is never summarised.
     match end {
-        End::Cancelled => return render(capture, "[cancelled]", ToolStatus::Cancelled),
-        End::TimedOut => return render(capture, &timed_out_footer, ToolStatus::Error),
+        End::Cancelled => return render(capture, "[cancelled]", ToolStatus::Cancelled, None),
+        End::TimedOut => return render(capture, &timed_out_footer, ToolStatus::Error, None),
         End::Closed => {}
     }
 
@@ -766,11 +792,11 @@ async fn run(
         biased;
         _ = cancel.cancelled() => {
             terminate(&mut child, pgid).await;
-            return render(capture, "[cancelled]", ToolStatus::Cancelled);
+            return render(capture, "[cancelled]", ToolStatus::Cancelled, None);
         }
         _ = &mut expiry => {
             terminate(&mut child, pgid).await;
-            return render(capture, &timed_out_footer, ToolStatus::Error);
+            return render(capture, &timed_out_footer, ToolStatus::Error, None);
         }
         status = child.wait() => status,
     };
@@ -778,18 +804,33 @@ async fn run(
     match status {
         Ok(status) => {
             if let Some(code) = status.code() {
-                render(capture, &format!("[exit code: {code}]"), ToolStatus::Ok)
+                // The seam: the filter only ever sees a COMPLETED command, and
+                // `exit_ok` is true only for exit code 0.
+                let filter = Filter {
+                    command,
+                    raw,
+                    exit_ok: code == 0,
+                };
+                render(
+                    capture,
+                    &format!("[exit code: {code}]"),
+                    ToolStatus::Ok,
+                    Some(filter),
+                )
             } else if let Some(signal) = status.signal() {
+                // Killed before it could exit: no output to summarise.
                 render(
                     capture,
                     &format!("[terminated by signal {signal}]"),
                     ToolStatus::Error,
+                    None,
                 )
             } else {
                 render(
                     capture,
                     "[terminated by an unknown signal]",
                     ToolStatus::Error,
+                    None,
                 )
             }
         }
@@ -838,18 +879,55 @@ async fn wait_for_empty_group(group: Pid, until: tokio::time::Instant) {
     }
 }
 
+/// A completed command whose output may be summarised: what ran, whether the
+/// model asked for the full log, and whether it exited 0. Absent for an
+/// incomplete run (cancellation, timeout, a signal) — there is no complete
+/// output to summarise then.
+#[derive(Clone, Copy)]
+struct Filter<'a> {
+    command: &'a str,
+    raw: bool,
+    exit_ok: bool,
+}
+
+impl Filter<'_> {
+    /// The model-visible body: the summary plus its marker line when a filter
+    /// applied, the raw body when none did (unrecognised command, decline,
+    /// panic, no reduction) or `raw: true` was passed.
+    fn apply<'a>(&self, body: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.raw {
+            return std::borrow::Cow::Borrowed(body);
+        }
+        match filter::filter_output(self.command, body, self.exit_ok) {
+            Some(summary) => std::borrow::Cow::Owned(format!("{summary}\n{FILTERED_MARKER}")),
+            None => std::borrow::Cow::Borrowed(body),
+        }
+    }
+}
+
 /// Render captured output plus a footer as the model-visible content.
-fn render(capture: Capture, footer: &str, status: ToolStatus) -> ToolOutcome {
+fn render(
+    capture: Capture,
+    footer: &str,
+    status: ToolStatus,
+    filter: Option<Filter<'_>>,
+) -> ToolOutcome {
     let bytes = capture.into_bytes();
     let text = String::from_utf8_lossy(&bytes);
     // The footer goes on its own line without an extra blank line after the
     // command's usual trailing newline.
     let body = text.trim_end_matches('\n');
+    // The structured filter runs BEFORE the byte bound: a summary is the
+    // smaller, more useful body to squeeze when it is still too long.
+    let body = match filter {
+        Some(filter) => filter.apply(body),
+        None => std::borrow::Cow::Borrowed(body),
+    };
     // Lossy decoding can TRIPLE the size of binary output (each bad byte becomes
     // U+FFFD), pushing already-capped bytes past the content bound. Squeeze the body
     // — head and tail kept, like the collector — and never bound the footer: the exit
     // code must survive however noisy the output was.
-    let body = squeeze(body, MAX_OUTPUT_BYTES - FOOTER_RESERVE);
+    let body = squeeze(&body, MAX_OUTPUT_BYTES - FOOTER_RESERVE);
     let content = if body.is_empty() {
         footer.to_string()
     } else {
@@ -859,6 +937,10 @@ fn render(capture: Capture, footer: &str, status: ToolStatus) -> ToolOutcome {
 }
 
 const FOOTER_RESERVE: usize = 2_000;
+
+/// Last line of a summarised result, before the exit-code footer. The raw log
+/// stays one call away, which is what makes summarising safe.
+const FILTERED_MARKER: &str = "[output filtered; pass raw:true for the full log]";
 
 /// Keep the first and last halves of `text` (cut on char boundaries) when it exceeds `max`.
 fn squeeze(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
@@ -953,7 +1035,7 @@ impl Capture {
 
 #[cfg(test)]
 mod tests {
-    use super::{ENV_ALLOW, ENV_ALLOW_PREFIXES, ShellTool, parse_input, run};
+    use super::{ENV_ALLOW, ENV_ALLOW_PREFIXES, ShellTool, Spawn, parse_input, run};
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     use p1_contracts::{
@@ -1079,8 +1161,11 @@ mod tests {
             Duration::from_secs(1),
             published,
             &CancellationToken::new(),
-            None,
-            &[(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+            Spawn {
+                sandbox: None,
+                env: &[(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+            },
+            false,
         )
         .await;
 
@@ -1187,6 +1272,8 @@ mod tests {
         assert_eq!(schema["properties"]["timeout_seconds"]["minimum"], 1);
         assert_eq!(schema["properties"]["timeout_seconds"]["maximum"], 3600);
         assert_eq!(schema["properties"]["timeout_seconds"]["default"], 120);
+        assert_eq!(schema["properties"]["raw"]["type"], "boolean");
+        assert_eq!(schema["properties"]["raw"]["default"], false);
     }
 
     #[test]
