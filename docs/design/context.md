@@ -140,6 +140,12 @@ the history (the marker) and `last_usage`. A crash during summarization leaves n
 resumed agent meets the same threshold and tries again. A committed `ContextReplaced` IS the
 history on resume (journal.md projection rule), with `last_usage` restored.
 
+**Rulings (after the independent test author's ambiguity list, 2026-09-20).** Rendered blocks
+are separated by ONE blank line. `<status>` in a result heading is the snake_case name the
+journal uses (`ok`, `error`, `unavailable`, `denied`, `cancelled`, `unknown`). "Under the wall"
+is inclusive (`<=`). `User`/`Inbox` items after the last unit belong to the tail and are always
+kept. Validation and soft-failure reason texts are free, except the `Failed` message at the wall.
+
 ## 3. Assembly and host
 
 `environment.toml` gains an optional table; absent = passthrough, as today:
