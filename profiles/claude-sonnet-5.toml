@@ -1,0 +1,11 @@
+# What the model is, independent of the route that reaches it (ADR-0039).
+id       = "claude-sonnet-5"
+revision = 1
+model_id = "claude-sonnet-5"
+family   = "claude"
+thinking = "effort-level"
+
+efforts = ["low", "medium", "high", "extra_high", "max"]
+
+# default_effort: absent — an effort-less request carries no thinking fields.
+# context_tokens and max_output_tokens: unknown for this model, so stated nowhere.
