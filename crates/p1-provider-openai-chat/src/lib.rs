@@ -4,8 +4,8 @@ mod parser;
 mod request;
 
 use p1_contracts::{
-    BoxFuture, CancellationToken, Effort, Origin, Provider, ProviderError, ProviderRequest,
-    ProviderStream, RouteDescription,
+    BoxFuture, CacheKeySupport, CancellationToken, Effort, Origin, Provider, ProviderError,
+    ProviderRequest, ProviderStream, RouteDescription,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_http::{
@@ -180,6 +180,14 @@ impl Provider for ChatProvider {
             supports_freeform_tools: false,
             mandatory_prompt_prefix: None,
             reports_cost: false,
+            // `options.cache_key` is consumed exactly as the route's session
+            // header; a route without one takes no key at all (validate rejects
+            // an explicit key on such a route).
+            cache_key: if self.route.session_header.is_some() {
+                CacheKeySupport::Optional
+            } else {
+                CacheKeySupport::Unsupported
+            },
         }
     }
     fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {

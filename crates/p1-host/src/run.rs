@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use p1_assembly::Catalog;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
-    BoxFuture, CancellationToken, CommitSink, ContextError, ContextInput, ContextPolicy, EventSink,
-    JournalRecord, Prepared, TurnEnd,
+    BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError, ContextInput,
+    ContextPolicy, EventSink, JournalRecord, Prepared, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, ResumeReport};
 #[cfg(feature = "delegation")]
@@ -252,16 +252,10 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         let _ = catalog_slot.set(catalog.clone());
     }
 
-    let mut environment = load_environment(&options.env, &deps.environment_dirs)
+    let environment = load_environment(&options.env, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
     let substitutions = substitutions(deps, &workspace);
-    let assembled = assemble_with_cache_key(
-        &catalog,
-        &mut environment,
-        &workspace,
-        &substitutions,
-        &completion_hub,
-    )?;
+    let assembled = assemble_with_cache_key(&catalog, &environment, &workspace, &substitutions)?;
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
     let completion = completion_hub.take();
@@ -841,14 +835,8 @@ fn make_child_factory(
             date: date.clone(),
             os: std::env::consts::OS.to_string(),
         };
-        let mut environment = environment;
-        let assembled = assemble_with_cache_key(
-            &catalog,
-            &mut environment,
-            &workspace,
-            &substitutions,
-            &completion_hub,
-        )?;
+        let assembled =
+            assemble_with_cache_key(&catalog, &environment, &workspace, &substitutions)?;
         // `InProcessWorkers` assigns `w{n}` after a SUCCESSFUL factory call and
         // factory calls are serialised, so this is the id the service will hand
         // out. The counter is only advanced at the very end: a start that fails
@@ -927,43 +915,47 @@ fn make_child_factory(
     })
 }
 
-/// Assemble with a host-generated prompt-cache key where the route takes one. Whether it
-/// does is the ROUTE's knowledge, not the host's: the key is offered, and if the assembled
-/// provider's `validate` refuses the environment with it, the environment is assembled again
-/// without it. A key the environment file sets EXPLICITLY is never dropped — a route that
-/// rejects it fails assembly, as any explicit option it cannot carry does.
+/// Assemble one agent under the host's explicit cache-key policy (ADR-0039): the
+/// RESOLVED route decides. A key is generated only when the environment sets
+/// none and the resolved provider reports [`CacheKeySupport::Optional`]; a key
+/// the environment file sets EXPLICITLY is passed through untouched, and a route
+/// that cannot carry it fails assembly, as any explicit option it cannot carry
+/// does. Exactly ONE assembly runs — the provider and the tools are each built
+/// once — and an assembly error is reported as it is: there is no second attempt
+/// to drop a key, because the description already said whether one is taken.
 fn assemble_with_cache_key(
     catalog: &Catalog,
-    environment: &mut p1_assembly::EnvironmentFile,
+    environment: &p1_assembly::EnvironmentFile,
     workspace: &std::path::Path,
     substitutions: &Substitutions,
-    completion_hub: &CompletionHub,
 ) -> Result<p1_assembly::Assembled, String> {
-    if environment.options.cache_key.is_some() {
-        return assemble(catalog, environment, workspace, substitutions).map_err(|e| e.to_string());
-    }
-    ensure_cache_key(environment, workspace);
-    if let Ok(assembled) = assemble(catalog, environment, workspace, substitutions) {
-        return Ok(assembled);
-    }
-    // The failed attempt may already have issued per-agent completion state.
-    let _ = completion_hub.take();
-    environment.options.cache_key = None;
-    assemble(catalog, environment, workspace, substitutions).map_err(|e| e.to_string())
+    let name = environment.name.clone();
+    let configured = environment.options.clone();
+    p1_assembly::assemble_with_route_options(
+        catalog,
+        environment,
+        workspace,
+        substitutions,
+        |route| {
+            let mut options = configured.clone();
+            if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {
+                options.cache_key = Some(generated_cache_key(&name, workspace));
+            }
+            options
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
-/// Give the agent a stable provider-side prompt-cache key for its lifetime when the
-/// environment sets none. Without one the Codex route served 0 cached tokens across a
-/// whole task (measured 2026-09-20); routes without such a key ignore it.
-fn ensure_cache_key(environment: &mut p1_assembly::EnvironmentFile, workspace: &std::path::Path) {
+/// A fresh provider-side prompt-cache key for one agent. Without one the Codex
+/// route served 0 cached tokens across a whole task (measured 2026-09-20);
+/// routes without such a key never see it.
+fn generated_cache_key(environment: &str, workspace: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
-    if environment.options.cache_key.is_some() {
-        return;
-    }
     static AGENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     workspace.hash(&mut hasher);
-    environment.name.hash(&mut hasher);
+    environment.hash(&mut hasher);
     std::process::id().hash(&mut hasher);
     AGENTS
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -971,5 +963,5 @@ fn ensure_cache_key(environment: &mut p1_assembly::EnvironmentFile, workspace: &
     if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         now.as_nanos().hash(&mut hasher);
     }
-    environment.options.cache_key = Some(format!("p1-{:016x}", hasher.finish()));
+    format!("p1-{:016x}", hasher.finish())
 }

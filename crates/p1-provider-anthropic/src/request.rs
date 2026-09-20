@@ -70,12 +70,43 @@ fn manual_budget(effort: p1_contracts::Effort) -> u32 {
     }
 }
 
+/// The conflict an EXPLICIT output cap can have with a manual thinking budget:
+/// the API requires `budget_tokens < max_tokens`, so a cap the budget meets or
+/// exceeds cannot be honoured. Rejected by `validate` and `build_request` with
+/// the smallest cap that would work (ADR-0039); an unspecified cap is never in
+/// conflict — it is derived in [`build_request`] as before.
+pub(crate) fn explicit_cap_conflict(
+    model: &str,
+    options: &p1_contracts::ModelOptions,
+) -> Option<ProviderError> {
+    let effort = options.reasoning_effort?;
+    let cap = options.max_output_tokens?;
+    if is_adaptive(model) {
+        return None;
+    }
+    let budget = manual_budget(effort);
+    (budget >= cap).then(|| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            format!(
+                "max_output_tokens {cap} leaves no room for the thinking budget {budget}: the \
+                 Messages API requires budget_tokens < max_tokens, so the smallest cap that works \
+                 is {} (or omit max_output_tokens and one is derived)",
+                budget + 1
+            ),
+        )
+    })
+}
+
 /// Translate a request into the Messages body. Pure: no credentials, no I/O and
 /// no route validation (that is [`AnthropicProvider::validate`]).
 ///
 /// Returns [`ProviderErrorKind::InvalidRequest`] when the history would start an
 /// assistant turn: the API requires the first message to be user-role.
 pub fn build_request(model: &str, request: &ProviderRequest) -> Result<Value, ProviderError> {
+    if let Some(error) = explicit_cap_conflict(model, &request.options) {
+        return Err(error);
+    }
     let mut max_tokens = request
         .options
         .max_output_tokens
@@ -101,7 +132,8 @@ pub fn build_request(model: &str, request: &ProviderRequest) -> Result<Value, Pr
                 "manual budget below the API floor"
             );
             // The API rejects `budget_tokens >= max_tokens`; raise the output cap
-            // rather than reducing the requested thinking budget.
+            // rather than reducing the requested thinking budget. An EXPLICIT cap
+            // this would swallow was rejected above; this is the derived default.
             if budget >= max_tokens {
                 max_tokens = budget + MANUAL_OUTPUT_MARGIN;
             }

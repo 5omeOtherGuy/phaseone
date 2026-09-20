@@ -199,15 +199,21 @@ fn manual_thinking_budgets_and_the_output_margin() {
 }
 
 #[test]
-fn an_explicit_output_cap_is_raised_to_keep_budget_below_max_tokens() {
+fn an_explicit_output_cap_below_the_thinking_budget_is_rejected_by_build_request() {
+    // ADR-0039: an explicit cap the manual thinking budget would meet or exceed
+    // is a rejected conflict, no longer silently raised to budget + 8192.
     let mut request = with_effort(vec![user("hi")], Effort::Low);
     request.options.max_output_tokens = Some(2_000);
-    let built = build_request("claude-sonnet-4-6", &request).unwrap();
-    assert_eq!(
-        built["thinking"],
-        json!({ "type": "enabled", "budget_tokens": 4_096 })
-    );
-    assert_eq!(built["max_tokens"], json!(4_096 + 8_192));
+    let error = build_request("claude-sonnet-4-6", &request).unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    for part in [
+        "max_output_tokens 2000".to_string(),
+        "thinking budget 4096".to_string(),
+        // The smallest cap that leaves room for the budget.
+        "is 4097".to_string(),
+    ] {
+        assert!(error.message.contains(&part), "{}: {}", error, part);
+    }
 }
 
 #[test]

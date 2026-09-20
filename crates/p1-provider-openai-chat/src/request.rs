@@ -50,13 +50,37 @@ pub(crate) fn validate(
             ));
         }
     }
-    if request.options.native.keys().any(|key| {
-        key.starts_with("openai-chat.") || key.starts_with(&format!("{}.", route.origin_route))
-    }) {
-        return Err(invalid("unknown native option in chat route namespace"));
+    // Namespaces this adapter owns: the generic `openai-chat.` one and this
+    // route's own id. No native option is known in this slice, so any key there
+    // is an error.
+    let own_namespaces = [
+        format!("{}.", route.origin_route),
+        "openai-chat.".to_string(),
+    ];
+    for key in request.options.native.keys() {
+        if own_namespaces.iter().any(|prefix| key.starts_with(prefix)) {
+            return Err(invalid("unknown native option in chat route namespace"));
+        }
+        // Another adapter's namespace is an explicit preference this route
+        // cannot consume; dropping it silently is the portability trap the
+        // adapter/route split exists to remove (ADR-0039).
+        if FOREIGN_NATIVE_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return Err(invalid(&format!(
+                "option \"{key}\" is not consumed by route \"{}\" (adapter openai-chat): \
+                 it belongs to another adapter's namespace",
+                route.origin_route
+            )));
+        }
     }
     Ok(())
 }
+
+/// Namespaces the OTHER compiled adapters own inside `ModelOptions::native`.
+/// Keys in no adapter's namespace keep their meaning: ignored.
+const FOREIGN_NATIVE_PREFIXES: &[&str] = &["anthropic-messages.", "openai-responses."];
 
 /// Pure wire builder. Foreign reasoning is dropped, never rendered as assistant text.
 pub fn build_request(
@@ -253,6 +277,77 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn a_native_option_in_another_adapters_namespace_is_an_error() {
+        let route = crate::test_config::route(false);
+        let profile = crate::test_config::profile(false);
+        for key in ["anthropic-messages.thinking", "openai-responses.verbosity"] {
+            let mut r = request();
+            r.options.native.insert(key.into(), json!(true));
+            let error = build_request(&route, "m", &profile, &r).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{key}");
+            for part in [
+                format!("option \"{key}\""),
+                "route \"openai-chat/opencode-go-subscription\"".to_string(),
+                "(adapter openai-chat)".to_string(),
+            ] {
+                assert!(error.message.contains(&part), "{}: {}", error, part);
+            }
+        }
+    }
+    #[test]
+    fn describe_reports_cache_key_support_from_the_session_header() {
+        use crate::ChatProvider;
+        use p1_contracts::{CacheKeySupport, Provider};
+        let session = ChatProvider::new(
+            crate::test_config::route(false),
+            "m",
+            std::sync::Arc::new(crate::test_config::profile(false)),
+            std::sync::Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            std::sync::Arc::new(Fixed),
+        )
+        .unwrap();
+        let no_session = ChatProvider::new(
+            crate::test_config::route(true),
+            "m",
+            std::sync::Arc::new(crate::test_config::profile(true)),
+            std::sync::Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            std::sync::Arc::new(Fixed),
+        )
+        .unwrap();
+        assert_eq!(session.describe().cache_key, CacheKeySupport::Optional);
+        assert_eq!(
+            no_session.describe().cache_key,
+            CacheKeySupport::Unsupported
+        );
+    }
+
+    struct Fixed;
+    impl p1_provider_http::CredentialSource for Fixed {
+        fn access<'a>(
+            &'a self,
+        ) -> p1_contracts::BoxFuture<'a, Result<p1_provider_http::Credential, ProviderError>>
+        {
+            Box::pin(async {
+                Ok(p1_provider_http::Credential {
+                    bearer: "TEST".into(),
+                    account_id: None,
+                })
+            })
+        }
+        fn refresh<'a>(
+            &'a self,
+            _rejected: &'a p1_provider_http::Credential,
+        ) -> p1_contracts::BoxFuture<'a, Result<p1_provider_http::Credential, ProviderError>>
+        {
+            Box::pin(async {
+                Ok(p1_provider_http::Credential {
+                    bearer: "TEST".into(),
+                    account_id: None,
+                })
+            })
+        }
     }
     #[test]
     fn glm_effort_and_output_limits_match_the_documented_wire() {

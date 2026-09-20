@@ -10,11 +10,11 @@ use std::task::{Context, Poll};
 
 use p1_contracts::{
     AgentEvent, AssistantBlock, AssistantItem, AuthorizationPolicy, AuthorizationRequest,
-    BoxFuture, CancellationToken, CommitError, CommitSink, CompletedResponse, ContextError,
-    ContextInput, ContextPolicy, Decision, DeclarationKind, Effect, EventSink, Item, JournalRecord,
-    Origin, Outcome, Prepared, Provider, ProviderError, ProviderRequest, ProviderStream,
-    RouteDescription, StopReason, StreamEvent, Tool, ToolCall, ToolContext, ToolDeclaration,
-    ToolIdentity, ToolInput, ToolOutcome, Usage,
+    BoxFuture, CacheKeySupport, CancellationToken, CommitError, CommitSink, CompletedResponse,
+    ContextError, ContextInput, ContextPolicy, Decision, DeclarationKind, Effect, EventSink, Item,
+    JournalRecord, Origin, Outcome, Prepared, Provider, ProviderError, ProviderRequest,
+    ProviderStream, RouteDescription, StopReason, StreamEvent, Tool, ToolCall, ToolContext,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, Usage,
 };
 use tokio::sync::Notify;
 
@@ -146,6 +146,8 @@ impl Provider for ScriptedProvider {
             supports_freeform_tools: true,
             mandatory_prompt_prefix: None,
             reports_cost: false,
+            // The fake consumes no cache key, so a host generates none for it.
+            cache_key: CacheKeySupport::Unsupported,
         }
     }
 
