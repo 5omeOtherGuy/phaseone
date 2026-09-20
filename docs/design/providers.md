@@ -95,6 +95,23 @@ Both adapters REUSE the owner's existing CLI logins; p1 has no login flow in thi
 
 Tests use temp files with fake tokens and a `ScriptedTransport` for the refresh endpoint.
 
+(Since ADR-0039 step 5 the sources themselves live in `p1-auth` — `docs/design/credentials.md`;
+the rules above are unchanged.)
+
+## An exhausted account (ADR-0046)
+
+A 401/403 whose body says the account has no balance is NOT an authentication failure.
+- `ProviderErrorKind::InsufficientBalance`, message exactly `the account has no balance`
+  (a constant — the server's text is never copied, sliced or formatted into it).
+- The chat adapter's `on_http_error` takes candidate words from `/error/type`, `/error/code`,
+  top-level `/type` and `/code` of a JSON body (strings only), lower-cases them and looks them up
+  in a fixed allow-list: `creditserror`, `insufficient_balance`, `insufficient_quota`,
+  `quota_exceeded`, `billing_error`. A hit → the new kind. No hit, no JSON, empty body → exactly
+  today's behaviour.
+- The shared driver finishes immediately on this kind: no credential refresh, no retry, ONE
+  HTTP request in total. The host's turn-level retry (completion.md §3b) does not cover it.
+- The host prints the message as it prints any provider error; exit code as for any failed run.
+
 ## The ONE conformance suite — `p1-provider-conformance`
 
 ```rust

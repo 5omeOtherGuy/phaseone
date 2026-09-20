@@ -283,6 +283,12 @@ impl ResponseParser for ChatParser {
         _headers: &[(String, String)],
         body: &[u8],
     ) -> ProviderError {
+        // A 401/403 whose body says the account has no balance is not a rejected
+        // key (ADR-0046): refreshing the credential cannot help, so the operator
+        // must read the balance, not a key error.
+        if matches!(status, 401 | 403) && names_no_balance(body) {
+            return ProviderError::new(ProviderErrorKind::InsufficientBalance, NO_BALANCE_MESSAGE);
+        }
         let context = serde_json::from_slice::<Value>(body).ok().is_some_and(|v| {
             v.pointer("/error/code").and_then(Value::as_str) == Some("context_length_exceeded")
         });
@@ -298,6 +304,34 @@ impl ResponseParser for ChatParser {
         };
         ProviderError::new(kind, format!("chat HTTP status {status}"))
     }
+}
+
+/// The whole text of an exhausted-account error: the server's words are a lookup
+/// key only, never copied, sliced or formatted into the message (ADR-0046).
+const NO_BALANCE_MESSAGE: &str = "the account has no balance";
+
+/// The fixed allow-list of error words that mean "this account has no balance".
+/// A guess about wire shapes nobody could call live: an unknown shape falls back
+/// to the status-based classification, which is safe and merely unhelpful.
+const NO_BALANCE_WORDS: [&str; 5] = [
+    "creditserror",
+    "insufficient_balance",
+    "insufficient_quota",
+    "quota_exceeded",
+    "billing_error",
+];
+
+/// Whether an error body names a no-balance word in one of the four fixed
+/// positions. The body is classification input: a non-JSON, empty or differently
+/// shaped body is simply not a hit.
+fn names_no_balance(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    ["/error/type", "/error/code", "/type", "/code"]
+        .iter()
+        .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .any(|word| NO_BALANCE_WORDS.contains(&word.to_ascii_lowercase().as_str()))
 }
 
 fn map_usage(value: &Value) -> Usage {

@@ -325,6 +325,18 @@ class RunReportTest(unittest.TestCase):
         self.assertIs(record["input_total_complete"], False)
         self.assertIs(record["worker_usage_known"], True)
         self.assertEqual(record["label"], "t")
+        # Which build ran is the caller's knowledge: null unless passed, never guessed.
+        self.assertIsNone(record["harness_head"])
+        self.assertIsNone(record["binary_sha256"])
+
+    def test_cli_records_the_build_identity_it_is_given(self) -> None:
+        path = self.write_journal("session.jsonl", PARENT_RECORDS)
+        done = subprocess.run([sys.executable, SCRIPT, path, "--harness-head", "abc1234",
+                               "--binary-sha256", "f" * 64], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        record = json.loads(done.stdout)
+        self.assertEqual(record["harness_head"], "abc1234")
+        self.assertEqual(record["binary_sha256"], "f" * 64)
 
 
 if __name__ == "__main__":

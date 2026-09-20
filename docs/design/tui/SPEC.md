@@ -429,3 +429,18 @@ parts to treat as fixed — they are the vocabulary everything else is built fro
   destructiveness classification (not a UI-side pattern match).
 - `AgentEvent` has no usage-seeding on resume: the ledger's SPEND starts fresh
   after `--resume` (the seam does not expose the restored `last_usage`).
+
+
+## 9. Static home (owner selection, 2026-09-21)
+
+The unused welcome area centers the static synapse-dot p1 mark, with the lowercase
+p below the top of the taller 1. `phaseone` and `We love pie` appear underneath.
+The mark uses the approved SVG node layout, rendered with terminal dots and thin
+connections. Small viewports use a compact mark or plain-text branding.
+
+This replaces the awakening animation at the owner's request: no cortex, neural
+field, orbiting agents, animation or easter eggs. The welcome prelude, composer,
+right pane and existing conversation/overlay suppression retain their behavior.
+
+Inspect actual cells without credentials or a provider:
+`cargo run -p p1-tui --example home_preview -- 120 40 > /tmp/home.svg`.

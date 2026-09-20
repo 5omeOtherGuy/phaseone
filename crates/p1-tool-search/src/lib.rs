@@ -3,8 +3,10 @@
 //!
 //! `ignore` provides the `.gitignore`-aware walk and the glob filter, and
 //! `grep` (regex + searcher) does the matching, so no `rg` binary is needed.
-//! Confinement and output bounding live in `p1-workspace`; this module owns the
-//! declaration, input validation and the grouped rendering.
+//! Confinement lives in `p1-workspace`; this module owns the declaration, input
+//! validation, the grouped rendering and the bounding of its own result — the
+//! shared output bound is applied to whole file blocks, and a footer says what
+//! is missing.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,13 +21,15 @@ use p1_contracts::{
     BoxFuture, CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
-use p1_workspace::{ToolFace, Workspace, bound_output};
+use p1_workspace::{ToolFace, Workspace};
 use serde::Deserialize;
 
 const NAME: &str = "grep";
 const DESCRIPTION: &str = "Search workspace files with a regular expression.\n`mode:\"content\"` (default) groups matching lines by file, with up to `context` surrounding lines; `mode:\"files\"` lists the matching paths, or every file matching `glob` when `pattern` is empty.\nHonours .gitignore, skips hidden and binary files, and never follows symlinks.";
-const MAX_OUTPUT_BYTES: usize = 50_000;
-const MAX_OUTPUT_LINES: usize = 2_000;
+/// The shared output bound (`bound_output`'s defaults). `grep` bounds its own
+/// result to it, so the bound is also part of this crate's interface.
+pub const MAX_OUTPUT_BYTES: usize = 50_000;
+pub const MAX_OUTPUT_LINES: usize = 2_000;
 const DEFAULT_CONTEXT: usize = 0;
 const MAX_CONTEXT: usize = 10;
 /// A NUL anywhere in this prefix marks a file as binary when listing files.
@@ -188,9 +192,9 @@ impl Tool for GrepTool {
             // All filesystem work runs on a blocking thread; the async thread is
             // never used for synchronous I/O.
             match tokio::task::spawn_blocking(move || run(&workspace, &input, &cancel)).await {
-                Ok(Ok(content)) => {
-                    ToolOutcome::ok(bound_output(&content, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES))
-                }
+                // `run` bounds its own rendering, so the footer that says what
+                // is missing survives.
+                Ok(Ok(content)) => ToolOutcome::ok(content),
                 Ok(Err(SearchFailure::Message(message))) => ToolOutcome::error(message),
                 Ok(Err(SearchFailure::Cancelled)) => ToolOutcome {
                     status: ToolStatus::Cancelled,
@@ -272,7 +276,7 @@ fn run(
                 .filter(|(_, path)| !looks_binary(path))
                 .map(|(display, _)| display)
                 .collect();
-            Ok(render_files(matched))
+            Ok(render_files(&matched))
         }
         Mode::Files => search_files(&matcher, &files, cancel),
     }
@@ -386,28 +390,200 @@ fn search_files(
             matched.push(display.clone());
         }
     }
-    Ok(render_files(matched))
+    Ok(render_files(&matched))
+}
+
+/// One rendered result unit — a whole file block in content mode, one path in
+/// files mode — with the path a footer can name and the newlines its text
+/// contains (the units the shared bound counts).
+struct Block<'a> {
+    path: &'a str,
+    text: String,
+    newlines: usize,
 }
 
 fn render_content(groups: &[FileHits]) -> String {
-    let mut blocks = Vec::with_capacity(groups.len());
-    for group in groups {
-        let mut block = group.path.clone();
-        for hit in &group.hits {
-            block.push('\n');
-            let separator = if hit.is_match { ':' } else { '-' };
-            block.push_str(&format!("{}{separator}{}", hit.line, hit.text));
-        }
-        blocks.push(block);
+    let blocks: Vec<Block<'_>> = groups
+        .iter()
+        .map(|group| Block {
+            path: group.path.as_str(),
+            text: render_block(group),
+            newlines: group.hits.len(),
+        })
+        .collect();
+    let joined = join_blocks(&blocks, "\n\n");
+    if within_bound(joined.len(), newlines(&joined)) {
+        return joined;
     }
-    blocks.join("\n\n")
+    match keep_whole_blocks(&blocks, "\n\n") {
+        Some(bounded) => bounded,
+        // Not even the first file's block fits.
+        None => cut_first_block(&groups[0], groups.len() - 1),
+    }
 }
 
-fn render_files(matched: Vec<String>) -> String {
+fn render_files(matched: &[String]) -> String {
     if matched.is_empty() {
         return "No matches.".to_string();
     }
-    matched.join("\n")
+    let blocks: Vec<Block<'_>> = matched
+        .iter()
+        .map(|path| Block {
+            path: path.as_str(),
+            text: path.clone(),
+            newlines: 0,
+        })
+        .collect();
+    let joined = join_blocks(&blocks, "\n");
+    if within_bound(joined.len(), newlines(&joined)) {
+        return joined;
+    }
+    match keep_whole_blocks(&blocks, "\n") {
+        Some(bounded) => bounded,
+        // A single path is far shorter than the bound, so this is unreachable;
+        // keeping it whole is the only honest answer if it ever happened.
+        None => blocks[0].text.clone(),
+    }
+}
+
+/// One file's block: the path on its own line, then a hit line per match or
+/// context line.
+fn render_block(group: &FileHits) -> String {
+    let mut block = String::with_capacity(group.path.len());
+    block.push_str(&group.path);
+    for hit in &group.hits {
+        block.push('\n');
+        push_hit(&mut block, hit);
+    }
+    block
+}
+
+fn push_hit(out: &mut String, hit: &Hit) {
+    let separator = if hit.is_match { ':' } else { '-' };
+    out.push_str(&format!("{}{separator}{}", hit.line, hit.text));
+}
+
+fn join_blocks(blocks: &[Block<'_>], separator: &str) -> String {
+    let mut out = String::new();
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            out.push_str(separator);
+        }
+        out.push_str(&block.text);
+    }
+    out
+}
+
+fn newlines(text: &str) -> usize {
+    text.matches('\n').count()
+}
+
+/// The shared output bound, for a result that ends with the footer line and so
+/// has no trailing newline: at most `MAX_OUTPUT_BYTES` bytes and fewer than
+/// `MAX_OUTPUT_LINES` newlines. This is exactly the set of results
+/// `bound_output` hands back unchanged.
+fn within_bound(bytes: usize, newlines: usize) -> bool {
+    bytes <= MAX_OUTPUT_BYTES && newlines < MAX_OUTPUT_LINES
+}
+
+/// Keep whole blocks, in walk order, while each one still leaves room for the
+/// footer that replaces everything after it. `None` when not even the first
+/// block fits.
+fn keep_whole_blocks(blocks: &[Block<'_>], separator: &str) -> Option<String> {
+    let separator_newlines = newlines(separator);
+    let mut kept = String::new();
+    let mut kept_newlines = 0;
+    let mut last = None;
+    for (index, block) in blocks.iter().enumerate() {
+        let before = kept.len();
+        if index > 0 {
+            kept.push_str(separator);
+            kept_newlines += separator_newlines;
+        }
+        kept.push_str(&block.text);
+        kept_newlines += block.newlines;
+        let footer = footer_after(block.path, blocks.len() - index - 1);
+        if !within_bound(kept.len() + 1 + footer.len(), kept_newlines + 1) {
+            kept.truncate(before);
+            break;
+        }
+        last = Some(index);
+    }
+    let index = last?;
+    Some(format!(
+        "{kept}\n{}",
+        footer_after(blocks[index].path, blocks.len() - index - 1)
+    ))
+}
+
+/// The first block alone is over the bound: show its path line and as many
+/// whole hit lines as fit, and name the last line shown. A line that does not
+/// fit is dropped, so the cut stays at a line boundary; only the first line has
+/// no boundary before it, and when it alone is larger than the whole bound its
+/// text is cut instead — on a character boundary, like every other bounded
+/// tool.
+fn cut_first_block(group: &FileHits, more_files: usize) -> String {
+    let path = group.path.as_str();
+    let mut body = path.to_string();
+    let mut body_newlines = 0;
+    let mut shown_line = None;
+    for hit in &group.hits {
+        let footer = footer_inside(path, hit.line, more_files);
+        let mut line = String::new();
+        push_hit(&mut line, hit);
+        let mut candidate = String::with_capacity(body.len() + 1 + line.len());
+        candidate.push_str(&body);
+        candidate.push('\n');
+        candidate.push_str(&line);
+        if within_bound(candidate.len() + 1 + footer.len(), body_newlines + 2) {
+            body = candidate;
+            body_newlines += 1;
+            shown_line = Some(hit.line);
+            continue;
+        }
+        if shown_line.is_none()
+            && let Some(prefix) = cut_to_fit(&body, body_newlines, &line, &footer)
+        {
+            body.push('\n');
+            body.push_str(&prefix);
+            shown_line = Some(hit.line);
+        }
+        break;
+    }
+    // Every group has at least one hit. When even the path line fills the
+    // bound, the footer still names the first line that did not fit.
+    let line = shown_line.unwrap_or_else(|| group.hits.first().map_or(0, |hit| hit.line));
+    format!("{body}\n{}", footer_inside(path, line, more_files))
+}
+
+/// The longest character-boundary prefix of one rendered `line` that still
+/// leaves room for `footer` after `body`, or `None` when none does.
+fn cut_to_fit(body: &str, body_newlines: usize, line: &str, footer: &str) -> Option<String> {
+    let room = MAX_OUTPUT_BYTES.saturating_sub(body.len() + 2 + footer.len());
+    let mut end = room.min(line.len());
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 || !within_bound(body.len() + 1 + end + 1 + footer.len(), body_newlines + 2) {
+        return None;
+    }
+    Some(line[..end].to_string())
+}
+
+/// The footer when whole blocks were kept: the last path shown, and how many
+/// matching files follow it.
+fn footer_after(last_path: &str, more_files: usize) -> String {
+    format!(
+        "[truncated after {last_path}; {more_files} more matching files not shown; narrow with path or glob]"
+    )
+}
+
+/// The footer when even the first block did not fit: the path, the last line
+/// shown inside it, and how many matching files follow it.
+fn footer_inside(path: &str, line: u64, more_files: usize) -> String {
+    format!(
+        "[truncated inside {path} after line {line}; {more_files} more matching files not shown; narrow with path, glob or a stricter pattern]"
+    )
 }
 
 fn content_searcher(context: usize) -> Searcher {
@@ -511,12 +687,14 @@ impl Sink for FirstMatchSink {
 
 #[cfg(test)]
 mod tests {
-    use super::{GrepTool, parse_input};
+    use super::{
+        GrepTool, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, newlines, parse_input, within_bound,
+    };
     use p1_contracts::{
         CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput,
         ToolOutcome, ToolStatus,
     };
-    use p1_workspace::{ToolFace, Workspace};
+    use p1_workspace::{ToolFace, Workspace, bound_output};
     use std::path::Path;
 
     fn workspace(root: &Path) -> Workspace {
@@ -847,5 +1025,35 @@ mod tests {
             input: ToolInput::Text("anything".into()),
         };
         assert!(parse_input("grep", &call).is_err());
+    }
+
+    /// `within_bound` must be exactly the set of results `bound_output` hands
+    /// back unchanged, or a result the tool kept would gain the shared footer.
+    #[test]
+    fn within_bound_matches_bound_output_for_footer_terminated_results() {
+        let mut texts = vec![
+            String::new(),
+            "a".to_string(),
+            "a\nb".to_string(),
+            "a\nb\nc".to_string(),
+        ];
+        // Around both limits, always without a trailing newline.
+        for lines in [MAX_OUTPUT_LINES - 1, MAX_OUTPUT_LINES, MAX_OUTPUT_LINES + 1] {
+            texts.push("x\n".repeat(lines) + "x");
+        }
+        for bytes in [MAX_OUTPUT_BYTES - 1, MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES + 1] {
+            texts.push("x".repeat(bytes));
+        }
+        texts.push("x\n".repeat(MAX_OUTPUT_LINES - 1) + &"x".repeat(MAX_OUTPUT_BYTES));
+
+        for text in &texts {
+            assert_eq!(
+                within_bound(text.len(), newlines(text)),
+                bound_output(text, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES) == *text,
+                "{} bytes, {} newlines",
+                text.len(),
+                newlines(text)
+            );
+        }
     }
 }

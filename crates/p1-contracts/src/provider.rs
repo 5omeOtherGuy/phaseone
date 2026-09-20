@@ -125,6 +125,9 @@ pub enum ProviderErrorKind {
     /// Bad request or unsupported option: retrying the same request cannot help.
     InvalidRequest,
     Authentication,
+    /// The account has no balance: a fresh credential cannot help and the request
+    /// is not retried (ADR-0046).
+    InsufficientBalance,
     RateLimited,
     ContextWindowExceeded,
     /// Network, 5xx, or a stream that broke (incl. EOF before the terminal event).

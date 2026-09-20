@@ -238,6 +238,12 @@ async fn post_once(mut state: State) -> State {
                 Raced::Done(bytes) => bytes,
             };
             let error = parser.on_http_error(status, &headers, &body);
+            if error.kind == ProviderErrorKind::InsufficientBalance {
+                // ADR-0046: an exhausted account is not a rejected key. Refreshing
+                // could only fail, and masking the adapter's diagnosis with a
+                // refresh error is the bug this kind exists to end.
+                return state.finish(Outcome::Failed(error));
+            }
             if state.reauth_used {
                 // Rule 1: a second 401/403 after the one refresh is terminal and
                 // is always an authentication failure.
@@ -487,8 +493,14 @@ mod tests {
             &self,
             status: u16,
             _headers: &[(String, String)],
-            _body: &[u8],
+            body: &[u8],
         ) -> ProviderError {
+            if body == b"exhausted-account" {
+                return ProviderError::new(
+                    ProviderErrorKind::InsufficientBalance,
+                    "the account has no balance",
+                );
+            }
             let kind = match status {
                 401 | 403 => ProviderErrorKind::Authentication,
                 408 | 425 | 429 | 500..=599 => ProviderErrorKind::Transport,
@@ -607,6 +619,14 @@ mod tests {
         ScriptedResponse::ok_sse(text)
     }
 
+    /// A 401 whose body says the account has no balance, the way the chat adapter
+    /// reports one (ADR-0046).
+    fn exhausted_response() -> ScriptedResponse {
+        let mut response = status_response(401);
+        response.chunks.push(b"exhausted-account".to_vec());
+        response
+    }
+
     fn text_turn() -> &'static str {
         "data: delta\n\ndata: done\n\n"
     }
@@ -703,6 +723,41 @@ mod tests {
         match terminal(&events) {
             Outcome::Failed(error) => assert_eq!(error.kind, ProviderErrorKind::Authentication),
             other => panic!("expected an authentication failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insufficient_balance_finishes_without_refresh_or_retry() {
+        // A second response is scripted so a stray request is reported as a plain
+        // count mismatch rather than a transport panic.
+        let harness = Harness::new(vec![exhausted_response(), ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        let refresh_calls = harness.credentials.refresh_calls.lock().unwrap();
+        assert!(refresh_calls.is_empty(), "{refresh_calls:?}");
+        assert_eq!(harness.credentials.access_calls.load(Ordering::SeqCst), 1);
+        match terminal(&events) {
+            Outcome::Failed(error) => {
+                assert_eq!(error.kind, ProviderErrorKind::InsufficientBalance);
+                assert_eq!(error.message, "the account has no balance");
+            }
+            other => panic!("expected an exhausted-account failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insufficient_balance_after_a_refresh_keeps_the_diagnosis() {
+        let harness = Harness::new(vec![status_response(401), exhausted_response()]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 2);
+        assert_eq!(harness.credentials.refresh_calls.lock().unwrap().len(), 1);
+        match terminal(&events) {
+            Outcome::Failed(error) => {
+                assert_eq!(error.kind, ProviderErrorKind::InsufficientBalance)
+            }
+            other => panic!("expected an exhausted-account failure, got {other:?}"),
         }
     }
 

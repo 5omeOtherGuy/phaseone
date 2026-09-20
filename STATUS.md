@@ -89,6 +89,28 @@ IN FLIGHT:
 * #30 DONE: `finish` rejects masked checks (`;`, `||`, newline, backgrounding `&`; `2>&1` is
   fine) and reports EVERY failing named command in one error (completion.md §2, last revision).
 * `[context]` tables for claude / claude-delegating / gpt: DONE (200k/120k, operational values).
+* OWNER RAN `p1 login opencode-go-2-subscription` (2026-09-21): the key is in the p1 store —
+  dispatch deepseek2 jobs WITHOUT the `OPENCODE_GO_2_API_KEY=…` prefix from now on (fall back
+  to it only if a run cannot find the key, then investigate p1-auth).
+* OWNER DIRECTIVES 2026-09-21 ~00:45 (owner asleep, work on): (1) WebSocket support wherever
+  possible (Codex first) — a DECISION, overrides the earlier 'no websocket for now'; (2) inventory
+  iris-agent for code worth taking (Rust token optimizer first); (3) prompt-caching optimisation
+  for the Anthropic and ChatGPT routes. = RESEARCH BATCH 3: #41, #42, #43, Opus subagent curator,
+  brief `../phaseone-briefs/research-curator-batch3.md`, memos `research/<n>/memo.md` (cap of two
+  lifted for this batch). NEXT: decide the memos; WebSocket needs lead spec + ADR (transport seam)
+  then p1 jobs; caching needs a small lead-run LIVE probe (few requests) before changing builders.
+* RESEARCH BATCH 2 DECIDED (2026-09-21): #36 grep bounding — USED, merged. #37 summarizer prompt —
+  USED as a negative result (prompt unchanged); by-product merged: run records carry
+  `harness_head` + `binary_sha256`. #35 out-of-credit diagnosis — USED, merged (ADR-0046 accepted).
+  Curator layer reviewed after two batches: KEEP (decision-ready memos, three corrected lead
+  premises, one unasked bug); one batch at a time.
+* MAIN WAS RED 23:38–00:05 (2026-09-20): the TUI session merged #32 while red (duplicate
+  `ellipsize` in `p1-tui/src/render/screen.rs`); its hotfix #33 (`8a873ec`, 11 deleted lines,
+  nothing else) is green. Second red TUI merge that night (#23 before). Rule posted on #12:
+  merge only after `gh pr checks --watch` passed on the final head. Before pushing, ALWAYS
+  re-gate or at least `cargo check --workspace` after merging origin/main — my 23:45 push went
+  out on a main I had not built. Several sessions now edit `p1-tui` (worktrees `12-tui`,
+  `12-tui-block-spec`, `neural-home-*`): stay out of those paths.
 * TUI: separate Kimi K3 session (tmux window `kimi-tui`, pane %48, worktree `../phaseone-12-tui`),
   coordination ONLY via issue #12. It has merged M1–M4a itself; the seam it needed is on main and
   it may edit exactly two spots of mine: `impl FrontEnd` in its `tui.rs`, the 5-line `--tui`
