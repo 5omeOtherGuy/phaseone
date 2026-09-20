@@ -50,6 +50,9 @@ pub enum Command {
     /// `PageUp` / `PageDown`: scroll the transcript.
     ScrollUp,
     ScrollDown,
+    /// `Up` / `Down` with the OUTPUT pane open: scroll the pane.
+    PaneUp,
+    PaneDown,
 }
 
 /// Map one key event to commands, given the screen state. Modal layers win in
@@ -109,6 +112,8 @@ pub fn handle(screen: &Screen, key: KeyEvent) -> Option<Command> {
         (KeyCode::Tab, true, false) => Some(Command::CyclePaneMode),
         (KeyCode::PageUp, false, false) => Some(Command::ScrollUp),
         (KeyCode::PageDown, false, false) => Some(Command::ScrollDown),
+        (KeyCode::Up, false, false) if screen.output.is_some() => Some(Command::PaneUp),
+        (KeyCode::Down, false, false) if screen.output.is_some() => Some(Command::PaneDown),
         (KeyCode::Char(c), false, false) => Some(Command::Insert(c)),
         (KeyCode::Char(c), false, true) => Some(Command::Insert(c)),
         (KeyCode::Backspace, false, false) => Some(Command::Backspace),

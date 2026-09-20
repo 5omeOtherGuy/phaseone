@@ -82,6 +82,8 @@ impl ToolRow {
 pub struct Transcript {
     pub blocks: Vec<Block>,
     outputs: HashMap<FoldId, String>,
+    /// The most recently registered fold — what `^O` opens.
+    pub latest_fold: Option<FoldId>,
     /// Index of the block streaming text deltas land in, while it is open.
     open_text: Option<usize>,
     open_reasoning: Option<usize>,
@@ -211,6 +213,7 @@ impl Transcript {
         row.elapsed_ms = elapsed_ms;
         if !content.is_empty() {
             if let Some(Fold::Folded { id, .. }) = row.fold_for(content) {
+                self.latest_fold = Some(id.clone());
                 self.outputs.insert(id, content.to_string());
             }
             row.output = Some(content.to_string());

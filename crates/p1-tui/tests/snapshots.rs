@@ -367,6 +367,27 @@ fn every_state_reads_with_colour_stripped() {
 }
 
 #[test]
+fn output_pane_opens_the_fold_handle() {
+    let mut s = Screen::new(true);
+    let content: String = (0..60).map(|n| format!("output line {n}\n")).collect();
+    let id = p1_tui::fold::FoldId::of(&content);
+    s.open_output(p1_tui::render::output::OutputView {
+        id: id.clone(),
+        lines: content.lines().map(str::to_string).collect(),
+        scroll: 0,
+    });
+    let text = render(&s, 120, 40, 0);
+    assert_palette_law(&s, 120, 40);
+    // The pane header names the handle; the body starts at the top.
+    assert!(text[0].contains(&format!("OUTPUT [{}]", id)));
+    assert!(text[1].contains("output line 0"));
+    // Up/Down scroll the pane.
+    s.scroll_output_by(10);
+    let text = render(&s, 120, 40, 0);
+    assert!(text[1].contains("output line 10"));
+}
+
+#[test]
 fn pane_width_cycling_changes_the_layout() {
     let mut s = Screen::new(true);
     s.goal = Some("fix compaction boundary stall".into());
