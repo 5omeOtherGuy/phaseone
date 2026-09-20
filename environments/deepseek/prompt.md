@@ -25,6 +25,7 @@ When a normal implementation choice is yours to make, make it and continue. Do n
 a time limit or stop at "good enough". If blocked, record the specific missing prerequisite.
 
 # Finishing
+Run verification commands standalone: no output pipes, trailing echo, or combined checks.
 After the last edit, run verification using `{{tool:shell}}`, then call `{{tool:finish}}` with
 status "done", a concise summary, and verification containing the exact successful commands.
 Only for a task that changed no files may verification be ["none"]. If an external blocker

@@ -164,3 +164,89 @@ tokens read from cache; WITH them 57 %, 69 %, 64 %. Individual requests still mi
 even with the headers, so routing is only part of the story; the Claude route reaches 97 % on
 comparable work. Small sample on one day — re-measure before building on the exact numbers.
 
+
+## C. DeepSeek on OpenCode Go (`openai-chat/opencode-go-subscription`)
+
+**[docs + live, 2026-09-20]** `POST https://opencode.ai/zen/go/v1/chat/completions`.
+Environment `deepseek` selects `deepseek-v4.1-flash`, high effort. This is the Go
+subscription endpoint; there is no fallback to Zen pay-as-you-go or another provider.
+[OpenCode Go documentation](https://opencode.ai/docs/go/) lists the endpoint and asks
+coding clients to identify themselves and supply a stable conversation header. p1 sends
+its own `user-agent: p1/<version>` and uses the host's cache key as `x-opencode-session`.
+No foreign client identity is impersonated.
+
+Credential precedence: `OPENCODE_API_KEY`; then the `opencode-go` API entry in
+`$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`);
+then the `opencode-go` API-key entry in `$PI_CODING_AGENT_DIR/auth.json` (default
+`~/.pi/agent/auth.json`). OpenCode uses `type: api`; Pi uses `type: api_key`; both
+use a `key` member. Only the selected entry is used. These are read by the credential
+source, never printed or included in the environment manifest. p1 does not execute
+Pi command-backed key configuration; use the environment variable in that case.
+
+## D. GLM on its Z.ai coding subscription (`openai-chat/glm-subscription`)
+
+**[docs + live, 2026-09-20]** `POST https://api.z.ai/api/coding/paas/v4/chat/completions`.
+Environment `glm` selects `glm-5.3`, high effort, matching the owner's `glm53` profile
+identified by the lead in issue #9. No fallback to the general paid API or Go.
+Credentials: `ZAI_API_KEY`, otherwise the `zai` API-key entry in Pi's auth file at the
+location above. Construction reads no credential. Access re-reads it; rejection re-reads
+once and only retries with a changed key. Static keys have no OAuth refresh; an unchanged
+rejected key produces an authentication error. Neither credential source writes files.
+
+[Z.ai Chat Completion](https://docs.z.ai/api-reference/llm/chat-completion) and
+[Thinking Mode](https://docs.z.ai/guides/capabilities/thinking-mode) document the message
+format and preserved reasoning. p1 sends `thinking: {type: enabled, clear_thinking: false}`
+and `reasoning_effort: high`. GLM uses automatic prefix caching: an explicit p1 cache key
+is rejected, rather than silently ignored. A preliminary smoke also passed on
+`glm-5.3-flash`; that is not the shipped default.
+
+### Shared Chat Completions implementation (C and D)
+
+One crate, `p1-provider-openai-chat`, two ordinary constructors/catalog registrations;
+no provider, core, HTTP or tool interface changes and no new third-party dependencies.
+The transport, SSE decoder, cancellation and retries are the existing shared driver.
+Both environments assemble read/edit/write/grep/shell/finish, with separate family prompts.
+
+**Request:** system/user/assistant/tool messages; function declarations under
+`tools[].function`; raw JSON arguments remain strings. Inbox items use user messages.
+Tool results retain their call IDs and exact content. Freeform declarations or history
+cannot be encoded and are rejected. `max_output_tokens` maps to positive `max_tokens`.
+High is the default; explicit high/max are carried, low/medium/extra-high rejected.
+Unknown options in the adapter namespace are errors. Go enables thinking without GLM's
+`clear_thinking` field. Both request streamed usage with `stream_options.include_usage`.
+
+**Stream:** `choices[0].delta.content`, `reasoning_content` (Go's `reasoning` alias also
+accepted), and indexed function-call fragments. Calls retain first-appearance order;
+arguments are concatenated byte-exact and never parsed/repaired. `finish_reason` maps
+stop/tool_calls/length/content_filter to end-turn/tool-use/output-limit/refusal. Completion
+requires `[DONE]` after a finish reason, retaining usage in a later empty-choices chunk.
+EOF is failure; output-limited partial calls are not executable. Missing/duplicate call
+identities are protocol errors. Diagnostics never copy server error bodies.
+
+**Replay:** each reasoning block carries a version-1 string payload, with configured route
+and model as origin. Matching blocks concatenate unchanged into `reasoning_content` in
+assistant history. Foreign replay is dropped; unsupported matching replay versions fail.
+The model name echoed by a server cannot change the origin.
+
+**Usage:** cache reads come from `prompt_tokens_details.cached_tokens` or
+`prompt_cache_hit_tokens`; uncached input is `prompt_cache_miss_tokens`, or prompt total
+minus explicitly reported cached input. If the cache split is absent, uncached input is
+unknown too. Completion and reasoning tokens remain separate. Cache writes and subscription
+cost remain `None`; no notional catalog price is charged as real spend.
+
+**Evidence:** both routes pass the unchanged shared conformance suite, including every-byte
+chunk splits, cancellation, retry limits, invalid raw arguments and foreign reasoning.
+Additional tests cover request JSON, endpoint/session headers, interleaved calls, truncated
+completion, usage splits, credential rotation and redacted errors. Fixtures are hand-written.
+
+Live smoke commands (three requests each; existing subscription credentials):
+```
+P1_LIVE=1 cargo test -p p1-live deepseek_subscription_route -- --nocapture --test-threads 1
+P1_LIVE=1 cargo test -p p1-live glm_subscription_route -- --nocapture --test-threads 1
+```
+Both passed text, function call and tool-result follow-up on 2026-09-20. DeepSeek emitted
+reasoning before the tool call and accepted its replay; GLM-5.3's tiny tool request emitted
+no reasoning, but its follow-up emitted reasoning. Both reported cache reads on follow-up
+(256 and 192 respectively); these small checks do not measure sustained cache efficiency.
+Max effort, explicit output caps and changed-key retry have synthetic coverage only;
+subscription key rejection/rotation has not been induced against the live services.

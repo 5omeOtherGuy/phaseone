@@ -97,3 +97,49 @@ fn glm_conformance() {
         invalid_request: invalid,
     });
 }
+
+#[tokio::test]
+async fn subscription_endpoint_and_session_header_are_route_scoped() {
+    use futures_util::StreamExt;
+    use p1_provider_http::testing::ScriptedResponse;
+    for route in [SubscriptionRoute::OpenCodeGo, SubscriptionRoute::Glm] {
+        let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(include_str!(
+            "fixtures/no_usage.sse"
+        ))]);
+        let provider =
+            ChatProvider::new(route, MODEL, Arc::new(transport.clone()), Arc::new(Fixed));
+        let mut r = invalid();
+        r.options = ModelOptions::default();
+        if route == SubscriptionRoute::OpenCodeGo {
+            r.options.cache_key = Some("synthetic-session".into());
+        }
+        let mut stream = provider
+            .stream(r, p1_contracts::CancellationToken::new())
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, route.endpoint());
+        let session = requests[0]
+            .headers
+            .iter()
+            .find(|(name, _)| name == "x-opencode-session")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(
+            session,
+            if route == SubscriptionRoute::OpenCodeGo {
+                Some("synthetic-session")
+            } else {
+                None
+            }
+        );
+        assert!(
+            requests[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "user-agent" && value.starts_with("p1/"))
+        );
+        assert!(!format!("{provider:?}").contains(BEARER));
+    }
+}

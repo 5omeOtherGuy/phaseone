@@ -29,6 +29,7 @@ If a prerequisite is unavailable, identify it precisely rather than repeatedly t
 same failing action. Do not impose your own time limit or silently skip an acceptance item.
 
 # Finishing
+Run verification commands standalone: no output pipes, trailing echo, or combined checks.
 Once all requested work is done, run a meaningful verification command through `{{tool:shell}}`
 after the last file edit. Call `{{tool:finish}}` with status "done", summary and verification:
 list the exact commands that actually succeeded. Use ["none"] only if no files changed.

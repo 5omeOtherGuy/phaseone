@@ -158,6 +158,20 @@ impl ResponseParser for ChatParser {
             let Some(delta) = choice.get("delta").filter(|v| v.is_object()) else {
                 return self.fail("chat choice missing delta");
             };
+            for field in ["content", "reasoning_content", "reasoning"] {
+                if delta
+                    .get(field)
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+                {
+                    return self.fail("invalid chat text delta type");
+                }
+            }
+            if delta
+                .get("tool_calls")
+                .is_some_and(|value| !value.is_null() && !value.is_array())
+            {
+                return self.fail("invalid tool delta list");
+            }
             // Go sometimes calls the field `reasoning`; requests always use reasoning_content.
             if let Some(part) = delta
                 .get("reasoning_content")
@@ -180,6 +194,17 @@ impl ResponseParser for ChatParser {
                     let Some(index) = call.get("index").and_then(Value::as_u64) else {
                         return self.fail("tool delta missing index");
                     };
+                    if call.get("type").is_some_and(|value| value != "function") {
+                        return self.fail("unsupported chat tool type");
+                    }
+                    for field in ["/id", "/function/name", "/function/arguments"] {
+                        if call
+                            .pointer(field)
+                            .is_some_and(|value| !value.is_null() && !value.is_string())
+                        {
+                            return self.fail("invalid tool fragment type");
+                        }
+                    }
                     let block = *self.calls.entry(index).or_insert_with(|| {
                         let block = self.blocks.len();
                         self.blocks.push(AssistantBlock::ToolCall(ToolCall {
@@ -450,5 +475,33 @@ mod block_order_tests {
         assert!(
             matches!(&p.blocks[..], [AssistantBlock::Reasoning{text:a,..},AssistantBlock::Text{text:b},AssistantBlock::Reasoning{text:c,..}] if a=="first" && b=="middle" && c=="last")
         );
+    }
+}
+
+#[cfg(test)]
+mod malformed_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn malformed_deltas_fail_instead_of_becoming_empty_success() {
+        for delta in [
+            json!({"content":17}),
+            json!({"tool_calls":{}}),
+            json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":{}}}]}),
+        ] {
+            let mut parser = ChatParser::new(crate::SubscriptionRoute::Glm.origin("m"));
+            let events = parser.on_event(SseEvent {
+                event: None,
+                data: json!({"choices":[{"index":0,"delta":delta,"finish_reason":"stop"}]})
+                    .to_string(),
+            });
+            assert!(matches!(
+                events.last(),
+                Some(StreamEvent::Finished(Outcome::Failed(ProviderError {
+                    kind: ProviderErrorKind::Protocol,
+                    ..
+                })))
+            ));
+        }
     }
 }
