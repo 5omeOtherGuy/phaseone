@@ -23,6 +23,9 @@ Only the lead edits this file (D13). Started 2026-09-19.
   demonstrated by a command in `docs/SLICE-REPORT.md`, including live runs on both routes,
   live cross-route delegation and live resume.
 
+- ADR system added after the slice (owner request): `docs/adr/` (30 ADRs), `scripts/adr.py`,
+  checked in the gate. New decisions are ADRs; `DECISIONS.md` is the frozen ledger (ADR-0030).
+
 ## Next (owner's call — see `docs/SLICE-REPORT.md` "What should come next")
 - Use it for real work and collect failures; context-control policy module; T1 comparison;
   granular authorization; turn-completion policy.
