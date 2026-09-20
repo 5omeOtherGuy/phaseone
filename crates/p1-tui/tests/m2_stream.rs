@@ -2,7 +2,9 @@
 //! runtime. Fake time drives the working indicator; queued steering and
 //! follow-ups are visible; the 80-column floor collapses the pane.
 
-use p1_contracts::{AgentEvent, StopReason, ToolCall, ToolInput, ToolResultItem, ToolStatus, TurnEnd, Usage};
+use p1_contracts::{
+    AgentEvent, StopReason, ToolCall, ToolInput, ToolResultItem, ToolStatus, TurnEnd, Usage,
+};
 use p1_tui::render::screen::draw;
 use p1_tui::state::Screen;
 use ratatui::Terminal;
@@ -33,48 +35,87 @@ fn script() -> Vec<(u64, AgentEvent)> {
     vec![
         (0, AgentEvent::TurnStarted),
         (10, AgentEvent::RequestStarted { request_index: 0 }),
-        (200, AgentEvent::ReasoningDelta { text: "check the boundary first".into() }),
-        (2_000, AgentEvent::TextDelta { text: "The boundary stalls because ".into() }),
-        (2_100, AgentEvent::TextDelta { text: "the summary is held.".into() }),
-        (4_000, AgentEvent::ResponseCompleted {
-            model: "sonnet-4.5".into(),
-            stop: StopReason::ToolUse,
-            usage: Some(Usage {
-                input_uncached: Some(12_000),
-                cache_read: Some(400),
-                output: Some(300),
-                cost_micro_usd: Some(1_100),
-                ..Default::default()
-            }),
-        }),
-        (4_100, AgentEvent::ToolStarted {
-            call: ToolCall {
-                call_id: "c1".into(),
-                name: "shell".into(),
-                input: ToolInput::Json("cargo test -p p1-context".into()),
+        (
+            200,
+            AgentEvent::ReasoningDelta {
+                text: "check the boundary first".into(),
             },
-        }),
-        (15_500, AgentEvent::ToolFinished {
-            result: ToolResultItem {
-                call_id: "c1".into(),
-                name: "shell".into(),
-                status: ToolStatus::Error,
-                content: big,
+        ),
+        (
+            2_000,
+            AgentEvent::TextDelta {
+                text: "The boundary stalls because ".into(),
             },
-        }),
-        (16_000, AgentEvent::TextDelta { text: "Confirmed.".into() }),
-        (16_500, AgentEvent::ResponseCompleted {
-            model: "sonnet-4.5".into(),
-            stop: StopReason::EndTurn,
-            usage: Some(Usage {
-                input_uncached: Some(8_000),
-                cache_read: Some(4_000),
-                output: Some(120),
-                cost_micro_usd: Some(2_300),
-                ..Default::default()
-            }),
-        }),
-        (16_600, AgentEvent::TurnFinished { end: TurnEnd::Completed { stop: StopReason::EndTurn } }),
+        ),
+        (
+            2_100,
+            AgentEvent::TextDelta {
+                text: "the summary is held.".into(),
+            },
+        ),
+        (
+            4_000,
+            AgentEvent::ResponseCompleted {
+                model: "sonnet-4.5".into(),
+                stop: StopReason::ToolUse,
+                usage: Some(Usage {
+                    input_uncached: Some(12_000),
+                    cache_read: Some(400),
+                    output: Some(300),
+                    cost_micro_usd: Some(1_100),
+                    ..Default::default()
+                }),
+            },
+        ),
+        (
+            4_100,
+            AgentEvent::ToolStarted {
+                call: ToolCall {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    input: ToolInput::Json("cargo test -p p1-context".into()),
+                },
+            },
+        ),
+        (
+            15_500,
+            AgentEvent::ToolFinished {
+                result: ToolResultItem {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    status: ToolStatus::Error,
+                    content: big,
+                },
+            },
+        ),
+        (
+            16_000,
+            AgentEvent::TextDelta {
+                text: "Confirmed.".into(),
+            },
+        ),
+        (
+            16_500,
+            AgentEvent::ResponseCompleted {
+                model: "sonnet-4.5".into(),
+                stop: StopReason::EndTurn,
+                usage: Some(Usage {
+                    input_uncached: Some(8_000),
+                    cache_read: Some(4_000),
+                    output: Some(120),
+                    cost_micro_usd: Some(2_300),
+                    ..Default::default()
+                }),
+            },
+        ),
+        (
+            16_600,
+            AgentEvent::TurnFinished {
+                end: TurnEnd::Completed {
+                    stop: StopReason::EndTurn,
+                },
+            },
+        ),
     ]
 }
 
@@ -134,8 +175,14 @@ fn queued_inputs_are_visible_above_the_hints() {
     s.queue(false, "also check the wrap boundary".into());
     s.queue(true, "then summarize".into());
     let text = render(&s, 120, 40, 5_000);
-    assert!(text.iter().any(|l| l.contains("· steering: also check the wrap boundary")));
-    assert!(text.iter().any(|l| l.contains("· follow-up: then summarize")));
+    assert!(
+        text.iter()
+            .any(|l| l.contains("· steering: also check the wrap boundary"))
+    );
+    assert!(
+        text.iter()
+            .any(|l| l.contains("· follow-up: then summarize"))
+    );
 }
 
 #[test]
@@ -144,7 +191,10 @@ fn the_80_column_floor_keeps_everything_readable() {
     play(&mut s, &script(), 16_600);
     let text = render(&s, 80, 24, 16_600);
     // Same glyphs, same shapes — nothing reflows into a different shape (§6).
-    assert!(text.iter().any(|l| l.starts_with("✗ shell     cargo test -p p1-context")));
+    assert!(
+        text.iter()
+            .any(|l| l.starts_with("✗ shell     cargo test -p p1-context"))
+    );
     assert!(text.iter().any(|l| l.contains("· 42 more lines folded")));
     // The floor line appears under the composer; the pane is gone.
     let last = text.last().unwrap();
