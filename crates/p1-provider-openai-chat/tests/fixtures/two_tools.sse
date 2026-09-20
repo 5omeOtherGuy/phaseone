@@ -1,0 +1,4 @@
+data: {"id":"synthetic","model":"dated-server-alias","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"},"id":"call_1","type":"function"},{"index":1,"function":{"name":"grep","arguments":"{\"pattern\":\"needle\"}"},"id":"call_2","type":"function"}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+

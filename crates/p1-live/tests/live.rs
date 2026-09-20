@@ -105,6 +105,18 @@ async fn respond(provider: &dyn Provider, request: ProviderRequest) -> Completed
 async fn round_trip(provider: &dyn Provider, tools: Vec<ToolDeclaration>, effort: Option<Effort>) {
     let options = ModelOptions {
         reasoning_effort: effort,
+        cache_key: (provider.describe().origin.route
+            == p1_provider_openai_chat::SubscriptionRoute::OpenCodeGo.id())
+        .then(|| {
+            format!(
+                "p1-live-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )
+        }),
         ..ModelOptions::default()
     };
     println!("- text turn");
@@ -252,4 +264,46 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
         ),
         other => panic!("expected freeform text input, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn deepseek_subscription_route() {
+    chat_subscription(
+        p1_provider_openai_chat::SubscriptionRoute::OpenCodeGo,
+        "P1_LIVE_DEEPSEEK_MODEL",
+        "deepseek-v4.1-flash",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn glm_subscription_route() {
+    chat_subscription(
+        p1_provider_openai_chat::SubscriptionRoute::Glm,
+        "P1_LIVE_GLM_MODEL",
+        "glm-5.3",
+    )
+    .await;
+}
+
+async fn chat_subscription(
+    route: p1_provider_openai_chat::SubscriptionRoute,
+    variable: &str,
+    default: &str,
+) {
+    if !live() {
+        return;
+    }
+    let model = model(variable, default);
+    println!("== {} · {model}", route.id());
+    let provider = p1_provider_openai_chat::ChatProvider::new(
+        route,
+        &model,
+        Arc::new(ReqwestTransport::new()),
+        Arc::new(
+            p1_provider_openai_chat::SubscriptionCredentials::from_default_location(route)
+                .expect("subscription credential source"),
+        ),
+    );
+    round_trip(&provider, vec![read_tool()], Some(Effort::High)).await;
 }

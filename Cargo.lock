@@ -797,6 +797,7 @@ dependencies = [
  "p1-provider-anthropic",
  "p1-provider-http",
  "p1-provider-openai",
+ "p1-provider-openai-chat",
  "p1-testkit",
  "p1-tool-delegate",
  "p1-tool-edit",
@@ -835,6 +836,7 @@ dependencies = [
  "p1-provider-anthropic",
  "p1-provider-http",
  "p1-provider-openai",
+ "p1-provider-openai-chat",
  "serde_json",
  "tokio",
 ]
@@ -878,6 +880,19 @@ dependencies = [
 
 [[package]]
 name = "p1-provider-openai"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "p1-contracts",
+ "p1-provider-conformance",
+ "p1-provider-http",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "p1-provider-openai-chat"
 version = "0.0.1"
 dependencies = [
  "futures-util",

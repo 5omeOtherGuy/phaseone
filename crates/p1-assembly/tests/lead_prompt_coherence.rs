@@ -78,3 +78,9 @@ fn the_gpt_prompt_mentions_exactly_its_own_tools() {
 fn the_delegating_claude_prompt_mentions_exactly_its_own_tools() {
     check("claude-delegating");
 }
+
+#[test]
+fn the_subscription_prompts_mention_exactly_their_own_tools() {
+    check("deepseek");
+    check("glm");
+}

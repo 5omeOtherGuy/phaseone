@@ -209,6 +209,39 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
             Ok(Arc::new(provider) as Arc<dyn Provider>)
         }),
     );
+    let transport = deps.transport.clone();
+    catalog.provider(
+        "opencode-go-subscription",
+        Box::new(move |spec: &ProviderSpec| {
+            let route = p1_provider_openai_chat::SubscriptionRoute::OpenCodeGo;
+            let credentials =
+                p1_provider_openai_chat::SubscriptionCredentials::from_default_location(route)
+                    .map_err(|error| error.to_string())?;
+            Ok(Arc::new(p1_provider_openai_chat::ChatProvider::new(
+                route,
+                &spec.model,
+                transport.clone(),
+                Arc::new(credentials),
+            )) as Arc<dyn Provider>)
+        }),
+    );
+
+    let transport = deps.transport.clone();
+    catalog.provider(
+        "glm-subscription",
+        Box::new(move |spec: &ProviderSpec| {
+            let route = p1_provider_openai_chat::SubscriptionRoute::Glm;
+            let credentials =
+                p1_provider_openai_chat::SubscriptionCredentials::from_default_location(route)
+                    .map_err(|error| error.to_string())?;
+            Ok(Arc::new(p1_provider_openai_chat::ChatProvider::new(
+                route,
+                &spec.model,
+                transport.clone(),
+                Arc::new(credentials),
+            )) as Arc<dyn Provider>)
+        }),
+    );
 }
 
 fn register_standard_tools(
