@@ -59,6 +59,9 @@ pub struct Options {
     /// Extra paths the sandbox keeps writable, absolute and canonicalised when
     /// they exist.
     pub sandbox_write: Vec<PathBuf>,
+    /// Extra paths the sandbox keeps visible READ-ONLY, absolute and
+    /// canonicalised when they exist.
+    pub sandbox_read: Vec<PathBuf>,
     /// Extra environment variable NAMES the `shell` tool passes on, on top of
     /// its built-in allow-list. Repeatable; a name never contains `=`.
     pub env_pass: Vec<String>,
@@ -118,6 +121,9 @@ pub fn usage() -> String {
     );
     out.push_str(
         "  --sandbox-write PATH\n                    keep PATH writable in the sandbox (repeatable;\n                    requires --sandbox workspace)\n",
+    );
+    out.push_str(
+        "  --sandbox-read PATH\n                    keep PATH readable in the sandbox (repeatable;\n                    requires --sandbox workspace)\n",
     );
     out.push_str(
         "  --env-pass NAME   pass NAME from p1's environment to shell commands\n                    (repeatable; NAME must not contain `=`)\n",
@@ -182,6 +188,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             // so they are not mistaken for prompt words.
             "--sandbox"
             | "--sandbox-write"
+            | "--sandbox-read"
             | "--env-pass"
             | "--max-continuations"
             | "--provider-retries" => {
@@ -210,7 +217,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     }
     // Validate the sandbox and env-pass flags and keep their parsed state on the
     // options.
-    let (sandbox, sandbox_write) = parse_sandbox(args)?;
+    let (sandbox, sandbox_write, sandbox_read) = parse_sandbox(args)?;
     let env_pass = parse_env_pass(args)?;
     let max_continuations = parse_max_continuations(args)?;
     let provider_retries = parse_provider_retries(args)?;
@@ -230,6 +237,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         ask,
         sandbox,
         sandbox_write,
+        sandbox_read,
         env_pass,
         max_continuations,
         provider_retries,
@@ -257,7 +265,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
     let mut index = 3;
     while index < args.len() {
         match args[index].as_str() {
-            "--sandbox" | "--sandbox-write" | "--env-pass" => index += 1,
+            "--sandbox" | "--sandbox-write" | "--sandbox-read" | "--env-pass" => index += 1,
             other => {
                 return Err(CliError {
                     message: format!("unexpected argument `{other}`"),
@@ -266,7 +274,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         }
         index += 1;
     }
-    let (sandbox, sandbox_write) = parse_sandbox(args)?;
+    let (sandbox, sandbox_write, sandbox_read) = parse_sandbox(args)?;
     let env_pass = parse_env_pass(args)?;
     Ok(Options {
         command: Command::EnvShow { name: name.clone() },
@@ -277,6 +285,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         ask: false,
         sandbox,
         sandbox_write,
+        sandbox_read,
         env_pass,
         max_continuations: DEFAULT_MAX_CONTINUATIONS,
         provider_retries: DEFAULT_PROVIDER_RETRIES,
@@ -287,9 +296,10 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
 ///
 /// `parse` and `parse_env_show` both use it, so the flag grammar and its usage
 /// errors exist once.
-fn parse_sandbox(args: &[String]) -> Result<(SandboxMode, Vec<PathBuf>), CliError> {
+fn parse_sandbox(args: &[String]) -> Result<(SandboxMode, Vec<PathBuf>, Vec<PathBuf>), CliError> {
     let mut mode = SandboxMode::Off;
     let mut writable: Vec<PathBuf> = Vec::new();
+    let mut readable: Vec<PathBuf> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -319,7 +329,16 @@ fn parse_sandbox(args: &[String]) -> Result<(SandboxMode, Vec<PathBuf>), CliErro
                         message: "--sandbox-write requires a value".to_string(),
                     });
                 };
-                writable.push(resolve_writable(value)?);
+                writable.push(resolve_sandbox_path(value, "--sandbox-write")?);
+            }
+            "--sandbox-read" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError {
+                        message: "--sandbox-read requires a value".to_string(),
+                    });
+                };
+                readable.push(resolve_sandbox_path(value, "--sandbox-read")?);
             }
             _ => {}
         }
@@ -330,7 +349,12 @@ fn parse_sandbox(args: &[String]) -> Result<(SandboxMode, Vec<PathBuf>), CliErro
             message: "--sandbox-write requires --sandbox workspace".to_string(),
         });
     }
-    Ok((mode, writable))
+    if !readable.is_empty() && mode == SandboxMode::Off {
+        return Err(CliError {
+            message: "--sandbox-read requires --sandbox workspace".to_string(),
+        });
+    }
+    Ok((mode, writable, readable))
 }
 
 /// Parse the repeatable `--env-pass NAME` flags out of any argument list.
@@ -361,17 +385,17 @@ fn parse_env_pass(args: &[String]) -> Result<Vec<String>, CliError> {
     Ok(names)
 }
 
-/// A `--sandbox-write` value: absolute, or relative to the current directory;
-/// canonicalised when the path exists. A path that does not exist is kept as an
-/// absolute path and simply not bound (see `bwrap_args`).
-fn resolve_writable(value: &str) -> Result<PathBuf, CliError> {
+/// A `--sandbox-write`/`--sandbox-read` value: absolute, or relative to the
+/// current directory; canonicalised when the path exists. A path that does not
+/// exist is kept as an absolute path and simply not bound (see `bwrap_args`).
+fn resolve_sandbox_path(value: &str, flag: &str) -> Result<PathBuf, CliError> {
     let path = Path::new(value);
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .map_err(|error| CliError {
-                message: format!("cannot resolve --sandbox-write `{value}`: {error}"),
+                message: format!("cannot resolve {flag} `{value}`: {error}"),
             })?
             .join(path)
     };
@@ -442,6 +466,7 @@ fn defaults(command: Command) -> Options {
         ask: false,
         sandbox: SandboxMode::Off,
         sandbox_write: Vec::new(),
+        sandbox_read: Vec::new(),
         env_pass: Vec::new(),
         max_continuations: DEFAULT_MAX_CONTINUATIONS,
         provider_retries: DEFAULT_PROVIDER_RETRIES,
@@ -507,6 +532,7 @@ mod tests {
         let options = parse(&args(&["--sandbox", "workspace"])).unwrap();
         assert_eq!(options.sandbox, SandboxMode::Workspace);
         assert!(options.sandbox_write.is_empty());
+        assert!(options.sandbox_read.is_empty());
 
         assert_eq!(
             parse(&args(&["--sandbox", "off"])).unwrap().sandbox,
@@ -516,6 +542,12 @@ mod tests {
         let options = parse(&args(&["--sandbox", "workspace", "--sandbox-write", "."])).unwrap();
         assert_eq!(
             options.sandbox_write,
+            vec![std::env::current_dir().unwrap().canonicalize().unwrap()]
+        );
+        // A relative --sandbox-read is resolved the same way.
+        let options = parse(&args(&["--sandbox", "workspace", "--sandbox-read", "."])).unwrap();
+        assert_eq!(
+            options.sandbox_read,
             vec![std::env::current_dir().unwrap().canonicalize().unwrap()]
         );
         let options = parse(&args(&["--sandbox", "workspace", "--yes", "do", "it"])).unwrap();
@@ -615,10 +647,37 @@ mod tests {
     #[test]
     fn sandbox_flag_misuse_is_a_usage_error() {
         assert!(parse(&args(&["--sandbox-write", "/tmp", "go"])).is_err());
+        assert!(parse(&args(&["--sandbox-read", "/tmp", "go"])).is_err());
         assert!(parse(&args(&["--sandbox", "bogus"])).is_err());
         assert!(parse(&args(&["--sandbox"])).is_err());
+        assert!(parse(&args(&["--sandbox-read"])).is_err());
         assert!(parse(&args(&["env", "show", "claude", "--sandbox-write", "/tmp"])).is_err());
+        assert!(parse(&args(&["env", "show", "claude", "--sandbox-read", "/tmp"])).is_err());
         assert!(parse(&args(&["env", "show", "claude", "--bogus"])).is_err());
         assert!(parse(&args(&["env", "show", "claude", "--sandbox", "workspace"])).is_ok());
+        // `env show` accepts both read and write alongside the mode.
+        assert!(
+            parse(&args(&[
+                "env",
+                "show",
+                "claude",
+                "--sandbox",
+                "workspace",
+                "--sandbox-read",
+                ".",
+            ]))
+            .is_ok()
+        );
+    }
+
+    /// `--sandbox-read` names itself in both of its usage errors, exactly as
+    /// `--sandbox-write` does.
+    #[test]
+    fn sandbox_read_usage_errors_name_the_flag() {
+        let error = parse(&args(&["--sandbox-read", "/tmp", "go"])).unwrap_err();
+        assert_eq!(error.message, "--sandbox-read requires --sandbox workspace");
+        let error = parse(&args(&["--sandbox", "workspace", "--sandbox-read"])).unwrap_err();
+        assert_eq!(error.message, "--sandbox-read requires a value");
+        assert!(usage().contains("--sandbox-read PATH"));
     }
 }

@@ -165,6 +165,7 @@ bubblewrap (`bwrap`, unprivileged user namespaces); nothing is installed or run 
 pub struct Sandbox {
     pub home: PathBuf,               // the home directory to hide
     pub home_visible: Vec<PathBuf>,  // RELATIVE to `home`; visible read-only if they exist
+    pub readable: Vec<PathBuf>,      // extra absolute paths visible READ-ONLY if they exist
     pub writable: Vec<PathBuf>,      // extra absolute paths that stay writable if they exist
     pub runtime_dir: Option<PathBuf>, // e.g. $XDG_RUNTIME_DIR: hidden behind a tmpfs (agent sockets, keyrings)
 }
@@ -173,12 +174,17 @@ impl Sandbox {
     /// `.local/bin`, `.local/lib`, `.nvm`, `.gitconfig`, `.config/git` — nothing else.
     pub fn for_home(home: impl Into<PathBuf>) -> Self;
 }
-pub enum SandboxError { NotInstalled, Unavailable(String), WorkspaceContainsHome }
+pub const CREDENTIAL_DIRECTORIES: &[&str]; // `.ssh`, `.claude`, `.codex`, `.gnupg`,
+                                          // `.local/share/opencode`, `.pi`, `.config/gh`, `.config/p1`
+pub enum SandboxError { NotInstalled, Unavailable(String), WorkspaceContainsHome, ReadableCredential { path: PathBuf, directory: PathBuf } }
 impl ShellTool {
     /// Probes ONCE (`bwrap <args> true`), so an unusable sandbox fails assembly, not the
     /// first command. `NotInstalled`: no `bwrap` on PATH. `Unavailable(stderr)`: it cannot
     /// run here (user namespaces disabled). `WorkspaceContainsHome`: the workspace root is
     /// the home directory or an ancestor of it — hiding the home would hide the workspace.
+    /// `ReadableCredential`: a `readable` path is equal to, inside or an ANCESTOR of a
+    /// `CREDENTIAL_DIRECTORIES` entry of the home (or of the home itself) — refused before
+    /// the probe, whether or not that directory exists yet.
     pub fn sandboxed(self, sandbox: Sandbox) -> Result<Self, SandboxError>;
 }
 /// Pure, unit-tested: the argument vector before `bash -lc <command>`.
@@ -193,12 +199,15 @@ itself live under `/tmp` or under the home:
 2. `--bind <private_tmp> /tmp` — a fresh directory per `ShellTool`, created under
    `std::env::temp_dir()` and removed when the tool is dropped; `--setenv TMPDIR /tmp`;
 3. `--tmpfs <home>` (`<home>` CANONICAL — the same path the containment check used), then
-   `--ro-bind <home>/<entry> <home>/<entry>` for every existing `home_visible` entry;
-   `--tmpfs $XDG_RUNTIME_DIR` when that variable names an existing directory — agent sockets
-   and keyrings live there;
+   `--ro-bind <home>/<entry> <home>/<entry>` for every existing `home_visible` entry, then
+   `--ro-bind <path> <path>` for every existing `readable` path (e.g. a git worktree's
+   common directory, from `--sandbox-read`); `--tmpfs $XDG_RUNTIME_DIR` when that variable
+   names an existing directory — agent sockets and keyrings live there;
 4. `--bind <path> <path>` for every existing `writable` path; THEN the masks, so that no
    writable bind can uncover them: `--ro-bind /dev/null <home>/.cargo/credentials.toml` (and
-   `…/credentials`) if that file exists — a visible or writable directory must not leak a token;
+   `…/credentials`) if that file exists — a visible or writable directory must not leak a token.
+   The `readable` binds come BEFORE this step, so no readable path can uncover
+   `~/.cargo/credentials*`;
 5. `--bind <workspace root> <workspace root>`;
 6. `--remount-ro <home>` — writes to the hidden home fail loudly (`Read-only file system`)
    instead of vanishing into a tmpfs;
@@ -213,10 +222,13 @@ directory is not visible. Do not try to install software outside the workspace.`
 identity variant becomes `<variant>+sandbox`.
 
 Host: `--sandbox workspace|off` (default `off` in this increment; the default is revisited
-after dogfooding) and repeatable `--sandbox-write PATH` (a usage error without
-`--sandbox workspace`). The sandbox applies to the parent's AND every worker's `shell`. A
-`SandboxError` fails assembly — exit 1 before any model call — with a message that names the
-remedy (`install bubblewrap, or pass --sandbox off`).
+after dogfooding), repeatable `--sandbox-write PATH` and repeatable `--sandbox-read PATH`
+(each a usage error without `--sandbox workspace`). The sandbox applies to the parent's AND
+every worker's `shell`. `scripts/fanout.py` and `scripts/dogfood.sh` pass the git common
+directory as `--sandbox-read` when the job dir is a git WORKTREE, so the agent can inspect
+(never commit) the metadata that lives in the main checkout. A `SandboxError` fails assembly
+— exit 1 before any model call — with a message that names the remedy (`install bubblewrap,
+or pass --sandbox off`).
 
 Must-pass (real `bwrap`; a test returns early with a printed `SKIP: bwrap unusable here` when
 the probe fails — CI runners may forbid user namespaces): fake home `H` containing
@@ -229,7 +241,14 @@ the host's real temp dir has no `t`; (f) a path listed in `writable` is writable
 (PID namespace numbers differ: have the child write its HOST-visible identity another way —
 e.g. `sleep 300` with a unique argument such as `sleep 300.0731`, then look for that command
 line in `/proc/*/cmdline` on the host); (h) workspace == home → `WorkspaceContainsHome`;
-(i) `bwrap_args` order exactly as listed, for a workspace under `/tmp` and one under the home.
+(i) `bwrap_args` order exactly as listed, for a workspace under `/tmp` and one under the home;
+(j) a `readable` path inside the hidden home can be read but not written, a `readable`
+path equal to, inside or an ANCESTOR of a `CREDENTIAL_DIRECTORIES` entry (the home itself,
+`~/.config`, `~/.local/share`, `/`, an ancestor of the home, a symlink to any of those) is
+refused with an error naming the path and the directory, and a safe path (a worktree common
+dir, `~/.config/git`, `~/.cargo`) stays accepted; (k) in a scratch repo + worktree under a
+scratch HOME, `git status --porcelain` works inside the sandbox when the worktree's common
+dir is `readable`, and `git commit` fails.
 
 ## `apply_patch` (GPT family) — freeform, `ToolInput::Text`
 Declaration kind `Freeform` with the V4A lark grammar. Input:

@@ -27,11 +27,24 @@ if [ -f "$clone/scripts/local-cargo-config.sh" ]; then "$here/scripts/local-carg
 p1=${P1_BIN:-$here/../phaseone-target/debug/p1}
 [ -x "$p1" ] || { echo "no p1 binary at $p1 — run: cargo build -p p1-host" >&2; exit 2; }
 locks=/tmp/p1-build-locks-$(id -u); mkdir -p "$locks"
+# A plain clone keeps its `.git` inside the workspace; a worktree keeps it in the main
+# checkout, which the sandbox hides. Make that common dir readable (never writable) so the
+# agent can run `git status`/`git diff`. Read-only on purpose: it may inspect, not commit.
+common=$(git -C "$clone" rev-parse --git-common-dir)
+case "$common" in
+  /*) ;;
+  *) common="$clone/$common" ;;
+esac
+common=$(realpath -m "$common")
+read_args=()
+if [ "$common" != "$clone" ] && [[ "$common" != "$clone"/* ]]; then
+  read_args=(--sandbox-read "$common")
+fi
 start=$(date +%s)
 set +e
 "$p1" --env "$env" --workspace "$clone" --session "$run/session.jsonl" --yes \
   --sandbox workspace --sandbox-write "$HOME/.cargo/registry" --sandbox-write "$HOME/.cargo/git" \
-  --sandbox-write "$locks" "$(cat "$task_file")" >"$run/stdout.txt" 2>"$run/stderr.txt"
+  --sandbox-write "$locks" "${read_args[@]}" "$(cat "$task_file")" >"$run/stdout.txt" 2>"$run/stderr.txt"
 code=$?
 set -e
 elapsed=$(( $(date +%s) - start ))

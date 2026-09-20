@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,6 +101,19 @@ pub const DEFAULT_HOME_VISIBLE: &[&str] = &[
     ".config/git",
 ];
 
+/// Home-relative directories [`Sandbox::readable`] must NEVER expose: they hold
+/// credentials or agent logins.
+pub const CREDENTIAL_DIRECTORIES: &[&str] = &[
+    ".ssh",
+    ".claude",
+    ".codex",
+    ".gnupg",
+    ".local/share/opencode",
+    ".pi",
+    ".config/gh",
+    ".config/p1",
+];
+
 /// What the sandbox hides, keeps visible and keeps writable. The host chooses
 /// this; [`ShellTool::sandboxed`] turns it into a `bwrap` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +122,13 @@ pub struct Sandbox {
     pub home: PathBuf,
     /// Paths relative to `home` that stay visible (read-only) if they exist.
     pub home_visible: Vec<PathBuf>,
+    /// Extra absolute paths that stay visible READ-ONLY if they exist. A git
+    /// worktree keeps its metadata outside the workspace, in the main checkout's
+    /// git directory, so a job there needs this to run `git status`/`git diff`.
+    /// [`ShellTool::sandboxed`] refuses a path equal to, inside or containing a
+    /// [`CREDENTIAL_DIRECTORIES`] entry of the home, and a path containing the
+    /// home itself.
+    pub readable: Vec<PathBuf>,
     /// Extra absolute paths that stay writable if they exist.
     pub writable: Vec<PathBuf>,
     /// A private runtime directory to replace (an empty `tmpfs`), when set and
@@ -123,6 +143,7 @@ impl Sandbox {
         Self {
             home: home.into(),
             home_visible: DEFAULT_HOME_VISIBLE.iter().map(PathBuf::from).collect(),
+            readable: Vec::new(),
             writable: Vec::new(),
             runtime_dir: None,
         }
@@ -145,6 +166,12 @@ pub enum SandboxError {
         .home.display()
     )]
     WorkspaceContainsHome { workspace: PathBuf, home: PathBuf },
+    #[error(
+        "the sandbox readable path {} would uncover the credential directory {}: choose another path, or pass --sandbox off",
+        .path.display(),
+        .directory.display()
+    )]
+    ReadableCredential { path: PathBuf, directory: PathBuf },
 }
 
 /// The live sandbox: its configuration plus the private `/tmp` the tool owns.
@@ -257,6 +284,17 @@ impl ShellTool {
             return Err(SandboxError::WorkspaceContainsHome { workspace, home });
         }
         let sandbox = Sandbox { home, ..sandbox };
+        // A readable path must never uncover a credential directory, whatever the
+        // caller asks for. The check is here, before the probe, so it costs nothing
+        // and fails assembly with a message naming the path.
+        for readable in &sandbox.readable {
+            if let Some(directory) = credential_directory(&sandbox.home, readable) {
+                return Err(SandboxError::ReadableCredential {
+                    path: readable.clone(),
+                    directory,
+                });
+            }
+        }
         let private_tmp = tempfile::Builder::new()
             .prefix("p1-shell-sandbox-")
             .tempdir()
@@ -315,9 +353,10 @@ impl ShellTool {
 ///
 /// Pure, and the ORDER is part of the contract: a later mount covers an earlier
 /// one, so the private `/tmp` is mounted before the home and the workspace (a
-/// workspace may itself live under `/tmp` or under the home), the token masks are
-/// emitted AFTER every writable bind so no writable directory can uncover them,
-/// and the workspace bind comes after the home's `tmpfs` but before
+/// workspace may itself live under `/tmp` or under the home), the read-only
+/// `readable` paths are mounted BEFORE every writable bind, and the token masks
+/// are emitted AFTER every writable bind so no writable directory can uncover
+/// them. The workspace bind comes after the home's `tmpfs` but before
 /// `--remount-ro`. `bwrap` creates missing mount points itself.
 pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Vec<OsString> {
     let home = &sandbox.home;
@@ -333,14 +372,25 @@ pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) 
     for arg in ["--setenv", "TMPDIR", "/tmp"] {
         args.push(arg.into());
     }
-    // 3. Hide the home behind a tmpfs, then put back only what stays visible,
-    //    and replace the runtime directory (agent sockets and keyrings).
+    // 3. Hide the home behind a tmpfs, then put back only what stays visible —
+    //    the allow-list entries, then the caller's read-only `readable` paths
+    //    (e.g. a git worktree's common directory) — and replace the runtime
+    //    directory (agent sockets and keyrings). The readable binds come BEFORE
+    //    the writable binds and the token masks below, so no readable path can
+    //    uncover `~/.cargo/credentials*`. The runtime `tmpfs` comes last, so a
+    //    readable path can never re-expose an agent socket. (`ShellTool::sandboxed`
+    //    also refuses a readable path that would contain a credential directory.)
     args.push("--tmpfs".into());
     args.push(home.into());
     for entry in &sandbox.home_visible {
         let path = home.join(entry);
         if path.exists() {
             push_ro_bind(&mut args, &path);
+        }
+    }
+    for readable in &sandbox.readable {
+        if readable.exists() {
+            push_ro_bind(&mut args, readable);
         }
     }
     if let Some(runtime_dir) = &sandbox.runtime_dir
@@ -386,6 +436,83 @@ fn push_ro_bind(args: &mut Vec<OsString>, path: &Path) {
     args.push("--ro-bind".into());
     args.push(path.into());
     args.push(path.into());
+}
+
+/// The credential directory of `home` that `readable` would uncover, if any.
+///
+/// A readable path uncovers a credential directory when it is equal to it, inside
+/// it, OR an ancestor of it (including the home itself and `/`): any of the three
+/// re-exposes the credentials. Literal and resolved forms are compared, so a
+/// symlink cannot smuggle one into view. Existence never matters: a credential
+/// directory may be created after the sandbox is assembled.
+fn credential_directory(home: &Path, readable: &Path) -> Option<PathBuf> {
+    let forms = readable_forms(readable);
+    CREDENTIAL_DIRECTORIES.iter().find_map(|entry| {
+        let literal = home.join(entry);
+        let canonical = std::fs::canonicalize(&literal).unwrap_or_else(|_| literal.clone());
+        forms
+            .iter()
+            .any(|form| {
+                form.starts_with(&literal)
+                    || form.starts_with(&canonical)
+                    || literal.starts_with(form)
+                    || canonical.starts_with(form)
+            })
+            .then_some(literal)
+    })
+}
+
+/// Every filesystem location `readable` can denote: the path as given, its
+/// canonical form when it exists, and the chain of symlink targets, each made
+/// absolute and lexically normalised. Following the links by hand (rather than
+/// only `canonicalize`, which needs the whole path to exist) catches a symlink
+/// whose target is created later. Bounded depth: a symlink loop must not hang.
+fn readable_forms(readable: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![readable.to_path_buf()];
+    let mut current = readable.to_path_buf();
+    for _ in 0..8 {
+        if let Ok(canonical) = std::fs::canonicalize(&current)
+            && !forms.contains(&canonical)
+        {
+            forms.push(canonical);
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            break;
+        };
+        if !metadata.file_type().is_symlink() {
+            break;
+        }
+        let Ok(target) = std::fs::read_link(&current) else {
+            break;
+        };
+        let next = lexical_normalize(&if target.is_absolute() {
+            target
+        } else {
+            current.parent().unwrap_or(Path::new("/")).join(target)
+        });
+        if forms.contains(&next) {
+            break;
+        }
+        forms.push(next.clone());
+        current = next;
+    }
+    forms
+}
+
+/// Resolve `.` and `..` lexically, without touching the filesystem (a symlink
+/// target may not exist, so `canonicalize` cannot be used).
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn default_face() -> ToolFace {
