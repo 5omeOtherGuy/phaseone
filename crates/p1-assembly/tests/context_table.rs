@@ -64,6 +64,56 @@ fn an_optional_excerpt_budget_is_honoured() {
     assert_eq!(environment.context.unwrap().tool_result_excerpt_chars, 500);
 }
 
+// The summary-output cap of context.md "Revision 2026-09-20": optional, defaulted,
+// validated and shown on the resolved environment.
+#[test]
+fn the_summary_output_cap_is_optional_validated_and_shown() {
+    // Absent: the compiled-in default, so existing environments are unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    write_environment(dir.path(), "ctx", &format!("{BASE}\n{TABLE}"), "hi");
+    let environment = load_environment("ctx", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(environment.context.unwrap().summary_output_tokens, 4_000);
+
+    // Present: parsed, kept, and displayed in the resolved environment.
+    let dir = tempfile::tempdir().unwrap();
+    let toml = format!("{BASE}\n{TABLE}summary_output_tokens = 12000\n");
+    write_environment(dir.path(), "ctx", &toml, "hi");
+    let environment = load_environment("ctx", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(
+        environment.context.clone().unwrap().summary_output_tokens,
+        12_000
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let assembled = assemble(&catalog(), &environment, workspace.path(), &substitutions()).unwrap();
+    let json = serde_json::to_string(&assembled.resolved).unwrap();
+    assert!(json.contains("\"summary_output_tokens\":12000"), "{json}");
+
+    // Zero is refused...
+    let dir = tempfile::tempdir().unwrap();
+    let toml = format!("{BASE}\n{TABLE}summary_output_tokens = 0\n");
+    write_environment(dir.path(), "ctx", &toml, "hi");
+    let error = load_environment("ctx", &[dir.path().to_path_buf()]).unwrap_err();
+    match &error {
+        AssemblyError::InvalidContext { message } => {
+            assert!(message.contains("summary_output_tokens"), "{message}");
+        }
+        other => panic!("expected InvalidContext, got {other:?}"),
+    }
+
+    // ...and so is a cap that leaves no room under the wall (200000 - 16000).
+    let dir = tempfile::tempdir().unwrap();
+    let toml = format!("{BASE}\n{TABLE}summary_output_tokens = 184000\n");
+    write_environment(dir.path(), "ctx", &toml, "hi");
+    let error = load_environment("ctx", &[dir.path().to_path_buf()]).unwrap_err();
+    match &error {
+        AssemblyError::InvalidContext { message } => {
+            assert!(message.contains("summary_output_tokens"), "{message}");
+            assert!(message.contains("184000"), "{message}");
+        }
+        other => panic!("expected InvalidContext, got {other:?}"),
+    }
+}
+
 #[test]
 fn summarize_md_is_read_as_the_prompt_override() {
     let dir = tempfile::tempdir().unwrap();

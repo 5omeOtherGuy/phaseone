@@ -44,6 +44,9 @@ const SUMMARIZE_FILE: &str = "summarize.md";
 const PROFILES_DIR: &str = "../profiles";
 /// Default per-tool-result budget for the summarizer transcript.
 const DEFAULT_TOOL_RESULT_EXCERPT_CHARS: usize = 2_000;
+/// Default cap on one summary's output tokens (context.md "Revision 2026-09-20").
+/// Duplicated from `p1-context` on purpose: `p1-assembly` names no context module.
+const DEFAULT_SUMMARY_OUTPUT_TOKENS: u64 = 4_000;
 
 // ------------------------------------------------------------------ public API
 
@@ -88,10 +91,18 @@ pub struct ContextSettings {
     /// Per tool result, when rendered for the summarizer.
     #[serde(default = "default_tool_result_excerpt_chars")]
     pub tool_result_excerpt_chars: usize,
+    /// Cap on one summary's output tokens: `max_output_tokens` of the summarizing
+    /// request, and the room its rendered transcript is measured against.
+    #[serde(default = "default_summary_output_tokens")]
+    pub summary_output_tokens: u64,
 }
 
 fn default_tool_result_excerpt_chars() -> usize {
     DEFAULT_TOOL_RESULT_EXCERPT_CHARS
+}
+
+fn default_summary_output_tokens() -> u64 {
+    DEFAULT_SUMMARY_OUTPUT_TOKENS
 }
 
 impl ContextSettings {
@@ -103,6 +114,7 @@ impl ContextSettings {
             ("summarize_at_tokens", self.summarize_at_tokens),
             ("keep_recent_tokens", self.keep_recent_tokens),
             ("user_verbatim_tokens", self.user_verbatim_tokens),
+            ("summary_output_tokens", self.summary_output_tokens),
         ] {
             if value == 0 {
                 return Err(format!("{name} must be greater than zero"));
@@ -118,6 +130,12 @@ impl ContextSettings {
             return Err(format!(
                 "summarize_at_tokens ({}) must be below window_tokens - output_headroom_tokens ({wall})",
                 self.summarize_at_tokens
+            ));
+        }
+        if self.summary_output_tokens >= wall {
+            return Err(format!(
+                "summary_output_tokens ({}) must be below window_tokens - output_headroom_tokens ({wall})",
+                self.summary_output_tokens
             ));
         }
         Ok(())

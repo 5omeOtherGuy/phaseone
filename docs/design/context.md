@@ -117,6 +117,21 @@ drop the OLDEST rendered items after the previous summary and put
 `[<n> earlier items omitted: the session was too long to summarize in one pass]` in their place.
 The answer is the concatenated text blocks of the completed response; an empty answer is a failure.
 
+**Revision 2026-09-20 (dogfood run split3b: 8 of 14 summaries were cut at the cap and accepted).**
+- The cap is a setting: `[context] summary_output_tokens` (default 4_000, so existing behaviour
+  and the frozen tests hold). On a thinking model the cap INCLUDES reasoning tokens; such an
+  environment sets it higher (the shipped `deepseek` one: 12_000). Everywhere this section says
+  4_000 it means this setting.
+- A summary that did not END is never accepted: a completed response whose `stop` is
+  `MaxOutputTokens` is retried ONCE with the cap doubled (only where a cap is being sent); a
+  second truncation, or any stop other than `EndTurn`, is a failure like an empty answer. Both
+  requests' usage is reported (summed by the usual known-parts rule).
+- The default prompt gains one section, between "State of the work" and "Verified facts":
+  `## Files` — for every file that was read or changed and still matters: its path and, in a few
+  words each, the symbols and line ranges that matter in it, so that the work can continue with
+  RANGED reads instead of reading whole files again. Copied forward from a previous summary
+  while the file still matters.
+
 `DEFAULT_SUMMARIZER_PROMPT` asks for these sections, in this order, and says what each is for:
 `## Task` · `## Constraints and instructions` (every rule the user or the repository imposed —
 copied forward from a previous summary, never dropped unless the user revoked it) ·
