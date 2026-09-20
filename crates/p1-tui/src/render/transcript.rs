@@ -123,13 +123,13 @@ fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
 fn call_lines(row: &ToolRow, width: usize, out: &mut Vec<Line<'static>>) {
     out.push(call_row(row, width));
     if let Some(fold) = row.fold() {
-        fold_lines(&fold, width, row.depth, out);
+        fold_lines(&fold, width, out);
     }
 }
 
 /// The §3 row: `▸ read      src/lib.rs              ✓ 412 lines`.
 fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
-    let indent = "  ".repeat(row.depth.min(1) as usize);
+    let indent = "";
     let (glyph, glyph_fg) = match row.status {
         RowStatus::Running => (glyphs::TOOL, palette::DIM),
         RowStatus::Settled(ToolStatus::Ok) => (glyphs::DONE, palette::DIM),
@@ -144,7 +144,7 @@ fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
         format!("{cut:<NAME_FIELD$}")
     };
     let mut spans = vec![
-        Span::styled(indent.clone(), Style::new().fg(palette::DIM)),
+        Span::styled(indent, Style::new().fg(palette::DIM)),
         Span::styled(format!("{glyph} "), Style::new().fg(glyph_fg)),
         Span::styled(name, Style::new().fg(palette::DIM)),
         Span::styled(row.summary.clone(), Style::new().fg(palette::DIM)),
@@ -171,8 +171,8 @@ fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
             }
             parts.push(first);
         }
-        if let Some(output) = &row.output {
-            let n = output.lines().count();
+        if row.line_count > 0 {
+            let n = row.line_count;
             parts.push(if n == 1 {
                 "1 line".into()
             } else {
@@ -227,8 +227,8 @@ fn status_word(status: ToolStatus) -> &'static str {
 
 /// A fold block: head lines DIM on BLOCK, then the FAINT handle line. The
 /// block is padded to the full width so it reads as one surface (SPEC §3).
-fn fold_lines(fold: &Fold, width: usize, depth: u8, out: &mut Vec<Line<'static>>) {
-    let indent = "  ".repeat(depth.min(1) as usize + 1);
+fn fold_lines(fold: &Fold, width: usize, out: &mut Vec<Line<'static>>) {
+    let indent = "  ".to_string();
     let (head, handle) = match fold {
         Fold::Full { lines } => (lines.as_slice(), None),
         Fold::Folded { head, folded, id } => (
