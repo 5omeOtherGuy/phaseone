@@ -97,6 +97,9 @@ fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
                 out.push(Line::styled(shown, Style::new().fg(palette::INK)));
             }
         }
+        Block::Meta { text } => {
+            out.push(Line::styled(text.clone(), Style::new().fg(palette::DIM)));
+        }
         Block::Notice { lines } => {
             // §4.9: state what broke, no banner. The first line is INK — it is
             // the fact; the rest are DIM detail.
