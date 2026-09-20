@@ -164,10 +164,13 @@ itself live under `/tmp` or under the home:
 1. `--ro-bind / /`, `--dev /dev`, `--proc /proc`;
 2. `--bind <private_tmp> /tmp` — a fresh directory per `ShellTool`, created under
    `std::env::temp_dir()` and removed when the tool is dropped; `--setenv TMPDIR /tmp`;
-3. `--tmpfs <home>`, then `--ro-bind <home>/<entry> <home>/<entry>` for every existing
-   `home_visible` entry, then `--ro-bind /dev/null <home>/.cargo/credentials.toml` (and
-   `…/credentials`) if that file exists — a visible directory must not leak a token;
-4. `--bind <path> <path>` for every existing `writable` path;
+3. `--tmpfs <home>` (`<home>` CANONICAL — the same path the containment check used), then
+   `--ro-bind <home>/<entry> <home>/<entry>` for every existing `home_visible` entry;
+   `--tmpfs $XDG_RUNTIME_DIR` when that variable names an existing directory — agent sockets
+   and keyrings live there;
+4. `--bind <path> <path>` for every existing `writable` path; THEN the masks, so that no
+   writable bind can uncover them: `--ro-bind /dev/null <home>/.cargo/credentials.toml` (and
+   `…/credentials`) if that file exists — a visible or writable directory must not leak a token;
 5. `--bind <workspace root> <workspace root>`;
 6. `--remount-ro <home>` — writes to the hidden home fail loudly (`Read-only file system`)
    instead of vanishing into a tmpfs;
