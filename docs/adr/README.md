@@ -56,7 +56,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0040 | [p1 keeps logins in one file keyed by route; environment variables win; other tools' logins are borrowed](0040-p1-keeps-logins-in-one-file-keyed-by-route-environment-variables-win-other-tools-logins-are-borrowed.md) | accepted | 2026-09-20 | owner |
 | ADR-0041 | [A headless run waits and continues after a transient provider failure](0041-a-headless-run-waits-and-continues-after-a-transient-provider-failure.md) | accepted | 2026-09-20 | lead |
 | ADR-0042 | [A headless run that only summarizes ends as stalled](0042-a-headless-run-that-only-summarizes-ends-as-stalled.md) | accepted | 2026-09-20 | lead |
-| ADR-0043 | [TUI: pure state machine in p1-tui, terminal driver in p1-host](0043-tui-pure-state-machine-in-p1-tui-terminal-driver-in-p1-host.md) | proposed | 2026-09-20 | lead |
+| ADR-0043 | [TUI: pure state machine in p1-tui, terminal driver in p1-host](0043-tui-pure-state-machine-in-p1-tui-terminal-driver-in-p1-host.md) | accepted | 2026-09-20 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
