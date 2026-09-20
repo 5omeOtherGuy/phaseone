@@ -79,7 +79,9 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
 commands was told about ONE missing run per call — five rejected calls for one mistake. Therefore:
 - **A masked exit status is not a verification.** A recorded command never counts when, outside
   quotes (the same simple scan), it contains `;`, `||`, a newline, or a single `&` that is not
-  part of `&&`. `&&` chains stay honest and stay accepted. Naming such a run →
+  part of `&&` and not part of a redirection (`>&`, `&>`, as in `2>&1`: an `&` directly after
+  `>` or directly before `>` redirects, it does not background). `&&` chains stay honest and
+  stay accepted; `cargo test 2>&1` stays accepted. Naming such a run →
   Error `\`<command>\` continues after a failure (\`;\`, \`||\`, \`&\` or a new line), so its exit code says nothing about the check. Run the check on its own, then finish.`
   The normalisation's one leading `cd <path> &&` is dropped BEFORE this test, as before.
   The trailer's list and its wording "(successful, not piped, after the last file change)" are
