@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dev-dependencies]
+p1-host = { path = "../p1-host" }
 p1-contracts = { path = "../p1-contracts" }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-provider-anthropic = { path = "../p1-provider-anthropic" }

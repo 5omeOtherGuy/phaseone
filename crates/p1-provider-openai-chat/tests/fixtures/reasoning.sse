@@ -1,0 +1,6 @@
+data: {"id":"synthetic","model":"dated-server-alias","choices":[{"index":0,"delta":{"reasoning_content":"opaque-reasoning-sentinel"},"finish_reason":null}]}
+
+data: {"id":"synthetic","model":"dated-server-alias","choices":[{"index":0,"delta":{"content":"Hello world"},"finish_reason":"stop"}]}
+
+data: [DONE]
+

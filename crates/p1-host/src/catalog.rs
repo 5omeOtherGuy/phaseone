@@ -209,6 +209,94 @@ fn register_providers(catalog: &mut Catalog, deps: &HostDeps) {
             Ok(Arc::new(provider) as Arc<dyn Provider>)
         }),
     );
+    let transport = deps.transport.clone();
+    catalog.provider(
+        "opencode-go-subscription",
+        Box::new(move |spec: &ProviderSpec| {
+            deepseek_subscription(&spec.model, transport.clone())
+                .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
+                .map_err(|error| error.to_string())
+        }),
+    );
+    let transport = deps.transport.clone();
+    catalog.provider(
+        "glm-subscription",
+        Box::new(move |spec: &ProviderSpec| {
+            glm_subscription(&spec.model, transport.clone())
+                .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
+                .map_err(|error| error.to_string())
+        }),
+    );
+}
+
+/// Shipped route binding, reused by live checks. Credential access remains lazy.
+pub fn deepseek_subscription(
+    model: &str,
+    transport: Arc<dyn p1_provider_http::Transport>,
+) -> Result<p1_provider_openai_chat::ChatProvider, p1_contracts::ProviderError> {
+    use p1_contracts::Effort;
+    use p1_model_profile::{ModelProfile, ThinkingPolicy};
+    use p1_provider_openai_chat::{ChatDialect, ChatLimits, ChatProvider, ChatRoute};
+    let route = ChatRoute {
+        origin_route: "openai-chat/opencode-go-subscription".into(),
+        endpoint: "https://opencode.ai/zen/go/v1/chat/completions".into(),
+        headers: vec![(
+            "user-agent".into(),
+            concat!("p1/", env!("CARGO_PKG_VERSION")).into(),
+        )],
+        session_header: Some("x-opencode-session".into()),
+        dialect: ChatDialect::ThinkingWithReasoningAlias,
+        limits: ChatLimits::default(),
+    };
+    let profile = ModelProfile {
+        model_id: model.into(),
+        thinking: ThinkingPolicy::Enabled,
+        efforts: vec![Effort::High, Effort::Max],
+        default_effort: Effort::High,
+        max_output_tokens: None,
+    };
+    ChatProvider::new(
+        route,
+        model,
+        Arc::new(profile),
+        transport,
+        Arc::new(crate::auth::SubscriptionCredentials::opencode_go()),
+    )
+}
+
+/// GLM model policy and the Z.ai coding route are separate constructor inputs.
+pub fn glm_subscription(
+    model: &str,
+    transport: Arc<dyn p1_provider_http::Transport>,
+) -> Result<p1_provider_openai_chat::ChatProvider, p1_contracts::ProviderError> {
+    use p1_contracts::Effort;
+    use p1_model_profile::{ModelProfile, ThinkingPolicy};
+    use p1_provider_openai_chat::{ChatDialect, ChatLimits, ChatProvider, ChatRoute};
+    let route = ChatRoute {
+        origin_route: "openai-chat/glm-subscription".into(),
+        endpoint: "https://api.z.ai/api/coding/paas/v4/chat/completions".into(),
+        headers: vec![(
+            "user-agent".into(),
+            concat!("p1/", env!("CARGO_PKG_VERSION")).into(),
+        )],
+        session_header: None,
+        dialect: ChatDialect::RetainedThinking,
+        limits: ChatLimits::default(),
+    };
+    let profile = ModelProfile {
+        model_id: model.into(),
+        thinking: ThinkingPolicy::Preserved,
+        efforts: vec![Effort::Low, Effort::High, Effort::Max],
+        default_effort: Effort::High,
+        max_output_tokens: Some(131_072),
+    };
+    ChatProvider::new(
+        route,
+        model,
+        Arc::new(profile),
+        transport,
+        Arc::new(crate::auth::SubscriptionCredentials::glm()),
+    )
 }
 
 fn register_standard_tools(

@@ -1,0 +1,10 @@
+data: {"id":"synthetic","model":"dated-server-alias","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"synthetic","model":"dated-server-alias","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}
+
+data: {"id":"synthetic","model":"dated-server-alias","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":40}}}
+
+data: [DONE]
+
+data: {"id":"synthetic","model":"dated-server-alias","choices":[{"index":0,"delta":{"content":"stray"},"finish_reason":null}]}
+

@@ -23,6 +23,7 @@ delegation = ["dep:p1-workers", "dep:p1-tool-delegate"]
 p1-assembly = { path = "../p1-assembly" }
 p1-context = { path = "../p1-context" }
 p1-contracts = { path = "../p1-contracts" }
+p1-model-profile = { path = "../p1-model-profile" }
 p1-core = { path = "../p1-core" }
 p1-journal = { path = "../p1-journal" }
 p1-workspace = { path = "../p1-workspace" }
@@ -35,6 +36,7 @@ p1-tool-patch = { path = "../p1-tool-patch" }
 p1-tool-finish = { path = "../p1-tool-finish" }
 p1-provider-anthropic = { path = "../p1-provider-anthropic" }
 p1-provider-openai = { path = "../p1-provider-openai" }
+p1-provider-openai-chat = { path = "../p1-provider-openai-chat" }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-workers = { path = "../p1-workers", optional = true }
 p1-tool-delegate = { path = "../p1-tool-delegate", optional = true }

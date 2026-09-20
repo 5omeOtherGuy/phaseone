@@ -105,6 +105,17 @@ async fn respond(provider: &dyn Provider, request: ProviderRequest) -> Completed
 async fn round_trip(provider: &dyn Provider, tools: Vec<ToolDeclaration>, effort: Option<Effort>) {
     let options = ModelOptions {
         reasoning_effort: effort,
+        cache_key: (provider.describe().origin.route == "openai-chat/opencode-go-subscription")
+            .then(|| {
+                format!(
+                    "p1-live-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                )
+            }),
         ..ModelOptions::default()
     };
     println!("- text turn");
@@ -252,4 +263,30 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
         ),
         other => panic!("expected freeform text input, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn deepseek_subscription_route() {
+    if !live() {
+        return;
+    }
+    let provider = p1_host::catalog::deepseek_subscription(
+        &model("P1_LIVE_DEEPSEEK_MODEL", "deepseek-v4.1-flash"),
+        Arc::new(ReqwestTransport::new()),
+    )
+    .expect("valid route/profile binding");
+    round_trip(&provider, vec![read_tool()], Some(Effort::High)).await;
+}
+
+#[tokio::test]
+async fn glm_subscription_route() {
+    if !live() {
+        return;
+    }
+    let provider = p1_host::catalog::glm_subscription(
+        &model("P1_LIVE_GLM_MODEL", "glm-5.3"),
+        Arc::new(ReqwestTransport::new()),
+    )
+    .expect("valid route/profile binding");
+    round_trip(&provider, vec![read_tool()], Some(Effort::High)).await;
 }

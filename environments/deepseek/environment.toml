@@ -1,0 +1,19 @@
+family = "deepseek"
+provider = "opencode-go-subscription"
+model = "deepseek-v4.1-flash"
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "finish"

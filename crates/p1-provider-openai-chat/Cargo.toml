@@ -1,0 +1,22 @@
+[package]
+name = "p1-provider-openai-chat"
+description = "Chat Completions subscription routes for OpenCode Go and Z.ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-model-profile = { path = "../p1-model-profile" }
+p1-provider-http = { path = "../p1-provider-http" }
+serde_json = "1"
+
+[dev-dependencies]
+p1-provider-conformance = { path = "../p1-provider-conformance" }
+p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time", "test-util"] }

@@ -1,4 +1,4 @@
-# The two real provider routes — verified wire shapes
+# The subscription provider routes — verified wire shapes
 
 Status legend: **[donor]** read from iris-agent@62c8345 source and its unit tests (the
 owner ran these routes in production) · **[live]** confirmed by a p1 live smoke check ·
@@ -164,3 +164,156 @@ tokens read from cache; WITH them 57 %, 69 %, 64 %. Individual requests still mi
 even with the headers, so routing is only part of the story; the Claude route reaches 97 % on
 comparable work. Small sample on one day — re-measure before building on the exact numbers.
 
+
+## C. DeepSeek on OpenCode Go (`openai-chat/opencode-go-subscription`)
+
+**[docs + live, 2026-09-20]** `POST https://opencode.ai/zen/go/v1/chat/completions`.
+Environment `deepseek` selects `deepseek-v4.1-flash`, high effort. This is the Go
+subscription endpoint; there is no fallback to Zen pay-as-you-go or another provider.
+[OpenCode Go documentation](https://opencode.ai/docs/go/) lists the endpoint and asks
+coding clients to identify themselves and supply a stable conversation header. p1 sends
+its own `user-agent: p1/<version>` and uses the host's cache key as `x-opencode-session`.
+No foreign client identity is impersonated.
+
+Credential precedence: `OPENCODE_API_KEY`; then the `opencode-go` API entry in
+`$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`);
+then the `opencode-go` API-key entry in `$PI_CODING_AGENT_DIR/auth.json` (default
+`~/.pi/agent/auth.json`). OpenCode uses `type: api`; Pi uses `type: api_key`; both
+use a `key` member. Only the selected entry is used. These are read by the credential
+source, never printed or included in the environment manifest. p1 does not execute
+Pi command-backed key configuration; use the environment variable in that case.
+
+## D. GLM on its Z.ai coding subscription (`openai-chat/glm-subscription`)
+
+**[docs + live, 2026-09-20]** `POST https://api.z.ai/api/coding/paas/v4/chat/completions`.
+Environment `glm` selects `glm-5.3`, high effort, matching the owner's `glm53` profile
+identified by the lead in issue #9. No fallback to the general paid API or Go.
+Credentials: `ZAI_API_KEY`, otherwise the `zai` API-key entry in Pi's auth file at the
+location above. Construction reads no credential. Access re-reads it; rejection re-reads
+once and only retries with a changed key. Static keys have no OAuth refresh; an unchanged
+rejected key produces an authentication error. Neither credential source writes files.
+
+[Z.ai Chat Completion](https://docs.z.ai/api-reference/llm/chat-completion) and
+[Thinking Mode](https://docs.z.ai/guides/capabilities/thinking-mode) document the message
+format and preserved reasoning. p1 sends `thinking: {type: enabled, clear_thinking: false}`
+and `reasoning_effort: high`. GLM uses automatic prefix caching: an explicit p1 cache key
+is rejected, rather than silently ignored. A preliminary smoke also passed on
+`glm-5.3-flash`; that is not the shipped default.
+
+### Shared Chat Completions implementation (C and D)
+
+Following ADR-0039 migration step 2, `p1-provider-openai-chat` takes an injected
+`ChatRoute`, configured wire model, `Arc<ModelProfile>`, transport and `CredentialSource`.
+The closed subscription-route enum is gone. `ChatRoute` carries origin, endpoint,
+non-secret headers, optional session header, wire dialect and route output ceiling.
+`ChatDialect` names implemented encodings (`ThinkingWithReasoningAlias` or
+`RetainedThinking`), never vendors; only the former permits the `reasoning` replay alias.
+The constructor rejects incompatible continuation requirements, unsupported efforts,
+credential-bearing URLs/known credential headers and invalid route settings.
+
+The additive `p1-model-profile` crate depends only on contracts. It holds the currently
+consumed model policy: identity, enabled/preserved thinking, supported/default efforts and
+output ceiling. The same profile can bind to two compatible endpoints without changing
+model-related request fields; route limits may narrow, never enlarge, its allowance.
+The host catalog supplies the two bindings and owns borrowed credential lookup in `auth`.
+Live smoke tests call those same host constructors. The p1 credential store is deferred:
+precedence today is explicit environment variable then borrowed CLI login, with the future
+store slot between them (ADR-0040). No credential writes are performed.
+
+Environment profile selection and data-driven route files are migration step 3, not part
+of this change. Both catalog keys, environments and origin strings stay unchanged.
+The runtime Provider/core/HTTP/tool seams stay unchanged, with no new third-party dependencies.
+Both environments assemble read/edit/write/grep/shell/finish, with separate family prompts.
+
+**Request:** system/user/assistant/tool messages; function declarations under
+`tools[].function`; raw JSON arguments remain strings. Inbox items use user messages.
+Tool results retain their call IDs and exact content. Freeform declarations or history
+cannot be encoded and are rejected. `max_output_tokens` maps to positive `max_tokens`.
+High is the default; GLM carries low/high/max, DeepSeek high/max; medium/extra-high
+are rejected. GLM rejects output caps above its documented 131,072-token maximum.
+Unknown options in the adapter namespace are errors. Go enables thinking without GLM's
+`clear_thinking` field. Both request streamed usage with `stream_options.include_usage`. GLM also sets
+`tool_stream: true` when tools are present to stream argument fragments.
+
+**Stream:** `choices[0].delta.content`, `reasoning_content` (Go's `reasoning` alias also
+accepted), and indexed function-call fragments. Calls retain first-appearance order;
+arguments are concatenated byte-exact and never parsed/repaired. `finish_reason` maps
+stop/tool_calls/length/content_filter to end-turn/tool-use/output-limit/refusal. Completion
+requires `[DONE]` after a finish reason, retaining usage in a later empty-choices chunk.
+EOF is failure; output-limited partial calls are not executable. Missing/duplicate call
+identities are protocol errors. Diagnostics never copy server error bodies.
+
+**Replay:** each reasoning block carries a version-1 string payload, with configured route
+and model as origin. Matching blocks concatenate unchanged into `reasoning_content` in
+assistant history. Foreign replay is dropped; unsupported matching replay versions fail.
+The model name echoed by a server cannot change the origin.
+
+**Usage:** cache reads come from `prompt_tokens_details.cached_tokens` or
+`prompt_cache_hit_tokens`; uncached input is `prompt_cache_miss_tokens`, or prompt total
+minus explicitly reported cached input. If the cache split is absent, uncached input is
+unknown too. Completion and reasoning tokens remain separate. Cache writes and subscription
+cost remain `None`; no notional catalog price is charged as real spend.
+
+**Evidence:** both routes pass the unchanged shared conformance suite, including every-byte
+chunk splits, cancellation, retry limits, invalid raw arguments and foreign reasoning.
+Additional tests cover request JSON, endpoint/session headers, interleaved calls, truncated
+completion, usage splits, credential precedence/rotation and redacted errors. Composition
+checks bind one profile to two synthetic routes, reject incompatible dialects, and verify
+exact reasoning placement in the second request sent through scripted transport. Fixtures
+are hand-written.
+
+Live smoke commands (three requests each; existing subscription credentials):
+```
+P1_LIVE=1 cargo test -p p1-live deepseek_subscription_route -- --nocapture --test-threads 1
+P1_LIVE=1 cargo test -p p1-live glm_subscription_route -- --nocapture --test-threads 1
+```
+Both passed text, function call and tool-result follow-up on 2026-09-20. DeepSeek emitted
+reasoning before the tool call and accepted its replay. With GLM's explicit `tool_stream`
+switch, the same smoke yielded five argument fragments and reasoning before the tool call;
+the follow-up replays it. Both reported cache reads in these tiny checks; they do not
+measure sustained cache efficiency.
+Low/max effort, explicit output caps and changed-key retry have synthetic coverage only;
+subscription key rejection/rotation has not been induced against the live services.
+
+**Sandboxed coding check, DeepSeek:** `scripts/dogfood.sh routes9-deepseek deepseek .
+/tmp/p1-route-checks/task.txt`, with `P1_BIN` pointing to this worktree's own debug build.
+Task: fix SSE initial UTF-8 BOM handling, including split BOM bytes, with regression tests.
+The disposable p1 clone completed in 150 seconds: exit 0, 25 requests, 27 tool calls,
+628,625 input tokens (606,720 cached), 18,227 output tokens; cost unknown. One `finish`
+call was rejected for naming checks differently from the actual compound shell commands;
+the model reran them standalone and recovered without intervention. New family prompts
+now explicitly request standalone verification commands.
+
+Independent acceptance: 54 HTTP tests and formatting passed; a separate Rust harness tested
+all three-chunk splits over leading/duplicate BOMs, BOMs inside values, a BOM-only stream
+and normal input. Candidate passed; the original baseline failed. Only the intended SSE
+file changed. The candidate is not merged as part of route implementation. Local evidence:
+`~/projects/phaseone-dogfood/routes9-deepseek.run/report.json`, with the diff alongside it.
+This one bounded task does not establish long-run reliability or comparative model quality.
+
+**After the ADR-0039 reshape (b34ba7e, 2026-09-20):** both host-wired live smokes
+passed again, with reasoning emitted before tool calls and accepted on follow-up.
+Both routes then completed the same bounded SSE BOM task in separate sandboxed clones:
+
+| Route/model | Seconds | Requests | Tool calls | Failed tool calls | Cached input share |
+|---|---:|---:|---:|---:|---:|
+| Go / deepseek-v4.1-flash, high | 145 | 26 | 32 | 0 | 96.5% |
+| Z.ai coding / glm-5.3, high | 434 | 22 | 29 | 0 | 93.7% |
+
+Both exited 0 with no operator intervention or reviewer repairs. Subscription cost remains
+unknown. DeepSeek used 630,628 input / 19,849 output tokens; GLM used 697,714 input /
+22,720 output tokens. One and two nonzero shell exits respectively were deliberate
+negative controls, not provider/tool failures. GLM noticed an insensitive regression fixture
+while testing the old behaviour and strengthened it before finishing.
+
+The reviewer independently reran each clone's HTTP tests (54 DeepSeek, 55 GLM), formatting,
+and the same standalone adversarial harness covering all two/three-chunk splits of leading,
+duplicate and embedded BOMs, BOM-only streams and ordinary streams. Both candidates passed;
+the unmodified baseline failed. Each changed only `crates/p1-provider-http/src/sse.rs`.
+The generated fixes remain in disposable clones, outside this route PR.
+
+Local evidence directories: `~/projects/phaseone-dogfood/routes9-deepseek-reshaped.run/`
+and `~/projects/phaseone-dogfood/routes9-glm.run/`; each has an `accepted-report.json`,
+original `report.json` and `changes.diff`. The independent harness is
+`/tmp/p1-route-checks/verify.py`. These are integration checks, not a controlled model
+comparison or evidence of hours-long reliability.
