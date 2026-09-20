@@ -202,8 +202,22 @@ impl ResponseParser for ChatParser {
                     let Some(index) = call.get("index").and_then(Value::as_u64) else {
                         return self.fail("tool delta missing index");
                     };
-                    if call.get("type").is_some_and(|value| value != "function") {
-                        return self.fail("unsupported chat tool type");
+                    // Continuation chunks of a streamed call may repeat the field as
+                    // `null` or `""` (seen on the opencode-go route: two long runs died
+                    // here). Only a NAMED other type is unsupported.
+                    if call
+                        .get("type")
+                        .is_some_and(|value| !value.is_null() && value != "" && value != "function")
+                    {
+                        // Name the type: a short, sanitised word, never stream content.
+                        let named: String = call["type"]
+                            .as_str()
+                            .unwrap_or("<non-string>")
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                            .take(32)
+                            .collect();
+                        return self.fail(&format!("unsupported chat tool type `{named}`"));
                     }
                     for field in ["/id", "/function/name", "/function/arguments"] {
                         if call
@@ -339,6 +353,52 @@ mod tests {
             StreamEvent::Finished(Outcome::Completed(response)) => response,
             other => panic!("{other:?}"),
         }
+    }
+    #[test]
+    fn a_null_or_empty_tool_type_on_a_continuation_chunk_is_not_a_protocol_error() {
+        for filler in [json!(null), json!("")] {
+            let mut p = parser();
+            send(
+                &mut p,
+                choice(
+                    json!({"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"read","arguments":"{\"file_"}}]}),
+                    json!(null),
+                ),
+            );
+            let events = send(
+                &mut p,
+                choice(
+                    json!({"tool_calls":[{"index":0,"type":filler,"function":{"arguments":"path\":\"a\"}"}}]}),
+                    json!("tool_calls"),
+                ),
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::Finished(Outcome::Failed(_)))),
+                "{events:?}"
+            );
+            let response = done(&mut p);
+            assert_eq!(response.stop, p1_contracts::StopReason::ToolUse);
+        }
+    }
+    #[test]
+    fn a_named_other_tool_type_is_still_a_protocol_error() {
+        let mut p = parser();
+        let events = send(
+            &mut p,
+            choice(
+                json!({"tool_calls":[{"index":0,"id":"c1","type":"custom","function":{"name":"read","arguments":"{}"}}]}),
+                json!(null),
+            ),
+        );
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Finished(Outcome::Failed(ProviderError {
+                kind: ProviderErrorKind::Protocol,
+                ..
+            })))
+        ));
     }
     #[test]
     fn usage_does_not_invent_cache_or_uncached_counts() {
