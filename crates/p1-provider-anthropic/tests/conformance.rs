@@ -9,13 +9,32 @@ use p1_contracts::{
     BoxFuture, DeclarationKind, Item, ModelOptions, Provider, ProviderError, ProviderRequest,
     ToolDeclaration,
 };
-use p1_provider_anthropic::{AnthropicProvider, build_request};
+use p1_model_profile::ModelProfile;
+use p1_provider_anthropic::{
+    AnthropicProvider, MessagesAccount, MessagesRoute, ROUTE, build_request,
+};
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource};
 
 const MODEL: &str = "claude-sonnet-5";
 const BEARER: &str = "CONFORMANCE-FAKE-BEARER";
+
+/// The shipped route and profile of the model this suite runs: `MODEL` is what
+/// `routes/anthropic-subscription.toml` binds `profiles/claude-sonnet-5.toml` to, so
+/// these expectations are the adapter's own, only obtained through the files.
+fn route() -> MessagesRoute {
+    MessagesRoute {
+        origin_route: ROUTE.to_string(),
+        endpoint: "https://api.anthropic.com".to_string(),
+        account: MessagesAccount::ClaudeCodeSubscription,
+    }
+}
+
+fn profile() -> Arc<ModelProfile> {
+    let text = include_str!("../../../profiles/claude-sonnet-5.toml");
+    Arc::new(ModelProfile::from_toml(MODEL, text).expect("the shipped profile is valid"))
+}
 
 struct FixedCredentials;
 
@@ -43,15 +62,20 @@ impl CredentialSource for FixedCredentials {
 }
 
 fn build(transport: ScriptedTransport) -> Arc<dyn Provider> {
-    Arc::new(AnthropicProvider::new(
-        MODEL,
-        Arc::new(transport),
-        Arc::new(FixedCredentials),
-    ))
+    Arc::new(
+        AnthropicProvider::new(
+            route(),
+            MODEL,
+            profile(),
+            Arc::new(transport),
+            Arc::new(FixedCredentials),
+        )
+        .expect("the shipped profile is expressible on the Messages wire"),
+    )
 }
 
 fn follow_up_request(request: &ProviderRequest) -> serde_json::Value {
-    build_request(MODEL, request).expect("follow-up request builds")
+    build_request(&route(), MODEL, &profile(), request).expect("follow-up request builds")
 }
 
 /// This route carries JSON-schema function tools only.

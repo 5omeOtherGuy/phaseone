@@ -97,15 +97,15 @@ macro_rules! apply_finish_face {
 
 /// Build the catalog from the injected dependencies.
 ///
-/// Provider keys: `anthropic-subscription`, `openai-codex-subscription`, plus one
-/// key per route file found in `<environments dir>/../routes`
-/// (`docs/design/routes-and-profiles.md` §2). Tool keys: `read`, `edit`, `write`,
-/// `grep`, `shell`, `apply_patch`, and — with the `delegation` feature and a worker
-/// service present — the four `worker_*` tools.
+/// Provider keys: `openai-codex-subscription`, plus one key per route file found in
+/// `<environments dir>/../routes` (`docs/design/routes-and-profiles.md` §2) — the
+/// Messages adapter's `anthropic-subscription` route among them. Tool keys: `read`,
+/// `edit`, `write`, `grep`, `shell`, `apply_patch`, and — with the `delegation`
+/// feature and a worker service present — the four `worker_*` tools.
 ///
 /// A routed key is selected with `route` + `profile` and refuses the whole-provider
-/// form; the whole providers above refuse a profile. A route file whose id collides
-/// with a whole-provider key is a start-up error, reported here before any run.
+/// form; a whole provider refuses a profile. A route file whose id collides with a
+/// whole-provider key is a start-up error, reported here before any run.
 ///
 /// Provider construction reads no credential file; the credential sources are
 /// resolved lazily on the first `access`. Tools are constructed per agent with
@@ -199,29 +199,14 @@ fn build_catalog_inner(
 
 /// The compiled whole-provider keys: a catalog key that consumes no profile. A route
 /// file may not take one of these ids, and a `route` naming one is the wrong-form
-/// error the whole provider itself reports.
-pub const WHOLE_PROVIDERS: [&str; 2] = ["anthropic-subscription", "openai-codex-subscription"];
+/// error the whole provider itself reports. `anthropic-subscription` left this list
+/// in ADR-0039 step 4: it is a route file now.
+pub const WHOLE_PROVIDERS: [&str; 1] = ["openai-codex-subscription"];
 
 fn register_providers(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
     let transport = deps.transport.clone();
     catalog.provider(
         WHOLE_PROVIDERS[0],
-        Box::new(move |spec: &ProviderSpec| {
-            reject_profile(spec)?;
-            let credentials = p1_provider_anthropic::ClaudeCodeCredentials::from_default_location()
-                .map_err(|error| error.to_string())?;
-            let provider = p1_provider_anthropic::AnthropicProvider::new(
-                &spec.model,
-                transport.clone(),
-                Arc::new(credentials),
-            );
-            Ok(Arc::new(provider) as Arc<dyn Provider>)
-        }),
-    );
-
-    let transport = deps.transport.clone();
-    catalog.provider(
-        WHOLE_PROVIDERS[1],
         Box::new(move |spec: &ProviderSpec| {
             reject_profile(spec)?;
             let credentials = p1_provider_openai::CodexCliCredentials::from_default_location()
@@ -258,16 +243,8 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
             Box::new(move |spec: &ProviderSpec| {
                 let profile = require_profile(spec)?;
                 let binding = data.binding(&profile.id)?;
-                let credentials = crate::auth::SubscriptionCredentials::from_ref(&data.credential)?;
-                route_provider(
-                    &data,
-                    binding,
-                    profile,
-                    transport.clone(),
-                    Arc::new(credentials),
-                )
-                .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
-                .map_err(|error| error.to_string())
+                let credentials = crate::auth::credential_source(&data.credential)?;
+                route_provider(&data, binding, profile, transport.clone(), credentials)
             }),
         );
     }
@@ -332,15 +309,32 @@ pub fn route_provider(
     profile: Arc<p1_model_profile::ModelProfile>,
     transport: Arc<dyn p1_provider_http::Transport>,
     credentials: Arc<dyn p1_provider_http::CredentialSource>,
-) -> Result<p1_provider_openai_chat::ChatProvider, String> {
-    p1_provider_openai_chat::ChatProvider::new(
-        chat_route(route, binding, &profile)?,
-        &binding.wire_model,
-        profile,
-        transport,
-        credentials,
-    )
-    .map_err(|error| error.to_string())
+) -> Result<Arc<dyn Provider>, String> {
+    use crate::routes::AdapterSettings;
+    match route.settings()? {
+        AdapterSettings::OpenAiChat(settings) => {
+            let provider = p1_provider_openai_chat::ChatProvider::new(
+                chat_route_from(route, binding, &profile, settings)?,
+                &binding.wire_model,
+                profile,
+                transport,
+                credentials,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(Arc::new(provider) as Arc<dyn Provider>)
+        }
+        AdapterSettings::AnthropicMessages(settings) => {
+            let provider = p1_provider_anthropic::AnthropicProvider::new(
+                messages_route_from(route, settings),
+                &binding.wire_model,
+                profile,
+                transport,
+                credentials,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(Arc::new(provider) as Arc<dyn Provider>)
+        }
+    }
 }
 
 /// The chat adapter's view of one route file: the file's endpoint and static headers,
@@ -351,10 +345,24 @@ pub fn chat_route(
     binding: &crate::routes::ModelBinding,
     profile: &p1_model_profile::ModelProfile,
 ) -> Result<p1_provider_openai_chat::ChatRoute, String> {
+    // A chat route file names `openai-chat`; any other adapter key is the wrong
+    // function, not a silent fallback.
+    let crate::routes::AdapterSettings::OpenAiChat(settings) = route.settings()? else {
+        return Err(format!(
+            "route \"{}\" names adapter \"{}\", not openai-chat",
+            route.id, route.adapter
+        ));
+    };
+    chat_route_from(route, binding, profile, settings)
+}
+
+fn chat_route_from(
+    route: &crate::routes::RouteFile,
+    binding: &crate::routes::ModelBinding,
+    profile: &p1_model_profile::ModelProfile,
+    settings: p1_provider_openai_chat::ChatAdapterSettings,
+) -> Result<p1_provider_openai_chat::ChatRoute, String> {
     use p1_provider_openai_chat::{ChatLimits, ChatRoute};
-    // One adapter key today, so the pattern is irrefutable; a second variant turns
-    // this into a compile error rather than a silent wrong adapter.
-    let crate::routes::AdapterSettings::OpenAiChat(settings) = route.settings()?;
     // `user-agent` stays compiled: it carries this crate's version, so a route file
     // cannot stale it. The file's own headers follow, sorted by name (a `BTreeMap`,
     // so the order is stable), and a file cannot name a secret-looking one.
@@ -378,6 +386,33 @@ pub fn chat_route(
             max_output_tokens: lower_ceiling(profile.max_output_tokens, binding.output_limit),
         },
     })
+}
+
+/// The Messages adapter's view of one route file: the recorded origin route, the
+/// endpoint and the account behaviour the file names (spec §7.2). It carries no
+/// static headers today, so a `[headers]` table on such a route is empty in every
+/// shipped file; nothing else about a Messages route is data.
+pub fn messages_route(
+    route: &crate::routes::RouteFile,
+) -> Result<p1_provider_anthropic::MessagesRoute, String> {
+    let crate::routes::AdapterSettings::AnthropicMessages(settings) = route.settings()? else {
+        return Err(format!(
+            "route \"{}\" names adapter \"{}\", not anthropic-messages",
+            route.id, route.adapter
+        ));
+    };
+    Ok(messages_route_from(route, settings))
+}
+
+fn messages_route_from(
+    route: &crate::routes::RouteFile,
+    settings: p1_provider_anthropic::MessagesAdapterSettings,
+) -> p1_provider_anthropic::MessagesRoute {
+    p1_provider_anthropic::MessagesRoute {
+        origin_route: route.origin_route.clone(),
+        endpoint: route.endpoint.clone(),
+        account: settings.account,
+    }
 }
 
 /// A route may restrict a profile's ceiling, never enlarge it. Unknown on one side

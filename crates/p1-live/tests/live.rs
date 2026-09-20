@@ -15,7 +15,6 @@ use p1_contracts::{
     ModelOptions, Outcome, Provider, ProviderRequest, StopReason, StreamEvent, ToolDeclaration,
     ToolInput, ToolResultItem, ToolStatus,
 };
-use p1_provider_anthropic::{AnthropicProvider, ClaudeCodeCredentials};
 use p1_provider_http::ReqwestTransport;
 use p1_provider_openai::{CodexCliCredentials, OpenAiCodexProvider};
 
@@ -196,14 +195,11 @@ async fn claude_subscription_route() {
     if !live() {
         return;
     }
-    let model = model("P1_LIVE_CLAUDE_MODEL", "claude-sonnet-5");
-    println!("== anthropic-messages/claude-subscription · {model}");
-    let provider = AnthropicProvider::new(
-        &model,
-        Arc::new(ReqwestTransport::new()),
-        Arc::new(ClaudeCodeCredentials::from_default_location().expect("Claude Code login")),
-    );
-    round_trip(&provider, vec![read_tool()], effort()).await;
+    let wire_model = model("P1_LIVE_CLAUDE_MODEL", "claude-sonnet-5");
+    println!("== anthropic-messages/claude-subscription · {wire_model}");
+    // The shipped route and profile, exactly as the host composes them.
+    let provider = live_route("anthropic-subscription", "claude-sonnet-5", &wire_model);
+    round_trip(&*provider, vec![read_tool()], effort()).await;
 }
 
 #[tokio::test]
@@ -286,18 +282,16 @@ fn live_route(route_id: &str, profile_id: &str, wire_model: &str) -> Arc<dyn Pro
         .expect("the route serves this profile")
         .clone();
     binding.wire_model = wire_model.to_string();
-    let credentials = p1_host::auth::SubscriptionCredentials::from_ref(&route.credential)
+    let credentials = p1_host::auth::credential_source(&route.credential)
         .expect("the route's credential reference");
-    Arc::new(
-        p1_host::catalog::route_provider(
-            &route,
-            &binding,
-            profile,
-            Arc::new(ReqwestTransport::new()),
-            Arc::new(credentials),
-        )
-        .expect("valid route/profile binding"),
+    p1_host::catalog::route_provider(
+        &route,
+        &binding,
+        profile,
+        Arc::new(ReqwestTransport::new()),
+        credentials,
     )
+    .expect("valid route/profile binding")
 }
 
 #[tokio::test]
