@@ -263,7 +263,18 @@ impl Driver {
                 false,
             ),
             Command::NextFile => {}
-            Command::OpenFold => {}
+            Command::OpenFold => {
+                // Open the most recent fold in the OUTPUT pane (SPEC §4.3).
+                if let Some(id) = self.screen.transcript.latest_fold.clone()
+                    && let Some(content) = self.screen.transcript.output(&id)
+                {
+                    self.screen.open_output(p1_tui::render::output::OutputView {
+                        id,
+                        lines: content.lines().map(str::to_string).collect(),
+                        scroll: 0,
+                    });
+                }
+            }
             Command::ExpandReasoning => {}
             Command::CyclePaneMode => self.screen.cycle_mode(),
             Command::CyclePaneWidth => self.screen.cycle_width(),
@@ -290,6 +301,8 @@ impl Driver {
             }
             Command::ScrollUp => self.screen.scroll_by(10),
             Command::ScrollDown => self.screen.scroll_by(-10),
+            Command::PaneUp => self.screen.scroll_output_by(-1),
+            Command::PaneDown => self.screen.scroll_output_by(1),
         }
         let _ = now_ms;
     }

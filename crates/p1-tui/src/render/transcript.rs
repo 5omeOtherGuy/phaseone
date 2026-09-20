@@ -169,6 +169,14 @@ fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
         let pad = width.saturating_sub(used + result.chars().count() + 1);
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(result, Style::new().fg(palette::DIM)));
+        // An output big enough to fold is addressable: `^O open` (FAINT hint).
+        if row
+            .output
+            .as_deref()
+            .is_some_and(|o| o.lines().count() > crate::fold::FULL_BLOCK_MAX_LINES)
+        {
+            spans.push(Span::styled("   ^O open", Style::new().fg(palette::FAINT)));
+        }
     }
     Line::from(spans)
 }

@@ -6,6 +6,7 @@
 pub mod composer;
 pub mod diff;
 pub mod ledger;
+pub mod output;
 pub mod permission;
 pub mod picker;
 pub mod screen;
