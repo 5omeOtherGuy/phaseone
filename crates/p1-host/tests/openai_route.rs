@@ -22,7 +22,7 @@ use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
 use p1_host::catalog::{build_catalog, resolve_environment, responses_route, route_provider};
 use p1_host::cli::SandboxMode;
-use p1_host::routes::{AdapterSettings, CredentialKind, RouteFile, load_route_by_id};
+use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
 use p1_provider_http::testing::ScriptedTransport;
@@ -180,7 +180,7 @@ fn the_shipped_responses_route_holds_what_the_host_used_to_compile() {
     );
     assert_eq!(route.adapter, "openai-responses");
     assert_eq!(route.endpoint, "https://chatgpt.com/backend-api");
-    assert_eq!(route.credential.kind, CredentialKind::CodexOauth);
+    assert_eq!(route.credential.kind, p1_auth::CredentialKind::CodexOauth);
     assert_eq!(
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
@@ -283,6 +283,7 @@ fn the_shipped_responses_route_passes_the_conformance_suite() {
 /// `p1 env show NAME` through the real CLI and catalog.
 fn show_env(name: &str) -> (i32, String, String) {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    common::isolated_environment(&mut harness);
     let code = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
@@ -294,7 +295,7 @@ fn show_env(name: &str) -> (i32, String, String) {
 fn the_shipped_gpt_environment_assembles_through_the_catalog_unchanged() {
     let (code, stdout, stderr) = show_env("gpt");
     assert_eq!(code, 0, "{stderr}");
-    let resolved: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let resolved: serde_json::Value = common::env_show_json(&stdout);
     assert_eq!(resolved["environment"], "gpt");
     assert_eq!(resolved["family"], "gpt");
     assert_eq!(

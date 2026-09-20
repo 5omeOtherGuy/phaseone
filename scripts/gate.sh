@@ -21,6 +21,7 @@ echo "== gate: adr"
 scripts/adr.py check
 python3 scripts/test_adr.py -q
 python3 scripts/test_fanout.py -q
+python3 scripts/test_run_report.py -q
 target_dir="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 echo "== target dir: $(du -sh "$target_dir" 2>/dev/null | cut -f1) $target_dir (free: $(df -h --output=avail "$target_dir" | tail -1 | tr -d ' '))"
 echo "== gate: GREEN"

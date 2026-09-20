@@ -201,6 +201,19 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
         write_stderr(deps, &format!("{message}\n"));
         return EXIT_FAILURE;
     }
+    // Which source this route's credential comes from — never a value (spec §4).
+    match crate::catalog::credential_line(
+        &environment,
+        &deps.environment_dirs,
+        &crate::auth::locations(deps),
+    ) {
+        Ok(Some(line)) => write_stdout(deps, &format!("credential  {line}\n")),
+        Ok(None) => {}
+        Err(message) => {
+            write_stderr(deps, &format!("{message}\n"));
+            return EXIT_FAILURE;
+        }
+    }
     let workspace = match resolve_workspace(options) {
         Ok(workspace) => workspace,
         Err(message) => {
