@@ -4,14 +4,14 @@
 //! This module owns the model-facing declaration, input validation, rendering
 //! and the read-before-mutate observation.
 
-use std::io::{BufRead, BufReader, ErrorKind, Read};
+use std::io::{ErrorKind, Read};
 use std::path::Path;
 
 use p1_contracts::{
     BoxFuture, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
     ToolInput, ToolOutcome, ToolStatus,
 };
-use p1_workspace::{ObservedFiles, StreamingHash, Workspace, bound_output};
+use p1_workspace::{ObservedFiles, StreamingHash, Workspace};
 use serde::Deserialize;
 
 pub use p1_workspace::ToolFace;
@@ -24,8 +24,7 @@ const MAX_OUTPUT_BYTES: usize = 50_000;
 const MAX_OUTPUT_LINES: usize = 2_000;
 /// A NUL anywhere in the first 8 KiB marks the file as binary.
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
-/// The internal buffer of the streaming line reader: fixed and small, however
-/// large the file is.
+/// The internal read buffer: fixed and small, however large the file is.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
 /// The `read` tool. Holds one agent's workspace and observation store.
@@ -221,24 +220,204 @@ fn run(
     read_windowed(file, metadata.len(), &resolved, &display, input, observed)
 }
 
-/// Stream `reader` (exactly `total_len` bytes) line by line, collecting at
-/// most the requested window while still validating and hashing every byte,
-/// and counting (never storing) the lines that follow it.
+/// Incremental UTF-8 validation with only an incomplete trailing character
+/// retained between chunks.
+#[derive(Default)]
+struct Utf8Validator {
+    pending: [u8; 4],
+    pending_len: usize,
+}
+
+impl Utf8Validator {
+    fn update(&mut self, mut bytes: &[u8]) -> Result<(), ()> {
+        if self.pending_len > 0 {
+            let character_len = match self.pending[0] {
+                0xC2..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF4 => 4,
+                _ => return Err(()),
+            };
+            let take = bytes.len().min(character_len - self.pending_len);
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&bytes[..take]);
+            self.pending_len += take;
+            bytes = &bytes[take..];
+
+            if self.pending_len == character_len {
+                std::str::from_utf8(&self.pending[..self.pending_len]).map_err(|_| ())?;
+                self.pending_len = 0;
+            }
+        }
+
+        if self.pending_len == 0
+            && let Err(error) = std::str::from_utf8(bytes)
+        {
+            if error.error_len().is_some() {
+                return Err(());
+            }
+            let incomplete = &bytes[error.valid_up_to()..];
+            self.pending[..incomplete.len()].copy_from_slice(incomplete);
+            self.pending_len = incomplete.len();
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), ()> {
+        if self.pending_len == 0 {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
+/// The bounded portion of the line currently being scanned.
+struct LineBuffer {
+    shown: Vec<u8>,
+    content_bytes: usize,
+    last_byte: Option<u8>,
+}
+
+impl LineBuffer {
+    fn new() -> Self {
+        Self {
+            shown: Vec::with_capacity(MAX_OUTPUT_BYTES),
+            content_bytes: 0,
+            last_byte: None,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8], retain: bool) {
+        self.content_bytes += bytes.len();
+        if let Some(last) = bytes.last() {
+            self.last_byte = Some(*last);
+        }
+        if retain {
+            let keep = bytes
+                .len()
+                .min(MAX_OUTPUT_BYTES.saturating_sub(self.shown.len()));
+            self.shown.extend_from_slice(&bytes[..keep]);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.shown.clear();
+        self.content_bytes = 0;
+        self.last_byte = None;
+    }
+}
+
+struct Window {
+    start: usize,
+    cap: usize,
+    line_number: usize,
+    emitted: usize,
+    end: usize,
+    stop_collecting: bool,
+    out: String,
+}
+
+impl Window {
+    fn wants_current_line(&self) -> bool {
+        self.line_number + 1 > self.start && !self.stop_collecting && self.emitted < self.cap
+    }
+
+    fn finish_line(&mut self, line: &mut LineBuffer) {
+        self.line_number += 1;
+        if !self.wants_finished_line() {
+            line.reset();
+            return;
+        }
+
+        let content_bytes = line.content_bytes - usize::from(line.last_byte == Some(b'\r'));
+        line.shown.truncate(line.shown.len().min(content_bytes));
+        let shown_end = match std::str::from_utf8(&line.shown) {
+            Ok(_) => line.shown.len(),
+            Err(error) => error.valid_up_to(),
+        };
+        line.shown.truncate(shown_end);
+
+        let prefix = format!("{:>6}\t", self.line_number);
+        let rendered_bytes = prefix.len() + content_bytes;
+        if self.emitted > 0 && self.out.len() + 1 + rendered_bytes > MAX_OUTPUT_BYTES {
+            self.stop_collecting = true;
+            line.reset();
+            return;
+        }
+
+        if self.emitted > 0 {
+            self.out.push('\n');
+        }
+        self.out.push_str(&prefix);
+        if rendered_bytes <= MAX_OUTPUT_BYTES {
+            self.out
+                .push_str(std::str::from_utf8(&line.shown).expect("validated line prefix"));
+        } else {
+            let available = MAX_OUTPUT_BYTES.saturating_sub(self.out.len());
+            let mut display_end = available.min(line.shown.len());
+            while display_end > 0 && std::str::from_utf8(&line.shown[..display_end]).is_err() {
+                display_end -= 1;
+            }
+            self.out
+                .push_str(std::str::from_utf8(&line.shown[..display_end]).expect("UTF-8 boundary"));
+            let shown_bytes = self.out.len();
+            self.out.push('\n');
+            self.out.push_str(&format!(
+                "[output truncated: showing {shown_bytes} of {rendered_bytes} bytes]"
+            ));
+            self.out.push('\n');
+            self.out.push_str(&format!(
+                "[{} bytes omitted from line {}]",
+                content_bytes - display_end,
+                self.line_number
+            ));
+            self.stop_collecting = true;
+        }
+        self.end = self.line_number;
+        self.emitted += 1;
+        line.reset();
+    }
+
+    fn wants_finished_line(&self) -> bool {
+        self.line_number > self.start && !self.stop_collecting && self.emitted < self.cap
+    }
+}
+
+struct WindowedRead {
+    output: String,
+    #[cfg(test)]
+    max_line_buffer_bytes: usize,
+}
+
+/// Stream `reader` (exactly `total_len` bytes), retaining a bounded prefix of
+/// the current line and requested window while validating and hashing every
+/// byte and counting the lines that follow it.
 fn read_windowed<R: Read>(
-    mut reader: R,
+    reader: R,
     total_len: u64,
     resolved: &Path,
     display: &str,
     input: &ReadInput,
     observed: &ObservedFiles,
 ) -> Result<String, String> {
+    read_windowed_impl(reader, total_len, resolved, display, input, observed)
+        .map(|result| result.output)
+}
+
+fn read_windowed_impl<R: Read>(
+    mut reader: R,
+    total_len: u64,
+    resolved: &Path,
+    display: &str,
+    input: &ReadInput,
+    observed: &ObservedFiles,
+) -> Result<WindowedRead, String> {
     // The binary sniff must run to completion, over exactly the bytes it
     // would see reading the whole file at once, before anything else is
     // checked — otherwise a NUL later in the file could race a UTF-8 error
-    // from an earlier chunk and change which error is reported. `chain` lets
-    // the sniffed bytes stand back in front of the stream for the real pass,
-    // without needing `Seek` (a synthetic or piped source may not have one).
-    let sniff_len = BINARY_SNIFF_BYTES.min(total_len as usize);
+    // from an earlier chunk and change which error is reported. The sniffed
+    // bytes are fed through the normal pass before reading the rest, without
+    // needing `Seek` (a synthetic or piped source may not have one).
+    let sniff_len = total_len.min(BINARY_SNIFF_BYTES as u64) as usize;
     let mut sniff = vec![0u8; sniff_len];
     reader
         .read_exact(&mut sniff)
@@ -246,61 +425,67 @@ fn read_windowed<R: Read>(
     if sniff.contains(&0) {
         return Err(format!("{display} is a binary file."));
     }
-    let chained = std::io::Cursor::new(sniff).chain(reader);
-    let mut lines = BufReader::with_capacity(READ_BUFFER_BYTES, chained);
 
     let offset = input.offset.unwrap_or(DEFAULT_OFFSET) as usize;
     let limit = input.limit.unwrap_or(DEFAULT_LIMIT) as usize;
     let start = offset - 1;
-    let window_cap = limit.min(MAX_OUTPUT_LINES);
-
     let mut hash = StreamingHash::new();
-    let mut raw = Vec::new();
-    let mut line_number = 0usize;
-    let mut out = String::new();
-    let mut emitted = 0usize;
-    let mut stop_collecting = false;
-    let mut end = start;
+    let mut utf8 = Utf8Validator::default();
+    let mut line = LineBuffer::new();
+    let mut window = Window {
+        start,
+        cap: limit.min(MAX_OUTPUT_LINES),
+        line_number: 0,
+        emitted: 0,
+        end: start,
+        stop_collecting: false,
+        out: String::new(),
+    };
+    #[cfg(test)]
+    let mut max_line_buffer_bytes = 0;
 
-    loop {
-        raw.clear();
-        let bytes_read = lines
-            .read_until(b'\n', &mut raw)
-            .map_err(|error| format!("{display} could not be read: {error}"))?;
-        if bytes_read == 0 {
-            break;
-        }
-        // The hash covers every raw byte of the file, in order, exactly as
-        // `ObservedFiles::record` would from the whole file at once.
-        hash.update(&raw);
-        // `\n` (0x0A) never appears inside a multi-byte UTF-8 sequence, so
-        // checking each line chunk is equivalent to validating the whole
-        // file as one string, and fails on the same first bad byte.
-        let text =
-            std::str::from_utf8(&raw).map_err(|_| format!("{display} is not valid UTF-8."))?;
+    {
+        let mut process = |chunk: &[u8]| -> Result<(), String> {
+            hash.update(chunk);
+            utf8.update(chunk)
+                .map_err(|_| format!("{display} is not valid UTF-8."))?;
+            let mut remaining = chunk;
+            while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
+                line.push(&remaining[..newline], window.wants_current_line());
+                #[cfg(test)]
+                {
+                    max_line_buffer_bytes = max_line_buffer_bytes.max(line.shown.len());
+                }
+                window.finish_line(&mut line);
+                remaining = &remaining[newline + 1..];
+            }
+            line.push(remaining, window.wants_current_line());
+            #[cfg(test)]
+            {
+                max_line_buffer_bytes = max_line_buffer_bytes.max(line.shown.len());
+            }
+            Ok(())
+        };
 
-        line_number += 1;
-        if line_number <= start {
-            continue;
+        process(&sniff)?;
+        drop(sniff);
+        let mut buffer = [0u8; READ_BUFFER_BYTES];
+        loop {
+            let bytes_read = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("{display} could not be read: {error}"))?;
+            if bytes_read == 0 {
+                break;
+            }
+            process(&buffer[..bytes_read])?;
         }
-        if stop_collecting || emitted >= window_cap {
-            continue;
-        }
-        let content = text.strip_suffix('\n').unwrap_or(text);
-        let content = content.strip_suffix('\r').unwrap_or(content);
-        let rendered = format!("{line_number:>6}\t{content}");
-        if emitted > 0 && out.len() + 1 + rendered.len() > MAX_OUTPUT_BYTES {
-            stop_collecting = true;
-            continue;
-        }
-        if emitted > 0 {
-            out.push('\n');
-        }
-        out.push_str(&rendered);
-        end = line_number;
-        emitted += 1;
     }
-    let total = line_number;
+    utf8.finish()
+        .map_err(|_| format!("{display} is not valid UTF-8."))?;
+    if line.content_bytes > 0 {
+        window.finish_line(&mut line);
+    }
+    let total = window.line_number;
 
     if start >= total {
         return Err(format!(
@@ -311,22 +496,24 @@ fn read_windowed<R: Read>(
     // returned lines: a later edit compares against the whole file.
     observed.record_streamed(resolved, hash);
 
-    // A single line larger than the byte budget is cut by the shared bounding rule.
-    let mut out = bound_output(&out, MAX_OUTPUT_BYTES, usize::MAX);
-    if end < total {
-        out.push('\n');
-        out.push_str(&format!(
+    if window.end < total {
+        window.out.push('\n');
+        window.out.push_str(&format!(
             "[{} more lines; continue with offset={}]",
-            total - end,
-            end + 1
+            total - window.end,
+            window.end + 1
         ));
     }
-    Ok(out)
+    Ok(WindowedRead {
+        output: window.out,
+        #[cfg(test)]
+        max_line_buffer_bytes,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_BUFFER_BYTES, ReadInput, ReadTool, parse_input};
+    use super::{MAX_OUTPUT_BYTES, READ_BUFFER_BYTES, ReadInput, ReadTool, parse_input};
     use p1_contracts::{
         DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome, ToolStatus,
     };
@@ -680,6 +867,43 @@ mod tests {
         assert!(parse_input("read", &call).is_err());
     }
 
+    #[test]
+    fn utf8_validator_matches_std_for_every_split_and_small_chunk_size() {
+        fn validate_incrementally(bytes: &[u8], split: usize, chunk_size: usize) -> bool {
+            let mut validator = super::Utf8Validator::default();
+            if validator.update(&bytes[..split]).is_err() {
+                return false;
+            }
+            for chunk in bytes[split..].chunks(chunk_size) {
+                if validator.update(chunk).is_err() {
+                    return false;
+                }
+            }
+            validator.finish().is_ok()
+        }
+
+        fn check_every_chunking(bytes: &[u8]) {
+            let expected = std::str::from_utf8(bytes).is_ok();
+            for split in 0..=bytes.len() {
+                for chunk_size in 1..=7 {
+                    assert_eq!(
+                        validate_incrementally(bytes, split, chunk_size),
+                        expected,
+                        "split={split}, chunk_size={chunk_size}, bytes={bytes:?}"
+                    );
+                }
+            }
+        }
+
+        let mixed = "aé€🦀Z¢水𐍈".as_bytes();
+        check_every_chunking(mixed);
+        for invalid_at in 0..=mixed.len() {
+            let mut invalid = mixed.to_vec();
+            invalid.insert(invalid_at, 0xff);
+            check_every_chunking(&invalid);
+        }
+    }
+
     /// A synthetic, effectively unbounded source: it computes each byte from
     /// a repeating pattern rather than holding the "file" anywhere, so a
     /// multi-hundred-megabyte read never allocates megabytes to produce it.
@@ -719,17 +943,13 @@ mod tests {
 
     #[test]
     fn read_windowed_never_asks_for_more_than_a_small_fixed_buffer() {
-        // A 22 MB "file" of uniform 11-byte lines: far bigger than the
-        // window and the byte cap, so a regression back to loading the whole
-        // file (e.g. `fs::read`, whose single big read matches the file's
-        // size) would show up as a huge `max_requested`.
-        const LINE: &[u8] = b"abcdefghij\n";
-        const TOTAL_LINES: u64 = 2_000_000;
-        let total_len = LINE.len() as u64 * TOTAL_LINES;
+        // A synthetic 50 MB single line exercises both buffers that matter:
+        // reads from the source and bytes retained from the current line.
+        const TOTAL_LEN: u64 = 50 * 1024 * 1024;
         let source = RepeatingPattern {
-            pattern: LINE,
+            pattern: b"x",
             produced: 0,
-            remaining: total_len,
+            remaining: TOTAL_LEN,
         };
         let mut tracked = TrackingReader {
             inner: source,
@@ -747,10 +967,10 @@ mod tests {
 
         // `read_windowed` only needs a reader and the declared length: feed
         // it the synthetic source directly, wrapped so its request sizes are
-        // observable, without ever materializing the 22 MB "file" anywhere.
-        let out = super::read_windowed(
+        // observable, without ever materializing the 50 MB "file" anywhere.
+        let result = super::read_windowed_impl(
             &mut tracked,
-            total_len,
+            TOTAL_LEN,
             &path,
             "huge.txt",
             &input,
@@ -758,20 +978,114 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            out,
-            "     1\tabcdefghij\n     2\tabcdefghij\n[1999998 more lines; continue with offset=3]"
+        assert!(
+            result
+                .output
+                .contains("[52378807 bytes omitted from line 1]"),
+            "{}",
+            result.output
         );
         assert!(
-            tracked.max_requested <= 2 * READ_BUFFER_BYTES,
-            "a single read asked for {} bytes out of a {total_len}-byte source; \
-             the window builder must never buffer more than a small fixed amount",
+            tracked.max_requested <= READ_BUFFER_BYTES,
+            "a single read asked for {} bytes out of a {TOTAL_LEN}-byte source",
             tracked.max_requested,
+        );
+        assert!(
+            result.max_line_buffer_bytes <= MAX_OUTPUT_BYTES,
+            "the line buffer retained {} bytes",
+            result.max_line_buffer_bytes
         );
         assert_eq!(
             observed.check_unchanged(&path, &[]),
             p1_workspace::Observation::ChangedSinceObserved,
             "the huge file must be observed by its real content, computed from the stream"
+        );
+    }
+
+    #[test]
+    fn read_windowed_accepts_a_character_split_across_chunks() {
+        let mut contents = vec![b'a'; super::BINARY_SNIFF_BYTES - 1];
+        contents.extend_from_slice("€tail".as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("split.txt");
+        let observed = ObservedFiles::new();
+        let input = ReadInput {
+            path: "split.txt".into(),
+            offset: Some(1),
+            limit: Some(1),
+        };
+
+        let output = super::read_windowed(
+            std::io::Cursor::new(&contents),
+            contents.len() as u64,
+            &path,
+            "split.txt",
+            &input,
+            &observed,
+        )
+        .unwrap();
+
+        assert!(output.ends_with("€tail"));
+    }
+
+    #[test]
+    fn read_windowed_rejects_an_invalid_byte_deep_inside_a_long_line() {
+        let mut contents = vec![b'a'; READ_BUFFER_BYTES * 3 + 17];
+        contents.push(0xff);
+        contents.extend_from_slice(b"tail");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.txt");
+        let observed = ObservedFiles::new();
+        let input = ReadInput {
+            path: "invalid.txt".into(),
+            offset: Some(1),
+            limit: Some(1),
+        };
+
+        let error = super::read_windowed(
+            std::io::Cursor::new(&contents),
+            contents.len() as u64,
+            &path,
+            "invalid.txt",
+            &input,
+            &observed,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "invalid.txt is not valid UTF-8.");
+    }
+
+    #[test]
+    fn long_line_streamed_hash_matches_observed_files_record() {
+        let contents = vec![b'z'; MAX_OUTPUT_BYTES * 4 + 13];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        let streamed = ObservedFiles::new();
+        let whole = ObservedFiles::new();
+        let input = ReadInput {
+            path: "long.txt".into(),
+            offset: Some(1),
+            limit: Some(1),
+        };
+        whole.record(&path, &contents);
+
+        super::read_windowed(
+            std::io::Cursor::new(&contents),
+            contents.len() as u64,
+            &path,
+            "long.txt",
+            &input,
+            &streamed,
+        )
+        .unwrap();
+
+        assert_eq!(
+            streamed.check_unchanged(&path, &contents),
+            whole.check_unchanged(&path, &contents)
+        );
+        assert_eq!(
+            streamed.check_unchanged(&path, &contents),
+            p1_workspace::Observation::Unchanged
         );
     }
 }
