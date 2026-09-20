@@ -8,9 +8,11 @@ mod common;
 use std::sync::Arc;
 
 use common::{Harness, provider_hook_arc, run_args, write_environment};
+#[cfg(feature = "delegation")]
+use p1_contracts::Item;
 use p1_contracts::{
-    BoxFuture, CancellationToken, Item, Origin, Provider, ProviderError, ProviderRequest,
-    ProviderStream, RouteDescription,
+    BoxFuture, CancellationToken, Origin, Provider, ProviderError, ProviderRequest, ProviderStream,
+    RouteDescription,
 };
 use p1_testkit::{ScriptedProvider, text_response};
 use tempfile::tempdir;
