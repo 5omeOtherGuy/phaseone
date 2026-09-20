@@ -185,6 +185,192 @@ async fn sandbox_write_keeps_a_path_writable_end_to_end() {
     );
 }
 
+/// `--sandbox-read PATH` keeps an extra path visible READ-ONLY end to end: the
+/// CLI flag reaches the tool's `Sandbox::readable`.
+#[tokio::test]
+async fn sandbox_read_keeps_a_path_readable_end_to_end() {
+    if !bwrap_usable() {
+        eprintln!("SKIP: bwrap unusable here");
+        return;
+    }
+    let home = tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // A directory inside the hidden home, so only `--sandbox-read` can expose it.
+    let shared = home.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("note.txt"), "readable-note").unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["shell"],
+        "test",
+    );
+    let read_note = serde_json::json!({
+        "command": format!("cat '{}/note.txt'", shared.display())
+    })
+    .to_string();
+    let write_note = serde_json::json!({
+        "command": format!("touch '{}/new.txt'", shared.display())
+    })
+    .to_string();
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "shell", &read_note)]),
+        tool_call_response(vec![json_call("c2", "shell", &write_note)]),
+        text_response("done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.home = Some(home.path().to_path_buf());
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--sandbox",
+            "workspace",
+            "--sandbox-read",
+            shared.to_str().unwrap(),
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert!(
+        !shared.join("new.txt").exists(),
+        "the path must stay read-only"
+    );
+    let requests = handle.requests();
+    let results = tool_results(&requests.last().unwrap().history);
+    assert!(
+        results
+            .iter()
+            .any(|content| content.contains("readable-note")),
+        "the readable file must be visible: {results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|content| content.contains("[exit code: 1]")),
+        "writing the readable path must fail: {results:?}"
+    );
+}
+
+/// A readable path inside a credential directory fails assembly before any
+/// provider request (the check needs no `bwrap`).
+#[tokio::test]
+async fn a_credential_sandbox_read_fails_assembly_before_any_provider_request() {
+    let home = tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["shell"],
+        "test",
+    );
+    let provider = ScriptedProvider::new(vec![text_response("must not be reached")]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.home = Some(home.path().to_path_buf());
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--sandbox",
+            "workspace",
+            "--sandbox-read",
+            home.path().join(".ssh").to_str().unwrap(),
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 1, "stderr: {}", harness.stderr.text());
+    assert!(
+        handle.requests().is_empty(),
+        "the provider must not be called"
+    );
+    assert!(
+        harness.stderr.text().contains(".ssh"),
+        "the error must name the credential directory: {}",
+        harness.stderr.text()
+    );
+}
+
+/// `--sandbox-read $HOME` would re-expose every credential directory, so it
+/// fails assembly before any provider request (the check needs no `bwrap`).
+#[tokio::test]
+async fn sandbox_read_of_the_home_fails_assembly_before_any_provider_request() {
+    let home = tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["shell"],
+        "test",
+    );
+    let provider = ScriptedProvider::new(vec![text_response("must not be reached")]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.home = Some(home.path().to_path_buf());
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--sandbox",
+            "workspace",
+            "--sandbox-read",
+            home.path().to_str().unwrap(),
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 1, "stderr: {}", harness.stderr.text());
+    assert!(
+        handle.requests().is_empty(),
+        "the provider must not be called"
+    );
+    let stderr = harness.stderr.text();
+    assert!(
+        stderr.contains(home.path().to_str().unwrap()),
+        "the error must name the readable path: {stderr}"
+    );
+    assert!(
+        stderr.contains(".ssh"),
+        "the error must name a credential directory: {stderr}"
+    );
+}
+
 /// Requirement 6 (2): `env show` with the flag shows the sandbox paragraph and the
 /// `+sandbox` identity variant.
 #[tokio::test]
@@ -246,11 +432,25 @@ fn sandbox_usage_errors_exit_2_and_help_lists_the_flags() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // `--sandbox-read` mirrors `--sandbox-write`: a usage error without the mode.
+    let output = p1()
+        .args(["--sandbox-read", "/tmp", "--yes", "hi"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--sandbox-read requires --sandbox workspace"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let output = p1().arg("--help").output().unwrap();
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--sandbox MODE"), "help: {help}");
     assert!(help.contains("--sandbox-write PATH"), "help: {help}");
+    assert!(help.contains("--sandbox-read PATH"), "help: {help}");
 }
 
 /// The host fills `Sandbox::runtime_dir` from `XDG_RUNTIME_DIR`, so a socket in

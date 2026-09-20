@@ -148,6 +148,7 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             Some(service),
             options.sandbox,
             &options.sandbox_write,
+            &options.sandbox_read,
             &options.env_pass,
             &completion,
         )
@@ -157,6 +158,7 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
         deps,
         options.sandbox,
         &options.sandbox_write,
+        &options.sandbox_read,
         &options.env_pass,
         &completion,
     );
@@ -244,6 +246,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         deps,
         options.sandbox,
         &options.sandbox_write,
+        &options.sandbox_read,
         &options.env_pass,
         &completion_hub,
     ));

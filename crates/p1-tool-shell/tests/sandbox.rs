@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use p1_contracts::{
     CancellationToken, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome, ToolStatus,
 };
-use p1_tool_shell::{DEFAULT_HOME_VISIBLE, Sandbox, SandboxError, ShellTool, bwrap_args};
+use p1_tool_shell::{
+    CREDENTIAL_DIRECTORIES, DEFAULT_HOME_VISIBLE, Sandbox, SandboxError, ShellTool, bwrap_args,
+};
 use p1_workspace::{ToolFace, Workspace};
 
 /// The marker used for the `setsid` child in (g): a unique `sleep` argument, so
@@ -331,12 +333,14 @@ fn h_a_workspace_that_contains_the_home_is_refused() {
 // ------------------------------------------------------------------------ (i)
 
 /// The argument vector exactly as the mount plan lists it: `/tmp` before the
-/// home, the runtime dir right after the visible entries, the token masks AFTER
-/// every writable bind, the workspace last before `--remount-ro`.
+/// home, the visible entries and then the read-only `readable` paths right after
+/// the home tmpfs, the runtime dir after those, the token masks AFTER every
+/// writable bind, the workspace last before `--remount-ro`.
 fn expected_args(
     home: &Path,
     workspace: &Path,
     tmp: &Path,
+    readable: &[&Path],
     writable: &[&Path],
     runtime_dir: Option<&Path>,
 ) -> Vec<String> {
@@ -359,6 +363,15 @@ fn expected_args(
     ];
     for entry in DEFAULT_HOME_VISIBLE {
         let path = home.join(entry);
+        if path.exists() {
+            args.extend([
+                "--ro-bind".into(),
+                path.display().to_string(),
+                path.display().to_string(),
+            ]);
+        }
+    }
+    for path in readable {
         if path.exists() {
             args.extend([
                 "--ro-bind".into(),
@@ -418,15 +431,20 @@ fn i_bwrap_args_order_for_a_workspace_under_tmp() {
     let private_tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tempfile::tempdir().unwrap();
     let missing = home.path().join("does-not-exist");
+    let readable = home.path().join("shared");
+    std::fs::create_dir_all(&readable).unwrap();
+    let missing_readable = home.path().join("no-shared");
 
     let mut sandbox = Sandbox::for_home(home.path());
     sandbox.writable = vec![extra.path().to_path_buf(), missing.clone()];
+    sandbox.readable = vec![readable.clone(), missing_readable.clone()];
     sandbox.runtime_dir = Some(runtime_dir.path().to_path_buf());
     let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
     let expected = expected_args(
         home.path(),
         &workspace,
         private_tmp.path(),
+        &[&readable, &missing_readable],
         &[extra.path(), &missing],
         Some(runtime_dir.path()),
     );
@@ -442,11 +460,21 @@ fn i_bwrap_args_order_for_a_workspace_under_the_home() {
     std::fs::create_dir_all(home.path().join(".gitconfig")).unwrap();
     let workspace = home.path().join("nested/ws");
     std::fs::create_dir_all(&workspace).unwrap();
+    let readable = home.path().join("shared");
+    std::fs::create_dir_all(&readable).unwrap();
     let private_tmp = tempfile::tempdir().unwrap();
 
-    let sandbox = Sandbox::for_home(home.path());
+    let mut sandbox = Sandbox::for_home(home.path());
+    sandbox.readable = vec![readable.clone()];
     let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
-    let expected = expected_args(home.path(), &workspace, private_tmp.path(), &[], None);
+    let expected = expected_args(
+        home.path(),
+        &workspace,
+        private_tmp.path(),
+        &[&readable],
+        &[],
+        None,
+    );
 
     assert_eq!(os_args(&args), expected);
 }
@@ -491,6 +519,254 @@ fn i_token_masks_come_after_the_writable_binds() {
         mask < workspace_bind,
         "the mask must come before the workspace bind"
     );
+}
+
+/// The mount ORDER alone (`bwrap_args` is pure and does not validate) keeps the
+/// token masked: even a readable `~/.cargo` — or the home, which `sandboxed`
+/// refuses — is mounted before the mask.
+#[test]
+fn i_a_readable_path_cannot_uncover_the_cargo_token_mask() {
+    let home = tempfile::tempdir().unwrap();
+    let cargo = home.path().join(".cargo");
+    std::fs::create_dir_all(&cargo).unwrap();
+    std::fs::write(cargo.join("credentials.toml"), "TOKEN-CANARY").unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let private_tmp = tempfile::tempdir().unwrap();
+
+    for readable in [home.path().to_path_buf(), cargo.clone()] {
+        let mut sandbox = Sandbox::for_home(home.path());
+        sandbox.readable = vec![readable.clone()];
+        let args = os_args(&bwrap_args(&sandbox, &workspace, private_tmp.path()));
+        let readable_bind = args
+            .windows(3)
+            .position(|window| {
+                window[0] == "--ro-bind" && window[1] == readable.display().to_string()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the readable bind for {} must be present",
+                    readable.display()
+                )
+            });
+        let home_tmpfs = args
+            .windows(2)
+            .position(|window| {
+                window[0] == "--tmpfs" && window[1] == home.path().display().to_string()
+            })
+            .expect("the home tmpfs must be present");
+        let mask = args
+            .windows(3)
+            .position(|window| {
+                window[0] == "--ro-bind"
+                    && window[1] == "/dev/null"
+                    && window[2] == cargo.join("credentials.toml").display().to_string()
+            })
+            .expect("the credentials mask must be present");
+        assert!(
+            readable_bind > home_tmpfs,
+            "the readable bind must come after the home tmpfs: {readable:?}"
+        );
+        assert!(
+            mask > readable_bind,
+            "the token mask must come after the readable bind: {readable:?}"
+        );
+    }
+}
+
+/// A readable path equal to or inside a credential directory is refused before
+/// any probe, and the error names both the path and the directory.
+#[test]
+fn a_readable_credential_directory_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    for entry in [
+        ".ssh",
+        ".ssh/known_hosts",
+        ".claude",
+        ".codex",
+        ".gnupg",
+        ".local/share/opencode",
+        ".pi/x",
+        ".config/gh",
+        ".config/p1/credentials.json",
+    ] {
+        let mut sandbox = Sandbox::for_home(home.path());
+        sandbox.readable = vec![home.path().join(entry)];
+        let error = match ShellTool::new(Workspace::new(&workspace).unwrap()).sandboxed(sandbox) {
+            Err(error) => error,
+            Ok(_) => panic!("a readable path under {entry} must be refused"),
+        };
+        assert!(
+            matches!(error, SandboxError::ReadableCredential { .. }),
+            "{entry}: {error:?}"
+        );
+        assert!(
+            error.to_string().contains(entry),
+            "the error must name the path: {entry}: {error}"
+        );
+    }
+}
+
+/// A readable path that is an ANCESTOR of a credential directory uncovers it, so
+/// it is refused too — the home itself, `~/.config`, `~/.local/share`, an ancestor
+/// of the home, `/`, and a symlink that resolves to such an ancestor. The
+/// credential directory need not exist: it may be created later.
+#[test]
+fn a_readable_ancestor_of_a_credential_directory_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let mut cases: Vec<PathBuf> = vec![
+        home.path().to_path_buf(),
+        home.path().join(".config"),
+        home.path().join(".local"),
+        home.path().join(".local/share"),
+        PathBuf::from("/"),
+    ];
+    if let Some(parent) = home.path().parent() {
+        cases.push(parent.to_path_buf());
+    }
+    // A symlink that resolves to `~/.config`, an ancestor of `.config/gh`.
+    let link = home.path().join("config-link");
+    std::os::unix::fs::symlink(home.path().join(".config"), &link).unwrap();
+    cases.push(link);
+
+    for readable in cases {
+        let mut sandbox = Sandbox::for_home(home.path());
+        sandbox.readable = vec![readable.clone()];
+        let error = match ShellTool::new(Workspace::new(&workspace).unwrap()).sandboxed(sandbox) {
+            Err(error) => error,
+            Ok(_) => panic!("a readable {} must be refused", readable.display()),
+        };
+        assert!(
+            matches!(error, SandboxError::ReadableCredential { .. }),
+            "{}: {error:?}",
+            readable.display()
+        );
+        assert!(
+            error.to_string().contains(&readable.display().to_string()),
+            "the error must name the path: {}: {error}",
+            readable.display()
+        );
+    }
+}
+
+/// A symlink that resolves into a credential directory is refused too.
+#[test]
+fn a_symlinked_readable_path_into_a_credential_directory_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+    let link = home.path().join("link-to-ssh");
+    std::os::unix::fs::symlink(home.path().join(".ssh"), &link).unwrap();
+
+    let mut sandbox = Sandbox::for_home(home.path());
+    sandbox.readable = vec![link];
+    let error = match ShellTool::new(Workspace::new(&workspace).unwrap()).sandboxed(sandbox) {
+        Err(error) => error,
+        Ok(_) => panic!("a symlink into .ssh must be refused"),
+    };
+    assert!(
+        matches!(error, SandboxError::ReadableCredential { .. }),
+        "{error:?}"
+    );
+}
+
+/// The credential list is exactly the spec's list; widening it is a decision,
+/// not an accident.
+#[test]
+fn the_credential_directories_are_exactly_the_spec_list() {
+    assert_eq!(
+        CREDENTIAL_DIRECTORIES,
+        &[
+            ".ssh",
+            ".claude",
+            ".codex",
+            ".gnupg",
+            ".local/share/opencode",
+            ".pi",
+            ".config/gh",
+            ".config/p1",
+        ]
+    );
+}
+
+/// Ancestor-safe readable paths stay accepted: a worktree common dir, the visible
+/// git config directory (a SIBLING of `.config/gh`, not an ancestor), and
+/// `~/.cargo` (whose token files the masks cover).
+#[tokio::test]
+async fn readable_paths_that_do_not_cover_a_credential_directory_are_accepted() {
+    require_bwrap!();
+    let home = tempfile::tempdir().unwrap();
+    let workspace = home.path().join("projects/x");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let common = home.path().join("projects/x/.git");
+    std::fs::create_dir_all(&common).unwrap();
+    let git_config = home.path().join(".config/git");
+    std::fs::create_dir_all(&git_config).unwrap();
+    let cargo = home.path().join(".cargo");
+    std::fs::create_dir_all(&cargo).unwrap();
+
+    for readable in [common, git_config, cargo] {
+        let mut sandbox = Sandbox::for_home(home.path());
+        sandbox.readable = vec![readable.clone()];
+        let result = ShellTool::new(Workspace::new(&workspace).unwrap()).sandboxed(sandbox);
+        assert!(
+            result.is_ok(),
+            "{} must be accepted: {:?}",
+            readable.display(),
+            result.err()
+        );
+    }
+}
+
+/// A harmless readable path is NOT refused: `sandboxed` still succeeds.
+#[tokio::test]
+async fn a_non_credential_readable_path_is_accepted() {
+    require_bwrap!();
+    let home = tempfile::tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let shared = home.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+
+    let mut sandbox = Sandbox::for_home(home.path());
+    sandbox.readable = vec![shared];
+    let tool = ShellTool::new(Workspace::new(&workspace).unwrap())
+        .sandboxed(sandbox)
+        .expect("a non-credential readable path must be accepted");
+
+    let outcome = execute(&tool, "echo readable > inside.txt").await;
+    assert!(exited_zero(&outcome), "{outcome:?}");
+}
+
+/// A configured readable path inside the hidden home really is visible and
+/// read-only: the file can be read, a new file beside it cannot be created.
+#[tokio::test]
+async fn a_configured_readable_path_is_visible_and_read_only() {
+    require_bwrap!();
+    let fixture = FakeHome::new();
+    let shared = fixture.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("note.txt"), "readable-note").unwrap();
+    let mut sandbox = Sandbox::for_home(fixture.path());
+    sandbox.readable = vec![shared.clone()];
+    let tool = ShellTool::new(Workspace::new(&fixture.workspace).unwrap())
+        .sandboxed(sandbox)
+        .expect("the bwrap probe must succeed once bwrap_usable() is true");
+
+    let read = execute(&tool, &format!("cat '{}/note.txt'", shared.display())).await;
+    assert!(exited_zero(&read), "{read:?}");
+    assert!(read.content.contains("readable-note"), "{read:?}");
+
+    let write = execute(&tool, &format!("echo w > '{}/new.txt'", shared.display())).await;
+    assert!(!exited_zero(&write), "{write:?}");
+    assert!(!shared.join("new.txt").exists());
 }
 
 /// Requirement 4: `with_face` after `sandboxed` and `sandboxed` after
@@ -724,4 +1000,98 @@ async fn the_runtime_directory_is_not_visible_inside_the_sandbox() {
     .await;
     assert!(!read.content.contains("socket"), "{read:?}");
     assert!(!exited_zero(&read), "{read:?}");
+}
+
+// ------------------------------------------------ git worktree (common dir)
+
+/// Run `git` for the fixture; panics on failure. No network and no user
+/// configuration: identity is passed with `-c`, so no real gitconfig is read.
+fn git(args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(args)
+        .output()
+        .expect("git must be installed for this test");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A job in a git worktree needs its common git directory to run `git status`;
+/// `--sandbox-read` makes it visible READ-ONLY, so `git status` works and
+/// `git commit` cannot write the index.
+#[tokio::test]
+async fn a_worktree_can_read_its_git_common_dir_but_not_commit() {
+    require_bwrap!();
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git(&["init", "-q", "-b", "main", main.to_str().unwrap()]);
+    git(&[
+        "-C",
+        main.to_str().unwrap(),
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "init",
+    ]);
+    let worktree = home.path().join("wt");
+    git(&[
+        "-C",
+        main.to_str().unwrap(),
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        worktree.to_str().unwrap(),
+    ]);
+    let common = PathBuf::from(git(&[
+        "-C",
+        worktree.to_str().unwrap(),
+        "rev-parse",
+        "--git-common-dir",
+    ]));
+    let common = if common.is_absolute() {
+        common
+    } else {
+        worktree.join(common)
+    };
+    let head_before = git(&["-C", worktree.to_str().unwrap(), "rev-parse", "HEAD"]);
+
+    let mut sandbox = Sandbox::for_home(home.path());
+    sandbox.readable = vec![common.clone()];
+    let tool = ShellTool::new(Workspace::new(&worktree).unwrap())
+        .sandboxed(sandbox)
+        .expect("the bwrap probe must succeed once bwrap_usable() is true");
+
+    // `git status` needs the common directory (the worktree's `.git` file points
+    // at it); without the readable bind it fails with "not a git repository".
+    let status = execute(&tool, "echo change > new.txt; git status --porcelain").await;
+    assert!(exited_zero(&status), "{status:?}");
+    assert!(status.content.contains("?? new.txt"), "{status:?}");
+
+    let commit = execute(
+        &tool,
+        "git -c user.name=t -c user.email=t@t commit --allow-empty -m blocked",
+    )
+    .await;
+    assert!(!exited_zero(&commit), "the commit must fail: {commit:?}");
+    assert!(
+        commit.content.contains("Read-only file system"),
+        "the failure must be the read-only common dir: {commit:?}"
+    );
+    // Nothing was committed: the readable bind really is read-only.
+    assert_eq!(
+        git(&["-C", worktree.to_str().unwrap(), "rev-parse", "HEAD"]),
+        head_before
+    );
 }

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -116,6 +117,52 @@ class FanoutTest(unittest.TestCase):
         job = self.p1_job(**overrides)
         entry = self.summary([job])[0]
         return self.recorded_argv(), entry
+
+    # --- git worktrees -----------------------------------------------------
+
+    def git(self, *args: str) -> None:
+        env = dict(os.environ)
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        env["GIT_CONFIG_SYSTEM"] = "/dev/null"
+        done = subprocess.run(["git", *args], capture_output=True, text=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def make_repo(self, name: str) -> str:
+        repo = os.path.join(self.dir, name)
+        os.makedirs(repo)
+        self.git("init", "-q", "-b", "main", repo)
+        self.git("-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "--allow-empty", "-m", "init")
+        return repo
+
+    def make_worktree(self, repo: str, name: str) -> str:
+        worktree = os.path.join(self.dir, name)
+        self.git("-C", repo, "worktree", "add", "-q", "--detach", worktree)
+        return worktree
+
+    def test_sandbox_read_paths_detects_a_worktree_and_ignores_a_clone(self) -> None:
+        repo = self.make_repo("repo")
+        worktree = self.make_worktree(repo, "wt")
+        common = os.path.realpath(os.path.join(repo, ".git"))
+        self.assertEqual(fanout.sandbox_read_paths(worktree), [common])
+        self.assertEqual(fanout.sandbox_read_paths(repo), [])
+        self.assertEqual(fanout.sandbox_read_paths(self.work), [])
+
+    def test_worktree_job_passes_sandbox_read(self) -> None:
+        repo = self.make_repo("repo")
+        worktree = self.make_worktree(repo, "wt")
+        argv, _ = self.p1_argv(dir=worktree)
+        common = os.path.realpath(os.path.join(repo, ".git"))
+        self.assertEqual(argv.count("--sandbox-read"), 1, argv)
+        self.assertEqual(argv[argv.index("--sandbox-read") + 1], common)
+        # Before the brief and after the last writable path.
+        self.assertLess(argv.index("--sandbox-read"), argv.index(BRIEF))
+        self.assertGreater(argv.index("--sandbox-read"), argv.index("--sandbox-write"))
+
+    def test_plain_clone_job_passes_no_sandbox_read(self) -> None:
+        repo = self.make_repo("clone")
+        argv, _ = self.p1_argv(dir=repo)
+        self.assertNotIn("--sandbox-read", argv)
 
     # --- argv --------------------------------------------------------------
 
