@@ -70,6 +70,24 @@ fn refresh_response() -> ScriptedResponse {
     }
 }
 
+/// The model policy the driver was recorded with: any model name took an effort
+/// level, and only `low`/`medium`/`high` (spec §7.1).
+fn test_profile() -> p1_model_profile::ModelProfile {
+    use p1_contracts::Effort;
+    p1_model_profile::ModelProfile {
+        id: "gpt-test".to_string(),
+        revision: 1,
+        model_id: "gpt-test".to_string(),
+        family: "gpt".to_string(),
+        thinking: p1_model_profile::ThinkingPolicy::EffortLevel,
+        efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+        default_effort: None,
+        thinking_budgets: std::collections::BTreeMap::new(),
+        context_tokens: None,
+        max_output_tokens: None,
+    }
+}
+
 #[tokio::test]
 async fn expired_token_is_refreshed_and_the_request_uses_the_new_bearer() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,7 +115,18 @@ async fn expired_token_is_refreshed_and_the_request_uses_the_new_bearer() {
         path.clone(),
         Arc::new(transport.clone()),
     ));
-    let provider = OpenAiCodexProvider::new("gpt-test", Arc::new(transport.clone()), credentials);
+    let provider = OpenAiCodexProvider::new(
+        p1_provider_openai::ResponsesRoute {
+            origin_route: p1_provider_openai::ROUTE.to_string(),
+            endpoint: "https://chatgpt.com/backend-api".to_string(),
+            account: p1_provider_openai::ResponsesAccount::CodexSubscription,
+        },
+        "gpt-test",
+        Arc::new(test_profile()),
+        Arc::new(transport.clone()),
+        credentials,
+    )
+    .expect("the route and the profile compose");
 
     let request = ProviderRequest {
         system_prompt: "sys".to_string(),

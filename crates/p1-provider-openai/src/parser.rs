@@ -14,11 +14,9 @@ use p1_contracts::{
 use p1_provider_http::{ResponseParser, SseEvent};
 use serde_json::Value;
 
-use crate::request::ROUTE;
-
 /// Route-native parser. One instance per request attempt.
 pub(crate) struct CodexResponseParser {
-    route: &'static str,
+    route: String,
     model: String,
     /// Completed blocks in arrival order.
     blocks: Vec<AssistantBlock>,
@@ -33,9 +31,11 @@ pub(crate) struct CodexResponseParser {
 }
 
 impl CodexResponseParser {
-    pub(crate) fn new(model: &str) -> Self {
+    /// `origin_route` is the composed route's `Origin.route`; the model is the
+    /// configured wire model, which `response.completed` may not echo.
+    pub(crate) fn new(origin_route: &str, model: &str) -> Self {
         Self {
-            route: ROUTE,
+            route: origin_route.to_string(),
             model: model.to_string(),
             blocks: Vec::new(),
             terminal: None,
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn output_text_deltas_use_the_item_block_index() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         assert_eq!(
             feed(
                 &mut parser,
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn message_text_concatenates_all_output_text_parts() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         feed(
             &mut parser,
             r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"Hello"},{"type":"output_text","text":" world"},{"type":"refusal","text":"no"}]}}"#,
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn function_call_item_is_raw_and_marks_tool_use() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         feed(
             &mut parser,
             r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"src/main.rs\"}"}}"#,
@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn invalid_function_arguments_are_not_repaired() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         feed(
             &mut parser,
             r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\": "}}"#,
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn custom_tool_call_item_carries_text_input() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         feed(
             &mut parser,
             r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch"}}"#,
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn blocks_keep_arrival_order() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         feed(
             &mut parser,
             r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"first"}]}}"#,
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn reasoning_summary_deltas_and_section_break() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         assert!(
             feed(
                 &mut parser,
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn custom_tool_input_and_function_argument_deltas_are_display_only() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         assert_eq!(
             feed(
                 &mut parser,
@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn reasoning_item_replays_summary_and_encrypted_content() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         feed(
             &mut parser,
             r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"enc-1","summary":[{"type":"summary_text","text":"first"},{"type":"summary_text","text":"second"}]}}"#,
@@ -718,7 +718,7 @@ mod tests {
             AssistantBlock::Reasoning { text, replay } => {
                 assert_eq!(text, "first\n\nsecond");
                 let replay = replay.as_ref().unwrap();
-                assert_eq!(replay.origin.route, ROUTE);
+                assert_eq!(replay.origin.route, crate::ROUTE);
                 assert_eq!(replay.origin.model, "gpt-test");
                 assert_eq!(replay.version, 1);
                 assert_eq!(replay.payload["encrypted_content"], "enc-1");
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn encrypted_reasoning_without_summary_is_continuity_only() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         feed(
             &mut parser,
             r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"enc-only"}}"#,
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn usage_maps_distinct_fields_and_stays_none_when_absent() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         let events = feed(
             &mut parser,
             r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":64,"cache_write_tokens":36},"output_tokens_details":{"reasoning_tokens":7}}}}"#,
@@ -767,7 +767,7 @@ mod tests {
             }
         );
 
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         let events = feed(
             &mut parser,
             r#"{"type":"response.completed","response":{"usage":{"input_tokens":10}}}"#,
@@ -777,7 +777,7 @@ mod tests {
         assert_eq!(usage.cache_read, None);
         assert_eq!(usage.output, None);
 
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         let events = feed(
             &mut parser,
             r#"{"type":"response.completed","response":{"id":"x"}}"#,
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn input_uncached_saturates_when_cached_exceeds_input() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         let events = feed(
             &mut parser,
             r#"{"type":"response.completed","response":{"usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":9}}}}"#,
@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn completed_keeps_the_configured_model_as_origin() {
-        let mut parser = CodexResponseParser::new("configured-model");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "configured-model");
         let events = feed(
             &mut parser,
             r#"{"type":"response.completed","response":{"model":"wire-model"}}"#,
@@ -812,7 +812,7 @@ mod tests {
             ("context_length_exceeded", StopReason::ContextWindowExceeded),
             ("something_else", StopReason::Other),
         ] {
-            let mut parser = CodexResponseParser::new("gpt-test");
+            let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
             let events = feed(
                 &mut parser,
                 &format!(
@@ -839,7 +839,7 @@ mod tests {
             ("weird_thing", ProviderErrorKind::Transport),
         ];
         for (code, kind) in cases {
-            let mut parser = CodexResponseParser::new("gpt-test");
+            let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
             let events = feed(
                 &mut parser,
                 &format!(
@@ -856,7 +856,7 @@ mod tests {
             }
         }
 
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         let events = feed(
             &mut parser,
             r#"{"type":"error","error":{"type":"invalid_request_error","message":"SENTINEL-BODY"}}"#,
@@ -873,7 +873,7 @@ mod tests {
 
     #[test]
     fn hostile_error_codes_are_not_copied_verbatim() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         let events = feed(
             &mut parser,
             r#"{"type":"response.failed","response":{"error":{"code":"has spaces and sk-secret"}}}"#,
@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn malformed_json_is_a_protocol_failure() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         let events = feed(&mut parser, "not json");
         assert!(matches!(
             terminal(&events),
@@ -901,7 +901,7 @@ mod tests {
 
     #[test]
     fn on_end_without_a_terminal_event_is_a_transport_failure() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         match parser.on_end() {
             Outcome::Failed(error) => {
                 assert_eq!(error.kind, ProviderErrorKind::Transport);
@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn done_and_empty_events_are_ignored() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         assert!(feed(&mut parser, "[DONE]").is_empty());
         assert!(parser.on_event(event("")).is_empty());
         assert!(parser.terminal.is_none());
@@ -921,7 +921,7 @@ mod tests {
 
     #[test]
     fn nothing_is_emitted_after_the_terminal_event() {
-        let mut parser = CodexResponseParser::new("gpt-test");
+        let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");
         let first = feed(
             &mut parser,
             r#"{"type":"response.completed","response":{}}"#,
@@ -986,6 +986,6 @@ mod tests {
     }
 
     fn parser_error(headers: &[(String, String)], status: u16, body: &[u8]) -> ProviderError {
-        CodexResponseParser::new("gpt-test").on_http_error(status, headers, body)
+        CodexResponseParser::new(crate::ROUTE, "gpt-test").on_http_error(status, headers, body)
     }
 }

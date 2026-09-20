@@ -81,6 +81,27 @@ fn claude_root() -> tempfile::TempDir {
     root
 }
 
+/// The same, for the shipped Responses route and the GPT profile it serves: an
+/// environment reaches the Codex adapter exactly as the shipped `gpt` one does.
+fn codex_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let profiles = root.path().join("profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::copy(
+        shipped("profiles/gpt-5.6-sol.toml"),
+        profiles.join("gpt-5.6-sol.toml"),
+    )
+    .unwrap();
+    let routes = root.path().join("routes");
+    std::fs::create_dir_all(&routes).unwrap();
+    std::fs::copy(
+        shipped("routes/openai-codex-subscription.toml"),
+        routes.join("openai-codex-subscription.toml"),
+    )
+    .unwrap();
+    root
+}
+
 /// `env show` against a synthetic root: `(code, stderr)`.
 fn show_in(root: &Path, name: &str) -> (i32, String) {
     let mut harness = Harness::new(vec![root.join("environments")], &[]);
@@ -190,12 +211,12 @@ fn an_explicit_output_cap_below_the_anthropic_thinking_budget_fails_assembly() {
 
 #[test]
 fn an_empty_explicit_cache_key_fails_assembly_on_the_codex_route() {
-    let root = tempfile::tempdir().unwrap();
+    let root = codex_root();
     write_environment(
         root.path(),
         "emptykey",
-        "family = \"gpt\"\nprovider = \"openai-codex-subscription\"\n\
-         model = \"gpt-5.6-sol\"\n\n[options]\ncache_key = \"\"\n",
+        "route = \"openai-codex-subscription\"\nprofile = \"gpt-5.6-sol\"\n\n\
+         [options]\ncache_key = \"\"\n",
     );
     let (code, stderr) = show_in(root.path(), "emptykey");
     assert_eq!(code, 1, "{stderr}");

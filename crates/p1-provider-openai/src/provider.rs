@@ -1,19 +1,28 @@
 //! The [`Provider`] implementation: contract in, codex stream out.
+//!
+//! The adapter holds one composed instance — a [`ResponsesRoute`], a wire model
+//! and a [`ModelProfile`] — and one credential source, and translates a
+//! [`ProviderRequest`] into a Responses request. All retry, refresh, cancellation
+//! and terminal-event policy lives in [`p1_provider_http::drive`]; this module
+//! only decides whether a request is buildable at all, through the same pure
+//! lowering function the request builder uses (ADR-0039, spec §7.3).
 
 use std::sync::Arc;
 
 use p1_contracts::{
-    BoxFuture, CacheKeySupport, CancellationToken, Origin, Provider, ProviderError,
+    BoxFuture, CacheKeySupport, CancellationToken, ModelOptions, Provider, ProviderError,
     ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription,
 };
+use p1_model_profile::ModelProfile;
 use p1_provider_http::{
     Credential, CredentialSource, DriveRequest, HttpRequest, ResponseParser, RetryPolicy,
     Transport, drive,
 };
 
+use crate::ResponsesRoute;
 use crate::parser::CodexResponseParser;
 use crate::request::{
-    DEFAULT_BASE_URL, ROUTE, build_headers, build_request, clamped_cache_key, resolve_base_url,
+    build_headers, build_request, clamped_cache_key, lower, resolve_base_url,
     validate as validate_options,
 };
 
@@ -26,32 +35,46 @@ const FOREIGN_NATIVE_PREFIXES: &[&str] = &["anthropic-messages.", "openai-chat."
 /// The adapter half of this route's identity, for error messages.
 const ADAPTER: &str = "openai-responses";
 
-/// The ChatGPT/Codex subscription route as a provider.
+/// One route file composed with one profile and one credential source.
 pub struct OpenAiCodexProvider {
-    model: String,
+    route: ResponsesRoute,
+    wire_model: String,
+    profile: Arc<ModelProfile>,
     transport: Arc<dyn Transport>,
     credentials: Arc<dyn CredentialSource>,
     retry: RetryPolicy,
-    base_url: String,
 }
 
 impl OpenAiCodexProvider {
-    /// Build a provider. Construction reads no credential file: the token file
-    /// is only opened by the first `access` call, inside the driver. The
-    /// credential source is wrapped so a credential without a ChatGPT account id
+    /// Compose the adapter from its three inputs (ADR-0039). A profile whose
+    /// thinking policy the Responses wire cannot express fails HERE, before any
+    /// request exists.
+    ///
+    /// Construction reads no credential file: the token file is only opened by
+    /// the first `access` call, inside the driver. The credential source is
+    /// wrapped so a credential without the ChatGPT account id this account needs
     /// is reported as an authentication failure, never a malformed request.
     pub fn new(
-        model: &str,
+        route: ResponsesRoute,
+        wire_model: &str,
+        profile: Arc<ModelProfile>,
         transport: Arc<dyn Transport>,
         credentials: Arc<dyn CredentialSource>,
-    ) -> Self {
-        Self {
-            model: model.to_string(),
+    ) -> Result<Self, ProviderError> {
+        validate_composition(&route, wire_model, &profile)?;
+        let credentials = if route.account.requires_account_id() {
+            Arc::new(AccountIdGuard { inner: credentials }) as Arc<dyn CredentialSource>
+        } else {
+            credentials
+        };
+        Ok(Self {
+            route,
+            wire_model: wire_model.to_string(),
+            profile,
             transport,
-            credentials: Arc::new(AccountIdGuard { inner: credentials }),
+            credentials,
             retry: RetryPolicy::default(),
-            base_url: DEFAULT_BASE_URL.to_string(),
-        }
+        })
     }
 
     /// Override the transient retry policy (tests and hosts).
@@ -60,21 +83,41 @@ impl OpenAiCodexProvider {
         self
     }
 
-    /// Override the endpoint base. The `/codex/responses` path is appended when
-    /// the base does not already end with it.
+    /// Override the endpoint base (embedding and tests). The route data of a
+    /// composed provider comes from its file; the `/codex/responses` path is
+    /// appended when the base does not already end with it.
     pub fn with_base_url(mut self, url: &str) -> Self {
-        self.base_url = url.to_string();
+        self.route.endpoint = url.to_string();
         self
     }
+}
+
+/// The one composition check, shared by the constructor and the pure request
+/// builder: the route data is usable, the profile is valid, and the profile's
+/// policy has an encoding here. Nothing is decided by a second, parallel table.
+pub(crate) fn validate_composition(
+    route: &ResponsesRoute,
+    wire_model: &str,
+    profile: &ModelProfile,
+) -> Result<(), ProviderError> {
+    route.validate()?;
+    profile.validate()?;
+    if wire_model.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "wire model must be nonempty",
+        ));
+    }
+    // The pure lowering decides: a `budget`, `enabled` or `preserved` profile has
+    // no Responses encoding, so it is refused here, at construction.
+    lower(profile, &ModelOptions::default())?;
+    Ok(())
 }
 
 impl Provider for OpenAiCodexProvider {
     fn describe(&self) -> RouteDescription {
         RouteDescription {
-            origin: Origin {
-                route: ROUTE.to_string(),
-                model: self.model.clone(),
-            },
+            origin: self.route.origin(&self.wire_model),
             supports_freeform_tools: true,
             mandatory_prompt_prefix: None,
             reports_cost: false,
@@ -93,8 +136,9 @@ impl Provider for OpenAiCodexProvider {
                 return Err(ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
                     format!(
-                        "option \"{key}\" is not consumed by route \"{ROUTE}\" \
-                         (adapter {ADAPTER}): it belongs to another adapter's namespace"
+                        "option \"{key}\" is not consumed by route \"{}\" \
+                         (adapter {ADAPTER}): it belongs to another adapter's namespace",
+                        self.route.origin_route
                     ),
                 ));
             }
@@ -105,7 +149,9 @@ impl Provider for OpenAiCodexProvider {
                 "cache_key must not be empty: set a stable nonempty key or leave it unset",
             ));
         }
-        validate_options(&request.options)
+        // The model policy: the same lowering the request builder runs, so
+        // `validate` can never accept a request the builder would reject.
+        validate_options(self.route.account, &self.profile, &request.options)
     }
 
     fn stream<'a>(
@@ -118,8 +164,8 @@ impl Provider for OpenAiCodexProvider {
             // a request the route cannot encode. Everything network-shaped is a
             // terminal event inside the returned stream.
             self.validate(&request)?;
-            let url = resolve_base_url(&self.base_url)?;
-            let body = build_request(&self.model, &request)?;
+            let url = resolve_base_url(&self.route.endpoint)?;
+            let body = build_request(&self.route, &self.wire_model, &self.profile, &request)?;
             let body = serde_json::to_vec(&body).map_err(|_| {
                 ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
@@ -132,7 +178,9 @@ impl Provider for OpenAiCodexProvider {
 
             let transport = self.transport.clone();
             let credentials = self.credentials.clone();
-            let model = self.model.clone();
+            let model = self.wire_model.clone();
+            let account = self.route.account;
+            let origin_route = self.route.origin_route.clone();
             Ok(drive(DriveRequest {
                 transport,
                 credentials,
@@ -140,7 +188,7 @@ impl Provider for OpenAiCodexProvider {
                     // Unreachable by construction: `AccountIdGuard` turns a
                     // credential without an account id into an authentication
                     // failure before the driver can build a request.
-                    let headers = build_headers(credential, cache_key.as_deref())
+                    let headers = build_headers(account, credential, cache_key.as_deref())
                         .expect("the credential guard guarantees a ChatGPT account id");
                     HttpRequest {
                         url: url.clone(),
@@ -149,7 +197,8 @@ impl Provider for OpenAiCodexProvider {
                     }
                 }),
                 new_parser: Box::new(move || {
-                    Box::new(CodexResponseParser::new(&model)) as Box<dyn ResponseParser>
+                    Box::new(CodexResponseParser::new(&origin_route, &model))
+                        as Box<dyn ResponseParser>
                 }),
                 retry: self.retry,
                 cancel,
@@ -162,14 +211,14 @@ impl std::fmt::Debug for OpenAiCodexProvider {
     /// Never prints the credential source; only the route identity is safe.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAiCodexProvider")
-            .field("model", &self.model)
-            .field("base_url", &self.base_url)
+            .field("route", &self.route)
+            .field("wire_model", &self.wire_model)
             .finish_non_exhaustive()
     }
 }
 
 /// Reject a credential that cannot name the ChatGPT account. This is the one
-/// enforcement point for `build_headers`' account-id requirement on the live
+/// enforcement point for [`build_headers`]' account-id requirement on the live
 /// path, so the header builder itself is infallible once a credential exists.
 struct AccountIdGuard {
     inner: Arc<dyn CredentialSource>,
@@ -206,8 +255,11 @@ fn require_account_id(credential: Credential) -> Result<Credential, ProviderErro
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use futures_util::StreamExt;
-    use p1_contracts::{ModelOptions, Outcome, Provider};
+    use p1_contracts::{Effort, ModelOptions, Outcome, Provider};
+    use p1_model_profile::ThinkingPolicy;
     use p1_provider_http::testing::ScriptedTransport;
 
     use super::*;
@@ -216,7 +268,7 @@ mod tests {
 
     impl CredentialSource for NoCredentials {
         fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
-            Box::pin(async move {
+            Box::pin(async {
                 Ok(Credential {
                     bearer: "SENTINEL-ACCESS".to_string(),
                     account_id: None,
@@ -228,7 +280,7 @@ mod tests {
             &'a self,
             _rejected: &'a Credential,
         ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
-            Box::pin(async move {
+            Box::pin(async {
                 Ok(Credential {
                     bearer: "SENTINEL-ACCESS".to_string(),
                     account_id: None,
@@ -237,19 +289,57 @@ mod tests {
         }
     }
 
+    /// The route data these expectations were recorded with (spec §7.2).
+    fn route() -> ResponsesRoute {
+        ResponsesRoute {
+            origin_route: crate::ROUTE.to_string(),
+            endpoint: "https://chatgpt.com/backend-api".to_string(),
+            account: crate::ResponsesAccount::CodexSubscription,
+        }
+    }
+
+    /// The model policy these expectations were recorded with: any model name took
+    /// an effort level, and only `low`/`medium`/`high` (spec §7.1).
+    fn profile() -> Arc<ModelProfile> {
+        Arc::new(ModelProfile {
+            id: "gpt-test".to_string(),
+            revision: 1,
+            model_id: "gpt-test".to_string(),
+            family: "gpt".to_string(),
+            thinking: ThinkingPolicy::EffortLevel,
+            efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+            default_effort: None,
+            thinking_budgets: BTreeMap::new(),
+            context_tokens: None,
+            max_output_tokens: None,
+        })
+    }
+
     fn provider() -> OpenAiCodexProvider {
         OpenAiCodexProvider::new(
+            route(),
             "gpt-test",
+            profile(),
             Arc::new(ScriptedTransport::new(Vec::new())),
             Arc::new(NoCredentials),
         )
+        .expect("the profile is expressible on the Responses wire")
         .with_base_url("https://example.test/backend")
+    }
+
+    fn request(options: ModelOptions) -> ProviderRequest {
+        ProviderRequest {
+            system_prompt: String::new(),
+            history: Vec::new(),
+            tools: Vec::new(),
+            options,
+        }
     }
 
     #[test]
     fn describe_reports_the_route_and_freeform_support() {
         let description = provider().describe();
-        assert_eq!(description.origin.route, ROUTE);
+        assert_eq!(description.origin.route, crate::ROUTE);
         assert_eq!(description.origin.model, "gpt-test");
         assert!(description.supports_freeform_tools);
         assert!(description.mandatory_prompt_prefix.is_none());
@@ -263,14 +353,8 @@ mod tests {
             max_output_tokens: Some(1),
             ..ModelOptions::default()
         };
-        let request = ProviderRequest {
-            system_prompt: String::new(),
-            history: Vec::new(),
-            tools: Vec::new(),
-            options,
-        };
         assert_eq!(
-            provider().validate(&request).unwrap_err().kind,
+            provider().validate(&request(options)).unwrap_err().kind,
             ProviderErrorKind::InvalidRequest
         );
     }
@@ -281,13 +365,7 @@ mod tests {
             cache_key: Some(String::new()),
             ..ModelOptions::default()
         };
-        let request = ProviderRequest {
-            system_prompt: String::new(),
-            history: Vec::new(),
-            tools: Vec::new(),
-            options,
-        };
-        let error = provider().validate(&request).unwrap_err();
+        let error = provider().validate(&request(options)).unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
         assert!(error.message.contains("cache_key"), "{}", error);
     }
@@ -299,17 +377,11 @@ mod tests {
             options
                 .native
                 .insert(key.to_string(), serde_json::json!(true));
-            let request = ProviderRequest {
-                system_prompt: String::new(),
-                history: Vec::new(),
-                tools: Vec::new(),
-                options,
-            };
-            let error = provider().validate(&request).unwrap_err();
+            let error = provider().validate(&request(options)).unwrap_err();
             assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{key}");
             for part in [
                 format!("option \"{key}\""),
-                format!("route \"{ROUTE}\""),
+                format!("route \"{}\"", crate::ROUTE),
                 format!("(adapter {ADAPTER})"),
             ] {
                 assert!(error.message.contains(&part), "{}: {}", error, part);
@@ -323,26 +395,14 @@ mod tests {
         options
             .native
             .insert("unrelated.option".to_string(), serde_json::json!(1));
-        let request = ProviderRequest {
-            system_prompt: String::new(),
-            history: Vec::new(),
-            tools: Vec::new(),
-            options,
-        };
-        assert!(provider().validate(&request).is_ok());
+        assert!(provider().validate(&request(options)).is_ok());
     }
 
     #[tokio::test]
     async fn a_credential_without_an_account_id_fails_authentication() {
         let provider = provider();
-        let request = ProviderRequest {
-            system_prompt: String::new(),
-            history: Vec::new(),
-            tools: Vec::new(),
-            options: ModelOptions::default(),
-        };
         let mut stream = provider
-            .stream(request, CancellationToken::new())
+            .stream(request(ModelOptions::default()), CancellationToken::new())
             .await
             .expect("setup succeeds");
         let mut events = Vec::new();

@@ -7,9 +7,8 @@ use std::sync::Arc;
 /// The credential source a route file's `[credential]` names (spec §1.2): the
 /// compiled source of that kind, reading exactly what the source read before route
 /// files existed. An API key is read from the environment variable first, then from
-/// the borrowed CLI logins in the order the file lists them; the Claude Code OAuth
-/// kind is the compiled login (ADR-0040). A kind without a data-driven source is
-/// refused with the reason.
+/// the borrowed CLI logins in the order the file lists them; the two OAuth kinds are
+/// the compiled CLIs' own login files.
 pub fn credential_source(
     reference: &crate::routes::CredentialRef,
 ) -> Result<Arc<dyn CredentialSource>, String> {
@@ -23,10 +22,9 @@ pub fn credential_source(
             p1_provider_anthropic::ClaudeCodeCredentials::from_default_location()
                 .map_err(|error| error.to_string())?,
         )),
-        // `validate_source` already refused this; kept total for the enum.
-        CredentialKind::CodexOauth => Err(format!(
-            "credential kind \"{}\" is not yet data-driven (ADR-0039 step 4)",
-            reference.kind.name()
+        CredentialKind::CodexOauth => Ok(Arc::new(
+            p1_provider_openai::CodexCliCredentials::from_default_location()
+                .map_err(|error| error.to_string())?,
         )),
     }
 }
