@@ -21,7 +21,7 @@ use p1_tui::input::{self, Command};
 use p1_tui::render::diff::DiffView;
 use p1_tui::render::permission::PermissionView;
 use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
-use p1_tui::state::{Approval, Promotion, Screen};
+use p1_tui::state::{Approval, Screen};
 use ratatui::backend::Backend;
 use tokio::sync::mpsc;
 
@@ -39,6 +39,8 @@ pub struct TuiOptions {
     pub ask: bool,
     /// The workspace root: approval diff views read files from here.
     pub workspace: std::path::PathBuf,
+    /// The shell sandbox posture, shown in §4.5 permission prompts.
+    pub sandbox: String,
 }
 
 /// The TUI front end. Created before the agent so its sink and policy install
@@ -120,6 +122,7 @@ impl FrontEnd for TuiFrontEnd {
             };
 
             let mut screen = Screen::new(std::env::var_os("P1_REDUCED_MOTION").is_some());
+            let (route, model) = self.labels.lock().unwrap().clone().unwrap_or_default();
             // The §4.1 idle prelude: version line, one sentence of state, the
             // four affordances — then the transcript takes over.
             screen
@@ -134,17 +137,22 @@ impl FrontEnd for TuiFrontEnd {
                         ),
                         String::new(),
                         "  /resume     reopen a previous session".into(),
-                        format!("  /env        {}", self.options.env),
+                        format!("  /env        {route} · {model}"),
                         format!(
                             "  /access     {}",
-                            if self.options.ask { "ask" } else { "full" }
+                            if self.options.ask {
+                                "ask · prompts on"
+                            } else {
+                                "full · --ask to confirm"
+                            }
                         ),
                         "  /goal       set the session objective".into(),
                     ],
                 });
+            screen.env = self.options.env.clone();
+            screen.route = route.clone();
             // A resumed session shows where it stands (issue #12, seam note).
             screen.transcript.paint_history(agent.history());
-            let (route, model) = self.labels.lock().unwrap().clone().unwrap_or_default();
             let worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>> =
                 Arc::new(Mutex::new(Vec::new()));
             #[cfg(feature = "delegation")]
@@ -157,8 +165,10 @@ impl FrontEnd for TuiFrontEnd {
                 route,
                 model,
                 workspace: self.options.workspace.clone(),
+                sandbox: self.options.sandbox.clone(),
                 policy: self.policy.clone(),
-                pending_auth: None,
+                pending_auth: VecDeque::new(),
+                pinned_by_approval: false,
                 follow_ups: VecDeque::new(),
                 submit_pending: None,
                 pending_calls: HashMap::new(),
@@ -211,9 +221,16 @@ pub(crate) struct Driver {
     route: String,
     model: String,
     workspace: std::path::PathBuf,
+    sandbox: String,
     policy: Arc<TuiPolicy>,
-    /// The parked authorization being shown; answered by the decision keys.
-    pending_auth: Option<AuthRequest>,
+    /// Parked authorizations; the front one is on screen. Two workers can
+    /// park at once (they share this policy) — a second request must QUEUE,
+    /// never replace the one the operator is reading (its dropped answer
+    /// would be a denial the operator never chose).
+    pending_auth: VecDeque<AuthRequest>,
+    /// Set when an approval pinned the pane, so deciding it releases only
+    /// the pin it took — an operator's own `^P` survives the decision.
+    pinned_by_approval: bool,
     /// Follow-ups fire only when the agent would otherwise stop (SPEC §7).
     follow_ups: VecDeque<String>,
     /// Task stats for the LEDGER's TASK section: call inputs arrive on
@@ -252,32 +269,6 @@ impl Driver {
                 _ => {}
             }
         }
-        // Composer editing is not modal: ordinary keys always edit.
-        if self.screen.approval.is_none()
-            && self.screen.picker.is_none()
-            && self.screen.status.is_none()
-        {
-            use crossterm::event::KeyCode;
-            match (key.code, plain) {
-                (KeyCode::Char(c), true) => {
-                    self.screen.composer.insert(c);
-                    return;
-                }
-                (KeyCode::Backspace, _) => {
-                    self.screen.composer.backspace();
-                    return;
-                }
-                (KeyCode::Left, true) => {
-                    self.screen.composer.left();
-                    return;
-                }
-                (KeyCode::Right, true) => {
-                    self.screen.composer.right();
-                    return;
-                }
-                _ => {}
-            }
-        }
         let Some(command) = input::handle(&self.screen, key) else {
             return;
         };
@@ -295,6 +286,11 @@ impl Driver {
                 self.screen.composer.take();
                 self.screen.queue(true, text.clone());
                 self.follow_ups.push_back(text);
+            }
+            Command::EditGoal => {
+                self.screen.composer.text = "/goal ".into();
+                self.screen.composer.cursor = 6;
+                self.screen.composer.revealed = true;
             }
             Command::Newline => self.screen.composer.insert('\n'),
             Command::Insert(c) => self.screen.composer.insert(c),
@@ -374,7 +370,18 @@ impl Driver {
         let (name, arg) = command.split_once(' ').unwrap_or((command, ""));
         match name {
             "exit" | "quit" => self.exit = Some(0),
-            "focus" => self.screen.focus = !self.screen.focus,
+            // `/focus` toggles; `/focus on|off` are deterministic, and `off`
+            // returns to the automatic short-terminal policy (SPEC §4.3a).
+            "focus" => {
+                self.screen.focus_explicit = match arg {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => {
+                        let on = !self.screen.focus;
+                        Some(on)
+                    }
+                };
+            }
             "goal" => {
                 self.screen.goal = (!arg.is_empty()).then(|| arg.to_string());
             }
@@ -391,7 +398,7 @@ impl Driver {
     }
 
     fn answer(&mut self, decision: Decision, grant: bool) {
-        let Some(pending) = self.pending_auth.take() else {
+        let Some(pending) = self.pending_auth.pop_front() else {
             return;
         };
         if grant {
@@ -399,8 +406,23 @@ impl Driver {
         }
         pending.answer(decision);
         self.screen.approval = None;
-        self.screen.pinned = false;
-        self.screen.promotion = Promotion::None;
+        if self.pinned_by_approval {
+            self.screen.pinned = false;
+            self.pinned_by_approval = false;
+        }
+        // The next queued approval takes the screen immediately.
+        self.show_next_auth();
+    }
+
+    /// A cancelled turn abandons its parked approvals: dropping a request
+    /// denies it (the policy's drop semantics), and the screen comes back.
+    fn drop_pending_auth(&mut self) {
+        self.pending_auth.clear();
+        self.screen.approval = None;
+        if self.pinned_by_approval {
+            self.screen.pinned = false;
+            self.pinned_by_approval = false;
+        }
     }
 
     /// Pull the refresher's snapshot into the screen (SPEC §5 promotion).
@@ -484,15 +506,28 @@ impl Driver {
         }
     }
 
-    /// A parked authorization becomes the blocking approval view (SPEC §4.4 /
-    /// §4.5): edit-shaped calls review as diffs, commands as §4.5 rows.
+    /// A parked authorization queues; the front one becomes the blocking
+    /// approval view (SPEC §4.4 / §4.5): edit-shaped calls review as diffs,
+    /// commands as §4.5 rows.
     fn on_auth(&mut self, request: AuthRequest) {
-        let view = approval_view(&request, &self.workspace);
-        self.screen.approval = Some(view);
+        self.pending_auth.push_back(request);
+        self.show_next_auth();
+    }
+
+    /// Show the queue's front request, if none is on screen.
+    fn show_next_auth(&mut self) {
+        if self.screen.approval.is_some() {
+            return;
+        }
+        let Some(request) = self.pending_auth.front() else {
+            return;
+        };
+        self.screen.approval = Some(approval_view(request, &self.workspace, &self.sandbox));
         // An approval self-pins (SPEC §5): nothing may swap it away.
-        self.screen.pinned = true;
-        self.screen.promotion = Promotion::Blocked;
-        self.pending_auth = Some(request);
+        if !self.screen.pinned {
+            self.screen.pinned = true;
+            self.pinned_by_approval = true;
+        }
     }
 
     /// The turn ended. On cancellation every queued input is dropped — a
@@ -502,6 +537,7 @@ impl Driver {
         if matches!(end, TurnEnd::Cancelled) {
             self.follow_ups.clear();
             self.screen.queued.clear();
+            self.drop_pending_auth();
         }
     }
 
@@ -546,6 +582,7 @@ where
         // interactive loop's drain rule, unchanged.
         if let Some(text) = prompt.take() {
             let child = cancel.child_token();
+            driver.policy.set_turn(Some(child.clone()));
             let end = pump(
                 terminal,
                 driver,
@@ -579,16 +616,19 @@ where
                 .await;
                 driver.note_turn_end(&end);
             }
+            driver.policy.set_turn(None);
             if matches!(end, TurnEnd::Cancelled) {
                 continue;
             }
-            if let Some(follow_up) = driver.take_follow_up() {
-                prompt = Some(follow_up);
-            }
+            // A follow-up the operator queued, or a prompt submitted while the
+            // turn was running (the pump's key handler routes by state).
+            prompt = driver
+                .take_follow_up()
+                .or_else(|| driver.submit_pending.take());
             continue;
         }
         // Idle: draw, then wait for anything.
-        draw(terminal, &driver.screen, sink.now_ms());
+        draw(terminal, &mut driver.screen, sink.now_ms());
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return 130,
@@ -616,9 +656,32 @@ where
             }
             _ = tick.tick() => { driver.sync_workers(); }
             _ = agent.inbox_ready() => {
-                // A worker's completion arrived at idle: run it as a turn so
-                // the same pump handles keys and approvals.
-                prompt = Some(String::new());
+                // A worker's completion arrived at idle: drain it through the
+                // inbox path — never as a phantom empty user turn.
+                let child = cancel.child_token();
+                driver.policy.set_turn(Some(child.clone()));
+                while agent.has_pending_inbox() {
+                    let end = pump(
+                        terminal,
+                        driver,
+                        &mut keys,
+                        &mut events,
+                        &mut auth,
+                        sink,
+                        &child,
+                        Box::pin(async {
+                            agent
+                                .run_inbox_turn(child.clone())
+                                .await
+                                .unwrap_or(TurnEnd::Completed {
+                                    stop: p1_contracts::StopReason::EndTurn,
+                                })
+                        }),
+                    )
+                    .await;
+                    driver.note_turn_end(&end);
+                }
+                driver.policy.set_turn(None);
             }
         }
     }
@@ -645,13 +708,14 @@ where
 {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut keys_done = false;
     loop {
-        draw(terminal, &driver.screen, sink.now_ms());
+        draw(terminal, &mut driver.screen, sink.now_ms());
         tokio::select! {
             biased;
             end = &mut turn => return end,
-            key = keys.next() => {
-                let Some(key) = key else { continue };
+            key = keys.next(), if !keys_done => {
+                let Some(key) = key else { keys_done = true; continue };
                 if is_cancel(&key) {
                     // ^C during a turn cancels the TURN; quitting is idle-only.
                     turn_cancel.cancel();
@@ -737,16 +801,32 @@ fn is_cancel(key: &crossterm::event::KeyEvent) -> bool {
 }
 
 /// Draw one frame.
-fn draw<B: Backend>(terminal: &mut ratatui::Terminal<B>, screen: &Screen, now_ms: u64) {
+fn draw<B: Backend>(terminal: &mut ratatui::Terminal<B>, screen: &mut Screen, now_ms: u64) {
     terminal
         .draw(|frame| {
-            p1_tui::render::screen::draw(screen, frame.area(), frame.buffer_mut(), now_ms)
+            // Focus mode: explicit (/focus) wins; otherwise automatic at 12
+            // rows or fewer (SPEC §4.3a).
+            screen.focus = screen.focus_explicit.unwrap_or(frame.area().height <= 12);
+            p1_tui::render::screen::draw(screen, frame.area(), frame.buffer_mut(), now_ms);
+            // The text cursor lives in the composer, unless a modal owns keys.
+            if screen.approval.is_none() && screen.picker.is_none() && screen.status.is_none() {
+                let area = frame.area();
+                let queued = screen.queued.len();
+                let (col, row) = p1_tui::render::composer::cursor_cell(
+                    &screen.composer,
+                    queued,
+                    area.width as usize,
+                );
+                let composer_rows = 1 + queued + 1; // input line(s) + hints
+                let y = area.height.saturating_sub(composer_rows as u16) + row as u16;
+                frame.set_cursor_position((col.min(area.width as usize - 1) as u16, y));
+            }
         })
         .ok();
 }
 
 /// Build the blocking approval view for a parked request.
-fn approval_view(request: &AuthRequest, workspace: &std::path::Path) -> Approval {
+fn approval_view(request: &AuthRequest, workspace: &std::path::Path, sandbox: &str) -> Approval {
     let raw = request.call.input.raw();
     let json: Option<serde_json::Value> = serde_json::from_str(raw).ok();
     let get = |key: &str| json.as_ref()?.get(key)?.as_str().map(str::to_string);
@@ -768,12 +848,22 @@ fn approval_view(request: &AuthRequest, workspace: &std::path::Path) -> Approval
                 (1, 1),
             ))
         }
-        // Commands prompt per SPEC §4.5.
+        // Commands prompt per SPEC §4.5: cwd, sandbox, network, reason.
         _ => Approval::Permission(PermissionView {
             command: get("command").unwrap_or_else(|| p1_tui::transcript::summarize_input(raw)),
             rows: vec![
                 ("cwd".into(), workspace.display().to_string()),
-                ("tool".into(), request.call.name.clone()),
+                ("sandbox".into(), sandbox.to_string()),
+                ("network".into(), "off".into()),
+                (
+                    "reason".into(),
+                    match request.effect {
+                        p1_contracts::Effect::Executes => "runs a process".into(),
+                        p1_contracts::Effect::WritesFiles => "writes files".into(),
+                        p1_contracts::Effect::Delegates => "starts an agent".into(),
+                        p1_contracts::Effect::ReadOnly => "read".into(),
+                    },
+                ),
             ],
             grantable: true,
         }),
@@ -789,7 +879,10 @@ fn status_groups(driver: &Driver) -> Vec<p1_tui::render::status::StatusGroup> {
         available: true,
     };
     let spend = &driver.screen.spend;
-    let or_unknown = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or("—".into());
+    let or_unknown = |v: Option<u64>| {
+        v.map(p1_tui::render::tokens)
+            .unwrap_or_else(|| p1_tui::render::UNKNOWN.into())
+    };
     vec![
         StatusGroup {
             header: "ENVIRONMENT".into(),

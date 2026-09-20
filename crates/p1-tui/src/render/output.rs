@@ -31,7 +31,9 @@ pub fn lines(view: &OutputView, grid: usize) -> Vec<Line<'static>> {
             body.push(Line::styled(part, Style::new().fg(palette::DIM)));
         }
     }
-    out.extend(body.into_iter().skip(view.scroll));
+    // Clamp: scrolling past the end shows the last row, never a blank pane.
+    let scroll = view.scroll.min(body.len().saturating_sub(1));
+    out.extend(body.into_iter().skip(scroll));
     out
 }
 

@@ -1634,6 +1634,7 @@ dependencies = [
  "p1-contracts",
  "ratatui",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

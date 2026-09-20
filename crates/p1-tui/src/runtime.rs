@@ -88,10 +88,11 @@ impl TuiSink {
 
 impl EventSink for TuiSink {
     fn emit(&self, event: AgentEvent) {
-        let at_ms = self.epoch.elapsed().as_millis() as u64;
-        // Two events inside one clock tick keep their arrival order.
-        let at_ms = at_ms.max(self.tick.fetch_add(1, Ordering::Relaxed));
-        self.tick.store(at_ms + 1, Ordering::Relaxed);
+        let now = self.epoch.elapsed().as_millis() as u64;
+        // Monotonic even for concurrent emits (a sink is Send+Sync): the stamp
+        // is max(now, previous+1), via fetch_max — no add-then-store window.
+        let prev = self.tick.fetch_max(now + 1, Ordering::Relaxed);
+        let at_ms = now.max(prev + 1);
         // Unbounded: observation must never block the agent loop (contract).
         let _ = self.tx.send(UiEvent::Agent(Stamped {
             at_ms,
@@ -131,6 +132,10 @@ impl AuthRequest {
 pub struct TuiPolicy {
     ask: bool,
     cancel: CancellationToken,
+    /// The live turn's token, swapped by the driver at turn start/end: an
+    /// approval parked when its turn is cancelled resolves CANCEL_DENY instead
+    /// of waiting for a decision about a dead turn.
+    turn: Mutex<Option<CancellationToken>>,
     tx: mpsc::UnboundedSender<AuthRequest>,
     /// (tool name, identity) granted for the session.
     granted: Mutex<HashSet<(String, ToolIdentity)>>,
@@ -152,11 +157,17 @@ impl TuiPolicy {
             Self {
                 ask,
                 cancel,
+                turn: Mutex::new(None),
                 tx,
                 granted: Mutex::new(HashSet::new()),
             },
             rx,
         )
+    }
+
+    /// The driver marks the live turn's token (None between turns).
+    pub fn set_turn(&self, token: Option<CancellationToken>) {
+        *self.turn.lock().unwrap() = token;
     }
 
     /// The operator's `a` answer: remember the grant, then permit this call.
@@ -194,9 +205,17 @@ impl AuthorizationPolicy for TuiPolicy {
                     reason: CANCEL_DENY.to_string(),
                 };
             }
+            let turn = self.turn.lock().unwrap().clone();
+            let turn_cancelled = async move {
+                match turn {
+                    Some(turn) => turn.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => Decision::Deny { reason: CANCEL_DENY.to_string() },
+                _ = turn_cancelled => Decision::Deny { reason: CANCEL_DENY.to_string() },
                 answer = answer => answer.unwrap_or(Decision::Deny { reason: USER_DENY.to_string() }),
             }
         })
@@ -210,8 +229,14 @@ pub struct TerminalGuard;
 
 impl TerminalGuard {
     pub fn enter() -> std::io::Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
+        // Alt screen first: if raw mode then fails, the terminal is still
+        // restored (raw-first would strand the terminal on alt-screen failure).
         crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        if let Err(error) = crossterm::terminal::enable_raw_mode() {
+            let _ =
+                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+            return Err(error);
+        }
         Ok(Self)
     }
 }
