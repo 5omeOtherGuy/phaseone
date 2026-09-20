@@ -1,0 +1,25 @@
+# How the ChatGPT/Codex subscription is reached (ADR-0039 step 4, spec §7.2 of
+# docs/design/routes-and-profiles.md). Everything the host used to compile for this
+# route lives here. `origin_route` is byte for byte the `Origin.route` the responses
+# adapter wrote before route data existed, so a session recorded then still resumes
+# (ADR-0033). The `store: false` body, the absent output-cap field, the
+# ChatGPT account-id header and the session/conversation identity headers stay
+# compiled: they are the account behaviour `account` selects.
+id           = "openai-codex-subscription"
+origin_route = "openai-responses/codex-subscription"
+adapter      = "openai-responses"
+endpoint     = "https://chatgpt.com/backend-api"
+
+[credential]
+# A reference, never a value: the compiled Codex CLI login source.
+kind = "codex-oauth"
+
+[adapter_settings]
+account = "codex-subscription"
+
+# Only profiles the host ships a policy for; any other profile is refused. A dated
+# snapshot is a binding (`wire_model`), not a profile.
+[models."gpt-5.6-sol"]
+wire_model = "gpt-5.6-sol"
+[models."gpt-5.6-sol-mini"]
+wire_model = "gpt-5.6-sol-mini"

@@ -481,15 +481,24 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         .into_iter()
         .map(|route| route.id)
         .collect();
-    // `anthropic-subscription` joined the shipped routes in ADR-0039 step 4; its own
-    // fields are pinned in `crates/p1-host/tests/anthropic_route.rs`.
+    // `anthropic-subscription` joined the shipped routes in ADR-0039 step 4 and
+    // `openai-codex-subscription` in step 4b; each one's own fields are pinned in
+    // `crates/p1-host/tests/{anthropic,openai}_route.rs`. With both first-party
+    // adapters routed, no shipped key is a whole provider any more.
     assert_eq!(
         ids,
         [
             "anthropic-subscription",
             "glm-subscription",
+            "openai-codex-subscription",
+            // The owner's second OpenCode Go account: data only, no Rust change.
+            "opencode-go-2-subscription",
             "opencode-go-subscription"
         ]
+    );
+    assert!(
+        p1_host::catalog::WHOLE_PROVIDERS.is_empty(),
+        "every shipped provider is a route file now"
     );
 
     let go = load_route_by_id(&dirs, "opencode-go-subscription").expect("the shipped route file");
@@ -747,11 +756,12 @@ fn an_unknown_borrow_store_is_a_load_error() {
     }
 }
 
-/// The Claude Code kind became data-driven in ADR-0039 step 4 (spec §7.2) and is
-/// covered by `tests/anthropic_route.rs`; the Codex login follows in the next step and
-/// still parses without a source.
+/// Both OAuth kinds are data-driven now (ADR-0039 step 4, spec §7.2): a route
+/// file may point at either compiled login. The shipped routes that do are pinned in
+/// `tests/anthropic_route.rs` and `tests/openai_route.rs`; this checks the parse and
+/// the validation of one synthetic file, which reads no credential.
 #[test]
-fn the_codex_oauth_credential_kind_parses_but_is_not_data_driven_yet() {
+fn the_codex_oauth_credential_kind_parses_and_loads() {
     let kind = "codex-oauth";
     let scratch = Scratch::new();
     let body = with(
@@ -767,17 +777,17 @@ fn the_codex_oauth_credential_kind_parses_but_is_not_data_driven_yet() {
         &format!("kind = \"{kind}\""),
     );
     scratch.write_route("oauth", &body);
-    let error = load_route(&scratch.route_path("oauth")).unwrap_err();
-    assert!(
-        error.contains(&format!(
-            "credential kind \"{kind}\" is not yet data-driven (ADR-0039 step 4)"
-        )),
-        "{error}"
+    let route = load_route(&scratch.route_path("oauth"))
+        .expect("the Codex login kind has a compiled source");
+    assert_eq!(route.credential.kind, CredentialKind::CodexOauth);
+    assert_eq!(route.credential.kind.name(), kind);
+    // The kind names WHICH compiled source is used; the file's own reference is kept
+    // as it was written.
+    assert_eq!(
+        route.credential.env.as_deref(),
+        Some("P1_ROUTE_FILES_TEST_KEY")
     );
-    assert!(
-        !error.contains("unknown variant"),
-        "the kind parses; only its source is missing: {error}"
-    );
+    assert!(route.credential.borrow.is_empty());
 }
 
 #[test]
@@ -842,8 +852,11 @@ fn a_missing_route_file_lists_the_ids_the_directory_holds() {
 
 #[test]
 fn a_route_id_that_collides_with_a_whole_provider_key_is_a_start_up_error() {
-    // `anthropic-subscription` is a route file of its own since ADR-0039 step 4, so
-    // only the whole providers that remain can be shadowed.
+    // `anthropic-subscription` became a route file in ADR-0039 step 4 and
+    // `openai-codex-subscription` in step 4b, so no shipped key is whole any more and
+    // this loop is empty. The check stays compiled for the next whole provider (or a
+    // test fake registered under such a key), and this test exercises it again as
+    // soon as one is added.
     for key in p1_host::catalog::WHOLE_PROVIDERS {
         let scratch = Scratch::new();
         scratch.write_route(

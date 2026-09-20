@@ -17,11 +17,11 @@ use serde::Deserialize;
 
 /// The adapter keys a route file may name. `catalog` dispatches on exactly this set;
 /// an unknown `adapter` is a load error listing these.
-pub const ADAPTER_KEYS: &[&str] = &["openai-chat", "anthropic-messages"];
+pub const ADAPTER_KEYS: &[&str] = &["openai-chat", "anthropic-messages", "openai-responses"];
 
-/// The credential kinds a route file may name (spec 1.2). The two OAuth kinds parse;
-/// the Claude Code kind has a compiled source (spec §7.2), the Codex kind follows in
-/// the next step and is refused until then.
+/// The credential kinds a route file may name (spec 1.2). Each kind names the
+/// compiled source that reads it (spec §7.2): the two OAuth logins are the CLIs'
+/// own files, never written by a login flow here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialKind {
@@ -110,15 +110,13 @@ pub struct CredentialRef {
 }
 
 impl CredentialRef {
-    /// A kind with a compiled source a route file may point at. The Claude Code
-    /// login became data-driven in ADR-0039 step 4; the Codex login is still to come.
+    /// A kind with a compiled source a route file may point at. Both OAuth logins
+    /// became data-driven in ADR-0039 step 4 (4a and 4b).
     pub fn validate_source(&self) -> Result<(), String> {
         match self.kind {
-            CredentialKind::ApiKey | CredentialKind::ClaudeCodeOauth => Ok(()),
-            CredentialKind::CodexOauth => Err(format!(
-                "credential kind \"{}\" is not yet data-driven (ADR-0039 step 4)",
-                self.kind.name()
-            )),
+            CredentialKind::ApiKey
+            | CredentialKind::ClaudeCodeOauth
+            | CredentialKind::CodexOauth => Ok(()),
         }
     }
 }
@@ -172,6 +170,7 @@ pub struct RouteFile {
 pub enum AdapterSettings {
     OpenAiChat(p1_provider_openai_chat::ChatAdapterSettings),
     AnthropicMessages(p1_provider_anthropic::MessagesAdapterSettings),
+    OpenAiResponses(p1_provider_openai::ResponsesAdapterSettings),
 }
 
 impl RouteFile {
@@ -186,6 +185,9 @@ impl RouteFile {
             "anthropic-messages" => self
                 .typed_settings::<p1_provider_anthropic::MessagesAdapterSettings>()
                 .map(AdapterSettings::AnthropicMessages),
+            "openai-responses" => self
+                .typed_settings::<p1_provider_openai::ResponsesAdapterSettings>()
+                .map(AdapterSettings::OpenAiResponses),
             other => Err(format!(
                 "unknown adapter \"{other}\"; the known adapters are {}",
                 known_adapters()
