@@ -415,29 +415,16 @@ parts to treat as fixed — they are the vocabulary everything else is built fro
   unwired — approvals arrive one call at a time, so there is nothing to page.
 
 
-## 9. Awakening home (owner selection, 2026-09-20)
+## 9. Static home (owner selection, 2026-09-21)
 
-The unused transcript space on a fresh session contains the dotted awakening
-animation: a continuously rotating cortex morphs into a sphere and back over
-24 seconds. The small-p/tall-1 synapse mark remains inside it; `phaseone` and
-`we love Pi` are centered beneath it. Three orbiting agent clusters exchange
-signals. This implementation uses only Braille cells and ordinary terminal text;
-no graphics protocols, image frames, browser runtime or additional dependencies.
+The unused welcome area centers the static synapse-dot p1 mark, with the lowercase
+p below the top of the taller 1. `phaseone` and `We love pie` appear underneath.
+The mark uses the approved SVG node layout, rendered with terminal dots and thin
+connections. Small viewports use a compact mark or plain-text branding.
 
-The welcome prelude, right pane and composer keep their existing positions.
-Conversation content, working state, focus mode, pickers and status overlays
-suppress the animation. At very small sizes, only the centered wordmark and
-tribute remain. `P1_REDUCED_MOTION` freezes the entire scene at its initial pose.
-
-`10841` and `[big]` appear briefly beneath foreground agents, as DIM ordinary text
-drawn after the dot raster. They must never become clusters of Braille dots.
-The decorative neuron field uses the existing RULE/FAINT/DIM/INK brightness steps;
-this does not expand the permitted palette for content or ordinary UI labels.
-
-Geometry is immutable and initialized once. The host's existing 50 ms idle tick
-advances rendering; elapsed time determines the phase, so skipped frames do not
-change the loop. The renderer has no independent timer or tasks.
+This replaces the awakening animation at the owner's request: no cortex, neural
+field, orbiting agents, animation or easter eggs. The welcome prelude, composer,
+right pane and existing conversation/overlay suppression retain their behavior.
 
 Inspect actual cells without credentials or a provider:
-`cargo run -p p1-tui --example home_preview -- 120 40 6000 > /tmp/home.svg`.
-Use `80 24 14000` for the floor-size frame with the other easter egg.
+`cargo run -p p1-tui --example home_preview -- 120 40 > /tmp/home.svg`.
