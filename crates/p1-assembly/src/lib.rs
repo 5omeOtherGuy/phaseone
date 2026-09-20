@@ -30,6 +30,7 @@ use p1_contracts::{
     Effort, ModelOptions, Provider, ProviderError, ProviderRequest, RouteDescription, Tool,
     ToolDeclaration, ToolIdentity,
 };
+use p1_model_profile::ModelProfile;
 use p1_workspace::{ObservedFiles, Workspace, WriteGate};
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,8 @@ const ENVIRONMENT_FILE: &str = "environment.toml";
 const PROMPT_FILE: &str = "prompt.md";
 /// Optional whole-file override of the summarizer prompt, next to `prompt.md`.
 const SUMMARIZE_FILE: &str = "summarize.md";
+/// Profile directory, next to the environments directory that was selected.
+const PROFILES_DIR: &str = "../profiles";
 /// Default per-tool-result budget for the summarizer transcript.
 const DEFAULT_TOOL_RESULT_EXCERPT_CHARS: usize = 2_000;
 
@@ -50,9 +53,14 @@ const DEFAULT_TOOL_RESULT_EXCERPT_CHARS: usize = 2_000;
 #[derive(Debug, Clone)]
 pub struct EnvironmentFile {
     pub name: String,
+    /// The old form's family, or the selected profile's family.
     pub family: String,
+    /// A whole-provider catalog key, or a route id when `profile` is `Some`.
     pub provider: String,
+    /// The old form's configured model, or the selected profile's `model_id`.
     pub model: String,
+    /// `Some` exactly when the environment names `route` + `profile`.
+    pub profile: Option<Arc<ModelProfile>>,
     pub options: ModelOptions,
     pub tools: Vec<ToolSpec>,
     pub prompt_template: String,
@@ -125,11 +133,15 @@ pub struct ToolSpec {
     pub variant: Option<String>,
 }
 
-/// What the provider factory is given: the catalog key and the requested model.
+/// What the provider factory is given: the catalog key (a whole-provider key, or a
+/// route id when the environment used the new form), the model to request, and the
+/// profile the environment selected. `profile` is `Some` exactly in the new form, so
+/// a factory can refuse the form its key does not accept instead of guessing.
 #[derive(Debug, Clone)]
 pub struct ProviderSpec {
     pub key: String,
     pub model: String,
+    pub profile: Option<Arc<ModelProfile>>,
 }
 
 /// What tools of ONE agent share. Created fresh per [`assemble`] call, so two
@@ -262,6 +274,19 @@ pub enum AssemblyError {
     },
     #[error("invalid environment file {}: {message}", path.display())]
     InvalidEnvironmentFile { path: PathBuf, message: String },
+    /// The provider keys present are neither `route` + `profile` nor
+    /// `provider` + `model` + `family`. The message names both valid forms.
+    #[error("invalid environment form in {}: {message}", path.display())]
+    InvalidEnvironmentForm { path: PathBuf, message: String },
+    /// The profile an environment names has no `profiles/<id>.toml`.
+    #[error("profile `{profile}` was not found in {}; available: {available:?}", dir.display())]
+    ProfileNotFound {
+        profile: String,
+        dir: PathBuf,
+        available: Vec<String>,
+    },
+    #[error("invalid profile file {}: {message}", path.display())]
+    InvalidProfileFile { path: PathBuf, message: String },
     #[error("missing prompt file: {}", path.display())]
     MissingPrompt { path: PathBuf },
     #[error("unknown provider key `{key}`; available: {available:?}")]
@@ -301,15 +326,16 @@ pub enum AssemblyError {
 
 /// Search each directory in `search_dirs` in order; the first
 /// `<dir>/<name>/environment.toml` wins. The prompt is read from `prompt.md` in
-/// the same directory and each `description_file` relative to it.
+/// the same directory and each `description_file` relative to it. A new-form
+/// environment (`route` + `profile`) loads `<dir>/../profiles/<profile>.toml`.
 pub fn load_environment(
     name: &str,
     search_dirs: &[PathBuf],
 ) -> Result<EnvironmentFile, AssemblyError> {
-    let dir = search_dirs
+    let (base, dir) = search_dirs
         .iter()
-        .map(|base| base.join(name))
-        .find(|dir| dir.join(ENVIRONMENT_FILE).is_file())
+        .map(|base| (base, base.join(name)))
+        .find(|(_, dir)| dir.join(ENVIRONMENT_FILE).is_file())
         .ok_or_else(|| AssemblyError::EnvironmentNotFound {
             name: name.to_string(),
             searched: search_dirs.to_vec(),
@@ -326,6 +352,26 @@ pub fn load_environment(
             path: path.clone(),
             message: error.to_string(),
         })?;
+
+    // Which provider the environment names, and — in the new form — the profile
+    // that carries the model policy. `family` and the model come from the profile;
+    // route bindings (wire model, limits) arrive with route files.
+    let (provider, model, family, profile) = match provider_form(&parsed, &path)? {
+        ProviderForm::Routed { route, profile } => {
+            let profile = load_profile(base, &profile)?;
+            (
+                route,
+                profile.model_id.clone(),
+                profile.family.clone(),
+                Some(profile),
+            )
+        }
+        ProviderForm::Whole {
+            provider,
+            model,
+            family,
+        } => (provider, model, family, None),
+    };
 
     let prompt_path = dir.join(PROMPT_FILE);
     let prompt_template = std::fs::read_to_string(&prompt_path).map_err(|error| {
@@ -400,9 +446,10 @@ pub fn load_environment(
 
     Ok(EnvironmentFile {
         name: name.to_string(),
-        family: parsed.family,
-        provider: parsed.provider,
-        model: parsed.model,
+        family,
+        provider,
+        model,
+        profile,
         options: parsed.options.into(),
         tools,
         prompt_template,
@@ -411,14 +458,124 @@ pub fn load_environment(
     })
 }
 
+/// Load `profiles/<id>.toml` next to the environments directory that was selected
+/// (`docs/design/routes-and-profiles.md` §1: shipped files live in the repository
+/// root, next to `environments/`). A missing file names the profiles that exist.
+fn load_profile(environments_base: &Path, id: &str) -> Result<Arc<ModelProfile>, AssemblyError> {
+    let dir = environments_base.join(PROFILES_DIR);
+    let path = dir.join(format!("{id}.toml"));
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AssemblyError::ProfileNotFound {
+                profile: id.to_string(),
+                dir: dir.clone(),
+                available: available_profiles(&dir),
+            }
+        } else {
+            AssemblyError::InvalidProfileFile {
+                path: path.clone(),
+                message: error.to_string(),
+            }
+        }
+    })?;
+    ModelProfile::from_toml(id, &text)
+        .map(Arc::new)
+        .map_err(|message| AssemblyError::InvalidProfileFile { path, message })
+}
+
+/// The profile ids a directory holds, sorted. A directory that does not exist or
+/// cannot be read holds none.
+fn available_profiles(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("toml"))
+        .filter_map(|entry| {
+            entry
+                .path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Which provider form the environment file uses. The two forms are exclusive, and
+/// every other combination of keys is an error naming both.
+enum ProviderForm {
+    /// `route` + `profile` (spec 1.3): the profile carries the model policy.
+    Routed { route: String, profile: String },
+    /// `provider` + `model` + `family`: a whole provider that consumes no profile.
+    Whole {
+        provider: String,
+        model: String,
+        family: String,
+    },
+}
+
+fn provider_form(parsed: &EnvironmentToml, path: &Path) -> Result<ProviderForm, AssemblyError> {
+    let form_error = |present: &str| AssemblyError::InvalidEnvironmentForm {
+        path: path.to_path_buf(),
+        message: format!(
+            "{present}; an environment names either `route` + `profile` or \
+             `provider` + `model` + `family`"
+        ),
+    };
+    match (
+        parsed.route.as_deref(),
+        parsed.profile.as_deref(),
+        parsed.provider.as_deref(),
+        parsed.model.as_deref(),
+        parsed.family.as_deref(),
+    ) {
+        (Some(route), Some(profile), None, None, None) => Ok(ProviderForm::Routed {
+            route: route.to_string(),
+            profile: profile.to_string(),
+        }),
+        (None, None, Some(provider), Some(model), Some(family)) => Ok(ProviderForm::Whole {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            family: family.to_string(),
+        }),
+        _ => Err(form_error(&present_keys(parsed))),
+    }
+}
+
+/// The provider-selecting keys an environment file actually sets, for the error.
+fn present_keys(parsed: &EnvironmentToml) -> String {
+    let keys: Vec<String> = [
+        ("route", &parsed.route),
+        ("profile", &parsed.profile),
+        ("provider", &parsed.provider),
+        ("model", &parsed.model),
+        ("family", &parsed.family),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.is_some())
+    .map(|(name, _)| format!("`{name}`"))
+    .collect();
+    if keys.is_empty() {
+        return "no provider keys were set".to_string();
+    }
+    format!("found {}", keys.join(" + "))
+}
+
 /// The TOML surface of `environment.toml`. `deny_unknown_fields` everywhere, so a
-/// typo is an error naming the key rather than a silently ignored setting.
+/// typo is an error naming the key rather than a silently ignored setting. The
+/// provider keys are optional here: [`provider_form`] enforces that exactly one
+/// form is present.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnvironmentToml {
-    family: String,
-    provider: String,
-    model: String,
+    route: Option<String>,
+    profile: Option<String>,
+    family: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
     #[serde(default)]
     options: OptionsToml,
     #[serde(default)]
@@ -491,6 +648,7 @@ pub fn assemble(
     let provider_spec = ProviderSpec {
         key: environment.provider.clone(),
         model: environment.model.clone(),
+        profile: environment.profile.clone(),
     };
     let provider =
         make_provider(&provider_spec).map_err(|message| AssemblyError::FactoryFailed {

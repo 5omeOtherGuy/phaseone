@@ -739,6 +739,7 @@ name = "p1-assembly"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "p1-model-profile",
  "p1-testkit",
  "p1-workspace",
  "serde",
@@ -835,6 +836,7 @@ dependencies = [
  "futures-util",
  "p1-contracts",
  "p1-host",
+ "p1-model-profile",
  "p1-provider-anthropic",
  "p1-provider-http",
  "p1-provider-openai",
@@ -847,6 +849,8 @@ name = "p1-model-profile"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "serde",
+ "toml",
 ]
 
 [[package]]
