@@ -88,6 +88,17 @@ PROGRESS 2026-09-20 late (all merged, CI green on the exact commit):
     `ContextStats` (observation-only context budget numbers). Lead never edits `crates/p1-tui*`
     or `docs/design/tui/`.
 
+- 2026-09-20 ~21:00: the PRIMARY opencode-go subscription ran out of credit (401 CreditsError).
+  Owner rule: use the second account, DeepSeek V4.1 Flash ONLY — `pi-worker deepseek2 …`, and in
+  p1 `--env deepseek2` (route `opencode-go-2-subscription`, a data-only addition). p1 jobs need
+  the key in the environment: dispatch with
+  `OPENCODE_GO_2_API_KEY="$(tr -d '\n' < ~/.config/keys/opencode-go-2.key)" scripts/fanout.py …`
+  (never print it). The z.ai GLM plan is small (5-hour quota) — use `--env glm` sparingly.
+  Steps done since: 4a-1, 4a-2 (Anthropic from route file + profile), FrontEnd seam (#12),
+  stall guard (ADR-0042), chat-parser tool-type fix. In flight: 4b (OpenAI Responses) as
+  `split4b-glm` in `../phaseone-split4b-openai`; if it dies, re-dispatch the same brief
+  (`../phaseone-briefs/split4b.md`) with env `deepseek2`.
+
 NEXT, in order:
 1. Review + merge 4a; then the host seam for the TUI (above); then 4b = the same for
    `p1-provider-openai` (brief not written yet; mirror `split4a.md`).
