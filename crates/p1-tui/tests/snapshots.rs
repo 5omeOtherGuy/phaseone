@@ -162,13 +162,13 @@ fn streaming_at_120x40() {
     let text = left(&render(&s, 120, 40, 11_400), 80);
     assert_palette_law(&s, 120, 40);
     assert_eq!(text[0], "› why does compaction stall at the turn edge?");
-    assert!(text[1].starts_with("· reasoning"));
-    assert!(text[1].ends_with("^R expand"));
-    assert!(text[2].starts_with("The hard-pressure wait"));
-    assert!(text[4].starts_with("✓ read      p1-context/src/edge.rs"));
-    assert!(text[4].ends_with("412 lines"));
-    assert_eq!(text[5], "▸ shell     cargo test -p p1-context boundary");
-    assert!(text[6].starts_with("▪▪▪ shell"));
+    assert!(text[2].starts_with("· reasoning"));
+    assert!(text[2].ends_with("^R expand"));
+    assert!(text[4].starts_with("The hard-pressure wait"));
+    assert!(text[7].contains("▸ read      p1-context/src/edge.rs"));
+    assert!(text[7].trim_end().ends_with("✓ 412 lines · 0.8 kB"));
+    assert!(text[34].contains("▸ shell     cargo test -p p1-context boundary"));
+    assert!(text[34].contains("▪▪▪"));
     // The pane is up by default: LEDGER on the right, composer at the bottom.
     assert!(text[38].starts_with('›'));
     assert_eq!(
@@ -237,10 +237,13 @@ fn fold_block_screen() {
     // The failure promoted a PEEK banner over the ledger (SPEC §5).
     assert!(full[0].contains("shell failed"));
     let text = left(&full, 80);
-    assert!(text[0].starts_with("✗ shell"));
-    assert_eq!(text[1], "  test line 0");
-    // The fold handle is stable, addressable, FAINT metadata.
-    assert!(text[9].contains("more lines folded → [h-"));
+    assert!(text[0].trim_start().starts_with("▸ shell"));
+    assert!(text[0].contains("✗ 11.4s"));
+    // A shell body folds from the tail: the verdict survives, the handle is
+    // stable, addressable, FAINT metadata.
+    assert_eq!(text[1].trim(), "test line 70");
+    assert!(text[25].contains("70 more lines folded → [h-"));
+    assert!(text[25].trim_end().ends_with("^O open in pane"));
 }
 
 #[test]
@@ -357,12 +360,12 @@ fn every_state_reads_with_colour_stripped() {
     let s = streaming_screen();
     let text = render(&s, 120, 40, 0);
     assert!(text.iter().any(|l| l.starts_with('›')), "operator turn");
-    assert!(text.iter().any(|l| l.starts_with('✓')), "settled call");
-    assert!(text.iter().any(|l| l.starts_with('▸')), "running call");
+    assert!(text.iter().any(|l| l.contains('✓')), "settled call");
     assert!(
-        text.iter().any(|l| l.starts_with("▪▪▪")),
-        "working indicator"
+        text.iter().any(|l| l.trim_start().starts_with('▸')),
+        "running call"
     );
+    assert!(text.iter().any(|l| l.contains("▪▪▪")), "working indicator");
     assert!(text.iter().any(|l| l.starts_with('·')), "folded reasoning");
 }
 

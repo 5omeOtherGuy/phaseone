@@ -3,6 +3,7 @@
 //! placement) is the caller's one mechanical step. Keeping renderers line-
 //! shaped makes every screen snapshot-testable against `TestBackend`.
 
+pub mod block;
 pub mod composer;
 pub mod diff;
 pub mod ledger;
@@ -59,6 +60,16 @@ pub fn tokens(count: u64) -> String {
 
 /// `—` for an unknown quantity (SPEC §5: unknown cost renders `—`, never 0).
 pub const UNKNOWN: &str = "—";
+
+/// Scale a palette colour toward the ground by `opacity` (0.0–1.0). The LED
+/// chase dims its cells; it never introduces a hue.
+pub(crate) fn dimmed(color: Color, opacity: f32) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return color;
+    };
+    let scale = |v: u8| (v as f32 * opacity) as u8;
+    Color::Rgb(scale(r), scale(g), scale(b))
+}
 
 #[cfg(test)]
 mod tests {

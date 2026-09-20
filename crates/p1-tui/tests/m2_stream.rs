@@ -132,13 +132,18 @@ fn mid_stream_working_indicator_and_running_call() {
     let mut s = Screen::new(false);
     play(&mut s, &script(), 4_100);
     let text = render(&s, 120, 40, 5_000);
-    // Reasoning is collapsed; the working indicator runs on its own line.
+    // Reasoning is collapsed; the working indicator runs on the header row of
+    // the running block (BLOCK-SPEC §7).
     assert!(text.iter().any(|l| l.contains("· reasoning")));
-    assert!(text.iter().any(|l| l.starts_with("▪▪▪ shell")));
-    // The running call row has no result yet.
-    assert!(text.iter().any(|l| l.starts_with("▸ shell")));
+    assert!(
+        text.iter()
+            .any(|l| l.trim_start().starts_with("▸ shell") && l.contains("▪▪▪"))
+    );
     // The LED chase is alive: at t=5000 the cells are not uniformly lit.
-    let working_row = text.iter().position(|l| l.starts_with("▪▪▪")).unwrap();
+    let working_row = text
+        .iter()
+        .position(|l| l.trim_start().starts_with("▸ shell"))
+        .unwrap();
     let _ = working_row;
 }
 
@@ -147,7 +152,10 @@ fn after_failure_the_evidence_block_and_peek_show() {
     let mut s = Screen::new(true);
     play(&mut s, &script(), 15_500);
     let text = render(&s, 120, 40, 15_600);
-    assert!(text.iter().any(|l| l.starts_with("✗ shell")));
+    assert!(
+        text.iter()
+            .any(|l| l.trim_start().starts_with("▸ shell") && l.contains("✗"))
+    );
     assert!(text.iter().any(|l| l.contains("more lines folded → [h-")));
     // The failure promoted a peek over the ledger…
     assert!(matches!(s.promotion, p1_tui::state::Promotion::Peek { .. }));
@@ -191,11 +199,12 @@ fn the_80_column_floor_keeps_everything_readable() {
     play(&mut s, &script(), 16_600);
     let text = render(&s, 80, 24, 16_600);
     // Same glyphs, same shapes — nothing reflows into a different shape (§6).
-    assert!(
-        text.iter()
-            .any(|l| { l.starts_with("✗ shell") && l.contains("test case 0") })
-    );
-    assert!(text.iter().any(|l| l.contains("· 42 more lines folded")));
+    // A 24-row fold block is taller than the 24-row floor, so the header is
+    // above the fold; what must survive at the floor is the tail body, the
+    // addressable handle and the floor line.
+    assert!(text.iter().any(|l| l.contains("test case 49")));
+    assert!(text.iter().any(|l| l.contains("26 more lines folded")));
+    assert!(text.iter().any(|l| l.contains("^O open in pane")));
     // The floor line appears under the composer; the pane is gone.
     let last = text.last().unwrap();
     assert!(last.ends_with("^L ledger   ^C cancel"));

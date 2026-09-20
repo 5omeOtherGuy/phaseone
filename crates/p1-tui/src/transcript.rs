@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use p1_contracts::{AgentEvent, ToolCall, ToolResultItem, ToolStatus, TurnEnd};
 
-use crate::fold::{Fold, FoldId};
+use crate::fold::{Fold, FoldId, FoldKeep};
 
 /// One block in the transcript. Order is history; nothing is re-sorted.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +43,9 @@ pub enum Block {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolRow {
     pub name: String,
+    /// The raw tool input (JSON), kept for per-tool rendering (the edit diff,
+    /// the write preview). The renderer parses only display hints from it.
+    pub input: String,
     /// The one-line argument summary (newlines as `␤`, bounded).
     pub summary: String,
     pub status: RowStatus,
@@ -62,17 +65,39 @@ pub enum RowStatus {
 }
 
 impl ToolRow {
-    /// The fold presentation of a settled row's output, when it earns one.
-    /// Only a FAILED call expands its evidence inline (SPEC §4.3: a settled
-    /// call collapses to one line); a successful call's oversized output is
-    /// registered under its handle and opened with `^O`, never shown.
-    pub fn fold(&self) -> Option<Fold> {
-        let output = self.output.as_deref()?;
-        match self.status {
-            RowStatus::Settled(ToolStatus::Ok) => None,
-            RowStatus::Settled(_) => Some(Fold::present(output)),
-            RowStatus::Running => None,
+    /// The text the fold is decided on. For most tools this is the tool's own
+    /// output; an edit/patch body is a diff built from the input's old/new
+    /// strings, so it folds from those instead (BLOCK-SPEC §4.4, §5).
+    pub fn body_source(&self) -> Option<String> {
+        self.output.as_ref()?;
+        match self.name.as_str() {
+            "edit" | "patch" => {
+                let old = json_string_field(&self.input, "old_string")
+                    .map(json_unescape)
+                    .unwrap_or_default();
+                let new = json_string_field(&self.input, "new_string")
+                    .map(json_unescape)
+                    .unwrap_or_default();
+                let mut diff = String::new();
+                for line in old.lines() {
+                    diff.push_str(line);
+                    diff.push('\n');
+                }
+                for line in new.lines() {
+                    diff.push_str(line);
+                    diff.push('\n');
+                }
+                Some(diff)
+            }
+            _ => self.output.clone(),
         }
+    }
+
+    /// The fold presentation of a settled row's body. BLOCK-SPEC §5: a body
+    /// over 40 rows folds to a 24-row window; below it nothing folds.
+    pub fn fold(&self) -> Option<Fold> {
+        let body = self.body_source()?;
+        Some(Fold::present(&body, FoldKeep::for_tool(&self.name)))
     }
 }
 
@@ -181,6 +206,7 @@ impl Transcript {
         self.close_streams();
         self.blocks.push(Block::Call(ToolRow {
             name: call.name.clone(),
+            input: call.input.raw().to_string(),
             summary: summarize_call(&call.name, call.input.raw()),
             status: RowStatus::Running,
             output: None,
@@ -212,11 +238,12 @@ impl Transcript {
         row.status = status;
         row.elapsed_ms = elapsed_ms;
         if !content.is_empty() {
-            if let Some(Fold::Folded { id, .. }) = row.fold_for(content) {
-                self.latest_fold = Some(id.clone());
-                self.outputs.insert(id, content.to_string());
-            }
             row.output = Some(content.to_string());
+            let body = row.body_source().unwrap_or_default();
+            if let Fold::Folded { id, .. } = Fold::present(&body, FoldKeep::for_tool(&row.name)) {
+                self.latest_fold = Some(id.clone());
+                self.outputs.insert(id, body);
+            }
         }
     }
 
@@ -305,15 +332,6 @@ impl Transcript {
     }
 }
 
-impl ToolRow {
-    fn fold_for(&self, output: &str) -> Option<Fold> {
-        match Fold::present(output) {
-            fold @ Fold::Folded { .. } => Some(fold),
-            Fold::Full { .. } => None,
-        }
-    }
-}
-
 /// Append streamed text to a line buffer, splitting on newlines.
 fn append_text(lines: &mut Vec<String>, text: &str) {
     for (n, part) in text.split('\n').enumerate() {
@@ -322,6 +340,32 @@ fn append_text(lines: &mut Vec<String>, text: &str) {
         }
         lines.last_mut().expect("a line exists").push_str(part);
     }
+}
+
+/// A minimal JSON string unescape for display hints (`\n`, `\t`, `\"`, `\\`).
+/// This is not a parser; a miss leaves the raw text in place.
+pub(crate) fn json_unescape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// The one-line input summary for a call row (SPEC §3). Raw JSON is not a
@@ -351,7 +395,7 @@ pub fn summarize_call(name: &str, raw: &str) -> String {
 /// Extract a string field's value from flat JSON, for DISPLAY only: this is a
 /// summary, not a parse — a miss or an escape edge case shows the raw input
 /// instead. p1-tui carries no JSON dependency for a display hint.
-fn json_string_field<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn json_string_field<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
     if key.is_empty() {
         return None;
     }
@@ -497,14 +541,36 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_small_output_stays_one_line() {
+    fn a_successful_small_output_does_not_fold() {
         let mut t = Transcript::new();
         t.apply(&call("c1", "read", "src/lib.rs"), None);
         t.apply(&result("c1", "read", ToolStatus::Ok, "fn main() {}"), None);
         let [Block::Call(row)] = &t.blocks[..] else {
             panic!("one call row");
         };
-        assert_eq!(row.fold(), None);
+        assert!(matches!(row.fold(), Some(Fold::Full { .. })));
+        assert_eq!(t.latest_fold, None);
+    }
+
+    #[test]
+    fn an_edit_registers_its_diff_behind_the_fold_handle() {
+        let mut t = Transcript::new();
+        let old: String = (0..60).map(|n| format!("old {n}\\n")).collect();
+        let new: String = (0..60).map(|n| format!("new {n}\\n")).collect();
+        let input = format!(r#"{{"file_path":"a.rs","old_string":"{old}","new_string":"{new}"}}"#);
+        t.apply(&call("c1", "edit", &input), None);
+        t.apply(
+            &result("c1", "edit", ToolStatus::Ok, "Edited a.rs (1 replacement)."),
+            Some(1),
+        );
+        let [Block::Call(row)] = &t.blocks[..] else {
+            panic!("one call row");
+        };
+        let Some(Fold::Folded { id, .. }) = row.fold() else {
+            panic!("an oversized diff folds");
+        };
+        let body = t.output(&id).expect("the diff is addressable");
+        assert!(body.contains("old 0") && body.contains("new 59"));
     }
 
     #[test]

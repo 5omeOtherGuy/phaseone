@@ -1,26 +1,23 @@
-//! The transcript renderer (SPEC §3, §4). Column grid: glyph, a 10-column name
-//! field, the argument, then the right-aligned result. Indentation is 2 cells
-//! per delegation depth — once and never more. No box-drawing, no role labels;
-//! tool output earns chrome (a BLOCK background), conversation does not.
+//! The transcript renderer (BLOCK-SPEC §1–§3). A transcript is a vertical list
+//! of events; operator input and assistant prose sit on GROUND with no chrome,
+//! a tool event earns the three-band block (§2). Events are separated by one
+//! blank GROUND row. No box-drawing, no role labels.
 
-use p1_contracts::ToolStatus;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::fold::Fold;
+use super::block;
 use crate::glyphs;
 use crate::palette;
-use crate::transcript::{Block, RowStatus, ToolRow, Transcript};
+use crate::transcript::{Block, RowStatus, Transcript};
 use crate::wrap::wrap;
 
-use super::{elapsed, fill};
-
-/// The name field of the §3 column grid, after the glyph prefix.
-const NAME_FIELD: usize = 10;
+use super::{dimmed, elapsed};
 
 /// Render the whole transcript to lines on a `width`-column grid.
-/// `working` is the live working-indicator label (e.g. "running tests") while
-/// the agent is mid-turn; `now_ms` drives the LED chase (fake time in tests).
+/// `working` is the live working-indicator label while the agent is mid-turn
+/// and no tool block is running; `now_ms` drives the LED chase (fake time in
+/// tests).
 pub fn lines(
     transcript: &Transcript,
     width: usize,
@@ -29,16 +26,39 @@ pub fn lines(
     reduced_motion: bool,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    let mut first = true;
     for block in &transcript.blocks {
-        block_lines(block, width, &mut out);
+        if !first {
+            out.push(Line::default());
+        }
+        first = false;
+        block_lines(block, width, now_ms, reduced_motion, &mut out);
     }
-    if let Some(label) = working {
-        out.push(working_line(label, width, now_ms, reduced_motion));
+    // A running tool block carries the chase in its header, so the standalone
+    // label would be a second animated thing. It appears only while the agent
+    // is working without a running block (e.g. assistant streaming).
+    let has_running = transcript
+        .blocks
+        .iter()
+        .any(|b| matches!(b, Block::Call(row) if row.status == RowStatus::Running));
+    if let Some(label) = working
+        && !has_running
+    {
+        if !first {
+            out.push(Line::default());
+        }
+        out.push(working_line(label, now_ms, reduced_motion));
     }
     out
 }
 
-fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
+fn block_lines(
+    block: &Block,
+    width: usize,
+    now_ms: u64,
+    reduced_motion: bool,
+    out: &mut Vec<Line<'static>>,
+) {
     match block {
         Block::Operator { text } => {
             let ink = Style::new().fg(palette::INK);
@@ -90,7 +110,7 @@ fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
                 }
             }
         }
-        Block::Call(row) => call_lines(row, width, out),
+        Block::Call(row) => out.extend(block::lines(row, width, now_ms, reduced_motion)),
         Block::Info { lines } => {
             for line in lines {
                 let shown: String = line.chars().take(width).collect();
@@ -119,149 +139,9 @@ fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
     }
 }
 
-/// One call row plus its fold block, when the row earned one.
-fn call_lines(row: &ToolRow, width: usize, out: &mut Vec<Line<'static>>) {
-    out.push(call_row(row, width));
-    if let Some(fold) = row.fold() {
-        fold_lines(&fold, width, row.depth, out);
-    }
-}
-
-/// The §3 row: `▸ read      src/lib.rs              ✓ 412 lines`.
-fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
-    let indent = "  ".repeat(row.depth.min(1) as usize);
-    let (glyph, glyph_fg) = match row.status {
-        RowStatus::Running => (glyphs::TOOL, palette::DIM),
-        RowStatus::Settled(ToolStatus::Ok) => (glyphs::DONE, palette::DIM),
-        RowStatus::Settled(ToolStatus::Error) => (glyphs::FAILED, palette::INK),
-        RowStatus::Settled(ToolStatus::Denied) => (glyphs::FAILED, palette::INK),
-        RowStatus::Settled(_) => (glyphs::PENDING, palette::FAINT),
-    };
-    let mut name: String = row.name.chars().take(NAME_FIELD).collect();
-    while name.chars().count() < NAME_FIELD {
-        name.push(' ');
-    }
-    let mut spans = vec![
-        Span::styled(indent.clone(), Style::new().fg(palette::DIM)),
-        Span::styled(format!("{glyph} "), Style::new().fg(glyph_fg)),
-        Span::styled(name, Style::new().fg(palette::DIM)),
-        Span::styled(row.summary.clone(), Style::new().fg(palette::DIM)),
-    ];
-    // The right-aligned result: status word + evidence, never FAINT. A failed
-    // call's first output line is part of the evidence (SPEC §3's
-    // `✗ 11.4s · 12 passed, 1 failed · 94 lines`).
-    if let RowStatus::Settled(status) = row.status {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(ms) = row.elapsed_ms {
-            parts.push(elapsed(ms));
-        }
-        if status != ToolStatus::Ok
-            && let Some(first) = row
-                .output
-                .as_deref()
-                .map(str::lines)
-                .and_then(|mut lines| lines.next())
-                .filter(|line| !line.is_empty())
-        {
-            parts.push(first.to_string());
-        }
-        if let Some(output) = &row.output {
-            let n = output.lines().count();
-            parts.push(if n == 1 {
-                "1 line".into()
-            } else {
-                format!("{n} lines")
-            });
-        }
-        let mut result = parts.join(" · ");
-        if result.is_empty() {
-            result.push_str(status_word(status));
-        }
-        if status == ToolStatus::Denied {
-            result = format!("denied · {result}");
-        }
-        // The result wins the row's right edge; the summary truncates with `…`
-        // until the row fits (the grid rule: nothing overflows).
-        let fixed: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let budget = width.saturating_sub(fixed + result.chars().count() + 1);
-        if row.summary.chars().count() > budget {
-            let keep = budget.saturating_sub(1);
-            let mut cut: String = row.summary.chars().take(keep).collect();
-            cut.push('…');
-            let span = spans.last_mut().expect("the summary span exists");
-            *span = Span::styled(cut, span.style);
-        }
-        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let pad = width.saturating_sub(used + result.chars().count() + 1);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(result, Style::new().fg(palette::DIM)));
-        // An output big enough to fold is addressable: `^O open` (FAINT hint).
-        if row
-            .output
-            .as_deref()
-            .is_some_and(|o| o.lines().count() > crate::fold::FULL_BLOCK_MAX_LINES)
-        {
-            spans.push(Span::styled("   ^O open", Style::new().fg(palette::FAINT)));
-        }
-    }
-    Line::from(spans)
-}
-
-/// The settled-status word when there is no other evidence to show.
-fn status_word(status: ToolStatus) -> &'static str {
-    match status {
-        ToolStatus::Ok => "ok",
-        ToolStatus::Error => "error",
-        ToolStatus::Unavailable => "unavailable",
-        ToolStatus::Denied => "denied",
-        ToolStatus::Cancelled => "cancelled",
-        ToolStatus::Unknown => "unknown",
-    }
-}
-
-/// A fold block: head lines DIM on BLOCK, then the FAINT handle line. The
-/// block is padded to the full width so it reads as one surface (SPEC §3).
-fn fold_lines(fold: &Fold, width: usize, depth: u8, out: &mut Vec<Line<'static>>) {
-    let indent = "  ".repeat(depth.min(1) as usize + 1);
-    let (head, handle) = match fold {
-        Fold::Full { lines } => (lines.as_slice(), None),
-        Fold::Folded { head, folded, id } => (
-            head.as_slice(),
-            Some(format!(
-                "{} {} more lines folded → [{}]",
-                glyphs::PENDING,
-                folded,
-                id
-            )),
-        ),
-    };
-    for line in head {
-        let room = width.saturating_sub(indent.len());
-        let shown = if line.chars().count() > room {
-            let mut cut: String = line.chars().take(room.saturating_sub(1)).collect();
-            cut.push('\u{2026}');
-            cut
-        } else {
-            line.clone()
-        };
-        out.push(fill(
-            Line::styled(format!("{indent}{shown}"), Style::new().fg(palette::DIM)),
-            width,
-            palette::BLOCK,
-        ));
-    }
-    if let Some(handle) = handle {
-        out.push(fill(
-            Line::styled(format!("{indent}{handle}"), Style::new().fg(palette::FAINT)),
-            width,
-            palette::BLOCK,
-        ));
-    }
-}
-
 /// The working indicator (SPEC §2): three `▪` cells chasing on a 1.1 s cycle,
 /// frozen to a static `▪▪▪` under reduced motion. Own line, short label, INK.
-fn working_line(label: &str, width: usize, now_ms: u64, reduced_motion: bool) -> Line<'static> {
+fn working_line(label: &str, now_ms: u64, reduced_motion: bool) -> Line<'static> {
     let mut spans = Vec::new();
     for cell in 0..glyphs::WORKING_CELLS {
         let opacity = if reduced_motion {
@@ -278,26 +158,14 @@ fn working_line(label: &str, width: usize, now_ms: u64, reduced_motion: bool) ->
         format!(" {label}"),
         Style::new().fg(palette::DIM),
     ));
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let _ = width.saturating_sub(used);
     Line::from(spans)
-}
-
-/// Scale a palette colour toward the ground by `opacity` (0.0–1.0). The LED
-/// chase dims its cells; it never introduces a hue.
-fn dimmed(color: ratatui::style::Color, opacity: f32) -> ratatui::style::Color {
-    let ratatui::style::Color::Rgb(r, g, b) = color else {
-        return color;
-    };
-    let scale = |v: u8| (v as f32 * opacity) as u8;
-    ratatui::style::Color::Rgb(scale(r), scale(g), scale(b))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transcript::Transcript;
-    use p1_contracts::{AgentEvent, ToolCall, ToolInput, ToolResultItem};
+    use p1_contracts::{AgentEvent, ToolCall, ToolInput, ToolResultItem, ToolStatus};
 
     fn plain(lines: &[Line<'static>]) -> Vec<String> {
         lines
@@ -320,7 +188,7 @@ mod tests {
                 call: ToolCall {
                     call_id: "c1".into(),
                     name: "read".into(),
-                    input: ToolInput::Json("src/edge.rs".into()),
+                    input: ToolInput::Json(r#"{"file_path":"src/edge.rs"}"#.into()),
                 },
             },
             None,
@@ -331,7 +199,7 @@ mod tests {
                     call_id: "c1".into(),
                     name: "read".into(),
                     status: ToolStatus::Ok,
-                    content: "a\nb\nc".into(),
+                    content: "     1\ta\n     2\tb\n     3\tc".into(),
                 },
             },
             Some(412),
@@ -340,29 +208,63 @@ mod tests {
     }
 
     #[test]
-    fn the_column_grid_holds() {
+    fn events_are_separated_by_one_blank_ground_row() {
         let lines = lines(&transcript_with_call(), 60, None, 0, true);
         let text = plain(&lines);
         assert_eq!(text[0], "› why does compaction stall?");
-        assert_eq!(text[1], "Checking.");
-        // Glyph + 10-column name field, argument, right-aligned result.
-        let expected = format!(
-            "{} read      src/edge.rs{}412ms · 3 lines",
-            glyphs::DONE,
-            " ".repeat(60 - 23 - 15 - 1)
-        );
-        assert_eq!(text[2], expected);
+        assert_eq!(text[1], "");
+        assert_eq!(text[2], "Checking.");
+        assert_eq!(text[3], "");
+        assert!(text[4].trim_start().starts_with("▸ read"), "{}", text[4]);
     }
 
     #[test]
-    fn a_failed_call_shows_its_evidence_on_block() {
+    fn a_tool_event_earns_the_three_band_block() {
+        let lines = lines(&transcript_with_call(), 60, None, 0, true);
+        // Band A on BLOCK+, body rows on BLOCK.
+        assert!(
+            lines[4]
+                .spans
+                .iter()
+                .all(|s| s.style.bg == Some(palette::BLOCK_PLUS))
+        );
+        assert_eq!(lines[5].spans[0].style.bg, Some(palette::BLOCK));
+        // Band A is one row; the read body carries FAINT line numbers.
+        let text = plain(&lines);
+        assert!(text[4].contains("▸ read      src/edge.rs"));
+        assert!(text[4].trim_end().ends_with("✓ 3 lines · 0.0 kB"));
+        assert_eq!(text[5].trim(), "1  a");
+    }
+
+    #[test]
+    fn a_running_call_animates_its_header_not_a_second_line() {
         let mut t = Transcript::new();
         t.apply(
             &AgentEvent::ToolStarted {
                 call: ToolCall {
                     call_id: "c1".into(),
                     name: "shell".into(),
-                    input: ToolInput::Json("cargo test".into()),
+                    input: ToolInput::Json(r#"{"command":"cargo test"}"#.into()),
+                },
+            },
+            None,
+        );
+        let lines = lines(&t, 60, Some("shell"), 0, true);
+        let text = plain(&lines);
+        assert_eq!(text.len(), 1, "no standalone working line: {text:?}");
+        assert!(text[0].trim_start().starts_with("▸ shell     cargo test"));
+        assert!(text[0].contains("▪▪▪"));
+    }
+
+    #[test]
+    fn a_failed_call_shows_the_failure_marker_in_the_header() {
+        let mut t = Transcript::new();
+        t.apply(
+            &AgentEvent::ToolStarted {
+                call: ToolCall {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    input: ToolInput::Json(r#"{"command":"cargo test"}"#.into()),
                 },
             },
             None,
@@ -373,26 +275,20 @@ mod tests {
                     call_id: "c1".into(),
                     name: "shell".into(),
                     status: ToolStatus::Error,
-                    content: "test one ... FAILED\nassertion failed".into(),
+                    content: "test one ... FAILED\n[exit code: 101]".into(),
                 },
             },
             Some(11_400),
         );
         let lines = lines(&t, 60, None, 0, true);
         let text = plain(&lines);
-        // The row carries the failure; the evidence block follows on BLOCK.
-        assert!(text[0].contains(&glyphs::FAILED.to_string()));
-        assert_eq!(text[1].trim_end(), "  test one ... FAILED");
-        assert_eq!(text[2].trim_end(), "  assertion failed");
-        assert_eq!(
-            lines[1].spans[0].style.bg,
-            Some(palette::BLOCK),
-            "tool output earns chrome"
-        );
+        assert!(text[0].contains("✗ 11.4s · exit 101"), "{}", text[0]);
+        assert_eq!(text[1].trim(), "test one ... FAILED");
+        assert_eq!(lines[1].spans[0].style.bg, Some(palette::BLOCK));
     }
 
     #[test]
-    fn a_long_summary_truncates_so_the_result_never_overflows() {
+    fn a_long_summary_truncates_so_the_outcome_never_overflows() {
         let mut t = Transcript::new();
         t.apply(
             &AgentEvent::ToolStarted {
@@ -413,7 +309,7 @@ mod tests {
                     call_id: "c1".into(),
                     name: "shell".into(),
                     status: ToolStatus::Ok,
-                    content: "ok".into(),
+                    content: "ok\n[exit code: 0]".into(),
                 },
             },
             Some(120),
@@ -421,22 +317,27 @@ mod tests {
         let width = 40;
         let lines = lines(&t, width, None, 0, true);
         let text = plain(&lines);
-        // The row never exceeds the grid width and ends in the truncation
-        // mark before the right-aligned result.
-        assert!(text[0].chars().count() < width, "never overflows the grid");
+        assert!(text[0].chars().count() <= width, "never overflows the grid");
         assert!(text[0].contains('…'));
-        assert!(text[0].trim_end().ends_with("120ms · 1 line"));
+        assert!(text[0].trim_end().ends_with("120ms"));
     }
 
     #[test]
     fn reduced_motion_freezes_the_chase() {
         let frozen = lines(&Transcript::new(), 60, Some("running tests"), 0, true);
-        // Every cell at full INK: a static `▪▪▪`.
-        for cell in 0..glyphs::WORKING_CELLS {
-            assert_eq!(frozen[0].spans[cell].style.fg, Some(palette::INK));
-        }
-        // Live, the same instant dims cells below the floor's opposite end.
+        let cells: Vec<&Span<'static>> = frozen[0]
+            .spans
+            .iter()
+            .filter(|s| s.content == glyphs::WORKING.to_string())
+            .collect();
+        assert_eq!(cells.len(), glyphs::WORKING_CELLS);
+        assert!(cells.iter().all(|s| s.style.fg == Some(palette::INK)));
         let live = lines(&Transcript::new(), 60, Some("running tests"), 0, false);
-        assert_ne!(live[0].spans[0].style.fg, Some(palette::INK));
+        let live_cell = live[0]
+            .spans
+            .iter()
+            .find(|s| s.content == glyphs::WORKING.to_string())
+            .expect("a working cell");
+        assert_ne!(live_cell.style.fg, Some(palette::INK));
     }
 }
