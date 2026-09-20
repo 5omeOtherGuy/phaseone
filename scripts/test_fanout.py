@@ -151,7 +151,7 @@ class FanoutTest(unittest.TestCase):
     def test_worktree_job_passes_sandbox_read(self) -> None:
         repo = self.make_repo("repo")
         worktree = self.make_worktree(repo, "wt")
-        argv, _ = self.p1_argv(dir=worktree)
+        argv, _ = self.p1_argv(dir=worktree, sandbox=True)
         common = os.path.realpath(os.path.join(repo, ".git"))
         self.assertEqual(argv.count("--sandbox-read"), 1, argv)
         self.assertEqual(argv[argv.index("--sandbox-read") + 1], common)
@@ -161,13 +161,33 @@ class FanoutTest(unittest.TestCase):
 
     def test_plain_clone_job_passes_no_sandbox_read(self) -> None:
         repo = self.make_repo("clone")
-        argv, _ = self.p1_argv(dir=repo)
+        argv, _ = self.p1_argv(dir=repo, sandbox=True)
         self.assertNotIn("--sandbox-read", argv)
 
     # --- argv --------------------------------------------------------------
 
+    def test_default_argv_is_full_access(self) -> None:
+        # Owner decision 2026-09-20 (ADR-0038): no sandbox unless the job asks for one,
+        # not even for a worktree.
+        repo = self.make_repo("repo-default")
+        worktree = self.make_worktree(repo, "wt-default")
+        argv, entry = self.p1_argv(dir=worktree, max_continuations=5)
+        session = os.path.join(entry["run_dir"], "session.jsonl")
+        self.assertEqual(argv, [
+            self.bin, "--env", "plain", "--workspace", worktree, "--session", session,
+            "--yes", "--max-continuations", "5", BRIEF,
+        ])
+
+    def test_sandbox_write_without_sandbox_is_a_job_error(self) -> None:
+        for job in (self.p1_job(sandbox_write=["/tmp/extra-write"]),
+                    self.p1_job(sandbox="yes")):
+            code, _, err = self.run_jobs([job])
+            self.assertNotEqual(code, 0)
+            self.assertIn("sandbox", err)
+
     def test_fresh_argv_is_exactly_specified(self) -> None:
-        argv, entry = self.p1_argv(max_continuations=5, sandbox_write=["/tmp/extra-write"])
+        argv, entry = self.p1_argv(max_continuations=5, sandbox=True,
+                                   sandbox_write=["/tmp/extra-write"])
         session = os.path.join(entry["run_dir"], "session.jsonl")
         self.assertEqual(argv, [
             self.bin, "--env", "plain", "--workspace", self.work, "--session", session,
