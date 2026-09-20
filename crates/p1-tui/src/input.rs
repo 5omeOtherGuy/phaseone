@@ -118,8 +118,14 @@ mod tests {
     fn enter_submits_idle_and_steers_while_working() {
         let mut s = Screen::default();
         s.composer.text = "fix it".into();
-        assert_eq!(handle(&s, key(KeyCode::Enter)), Some(Command::Submit("fix it".into())));
-        s.working = Some(crate::state::Working { label: "shell".into(), started_ms: 0 });
+        assert_eq!(
+            handle(&s, key(KeyCode::Enter)),
+            Some(Command::Submit("fix it".into()))
+        );
+        s.working = Some(crate::state::Working {
+            label: "shell".into(),
+            started_ms: 0,
+        });
         assert_eq!(
             handle(&s, key(KeyCode::Enter)),
             Some(Command::QueueSteering("fix it".into()))
@@ -137,13 +143,20 @@ mod tests {
 
     #[test]
     fn a_pending_approval_captures_single_character_decisions() {
-        let mut s = Screen::default();
-        s.approval = Some(Approval::Permission(crate::render::permission::PermissionView {
-            command: "rm -rf /".into(),
-            rows: vec![],
-            grantable: false,
-        }));
-        assert_eq!(handle(&s, key(KeyCode::Char('y'))), Some(Command::ApproveOnce));
+        let s = Screen {
+            approval: Some(Approval::Permission(
+                crate::render::permission::PermissionView {
+                    command: "rm -rf /".into(),
+                    rows: vec![],
+                    grantable: false,
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            handle(&s, key(KeyCode::Char('y'))),
+            Some(Command::ApproveOnce)
+        );
         assert_eq!(handle(&s, key(KeyCode::Char('n'))), Some(Command::Deny));
         assert_eq!(handle(&s, ctrl('d')), Some(Command::NextFile));
         // Composer keys do not leak through the modal layer.
@@ -152,15 +165,21 @@ mod tests {
 
     #[test]
     fn the_picker_layer_moves_accepts_and_dismisses() {
-        let mut s = Screen::default();
-        s.picker = Some(Picker {
-            groups: vec![PickerGroup {
-                header: "G".into(),
-                rows: vec![PickerRow { label: "a".into(), value: String::new(), available: true }],
-            }],
-            filter: String::new(),
-            selected: 0,
-        });
+        let s = Screen {
+            picker: Some(Picker {
+                groups: vec![PickerGroup {
+                    header: "G".into(),
+                    rows: vec![PickerRow {
+                        label: "a".into(),
+                        value: String::new(),
+                        available: true,
+                    }],
+                }],
+                filter: String::new(),
+                selected: 0,
+            }),
+            ..Default::default()
+        };
         assert_eq!(handle(&s, key(KeyCode::Down)), Some(Command::PickerDown));
         assert_eq!(handle(&s, key(KeyCode::Enter)), Some(Command::PickerAccept));
         assert_eq!(handle(&s, key(KeyCode::Esc)), Some(Command::Dismiss));
