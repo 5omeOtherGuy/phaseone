@@ -11,12 +11,82 @@ use p1_contracts::{
     BoxFuture, CancellationToken, Effort, ModelOptions, Provider, ProviderError, ProviderErrorKind,
     ProviderRequest,
 };
-use p1_provider_anthropic::{AnthropicProvider, ROUTE, build_headers, build_request};
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
+use p1_provider_anthropic::{
+    AnthropicProvider, MessagesAccount, MessagesRoute, ROUTE, build_headers, build_request,
+};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource, RetryPolicy, Transport};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// The route data the frozen expectations were recorded with: today's origin route
+/// and endpoint. ADR-0039 step 4 moved them into `routes/anthropic-subscription.toml`;
+/// these tests keep the same values, so their bodies stay byte-identical.
+fn route() -> MessagesRoute {
+    MessagesRoute {
+        origin_route: ROUTE.to_string(),
+        endpoint: "https://api.anthropic.com".to_string(),
+        account: MessagesAccount::ClaudeCodeSubscription,
+    }
+}
+
+/// The profile the OLD rule selected for `model`: the three adaptive prefixes
+/// (`claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`) took an effort level, every
+/// other name took the manual budget table. The mapping documents what the explicit
+/// `profiles/claude-*.toml` records replaced; every expected body is unchanged.
+fn profile(model: &str) -> ModelProfile {
+    let effort_level = ["claude-fable-5", "claude-opus-5", "claude-sonnet-5"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix));
+    let efforts = vec![
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::ExtraHigh,
+        Effort::Max,
+    ];
+    ModelProfile {
+        id: model.to_string(),
+        revision: 1,
+        model_id: model.to_string(),
+        family: "claude".to_string(),
+        thinking: if effort_level {
+            ThinkingPolicy::EffortLevel
+        } else {
+            ThinkingPolicy::Budget
+        },
+        efforts,
+        default_effort: None,
+        thinking_budgets: if effort_level {
+            BTreeMap::new()
+        } else {
+            [
+                (Effort::Low, 4_096),
+                (Effort::Medium, 10_240),
+                (Effort::High, 20_480),
+                (Effort::ExtraHigh, 32_768),
+                (Effort::Max, 32_768),
+            ]
+            .into_iter()
+            .collect()
+        },
+        context_tokens: None,
+        max_output_tokens: None,
+    }
+}
+
+/// The account these frozen headers belong to (the shipped route's).
+fn account() -> MessagesAccount {
+    MessagesAccount::ClaudeCodeSubscription
+}
+
+/// `build_request` over the route and the profile `model` selects.
+fn build(model: &str, request: &ProviderRequest) -> Result<Value, ProviderError> {
+    build_request(&route(), model, &profile(model), request)
+}
 
 fn user(text: &str) -> Item {
     Item::User {
@@ -88,7 +158,7 @@ fn ephemeral() -> Value {
 
 #[test]
 fn golden_request_whole_body() {
-    let built = build_request("claude-sonnet-4-6", &request(vec![user("hi")])).unwrap();
+    let built = build("claude-sonnet-4-6", &request(vec![user("hi")])).unwrap();
     let expected = json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 32_000,
@@ -110,7 +180,7 @@ fn golden_request_whole_body() {
 fn empty_prompt_omits_the_second_system_block() {
     let mut request = request(vec![user("hi")]);
     request.system_prompt = String::new();
-    let built = build_request("claude-sonnet-4-6", &request).unwrap();
+    let built = build("claude-sonnet-4-6", &request).unwrap();
     assert_eq!(
         built["system"],
         json!([{ "type": "text", "text": IDENTITY, "cache_control": ephemeral() }])
@@ -125,7 +195,7 @@ fn cache_control_marks_last_system_last_tool_and_last_user_block() {
         user("three"),
     ]);
     request.tools = vec![function_tool("read"), function_tool("grep")];
-    let built = build_request("claude-sonnet-4-6", &request).unwrap();
+    let built = build("claude-sonnet-4-6", &request).unwrap();
 
     let system = built["system"].as_array().unwrap();
     assert!(system[0].get("cache_control").is_none());
@@ -146,12 +216,12 @@ fn cache_control_marks_last_system_last_tool_and_last_user_block() {
 
 #[test]
 fn tools_are_omitted_when_empty_and_shaped_as_json_schema() {
-    let bare = build_request("m", &request(vec![user("hi")])).unwrap();
+    let bare = build("m", &request(vec![user("hi")])).unwrap();
     assert!(bare.get("tools").is_none());
 
     let mut with_tools = request(vec![user("hi")]);
     with_tools.tools = vec![function_tool("read")];
-    let built = build_request("m", &with_tools).unwrap();
+    let built = build("m", &with_tools).unwrap();
     assert_eq!(
         built["tools"][0],
         json!({
@@ -165,7 +235,7 @@ fn tools_are_omitted_when_empty_and_shaped_as_json_schema() {
 
 #[test]
 fn no_thinking_when_no_reasoning_effort() {
-    let built = build_request("claude-sonnet-4-6", &request(vec![user("hi")])).unwrap();
+    let built = build("claude-sonnet-4-6", &request(vec![user("hi")])).unwrap();
     assert!(built.get("thinking").is_none());
     assert!(built.get("output_config").is_none());
     assert_eq!(built["max_tokens"], json!(32_000));
@@ -182,8 +252,7 @@ fn manual_thinking_budgets_and_the_output_margin() {
         (Effort::ExtraHigh, 32_768, 40_960),
         (Effort::Max, 32_768, 40_960),
     ] {
-        let built =
-            build_request("claude-sonnet-4-6", &with_effort(vec![user("hi")], effort)).unwrap();
+        let built = build("claude-sonnet-4-6", &with_effort(vec![user("hi")], effort)).unwrap();
         assert_eq!(
             built["thinking"],
             json!({ "type": "enabled", "budget_tokens": budget }),
@@ -204,7 +273,7 @@ fn an_explicit_output_cap_below_the_thinking_budget_is_rejected_by_build_request
     // is a rejected conflict, no longer silently raised to budget + 8192.
     let mut request = with_effort(vec![user("hi")], Effort::Low);
     request.options.max_output_tokens = Some(2_000);
-    let error = build_request("claude-sonnet-4-6", &request).unwrap_err();
+    let error = build("claude-sonnet-4-6", &request).unwrap_err();
     assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
     for part in [
         "max_output_tokens 2000".to_string(),
@@ -220,7 +289,7 @@ fn an_explicit_output_cap_below_the_thinking_budget_is_rejected_by_build_request
 fn an_explicit_output_cap_is_used_verbatim_without_thinking() {
     let mut request = request(vec![user("hi")]);
     request.options.max_output_tokens = Some(4_242);
-    let built = build_request("claude-sonnet-4-6", &request).unwrap();
+    let built = build("claude-sonnet-4-6", &request).unwrap();
     assert_eq!(built["max_tokens"], json!(4_242));
 }
 
@@ -233,8 +302,7 @@ fn adaptive_models_use_effort_instead_of_a_budget() {
         (Effort::ExtraHigh, "xhigh"),
         (Effort::Max, "max"),
     ] {
-        let built =
-            build_request("claude-sonnet-5", &with_effort(vec![user("hi")], effort)).unwrap();
+        let built = build("claude-sonnet-5", &with_effort(vec![user("hi")], effort)).unwrap();
         assert_eq!(
             built["thinking"],
             json!({ "type": "adaptive", "display": "summarized" }),
@@ -255,10 +323,10 @@ fn adaptive_models_use_effort_instead_of_a_budget() {
         "claude-opus-5",
         "claude-sonnet-5-20260101",
     ] {
-        let built = build_request(model, &with_effort(vec![user("hi")], Effort::High)).unwrap();
+        let built = build(model, &with_effort(vec![user("hi")], Effort::High)).unwrap();
         assert_eq!(built["thinking"]["type"], json!("adaptive"), "{model}");
     }
-    let manual = build_request(
+    let manual = build(
         "claude-opus-4-6",
         &with_effort(vec![user("hi")], Effort::High),
     )
@@ -272,7 +340,7 @@ fn headers_carry_the_oauth_set_and_never_an_api_key() {
         bearer: "TEST-TOKEN".to_string(),
         account_id: None,
     };
-    let headers = build_headers(&credential, &json!({ "stream": true }));
+    let headers = build_headers(account(), &credential, &json!({ "stream": true }));
     let expected = vec![
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "text/event-stream".to_string()),
@@ -307,6 +375,7 @@ fn interleaved_thinking_beta_is_present_only_for_manual_budget_thinking() {
         account_id: None,
     };
     let manual = build_headers(
+        account(),
         &credential,
         &json!({ "thinking": { "type": "enabled", "budget_tokens": 4_096 } }),
     );
@@ -322,6 +391,7 @@ fn interleaved_thinking_beta_is_present_only_for_manual_budget_thinking() {
     );
 
     let adaptive = build_headers(
+        account(),
         &credential,
         &json!({ "thinking": { "type": "adaptive", "display": "summarized" } }),
     );
@@ -346,7 +416,7 @@ fn assistant_text_and_tool_calls_coalesce_into_one_message() {
         result("call_1", ToolStatus::Ok),
         result("call_2", ToolStatus::Error),
     ];
-    let built = build_request("claude-sonnet-4-6", &request(history)).unwrap();
+    let built = build("claude-sonnet-4-6", &request(history)).unwrap();
     let messages = built["messages"].as_array().unwrap();
     let roles: Vec<&str> = messages
         .iter()
@@ -373,7 +443,7 @@ fn assistant_text_and_tool_calls_coalesce_into_one_message() {
 #[test]
 fn user_text_after_tool_results_coalesces_into_the_same_user_message() {
     let history = vec![result("call_1", ToolStatus::Ok), user("next prompt")];
-    let built = build_request("m", &request(history)).unwrap();
+    let built = build("m", &request(history)).unwrap();
     let messages = built["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["role"], json!("user"));
@@ -390,7 +460,7 @@ fn inbox_items_are_user_role_text() {
         kind: InboxKind::Steering,
         text: "steer".to_string(),
     }];
-    let built = build_request("m", &request(history)).unwrap();
+    let built = build("m", &request(history)).unwrap();
     assert_eq!(
         built["messages"][0],
         json!({ "role": "user", "content": [
@@ -405,13 +475,13 @@ fn invalid_tool_input_is_mapped_to_an_empty_object() {
         user("go"),
         assistant(vec![tool_call("call_1", "read", "{\"path\": ")]),
     ];
-    let built = build_request("m", &request(history)).unwrap();
+    let built = build("m", &request(history)).unwrap();
     assert_eq!(built["messages"][1]["content"][0]["input"], json!({}));
 }
 
 #[test]
 fn history_starting_with_an_assistant_turn_is_an_invalid_request() {
-    let error = build_request("m", &request(vec![assistant(vec![text_block("hi")])])).unwrap_err();
+    let error = build("m", &request(vec![assistant(vec![text_block("hi")])])).unwrap_err();
     assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
 }
 
@@ -432,7 +502,7 @@ fn an_assistant_item_with_only_dropped_blocks_contributes_no_message() {
         }]),
         user("hi"),
     ];
-    let built = build_request("m", &request(history)).unwrap();
+    let built = build("m", &request(history)).unwrap();
     let messages = built["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["role"], json!("user"));
@@ -492,7 +562,7 @@ fn replay_is_same_origin_gated_and_byte_exact() {
             text_block("answer"),
         ]),
     ];
-    let built = build_request("claude-sonnet-4-6", &request(history)).unwrap();
+    let built = build("claude-sonnet-4-6", &request(history)).unwrap();
     let blocks = built["messages"][1]["content"].as_array().unwrap();
     assert_eq!(
         blocks,
@@ -507,7 +577,7 @@ fn replay_is_same_origin_gated_and_byte_exact() {
 #[test]
 fn empty_assistant_text_is_skipped() {
     let history = vec![user("go"), assistant(vec![text_block("")]), user("again")];
-    let built = build_request("m", &request(history)).unwrap();
+    let built = build("m", &request(history)).unwrap();
     let messages = built["messages"].as_array().unwrap();
     // The assistant message is dropped entirely; the two user items are now
     // adjacent and coalesce into one message.
@@ -550,7 +620,14 @@ impl CredentialSource for NoCredentials {
 
 fn provider(model: &str) -> AnthropicProvider {
     let transport: Arc<dyn Transport> = Arc::new(ScriptedTransport::new(Vec::new()));
-    AnthropicProvider::new(model, transport, Arc::new(NoCredentials))
+    AnthropicProvider::new(
+        route(),
+        model,
+        Arc::new(profile(model)),
+        transport,
+        Arc::new(NoCredentials),
+    )
+    .expect("the profile is expressible on the Messages wire")
 }
 
 #[test]

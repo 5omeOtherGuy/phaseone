@@ -863,8 +863,10 @@ version = "0.0.1"
 dependencies = [
  "futures-util",
  "p1-contracts",
+ "p1-model-profile",
  "p1-provider-conformance",
  "p1-provider-http",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

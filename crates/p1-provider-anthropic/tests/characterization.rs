@@ -29,13 +29,100 @@ use p1_contracts::{
     BoxFuture, CancellationToken, Effort, ModelOptions, Outcome, Provider, ProviderError,
     ProviderErrorKind, ProviderRequest, RouteDescription, StreamEvent,
 };
-use p1_provider_anthropic::{AnthropicProvider, ROUTE, build_headers, build_request};
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
+use p1_provider_anthropic::{
+    AnthropicProvider, MessagesAccount, MessagesRoute, ROUTE, build_headers, build_request,
+};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource, Transport};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const MATRIX: &str = include_str!("fixtures/characterization/model_effort_matrix.json");
+
+/// The route data these expectations were recorded with: today's origin route and
+/// endpoint. ADR-0039 step 4 moved them into `routes/anthropic-subscription.toml`
+/// without changing a byte of what the adapter sends.
+fn route() -> MessagesRoute {
+    MessagesRoute {
+        origin_route: ROUTE.to_string(),
+        endpoint: "https://api.anthropic.com".to_string(),
+        account: MessagesAccount::ClaudeCodeSubscription,
+    }
+}
+
+/// The account these expectations were recorded with.
+fn account() -> MessagesAccount {
+    MessagesAccount::ClaudeCodeSubscription
+}
+
+/// The profile the OLD rule selected for `model`: a name starting with one of
+/// `claude-fable-5`, `claude-opus-5` or `claude-sonnet-5` was the effort-level lane
+/// (all five efforts); every other name — the budget models AND the near misses
+/// (`claude-opus5`, `claude-fable-4`) — took the manual budget table. This mapping
+/// documents what the explicit `profiles/claude-*.toml` records replaced; the
+/// fixture's expected values are untouched.
+fn profile_for(model: &str) -> ModelProfile {
+    let effort_level = ["claude-fable-5", "claude-opus-5", "claude-sonnet-5"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix));
+    ModelProfile {
+        id: model.to_string(),
+        revision: 1,
+        model_id: model.to_string(),
+        family: "claude".to_string(),
+        thinking: if effort_level {
+            ThinkingPolicy::EffortLevel
+        } else {
+            ThinkingPolicy::Budget
+        },
+        efforts: vec![
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::ExtraHigh,
+            Effort::Max,
+        ],
+        default_effort: None,
+        thinking_budgets: if effort_level {
+            BTreeMap::new()
+        } else {
+            [
+                (Effort::Low, 4_096),
+                (Effort::Medium, 10_240),
+                (Effort::High, 20_480),
+                (Effort::ExtraHigh, 32_768),
+                (Effort::Max, 32_768),
+            ]
+            .into_iter()
+            .collect()
+        },
+        context_tokens: None,
+        max_output_tokens: None,
+    }
+}
+
+/// `build_request` over the route and the profile `model` selects.
+fn build(model: &str, request: &ProviderRequest) -> Result<Value, ProviderError> {
+    build_request(&route(), model, &profile_for(model), request)
+}
+
+/// The adapter composed with the route and the profile `model` selects.
+fn provider_with(
+    model: &str,
+    transport: Arc<dyn Transport>,
+    credentials: Arc<dyn CredentialSource>,
+) -> AnthropicProvider {
+    AnthropicProvider::new(
+        route(),
+        model,
+        Arc::new(profile_for(model)),
+        transport,
+        credentials,
+    )
+    .expect("the profile is expressible on the Messages wire")
+}
 
 fn request() -> ProviderRequest {
     ProviderRequest {
@@ -91,7 +178,7 @@ fn model_effort_matrix_pins_thinking_output_config_max_tokens_and_beta() {
         let effort = effort_from_name(case["effort"].as_str());
         let mut req = request();
         req.options.reasoning_effort = effort;
-        let body = build_request(model, &req).unwrap();
+        let body = build(model, &req).unwrap();
 
         let actual_output_config = body.get("output_config").cloned().unwrap_or(Value::Null);
         assert_eq!(
@@ -107,7 +194,11 @@ fn model_effort_matrix_pins_thinking_output_config_max_tokens_and_beta() {
             "max_tokens: {model} {effort:?}"
         );
         assert_eq!(
-            Value::String(beta_header(&build_headers(&test_credential(), &body))),
+            Value::String(beta_header(&build_headers(
+                account(),
+                &test_credential(),
+                &body
+            ))),
             case["beta"],
             "anthropic-beta: {model} {effort:?}"
         );
@@ -200,7 +291,7 @@ fn explicit_output_cap_below_the_thinking_budget_is_rejected() {
             // A cap at or below the manual budget is rejected, with the cap,
             // the budget and the smallest cap that would work in the message.
             None => {
-                let error = build_request(model, &req).unwrap_err();
+                let error = build(model, &req).unwrap_err();
                 assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
                 let budget = expected_thinking["budget_tokens"].as_u64().unwrap();
                 for part in [
@@ -216,7 +307,7 @@ fn explicit_output_cap_below_the_thinking_budget_is_rejected() {
                 }
             }
             Some(expected_max) => {
-                let body = build_request(model, &req).unwrap();
+                let body = build(model, &req).unwrap();
                 let actual_thinking = body.get("thinking").cloned().unwrap_or(Value::Null);
                 assert_eq!(
                     actual_thinking, expected_thinking,
@@ -240,7 +331,7 @@ fn explicit_output_cap_below_the_thinking_budget_is_rejected() {
 fn golden_shipped_model_medium_request_whole_body() {
     let mut req = request();
     req.options.reasoning_effort = Some(Effort::Medium);
-    let body = build_request("claude-sonnet-5", &req).unwrap();
+    let body = build("claude-sonnet-5", &req).unwrap();
     assert_eq!(
         body,
         json!({
@@ -294,7 +385,7 @@ fn replay_on_an_adaptive_model_coexists_with_adaptive_thinking() {
             text: "continue".to_string(),
         },
     ];
-    let body = build_request("claude-sonnet-5", &req).unwrap();
+    let body = build("claude-sonnet-5", &req).unwrap();
     assert_eq!(
         body["thinking"],
         json!({ "type": "adaptive", "display": "summarized" })
@@ -344,9 +435,9 @@ impl CredentialSource for FixedCredentials {
 async fn parser_origin_is_the_configured_model_not_the_echoed_alias() {
     let transport =
         ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::reasoning_turn)]);
-    let provider = AnthropicProvider::new(
+    let provider = provider_with(
         "claude-sonnet-5",
-        Arc::new(transport),
+        Arc::new(transport) as Arc<dyn Transport>,
         Arc::new(FixedCredentials),
     );
     let mut stream = provider
@@ -378,7 +469,7 @@ async fn parser_origin_is_the_configured_model_not_the_echoed_alias() {
         tools: Vec::new(),
         options: ModelOptions::default(),
     };
-    let configured = build_request("claude-sonnet-5", &follow_up).unwrap();
+    let configured = build("claude-sonnet-5", &follow_up).unwrap();
     assert_eq!(
         configured["messages"][1]["content"],
         json!([
@@ -386,7 +477,7 @@ async fn parser_origin_is_the_configured_model_not_the_echoed_alias() {
             { "type": "text", "text": "Answer" },
         ])
     );
-    let echoed = build_request("claude-sonnet-4-6", &follow_up).unwrap();
+    let echoed = build("claude-sonnet-4-6", &follow_up).unwrap();
     assert!(
         !echoed["messages"][1]["content"]
             .as_array()
@@ -428,21 +519,30 @@ impl CredentialSource for NoCredentials {
 
 fn provider(model: &str) -> AnthropicProvider {
     let transport: Arc<dyn Transport> = Arc::new(ScriptedTransport::new(Vec::new()));
-    AnthropicProvider::new(model, transport, Arc::new(NoCredentials))
+    provider_with(model, transport, Arc::new(NoCredentials))
 }
 
-/// Every shipped model name in the environments that use this adapter.
+/// Every shipped model name in the environments that use this adapter: the profile
+/// each environment selects, bound to its wire model by the shipped route file.
+/// ADR-0039 step 4 replaced the environments' `model` key with `route` + `profile`.
 fn shipped_models() -> Vec<&'static str> {
     const ENVIRONMENTS: &[&str] = &[
         include_str!("../../../environments/claude/environment.toml"),
         include_str!("../../../environments/claude-delegating/environment.toml"),
     ];
+    const SHIPPED_ROUTE: &str = include_str!("../../../routes/anthropic-subscription.toml");
     ENVIRONMENTS
         .iter()
         .map(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("model")?.split('"').nth(1))
-                .expect("a shipped environment names a model")
+            let profile = text
+                .lines()
+                .find_map(|line| line.strip_prefix("profile")?.split('"').nth(1))
+                .expect("a shipped environment names a profile");
+            SHIPPED_ROUTE
+                .lines()
+                .skip_while(|line| !line.trim().starts_with(&format!("[models.\"{profile}\"]")))
+                .find_map(|line| line.strip_prefix("wire_model")?.split('"').nth(1))
+                .expect("the shipped route binds the profile it serves")
         })
         .collect()
 }

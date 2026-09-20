@@ -30,6 +30,13 @@ fn write_environment(root: &Path, name: &str, toml: &str) {
     std::fs::write(dir.join("prompt.md"), "prompt").unwrap();
 }
 
+/// A shipped file, read from the repository root.
+fn shipped(relative: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../")
+        .join(relative)
+}
+
 /// A synthetic environments root whose `../profiles` and `../routes` hold the shipped
 /// GLM profile and route, so a routed environment resolves exactly like a shipped one.
 fn routed_root() -> tempfile::TempDir {
@@ -37,15 +44,38 @@ fn routed_root() -> tempfile::TempDir {
     let profiles = root.path().join("profiles");
     std::fs::create_dir_all(&profiles).unwrap();
     std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/glm-5.3.toml"),
+        shipped("profiles/glm-5.3.toml"),
         profiles.join("glm-5.3.toml"),
     )
     .unwrap();
     let routes = root.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
     std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../routes/glm-subscription.toml"),
+        shipped("routes/glm-subscription.toml"),
         routes.join("glm-subscription.toml"),
+    )
+    .unwrap();
+    root
+}
+
+/// The same, for the shipped Messages route and the two Claude profiles these tests
+/// select: an environment reaches the adapter exactly as the shipped `claude` one does.
+fn claude_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let profiles = root.path().join("profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    for id in ["claude-opus-4-6", "claude-sonnet-5"] {
+        std::fs::copy(
+            shipped(&format!("profiles/{id}.toml")),
+            profiles.join(format!("{id}.toml")),
+        )
+        .unwrap();
+    }
+    let routes = root.path().join("routes");
+    std::fs::create_dir_all(&routes).unwrap();
+    std::fs::copy(
+        shipped("routes/anthropic-subscription.toml"),
+        routes.join("anthropic-subscription.toml"),
     )
     .unwrap();
     root
@@ -142,12 +172,11 @@ fn a_native_option_in_no_adapters_namespace_keeps_its_meaning() {
 
 #[test]
 fn an_explicit_output_cap_below_the_anthropic_thinking_budget_fails_assembly() {
-    let root = tempfile::tempdir().unwrap();
+    let root = claude_root();
     write_environment(
         root.path(),
         "capped",
-        "family = \"claude\"\nprovider = \"anthropic-subscription\"\n\
-         model = \"claude-opus-4-6\"\n\n\
+        "route = \"anthropic-subscription\"\nprofile = \"claude-opus-4-6\"\n\n\
          [options]\nreasoning_effort = \"low\"\nmax_output_tokens = 4096\n",
     );
     let (code, stderr) = show_in(root.path(), "capped");
@@ -175,12 +204,12 @@ fn an_empty_explicit_cache_key_fails_assembly_on_the_codex_route() {
 
 #[test]
 fn an_explicit_cache_key_on_an_anthropic_route_fails_assembly() {
-    let root = tempfile::tempdir().unwrap();
+    let root = claude_root();
     write_environment(
         root.path(),
         "keyed",
-        "family = \"claude\"\nprovider = \"anthropic-subscription\"\n\
-         model = \"claude-sonnet-5\"\n\n[options]\ncache_key = \"mine\"\n",
+        "route = \"anthropic-subscription\"\nprofile = \"claude-sonnet-5\"\n\n\
+         [options]\ncache_key = \"mine\"\n",
     );
     let (code, stderr) = show_in(root.path(), "keyed");
     assert_eq!(code, 1, "{stderr}");

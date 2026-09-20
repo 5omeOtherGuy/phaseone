@@ -13,10 +13,89 @@ use p1_contracts::{
     BoxFuture, CancellationToken, ModelOptions, Outcome, Provider, ProviderError,
     ProviderErrorKind, ProviderRequest, ProviderStream, StopReason, StreamEvent,
 };
-use p1_provider_anthropic::{AnthropicProvider, ClaudeCodeCredentials, ROUTE, build_request};
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
+use p1_provider_anthropic::{
+    AnthropicProvider, ClaudeCodeCredentials, MessagesAccount, MessagesRoute, ROUTE, build_request,
+};
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource, RetryPolicy};
 use serde_json::json;
+use std::collections::BTreeMap;
+
+/// The route data the frozen expectations were recorded with (spec §7.2: the shipped
+/// `routes/anthropic-subscription.toml` keeps this origin route byte for byte).
+fn route() -> MessagesRoute {
+    MessagesRoute {
+        origin_route: ROUTE.to_string(),
+        endpoint: "https://api.anthropic.com".to_string(),
+        account: MessagesAccount::ClaudeCodeSubscription,
+    }
+}
+
+/// The profile the OLD model-name rule selected: the three adaptive prefixes took an
+/// effort level, every other name took the manual budget table. The mapping documents
+/// what the explicit `profiles/claude-*.toml` records replaced.
+fn profile(model: &str) -> ModelProfile {
+    let effort_level = ["claude-fable-5", "claude-opus-5", "claude-sonnet-5"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix));
+    let efforts = vec![
+        p1_contracts::Effort::Low,
+        p1_contracts::Effort::Medium,
+        p1_contracts::Effort::High,
+        p1_contracts::Effort::ExtraHigh,
+        p1_contracts::Effort::Max,
+    ];
+    ModelProfile {
+        id: model.to_string(),
+        revision: 1,
+        model_id: model.to_string(),
+        family: "claude".to_string(),
+        thinking: if effort_level {
+            ThinkingPolicy::EffortLevel
+        } else {
+            ThinkingPolicy::Budget
+        },
+        efforts,
+        default_effort: None,
+        thinking_budgets: if effort_level {
+            BTreeMap::new()
+        } else {
+            [
+                (p1_contracts::Effort::Low, 4_096),
+                (p1_contracts::Effort::Medium, 10_240),
+                (p1_contracts::Effort::High, 20_480),
+                (p1_contracts::Effort::ExtraHigh, 32_768),
+                (p1_contracts::Effort::Max, 32_768),
+            ]
+            .into_iter()
+            .collect()
+        },
+        context_tokens: None,
+        max_output_tokens: None,
+    }
+}
+
+/// `build_request` over the route and the profile `model` selects.
+fn build(model: &str, request: &ProviderRequest) -> Result<serde_json::Value, ProviderError> {
+    build_request(&route(), model, &profile(model), request)
+}
+
+/// The adapter composed with the frozen route/profile for `model`.
+fn provider(
+    model: &str,
+    transport: Arc<ScriptedTransport>,
+    credentials: Arc<dyn CredentialSource>,
+) -> AnthropicProvider {
+    AnthropicProvider::new(
+        route(),
+        model,
+        Arc::new(profile(model)),
+        transport,
+        credentials,
+    )
+    .expect("the profile is expressible on the Messages wire")
+}
 
 struct FakeCredentials {
     bearer: String,
@@ -87,7 +166,7 @@ fn harness_with(
     credentials: Arc<FakeCredentials>,
 ) -> Harness {
     let transport = ScriptedTransport::new(responses);
-    let provider = AnthropicProvider::new(model, Arc::new(transport.clone()), credentials);
+    let provider = provider(model, Arc::new(transport.clone()), credentials);
     Harness {
         provider,
         transport,
@@ -415,7 +494,7 @@ async fn reasoning_turn_round_trips_replay_data_byte_exact() {
     assert_eq!(completed.item.text(), "Answer");
 
     // The replay data goes back byte-exact in a follow-up request.
-    let follow_up = build_request(
+    let follow_up = build(
         "claude-sonnet-4-6",
         &request(vec![user("next"), Item::Assistant(completed.item.clone())]),
     )
@@ -689,7 +768,7 @@ fn file_clock() -> u64 {
 #[tokio::test]
 async fn base_url_and_retry_policy_are_applied_through_drive() {
     let harness = harness("claude-sonnet-4-6", vec![ok(fixtures::text_turn)]);
-    let provider = AnthropicProvider::new(
+    let provider = provider(
         "claude-sonnet-4-6",
         Arc::new(harness.transport.clone()),
         FakeCredentials::new("SENTINEL-ACCESS"),
@@ -735,7 +814,7 @@ async fn file_credentials_drive_a_request_end_to_end() {
     let transport = ScriptedTransport::new(vec![ok(fixtures::text_turn)]);
     let credentials =
         ClaudeCodeCredentials::at(path, Arc::new(transport.clone())).with_clock(file_clock);
-    let provider = AnthropicProvider::new(
+    let provider = provider(
         "claude-sonnet-4-6",
         Arc::new(transport.clone()),
         Arc::new(credentials),

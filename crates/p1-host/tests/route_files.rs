@@ -129,16 +129,14 @@ fn provider_of(resolved: &Resolved, transport: ScriptedTransport) -> Arc<dyn Pro
         .route
         .binding(&resolved.profile.id)
         .expect("the route serves this profile");
-    Arc::new(
-        route_provider(
-            &resolved.route,
-            binding,
-            resolved.profile.clone(),
-            Arc::new(transport),
-            Arc::new(Fixed),
-        )
-        .expect("the route composes"),
+    route_provider(
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(transport),
+        Arc::new(Fixed),
     )
+    .expect("the route composes")
 }
 
 /// One shipped route, composed from the shipped environment that names it.
@@ -483,7 +481,16 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         .into_iter()
         .map(|route| route.id)
         .collect();
-    assert_eq!(ids, ["glm-subscription", "opencode-go-subscription"]);
+    // `anthropic-subscription` joined the shipped routes in ADR-0039 step 4; its own
+    // fields are pinned in `crates/p1-host/tests/anthropic_route.rs`.
+    assert_eq!(
+        ids,
+        [
+            "anthropic-subscription",
+            "glm-subscription",
+            "opencode-go-subscription"
+        ]
+    );
 
     let go = load_route_by_id(&dirs, "opencode-go-subscription").expect("the shipped route file");
     assert_eq!(go.origin_route, "openai-chat/opencode-go-subscription");
@@ -740,35 +747,37 @@ fn an_unknown_borrow_store_is_a_load_error() {
     }
 }
 
+/// The Claude Code kind became data-driven in ADR-0039 step 4 (spec §7.2) and is
+/// covered by `tests/anthropic_route.rs`; the Codex login follows in the next step and
+/// still parses without a source.
 #[test]
-fn the_two_oauth_credential_kinds_parse_but_are_not_data_driven_yet() {
-    for kind in ["claude-code-oauth", "codex-oauth"] {
-        let scratch = Scratch::new();
-        let body = with(
-            &route_file(
-                "oauth",
-                "https://synthetic.example.test/v1/chat/completions",
-                "retained-thinking",
-                None,
-                &[],
-                &binding("synthetic-profile", "synthetic-profile"),
-            ),
-            "kind = \"api-key\"",
-            &format!("kind = \"{kind}\""),
-        );
-        scratch.write_route("oauth", &body);
-        let error = load_route(&scratch.route_path("oauth")).unwrap_err();
-        assert!(
-            error.contains(&format!(
-                "credential kind \"{kind}\" is not yet data-driven (ADR-0039 step 4)"
-            )),
-            "{error}"
-        );
-        assert!(
-            !error.contains("unknown variant"),
-            "the kind parses; only its source is missing: {error}"
-        );
-    }
+fn the_codex_oauth_credential_kind_parses_but_is_not_data_driven_yet() {
+    let kind = "codex-oauth";
+    let scratch = Scratch::new();
+    let body = with(
+        &route_file(
+            "oauth",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("synthetic-profile", "synthetic-profile"),
+        ),
+        "kind = \"api-key\"",
+        &format!("kind = \"{kind}\""),
+    );
+    scratch.write_route("oauth", &body);
+    let error = load_route(&scratch.route_path("oauth")).unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "credential kind \"{kind}\" is not yet data-driven (ADR-0039 step 4)"
+        )),
+        "{error}"
+    );
+    assert!(
+        !error.contains("unknown variant"),
+        "the kind parses; only its source is missing: {error}"
+    );
 }
 
 #[test]
@@ -833,7 +842,9 @@ fn a_missing_route_file_lists_the_ids_the_directory_holds() {
 
 #[test]
 fn a_route_id_that_collides_with_a_whole_provider_key_is_a_start_up_error() {
-    for key in ["anthropic-subscription", "openai-codex-subscription"] {
+    // `anthropic-subscription` is a route file of its own since ADR-0039 step 4, so
+    // only the whole providers that remain can be shadowed.
+    for key in p1_host::catalog::WHOLE_PROVIDERS {
         let scratch = Scratch::new();
         scratch.write_route(
             key,

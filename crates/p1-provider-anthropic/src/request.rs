@@ -1,17 +1,20 @@
 //! Pure request construction: body, headers, history mapping and thinking.
 //!
-//! Everything here is a pure function of the contracts, so it is golden-tested
-//! whole-body and byte-exact. The route's wire facts are `docs/design/routes.md`
-//! §A; where this file and that document disagree the document wins.
+//! Everything here is a pure function of the contracts and the composed model
+//! policy, so it is golden-tested whole-body and byte-exact. Where this file and a
+//! document disagree the document wins: the route's wire facts are
+//! `docs/design/routes.md` §A, the policy split is `docs/design/routes-and-profiles.md`
+//! §7.
 
 use p1_contracts::history::{AssistantBlock, Item, ReplayData, ToolCall, ToolStatus};
 use p1_contracts::tool::{DeclarationKind, ToolDeclaration};
-use p1_contracts::{ProviderError, ProviderErrorKind, ProviderRequest};
+use p1_contracts::{ModelOptions, ProviderError, ProviderErrorKind, ProviderRequest};
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use serde_json::{Value, json};
 
-use crate::ROUTE;
+use crate::MessagesAccount;
 
-/// The route-mandated first system block. Without it the subscription route
+/// The account-mandated first system block. Without it the subscription account
 /// rejects the request; it is wire behaviour, not part of any prompt file.
 pub(crate) const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
@@ -30,23 +33,24 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 /// violate `budget_tokens < max_tokens`.
 pub(crate) const MANUAL_OUTPUT_MARGIN: u32 = 8_192;
 
-/// The smallest thinking budget the API accepts.
-pub(crate) const MIN_THINKING_BUDGET: u32 = 1_024;
+impl MessagesAccount {
+    /// The identity block this account requires as the first system block.
+    fn identity(self) -> &'static str {
+        match self {
+            MessagesAccount::ClaudeCodeSubscription => IDENTITY,
+        }
+    }
 
-pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-
-/// Model ids with a server-side adaptive effort control instead of a manual
-/// `budget_tokens`. Prefix match so dated snapshots (`claude-opus-5-2026…`)
-/// resolve to the same lane.
-fn is_adaptive(model: &str) -> bool {
-    const ADAPTIVE_PREFIXES: [&str; 3] = ["claude-fable-5", "claude-opus-5", "claude-sonnet-5"];
-    ADAPTIVE_PREFIXES
-        .iter()
-        .any(|prefix| model.starts_with(prefix))
+    /// The betas every request on this account carries.
+    fn base_beta(self) -> &'static str {
+        match self {
+            MessagesAccount::ClaudeCodeSubscription => BASE_BETA,
+        }
+    }
 }
 
 /// `Effort` -> adaptive `output_config.effort`. `ExtraHigh` is the wire's
-/// `xhigh`.
+/// `xhigh`: the spelling is the protocol's, so it stays in the adapter.
 fn adaptive_effort(effort: p1_contracts::Effort) -> &'static str {
     use p1_contracts::Effort;
     match effort {
@@ -58,101 +62,134 @@ fn adaptive_effort(effort: p1_contracts::Effort) -> &'static str {
     }
 }
 
-/// `Effort` -> manual `thinking.budget_tokens`. The map is the donor's
-/// minimalcc-pi budget table; `ExtraHigh` and `Max` share the 32768 ceiling.
-fn manual_budget(effort: p1_contracts::Effort) -> u32 {
-    use p1_contracts::Effort;
-    match effort {
-        Effort::Low => 4_096,
-        Effort::Medium => 10_240,
-        Effort::High => 20_480,
-        Effort::ExtraHigh | Effort::Max => 32_768,
+/// The file spelling of a thinking policy, for the refusal message.
+fn policy_name(policy: ThinkingPolicy) -> &'static str {
+    match policy {
+        ThinkingPolicy::Enabled => "enabled",
+        ThinkingPolicy::Preserved => "preserved",
+        ThinkingPolicy::EffortLevel => "effort-level",
+        ThinkingPolicy::Budget => "budget",
     }
 }
 
-/// The conflict an EXPLICIT output cap can have with a manual thinking budget:
-/// the API requires `budget_tokens < max_tokens`, so a cap the budget meets or
-/// exceeds cannot be honoured. Rejected by `validate` and `build_request` with
-/// the smallest cap that would work (ADR-0039); an unspecified cap is never in
-/// conflict — it is derived in [`build_request`] as before.
-pub(crate) fn explicit_cap_conflict(
-    model: &str,
-    options: &p1_contracts::ModelOptions,
-) -> Option<ProviderError> {
-    let effort = options.reasoning_effort?;
-    let cap = options.max_output_tokens?;
-    if is_adaptive(model) {
-        return None;
-    }
-    let budget = manual_budget(effort);
-    (budget >= cap).then(|| {
-        ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            format!(
-                "max_output_tokens {cap} leaves no room for the thinking budget {budget}: the \
-                 Messages API requires budget_tokens < max_tokens, so the smallest cap that works \
-                 is {} (or omit max_output_tokens and one is derived)",
-                budget + 1
-            ),
-        )
-    })
+fn invalid(message: &str) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::InvalidRequest, message)
 }
 
-/// Translate a request into the Messages body. Pure: no credentials, no I/O and
-/// no route validation (that is [`AnthropicProvider::validate`]).
+/// The model-dependent part of one Messages request: what the model profile's
+/// policy makes of the request's options.
+pub(crate) struct Lowered {
+    /// `thinking`, absent when the profile resolves to no effort.
+    pub thinking: Option<Value>,
+    /// `output_config`, present only on the effort-level lane.
+    pub output_config: Option<Value>,
+    /// `max_tokens` when the request names no explicit cap.
+    pub max_tokens: u32,
+}
+
+/// The ONE lowering function (ADR-0039, spec §7.3): profile policy × request
+/// options -> the body's thinking fields and the output cap they require, or the
+/// error that says why this combination cannot be expressed. The constructor,
+/// `Provider::validate` and [`build_request`] all call it, so no rule about a
+/// model lives anywhere else.
+pub(crate) fn lower(
+    profile: &ModelProfile,
+    options: &ModelOptions,
+) -> Result<Lowered, ProviderError> {
+    let effort = profile.resolve_effort(options.reasoning_effort)?;
+    match profile.thinking {
+        ThinkingPolicy::EffortLevel => Ok(Lowered {
+            thinking: effort.map(|_| json!({ "type": "adaptive", "display": "summarized" })),
+            output_config: effort.map(|effort| json!({ "effort": adaptive_effort(effort) })),
+            max_tokens: DEFAULT_MAX_TOKENS,
+        }),
+        ThinkingPolicy::Budget => {
+            let Some(effort) = effort else {
+                return Ok(Lowered {
+                    thinking: None,
+                    output_config: None,
+                    max_tokens: DEFAULT_MAX_TOKENS,
+                });
+            };
+            let budget = profile.budget_for(effort).ok_or_else(|| {
+                invalid(&format!(
+                    "profile `{}` carries no thinking budget for the requested effort",
+                    profile.id
+                ))
+            })?;
+            // The API requires `budget_tokens < max_tokens`. An EXPLICIT cap the
+            // budget meets or exceeds cannot be honoured: reject it with the
+            // smallest cap that would work, never raise it silently (ADR-0039).
+            if let Some(cap) = options.max_output_tokens
+                && budget >= cap
+            {
+                return Err(invalid(&format!(
+                    "max_output_tokens {cap} leaves no room for the thinking budget {budget}: the \
+                     Messages API requires budget_tokens < max_tokens, so the smallest cap that \
+                     works is {} (or omit max_output_tokens and one is derived)",
+                    budget + 1
+                )));
+            }
+            Ok(Lowered {
+                // The derived cap makes room for the budget rather than reducing it.
+                max_tokens: if budget >= DEFAULT_MAX_TOKENS {
+                    budget + MANUAL_OUTPUT_MARGIN
+                } else {
+                    DEFAULT_MAX_TOKENS
+                },
+                thinking: Some(json!({ "type": "enabled", "budget_tokens": budget })),
+                output_config: None,
+            })
+        }
+        ThinkingPolicy::Enabled | ThinkingPolicy::Preserved => Err(invalid(&format!(
+            "the Messages adapter cannot express the profile's `thinking = \"{}\"` policy; it \
+             encodes `effort-level` and `budget` only",
+            policy_name(profile.thinking)
+        ))),
+    }
+}
+
+/// Translate a request into the Messages body. Pure: no credentials and no I/O.
 ///
-/// Returns [`ProviderErrorKind::InvalidRequest`] when the history would start an
-/// assistant turn: the API requires the first message to be user-role.
-pub fn build_request(model: &str, request: &ProviderRequest) -> Result<Value, ProviderError> {
-    if let Some(error) = explicit_cap_conflict(model, &request.options) {
-        return Err(error);
-    }
-    let mut max_tokens = request
+/// Returns [`ProviderErrorKind::InvalidRequest`] for a route/profile pair the wire
+/// cannot express, an effort the profile does not list, a cap that contradicts the
+/// thinking budget, or a history that would start with an assistant turn (the API
+/// requires the first message to be user-role).
+pub fn build_request(
+    route: &crate::MessagesRoute,
+    wire_model: &str,
+    profile: &ModelProfile,
+    request: &ProviderRequest,
+) -> Result<Value, ProviderError> {
+    crate::provider::validate_composition(route, wire_model, profile)?;
+    let lowered = lower(profile, &request.options)?;
+    let max_tokens = request
         .options
         .max_output_tokens
-        .unwrap_or(DEFAULT_MAX_TOKENS);
+        .unwrap_or(lowered.max_tokens);
 
     let mut body = serde_json::Map::new();
-    body.insert("model".to_string(), json!(model));
-
-    if let Some(effort) = request.options.reasoning_effort {
-        if is_adaptive(model) {
-            body.insert(
-                "thinking".to_string(),
-                json!({ "type": "adaptive", "display": "summarized" }),
-            );
-            body.insert(
-                "output_config".to_string(),
-                json!({ "effort": adaptive_effort(effort) }),
-            );
-        } else {
-            let budget = manual_budget(effort);
-            debug_assert!(
-                budget >= MIN_THINKING_BUDGET,
-                "manual budget below the API floor"
-            );
-            // The API rejects `budget_tokens >= max_tokens`; raise the output cap
-            // rather than reducing the requested thinking budget. An EXPLICIT cap
-            // this would swallow was rejected above; this is the derived default.
-            if budget >= max_tokens {
-                max_tokens = budget + MANUAL_OUTPUT_MARGIN;
-            }
-            body.insert(
-                "thinking".to_string(),
-                json!({ "type": "enabled", "budget_tokens": budget }),
-            );
-        }
+    body.insert("model".to_string(), json!(wire_model));
+    if let Some(thinking) = lowered.thinking {
+        body.insert("thinking".to_string(), thinking);
+    }
+    if let Some(output_config) = lowered.output_config {
+        body.insert("output_config".to_string(), output_config);
     }
 
     body.insert("max_tokens".to_string(), json!(max_tokens));
     body.insert("stream".to_string(), json!(true));
     body.insert(
         "system".to_string(),
-        Value::Array(system_blocks(&request.system_prompt)),
+        Value::Array(system_blocks(route.account, &request.system_prompt)),
     );
     body.insert(
         "messages".to_string(),
-        Value::Array(build_messages(model, &request.history)?),
+        Value::Array(build_messages(
+            &route.origin_route,
+            wire_model,
+            &request.history,
+        )?),
     );
 
     if !request.tools.is_empty() {
@@ -180,11 +217,11 @@ pub fn build_request(model: &str, request: &ProviderRequest) -> Result<Value, Pr
     Ok(Value::Object(body))
 }
 
-/// `system` is a block array: the mandatory identity block first, then the
-/// prompt block when the prompt is non-empty. The last block carries the cache
-/// marker so the whole system prefix is cached.
-fn system_blocks(prompt: &str) -> Vec<Value> {
-    let mut blocks = vec![json!({ "type": "text", "text": IDENTITY })];
+/// `system` is a block array: the account's identity block first, then the prompt
+/// block when the prompt is non-empty. The last block carries the cache marker so
+/// the whole system prefix is cached.
+fn system_blocks(account: MessagesAccount, prompt: &str) -> Vec<Value> {
+    let mut blocks = vec![json!({ "type": "text", "text": account.identity() })];
     if !prompt.is_empty() {
         blocks.push(json!({ "type": "text", "text": prompt }));
     }
@@ -216,7 +253,11 @@ fn tool_declarations(tools: &[ToolDeclaration]) -> Vec<Value> {
 /// Map the flat history onto strictly alternating messages. Adjacent same-role
 /// items coalesce into one message's `content[]`; an assistant item whose blocks
 /// all drop contributes no message at all.
-fn build_messages(model: &str, history: &[Item]) -> Result<Vec<Value>, ProviderError> {
+fn build_messages(
+    origin_route: &str,
+    wire_model: &str,
+    history: &[Item],
+) -> Result<Vec<Value>, ProviderError> {
     let mut messages: Vec<Value> = Vec::new();
 
     for item in history {
@@ -252,7 +293,9 @@ fn build_messages(model: &str, history: &[Item]) -> Result<Vec<Value>, ProviderE
                         }
                         AssistantBlock::ToolCall(call) => blocks.push(tool_use_block(call)),
                         AssistantBlock::Reasoning { text, replay } => {
-                            if let Some(replay) = replay_block(model, text, replay.as_ref()) {
+                            if let Some(replay) =
+                                replay_block(origin_route, wire_model, text, replay.as_ref())
+                            {
                                 blocks.push(replay);
                             }
                         }
@@ -299,12 +342,17 @@ fn tool_use_block(call: &ToolCall) -> Value {
 /// A reasoning block replays only when the origin is this exact route + model
 /// and the payload version is current. A foreign or stale-version block is
 /// dropped entirely — never downgraded to assistant text.
-fn replay_block(model: &str, text: &str, replay: Option<&ReplayData>) -> Option<Value> {
+fn replay_block(
+    origin_route: &str,
+    wire_model: &str,
+    text: &str,
+    replay: Option<&ReplayData>,
+) -> Option<Value> {
     let replay = replay?;
     if replay.version != 1 {
         return None;
     }
-    if replay.origin.route != ROUTE || replay.origin.model != model {
+    if replay.origin.route != origin_route || replay.origin.model != wire_model {
         return None;
     }
     match replay.payload.get("type").and_then(Value::as_str) {
@@ -340,11 +388,12 @@ fn push_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
     messages.push(json!({ "role": role, "content": blocks }));
 }
 
-/// Build the OAuth request headers from the credential and the already-built
-/// body. The `anthropic-beta` set is payload-driven: the interleaved-thinking
-/// beta is present exactly when the body carries a manual-budget thinking block.
-/// This route never sends `x-api-key`.
+/// Build the request headers this account requires from the credential and the
+/// already-built body. The `anthropic-beta` set is payload-driven: the
+/// interleaved-thinking beta is present exactly when the body carries a
+/// manual-budget thinking block. This route never sends `x-api-key`.
 pub fn build_headers(
+    account: MessagesAccount,
     credential: &p1_provider_http::Credential,
     body: &Value,
 ) -> Vec<(String, String)> {
@@ -370,7 +419,7 @@ pub fn build_headers(
         ("x-app".to_string(), "cli".to_string()),
     ];
 
-    let mut beta = BASE_BETA.to_string();
+    let mut beta = account.base_beta().to_string();
     if body
         .get("thinking")
         .and_then(|thinking| thinking.get("type"))

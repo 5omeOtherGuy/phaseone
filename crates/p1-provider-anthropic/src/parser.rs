@@ -22,8 +22,6 @@ use p1_contracts::{
 use p1_provider_http::{ResponseParser, SseEvent};
 use serde_json::{Value, json};
 
-use crate::ROUTE;
-
 /// Parse one streaming Messages response into contract events.
 pub(crate) struct AnthropicParser {
     origin_route: String,
@@ -56,9 +54,11 @@ enum OpenKind {
 }
 
 impl AnthropicParser {
-    pub(crate) fn new(model: &str) -> Self {
+    /// `origin_route` is the composed route's `Origin.route`; the model is the
+    /// configured wire model that `message_start` re-keys to the RESPONSE model.
+    pub(crate) fn new(origin_route: &str, model: &str) -> Self {
         Self {
-            origin_route: ROUTE.to_string(),
+            origin_route: origin_route.to_string(),
             origin_model: model.to_string(),
             blocks: Vec::new(),
             open: HashMap::new(),
