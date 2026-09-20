@@ -109,6 +109,10 @@ impl Frontend {
             policy: self.policy,
             pending_auth: None,
             follow_ups: VecDeque::new(),
+            pending_calls: Default::default(),
+            task_files: Default::default(),
+            task_added: 0,
+            task_removed: 0,
             exit: None,
         };
 
@@ -176,6 +180,13 @@ pub(crate) struct Driver {
     pending_auth: Option<AuthRequest>,
     /// Follow-ups fire only when the agent would otherwise stop (SPEC §7).
     follow_ups: VecDeque<String>,
+    /// Task stats for the LEDGER's TASK section: files touched and lines
+    /// added/removed by successful edit-shaped calls. Call inputs arrive on
+    /// `ToolStarted`; the counts settle on `ToolFinished`.
+    pending_calls: std::collections::HashMap<String, p1_contracts::ToolCall>,
+    task_files: std::collections::HashSet<String>,
+    task_added: u64,
+    task_removed: u64,
     exit: Option<i32>,
 }
 
@@ -386,7 +397,49 @@ impl Driver {
         ) {
             self.screen.queued.retain(|q| q.follow_up);
         }
+        self.track_task(&stamped.event);
         self.screen.apply(&stamped.event, stamped.at_ms);
+    }
+
+    /// Successful edit-shaped calls move the TASK section. Reads only the
+    /// call's own input (the presentation adapter's data, not tool internals);
+    /// a denied or failed call counts nothing.
+    fn track_task(&mut self, event: &p1_contracts::AgentEvent) {
+        match event {
+            p1_contracts::AgentEvent::ToolStarted { call } => {
+                self.pending_calls
+                    .insert(call.call_id.clone(), call.clone());
+            }
+            p1_contracts::AgentEvent::ToolFinished { result } => {
+                let Some(call) = self.pending_calls.remove(&result.call_id) else {
+                    return;
+                };
+                if result.status != p1_contracts::ToolStatus::Ok {
+                    return;
+                }
+                if !matches!(call.name.as_str(), "edit" | "patch" | "write") {
+                    return;
+                }
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(call.input.raw()) else {
+                    return;
+                };
+                let get = |key: &str| json.get(key).and_then(|v| v.as_str());
+                if let Some(path) = get("file_path") {
+                    self.task_files.insert(path.to_string());
+                }
+                self.task_removed += get("old_string").map_or(0, |s| s.lines().count() as u64);
+                self.task_added += get("new_string")
+                    .or_else(|| get("content"))
+                    .map_or(0, |s| s.lines().count() as u64);
+                self.screen.task_view = Some(p1_tui::render::ledger::Task {
+                    id: None,
+                    files: Some(self.task_files.len() as u64),
+                    diff: Some((self.task_added, self.task_removed)),
+                    journal: None,
+                });
+            }
+            _ => {}
+        }
     }
 
     /// A parked authorization becomes the blocking approval view (SPEC §4.4 /

@@ -49,6 +49,10 @@ fn driver() -> Driver {
         policy: Arc::new(policy),
         pending_auth: None,
         follow_ups: VecDeque::new(),
+        pending_calls: Default::default(),
+        task_files: Default::default(),
+        task_added: 0,
+        task_removed: 0,
         exit: None,
     }
 }

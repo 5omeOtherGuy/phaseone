@@ -51,7 +51,9 @@ pub struct ContextPart {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
-    pub id: String,
+    /// The task id when the session has one; `None` shows the files count on
+    /// the TASK row instead (p1 has no task ids yet).
+    pub id: Option<String>,
     pub files: Option<u64>,
     /// Added / removed lines.
     pub diff: Option<(u64, u64)>,
@@ -146,8 +148,14 @@ fn context_lines(context: &Context, out: &mut Vec<Line<'static>>) {
 }
 
 fn task_lines(task: &Task, out: &mut Vec<Line<'static>>) {
-    out.push(grid::row(LEDGER_GRID, "TASK", &task.id));
-    if let Some(files) = task.files {
+    match (&task.id, task.files) {
+        (Some(id), _) => out.push(grid::row(LEDGER_GRID, "TASK", id)),
+        (None, Some(files)) => out.push(grid::row(LEDGER_GRID, "TASK", &files.to_string())),
+        (None, None) => out.push(header("TASK")),
+    }
+    if task.id.is_some()
+        && let Some(files) = task.files
+    {
         out.push(grid::row(LEDGER_GRID, "  files", &files.to_string()));
     }
     if let Some((added, removed)) = task.diff {
@@ -236,7 +244,7 @@ mod tests {
                 ],
             }),
             task: Some(Task {
-                id: "t-3f9a".into(),
+                id: Some("t-3f9a".into()),
                 files: Some(3),
                 diff: Some((48, 12)),
                 journal: Some("2m ago".into()),

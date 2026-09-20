@@ -271,7 +271,7 @@ fn main() {
             ],
         });
         screen.task_view = Some(Task {
-            id: "t-3f9a".into(),
+            id: Some("t-3f9a".into()),
             files: Some(3),
             diff: Some((48, 12)),
             journal: Some("2m ago".into()),
