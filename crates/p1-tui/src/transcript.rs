@@ -220,6 +220,16 @@ impl Transcript {
         }
     }
 
+    /// `^R`: toggle the most recent reasoning block (SPEC §4.2).
+    pub fn toggle_reasoning(&mut self) {
+        for block in self.blocks.iter_mut().rev() {
+            if let Block::Reasoning { expanded, .. } = block {
+                *expanded = !*expanded;
+                return;
+            }
+        }
+    }
+
     /// A quiet meta line from the driver (`· …`), e.g. an unknown command.
     pub fn note(&mut self, text: &str) {
         self.blocks.push(Block::Meta {

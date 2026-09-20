@@ -254,6 +254,9 @@ pub struct Screen {
     pub ledger_overlay: bool,
     /// The OUTPUT pane's open fold, if any (SPEC §5 OUTPUT mode).
     pub output: Option<crate::render::output::OutputView>,
+    /// The WORKERS pane's rows, refreshed by the driver from the host's
+    /// worker service (p1-tui never names p1-workers).
+    pub workers: Vec<crate::render::workers::WorkerRow>,
     /// A pending approval: the blocking, full-width review (SPEC §4.4/§4.5).
     /// While this is `Some` the pane is hidden and the transcript waits.
     pub approval: Option<Approval>,
@@ -357,6 +360,26 @@ impl Screen {
         self.scroll = self.scroll.saturating_add_signed(delta);
     }
 
+    /// Sync the WORKERS pane from a fresh snapshot, handling the promotion
+    /// rule (SPEC §5): a live delegate promotes the pane to WORKERS while any
+    /// worker runs; when none is live and nothing needs review, an UNPINNED
+    /// WORKERS pane falls back to LEDGER.
+    pub fn sync_workers(&mut self, rows: Vec<crate::render::workers::WorkerRow>) {
+        let live = rows
+            .iter()
+            .any(|w| w.state == crate::render::workers::WorkerState::Running);
+        self.workers = rows;
+        if live {
+            if !self.pinned && self.pane_mode != PaneMode::Workers {
+                self.pane_mode = PaneMode::Workers;
+            }
+            if matches!(self.pane_width, PaneWidth::Off) {
+                self.pane_width = PaneWidth::Ch56;
+            }
+        } else if self.pane_mode == PaneMode::Workers && !self.pinned {
+            self.pane_mode = PaneMode::Ledger;
+        }
+    }
     /// Open a fold handle in the OUTPUT pane (`^O`): switches the pane to
     /// OUTPUT mode and widens it if it is hidden.
     pub fn open_output(&mut self, view: crate::render::output::OutputView) {

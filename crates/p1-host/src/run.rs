@@ -236,8 +236,23 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
 /// [`run_with_front_end`] directly, leaving `run.rs` untouched.
 async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String> {
     let cancel = CancellationToken::new();
-    // The ONE branch point: the line front end is the default.
-    let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone()));
+    // The ONE branch point: the TUI (issue #12) owns the terminal when --tui.
+    let front_end: Arc<dyn FrontEnd> = if options.tui {
+        let workspace = options
+            .workspace
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        Arc::new(crate::tui::TuiFrontEnd::new(
+            crate::tui::TuiOptions {
+                env: options.env.clone(),
+                ask: options.ask,
+                workspace,
+            },
+            cancel.clone(),
+        ))
+    } else {
+        Arc::new(LineFrontEnd::new(deps, options, cancel.clone()))
+    };
     run_with_front_end(deps, options, cancel, front_end).await
 }
 

@@ -22,33 +22,61 @@ use tokio::sync::{mpsc, oneshot};
 
 /// One agent event stamped with milliseconds since the frontend's epoch, so
 /// the screen's fake-time discipline holds in production too: the clock is
-/// injected at the seam, never read inside the renderers.
+/// injected at the seam, never read inside the renderers. `worker` is `Some`
+/// for a delegated child's events (the WORKERS pane keys on it).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stamped {
     pub at_ms: u64,
+    pub worker: Option<String>,
     pub event: AgentEvent,
 }
 
+/// Everything the UI loop can receive from agents: events, and the marker that
+/// a worker's agent was actually built (a failed start never reports).
+#[derive(Debug)]
+pub enum UiEvent {
+    Agent(Stamped),
+    WorkerStarted(String),
+}
+
 /// The `EventSink` for a TUI agent. Created before the agent; the receiving
-/// end feeds the screen.
+/// end feeds the screen. Child sinks share the parent's channel, tagged.
 pub struct TuiSink {
     epoch: Instant,
     /// Compensates for clock granularity collisions so ordering survives.
     tick: AtomicU64,
-    tx: mpsc::UnboundedSender<Stamped>,
+    worker: Option<String>,
+    tx: mpsc::UnboundedSender<UiEvent>,
 }
 
 impl TuiSink {
-    pub fn new() -> (Self, mpsc::UnboundedReceiver<Stamped>) {
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<UiEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
                 epoch: Instant::now(),
                 tick: AtomicU64::new(0),
+                worker: None,
                 tx,
             },
             rx,
         )
+    }
+
+    /// The sink for one worker's agent: same channel, tagged with its id.
+    pub fn child(&self, worker_id: &str) -> Self {
+        Self {
+            epoch: self.epoch,
+            tick: AtomicU64::new(0),
+            worker: Some(worker_id.to_string()),
+            tx: self.tx.clone(),
+        }
+    }
+
+    /// A worker's agent was built and started (the host calls this only after
+    /// a successful build, so a failed start never shows).
+    pub fn worker_started(&self, worker_id: &str) {
+        let _ = self.tx.send(UiEvent::WorkerStarted(worker_id.to_string()));
     }
 
     /// Milliseconds since this sink's epoch — the ONE clock the screen runs on
@@ -65,7 +93,11 @@ impl EventSink for TuiSink {
         let at_ms = at_ms.max(self.tick.fetch_add(1, Ordering::Relaxed));
         self.tick.store(at_ms + 1, Ordering::Relaxed);
         // Unbounded: observation must never block the agent loop (contract).
-        let _ = self.tx.send(Stamped { at_ms, event });
+        let _ = self.tx.send(UiEvent::Agent(Stamped {
+            at_ms,
+            worker: self.worker.clone(),
+            event,
+        }));
     }
 }
 
