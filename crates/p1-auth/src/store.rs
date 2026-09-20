@@ -3,9 +3,10 @@
 //!
 //! One JSON object keyed by ROUTE id, with `{"type":"api_key","key":…}` and
 //! `{"type":"oauth","access":…,"refresh":…,"expires":…,"account_id":…}` entries.
-//! This step READS it, except for one write: an `oauth` entry that had to be
-//! refreshed is written back to the store, under the same non-blocking lock and
-//! the same atomic 0600 writer the borrowed OAuth sources use.
+//! It READS it, and it WRITES it for two callers: an `oauth` entry that had to be
+//! refreshed is written back to the store, and `p1 login`/`p1 logout` (spec §6,
+//! ADR-0044) put one pasted API key in and take one out. Every write goes under
+//! the same non-blocking lock, through the same atomic 0600 writer.
 //!
 //! A store file or directory that is group/world-accessible is REFUSED (spec §3):
 //! plain text on disk is only as private as its mode. The borrowed files of other
@@ -273,6 +274,92 @@ pub(crate) fn presence(locations: &Locations, route_id: &str, kind: CredentialKi
     }
 }
 
+// ------------------------------------------------------------------ the write side (spec §6)
+
+/// Write one route's API key into p1's store (spec §6, ADR-0044): read-modify-write
+/// under the store lock, written atomically, with every other entry left as it was.
+///
+/// The store is created 0700/0600 when it is missing. An existing file or directory
+/// anyone but the owner can reach is REFUSED with the `chmod` to run, never silently
+/// tightened. The key is checked here, next to the readers that apply the same rule,
+/// and never appears in an error.
+pub async fn put_api_key(route_id: &str, key: &str, locations: &Locations) -> Result<(), String> {
+    if key.is_empty() {
+        return Err(format!(
+            "the key for route \"{route_id}\" is empty; nothing was written"
+        ));
+    }
+    if !crate::api_key::usable_key(key) {
+        return Err(format!(
+            "the key for route \"{route_id}\" is not a header-safe token (printable ASCII, no \
+             spaces); nothing was written"
+        ));
+    }
+    let path = store_path(locations)?;
+    check_writable(locations)?;
+    let _lock = lock(&path).await.map_err(|error| error.message)?;
+    let mut document = match load(locations)? {
+        Some((_, document)) => document,
+        None => Value::Object(serde_json::Map::new()),
+    };
+    if let Some(object) = document.as_object_mut() {
+        object.insert(route_id.to_string(), json!({"type": "api_key", "key": key}));
+    }
+    write_atomic(&path, &encode(&document)).map_err(|error| error.message)
+}
+
+/// Remove one route's entry from p1's store (spec §6), leaving every other entry as
+/// it was. `Ok(false)` means there was nothing to remove — a missing entry is
+/// reported, not an error — and nothing is created for a route that has no store yet.
+pub async fn remove(route_id: &str, locations: &Locations) -> Result<bool, String> {
+    let path = store_path(locations)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    check_writable(locations)?;
+    let _lock = lock(&path).await.map_err(|error| error.message)?;
+    // The file can be gone between the check and the lock: then there is nothing to
+    // remove either.
+    let Some((_, mut document)) = load(locations)? else {
+        return Ok(false);
+    };
+    if document.get(route_id).is_none() {
+        return Ok(false);
+    }
+    if let Some(object) = document.as_object_mut() {
+        object.remove(route_id);
+    }
+    write_atomic(&path, &encode(&document)).map_err(|error| error.message)?;
+    Ok(true)
+}
+
+/// Whether p1's store may be written: the host has a location for it, and what is
+/// already there is private and readable. A login calls this BEFORE it reads a key
+/// (spec §6), so a store with wider permissions — or a file this crate could not
+/// preserve — is refused before the user types anything; the write checks again under
+/// the lock.
+pub fn check_writable(locations: &Locations) -> Result<(), String> {
+    store_path(locations)?;
+    load(locations)?;
+    Ok(())
+}
+
+/// The store's path, or the error that names what to set when the host has no home.
+fn store_path(locations: &Locations) -> Result<PathBuf, String> {
+    locations.p1_store_path().ok_or_else(|| {
+        "cannot locate p1's credential store: set HOME or XDG_CONFIG_HOME".to_string()
+    })
+}
+
+/// The document as p1 writes it: pretty, newline-terminated, so rewriting an
+/// unchanged document is byte-identical.
+fn encode(document: &Value) -> String {
+    let mut encoded =
+        serde_json::to_string_pretty(document).unwrap_or_else(|_| document.to_string());
+    encoded.push('\n');
+    encoded
+}
+
 /// An API key read from p1's store. Re-read on every `access`: a key rotated in
 /// the file is picked up without a restart.
 pub(crate) struct StoreApiKey {
@@ -409,11 +496,7 @@ impl StoreOauth {
     /// Refresh under the store lock: re-read, rotate, write back atomically. A peer
     /// that already rotated the rejected token is used instead of a second rotation.
     async fn refresh_locked(&self, rejected: Option<&str>) -> Result<Credential, ProviderError> {
-        let Some(path) = self.locations.p1_store_path() else {
-            return Err(auth(
-                "cannot locate p1's credential store: set HOME or XDG_CONFIG_HOME",
-            ));
-        };
+        let path = store_path(&self.locations).map_err(auth)?;
         let _lock = lock(&path).await?;
         let Some((_, document)) = load(&self.locations).map_err(auth)? else {
             return Err(auth(format!(
@@ -540,10 +623,7 @@ fn merge(document: &Value, route_id: &str, response: &Refreshed) -> String {
             json!(now_ms().saturating_add(response.expires_in_secs.saturating_mul(1000))),
         );
     }
-    let mut encoded =
-        serde_json::to_string_pretty(&document).unwrap_or_else(|_| document.to_string());
-    encoded.push('\n');
-    encoded
+    encode(&document)
 }
 
 /// Take the advisory lock on the sibling `.lock` file, never blocking the thread.

@@ -3,6 +3,7 @@
 //!
 //! `p1 [--env NAME] [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
 //! `p1 env show NAME`
+//! `p1 login <route>` / `p1 login --list` / `p1 logout <route>`
 //! `p1 --help` / `p1 --version`
 
 use std::path::{Path, PathBuf};
@@ -42,6 +43,16 @@ pub enum Command {
     /// Print the resolved environment as JSON and exit.
     EnvShow {
         name: String,
+    },
+    /// Read one API key from stdin and store it for this route (ADR-0044, spec §6).
+    Login {
+        route: String,
+    },
+    /// Every route, its credential kind and which source its credential comes from.
+    LoginList,
+    /// Remove this route's entry from p1's store.
+    Logout {
+        route: String,
     },
     Help,
     Version,
@@ -113,6 +124,9 @@ pub fn usage() -> String {
         "  p1 [--env NAME] [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]\n",
     );
     out.push_str("  p1 env show NAME\n");
+    out.push_str("  p1 login <route>     read one API key from stdin and store it for ROUTE\n");
+    out.push_str("  p1 login --list      every route, its credential kind and its source\n");
+    out.push_str("  p1 logout <route>    remove ROUTE's entry from p1's store\n");
     out.push_str("  p1 --help\n");
     out.push_str("  p1 --version\n\n");
     out.push_str("flags:\n");
@@ -167,6 +181,12 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         }
         if first == "env" {
             return parse_env_show(args);
+        }
+        if first == "login" {
+            return parse_login(args);
+        }
+        if first == "logout" {
+            return parse_logout(args);
         }
     }
 
@@ -328,6 +348,61 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         provider_retries: DEFAULT_PROVIDER_RETRIES,
         max_idle_summaries: DEFAULT_MAX_IDLE_SUMMARIES,
     })
+}
+
+/// `p1 login <route>` and `p1 login --list` (ADR-0044, spec §6). The key is never an
+/// argument: it is read from stdin, so arguments would only put it in shell history
+/// and in `ps`.
+fn parse_login(args: &[String]) -> Result<Options, CliError> {
+    const USAGE: &str = "usage: p1 login <route> | p1 login --list";
+    match args.get(1).map(String::as_str) {
+        None => Err(CliError {
+            message: USAGE.to_string(),
+        }),
+        Some("--list") => {
+            if let Some(extra) = args.get(2) {
+                return Err(CliError {
+                    message: format!("unexpected argument `{extra}`"),
+                });
+            }
+            Ok(defaults(Command::LoginList))
+        }
+        Some(other) if other.starts_with('-') => Err(CliError {
+            message: format!("unknown flag `{other}`"),
+        }),
+        Some(route) => {
+            if let Some(extra) = args.get(2) {
+                return Err(CliError {
+                    message: format!("unexpected argument `{extra}`"),
+                });
+            }
+            Ok(defaults(Command::Login {
+                route: route.to_string(),
+            }))
+        }
+    }
+}
+
+/// `p1 logout <route>` (ADR-0044, spec §6).
+fn parse_logout(args: &[String]) -> Result<Options, CliError> {
+    match args.get(1).map(String::as_str) {
+        None => Err(CliError {
+            message: "usage: p1 logout <route>".to_string(),
+        }),
+        Some(other) if other.starts_with('-') => Err(CliError {
+            message: format!("unknown flag `{other}`"),
+        }),
+        Some(route) => {
+            if let Some(extra) = args.get(2) {
+                return Err(CliError {
+                    message: format!("unexpected argument `{extra}`"),
+                });
+            }
+            Ok(defaults(Command::Logout {
+                route: route.to_string(),
+            }))
+        }
+    }
 }
 
 /// Parse the sandbox flags out of any argument list, ignoring everything else.
@@ -578,6 +653,41 @@ mod tests {
             parse(&args(&["--version"])).unwrap().command,
             Command::Version
         );
+    }
+
+    #[test]
+    fn parses_login_and_logout() {
+        // Route ids here are neutral: a real route's endpoint, header or model name
+        // compiled into this crate is a load error the route tests guard against.
+        assert_eq!(
+            parse(&args(&["login", "a-route"])).unwrap().command,
+            Command::Login {
+                route: "a-route".to_string()
+            }
+        );
+        assert_eq!(
+            parse(&args(&["login", "--list"])).unwrap().command,
+            Command::LoginList
+        );
+        assert_eq!(
+            parse(&args(&["logout", "another-route"])).unwrap().command,
+            Command::Logout {
+                route: "another-route".to_string()
+            }
+        );
+
+        assert!(parse(&args(&["login"])).is_err());
+        assert!(parse(&args(&["logout"])).is_err());
+        assert!(parse(&args(&["login", "--bogus"])).is_err());
+        assert!(parse(&args(&["login", "-"])).is_err());
+        assert!(parse(&args(&["login", "a", "b"])).is_err());
+        assert!(parse(&args(&["login", "--list", "a"])).is_err());
+        assert!(parse(&args(&["logout", "--list"])).is_err());
+        assert!(parse(&args(&["logout", "a", "b"])).is_err());
+
+        assert!(usage().contains("p1 login <route>"));
+        assert!(usage().contains("p1 login --list"));
+        assert!(usage().contains("p1 logout <route>"));
     }
 
     #[test]
