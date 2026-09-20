@@ -54,11 +54,15 @@ reviewer's AMENDMENTS to the lead's plan — authoritative, in full at
    p1's own changes to p1 (read tool streams; long lines capped). Records: docs/dogfood/runs.jsonl.
    Shell env allow-list (#4) merged. `scripts/push-main.sh` = push + wait for CI on that SHA
    (CI was red twice after local-green merges: bwrap and login-profile differences).
-1d. IN FLIGHT (deepseek workers): `../phaseone-7-codex-cache` (issue #7: session_id /
-   conversation_id headers; LEAD then measures cache share live before/after, same task);
-   `../phaseone-completion` (spec docs/design/completion.md: finish tool + bounded continuation;
-   LEAD then: review, ADR, live check of both must-show behaviours, merge).
-   Open issues: #6 grouped dogfood findings (pick [context] values; path vs file_path).
+1d. DONE 2026-09-20: Codex caching (#7: session_id/conversation_id headers; live A/B 9-27 % →
+   57-69 % cached, routes.md); turn completion (ADR-0037, docs/design/completion.md: `finish`
+   tool in all shipped environments, exit 3 blocked / 4 stalled, `--max-continuations`; live on
+   both routes; the continuation path itself only proven by scripted tests).
+NEXT (plan order): more supervised dogfood runs on real p1 issues (now WITH finish; record
+   each in docs/dogfood/runs.jsonl; group findings in #6) → choose `[context]` values for the
+   shipped environments from those numbers → T1 measurement (fixed task set, repeated, parent+
+   child tokens — child usage is still not summed: make that a worker job first) → host
+   cleanup around the state transitions → model cards for sol / deepseek from evidence.jsonl.
 2. Dogfood under supervision; run-level evidence grouped into issues; shell non-zero exits
    recorded separately from tool failures; look at Codex caching here.
 3. Context-control policy module (spec requirements listed in the amendments, item 4).
