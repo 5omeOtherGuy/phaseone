@@ -16,8 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::{
-    ByteStream, Credential, CredentialSource, HttpRequest, ReqwestTransport, Transport,
-    TransportError,
+    ByteStream, Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, ReqwestTransport,
+    Transport, TransportError, lock_exclusive,
 };
 use serde_json::Value;
 
@@ -77,7 +77,7 @@ impl CodexCliCredentials {
         self
     }
 
-    fn lock_file(&self) -> Result<fs::File, ProviderError> {
+    async fn lock_file(&self) -> Result<fs::File, ProviderError> {
         let lock_path = self.path.with_extension("lock");
         if let Some(parent) = lock_path
             .parent()
@@ -93,15 +93,19 @@ impl CodexCliCredentials {
             options.mode(0o600);
         }
         let file = options.open(&lock_path).map_err(|_| lock_error())?;
-        // Advisory exclusive lock; released when the handle drops.
-        file.lock().map_err(|_| lock_error())?;
-        Ok(file)
+        // Advisory exclusive lock; released when the handle drops. Never a blocking
+        // lock: the holder keeps it across its refresh request, and on a
+        // current-thread runtime a blocked thread would stop that request (and
+        // cancellation) for good.
+        lock_exclusive(file, LOCK_PATIENCE)
+            .await
+            .map_err(|_| lock_error())
     }
 
     /// Refresh under the cross-process lock. `stale` is the rejected bearer on
     /// the 401/403 path; `None` on the expiry path.
     async fn refresh_locked(&self, stale: Option<&str>) -> Result<Credential, ProviderError> {
-        let _lock = self.lock_file()?;
+        let _lock = self.lock_file().await?;
         let mut document = read_document(&self.path)?;
         let tokens = tokens_from(&document)?;
         match stale {

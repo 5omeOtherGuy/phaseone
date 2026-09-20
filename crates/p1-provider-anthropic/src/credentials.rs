@@ -18,7 +18,8 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::{
-    ByteStream, Credential, CredentialSource, HttpRequest, ReqwestTransport, Transport,
+    ByteStream, Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, ReqwestTransport,
+    Transport, lock_exclusive,
 };
 use serde_json::{Value, json};
 
@@ -96,7 +97,7 @@ impl ClaudeCodeCredentials {
     /// this file, and a token someone else already rotated must be used instead
     /// of burning another rotation.
     async fn refresh_locked(&self, rejected: Option<&str>) -> Result<Credential, ProviderError> {
-        let _lock = self.lock()?;
+        let _lock = self.lock().await?;
 
         let raw = std::fs::read_to_string(&self.path)
             .map_err(|_| auth_error(&self.path, "Claude Code credentials could not be read"))?;
@@ -226,7 +227,7 @@ impl ClaudeCodeCredentials {
 
     /// Take the advisory lock on the sibling `.lock` file. The lock is released
     /// when the returned handle drops.
-    fn lock(&self) -> Result<std::fs::File, ProviderError> {
+    async fn lock(&self) -> Result<std::fs::File, ProviderError> {
         let path = self.lock_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -242,13 +243,15 @@ impl ClaudeCodeCredentials {
                     "the Claude Code credentials lock could not be opened",
                 )
             })?;
-        file.lock().map_err(|_| {
+        // Never a blocking lock: the holder keeps it across its refresh request,
+        // and on a current-thread runtime a blocked thread would stop that request
+        // (and cancellation) for good.
+        lock_exclusive(file, LOCK_PATIENCE).await.map_err(|_| {
             auth_error(
                 &path,
                 "the Claude Code credentials lock could not be acquired",
             )
-        })?;
-        Ok(file)
+        })
     }
 
     fn lock_path(&self) -> PathBuf {

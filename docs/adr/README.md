@@ -44,6 +44,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0028 | [Lead authority while the owner is away](0028-lead-authority-while-owner-is-away.md) | accepted | 2026-09-20 | owner |
 | ADR-0029 | [Test-first with independent authors and frozen suites](0029-test-first-with-independent-authors-and-frozen-suites.md) | accepted | 2026-09-20 | lead |
 | ADR-0030 | [Decisions are recorded as ADRs](0030-decisions-are-recorded-as-adrs.md) | accepted | 2026-09-20 | owner+lead |
+| ADR-0031 | [A session file is owned before it is read](0031-a-session-file-is-owned-before-it-is-read.md) | accepted | 2026-09-20 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

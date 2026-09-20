@@ -20,7 +20,7 @@
 //! - new session files are created with mode 0600.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -63,6 +63,10 @@ pub enum JournalError {
     /// Another writer holds the advisory lock on this session file.
     #[error("journal file is locked by another writer")]
     Locked,
+    /// The file no longer ends in the truncated tail the caller observed: someone
+    /// wrote to it since. Repairing from a stale observation would cut off records.
+    #[error("the journal changed since its truncated tail was observed; load it again")]
+    StaleTail,
     #[error("journal io error: {0}")]
     Io(String),
 }
@@ -85,6 +89,14 @@ pub struct TruncatedTail {
 
 /// What [`load`] found: every complete valid record, plus a truncated tail if the
 /// file ended mid-line.
+/// What [`JsonlJournal::resume`] found under the lock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resumed {
+    pub records: Vec<JournalRecord>,
+    /// The incomplete last record that was cut off, if there was one.
+    pub repaired_tail: Option<TruncatedTail>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Loaded {
     pub records: Vec<JournalRecord>,
@@ -202,6 +214,47 @@ impl JsonlJournal {
         })
     }
 
+    /// Take over an existing session file: lock it FIRST, then read, validate, cut
+    /// off a truncated tail and derive the next sequence number — all under that
+    /// lock, which is held for the life of the returned writer. This is the resume
+    /// path; nothing in it acts on an observation made before ownership.
+    pub fn resume(path: &Path, sync: SyncPolicy) -> Result<(Self, Resumed), JournalError> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .map_err(JournalError::from)?;
+        lock_or_err(&file)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(JournalError::from)?;
+        let loaded = parse_records(&bytes)?;
+        if let Some(tail) = &loaded.truncated_tail {
+            file.set_len(tail.byte_offset).map_err(JournalError::from)?;
+            file.sync_all().map_err(JournalError::from)?;
+        }
+        let header_lost = loaded
+            .truncated_tail
+            .is_some_and(|tail| tail.byte_offset == 0);
+        let mut inner = JsonlInner {
+            file,
+            path: path.to_path_buf(),
+            sync,
+            next_seq: loaded.records.len() as u64,
+        };
+        if header_lost {
+            write_header(&mut inner)?;
+        }
+        Ok((
+            Self {
+                inner: Arc::new(Mutex::new(inner)),
+            },
+            Resumed {
+                records: loaded.records,
+                repaired_tail: loaded.truncated_tail,
+            },
+        ))
+    }
+
     /// Open an existing session file for appending after [`load`] has validated it.
     /// Refuses (`Corrupt`) a file that still holds a truncated tail.
     ///
@@ -213,7 +266,16 @@ impl JsonlJournal {
         sync: SyncPolicy,
         next_seq: u64,
     ) -> Result<Self, JournalError> {
-        let bytes = std::fs::read(path).map_err(JournalError::from)?;
+        // Own the file BEFORE reading it: what is validated below must be what gets
+        // appended to, and a second writer must fail here, not after a stale read.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .map_err(JournalError::from)?;
+        lock_or_err(&file)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(JournalError::from)?;
         if bytes.is_empty() {
             if next_seq != 0 {
                 return Err(JournalError::Corrupt { line: 1 });
@@ -224,13 +286,16 @@ impl JsonlJournal {
                 let line = complete_lines_before(&bytes, tail.byte_offset as usize) + 1;
                 return Err(JournalError::Corrupt { line });
             }
+            // The caller's number comes from an earlier, unlocked load. If the file
+            // grew since, appending at that number would duplicate a sequence.
+            let expected = loaded.records.len() as u64;
+            if next_seq != expected {
+                return Err(JournalError::OutOfOrder {
+                    expected,
+                    got: next_seq,
+                });
+            }
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(path)
-            .map_err(JournalError::from)?;
-        lock_or_err(&file)?;
         let mut inner = JsonlInner {
             file,
             path: path.to_path_buf(),
@@ -442,16 +507,18 @@ fn parse_header(line: &[u8]) -> Result<(), JournalError> {
 /// incomplete header) the result is a zero-byte file, which
 /// [`JsonlJournal::open_for_append`] can re-open and re-head.
 pub fn repair_truncated_tail(path: &Path, tail: &TruncatedTail) -> Result<(), JournalError> {
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
+        .read(true)
         .write(true)
         .open(path)
         .map_err(JournalError::from)?;
-    let len = file.metadata().map_err(JournalError::from)?.len();
-    if tail.byte_offset > len {
-        return Err(JournalError::Io(format!(
-            "cannot repair to offset {} of a {len}-byte file",
-            tail.byte_offset
-        )));
+    // Never cut a file an active writer owns, and never cut from an observation
+    // that is no longer true: re-read under the lock and require the same tail.
+    lock_or_err(&file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(JournalError::from)?;
+    if parse_records(&bytes)?.truncated_tail.as_ref() != Some(tail) {
+        return Err(JournalError::StaleTail);
     }
     file.set_len(tail.byte_offset).map_err(JournalError::from)?;
     file.sync_all().map_err(JournalError::from)?;

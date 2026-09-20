@@ -110,7 +110,9 @@ Invalid regex → error.
 ## `shell` — `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120)}`
 Runs `bash -lc <command>` with the workspace root as cwd, stdin closed, in its own process
 group. Captures stdout+stderr interleaved. On timeout or cancellation the WHOLE process group
-is killed (SIGTERM, then SIGKILL after 2 s) — no orphans. Content:
+is killed (SIGTERM, then SIGKILL after 2 s) — no orphans. The GROUP is watched, not the
+shell: whatever is left of it after the grace period is killed even if the shell itself exited
+at once, and the tool returns only when the group is empty. Content:
 `<bounded output>\n[exit code: <n>]`, or `[timed out after <s> s]`, or status `Cancelled`.
 Non-zero exit is `ToolStatus::Ok` (the command ran; the model reads the code). The timeout is a
 tool parameter the MODEL chooses — not a harness-imposed limit on the agent.

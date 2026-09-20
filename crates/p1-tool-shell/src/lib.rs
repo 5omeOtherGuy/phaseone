@@ -41,6 +41,9 @@ const HEAD_LINES: usize = 990;
 const TAIL_LINES: usize = 990;
 /// How long the group is given to exit after SIGTERM before SIGKILL.
 const SIGTERM_GRACE: Duration = Duration::from_secs(2);
+/// How long to wait for a SIGKILLed group to disappear before giving up on it.
+const SIGKILL_WAIT: Duration = Duration::from_secs(2);
+const GROUP_POLL: Duration = Duration::from_millis(10);
 const READ_BUFFER_BYTES: usize = 16 * 1024;
 
 /// The `shell` tool. Holds one agent's workspace.
@@ -161,6 +164,7 @@ impl Tool for ShellTool {
                 self.workspace.root(),
                 &input.command,
                 timeout,
+                tokio::time::sleep(timeout),
                 &context.cancel,
             )
             .await
@@ -204,12 +208,17 @@ enum End {
     Cancelled,
 }
 
+/// `expiry` is the timeout as a future, so a test can fire it on an observed
+/// condition instead of racing the shell's start-up against a wall clock;
+/// `timeout` is only what the footer reports.
 async fn run(
     root: &Path,
     command: &str,
     timeout: Duration,
+    expiry: impl Future<Output = ()>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
+    let mut expiry = std::pin::pin!(expiry);
     let mut builder = Command::new("bash");
     builder
         .arg("-lc")
@@ -235,7 +244,6 @@ async fn run(
         return ToolOutcome::error("failed to capture bash stderr");
     };
 
-    let deadline = tokio::time::Instant::now() + timeout;
     let mut capture = Capture::default();
     let mut out_buffer = [0u8; READ_BUFFER_BYTES];
     let mut err_buffer = [0u8; READ_BUFFER_BYTES];
@@ -257,7 +265,7 @@ async fn run(
                 terminate(&mut child, pgid).await;
                 break End::Cancelled;
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = &mut expiry => {
                 terminate(&mut child, pgid).await;
                 break End::TimedOut;
             }
@@ -287,7 +295,7 @@ async fn run(
             terminate(&mut child, pgid).await;
             return render(capture, "[cancelled]", ToolStatus::Cancelled);
         }
-        _ = tokio::time::sleep_until(deadline) => {
+        _ = &mut expiry => {
             terminate(&mut child, pgid).await;
             return render(capture, &timed_out_footer, ToolStatus::Error);
         }
@@ -318,20 +326,42 @@ async fn run(
 
 /// Terminate the child's whole process group and reap the child.
 ///
-/// SIGTERM first so cooperative children can exit; if the group is still alive
-/// after [`SIGTERM_GRACE`], SIGKILL it. The child is always reaped.
+/// SIGTERM first so cooperative processes can exit. The shell's own exit says
+/// nothing about its descendants — one that ignores SIGTERM outlives a shell that
+/// honours it — so the GROUP is watched, not the child: whatever is left of it
+/// after [`SIGTERM_GRACE`] is SIGKILLed, and the function returns only once the
+/// group is empty (bounded by [`SIGKILL_WAIT`]). The child is always reaped.
 async fn terminate(child: &mut Child, pgid: i32) {
-    if pgid > 0 {
-        let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
+    if pgid <= 0 {
+        // No group to signal (the pid was already gone at spawn time).
+        let _ = child.kill().await;
+        return;
     }
-    if tokio::time::timeout(SIGTERM_GRACE, child.wait())
+    let group = Pid::from_raw(pgid);
+    let _ = killpg(group, Signal::SIGTERM);
+    let grace_end = tokio::time::Instant::now() + SIGTERM_GRACE;
+    // Reap the shell first: an unreaped group leader keeps the group alive.
+    let reaped = tokio::time::timeout_at(grace_end, child.wait())
         .await
-        .is_err()
-    {
-        if pgid > 0 {
-            let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-        }
+        .is_ok();
+    wait_for_empty_group(group, grace_end).await;
+    if group_exists(group) {
+        let _ = killpg(group, Signal::SIGKILL);
+    }
+    if !reaped {
         let _ = child.wait().await;
+    }
+    wait_for_empty_group(group, tokio::time::Instant::now() + SIGKILL_WAIT).await;
+}
+
+/// Signal 0 probes without signalling: only ESRCH means no process is left in the group.
+fn group_exists(group: Pid) -> bool {
+    !matches!(killpg(group, None), Err(nix::errno::Errno::ESRCH))
+}
+
+async fn wait_for_empty_group(group: Pid, until: tokio::time::Instant) {
+    while group_exists(group) && tokio::time::Instant::now() < until {
+        tokio::time::sleep(GROUP_POLL).await;
     }
 }
 
@@ -450,7 +480,7 @@ impl Capture {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellTool, parse_input};
+    use super::{ShellTool, parse_input, run};
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     use p1_contracts::{
@@ -557,19 +587,27 @@ mod tests {
         assert_eq!(outcome.content, "[exit code: 0]");
     }
 
+    /// The timeout fires only once the background child has published its pid, so
+    /// a slow shell start-up (CI) cannot make the precondition race the clock.
     #[tokio::test]
     async fn a_timeout_kills_the_whole_group() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = tool(dir.path());
-        let started = Instant::now();
+        let root = dir.path().to_path_buf();
+        let published = async move {
+            while pid_file(&root, "pid").is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
 
-        let outcome = execute(
-            &tool,
-            r#"{"command": "sleep 30 & echo $! > pid; wait", "timeout_seconds": 1}"#,
+        let outcome = run(
+            dir.path(),
+            "sleep 30 & echo $! > pid; wait",
+            Duration::from_secs(1),
+            published,
+            &CancellationToken::new(),
         )
         .await;
 
-        assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(outcome.status, ToolStatus::Error);
         assert!(
             outcome.content.contains("[timed out after 1 s]"),
@@ -577,6 +615,22 @@ mod tests {
         );
         let pid = pid_file(dir.path(), "pid").expect("the child wrote its pid");
         wait_for_gone(pid);
+    }
+
+    /// `timeout_seconds` is wired to a real clock. Nothing has to happen before it
+    /// fires, so there is no start-up race here.
+    #[tokio::test]
+    async fn timeout_seconds_stops_a_long_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"command": "sleep 30", "timeout_seconds": 1}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(
+            outcome.content.contains("[timed out after 1 s]"),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]

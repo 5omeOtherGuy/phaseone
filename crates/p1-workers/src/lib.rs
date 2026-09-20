@@ -152,16 +152,17 @@ struct ChildEntry {
     /// Retained status; `send_replace` also wakes every `wait`er.
     status: watch::Sender<ChildStatus>,
     commands: mpsc::UnboundedSender<ChildCommand>,
-    /// The token of the child's CURRENT turn, replaced at each turn start.
+    /// The token of the child's CURRENT turn. Whoever moves the child to
+    /// `Running` (`start`, `continue_child`) installs the new turn's token in the
+    /// same critical section, so a cancel can never land on a finished turn's
+    /// token while the next turn is accepted but not yet polled.
     turn_cancel: Arc<Mutex<CancellationToken>>,
-    /// Serialises `continue_child`'s check-then-set so two calls cannot both
-    /// observe a non-running child and queue two turns.
-    transition: Arc<Mutex<()>>,
     description: String,
 }
 
 enum ChildCommand {
-    Continue(String),
+    /// Another turn, with the cancellation token installed when it was accepted.
+    Continue(String, CancellationToken),
     Shutdown,
 }
 
@@ -213,6 +214,23 @@ impl InProcessWorkers {
 }
 
 impl Shared {
+    /// `Err(LimitReached)` when `max_concurrent` children are already Running.
+    /// Called with the state lock held, by everything that sets a child Running.
+    /// A turn ending concurrently only lowers the count, so the check is safe.
+    fn reserve_running_slot(&self, state: &State) -> Result<(), WorkerError> {
+        let running = state
+            .children
+            .values()
+            .filter(|entry| matches!(&*entry.status.borrow(), ChildStatus::Running))
+            .count();
+        if running >= self.max_concurrent {
+            return Err(WorkerError::LimitReached {
+                max: self.max_concurrent,
+            });
+        }
+        Ok(())
+    }
+
     fn is_shut_down(&self) -> bool {
         self.shutdown.is_cancelled() || self.state.lock().unwrap().shut_down
     }
@@ -239,23 +257,14 @@ impl WorkerService for InProcessWorkers {
             // std lock across the `yield_now` (invariant 7d). The factory is
             // synchronous, so holding the lock across it keeps the RUNNING count
             // and the id assignment atomic under concurrent `start` calls.
-            let (id, status, command_rx, turn_cancel, transition, agent) = {
+            let (id, status, command_rx, token, agent) = {
                 let mut state = self.shared.state.lock().unwrap();
                 if state.shut_down || self.shared.shutdown.is_cancelled() {
                     return Err(WorkerError::ShutDown);
                 }
                 // Count RUNNING children before building: a rejected start must
                 // not build (and then discard) a child it cannot run.
-                let running = state
-                    .children
-                    .values()
-                    .filter(|entry| matches!(&*entry.status.borrow(), ChildStatus::Running))
-                    .count();
-                if running >= self.shared.max_concurrent {
-                    return Err(WorkerError::LimitReached {
-                        max: self.shared.max_concurrent,
-                    });
-                }
+                self.shared.reserve_running_slot(&state)?;
                 // Factory failure is an invalid environment, not a service fault.
                 let child =
                     (self.shared.factory)(&spec).map_err(WorkerError::InvalidEnvironment)?;
@@ -264,32 +273,23 @@ impl WorkerService for InProcessWorkers {
 
                 let (status, _) = watch::channel(ChildStatus::Running);
                 let (commands, command_rx) = mpsc::unbounded_channel();
-                let turn_cancel = Arc::new(Mutex::new(CancellationToken::new()));
-                let transition = Arc::new(Mutex::new(()));
+                let token = CancellationToken::new();
                 state.children.insert(
                     id.clone(),
                     ChildEntry {
                         status: status.clone(),
                         commands,
-                        turn_cancel: Arc::clone(&turn_cancel),
-                        transition: Arc::clone(&transition),
+                        turn_cancel: Arc::new(Mutex::new(token.clone())),
                         description: child.description.clone(),
                     },
                 );
-                (id, status, command_rx, turn_cancel, transition, child.agent)
+                (id, status, command_rx, token, child.agent)
             };
 
             let task_id = id.clone();
             let shared = Arc::clone(&self.shared);
             let handle = tokio::spawn(run_child(
-                shared,
-                task_id,
-                agent,
-                spec.task,
-                command_rx,
-                status,
-                turn_cancel,
-                transition,
+                shared, task_id, agent, spec.task, token, command_rx, status,
             ));
             self.tasks.lock().unwrap().push(handle);
             // Give the fresh task one turn before returning: `start` promises the
@@ -379,26 +379,28 @@ impl WorkerService for InProcessWorkers {
             if self.shared.is_shut_down() {
                 return Err(WorkerError::ShutDown);
             }
-            let (status, commands, transition) = {
-                let state = self.shared.state.lock().unwrap();
-                let Some(entry) = state.children.get(&id.0) else {
-                    return Err(WorkerError::UnknownChild);
-                };
-                (
-                    entry.status.clone(),
-                    entry.commands.clone(),
-                    Arc::clone(&entry.transition),
-                )
+            // Every transition into Running happens under the state lock: the limit
+            // check, the status change and the new turn's cancellation token are one
+            // step, so neither a concurrent `start`/`continue_child` nor a `cancel`
+            // or `shutdown` can slip between them. No await is held here.
+            let state = self.shared.state.lock().unwrap();
+            if state.shut_down {
+                return Err(WorkerError::ShutDown);
+            }
+            let Some(entry) = state.children.get(&id.0) else {
+                return Err(WorkerError::UnknownChild);
             };
-            // Check-and-set under the transition lock; no await is held here.
-            let _guard = transition.lock().unwrap();
-            if matches!(&*status.borrow(), ChildStatus::Running) {
+            if matches!(&*entry.status.borrow(), ChildStatus::Running) {
                 return Err(WorkerError::Busy);
             }
-            status.send_replace(ChildStatus::Running);
-            commands
-                .send(ChildCommand::Continue(message))
+            self.shared.reserve_running_slot(&state)?;
+            let token = CancellationToken::new();
+            entry
+                .commands
+                .send(ChildCommand::Continue(message, token.clone()))
                 .map_err(|_| WorkerError::ShutDown)?;
+            *entry.turn_cancel.lock().unwrap() = token;
+            entry.status.send_replace(ChildStatus::Running);
             Ok(())
         })
     }
@@ -430,21 +432,18 @@ impl WorkerService for InProcessWorkers {
 
 /// The whole life of one child, owned by one task. `task` is replaced by each
 /// `continue_child`; the `Agent` is never moved and its turns never overlap.
-#[allow(clippy::too_many_arguments)]
 async fn run_child(
     shared: Arc<Shared>,
     id: String,
     mut agent: Agent,
     mut task: String,
+    mut token: CancellationToken,
     mut commands: mpsc::UnboundedReceiver<ChildCommand>,
     status: watch::Sender<ChildStatus>,
-    turn_cancel: Arc<Mutex<CancellationToken>>,
-    transition: Arc<Mutex<()>>,
 ) {
     loop {
-        let token = CancellationToken::new();
-        *turn_cancel.lock().unwrap() = token.clone();
-        status.send_replace(ChildStatus::Running);
+        // The status is already Running and `token` already installed: whoever
+        // accepted this turn did both before the task could see it.
         let mut end = agent.run_turn(task, token.clone()).await;
         // Drain any inbox messages that arrived during the turn, per the spec.
         while agent.has_pending_inbox() {
@@ -455,10 +454,7 @@ async fn run_child(
         }
         let child_status = status_from_end(&end, last_assistant_text(&agent));
         // (1) store the status and (2) wake every waiter: one `send_replace`.
-        {
-            let _transition = transition.lock().unwrap();
-            status.send_replace(child_status.clone());
-        }
+        status.send_replace(child_status.clone());
         // (3) exactly ONE notification, and only after the result is retrievable.
         notify_parent(&shared, &id, &child_status);
         // The session is retained for repair: wait for `continue_child` or
@@ -469,7 +465,10 @@ async fn run_child(
             command = commands.recv() => command,
         };
         match command {
-            Some(ChildCommand::Continue(message)) => task = message,
+            Some(ChildCommand::Continue(message, next_token)) => {
+                task = message;
+                token = next_token;
+            }
             _ => break,
         }
     }

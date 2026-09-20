@@ -13,12 +13,14 @@
 
 mod credential;
 mod drive;
+mod file_lock;
 mod http;
 mod retry;
 mod sse;
 
 pub use credential::{Credential, CredentialSource};
 pub use drive::{DriveRequest, ResponseParser, drive};
+pub use file_lock::{LOCK_PATIENCE, lock_exclusive};
 pub use http::{
     ByteStream, HttpRequest, HttpResponse, ReqwestTransport, Transport, TransportError,
 };

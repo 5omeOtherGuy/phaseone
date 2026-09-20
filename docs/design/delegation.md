@@ -47,8 +47,11 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
   with `InboxKind::Notification`. A missed or ignored notification loses nothing.
 - The notification wakes the parent at its next safe boundary (core §3a/§3f, R4); an idle
   parent is woken by the host via `Agent::inbox_ready()` → `run_inbox_turn`.
-- `max_concurrent` bounds RUNNING children (default 2); `start` beyond it is an error the model
-  can read, not a queue. No recursion in this slice: child environments are assembled
+- `max_concurrent` bounds RUNNING children (default 2); `start` AND `continue_child` beyond it
+  are an error the model can read, not a queue. Every transition into Running is one critical
+  section: limit check, status change and the new turn's cancellation token together — so a
+  `cancel` or `shutdown` right after an accepted `start`/`continue_child` always reaches that
+  turn, even before the child task has been polled. No recursion in this slice: child environments are assembled
   WITHOUT the delegation tools.
 - Cancelling the parent's service (`shutdown()`) cancels every running child and joins the
   tasks; dropping it does the same best-effort. Child authorization: the parent's policy

@@ -54,16 +54,29 @@ pub trait InterruptSource: Send + Sync {
     fn recv<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 }
 
-/// Real stdin: one line at a time, newline trimmed.
-pub struct StdinLines {
-    reader: tokio::sync::Mutex<tokio::io::BufReader<tokio::io::Stdin>>,
+/// Lines from any async reader, newline trimmed.
+///
+/// `next_line` is cancel-safe: the prompt loop drops a pending read whenever the
+/// agent has to run an inbox turn, so bytes read so far are kept HERE, not in the
+/// future, and the next call continues the same line.
+pub struct ReaderLines<R> {
+    state: tokio::sync::Mutex<(tokio::io::BufReader<R>, Vec<u8>)>,
+}
+
+/// Real stdin.
+pub type StdinLines = ReaderLines<tokio::io::Stdin>;
+
+impl<R: tokio::io::AsyncRead + Unpin + Send> ReaderLines<R> {
+    pub fn from_reader(reader: R) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new((tokio::io::BufReader::new(reader), Vec::new())),
+        }
+    }
 }
 
 impl StdinLines {
     pub fn new() -> Self {
-        Self {
-            reader: tokio::sync::Mutex::new(tokio::io::BufReader::new(tokio::io::stdin())),
-        }
+        Self::from_reader(tokio::io::stdin())
     }
 }
 
@@ -73,19 +86,25 @@ impl Default for StdinLines {
     }
 }
 
-impl LineSource for StdinLines {
+impl<R: tokio::io::AsyncRead + Unpin + Send> LineSource for ReaderLines<R> {
     fn next_line<'a>(
         &'a self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
         Box::pin(async move {
             use tokio::io::AsyncBufReadExt;
-            let mut line = String::new();
-            let mut reader = self.reader.lock().await;
-            match reader.read_line(&mut line).await {
-                Ok(0) => None,
-                Ok(_) => Some(line.trim_end_matches(['\n', '\r']).to_string()),
-                Err(_) => None,
+            let mut state = self.state.lock().await;
+            let (reader, partial) = &mut *state;
+            // `read_until` appends what it has read to `partial` even when this
+            // future is dropped mid-line (`read_line` would lose it).
+            let read = reader.read_until(b'\n', partial).await;
+            if partial.is_empty() || (read.is_err() && !partial.ends_with(b"\n")) {
+                return None;
             }
+            let line = String::from_utf8_lossy(partial)
+                .trim_end_matches(['\n', '\r'])
+                .to_string();
+            partial.clear();
+            Some(line)
         })
     }
 }
