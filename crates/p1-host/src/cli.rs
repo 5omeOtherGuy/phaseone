@@ -13,6 +13,9 @@ pub const DEFAULT_ENV: &str = "claude";
 /// Headless continuation budget when `--max-continuations` is not given.
 pub const DEFAULT_MAX_CONTINUATIONS: usize = 3;
 
+/// Headless provider-retry budget when `--provider-retries` is not given.
+pub const DEFAULT_PROVIDER_RETRIES: usize = 3;
+
 /// Whether `shell` commands run inside the bubblewrap sandbox.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SandboxMode {
@@ -62,6 +65,9 @@ pub struct Options {
     /// At most this many continuations after a premature stop in an unattended
     /// run. `0` disables continuation.
     pub max_continuations: usize,
+    /// At most this many CONSECUTIVE transient provider failures to wait out and
+    /// retry in an unattended run. `0` disables retrying.
+    pub provider_retries: usize,
 }
 
 impl Options {
@@ -119,6 +125,9 @@ pub fn usage() -> String {
     out.push_str(
         "  --max-continuations N\n                    most continuations after a premature stop in an unattended\n                    run (default: 3; 0 disables)\n",
     );
+    out.push_str(
+        "  --provider-retries N\n                    most consecutive transient provider failures to wait out and\n                    retry in an unattended run (default: 3; 0 disables)\n",
+    );
     out
 }
 
@@ -169,9 +178,13 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             "--ask" => ask = true,
             "--yes" => yes = true,
             // Validated by `parse_sandbox`/`parse_env_pass`/`parse_max_continuations`
-            // after the loop; the values are consumed here so they are not mistaken
-            // for prompt words.
-            "--sandbox" | "--sandbox-write" | "--env-pass" | "--max-continuations" => {
+            // /`parse_provider_retries` after the loop; the values are consumed here
+            // so they are not mistaken for prompt words.
+            "--sandbox"
+            | "--sandbox-write"
+            | "--env-pass"
+            | "--max-continuations"
+            | "--provider-retries" => {
                 take_value(args, &mut index, arg)?;
             }
             other if other.starts_with('-') && other != "-" => {
@@ -200,6 +213,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let (sandbox, sandbox_write) = parse_sandbox(args)?;
     let env_pass = parse_env_pass(args)?;
     let max_continuations = parse_max_continuations(args)?;
+    let provider_retries = parse_provider_retries(args)?;
 
     let prompt = if prompt_words.is_empty() {
         None
@@ -218,6 +232,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         sandbox_write,
         env_pass,
         max_continuations,
+        provider_retries,
     })
 }
 
@@ -264,6 +279,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         sandbox_write,
         env_pass,
         max_continuations: DEFAULT_MAX_CONTINUATIONS,
+        provider_retries: DEFAULT_PROVIDER_RETRIES,
     })
 }
 
@@ -394,6 +410,28 @@ fn parse_max_continuations(args: &[String]) -> Result<usize, CliError> {
     Ok(value)
 }
 
+/// Parse `--provider-retries N` out of any argument list. A missing or
+/// non-numeric value is a usage error.
+fn parse_provider_retries(args: &[String]) -> Result<usize, CliError> {
+    let mut value = DEFAULT_PROVIDER_RETRIES;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--provider-retries" {
+            index += 1;
+            let Some(raw) = args.get(index) else {
+                return Err(CliError {
+                    message: "--provider-retries requires a value".to_string(),
+                });
+            };
+            value = raw.parse::<usize>().map_err(|_| CliError {
+                message: format!("--provider-retries takes a non-negative integer, got `{raw}`"),
+            })?;
+        }
+        index += 1;
+    }
+    Ok(value)
+}
+
 fn defaults(command: Command) -> Options {
     Options {
         command,
@@ -406,6 +444,7 @@ fn defaults(command: Command) -> Options {
         sandbox_write: Vec::new(),
         env_pass: Vec::new(),
         max_continuations: DEFAULT_MAX_CONTINUATIONS,
+        provider_retries: DEFAULT_PROVIDER_RETRIES,
     }
 }
 
@@ -542,6 +581,35 @@ mod tests {
         assert!(parse(&args(&["--max-continuations", "many"])).is_err());
         assert!(parse(&args(&["--max-continuations"])).is_err());
         assert!(usage().contains("--max-continuations N"));
+    }
+
+    #[test]
+    fn parses_provider_retries_and_rejects_a_non_numeric_value() {
+        let options = parse(&args(&["--provider-retries", "7", "go"])).unwrap();
+        assert_eq!(options.provider_retries, 7);
+        assert_eq!(
+            options.command,
+            Command::Run {
+                prompt: Some("go".to_string())
+            }
+        );
+        assert_eq!(parse(&args(&[])).unwrap().provider_retries, 3);
+        assert_eq!(
+            parse(&args(&["--provider-retries", "0"]))
+                .unwrap()
+                .provider_retries,
+            0
+        );
+
+        assert!(parse(&args(&["--provider-retries", "many"])).is_err());
+        assert!(parse(&args(&["--provider-retries"])).is_err());
+        assert!(usage().contains("--provider-retries N"));
+        assert!(
+            parse(&args(&["--provider-retries", "1", "do", "it"]))
+                .unwrap()
+                .is_headless(),
+            "the flag value is not taken for a prompt word"
+        );
     }
 
     #[test]

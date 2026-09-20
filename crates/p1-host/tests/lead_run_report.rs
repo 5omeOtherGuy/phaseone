@@ -131,6 +131,68 @@ async fn the_report_counts_what_the_journal_holds() {
     assert_eq!(report["includes_worker_usage"], false);
 }
 
+/// §3b: the host's provider retries are journalled as ordinary user inputs, and the
+/// report counts exactly those as `provider_retries` — a continuation or an inbox
+/// message is not a retry.
+#[tokio::test]
+async fn the_report_counts_journalled_provider_retries() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["read"],
+        "test",
+    );
+    let session = workspace.path().join("session.jsonl");
+    let provider = ScriptedProvider::new(vec![
+        Step::SetupError(p1_contracts::ProviderError::new(
+            p1_contracts::ProviderErrorKind::Transport,
+            "connection reset by peer",
+        )),
+        p1_testkit::text_response("plain answer"),
+    ]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    // No test sleeps: the retry wait is injected as an already-ready future.
+    harness.deps.wait = std::sync::Arc::new(|_wait| Box::pin(std::future::ready(())));
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/run-report.py");
+    let output = std::process::Command::new("python3")
+        .arg(script)
+        .arg(&session)
+        .output()
+        .expect("python3 runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("one JSON record");
+
+    assert_eq!(report["provider_retries"], 1);
+    assert_eq!(report["user_inputs"], 2, "the prompt and the retry message");
+    assert_eq!(report["requests"], 2);
+    assert_eq!(report["interrupted_responses"], 1);
+}
+
 /// A child provider whose response waits for `gate`: the test can hold the worker
 /// running until the parent has reached a known point, so the inbox turn the
 /// completion notification causes is deterministic.
