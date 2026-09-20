@@ -247,6 +247,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
                 env: options.env.clone(),
                 ask: options.ask,
                 workspace,
+                sandbox: format!("{:?}", options.sandbox).to_lowercase(),
             },
             cancel.clone(),
         ))

@@ -10,8 +10,6 @@
 use ratatui::style::Style;
 use ratatui::text::Line;
 
-use crate::glyphs;
-use crate::grid;
 use crate::palette;
 
 /// Visible rows before truncation (SPEC §4.6).
@@ -44,8 +42,8 @@ pub struct Picker {
 }
 
 impl Picker {
-    /// Rows surviving the filter, as (group header position is separate).
-    /// The match is a case-insensitive substring on the label.
+    /// Rows surviving the filter. The match is a case-insensitive substring
+    /// on the label — the ONE matching rule, used by the model and the view.
     pub fn visible(&self) -> Vec<&PickerRow> {
         let needle = self.filter.to_lowercase();
         self.groups
@@ -81,63 +79,68 @@ impl Picker {
     }
 }
 
-/// Render the picker on a `width`-column grid.
+/// Render the picker on a `width`-column grid. The 8-row window follows the
+/// selection (SPEC §4.6: there is always exactly one inverted row), group
+/// headers attach only to visible rows, and `· N more` counts the rows below
+/// the window.
 pub fn lines(picker: &Picker, width: usize) -> Vec<Line<'static>> {
+    let visible = picker.visible();
+    let total = visible.len();
+    let first = picker
+        .selected
+        .saturating_sub(MAX_ROWS - 1)
+        .min(total.saturating_sub(MAX_ROWS));
+    let window: &[&PickerRow] = &visible[first..(first + MAX_ROWS).min(total)];
     let mut out = Vec::new();
-    let mut flat_index = 0usize;
-    let mut shown = 0usize;
-    let mut hidden = 0usize;
+    // Group headers above their first visible row. A row's group is found by
+    // walking the groups' surviving rows in order.
+    let mut by_ptr: std::collections::HashMap<*const PickerRow, &str> =
+        std::collections::HashMap::new();
+    let needle = picker.filter.to_lowercase();
     for group in &picker.groups {
-        let surviving: Vec<&PickerRow> = group
-            .rows
-            .iter()
-            .filter(|r| {
-                picker.filter.is_empty()
-                    || r.label
-                        .to_lowercase()
-                        .contains(&picker.filter.to_lowercase())
-            })
-            .collect();
-        if surviving.is_empty() {
-            continue;
-        }
-        out.push(Line::styled(
-            group.header.clone(),
-            Style::new().fg(palette::DIM),
-        ));
-        for row in surviving {
-            let index = flat_index;
-            flat_index += 1;
-            if shown >= MAX_ROWS {
-                hidden += 1;
-                continue;
+        for row in &group.rows {
+            if needle.is_empty() || row.label.to_lowercase().contains(&needle) {
+                by_ptr.insert(row as *const _, group.header.as_str());
             }
-            shown += 1;
-            let mut line = if row.available {
-                grid::row(width, &format!("  {}", row.label), &row.value)
-            } else {
-                grid::styled_row(
-                    width,
-                    &format!("  {}", row.label),
-                    palette::FAINT,
-                    &row.value,
-                    palette::FAINT,
-                )
-            };
-            if index == picker.selected && row.available {
-                // Selection inverts — the only highlight mechanism (SPEC §1).
-                for span in &mut line.spans {
-                    span.style = Style::new()
-                        .fg(palette::SELECTION_FG)
-                        .bg(palette::SELECTION_BG);
-                }
-            }
-            out.push(line);
         }
     }
-    if hidden > 0 {
+    let mut last_header: Option<&str> = None;
+    for (offset, row) in window.iter().enumerate() {
+        let header = by_ptr.get(&(*row as *const PickerRow)).copied();
+        if header != last_header {
+            if let Some(header) = header {
+                out.push(Line::styled(
+                    header.to_string(),
+                    Style::new().fg(palette::DIM),
+                ));
+            }
+            last_header = header;
+        }
+        let mut line = if row.available {
+            crate::grid::row(width, &format!("  {}", row.label), &row.value)
+        } else {
+            crate::grid::styled_row(
+                width,
+                &format!("  {}", row.label),
+                palette::FAINT,
+                &row.value,
+                palette::FAINT,
+            )
+        };
+        if first + offset == picker.selected && row.available {
+            // Selection inverts — the only highlight mechanism (SPEC §1).
+            for span in &mut line.spans {
+                span.style = Style::new()
+                    .fg(palette::SELECTION_FG)
+                    .bg(palette::SELECTION_BG);
+            }
+        }
+        out.push(line);
+    }
+    let below = total.saturating_sub(first + window.len());
+    if below > 0 {
         out.push(Line::styled(
-            format!("  {} {hidden} more", glyphs::PENDING),
+            format!("  {} {below} more", crate::glyphs::PENDING),
             Style::new().fg(palette::FAINT),
         ));
     }
@@ -232,7 +235,7 @@ mod tests {
         assert_eq!(text.len(), 1 + MAX_ROWS + 1);
         assert_eq!(
             text.last().unwrap(),
-            &format!("  {} 2 more", glyphs::PENDING)
+            &format!("  {} 2 more", crate::glyphs::PENDING)
         );
     }
 }

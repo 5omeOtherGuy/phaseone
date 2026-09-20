@@ -14,8 +14,9 @@ pub const FULL_BLOCK_MAX_LINES: usize = 40;
 /// A folded block shows this many head lines above its handle line.
 pub const FOLD_HEAD_LINES: usize = 8;
 
-/// A stable fold handle, e.g. `h-7c21`. Stable because it is a content hash:
-/// reopening the same output after a resume finds the same handle.
+/// A stable fold handle, e.g. `h-7c21ab90`. Stable because it is a content
+/// hash: reopening the same output after a resume finds the same handle.
+/// 32 bits: at 16 bits a few hundred folds collide by birthday (SPEC §9).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FoldId(pub String);
 
@@ -23,7 +24,7 @@ impl FoldId {
     pub fn of(content: &str) -> Self {
         let mut hasher = DefaultHasher::new();
         content.hash(&mut hasher);
-        Self(format!("h-{:04x}", hasher.finish() as u16))
+        Self(format!("h-{:08x}", hasher.finish() as u32))
     }
 }
 
@@ -89,7 +90,14 @@ mod tests {
         assert_eq!(*folded, 89 - FOLD_HEAD_LINES);
         // Stable: the same content hashes to the same handle.
         assert_eq!(*id, FoldId::of(&content));
-        assert_eq!(id.0.len(), "h-0000".len());
+        assert_eq!(id.0.len(), "h-00000000".len());
+    }
+
+    #[test]
+    fn handles_do_not_collide_at_session_scale() {
+        let ids: std::collections::HashSet<FoldId> =
+            (0..2_000).map(|n| FoldId::of(&n.to_string())).collect();
+        assert_eq!(ids.len(), 2_000);
     }
 
     #[test]

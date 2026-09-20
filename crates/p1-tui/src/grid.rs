@@ -10,6 +10,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::palette;
+use crate::wrap::{cell_width, fit_cells};
 
 /// One label/value row: `DIM label` left, `INK value` right-aligned to `width`
 /// (the SPEC §1 hierarchy rule applied at the grid rule's single call site).
@@ -29,7 +30,7 @@ pub fn styled_row(
     value_fg: Color,
 ) -> Line<'static> {
     let label = fit_label(width, label, value);
-    let pad = width.saturating_sub(label.chars().count() + value.chars().count());
+    let pad = width.saturating_sub(cell_width(&label) + cell_width(value));
     Line::from(vec![
         Span::styled(label, Style::new().fg(label_fg)),
         // The pad shares the label's colour so a "whole row FAINT" rule holds
@@ -53,8 +54,8 @@ pub fn counted_row(
     // Lay out as two nested grid rows: [label, count] on the inner stop, then
     // the value against the full width.
     let label = fit_label(stop, label, count);
-    let inner_pad = stop.saturating_sub(label.chars().count() + count.chars().count());
-    let outer_pad = width.saturating_sub(stop + value.chars().count());
+    let inner_pad = stop.saturating_sub(cell_width(&label) + cell_width(count));
+    let outer_pad = width.saturating_sub(stop + cell_width(value));
     Line::from(vec![
         Span::styled(label, Style::new().fg(palette::DIM)),
         Span::raw(" ".repeat(inner_pad)),
@@ -75,14 +76,14 @@ pub fn bar(cells: usize, fraction: f64) -> Vec<Span<'static>> {
     ]
 }
 
-/// Truncate `label` with `…` until `label + 1 space + value` fits `width`.
+/// Truncate `label` with `…` until `label + 1 space + value` fits `width`
+/// CELLS (display width — a wide char occupies two).
 fn fit_label(width: usize, label: &str, value: &str) -> String {
-    let room = width.saturating_sub(value.chars().count() + 1);
-    if label.chars().count() <= room {
+    let room = width.saturating_sub(cell_width(value) + 1);
+    if cell_width(label) <= room {
         return label.to_string();
     }
-    let keep = room.saturating_sub(1);
-    let mut out: String = label.chars().take(keep).collect();
+    let mut out = fit_cells(label, room.saturating_sub(1));
     out.push('…');
     out
 }
@@ -124,6 +125,9 @@ mod tests {
         let spans = bar(4, 0.5);
         assert_eq!(spans[0].content.as_ref(), "██");
         assert_eq!(spans[1].content.as_ref(), "██");
+        // The fill is carried by the STYLE (INK over RULE), not the glyph.
+        assert_eq!(spans[0].style.fg, Some(palette::INK));
+        assert_eq!(spans[1].style.fg, Some(palette::RULE));
         let spans = bar(4, 2.0);
         assert_eq!(spans[0].content.as_ref(), "████");
         assert_eq!(spans[1].content.as_ref(), "");

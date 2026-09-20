@@ -18,13 +18,11 @@ use crate::fold::{Fold, FoldId};
 pub enum Block {
     /// `›` operator input — the one marked turn.
     Operator { text: String },
-    /// Assistant prose, unadorned. Streams open; a response boundary closes.
-    Prose { lines: Vec<String>, open: bool },
-    /// Reasoning collapses to `· reasoning Ns`; `^R` expands. While streaming,
-    /// `open` holds the arriving lines.
+    /// Assistant prose, unadorned.
+    Prose { lines: Vec<String> },
+    /// Reasoning collapses to `· reasoning Ns`; `^R` expands.
     Reasoning {
         lines: Vec<String>,
-        open: bool,
         expanded: bool,
         elapsed_ms: Option<u64>,
     },
@@ -145,10 +143,7 @@ impl Transcript {
         let index = match self.open_text {
             Some(index) => index,
             None => {
-                self.blocks.push(Block::Prose {
-                    lines: Vec::new(),
-                    open: true,
-                });
+                self.blocks.push(Block::Prose { lines: Vec::new() });
                 self.open_text = Some(self.blocks.len() - 1);
                 self.blocks.len() - 1
             }
@@ -164,7 +159,6 @@ impl Transcript {
             None => {
                 self.blocks.push(Block::Reasoning {
                     lines: Vec::new(),
-                    open: true,
                     expanded: false,
                     elapsed_ms: None,
                 });
@@ -212,7 +206,7 @@ impl Transcript {
         row.status = status;
         row.elapsed_ms = elapsed_ms;
         if !content.is_empty() {
-            if let Some(Fold::Folded { id, .. }) = row.fold_for(content) {
+            if let Fold::Folded { id, .. } = Fold::present(content) {
                 self.latest_fold = Some(id.clone());
                 self.outputs.insert(id, content.to_string());
             }
@@ -252,14 +246,12 @@ impl Transcript {
                                 self.close_streams();
                                 self.blocks.push(Block::Prose {
                                     lines: text.lines().map(str::to_string).collect(),
-                                    open: false,
                                 });
                             }
                             AssistantBlock::Reasoning { text, .. } => {
                                 self.close_streams();
                                 self.blocks.push(Block::Reasoning {
                                     lines: text.lines().map(str::to_string).collect(),
-                                    open: false,
                                     expanded: false,
                                     elapsed_ms: None,
                                 });
@@ -292,25 +284,8 @@ impl Transcript {
     }
 
     fn close_streams(&mut self) {
-        for index in [self.open_text.take(), self.open_reasoning.take()]
-            .into_iter()
-            .flatten()
-        {
-            match &mut self.blocks[index] {
-                Block::Prose { open, .. } => *open = false,
-                Block::Reasoning { open, .. } => *open = false,
-                _ => {}
-            }
-        }
-    }
-}
-
-impl ToolRow {
-    fn fold_for(&self, output: &str) -> Option<Fold> {
-        match Fold::present(output) {
-            fold @ Fold::Folded { .. } => Some(fold),
-            Fold::Full { .. } => None,
-        }
+        self.open_text = None;
+        self.open_reasoning = None;
     }
 }
 
@@ -439,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn deltas_stream_into_one_open_prose_block() {
+    fn deltas_stream_into_one_prose_block_until_a_boundary() {
         let mut t = Transcript::new();
         t.apply(&AgentEvent::TextDelta { text: "hel".into() }, None);
         t.apply(
@@ -448,11 +423,26 @@ mod tests {
             },
             None,
         );
-        let [Block::Prose { lines, open }] = &t.blocks[..] else {
+        let [Block::Prose { lines }] = &t.blocks[..] else {
             panic!("one prose block");
         };
-        assert!(open);
         assert_eq!(lines, &["hello", "wor"]);
+        // A response boundary closes the stream: the next delta is a NEW block.
+        t.apply(
+            &AgentEvent::ResponseCompleted {
+                model: "m".into(),
+                stop: p1_contracts::StopReason::EndTurn,
+                usage: None,
+            },
+            None,
+        );
+        t.apply(
+            &AgentEvent::TextDelta {
+                text: "next".into(),
+            },
+            None,
+        );
+        assert_eq!(t.blocks.len(), 2);
     }
 
     #[test]
@@ -467,10 +457,10 @@ mod tests {
             },
             None,
         );
-        let [Block::Prose { open, .. }] = &t.blocks[..] else {
-            panic!("one prose block");
+        t.apply(&AgentEvent::TextDelta { text: "b".into() }, None);
+        let [Block::Prose { .. }, Block::Prose { .. }] = &t.blocks[..] else {
+            panic!("two prose blocks");
         };
-        assert!(!open);
     }
 
     #[test]
@@ -505,6 +495,38 @@ mod tests {
             panic!("one call row");
         };
         assert_eq!(row.fold(), None);
+    }
+
+    #[test]
+    fn toggle_reasoning_expands_and_collapses_the_last_block() {
+        let mut t = Transcript::new();
+        t.apply(&AgentEvent::ReasoningDelta { text: "why".into() }, None);
+        t.apply(
+            &AgentEvent::ResponseCompleted {
+                model: "m".into(),
+                stop: p1_contracts::StopReason::EndTurn,
+                usage: None,
+            },
+            None,
+        );
+        t.toggle_reasoning();
+        let [Block::Reasoning { expanded, .. }] = &t.blocks[..] else {
+            panic!("one reasoning block");
+        };
+        assert!(expanded);
+        t.toggle_reasoning();
+        let [Block::Reasoning { expanded, .. }] = &t.blocks[..] else {
+            panic!("one reasoning block");
+        };
+        assert!(!expanded);
+    }
+
+    #[test]
+    fn summarize_bounds_and_joins() {
+        assert_eq!(summarize_input("a\nb"), "a␤b");
+        assert_eq!(summarize_input(&"x".repeat(200)).chars().count(), 100);
+        assert_eq!(summarize_call("shell", r#"{"command":"ls -la"}"#), "ls -la");
+        assert_eq!(summarize_call("read", "not json"), "not json");
     }
 
     #[test]

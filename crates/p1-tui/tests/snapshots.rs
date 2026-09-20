@@ -16,7 +16,7 @@ use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
 /// Render one screen and return its cell rows, trailing spaces trimmed.
-fn render(screen: &Screen, width: u16, height: u16, now_ms: u64) -> Vec<String> {
+fn render(screen: &mut Screen, width: u16, height: u16, now_ms: u64) -> Vec<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -49,7 +49,7 @@ fn left(text: &[String], cols: usize) -> Vec<String> {
 }
 
 /// Every colour used anywhere on the screen, for the closed-palette law.
-fn colors_used(screen: &Screen, width: u16, height: u16) -> Vec<Color> {
+fn colors_used(screen: &mut Screen, width: u16, height: u16) -> Vec<Color> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -84,7 +84,7 @@ const ALLOWED: &[Color] = &[
     Color::Reset,
 ];
 
-fn assert_palette_law(screen: &Screen, width: u16, height: u16) {
+fn assert_palette_law(screen: &mut Screen, width: u16, height: u16) {
     let used = colors_used(screen, width, height);
     for color in &used {
         assert!(
@@ -119,6 +119,8 @@ fn done(id: &str, name: &str, status: ToolStatus, content: &str) -> AgentEvent {
 /// calls, one running.
 fn streaming_screen() -> Screen {
     let mut s = Screen::new(true);
+    s.env = "ask".into();
+    s.route = "claude".into();
     s.transcript
         .operator("why does compaction stall at the turn edge?");
     s.apply(
@@ -158,9 +160,9 @@ fn streaming_screen() -> Screen {
 
 #[test]
 fn streaming_at_120x40() {
-    let s = streaming_screen();
-    let text = left(&render(&s, 120, 40, 11_400), 80);
-    assert_palette_law(&s, 120, 40);
+    let mut s = streaming_screen();
+    let text = left(&render(&mut s, 120, 40, 11_400), 80);
+    assert_palette_law(&mut s, 120, 40);
     assert_eq!(text[0], "› why does compaction stall at the turn edge?");
     assert!(text[1].starts_with("· reasoning"));
     assert!(text[1].ends_with("^R expand"));
@@ -179,9 +181,9 @@ fn streaming_at_120x40() {
 
 #[test]
 fn streaming_at_80x24_collapses_the_pane() {
-    let s = streaming_screen();
-    let text = render(&s, 80, 24, 11_400);
-    assert_palette_law(&s, 80, 24);
+    let mut s = streaming_screen();
+    let text = render(&mut s, 80, 24, 11_400);
+    assert_palette_law(&mut s, 80, 24);
     // Newest rows stay visible; the pane is gone and the floor line appears.
     assert!(text[21].starts_with('›'));
     assert_eq!(
@@ -208,8 +210,8 @@ fn idle_screen_affordances() {
             "  /goal       set the session objective".into(),
         ],
     });
-    let text = left(&render(&s, 120, 40, 0), 80);
-    assert_palette_law(&s, 120, 40);
+    let text = left(&render(&mut s, 120, 40, 0), 80);
+    assert_palette_law(&mut s, 120, 40);
     assert_eq!(text[0], "p1 0.1.0   ~/dev/phaseone   main");
     assert_eq!(text[2], "  no journal in this directory.");
     assert_eq!(text[4], "  /resume     reopen a previous session");
@@ -232,8 +234,8 @@ fn fold_block_screen() {
         },
         11_400,
     );
-    let full = render(&s, 120, 40, 12_000);
-    assert_palette_law(&s, 120, 40);
+    let full = render(&mut s, 120, 40, 12_000);
+    assert_palette_law(&mut s, 120, 40);
     // The failure promoted a PEEK banner over the ledger (SPEC §5).
     assert!(full[0].contains("shell failed"));
     let text = left(&full, 80);
@@ -267,15 +269,15 @@ fn diff_review_blocks_full_width() {
         ],
         grantable: true,
     }));
-    let text = render(&s, 120, 40, 0);
-    assert_palette_law(&s, 120, 40);
+    let text = render(&mut s, 120, 40, 0);
+    assert_palette_law(&mut s, 120, 40);
     assert!(text[0].starts_with("! edit      p1-context/src/edge.rs"));
     assert!(text[0].ends_with("1 of 3 files"));
     assert!(text[3].starts_with(" 410"));
     assert!(text[4].contains('−'));
     assert!(text[5].contains('+'));
-    assert!(text[7].contains("y  allow once"));
-    assert!(text[8].contains("^D next file   ^A all files"));
+    assert!(text[38].contains("y  allow once"));
+    assert!(text[39].contains("^D next file   ^A all files"));
 }
 
 #[test]
@@ -290,11 +292,13 @@ fn permission_prompt_with_destructive_floor() {
         ],
         grantable: false,
     }));
-    let text = render(&s, 120, 40, 0);
-    assert_palette_law(&s, 120, 40);
+    let text = render(&mut s, 120, 40, 0);
+    assert_palette_law(&mut s, 120, 40);
     assert_eq!(text[0], "  rm -rf target/");
-    assert!(text[6].contains("y  allow once"));
-    assert!(text[7].contains("not grantable — destructive floor"));
+    // Decision keys pinned at the bottom; grant rows greyed above them.
+    assert!(text[37].contains("y  allow once"));
+    assert!(text[38].contains("not grantable — destructive floor"));
+    assert!(text[39].contains("not grantable — destructive floor"));
 }
 
 #[test]
@@ -324,8 +328,8 @@ fn picker_and_status_overlays_dock_above_the_composer() {
         filter: String::new(),
         selected: 0,
     });
-    let text = left(&render(&s, 120, 40, 0), 80);
-    assert_palette_law(&s, 120, 40);
+    let text = left(&render(&mut s, 120, 40, 0), 80);
+    assert_palette_law(&mut s, 120, 40);
     assert_eq!(text[1], "ANTHROPIC ROUTE");
     assert!(text[2].contains("claude · sonnet-4.5"));
     assert!(text[4].contains("quota exhausted"));
@@ -345,7 +349,7 @@ fn a_failure_states_what_broke_without_a_banner() {
         },
         0,
     );
-    let text = left(&render(&s, 120, 40, 0), 80);
+    let text = left(&render(&mut s, 120, 40, 0), 80);
     assert_eq!(text[0], "provider failed: Transport: connection dropped");
 }
 
@@ -354,8 +358,8 @@ fn every_state_reads_with_colour_stripped() {
     // The monochrome-legibility rule (SPEC §2/§8): with all styles stripped —
     // which is exactly what the text snapshots above are — the glyphs must
     // still carry the state. This test pins the glyph per state.
-    let s = streaming_screen();
-    let text = render(&s, 120, 40, 0);
+    let mut s = streaming_screen();
+    let text = render(&mut s, 120, 40, 0);
     assert!(text.iter().any(|l| l.starts_with('›')), "operator turn");
     assert!(text.iter().any(|l| l.starts_with('✓')), "settled call");
     assert!(text.iter().any(|l| l.starts_with('▸')), "running call");
@@ -364,6 +368,52 @@ fn every_state_reads_with_colour_stripped() {
         "working indicator"
     );
     assert!(text.iter().any(|l| l.starts_with('·')), "folded reasoning");
+}
+
+#[test]
+fn every_screen_renders_at_the_80x24_floor_without_overflow() {
+    // The floor law (§6): same glyphs, same shapes, nothing overflows — and
+    // nothing panics when the composer or an approval nearly fills the screen.
+    for mut s in [
+        streaming_screen(),
+        {
+            let mut s = Screen::new(true);
+            s.approval = Some(Approval::Diff(p1_tui::render::diff::DiffView {
+                tool: "edit".into(),
+                file: "src/x.rs".into(),
+                summary: "replace exact string · once".into(),
+                position: (1, 1),
+                rows: (0..40)
+                    .map(|n| p1_tui::render::diff::DiffRow::Add {
+                        line: n,
+                        text: format!("line {n}"),
+                    })
+                    .collect(),
+                grantable: true,
+            }));
+            s
+        },
+        {
+            let mut s = Screen::new(true);
+            s.approval = Some(Approval::Permission(
+                p1_tui::render::permission::PermissionView {
+                    command: "rm -rf target/".into(),
+                    rows: vec![("cwd".into(), "~/dev".into())],
+                    grantable: false,
+                },
+            ));
+            s
+        },
+    ] {
+        let text = render(&mut s, 80, 24, 0);
+        assert_palette_law(&mut s, 80, 24);
+        assert_eq!(text.len(), 24);
+        // A diff review's decision keys are ALWAYS on screen at the floor.
+        if s.approval.is_some() {
+            let tail = text[20..].join("\n");
+            assert!(tail.contains("allow once"), "decision keys visible: {tail}");
+        }
+    }
 }
 
 #[test]
@@ -376,14 +426,14 @@ fn output_pane_opens_the_fold_handle() {
         lines: content.lines().map(str::to_string).collect(),
         scroll: 0,
     });
-    let text = render(&s, 120, 40, 0);
-    assert_palette_law(&s, 120, 40);
+    let text = render(&mut s, 120, 40, 0);
+    assert_palette_law(&mut s, 120, 40);
     // The pane header names the handle; the body starts at the top.
     assert!(text[0].contains(&format!("OUTPUT [{}]", id)));
     assert!(text[1].contains("output line 0"));
     // Up/Down scroll the pane.
     s.scroll_output_by(10);
-    let text = render(&s, 120, 40, 0);
+    let text = render(&mut s, 120, 40, 0);
     assert!(text[1].contains("output line 10"));
 }
 
@@ -391,15 +441,15 @@ fn output_pane_opens_the_fold_handle() {
 fn pane_width_cycling_changes_the_layout() {
     let mut s = Screen::new(true);
     s.goal = Some("fix compaction boundary stall".into());
-    let wide = render(&s, 120, 40, 0);
+    let wide = render(&mut s, 120, 40, 0);
     // Default 40ch pane: the ledger sits at the right.
     assert!(wide[0].contains("GOAL"));
     s.cycle_width(); // 56
-    let wider = render(&s, 120, 40, 0);
+    let wider = render(&mut s, 120, 40, 0);
     assert!(wider[0].contains("GOAL"));
     s.cycle_width(); // split
     s.cycle_width(); // off
-    let off = render(&s, 120, 40, 0);
+    let off = render(&mut s, 120, 40, 0);
     assert!(!off[0].contains("GOAL"));
     assert_eq!(s.pane_width, PaneWidth::Off);
 }

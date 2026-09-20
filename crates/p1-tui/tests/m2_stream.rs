@@ -10,7 +10,7 @@ use p1_tui::state::Screen;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-fn render(screen: &Screen, width: u16, height: u16, now_ms: u64) -> Vec<String> {
+fn render(screen: &mut Screen, width: u16, height: u16, now_ms: u64) -> Vec<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -131,22 +131,30 @@ fn play(screen: &mut Screen, script: &[(u64, AgentEvent)], upto: u64) {
 fn mid_stream_working_indicator_and_running_call() {
     let mut s = Screen::new(false);
     play(&mut s, &script(), 4_100);
-    let text = render(&s, 120, 40, 5_000);
+    let text = render(&mut s, 120, 40, 5_000);
     // Reasoning is collapsed; the working indicator runs on its own line.
     assert!(text.iter().any(|l| l.contains("· reasoning")));
     assert!(text.iter().any(|l| l.starts_with("▪▪▪ shell")));
     // The running call row has no result yet.
     assert!(text.iter().any(|l| l.starts_with("▸ shell")));
-    // The LED chase is alive: at t=5000 the cells are not uniformly lit.
-    let working_row = text.iter().position(|l| l.starts_with("▪▪▪")).unwrap();
-    let _ = working_row;
+    // The LED chase is alive: the same cell's brightness differs between two
+    // fake times (0 = floor, 275 = cell 0's peak).
+    let styled_early =
+        p1_tui::render::transcript::lines(&s.transcript, 80, Some("shell"), 0, false);
+    let styled_later =
+        p1_tui::render::transcript::lines(&s.transcript, 80, Some("shell"), 275, false);
+    let last = styled_early.len() - 1;
+    assert_ne!(
+        styled_early[last].spans[0].style.fg, styled_later[last].spans[0].style.fg,
+        "the chase cell changes brightness between fake times"
+    );
 }
 
 #[test]
 fn after_failure_the_evidence_block_and_peek_show() {
     let mut s = Screen::new(true);
     play(&mut s, &script(), 15_500);
-    let text = render(&s, 120, 40, 15_600);
+    let text = render(&mut s, 120, 40, 15_600);
     assert!(text.iter().any(|l| l.starts_with("✗ shell")));
     assert!(text.iter().any(|l| l.contains("more lines folded → [h-")));
     // The failure promoted a peek over the ledger…
@@ -163,7 +171,7 @@ fn the_turn_settles_with_spend_totals() {
     assert!(s.working.is_none());
     assert_eq!(s.spend.input, Some(24_400));
     assert_eq!(s.spend.cost_micro_usd, Some(3_400));
-    let text = render(&s, 120, 40, 16_600);
+    let text = render(&mut s, 120, 40, 16_600);
     assert!(text.iter().any(|l| l.contains("Confirmed.")));
     assert_eq!(text[39], "⏎ send   ⌥⏎ newline   ^C quit");
 }
@@ -174,7 +182,7 @@ fn queued_inputs_are_visible_above_the_hints() {
     play(&mut s, &script(), 4_100);
     s.queue(false, "also check the wrap boundary".into());
     s.queue(true, "then summarize".into());
-    let text = render(&s, 120, 40, 5_000);
+    let text = render(&mut s, 120, 40, 5_000);
     assert!(
         text.iter()
             .any(|l| l.contains("· steering: also check the wrap boundary"))
@@ -189,7 +197,7 @@ fn queued_inputs_are_visible_above_the_hints() {
 fn the_80_column_floor_keeps_everything_readable() {
     let mut s = Screen::new(true);
     play(&mut s, &script(), 16_600);
-    let text = render(&s, 80, 24, 16_600);
+    let text = render(&mut s, 80, 24, 16_600);
     // Same glyphs, same shapes — nothing reflows into a different shape (§6).
     assert!(
         text.iter()
@@ -202,13 +210,24 @@ fn the_80_column_floor_keeps_everything_readable() {
 }
 
 #[test]
-fn scrolling_reaches_back_and_new_output_repins() {
+fn scrolling_reaches_back_and_new_output_never_yanks_the_view() {
     let mut s = Screen::new(true);
     play(&mut s, &script(), 16_600);
-    s.scroll_by(10);
-    let text = render(&s, 80, 24, 16_600);
-    // Scrolled up: the composer stays, the transcript shows earlier rows.
+    // A small transcript area so the content overflows it.
+    render(&mut s, 80, 8, 16_600); // records last_rendered
+    s.scroll_by(6);
+    let text = render(&mut s, 80, 8, 16_600);
     assert!(text.iter().any(|l| l.contains("the summary is held.")));
+    // New output while scrolled: the view does NOT snap to the tail.
     s.apply(&AgentEvent::TextDelta { text: "new".into() }, 17_000);
-    assert_eq!(s.scroll, 0);
+    assert!(s.scroll_top.is_some());
+    let text = render(&mut s, 80, 8, 17_000);
+    assert!(!text.iter().any(|l| l == "new"));
+    // Over-scrolling past the top clamps: the oldest row stays visible.
+    s.scroll_by(10_000);
+    let text = render(&mut s, 80, 8, 17_000);
+    assert!(text[0].starts_with("· reasoning"));
+    // Scrolling back down releases the pin to the live tail.
+    s.scroll_by(-10_000);
+    assert_eq!(s.scroll_top, None);
 }

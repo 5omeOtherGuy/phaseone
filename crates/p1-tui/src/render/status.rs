@@ -27,7 +27,9 @@ pub struct StatusRow {
 }
 
 pub fn lines(groups: &[StatusGroup], width: usize) -> Vec<Line<'static>> {
-    let grid = width.clamp(STATUS_GRID, STATUS_GRID_MAX);
+    // Widen up to 60 for long values; below 40 the grid follows the
+    // transcript (a narrow overlay beats clipped values).
+    let grid = width.min(STATUS_GRID_MAX);
     let mut out = Vec::new();
     for (n, group) in groups.iter().enumerate() {
         if n > 0 {

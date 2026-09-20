@@ -35,8 +35,10 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             route: "claude".into(),
             model: "sonnet-4.5".into(),
             workspace: std::env::current_dir().unwrap(),
+            sandbox: "off".into(),
             policy: Arc::new(policy),
-            pending_auth: None,
+            pending_auth: VecDeque::new(),
+            pinned_by_approval: false,
             follow_ups: VecDeque::new(),
             submit_pending: None,
             worker_rows: Arc::new(Mutex::new(Vec::new())),
@@ -75,7 +77,7 @@ fn slash_exit_quits_and_focus_toggles() {
         d.on_key(key(KeyCode::Char(c)));
     }
     d.on_key(key(KeyCode::Enter));
-    assert!(d.screen.focus);
+    assert_eq!(d.screen.focus_explicit, Some(true));
     assert_eq!(d.submit_pending, None);
     for c in "/exit".chars() {
         d.on_key(key(KeyCode::Char(c)));
@@ -86,7 +88,7 @@ fn slash_exit_quits_and_focus_toggles() {
 
 #[test]
 fn enter_while_working_queues_steering_to_the_inbox() {
-    let (mut d, _auth) = driver();
+    let (mut d, agent) = driver_with_agent();
     d.screen.working = Some(p1_tui::state::Working {
         label: "shell".into(),
         started_ms: 0,
@@ -98,6 +100,66 @@ fn enter_while_working_queues_steering_to_the_inbox() {
     assert_eq!(d.submit_pending, None, "steering never starts a turn");
     assert_eq!(d.screen.queued.len(), 1);
     assert_eq!(d.screen.queued[0].text, "use vecdeque");
+    // The steering actually reached the agent's inbox (the earlier version of
+    // this test dropped the agent and never noticed the send failing).
+    assert!(agent.has_pending_inbox());
+}
+
+/// A driver plus the agent whose inbox handle it holds.
+fn driver_with_agent() -> (Driver, Agent) {
+    let (mut d, _auth) = driver();
+    let agent = Agent::new(p1_core::AgentParts {
+        provider: Arc::new(p1_testkit::ScriptedProvider::new(vec![])),
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(crate::policy::HostPolicy::new(
+            false,
+            false,
+            Arc::new(crate::StdinLines::new()),
+            Arc::new(std::sync::Mutex::new(Box::new(std::io::sink()))),
+            CancellationToken::new(),
+        )),
+        journal: Arc::new(p1_journal::MemoryJournal::new()),
+        events: Arc::new(p1_tui::runtime::TuiSink::new().0),
+    })
+    .expect("agent builds");
+    d.inbox = agent.inbox();
+    (d, agent)
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_denies_its_parked_approval() {
+    let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
+    let turn = CancellationToken::new();
+    policy.set_turn(Some(turn.clone()));
+    let call = p1_contracts::ToolCall {
+        call_id: "c1".into(),
+        name: "shell".into(),
+        input: p1_contracts::ToolInput::Json("{}".into()),
+    };
+    let identity = p1_contracts::ToolIdentity {
+        implementation: "shell".into(),
+        variant: String::new(),
+    };
+    let pending = tokio::spawn(async move {
+        policy
+            .authorize(p1_contracts::AuthorizationRequest {
+                call: &call,
+                identity: &identity,
+                effect: p1_contracts::Effect::Executes,
+            })
+            .await
+    });
+    let _request = auth_rx.recv().await.unwrap();
+    turn.cancel();
+    assert_eq!(
+        pending.await.unwrap(),
+        Decision::Deny {
+            reason: p1_tui::runtime::CANCEL_DENY.into()
+        }
+    );
 }
 
 #[test]

@@ -20,18 +20,43 @@ const PANE_PAD: usize = 4;
 
 /// Draw the whole screen. `now_ms` drives the working indicator; callers pass
 /// a fake clock in tests.
-pub fn draw(screen: &Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
+pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     fill_bg(area, buf, palette::GROUND);
 
     // A pending approval owns the screen: full width, pane hidden (SPEC §4.4).
+    // The decision footer is pinned to the bottom rows — a tall diff must
+    // never push the decision keys off-screen.
     if let Some(approval) = &screen.approval {
-        let lines = match approval {
-            crate::state::Approval::Diff(view) => diff::lines(view, area.width as usize),
+        let (lines, head_rows, foot_rows) = match approval {
+            crate::state::Approval::Diff(view) => (diff::lines(view, area.width as usize), 3, 2),
             crate::state::Approval::Permission(view) => {
-                permission::lines(view, area.width as usize)
+                let foot = if view.grantable { 1 } else { 3 };
+                (permission::lines(view, area.width as usize), 2, foot)
             }
         };
-        draw_lines(&lines, area, buf, palette::GROUND);
+        let foot_area = Rect {
+            y: area.y + area.height.saturating_sub(foot_rows as u16),
+            height: foot_rows as u16,
+            ..area
+        };
+        draw_lines(&lines[..head_rows.min(lines.len())], area, buf);
+        draw_lines(
+            &lines[lines.len().saturating_sub(foot_rows)..],
+            foot_area,
+            buf,
+        );
+        // The body: clipped between header and footer, newest rows win when
+        // it overflows (the change itself matters more than its context).
+        let body = &lines[head_rows.min(lines.len())..lines.len().saturating_sub(foot_rows)];
+        let body_area = Rect {
+            y: area.y + head_rows as u16,
+            height: area
+                .height
+                .saturating_sub(head_rows as u16 + foot_rows as u16),
+            ..area
+        };
+        let skip = body.len().saturating_sub(body_area.height as usize);
+        draw_lines(&body[skip..], body_area, buf);
         return;
     }
 
@@ -57,12 +82,28 @@ pub fn draw(screen: &Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     };
     if (area.width as usize) < PANE_FLOOR_COLS && pane_cols.is_none() && !screen.ledger_overlay {
         // §6: the one bottom-of-screen line, only when the ledger is gone.
+        let context = screen
+            .spend
+            .input
+            .map(super::tokens)
+            .unwrap_or_else(|| super::UNKNOWN.into());
         composer_lines.push(composer::floor_line(
-            "ask",
-            "claude",
-            "—",
+            &screen.env,
+            &screen.route,
+            &context,
             area.width as usize,
         ));
+    }
+    // The composer never eats the screen: at most a third, keeping the
+    // newest input rows and always the hint line (a paste of 2 KB must not
+    // push the transcript area to zero — that panicked the buffer).
+    let cap = ((area.height as usize) / 3)
+        .max(2)
+        .min(area.height as usize);
+    if composer_lines.len() > cap {
+        let hints = composer_lines.pop();
+        composer_lines.truncate(cap - 1);
+        composer_lines.extend(hints);
     }
     let composer_height = composer_lines.len() as u16;
 
@@ -91,7 +132,9 @@ pub fn draw(screen: &Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
         body.push(Line::default());
         body.extend(status::lines(groups, transcript_area.width as usize));
     }
-    draw_lines_bottom(&body, transcript_area, buf, palette::GROUND, screen.scroll);
+    // Record the rendered shape for the scroll math (state.rs scroll_by).
+    screen.last_rendered = (body.len(), transcript_area.height as usize);
+    draw_lines_bottom(&body, transcript_area, buf, screen.scroll_top);
 
     let composer_area = Rect {
         x: area.x,
@@ -99,16 +142,16 @@ pub fn draw(screen: &Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
         width: area.width - pane_cols.unwrap_or(0) as u16,
         height: composer_height,
     };
-    draw_lines(&composer_lines, composer_area, buf, palette::GROUND);
+    draw_lines(&composer_lines, composer_area, buf);
 
     if let Some(cols) = pane_cols {
-        draw_pane(screen, area, buf, cols, now_ms);
+        draw_pane(screen, area, buf, cols);
     }
 }
 
 /// The right pane: BLOCK background, content on its inner grid, PEEK banner
 /// on BLOCK+ when promoted (SPEC §5).
-fn draw_pane(screen: &Screen, area: Rect, buf: &mut Buffer, cols: usize, _now_ms: u64) {
+fn draw_pane(screen: &Screen, area: Rect, buf: &mut Buffer, cols: usize) {
     let pane = Rect {
         x: area.x + area.width - cols as u16,
         y: area.y,
@@ -133,10 +176,13 @@ fn draw_pane(screen: &Screen, area: Rect, buf: &mut Buffer, cols: usize, _now_ms
         // DIFF lands with its pane mode; the pane still earns its place.
         _ => vec![],
     };
-    draw_lines(&lines, content, buf, palette::BLOCK);
+    draw_lines(&lines, content, buf);
     // PEEK: a two-line banner on BLOCK+ drawn OVER the ledger's top rows —
-    // the ledger underneath does not move (SPEC §5).
-    if let Promotion::Peek { lines: peek, .. } = &screen.promotion {
+    // the ledger underneath does not move (SPEC §5). Only over the ledger:
+    // a banner must never stamp over an open OUTPUT or WORKERS pane.
+    if let Promotion::Peek { lines: peek, .. } = &screen.promotion
+        && screen.pane_mode == PaneMode::Ledger
+    {
         for (n, line) in peek.iter().enumerate() {
             let y = content.y + n as u16;
             if y >= content.bottom() {
@@ -155,7 +201,6 @@ fn draw_pane(screen: &Screen, area: Rect, buf: &mut Buffer, cols: usize, _now_ms
                     ..content
                 },
                 buf,
-                palette::BLOCK_PLUS,
             );
         }
     }
@@ -171,7 +216,7 @@ fn fill_bg(area: Rect, buf: &mut Buffer, bg: ratatui::style::Color) {
 }
 
 /// Draw lines top-down, clipping at the area bottom.
-fn draw_lines(lines: &[Line<'static>], area: Rect, buf: &mut Buffer, bg: ratatui::style::Color) {
+fn draw_lines(lines: &[Line<'static>], area: Rect, buf: &mut Buffer) {
     for (n, line) in lines.iter().enumerate() {
         let y = area.y + n as u16;
         if y >= area.bottom() {
@@ -179,8 +224,6 @@ fn draw_lines(lines: &[Line<'static>], area: Rect, buf: &mut Buffer, bg: ratatui
         }
         buf.set_line(area.x, y, line, area.width);
     }
-    // Lines narrower than the area still sit on the region's background.
-    let _ = bg;
 }
 
 /// Draw the transcript: top-aligned while it fits (the conversation grows
@@ -189,13 +232,14 @@ fn draw_lines_bottom(
     lines: &[Line<'static>],
     area: Rect,
     buf: &mut Buffer,
-    bg: ratatui::style::Color,
-    scroll: usize,
+    scroll_top: Option<usize>,
 ) {
     let fits = area.height as usize;
-    let start = lines.len().saturating_sub(fits + scroll);
-    let end = lines.len().saturating_sub(scroll).max(start);
-    draw_lines(&lines[start..end], area, buf, bg);
+    let start = scroll_top
+        .unwrap_or_else(|| lines.len().saturating_sub(fits))
+        .min(lines.len().saturating_sub(fits));
+    let end = (start + fits).min(lines.len());
+    draw_lines(&lines[start..end], area, buf);
 }
 
 /// Cut a banner line at the grid edge with `…` — a hard cut mid-word reads as
