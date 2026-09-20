@@ -281,6 +281,7 @@ fn sample_records() -> Vec<JournalRecord> {
                     },
                     Item::Assistant(assistant),
                 ],
+                usage: None,
             },
         },
     ]

@@ -750,6 +750,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-context"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "p1-contracts",
+ "p1-core",
+ "p1-journal",
+ "p1-testkit",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "p1-contracts"
 version = "0.0.1"
 dependencies = [
@@ -777,6 +790,7 @@ name = "p1-host"
 version = "0.0.1"
 dependencies = [
  "p1-assembly",
+ "p1-context",
  "p1-contracts",
  "p1-core",
  "p1-journal",

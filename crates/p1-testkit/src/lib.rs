@@ -11,10 +11,10 @@ use std::task::{Context, Poll};
 use p1_contracts::{
     AgentEvent, AssistantBlock, AssistantItem, AuthorizationPolicy, AuthorizationRequest,
     BoxFuture, CancellationToken, CommitError, CommitSink, CompletedResponse, ContextError,
-    ContextPolicy, Decision, DeclarationKind, Effect, EventSink, Item, JournalRecord, Origin,
-    Outcome, Provider, ProviderError, ProviderRequest, ProviderStream, RouteDescription,
-    StopReason, StreamEvent, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput,
-    ToolOutcome, Usage,
+    ContextInput, ContextPolicy, Decision, DeclarationKind, Effect, EventSink, Item, JournalRecord,
+    Origin, Outcome, Prepared, Provider, ProviderError, ProviderRequest, ProviderStream,
+    RouteDescription, StopReason, StreamEvent, Tool, ToolCall, ToolContext, ToolDeclaration,
+    ToolIdentity, ToolInput, ToolOutcome, Usage,
 };
 use tokio::sync::Notify;
 
@@ -468,8 +468,8 @@ pub struct PassthroughContext;
 impl ContextPolicy for PassthroughContext {
     fn prepare<'a>(
         &'a self,
-        _history: &'a [Item],
-    ) -> BoxFuture<'a, Result<Option<Vec<Item>>, ContextError>> {
+        _input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Option<Prepared>, ContextError>> {
         Box::pin(async { Ok(None) })
     }
 }
@@ -480,6 +480,8 @@ impl ContextPolicy for PassthroughContext {
 pub struct ReplacingContext {
     pub when_longer_than: usize,
     pub replacement: Vec<Item>,
+    /// What the replacement is reported to have cost; `None` = unknown.
+    pub usage: Option<Usage>,
     fail: bool,
 }
 
@@ -488,6 +490,7 @@ impl ReplacingContext {
         Self {
             when_longer_than,
             replacement,
+            usage: None,
             fail: false,
         }
     }
@@ -496,24 +499,82 @@ impl ReplacingContext {
         Self {
             when_longer_than: 0,
             replacement: Vec::new(),
+            usage: None,
             fail: true,
         }
+    }
+
+    /// Report a usage for the replacement (the cost of preparing it).
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
     }
 }
 
 impl ContextPolicy for ReplacingContext {
     fn prepare<'a>(
         &'a self,
-        history: &'a [Item],
-    ) -> BoxFuture<'a, Result<Option<Vec<Item>>, ContextError>> {
+        input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Option<Prepared>, ContextError>> {
         Box::pin(async move {
             if self.fail {
-                return Err(ContextError("scripted context failure".into()));
+                return Err(ContextError::Failed("scripted context failure".into()));
             }
-            if history.len() > self.when_longer_than {
-                Ok(Some(self.replacement.clone()))
+            if input.history.len() > self.when_longer_than {
+                Ok(Some(Prepared {
+                    items: self.replacement.clone(),
+                    usage: self.usage,
+                }))
             } else {
                 Ok(None)
+            }
+        })
+    }
+}
+
+/// A context policy that signals `started` and then waits for `release`. If the
+/// turn's `cancel` fires first it returns `Err(ContextError::Cancelled)`, exactly
+/// as a real summarizer must when its request is abandoned.
+#[derive(Clone)]
+pub struct GatedContext {
+    /// Notified when a preparation has begun.
+    pub started: Arc<Notify>,
+    /// Notify this to let a waiting preparation return its replacement.
+    pub release: Arc<Notify>,
+    replacement: Vec<Item>,
+    usage: Option<Usage>,
+}
+
+impl GatedContext {
+    pub fn new(replacement: Vec<Item>) -> Self {
+        Self {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            replacement,
+            usage: None,
+        }
+    }
+
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+}
+
+impl ContextPolicy for GatedContext {
+    fn prepare<'a>(
+        &'a self,
+        input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Option<Prepared>, ContextError>> {
+        Box::pin(async move {
+            self.started.notify_one();
+            tokio::select! {
+                biased;
+                _ = input.cancel.cancelled() => Err(ContextError::Cancelled),
+                _ = self.release.notified() => Ok(Some(Prepared {
+                    items: self.replacement.clone(),
+                    usage: self.usage,
+                })),
             }
         })
     }

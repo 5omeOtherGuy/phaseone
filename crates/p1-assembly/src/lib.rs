@@ -37,6 +37,10 @@ use serde::{Deserialize, Serialize};
 const ENVIRONMENT_FILE: &str = "environment.toml";
 /// Prompt file name inside an environment directory. Not configurable in this slice.
 const PROMPT_FILE: &str = "prompt.md";
+/// Optional whole-file override of the summarizer prompt, next to `prompt.md`.
+const SUMMARIZE_FILE: &str = "summarize.md";
+/// Default per-tool-result budget for the summarizer transcript.
+const DEFAULT_TOOL_RESULT_EXCERPT_CHARS: usize = 2_000;
 
 // ------------------------------------------------------------------ public API
 
@@ -52,6 +56,64 @@ pub struct EnvironmentFile {
     pub options: ModelOptions,
     pub tools: Vec<ToolSpec>,
     pub prompt_template: String,
+    /// The validated `[context]` table, when the environment has one.
+    pub context: Option<ContextSettings>,
+    /// The raw `summarize.md` override, when present.
+    pub summarize_prompt: Option<String>,
+}
+
+/// The optional `[context]` table of an environment file, already validated.
+/// Plain data: `p1-assembly` names no context module and does not depend on one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSettings {
+    /// Capacity of this model on this route.
+    pub window_tokens: u64,
+    /// Reserved for the next response.
+    pub output_headroom_tokens: u64,
+    /// The useful point: where summarizing starts. Below `window - headroom`.
+    pub summarize_at_tokens: u64,
+    /// Newest part of the history kept verbatim.
+    pub keep_recent_tokens: u64,
+    /// Budget for user messages kept verbatim.
+    pub user_verbatim_tokens: u64,
+    /// Per tool result, when rendered for the summarizer.
+    #[serde(default = "default_tool_result_excerpt_chars")]
+    pub tool_result_excerpt_chars: usize,
+}
+
+fn default_tool_result_excerpt_chars() -> usize {
+    DEFAULT_TOOL_RESULT_EXCERPT_CHARS
+}
+
+impl ContextSettings {
+    /// The checks `load_environment` enforces before an agent is built.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("window_tokens", self.window_tokens),
+            ("output_headroom_tokens", self.output_headroom_tokens),
+            ("summarize_at_tokens", self.summarize_at_tokens),
+            ("keep_recent_tokens", self.keep_recent_tokens),
+            ("user_verbatim_tokens", self.user_verbatim_tokens),
+        ] {
+            if value == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+        }
+        if self.tool_result_excerpt_chars == 0 {
+            return Err("tool_result_excerpt_chars must be greater than zero".to_string());
+        }
+        let wall = self
+            .window_tokens
+            .saturating_sub(self.output_headroom_tokens);
+        if self.summarize_at_tokens >= wall {
+            return Err(format!(
+                "summarize_at_tokens ({}) must be below window_tokens - output_headroom_tokens ({wall})",
+                self.summarize_at_tokens
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One `[[tools]]` entry: a catalog key plus the optional per-agent face override.
@@ -171,6 +233,13 @@ pub struct ResolvedEnvironment {
     pub system_prompt: String,
     pub tools: Vec<ResolvedTool>,
     pub options: ModelOptions,
+    /// The effective context-control table, or absent when the environment does
+    /// not opt in (passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextSettings>,
+    /// The `summarize.md` override, or absent when the compiled-in prompt is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summarize_prompt: Option<String>,
 }
 
 /// One assembled tool: the catalog key, what the model is told, and the stable
@@ -222,6 +291,8 @@ pub enum AssemblyError {
     ToolNotInEnvironment { module: String },
     #[error("provider rejected the assembled environment: {0}")]
     ProviderRejected(ProviderError),
+    #[error("invalid [context] configuration: {message}")]
+    InvalidContext { message: String },
     #[error("invalid workspace: {message}")]
     InvalidWorkspace { message: String },
 }
@@ -270,6 +341,40 @@ pub fn load_environment(
         }
     })?;
 
+    // The `[context]` table and its `summarize.md` override are parsed and checked
+    // here, next to the files they came from, so an invalid one fails before an
+    // agent is built. `p1-assembly` names no context module: this is plain data.
+    let context = match parsed.context {
+        Some(settings) => {
+            settings
+                .validate()
+                .map_err(|message| AssemblyError::InvalidContext {
+                    message: format!("{}: {message}", path.display()),
+                })?;
+            Some(settings)
+        }
+        None => None,
+    };
+    let summarize_path = dir.join(SUMMARIZE_FILE);
+    let summarize_prompt = match std::fs::read_to_string(&summarize_path) {
+        Ok(text) if text.trim().is_empty() => {
+            return Err(AssemblyError::InvalidContext {
+                message: format!(
+                    "{}: the summarizer prompt is empty",
+                    summarize_path.display()
+                ),
+            });
+        }
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(AssemblyError::InvalidEnvironmentFile {
+                path: summarize_path,
+                message: error.to_string(),
+            });
+        }
+    };
+
     let mut tools = Vec::with_capacity(parsed.tools.len());
     for tool in parsed.tools {
         let description = match &tool.description_file {
@@ -301,6 +406,8 @@ pub fn load_environment(
         options: parsed.options.into(),
         tools,
         prompt_template,
+        context,
+        summarize_prompt,
     })
 }
 
@@ -314,6 +421,8 @@ struct EnvironmentToml {
     model: String,
     #[serde(default)]
     options: OptionsToml,
+    #[serde(default)]
+    context: Option<ContextSettings>,
     #[serde(default)]
     tools: Vec<ToolToml>,
 }
@@ -463,6 +572,8 @@ pub fn assemble(
         system_prompt: system_prompt.clone(),
         tools: resolved_tools,
         options: options.clone(),
+        context: environment.context.clone(),
+        summarize_prompt: environment.summarize_prompt.clone(),
     };
 
     Ok(Assembled {

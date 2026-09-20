@@ -1,0 +1,22 @@
+[package]
+name = "p1-context"
+description = "Context control: a summarizing ContextPolicy that works through the ordinary provider interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["macros"] }
+
+[dev-dependencies]
+p1-core = { path = "../p1-core" }
+p1-journal = { path = "../p1-journal" }
+p1-testkit = { path = "../p1-testkit" }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "test-util"] }

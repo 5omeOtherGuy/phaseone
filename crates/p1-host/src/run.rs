@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "delegation")]
 use p1_assembly::Catalog;
-use p1_assembly::{Substitutions, assemble, load_environment};
+use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
-    BoxFuture, CancellationToken, CommitSink, ContextError, ContextPolicy, EventSink, Item,
-    JournalRecord, TurnEnd,
+    BoxFuture, CancellationToken, CommitSink, ContextError, ContextInput, ContextPolicy, EventSink,
+    JournalRecord, Prepared, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, ResumeReport};
 #[cfg(feature = "delegation")]
@@ -51,10 +51,40 @@ pub struct DefaultContext;
 impl ContextPolicy for DefaultContext {
     fn prepare<'a>(
         &'a self,
-        _history: &'a [Item],
-    ) -> BoxFuture<'a, Result<Option<Vec<Item>>, ContextError>> {
+        _input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Option<Prepared>, ContextError>> {
         Box::pin(async { Ok(None) })
     }
+}
+
+/// The context policy for an assembled agent (context.md §3): a
+/// `SummarizingContext` when the environment opts in with `[context]`,
+/// passthrough otherwise. The host is the composition root: `p1-assembly` only
+/// carries the plain settings and the prompt override.
+fn agent_context(assembled: &Assembled) -> Result<Arc<dyn ContextPolicy>, String> {
+    let Some(settings) = &assembled.resolved.context else {
+        return Ok(Arc::new(DefaultContext));
+    };
+    let config = p1_context::ContextConfig {
+        window_tokens: settings.window_tokens,
+        output_headroom_tokens: settings.output_headroom_tokens,
+        summarize_at_tokens: settings.summarize_at_tokens,
+        keep_recent_tokens: settings.keep_recent_tokens,
+        user_verbatim_tokens: settings.user_verbatim_tokens,
+        tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
+    };
+    let prompt = assembled
+        .resolved
+        .summarize_prompt
+        .clone()
+        .unwrap_or_else(|| p1_context::DEFAULT_SUMMARIZER_PROMPT.to_string());
+    let policy = p1_context::SummarizingContext::new(
+        assembled.provider.clone(),
+        assembled.options.clone(),
+        config,
+        prompt,
+    )?;
+    Ok(Arc::new(policy))
 }
 
 /// A session store plus the records to resume from (when resuming).
@@ -190,6 +220,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     let substitutions = substitutions(deps, &workspace);
     let assembled =
         assemble(&catalog, &environment, &workspace, &substitutions).map_err(|e| e.to_string())?;
+    let context = agent_context(&assembled)?;
     let route = assembled.resolved.route.origin.route.clone();
     let model = assembled.resolved.route.origin.model.clone();
 
@@ -210,7 +241,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         tools: assembled.tools,
         system_prompt: assembled.system_prompt,
         options: assembled.options,
-        context: Arc::new(DefaultContext),
+        context,
         authorization: policy,
         journal,
         events,
@@ -612,6 +643,7 @@ fn make_child_factory(
         ensure_cache_key(&mut environment, &workspace);
         let assembled = assemble(&catalog, &environment, &workspace, &substitutions)
             .map_err(|e| e.to_string())?;
+        let context = agent_context(&assembled)?;
         let route = assembled.resolved.route.origin.route.clone();
         let model = assembled.resolved.route.origin.model.clone();
         let description = format!("{route}/{model}");
@@ -630,7 +662,7 @@ fn make_child_factory(
             tools: assembled.tools,
             system_prompt: assembled.system_prompt,
             options: assembled.options,
-            context: Arc::new(DefaultContext),
+            context,
             authorization: policy.clone(),
             journal: Arc::new(MemoryJournal::new()),
             events: renderer,

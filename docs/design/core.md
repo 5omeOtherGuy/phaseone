@@ -38,9 +38,13 @@ Events are written `[Event]`, committed records `{Record}`.
    a. **Inbox.** Take every pending inbox message, in arrival order. For each:
       `{Inbox{kind,text}}`, push `Item::Inbox{kind,text}`. If at least one was taken:
       `[InboxDelivered{count}]`.
-   b. **Context.** `context.prepare(&history)`. `Ok(None)` → unchanged.
-      `Ok(Some(items))` → `{ContextReplaced{items}}`, and the history IS `items` from now on.
-      `Err(e)` → the turn ends with `TurnEnd::ContextFailed{message: e.0}`.
+   b. **Context.** `context.prepare(ContextInput{history, last_usage, cancel})`, raced against
+      `cancel` (cancel wins). `Ok(None)` → unchanged. `Ok(Some(Prepared{items, usage}))` → the
+      replacement is validated for call/result pairing, then `{ContextReplaced{items, usage}}`,
+      the history IS `items` from now on, `[ContextReplaced{..}]`. `Err(Failed(m))` or an
+      unpaired replacement → `TurnEnd::ContextFailed`. `Err(Cancelled)` or `cancel` firing →
+      `{AssistantInterrupted{Cancelled, "", None}}`, turn ends `Cancelled`. Full rules:
+      `context.md` §1.
    c. `[RequestStarted{request_index}]`. Call `provider.stream(request, cancel_child)` with
       `system_prompt`, the whole current history, all tool declarations (same order as
       given), `options`.

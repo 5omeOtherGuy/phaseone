@@ -351,6 +351,7 @@ fn project_of_empty_records_is_empty() {
             next_seq: 0,
             environment_committed: false,
             unresolved_calls: Vec::new(),
+            last_usage: None,
         }
     );
 }
@@ -464,6 +465,7 @@ fn project_skips_non_history_records_and_applies_context_replacement() {
                 items: vec![Item::User {
                     text: "summary".into(),
                 }],
+                usage: None,
             },
         },
         JournalRecord {

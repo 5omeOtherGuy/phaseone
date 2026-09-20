@@ -1042,7 +1042,8 @@ async fn context_replacement_is_journalled_and_sent() {
             rec(
                 5,
                 RecordBody::ContextReplaced {
-                    items: replacement.clone()
+                    items: replacement.clone(),
+                    usage: None,
                 }
             ),
             assistant_record(6, text_item("done"), StopReason::EndTurn, None),

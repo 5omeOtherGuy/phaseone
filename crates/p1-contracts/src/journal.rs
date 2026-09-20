@@ -66,6 +66,10 @@ pub enum RecordBody {
     /// The context policy replaced the model-visible history from here on.
     ContextReplaced {
         items: Vec<Item>,
+        /// What preparing cost, where it was reported. Defaulted so journals
+        /// written before this field existed still load.
+        #[serde(default)]
+        usage: Option<Usage>,
     },
 }
 
