@@ -16,3 +16,12 @@ module = "grep"
 module = "shell"
 [[tools]]
 module = "finish"
+
+# Measured, not guessed: a 109-request job without this table grew to 177k input tokens per
+# request (docs/dogfood/runs.jsonl, split3a-deepseek). The window is the size proven to work.
+[context]
+window_tokens = 170000
+output_headroom_tokens = 16000
+summarize_at_tokens = 90000
+keep_recent_tokens = 25000
+user_verbatim_tokens = 8000
