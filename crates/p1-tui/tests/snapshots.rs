@@ -38,7 +38,13 @@ fn render(screen: &Screen, width: u16, height: u16, now_ms: u64) -> Vec<String> 
 /// whatever the right pane is showing.
 fn left(text: &[String], cols: usize) -> Vec<String> {
     text.iter()
-        .map(|l| l.chars().take(cols).collect::<String>().trim_end().to_string())
+        .map(|l| {
+            l.chars()
+                .take(cols)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
         .collect()
 }
 
@@ -81,7 +87,10 @@ const ALLOWED: &[Color] = &[
 fn assert_palette_law(screen: &Screen, width: u16, height: u16) {
     let used = colors_used(screen, width, height);
     for color in &used {
-        assert!(ALLOWED.contains(color), "colour outside the palette: {color:?}");
+        assert!(
+            ALLOWED.contains(color),
+            "colour outside the palette: {color:?}"
+        );
     }
 }
 
@@ -110,14 +119,40 @@ fn done(id: &str, name: &str, status: ToolStatus, content: &str) -> AgentEvent {
 /// calls, one running.
 fn streaming_screen() -> Screen {
     let mut s = Screen::new(true);
-    s.transcript.operator("why does compaction stall at the turn edge?");
-    s.apply(&AgentEvent::ReasoningDelta { text: "the hard-pressure wait blocks the boundary".into() }, 0);
-    s.apply(&AgentEvent::ResponseCompleted { model: "m".into(), stop: p1_contracts::StopReason::EndTurn, usage: None }, 4_200);
+    s.transcript
+        .operator("why does compaction stall at the turn edge?");
+    s.apply(
+        &AgentEvent::ReasoningDelta {
+            text: "the hard-pressure wait blocks the boundary".into(),
+        },
+        0,
+    );
+    s.apply(
+        &AgentEvent::ResponseCompleted {
+            model: "m".into(),
+            stop: p1_contracts::StopReason::EndTurn,
+            usage: None,
+        },
+        4_200,
+    );
     s.apply(&AgentEvent::TextDelta { text: "The hard-pressure wait in `p1-context` blocks the turn boundary instead of applying the summary.".into() }, 4_300);
-    s.apply(&AgentEvent::ResponseCompleted { model: "m".into(), stop: p1_contracts::StopReason::EndTurn, usage: None }, 5_000);
+    s.apply(
+        &AgentEvent::ResponseCompleted {
+            model: "m".into(),
+            stop: p1_contracts::StopReason::EndTurn,
+            usage: None,
+        },
+        5_000,
+    );
     s.apply(&tool("read", "c1", "p1-context/src/edge.rs"), 5_100);
-    s.apply(&done("c1", "read", ToolStatus::Ok, &"x\n".repeat(412)), 5_300);
-    s.apply(&tool("shell", "c2", "cargo test -p p1-context boundary"), 5_400);
+    s.apply(
+        &done("c1", "read", ToolStatus::Ok, &"x\n".repeat(412)),
+        5_300,
+    );
+    s.apply(
+        &tool("shell", "c2", "cargo test -p p1-context boundary"),
+        5_400,
+    );
     s
 }
 
@@ -136,7 +171,10 @@ fn streaming_at_120x40() {
     assert!(text[6].starts_with("▪▪▪ shell"));
     // The pane is up by default: LEDGER on the right, composer at the bottom.
     assert!(text[38].starts_with('›'));
-    assert_eq!(text[39], "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel");
+    assert_eq!(
+        text[39],
+        "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel"
+    );
 }
 
 #[test]
@@ -146,7 +184,10 @@ fn streaming_at_80x24_collapses_the_pane() {
     assert_palette_law(&s, 80, 24);
     // Newest rows stay visible; the pane is gone and the floor line appears.
     assert!(text[21].starts_with('›'));
-    assert_eq!(text[22], "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel");
+    assert_eq!(
+        text[22],
+        "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel"
+    );
     let floor = &text[23];
     assert!(floor.ends_with("^L ledger   ^C cancel"));
     assert!(floor.starts_with("ask · claude · —"));
@@ -155,16 +196,18 @@ fn streaming_at_80x24_collapses_the_pane() {
 #[test]
 fn idle_screen_affordances() {
     let mut s = Screen::new(true);
-    s.transcript.blocks.push(p1_tui::transcript::Block::Info { lines: vec![
-        "p1 0.1.0   ~/dev/phaseone   main".into(),
-        String::new(),
-        "  no journal in this directory.".into(),
-        String::new(),
-        "  /resume     reopen a previous session".into(),
-        "  /env        claude · sonnet-4.5".into(),
-        "  /access     full · --ask to confirm".into(),
-        "  /goal       set the session objective".into(),
-    ] });
+    s.transcript.blocks.push(p1_tui::transcript::Block::Info {
+        lines: vec![
+            "p1 0.1.0   ~/dev/phaseone   main".into(),
+            String::new(),
+            "  no journal in this directory.".into(),
+            String::new(),
+            "  /resume     reopen a previous session".into(),
+            "  /env        claude · sonnet-4.5".into(),
+            "  /access     full · --ask to confirm".into(),
+            "  /goal       set the session objective".into(),
+        ],
+    });
     let text = left(&render(&s, 120, 40, 0), 80);
     assert_palette_law(&s, 120, 40);
     assert_eq!(text[0], "p1 0.1.0   ~/dev/phaseone   main");
@@ -178,14 +221,17 @@ fn fold_block_screen() {
     let mut s = Screen::new(true);
     s.apply(&tool("shell", "c1", "cargo test -p p1-context boundary"), 0);
     let big: String = (0..94).map(|n| format!("test line {n}\n")).collect();
-    s.apply(&AgentEvent::ToolFinished {
-        result: ToolResultItem {
-            call_id: "c1".into(),
-            name: "shell".into(),
-            status: ToolStatus::Error,
-            content: big,
+    s.apply(
+        &AgentEvent::ToolFinished {
+            result: ToolResultItem {
+                call_id: "c1".into(),
+                name: "shell".into(),
+                status: ToolStatus::Error,
+                content: big,
+            },
         },
-    }, 11_400);
+        11_400,
+    );
     let full = render(&s, 120, 40, 12_000);
     assert_palette_law(&s, 120, 40);
     // The failure promoted a PEEK banner over the ledger (SPEC §5).
@@ -206,9 +252,18 @@ fn diff_review_blocks_full_width() {
         summary: "replace exact string · once".into(),
         position: (1, 3),
         rows: vec![
-            DiffRow::Context { line: 410, text: "let ready = worker.take_summary();".into() },
-            DiffRow::Del { line: 412, text: "    block_until_ready(&worker);".into() },
-            DiffRow::Add { line: 412, text: "    if let Some(summary) = ready {".into() },
+            DiffRow::Context {
+                line: 410,
+                text: "let ready = worker.take_summary();".into(),
+            },
+            DiffRow::Del {
+                line: 412,
+                text: "    block_until_ready(&worker);".into(),
+            },
+            DiffRow::Add {
+                line: 412,
+                text: "    if let Some(summary) = ready {".into(),
+            },
         ],
         grantable: true,
     }));
@@ -249,9 +304,21 @@ fn picker_and_status_overlays_dock_above_the_composer() {
         groups: vec![PickerGroup {
             header: "ANTHROPIC ROUTE".into(),
             rows: vec![
-                PickerRow { label: "claude · sonnet-4.5".into(), value: "300k · $3/$15".into(), available: true },
-                PickerRow { label: "claude · opus-4.8".into(), value: "300k · $15/$75".into(), available: true },
-                PickerRow { label: "glm · 5.3".into(), value: "quota exhausted".into(), available: false },
+                PickerRow {
+                    label: "claude · sonnet-4.5".into(),
+                    value: "300k · $3/$15".into(),
+                    available: true,
+                },
+                PickerRow {
+                    label: "claude · opus-4.8".into(),
+                    value: "300k · $15/$75".into(),
+                    available: true,
+                },
+                PickerRow {
+                    label: "glm · 5.3".into(),
+                    value: "quota exhausted".into(),
+                    available: false,
+                },
             ],
         }],
         filter: String::new(),
@@ -267,14 +334,17 @@ fn picker_and_status_overlays_dock_above_the_composer() {
 #[test]
 fn a_failure_states_what_broke_without_a_banner() {
     let mut s = Screen::new(true);
-    s.apply(&AgentEvent::TurnFinished {
-        end: p1_contracts::TurnEnd::ProviderFailed {
-            error: p1_contracts::ProviderError::new(
-                p1_contracts::ProviderErrorKind::Transport,
-                "connection dropped",
-            ),
+    s.apply(
+        &AgentEvent::TurnFinished {
+            end: p1_contracts::TurnEnd::ProviderFailed {
+                error: p1_contracts::ProviderError::new(
+                    p1_contracts::ProviderErrorKind::Transport,
+                    "connection dropped",
+                ),
+            },
         },
-    }, 0);
+        0,
+    );
     let text = left(&render(&s, 120, 40, 0), 80);
     assert_eq!(text[0], "provider failed: Transport: connection dropped");
 }
@@ -289,7 +359,10 @@ fn every_state_reads_with_colour_stripped() {
     assert!(text.iter().any(|l| l.starts_with('›')), "operator turn");
     assert!(text.iter().any(|l| l.starts_with('✓')), "settled call");
     assert!(text.iter().any(|l| l.starts_with('▸')), "running call");
-    assert!(text.iter().any(|l| l.starts_with("▪▪▪")), "working indicator");
+    assert!(
+        text.iter().any(|l| l.starts_with("▪▪▪")),
+        "working indicator"
+    );
     assert!(text.iter().any(|l| l.starts_with('·')), "folded reasoning");
 }
 
@@ -309,4 +382,3 @@ fn pane_width_cycling_changes_the_layout() {
     assert!(!off[0].contains("GOAL"));
     assert_eq!(s.pane_width, PaneWidth::Off);
 }
-

@@ -21,7 +21,13 @@ pub fn row(width: usize, label: &str, value: &str) -> Line<'static> {
 
 /// The same row with explicit colours, for states the hierarchy rule varies
 /// (an unavailable row is FAINT across the WHOLE row, label included).
-pub fn styled_row(width: usize, label: &str, label_fg: Color, value: &str, value_fg: Color) -> Line<'static> {
+pub fn styled_row(
+    width: usize,
+    label: &str,
+    label_fg: Color,
+    value: &str,
+    value_fg: Color,
+) -> Line<'static> {
     let label = fit_label(width, label, value);
     let pad = width.saturating_sub(label.chars().count() + value.chars().count());
     Line::from(vec![
@@ -36,7 +42,13 @@ pub fn styled_row(width: usize, label: &str, label_fg: Color, value: &str, value
 /// A three-column row: label left, a count right-aligned to the fixed inner
 /// `stop`, the value right-aligned to the grid width (SPEC §5: 20 in the
 /// ledger). Rows with and without a count therefore share one value column.
-pub fn counted_row(width: usize, stop: usize, label: &str, count: &str, value: &str) -> Line<'static> {
+pub fn counted_row(
+    width: usize,
+    stop: usize,
+    label: &str,
+    count: &str,
+    value: &str,
+) -> Line<'static> {
     let stop = stop.min(width);
     // Lay out as two nested grid rows: [label, count] on the inner stop, then
     // the value against the full width.

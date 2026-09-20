@@ -21,10 +21,8 @@ pub fn fill(line: Line<'static>, width: usize, bg: Color) -> Line<'static> {
     let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
     let mut line = line;
     if used < width {
-        line.spans.push(Span::styled(
-            " ".repeat(width - used),
-            Style::new().bg(bg),
-        ));
+        line.spans
+            .push(Span::styled(" ".repeat(width - used), Style::new().bg(bg)));
     }
     for span in &mut line.spans {
         span.style = span.style.bg(bg);

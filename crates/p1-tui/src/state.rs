@@ -21,9 +21,10 @@ pub enum Approval {
 }
 
 /// Pane width states, in `^W` cycle order (SPEC §5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneWidth {
     Off,
+    #[default]
     Ch40,
     Ch56,
     Split,
@@ -59,8 +60,9 @@ impl PaneWidth {
 pub const PANE_FLOOR_COLS: usize = 100;
 
 /// Pane modes, in `^Tab` cycle order (SPEC §5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneMode {
+    #[default]
     Ledger,
     Output,
     Diff,
@@ -251,18 +253,6 @@ pub struct Screen {
     pub task_view: Option<crate::render::ledger::Task>,
 }
 
-impl Default for PaneWidth {
-    fn default() -> Self {
-        Self::Ch40
-    }
-}
-
-impl Default for PaneMode {
-    fn default() -> Self {
-        Self::Ledger
-    }
-}
-
 impl Screen {
     pub fn new(reduced_motion: bool) -> Self {
         Self {
@@ -382,10 +372,21 @@ mod tests {
     #[test]
     fn width_cycles_through_the_four_states() {
         let mut w = PaneWidth::Off;
-        let order: Vec<PaneWidth> = (0..5).map(|_| { w = w.cycle(); w }).collect();
+        let order: Vec<PaneWidth> = (0..5)
+            .map(|_| {
+                w = w.cycle();
+                w
+            })
+            .collect();
         assert_eq!(
             order,
-            [PaneWidth::Ch40, PaneWidth::Ch56, PaneWidth::Split, PaneWidth::Off, PaneWidth::Ch40]
+            [
+                PaneWidth::Ch40,
+                PaneWidth::Ch56,
+                PaneWidth::Split,
+                PaneWidth::Off,
+                PaneWidth::Ch40
+            ]
         );
     }
 

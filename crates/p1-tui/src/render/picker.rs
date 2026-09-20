@@ -10,8 +10,8 @@
 use ratatui::style::Style;
 use ratatui::text::Line;
 
-use crate::grid;
 use crate::glyphs;
+use crate::grid;
 use crate::palette;
 
 /// Visible rows before truncation (SPEC §4.6).
@@ -93,7 +93,9 @@ pub fn lines(picker: &Picker, width: usize) -> Vec<Line<'static>> {
             .iter()
             .filter(|r| {
                 picker.filter.is_empty()
-                    || r.label.to_lowercase().contains(&picker.filter.to_lowercase())
+                    || r.label
+                        .to_lowercase()
+                        .contains(&picker.filter.to_lowercase())
             })
             .collect();
         if surviving.is_empty() {
@@ -152,9 +154,21 @@ mod tests {
             groups: vec![PickerGroup {
                 header: "ANTHROPIC ROUTE".into(),
                 rows: vec![
-                    PickerRow { label: "claude · sonnet-4.5".into(), value: "300k · $3/$15".into(), available: true },
-                    PickerRow { label: "claude · opus-4.8".into(), value: "300k · $15/$75".into(), available: true },
-                    PickerRow { label: "glm · 5.3".into(), value: "quota exhausted".into(), available: false },
+                    PickerRow {
+                        label: "claude · sonnet-4.5".into(),
+                        value: "300k · $3/$15".into(),
+                        available: true,
+                    },
+                    PickerRow {
+                        label: "claude · opus-4.8".into(),
+                        value: "300k · $15/$75".into(),
+                        available: true,
+                    },
+                    PickerRow {
+                        label: "glm · 5.3".into(),
+                        value: "quota exhausted".into(),
+                        available: false,
+                    },
                 ],
             }],
             filter: String::new(),
@@ -176,7 +190,12 @@ mod tests {
         assert_eq!(selected.spans[0].style.bg, Some(palette::SELECTION_BG));
         // The unavailable row is FAINT across the whole row.
         let unavailable = &rendered[3];
-        assert!(unavailable.spans.iter().all(|s| s.style.fg == Some(palette::FAINT)));
+        assert!(
+            unavailable
+                .spans
+                .iter()
+                .all(|s| s.style.fg == Some(palette::FAINT))
+        );
     }
 
     #[test]
@@ -184,7 +203,10 @@ mod tests {
         let mut p = picker();
         p.filter = "opus".into();
         let rendered = lines(&p, 40);
-        let text: Vec<String> = rendered.iter().map(|l| Text::from(l.clone()).to_string()).collect();
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|l| Text::from(l.clone()).to_string())
+            .collect();
         assert_eq!(text.len(), 2, "header + one surviving row");
         assert!(text[1].contains("opus"));
 
@@ -193,7 +215,11 @@ mod tests {
             groups: vec![PickerGroup {
                 header: "G".into(),
                 rows: (0..10)
-                    .map(|n| PickerRow { label: format!("r{n}"), value: "v".into(), available: true })
+                    .map(|n| PickerRow {
+                        label: format!("r{n}"),
+                        value: "v".into(),
+                        available: true,
+                    })
                     .collect(),
             }],
             filter: String::new(),
@@ -204,6 +230,9 @@ mod tests {
             .map(|l| Text::from(l.clone()).to_string())
             .collect();
         assert_eq!(text.len(), 1 + MAX_ROWS + 1);
-        assert_eq!(text.last().unwrap(), &format!("  {} 2 more", glyphs::PENDING));
+        assert_eq!(
+            text.last().unwrap(),
+            &format!("  {} 2 more", glyphs::PENDING)
+        );
     }
 }

@@ -270,7 +270,12 @@ mod tests {
     fn deltas_stream_into_one_open_prose_block() {
         let mut t = Transcript::new();
         t.apply(&AgentEvent::TextDelta { text: "hel".into() }, None);
-        t.apply(&AgentEvent::TextDelta { text: "lo\nwor".into() }, None);
+        t.apply(
+            &AgentEvent::TextDelta {
+                text: "lo\nwor".into(),
+            },
+            None,
+        );
         let [Block::Prose { lines, open }] = &t.blocks[..] else {
             panic!("one prose block");
         };
@@ -302,7 +307,10 @@ mod tests {
         let big: String = (0..90).map(|n| format!("line {n}\n")).collect();
         t.apply(&call("c1", "shell", "cargo test"), None);
         t.apply(&call("c2", "read", "src/lib.rs"), None);
-        t.apply(&result("c1", "shell", ToolStatus::Error, &big), Some(11_400));
+        t.apply(
+            &result("c1", "shell", ToolStatus::Error, &big),
+            Some(11_400),
+        );
         let [Block::Call(shell), Block::Call(read)] = &t.blocks[..] else {
             panic!("two call rows");
         };

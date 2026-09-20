@@ -82,7 +82,10 @@ fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
             if *expanded {
                 for line in body {
                     for part in wrap(line, width.saturating_sub(2)) {
-                        out.push(Line::styled(format!("  {part}"), Style::new().fg(palette::DIM)));
+                        out.push(Line::styled(
+                            format!("  {part}"),
+                            Style::new().fg(palette::DIM),
+                        ));
                     }
                 }
             }
@@ -196,7 +199,10 @@ fn fold_lines(fold: &Fold, width: usize, depth: u8, out: &mut Vec<Line<'static>>
         ),
     };
     for line in head {
-        let shown: String = line.chars().take(width.saturating_sub(indent.len())).collect();
+        let shown: String = line
+            .chars()
+            .take(width.saturating_sub(indent.len()))
+            .collect();
         out.push(fill(
             Line::styled(format!("{indent}{shown}"), Style::new().fg(palette::DIM)),
             width,
@@ -262,7 +268,12 @@ mod tests {
     fn transcript_with_call() -> Transcript {
         let mut t = Transcript::new();
         t.operator("why does compaction stall?");
-        t.apply(&AgentEvent::TextDelta { text: "Checking.".into() }, None);
+        t.apply(
+            &AgentEvent::TextDelta {
+                text: "Checking.".into(),
+            },
+            None,
+        );
         t.apply(
             &AgentEvent::ToolStarted {
                 call: ToolCall {

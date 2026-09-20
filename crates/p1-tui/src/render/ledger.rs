@@ -151,7 +151,11 @@ fn task_lines(task: &Task, out: &mut Vec<Line<'static>>) {
         out.push(grid::row(LEDGER_GRID, "  files", &files.to_string()));
     }
     if let Some((added, removed)) = task.diff {
-        out.push(grid::row(LEDGER_GRID, "  diff", &format!("+{added} −{removed}")));
+        out.push(grid::row(
+            LEDGER_GRID,
+            "  diff",
+            &format!("+{added} −{removed}"),
+        ));
     }
     if let Some(journal) = &task.journal {
         out.push(grid::row(LEDGER_GRID, "  journal", journal));
@@ -162,10 +166,22 @@ fn spend_lines(spend: &SpendView, out: &mut Vec<Line<'static>>) {
     out.push(header("SPEND"));
     let known = spend.responses > 0;
     let or_unknown = |value: Option<u64>, format: fn(u64) -> String| {
-        if known { value.map(format).unwrap_or(UNKNOWN.into()) } else { UNKNOWN.into() }
+        if known {
+            value.map(format).unwrap_or(UNKNOWN.into())
+        } else {
+            UNKNOWN.into()
+        }
     };
-    out.push(grid::row(LEDGER_GRID, "  in", &or_unknown(spend.input, tokens)));
-    out.push(grid::row(LEDGER_GRID, "  out", &or_unknown(spend.output, tokens)));
+    out.push(grid::row(
+        LEDGER_GRID,
+        "  in",
+        &or_unknown(spend.input, tokens),
+    ));
+    out.push(grid::row(
+        LEDGER_GRID,
+        "  out",
+        &or_unknown(spend.output, tokens),
+    ));
     out.push(grid::row(
         LEDGER_GRID,
         "  cache hit",
@@ -197,10 +213,26 @@ mod tests {
                 window: 200_000,
                 warn_at: 120_000,
                 parts: vec![
-                    ContextPart { label: "system".into(), count: None, tokens: 1_200 },
-                    ContextPart { label: "files".into(), count: Some(4), tokens: 6_800 },
-                    ContextPart { label: "tools".into(), count: Some(11), tokens: 3_100 },
-                    ContextPart { label: "recent".into(), count: None, tokens: 1_300 },
+                    ContextPart {
+                        label: "system".into(),
+                        count: None,
+                        tokens: 1_200,
+                    },
+                    ContextPart {
+                        label: "files".into(),
+                        count: Some(4),
+                        tokens: 6_800,
+                    },
+                    ContextPart {
+                        label: "tools".into(),
+                        count: Some(11),
+                        tokens: 3_100,
+                    },
+                    ContextPart {
+                        label: "recent".into(),
+                        count: None,
+                        tokens: 1_300,
+                    },
                 ],
             }),
             task: Some(Task {
@@ -227,7 +259,10 @@ mod tests {
         assert_eq!(text[1], "fix compaction boundary stall");
         assert_eq!(text[3], "CONTEXT             12.4k / 200k");
         // 26 bar cells, 6% filled → 2 cells, percentage right-aligned.
-        assert_eq!(text[4], format!("{}{}    6%", "█".repeat(2), "█".repeat(24)));
+        assert_eq!(
+            text[4],
+            format!("{}{}    6%", "█".repeat(2), "█".repeat(24))
+        );
         assert_eq!(text[5], "  system                    1.2k");
         assert_eq!(text[6], "  files            4        6.8k");
         assert_eq!(text[9], "  warn at 60%               120k");
@@ -237,7 +272,10 @@ mod tests {
         // Unknown cost renders —, never 0.
         assert_eq!(text[20], "  cost                         —");
         for line in &text {
-            assert!(line.chars().count() <= LEDGER_GRID, "row overflow: {line:?}");
+            assert!(
+                line.chars().count() <= LEDGER_GRID,
+                "row overflow: {line:?}"
+            );
         }
     }
 

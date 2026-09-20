@@ -39,7 +39,13 @@ pub fn lines(groups: &[StatusGroup]) -> Vec<Line<'static>> {
             out.push(if row.available {
                 grid::row(STATUS_GRID, &label, &row.value)
             } else {
-                grid::styled_row(STATUS_GRID, &label, palette::FAINT, &row.value, palette::FAINT)
+                grid::styled_row(
+                    STATUS_GRID,
+                    &label,
+                    palette::FAINT,
+                    &row.value,
+                    palette::FAINT,
+                )
             });
         }
     }
@@ -62,18 +68,37 @@ mod tests {
             StatusGroup {
                 header: "ROUTES".into(),
                 rows: vec![
-                    StatusRow { label: "claude".into(), value: "oauth · cached".into(), available: true },
-                    StatusRow { label: "deepseek".into(), value: "api key".into(), available: true },
-                    StatusRow { label: "glm".into(), value: "quota exhausted".into(), available: false },
+                    StatusRow {
+                        label: "claude".into(),
+                        value: "oauth · cached".into(),
+                        available: true,
+                    },
+                    StatusRow {
+                        label: "deepseek".into(),
+                        value: "api key".into(),
+                        available: true,
+                    },
+                    StatusRow {
+                        label: "glm".into(),
+                        value: "quota exhausted".into(),
+                        available: false,
+                    },
                 ],
             },
             StatusGroup {
                 header: "TOOLS".into(),
-                rows: vec![StatusRow { label: "assembled".into(), value: "9".into(), available: true }],
+                rows: vec![StatusRow {
+                    label: "assembled".into(),
+                    value: "9".into(),
+                    available: true,
+                }],
             },
         ];
         let lines = lines(&groups);
-        let text: Vec<String> = lines.iter().map(|l| Text::from(l.clone()).to_string()).collect();
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| Text::from(l.clone()).to_string())
+            .collect();
         assert_eq!(text[0], "ROUTES");
         assert_eq!(text[1], "  claude                  oauth · cached");
         assert_eq!(text[3], "  glm                    quota exhausted");
@@ -82,6 +107,11 @@ mod tests {
         assert_eq!(text[7], "");
         assert_eq!(text[8], "  esc");
         // The unavailable row is FAINT label included.
-        assert!(lines[3].spans.iter().all(|s| s.style.fg == Some(palette::FAINT)));
+        assert!(
+            lines[3]
+                .spans
+                .iter()
+                .all(|s| s.style.fg == Some(palette::FAINT))
+        );
     }
 }

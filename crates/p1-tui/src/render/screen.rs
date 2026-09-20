@@ -9,7 +9,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 
 use crate::palette;
-use crate::state::{PaneMode, PANE_FLOOR_COLS, Promotion, Screen};
+use crate::state::{PANE_FLOOR_COLS, PaneMode, Promotion, Screen};
 
 use super::{composer, diff, ledger, permission, picker, status, transcript};
 
@@ -46,13 +46,22 @@ pub fn draw(screen: &Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
 
     // Composer: hidden in focus mode while empty.
     let mut composer_lines = if screen.composer.visible(focus) {
-        composer::lines(&screen.composer, screen.working.is_some(), area.width as usize)
+        composer::lines(
+            &screen.composer,
+            screen.working.is_some(),
+            area.width as usize,
+        )
     } else {
         Vec::new()
     };
     if (area.width as usize) < PANE_FLOOR_COLS && pane_cols.is_none() && !screen.ledger_overlay {
         // §6: the one bottom-of-screen line, only when the ledger is gone.
-        composer_lines.push(composer::floor_line("ask", "claude", "—", area.width as usize));
+        composer_lines.push(composer::floor_line(
+            "ask",
+            "claude",
+            "—",
+            area.width as usize,
+        ));
     }
     let composer_height = composer_lines.len() as u16;
 
@@ -132,7 +141,16 @@ fn draw_pane(screen: &Screen, area: Rect, buf: &mut Buffer, cols: usize, _now_ms
                 grid,
                 palette::BLOCK_PLUS,
             );
-            draw_lines(&[banner], Rect { y, height: 1, ..content }, buf, palette::BLOCK_PLUS);
+            draw_lines(
+                &[banner],
+                Rect {
+                    y,
+                    height: 1,
+                    ..content
+                },
+                buf,
+                palette::BLOCK_PLUS,
+            );
         }
     }
 }
@@ -161,7 +179,12 @@ fn draw_lines(lines: &[Line<'static>], area: Rect, buf: &mut Buffer, bg: ratatui
 
 /// Draw the transcript: top-aligned while it fits (the conversation grows
 /// downward from the top), scrolling only once it overfills the area.
-fn draw_lines_bottom(lines: &[Line<'static>], area: Rect, buf: &mut Buffer, bg: ratatui::style::Color) {
+fn draw_lines_bottom(
+    lines: &[Line<'static>],
+    area: Rect,
+    buf: &mut Buffer,
+    bg: ratatui::style::Color,
+) {
     let fits = area.height as usize;
     let start = lines.len().saturating_sub(fits);
     draw_lines(&lines[start..], area, buf, bg);

@@ -42,11 +42,19 @@ pub fn lines(view: &PermissionView, width: usize) -> Vec<Line<'static>> {
 /// the reason inline (SPEC §4.5's layout).
 fn decision_lines(grantable: bool) -> Vec<Line<'static>> {
     fn key(spans: &mut Vec<Span<'static>>, k: &str, label: &str, available: bool) {
-        let key_fg = if available { palette::INK } else { palette::FAINT };
+        let key_fg = if available {
+            palette::INK
+        } else {
+            palette::FAINT
+        };
         spans.push(Span::styled(format!(" {k}  "), Style::new().fg(key_fg)));
         spans.push(Span::styled(
             format!("{label}     "),
-            Style::new().fg(if available { palette::DIM } else { palette::FAINT }),
+            Style::new().fg(if available {
+                palette::DIM
+            } else {
+                palette::FAINT
+            }),
         ));
     }
     let mut first = Vec::new();
@@ -95,7 +103,10 @@ mod tests {
         };
         let lines = lines(&view, 100);
         assert_eq!(lines[0].spans[0].style.bg, Some(palette::BLOCK_PLUS));
-        let text: Vec<String> = lines.iter().map(|l| Text::from(l.clone()).to_string()).collect();
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| Text::from(l.clone()).to_string())
+            .collect();
         assert_eq!(text[2], grid_line("  cwd", "~/dev/phaseone"));
         // y and n share the decision line; the greyed grants sit on their own
         // lines below it, reason inline.

@@ -38,7 +38,8 @@ fn done(id: &str, name: &str, status: ToolStatus, content: &str) -> AgentEvent {
 fn streaming() -> Screen {
     let mut s = Screen::new(false);
     s.goal = Some("fix compaction boundary stall".into());
-    s.transcript.operator("why does compaction stall at the turn edge?");
+    s.transcript
+        .operator("why does compaction stall at the turn edge?");
     s.apply(
         &AgentEvent::ReasoningDelta {
             text: "the hard-pressure wait blocks the boundary".into(),
@@ -65,10 +66,16 @@ fn streaming() -> Screen {
         4_300,
     );
     s.apply(&tool("read", "c1", "p1-context/src/edge.rs"), 5_100);
-    s.apply(&done("c1", "read", ToolStatus::Ok, &"x\n".repeat(412)), 5_300);
+    s.apply(
+        &done("c1", "read", ToolStatus::Ok, &"x\n".repeat(412)),
+        5_300,
+    );
     s.apply(&tool("search", "c2", "block_until_ready"), 5_400);
     s.apply(&done("c2", "search", ToolStatus::Ok, "a\nb\nc"), 5_600);
-    s.apply(&tool("shell", "c3", "cargo test -p p1-context boundary"), 5_700);
+    s.apply(
+        &tool("shell", "c3", "cargo test -p p1-context boundary"),
+        5_700,
+    );
     s
 }
 
@@ -95,7 +102,10 @@ fn fold() -> Screen {
     s.apply(&done("c1", "read", ToolStatus::Ok, &"x\n".repeat(412)), 100);
     s.apply(&tool("search", "c2", "block_until_ready"), 200);
     s.apply(&done("c2", "search", ToolStatus::Ok, "a\nb\nc"), 300);
-    s.apply(&tool("shell", "c3", "cargo test -p p1-context boundary"), 400);
+    s.apply(
+        &tool("shell", "c3", "cargo test -p p1-context boundary"),
+        400,
+    );
     let big: String = (0..94)
         .map(|n| {
             if n == 3 {
@@ -124,14 +134,38 @@ fn diff() -> Screen {
         summary: "replace exact string · once".into(),
         position: (1, 3),
         rows: vec![
-            DiffRow::Context { line: 410, text: "let ready = worker.take_summary();".into() },
-            DiffRow::Context { line: 411, text: "let pressure = self.pressure_at_edge();".into() },
-            DiffRow::Del { line: 412, text: "if pressure == Pressure::Hard {".into() },
-            DiffRow::Del { line: 413, text: "    block_until_ready(&worker);".into() },
-            DiffRow::Del { line: 414, text: "}".into() },
-            DiffRow::Add { line: 412, text: "if let Some(summary) = ready {".into() },
-            DiffRow::Add { line: 413, text: "    return self.apply_at_boundary(summary);".into() },
-            DiffRow::Add { line: 414, text: "}".into() },
+            DiffRow::Context {
+                line: 410,
+                text: "let ready = worker.take_summary();".into(),
+            },
+            DiffRow::Context {
+                line: 411,
+                text: "let pressure = self.pressure_at_edge();".into(),
+            },
+            DiffRow::Del {
+                line: 412,
+                text: "if pressure == Pressure::Hard {".into(),
+            },
+            DiffRow::Del {
+                line: 413,
+                text: "    block_until_ready(&worker);".into(),
+            },
+            DiffRow::Del {
+                line: 414,
+                text: "}".into(),
+            },
+            DiffRow::Add {
+                line: 412,
+                text: "if let Some(summary) = ready {".into(),
+            },
+            DiffRow::Add {
+                line: 413,
+                text: "    return self.apply_at_boundary(summary);".into(),
+            },
+            DiffRow::Add {
+                line: 414,
+                text: "}".into(),
+            },
         ],
         grantable: true,
     }));
@@ -160,15 +194,31 @@ fn picker() -> Screen {
             PickerGroup {
                 header: "ANTHROPIC ROUTE".into(),
                 rows: vec![
-                    PickerRow { label: "claude · sonnet-4.5".into(), value: "300k · $3/$15".into(), available: true },
-                    PickerRow { label: "claude · opus-4.8".into(), value: "300k · $15/$75".into(), available: true },
+                    PickerRow {
+                        label: "claude · sonnet-4.5".into(),
+                        value: "300k · $3/$15".into(),
+                        available: true,
+                    },
+                    PickerRow {
+                        label: "claude · opus-4.8".into(),
+                        value: "300k · $15/$75".into(),
+                        available: true,
+                    },
                 ],
             },
             PickerGroup {
                 header: "OPENAI-CHAT ROUTE".into(),
                 rows: vec![
-                    PickerRow { label: "deepseek · v4.1-flash".into(), value: "128k · $0.14/$0.28".into(), available: true },
-                    PickerRow { label: "glm · 5.3".into(), value: "quota exhausted".into(), available: false },
+                    PickerRow {
+                        label: "deepseek · v4.1-flash".into(),
+                        value: "128k · $0.14/$0.28".into(),
+                        available: true,
+                    },
+                    PickerRow {
+                        label: "glm · 5.3".into(),
+                        value: "quota exhausted".into(),
+                        available: false,
+                    },
                 ],
             },
         ],
@@ -179,7 +229,9 @@ fn picker() -> Screen {
 }
 
 fn main() {
-    let name = std::env::args().nth(1).unwrap_or_else(|| "streaming".into());
+    let name = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "streaming".into());
     let mut screen = match name.as_str() {
         "idle" => idle(),
         "fold" => fold(),
@@ -196,10 +248,26 @@ fn main() {
             window: 200_000,
             warn_at: 120_000,
             parts: vec![
-                ContextPart { label: "system".into(), count: None, tokens: 1_200 },
-                ContextPart { label: "files".into(), count: Some(4), tokens: 6_800 },
-                ContextPart { label: "tools".into(), count: Some(11), tokens: 3_100 },
-                ContextPart { label: "recent".into(), count: None, tokens: 1_300 },
+                ContextPart {
+                    label: "system".into(),
+                    count: None,
+                    tokens: 1_200,
+                },
+                ContextPart {
+                    label: "files".into(),
+                    count: Some(4),
+                    tokens: 6_800,
+                },
+                ContextPart {
+                    label: "tools".into(),
+                    count: Some(11),
+                    tokens: 3_100,
+                },
+                ContextPart {
+                    label: "recent".into(),
+                    count: None,
+                    tokens: 1_300,
+                },
             ],
         });
         screen.task_view = Some(Task {

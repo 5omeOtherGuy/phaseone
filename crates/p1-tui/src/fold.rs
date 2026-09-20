@@ -94,9 +94,13 @@ mod tests {
 
     #[test]
     fn the_boundary_is_exact() {
-        let at_limit: String = (0..FULL_BLOCK_MAX_LINES).map(|n| format!("{n}\n")).collect();
+        let at_limit: String = (0..FULL_BLOCK_MAX_LINES)
+            .map(|n| format!("{n}\n"))
+            .collect();
         assert!(matches!(Fold::present(&at_limit), Fold::Full { .. }));
-        let over: String = (0..=FULL_BLOCK_MAX_LINES).map(|n| format!("{n}\n")).collect();
+        let over: String = (0..=FULL_BLOCK_MAX_LINES)
+            .map(|n| format!("{n}\n"))
+            .collect();
         assert!(matches!(Fold::present(&over), Fold::Folded { .. }));
     }
 }

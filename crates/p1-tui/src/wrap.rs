@@ -41,7 +41,10 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         }
     }
     lines.push(current);
-    lines.into_iter().map(|line| format!("{indent}{line}")).collect()
+    lines
+        .into_iter()
+        .map(|line| format!("{indent}{line}"))
+        .collect()
 }
 
 #[cfg(test)]

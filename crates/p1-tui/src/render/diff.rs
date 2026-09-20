@@ -65,15 +65,23 @@ pub fn lines(view: &DiffView, width: usize) -> Vec<Line<'static>> {
 
 fn diff_row(row: &DiffRow, width: usize) -> Line<'static> {
     let (num, marker, text, fg, bg) = match row {
-        DiffRow::Context { line, text } => (
+        DiffRow::Context { line, text } => {
+            (*line, ' ', text.as_str(), palette::DIM, palette::GROUND)
+        }
+        DiffRow::Add { line, text } => (
             *line,
-            ' ',
+            '+',
             text.as_str(),
-            palette::DIM,
-            palette::GROUND,
+            palette::DIFF_ADD_FG,
+            palette::DIFF_ADD_BG,
         ),
-        DiffRow::Add { line, text } => (*line, '+', text.as_str(), palette::DIFF_ADD_FG, palette::DIFF_ADD_BG),
-        DiffRow::Del { line, text } => (*line, '−', text.as_str(), palette::DIFF_DEL_FG, palette::DIFF_DEL_BG),
+        DiffRow::Del { line, text } => (
+            *line,
+            '−',
+            text.as_str(),
+            palette::DIFF_DEL_FG,
+            palette::DIFF_DEL_BG,
+        ),
     };
     let room = width.saturating_sub(LINE_NUM_WIDTH + 2);
     let text: String = text.chars().take(room).collect();
@@ -92,12 +100,20 @@ fn diff_row(row: &DiffRow, width: usize) -> Line<'static> {
 /// destructive floor greys the grant rows with the reason inline (§4.5).
 fn footer(grantable: bool) -> Vec<Line<'static>> {
     let key = |k: &str, label: &str, available: bool| {
-        let fg = if available { palette::INK } else { palette::FAINT };
+        let fg = if available {
+            palette::INK
+        } else {
+            palette::FAINT
+        };
         vec![
             Span::styled(format!(" {k}  "), Style::new().fg(fg)),
             Span::styled(
                 format!("{label}     "),
-                Style::new().fg(if available { palette::DIM } else { palette::FAINT }),
+                Style::new().fg(if available {
+                    palette::DIM
+                } else {
+                    palette::FAINT
+                }),
             ),
         ]
     };
@@ -106,8 +122,16 @@ fn footer(grantable: bool) -> Vec<Line<'static>> {
         first.extend(key("a", "session", true));
         first.extend(key("p", "project", true));
     } else {
-        first.extend(key("a", "session      not grantable — destructive floor", false));
-        first.extend(key("p", "project      not grantable — destructive floor", false));
+        first.extend(key(
+            "a",
+            "session      not grantable — destructive floor",
+            false,
+        ));
+        first.extend(key(
+            "p",
+            "project      not grantable — destructive floor",
+            false,
+        ));
     }
     first.extend(key("n", "deny", true));
     let second = Line::styled(
@@ -129,9 +153,18 @@ mod tests {
             summary: "replace exact string · once".into(),
             position: (1, 3),
             rows: vec![
-                DiffRow::Context { line: 411, text: "let pressure = self.pressure_at_edge();".into() },
-                DiffRow::Del { line: 412, text: "if pressure == Pressure::Hard {".into() },
-                DiffRow::Add { line: 412, text: "if let Some(summary) = ready {".into() },
+                DiffRow::Context {
+                    line: 411,
+                    text: "let pressure = self.pressure_at_edge();".into(),
+                },
+                DiffRow::Del {
+                    line: 412,
+                    text: "if pressure == Pressure::Hard {".into(),
+                },
+                DiffRow::Add {
+                    line: 412,
+                    text: "if let Some(summary) = ready {".into(),
+                },
             ],
             grantable: true,
         }
@@ -140,11 +173,17 @@ mod tests {
     #[test]
     fn the_review_layout_and_hues() {
         let lines = lines(&view(), 100);
-        let text: Vec<String> = lines.iter().map(|l| Text::from(l.clone()).to_string()).collect();
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| Text::from(l.clone()).to_string())
+            .collect();
         assert!(text[0].starts_with("! edit      p1-context/src/edge.rs"));
         assert!(text[0].ends_with("1 of 3 files"));
         assert_eq!(text[2], "");
-        assert_eq!(text[3].trim_end(), " 411   let pressure = self.pressure_at_edge();");
+        assert_eq!(
+            text[3].trim_end(),
+            " 411   let pressure = self.pressure_at_edge();"
+        );
         // The minus column is the UNICODE minus, and the hues sit on the row.
         assert_eq!(text[4].trim_end(), " 412 − if pressure == Pressure::Hard {");
         assert_eq!(text[5].trim_end(), " 412 + if let Some(summary) = ready {");
