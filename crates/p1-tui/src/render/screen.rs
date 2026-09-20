@@ -11,7 +11,9 @@ use ratatui::text::Line;
 use crate::palette;
 use crate::state::{PANE_FLOOR_COLS, PaneMode, Promotion, Screen};
 
-use super::{composer, diff, ledger, output, permission, picker, status, transcript, workers};
+use super::{
+    composer, diff, home, ledger, output, permission, picker, status, transcript, workers,
+};
 
 /// The pane's padding: the content grid is the pane width minus 4 on each
 /// side (SPEC §5: LEDGER grid 32 in a 40-ch pane; recorded as a refinement —
@@ -21,6 +23,9 @@ const PANE_PAD: usize = 4;
 /// Draw the whole screen. `now_ms` drives the working indicator; callers pass
 /// a fake clock in tests.
 pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     fill_bg(area, buf, palette::GROUND);
 
     // A pending approval owns the screen: full width, pane hidden (SPEC §4.4).
@@ -135,6 +140,30 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     // Record the rendered shape for the scroll math (state.rs scroll_by).
     screen.last_rendered = (body.len(), transcript_area.height as usize);
     draw_lines_bottom(&body, transcript_area, buf, screen.scroll_top);
+    // Welcome metadata remains at the top. Only unused space may animate;
+    // any conversation, working state or overlay takes priority immediately.
+    if !screen.focus
+        && screen.working.is_none()
+        && screen.picker.is_none()
+        && screen.status.is_none()
+        && screen
+            .transcript
+            .blocks
+            .iter()
+            .all(|block| matches!(block, crate::transcript::Block::Info { .. }))
+    {
+        let used = (body.len() as u16).min(transcript_area.height);
+        home::draw(
+            Rect {
+                y: transcript_area.y + used,
+                height: transcript_area.height - used,
+                ..transcript_area
+            },
+            buf,
+            now_ms,
+            screen.reduced_motion,
+        );
+    }
 
     let composer_area = Rect {
         x: area.x,
@@ -240,17 +269,6 @@ fn draw_lines_bottom(
         .min(lines.len().saturating_sub(fits));
     let end = (start + fits).min(lines.len());
     draw_lines(&lines[start..end], area, buf);
-}
-
-/// Cut a banner line at the grid edge with `…` — a hard cut mid-word reads as
-/// a rendering bug, an ellipsis as a folded fact.
-fn ellipsize(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-    out.push('\u{2026}');
-    out
 }
 
 /// Cut a banner line at the grid edge with `…` — a hard cut mid-word reads as
