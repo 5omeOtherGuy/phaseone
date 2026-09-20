@@ -4,6 +4,15 @@
 Code) orchestrating worker models, test-first. State: `main`, gate green, CI green.
 Decisions: `DECISIONS.md` (D1–D20). Specs: `docs/design/`.
 
+> **Corrections after the independent review of 2026-09-20** — see
+> `docs/review-2026-09-20-dispositions.md`. "CI green" above was wrong: the CI run of the
+> final report commit was red (a timing-dependent shell test). Six lifecycle defects were
+> found in guarantees this report claims (shell group cleanup, credential-refresh deadlock,
+> idle interactive wake-up, worker limit on continuation, lost cancellation, journal
+> ownership on resume); all are fixed with the reviewer's reproductions as tests. The review
+> also narrows what the acceptance items below prove: they demonstrate the paths, not
+> unattended reliability.
+
 ## What was built
 
 A working coding harness. `p1 --env claude|gpt "prompt"` runs an agent on a real repository;

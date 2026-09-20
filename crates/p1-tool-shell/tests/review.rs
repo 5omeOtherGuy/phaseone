@@ -24,10 +24,10 @@ async fn review_cancel_kills_term_ignoring_descendant() {
     });
     let pid = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
-            if let Ok(s) = std::fs::read_to_string(dir.path().join("survivor")) {
-                if let Ok(pid) = s.trim().parse::<i32>() {
-                    break Pid::from_raw(pid);
-                }
+            if let Ok(s) = std::fs::read_to_string(dir.path().join("survivor"))
+                && let Ok(pid) = s.trim().parse::<i32>()
+            {
+                break Pid::from_raw(pid);
             }
             tokio::task::yield_now().await;
         }

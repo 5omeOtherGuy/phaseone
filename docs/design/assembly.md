@@ -96,6 +96,9 @@ p1 [--env claude|gpt|<name>] [--workspace DIR] [--session FILE] [--resume] [--ye
 p1 [--env …]                                                                                  # plain terminal prompt loop
 p1 env show <name>                                                                            # resolved environment, no secrets
 ```
+- Interactive: while waiting at the prompt the host also waits on the agent's inbox; a
+  notification (a worker finishing) runs inbox turns at once, then the prompt is shown again.
+  The line source is cancel-safe, so a half-typed line survives that.
 - Headless: runs the turn; while the agent has pending inbox messages it runs inbox turns;
   exits 0 on `Completed`, 1 on provider/commit/context failure, 130 on cancel (Ctrl-C cancels
   the turn's token; a second Ctrl-C exits).

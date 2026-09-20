@@ -11,14 +11,19 @@ pub struct JsonlJournal;                  // CommitSink
 impl JsonlJournal {
     /// Create a NEW session file. Fails if the file exists.
     pub fn create(path: &Path, sync: SyncPolicy) -> Result<Self, JournalError>;
-    /// Open an existing session file for appending after `load` has validated it.
+    /// RESUME: lock the file FIRST, then read, validate, cut off a truncated tail and derive
+    /// the next sequence — all under that lock, held for the writer's life (ADR-0031).
+    pub fn resume(path: &Path, sync: SyncPolicy) -> Result<(Self, Resumed), JournalError>;
+    /// Lower-level: locks before reading; rejects a `next_seq` that does not match the file.
     pub fn open_for_append(path: &Path, sync: SyncPolicy, next_seq: u64) -> Result<Self, JournalError>;
 }
 pub enum SyncPolicy { EveryRecord, OsBuffered }
 pub fn load(path: &Path) -> Result<Loaded, JournalError>;
 pub struct Loaded { pub records: Vec<JournalRecord>, pub truncated_tail: Option<TruncatedTail> }
 pub struct TruncatedTail { pub byte_offset: u64, pub bytes: u64 }
-/// Cut the file back to `byte_offset` (after the caller decided to continue from it).
+pub struct Resumed { pub records: Vec<JournalRecord>, pub repaired_tail: Option<TruncatedTail> }
+/// Cut the file back to `byte_offset`. Takes the lock (`Locked` if a writer owns the file) and
+/// refuses a tail that is no longer the file's tail (`StaleTail`).
 pub fn repair_truncated_tail(path: &Path, tail: &TruncatedTail) -> Result<(), JournalError>;
 ```
 
@@ -72,6 +77,10 @@ old is ever dispatched. If the route origin differs from the journalled one, rep
 the old origin is dropped by the adapter (providers.md) — `ResumeReport` says so. A new
 `Environment` record is committed when the resolved environment differs.
 
+**Ownership.** Every writer holds an exclusive advisory lock on the session file itself. A
+second process fails with `Locked` WITHOUT having modified the file — this includes resume
+and tail repair, which act only under the lock, never on an earlier unlocked observation.
+
 ## Not promised in this slice
-Multi-writer safety on one session file (a lock file makes a second writer fail fast),
+Several writers sharing one session file (the second one fails fast, see Ownership),
 compaction of journals, encryption, recovery from corruption in the middle of a file.
