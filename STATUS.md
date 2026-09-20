@@ -26,9 +26,30 @@ Only the lead edits this file (D13). Started 2026-09-19.
 - ADR system added after the slice (owner request): `docs/adr/` (30 ADRs), `scripts/adr.py`,
   checked in the gate. New decisions are ADRs; `DECISIONS.md` is the frozen ledger (ADR-0030).
 
-## Next (owner's call — see `docs/SLICE-REPORT.md` "What should come next")
-- Use it for real work and collect failures; context-control policy module; T1 comparison;
-  granular authorization; turn-completion policy.
+## Next — READ FIRST after compaction
+An independent REVIEW of the first slice exists and is the first thing to tackle:
+`/home/phaseonebig/projects/phaseone-review-2026-09-20/REVIEW.md` (+ `reproductions.patch`
+with five reproduction tests, `ci.log`, `gate.log`, other logs). The owner also passed on the
+reviewer's AMENDMENTS to the lead's plan — authoritative, in full at
+`../phaseone-briefs/plan-amendments-from-reviewer-2026-09-20.md`. Order:
+0. HARDENING CHECKPOINT. Read REVIEW.md; apply `reproductions.patch` on a task branch and
+   confirm each reproduction fails for the stated reason. Build the disposition table
+   `docs/review-2026-09-20-dispositions.md`: finding → validity / severity / prior awareness /
+   disposition / issue / fixing commit. "Already known" is NOT a disposition. Fix: shell
+   descendant cleanup, interactive completion wake-up, worker concurrency enforcement, lost
+   cancellation, journal locking, credential-refresh locking (can deadlock the current-thread
+   runtime). Keep the reproduction assertions intact; restore reliable CI (see `ci.log`)
+   without weakening the shell cleanup test. No ADR may redefine a broken guarantee as intended.
+1. Workspace ownership: serialize or isolate conflicting parent/child writes BEFORE any
+   concurrent dogfooding; first real tasks run in disposable task worktrees.
+2. Dogfood under supervision; run-level evidence grouped into issues; shell non-zero exits
+   recorded separately from tool failures; look at Codex caching here.
+3. Context-control policy module (spec requirements listed in the amendments, item 4).
+4. Turn-completion policy with the narrowed promise (item 5); explicit resume decisions as
+   ADRs (item 7: changed-route resume; child sessions are not restored).
+5. T1 measurement (item 6). Host cleanup after the correctness work; model cards for sol/glm-5.3.
+Disk: 17 GB free on 2026-09-20 because `~/brain-tools-wt` (another session) holds 39 GB — do
+not clean it without verifying ownership and unmerged work; remove own worktrees promptly.
 
 ## Blocked
 - nothing
