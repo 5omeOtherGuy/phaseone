@@ -30,6 +30,9 @@ struct Inner {
 /// unknown is `?`" has exactly one implementation.
 #[derive(Debug, Default, Clone, Copy)]
 struct UsageSums {
+    /// Responses recorded. With none, nothing is known: a sum over no responses is
+    /// not a measured zero (a run that never got an answer did not cost $0.0000).
+    responses: u64,
     in_total: u64,
     in_unknown: bool,
     cached_total: u64,
@@ -44,6 +47,7 @@ impl UsageSums {
     /// Add one response. `None` means the response reported no usage at all, so
     /// every part becomes unknown.
     fn record(&mut self, usage: Option<Usage>) {
+        self.responses += 1;
         match usage {
             None => {
                 self.in_unknown = true;
@@ -74,6 +78,10 @@ impl UsageSums {
 
     /// The four displayed parts, `?`/`unknown` for anything not known everywhere.
     fn parts(&self) -> (String, String, String, String) {
+        if self.responses == 0 {
+            let unknown = || "?".to_string();
+            return (unknown(), unknown(), unknown(), "unknown".to_string());
+        }
         (
             unknown_or(self.in_total, self.in_unknown),
             unknown_or(self.cached_total, self.cached_unknown),
@@ -507,6 +515,16 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn sums_over_no_responses_are_unknown_not_zero() {
+        let (input, cached, output, cost) = UsageSums::default().parts();
+        assert_eq!(
+            (input.as_str(), cached.as_str(), output.as_str()),
+            ("?", "?", "?")
+        );
+        assert_eq!(cost, "unknown");
     }
 
     #[test]
