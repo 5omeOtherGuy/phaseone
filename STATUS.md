@@ -104,7 +104,8 @@ IN FLIGHT:
   (owner); development, specs, briefs, review, merges stay with the lead.
   BATCH 1 (offline, no build, no live experiment calls): #26 measurement + failure audit,
   #27 context capacity inventory, #28 finish-nudge experiment design. Curator = ONE
-  `pi-worker opus` run (brief `../phaseone-briefs/research-curator-batch1.md`, output
+  Opus run as a Claude Code subagent (`pi-worker opus` FAILED: tool_calls 0, it wrote tool
+  calls as text and invented results — never use it for tool work) (brief `../phaseone-briefs/research-curator-batch1.md`, output
   `../phaseone-briefs/research/curator-batch1.out`, memos `research/<n>/memo.md`), leaves =
   `pi-worker deepseek2`. NEXT: `gh issue list --label research:decision`, decide each memo
   (accept -> lead-owned brief, label `research:implement`; else discard with reopening
