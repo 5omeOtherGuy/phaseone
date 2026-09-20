@@ -89,6 +89,13 @@ IN FLIGHT:
 * #30 DONE: `finish` rejects masked checks (`;`, `||`, newline, backgrounding `&`; `2>&1` is
   fine) and reports EVERY failing named command in one error (completion.md §2, last revision).
 * `[context]` tables for claude / claude-delegating / gpt: DONE (200k/120k, operational values).
+* OWNER DIRECTIVES 2026-09-21 ~00:45 (owner asleep, work on): (1) WebSocket support wherever
+  possible (Codex first) — a DECISION, overrides the earlier 'no websocket for now'; (2) inventory
+  iris-agent for code worth taking (Rust token optimizer first); (3) prompt-caching optimisation
+  for the Anthropic and ChatGPT routes. = RESEARCH BATCH 3: #41, #42, #43, Opus subagent curator,
+  brief `../phaseone-briefs/research-curator-batch3.md`, memos `research/<n>/memo.md` (cap of two
+  lifted for this batch). NEXT: decide the memos; WebSocket needs lead spec + ADR (transport seam)
+  then p1 jobs; caching needs a small lead-run LIVE probe (few requests) before changing builders.
 * RESEARCH BATCH 2 DECIDED (2026-09-21): #36 grep bounding — USED, merged. #37 summarizer prompt —
   USED as a negative result (prompt unchanged); by-product merged: run records carry
   `harness_head` + `binary_sha256`. #35 out-of-credit diagnosis — ACCEPTED, ADR-0046 (proposed) +
