@@ -20,7 +20,7 @@ use p1_contracts::{
 use p1_core::Agent;
 use p1_host::HostDeps;
 use p1_host::frontend::{FrontEnd, WorkerService};
-use p1_host::run::run_with_front_end;
+use p1_host::run::{StallGuard, run_with_front_end};
 use p1_testkit::{ScriptedProvider, text_response};
 #[cfg(feature = "delegation")]
 use p1_testkit::{json_call, tool_call_response};
@@ -190,9 +190,10 @@ impl FrontEnd for RecordingFrontEnd {
         agent: &'a mut Agent,
         cancel: &'a CancellationToken,
         workers: Option<Arc<dyn WorkerService>>,
+        stall: Option<Arc<StallGuard>>,
     ) -> BoxFuture<'a, i32> {
         self.ran.store(true, Ordering::SeqCst);
-        self.inner.run(deps, agent, cancel, workers)
+        self.inner.run(deps, agent, cancel, workers, stall)
     }
 
     fn finish(&self) {
@@ -240,6 +241,7 @@ impl FrontEnd for SentinelFrontEnd {
         agent: &'a mut Agent,
         cancel: &'a CancellationToken,
         _workers: Option<Arc<dyn WorkerService>>,
+        _stall: Option<Arc<StallGuard>>,
     ) -> BoxFuture<'a, i32> {
         Box::pin(async move {
             let _ = agent.run_turn("go".to_string(), cancel.clone()).await;

@@ -70,7 +70,8 @@ fn config(retained: bool) -> (ChatRoute, Arc<ModelProfile>) {
             } else {
                 vec![Effort::High, Effort::Max]
             },
-            default_effort: Effort::High,
+            default_effort: Some(Effort::High),
+            thinking_budgets: std::collections::BTreeMap::new(),
             context_tokens: None,
             max_output_tokens: retained.then_some(131_072),
         }),

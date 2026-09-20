@@ -9,24 +9,25 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(feature = "delegation")]
 use std::sync::OnceLock;
 #[cfg(feature = "delegation")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 use p1_assembly::Catalog;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
-    BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError, ContextInput,
-    ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, TurnEnd,
+    AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
+    ContextInput, ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, ResumeReport};
 #[cfg(feature = "delegation")]
 use p1_journal::MemoryJournal;
 
-use crate::activity::{ActivityTee, Completion, CompletionHub};
+use crate::activity::{ActivityLog, ActivityTee, Completion, CompletionHub};
 use crate::catalog::build_catalog;
 use crate::cli::{self, Command, Options};
 use crate::frontend::{FrontEnd, LineFrontEnd};
@@ -47,6 +48,16 @@ pub const EXIT_CANCELLED: i32 = 130;
 pub const EXIT_BLOCKED: i32 = 3;
 /// The model kept stopping without finishing and the continuation budget ran out.
 pub const EXIT_STALLED: i32 = 4;
+
+/// The ONE message printed when the §3c stall guard fires. `<N>` is the configured
+/// `--max-idle-summaries` bound.
+pub fn stall_message(max_idle_summaries: usize) -> String {
+    format!(
+        "stalled: {max_idle_summaries} context summaries without a change to the workspace — the \
+         task does not fit the configured context (see [context] in the environment), or it is too \
+         large for one job"
+    )
+}
 
 /// The ONE message the host sends after a premature stop in an unattended run.
 /// Committed as a normal `UserInput` record, so the journal shows every
@@ -242,6 +253,10 @@ pub async fn run_with_front_end(
     front_end: Arc<dyn FrontEnd>,
 ) -> Result<i32, String> {
     let workspace = resolve_workspace(options)?;
+    // The §3c stall guard is host policy and applies only to unattended runs; the
+    // front end decides what "headless" means (the line front end uses the CLI
+    // rule, a terminal UI is interactive by definition).
+    let headless = front_end.is_headless(options);
 
     // The delegation service must exist before the catalog so the `worker_*`
     // tools can be registered; the child factory reaches the catalog lazily,
@@ -306,14 +321,34 @@ pub async fn run_with_front_end(
 
     // The activity tee forwards every event to the front end's sink unchanged and
     // feeds this agent's log the effects and exit codes a later `finish` reads.
-    // Without `finish` there is nothing to feed: install the sink directly.
-    let events: Arc<dyn EventSink> = match &completion {
-        Some(completion) => Arc::new(ActivityTee::new(
-            front_end.event_sink(),
-            completion.log.clone(),
-            &assembled.tools,
-        )),
-        None => front_end.event_sink(),
+    // It is installed even without `finish`: the headless stall guard (§3c) reads
+    // the same log for workspace mutations. Without a `finish` tool the hub issued
+    // no log, so the host makes one.
+    let log = match &completion {
+        Some(completion) => completion.log.clone(),
+        None => Arc::new(ActivityLog::default()),
+    };
+    let events: Arc<dyn EventSink> = Arc::new(ActivityTee::new(
+        front_end.event_sink(),
+        log.clone(),
+        &assembled.tools,
+    ));
+    // The guard is headless-only (completion.md §3c); an interactive user sees the
+    // summaries and decides.
+    let mut stall: Option<Arc<StallGuard>> = None;
+    let events: Arc<dyn EventSink> = if headless {
+        let guard = Arc::new(StallGuard::new(
+            log,
+            options.max_idle_summaries,
+            cancel.clone(),
+        ));
+        stall = Some(guard.clone());
+        Arc::new(StallWatcher {
+            inner: events,
+            guard,
+        })
+    } else {
+        events
     };
 
     let parts = AgentParts {
@@ -353,7 +388,9 @@ pub async fn run_with_front_end(
         .map(|service| service.clone() as Arc<dyn crate::frontend::WorkerService>);
     #[cfg(not(feature = "delegation"))]
     let workers: Option<Arc<dyn crate::frontend::WorkerService>> = None;
-    let code = front_end.run(deps, &mut agent, &cancel, workers).await;
+    let code = front_end
+        .run(deps, &mut agent, &cancel, workers, stall)
+        .await;
 
     #[cfg(feature = "delegation")]
     if let Some(service) = &service {
@@ -394,6 +431,7 @@ pub(crate) async fn run_headless(
     options: &Options,
     cancel: &CancellationToken,
     completion: Option<Completion>,
+    stall: &Arc<StallGuard>,
     renderer: &Renderer,
 ) -> i32 {
     let second = Arc::new(tokio::sync::Notify::new());
@@ -406,9 +444,10 @@ pub(crate) async fn run_headless(
         _ => String::new(),
     };
 
-    // No `finish` in the assembled environment: the run behaves exactly as before.
+    // No `finish` in the assembled environment: the run behaves exactly as before
+    // except that the §3c stall guard is still headless policy.
     let Some(completion) = completion else {
-        return run_headless_plain(deps, agent, cancel, &second, prompt, renderer, options).await;
+        return run_headless_plain(deps, agent, cancel, &second, stall, renderer, options).await;
     };
 
     let log = completion.log.clone();
@@ -418,7 +457,7 @@ pub(crate) async fn run_headless(
     outcome.clear();
     let mut end = match prompt_turn(deps, agent, renderer, cancel, &second, options, prompt).await {
         TurnOutcome::End(end) => end,
-        TurnOutcome::Cancelled => return EXIT_CANCELLED,
+        TurnOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
     };
 
     let mut continuations = 0usize;
@@ -427,11 +466,14 @@ pub(crate) async fn run_headless(
 
     loop {
         if cancel.is_cancelled() {
-            return EXIT_CANCELLED;
+            return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED);
         }
         // A turn that did not complete (cancelled, provider failure, …) is
-        // handled exactly as before.
+        // handled exactly as before, except that a stall-guard cancel is a stall.
         if !matches!(end, TurnEnd::Completed { .. }) {
+            if let Some(code) = stalled_exit(deps, stall) {
+                return code;
+            }
             return end_code(&end);
         }
         match outcome.get() {
@@ -454,7 +496,7 @@ pub(crate) async fn run_headless(
                 end = next;
                 continue;
             }
-            WaitOutcome::Cancelled => return EXIT_CANCELLED,
+            WaitOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
             WaitOutcome::Idle => {}
         }
         // Premature stop. It is allowed while BOTH bounds hold: the whole-run
@@ -486,7 +528,7 @@ pub(crate) async fn run_headless(
         .await
         {
             TurnOutcome::End(end) => end,
-            TurnOutcome::Cancelled => return EXIT_CANCELLED,
+            TurnOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
         };
     }
 }
@@ -498,28 +540,34 @@ async fn run_headless_plain(
     agent: &mut Agent,
     cancel: &CancellationToken,
     second: &Arc<tokio::sync::Notify>,
-    prompt: String,
+    stall: &Arc<StallGuard>,
     renderer: &Renderer,
     options: &Options,
 ) -> i32 {
+    let prompt = match &options.command {
+        Command::Run {
+            prompt: Some(prompt),
+        } => prompt.clone(),
+        _ => String::new(),
+    };
     let mut code = match prompt_turn(deps, agent, renderer, cancel, second, options, prompt).await {
         TurnOutcome::End(end) => end_code(&end),
-        TurnOutcome::Cancelled => return EXIT_CANCELLED,
+        TurnOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
     };
 
     loop {
         if cancel.is_cancelled() {
-            return EXIT_CANCELLED;
+            return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED);
         }
         match wait_for_work(deps, agent, cancel, second, renderer, options).await {
             WaitOutcome::Turn(end) => {
                 code = end_code(&end);
                 if code == EXIT_CANCELLED {
-                    return code;
+                    return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED);
                 }
             }
             WaitOutcome::Idle => break,
-            WaitOutcome::Cancelled => return EXIT_CANCELLED,
+            WaitOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
         }
     }
     code
@@ -714,6 +762,73 @@ where
     }
 }
 
+// ------------------------------------------------------ stall guard (completion.md §3c)
+
+/// The headless §3c guard: count consecutive context replacements and cancel the
+/// turn when they reach `--max-idle-summaries`. Progress — a workspace mutation or
+/// a `finish` call of any status — resets the count through [`ActivityLog`].
+///
+/// Opaque to a front end: it is handed to [`crate::frontend::FrontEnd::run`] so the
+/// line drivers can report a stall, and a custom front end may ignore it.
+pub struct StallGuard {
+    log: Arc<ActivityLog>,
+    max: usize,
+    cancel: CancellationToken,
+    stalled: AtomicBool,
+}
+
+impl StallGuard {
+    fn new(log: Arc<ActivityLog>, max: usize, cancel: CancellationToken) -> Self {
+        Self {
+            log,
+            max,
+            cancel,
+            stalled: AtomicBool::new(false),
+        }
+    }
+
+    /// One committed `ContextReplaced` was observed. On reaching the bound the
+    /// guard latches and cancels the turn; the driver then reports the stall.
+    fn on_context_replaced(&self) {
+        self.log.record_replacement();
+        if self.max > 0 && self.log.consecutive_replacements() >= self.max as u64 {
+            self.stalled.store(true, Ordering::SeqCst);
+            self.cancel.cancel();
+        }
+    }
+
+    fn stalled(&self) -> bool {
+        self.stalled.load(Ordering::SeqCst)
+    }
+}
+
+/// Wraps the event sink for a headless run so the guard sees every committed
+/// `ContextReplaced`; it forwards the event unchanged.
+struct StallWatcher {
+    inner: Arc<dyn EventSink>,
+    guard: Arc<StallGuard>,
+}
+
+impl EventSink for StallWatcher {
+    fn emit(&self, event: AgentEvent) {
+        if matches!(event, AgentEvent::ContextReplaced { .. }) {
+            self.guard.on_context_replaced();
+        }
+        self.inner.emit(event);
+    }
+}
+
+/// §3c: a cancellation caused by the stall guard is reported as a stall, not as an
+/// ordinary Ctrl-C.
+fn stalled_exit(deps: &HostDeps, stall: &StallGuard) -> Option<i32> {
+    if stall.stalled() {
+        write_stderr(deps, &format!("{}\n", stall_message(stall.max)));
+        Some(EXIT_STALLED)
+    } else {
+        None
+    }
+}
+
 // ------------------------------------------------------ transient provider ends
 
 /// The fixed waits for a dropped connection, in order (completion.md §3b).
@@ -730,14 +845,17 @@ const RATE_LIMITED_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(900),
 ];
 
-/// The transient kind of a turn end, if it is one (completion.md §3b): only a
-/// dropped transport and a rate limit are worth waiting out. Everything else
-/// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`, `Protocol`) ends
-/// the run as it always did.
+/// The transient kind of a turn end, if it is one (completion.md §3b, amended by
+/// §3c): a dropped transport, a rate limit, or a malformed response are worth
+/// waiting out — the model's or the route's one-off. Everything else
+/// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`) ends the run as it
+/// always did.
 fn transient_kind(end: &TurnEnd) -> Option<ProviderErrorKind> {
     match end {
         TurnEnd::ProviderFailed { error } => match error.kind {
-            kind @ (ProviderErrorKind::Transport | ProviderErrorKind::RateLimited) => Some(kind),
+            kind @ (ProviderErrorKind::Transport
+            | ProviderErrorKind::RateLimited
+            | ProviderErrorKind::Protocol) => Some(kind),
             _ => None,
         },
         _ => None,
@@ -745,11 +863,11 @@ fn transient_kind(end: &TurnEnd) -> Option<ProviderErrorKind> {
 }
 
 /// The fixed wait schedule of a transient kind (completion.md §3b): a dropped
-/// connection is retried quickly, a quota window slowly. The schedules are not
-/// computed.
+/// connection is retried quickly, a quota window slowly, and a malformed response
+/// on the transport schedule (§3c). The schedules are not computed.
 fn retry_schedule(kind: ProviderErrorKind) -> &'static [Duration] {
     match kind {
-        ProviderErrorKind::Transport => &TRANSPORT_RETRY_WAITS,
+        ProviderErrorKind::Transport | ProviderErrorKind::Protocol => &TRANSPORT_RETRY_WAITS,
         ProviderErrorKind::RateLimited => &RATE_LIMITED_RETRY_WAITS,
         _ => &[],
     }

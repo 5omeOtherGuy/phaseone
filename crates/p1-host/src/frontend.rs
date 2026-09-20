@@ -22,7 +22,7 @@ use crate::activity::Completion;
 use crate::cli::Options;
 use crate::policy::HostPolicy;
 use crate::render::Renderer;
-use crate::run::{run_headless, run_interactive};
+use crate::run::{StallGuard, run_headless, run_interactive};
 use crate::{HostDeps, SharedWriter};
 
 /// The optional in-process delegation service as the seam sees it. With the
@@ -60,15 +60,25 @@ pub trait FrontEnd: Send + Sync {
     /// (`None` when the environment does not assemble `finish`).
     fn parent_assembled(&self, route: &str, model: &str, completion: Option<Completion>);
 
+    /// Whether this run is unattended and the host's §3c stall guard applies. The
+    /// default is the CLI rule (`a prompt means headless`); a front end that owns
+    /// a terminal UI overrides it to `false` — a TUI is interactive by definition,
+    /// so the guard is never installed for it.
+    fn is_headless(&self, options: &Options) -> bool {
+        options.is_headless()
+    }
+
     /// Drive the assembled agent to the end of the session and return the
     /// process exit code. The worker service, when present, stays live for the
-    /// whole loop and is shut down by the host after this returns.
+    /// whole loop and is shut down by the host after this returns. `stall` is the
+    /// host's headless §3c guard; a custom front end may ignore it.
     fn run<'a>(
         &'a self,
         deps: &'a HostDeps,
         agent: &'a mut Agent,
         cancel: &'a CancellationToken,
         workers: Option<Arc<dyn WorkerService>>,
+        stall: Option<Arc<StallGuard>>,
     ) -> BoxFuture<'a, i32>;
 
     /// Called once after the run loop returns and the worker service is shut
@@ -184,12 +194,23 @@ impl FrontEnd for LineFrontEnd {
         agent: &'a mut Agent,
         cancel: &'a CancellationToken,
         _workers: Option<Arc<dyn WorkerService>>,
+        stall: Option<Arc<StallGuard>>,
     ) -> BoxFuture<'a, i32> {
         Box::pin(async move {
             let completion = self.completion.get().cloned().unwrap_or(None);
             let renderer = self.renderer().clone();
-            if self.options.is_headless() {
-                run_headless(deps, agent, &self.options, cancel, completion, &renderer).await
+            if self.is_headless(&self.options) {
+                let stall = stall.expect("the host installs the guard for a headless run");
+                run_headless(
+                    deps,
+                    agent,
+                    &self.options,
+                    cancel,
+                    completion,
+                    &stall,
+                    &renderer,
+                )
+                .await
             } else {
                 run_interactive(deps, agent, cancel).await
             }

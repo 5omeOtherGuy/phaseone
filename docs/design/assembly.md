@@ -120,10 +120,13 @@ p1 env show <name>                                                              
 
 Composition seam: the host drives an agent through a `FrontEnd`
 (`crates/p1-host/src/frontend.rs`) — an ordinary value passed down, not a registry or a plugin.
-It supplies the parent's event sink (the host still wraps it in its `ActivityTee`), the labelled
-sink for each delegated worker, the authorization policy shared by the parent and every worker,
-and the run loop (`Agent` + `CancellationToken` + the optional worker service → exit code, then
-a one-shot `finish`). The default `LineFrontEnd` keeps the `HostPolicy` and line `Renderer` and
-the existing headless/interactive drivers exactly as before, so line and delegation behaviour is
-byte-identical. `run.rs` constructs the line front end at one branch point; a session that owns
-its own terminal UI implements the same trait and calls `run_with_front_end` instead.
+It supplies the parent's event sink (the host still wraps it in its `ActivityTee`, and in a
+headless run in the `StallWatcher`), the labelled sink for each delegated worker, the
+authorization policy shared by the parent and every worker, and the run loop (`Agent` +
+`CancellationToken` + the optional worker service + the host's headless stall guard → exit code,
+then a one-shot `finish`). The default `LineFrontEnd` keeps the `HostPolicy` and line `Renderer`
+and the existing headless/interactive drivers exactly as before, so line and delegation behaviour
+is byte-identical. It is also the front end that declares `is_headless` (the CLI rule); a terminal
+UI overrides that to `false`, so the §3c guard stays host policy and is never installed for it.
+`run.rs` constructs the line front end at one branch point; a session that owns its own terminal
+UI implements the same trait and calls `run_with_front_end` instead.
