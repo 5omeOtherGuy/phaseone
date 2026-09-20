@@ -154,7 +154,7 @@ successful `finish` calls), so it owns this guard too.
 
 Must-pass (scripted provider + scripted context policy that always replaces): N replacements with
 no mutation → exit 4 and the message, no further provider request after the Nth; a mutation
-between them resets the count (2N-1 replacements with one mutation in the middle → no stall); a
+between them resets the count (2N-2 replacements with one mutation in the middle → no stall; 2N-1 cannot avoid a run of N); a
 `finish` call resets it; `--max-idle-summaries 0` never stalls; interactive mode unchanged; the
 count survives nothing — a resumed run starts at 0; Protocol failure then success → run completes
 with one retry message.
