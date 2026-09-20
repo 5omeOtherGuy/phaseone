@@ -35,6 +35,15 @@ make that fast and conflict-free.
 `clippy -D warnings`, all tests, core isolation. CI runs exactly the same script.
 It must be green before a merge; it is not required for every intermediate commit.
 
+## Decisions
+
+A decision that changes an interface, a dependency rule, a workflow rule, or that reverses
+an earlier decision gets an Architecture Decision Record in `docs/adr/` — start one with
+`scripts/adr.py new "Title"`. Keep it `proposed` until the change is merged, then set it
+`accepted` (or `rejected`). Never edit an accepted ADR except its `status` and
+`superseded_by`; reverse it with a NEW ADR that supersedes it (`--supersedes N`). Small
+choices stay in commit messages. `scripts/adr.py check` runs in the gate.
+
 ## Hard rules
 
 - No sudo, no package installs. Ask in an issue.

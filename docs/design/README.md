@@ -9,7 +9,9 @@ The baseline for the first slice:
 | `seams.md` | Modules, contracts, acceptance criteria (§10), what carries over from Iris |
 
 These are the joint working proposal that went into `DECISIONS.md`; owner decisions
-there win over anything written here. Notes in this directory record each shared seam
+there win over anything written here. Settled decisions are recorded as Architecture
+Decision Records in `../adr/` (start at `../adr/README.md`); this directory holds the
+design proposals they were made from. Notes in this directory record each shared seam
 as it is actually built — a new shared seam gets a short note, small tasks do not.
 When a proposal proves wrong, the note and `DECISIONS.md` are updated with evidence.
 
