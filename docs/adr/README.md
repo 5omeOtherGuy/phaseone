@@ -48,6 +48,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0032 | [Agents sharing a directory serialize their file mutations](0032-agents-sharing-a-directory-serialize-their-file-mutations.md) | accepted | 2026-09-20 | lead |
 | ADR-0033 | [A session resumes only on the route and model that recorded it](0033-a-session-resumes-only-on-the-route-and-model-that-recorded-it.md) | accepted | 2026-09-20 | lead |
 | ADR-0034 | [Workers are not restored when their parent session resumes](0034-workers-are-not-restored-when-their-parent-session-resumes.md) | accepted | 2026-09-20 | lead |
+| ADR-0035 | [The shell tool can run inside a bubblewrap execution boundary](0035-the-shell-tool-can-run-inside-a-bubblewrap-execution-boundary.md) | accepted | 2026-09-20 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

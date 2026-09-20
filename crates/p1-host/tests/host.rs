@@ -932,6 +932,8 @@ async fn usage_errors_exit_2() {
         session: None,
         resume: true,
         yes: false,
+        sandbox: p1_host::cli::SandboxMode::Off,
+        sandbox_write: Vec::new(),
     };
     let code = p1_host::run::run(&mut harness.deps, options).await;
 
