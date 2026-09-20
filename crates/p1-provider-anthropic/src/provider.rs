@@ -1,27 +1,28 @@
 //! The provider adapter: `describe`, `validate`, `stream`.
 //!
-//! The adapter holds one model and one credential source and translates a
+//! The adapter holds one composed instance — a [`MessagesRoute`], a wire model and
+//! a [`ModelProfile`] — and one credential source, and translates a
 //! [`ProviderRequest`] into a Messages request. All retry, refresh, cancellation
 //! and terminal-event policy lives in [`p1_provider_http::drive`]; this module
-//! only decides whether a request is buildable at all.
+//! only decides whether a request is buildable at all, through the same pure
+//! lowering function the request builder uses (ADR-0039, spec §7.3).
 
 use std::sync::Arc;
 
 use p1_contracts::tool::DeclarationKind;
 use p1_contracts::{
-    BoxFuture, CacheKeySupport, CancellationToken, Origin, Provider, ProviderError,
+    BoxFuture, CacheKeySupport, CancellationToken, ModelOptions, Origin, Provider, ProviderError,
     ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription,
 };
+use p1_model_profile::ModelProfile;
 use p1_provider_http::{
     Credential, CredentialSource, DriveRequest, HttpRequest, ResponseParser, RetryPolicy,
     Transport, drive,
 };
 
-use crate::ROUTE;
+use crate::MessagesRoute;
 use crate::parser::AnthropicParser;
-use crate::request::{
-    DEFAULT_BASE_URL, IDENTITY, build_headers, build_request, explicit_cap_conflict,
-};
+use crate::request::{build_headers, build_request, lower};
 
 /// `native` keys in this namespace are route-specific. None are known in this
 /// slice, so any key here is rejected.
@@ -33,28 +34,36 @@ const NATIVE_PREFIX: &str = "anthropic-messages.";
 /// (ADR-0039). Keys in no adapter's namespace keep their meaning: ignored.
 const FOREIGN_NATIVE_PREFIXES: &[&str] = &["openai-responses.", "openai-chat."];
 
-/// The Claude subscription route bound to one model and credential source.
+/// One route file composed with one profile and one credential source.
 pub struct AnthropicProvider {
-    model: String,
+    route: MessagesRoute,
+    wire_model: String,
+    profile: Arc<ModelProfile>,
     transport: Arc<dyn Transport>,
     credentials: Arc<dyn CredentialSource>,
     retry: RetryPolicy,
-    base_url: String,
 }
 
 impl AnthropicProvider {
+    /// Compose the adapter from its three inputs (ADR-0039). A profile whose
+    /// thinking policy the Messages wire cannot express fails HERE, before any
+    /// request exists.
     pub fn new(
-        model: &str,
+        route: MessagesRoute,
+        wire_model: &str,
+        profile: Arc<ModelProfile>,
         transport: Arc<dyn Transport>,
         credentials: Arc<dyn CredentialSource>,
-    ) -> Self {
-        Self {
-            model: model.to_string(),
+    ) -> Result<Self, ProviderError> {
+        validate_composition(&route, wire_model, &profile)?;
+        Ok(Self {
+            route,
+            wire_model: wire_model.to_string(),
+            profile,
             transport,
             credentials,
             retry: RetryPolicy::default(),
-            base_url: DEFAULT_BASE_URL.to_string(),
-        }
+        })
     }
 
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
@@ -62,16 +71,46 @@ impl AnthropicProvider {
         self
     }
 
+    /// Replace the route's endpoint (embedding and tests). The route data of a
+    /// composed provider comes from its file.
     pub fn with_base_url(mut self, url: &str) -> Self {
-        self.base_url = url.trim_end_matches('/').to_string();
+        self.route.endpoint = url.trim_end_matches('/').to_string();
         self
     }
 
     fn origin(&self) -> Origin {
-        Origin {
-            route: ROUTE.to_string(),
-            model: self.model.clone(),
-        }
+        self.route.origin(&self.wire_model)
+    }
+}
+
+/// The one composition check, shared by the constructor and the pure request
+/// builder: the route data is usable, the profile is valid, and the profile's
+/// policy has an encoding here. Nothing is decided by a second, parallel table.
+pub(crate) fn validate_composition(
+    route: &MessagesRoute,
+    wire_model: &str,
+    profile: &ModelProfile,
+) -> Result<(), ProviderError> {
+    route.validate()?;
+    profile.validate()?;
+    if wire_model.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "wire model must be nonempty",
+        ));
+    }
+    // The pure lowering decides: an `enabled`/`preserved` profile has no Messages
+    // encoding, so it is refused here, at construction.
+    lower(profile, &ModelOptions::default())?;
+    Ok(())
+}
+
+impl std::fmt::Debug for AnthropicProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicProvider")
+            .field("route", &self.route)
+            .field("wire_model", &self.wire_model)
+            .finish_non_exhaustive()
     }
 }
 
@@ -81,7 +120,7 @@ impl Provider for AnthropicProvider {
             origin: self.origin(),
             // The Messages route declares JSON-schema function tools only.
             supports_freeform_tools: false,
-            mandatory_prompt_prefix: Some(IDENTITY.to_string()),
+            mandatory_prompt_prefix: Some(crate::request::IDENTITY.to_string()),
             // A subscription bills by plan, not per request: cost is unknown.
             reports_cost: false,
             // This route caches with `cache_control` markers; `options.cache_key`
@@ -96,8 +135,8 @@ impl Provider for AnthropicProvider {
                 return Err(ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
                     format!(
-                        "tool `{}` is declared freeform, which route {ROUTE} cannot carry",
-                        tool.name
+                        "tool `{}` is declared freeform, which route {} cannot carry",
+                        tool.name, self.route.origin_route
                     ),
                 ));
             }
@@ -116,8 +155,9 @@ impl Provider for AnthropicProvider {
                 return Err(ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
                     format!(
-                        "option \"{key}\" is not consumed by route \"{ROUTE}\" \
-                         (adapter anthropic-messages): it belongs to another adapter's namespace"
+                        "option \"{key}\" is not consumed by route \"{}\" \
+                         (adapter anthropic-messages): it belongs to another adapter's namespace",
+                        self.route.origin_route
                     ),
                 ));
             }
@@ -125,11 +165,8 @@ impl Provider for AnthropicProvider {
         if request.options.cache_key.is_some() {
             return Err(ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
-                format!("route {ROUTE} takes no cache key"),
+                format!("route {} takes no cache key", self.route.origin_route),
             ));
-        }
-        if let Some(error) = explicit_cap_conflict(&self.model, &request.options) {
-            return Err(error);
         }
         if request.options.max_output_tokens == Some(0) {
             return Err(ProviderError::new(
@@ -137,6 +174,9 @@ impl Provider for AnthropicProvider {
                 "max_output_tokens must be greater than zero",
             ));
         }
+        // The model policy: the same lowering the request builder runs, so
+        // `validate` can never accept a request the builder would reject.
+        lower(&self.profile, &request.options)?;
         Ok(())
     }
 
@@ -150,7 +190,7 @@ impl Provider for AnthropicProvider {
             // that cannot be built. All network-side failures are reported by the
             // stream's terminal event.
             self.validate(&request)?;
-            let body = build_request(&self.model, &request)?;
+            let body = build_request(&self.route, &self.wire_model, &self.profile, &request)?;
             let encoded = serde_json::to_vec(&body).map_err(|_| {
                 ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
@@ -158,15 +198,18 @@ impl Provider for AnthropicProvider {
                 )
             })?;
 
-            let url = format!("{}/v1/messages", self.base_url);
-            let model = self.model.clone();
+            let url = format!("{}/v1/messages", self.route.endpoint);
+            let account = self.route.account;
+            let origin_route = self.route.origin_route.clone();
+            let model = self.wire_model.clone();
             let build = Box::new(move |credential: &Credential| HttpRequest {
                 url: url.clone(),
-                headers: build_headers(credential, &body),
+                headers: build_headers(account, credential, &body),
                 body: encoded.clone(),
             });
-            let new_parser =
-                Box::new(move || Box::new(AnthropicParser::new(&model)) as Box<dyn ResponseParser>);
+            let new_parser = Box::new(move || {
+                Box::new(AnthropicParser::new(&origin_route, &model)) as Box<dyn ResponseParser>
+            });
 
             Ok(drive(DriveRequest {
                 transport: self.transport.clone(),
@@ -184,13 +227,73 @@ impl Provider for AnthropicProvider {
 mod tests {
     use super::*;
     use p1_contracts::{Effort, Item, ModelOptions};
+    use p1_model_profile::ThinkingPolicy;
+    use std::collections::BTreeMap;
+
+    /// A synthetic Messages route: today's shipped origin route, so the origin in
+    /// these unit expectations is the recorded one (spec §7.2).
+    fn route() -> MessagesRoute {
+        MessagesRoute {
+            origin_route: crate::ROUTE.to_string(),
+            endpoint: "https://api.anthropic.com".to_string(),
+            account: crate::MessagesAccount::ClaudeCodeSubscription,
+        }
+    }
+
+    /// The profile the OLD model-name rule selected: `claude-opus-4-6` /
+    /// `claude-sonnet-4-6` took the manual budget table, the three adaptive
+    /// prefixes took an effort level. This mapping documents what the explicit
+    /// `profiles/claude-*.toml` records replaced; the expectations are unchanged.
+    fn profile(model: &str) -> Arc<ModelProfile> {
+        let effort_level = ["claude-fable-5", "claude-opus-5", "claude-sonnet-5"]
+            .iter()
+            .any(|prefix| model.starts_with(prefix));
+        let efforts = vec![
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::ExtraHigh,
+            Effort::Max,
+        ];
+        Arc::new(ModelProfile {
+            id: model.to_string(),
+            revision: 1,
+            model_id: model.to_string(),
+            family: "claude".to_string(),
+            thinking: if effort_level {
+                ThinkingPolicy::EffortLevel
+            } else {
+                ThinkingPolicy::Budget
+            },
+            efforts: efforts.clone(),
+            default_effort: None,
+            thinking_budgets: if effort_level {
+                BTreeMap::new()
+            } else {
+                [
+                    (Effort::Low, 4_096),
+                    (Effort::Medium, 10_240),
+                    (Effort::High, 20_480),
+                    (Effort::ExtraHigh, 32_768),
+                    (Effort::Max, 32_768),
+                ]
+                .into_iter()
+                .collect()
+            },
+            context_tokens: None,
+            max_output_tokens: None,
+        })
+    }
 
     fn provider(model: &str) -> AnthropicProvider {
         AnthropicProvider::new(
+            route(),
             model,
+            profile(model),
             Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
             Arc::new(NoCredentials),
         )
+        .expect("the profile is expressible on the Messages wire")
     }
 
     struct NoCredentials;
@@ -273,13 +376,18 @@ mod tests {
             }
             // The pure builder rejects the same request.
             assert_eq!(
-                build_request("claude-opus-4-6", &request(options))
-                    .unwrap_err()
-                    .kind,
+                build_request(
+                    &route(),
+                    "claude-opus-4-6",
+                    &profile("claude-opus-4-6"),
+                    &request(options)
+                )
+                .unwrap_err()
+                .kind,
                 ProviderErrorKind::InvalidRequest
             );
         }
-        // One above the budget is fine, and so is every cap on the adaptive lane.
+        // One above the budget is fine, and so is every cap on the effort-level lane.
         let options = ModelOptions {
             reasoning_effort: Some(Effort::Low),
             max_output_tokens: Some(4_097),
@@ -315,7 +423,7 @@ mod tests {
             assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{key}");
             for part in [
                 format!("option \"{key}\""),
-                format!("route \"{ROUTE}\""),
+                format!("route \"{}\"", crate::ROUTE),
                 "(adapter anthropic-messages)".to_string(),
             ] {
                 assert!(error.message.contains(&part), "{}: {}", error, part);
@@ -337,5 +445,75 @@ mod tests {
                 .validate(&request(options))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn an_effort_the_profile_does_not_list_is_rejected_by_validate_and_the_builder() {
+        let profile = Arc::new(ModelProfile {
+            efforts: vec![Effort::High],
+            thinking_budgets: [(Effort::High, 20_480)].into_iter().collect(),
+            ..(*profile("claude-opus-4-6")).clone()
+        });
+        let provider = AnthropicProvider::new(
+            route(),
+            "claude-opus-4-6",
+            profile.clone(),
+            Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            Arc::new(NoCredentials),
+        )
+        .expect("the policy is expressible");
+        let options = ModelOptions {
+            reasoning_effort: Some(Effort::Low),
+            ..ModelOptions::default()
+        };
+        let error = provider.validate(&request(options.clone())).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert_eq!(
+            build_request(&route(), "claude-opus-4-6", &profile, &request(options))
+                .unwrap_err()
+                .kind,
+            ProviderErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn the_messages_adapter_refuses_the_enabled_and_preserved_policies() {
+        for (policy, variant) in [
+            (ThinkingPolicy::Enabled, "enabled"),
+            (ThinkingPolicy::Preserved, "preserved"),
+        ] {
+            let profile = Arc::new(ModelProfile {
+                thinking: policy,
+                thinking_budgets: BTreeMap::new(),
+                ..(*profile("claude-opus-4-6")).clone()
+            });
+            assert!(profile.validate().is_ok(), "{variant}");
+            let error = AnthropicProvider::new(
+                route(),
+                "claude-opus-4-6",
+                profile.clone(),
+                Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+                Arc::new(NoCredentials),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{variant}");
+            assert!(
+                error.message.contains(&format!("thinking = \"{variant}\"")),
+                "{variant}: {}",
+                error.message
+            );
+            assert!(error.message.contains("Messages"), "{variant}: {error}");
+            // The pure builder refuses it too: one lowering, not two rules.
+            assert!(
+                build_request(
+                    &route(),
+                    "claude-opus-4-6",
+                    &profile,
+                    &request(ModelOptions::default())
+                )
+                .is_err(),
+                "{variant}"
+            );
+        }
     }
 }

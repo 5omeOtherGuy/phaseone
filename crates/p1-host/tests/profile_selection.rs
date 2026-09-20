@@ -176,7 +176,9 @@ fn a_chat_key_in_the_old_form_is_refused_and_says_which_form_to_write() {
 
 #[test]
 fn a_whole_provider_in_the_new_form_is_refused_and_says_which_form_to_write() {
-    for key in ["anthropic-subscription", "openai-codex-subscription"] {
+    // `anthropic-subscription` left this list in ADR-0039 step 4: it is a route file
+    // now, and `crates/p1-host/tests/anthropic_route.rs` covers its new form.
+    for key in p1_host::catalog::WHOLE_PROVIDERS {
         let root = tempdir().unwrap();
         let environments = root.path().join("environments");
         std::fs::create_dir_all(&environments).unwrap();

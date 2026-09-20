@@ -17,11 +17,11 @@ use serde::Deserialize;
 
 /// The adapter keys a route file may name. `catalog` dispatches on exactly this set;
 /// an unknown `adapter` is a load error listing these.
-pub const ADAPTER_KEYS: &[&str] = &["openai-chat"];
+pub const ADAPTER_KEYS: &[&str] = &["openai-chat", "anthropic-messages"];
 
-/// The credential kinds a route file may name (spec 1.2). The two OAuth kinds parse,
-/// but a route that uses one is rejected until step 4 makes their sources
-/// data-driven.
+/// The credential kinds a route file may name (spec 1.2). The two OAuth kinds parse;
+/// the Claude Code kind has a compiled source (spec §7.2), the Codex kind follows in
+/// the next step and is refused until then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialKind {
@@ -110,14 +110,14 @@ pub struct CredentialRef {
 }
 
 impl CredentialRef {
-    /// Only an API-key reference has a data-driven source yet (ADR-0039 step 4 gives
-    /// the two OAuth kinds theirs).
+    /// A kind with a compiled source a route file may point at. The Claude Code
+    /// login became data-driven in ADR-0039 step 4; the Codex login is still to come.
     pub fn validate_source(&self) -> Result<(), String> {
         match self.kind {
-            CredentialKind::ApiKey => Ok(()),
-            kind => Err(format!(
+            CredentialKind::ApiKey | CredentialKind::ClaudeCodeOauth => Ok(()),
+            CredentialKind::CodexOauth => Err(format!(
                 "credential kind \"{}\" is not yet data-driven (ADR-0039 step 4)",
-                kind.name()
+                self.kind.name()
             )),
         }
     }
@@ -171,6 +171,7 @@ pub struct RouteFile {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdapterSettings {
     OpenAiChat(p1_provider_openai_chat::ChatAdapterSettings),
+    AnthropicMessages(p1_provider_anthropic::MessagesAdapterSettings),
 }
 
 impl RouteFile {
@@ -182,6 +183,9 @@ impl RouteFile {
             "openai-chat" => self
                 .typed_settings::<p1_provider_openai_chat::ChatAdapterSettings>()
                 .map(AdapterSettings::OpenAiChat),
+            "anthropic-messages" => self
+                .typed_settings::<p1_provider_anthropic::MessagesAdapterSettings>()
+                .map(AdapterSettings::AnthropicMessages),
             other => Err(format!(
                 "unknown adapter \"{other}\"; the known adapters are {}",
                 known_adapters()

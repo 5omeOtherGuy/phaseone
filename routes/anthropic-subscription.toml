@@ -1,0 +1,30 @@
+# How the Claude Code subscription is reached (ADR-0039 step 4, spec §7.2 of
+# docs/design/routes-and-profiles.md). Everything the host used to compile for this
+# route lives here. `origin_route` is byte for byte the `Origin.route` the messages
+# adapter wrote before route data existed, so a session recorded then still resumes
+# (ADR-0033). The identity block, the OAuth beta/version header set and the
+# `/v1/messages` path stay compiled: they are the account behaviour `account` selects.
+id           = "anthropic-subscription"
+origin_route = "anthropic-messages/claude-subscription"
+adapter      = "anthropic-messages"
+endpoint     = "https://api.anthropic.com"
+
+[credential]
+# A reference, never a value: the compiled Claude Code login source.
+kind = "claude-code-oauth"
+
+[adapter_settings]
+account = "claude-code-subscription"
+
+# Only profiles the host ships a policy for; any other profile is refused. A dated
+# snapshot is a binding (`wire_model`), not a profile.
+[models."claude-fable-5"]
+wire_model = "claude-fable-5"
+[models."claude-opus-4-6"]
+wire_model = "claude-opus-4-6"
+[models."claude-opus-5"]
+wire_model = "claude-opus-5"
+[models."claude-sonnet-4-6"]
+wire_model = "claude-sonnet-4-6"
+[models."claude-sonnet-5"]
+wire_model = "claude-sonnet-5"

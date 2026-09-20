@@ -1,6 +1,5 @@
-family   = "claude"
-provider = "anthropic-subscription"
-model    = "claude-sonnet-5"
+route   = "anthropic-subscription"
+profile = "claude-sonnet-5"
 
 [options]
 reasoning_effort = "medium"

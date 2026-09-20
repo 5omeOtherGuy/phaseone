@@ -2,6 +2,34 @@
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::{Credential, CredentialSource};
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// The credential source a route file's `[credential]` names (spec §1.2): the
+/// compiled source of that kind, reading exactly what the source read before route
+/// files existed. An API key is read from the environment variable first, then from
+/// the borrowed CLI logins in the order the file lists them; the Claude Code OAuth
+/// kind is the compiled login (ADR-0040). A kind without a data-driven source is
+/// refused with the reason.
+pub fn credential_source(
+    reference: &crate::routes::CredentialRef,
+) -> Result<Arc<dyn CredentialSource>, String> {
+    use crate::routes::CredentialKind;
+    reference.validate_source()?;
+    match reference.kind {
+        CredentialKind::ApiKey => Ok(Arc::new(SubscriptionCredentials::from_api_key_ref(
+            reference,
+        )?)),
+        CredentialKind::ClaudeCodeOauth => Ok(Arc::new(
+            p1_provider_anthropic::ClaudeCodeCredentials::from_default_location()
+                .map_err(|error| error.to_string())?,
+        )),
+        // `validate_source` already refused this; kept total for the enum.
+        CredentialKind::CodexOauth => Err(format!(
+            "credential kind \"{}\" is not yet data-driven (ADR-0039 step 4)",
+            reference.kind.name()
+        )),
+    }
+}
 
 /// Read-only API key reuse. No shell commands, refresh endpoint or credential writes.
 /// Environment overrides precede OpenCode/Pi auth files. Files are re-read on access.
@@ -18,14 +46,12 @@ fn auth(message: &str) -> ProviderError {
     ProviderError::new(ProviderErrorKind::Authentication, message)
 }
 impl SubscriptionCredentials {
-    /// Build the source a route file's `[credential]` names (spec §1.2): the
-    /// environment variable first, then the borrowed CLI logins in the order the file
-    /// lists them. The file paths are exactly the ones the compiled sources used, so
-    /// picking a key still precedes in the same order. A kind without a data-driven
-    /// source yet is refused with the reason.
-    pub fn from_ref(reference: &crate::routes::CredentialRef) -> Result<Self, String> {
+    /// The API-key source one `[credential]` reference describes: the environment
+    /// variable first, then the borrowed CLI logins in the order the file lists
+    /// them. The file paths are exactly the ones the compiled sources used, so
+    /// picking a key still precedes in the same order.
+    fn from_api_key_ref(reference: &crate::routes::CredentialRef) -> Result<Self, String> {
         use crate::routes::BorrowStore;
-        reference.validate_source()?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut files = Vec::new();
         for source in &reference.borrow {
