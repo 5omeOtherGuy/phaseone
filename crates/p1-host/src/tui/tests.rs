@@ -1,19 +1,16 @@
-//! Driver tests: no TTY, no terminal — the driver core over channels, with a
-//! fake agent task that answers turns immediately.
+//! Driver tests: no TTY, no terminal — the driver over plain method calls.
 
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use p1_contracts::{AuthorizationPolicy, StopReason};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-/// A driver wired to a real agent task over a scripted (empty) provider;
-/// each turn ends immediately with the scripted provider's exhaustion.
-fn driver() -> Driver {
-    let (policy, _auth) = TuiPolicy::new(false, CancellationToken::new());
-    let (_sink, _events) = TuiSink::new();
+/// A driver with an `--ask`-off policy and no wiring behind it.
+fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
+    let (policy, auth) = TuiPolicy::new(false, CancellationToken::new());
+    // A minimal real agent, for its inbox handle.
     let agent = Agent::new(p1_core::AgentParts {
         provider: Arc::new(p1_testkit::ScriptedProvider::new(vec![])),
         tools: vec![],
@@ -28,102 +25,107 @@ fn driver() -> Driver {
             CancellationToken::new(),
         )),
         journal: Arc::new(p1_journal::MemoryJournal::new()),
-        events: Arc::new(_sink),
+        events: Arc::new(p1_tui::runtime::TuiSink::new().0),
     })
     .expect("agent builds");
-    let inbox = agent.inbox();
-    let (agent_tx, agent_rx) = mpsc::unbounded_channel();
-    tokio::spawn(agent_task(agent, agent_rx));
-    Driver {
-        screen: Screen::new(true),
-        options: TuiOptions {
+    (
+        Driver {
+            screen: Screen::new(true),
             env: "claude".into(),
             route: "claude".into(),
             model: "sonnet-4.5".into(),
-            ask: false,
             workspace: std::env::current_dir().unwrap(),
+            policy: Arc::new(policy),
+            pending_auth: None,
+            follow_ups: VecDeque::new(),
+            submit_pending: None,
+            pending_calls: HashMap::new(),
+            task_files: HashSet::new(),
+            task_added: 0,
+            task_removed: 0,
+            exit: None,
+            inbox: agent.inbox(),
+            _workers: None,
         },
-        agent_tx,
-        turn: None,
-        inbox,
-        policy: Arc::new(policy),
-        pending_auth: None,
-        follow_ups: VecDeque::new(),
-        pending_calls: Default::default(),
-        task_files: Default::default(),
-        task_added: 0,
-        task_removed: 0,
-        exit: None,
-    }
+        auth,
+    )
 }
 
-#[tokio::test]
-async fn typing_and_enter_submits_a_prompt() {
-    let mut d = driver();
+#[test]
+fn typing_and_enter_submits_a_prompt() {
+    let (mut d, _auth) = driver();
     for c in "fix it".chars() {
-        d.on_key(key(KeyCode::Char(c)), 0);
+        d.on_key(key(KeyCode::Char(c)));
     }
-    d.on_key(key(KeyCode::Enter), 0);
-    assert!(d.turn.is_some(), "a turn started");
+    d.on_key(key(KeyCode::Enter));
+    assert_eq!(d.submit_pending.as_deref(), Some("fix it"));
     assert_eq!(d.screen.composer.text, "");
+    // The operator line is in the transcript.
+    assert!(matches!(
+        d.screen.transcript.blocks[0],
+        p1_tui::transcript::Block::Operator { .. }
+    ));
 }
 
-#[tokio::test]
-async fn slash_exit_quits_and_focus_toggles() {
-    let mut d = driver();
+#[test]
+fn slash_exit_quits_and_focus_toggles() {
+    let (mut d, _auth) = driver();
     for c in "/focus".chars() {
-        d.on_key(key(KeyCode::Char(c)), 0);
+        d.on_key(key(KeyCode::Char(c)));
     }
-    d.on_key(key(KeyCode::Enter), 0);
+    d.on_key(key(KeyCode::Enter));
     assert!(d.screen.focus);
+    assert_eq!(d.submit_pending, None);
     for c in "/exit".chars() {
-        d.on_key(key(KeyCode::Char(c)), 0);
+        d.on_key(key(KeyCode::Char(c)));
     }
-    d.on_key(key(KeyCode::Enter), 0);
+    d.on_key(key(KeyCode::Enter));
     assert_eq!(d.exit, Some(0));
 }
 
-#[tokio::test]
-async fn enter_while_working_queues_steering_to_the_inbox() {
-    let mut d = driver();
+#[test]
+fn enter_while_working_queues_steering_to_the_inbox() {
+    let (mut d, _auth) = driver();
     d.screen.working = Some(p1_tui::state::Working {
         label: "shell".into(),
         started_ms: 0,
     });
     for c in "use vecdeque".chars() {
-        d.on_key(key(KeyCode::Char(c)), 0);
+        d.on_key(key(KeyCode::Char(c)));
     }
-    d.on_key(key(KeyCode::Enter), 0);
+    d.on_key(key(KeyCode::Enter));
+    assert_eq!(d.submit_pending, None, "steering never starts a turn");
     assert_eq!(d.screen.queued.len(), 1);
     assert_eq!(d.screen.queued[0].text, "use vecdeque");
 }
 
-#[tokio::test]
-async fn a_turn_end_runs_the_oldest_follow_up() {
-    let mut d = driver();
+#[test]
+fn a_turn_end_offers_the_oldest_follow_up() {
+    let (mut d, _auth) = driver();
     d.follow_ups.push_back("next step".into());
     d.screen.queue(true, "next step".into());
-    d.on_turn_end(TurnEnd::Completed {
-        stop: StopReason::EndTurn,
+    d.note_turn_end(&TurnEnd::Completed {
+        stop: p1_contracts::StopReason::EndTurn,
     });
-    assert!(d.turn.is_some(), "the follow-up started a turn");
+    assert_eq!(d.take_follow_up().as_deref(), Some("next step"));
     assert!(d.follow_ups.is_empty());
     assert!(d.screen.queued.is_empty());
 }
 
-#[tokio::test]
-async fn cancel_clears_the_follow_up_queue() {
-    let mut d = driver();
+#[test]
+fn cancel_clears_the_follow_up_queue() {
+    let (mut d, _auth) = driver();
     d.follow_ups.push_back("next step".into());
-    d.on_turn_end(TurnEnd::Cancelled);
-    assert!(d.follow_ups.is_empty());
-    assert!(d.turn.is_none());
+    d.screen.queue(true, "next step".into());
+    d.note_turn_end(&TurnEnd::Cancelled);
+    assert_eq!(d.take_follow_up(), None);
+    assert!(d.screen.queued.is_empty());
 }
 
 #[tokio::test]
 async fn an_auth_request_becomes_the_approval_view_and_answers() {
     let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
-    let mut d = driver();
+    let (mut d, _auth) = driver();
     d.policy = Arc::new(policy);
     let call = p1_contracts::ToolCall {
         call_id: "c1".into(),
@@ -134,7 +136,6 @@ async fn an_auth_request_becomes_the_approval_view_and_answers() {
         implementation: "shell".into(),
         variant: String::new(),
     };
-    // Park a request from the policy side, as the core would.
     let pending = tokio::spawn({
         let policy = d.policy.clone();
         let call = call.clone();
@@ -153,9 +154,49 @@ async fn an_auth_request_becomes_the_approval_view_and_answers() {
     d.on_auth(request);
     assert!(matches!(d.screen.approval, Some(Approval::Permission(_))));
     assert!(d.screen.pinned);
-    // `y` answers it.
-    d.on_key(key(KeyCode::Char('y')), 0);
+    d.on_key(key(KeyCode::Char('y')));
     assert_eq!(pending.await.unwrap(), Decision::Permit);
     assert!(d.screen.approval.is_none());
     assert!(!d.screen.pinned);
+}
+
+#[test]
+fn worker_events_stay_out_of_the_parent_transcript_but_mark_start_and_end() {
+    let (mut d, _auth) = driver();
+    d.on_ui_event(UiEvent::WorkerStarted("w1".into()));
+    d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 0,
+        worker: Some("w1".into()),
+        event: p1_contracts::AgentEvent::TextDelta {
+            text: "worker prose".into(),
+        },
+    }));
+    d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 1,
+        worker: Some("w1".into()),
+        event: p1_contracts::AgentEvent::TurnFinished {
+            end: TurnEnd::Completed {
+                stop: p1_contracts::StopReason::EndTurn,
+            },
+        },
+    }));
+    let texts: Vec<String> = d
+        .screen
+        .transcript
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            p1_tui::transcript::Block::Meta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["↳ w1 started", "↳ w1 finished"]);
+    // No prose leaked into the parent's transcript.
+    assert!(
+        !d.screen
+            .transcript
+            .blocks
+            .iter()
+            .any(|b| matches!(b, p1_tui::transcript::Block::Prose { .. }))
+    );
 }
