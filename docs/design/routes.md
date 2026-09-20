@@ -290,3 +290,30 @@ and normal input. Candidate passed; the original baseline failed. Only the inten
 file changed. The candidate is not merged as part of route implementation. Local evidence:
 `~/projects/phaseone-dogfood/routes9-deepseek.run/report.json`, with the diff alongside it.
 This one bounded task does not establish long-run reliability or comparative model quality.
+
+**After the ADR-0039 reshape (b34ba7e, 2026-09-20):** both host-wired live smokes
+passed again, with reasoning emitted before tool calls and accepted on follow-up.
+Both routes then completed the same bounded SSE BOM task in separate sandboxed clones:
+
+| Route/model | Seconds | Requests | Tool calls | Failed tool calls | Cached input share |
+|---|---:|---:|---:|---:|---:|
+| Go / deepseek-v4.1-flash, high | 145 | 26 | 32 | 0 | 96.5% |
+| Z.ai coding / glm-5.3, high | 434 | 22 | 29 | 0 | 93.7% |
+
+Both exited 0 with no operator intervention or reviewer repairs. Subscription cost remains
+unknown. DeepSeek used 630,628 input / 19,849 output tokens; GLM used 697,714 input /
+22,720 output tokens. One and two nonzero shell exits respectively were deliberate
+negative controls, not provider/tool failures. GLM noticed an insensitive regression fixture
+while testing the old behaviour and strengthened it before finishing.
+
+The reviewer independently reran each clone's HTTP tests (54 DeepSeek, 55 GLM), formatting,
+and the same standalone adversarial harness covering all two/three-chunk splits of leading,
+duplicate and embedded BOMs, BOM-only streams and ordinary streams. Both candidates passed;
+the unmodified baseline failed. Each changed only `crates/p1-provider-http/src/sse.rs`.
+The generated fixes remain in disposable clones, outside this route PR.
+
+Local evidence directories: `~/projects/phaseone-dogfood/routes9-deepseek-reshaped.run/`
+and `~/projects/phaseone-dogfood/routes9-glm.run/`; each has an `accepted-report.json`,
+original `report.json` and `changes.diff`. The independent harness is
+`/tmp/p1-route-checks/verify.py`. These are integration checks, not a controlled model
+comparison or evidence of hours-long reliability.
