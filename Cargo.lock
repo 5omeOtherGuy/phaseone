@@ -794,6 +794,7 @@ dependencies = [
  "p1-contracts",
  "p1-core",
  "p1-journal",
+ "p1-model-profile",
  "p1-provider-anthropic",
  "p1-provider-http",
  "p1-provider-openai",
@@ -833,12 +834,19 @@ version = "0.0.1"
 dependencies = [
  "futures-util",
  "p1-contracts",
+ "p1-host",
  "p1-provider-anthropic",
  "p1-provider-http",
  "p1-provider-openai",
- "p1-provider-openai-chat",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "p1-model-profile"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
 ]
 
 [[package]]
@@ -897,10 +905,10 @@ version = "0.0.1"
 dependencies = [
  "futures-util",
  "p1-contracts",
+ "p1-model-profile",
  "p1-provider-conformance",
  "p1-provider-http",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 

@@ -1,8 +1,9 @@
-use crate::SubscriptionRoute;
+use crate::{ChatDialect, ChatRoute};
 use p1_contracts::{
     AssistantBlock, DeclarationKind, Effort, Item, ProviderError, ProviderErrorKind,
     ProviderRequest, ToolInput,
 };
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use serde_json::{Value, json};
 
 pub(crate) fn invalid(message: &str) -> ProviderError {
@@ -10,7 +11,8 @@ pub(crate) fn invalid(message: &str) -> ProviderError {
 }
 
 pub(crate) fn validate(
-    route: SubscriptionRoute,
+    route: &ChatRoute,
+    profile: &ModelProfile,
     request: &ProviderRequest,
 ) -> Result<(), ProviderError> {
     if request
@@ -22,35 +24,25 @@ pub(crate) fn validate(
             "chat subscription routes support function tools only",
         ));
     }
-    if matches!(
-        request.options.reasoning_effort,
-        Some(Effort::Medium | Effort::ExtraHigh)
-    ) {
-        return Err(invalid(
-            "this subscription route does not support medium or extra-high reasoning effort",
-        ));
-    }
-    if route == SubscriptionRoute::OpenCodeGo
-        && request.options.reasoning_effort == Some(Effort::Low)
+    profile.resolve_effort(request.options.reasoning_effort)?;
+    for limit in [profile.max_output_tokens, route.limits.max_output_tokens]
+        .into_iter()
+        .flatten()
     {
-        return Err(invalid("DeepSeek Go supports high or max reasoning effort"));
-    }
-    if route == SubscriptionRoute::Glm
-        && request
+        if request
             .options
             .max_output_tokens
-            .is_some_and(|cap| cap > 131_072)
-    {
-        return Err(invalid("GLM output cap exceeds 131072 tokens"));
+            .is_some_and(|cap| cap > limit)
+        {
+            return Err(invalid("output cap exceeds the model or route limit"));
+        }
     }
     if request.options.max_output_tokens == Some(0) {
         return Err(invalid("output cap must be positive"));
     }
     if let Some(key) = &request.options.cache_key {
-        if route == SubscriptionRoute::Glm {
-            return Err(invalid(
-                "GLM has automatic prefix caching, no explicit cache key",
-            ));
+        if route.session_header.is_none() {
+            return Err(invalid("chat route does not support an explicit cache key"));
         }
         if key.is_empty() || key.len() > 256 || !key.bytes().all(|b| (33..=126).contains(&b)) {
             return Err(invalid(
@@ -58,12 +50,9 @@ pub(crate) fn validate(
             ));
         }
     }
-    if request
-        .options
-        .native
-        .keys()
-        .any(|key| key.starts_with("openai-chat.") || key.starts_with(&format!("{}.", route.id())))
-    {
+    if request.options.native.keys().any(|key| {
+        key.starts_with("openai-chat.") || key.starts_with(&format!("{}.", route.origin_route))
+    }) {
         return Err(invalid("unknown native option in chat route namespace"));
     }
     Ok(())
@@ -71,11 +60,13 @@ pub(crate) fn validate(
 
 /// Pure wire builder. Foreign reasoning is dropped, never rendered as assistant text.
 pub fn build_request(
-    route: SubscriptionRoute,
+    route: &ChatRoute,
     model: &str,
+    profile: &ModelProfile,
     request: &ProviderRequest,
 ) -> Result<Value, ProviderError> {
-    validate(route, request)?;
+    crate::validate_composition(route, model, profile)?;
+    validate(route, profile, request)?;
     let origin = route.origin(model);
     let mut messages = vec![json!({"role":"system", "content": request.system_prompt})];
     for item in &request.history {
@@ -129,16 +120,16 @@ pub fn build_request(
             }
         }
     }
-    let mut body = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"reasoning_effort":match request.options.reasoning_effort {Some(Effort::Max)=>"max", Some(Effort::Low)=>"low", _=>"high"}});
-    body["thinking"] = match route {
-        SubscriptionRoute::OpenCodeGo => json!({"type":"enabled"}),
-        SubscriptionRoute::Glm => json!({"type":"enabled","clear_thinking":false}),
+    let mut body = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"reasoning_effort":match profile.resolve_effort(request.options.reasoning_effort)? {Effort::Max=>"max", Effort::Low=>"low", _=>"high"}});
+    body["thinking"] = match profile.thinking {
+        ThinkingPolicy::Enabled => json!({"type":"enabled"}),
+        ThinkingPolicy::Preserved => json!({"type":"enabled","clear_thinking":false}),
     };
     if let Some(cap) = request.options.max_output_tokens {
         body["max_tokens"] = json!(cap);
     }
     if !request.tools.is_empty() {
-        if route == SubscriptionRoute::Glm {
+        if route.dialect == ChatDialect::RetainedThinking {
             body["tool_stream"] = json!(true);
         }
         body["tools"] = request.tools.iter().map(|tool| match &tool.kind {
@@ -166,7 +157,9 @@ mod tests {
     }
     #[test]
     fn golden_tool_round_trip_and_subscription_options() {
-        for route in [SubscriptionRoute::OpenCodeGo, SubscriptionRoute::Glm] {
+        for retained in [false, true] {
+            let route = crate::test_config::route(retained);
+            let profile = crate::test_config::profile(retained);
             let mut r = request();
             let origin = route.origin("model");
             r.tools.push(ToolDeclaration {
@@ -206,17 +199,17 @@ mod tests {
                 }),
             ];
             r.options.max_output_tokens = Some(200);
-            let body = build_request(route, "model", &r).unwrap();
+            let body = build_request(&route, "model", &profile, &r).unwrap();
             let mut expected = json!({"model":"model","stream":true,"stream_options":{"include_usage":true},"reasoning_effort":"high","max_tokens":200,
-                "thinking":if route==SubscriptionRoute::Glm {json!({"type":"enabled","clear_thinking":false})}else{json!({"type":"enabled"})},
+                "thinking":if retained {json!({"type":"enabled","clear_thinking":false})}else{json!({"type":"enabled"})},
                 "tools":[{"type":"function","function":{"name":"read","description":"Read","parameters":{"type":"object"}}}],
                 "messages":[{"role":"system","content":"system"},{"role":"user","content":"inspect"},{"role":"assistant","content":"","reasoning_content":"exact\n雪","tool_calls":[{"id":"call","type":"function","function":{"name":"read","arguments":"{ \"path\": \"a\" }"}}]},{"role":"tool","tool_call_id":"call","content":"not found"}]
             });
-            if route == SubscriptionRoute::Glm {
+            if route.dialect == ChatDialect::RetainedThinking {
                 expected["tool_stream"] = json!(true);
             }
             assert_eq!(body, expected);
-            let foreign = build_request(route, "different-model", &r)
+            let foreign = build_request(&route, "different-model", &profile, &r)
                 .unwrap()
                 .to_string();
             assert!(!foreign.contains("exact"));
@@ -225,32 +218,41 @@ mod tests {
     }
     #[test]
     fn rejects_unrepresentable_options_and_tools() {
-        let route = SubscriptionRoute::OpenCodeGo;
+        let route = crate::test_config::route(false);
+        let profile = crate::test_config::profile(false);
         let mut r = request();
         r.tools.push(ToolDeclaration {
             name: "patch".into(),
             description: String::new(),
             kind: DeclarationKind::Freeform { grammar: None },
         });
-        assert!(build_request(route, "m", &r).is_err());
+        assert!(build_request(&route, "m", &profile, &r).is_err());
         r.tools.clear();
         for effort in [Effort::Low, Effort::Medium, Effort::ExtraHigh] {
             r.options.reasoning_effort = Some(effort);
-            assert!(build_request(route, "m", &r).is_err());
+            assert!(build_request(&route, "m", &profile, &r).is_err());
         }
         r.options = ModelOptions::default();
         r.options
             .native
             .insert("openai-chat.typo".into(), json!(true));
-        assert!(build_request(route, "m", &r).is_err());
+        assert!(build_request(&route, "m", &profile, &r).is_err());
         r.options.native.clear();
         r.options.native.insert("other.option".into(), json!(true));
-        assert!(build_request(route, "m", &r).is_ok());
+        assert!(build_request(&route, "m", &profile, &r).is_ok());
         r.options.cache_key = Some("bad\nheader".into());
-        assert!(build_request(route, "m", &r).is_err());
+        assert!(build_request(&route, "m", &profile, &r).is_err());
         r.options.cache_key = Some("valid".into());
-        assert!(build_request(route, "m", &r).is_ok());
-        assert!(build_request(SubscriptionRoute::Glm, "m", &r).is_err());
+        assert!(build_request(&route, "m", &profile, &r).is_ok());
+        assert!(
+            build_request(
+                &crate::test_config::route(true),
+                "m",
+                &crate::test_config::profile(true),
+                &r
+            )
+            .is_err()
+        );
     }
     #[test]
     fn glm_effort_and_output_limits_match_the_documented_wire() {
@@ -262,13 +264,35 @@ mod tests {
         ] {
             r.options.reasoning_effort = Some(effort);
             assert_eq!(
-                build_request(SubscriptionRoute::Glm, "glm-5.3", &r).unwrap()["reasoning_effort"],
+                build_request(
+                    &crate::test_config::route(true),
+                    "glm-5.3",
+                    &crate::test_config::profile(true),
+                    &r
+                )
+                .unwrap()["reasoning_effort"],
                 name
             );
         }
         r.options.max_output_tokens = Some(131_072);
-        assert!(build_request(SubscriptionRoute::Glm, "glm-5.3", &r).is_ok());
+        assert!(
+            build_request(
+                &crate::test_config::route(true),
+                "glm-5.3",
+                &crate::test_config::profile(true),
+                &r
+            )
+            .is_ok()
+        );
         r.options.max_output_tokens = Some(131_073);
-        assert!(build_request(SubscriptionRoute::Glm, "glm-5.3", &r).is_err());
+        assert!(
+            build_request(
+                &crate::test_config::route(true),
+                "glm-5.3",
+                &crate::test_config::profile(true),
+                &r
+            )
+            .is_err()
+        );
     }
 }

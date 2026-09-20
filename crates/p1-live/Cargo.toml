@@ -10,11 +10,11 @@ publish.workspace = true
 workspace = true
 
 [dev-dependencies]
+p1-host = { path = "../p1-host" }
 p1-contracts = { path = "../p1-contracts" }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-provider-anthropic = { path = "../p1-provider-anthropic" }
 p1-provider-openai = { path = "../p1-provider-openai" }
-p1-provider-openai-chat = { path = "../p1-provider-openai-chat" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }

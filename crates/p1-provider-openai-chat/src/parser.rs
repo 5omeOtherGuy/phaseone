@@ -1,3 +1,4 @@
+use crate::ChatDialect;
 use p1_contracts::{
     AssistantBlock, AssistantItem, CompletedResponse, Origin, Outcome, ProviderError,
     ProviderErrorKind, ReplayData, StopReason, StreamEvent, ToolCall, ToolInput, Usage,
@@ -8,6 +9,7 @@ use std::collections::BTreeMap;
 
 pub(crate) struct ChatParser {
     origin: Origin,
+    dialect: ChatDialect,
     blocks: Vec<AssistantBlock>,
     calls: BTreeMap<u64, usize>,
     text: Option<usize>,
@@ -17,9 +19,10 @@ pub(crate) struct ChatParser {
     ended: bool,
 }
 impl ChatParser {
-    pub(crate) fn new(origin: Origin) -> Self {
+    pub(crate) fn new(origin: Origin, dialect: ChatDialect) -> Self {
         Self {
             origin,
+            dialect,
             blocks: Vec::new(),
             calls: BTreeMap::new(),
             text: None,
@@ -173,7 +176,12 @@ impl ResponseParser for ChatParser {
             {
                 return self.fail("invalid tool delta list");
             }
-            // Go sometimes calls the field `reasoning`; requests always use reasoning_content.
+            if self.dialect != ChatDialect::ThinkingWithReasoningAlias
+                && delta.get("reasoning").is_some_and(|value| !value.is_null())
+            {
+                return self.fail("reasoning alias is not supported by this chat dialect");
+            }
+            // This dialect declares the alias equivalent to the replayable reasoning field.
             if let Some(part) = delta
                 .get("reasoning_content")
                 .and_then(Value::as_str)
@@ -305,7 +313,10 @@ mod tests {
     use super::*;
     use serde_json::json;
     fn parser() -> ChatParser {
-        ChatParser::new(crate::SubscriptionRoute::OpenCodeGo.origin("configured"))
+        ChatParser::new(
+            crate::test_config::route(false).origin("configured"),
+            ChatDialect::ThinkingWithReasoningAlias,
+        )
     }
     fn send(p: &mut ChatParser, value: Value) -> Vec<StreamEvent> {
         p.on_event(SseEvent {
@@ -460,7 +471,10 @@ mod block_order_tests {
     use serde_json::json;
     #[test]
     fn text_and_reasoning_blocks_keep_their_sequence() {
-        let mut p = ChatParser::new(crate::SubscriptionRoute::Glm.origin("m"));
+        let mut p = ChatParser::new(
+            crate::test_config::route(true).origin("m"),
+            ChatDialect::RetainedThinking,
+        );
         for delta in [
             json!({"reasoning_content":"first"}),
             json!({"content":"middle"}),
@@ -489,7 +503,10 @@ mod malformed_tests {
             json!({"tool_calls":{}}),
             json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":{}}}]}),
         ] {
-            let mut parser = ChatParser::new(crate::SubscriptionRoute::Glm.origin("m"));
+            let mut parser = ChatParser::new(
+                crate::test_config::route(true).origin("m"),
+                ChatDialect::RetainedThinking,
+            );
             let events = parser.on_event(SseEvent {
                 event: None,
                 data: json!({"choices":[{"index":0,"delta":delta,"finish_reason":"stop"}]})

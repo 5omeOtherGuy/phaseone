@@ -1,4 +1,4 @@
-use crate::SubscriptionRoute;
+//! Borrowed subscription key sources (ADR-0040). The p1 store is a later migration.
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::{Credential, CredentialSource};
 use std::path::PathBuf;
@@ -18,14 +18,16 @@ fn auth(message: &str) -> ProviderError {
     ProviderError::new(ProviderErrorKind::Authentication, message)
 }
 impl SubscriptionCredentials {
-    pub fn from_default_location(route: SubscriptionRoute) -> Result<Self, ProviderError> {
+    pub fn opencode_go() -> Self {
+        Self::borrowed("OPENCODE_API_KEY", "opencode-go", true)
+    }
+    pub fn glm() -> Self {
+        Self::borrowed("ZAI_API_KEY", "zai", false)
+    }
+    fn borrowed(env_var: &str, pi_key: &str, opencode: bool) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut files = Vec::new();
-        let (env_var, pi_key) = match route {
-            SubscriptionRoute::OpenCodeGo => ("OPENCODE_API_KEY", "opencode-go"),
-            SubscriptionRoute::Glm => ("ZAI_API_KEY", "zai"),
-        };
-        if route == SubscriptionRoute::OpenCodeGo {
+        if opencode {
             let data = std::env::var_os("XDG_DATA_HOME")
                 .map(PathBuf::from)
                 .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
@@ -39,10 +41,10 @@ impl SubscriptionCredentials {
         if let Some(dir) = pi_dir {
             files.push((dir.join("auth.json"), pi_key.into(), "api_key".into()));
         }
-        Ok(Self {
+        Self {
             env_var: Some(env_var.into()),
             files,
-        })
+        }
     }
     /// Explicit location for embedding and isolated tests; uses no process environment.
     pub fn from_file(path: PathBuf, provider: &str, opencode_format: bool) -> Self {
@@ -83,7 +85,7 @@ impl SubscriptionCredentials {
                 .get("key")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| auth("subscription credential has no key"))?;
-            // Pi permits command-backed keys; executing configuration is outside this adapter.
+            // Pi permits command-backed keys; executing configuration is outside this credential source.
             if value.starts_with('!') {
                 return Err(auth(
                     "command-backed keys are unsupported; set the documented key environment variable",
@@ -166,5 +168,37 @@ mod tests {
             assert_eq!(error.kind, ProviderErrorKind::Authentication);
             assert!(!error.to_string().contains("PRIVATE"));
         }
+    }
+}
+
+#[cfg(test)]
+mod precedence_tests {
+    use super::*;
+    #[test]
+    fn environment_override_child() {
+        let Some(path) = std::env::var_os("P1_TEST_AUTH_FILE") else {
+            return;
+        };
+        let source = SubscriptionCredentials {
+            env_var: Some("P1_TEST_SUBSCRIPTION_KEY".into()),
+            files: vec![(path.into(), "test".into(), "api_key".into())],
+        };
+        assert_eq!(source.read().unwrap().bearer, "FAKE-environment");
+    }
+    #[test]
+    fn explicit_environment_key_wins_over_the_borrowed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"test":{"type":"api_key","key":"FAKE-file"}}"#).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "auth::precedence_tests::environment_override_child",
+            ])
+            .env("P1_TEST_AUTH_FILE", path)
+            .env("P1_TEST_SUBSCRIPTION_KEY", "FAKE-environment")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

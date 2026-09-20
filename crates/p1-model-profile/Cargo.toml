@@ -1,0 +1,13 @@
+[package]
+name = "p1-model-profile"
+description = "Reusable model policy, independent of routes and wire protocols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }

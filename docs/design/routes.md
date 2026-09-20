@@ -202,9 +202,27 @@ is rejected, rather than silently ignored. A preliminary smoke also passed on
 
 ### Shared Chat Completions implementation (C and D)
 
-One crate, `p1-provider-openai-chat`, two ordinary constructors/catalog registrations;
-no provider, core, HTTP or tool interface changes and no new third-party dependencies.
-The transport, SSE decoder, cancellation and retries are the existing shared driver.
+Following ADR-0039 migration step 2, `p1-provider-openai-chat` takes an injected
+`ChatRoute`, configured wire model, `Arc<ModelProfile>`, transport and `CredentialSource`.
+The closed subscription-route enum is gone. `ChatRoute` carries origin, endpoint,
+non-secret headers, optional session header, wire dialect and route output ceiling.
+`ChatDialect` names implemented encodings (`ThinkingWithReasoningAlias` or
+`RetainedThinking`), never vendors; only the former permits the `reasoning` replay alias.
+The constructor rejects incompatible continuation requirements, unsupported efforts,
+credential-bearing URLs/known credential headers and invalid route settings.
+
+The additive `p1-model-profile` crate depends only on contracts. It holds the currently
+consumed model policy: identity, enabled/preserved thinking, supported/default efforts and
+output ceiling. The same profile can bind to two compatible endpoints without changing
+model-related request fields; route limits may narrow, never enlarge, its allowance.
+The host catalog supplies the two bindings and owns borrowed credential lookup in `auth`.
+Live smoke tests call those same host constructors. The p1 credential store is deferred:
+precedence today is explicit environment variable then borrowed CLI login, with the future
+store slot between them (ADR-0040). No credential writes are performed.
+
+Environment profile selection and data-driven route files are migration step 3, not part
+of this change. Both catalog keys, environments and origin strings stay unchanged.
+The runtime Provider/core/HTTP/tool seams stay unchanged, with no new third-party dependencies.
 Both environments assemble read/edit/write/grep/shell/finish, with separate family prompts.
 
 **Request:** system/user/assistant/tool messages; function declarations under
@@ -239,7 +257,10 @@ cost remain `None`; no notional catalog price is charged as real spend.
 **Evidence:** both routes pass the unchanged shared conformance suite, including every-byte
 chunk splits, cancellation, retry limits, invalid raw arguments and foreign reasoning.
 Additional tests cover request JSON, endpoint/session headers, interleaved calls, truncated
-completion, usage splits, credential rotation and redacted errors. Fixtures are hand-written.
+completion, usage splits, credential precedence/rotation and redacted errors. Composition
+checks bind one profile to two synthetic routes, reject incompatible dialects, and verify
+exact reasoning placement in the second request sent through scripted transport. Fixtures
+are hand-written.
 
 Live smoke commands (three requests each; existing subscription credentials):
 ```

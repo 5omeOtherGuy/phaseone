@@ -15,6 +15,7 @@
 //! behaviour was chosen and listed in the handoff.
 
 pub mod activity;
+pub mod auth;
 pub mod catalog;
 pub mod cli;
 pub mod policy;
