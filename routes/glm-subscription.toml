@@ -1,0 +1,25 @@
+# How the Z.ai coding-plan subscription is reached (ADR-0039 step 3, spec §1.2 of
+# docs/design/routes-and-profiles.md). Everything the host used to hard-code for this
+# route lives here. `user-agent` does NOT: it carries this crate's version, so it stays
+# compiled in `p1_host::catalog` where `env!("CARGO_PKG_VERSION")` is available, and a
+# route file cannot stale it. There are no other static headers on this route, so there
+# is no `[headers]` table.
+id           = "glm-subscription"
+origin_route = "openai-chat/glm-subscription"
+adapter      = "openai-chat"
+endpoint     = "https://api.z.ai/api/coding/paas/v4/chat/completions"
+
+[credential]
+# A reference, never a value: the environment variable first, then the Pi CLI login.
+kind   = "api-key"
+env    = "ZAI_API_KEY"
+borrow = ["pi:zai"]
+
+[adapter_settings]
+# This route keeps the provider's thinking blocks and carries no session header, so an
+# explicit cache key is an error here.
+dialect = "retained-thinking"
+
+# Only profiles the host ships a policy for; any other profile is refused.
+[models."glm-5.3"]
+wire_model = "glm-5.3"

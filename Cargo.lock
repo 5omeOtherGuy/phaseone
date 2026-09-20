@@ -790,6 +790,7 @@ dependencies = [
 name = "p1-host"
 version = "0.0.1"
 dependencies = [
+ "futures-util",
  "p1-assembly",
  "p1-context",
  "p1-contracts",
@@ -797,6 +798,7 @@ dependencies = [
  "p1-journal",
  "p1-model-profile",
  "p1-provider-anthropic",
+ "p1-provider-conformance",
  "p1-provider-http",
  "p1-provider-openai",
  "p1-provider-openai-chat",
@@ -811,9 +813,11 @@ dependencies = [
  "p1-tool-write",
  "p1-workers",
  "p1-workspace",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -912,6 +916,7 @@ dependencies = [
  "p1-model-profile",
  "p1-provider-conformance",
  "p1-provider-http",
+ "serde",
  "serde_json",
  "tokio",
 ]

@@ -273,18 +273,44 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
     }
 }
 
+/// A shipped route through the host's own loading path: `routes::load_route_by_id`
+/// reads the file and `catalog::route_provider` builds the provider from the file's
+/// data, so a live check runs exactly what the host runs. `wire_model` is the live
+/// knob's model, which overrides the file's binding for the run.
+fn live_route(route_id: &str, profile_id: &str, wire_model: &str) -> Arc<dyn Provider> {
+    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+    let route = p1_host::routes::load_route_by_id(&dirs, route_id).expect("the shipped route file");
+    let profile = profile(profile_id);
+    let mut binding = route
+        .binding(&profile.id)
+        .expect("the route serves this profile")
+        .clone();
+    binding.wire_model = wire_model.to_string();
+    let credentials = p1_host::auth::SubscriptionCredentials::from_ref(&route.credential)
+        .expect("the route's credential reference");
+    Arc::new(
+        p1_host::catalog::route_provider(
+            &route,
+            &binding,
+            profile,
+            Arc::new(ReqwestTransport::new()),
+            Arc::new(credentials),
+        )
+        .expect("valid route/profile binding"),
+    )
+}
+
 #[tokio::test]
 async fn deepseek_subscription_route() {
     if !live() {
         return;
     }
-    let provider = p1_host::catalog::deepseek_subscription(
+    let provider = live_route(
+        "opencode-go-subscription",
+        "deepseek-v4.1-flash",
         &model("P1_LIVE_DEEPSEEK_MODEL", "deepseek-v4.1-flash"),
-        profile("deepseek-v4.1-flash"),
-        Arc::new(ReqwestTransport::new()),
-    )
-    .expect("valid route/profile binding");
-    round_trip(&provider, vec![read_tool()], Some(Effort::High)).await;
+    );
+    round_trip(&*provider, vec![read_tool()], Some(Effort::High)).await;
 }
 
 #[tokio::test]
@@ -292,11 +318,10 @@ async fn glm_subscription_route() {
     if !live() {
         return;
     }
-    let provider = p1_host::catalog::glm_subscription(
+    let provider = live_route(
+        "glm-subscription",
+        "glm-5.3",
         &model("P1_LIVE_GLM_MODEL", "glm-5.3"),
-        profile("glm-5.3"),
-        Arc::new(ReqwestTransport::new()),
-    )
-    .expect("valid route/profile binding");
-    round_trip(&provider, vec![read_tool()], Some(Effort::High)).await;
+    );
+    round_trip(&*provider, vec![read_tool()], Some(Effort::High)).await;
 }

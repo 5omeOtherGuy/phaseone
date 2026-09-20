@@ -40,7 +40,11 @@ p1-provider-openai-chat = { path = "../p1-provider-openai-chat" }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-workers = { path = "../p1-workers", optional = true }
 p1-tool-delegate = { path = "../p1-tool-delegate", optional = true }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Route files are TOML data; `parse` is all this crate needs, exactly like the profile
+# and environment loaders in `p1-model-profile`/`p1-assembly`.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 tokio = { version = "1", default-features = false, features = [
     "rt",
     "macros",
@@ -54,6 +58,10 @@ tokio = { version = "1", default-features = false, features = [
 [dev-dependencies]
 p1-testkit = { path = "../p1-testkit" }
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
+# The shared provider conformance suite, run over the SHIPPED composed routes in
+# `tests/route_files.rs` through the same host loading path the binary uses.
+p1-provider-conformance = { path = "../p1-provider-conformance" }
+futures-util = "0.3"
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = [
     "rt",

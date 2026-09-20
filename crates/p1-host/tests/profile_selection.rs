@@ -20,6 +20,23 @@ fn shipped_profiles() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles")
 }
 
+/// The repository's own `routes/` directory: the shipped route files are what make
+/// the two chat keys exist at all.
+fn shipped_routes() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../routes")
+}
+
+/// Copy the shipped route files next to a scratch `environments/` directory, so a
+/// scratch harness registers the same chat keys the shipped host does.
+fn copy_routes(root: &Path) {
+    let routes = root.join("routes");
+    std::fs::create_dir_all(&routes).unwrap();
+    for entry in std::fs::read_dir(shipped_routes()).unwrap() {
+        let path = entry.unwrap().path();
+        std::fs::copy(&path, routes.join(path.file_name().unwrap())).unwrap();
+    }
+}
+
 /// Write `<environments>/<name>/{environment.toml,prompt.md}`.
 fn write_environment(environments: &Path, name: &str, toml: &str) {
     let dir = environments.join(name);
@@ -40,6 +57,7 @@ fn substitutions(workspace: &Path) -> Substitutions {
 fn catalog(harness: &Harness) -> Catalog {
     let completion = Arc::new(CompletionHub::new());
     p1_host::catalog::build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &completion)
+        .expect("the routes the harness can see are valid")
 }
 
 /// Assemble one environment from the shipped `environments/` directory.
@@ -125,6 +143,7 @@ fn a_chat_key_in_the_old_form_is_refused_and_says_which_form_to_write() {
         let root = tempdir().unwrap();
         let environments = root.path().join("environments");
         std::fs::create_dir_all(&environments).unwrap();
+        copy_routes(root.path());
         write_environment(
             &environments,
             "legacy",

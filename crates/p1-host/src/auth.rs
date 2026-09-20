@@ -18,33 +18,37 @@ fn auth(message: &str) -> ProviderError {
     ProviderError::new(ProviderErrorKind::Authentication, message)
 }
 impl SubscriptionCredentials {
-    pub fn opencode_go() -> Self {
-        Self::borrowed("OPENCODE_API_KEY", "opencode-go", true)
-    }
-    pub fn glm() -> Self {
-        Self::borrowed("ZAI_API_KEY", "zai", false)
-    }
-    fn borrowed(env_var: &str, pi_key: &str, opencode: bool) -> Self {
+    /// Build the source a route file's `[credential]` names (spec §1.2): the
+    /// environment variable first, then the borrowed CLI logins in the order the file
+    /// lists them. The file paths are exactly the ones the compiled sources used, so
+    /// picking a key still precedes in the same order. A kind without a data-driven
+    /// source yet is refused with the reason.
+    pub fn from_ref(reference: &crate::routes::CredentialRef) -> Result<Self, String> {
+        use crate::routes::BorrowStore;
+        reference.validate_source()?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut files = Vec::new();
-        if opencode {
-            let data = std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
-            if let Some(data) = data {
-                files.push((data.join("opencode/auth.json"), pi_key.into(), "api".into()));
+        for source in &reference.borrow {
+            let entry = match source.store {
+                BorrowStore::Opencode => {
+                    let data = std::env::var_os("XDG_DATA_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
+                    data.map(|data| (data.join("opencode/auth.json"), "api"))
+                }
+                BorrowStore::Pi => std::env::var_os("PI_CODING_AGENT_DIR")
+                    .map(PathBuf::from)
+                    .or_else(|| home.as_ref().map(|h| h.join(".pi/agent")))
+                    .map(|dir| (dir.join("auth.json"), "api_key")),
+            };
+            if let Some((path, kind)) = entry {
+                files.push((path, source.key.clone(), kind.into()));
             }
         }
-        let pi_dir = std::env::var_os("PI_CODING_AGENT_DIR")
-            .map(PathBuf::from)
-            .or_else(|| home.map(|h| h.join(".pi/agent")));
-        if let Some(dir) = pi_dir {
-            files.push((dir.join("auth.json"), pi_key.into(), "api_key".into()));
-        }
-        Self {
-            env_var: Some(env_var.into()),
+        Ok(Self {
+            env_var: reference.env.clone(),
             files,
-        }
+        })
     }
     /// Explicit location for embedding and isolated tests; uses no process environment.
     pub fn from_file(path: PathBuf, provider: &str, opencode_format: bool) -> Self {

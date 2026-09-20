@@ -160,13 +160,30 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
         &options.env_pass,
         &completion,
     );
-    let environment = match load_environment(name, &deps.environment_dirs) {
+    // A route file that collides with a whole-provider key fails here, before any
+    // environment is loaded or any provider is built.
+    let catalog = match catalog {
+        Ok(catalog) => catalog,
+        Err(message) => {
+            write_stderr(deps, &format!("{message}\n"));
+            return EXIT_FAILURE;
+        }
+    };
+    let mut environment = match load_environment(name, &deps.environment_dirs) {
         Ok(environment) => environment,
         Err(error) => {
             write_stderr(deps, &format!("{error}\n"));
             return EXIT_FAILURE;
         }
     };
+    // Resolve the route binding before assembling: the wire model and the route's
+    // own output ceiling come from the route file (spec §2).
+    if let Err(message) =
+        crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)
+    {
+        write_stderr(deps, &format!("{message}\n"));
+        return EXIT_FAILURE;
+    }
     let workspace = match resolve_workspace(options) {
         Ok(workspace) => workspace,
         Err(message) => {
@@ -246,7 +263,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         &options.sandbox_write,
         &options.env_pass,
         &completion_hub,
-    ));
+    )?);
     #[cfg(feature = "delegation")]
     {
         let _ = catalog_slot.set(catalog.clone());
@@ -254,6 +271,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
 
     let mut environment = load_environment(&options.env, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
+    crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
     let substitutions = substitutions(deps, &workspace);
     let assembled = assemble_with_cache_key(
         &catalog,
@@ -819,7 +837,7 @@ fn make_child_factory(
     let parent_workspace = parent_workspace.to_path_buf();
 
     Arc::new(move |spec: &ChildSpec| -> Result<ChildAgent, String> {
-        let environment = load_environment(&spec.environment, &environment_dirs)
+        let mut environment = load_environment(&spec.environment, &environment_dirs)
             .map_err(|error| error.to_string())?;
         if environment
             .tools
@@ -841,7 +859,7 @@ fn make_child_factory(
             date: date.clone(),
             os: std::env::consts::OS.to_string(),
         };
-        let mut environment = environment;
+        crate::catalog::resolve_environment(&mut environment, &environment_dirs)?;
         let assembled = assemble_with_cache_key(
             &catalog,
             &mut environment,
