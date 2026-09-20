@@ -32,15 +32,13 @@ An independent REVIEW of the first slice exists and is the first thing to tackle
 with five reproduction tests, `ci.log`, `gate.log`, other logs). The owner also passed on the
 reviewer's AMENDMENTS to the lead's plan — authoritative, in full at
 `../phaseone-briefs/plan-amendments-from-reviewer-2026-09-20.md`. Order:
-0. HARDENING CHECKPOINT. Read REVIEW.md; apply `reproductions.patch` on a task branch and
-   confirm each reproduction fails for the stated reason. Build the disposition table
-   `docs/review-2026-09-20-dispositions.md`: finding → validity / severity / prior awareness /
-   disposition / issue / fixing commit. "Already known" is NOT a disposition. Fix: shell
-   descendant cleanup, interactive completion wake-up, worker concurrency enforcement, lost
-   cancellation, journal locking, credential-refresh locking (can deadlock the current-thread
-   runtime). Keep the reproduction assertions intact; restore reliable CI (see `ci.log`)
-   without weakening the shell cleanup test. No ADR may redefine a broken guarantee as intended.
-1. Workspace ownership: serialize or isolate conflicting parent/child writes BEFORE any
+0. HARDENING CHECKPOINT — DONE 2026-09-20 (merge `ec2ae81`, gate green 573 tests, CI green
+   on that exact commit). All seven findings R1-R7 valid and fixed; the reviewer's five
+   reproductions are in the suites with assertions unchanged; R2 (refresh deadlock) was
+   additionally reproduced by the lead. Table: `docs/review-2026-09-20-dispositions.md`.
+   ADR-0031 (session file owned before read). Open departures are issues #1 (workspace
+   ownership), #2 (changed-route resume), #3 (child sessions not restored).
+1. NEXT → issue #1. Workspace ownership: serialize or isolate conflicting parent/child writes BEFORE any
    concurrent dogfooding; first real tasks run in disposable task worktrees.
 2. Dogfood under supervision; run-level evidence grouped into issues; shell non-zero exits
    recorded separately from tool failures; look at Codex caching here.
@@ -48,8 +46,9 @@ reviewer's AMENDMENTS to the lead's plan — authoritative, in full at
 4. Turn-completion policy with the narrowed promise (item 5); explicit resume decisions as
    ADRs (item 7: changed-route resume; child sessions are not restored).
 5. T1 measurement (item 6). Host cleanup after the correctness work; model cards for sol/glm-5.3.
-Disk: 17 GB free on 2026-09-20 because `~/brain-tools-wt` (another session) holds 39 GB — do
-not clean it without verifying ownership and unmerged work; remove own worktrees promptly.
+Disk: the owner handles disk space (55 GB free after their cleanup on 2026-09-20). Never touch
+`~/brain-tools-wt`; remove own worktrees promptly.
+Rule learned (R7): before reporting "CI green", check the run whose headSha is the FINAL commit.
 
 ## Blocked
 - nothing
