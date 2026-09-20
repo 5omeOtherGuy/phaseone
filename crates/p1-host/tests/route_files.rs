@@ -488,6 +488,8 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         [
             "anthropic-subscription",
             "glm-subscription",
+            // The owner's second OpenCode Go account: data only, no Rust change.
+            "opencode-go-2-subscription",
             "opencode-go-subscription"
         ]
     );
