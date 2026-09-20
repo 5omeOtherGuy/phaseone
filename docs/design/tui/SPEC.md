@@ -112,9 +112,30 @@ Working indicator on its own line with a short label. Composer hints:
 `⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel`.
 
 ### 4.3 Tool call + fold
-A settled call collapses to one line. Output over ~40 lines renders a bounded block on
-BLOCK background with a fold handle `· N more lines folded → [h-7c21]`. The handle id is
-stable and addressable — the right pane opens the same object (§6).
+A settled call collapses to one line. Only a **failed** call expands its output
+inline, as a bounded block on BLOCK background; a successful call's oversized
+output (over ~40 lines) is registered under its fold handle and opened with
+`^O`, never shown (refinement: the mock-up shows the block under the failed
+call only — successes stay one line). Blocks over ~40 lines fold to 8 head
+lines plus a handle `· N more lines folded → [h-7c21]`. The handle id is a
+content hash — stable and addressable across resume — and the right pane
+opens the same object (§6).
+
+### 4.3a Focus mode
+
+Focus mode folds passive chrome away so the transcript owns the screen
+(carried over from the iris TUI's focus mode, restated in this spec's visual
+language — no new grammar):
+
+- The right pane hides (as if width `off`); the composer hides **while empty**.
+- Input drives disclosure: the first edit, paste, or history recall reveals
+  the composer; submit and clear collapse it again.
+- Safety always reveals: a pending approval (§4.4/§4.5) takes the screen
+  regardless of focus.
+- Toggled with `/focus`; at terminal heights of **12 rows or fewer** focus is
+  selected automatically and `/focus off` returns to that automatic policy.
+- The transcript grammar, symbol set and pane contents do not change — only
+  their visibility.
 
 ### 4.4 Diff review (blocking, full width)
 Right pane hidden. Line numbers FAINT, context DIM, changed lines in the two hues with a
@@ -209,6 +230,15 @@ Every label/value row is **one label at the left edge of the grid and one value
 right-aligned to the grid width**. No value is positioned by eye or by a counted run of
 spaces; each row is `label + pad + value` computed against the grid width. A row with a
 third column (a count) right-aligns that count to a fixed inner stop — 20 in the ledger.
+
+Two refinements pinned during implementation:
+
+- **Pane padding:** the content grid is the pane width minus 4 columns on each side
+  (the mock-up specifies grid widths but not the padding split; 4/4 is symmetric).
+- **Token counts:** `< 1000` plain, below 100k one decimal (`12.4k`), at and above 100k
+  whole thousands (`120k`, `200k`). The mock-up mixed `120.0k` with `200k`; one rule wins.
+- **PEEK** overlays the ledger's top two rows; the ledger underneath does not move
+  (it is covered, not pushed).
 
 This is what keeps a pane readable as a table rather than a paragraph of fragments, and
 it is the single rule to re-apply whenever a string's length changes.
@@ -363,3 +393,12 @@ symbol set and one pair of hues stretch across a context ledger, a log viewer, a
 reviewer and a worker dashboard without a second visual language appearing. Which modes
 ship and how promotion is timed are implementation choices. Sections 1–3 and 8 are the
 parts to treat as fixed — they are the vocabulary everything else is built from.
+
+### Refinements recorded during implementation (Kimi TUI session)
+
+- §4.3: only failed calls expand output inline; the fold rule (40/8) and handle
+  hashing are pinned. **Added §4.3a Focus mode** (owner requirement, from the iris TUI).
+- §5: pane padding split (4/4), token-count formatting rule, PEEK overlays rather
+  than pushes — all recorded at the grid rule.
+- §4.1: the idle prelude (version line, affordances) is verbatim host text with
+  exact spacing, not wrapped prose.
