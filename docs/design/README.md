@@ -26,3 +26,4 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 | `journal.md` | Memory/JSONL stores, sync guarantee, truncated tail, projection, resume, interrupted calls |
 | `delegation.md` | Optional worker service and delegation tools |
 | `core.md` | Agent core behaviour specification (authoritative for `p1-core`) |
+| `research-program.md` | How research fans out: issue states, caps, curator limits, experiment design (ADR-0045) |
