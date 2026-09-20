@@ -1,7 +1,7 @@
 ---
 adr: 46
 title: An exhausted account is its own provider error kind; it is never refreshed or retried
-status: proposed
+status: accepted
 date: 2026-09-21
 deciders: lead
 supersedes: []

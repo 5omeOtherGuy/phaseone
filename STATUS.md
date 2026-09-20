@@ -89,6 +89,9 @@ IN FLIGHT:
 * #30 DONE: `finish` rejects masked checks (`;`, `||`, newline, backgrounding `&`; `2>&1` is
   fine) and reports EVERY failing named command in one error (completion.md §2, last revision).
 * `[context]` tables for claude / claude-delegating / gpt: DONE (200k/120k, operational values).
+* OWNER RAN `p1 login opencode-go-2-subscription` (2026-09-21): the key is in the p1 store —
+  dispatch deepseek2 jobs WITHOUT the `OPENCODE_GO_2_API_KEY=…` prefix from now on (fall back
+  to it only if a run cannot find the key, then investigate p1-auth).
 * OWNER DIRECTIVES 2026-09-21 ~00:45 (owner asleep, work on): (1) WebSocket support wherever
   possible (Codex first) — a DECISION, overrides the earlier 'no websocket for now'; (2) inventory
   iris-agent for code worth taking (Rust token optimizer first); (3) prompt-caching optimisation
@@ -98,10 +101,7 @@ IN FLIGHT:
   then p1 jobs; caching needs a small lead-run LIVE probe (few requests) before changing builders.
 * RESEARCH BATCH 2 DECIDED (2026-09-21): #36 grep bounding — USED, merged. #37 summarizer prompt —
   USED as a negative result (prompt unchanged); by-product merged: run records carry
-  `harness_head` + `binary_sha256`. #35 out-of-credit diagnosis — ACCEPTED, ADR-0046 (proposed) +
-  providers.md section; p1 job `insufficient-balance` on deepseek2 (brief
-  `../phaseone-briefs/insufficient-balance.md`, worktree `../phaseone-insufficient-balance`).
-  When merged: ADR-0046 accepted, #35 `research:used` + close, tick the item on #6.
+  `harness_head` + `binary_sha256`. #35 out-of-credit diagnosis — USED, merged (ADR-0046 accepted).
   Curator layer reviewed after two batches: KEEP (decision-ready memos, three corrected lead
   premises, one unasked bug); one batch at a time.
 * MAIN WAS RED 23:38–00:05 (2026-09-20): the TUI session merged #32 while red (duplicate
