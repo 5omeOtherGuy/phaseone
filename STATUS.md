@@ -97,16 +97,22 @@ IN FLIGHT:
   branch in `run_agent`. Still owed by the lead, not urgent: a small spec + ADR for
   `ContextStats` (observation-only context budget numbers for the ledger). Check #12 between jobs.
 
-* FAN-OUT PROGRAM (owner request 2026-09-20, issue #25): organised parallel research +
-  development within this machine's build limits; every research item is evaluated and then USED
-  or DISCARDED. Astra (pane %39, read-only oracle) is writing the proposed structure to
-  `../phaseone-briefs/fanout-program.answer.md` (request: `fanout-program-request.md` there) and
-  will comment on #25. NEXT for the lead: read it, decide the structure (ADR if it changes a
-  workflow rule), set up a RESEARCH ORCHESTRATOR (owner: e.g. Opus 5 — it may orchestrate and
-  curate research, NEVER development; development, specs, briefs, review and merges stay with
-  the lead), start the first build-free items. Owner's themes: model/provider-specific tools,
-  prompting + model cards per model, evidence-based system-prompt nudges, compaction/context per
-  provider, websocket vs http, tool outputs / tool-call formats, effort levels.
+* FAN-OUT PROGRAM (owner request 2026-09-20, issue #25): DECIDED — ADR-0045 (proposed) +
+  `docs/design/research-program.md`. Research item = issue labelled `research` + one
+  `research:queued|active|decision|implement|used|discarded`; every item ends USED or DISCARDED;
+  caps 3 active / 2 in decision / 1 in implement. Curator organises research, NEVER development
+  (owner); development, specs, briefs, review, merges stay with the lead.
+  BATCH 1 (offline, no build, no live experiment calls): #26 measurement + failure audit,
+  #27 context capacity inventory, #28 finish-nudge experiment design. Curator = ONE
+  `pi-worker opus` run (brief `../phaseone-briefs/research-curator-batch1.md`, output
+  `../phaseone-briefs/research/curator-batch1.out`, memos `research/<n>/memo.md`), leaves =
+  `pi-worker deepseek2`. NEXT: `gh issue list --label research:decision`, decide each memo
+  (accept -> lead-owned brief, label `research:implement`; else discard with reopening
+  condition). Dev slice A (run-report.py usage aggregation + `scripts/test_run_report.py`)
+  enters as #26's implementation. Set ADR-0045 accepted after batch 1 ran under it. After two
+  batches: keep the curator layer only if it saves lead effort. Said no for now: websocket,
+  benchmark grids, new profile capabilities. Astra's full answer:
+  `../phaseone-briefs/fanout-program.answer.md`.
 
 HOW JOBS GO (what worked today): small briefs with a SHORT read-first list and "work in this
 order, start editing early"; one job ≈ one crate; p1 runner for implementation, pi-worker for
