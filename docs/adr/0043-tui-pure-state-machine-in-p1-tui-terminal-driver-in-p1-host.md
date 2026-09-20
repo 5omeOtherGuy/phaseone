@@ -1,7 +1,7 @@
 ---
 adr: 43
 title: TUI: pure state machine in p1-tui, terminal driver in p1-host
-status: proposed
+status: accepted
 date: 2026-09-20
 deciders: lead
 supersedes: []
