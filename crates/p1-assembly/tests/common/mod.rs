@@ -63,6 +63,8 @@ pub fn environment_file(
             })
             .collect(),
         prompt_template: prompt.into(),
+        context: None,
+        summarize_prompt: None,
     }
 }
 

@@ -790,6 +790,7 @@ name = "p1-host"
 version = "0.0.1"
 dependencies = [
  "p1-assembly",
+ "p1-context",
  "p1-contracts",
  "p1-core",
  "p1-journal",

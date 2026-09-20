@@ -112,6 +112,8 @@ fn name_override_becomes_the_model_facing_name() {
             variant: None,
         }],
         prompt_template: "Run `{{tool:shell}}`. Tools: {{tool_names}}.".into(),
+        context: None,
+        summarize_prompt: None,
     };
 
     let workspace = tempfile::tempdir().unwrap();

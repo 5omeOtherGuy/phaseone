@@ -21,6 +21,7 @@ delegation = ["dep:p1-workers", "dep:p1-tool-delegate"]
 
 [dependencies]
 p1-assembly = { path = "../p1-assembly" }
+p1-context = { path = "../p1-context" }
 p1-contracts = { path = "../p1-contracts" }
 p1-core = { path = "../p1-core" }
 p1-journal = { path = "../p1-journal" }
