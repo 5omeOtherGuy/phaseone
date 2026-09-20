@@ -1,197 +1,208 @@
-//! The TUI driver (issue #12): owns the terminal, the input loop and the agent
-//! task. The UI itself is `p1-tui`'s pure state machine; this module is the
-//! wiring: crossterm keys in, agent events in, authorization questions parked
-//! on the screen, answers back. Composition stays ordinary — `run_agent`
-//! constructs the `Frontend`, installs its sink and policy into `AgentParts`,
-//! then calls [`Frontend::run`].
+//! The TUI front end (issue #12): implements the host's [`FrontEnd`] seam —
+//! event observation through `TuiSink`, authorization through `TuiPolicy`, and
+//! the run loop below. The UI itself is `p1-tui`'s pure state machine; this
+//! module is wiring: crossterm keys in, agent events in, authorization
+//! questions parked on the screen, answers back.
 //!
-//! The agent lives on its own task (the iris harness-actor lesson, ADR-0060):
-//! `run_turn` holds `&mut Agent` for the whole turn, so the input loop can
-//! never call it directly without going deaf. Commands cross a channel.
+//! The seam hands `run` a `&mut Agent`, so turns are driven by a pinned future
+//! inside the select loop (`pump`): the UI keeps reading keys and events while
+//! a turn runs, and the turn future is never dropped mid-flight (the iris
+//! harness-actor lesson, ADR-0060, adapted to a borrowed agent).
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
-use p1_contracts::{CancellationToken, Decision, EventSink, InboxKind, TurnEnd};
+use futures_util::StreamExt;
+use p1_contracts::{
+    AuthorizationPolicy, CancellationToken, Decision, EventSink, InboxKind, TurnEnd,
+};
 use p1_core::Agent;
 use p1_tui::input::{self, Command};
 use p1_tui::render::diff::DiffView;
 use p1_tui::render::permission::PermissionView;
-use p1_tui::runtime::{AuthRequest, Stamped, TerminalGuard, TuiPolicy, TuiSink};
+use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
 use p1_tui::state::{Approval, Promotion, Screen};
 use ratatui::backend::Backend;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-/// What the branch point knows: how to label the session.
+use crate::HostDeps;
+use crate::activity::Completion;
+use crate::cli::Options;
+use crate::frontend::{FrontEnd, WorkerService};
+use crate::run::StallGuard;
+
+/// What the host knows at construction time. The resolved route and model
+/// arrive later, through [`FrontEnd::parent_assembled`].
 pub struct TuiOptions {
     pub env: String,
-    pub route: String,
-    pub model: String,
     /// ADR-0038: full access is the default; prompts appear only under --ask.
     pub ask: bool,
     /// The workspace root: approval diff views read files from here.
     pub workspace: std::path::PathBuf,
 }
 
-/// The TUI frontend. Created before the agent so its sink and policy install
-/// into `AgentParts`; [`Frontend::run`] then takes the agent over.
-pub struct Frontend {
+/// The TUI front end. Created before the agent so its sink and policy install
+/// into `AgentParts`; the run loop takes over in [`FrontEnd::run`].
+pub struct TuiFrontEnd {
     options: TuiOptions,
     sink: Arc<TuiSink>,
     policy: Arc<TuiPolicy>,
-    events: Option<mpsc::UnboundedReceiver<Stamped>>,
-    auth: Option<mpsc::UnboundedReceiver<AuthRequest>>,
+    events: Mutex<Option<mpsc::UnboundedReceiver<UiEvent>>>,
+    auth: Mutex<Option<mpsc::UnboundedReceiver<AuthRequest>>>,
+    /// (route, model), announced by the host once assembly has happened.
+    labels: Mutex<Option<(String, String)>>,
 }
 
-impl Frontend {
-    pub fn new(options: TuiOptions) -> Self {
+impl TuiFrontEnd {
+    pub fn new(options: TuiOptions, cancel: CancellationToken) -> Self {
         let (sink, events) = TuiSink::new();
-        let (policy, auth) = TuiPolicy::new(options.ask, CancellationToken::new());
+        let (policy, auth) = TuiPolicy::new(options.ask, cancel.clone());
         Self {
             options,
             sink: Arc::new(sink),
             policy: Arc::new(policy),
-            events: Some(events),
-            auth: Some(auth),
+            events: Mutex::new(Some(events)),
+            auth: Mutex::new(Some(auth)),
+            labels: Mutex::new(None),
         }
     }
+}
 
-    /// The observation end: install as `AgentParts.events` (behind the
-    /// `ActivityTee`, exactly like the line renderer).
-    pub fn event_sink(&self) -> Arc<dyn EventSink> {
+impl FrontEnd for TuiFrontEnd {
+    fn event_sink(&self) -> Arc<dyn EventSink> {
         self.sink.clone()
     }
 
-    /// The decision end: install as `AgentParts.authorization`.
-    pub fn authorization(&self) -> Arc<dyn p1_contracts::AuthorizationPolicy> {
+    fn child_event_sink(&self, worker_id: &str, _route: &str, _model: &str) -> Arc<dyn EventSink> {
+        Arc::new(self.sink.child(worker_id))
+    }
+
+    fn child_started(&self, worker_id: &str) {
+        self.sink.worker_started(worker_id);
+    }
+
+    fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
         self.policy.clone()
     }
 
-    /// The TUI shares the run's cancellation: `^C` cancels the turn; a second
-    /// `^C` (or one at idle) quits. Rebind the policy to the run's token.
-    pub fn bind_cancel(self, cancel: CancellationToken) -> Self {
-        let (policy, auth) = TuiPolicy::new(self.options.ask, cancel);
-        Self {
-            policy: Arc::new(policy),
-            auth: Some(auth),
-            ..self
-        }
+    fn parent_assembled(&self, route: &str, model: &str, _completion: Option<Completion>) {
+        *self.labels.lock().unwrap() = Some((route.to_string(), model.to_string()));
     }
 
-    /// Run the TUI to the end of the session. Returns the process exit code.
-    pub async fn run(mut self, agent: Agent, cancel: CancellationToken) -> i32 {
-        let Ok(_guard) = TerminalGuard::enter() else {
-            eprintln!("p1 --tui: could not enter the alternate screen");
-            return 1;
-        };
-        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
-        let mut terminal = match ratatui::Terminal::new(backend) {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                eprintln!("p1 --tui: {error}");
+    /// A TUI is interactive by definition: the host's §3c stall guard and the
+    /// headless drivers never apply.
+    fn is_headless(&self, _options: &Options) -> bool {
+        false
+    }
+
+    fn run<'a>(
+        &'a self,
+        _deps: &'a HostDeps,
+        agent: &'a mut Agent,
+        cancel: &'a CancellationToken,
+        workers: Option<Arc<dyn WorkerService>>,
+        _stall: Option<Arc<StallGuard>>,
+    ) -> p1_contracts::BoxFuture<'a, i32> {
+        let mut events = self.events.lock().unwrap().take();
+        let mut auth_rx = self.auth.lock().unwrap().take();
+        Box::pin(async move {
+            let Ok(_guard) = TerminalGuard::enter() else {
+                eprintln!("p1 --tui: could not enter the alternate screen");
                 return 1;
-            }
-        };
-
-        let mut screen = Screen::new(std::env::var_os("P1_REDUCED_MOTION").is_some());
-        // A resumed session shows where it stands (issue #12, seam note).
-        screen.transcript.paint_history(agent.history());
-        let inbox = agent.inbox();
-        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
-        tokio::spawn(agent_task(agent, agent_rx));
-
-        let mut driver = Driver {
-            screen,
-            options: self.options,
-            agent_tx,
-            turn: None,
-            inbox,
-            policy: self.policy,
-            pending_auth: None,
-            follow_ups: VecDeque::new(),
-            pending_calls: Default::default(),
-            task_files: Default::default(),
-            task_added: 0,
-            task_removed: 0,
-            exit: None,
-        };
-
-        use futures_util::StreamExt;
-        let keys = Box::pin(
-            crossterm::event::EventStream::new().filter_map(|event| async move {
-                match event {
-                    Ok(crossterm::event::Event::Key(key))
-                        if key.kind == crossterm::event::KeyEventKind::Press =>
-                    {
-                        Some(key)
-                    }
-                    _ => None,
+            };
+            let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+            let mut terminal = match ratatui::Terminal::new(backend) {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    eprintln!("p1 --tui: {error}");
+                    return 1;
                 }
-            }),
-        );
-        drive_loop(
-            &mut terminal,
-            &mut driver,
-            keys,
-            self.events.take().expect("run once"),
-            self.auth.take().expect("run once"),
-            cancel,
-        )
-        .await
+            };
+
+            let mut screen = Screen::new(std::env::var_os("P1_REDUCED_MOTION").is_some());
+            // A resumed session shows where it stands (issue #12, seam note).
+            screen.transcript.paint_history(agent.history());
+            let (route, model) = self.labels.lock().unwrap().clone().unwrap_or_default();
+            let mut driver = Driver {
+                screen,
+                env: self.options.env.clone(),
+                route,
+                model,
+                workspace: self.options.workspace.clone(),
+                policy: self.policy.clone(),
+                pending_auth: None,
+                follow_ups: VecDeque::new(),
+                submit_pending: None,
+                pending_calls: HashMap::new(),
+                task_files: HashSet::new(),
+                task_added: 0,
+                task_removed: 0,
+                exit: None,
+                inbox: agent.inbox(),
+                _workers: workers,
+            };
+
+            let keys = Box::pin(crossterm::event::EventStream::new().filter_map(
+                |event| async move {
+                    match event {
+                        Ok(crossterm::event::Event::Key(key))
+                            if key.kind == crossterm::event::KeyEventKind::Press =>
+                        {
+                            Some(key)
+                        }
+                        _ => None,
+                    }
+                },
+            ));
+            drive_loop(
+                &mut terminal,
+                &mut driver,
+                agent,
+                keys,
+                events.take().expect("run once"),
+                auth_rx.take().expect("run once"),
+                cancel,
+                &self.sink,
+            )
+            .await
+        })
+    }
+
+    fn finish(&self) {
+        // Nothing to total up: the TUI showed spend live, and the terminal
+        // was restored when the run loop's guard dropped.
     }
 }
 
-/// One turn request to the agent task: the prompt, the turn's cancellation
-/// child token, and where the end goes.
-struct AgentCmd {
-    text: String,
-    cancel: CancellationToken,
-    done: oneshot::Sender<TurnEnd>,
-}
-
-/// The agent task: owns the `Agent`, runs turns and drains the inbox after
-/// each one (the interactive loop's drain rule, unchanged).
-async fn agent_task(mut agent: Agent, mut rx: mpsc::UnboundedReceiver<AgentCmd>) {
-    while let Some(cmd) = rx.recv().await {
-        let mut end = agent.run_turn(cmd.text, cmd.cancel.clone()).await;
-        while !cmd.cancel.is_cancelled() && agent.has_pending_inbox() {
-            match agent.run_inbox_turn(cmd.cancel.clone()).await {
-                Some(next) => end = next,
-                None => break,
-            }
-        }
-        if cmd.done.send(end).is_err() {
-            return; // the UI is gone
-        }
-    }
-}
-
-/// The testable core: screen state plus the channels, no terminal. Keys and
-/// events come in through methods; `drive_loop` is thin wiring over it.
+/// The UI state plus the wiring the loop needs. No terminal in here: keys and
+/// events enter through methods, so the whole driver is channel-testable.
 pub(crate) struct Driver {
     screen: Screen,
-    options: TuiOptions,
-    agent_tx: mpsc::UnboundedSender<AgentCmd>,
-    /// The running turn: its cancellation token and completion channel.
-    turn: Option<(CancellationToken, oneshot::Receiver<TurnEnd>)>,
-    inbox: p1_core::Inbox,
+    env: String,
+    route: String,
+    model: String,
+    workspace: std::path::PathBuf,
     policy: Arc<TuiPolicy>,
     /// The parked authorization being shown; answered by the decision keys.
     pending_auth: Option<AuthRequest>,
     /// Follow-ups fire only when the agent would otherwise stop (SPEC §7).
     follow_ups: VecDeque<String>,
-    /// Task stats for the LEDGER's TASK section: files touched and lines
-    /// added/removed by successful edit-shaped calls. Call inputs arrive on
+    /// Task stats for the LEDGER's TASK section: call inputs arrive on
     /// `ToolStarted`; the counts settle on `ToolFinished`.
-    pending_calls: std::collections::HashMap<String, p1_contracts::ToolCall>,
-    task_files: std::collections::HashSet<String>,
+    pending_calls: HashMap<String, p1_contracts::ToolCall>,
+    task_files: HashSet<String>,
     task_added: u64,
     task_removed: u64,
     exit: Option<i32>,
+    /// A submitted prompt waiting for the loop to start the turn (the agent
+    /// borrow lives in the loop, not in the driver).
+    submit_pending: Option<String>,
+    inbox: p1_core::Inbox,
+    _workers: Option<Arc<dyn WorkerService>>,
 }
 
 impl Driver {
-    fn on_key(&mut self, key: crossterm::event::KeyEvent, now_ms: u64) {
+    fn on_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyModifiers;
         let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
         // The picker filters as you type (SPEC §4.6).
@@ -216,12 +227,12 @@ impl Driver {
             && self.screen.status.is_none()
         {
             use crossterm::event::KeyCode;
-            match (key.code, key.modifiers.is_empty()) {
+            match (key.code, plain) {
                 (KeyCode::Char(c), true) => {
                     self.screen.composer.insert(c);
                     return;
                 }
-                (KeyCode::Backspace, true) => {
+                (KeyCode::Backspace, _) => {
                     self.screen.composer.backspace();
                     return;
                 }
@@ -259,12 +270,12 @@ impl Driver {
             Command::Backspace => self.screen.composer.backspace(),
             Command::Left => self.screen.composer.left(),
             Command::Right => self.screen.composer.right(),
-            Command::CancelOrQuit => self.cancel_or_quit(),
+            // ^C is handled by the loop: cancel the turn, quit at idle.
+            Command::CancelOrQuit => {}
             Command::ApproveOnce => self.answer(Decision::Permit, false),
             Command::ApproveSession | Command::ApproveProject | Command::AllFiles => {
                 // Project grants share the in-memory set until a trust store
-                // exists (issue #12). AllFiles is the session grant for the
-                // tool under review.
+                // exists (issue #12). AllFiles grants the tool under review.
                 self.answer(Decision::Permit, true);
             }
             Command::Deny => self.answer(
@@ -275,7 +286,6 @@ impl Driver {
             ),
             Command::NextFile => {}
             Command::OpenFold => {
-                // Open the most recent fold in the OUTPUT pane (SPEC §4.3).
                 if let Some(id) = self.screen.transcript.latest_fold.clone()
                     && let Some(content) = self.screen.transcript.output(&id)
                 {
@@ -315,17 +325,18 @@ impl Driver {
             Command::PaneUp => self.screen.scroll_output_by(-1),
             Command::PaneDown => self.screen.scroll_output_by(1),
         }
-        let _ = now_ms;
     }
 
-    /// `⏎` idle: a slash command or a prompt for the agent.
+    /// A submitted line: a slash command, or a prompt for the agent. The
+    /// prompt waits in `submit_pending` for the loop (the agent borrow lives
+    /// there, not here).
     fn submit(&mut self, text: String) {
         if let Some(command) = text.strip_prefix('/') {
             self.slash(command);
             return;
         }
         self.screen.transcript.operator(text.clone());
-        self.start_turn(text);
+        self.submit_pending = Some(text);
     }
 
     fn slash(&mut self, command: &str) {
@@ -337,7 +348,7 @@ impl Driver {
                 self.screen.goal = (!arg.is_empty()).then(|| arg.to_string());
             }
             "status" => {
-                self.screen.status = Some(status_groups(&self.screen, &self.options));
+                self.screen.status = Some(status_groups(self));
             }
             other => {
                 self.screen.transcript.operator(format!("/{other}"));
@@ -345,33 +356,6 @@ impl Driver {
                     "· /{other} is not a TUI command yet — try /status, /focus, /goal, /exit"
                 ));
             }
-        }
-    }
-
-    /// Start a turn unless one is running; the prompt becomes a follow-up
-    /// otherwise (cannot happen through `Submit`, which checks `working`, but
-    /// follow-ups funnel through here).
-    fn start_turn(&mut self, text: String) {
-        let (done_tx, done_rx) = oneshot::channel();
-        let turn_cancel = CancellationToken::new();
-        if self
-            .agent_tx
-            .send(AgentCmd {
-                text,
-                cancel: turn_cancel.clone(),
-                done: done_tx,
-            })
-            .is_ok()
-        {
-            self.turn = Some((turn_cancel, done_rx));
-        }
-    }
-
-    fn cancel_or_quit(&mut self) {
-        if let Some((turn_cancel, _)) = &self.turn {
-            turn_cancel.cancel();
-        } else {
-            self.exit = Some(0);
         }
     }
 
@@ -388,22 +372,43 @@ impl Driver {
         self.screen.promotion = Promotion::None;
     }
 
-    /// One observed agent event, stamped on the sink's clock.
-    fn on_event(&mut self, stamped: Stamped) {
-        // A delivered inbox message clears the queued steering display.
-        if matches!(
-            stamped.event,
-            p1_contracts::AgentEvent::InboxDelivered { .. }
-        ) {
-            self.screen.queued.retain(|q| q.follow_up);
+    /// One UI event: an agent event (parent or a tagged worker) or a marker.
+    fn on_ui_event(&mut self, ui: UiEvent) {
+        match ui {
+            UiEvent::WorkerStarted(id) => {
+                self.screen.transcript.note(&format!("↳ {id} started"));
+            }
+            UiEvent::Agent(stamped) => {
+                if stamped.worker.is_some() {
+                    // Worker streams stay OUT of the parent's transcript (the
+                    // WORKERS pane is a later milestone); a finished worker is
+                    // worth one quiet line.
+                    if let p1_contracts::AgentEvent::TurnFinished { end } = &stamped.event {
+                        let state = match end {
+                            TurnEnd::Completed { .. } => "finished",
+                            TurnEnd::Cancelled => "cancelled",
+                            _ => "failed",
+                        };
+                        let id = stamped.worker.clone().unwrap_or_default();
+                        self.screen.transcript.note(&format!("↳ {id} {state}"));
+                    }
+                    return;
+                }
+                // A delivered inbox message clears the queued steering display.
+                if matches!(
+                    stamped.event,
+                    p1_contracts::AgentEvent::InboxDelivered { .. }
+                ) {
+                    self.screen.queued.retain(|q| q.follow_up);
+                }
+                self.track_task(&stamped.event);
+                self.screen.apply(&stamped.event, stamped.at_ms);
+            }
         }
-        self.track_task(&stamped.event);
-        self.screen.apply(&stamped.event, stamped.at_ms);
     }
 
     /// Successful edit-shaped calls move the TASK section. Reads only the
-    /// call's own input (the presentation adapter's data, not tool internals);
-    /// a denied or failed call counts nothing.
+    /// call's own input; a denied or failed call counts nothing.
     fn track_task(&mut self, event: &p1_contracts::AgentEvent) {
         match event {
             p1_contracts::AgentEvent::ToolStarted { call } => {
@@ -443,9 +448,9 @@ impl Driver {
     }
 
     /// A parked authorization becomes the blocking approval view (SPEC §4.4 /
-    /// §4.5). The edit-shaped calls render as diffs; commands as §4.5 rows.
+    /// §4.5): edit-shaped calls review as diffs, commands as §4.5 rows.
     fn on_auth(&mut self, request: AuthRequest) {
-        let view = approval_view(&request, &self.options.workspace);
+        let view = approval_view(&request, &self.workspace);
         self.screen.approval = Some(view);
         // An approval self-pins (SPEC §5): nothing may swap it away.
         self.screen.pinned = true;
@@ -453,37 +458,45 @@ impl Driver {
         self.pending_auth = Some(request);
     }
 
-    /// The turn ended: run the oldest queued follow-up, or go idle.
-    fn on_turn_end(&mut self, end: TurnEnd) {
-        self.turn = None;
+    /// The turn ended. On cancellation every queued input is dropped — a
+    /// cancelled turn means "stop", not "continue with the queue".
+    fn note_turn_end(&mut self, end: &TurnEnd) {
         self.screen.queued.retain(|q| q.follow_up);
         if matches!(end, TurnEnd::Cancelled) {
             self.follow_ups.clear();
             self.screen.queued.clear();
-            return;
         }
-        if let Some(next) = self.follow_ups.pop_front() {
-            self.screen.queued.pop_front();
-            self.screen.transcript.operator(next.clone());
-            self.start_turn(next);
-        }
+    }
+
+    /// The oldest queued follow-up, fired only when the agent would stop.
+    fn take_follow_up(&mut self) -> Option<String> {
+        let next = self.follow_ups.pop_front()?;
+        self.screen.queued.pop_front();
+        self.screen.transcript.operator(next.clone());
+        Some(next)
     }
 }
 
-/// The render/input loop. Generic over the backend and the key stream so the
-/// whole thing is drivable from tests without a TTY.
-async fn drive_loop<B: Backend>(
+/// The render/input loop over a borrowed agent. Turns are pinned futures
+/// inside this function: polled every wakeup, never dropped mid-flight.
+#[allow(clippy::too_many_arguments)]
+async fn drive_loop<B, K>(
     terminal: &mut ratatui::Terminal<B>,
     driver: &mut Driver,
-    mut keys: impl futures_util::Stream<Item = crossterm::event::KeyEvent> + Unpin,
-    mut events: mpsc::UnboundedReceiver<Stamped>,
+    agent: &mut Agent,
+    mut keys: K,
+    mut events: mpsc::UnboundedReceiver<UiEvent>,
     mut auth: mpsc::UnboundedReceiver<AuthRequest>,
-    cancel: CancellationToken,
-) -> i32 {
-    use futures_util::StreamExt;
-    let sink_epoch = std::time::Instant::now();
+    cancel: &CancellationToken,
+    sink: &TuiSink,
+) -> i32
+where
+    B: Backend,
+    K: futures_util::Stream<Item = crossterm::event::KeyEvent> + Unpin,
+{
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prompt: Option<String> = None;
     loop {
         if let Some(code) = driver.exit {
             return code;
@@ -491,31 +504,72 @@ async fn drive_loop<B: Backend>(
         if cancel.is_cancelled() {
             return 130;
         }
-        // Draw first: the initial frame must not wait for input.
-        let now_ms = sink_epoch.elapsed().as_millis() as u64;
-        terminal
-            .draw(|frame| {
-                p1_tui::render::screen::draw(
-                    &driver.screen,
-                    frame.area(),
-                    frame.buffer_mut(),
-                    now_ms,
+        // Start the next turn (submitted prompt, or a queued follow-up from
+        // the last turn's end), then drain the inbox after it — the
+        // interactive loop's drain rule, unchanged.
+        if let Some(text) = prompt.take() {
+            let child = cancel.child_token();
+            let end = pump(
+                terminal,
+                driver,
+                &mut keys,
+                &mut events,
+                &mut auth,
+                sink,
+                &child,
+                Box::pin(agent.run_turn(text, child.clone())),
+            )
+            .await;
+            driver.note_turn_end(&end);
+            while !child.is_cancelled() && agent.has_pending_inbox() {
+                let end = pump(
+                    terminal,
+                    driver,
+                    &mut keys,
+                    &mut events,
+                    &mut auth,
+                    sink,
+                    &child,
+                    Box::pin(async {
+                        agent
+                            .run_inbox_turn(child.clone())
+                            .await
+                            .unwrap_or(TurnEnd::Completed {
+                                stop: p1_contracts::StopReason::EndTurn,
+                            })
+                    }),
                 )
-            })
-            .ok();
+                .await;
+                driver.note_turn_end(&end);
+            }
+            if matches!(end, TurnEnd::Cancelled) {
+                continue;
+            }
+            if let Some(follow_up) = driver.take_follow_up() {
+                prompt = Some(follow_up);
+            }
+            continue;
+        }
+        // Idle: draw, then wait for anything.
+        draw(terminal, &driver.screen, sink.now_ms());
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return 130,
             key = keys.next() => {
-                match key {
-                    Some(key) => driver.on_key(key, now_ms),
-                    None => return 0, // input stream ended
+                let Some(key) = key else { return 0 };
+                if is_cancel(&key) {
+                    driver.exit = Some(0);
+                    continue;
+                }
+                driver.on_key(key);
+                if let Some(text) = driver.submit_pending.take() {
+                    prompt = Some(text);
                 }
             }
-            event = events.recv() => {
-                match event {
-                    Some(stamped) => driver.on_event(stamped),
-                    None => return 0, // the agent is gone
+            ui = events.recv() => {
+                match ui {
+                    Some(ui) => driver.on_ui_event(ui),
+                    None => return 0,
                 }
             }
             request = auth.recv() => {
@@ -523,15 +577,81 @@ async fn drive_loop<B: Backend>(
                     driver.on_auth(request);
                 }
             }
-            end = async {
-                match &mut driver.turn {
-                    Some((_, done)) => done.await.unwrap_or(TurnEnd::Cancelled),
-                    None => std::future::pending().await,
-                }
-            } => driver.on_turn_end(end),
+            _ = agent.inbox_ready() => {
+                // A worker's completion arrived at idle: run it as a turn so
+                // the same pump handles keys and approvals.
+                prompt = Some(String::new());
+            }
             _ = tick.tick() => {}
         }
     }
+}
+
+/// Poll one turn-shaped future to completion while the UI stays live: keys,
+/// events and parked authorizations are handled on every wakeup, and the
+/// future is re-polled — never dropped — until it resolves.
+#[allow(clippy::too_many_arguments)]
+async fn pump<B, K, F>(
+    terminal: &mut ratatui::Terminal<B>,
+    driver: &mut Driver,
+    keys: &mut K,
+    events: &mut mpsc::UnboundedReceiver<UiEvent>,
+    auth: &mut mpsc::UnboundedReceiver<AuthRequest>,
+    sink: &TuiSink,
+    turn_cancel: &CancellationToken,
+    mut turn: std::pin::Pin<Box<F>>,
+) -> TurnEnd
+where
+    B: Backend,
+    K: futures_util::Stream<Item = crossterm::event::KeyEvent> + Unpin,
+    F: std::future::Future<Output = TurnEnd>,
+{
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        draw(terminal, &driver.screen, sink.now_ms());
+        tokio::select! {
+            biased;
+            end = &mut turn => return end,
+            key = keys.next() => {
+                let Some(key) = key else { continue };
+                if is_cancel(&key) {
+                    // ^C during a turn cancels the TURN; quitting is idle-only.
+                    turn_cancel.cancel();
+                    continue;
+                }
+                driver.on_key(key);
+            }
+            ui = events.recv() => {
+                if let Some(ui) = ui {
+                    driver.on_ui_event(ui);
+                }
+            }
+            request = auth.recv() => {
+                if let Some(request) = request {
+                    driver.on_auth(request);
+                }
+            }
+            _ = tick.tick() => {}
+        }
+    }
+}
+
+/// `^C`: cancel during a turn, quit at idle.
+fn is_cancel(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == crossterm::event::KeyCode::Char('c')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+}
+
+/// Draw one frame.
+fn draw<B: Backend>(terminal: &mut ratatui::Terminal<B>, screen: &Screen, now_ms: u64) {
+    terminal
+        .draw(|frame| {
+            p1_tui::render::screen::draw(screen, frame.area(), frame.buffer_mut(), now_ms)
+        })
+        .ok();
 }
 
 /// Build the blocking approval view for a parked request.
@@ -561,12 +681,7 @@ fn approval_view(request: &AuthRequest, workspace: &std::path::Path) -> Approval
         _ => Approval::Permission(PermissionView {
             command: get("command").unwrap_or_else(|| p1_tui::transcript::summarize_input(raw)),
             rows: vec![
-                (
-                    "cwd".into(),
-                    std::env::current_dir()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default(),
-                ),
+                ("cwd".into(), workspace.display().to_string()),
                 ("tool".into(), request.call.name.clone()),
             ],
             grantable: true,
@@ -575,25 +690,22 @@ fn approval_view(request: &AuthRequest, workspace: &std::path::Path) -> Approval
 }
 
 /// The `/status` overlay from live state (SPEC §4.6 shape).
-fn status_groups(
-    screen: &Screen,
-    options: &TuiOptions,
-) -> Vec<p1_tui::render::status::StatusGroup> {
+fn status_groups(driver: &Driver) -> Vec<p1_tui::render::status::StatusGroup> {
     use p1_tui::render::status::{StatusGroup, StatusRow};
     let row = |label: &str, value: String| StatusRow {
         label: label.into(),
         value,
         available: true,
     };
-    let spend = &screen.spend;
+    let spend = &driver.screen.spend;
     let or_unknown = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or("—".into());
     vec![
         StatusGroup {
             header: "ENVIRONMENT".into(),
             rows: vec![
-                row("environment", options.env.clone()),
-                row("route", options.route.clone()),
-                row("profile", options.model.clone()),
+                row("environment", driver.env.clone()),
+                row("route", driver.route.clone()),
+                row("profile", driver.model.clone()),
             ],
         },
         StatusGroup {

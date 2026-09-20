@@ -123,6 +123,7 @@ pub fn usage() -> String {
     out.push_str(
         "  --ask             ask before permitting a tool call; headless permits only\n                    read-only calls (default: full access, no questions)\n",
     );
+    out.push_str("  --tui             run the interactive session in the TUI\n");
     out.push_str(
         "  --yes             permit every tool call without asking (the default; kept for\n                    compatibility; cannot be combined with --ask)\n",
     );
@@ -238,6 +239,22 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let max_continuations = parse_max_continuations(args)?;
     let provider_retries = parse_provider_retries(args)?;
     let max_idle_summaries = parse_max_idle_summaries(args)?;
+
+    // The TUI is interactive-only (issue #12): a prompt means headless, and a
+    // non-terminal stdio is the line renderer's domain forever.
+    if tui {
+        if !prompt_words.is_empty() {
+            return Err(CliError {
+                message: "--tui is interactive-only: it cannot run with a prompt".to_string(),
+            });
+        }
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            return Err(CliError {
+                message: "--tui requires a terminal".to_string(),
+            });
+        }
+    }
 
     let prompt = if prompt_words.is_empty() {
         None
