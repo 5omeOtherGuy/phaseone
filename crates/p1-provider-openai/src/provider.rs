@@ -13,7 +13,7 @@ use p1_provider_http::{
 
 use crate::parser::CodexResponseParser;
 use crate::request::{
-    DEFAULT_BASE_URL, ROUTE, build_headers, build_request, resolve_base_url,
+    DEFAULT_BASE_URL, ROUTE, build_headers, build_request, clamped_cache_key, resolve_base_url,
     validate as validate_options,
 };
 
@@ -94,6 +94,9 @@ impl Provider for OpenAiCodexProvider {
                     "failed to serialize the request body",
                 )
             })?;
+            // The same clamped key as the body's `prompt_cache_key`, sent as
+            // the session identity headers.
+            let cache_key = clamped_cache_key(&request.options);
 
             let transport = self.transport.clone();
             let credentials = self.credentials.clone();
@@ -105,7 +108,7 @@ impl Provider for OpenAiCodexProvider {
                     // Unreachable by construction: `AccountIdGuard` turns a
                     // credential without an account id into an authentication
                     // failure before the driver can build a request.
-                    let headers = build_headers(credential)
+                    let headers = build_headers(credential, cache_key.as_deref())
                         .expect("the credential guard guarantees a ChatGPT account id");
                     HttpRequest {
                         url: url.clone(),

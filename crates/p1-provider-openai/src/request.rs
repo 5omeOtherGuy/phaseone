@@ -46,17 +46,22 @@ pub fn resolve_base_url(base: &str) -> Result<String, ProviderError> {
     })
 }
 
-/// Build the fixed header set for this route. The credential is the only input;
-/// an absent account id is an authentication failure because the route cannot
-/// name the ChatGPT account without it.
-pub fn build_headers(credential: &Credential) -> Result<Vec<(String, String)>, ProviderError> {
+/// Build the fixed header set for this route. When `cache_key` is set it is
+/// also sent as `session_id` and `conversation_id`, so the wire's session
+/// identity matches the body. The credential is the only other input; an absent
+/// account id is an authentication failure because the route cannot name the
+/// ChatGPT account without it.
+pub fn build_headers(
+    credential: &Credential,
+    cache_key: Option<&str>,
+) -> Result<Vec<(String, String)>, ProviderError> {
     let account_id = credential.account_id.as_deref().ok_or_else(|| {
         ProviderError::new(
             ProviderErrorKind::Authentication,
             "the Codex credential has no ChatGPT account id",
         )
     })?;
-    Ok(vec![
+    let mut headers = vec![
         (
             "Authorization".to_string(),
             format!("Bearer {}", credential.bearer),
@@ -73,7 +78,12 @@ pub fn build_headers(credential: &Credential) -> Result<Vec<(String, String)>, P
         ),
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "text/event-stream".to_string()),
-    ])
+    ];
+    if let Some(key) = cache_key {
+        headers.push(("session_id".to_string(), key.to_string()));
+        headers.push(("conversation_id".to_string(), key.to_string()));
+    }
+    Ok(headers)
 }
 
 /// Reject what the route cannot carry before a run starts.
@@ -138,6 +148,16 @@ fn reasoning_effort(effort: Effort) -> Result<&'static str, ProviderError> {
     }
 }
 
+/// The route's `prompt_cache_key` for a request: clamped to the 64-character
+/// cap the wire enforces, or `None` when the caller asked for no caching. The
+/// body and the session headers both go through here so they cannot diverge.
+pub(crate) fn clamped_cache_key(options: &ModelOptions) -> Option<String> {
+    options
+        .cache_key
+        .as_ref()
+        .map(|key| key.chars().take(64).collect())
+}
+
 /// Build the request body. Pure: no transport, no clock, no credentials.
 pub fn build_request(model: &str, request: &ProviderRequest) -> Result<Value, ProviderError> {
     let origin = Origin {
@@ -163,9 +183,8 @@ pub fn build_request(model: &str, request: &ProviderRequest) -> Result<Value, Pr
         "text".to_string(),
         json!({ "verbosity": verbosity(&request.options)? }),
     );
-    if let Some(key) = &request.options.cache_key {
-        let clamped: String = key.chars().take(64).collect();
-        body.insert("prompt_cache_key".to_string(), json!(clamped));
+    if let Some(key) = clamped_cache_key(&request.options) {
+        body.insert("prompt_cache_key".to_string(), json!(key));
     }
 
     let mut include_reasoning = replayed_reasoning;
@@ -377,9 +396,16 @@ mod tests {
         assert!(resolve_base_url("").is_err());
     }
 
+    fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
     #[test]
     fn builds_the_exact_header_set() {
-        let headers = build_headers(&credential(Some("acct_1"))).unwrap();
+        let headers = build_headers(&credential(Some("acct_1")), None).unwrap();
         assert_eq!(
             headers,
             vec![
@@ -405,9 +431,77 @@ mod tests {
 
     #[test]
     fn build_headers_requires_an_account_id() {
-        let error = build_headers(&credential(None)).unwrap_err();
+        let error = build_headers(&credential(None), None).unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::Authentication);
         assert!(!error.message.contains("SENTINEL-ACCESS"));
+    }
+
+    #[test]
+    fn cache_key_is_sent_as_session_and_conversation_headers() {
+        let mut request = request_with(vec![user("hi")], Vec::new());
+        request.options.cache_key = Some("agent-a-key".to_string());
+        let body = build_request("gpt-test", &request).unwrap();
+        let key = clamped_cache_key(&request.options).unwrap();
+        let headers = build_headers(&credential(Some("acct_1")), Some(&key)).unwrap();
+        assert_eq!(header(&headers, "session_id"), Some("agent-a-key"));
+        assert_eq!(header(&headers, "conversation_id"), Some("agent-a-key"));
+        assert_eq!(
+            header(&headers, "session_id"),
+            body["prompt_cache_key"].as_str()
+        );
+    }
+
+    #[test]
+    fn cache_key_headers_are_absent_without_a_cache_key() {
+        let headers = build_headers(&credential(Some("acct_1")), None).unwrap();
+        assert!(header(&headers, "session_id").is_none());
+        assert!(header(&headers, "conversation_id").is_none());
+    }
+
+    #[test]
+    fn cache_key_headers_use_the_clamped_value() {
+        let mut request = request_with(vec![user("hi")], Vec::new());
+        request.options.cache_key = Some(format!("{}tail", "å".repeat(70)));
+        let body = build_request("gpt-test", &request).unwrap();
+        let key = clamped_cache_key(&request.options).unwrap();
+        assert_eq!(key.chars().count(), 64);
+        let headers = build_headers(&credential(Some("acct_1")), Some(&key)).unwrap();
+        for name in ["session_id", "conversation_id"] {
+            let value = header(&headers, name).unwrap();
+            assert_eq!(value.chars().count(), 64, "{name} must be clamped too");
+            assert_eq!(value, "å".repeat(64));
+            assert_eq!(Some(value), body["prompt_cache_key"].as_str());
+        }
+    }
+
+    #[test]
+    fn cache_key_headers_never_carry_a_different_agents_key() {
+        let mut first = request_with(vec![user("hi")], Vec::new());
+        first.options.cache_key = Some("agent-a-key".to_string());
+        let mut second = request_with(vec![user("hi")], Vec::new());
+        second.options.cache_key = Some("agent-b-key".to_string());
+
+        let first_key = clamped_cache_key(&first.options).unwrap();
+        let second_key = clamped_cache_key(&second.options).unwrap();
+        let first_headers = build_headers(&credential(Some("acct_1")), Some(&first_key)).unwrap();
+        let second_headers = build_headers(&credential(Some("acct_2")), Some(&second_key)).unwrap();
+
+        assert_eq!(header(&first_headers, "session_id"), Some("agent-a-key"));
+        assert_eq!(
+            header(&first_headers, "conversation_id"),
+            Some("agent-a-key")
+        );
+        assert_ne!(header(&first_headers, "session_id"), Some("agent-b-key"));
+        assert_ne!(
+            header(&first_headers, "conversation_id"),
+            Some("agent-b-key")
+        );
+        assert_eq!(header(&second_headers, "session_id"), Some("agent-b-key"));
+        assert_eq!(
+            header(&second_headers, "conversation_id"),
+            Some("agent-b-key")
+        );
+        assert_ne!(header(&second_headers, "session_id"), Some("agent-a-key"));
     }
 
     #[test]
