@@ -24,11 +24,24 @@ pub(crate) fn validate(
     }
     if matches!(
         request.options.reasoning_effort,
-        Some(Effort::Medium | Effort::ExtraHigh | Effort::Low)
+        Some(Effort::Medium | Effort::ExtraHigh)
     ) {
         return Err(invalid(
-            "this subscription route supports high or max reasoning effort",
+            "this subscription route does not support medium or extra-high reasoning effort",
         ));
+    }
+    if route == SubscriptionRoute::OpenCodeGo
+        && request.options.reasoning_effort == Some(Effort::Low)
+    {
+        return Err(invalid("DeepSeek Go supports high or max reasoning effort"));
+    }
+    if route == SubscriptionRoute::Glm
+        && request
+            .options
+            .max_output_tokens
+            .is_some_and(|cap| cap > 131_072)
+    {
+        return Err(invalid("GLM output cap exceeds 131072 tokens"));
     }
     if request.options.max_output_tokens == Some(0) {
         return Err(invalid("output cap must be positive"));
@@ -116,7 +129,7 @@ pub fn build_request(
             }
         }
     }
-    let mut body = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"reasoning_effort":match request.options.reasoning_effort {Some(Effort::Max)=>"max", _=>"high"}});
+    let mut body = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"reasoning_effort":match request.options.reasoning_effort {Some(Effort::Max)=>"max", Some(Effort::Low)=>"low", _=>"high"}});
     body["thinking"] = match route {
         SubscriptionRoute::OpenCodeGo => json!({"type":"enabled"}),
         SubscriptionRoute::Glm => json!({"type":"enabled","clear_thinking":false}),
@@ -125,6 +138,9 @@ pub fn build_request(
         body["max_tokens"] = json!(cap);
     }
     if !request.tools.is_empty() {
+        if route == SubscriptionRoute::Glm {
+            body["tool_stream"] = json!(true);
+        }
         body["tools"] = request.tools.iter().map(|tool| match &tool.kind {
             DeclarationKind::Function { input_schema } => json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":input_schema}}),
             _ => unreachable!("validated"),
@@ -191,14 +207,15 @@ mod tests {
             ];
             r.options.max_output_tokens = Some(200);
             let body = build_request(route, "model", &r).unwrap();
-            assert_eq!(
-                body,
-                json!({"model":"model","stream":true,"stream_options":{"include_usage":true},"reasoning_effort":"high","max_tokens":200,
-                    "thinking":if route==SubscriptionRoute::Glm {json!({"type":"enabled","clear_thinking":false})}else{json!({"type":"enabled"})},
-                    "tools":[{"type":"function","function":{"name":"read","description":"Read","parameters":{"type":"object"}}}],
-                    "messages":[{"role":"system","content":"system"},{"role":"user","content":"inspect"},{"role":"assistant","content":"","reasoning_content":"exact\n雪","tool_calls":[{"id":"call","type":"function","function":{"name":"read","arguments":"{ \"path\": \"a\" }"}}]},{"role":"tool","tool_call_id":"call","content":"not found"}]
-                })
-            );
+            let mut expected = json!({"model":"model","stream":true,"stream_options":{"include_usage":true},"reasoning_effort":"high","max_tokens":200,
+                "thinking":if route==SubscriptionRoute::Glm {json!({"type":"enabled","clear_thinking":false})}else{json!({"type":"enabled"})},
+                "tools":[{"type":"function","function":{"name":"read","description":"Read","parameters":{"type":"object"}}}],
+                "messages":[{"role":"system","content":"system"},{"role":"user","content":"inspect"},{"role":"assistant","content":"","reasoning_content":"exact\n雪","tool_calls":[{"id":"call","type":"function","function":{"name":"read","arguments":"{ \"path\": \"a\" }"}}]},{"role":"tool","tool_call_id":"call","content":"not found"}]
+            });
+            if route == SubscriptionRoute::Glm {
+                expected["tool_stream"] = json!(true);
+            }
+            assert_eq!(body, expected);
             let foreign = build_request(route, "different-model", &r)
                 .unwrap()
                 .to_string();
@@ -234,5 +251,24 @@ mod tests {
         r.options.cache_key = Some("valid".into());
         assert!(build_request(route, "m", &r).is_ok());
         assert!(build_request(SubscriptionRoute::Glm, "m", &r).is_err());
+    }
+    #[test]
+    fn glm_effort_and_output_limits_match_the_documented_wire() {
+        let mut r = request();
+        for (effort, name) in [
+            (Effort::Low, "low"),
+            (Effort::High, "high"),
+            (Effort::Max, "max"),
+        ] {
+            r.options.reasoning_effort = Some(effort);
+            assert_eq!(
+                build_request(SubscriptionRoute::Glm, "glm-5.3", &r).unwrap()["reasoning_effort"],
+                name
+            );
+        }
+        r.options.max_output_tokens = Some(131_072);
+        assert!(build_request(SubscriptionRoute::Glm, "glm-5.3", &r).is_ok());
+        r.options.max_output_tokens = Some(131_073);
+        assert!(build_request(SubscriptionRoute::Glm, "glm-5.3", &r).is_err());
     }
 }

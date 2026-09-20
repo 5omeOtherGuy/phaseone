@@ -1,4 +1,4 @@
-# The two real provider routes — verified wire shapes
+# The subscription provider routes — verified wire shapes
 
 Status legend: **[donor]** read from iris-agent@62c8345 source and its unit tests (the
 owner ran these routes in production) · **[live]** confirmed by a p1 live smoke check ·
@@ -211,9 +211,11 @@ Both environments assemble read/edit/write/grep/shell/finish, with separate fami
 `tools[].function`; raw JSON arguments remain strings. Inbox items use user messages.
 Tool results retain their call IDs and exact content. Freeform declarations or history
 cannot be encoded and are rejected. `max_output_tokens` maps to positive `max_tokens`.
-High is the default; explicit high/max are carried, low/medium/extra-high rejected.
+High is the default; GLM carries low/high/max, DeepSeek high/max; medium/extra-high
+are rejected. GLM rejects output caps above its documented 131,072-token maximum.
 Unknown options in the adapter namespace are errors. Go enables thinking without GLM's
-`clear_thinking` field. Both request streamed usage with `stream_options.include_usage`.
+`clear_thinking` field. Both request streamed usage with `stream_options.include_usage`. GLM also sets
+`tool_stream: true` when tools are present to stream argument fragments.
 
 **Stream:** `choices[0].delta.content`, `reasoning_content` (Go's `reasoning` alias also
 accepted), and indexed function-call fragments. Calls retain first-appearance order;
@@ -245,8 +247,25 @@ P1_LIVE=1 cargo test -p p1-live deepseek_subscription_route -- --nocapture --tes
 P1_LIVE=1 cargo test -p p1-live glm_subscription_route -- --nocapture --test-threads 1
 ```
 Both passed text, function call and tool-result follow-up on 2026-09-20. DeepSeek emitted
-reasoning before the tool call and accepted its replay; GLM-5.3's tiny tool request emitted
-no reasoning, but its follow-up emitted reasoning. Both reported cache reads on follow-up
-(256 and 192 respectively); these small checks do not measure sustained cache efficiency.
-Max effort, explicit output caps and changed-key retry have synthetic coverage only;
+reasoning before the tool call and accepted its replay. With GLM's explicit `tool_stream`
+switch, the same smoke yielded five argument fragments and reasoning before the tool call;
+the follow-up replays it. Both reported cache reads in these tiny checks; they do not
+measure sustained cache efficiency.
+Low/max effort, explicit output caps and changed-key retry have synthetic coverage only;
 subscription key rejection/rotation has not been induced against the live services.
+
+**Sandboxed coding check, DeepSeek:** `scripts/dogfood.sh routes9-deepseek deepseek .
+/tmp/p1-route-checks/task.txt`, with `P1_BIN` pointing to this worktree's own debug build.
+Task: fix SSE initial UTF-8 BOM handling, including split BOM bytes, with regression tests.
+The disposable p1 clone completed in 150 seconds: exit 0, 25 requests, 27 tool calls,
+628,625 input tokens (606,720 cached), 18,227 output tokens; cost unknown. One `finish`
+call was rejected for naming checks differently from the actual compound shell commands;
+the model reran them standalone and recovered without intervention. New family prompts
+now explicitly request standalone verification commands.
+
+Independent acceptance: 54 HTTP tests and formatting passed; a separate Rust harness tested
+all three-chunk splits over leading/duplicate BOMs, BOMs inside values, a BOM-only stream
+and normal input. Candidate passed; the original baseline failed. Only the intended SSE
+file changed. The candidate is not merged as part of route implementation. Local evidence:
+`~/projects/phaseone-dogfood/routes9-deepseek.run/report.json`, with the diff alongside it.
+This one bounded task does not establish long-run reliability or comparative model quality.
