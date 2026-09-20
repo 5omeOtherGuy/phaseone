@@ -14,6 +14,25 @@ use tempfile::tempdir;
 
 const DONE_TRUE: &str = r#"{"status":"done","summary":"wrote it","verification":["true"]}"#;
 
+/// Every verification rejection now ends with what would be accepted right now.
+const TRAILER_HEADING: &str =
+    "Runs that count right now (successful, not piped, after the last file change):";
+const TRAILER_NONE: &str =
+    "No run counts right now: run your checks (without a pipe) after your last file change.";
+
+fn with_no_runs(message: &str) -> String {
+    format!("{message}\n\n{TRAILER_NONE}")
+}
+
+fn with_runs(message: &str, commands: &[&str]) -> String {
+    let mut text = format!("{message}\n\n{TRAILER_HEADING}");
+    for command in commands {
+        text.push_str("\n- ");
+        text.push_str(command);
+    }
+    text
+}
+
 fn finish_environment(root: &Path, tools: &[&str]) {
     write_environment(root, "finish-env", "fake", "fake-model", tools, "test");
 }
@@ -312,9 +331,61 @@ async fn d_the_three_exact_errors_then_a_valid_finish() {
     assert_eq!(
         finish_results(&provider),
         vec![
-            "No successful run of `never-run` is recorded in this session. Run it, read the result, then finish.".to_string(),
-            "No successful run of `false` is recorded in this session. Run it, read the result, then finish.".to_string(),
-            "You changed files after running `true`. Run it again, then finish.".to_string(),
+            with_no_runs(
+                "No successful run of `never-run` is recorded in this session. Run it, read the result, then finish."
+            ),
+            with_no_runs(
+                "No successful run of `false` is recorded in this session. Run it, read the result, then finish."
+            ),
+            with_no_runs("You changed files after running `true`. Run it again, then finish."),
+            "Finished.".to_string(),
+        ]
+    );
+}
+
+// ------------------------------------------------------------------ (d, revision)
+
+/// A real model piped its check (`… | tail -5`), which exits 0 even when the
+/// check fails. The pipe is rejected; the unpiped re-run is accepted.
+#[tokio::test]
+async fn a_piped_verification_is_rejected_then_an_unpiped_one_is_accepted() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    finish_environment(environments.path(), &["shell", "finish"]);
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![shell_call("s1", "true | cat")]),
+        tool_call_response(vec![json_call(
+            "f1",
+            "finish",
+            r#"{"status":"done","summary":"s","verification":["true | cat"]}"#,
+        )]),
+        tool_call_response(vec![shell_call("s2", "true")]),
+        tool_call_response(vec![json_call("f2", "finish", DONE_TRUE)]),
+        text_response("done"),
+    ]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider.clone())]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "finish-env",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert_eq!(
+        finish_results(&provider),
+        vec![
+            with_no_runs(
+                "`true | cat` was run through a pipe, so its exit code says nothing about it. Run it without a pipe, then finish."
+            ),
             "Finished.".to_string(),
         ]
     );
@@ -368,7 +439,10 @@ async fn e_a_later_failing_rerun_invalidates_the_earlier_success() {
     assert_eq!(
         finish_results(&provider),
         vec![
-            "No successful run of `cat marker` is recorded in this session. Run it, read the result, then finish.".to_string(),
+            with_runs(
+                "No successful run of `cat marker` is recorded in this session. Run it, read the result, then finish.",
+                &["rm marker"],
+            ),
             "Recorded as blocked.".to_string(),
         ]
     );
@@ -443,8 +517,9 @@ async fn f_none_is_accepted_without_files_and_rejected_after_a_write() {
     assert_eq!(
         finish_results(&provider),
         vec![
-            "This session changed files; verify the result with a command before finishing."
-                .to_string(),
+            with_no_runs(
+                "This session changed files; verify the result with a command before finishing."
+            ),
             "Finished.".to_string(),
         ]
     );
@@ -899,7 +974,7 @@ async fn resume_rebuilds_activity_so_a_later_write_still_invalidates() {
     assert_eq!(
         session_finish_results(&second),
         vec![
-            "You changed files after running `true`. Run it again, then finish.".to_string(),
+            with_no_runs("You changed files after running `true`. Run it again, then finish."),
             "Recorded as blocked.".to_string(),
         ]
     );
