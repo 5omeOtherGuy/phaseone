@@ -14,7 +14,7 @@ mod text;
 use std::path::{Path, PathBuf};
 
 pub use gate::{Mutation, WriteGate};
-pub use observe::{Observation, ObservedFiles};
+pub use observe::{Observation, ObservedFiles, StreamingHash};
 pub use text::{bound_output, write_atomic};
 
 /// The model-facing name and description of a tool.
