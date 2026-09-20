@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+  body { margin: 0; background: #0a0a0a; }
+  a { color: #e8e8e8; text-decoration: none; border-bottom: 1px solid #3d3d3d; }
+  a:hover { color: #ffffff; border-bottom-color: #9a9a9a; }
+  ::selection { background: #e8e8e8; color: #0a0a0a; }
+  @keyframes led { 0%, 100% { opacity: .18 } 50% { opacity: 1 } }
+</style>
+</helmet>
+<div style="font-family: 'JetBrains Mono', ui-monospace, monospace; background: #0a0a0a; color: #e8e8e8; min-height: 100vh; padding: 0 0 56px; box-sizing: border-box;">
+
+  <div style="border-bottom: 1px solid #2a2a2a; padding: 28px 24px 22px; display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end; justify-content: space-between;">
+    <div>
+      <div style="font-size: 11px; letter-spacing: 0.22em; color: #9a9a9a; text-transform: uppercase; margin-bottom: 10px;">TUI specification / v0.1</div>
+      <h1 style="margin: 0; font-size: clamp(26px, 5vw, 44px); font-weight: 700; letter-spacing: -0.02em; line-height: 1;">PHASEONE<span style="color: #6a6a6a;">/</span>TUI</h1>
+    </div>
+    <div style="font-size: 11px; line-height: 1.9; color: #9a9a9a; text-align: right;">
+      <div>AGENT &nbsp;&nbsp;&nbsp;p1 · PHASEONE HARNESS</div>
+      <div>GRID &nbsp;&nbsp;&nbsp;&nbsp;120×40 TYPICAL · 80×24 FLOOR</div>
+      <div>CHROME &nbsp;&nbsp;BACKGROUND BLOCKS · NO RULES</div>
+      <div>COLOUR &nbsp;&nbsp;MONO + 2 DIFF HUES</div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 16px;">00 — SYSTEM</div>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 1px; background: #2a2a2a; border: 1px solid #2a2a2a;">
+
+      <div style="background: #0a0a0a; padding: 18px;">
+        <div style="font-size: 10px; letter-spacing: 0.14em; color: #9a9a9a; margin-bottom: 14px;">SYMBOL VOCABULARY</div>
+        <div style="font-size: 12.5px; line-height: 2; white-space: pre;">
+<div><span style="color: #e8e8e8;">›</span>  <span style="color: #9a9a9a;">operator input</span></div>
+<div><span style="color: #e8e8e8;">▸</span>  <span style="color: #9a9a9a;">tool call</span></div>
+<div><span style="color: #e8e8e8;">✓</span>  <span style="color: #9a9a9a;">completed</span></div>
+<div><span style="color: #e8e8e8;">✗</span>  <span style="color: #9a9a9a;">failed</span></div>
+<div><span style="color: #e8e8e8;">!</span>  <span style="color: #9a9a9a;">approval required</span></div>
+<div><span style="color: #e8e8e8;">·</span>  <span style="color: #9a9a9a;">queued · folded · skipped</span></div>
+<div><span style="color: #e8e8e8;">↳</span>  <span style="color: #9a9a9a;">subagent / nested</span></div>
+<div><span style="color: #e8e8e8;">▪</span>  <span style="color: #9a9a9a;">working (LED chase)</span></div>
+</div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.7; margin-top: 16px;">Eight glyphs, no more. Every state is readable with colour stripped — the symbol carries it, colour only reinforces.</div>
+      </div>
+
+      <div style="background: #0a0a0a; padding: 18px;">
+        <div style="font-size: 10px; letter-spacing: 0.14em; color: #9a9a9a; margin-bottom: 14px;">INK</div>
+        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: #2a2a2a; border: 1px solid #2a2a2a;">
+          <div style="background: #0a0a0a; padding: 12px 10px; height: 62px; box-sizing: border-box;"><div style="font-size: 10px; color: #9a9a9a;">GROUND</div><div style="font-size: 11px; margin-top: 4px;">#0A0A0A</div></div>
+          <div style="background: #121212; padding: 12px 10px; height: 62px; box-sizing: border-box;"><div style="font-size: 10px; color: #9a9a9a;">BLOCK</div><div style="font-size: 11px; margin-top: 4px;">#121212</div></div>
+          <div style="background: #1c1c1c; padding: 12px 10px; height: 62px; box-sizing: border-box;"><div style="font-size: 10px; color: #9a9a9a;">BLOCK+</div><div style="font-size: 11px; margin-top: 4px;">#1C1C1C</div></div>
+          <div style="background: #e8e8e8; color: #0a0a0a; padding: 12px 10px; height: 62px; box-sizing: border-box;"><div style="font-size: 10px;">INK</div><div style="font-size: 11px; margin-top: 4px;">#E8E8E8</div></div>
+          <div style="background: #9a9a9a; color: #0a0a0a; padding: 12px 10px; height: 62px; box-sizing: border-box;"><div style="font-size: 10px;">DIM</div><div style="font-size: 11px; margin-top: 4px;">#9A9A9A</div></div>
+          <div style="background: #6a6a6a; color: #0a0a0a; padding: 12px 10px; height: 62px; box-sizing: border-box;"><div style="font-size: 10px;">FAINT</div><div style="font-size: 11px; margin-top: 4px;">#6A6A6A</div></div>
+        </div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.7; margin-top: 14px;">Selection and focus invert to <span style="background: #e8e8e8; color: #0a0a0a;">&nbsp;ink on ground&nbsp;</span> — the only "highlight" in the build.</div>
+      </div>
+
+      <div style="background: #0a0a0a; padding: 18px;">
+        <div style="font-size: 10px; letter-spacing: 0.14em; color: #9a9a9a; margin-bottom: 14px;">THE TWO HUES</div>
+        <div style="font-size: 12.5px; line-height: 1.7; white-space: pre;">
+<div><span style="background: #3a4a3a; color: #d8e8d0;">  +  apply_at_boundary(s);     </span></div>
+<div><span style="background: #4a3535; color: #e8d0d0;">  -  block_until_ready(&amp;w);    </span></div>
+</div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.7; margin-top: 14px;">Desaturated to sit on #0A0A0A without glowing. Reserved <span style="color: #e8e8e8;">exclusively</span> for diff bodies — never for status, never for emphasis. The <span style="color: #e8e8e8;">+</span>/<span style="color: #e8e8e8;">−</span> column means a colour-blind or monochrome terminal loses nothing.</div>
+      </div>
+
+      <div style="background: #0a0a0a; padding: 18px;">
+        <div style="font-size: 10px; letter-spacing: 0.14em; color: #9a9a9a; margin-bottom: 14px;">SEPARATION</div>
+        <div style="display: flex; gap: 0; font-size: 11.5px; line-height: 1.7; margin-bottom: 14px;">
+          <div style="flex: 1; background: #0a0a0a; padding: 10px 12px; white-space: pre; color: #9a9a9a;">
+<div>transcript</div>
+<div>sits on ground</div>
+</div>
+          <div style="width: 40%; background: #121212; padding: 10px 12px; white-space: pre; color: #9a9a9a;">
+<div>ledger</div>
+<div>one step up</div>
+</div>
+        </div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.7;">No box-drawing characters anywhere in the interface. Panes are told apart by a one-step background shift and by whitespace — the same logic as the desktop theme, where 1px rules do the work no border-radius is allowed to.</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 6px;">01 — IDLE / SESSION START</div>
+    <div style="font-size: 11px; color: #9a9a9a; margin-bottom: 16px; line-height: 1.7; max-width: 62ch;">Cold open. No banner, no logo, no tips carousel. Four affordances and a prompt.</div>
+
+    <div style="border: 1px solid #3d3d3d; background: #121212; max-width: 1000px; overflow: hidden;">
+      <div style="display: flex; align-items: center; justify-content: space-between; height: 30px; background: #202020; border-bottom: 1px solid #3d3d3d; padding: 0 0 0 10px;">
+        <div style="font-size: 12px;">p1 — ~/dev/phaseone</div>
+        <div style="display: flex; height: 100%;">
+          <div style="width: 30px; display: grid; place-items: center; font-size: 12px; color: #9a9a9a; border-left: 1px solid #3d3d3d;">–</div>
+          <div style="width: 30px; display: grid; place-items: center; font-size: 12px; color: #9a9a9a; border-left: 1px solid #3d3d3d;">□</div>
+          <div style="width: 30px; display: grid; place-items: center; font-size: 12px; color: #0a0a0a; background: #e8e8e8; border-left: 1px solid #3d3d3d;">×</div>
+        </div>
+      </div>
+      <div style="display: flex; background: #0a0a0a; font-size: 12.5px; line-height: 1.6; overflow-x: auto;">
+        <div style="flex: 1; min-width: 0; padding: 12px 14px; white-space: pre;">
+<div><span style="color: #9a9a9a;">p1 0.1.0   ~/dev/phaseone   main</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  no journal in this directory.</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  /resume  </span><span style="color: #e8e8e8;">   reopen a previous session</span></div>
+<div><span style="color: #9a9a9a;">  /env     </span><span style="color: #e8e8e8;">   claude · sonnet-4.5</span></div>
+<div><span style="color: #9a9a9a;">  /access  </span><span style="color: #e8e8e8;">   full · --ask to confirm</span></div>
+<div><span style="color: #9a9a9a;">  /goal    </span><span style="color: #e8e8e8;">   set the session objective</span></div>
+<div> </div>
+<div> </div>
+<div> </div>
+<div><span style="color: #e8e8e8;">›</span> <span style="background: #e8e8e8; color: #0a0a0a;"> </span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">  ⏎ send   ⌥⏎ newline   ^C quit</span></div>
+</div>
+        <sc-if value="{{ showLedger }}" hint-placeholder-val="{{ true }}">
+          <div style="width: 40ch; flex-shrink: 0; background: #121212; padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">WORKSPACE</span></div>
+<div><span style="color: #e8e8e8;">~/dev/phaseone</span></div>
+<div><span style="color: #9a9a9a;">main · clean</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">ROUTE</span></div>
+<div><span style="color: #e8e8e8;">claude</span></div>
+<div><span style="color: #9a9a9a;">profile sonnet-4.5</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">ACCESS</span></div>
+<div><span style="color: #e8e8e8;">{{ mode }}</span></div>
+<div><span style="color: #9a9a9a;">shell sandboxed</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">TOOLS</span></div>
+<div><span style="color: #9a9a9a;">9 assembled</span></div>
+<div><span style="color: #9a9a9a;">delegate → gpt</span></div>
+</div>
+        </sc-if>
+      </div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 6px;">02 — STREAMING + CONTEXT LEDGER</div>
+    <div style="font-size: 11px; color: #9a9a9a; margin-bottom: 16px; line-height: 1.7; max-width: 62ch;">Assistant prose is unadorned — no role label, no bubble, no left gutter bar. The ledger is where "every token is deliberate" becomes visible: a live breakdown of what is actually in context, not a telemetry strip.</div>
+
+    <div style="border: 1px solid #2a2a2a; background: #0a0a0a; max-width: 1000px; overflow-x: auto;">
+      <div style="display: flex; font-size: 12.5px; line-height: 1.6;">
+        <div style="flex: 1; min-width: 0; padding: 12px 14px; white-space: pre;">
+<div><span style="color: #e8e8e8;">›</span> <span style="color: #e8e8e8;">why does compaction stall at the turn edge?</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">· reasoning 4.2s</span><span style="color: #6a6a6a;">                      ^R expand</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">  The hard-pressure wait in `p1-context` blocks the</span></div>
+<div><span style="color: #e8e8e8;">  turn boundary instead of applying the summary the</span></div>
+<div><span style="color: #e8e8e8;">  worker already prepared. Three things line up:</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">  1. the worker starts at 72% and finishes early</span></div>
+<div><span style="color: #e8e8e8;">  2. the ready summary is held, not applied</span></div>
+<div><span style="color: #e8e8e8;">  3. at 90% the turn edge waits on a lock the</span></div>
+<div><span style="color: #e8e8e8;">     worker already released</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">  Let me confirm against the test.</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">▪</span><span style="color: #e8e8e8; animation: led 1.1s infinite .18s;">▪</span><span style="color: #e8e8e8; animation: led 1.1s infinite .36s;">▪</span> <span style="color: #9a9a9a;">{{ working }}</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">  ⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel</span></div>
+</div>
+        <sc-if value="{{ showLedger }}" hint-placeholder-val="{{ true }}">
+          <div style="width: 40ch; flex-shrink: 0; background: #121212; padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">GOAL</span></div>
+<div><span style="color: #e8e8e8;">fix compaction boundary stall</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">CONTEXT             </span><span style="color: #e8e8e8;">12.4k / 200k</span></div>
+<div><span style="color: #e8e8e8;">██</span><span style="color: #2a2a2a;">████████████████████████</span><span style="color: #9a9a9a;">    </span><span style="color: #e8e8e8;">6%</span></div>
+<div><span style="color: #9a9a9a;">  system                    </span><span style="color: #e8e8e8;">1.2k</span></div>
+<div><span style="color: #9a9a9a;">  files            4        </span><span style="color: #e8e8e8;">6.8k</span></div>
+<div><span style="color: #9a9a9a;">  tools           11        </span><span style="color: #e8e8e8;">3.1k</span></div>
+<div><span style="color: #9a9a9a;">  recent                    </span><span style="color: #e8e8e8;">1.3k</span></div>
+<div><span style="color: #9a9a9a;">  warn at 60%             120.0k</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">TASK                      </span><span style="color: #e8e8e8;">t-3f9a</span></div>
+<div><span style="color: #9a9a9a;">  files                        </span><span style="color: #e8e8e8;">3</span></div>
+<div><span style="color: #9a9a9a;">  diff                   </span><span style="color: #e8e8e8;">+48 −12</span></div>
+<div><span style="color: #9a9a9a;">  journal                 </span><span style="color: #e8e8e8;">2m ago</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">SPEND</span></div>
+<div><span style="color: #9a9a9a;">  in                       </span><span style="color: #e8e8e8;">38.1k</span></div>
+<div><span style="color: #9a9a9a;">  out                       </span><span style="color: #e8e8e8;">4.2k</span></div>
+<div><span style="color: #9a9a9a;">  cache hit                  </span><span style="color: #e8e8e8;">71%</span></div>
+<div><span style="color: #9a9a9a;">  cost                         </span><span style="color: #e8e8e8;">—</span></div>
+</div>
+        </sc-if>
+      </div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 6px;">03 — TOOL CALL + OUTPUT HANDLE</div>
+    <div style="font-size: 11px; color: #9a9a9a; margin-bottom: 16px; line-height: 1.7; max-width: 62ch;">Tool output earns chrome; conversation does not. The call collapses to one line once settled, and oversized output folds behind a handle rather than flooding the transcript.</div>
+
+    <div style="border: 1px solid #2a2a2a; background: #0a0a0a; max-width: 1000px; overflow-x: auto;">
+      <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">▸ read      </span><span style="color: #e8e8e8;">p1-context/src/edge.rs</span><span style="color: #9a9a9a;">        ✓ 412 lines</span></div>
+<div><span style="color: #9a9a9a;">▸ search    </span><span style="color: #e8e8e8;">block_until_ready</span><span style="color: #9a9a9a;">             ✓ 3 hits</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">▸ shell     </span><span style="color: #e8e8e8;">cargo test -p p1-context boundary</span></div>
+<div><span style="color: #9a9a9a;">  ✗ 11.4s · 12 passed, 1 failed · 94 lines</span><span style="color: #6a6a6a;">      ^O open</span></div>
+<div> </div>
+<div><span style="background: #121212; color: #9a9a9a;">     running 13 tests                                     </span></div>
+<div><span style="background: #121212; color: #9a9a9a;">     test compaction::worker_prepares_early ... ok        </span></div>
+<div><span style="background: #121212; color: #e8e8e8;">     test compaction::hard_pressure_waits ... FAILED      </span></div>
+<div><span style="background: #121212; color: #9a9a9a;">                                                          </span></div>
+<div><span style="background: #121212; color: #9a9a9a;">     assertion `left == right` failed                     </span></div>
+<div><span style="background: #121212; color: #9a9a9a;">       left:  Waited(1420ms)                              </span></div>
+<div><span style="background: #121212; color: #9a9a9a;">       right: AppliedReady                                </span></div>
+<div><span style="background: #121212; color: #6a6a6a;">     · 81 more lines folded → [h-7c21]                    </span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">  Confirmed — the ready summary never applies.</span></div>
+</div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 6px;">04 — DIFF REVIEW &amp; APPROVAL</div>
+    <div style="font-size: 11px; color: #9a9a9a; margin-bottom: 16px; line-height: 1.7; max-width: 62ch;">The deliverable. Full-width, no ledger competing with it. Decision keys are single characters — y / a / p / n — spelled out rather than encoded in a button row.</div>
+
+    <div style="border: 1px solid #2a2a2a; background: #0a0a0a; max-width: 1000px; overflow-x: auto;">
+      <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #e8e8e8;">! edit      </span><span style="color: #e8e8e8;">p1-context/src/edge.rs</span><span style="color: #9a9a9a;">          1 of 3 files</span></div>
+<div><span style="color: #9a9a9a;">  replace exact string · once</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">  410 </span><span style="color: #9a9a9a;">    let ready = worker.take_summary();</span></div>
+<div><span style="color: #6a6a6a;">  411 </span><span style="color: #9a9a9a;">    let pressure = self.pressure_at_edge();</span></div>
+<div><span style="background: #4a3535; color: #e8d0d0;">  412 -   if pressure == Pressure::Hard {                  </span></div>
+<div><span style="background: #4a3535; color: #e8d0d0;">  413 -       block_until_ready(&amp;worker);                  </span></div>
+<div><span style="background: #4a3535; color: #e8d0d0;">  414 -   }                                                </span></div>
+<div><span style="background: #3a4a3a; color: #d8e8d0;">  412 +   if let Some(summary) = ready {                   </span></div>
+<div><span style="background: #3a4a3a; color: #d8e8d0;">  413 +       self.apply_at_boundary(summary);             </span></div>
+<div><span style="background: #3a4a3a; color: #d8e8d0;">  414 +   } else if pressure == Pressure::Hard {           </span></div>
+<div><span style="background: #3a4a3a; color: #d8e8d0;">  415 +       block_until_ready(&amp;worker);                  </span></div>
+<div><span style="background: #3a4a3a; color: #d8e8d0;">  416 +   }                                                </span></div>
+<div><span style="color: #6a6a6a;">  417 </span><span style="color: #9a9a9a;">    self.checkpoint();</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  next  p1-core/src/turn.rs </span><span style="color: #e8e8e8;">+6</span> <span style="color: #e8e8e8;">−2</span><span style="color: #9a9a9a;">   p1-context/tests/edge.rs </span><span style="color: #e8e8e8;">+14</span></div>
+<div> </div>
+<div><span style="background: #e8e8e8; color: #0a0a0a;"> y </span><span style="color: #9a9a9a;"> allow once   </span><span style="color: #e8e8e8;">a</span><span style="color: #9a9a9a;"> session   </span><span style="color: #e8e8e8;">p</span><span style="color: #9a9a9a;"> project   </span><span style="color: #e8e8e8;">n</span><span style="color: #9a9a9a;"> deny</span></div>
+<div><span style="color: #6a6a6a;">                            ^D next file   ^A all files</span></div>
+</div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 6px;">05 — PERMISSION PROMPT (DESTRUCTIVE)</div>
+    <div style="font-size: 11px; color: #9a9a9a; margin-bottom: 16px; line-height: 1.7; max-width: 62ch;">Destructive commands re-prompt and are not grantable. The unavailable keys stay visible but dimmed — the operator learns the policy by reading the prompt, not the manual.</div>
+
+    <div style="border: 1px solid #2a2a2a; background: #0a0a0a; max-width: 1000px; overflow-x: auto;">
+      <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #e8e8e8;">! shell</span></div>
+<div><span style="background: #1c1c1c; color: #e8e8e8;">  rm -rf target/debug/incremental                         </span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  destructive · re-prompts every call in {{ mode }}</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  cwd      </span><span style="color: #e8e8e8;">~/dev/phaseone</span></div>
+<div><span style="color: #9a9a9a;">  sandbox  </span><span style="color: #e8e8e8;">bubblewrap · writes: worktree, /tmp, /dev/null</span></div>
+<div><span style="color: #9a9a9a;">  network  </span><span style="color: #e8e8e8;">denied</span></div>
+<div><span style="color: #9a9a9a;">  reason   </span><span style="color: #e8e8e8;">stale incremental artifacts before rebuild</span></div>
+<div> </div>
+<div><span style="background: #e8e8e8; color: #0a0a0a;"> y </span><span style="color: #9a9a9a;"> allow once   </span><span style="color: #e8e8e8;">n</span><span style="color: #9a9a9a;"> deny</span></div>
+<div><span style="color: #6a6a6a;"> a  session      not grantable — destructive floor</span></div>
+<div><span style="color: #6a6a6a;"> p  project      not grantable — destructive floor</span></div>
+</div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 16px;">06 — SLASH PALETTE &amp; PICKERS</div>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 20px; align-items: start;">
+
+      <div>
+        <div style="font-size: 10px; color: #9a9a9a; margin-bottom: 10px;">SLASH PALETTE — filters as you type, 8 rows max</div>
+        <div style="border: 1px solid #2a2a2a; background: #0a0a0a; overflow-x: auto;">
+          <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #e8e8e8;">› /co</span><span style="background: #e8e8e8; color: #0a0a0a;"> </span></div>
+<div> </div>
+<div><span style="background: #e8e8e8; color: #0a0a0a;">  /compact      compact context now        </span></div>
+<div><span style="color: #9a9a9a;">  /compaction   compaction settings</span></div>
+<div><span style="color: #9a9a9a;">  /context      context ledger detail</span></div>
+<div><span style="color: #9a9a9a;">  /copy         copy last reply</span></div>
+<div><span style="color: #9a9a9a;">  /checkpoint   save a restore point</span></div>
+<div><span style="color: #6a6a6a;">  · 2 more</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">  ⏎ run   ⇥ complete   esc dismiss</span></div>
+</div>
+        </div>
+      </div>
+
+      <div>
+        <div style="font-size: 10px; color: #9a9a9a; margin-bottom: 10px;">ROUTE PICKER — /env</div>
+        <div style="border: 1px solid #2a2a2a; background: #0a0a0a; overflow-x: auto;">
+          <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">ANTHROPIC ROUTE</span></div>
+<div><span style="background: #e8e8e8; color: #0a0a0a;">  claude · sonnet-4.5    200k   in 3.00  out 15.00 </span></div>
+<div><span style="color: #9a9a9a;">  claude · opus-4.1      200k   in 15.0  out 75.00</span></div>
+<div><span style="color: #9a9a9a;">OPENAI-CHAT ROUTE</span></div>
+<div><span style="color: #9a9a9a;">  deepseek · v4.1-flash  128k   in 0.14  out 0.28</span></div>
+<div><span style="color: #6a6a6a;">  glm · 5.3              200k   quota exhausted</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  scoped: delegate → deepseek</span></div>
+<div><span style="color: #6a6a6a;">  ⏎ select   ^S scope delegate   esc</span></div>
+</div>
+        </div>
+      </div>
+
+      <div>
+        <div style="font-size: 10px; color: #9a9a9a; margin-bottom: 10px;">SESSION PICKER — /resume</div>
+        <div style="border: 1px solid #2a2a2a; background: #0a0a0a; overflow-x: auto;">
+          <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">~/dev/phaseone</span></div>
+<div><span style="background: #e8e8e8; color: #0a0a0a;">  2m    compaction boundary stall   3f  124k   ⌁ </span></div>
+<div><span style="color: #9a9a9a;">  1h    route + profile split        3f   18k</span></div>
+<div><span style="color: #9a9a9a;">  y'day bubblewrap read probe       11f   96k</span></div>
+<div><span style="color: #9a9a9a;">OTHER PROJECTS</span></div>
+<div><span style="color: #9a9a9a;">  3d    ~/dev/slab-theme             6f   41k</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">  ⏎ resume   ^T timeline   ^X delete   esc</span></div>
+</div>
+        </div>
+      </div>
+
+      <div>
+        <div style="font-size: 10px; color: #9a9a9a; margin-bottom: 10px;">STATUS — /status</div>
+        <div style="border: 1px solid #2a2a2a; background: #0a0a0a; overflow-x: auto;">
+          <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">ROUTES</span></div>
+<div><span style="color: #9a9a9a;">  claude                  </span><span style="color: #e8e8e8;">oauth · cached</span></div>
+<div><span style="color: #9a9a9a;">  deepseek                       </span><span style="color: #e8e8e8;">api key</span></div>
+<div><span style="color: #6a6a6a;">  glm                    quota exhausted</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">ENVIRONMENT</span></div>
+<div><span style="color: #9a9a9a;">  route                           </span><span style="color: #e8e8e8;">claude</span></div>
+<div><span style="color: #9a9a9a;">  profile                     </span><span style="color: #e8e8e8;">sonnet-4.5</span></div>
+<div><span style="color: #9a9a9a;">  context                     </span><span style="color: #e8e8e8;">configured</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">TOOLS</span></div>
+<div><span style="color: #9a9a9a;">  assembled                            </span><span style="color: #e8e8e8;">9</span></div>
+<div><span style="color: #9a9a9a;">  shell                        </span><span style="color: #e8e8e8;">sandboxed</span></div>
+<div><span style="color: #9a9a9a;">  delegate                     </span><span style="color: #e8e8e8;">route gpt</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">STORE</span></div>
+<div><span style="color: #9a9a9a;">  journal                   </span><span style="color: #e8e8e8;">~/.config/p1</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">  esc</span></div>
+</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 16px;">07 — GOAL &amp; PLAN</div>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 20px; align-items: start;">
+      <div style="border: 1px solid #2a2a2a; background: #0a0a0a; overflow-x: auto;">
+        <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">GOAL</span><span style="color: #6a6a6a;">                                      set 14m ago</span></div>
+<div><span style="color: #e8e8e8;">  Apply the prepared summary at the turn edge</span></div>
+<div><span style="color: #e8e8e8;">  instead of blocking, without breaking pair</span></div>
+<div><span style="color: #e8e8e8;">  validity on resume.</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">PLAN</span></div>
+<div><span style="color: #9a9a9a;">  ✓ reproduce with the failing test</span></div>
+<div><span style="color: #9a9a9a;">  ✓ locate the hard-pressure wait</span></div>
+<div><span style="color: #e8e8e8;">  ▪ apply ready summary at boundary</span></div>
+<div><span style="color: #6a6a6a;">  · re-run compaction suite</span></div>
+<div><span style="color: #6a6a6a;">  · check resume rebuilds pairs</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">  ^G edit goal   ⏎ dismiss</span></div>
+</div>
+      </div>
+      <div style="font-size: 11px; color: #9a9a9a; line-height: 1.8;">
+        <div style="color: #e8e8e8; margin-bottom: 8px;">WHY NO CHECKBOXES</div>
+        The plan reuses the transcript's own symbol set — <span style="color: #e8e8e8;">✓</span> done, <span style="color: #e8e8e8;">▪</span> working, <span style="color: #9a9a9a;">·</span> pending. A second notation for the same three states would be one vocabulary too many. The working row is the only line at full ink, so the eye lands on it without a highlight bar.
+        <div style="color: #e8e8e8; margin: 16px 0 8px;">GOAL IS NOT A TODO LIST</div>
+        <span style="color: #e8e8e8;">/goal</span> is host-owned and is never assembled as a tool, so the goal block is rendered as a quotation the agent is held to — not an editable checklist it can quietly rewrite.
+      </div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 6px;">08 — DELEGATION</div>
+    <div style="font-size: 11px; color: #9a9a9a; margin-bottom: 16px; line-height: 1.7; max-width: 62ch;">Delegation indents once and never more. A worker's transcript stays folded; only its manifest, its ceiling, and its reviewed apply surface in the parent.</div>
+
+    <div style="border: 1px solid #2a2a2a; background: #0a0a0a; max-width: 1000px; overflow-x: auto;">
+      <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">▸ delegate  </span><span style="color: #e8e8e8;">2 workers</span><span style="color: #9a9a9a;">                    ceiling 40 calls</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  ↳ </span><span style="color: #e8e8e8;">audit-resume</span><span style="color: #9a9a9a;">      ✓ 1m12s · 18 calls · 31k</span></div>
+<div><span style="color: #9a9a9a;">      isolated · 0 mutations · report only</span></div>
+<div><span style="color: #6a6a6a;">      · transcript folded → [h-9d04]</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  ↳ </span><span style="color: #e8e8e8;">patch-tests</span><span style="color: #e8e8e8;">       ▪ 0m41s · 11 calls · 14k</span></div>
+<div><span style="color: #9a9a9a;">      isolated worktree · 2 staged mutations</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">! apply     </span><span style="color: #e8e8e8;">patch-tests</span><span style="color: #9a9a9a;">                   2 files staged</span></div>
+<div><span style="color: #9a9a9a;">  p1-context/tests/edge.rs  </span><span style="color: #e8e8e8;">+14</span></div>
+<div><span style="color: #9a9a9a;">  p1-journal/tests/resume.rs</span><span style="color: #e8e8e8;"> +6</span> <span style="color: #e8e8e8;">−1</span></div>
+<div> </div>
+<div><span style="background: #e8e8e8; color: #0a0a0a;"> r </span><span style="color: #9a9a9a;"> review diff   </span><span style="color: #e8e8e8;">y</span><span style="color: #9a9a9a;"> apply   </span><span style="color: #e8e8e8;">n</span><span style="color: #9a9a9a;"> discard worktree</span></div>
+</div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 6px;">09 — FAILURE</div>
+    <div style="font-size: 11px; color: #9a9a9a; margin-bottom: 16px; line-height: 1.7; max-width: 62ch;">No red banner, no apology, no retry spinner. The error states what broke, what it cost, and what is still safe — then hands back control.</div>
+
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 20px; align-items: start;">
+      <div style="border: 1px solid #2a2a2a; background: #0a0a0a; overflow-x: auto;">
+        <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #e8e8e8;">✗ provider  </span><span style="color: #9a9a9a;">anthropic · 529 overloaded</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  turn stopped after 2 tool calls.</span></div>
+<div><span style="color: #9a9a9a;">  context and task checkpoint are intact.</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  spent this turn   </span><span style="color: #e8e8e8;">4.1k in · 0 out</span></div>
+<div><span style="color: #9a9a9a;">  attempt           </span><span style="color: #e8e8e8;">2 of 3 · next in 8s</span></div>
+<div> </div>
+<div><span style="background: #e8e8e8; color: #0a0a0a;"> ⏎ </span><span style="color: #9a9a9a;"> retry now   </span><span style="color: #e8e8e8;">m</span><span style="color: #9a9a9a;"> switch route   </span><span style="color: #e8e8e8;">^C</span><span style="color: #9a9a9a;"> stop</span></div>
+</div>
+      </div>
+      <div style="border: 1px solid #2a2a2a; background: #0a0a0a; overflow-x: auto;">
+        <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #e8e8e8;">✗ shell     </span><span style="color: #e8e8e8;">cargo test -p p1-context</span></div>
+<div><span style="color: #9a9a9a;">  exit 101 · 4.2s · 210 lines</span><span style="color: #6a6a6a;">            ^O open</span></div>
+<div> </div>
+<div><span style="background: #121212; color: #9a9a9a;">   error[E0382]: borrow of moved value: `worker`  </span></div>
+<div><span style="background: #121212; color: #9a9a9a;">      --&gt; p1-context/src/edge.rs:414:26           </span></div>
+<div><span style="background: #121212; color: #6a6a6a;">   · 206 more lines folded → [h-1a88]             </span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  denied calls stay in the transcript as denied</span></div>
+<div><span style="color: #9a9a9a;">  results — nothing disappears.</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">  ⏎ let the agent continue   ^C take over</span></div>
+</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 6px;">10 — 80×24 FLOOR</div>
+    <div style="font-size: 11px; color: #9a9a9a; margin-bottom: 16px; line-height: 1.7; max-width: 62ch;">Below 100 columns the ledger drops out and the transcript takes the full width. Nothing is lost — the ledger's contents are reachable through <span style="color: #e8e8e8;">/context</span> and <span style="color: #e8e8e8;">/status</span>, and <span style="color: #e8e8e8;">^L</span> forces it back as an overlay at any width.</div>
+
+    <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start;">
+      <div style="border: 1px solid #2a2a2a; background: #0a0a0a; overflow-x: auto;">
+        <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #6a6a6a;">80 columns · ledger collapsed</span></div>
+<div><span style="color: #6a6a6a;">────────────────────────────────────────────────────────────────────────────────</span></div>
+<div><span style="color: #e8e8e8;">›</span> <span style="color: #e8e8e8;">why does compaction stall at the turn edge?</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">· reasoning 4.2s                                              ^R expand</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">  The hard-pressure wait in `p1-context` blocks the turn boundary</span></div>
+<div><span style="color: #e8e8e8;">  instead of applying the summary the worker already prepared.</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">▸ shell     </span><span style="color: #e8e8e8;">cargo test -p p1-context</span><span style="color: #9a9a9a;">       ✗ 12 passed, 1 failed</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">▪</span><span style="color: #e8e8e8; animation: led 1.1s infinite .18s;">▪</span><span style="color: #e8e8e8; animation: led 1.1s infinite .36s;">▪</span> <span style="color: #9a9a9a;">{{ working }}</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">›</span> <span style="background: #e8e8e8; color: #0a0a0a;"> </span></div>
+<div><span style="color: #9a9a9a;">{{ mode }} · claude · 12.4k</span><span style="color: #6a6a6a;">        ^L ledger   ^C cancel</span></div>
+</div>
+      </div>
+      <div style="font-size: 11px; color: #9a9a9a; line-height: 1.8; max-width: 34ch;">
+        <div style="color: #e8e8e8; margin-bottom: 8px;">THE ONE-LINE COMPROMISE</div>
+        At 80 columns a single dim line appears under the composer carrying access mode, route, and context size. It is the only place this interface ever puts state at the bottom of the screen, and it exists because the ledger that normally holds those three values is gone.
+        <div style="color: #e8e8e8; margin: 16px 0 8px;">WHAT DOESN'T CHANGE</div>
+        Indentation, symbol set, and the two diff hues are identical at every width. Nothing reflows into a different shape — the interface only gets narrower.
+      </div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px; border-bottom: 1px solid #2a2a2a;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 6px;">11 — THE RIGHT PANE, DYNAMICALLY</div>
+    <div style="font-size: 11px; color: #9a9a9a; margin-bottom: 20px; line-height: 1.7; max-width: 68ch;">Concept, not a contract — these four are sketches of what one pane can hold, in one design language. The pane has a mode, the mode follows what the session is doing, and the operator can always pin it. Width cycles <span style="color: #e8e8e8;">off / 40ch / 56ch / split</span> with <span style="color: #e8e8e8;">^W</span>; <span style="color: #e8e8e8;">^Tab</span> cycles the mode by hand.</div>
+
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr)); gap: 20px; align-items: start;">
+
+      <div>
+        <div style="font-size: 10px; color: #9a9a9a; margin-bottom: 10px;">WORKERS — while any delegate is live</div>
+        <div style="border: 1px solid #2a2a2a; background: #121212; overflow-x: auto;">
+          <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">WORKERS                       3 live · 1 waiting</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">!  sandbox-read</span><span style="color: #9a9a9a;">                     needs review</span></div>
+<div><span style="color: #9a9a9a;">   deepseek · v4.1-flash           </span><span style="color: #e8e8e8;">0m48s · $0.02</span></div>
+<div><span style="color: #9a9a9a;">   reject cred-dir ancestors        ✓ gate green</span></div>
+<div><span style="color: #9a9a9a;">   2 files staged                       </span><span style="background: #e8e8e8; color: #0a0a0a;"> r </span><span style="color: #9a9a9a;"> open</span></div>
+<div> </div>
+<div><span style="color: #e8e8e8;">▪  split3b</span><span style="color: #9a9a9a;">                               running</span></div>
+<div><span style="color: #9a9a9a;">   deepseek · v4.1-flash           </span><span style="color: #e8e8e8;">0m52s · $0.02</span></div>
+<div><span style="color: #9a9a9a;">   </span><span style="color: #e8e8e8;">█████████</span><span style="color: #2a2a2a;">███████████████</span><span style="color: #9a9a9a;">    14/40 calls · 38%</span></div>
+<div><span style="color: #9a9a9a;">   crates/p1-provider-http/                     </span></div>
+<div><span style="color: #9a9a9a;">   ↳ writing route.rs</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">✓  split3a</span><span style="color: #9a9a9a;">                         merged 4m ago</span></div>
+<div><span style="color: #9a9a9a;">   glm · 5.3                       </span><span style="color: #e8e8e8;">2m10s · $0.31</span></div>
+<div><span style="color: #9a9a9a;">   profiles as files</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">·  t1-measure               queued after split3b</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">   ^Tab pane   a attach   x stop   ^W width</span></div>
+</div>
+        </div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.8; margin-top: 12px;">One row per worker, ordered by what needs you: <span style="color: #e8e8e8;">!</span> waiting, <span style="color: #e8e8e8;">▪</span> running, <span style="color: #9a9a9a;">✓</span> done, <span style="color: #6a6a6a;">·</span> queued. Each carries its route and profile, because in p1 two workers on the same task are usually not the same model — and the paths it <span style="color: #e8e8e8;">owns</span>, so a collision between two worktrees is visible before the merge, not after.</div>
+      </div>
+
+      <div>
+        <div style="font-size: 10px; color: #9a9a9a; margin-bottom: 10px;">OUTPUT — the expanded form of a fold handle</div>
+        <div style="border: 1px solid #2a2a2a; background: #121212; overflow-x: auto;">
+          <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">OUTPUT  </span><span style="color: #e8e8e8;">h-7c21</span><span style="color: #9a9a9a;">              shell · 94 lines</span></div>
+<div> </div>
+<div><span style="background: #0a0a0a; color: #9a9a9a;">   running 13 tests                            </span></div>
+<div><span style="background: #0a0a0a; color: #9a9a9a;">   test compaction::worker_prepares_early .. ok</span></div>
+<div><span style="background: #0a0a0a; color: #e8e8e8;">   test compaction::hard_pressure_waits FAILED </span></div>
+<div><span style="background: #0a0a0a; color: #9a9a9a;">                                               </span></div>
+<div><span style="background: #0a0a0a; color: #9a9a9a;">   assertion `left == right` failed            </span></div>
+<div><span style="background: #0a0a0a; color: #9a9a9a;">     left:  Waited(1420ms)                     </span></div>
+<div><span style="background: #0a0a0a; color: #9a9a9a;">     right: AppliedReady                       </span></div>
+<div><span style="background: #0a0a0a; color: #9a9a9a;">                                               </span></div>
+<div><span style="background: #0a0a0a; color: #6a6a6a;">   · 81 lines above                            </span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">  81/94</span><span style="color: #9a9a9a;">           ⌃⌄ scroll   f only failures</span></div>
+<div><span style="color: #6a6a6a;">  y yank   ⏎ hand back to the agent   ^O close</span></div>
+</div>
+        </div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.8; margin-top: 12px;">The transcript never grows to hold this. A fold handle in the transcript and this pane are the same object at two sizes — opening one here does not reflow a single line of the conversation, which is the whole reason output folds in the first place.</div>
+      </div>
+
+      <div>
+        <div style="font-size: 10px; color: #9a9a9a; margin-bottom: 10px;">DIFF — review without stopping the agent</div>
+        <div style="border: 1px solid #2a2a2a; background: #121212; overflow-x: auto;">
+          <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="color: #9a9a9a;">DIFF  </span><span style="color: #e8e8e8;">p1-context/src/edge.rs</span><span style="color: #9a9a9a;">      +5 −3</span></div>
+<div><span style="color: #9a9a9a;">  1 of 3 files</span><span style="color: #6a6a6a;">        ^D next   ^A all files</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;"> 411 </span><span style="color: #9a9a9a;">   let pressure = self.pressure_at_edge();</span></div>
+<div><span style="background: #4a3535; color: #e8d0d0;"> 412 -  if pressure == Pressure::Hard {        </span></div>
+<div><span style="background: #4a3535; color: #e8d0d0;"> 413 -      block_until_ready(&amp;worker);        </span></div>
+<div><span style="background: #3a4a3a; color: #d8e8d0;"> 412 +  if let Some(summary) = ready {         </span></div>
+<div><span style="background: #3a4a3a; color: #d8e8d0;"> 413 +      self.apply_at_boundary(summary);   </span></div>
+<div><span style="background: #3a4a3a; color: #d8e8d0;"> 414 +  } else if pressure == Pressure::Hard { </span></div>
+<div><span style="color: #6a6a6a;"> 417 </span><span style="color: #9a9a9a;">   self.checkpoint();</span></div>
+<div> </div>
+<div><span style="background: #e8e8e8; color: #0a0a0a;"> y </span><span style="color: #9a9a9a;"> once   </span><span style="color: #e8e8e8;">a</span><span style="color: #9a9a9a;"> session   </span><span style="color: #e8e8e8;">p</span><span style="color: #9a9a9a;"> project   </span><span style="color: #e8e8e8;">n</span><span style="color: #9a9a9a;"> deny</span></div>
+<div> </div>
+<div><span style="color: #6a6a6a;">  the agent keeps working while you read</span></div>
+</div>
+        </div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.8; margin-top: 12px;">The same diff as section 04, at 56 columns instead of full width. §04 is the blocking review that owns the screen; this is the non-blocking one you scan while a worker keeps going. Identical keys, identical hues — only the width tells you whether the session is waiting on you.</div>
+      </div>
+
+      <div>
+        <div style="font-size: 10px; color: #9a9a9a; margin-bottom: 10px;">PEEK — the ledger, briefly interrupted</div>
+        <div style="border: 1px solid #2a2a2a; background: #121212; overflow-x: auto;">
+          <div style="padding: 12px 14px; white-space: pre; font-size: 12.5px; line-height: 1.6;">
+<div><span style="background: #1c1c1c; color: #e8e8e8;"> ✗ shell · 1 failed     </span><span style="background: #1c1c1c; color: #6a6a6a;">^O open </span></div>
+<div><span style="background: #1c1c1c; color: #6a6a6a;">                dismisses in 3s </span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">GOAL</span></div>
+<div><span style="color: #e8e8e8;">fix compaction boundary stall</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">CONTEXT             </span><span style="color: #e8e8e8;">12.4k / 200k</span></div>
+<div><span style="color: #e8e8e8;">██</span><span style="color: #2a2a2a;">████████████████████████</span><span style="color: #9a9a9a;">    </span><span style="color: #e8e8e8;">6%</span></div>
+<div><span style="color: #9a9a9a;">  system                    </span><span style="color: #e8e8e8;">1.2k</span></div>
+<div><span style="color: #9a9a9a;">  files            4        </span><span style="color: #e8e8e8;">6.8k</span></div>
+<div> </div>
+<div><span style="color: #9a9a9a;">WORKERS             2 live · </span><span style="color: #e8e8e8;">1 !</span></div>
+<div><span style="color: #6a6a6a;">  ^Tab to open</span></div>
+</div>
+        </div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.8; margin-top: 12px;">Most events do not deserve the whole pane. A two-line banner takes the top of the ledger, states the outcome and the key that opens it, and retires itself — the ledger underneath never moves. Anything still unresolved leaves a single counted line behind rather than a badge.</div>
+      </div>
+    </div>
+
+    <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 1px; background: #2a2a2a; border: 1px solid #2a2a2a;">
+      <div style="background: #0a0a0a; padding: 16px;">
+        <div style="font-size: 10px; letter-spacing: 0.14em; color: #9a9a9a; margin-bottom: 12px;">WHAT PROMOTES THE PANE</div>
+        <div style="font-size: 12.5px; line-height: 1.9; white-space: pre; color: #9a9a9a;">
+<div><span style="color: #e8e8e8;">approval requested</span>    <span style="color: #9a9a9a;">→ DIFF, pinned</span></div>
+<div><span style="color: #e8e8e8;">worker needs review</span>   <span style="color: #9a9a9a;">→ WORKERS, pinned</span></div>
+<div><span style="color: #e8e8e8;">delegate spawns</span>       <span style="color: #9a9a9a;">→ WORKERS while live</span></div>
+<div><span style="color: #e8e8e8;">output over 40 lines</span>  <span style="color: #9a9a9a;">→ PEEK, 3s</span></div>
+<div><span style="color: #e8e8e8;">tool fails</span>            <span style="color: #9a9a9a;">→ PEEK, 3s</span></div>
+<div><span style="color: #e8e8e8;">context over 60%</span>      <span style="color: #9a9a9a;">→ PEEK, 3s</span></div>
+<div><span style="color: #e8e8e8;">nothing pending</span>       <span style="color: #9a9a9a;">→ LEDGER</span></div>
+</div>
+      </div>
+      <div style="background: #0a0a0a; padding: 16px;">
+        <div style="font-size: 10px; letter-spacing: 0.14em; color: #9a9a9a; margin-bottom: 12px;">TWO RULES THAT MAKE IT LIVEABLE</div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.9;">
+          <span style="color: #e8e8e8;">Pinning always wins.</span> <span style="color: #e8e8e8;">^P</span> pins the current mode and no event may swap it; what would have promoted itself waits as a counted line instead. A pane that changes under your hands while you read a diff is worse than no pane.
+          <div style="margin-top: 12px;"><span style="color: #e8e8e8;">Only two states ever pin themselves</span> — an approval and a worker waiting on review. Both are the session blocked on you, and both stay until you answer. Everything else peeks and retires.</div>
+        </div>
+      </div>
+      <div style="background: #0a0a0a; padding: 16px;">
+        <div style="font-size: 10px; letter-spacing: 0.14em; color: #9a9a9a; margin-bottom: 12px;">STILL A MOCK-UP</div>
+        <div style="font-size: 11px; color: #9a9a9a; line-height: 1.9;">These four modes are here to show that one pane, one symbol set and one pair of hues stretch across a context ledger, a log viewer, a diff reviewer and a worker dashboard without a second visual language appearing. Which modes ship, what they contain, and how promotion is timed are implementation choices — the constraint this section fixes is the vocabulary, not the feature list.</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="padding: 22px 24px;">
+    <div style="font-size: 10px; letter-spacing: 0.22em; color: #9a9a9a; margin-bottom: 16px;">12 — HOUSE RULES</div>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 1px; background: #2a2a2a; border: 1px solid #2a2a2a; font-size: 11px;">
+      <div style="background: #0a0a0a; padding: 16px;">
+        <div style="color: #e8e8e8; letter-spacing: 0.14em; font-size: 10px; margin-bottom: 10px;">WHY A SECOND PANE</div>
+        <div style="color: #9a9a9a; line-height: 1.9;">The ledger is not GUI chrome: no box-drawing, separated only by a background step, key-toggled, and gone below 100 columns. What it displays — budgeted context, spend, task diff — is the efficiency claim made visible, which is the one thing a second pane earns its width for. Unknown cost renders as <span style="color: #e8e8e8;">—</span>, never as zero.</div>
+      </div>
+      <div style="background: #0a0a0a; padding: 16px;">
+        <div style="color: #e8e8e8; letter-spacing: 0.14em; font-size: 10px; margin-bottom: 10px;">NO BOTTOM STATUS BAR</div>
+        <div style="color: #9a9a9a; line-height: 1.9;">Honoured everywhere except the 80-column fallback, where one dim line replaces the ledger it can no longer show. No CPU, no memory, no queue depth — three values that were already on screen a moment ago.</div>
+      </div>
+      <div style="background: #0a0a0a; padding: 16px;">
+        <div style="color: #e8e8e8; letter-spacing: 0.14em; font-size: 10px; margin-bottom: 10px;">NO BRAILLE SPINNER</div>
+        <div style="color: #9a9a9a; line-height: 1.9;">The working indicator is a three-cell LED chase in ink, which freezes to a static <span style="color: #e8e8e8;">▪▪▪</span> under <span style="color: #e8e8e8;">P1_REDUCED_MOTION=1</span>. Toggle it in the tweaks panel.</div>
+      </div>
+      <div style="background: #0a0a0a; padding: 16px;">
+        <div style="color: #e8e8e8; letter-spacing: 0.14em; font-size: 10px; margin-bottom: 10px;">COLOUR NEVER CARRIES STATE ALONE</div>
+        <div style="color: #9a9a9a; line-height: 1.9;">The two diff hues are the only colour in the interface and they always sit behind a <span style="color: #e8e8e8;">+</span> or <span style="color: #e8e8e8;">−</span> column. Strip every hue and the screens above still read correctly — success, failure, and approval are carried by <span style="color: #e8e8e8;">✓ ✗ !</span>, never by green, red, or amber.</div>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;showLedger&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;accessMode&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;ask&quot;,&quot;options&quot;:[&quot;full&quot;,&quot;ask&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Behaviour&quot;},&quot;reducedMotion&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behaviour&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    const reduced = this.props.reducedMotion ?? false;
+    return {
+      showLedger: this.props.showLedger ?? true,
+      mode: this.props.accessMode ?? "ask",
+      working: reduced ? "running tests" : "running tests · 11.4s"
+    };
+  }
+}
+</script>
+</body>
+</html>
