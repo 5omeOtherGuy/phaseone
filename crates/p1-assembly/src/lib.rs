@@ -30,7 +30,7 @@ use p1_contracts::{
     Effort, ModelOptions, Provider, ProviderError, ProviderRequest, RouteDescription, Tool,
     ToolDeclaration, ToolIdentity,
 };
-use p1_workspace::{ObservedFiles, Workspace};
+use p1_workspace::{ObservedFiles, Workspace, WriteGate};
 use serde::{Deserialize, Serialize};
 
 /// File name of an environment definition inside `<dir>/<name>/`.
@@ -91,6 +91,9 @@ pub type ToolFactory =
 pub struct Catalog {
     providers: BTreeMap<String, ProviderFactory>,
     tools: BTreeMap<String, ToolFactory>,
+    /// Shared by every agent assembled from this catalog — a parent and its
+    /// workers — so their file mutations are serialized (`p1_workspace::WriteGate`).
+    write_gate: WriteGate,
 }
 
 impl Catalog {
@@ -357,9 +360,11 @@ pub fn assemble(
     workspace: &Path,
     substitutions: &Substitutions,
 ) -> Result<Assembled, AssemblyError> {
-    let workspace = Workspace::new(workspace).map_err(|error| AssemblyError::InvalidWorkspace {
-        message: error.to_string(),
-    })?;
+    let workspace = Workspace::new(workspace)
+        .map_err(|error| AssemblyError::InvalidWorkspace {
+            message: error.to_string(),
+        })?
+        .with_write_gate(catalog.write_gate.clone());
     let services = ToolServices {
         workspace,
         observed: ObservedFiles::new(),

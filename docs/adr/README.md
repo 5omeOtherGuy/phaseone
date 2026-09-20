@@ -45,6 +45,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0029 | [Test-first with independent authors and frozen suites](0029-test-first-with-independent-authors-and-frozen-suites.md) | accepted | 2026-09-20 | lead |
 | ADR-0030 | [Decisions are recorded as ADRs](0030-decisions-are-recorded-as-adrs.md) | accepted | 2026-09-20 | owner+lead |
 | ADR-0031 | [A session file is owned before it is read](0031-a-session-file-is-owned-before-it-is-read.md) | accepted | 2026-09-20 | lead |
+| ADR-0032 | [Agents sharing a directory serialize their file mutations](0032-agents-sharing-a-directory-serialize-their-file-mutations.md) | accepted | 2026-09-20 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

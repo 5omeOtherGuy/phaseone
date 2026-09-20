@@ -313,6 +313,10 @@ fn run(
     cancel: &CancellationToken,
 ) -> Result<String, PatchFailure> {
     let hunks = parse_patch(text)?;
+    // Planning reads the files the hunks are located in; applying writes them.
+    // Both under the gate: another agent's write cannot land in between and be
+    // overwritten by contents planned from the older state.
+    let _mutation = workspace.begin_mutation();
     let ops = plan(workspace, &hunks, cancel)?;
     apply(&ops, observed, cancel)?;
     Ok(ops

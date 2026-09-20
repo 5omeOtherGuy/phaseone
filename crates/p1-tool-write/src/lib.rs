@@ -168,6 +168,9 @@ fn run(
         .map_err(|error| error.to_string())?;
     let display = workspace.display(&resolved);
 
+    // Check and write are one step for every agent sharing this gate: another
+    // agent's write (or create) cannot land between the check and ours.
+    let _mutation = workspace.begin_mutation();
     // Read-before-mutate applies only when the target already exists: creating
     // a new file is a blind create, which is allowed.
     if resolved.exists() {

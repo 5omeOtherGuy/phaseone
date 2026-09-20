@@ -191,6 +191,9 @@ fn run(
         .map_err(|error| error.to_string())?;
     let display = workspace.display(&resolved);
 
+    // Check and write are one step for every agent sharing this gate: another
+    // agent's write cannot land between the staleness check and ours.
+    let _mutation = workspace.begin_mutation();
     let bytes = match std::fs::read(&resolved) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => {
