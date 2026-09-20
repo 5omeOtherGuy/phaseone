@@ -258,6 +258,12 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     let model = assembled.resolved.route.origin.model.clone();
 
     let (journal, records): OpenedSession = open_session(deps, options)?;
+    // On resume the journal holds the earlier turns; rebuild this agent's activity
+    // from them so a verification run before the restart still counts and a file
+    // change before it still invalidates (completion.md §3).
+    if let (Some(completion), Some(records)) = (&completion, &records) {
+        completion.log.replay(&assembled.tools, records);
+    }
 
     let renderer = Arc::new(Renderer::new(
         deps.stdout.clone(),
@@ -405,6 +411,18 @@ async fn run_headless(
             }
             None => {}
         }
+        // FIRST the things a turn end legitimately waits for: a pending inbox or a
+        // running worker. A parent that stopped while its worker runs is WAITING,
+        // not stopping (completion.md §3, must-pass a0).
+        outcome.clear();
+        match wait_for_work(deps, agent, cancel, &second).await {
+            WaitOutcome::Turn(next) => {
+                end = next;
+                continue;
+            }
+            WaitOutcome::Cancelled => return EXIT_CANCELLED,
+            WaitOutcome::Idle => {}
+        }
         // Premature stop. It is allowed while BOTH bounds hold: the whole-run
         // count and at least one non-finish call finished since the last
         // continuation.
@@ -452,33 +470,66 @@ async fn run_headless_plain(
         if cancel.is_cancelled() {
             return EXIT_CANCELLED;
         }
-        if agent.has_pending_inbox() {
-            match race_inbox(agent.run_inbox_turn(cancel.clone()), second).await {
-                Some(Some(end)) => {
-                    code = end_code(&end);
-                    if code == EXIT_CANCELLED {
-                        return code;
-                    }
-                }
-                Some(None) => {}
-                None => return EXIT_CANCELLED,
-            }
-            continue;
-        }
-        #[cfg(feature = "delegation")]
-        {
-            if running_children(deps).await > 0 {
-                tokio::select! {
-                    biased;
-                    _ = second.notified() => return EXIT_CANCELLED,
-                    _ = cancel.cancelled() => return EXIT_CANCELLED,
-                    _ = agent.inbox_ready() => continue,
+        match wait_for_work(deps, agent, cancel, second).await {
+            WaitOutcome::Turn(end) => {
+                code = end_code(&end);
+                if code == EXIT_CANCELLED {
+                    return code;
                 }
             }
+            WaitOutcome::Idle => break,
+            WaitOutcome::Cancelled => return EXIT_CANCELLED,
         }
-        break;
     }
     code
+}
+
+/// What the host found when a turn ended and it looked for legitimate work.
+enum WaitOutcome {
+    /// An inbox turn ran and ended with this end; judge it from the top.
+    Turn(TurnEnd),
+    /// The inbox is empty and no worker is running: there is nothing to wait for.
+    Idle,
+    /// The run was cancelled while waiting.
+    Cancelled,
+}
+
+/// The ONE place a turn end waits instead of stopping: a pending inbox message,
+/// or a running worker whose completion notification will arrive on the inbox.
+/// Shared by the plain and the `finish`-aware headless drivers so waiting has one
+/// meaning in both. `_deps` is only read under the delegation feature.
+async fn wait_for_work(
+    _deps: &HostDeps,
+    agent: &mut Agent,
+    cancel: &CancellationToken,
+    second: &Arc<tokio::sync::Notify>,
+) -> WaitOutcome {
+    if agent.has_pending_inbox() {
+        return match race_inbox(agent.run_inbox_turn(cancel.clone()), second).await {
+            Some(Some(end)) => WaitOutcome::Turn(end),
+            Some(None) => WaitOutcome::Idle,
+            None => WaitOutcome::Cancelled,
+        };
+    }
+    #[cfg(feature = "delegation")]
+    {
+        if running_children(_deps).await > 0 {
+            tokio::select! {
+                biased;
+                _ = second.notified() => return WaitOutcome::Cancelled,
+                _ = cancel.cancelled() => return WaitOutcome::Cancelled,
+                _ = agent.inbox_ready() => {}
+            }
+            // `inbox_ready` only resolves with a message pending, so this turn is
+            // the worker's completion notification.
+            return match race_inbox(agent.run_inbox_turn(cancel.clone()), second).await {
+                Some(Some(end)) => WaitOutcome::Turn(end),
+                Some(None) => WaitOutcome::Idle,
+                None => WaitOutcome::Cancelled,
+            };
+        }
+    }
+    WaitOutcome::Idle
 }
 
 async fn run_interactive(deps: &HostDeps, agent: &mut Agent, cancel: &CancellationToken) -> i32 {

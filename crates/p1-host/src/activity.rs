@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use p1_contracts::{
-    AgentEvent, Effect, EventSink, Tool, ToolCall, ToolInput, ToolResultItem, ToolStatus,
+    AgentEvent, Effect, EventSink, JournalRecord, RecordBody, Tool, ToolCall, ToolInput,
+    ToolResultItem, ToolStatus,
 };
 use p1_tool_finish::{FinishOutcome, SessionActivity, ShellRun};
 
@@ -90,6 +91,46 @@ impl ActivityLog {
     /// The model-facing name of this agent's `finish` tool.
     pub fn set_finish_name(&self, name: String) {
         *self.finish_name.lock().unwrap() = Some(name);
+    }
+
+    /// Rebuild the log from a resumed session's journal (completion.md §3), in
+    /// record order, BEFORE the first turn. A verification run before the restart
+    /// then still counts, and a file change before it still invalidates.
+    ///
+    /// `ToolStarted` carries no call name or input, so those come from the
+    /// `AssistantCompleted` item that produced the call. The effect is looked up on
+    /// the tool assembled NOW, by model-facing name. A tool that no longer exists is
+    /// treated as NOT writing and NOT executing: we cannot know what it did, and
+    /// guessing that a vanished tool wrote a file would be worse than missing it.
+    pub fn replay(&self, tools: &[Arc<dyn Tool>], records: &[JournalRecord]) {
+        let mut calls: std::collections::HashMap<&str, &ToolCall> =
+            std::collections::HashMap::new();
+        for record in records {
+            if let RecordBody::AssistantCompleted { item, .. } = &record.body {
+                for call in item.tool_calls() {
+                    calls.insert(call.call_id.as_str(), call);
+                }
+            }
+        }
+        let by_name: std::collections::HashMap<&str, &Arc<dyn Tool>> = tools
+            .iter()
+            .map(|tool| (tool.declaration().name.as_str(), tool))
+            .collect();
+        for record in records {
+            match &record.body {
+                RecordBody::ToolStarted { call_id, .. } => {
+                    let Some(call) = calls.get(call_id.as_str()) else {
+                        continue;
+                    };
+                    let effect = by_name
+                        .get(call.name.as_str())
+                        .map_or(Effect::ReadOnly, |tool| tool.effect(call));
+                    self.record_started(call, effect);
+                }
+                RecordBody::ToolFinished { result } => self.record_finished(result),
+                _ => {}
+            }
+        }
     }
 
     /// Finished calls other than the `finish` tool — the host's progress signal
@@ -228,6 +269,10 @@ impl CompletionHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p1_contracts::{
+        AssistantBlock, AssistantItem, Origin, RecordBody, StopReason, ToolIdentity,
+    };
+    use p1_testkit::FakeTool;
 
     fn result(call_id: &str, name: &str, status: ToolStatus, content: &str) -> ToolResultItem {
         ToolResultItem {
@@ -236,6 +281,104 @@ mod tests {
             status,
             content: content.into(),
         }
+    }
+
+    fn call(call_id: &str, name: &str, raw: &str) -> ToolCall {
+        ToolCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            input: ToolInput::Json(raw.into()),
+        }
+    }
+
+    fn assistant(calls: Vec<ToolCall>) -> JournalRecord {
+        JournalRecord {
+            seq: 0,
+            body: RecordBody::AssistantCompleted {
+                item: AssistantItem {
+                    origin: Origin {
+                        route: "r".into(),
+                        model: "m".into(),
+                    },
+                    blocks: calls.into_iter().map(AssistantBlock::ToolCall).collect(),
+                },
+                stop: StopReason::ToolUse,
+                usage: None,
+            },
+        }
+    }
+
+    fn started(call_id: &str) -> JournalRecord {
+        JournalRecord {
+            seq: 0,
+            body: RecordBody::ToolStarted {
+                call_id: call_id.into(),
+                identity: ToolIdentity {
+                    implementation: "p1-tool".into(),
+                    variant: "claude".into(),
+                },
+            },
+        }
+    }
+
+    fn finished(call_id: &str, name: &str, status: ToolStatus, content: &str) -> JournalRecord {
+        JournalRecord {
+            seq: 0,
+            body: RecordBody::ToolFinished {
+                result: result(call_id, name, status, content),
+            },
+        }
+    }
+
+    #[test]
+    fn replay_rebuilds_file_changes_and_shell_runs_in_order() {
+        let log = ActivityLog::default();
+        let write = call("w", "write", r#"{"file_path":"a","content":"x"}"#);
+        let shell = call("s", "shell", r#"{"command":"cargo test"}"#);
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(FakeTool::new("write").with_effect(Effect::WritesFiles)),
+            Arc::new(FakeTool::new("shell").with_effect(Effect::Executes)),
+        ];
+        let records = vec![
+            assistant(vec![write]),
+            started("w"),
+            finished("w", "write", ToolStatus::Ok, "Wrote a (1 bytes)."),
+            assistant(vec![shell]),
+            started("s"),
+            finished("s", "shell", ToolStatus::Ok, "ok\n[exit code: 0]"),
+        ];
+
+        log.replay(&tools, &records);
+
+        assert_eq!(log.last_file_change(), Some(1));
+        assert_eq!(
+            log.shell_runs(),
+            vec![ShellRun {
+                command: "cargo test".into(),
+                exit_code: Some(0),
+                order: 2,
+            }]
+        );
+        assert_eq!(log.non_finish_finishes(), 2);
+    }
+
+    #[test]
+    fn replay_treats_a_tool_that_no_longer_exists_as_not_writing() {
+        let log = ActivityLog::default();
+        let vanish = call("v", "vanish", r#"{"path":"a"}"#);
+        let records = vec![
+            assistant(vec![vanish]),
+            started("v"),
+            finished("v", "vanish", ToolStatus::Ok, "did something"),
+        ];
+
+        // No assembled tool named `vanish`: its effect is unknown, so it is NOT a
+        // file change and NOT a shell run.
+        log.replay(&[], &records);
+
+        assert_eq!(log.last_file_change(), None);
+        assert!(log.shell_runs().is_empty());
+        assert_eq!(log.non_finish_finishes(), 1);
     }
 
     #[test]
