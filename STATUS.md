@@ -79,18 +79,19 @@ deepseek2 summarize at 300k of 1M; glm 150k of 260k. NEVER size [context] from o
 (run split4a thrashed 96 min, 0 edits, under a 90k threshold).
 
 IN FLIGHT:
-* `p1-auth` (step 5, spec `docs/design/credentials.md` §1–5): p1 job on deepseek2, shell task
-  `bu3cvc4hh`, worktree `../phaseone-p1-auth`, run dir `../phaseone-briefs/runs/p1-auth-*`, brief
-  `../phaseone-briefs/p1-auth.md`. When done: review diff (NO credential lookup left in the
-  adapters; adapter characterization/conformance expectations untouched; no real credential
-  file read), merge main into it, independent `scripts/gate.sh`, merge, `scripts/push-main.sh`,
-  record in `docs/dogfood/runs.jsonl`. If the notification is lost: `pgrep -af "debug/p1"`, then
-  `report.json` / `stdout.txt` in the run dir.
-* QUEUED behind it: `p1 login` (owner decision, ADR-0044 proposed → set accepted when merged;
-  spec `credentials.md` §6): brief `../phaseone-briefs/p1-login.md`, jobs file
-  `p1-login-jobs.json`; create worktree `scripts/new-worktree.sh p1-login` AFTER p1-auth is on
-  main, dispatch with the env var above. After it lands tell the owner:
+* `p1-auth` (ADR-0039 step 5): DONE, merged (`bb36fc8`), run recorded. `p1 env show` prints a
+  `credential  <source>` line.
+* `p1 login` (ADR-0044 proposed -> set accepted when merged; spec `credentials.md` §6): p1 job on
+  deepseek2 RUNNING, worktree `../phaseone-p1-login`, brief `../phaseone-briefs/p1-login.md`, run
+  dir `../phaseone-briefs/runs/p1-login-*`. Land like every job (review: sentinel test, no key in
+  any output, never ran against the real home). Then tell the owner:
   `p1 login opencode-go-2-subscription < ~/.config/keys/opencode-go-2.key`, then drop the env var.
+* `run-report-usage` (research #26 -> implement): p1 job on deepseek2 RUNNING, worktree
+  `../phaseone-run-report-usage`, brief `../phaseone-briefs/run-report-usage.md`. Python only.
+  When merged: label #26 `research:used`, close it.
+* NEW bug #30 (from research #28): `finish` accepts masked checks (`cmd; echo done`,
+  `cmd || true`). Lead-owned, one crate, needs a spec line in completion.md §2 first. Also seen
+  in the p1-auth run: `finish` names ONE missing verification command per rejection (5 rounds).
 * TUI: separate Kimi K3 session (tmux window `kimi-tui`, pane %48, worktree `../phaseone-12-tui`),
   coordination ONLY via issue #12. It has merged M1–M4a itself; the seam it needed is on main and
   it may edit exactly two spots of mine: `impl FrontEnd` in its `tui.rs`, the 5-line `--tui`
