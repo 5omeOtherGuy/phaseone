@@ -153,3 +153,14 @@ at high effort). PROVEN LIVE the same day by the end-to-end coding tasks through
 both models produced reasoning blocks (Claude `thinking` + signature, Codex
 `encrypted_content`) that were replayed across follow-up requests, and across a JSONL
 `--resume`, without a rejected request (`docs/SLICE-REPORT.md`).
+
+### Codex prompt caching — measured 2026-09-20 (issue #7)
+
+`prompt_cache_key` in the body alone gave all-or-nothing hits per request (dogfood run 2: 29 %
+overall, the first ten requests 0 %). The adapter now also sends the same clamped key as
+`session_id` and `conversation_id` headers, as the Codex CLI does. Three interleaved A/B pairs,
+same ten-request task, `gpt-5.6-sol`, medium: WITHOUT the headers 9 %, 27 %, 9 % of input
+tokens read from cache; WITH them 57 %, 69 %, 64 %. Individual requests still miss (0–17 %)
+even with the headers, so routing is only part of the story; the Claude route reaches 97 % on
+comparable work. Small sample on one day — re-measure before building on the exact numbers.
+
