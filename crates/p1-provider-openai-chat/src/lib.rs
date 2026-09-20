@@ -162,11 +162,30 @@ pub(crate) fn validate_composition(
     if wire_model.is_empty() {
         return Err(request::invalid("wire model must be nonempty"));
     }
-    if profile.thinking == ThinkingPolicy::Preserved
-        && route.dialect != ChatDialect::RetainedThinking
-    {
+    match profile.thinking {
+        ThinkingPolicy::Enabled => {}
+        ThinkingPolicy::Preserved if route.dialect == ChatDialect::RetainedThinking => {}
+        ThinkingPolicy::Preserved => {
+            return Err(request::invalid(
+                "chat dialect cannot express the profile's preserved thinking requirement",
+            ));
+        }
+        ThinkingPolicy::EffortLevel => {
+            return Err(request::invalid(&format!(
+                "chat dialect `{}` cannot express the profile's `thinking = \"effort-level\"` policy",
+                dialect_name(route.dialect)
+            )));
+        }
+        ThinkingPolicy::Budget => {
+            return Err(request::invalid(&format!(
+                "chat dialect `{}` cannot express the profile's `thinking = \"budget\"` policy",
+                dialect_name(route.dialect)
+            )));
+        }
+    }
+    if profile.default_effort.is_none() {
         return Err(request::invalid(
-            "chat dialect cannot express the profile's preserved thinking requirement",
+            "chat profile requires a default reasoning effort",
         ));
     }
     if profile
@@ -179,6 +198,14 @@ pub(crate) fn validate_composition(
         ));
     }
     Ok(())
+}
+
+/// The kebab-case file spelling of a `ChatDialect`, for error messages.
+fn dialect_name(dialect: ChatDialect) -> &'static str {
+    match dialect {
+        ChatDialect::ThinkingWithReasoningAlias => "thinking-with-reasoning-alias",
+        ChatDialect::RetainedThinking => "retained-thinking",
+    }
 }
 impl std::fmt::Debug for ChatProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -295,9 +322,92 @@ mod test_config {
             } else {
                 vec![Effort::High, Effort::Max]
             },
-            default_effort: Effort::High,
+            default_effort: Some(Effort::High),
+            thinking_budgets: std::collections::BTreeMap::new(),
             context_tokens: None,
             max_output_tokens: retained.then_some(131_072),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn all_efforts() -> Vec<Effort> {
+        vec![
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::ExtraHigh,
+            Effort::Max,
+        ]
+    }
+
+    fn profile(
+        thinking: ThinkingPolicy,
+        efforts: Vec<Effort>,
+        thinking_budgets: BTreeMap<Effort, u32>,
+    ) -> ModelProfile {
+        ModelProfile {
+            id: "claude-example".into(),
+            revision: 1,
+            model_id: "claude-example".into(),
+            family: "claude".into(),
+            thinking,
+            efforts,
+            default_effort: None,
+            thinking_budgets,
+            context_tokens: None,
+            max_output_tokens: None,
+        }
+    }
+
+    #[test]
+    fn chat_refuses_the_effort_level_and_budget_policies_by_variant_and_dialect() {
+        let efforts = all_efforts();
+        let budgets: BTreeMap<Effort, u32> =
+            efforts.iter().map(|effort| (*effort, 32_768)).collect();
+        let cases = [
+            (ThinkingPolicy::EffortLevel, "effort-level", BTreeMap::new()),
+            (ThinkingPolicy::Budget, "budget", budgets),
+        ];
+        for retained in [false, true] {
+            let route = test_config::route(retained);
+            let dialect = dialect_name(route.dialect);
+            for (thinking, variant, table) in &cases {
+                let profile = profile(*thinking, efforts.clone(), table.clone());
+                assert!(profile.validate().is_ok(), "{variant}");
+                let error = validate_composition(&route, "claude-example", &profile).unwrap_err();
+                assert_eq!(
+                    error.kind,
+                    p1_contracts::ProviderErrorKind::InvalidRequest,
+                    "{variant}"
+                );
+                assert!(
+                    error.message.contains(variant),
+                    "{variant}: {}",
+                    error.message
+                );
+                assert!(
+                    error.message.contains(dialect),
+                    "{variant}: {}",
+                    error.message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chat_refuses_a_profile_without_a_default_effort() {
+        let route = test_config::route(false);
+        let profile = profile(
+            ThinkingPolicy::Enabled,
+            vec![Effort::Low, Effort::High, Effort::Max],
+            BTreeMap::new(),
+        );
+        let error = validate_composition(&route, "claude-example", &profile).unwrap_err();
+        assert!(error.message.contains("default"), "{}", error.message);
     }
 }

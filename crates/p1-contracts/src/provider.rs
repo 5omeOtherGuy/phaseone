@@ -21,7 +21,7 @@ use crate::history::{AssistantItem, Item, Origin};
 use crate::tool::ToolDeclaration;
 use crate::{BoxFuture, CancellationToken};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Effort {
     Low,

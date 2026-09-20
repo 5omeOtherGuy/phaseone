@@ -3,7 +3,8 @@
 One JSON record per supervised run in `runs.jsonl`, written by
 `scripts/run-report.py SESSION.jsonl --append docs/dogfood/runs.jsonl …`. The journal supplies
 the counts (including `provider_retries`, the host's own messages after a transient provider
-failure, §3b of `docs/design/completion.md`); the operator supplies what only they know:
+failure, §3b of `docs/design/completion.md`, and `stalled_on_summaries`, the §3c stall guard's
+six-consecutive-summaries-without-progress signal); the operator supplies what only they know:
 `--accepted` (after INDEPENDENT verification — re-run the checks yourself), `--interventions`,
 `--elapsed`, `--exit-code`.
 

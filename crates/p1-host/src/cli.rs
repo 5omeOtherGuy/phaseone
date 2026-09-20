@@ -16,6 +16,10 @@ pub const DEFAULT_MAX_CONTINUATIONS: usize = 3;
 /// Headless provider-retry budget when `--provider-retries` is not given.
 pub const DEFAULT_PROVIDER_RETRIES: usize = 3;
 
+/// Headless bound on consecutive context replacements without progress when
+/// `--max-idle-summaries` is not given (completion.md §3c).
+pub const DEFAULT_MAX_IDLE_SUMMARIES: usize = 6;
+
 /// Whether `shell` commands run inside the bubblewrap sandbox.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SandboxMode {
@@ -71,6 +75,9 @@ pub struct Options {
     /// At most this many CONSECUTIVE transient provider failures to wait out and
     /// retry in an unattended run. `0` disables retrying.
     pub provider_retries: usize,
+    /// At most this many CONSECUTIVE context replacements without a workspace
+    /// change before an unattended run stalls. `0` disables the guard.
+    pub max_idle_summaries: usize,
     /// Run the interactive session in the TUI (issue #12). Interactive only:
     /// headless runs and non-TTY stdout keep the line renderer forever.
     pub tui: bool,
@@ -137,6 +144,9 @@ pub fn usage() -> String {
     out.push_str(
         "  --provider-retries N\n                    most consecutive transient provider failures to wait out and\n                    retry in an unattended run (default: 3; 0 disables)\n",
     );
+    out.push_str(
+        "  --max-idle-summaries N\n                    most consecutive context summaries without a workspace change\n                    before an unattended run stalls (default: 6; 0 disables)\n",
+    );
     out
 }
 
@@ -196,7 +206,8 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             | "--sandbox-read"
             | "--env-pass"
             | "--max-continuations"
-            | "--provider-retries" => {
+            | "--provider-retries"
+            | "--max-idle-summaries" => {
                 take_value(args, &mut index, arg)?;
             }
             other if other.starts_with('-') && other != "-" => {
@@ -226,6 +237,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let env_pass = parse_env_pass(args)?;
     let max_continuations = parse_max_continuations(args)?;
     let provider_retries = parse_provider_retries(args)?;
+    let max_idle_summaries = parse_max_idle_summaries(args)?;
 
     let prompt = if prompt_words.is_empty() {
         None
@@ -247,6 +259,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         env_pass,
         max_continuations,
         provider_retries,
+        max_idle_summaries,
     })
 }
 
@@ -296,6 +309,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         env_pass,
         max_continuations: DEFAULT_MAX_CONTINUATIONS,
         provider_retries: DEFAULT_PROVIDER_RETRIES,
+        max_idle_summaries: DEFAULT_MAX_IDLE_SUMMARIES,
     })
 }
 
@@ -463,6 +477,28 @@ fn parse_provider_retries(args: &[String]) -> Result<usize, CliError> {
     Ok(value)
 }
 
+/// Parse `--max-idle-summaries N` out of any argument list. A missing or
+/// non-numeric value is a usage error.
+fn parse_max_idle_summaries(args: &[String]) -> Result<usize, CliError> {
+    let mut value = DEFAULT_MAX_IDLE_SUMMARIES;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--max-idle-summaries" {
+            index += 1;
+            let Some(raw) = args.get(index) else {
+                return Err(CliError {
+                    message: "--max-idle-summaries requires a value".to_string(),
+                });
+            };
+            value = raw.parse::<usize>().map_err(|_| CliError {
+                message: format!("--max-idle-summaries takes a non-negative integer, got `{raw}`"),
+            })?;
+        }
+        index += 1;
+    }
+    Ok(value)
+}
+
 fn defaults(command: Command) -> Options {
     Options {
         command,
@@ -478,6 +514,7 @@ fn defaults(command: Command) -> Options {
         env_pass: Vec::new(),
         max_continuations: DEFAULT_MAX_CONTINUATIONS,
         provider_retries: DEFAULT_PROVIDER_RETRIES,
+        max_idle_summaries: DEFAULT_MAX_IDLE_SUMMARIES,
     }
 }
 
@@ -646,6 +683,35 @@ mod tests {
         assert!(usage().contains("--provider-retries N"));
         assert!(
             parse(&args(&["--provider-retries", "1", "do", "it"]))
+                .unwrap()
+                .is_headless(),
+            "the flag value is not taken for a prompt word"
+        );
+    }
+
+    #[test]
+    fn parses_max_idle_summaries_and_rejects_a_non_numeric_value() {
+        let options = parse(&args(&["--max-idle-summaries", "7", "go"])).unwrap();
+        assert_eq!(options.max_idle_summaries, 7);
+        assert_eq!(
+            options.command,
+            Command::Run {
+                prompt: Some("go".to_string())
+            }
+        );
+        assert_eq!(parse(&args(&[])).unwrap().max_idle_summaries, 6);
+        assert_eq!(
+            parse(&args(&["--max-idle-summaries", "0"]))
+                .unwrap()
+                .max_idle_summaries,
+            0
+        );
+
+        assert!(parse(&args(&["--max-idle-summaries", "many"])).is_err());
+        assert!(parse(&args(&["--max-idle-summaries"])).is_err());
+        assert!(usage().contains("--max-idle-summaries N"));
+        assert!(
+            parse(&args(&["--max-idle-summaries", "2", "do", "it"]))
                 .unwrap()
                 .is_headless(),
             "the flag value is not taken for a prompt word"

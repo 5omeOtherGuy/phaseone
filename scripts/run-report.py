@@ -19,6 +19,13 @@ discovered automatically and reported under `workers`, with `usage_with_workers`
 `input_total_with_workers` adding them to the parent's numbers. `includes_worker_usage` is
 true exactly when at least one worker file was read (no worker file means no workers — a
 child session without `--session` stays in memory and cannot be read back).
+
+`stalled_on_summaries` is derived from the journal (completion.md §3c): the longest run of
+`context_replaced` records after the last `tool_finished` that was a mutating tool (`write`,
+`edit`, `apply_patch`) or `finish`, AND the journal's last response is an interrupted one.
+A run that completed ends on `assistant_completed`; a stalled run is cancelled mid-turn and
+ends on `assistant_interrupted`. The bound is the host's `--max-idle-summaries` default of 6
+unless `--max-idle-summaries` is passed to this script.
 """
 import argparse
 import glob
@@ -33,6 +40,14 @@ SHELL_IMPLEMENTATION = "p1-tool-shell"
 # §3b). A `user_input` with exactly this text is a provider retry.
 PROVIDER_RETRY_MESSAGE = ("The connection to the model failed and the last response was lost; "
                           "nothing else changed. Continue the work now.")
+# completion.md §3c: the default bound on consecutive context replacements without
+# progress. The report cannot see the CLI flag, so it uses the host's default unless
+# the caller passes --max-idle-summaries.
+DEFAULT_MAX_IDLE_SUMMARIES = 6
+# A mutating tool result is progress; `finish` is progress whatever its status. The
+# host decides by durable effect; a journal only has the model-facing name.
+MUTATING_TOOLS = frozenset(("write", "edit", "apply_patch"))
+FINISH_TOOL = "finish"
 
 
 def add(total, value):
@@ -42,7 +57,7 @@ def add(total, value):
     return value if total is None else total + value
 
 
-def analyze(path):
+def analyze(path, max_idle_summaries=DEFAULT_MAX_IDLE_SUMMARIES):
     """Every metric of ONE journal file (the parent's, or one worker's)."""
     with open(path, encoding="utf-8") as handle:
         lines = handle.read().splitlines()
@@ -64,9 +79,16 @@ def analyze(path):
     shell_exits = {"zero": 0, "non_zero": 0, "no_exit_code": 0}
     started = set()
     finished = set()
+    # §3c: the run of context replacements since the last progress, and whether the
+    # journal ends on an interrupted (never-completed) response.
+    idle_run = 0
+    max_idle_run = 0
+    last_response = None
 
     for record in records:
         kind = record["record"]
+        if kind in ("assistant_completed", "assistant_interrupted"):
+            last_response = kind
         if kind == "environment":
             counts["environment_records"] += 1
             origin = record["route"]["origin"]
@@ -88,6 +110,8 @@ def analyze(path):
             counts["interrupted_responses"] += 1
         elif kind == "context_replaced":
             counts["context_replacements"] += 1
+            idle_run += 1
+            max_idle_run = max(max_idle_run, idle_run)
         elif kind == "tool_started":
             started.add(record["call_id"])
             if record["identity"]["implementation"] == SHELL_IMPLEMENTATION:
@@ -97,6 +121,9 @@ def analyze(path):
             finished.add(result["call_id"])
             tool_calls[result["status"]] = tool_calls.get(result["status"], 0) + 1
             by_tool[result["name"]] = by_tool.get(result["name"], 0) + 1
+            if result["name"] == FINISH_TOOL or (
+                    result["name"] in MUTATING_TOOLS and result["status"] == "ok"):
+                idle_run = 0
             if result["call_id"] in shell_calls and result["status"] == "ok":
                 match = EXIT_CODE.search(result["content"])
                 if match is None:
@@ -125,6 +152,8 @@ def analyze(path):
         "cache_read_share": (round(usage["cache_read"] / input_total, 3)
                              if input_total and usage["cache_read"] is not None else None),
         "responses_without_usage": responses_without_usage,
+        "stalled_on_summaries": (max_idle_run >= max_idle_summaries
+                                 and last_response == "assistant_interrupted"),
     }
 
 
@@ -139,11 +168,11 @@ def worker_files(path):
     return found
 
 
-def report(path):
-    parent = analyze(path)
+def report(path, max_idle_summaries=DEFAULT_MAX_IDLE_SUMMARIES):
+    parent = analyze(path, max_idle_summaries)
     workers = []
     for number, worker_path in worker_files(path):
-        stats = analyze(worker_path)
+        stats = analyze(worker_path, max_idle_summaries)
         workers.append({
             "id": f"w{number}",
             "origin": stats["origin"],
@@ -183,10 +212,13 @@ def main():
                         help="result accepted after INDEPENDENT verification")
     parser.add_argument("--interventions", type=int, help="times the operator had to step in")
     parser.add_argument("--note")
+    parser.add_argument("--max-idle-summaries", type=int, default=DEFAULT_MAX_IDLE_SUMMARIES,
+                        help="the run's --max-idle-summaries (default: 6); only used for "
+                             "stalled_on_summaries")
     parser.add_argument("--append", metavar="FILE", help="also append the record to FILE")
     args = parser.parse_args()
 
-    record = report(args.session)
+    record = report(args.session, args.max_idle_summaries)
     record.update({"label": args.label, "elapsed_seconds": args.elapsed,
                    "exit_code": args.exit_code, "accepted": args.accepted,
                    "operator_interventions": args.interventions, "note": args.note})

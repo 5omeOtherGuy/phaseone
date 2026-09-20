@@ -8,31 +8,29 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(feature = "delegation")]
 use std::sync::OnceLock;
 #[cfg(feature = "delegation")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
-#[cfg(feature = "delegation")]
 use p1_assembly::Catalog;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
-    BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError, ContextInput,
-    ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, TurnEnd,
+    AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
+    ContextInput, ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, ResumeReport};
 #[cfg(feature = "delegation")]
 use p1_journal::MemoryJournal;
 
-#[cfg(feature = "delegation")]
-use crate::SharedWriter;
-use crate::activity::{ActivityTee, Completion, CompletionHub};
+use crate::activity::{ActivityLog, ActivityTee, Completion, CompletionHub};
 use crate::catalog::build_catalog;
 use crate::cli::{self, Command, Options};
-use crate::policy::HostPolicy;
+use crate::frontend::{FrontEnd, LineFrontEnd};
 use crate::render::Renderer;
 use crate::session;
 use crate::{HostDeps, InterruptSource};
@@ -50,6 +48,16 @@ pub const EXIT_CANCELLED: i32 = 130;
 pub const EXIT_BLOCKED: i32 = 3;
 /// The model kept stopping without finishing and the continuation budget ran out.
 pub const EXIT_STALLED: i32 = 4;
+
+/// The ONE message printed when the §3c stall guard fires. `<N>` is the configured
+/// `--max-idle-summaries` bound.
+pub fn stall_message(max_idle_summaries: usize) -> String {
+    format!(
+        "stalled: {max_idle_summaries} context summaries without a change to the workspace — the \
+         task does not fit the configured context (see [context] in the environment), or it is too \
+         large for one job"
+    )
+}
 
 /// The ONE message the host sends after a premature stop in an unattended run.
 /// Committed as a normal `UserInput` record, so the journal shows every
@@ -222,18 +230,33 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     }
 }
 
+/// The default `Run` path: build the line front end and hand the run over. The
+/// single branch point below is where a session that owns its own event sink and
+/// run loop (the TUI, `--tui`) would construct its front end — or it can call
+/// [`run_with_front_end`] directly, leaving `run.rs` untouched.
 async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String> {
-    let workspace = resolve_workspace(options)?;
-    let headless = options.is_headless();
-
     let cancel = CancellationToken::new();
-    let policy: Arc<HostPolicy> = Arc::new(HostPolicy::new(
-        options.ask,
-        headless,
-        deps.lines.clone(),
-        deps.stderr.clone(),
-        cancel.clone(),
-    ));
+    // The ONE branch point: the line front end is the default.
+    let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone()));
+    run_with_front_end(deps, options, cancel, front_end).await
+}
+
+/// Assemble the parent agent and drive it through `front_end`. `run_agent` calls
+/// this with a [`LineFrontEnd`]; a custom front end (issue #12) calls it with
+/// its own. The composition below is unchanged: only the event sink, the
+/// authorization policy and the child sinks come from the front end, and the run
+/// loop is handed to it.
+pub async fn run_with_front_end(
+    deps: &mut HostDeps,
+    options: &Options,
+    cancel: CancellationToken,
+    front_end: Arc<dyn FrontEnd>,
+) -> Result<i32, String> {
+    let workspace = resolve_workspace(options)?;
+    // The §3c stall guard is host policy and applies only to unattended runs; the
+    // front end decides what "headless" means (the line front end uses the CLI
+    // rule, a terminal UI is interactive by definition).
+    let headless = front_end.is_headless(options);
 
     // The delegation service must exist before the catalog so the `worker_*`
     // tools can be registered; the child factory reaches the catalog lazily,
@@ -243,23 +266,16 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
     #[cfg(feature = "delegation")]
     let child_counter = Arc::new(AtomicUsize::new(0));
-    // One owner for the worker usage aggregate: the host creates it and every
-    // child renderer feeds it, so the exit line is a plain read at the end.
-    #[cfg(feature = "delegation")]
-    let worker_usage = Arc::new(crate::render::WorkerUsage::new());
     #[cfg(feature = "delegation")]
     let service: Option<Arc<InProcessWorkers>> = {
         let factory = make_child_factory(
             deps,
             &workspace,
-            policy.clone(),
+            front_end.clone(),
             catalog_slot.clone(),
             child_counter.clone(),
             completion_hub.clone(),
-            WorkerJournals {
-                session: options.session.clone(),
-                usage: worker_usage.clone(),
-            },
+            options.session.clone(),
         );
         let service = InProcessWorkers::new(factory, 2);
         deps.worker_service = Some(service.clone());
@@ -291,6 +307,10 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
     let route = assembled.resolved.route.origin.route.clone();
     let model = assembled.resolved.route.origin.model.clone();
 
+    // Announce the assembled parent before the agent is built: the front end
+    // builds its parent renderer from this.
+    front_end.parent_assembled(&route, &model, completion.clone());
+
     let (journal, records): OpenedSession = open_session(deps, options)?;
     // On resume the journal holds the earlier turns; rebuild this agent's activity
     // from them so a verification run before the restart still counts and a file
@@ -299,24 +319,36 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         completion.log.replay(&assembled.tools, records);
     }
 
-    let renderer = Arc::new(Renderer::new(
-        deps.stdout.clone(),
-        deps.stderr.clone(),
-        deps.stdout_is_tty,
-        route,
-        model,
-        Arc::new(Mutex::new(String::new())),
+    // The activity tee forwards every event to the front end's sink unchanged and
+    // feeds this agent's log the effects and exit codes a later `finish` reads.
+    // It is installed even without `finish`: the headless stall guard (§3c) reads
+    // the same log for workspace mutations. Without a `finish` tool the hub issued
+    // no log, so the host makes one.
+    let log = match &completion {
+        Some(completion) => completion.log.clone(),
+        None => Arc::new(ActivityLog::default()),
+    };
+    let events: Arc<dyn EventSink> = Arc::new(ActivityTee::new(
+        front_end.event_sink(),
+        log.clone(),
+        &assembled.tools,
     ));
-    // The activity tee forwards every event to the renderer unchanged and feeds
-    // this agent's log the effects and exit codes a later `finish` reads. Without
-    // `finish` there is nothing to feed: install the renderer directly.
-    let events: Arc<dyn EventSink> = match &completion {
-        Some(completion) => Arc::new(ActivityTee::new(
-            renderer.clone(),
-            completion.log.clone(),
-            &assembled.tools,
-        )),
-        None => renderer.clone(),
+    // The guard is headless-only (completion.md §3c); an interactive user sees the
+    // summaries and decides.
+    let mut stall: Option<Arc<StallGuard>> = None;
+    let events: Arc<dyn EventSink> = if headless {
+        let guard = Arc::new(StallGuard::new(
+            log,
+            options.max_idle_summaries,
+            cancel.clone(),
+        ));
+        stall = Some(guard.clone());
+        Arc::new(StallWatcher {
+            inner: events,
+            guard,
+        })
+    } else {
+        events
     };
 
     let parts = AgentParts {
@@ -325,7 +357,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         system_prompt: assembled.system_prompt,
         options: assembled.options,
         context,
-        authorization: policy,
+        authorization: front_end.authorization(),
         journal,
         events,
     };
@@ -350,23 +382,22 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
         service.set_parent_inbox(agent.inbox());
     }
 
-    let code = if headless {
-        run_headless(deps, &mut agent, options, &cancel, completion, &renderer).await
-    } else {
-        run_interactive(deps, &mut agent, &cancel).await
-    };
+    #[cfg(feature = "delegation")]
+    let workers: Option<Arc<dyn crate::frontend::WorkerService>> = service
+        .as_ref()
+        .map(|service| service.clone() as Arc<dyn crate::frontend::WorkerService>);
+    #[cfg(not(feature = "delegation"))]
+    let workers: Option<Arc<dyn crate::frontend::WorkerService>> = None;
+    let code = front_end
+        .run(deps, &mut agent, &cancel, workers, stall)
+        .await;
 
     #[cfg(feature = "delegation")]
     if let Some(service) = &service {
         service.shutdown().await;
     }
 
-    renderer.finish();
-    // After the parent's own total, and only when a worker actually ran.
-    #[cfg(feature = "delegation")]
-    if let Some(line) = worker_usage.line() {
-        write_stderr(deps, &format!("{line}\n"));
-    }
+    front_end.finish();
     Ok(code)
 }
 
@@ -394,12 +425,13 @@ fn open_session(deps: &HostDeps, options: &Options) -> Result<OpenedSession, Str
     }
 }
 
-async fn run_headless(
+pub(crate) async fn run_headless(
     deps: &HostDeps,
     agent: &mut Agent,
     options: &Options,
     cancel: &CancellationToken,
     completion: Option<Completion>,
+    stall: &Arc<StallGuard>,
     renderer: &Renderer,
 ) -> i32 {
     let second = Arc::new(tokio::sync::Notify::new());
@@ -412,9 +444,10 @@ async fn run_headless(
         _ => String::new(),
     };
 
-    // No `finish` in the assembled environment: the run behaves exactly as before.
+    // No `finish` in the assembled environment: the run behaves exactly as before
+    // except that the §3c stall guard is still headless policy.
     let Some(completion) = completion else {
-        return run_headless_plain(deps, agent, cancel, &second, prompt, renderer, options).await;
+        return run_headless_plain(deps, agent, cancel, &second, stall, renderer, options).await;
     };
 
     let log = completion.log.clone();
@@ -424,7 +457,7 @@ async fn run_headless(
     outcome.clear();
     let mut end = match prompt_turn(deps, agent, renderer, cancel, &second, options, prompt).await {
         TurnOutcome::End(end) => end,
-        TurnOutcome::Cancelled => return EXIT_CANCELLED,
+        TurnOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
     };
 
     let mut continuations = 0usize;
@@ -433,11 +466,14 @@ async fn run_headless(
 
     loop {
         if cancel.is_cancelled() {
-            return EXIT_CANCELLED;
+            return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED);
         }
         // A turn that did not complete (cancelled, provider failure, …) is
-        // handled exactly as before.
+        // handled exactly as before, except that a stall-guard cancel is a stall.
         if !matches!(end, TurnEnd::Completed { .. }) {
+            if let Some(code) = stalled_exit(deps, stall) {
+                return code;
+            }
             return end_code(&end);
         }
         match outcome.get() {
@@ -460,7 +496,7 @@ async fn run_headless(
                 end = next;
                 continue;
             }
-            WaitOutcome::Cancelled => return EXIT_CANCELLED,
+            WaitOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
             WaitOutcome::Idle => {}
         }
         // Premature stop. It is allowed while BOTH bounds hold: the whole-run
@@ -492,7 +528,7 @@ async fn run_headless(
         .await
         {
             TurnOutcome::End(end) => end,
-            TurnOutcome::Cancelled => return EXIT_CANCELLED,
+            TurnOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
         };
     }
 }
@@ -504,28 +540,34 @@ async fn run_headless_plain(
     agent: &mut Agent,
     cancel: &CancellationToken,
     second: &Arc<tokio::sync::Notify>,
-    prompt: String,
+    stall: &Arc<StallGuard>,
     renderer: &Renderer,
     options: &Options,
 ) -> i32 {
+    let prompt = match &options.command {
+        Command::Run {
+            prompt: Some(prompt),
+        } => prompt.clone(),
+        _ => String::new(),
+    };
     let mut code = match prompt_turn(deps, agent, renderer, cancel, second, options, prompt).await {
         TurnOutcome::End(end) => end_code(&end),
-        TurnOutcome::Cancelled => return EXIT_CANCELLED,
+        TurnOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
     };
 
     loop {
         if cancel.is_cancelled() {
-            return EXIT_CANCELLED;
+            return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED);
         }
         match wait_for_work(deps, agent, cancel, second, renderer, options).await {
             WaitOutcome::Turn(end) => {
                 code = end_code(&end);
                 if code == EXIT_CANCELLED {
-                    return code;
+                    return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED);
                 }
             }
             WaitOutcome::Idle => break,
-            WaitOutcome::Cancelled => return EXIT_CANCELLED,
+            WaitOutcome::Cancelled => return stalled_exit(deps, stall).unwrap_or(EXIT_CANCELLED),
         }
     }
     code
@@ -595,7 +637,11 @@ async fn inbox_turn(
     }
 }
 
-async fn run_interactive(deps: &HostDeps, agent: &mut Agent, cancel: &CancellationToken) -> i32 {
+pub(crate) async fn run_interactive(
+    deps: &HostDeps,
+    agent: &mut Agent,
+    cancel: &CancellationToken,
+) -> i32 {
     let second = Arc::new(tokio::sync::Notify::new());
     spawn_interrupt(deps.interrupt.clone(), cancel.clone(), second.clone());
 
@@ -716,6 +762,73 @@ where
     }
 }
 
+// ------------------------------------------------------ stall guard (completion.md §3c)
+
+/// The headless §3c guard: count consecutive context replacements and cancel the
+/// turn when they reach `--max-idle-summaries`. Progress — a workspace mutation or
+/// a `finish` call of any status — resets the count through [`ActivityLog`].
+///
+/// Opaque to a front end: it is handed to [`crate::frontend::FrontEnd::run`] so the
+/// line drivers can report a stall, and a custom front end may ignore it.
+pub struct StallGuard {
+    log: Arc<ActivityLog>,
+    max: usize,
+    cancel: CancellationToken,
+    stalled: AtomicBool,
+}
+
+impl StallGuard {
+    fn new(log: Arc<ActivityLog>, max: usize, cancel: CancellationToken) -> Self {
+        Self {
+            log,
+            max,
+            cancel,
+            stalled: AtomicBool::new(false),
+        }
+    }
+
+    /// One committed `ContextReplaced` was observed. On reaching the bound the
+    /// guard latches and cancels the turn; the driver then reports the stall.
+    fn on_context_replaced(&self) {
+        self.log.record_replacement();
+        if self.max > 0 && self.log.consecutive_replacements() >= self.max as u64 {
+            self.stalled.store(true, Ordering::SeqCst);
+            self.cancel.cancel();
+        }
+    }
+
+    fn stalled(&self) -> bool {
+        self.stalled.load(Ordering::SeqCst)
+    }
+}
+
+/// Wraps the event sink for a headless run so the guard sees every committed
+/// `ContextReplaced`; it forwards the event unchanged.
+struct StallWatcher {
+    inner: Arc<dyn EventSink>,
+    guard: Arc<StallGuard>,
+}
+
+impl EventSink for StallWatcher {
+    fn emit(&self, event: AgentEvent) {
+        if matches!(event, AgentEvent::ContextReplaced { .. }) {
+            self.guard.on_context_replaced();
+        }
+        self.inner.emit(event);
+    }
+}
+
+/// §3c: a cancellation caused by the stall guard is reported as a stall, not as an
+/// ordinary Ctrl-C.
+fn stalled_exit(deps: &HostDeps, stall: &StallGuard) -> Option<i32> {
+    if stall.stalled() {
+        write_stderr(deps, &format!("{}\n", stall_message(stall.max)));
+        Some(EXIT_STALLED)
+    } else {
+        None
+    }
+}
+
 // ------------------------------------------------------ transient provider ends
 
 /// The fixed waits for a dropped connection, in order (completion.md §3b).
@@ -732,14 +845,17 @@ const RATE_LIMITED_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(900),
 ];
 
-/// The transient kind of a turn end, if it is one (completion.md §3b): only a
-/// dropped transport and a rate limit are worth waiting out. Everything else
-/// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`, `Protocol`) ends
-/// the run as it always did.
+/// The transient kind of a turn end, if it is one (completion.md §3b, amended by
+/// §3c): a dropped transport, a rate limit, or a malformed response are worth
+/// waiting out — the model's or the route's one-off. Everything else
+/// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`) ends the run as it
+/// always did.
 fn transient_kind(end: &TurnEnd) -> Option<ProviderErrorKind> {
     match end {
         TurnEnd::ProviderFailed { error } => match error.kind {
-            kind @ (ProviderErrorKind::Transport | ProviderErrorKind::RateLimited) => Some(kind),
+            kind @ (ProviderErrorKind::Transport
+            | ProviderErrorKind::RateLimited
+            | ProviderErrorKind::Protocol) => Some(kind),
             _ => None,
         },
         _ => None,
@@ -747,11 +863,11 @@ fn transient_kind(end: &TurnEnd) -> Option<ProviderErrorKind> {
 }
 
 /// The fixed wait schedule of a transient kind (completion.md §3b): a dropped
-/// connection is retried quickly, a quota window slowly. The schedules are not
-/// computed.
+/// connection is retried quickly, a quota window slowly, and a malformed response
+/// on the transport schedule (§3c). The schedules are not computed.
 fn retry_schedule(kind: ProviderErrorKind) -> &'static [Duration] {
     match kind {
-        ProviderErrorKind::Transport => &TRANSPORT_RETRY_WAITS,
+        ProviderErrorKind::Transport | ProviderErrorKind::Protocol => &TRANSPORT_RETRY_WAITS,
         ProviderErrorKind::RateLimited => &RATE_LIMITED_RETRY_WAITS,
         _ => &[],
     }
@@ -980,36 +1096,23 @@ async fn running_children(deps: &HostDeps) -> usize {
     }
 }
 
-/// What a child factory needs beyond the catalog: where worker journals go and
-/// the run's shared usage aggregate. (Kept as one argument so the factory's
-/// signature stays legible.)
-#[cfg(feature = "delegation")]
-struct WorkerJournals {
-    /// The parent's `--session FILE`; worker `w<N>` writes `FILE.w<N>.jsonl`.
-    /// `None` keeps a child's journal in memory.
-    session: Option<PathBuf>,
-    usage: Arc<crate::render::WorkerUsage>,
-}
-
 /// Build the child `Agent` through the SAME load + assemble path the top-level
 /// agent uses. The child gets its own fresh `ToolServices` (inside `assemble`),
-/// the parent's workspace unless the spec overrides it, the parent's
-/// authorization policy, its own session journal, and a prefixed renderer.
+/// the parent's workspace unless the spec overrides it, the front end's shared
+/// authorization policy, its own session journal, and the front end's labelled
+/// sink for its id.
 #[cfg(feature = "delegation")]
 fn make_child_factory(
     deps: &HostDeps,
     parent_workspace: &Path,
-    policy: Arc<HostPolicy>,
+    front_end: Arc<dyn FrontEnd>,
     catalog_slot: Arc<OnceLock<Arc<Catalog>>>,
     counter: Arc<AtomicUsize>,
     completion_hub: Arc<CompletionHub>,
-    journals: WorkerJournals,
+    session: Option<PathBuf>,
 ) -> AgentFactory {
     let environment_dirs = deps.environment_dirs.clone();
     let date = deps.date.clone();
-    let stdout: SharedWriter = deps.stdout.clone();
-    let stderr: SharedWriter = deps.stderr.clone();
-    let tty = deps.stdout_is_tty;
     let parent_workspace = parent_workspace.to_path_buf();
 
     Arc::new(move |spec: &ChildSpec| -> Result<ChildAgent, String> {
@@ -1044,6 +1147,7 @@ fn make_child_factory(
         // (bad environment, an existing worker session file, a failed build) must
         // not desynchronise it from the service's own numbering.
         let id = counter.load(Ordering::SeqCst) + 1;
+        let worker_id = format!("w{id}");
         // The child gets its OWN activity log and outcome, issued by the shared
         // catalog for this assembly. The worker service does not read the
         // outcome: a child's turn end is its completion, the parent verifies.
@@ -1053,21 +1157,12 @@ fn make_child_factory(
         let model = assembled.resolved.route.origin.model.clone();
         let description = format!("{route}/{model}");
 
-        let label = Arc::new(Mutex::new(String::new()));
-        let renderer: Arc<dyn EventSink> = Arc::new(
-            Renderer::new(
-                stdout.clone(),
-                stderr.clone(),
-                tty,
-                route,
-                model,
-                label.clone(),
-            )
-            .with_worker_usage(journals.usage.clone()),
-        );
+        // The front end builds the labelled child sink; under delegation it also
+        // feeds the run's worker-usage aggregate.
+        let renderer = front_end.child_event_sink(&worker_id, &route, &model);
         let events: Arc<dyn EventSink> = match &child_completion {
             Some(completion) => Arc::new(ActivityTee::new(
-                renderer.clone(),
+                renderer,
                 completion.log.clone(),
                 &assembled.tools,
             )),
@@ -1077,11 +1172,10 @@ fn make_child_factory(
         // parent's (`FILE.w{n}.jsonl`). Without one it stays in memory like before.
         // Created last among the fallible steps so a later failure cannot leave a
         // stray file behind — and if `Agent::new` still fails, remove what we made.
-        let created_file = journals
-            .session
+        let created_file = session
             .as_ref()
             .map(|session| crate::session::worker_path(session, id));
-        let journal: Arc<dyn CommitSink> = match &journals.session {
+        let journal: Arc<dyn CommitSink> = match &session {
             Some(session) => crate::session::worker(session, id).map_err(|error| {
                 format!(
                     "cannot create worker session file {}: {error}",
@@ -1096,7 +1190,7 @@ fn make_child_factory(
             system_prompt: assembled.system_prompt,
             options: assembled.options,
             context,
-            authorization: policy.clone(),
+            authorization: front_end.authorization(),
             journal,
             events,
         };
@@ -1110,8 +1204,7 @@ fn make_child_factory(
             }
         };
         counter.fetch_add(1, Ordering::SeqCst);
-        *label.lock().unwrap() = format!("[w{id}] ");
-        journals.usage.worker_started();
+        front_end.child_started(&worker_id);
         Ok(ChildAgent { agent, description })
     })
 }
