@@ -1,0 +1,394 @@
+{
+  "cases": [
+    {
+      "body": {
+        "input": [
+          {
+            "content": [
+              {
+                "text": "hi",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol",
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": null,
+      "effort": null,
+      "model": "gpt-5.6-sol",
+      "name": "default_sol",
+      "sent_cache_key": null,
+      "session_id": null
+    },
+    {
+      "body": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "input": [
+          {
+            "content": [
+              {
+                "text": "hi",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol",
+        "reasoning": {
+          "effort": "low",
+          "summary": "auto"
+        },
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": null,
+      "effort": "low",
+      "model": "gpt-5.6-sol",
+      "name": "low_sol",
+      "sent_cache_key": null,
+      "session_id": null
+    },
+    {
+      "body": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "input": [
+          {
+            "content": [
+              {
+                "text": "hi",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol",
+        "reasoning": {
+          "effort": "medium",
+          "summary": "auto"
+        },
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": null,
+      "effort": "medium",
+      "model": "gpt-5.6-sol",
+      "name": "medium_sol",
+      "sent_cache_key": null,
+      "session_id": null
+    },
+    {
+      "body": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "input": [
+          {
+            "content": [
+              {
+                "text": "hi",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol",
+        "reasoning": {
+          "effort": "high",
+          "summary": "auto"
+        },
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": null,
+      "effort": "high",
+      "model": "gpt-5.6-sol",
+      "name": "high_sol",
+      "sent_cache_key": null,
+      "session_id": null
+    },
+    {
+      "body": {
+        "input": [
+          {
+            "content": [
+              {
+                "text": "hi",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol-mini",
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": null,
+      "effort": null,
+      "model": "gpt-5.6-sol-mini",
+      "name": "default_mini",
+      "sent_cache_key": null,
+      "session_id": null
+    },
+    {
+      "body": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "input": [
+          {
+            "content": [
+              {
+                "text": "hi",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol-mini",
+        "reasoning": {
+          "effort": "medium",
+          "summary": "auto"
+        },
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": null,
+      "effort": "medium",
+      "model": "gpt-5.6-sol-mini",
+      "name": "medium_mini",
+      "sent_cache_key": null,
+      "session_id": null
+    },
+    {
+      "body": {
+        "input": [
+          {
+            "content": [
+              {
+                "text": "hi",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol",
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "medium"
+        }
+      },
+      "conversation_id": null,
+      "effort": null,
+      "model": "gpt-5.6-sol",
+      "name": "verbosity_medium",
+      "sent_cache_key": null,
+      "session_id": null
+    },
+    {
+      "body": {
+        "input": [
+          {
+            "content": [
+              {
+                "text": "hi",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol",
+        "prompt_cache_key": "åååååååååååååååååååååååååååååååååååååååååååååååååååååååååååååååå",
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": "åååååååååååååååååååååååååååååååååååååååååååååååååååååååååååååååå",
+      "effort": null,
+      "model": "gpt-5.6-sol",
+      "name": "cache_key_long",
+      "sent_cache_key": "åååååååååååååååååååååååååååååååååååååååååååååååååååååååååååååååå",
+      "session_id": "åååååååååååååååååååååååååååååååååååååååååååååååååååååååååååååååå"
+    },
+    {
+      "body": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "input": [
+          {
+            "content": [
+              {
+                "text": "go",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          },
+          {
+            "encrypted_content": "enc-1",
+            "summary": [],
+            "type": "reasoning"
+          },
+          {
+            "content": [
+              {
+                "text": "continue",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol",
+        "reasoning": {
+          "effort": "high",
+          "summary": "auto"
+        },
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": null,
+      "effort": "high",
+      "model": "gpt-5.6-sol",
+      "name": "replay_same_origin_high",
+      "sent_cache_key": null,
+      "session_id": null
+    },
+    {
+      "body": {
+        "input": [
+          {
+            "content": [
+              {
+                "text": "go",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          },
+          {
+            "content": [
+              {
+                "text": "continue",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol",
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": null,
+      "effort": null,
+      "model": "gpt-5.6-sol",
+      "name": "replay_foreign_route",
+      "sent_cache_key": null,
+      "session_id": null
+    },
+    {
+      "body": {
+        "input": [
+          {
+            "content": [
+              {
+                "text": "go",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          },
+          {
+            "content": [
+              {
+                "text": "continue",
+                "type": "input_text"
+              }
+            ],
+            "role": "user",
+            "type": "message"
+          }
+        ],
+        "instructions": "SYS",
+        "model": "gpt-5.6-sol",
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        }
+      },
+      "conversation_id": null,
+      "effort": null,
+      "model": "gpt-5.6-sol",
+      "name": "replay_foreign_model",
+      "sent_cache_key": null,
+      "session_id": null
+    }
+  ]
+}
