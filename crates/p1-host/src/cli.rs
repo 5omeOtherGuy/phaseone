@@ -1,12 +1,18 @@
 //! Hand-written argument parsing. No clap: the surface is tiny and the error
 //! messages are part of the interface.
 //!
-//! `p1 [--env NAME] [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
+//! `p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]
+//! [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
+//! `p1 models [SEARCH]`
 //! `p1 env show NAME`
 //! `p1 login <route>` / `p1 login --list` / `p1 logout <route>`
 //! `p1 --help` / `p1 --version`
 
 use std::path::{Path, PathBuf};
+
+use p1_contracts::Effort;
+
+use crate::models::parse_effort;
 
 /// The default environment when `--env` is not given.
 pub const DEFAULT_ENV: &str = "claude";
@@ -44,6 +50,10 @@ pub enum Command {
     EnvShow {
         name: String,
     },
+    /// Every model this host can run: `E/P`, route, efforts and credential source.
+    Models {
+        search: Option<String>,
+    },
     /// Read one API key from stdin and store it for this route (ADR-0044, spec §6).
     Login {
         route: String,
@@ -63,6 +73,15 @@ pub enum Command {
 pub struct Options {
     pub command: Command,
     pub env: String,
+    /// Whether `--env` was given. `settings.toml`'s `default_model` decides the
+    /// environment only when it was not.
+    pub env_given: bool,
+    /// `--model REF`: the model to run (ADR-0049 stage 1).
+    pub model: Option<String>,
+    /// `--effort LEVEL`: the reasoning effort of whatever was selected.
+    pub effort: Option<Effort>,
+    /// `--models PATTERNS`: the scope for this run, replacing `enabled_models`.
+    pub models: Option<String>,
     pub workspace: Option<PathBuf>,
     pub session: Option<PathBuf>,
     pub resume: bool,
@@ -121,8 +140,9 @@ pub fn usage() -> String {
     out.push_str("p1 — a lean, model-shaped coding harness\n\n");
     out.push_str("usage:\n");
     out.push_str(
-        "  p1 [--env NAME] [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]\n",
+        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]\n     [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]\n",
     );
+    out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str("  p1 env show NAME\n");
     out.push_str("  p1 login <route>     read one API key from stdin and store it for ROUTE\n");
     out.push_str("  p1 login --list      every route, its credential kind and its source\n");
@@ -131,6 +151,15 @@ pub fn usage() -> String {
     out.push_str("  p1 --version\n\n");
     out.push_str("flags:\n");
     out.push_str("  --env NAME        environment to run (default: claude)\n");
+    out.push_str(
+        "  --model REF       model to run: `environment/profile`, or a bare profile name\n                    bound in exactly one environment, with an optional `:effort`\n                    (default: the environment's own profile)\n",
+    );
+    out.push_str(
+        "  --effort LEVEL    reasoning effort of the selected model: low, medium, high,\n                    extra_high or max\n",
+    );
+    out.push_str(
+        "  --models PATTERNS comma-separated globs (`*`, `?`) that scope the models this\n                    run may cycle through, replacing `enabled_models` from\n                    settings.toml; a pattern without `/` matches the profile part\n                    (`p1 models` takes it too)\n",
+    );
     out.push_str("  --workspace DIR   workspace root (default: current directory)\n");
     out.push_str("  --session FILE    write the session journal to FILE as JSONL\n");
     out.push_str("  --resume          continue an existing --session file\n");
@@ -182,6 +211,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         if first == "env" {
             return parse_env_show(args);
         }
+        if first == "models" {
+            return parse_models(args);
+        }
         if first == "login" {
             return parse_login(args);
         }
@@ -191,6 +223,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     }
 
     let mut env: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut effort: Option<Effort> = None;
+    let mut models: Option<String> = None;
     let mut workspace: Option<PathBuf> = None;
     let mut session: Option<PathBuf> = None;
     let mut resume = false;
@@ -206,6 +241,18 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             "--env" => {
                 let value = take_value(args, &mut index, "--env")?;
                 env = Some(value);
+            }
+            "--model" => {
+                let value = take_value(args, &mut index, "--model")?;
+                model = Some(value);
+            }
+            "--effort" => {
+                let value = take_value(args, &mut index, "--effort")?;
+                effort = Some(parse_effort(&value).map_err(|message| CliError { message })?);
+            }
+            "--models" => {
+                let value = take_value(args, &mut index, "--models")?;
+                models = Some(value);
             }
             "--workspace" => {
                 let value = take_value(args, &mut index, "--workspace")?;
@@ -282,9 +329,31 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         Some(prompt_words.join(" "))
     };
 
+    // `--env` and `--model` name the same choice twice, so a model reference whose
+    // environment is not the one `--env` named is a usage error. A bare profile
+    // reference is checked where the routes are known (a bare `P` may be bound in
+    // exactly one environment, which `--env` then has to be).
+    if let (Some(environment), Some(reference)) = (&env, &model)
+        && let Some((named, profile)) = reference.split_once('/')
+        && !named.is_empty()
+        && !profile.is_empty()
+        && named != environment
+    {
+        return Err(CliError {
+            message: format!(
+                "--env `{environment}` and --model `{reference}` name different environments"
+            ),
+        });
+    }
+
+    let env_given = env.is_some();
     Ok(Options {
         command: Command::Run { prompt },
         env: env.unwrap_or_else(|| DEFAULT_ENV.to_string()),
+        env_given,
+        model,
+        effort,
+        models,
         workspace,
         session,
         resume,
@@ -335,6 +404,10 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
     Ok(Options {
         command: Command::EnvShow { name: name.clone() },
         env: name.clone(),
+        env_given: true,
+        model: None,
+        effort: None,
+        models: None,
         workspace: None,
         session: None,
         resume: false,
@@ -348,6 +421,39 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         provider_retries: DEFAULT_PROVIDER_RETRIES,
         max_idle_summaries: DEFAULT_MAX_IDLE_SUMMARIES,
     })
+}
+
+/// `p1 models [SEARCH]` (ADR-0049 stage 1, spec §2): one row per model. SEARCH is a
+/// case-insensitive substring of `E/P`. `--models PATTERNS` scopes the run this
+/// listing is for, exactly as it does on a run.
+fn parse_models(args: &[String]) -> Result<Options, CliError> {
+    let mut search: Option<String> = None;
+    let mut models: Option<String> = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--models" => {
+                models = Some(take_value(args, &mut index, "--models")?);
+            }
+            other if other.starts_with('-') && other != "-" => {
+                return Err(CliError {
+                    message: format!("unknown flag `{other}`"),
+                });
+            }
+            other => {
+                if search.is_some() {
+                    return Err(CliError {
+                        message: format!("unexpected argument `{other}`"),
+                    });
+                }
+                search = Some(other.to_string());
+            }
+        }
+        index += 1;
+    }
+    let mut options = defaults(Command::Models { search });
+    options.models = models;
+    Ok(options)
 }
 
 /// `p1 login <route>` and `p1 login --list` (ADR-0044, spec §6). The key is never an
@@ -595,6 +701,10 @@ fn defaults(command: Command) -> Options {
     Options {
         command,
         env: DEFAULT_ENV.to_string(),
+        env_given: false,
+        model: None,
+        effort: None,
+        models: None,
         workspace: None,
         session: None,
         resume: false,
@@ -880,5 +990,108 @@ mod tests {
         let error = parse(&args(&["--sandbox", "workspace", "--sandbox-read"])).unwrap_err();
         assert_eq!(error.message, "--sandbox-read requires a value");
         assert!(usage().contains("--sandbox-read PATH"));
+    }
+
+    #[test]
+    fn parses_the_model_flags_and_keeps_the_prompt() {
+        let options = parse(&args(&["--model", "claude/claude-opus-5", "go"])).unwrap();
+        assert_eq!(options.model.as_deref(), Some("claude/claude-opus-5"));
+        assert_eq!(options.effort, None);
+        assert_eq!(options.models, None);
+        assert!(!options.env_given, "no --env was given");
+        assert_eq!(options.env, DEFAULT_ENV);
+        assert_eq!(
+            options.command,
+            Command::Run {
+                prompt: Some("go".to_string())
+            }
+        );
+
+        let options = parse(&args(&[
+            "--env",
+            "claude",
+            "--model",
+            "claude/claude-opus-5:high",
+            "--effort",
+            "extra_high",
+            "--models",
+            "claude/*,gpt/gpt-5.6-sol*",
+            "go",
+        ]))
+        .unwrap();
+        assert!(options.env_given);
+        assert_eq!(
+            options.model.as_deref(),
+            Some("claude/claude-opus-5:high"),
+            "the reference is kept verbatim: `:effort` is resolved with the routes"
+        );
+        assert_eq!(options.effort, Some(Effort::ExtraHigh));
+        assert_eq!(options.models.as_deref(), Some("claude/*,gpt/gpt-5.6-sol*"));
+        assert!(
+            options.is_headless(),
+            "the flag values are not prompt words"
+        );
+
+        // `--effort` alone selects nothing but the effort of whatever runs.
+        let options = parse(&args(&["--effort", "max"])).unwrap();
+        assert_eq!(options.effort, Some(Effort::Max));
+        assert_eq!(options.model, None);
+    }
+
+    #[test]
+    fn an_unknown_effort_or_a_missing_value_is_a_usage_error() {
+        let error = parse(&args(&["--effort", "loud"])).unwrap_err();
+        assert!(error.message.contains("unknown effort `loud`"), "{error}");
+        assert!(error.message.contains("extra_high"), "{error}");
+        assert!(parse(&args(&["--effort"])).is_err());
+        assert!(parse(&args(&["--model"])).is_err());
+        assert!(parse(&args(&["--models"])).is_err());
+        assert!(usage().contains("--model REF"));
+        assert!(usage().contains("--effort LEVEL"));
+        assert!(usage().contains("--models PATTERNS"));
+    }
+
+    /// `--env` and `--model` name the same choice twice; a pair that names another
+    /// environment is a usage error before anything is loaded.
+    #[test]
+    fn an_env_that_disagrees_with_a_model_pair_is_a_usage_error() {
+        let error = parse(&args(&["--env", "claude", "--model", "gpt/gpt-5.6-sol"])).unwrap_err();
+        assert!(error.message.contains("--env `claude`"), "{error}");
+        assert!(
+            error.message.contains("--model `gpt/gpt-5.6-sol`"),
+            "{error}"
+        );
+
+        // Agreeing forms parse; a bare profile is left to the routes.
+        assert!(parse(&args(&["--env", "gpt", "--model", "gpt/gpt-5.6-sol-mini"])).is_ok());
+        assert!(parse(&args(&["--env", "claude", "--model", "claude-opus-5"])).is_ok());
+        assert!(parse(&args(&["--model", "claude/claude-opus-5"])).is_ok());
+    }
+
+    #[test]
+    fn parses_the_models_subcommand() {
+        assert_eq!(
+            parse(&args(&["models"])).unwrap().command,
+            Command::Models { search: None }
+        );
+        let options = parse(&args(&["models", "gpt/"])).unwrap();
+        assert_eq!(
+            options.command,
+            Command::Models {
+                search: Some("gpt/".to_string())
+            }
+        );
+        assert_eq!(
+            parse(&args(&["models", "--models", "gpt/*"]))
+                .unwrap()
+                .models
+                .as_deref(),
+            Some("gpt/*")
+        );
+
+        assert!(parse(&args(&["models", "a", "b"])).is_err());
+        assert!(parse(&args(&["models", "--bogus"])).is_err());
+        assert!(parse(&args(&["models", "--models"])).is_err());
+        assert!(usage().contains("p1 models [SEARCH]"));
     }
 }
