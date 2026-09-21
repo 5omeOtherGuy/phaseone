@@ -167,7 +167,7 @@ fn models_lists_every_shipped_model() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 15, "one row per model: {stdout}");
+    assert_eq!(lines.len(), 18, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(
@@ -193,9 +193,10 @@ fn models_lists_every_shipped_model() {
         "no settings, no scope: {stdout}"
     );
     assert!(
-        lines.iter().any(
-            |line| line.starts_with("gpt/gpt-5.6-sol-mini") && line.contains("low,medium,high")
-        ),
+        lines
+            .iter()
+            .any(|line| line.starts_with("gpt/gpt-5.5 ")
+                && line.contains("low,medium,high,extra_high ")),
         "{stdout}"
     );
     for secret in ["accessToken", "refreshToken", "Bearer", "sk-"] {
@@ -230,7 +231,7 @@ fn models_scopes_the_listing() {
         .lines()
         .filter(|line| line.ends_with("scoped"))
         .collect();
-    assert_eq!(scoped.len(), 2, "{stdout}");
+    assert_eq!(scoped.len(), 5, "{stdout}");
     assert!(scoped.iter().all(|line| line.starts_with("gpt/")));
 
     let output = isolated(home.path())

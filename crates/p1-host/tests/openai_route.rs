@@ -199,7 +199,13 @@ fn the_shipped_responses_route_holds_what_the_host_used_to_compile() {
     assert!(route.headers.is_empty(), "no static headers on this route");
     // Every shipped GPT profile is reachable by its own name; a dated snapshot would
     // be a different `wire_model` here, not a different profile.
-    for id in ["gpt-5.6-sol", "gpt-5.6-sol-mini"] {
+    for id in [
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+    ] {
         assert_eq!(route.binding(id).expect("served").wire_model, id);
     }
 }
@@ -338,15 +344,60 @@ fn the_shipped_gpt_environment_assembles_through_the_catalog_unchanged() {
 
 #[test]
 fn every_shipped_gpt_profile_carries_its_thinking_policy() {
-    for id in ["gpt-5.6-sol", "gpt-5.6-sol-mini"] {
+    // The efforts the ChatGPT/Codex subscription endpoint lists for this account (Codex
+    // CLI model cache, 2026-09-21); `ultra` has no p1 effort, so no profile lists it.
+    for (id, efforts) in [
+        (
+            "gpt-6-astra",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-5.6-sol",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-5.6-terra",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-5.6-luna",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-5.5",
+            vec![Effort::Low, Effort::Medium, Effort::High, Effort::ExtraHigh],
+        ),
+    ] {
         let profile = shipped_profile(id);
         assert_eq!(profile.thinking, ThinkingPolicy::EffortLevel, "{id}");
         assert_eq!(profile.family, "gpt", "{id}");
         assert_eq!(
-            profile.efforts,
-            vec![Effort::Low, Effort::Medium, Effort::High],
-            "{id}: the adapter rejected extra_high/max outright, so the profile lists \
-             no higher lane"
+            profile.efforts, efforts,
+            "{id}: the endpoint listed these efforts for this account"
         );
         // Spec §7.1: an effort-less request carries no reasoning fields, so no default.
         assert_eq!(profile.default_effort, None, "{id}");
@@ -489,7 +540,7 @@ fn budget_table() -> &'static str {
 /// the adapter (spec §7.1/§7.4). The route file is the shipped one.
 #[test]
 fn assembly_refuses_each_adapter_and_profile_variant_pair() {
-    // `openai-codex-subscription` binds `gpt-5.6-sol` and `gpt-5.6-sol-mini`.
+    // `openai-codex-subscription` binds every GPT profile the host ships.
     let cases = [
         ("budget", budget_table()),
         ("enabled", ""),

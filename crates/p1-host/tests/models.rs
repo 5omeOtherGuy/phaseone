@@ -234,8 +234,11 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "deepseek/deepseek-v4.1-flash",
             "deepseek2/deepseek-v4.1-flash",
             "glm/glm-5.3",
+            "gpt/gpt-5.5",
+            "gpt/gpt-5.6-luna",
             "gpt/gpt-5.6-sol",
-            "gpt/gpt-5.6-sol-mini",
+            "gpt/gpt-5.6-terra",
+            "gpt/gpt-6-astra",
         ],
         "sorted by environment then profile"
     );
@@ -250,11 +253,11 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             .all(|model| model.route == "anthropic-subscription")
     );
     // The efforts are the profile's own, in its own order.
-    let mini = models
+    let older = models
         .iter()
-        .find(|model| model.id() == "gpt/gpt-5.6-sol-mini")
-        .expect("the shipped mini profile");
-    assert_eq!(mini.efforts_line(), "low,medium,high");
+        .find(|model| model.id() == "gpt/gpt-5.5")
+        .expect("the shipped gpt-5.5 profile");
+    assert_eq!(older.efforts_line(), "low,medium,high,extra_high");
     let deepseek = models
         .iter()
         .find(|model| model.id() == "deepseek2/deepseek-v4.1-flash")
@@ -284,7 +287,7 @@ fn a_pair_reference_resolves_to_that_pair() {
     assert_eq!(resolved.profile, "claude-opus-5");
     assert_eq!(resolved.effort, None);
 
-    let resolved = models::resolve("gpt/gpt-5.6-sol-mini:high", "claude", &models).unwrap();
+    let resolved = models::resolve("gpt/gpt-5.5:high", "claude", &models).unwrap();
     assert_eq!(resolved.environment, "gpt");
     assert_eq!(resolved.effort, Some(Effort::High));
 
@@ -325,7 +328,7 @@ fn every_resolution_failure_lists_the_candidates() {
 
     // A pair that matches nothing at all lists every model.
     let error = models::resolve("nope/nope", "claude", &models).unwrap_err();
-    assert!(error.contains("gpt/gpt-5.6-sol-mini"), "{error}");
+    assert!(error.contains("gpt/gpt-5.5"), "{error}");
 
     // An ambiguous bare profile lists both pairs and never guesses.
     let error = models::resolve("claude-sonnet-5", "gpt", &models).unwrap_err();
@@ -508,12 +511,12 @@ fn default_model_is_the_model_a_bare_run_would_use() {
         "the default environment's own profile"
     );
     let settings = Settings {
-        default_model: Some("gpt/gpt-5.6-sol-mini".to_string()),
+        default_model: Some("gpt/gpt-5.5".to_string()),
         enabled_models: Vec::new(),
     };
     assert_eq!(
         models::default_model(&settings, &shipped(), &models).unwrap(),
-        Some("gpt/gpt-5.6-sol-mini".to_string())
+        Some("gpt/gpt-5.5".to_string())
     );
     // A scratch tree whose default environment does not exist has no default model.
     let scratch = Scratch::new();
@@ -528,7 +531,7 @@ fn default_model_decides_only_without_env_or_model() {
     let config = tempfile::tempdir().unwrap();
     write(
         &config.path().join("p1/settings.toml"),
-        "default_model = \"gpt/gpt-5.6-sol-mini\"\n",
+        "default_model = \"gpt/gpt-5.5\"\n",
     );
     let locations = locations_for(config.path());
     let dirs = shipped();
@@ -536,7 +539,7 @@ fn default_model_decides_only_without_env_or_model() {
     // Neither flag: the settings decide.
     let choice = models::choose(&dirs, &locations, None, None, None).unwrap();
     assert_eq!(choice.environment, "gpt");
-    assert_eq!(choice.profile.as_deref(), Some("gpt-5.6-sol-mini"));
+    assert_eq!(choice.profile.as_deref(), Some("gpt-5.5"));
 
     // `--env` wins over the settings.
     let choice = models::choose(&dirs, &locations, Some("claude"), None, None).unwrap();
@@ -616,14 +619,7 @@ fn an_env_that_disagrees_with_the_model_is_an_error() {
     .unwrap();
     assert_eq!(choice.environment, "claude-delegating");
     assert_eq!(choice.profile.as_deref(), Some("claude-sonnet-5"));
-    let choice = models::choose(
-        &dirs,
-        &locations,
-        Some("gpt"),
-        Some("gpt/gpt-5.6-sol-mini"),
-        None,
-    )
-    .unwrap();
+    let choice = models::choose(&dirs, &locations, Some("gpt"), Some("gpt/gpt-5.5"), None).unwrap();
     assert_eq!(choice.environment, "gpt");
 }
 
@@ -755,7 +751,7 @@ fn the_table_is_aligned_and_marked() {
         .lines()
         .filter(|line| line.ends_with("scoped"))
         .collect();
-    assert_eq!(scoped.len(), 2);
+    assert_eq!(scoped.len(), 5);
     assert!(scoped.iter().all(|line| line.starts_with("gpt/")));
 }
 
