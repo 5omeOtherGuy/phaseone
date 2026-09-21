@@ -460,6 +460,12 @@ impl Driver {
                 ) {
                     self.screen.queued.retain(|q| q.follow_up);
                 }
+                // ADR-0048: a provider notice is display-only — one quiet
+                // transcript note, like every other note the driver adds.
+                if let p1_contracts::AgentEvent::ProviderNotice { text } = &stamped.event {
+                    self.screen.transcript.note(&format!("· {text}"));
+                    return;
+                }
                 self.track_task(&stamped.event);
                 self.screen.apply(&stamped.event, stamped.at_ms);
             }

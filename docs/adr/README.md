@@ -61,6 +61,8 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0045 | [Research items are issues that end used or discarded; a curator organises research, the lead alone develops](0045-research-items-are-issues-that-end-used-or-discarded-a-curator-organises-research-the-lead-alone-develops.md) | accepted | 2026-09-20 | owner+lead |
 | ADR-0046 | [An exhausted account is its own provider error kind; it is never refreshed or retried](0046-an-exhausted-account-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md) | accepted | 2026-09-21 | lead |
 | ADR-0047 | [The Codex route may speak WebSocket: an adapter-local transport with SSE as the fallback](0047-the-codex-route-may-speak-websocket-an-adapter-local-transport-with-sse-as-the-fallback.md) | accepted | 2026-09-21 | owner+lead |
+| ADR-0048 | [Providers may tell the operator something: a display-only notice event](0048-providers-may-tell-the-operator-something-a-display-only-notice-event.md) | proposed | 2026-09-21 | lead |
+| ADR-0049 | [Model selection and switching a session to another model](0049-model-selection-and-switching-a-session-to-another-model.md) | proposed | 2026-09-21 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

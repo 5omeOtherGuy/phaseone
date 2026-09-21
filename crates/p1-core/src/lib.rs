@@ -481,6 +481,12 @@ impl Agent {
                             .events
                             .emit(AgentEvent::ToolInputDelta { call_id, text });
                     }
+                    // ADR-0048: a display-only notice is forwarded in order with
+                    // the other events and touches nothing else — no history, no
+                    // journal, no partial text.
+                    StreamEvent::Notice { text } => {
+                        self.parts.events.emit(AgentEvent::ProviderNotice { text });
+                    }
                     StreamEvent::Activity => {}
                     StreamEvent::Finished(Outcome::Completed(response)) => {
                         // The stream is dropped here; later events are never read.
