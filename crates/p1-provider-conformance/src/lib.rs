@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use p1_contracts::{
-    AssistantBlock, DeclarationKind, Item, ModelOptions, Outcome, Provider, ProviderErrorKind,
-    ProviderRequest, StopReason, StreamEvent, ToolDeclaration, ToolInput,
+    AssistantBlock, AssistantItem, DeclarationKind, Item, ModelOptions, Origin, Outcome, Provider,
+    ProviderErrorKind, ProviderRequest, ReplayData, StopReason, StreamEvent, ToolCall,
+    ToolDeclaration, ToolInput, ToolResultItem, ToolStatus,
 };
 use p1_provider_http::SseDecoder;
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
@@ -379,6 +380,138 @@ pub fn reasoning_replay_round_trips(route: &RouteUnderTest) {
         leaves.iter().all(|leaf| !foreign_native.contains(leaf)),
         "expected foreign replay leaves to be absent, but at least one was present"
     );
+}
+
+/// True when `value` carries the JSON object `{"input": raw}` — as a nested value (a
+/// Messages `tool_use` block's `input`) or as a string holding that JSON (a Chat
+/// function call's `arguments`).
+fn carries_wrapped_text_input(value: &serde_json::Value, raw: &str) -> bool {
+    let wrapped = serde_json::json!({ "input": raw });
+    fn walk(value: &serde_json::Value, wrapped: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(fields) => {
+                fields.get("input") == Some(wrapped)
+                    || fields.values().any(|field| walk(field, wrapped))
+            }
+            serde_json::Value::Array(values) => values.iter().any(|value| walk(value, wrapped)),
+            serde_json::Value::String(text) => serde_json::from_str::<serde_json::Value>(text)
+                .is_ok_and(|parsed| parsed == *wrapped),
+            _ => false,
+        }
+    }
+    walk(value, &wrapped)
+}
+
+/// ADR-0049: a history recorded on ANOTHER origin is carried, not refused for being
+/// foreign. Every route accepts a transcript it can lower — a JSON call and a
+/// freeform call with their results — and drops the foreign reasoning replay data.
+/// A route without a freeform shape carries the freeform call as a function-shaped
+/// call whose arguments are the JSON object `{"input": <raw text>}`.
+pub fn foreign_history_is_carried(route: &RouteUnderTest) {
+    const NAME: &str = "foreign_history_is_carried";
+    /// A call of a kind only a route WITH a freeform shape can make (an
+    /// `apply_patch` call on the Codex route), with no character JSON would escape.
+    const RAW_TEXT: &str = "*** Begin Patch *** End Patch";
+    /// A leaf of the foreign reasoning replay data: it must appear nowhere.
+    const FOREIGN_LEAF: &str = "FOREIGN-ORIGIN-THINKING-PAYLOAD";
+    let provider = (route.build)(ScriptedTransport::new(Vec::new()));
+    let freeform = provider.describe().supports_freeform_tools;
+    let foreign = Origin {
+        route: "elsewhere/foreign-route".to_string(),
+        model: "foreign-model".to_string(),
+    };
+    let mut request = request();
+    request.history = vec![
+        Item::User {
+            text: "carry this on".to_string(),
+        },
+        Item::Assistant(AssistantItem {
+            origin: foreign.clone(),
+            blocks: vec![
+                AssistantBlock::Reasoning {
+                    text: "foreign thinking".to_string(),
+                    replay: Some(ReplayData {
+                        origin: foreign.clone(),
+                        version: 1,
+                        payload: serde_json::json!({
+                            "type": "thinking",
+                            "signature": FOREIGN_LEAF,
+                        }),
+                    }),
+                },
+                AssistantBlock::ToolCall(ToolCall {
+                    call_id: "call_json".to_string(),
+                    name: "read".to_string(),
+                    input: ToolInput::Json("{\"path\":\"a.txt\"}".to_string()),
+                }),
+            ],
+        }),
+        Item::ToolResult(ToolResultItem {
+            call_id: "call_json".to_string(),
+            name: "read".to_string(),
+            status: ToolStatus::Ok,
+            content: "file body".to_string(),
+        }),
+        Item::Assistant(AssistantItem {
+            origin: foreign,
+            blocks: vec![AssistantBlock::ToolCall(ToolCall {
+                call_id: "call_text".to_string(),
+                name: "apply_patch".to_string(),
+                input: ToolInput::Text(RAW_TEXT.to_string()),
+            })],
+        }),
+        Item::ToolResult(ToolResultItem {
+            call_id: "call_text".to_string(),
+            name: "apply_patch".to_string(),
+            status: ToolStatus::Ok,
+            content: "patch applied".to_string(),
+        }),
+    ];
+    let validation = provider.validate(&request);
+    check!(
+        route,
+        NAME,
+        validation.is_ok(),
+        "expected a foreign history to validate, saw {:?}",
+        validation.as_ref().err().map(|error| error.kind)
+    );
+    let native = (route.follow_up_request)(&request);
+    let rendered = native.to_string();
+    for needle in [
+        "\"call_json\"",
+        "\"call_text\"",
+        "\"file body\"",
+        "\"patch applied\"",
+    ] {
+        check!(
+            route,
+            NAME,
+            rendered.contains(needle),
+            "expected {needle} in the built request"
+        );
+    }
+    check!(
+        route,
+        NAME,
+        !rendered.contains(FOREIGN_LEAF),
+        "expected foreign reasoning replay data to be absent from the built request"
+    );
+    if freeform {
+        check!(
+            route,
+            NAME,
+            rendered.contains(RAW_TEXT),
+            "expected the freeform call's raw text in the built request"
+        );
+    } else {
+        check!(
+            route,
+            NAME,
+            carries_wrapped_text_input(&native, RAW_TEXT),
+            "expected the freeform call as a function-shaped call carrying {RAW_TEXT:?} wrapped in \
+             {{\"input\": …}}"
+        );
+    }
 }
 
 pub fn nothing_after_terminal(route: &RouteUnderTest) {
@@ -807,6 +940,7 @@ pub fn run_all(route: &RouteUnderTest) {
     error_event_is_single_failed_terminal(route);
     unknown_usage_is_none_not_zero(route);
     reasoning_replay_round_trips(route);
+    foreign_history_is_carried(route);
     nothing_after_terminal(route);
     chunking_is_irrelevant(route);
     cancel_before_first_byte(route);

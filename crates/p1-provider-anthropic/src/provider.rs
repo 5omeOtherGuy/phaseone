@@ -22,7 +22,7 @@ use p1_provider_http::{
 
 use crate::MessagesRoute;
 use crate::parser::AnthropicParser;
-use crate::request::{build_headers, build_request, lower};
+use crate::request::{build_headers, build_messages, build_request, lower};
 
 /// `native` keys in this namespace are route-specific. None are known in this
 /// slice, so any key here is rejected.
@@ -177,6 +177,11 @@ impl Provider for AnthropicProvider {
         // The model policy: the same lowering the request builder runs, so
         // `validate` can never accept a request the builder would reject.
         lower(&self.profile, &request.options)?;
+        // The history: everything else the Messages wire cannot carry is lowered
+        // (a freeform call travels as `{"input": …}`), so the message mapping is
+        // the check. A transcript whose first message would be an assistant turn
+        // is refused by name before anything is sent (ADR-0049).
+        build_messages(&self.route.origin_route, &self.wire_model, &request.history)?;
         Ok(())
     }
 

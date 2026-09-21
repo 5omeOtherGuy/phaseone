@@ -691,6 +691,95 @@ fn validate_rejects_a_zero_output_cap() {
     assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
 }
 
+#[test]
+fn a_freeform_call_from_another_route_is_carried_as_a_wrapped_function_call() {
+    // This route declares JSON-schema functions only; the call is sent as a
+    // function-shaped call whose input is `{"input": <raw text>}` (ADR-0049).
+    let history = vec![
+        user("go"),
+        assistant(vec![AssistantBlock::ToolCall(ToolCall {
+            call_id: "call_patch".to_string(),
+            name: "apply_patch".to_string(),
+            input: ToolInput::Text("*** Begin Patch ***".to_string()),
+        })]),
+        result("call_patch", ToolStatus::Ok),
+    ];
+    let built = build("m", &request(history)).unwrap();
+    assert_eq!(
+        built["messages"][1]["content"][0],
+        json!({
+            "type": "tool_use",
+            "id": "call_patch",
+            "name": "apply_patch",
+            "input": { "input": "*** Begin Patch ***" },
+        })
+    );
+}
+
+#[test]
+fn validate_accepts_a_mixed_foreign_history_and_refuses_one_it_cannot_lower() {
+    let foreign = Origin {
+        route: "elsewhere/foreign-route".to_string(),
+        model: "foreign-model".to_string(),
+    };
+    let mut mixed = request(vec![
+        user("go"),
+        Item::Assistant(AssistantItem {
+            origin: foreign.clone(),
+            blocks: vec![
+                AssistantBlock::Reasoning {
+                    text: "foreign thought".to_string(),
+                    replay: Some(ReplayData {
+                        origin: foreign,
+                        version: 1,
+                        payload: json!({ "type": "thinking", "signature": "FOREIGN-SIGNATURE" }),
+                    }),
+                },
+                AssistantBlock::ToolCall(ToolCall {
+                    call_id: "call_json".to_string(),
+                    name: "read".to_string(),
+                    input: ToolInput::Json(r#"{"path":"a.txt"}"#.to_string()),
+                }),
+                AssistantBlock::ToolCall(ToolCall {
+                    call_id: "call_text".to_string(),
+                    name: "apply_patch".to_string(),
+                    input: ToolInput::Text("*** Begin Patch ***".to_string()),
+                }),
+            ],
+        }),
+        result("call_json", ToolStatus::Ok),
+        result("call_text", ToolStatus::Ok),
+    ]);
+    mixed.tools = vec![function_tool("read"), function_tool("apply_patch")];
+    provider("m")
+        .validate(&mixed)
+        .expect("a foreign history lowers on the Messages wire");
+
+    let built = build("m", &mixed).unwrap();
+    let blocks = built["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "the foreign reasoning block is dropped");
+    assert_eq!(blocks[0]["input"], json!({ "path": "a.txt" }));
+    assert_eq!(
+        blocks[1]["input"],
+        json!({ "input": "*** Begin Patch ***" })
+    );
+    let rendered = built.to_string();
+    assert!(!rendered.contains("FOREIGN-SIGNATURE"), "{rendered}");
+    assert!(!rendered.contains("foreign thought"), "{rendered}");
+
+    // The one history this route cannot carry: an assistant message first. Both
+    // `validate` and the builder refuse it, with the same sentence.
+    let leaderless = request(vec![assistant(vec![text_block("hi")])]);
+    let error = provider("m").validate(&leaderless).unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(
+        error.message.contains("first message must be user-role"),
+        "{}",
+        error.message
+    );
+    assert_eq!(build("m", &leaderless).unwrap_err(), error);
+}
+
 #[tokio::test]
 async fn stream_returns_err_only_for_unbuildable_requests() {
     let mut freeform = request(vec![user("hi")]);

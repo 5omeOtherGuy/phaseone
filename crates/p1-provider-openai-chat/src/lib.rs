@@ -233,7 +233,7 @@ impl Provider for ChatProvider {
         }
     }
     fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
-        request::validate(&self.route, &self.profile, request)
+        request::validate(&self.route, &self.wire_model, &self.profile, request)
     }
     fn stream<'a>(
         &'a self,
