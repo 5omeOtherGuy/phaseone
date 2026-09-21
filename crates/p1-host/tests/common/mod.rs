@@ -194,9 +194,14 @@ pub fn isolated_environment(harness: &mut Harness) {
     harness.deps.shell_env = Some(Vec::new());
 }
 
-/// The resolved environment `env show` printed, after its `credential  …` line.
+/// The resolved environment `env show` printed, after its `credential  …` and
+/// `model  …` lines.
 pub fn env_show_json(stdout: &str) -> serde_json::Value {
-    let json = stdout.split_once('\n').map_or(stdout, |(_, rest)| rest);
+    let json = stdout
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with('{'))
+        .collect::<Vec<_>>()
+        .join("\n");
     serde_json::from_str(json.trim()).expect("env show prints the resolved environment as JSON")
 }
 

@@ -377,3 +377,351 @@ async fn a_resumed_run_starts_its_summary_count_at_zero() {
     );
     assert!(!second.stderr.text().contains("stalled:"));
 }
+
+// ------------------------------------------------ the same guard for a worker
+
+/// §3c for a delegated worker. A worker is ALWAYS unattended — nobody reads its
+/// summaries and decides — so the parent's `--max-idle-summaries` bound applies to
+/// every child, whatever the parent's own mode is, and one child's stall never
+/// cancels the parent or another child. The child ends `Failed` with the parent's
+/// exact sentence, not `Cancelled`, so the parent model and the operator read the
+/// same words.
+#[cfg(feature = "delegation")]
+mod delegated {
+    use super::*;
+    use p1_contracts::{Item, ProviderRequest};
+
+    /// The child's task. Long enough (400 chars ≈ 115 estimated tokens) to cross
+    /// `summarize_at_tokens` on the child's very first request, exactly as
+    /// [`big_prompt`] does for the parent tests.
+    fn task() -> String {
+        "x".repeat(400)
+    }
+
+    /// One environment: `name` with the given provider key and tools. With
+    /// `idle_context` it carries the always-replacing `[context]` table, so every
+    /// request of that agent is preceded by a summary.
+    fn write_env(
+        root: &std::path::Path,
+        name: &str,
+        provider: &str,
+        tools: &[&str],
+        idle_context: bool,
+    ) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut toml =
+            format!("family = \"{name}\"\nprovider = \"{provider}\"\nmodel = \"{name}-model\"\n");
+        if idle_context {
+            toml.push_str(IDLE_CONTEXT);
+        }
+        for tool in tools {
+            toml.push_str(&format!("[[tools]]\nmodule = \"{tool}\"\n"));
+        }
+        std::fs::write(dir.join("environment.toml"), toml).unwrap();
+        std::fs::write(dir.join("prompt.md"), "test").unwrap();
+    }
+
+    fn worker_start(id: &str, environment: &str) -> Step {
+        tool_call_response(vec![json_call(
+            id,
+            "worker_start",
+            &format!(r#"{{"environment":"{environment}","task":"{}"}}"#, task()),
+        )])
+    }
+
+    fn worker_result(call: &str, worker: &str) -> Step {
+        tool_call_response(vec![json_call(
+            call,
+            "worker_result",
+            &format!(r#"{{"id":"{worker}","wait":true}}"#),
+        )])
+    }
+
+    fn finish_done(id: &str) -> Step {
+        tool_call_response(vec![json_call(
+            id,
+            "finish",
+            r#"{"status":"done","summary":"read the worker's result","verification":["none"]}"#,
+        )])
+    }
+
+    /// Everything the parent was shown, tool results and inbox messages alike.
+    fn parent_saw(requests: &[ProviderRequest], needle: &str) -> bool {
+        requests.iter().any(|request| {
+            request.history.iter().any(|item| match item {
+                Item::ToolResult(result) => result.content.contains(needle),
+                Item::Inbox { text, .. } => text.contains(needle),
+                _ => false,
+            })
+        })
+    }
+
+    /// Run one headless parent (`fake-a`) that starts, waits for and reads the
+    /// result of one always-replacing child (`fake-b`), then finishes.
+    async fn run_parent_and_child(
+        environments: &std::path::Path,
+        workspace: &std::path::Path,
+        parent_script: Vec<Step>,
+        child_script: Vec<Step>,
+        child_tools: &[&str],
+        max_idle_summaries: &str,
+    ) -> (i32, Harness, ScriptedProvider, ScriptedProvider) {
+        write_env(
+            environments,
+            "parent",
+            "fake-a",
+            &["worker_start", "worker_result", "finish"],
+            false,
+        );
+        write_env(environments, "child", "fake-b", child_tools, true);
+        let parent = ScriptedProvider::new(parent_script);
+        let child = ScriptedProvider::new(child_script);
+        let parent_handle = parent.clone();
+        let child_handle = child.clone();
+        let mut harness = Harness::new(vec![environments.to_path_buf()], &[]);
+        harness.deps.catalog_hook =
+            Some(provider_hook(vec![("fake-a", parent), ("fake-b", child)]));
+        let code = run_args(
+            &mut harness,
+            &[
+                "--yes",
+                "--max-idle-summaries",
+                max_idle_summaries,
+                "--env",
+                "parent",
+                "--workspace",
+                workspace.to_str().unwrap(),
+                "go",
+            ],
+        )
+        .await;
+        (code, harness, parent_handle, child_handle)
+    }
+
+    /// §3c must-pass for workers: N replacements with no mutation end THAT child
+    /// as `Failed` carrying the parent's own sentence — "failed", not "cancelled" —
+    /// and the parent runs on to its own `finish`. The Nth replacement is the last
+    /// child request: the model request that would follow it is never made.
+    #[tokio::test]
+    async fn a_child_that_summarizes_without_progress_fails_with_the_parents_message() {
+        let workspace = tempdir().unwrap();
+        let environments = tempdir().unwrap();
+        let (code, harness, parent, child) = run_parent_and_child(
+            environments.path(),
+            workspace.path(),
+            vec![
+                worker_start("c1", "child"),
+                worker_result("c2", "w1"),
+                finish_blocked("f1"),
+                text_response("parent done"),
+            ],
+            // summary #1, the model's read call, summary #2 — the bound.
+            vec![summary(), read_call("r1"), summary()],
+            &["read"],
+            "2",
+        )
+        .await;
+
+        assert_eq!(
+            code,
+            p1_host::run::EXIT_BLOCKED,
+            "the parent must run on to its own finish: stderr {}",
+            harness.stderr.text()
+        );
+        assert!(
+            !harness.stderr.text().contains("stalled: "),
+            "the parent did not stall: {}",
+            harness.stderr.text()
+        );
+        assert_eq!(
+            child.requests().len(),
+            3,
+            "summary, the model's read call, summary — and no model request after the Nth"
+        );
+        assert_eq!(child.remaining_steps(), 0);
+        assert!(
+            parent_saw(
+                &parent.requests(),
+                &format!("Worker w1: failed\n\n{}", stalled_message(2))
+            ),
+            "the parent reads the child's failure in the parent's own words"
+        );
+        assert!(
+            parent_saw(&parent.requests(), "Worker w1 finished (failed)"),
+            "the completion notification says failed"
+        );
+        assert!(
+            !parent_saw(&parent.requests(), "Worker w1: cancelled"),
+            "a stalled child is not merely cancelled"
+        );
+    }
+
+    /// §3c must-pass for workers: a mutation between replacements resets that
+    /// child's count, so the child is never stopped. With N = 2 the child makes one
+    /// replacement, a `write`, one more replacement and a `write` again, then ends
+    /// its turn normally: the parent reads a FINISHED worker.
+    #[tokio::test]
+    async fn a_child_that_mutates_between_replacements_is_not_stopped() {
+        let workspace = tempdir().unwrap();
+        let environments = tempdir().unwrap();
+        let (code, harness, parent, child) = run_parent_and_child(
+            environments.path(),
+            workspace.path(),
+            vec![
+                worker_start("c1", "child"),
+                worker_result("c2", "w1"),
+                finish_done("f1"),
+                text_response("parent done"),
+            ],
+            vec![
+                summary(),
+                write_call("w1"),
+                summary(),
+                write_call("w2"),
+                summary(),
+                text_response("child done"),
+            ],
+            &["read", "write"],
+            "2",
+        )
+        .await;
+
+        assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+        assert!(!harness.stderr.text().contains("stalled: "));
+        assert_eq!(child.requests().len(), 6);
+        assert_eq!(child.remaining_steps(), 0);
+        assert!(
+            parent_saw(&parent.requests(), "Worker w1: finished\n\nchild done"),
+            "the child finished; the parent read its text"
+        );
+        assert!(workspace.path().join("out.txt").exists());
+    }
+
+    /// §3c must-pass for workers: `--max-idle-summaries 0` disables the guard for
+    /// children too. Three replacements in a row are more than the 2 the flag would
+    /// otherwise allow, and the child still finishes.
+    #[tokio::test]
+    async fn max_idle_summaries_zero_never_stops_a_child() {
+        let workspace = tempdir().unwrap();
+        let environments = tempdir().unwrap();
+        let (code, harness, parent, child) = run_parent_and_child(
+            environments.path(),
+            workspace.path(),
+            vec![
+                worker_start("c1", "child"),
+                worker_result("c2", "w1"),
+                finish_done("f1"),
+                text_response("parent done"),
+            ],
+            vec![
+                summary(),
+                read_call("r1"),
+                summary(),
+                read_call("r2"),
+                summary(),
+                text_response("child done"),
+            ],
+            &["read"],
+            "0",
+        )
+        .await;
+
+        assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+        assert!(!harness.stderr.text().contains("stalled: "));
+        assert_eq!(child.requests().len(), 6);
+        assert!(
+            parent_saw(&parent.requests(), "Worker w1: finished\n\nchild done"),
+            "with the bound disabled the child is not stopped"
+        );
+    }
+
+    /// §3c must-pass for workers: one child's stall cancels THAT child only. While
+    /// the stalling child (`fake-b`) ends `Failed`, its sibling (`fake-c`) keeps
+    /// replacing, mutating and finally finishing, and the parent reads both.
+    #[tokio::test]
+    async fn one_child_stalling_leaves_its_sibling_running() {
+        let workspace = tempdir().unwrap();
+        let environments = tempdir().unwrap();
+        write_env(
+            environments.path(),
+            "parent",
+            "fake-a",
+            &["worker_start", "worker_result", "finish"],
+            false,
+        );
+        write_env(environments.path(), "stalling", "fake-b", &["read"], true);
+        write_env(
+            environments.path(),
+            "working",
+            "fake-c",
+            &["read", "write"],
+            true,
+        );
+
+        let parent = ScriptedProvider::new(vec![
+            worker_start("c1", "stalling"),
+            worker_start("c2", "working"),
+            worker_result("c3", "w1"),
+            worker_result("c4", "w2"),
+            finish_blocked("f1"),
+            text_response("parent done"),
+        ]);
+        let stalling = ScriptedProvider::new(vec![summary(), read_call("r1"), summary()]);
+        let working = ScriptedProvider::new(vec![
+            summary(),
+            write_call("w1"),
+            summary(),
+            write_call("w2"),
+            summary(),
+            text_response("second done"),
+        ]);
+        let parent_handle = parent.clone();
+        let stalling_handle = stalling.clone();
+        let working_handle = working.clone();
+        let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+        harness.deps.catalog_hook = Some(provider_hook(vec![
+            ("fake-a", parent),
+            ("fake-b", stalling),
+            ("fake-c", working),
+        ]));
+
+        let code = run_args(
+            &mut harness,
+            &[
+                "--yes",
+                "--max-idle-summaries",
+                "2",
+                "--env",
+                "parent",
+                "--workspace",
+                workspace.path().to_str().unwrap(),
+                "go",
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            code,
+            p1_host::run::EXIT_BLOCKED,
+            "stderr: {}",
+            harness.stderr.text()
+        );
+        assert_eq!(stalling_handle.requests().len(), 3);
+        assert_eq!(working_handle.requests().len(), 6);
+        assert!(
+            parent_saw(
+                &parent_handle.requests(),
+                &format!("Worker w1: failed\n\n{}", stalled_message(2))
+            ),
+            "the stalling child fails with the parent's sentence"
+        );
+        assert!(
+            parent_saw(
+                &parent_handle.requests(),
+                "Worker w2: finished\n\nsecond done"
+            ),
+            "the sibling was never stopped"
+        );
+    }
+}

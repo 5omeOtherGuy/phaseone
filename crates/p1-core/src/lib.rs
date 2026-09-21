@@ -37,6 +37,17 @@ pub struct AgentParts {
     pub events: Arc<dyn EventSink>,
 }
 
+/// The parts of [`AgentParts`] a running agent can be switched to between turns
+/// (ADR-0049). Journal, events and authorization belong to the session, not to the
+/// model it talks to, so a switch never replaces them.
+pub struct Reconfiguration {
+    pub provider: Arc<dyn Provider>,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub system_prompt: String,
+    pub options: ModelOptions,
+    pub context: Arc<dyn ContextPolicy>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BuildError {
     #[error("two assembled tools share the call name `{0}`")]
@@ -116,9 +127,39 @@ impl Agent {
         Self::assemble(parts, Vec::new(), 0, false, HashSet::new(), None)
     }
 
+    /// Switch this agent to another environment/profile pair between turns
+    /// (ADR-0049, model-selection.md §3). Callable only between turns (`&mut self`),
+    /// never inside a tool loop: a boundary has no thinking blocks pending.
+    ///
+    /// Runs exactly [`Agent::new`]'s checks, but `provider.validate` gets the
+    /// CURRENT history, so a route that cannot carry this transcript is refused
+    /// before anything is sent or committed. On success the parts are replaced —
+    /// journal, events and authorization stay — and `environment_committed` is
+    /// cleared, so the next turn commits the new `Environment` before its input.
+    /// On failure nothing changes at all.
+    pub fn reconfigure(&mut self, next: Reconfiguration) -> Result<(), BuildError> {
+        let Reconfiguration {
+            provider,
+            tools,
+            system_prompt,
+            options,
+            context,
+        } = next;
+        check_environment(&provider, &tools, &system_prompt, &options, &self.history)?;
+        self.parts.provider = provider;
+        self.parts.tools = tools;
+        self.parts.system_prompt = system_prompt;
+        self.parts.options = options;
+        self.parts.context = context;
+        self.environment_committed = false;
+        Ok(())
+    }
+
     /// Validate the parts (exactly as [`Agent::new`] does) and install `history`,
     /// `next_seq`, `environment_committed`, `started_calls` and `last_usage`.
-    /// Shared with `resume`, so construction and its `BuildError`s exist once.
+    /// Shared with `resume`, so construction and its `BuildError`s exist once. The
+    /// parts are validated against `history` — the transcript this agent will send
+    /// — so a resumed session is checked against what it projects (ADR-0049).
     pub(crate) fn assemble(
         parts: AgentParts,
         history: Vec<Item>,
@@ -127,29 +168,13 @@ impl Agent {
         started_calls: HashSet<String>,
         last_usage: Option<Usage>,
     ) -> Result<Self, BuildError> {
-        // §1: reject duplicate assembled call names before anything else runs.
-        let mut names = HashSet::new();
-        for tool in &parts.tools {
-            let name = tool.declaration().name.clone();
-            if !names.insert(name.clone()) {
-                return Err(BuildError::DuplicateToolName(name));
-            }
-        }
-        // R3: validate exactly once, against the empty-history first request.
-        let request = ProviderRequest {
-            system_prompt: parts.system_prompt.clone(),
-            history: Vec::new(),
-            tools: parts
-                .tools
-                .iter()
-                .map(|tool| tool.declaration().clone())
-                .collect(),
-            options: parts.options.clone(),
-        };
-        parts
-            .provider
-            .validate(&request)
-            .map_err(BuildError::ProviderRejected)?;
+        check_environment(
+            &parts.provider,
+            &parts.tools,
+            &parts.system_prompt,
+            &parts.options,
+            &history,
+        )?;
         Ok(Self {
             parts,
             history,
@@ -788,6 +813,41 @@ impl Agent {
             options: self.parts.options.clone(),
         }
     }
+}
+
+/// The ONE environment check, shared by every path that installs parts: §1 rejects
+/// duplicate assembled call names before anything else runs; R3 then asks the
+/// provider to validate a request as it would be sent. `history` is the transcript
+/// the agent will send: empty for [`Agent::new`]'s first request, the history the
+/// agent already holds for [`Agent::reconfigure`], and the projection for
+/// [`Agent::resume`] — so a switch, a resume and a construction cannot disagree
+/// about what the provider accepts (ADR-0049).
+fn check_environment(
+    provider: &Arc<dyn Provider>,
+    tools: &[Arc<dyn Tool>],
+    system_prompt: &str,
+    options: &ModelOptions,
+    history: &[Item],
+) -> Result<(), BuildError> {
+    let mut names = HashSet::new();
+    for tool in tools {
+        let name = tool.declaration().name.clone();
+        if !names.insert(name.clone()) {
+            return Err(BuildError::DuplicateToolName(name));
+        }
+    }
+    let request = ProviderRequest {
+        system_prompt: system_prompt.to_string(),
+        history: history.to_vec(),
+        tools: tools
+            .iter()
+            .map(|tool| tool.declaration().clone())
+            .collect(),
+        options: options.clone(),
+    };
+    provider
+        .validate(&request)
+        .map_err(BuildError::ProviderRejected)
 }
 
 /// §3b: a replacement must be a well-formed transcript BEFORE it becomes history.
