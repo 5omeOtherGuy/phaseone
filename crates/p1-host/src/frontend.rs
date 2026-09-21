@@ -60,6 +60,14 @@ pub trait FrontEnd: Send + Sync {
     /// (`None` when the environment does not assemble `finish`).
     fn parent_assembled(&self, route: &str, model: &str, completion: Option<Completion>);
 
+    /// The route label the parent renderer names, when this front end has one: the
+    /// host moves it after a successful model switch, so the per-response line names
+    /// the route that produced the response (ADR-0049 stage 3). `None` — the default
+    /// — leaves the label fixed at the assembled route.
+    fn route_label(&self) -> Option<Arc<Mutex<String>>> {
+        None
+    }
+
     /// Whether this run is unattended and the host's §3c stall guard applies. The
     /// default is the CLI rule (`a prompt means headless`); a front end that owns
     /// a terminal UI overrides it to `false` — a TUI is interactive by definition,
@@ -100,6 +108,9 @@ pub struct LineFrontEnd {
     options: Options,
     policy: Arc<HostPolicy>,
     renderer: OnceLock<Arc<Renderer>>,
+    /// The parent renderer's route label, shared with the renderer so the host can
+    /// move it on a model switch; the assembled route fills it in.
+    route_label: Arc<Mutex<String>>,
     completion: OnceLock<Option<Completion>>,
     /// One owner for the worker usage aggregate: every child renderer this front
     /// end builds feeds it, so the exit line is a plain read in `finish`.
@@ -123,6 +134,7 @@ impl LineFrontEnd {
             options: options.clone(),
             policy,
             renderer: OnceLock::new(),
+            route_label: Arc::new(Mutex::new(String::new())),
             completion: OnceLock::new(),
             #[cfg(feature = "delegation")]
             worker_usage: Arc::new(crate::render::WorkerUsage::new()),
@@ -176,6 +188,7 @@ impl FrontEnd for LineFrontEnd {
     }
 
     fn parent_assembled(&self, route: &str, model: &str, completion: Option<Completion>) {
+        *self.route_label.lock().unwrap() = route.to_string();
         let renderer = Renderer::new(
             self.stdout.clone(),
             self.stderr.clone(),
@@ -183,9 +196,14 @@ impl FrontEnd for LineFrontEnd {
             route.to_string(),
             model.to_string(),
             Arc::new(Mutex::new(String::new())),
-        );
+        )
+        .with_route_label(self.route_label.clone());
         let _ = self.renderer.set(Arc::new(renderer));
         let _ = self.completion.set(completion);
+    }
+
+    fn route_label(&self) -> Option<Arc<Mutex<String>>> {
+        Some(self.route_label.clone())
     }
 
     fn run<'a>(

@@ -4,7 +4,9 @@
 //! the response completes. Reasoning is shown only on a TTY, dimmed. Tool
 //! start/finish, inbox delivery and turn failures are one line each. Usage goes
 //! to stderr after EVERY response, and a totals line at exit. Unknown usage is
-//! printed `?`/`unknown`, never `0`.
+//! printed `?`/`unknown`, never `0`. Every usage line names the route and model
+//! that produced THAT response; the totals line names one only when every response
+//! came from the same route and model.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -19,6 +21,11 @@ struct Inner {
     /// True when the next stdout character begins a line (so it needs the prefix).
     line_start: bool,
     last_model: String,
+    /// The `(route, model)` of the FIRST response this renderer printed, and whether
+    /// a later one differed. A session whose responses came from more than one route
+    /// or model must not claim a single one on the totals line (ADR-0049 stage 3).
+    first_origin: Option<(String, String)>,
+    origin_changed: bool,
     usage: UsageSums,
     /// Responses that completed. The host reads it to tell whether a turn that
     /// ended `ProviderFailed` made any progress (completion.md §3b).
@@ -156,7 +163,9 @@ pub struct Renderer {
     stdout: SharedWriter,
     stderr: SharedWriter,
     tty: bool,
-    route: String,
+    /// The route label the usage lines name, shared so a model switch can move it
+    /// to the route the session runs now (ADR-0049 stage 3): a child's is its own.
+    route: Arc<Mutex<String>>,
     model: String,
     prefix: Arc<Mutex<String>>,
     /// Set on a child renderer so the run can print a workers aggregate.
@@ -178,7 +187,7 @@ impl Renderer {
             stdout,
             stderr,
             tty,
-            route,
+            route: Arc::new(Mutex::new(route)),
             model,
             prefix,
             #[cfg(feature = "delegation")]
@@ -186,10 +195,25 @@ impl Renderer {
             inner: Mutex::new(Inner {
                 line_start: true,
                 last_model: String::new(),
+                first_origin: None,
+                origin_changed: false,
                 usage: UsageSums::default(),
                 responses: 0,
             }),
         }
+    }
+
+    /// Take the route label from the host instead of owning a fixed one, so a
+    /// successful model switch can move it. The host builds the parent's label once
+    /// and gives the same one to the model switch.
+    pub fn with_route_label(mut self, label: Arc<Mutex<String>>) -> Self {
+        self.route = label;
+        self
+    }
+
+    /// The route label the lines name now.
+    fn route(&self) -> String {
+        self.route.lock().unwrap().clone()
     }
 
     /// Feed every committed response of this renderer into `usage`. Used by the
@@ -200,20 +224,32 @@ impl Renderer {
         self
     }
 
-    /// Print the totals line to stderr. Called once, at exit.
+    /// Print the totals line to stderr. Called once, at exit. It names a route and
+    /// a model only when every response came from the same one; a session that ran
+    /// on more than one route or model names none of them (ADR-0049 stage 3).
     pub fn finish(&self) {
         let mut inner = self.inner.lock().unwrap();
         self.close_line(&mut inner);
-        let model = if inner.last_model.is_empty() {
-            self.model.clone()
-        } else {
-            inner.last_model.clone()
-        };
         let (input, cached, output, cost) = inner.usage.parts();
-        let line = format!(
-            "total model {}/{model} · in {input} (cached {cached}) · out {output} · cost {cost}",
-            self.route
-        );
+        let label = if inner.origin_changed {
+            String::new()
+        } else {
+            let (route, model) = match &inner.first_origin {
+                Some((route, model)) => (route.clone(), model.clone()),
+                // No response completed: the label the renderer was built with.
+                None => (
+                    self.route(),
+                    if inner.last_model.is_empty() {
+                        self.model.clone()
+                    } else {
+                        inner.last_model.clone()
+                    },
+                ),
+            };
+            format!(" model {route}/{model}")
+        };
+        let line =
+            format!("total{label} · in {input} (cached {cached}) · out {output} · cost {cost}");
         self.write_line(&mut inner, true, &line);
     }
 
@@ -349,9 +385,15 @@ impl EventSink for Renderer {
             }
             AgentEvent::ResponseCompleted { model, usage, .. } => {
                 self.close_line(&mut inner);
-                let line = usage_line(&self.route, &model, usage);
+                let route = self.route();
+                let line = usage_line(&route, &model, usage);
                 self.write_line(&mut inner, true, &line);
                 self.record_usage(&mut inner, usage);
+                match &inner.first_origin {
+                    None => inner.first_origin = Some((route, model.clone())),
+                    Some(seen) if *seen != (route, model.clone()) => inner.origin_changed = true,
+                    Some(_) => {}
+                }
                 inner.last_model = model;
                 inner.responses += 1;
             }
@@ -374,7 +416,8 @@ impl EventSink for Renderer {
                 } else {
                     inner.last_model.clone()
                 };
-                let line = context_line(&self.route, &model, items_before, items_after, usage);
+                let route = self.route();
+                let line = context_line(&route, &model, items_before, items_after, usage);
                 self.write_line(&mut inner, true, &line);
             }
             AgentEvent::ToolStarted { call } => {
