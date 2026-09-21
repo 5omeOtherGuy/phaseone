@@ -267,9 +267,18 @@ pub fn credential_line(
     if environment.profile.is_none() {
         return Ok(None);
     }
-    let route = crate::routes::load_route_by_id(environment_dirs, &environment.provider)?;
-    let report = p1_auth::describe(&route.id, &route.credential, locations);
-    Ok(Some(report.line()))
+    credential_line_for_route(&environment.provider, environment_dirs, locations).map(Some)
+}
+
+/// The same line for a route id alone: `p1 models` prints it for every model, so
+/// both commands show one wording from one probe.
+pub fn credential_line_for_route(
+    route_id: &str,
+    environment_dirs: &[PathBuf],
+    locations: &p1_auth::Locations,
+) -> Result<String, String> {
+    let route = crate::routes::load_route_by_id(environment_dirs, route_id)?;
+    Ok(p1_auth::describe(&route.id, &route.credential, locations).line())
 }
 
 /// Resolve a loaded environment against the route files, before `assemble` is

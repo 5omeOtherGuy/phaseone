@@ -128,6 +128,10 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
             EXIT_OK
         }
         Command::EnvShow { name } => env_show(deps, &options, &name),
+        // The model list (ADR-0049 stage 1): every environment × the profiles its
+        // route binds. No catalog and no network — the credential column is the same
+        // non-secret probe `env show` prints.
+        Command::Models { search } => models_command(deps, &options, search.as_deref()),
         // The login surface (ADR-0044, spec §6): no catalog, no provider and no
         // network — the store is written and the "which source" report is printed.
         Command::Login { route } => crate::login::login(deps, &route).await,
@@ -140,11 +144,104 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
             }
             match run_agent(deps, &options).await {
                 Ok(code) => code,
-                Err(message) => {
-                    write_stderr(deps, &format!("{message}\n"));
-                    EXIT_FAILURE
+                Err(error) => {
+                    write_stderr(deps, &format!("{}\n", error.message()));
+                    error.code()
                 }
             }
+        }
+    }
+}
+
+/// A run that stopped before it finished. The exit code says what has to be fixed:
+/// the command line — a model reference that names no model, a scope pattern that
+/// matches nothing, `settings.toml` — or the run itself (an environment, a provider,
+/// a journal), which fails the way it always has.
+#[derive(Debug)]
+pub struct RunError {
+    message: String,
+    code: i32,
+}
+
+impl RunError {
+    /// A command line the operator must fix.
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: EXIT_USAGE,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn code(&self) -> i32 {
+        self.code
+    }
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: EXIT_FAILURE,
+        }
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+/// The model selection this command line asks for (ADR-0049 stage 1): `--model`,
+/// else `--env`, else `settings.toml`'s `default_model`, else the default
+/// environment. Reading `settings.toml` is the only reason a bare run touches the
+/// p1 config directory.
+fn selection(deps: &HostDeps, options: &Options) -> Result<crate::models::Choice, String> {
+    // `--models` scopes what the session may cycle through (stage 3); a pattern
+    // that matches nothing is a typo, so a run rejects it exactly as `p1 models` does.
+    if let Some(patterns) = options.models.as_deref() {
+        let models = crate::models::enumerate(&deps.environment_dirs)?;
+        crate::models::check_scope(patterns, &models)?;
+    }
+    crate::models::choose(
+        &deps.environment_dirs,
+        &crate::auth::locations(deps),
+        options.env_given.then_some(options.env.as_str()),
+        options.model.as_deref(),
+        options.effort,
+    )
+}
+
+/// `p1 models [SEARCH]` (ADR-0049 stage 1, spec §2): one row per model, sorted by
+/// environment then profile. Every failure is a usage error: the reference, the
+/// scope or `settings.toml` is what the operator fixes.
+fn models_command(deps: &HostDeps, options: &Options, search: Option<&str>) -> i32 {
+    let locations = crate::auth::locations(deps);
+    let outcome = (|| -> Result<String, String> {
+        let settings = crate::models::load_settings(&locations)?;
+        let all = crate::models::enumerate(&deps.environment_dirs)?;
+        let scope = crate::models::scope(options.models.as_deref(), &settings, &all)?;
+        let default = crate::models::default_model(&settings, &deps.environment_dirs, &all)?;
+        let rows: Vec<crate::models::Model> = crate::models::search(&all, search)
+            .into_iter()
+            .cloned()
+            .collect();
+        crate::models::table(&rows, &scope, default.as_deref(), |route| {
+            crate::catalog::credential_line_for_route(route, &deps.environment_dirs, &locations)
+        })
+    })();
+    match outcome {
+        Ok(table) => {
+            write_stdout(deps, &table);
+            EXIT_OK
+        }
+        Err(message) => {
+            write_stderr(deps, &format!("{message}\n"));
+            EXIT_USAGE
         }
     }
 }
@@ -219,6 +316,19 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             return EXIT_FAILURE;
         }
     }
+    // The model this environment resolves to (ADR-0049 stage 1, spec §2): `E/P`,
+    // with the effort its `[options]` carries.
+    if let Some(profile) = &environment.profile {
+        let effort = environment
+            .options
+            .reasoning_effort
+            .map(|effort| format!(":{}", crate::models::effort_name(effort)))
+            .unwrap_or_default();
+        write_stdout(
+            deps,
+            &format!("model  {}/{}{effort}\n", environment.name, profile.id),
+        );
+    }
     let workspace = match resolve_workspace(options) {
         Ok(workspace) => workspace,
         Err(message) => {
@@ -252,7 +362,7 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
 /// single branch point below is where a session that owns its own event sink and
 /// run loop (the TUI, `--tui`) would construct its front end — or it can call
 /// [`run_with_front_end`] directly, leaving `run.rs` untouched.
-async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String> {
+async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunError> {
     let cancel = CancellationToken::new();
     // The ONE branch point: the TUI (issue #12) owns the terminal when --tui.
     let front_end: Arc<dyn FrontEnd> = if options.tui {
@@ -262,7 +372,11 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, String
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         Arc::new(crate::tui::TuiFrontEnd::new(
             crate::tui::TuiOptions {
-                env: options.env.clone(),
+                // The label the TUI shows is the environment the selection chose,
+                // not the `--env` name it was asked for.
+                env: selection(deps, options)
+                    .map_err(RunError::usage)?
+                    .environment,
                 ask: options.ask,
                 workspace,
                 sandbox: format!("{:?}", options.sandbox).to_lowercase(),
@@ -285,7 +399,7 @@ pub async fn run_with_front_end(
     options: &Options,
     cancel: CancellationToken,
     front_end: Arc<dyn FrontEnd>,
-) -> Result<i32, String> {
+) -> Result<i32, RunError> {
     let workspace = resolve_workspace(options)?;
     // The §3c stall guard is host policy and applies only to unattended runs; the
     // front end decides what "headless" means (the line front end uses the CLI
@@ -336,8 +450,15 @@ pub async fn run_with_front_end(
         let _ = catalog_slot.set(catalog.clone());
     }
 
-    let mut environment = load_environment(&options.env, &deps.environment_dirs)
+    // The chosen model (ADR-0049 stage 1): the environment the reference or
+    // `default_model` named, with the selected profile applied on top of it. The
+    // resolution and assembly path below is unchanged — `resolve_environment` still
+    // turns the profile into the route's wire model.
+    let choice = selection(deps, options).map_err(RunError::usage)?;
+    let mut environment = load_environment(&choice.environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
+    crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
+        .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
     let substitutions = substitutions(deps, &workspace);
     let assembled = assemble_with_cache_key(

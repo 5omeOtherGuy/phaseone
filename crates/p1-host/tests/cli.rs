@@ -11,13 +11,17 @@ fn p1() -> Command {
 
 /// The real binary with a scratch home and NO ambient credential path, so it can
 /// never read a real login: every credential variable a route may name is removed
-/// and every per-tool directory variable is unset.
+/// and every per-tool directory variable is unset. `P1_CONFIG_DIR` and
+/// `P1_ENVIRONMENTS_DIR` are removed too, so the shipped `environments/` directory
+/// of the source tree is the one the binary sees.
 fn isolated(home: &Path) -> Command {
     let mut command = p1();
     command.env("HOME", home);
     for name in [
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
+        "P1_CONFIG_DIR",
+        "P1_ENVIRONMENTS_DIR",
         "PI_CODING_AGENT_DIR",
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
@@ -126,4 +130,175 @@ fn env_show_names_the_borrowed_login_it_would_use() {
         !stdout.contains("FAKE-ENV-SHOW-KEY"),
         "the report never contains a value: {stdout}"
     );
+}
+
+/// `p1 env show` names the resolved model (ADR-0049 stage 1, spec §2) right after
+/// the credential source.
+#[test]
+fn env_show_prints_the_resolved_model() {
+    let home = tempfile::tempdir().unwrap();
+    let output = isolated(home.path())
+        .args(["env", "show", "claude"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "env show claude failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.lines().nth(1).unwrap_or_default(),
+        "model  claude/claude-sonnet-5:medium",
+        "{stdout}"
+    );
+}
+
+/// `p1 models` against the shipped `environments/`, `routes/` and `profiles/`: one
+/// aligned row per model, the default marked, no scope and no credential value.
+#[test]
+fn models_lists_every_shipped_model() {
+    let home = tempfile::tempdir().unwrap();
+    let output = isolated(home.path()).arg("models").output().unwrap();
+    assert!(
+        output.status.success(),
+        "p1 models failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 15, "one row per model: {stdout}");
+    assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
+    assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
+    assert!(
+        lines[0].contains("low,medium,high,extra_high,max"),
+        "{stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("claude/claude-sonnet-5") && line.ends_with("default")),
+        "the model a bare `p1` would run is marked: {stdout}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.ends_with("default"))
+            .count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("scoped"),
+        "no settings, no scope: {stdout}"
+    );
+    assert!(
+        lines.iter().any(
+            |line| line.starts_with("gpt/gpt-5.6-sol-mini") && line.contains("low,medium,high")
+        ),
+        "{stdout}"
+    );
+    for secret in ["accessToken", "refreshToken", "Bearer", "sk-"] {
+        assert!(!stdout.contains(secret), "p1 models leaked {secret}");
+    }
+
+    // SEARCH is a case-insensitive substring of `E/P`.
+    let output = isolated(home.path())
+        .args(["models", "DEEPSEEK2"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(
+        stdout.starts_with("deepseek2/deepseek-v4.1-flash"),
+        "{stdout}"
+    );
+}
+
+/// `--models` scopes the listing; a pattern that matches nothing is an error.
+#[test]
+fn models_scopes_the_listing() {
+    let home = tempfile::tempdir().unwrap();
+    let output = isolated(home.path())
+        .args(["models", "--models", "gpt/*"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let scoped: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.ends_with("scoped"))
+        .collect();
+    assert_eq!(scoped.len(), 2, "{stdout}");
+    assert!(scoped.iter().all(|line| line.starts_with("gpt/")));
+
+    let output = isolated(home.path())
+        .args(["models", "--models", "nope/*"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--models pattern `nope/*`"), "{stderr}");
+}
+
+/// A `--env` and a `--model` that name different environments is a usage error,
+/// and so is an effort level that is not one of the five.
+#[test]
+fn a_conflicting_model_reference_is_a_usage_error() {
+    let home = tempfile::tempdir().unwrap();
+
+    let output = isolated(home.path())
+        .args(["--env", "claude", "--model", "gpt/gpt-5.6-sol", "go"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--env `claude`"), "{stderr}");
+    assert!(stderr.contains("--model `gpt/gpt-5.6-sol`"), "{stderr}");
+    assert!(stderr.contains("usage:"), "a usage error prints the usage");
+
+    let output = isolated(home.path())
+        .args(["--effort", "loud", "go"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown effort `loud`"), "{stderr}");
+    assert!(stderr.contains("extra_high"), "{stderr}");
+
+    // A reference that names no model lists the candidates.
+    let output = isolated(home.path())
+        .args(["--model", "claude/nope", "go"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown model `claude/nope`"), "{stderr}");
+    assert!(stderr.contains("claude/claude-opus-5"), "{stderr}");
+
+    // A pattern that matches nothing is caught on a run too.
+    let output = isolated(home.path())
+        .args(["--models", "nope/*", "--env", "claude", "go"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("matches no model"), "{stderr}");
+}
+
+/// The usage text documents the whole model-selection surface.
+#[test]
+fn help_documents_the_model_flags() {
+    let output = p1().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "--model REF",
+        "--effort LEVEL",
+        "--models PATTERNS",
+        "p1 models [SEARCH]",
+        "extra_high",
+    ] {
+        assert!(help.contains(needle), "help must document {needle}: {help}");
+    }
 }
