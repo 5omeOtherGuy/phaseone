@@ -18,7 +18,7 @@ use p1_contracts::{
     BoxFuture, CancellationToken, Effort, Item, JournalRecord, ModelOptions, Origin, Outcome,
     Provider, ProviderError, ProviderRequest, StreamEvent, TurnEnd,
 };
-use p1_core::{Agent, AgentParts, ResumeError};
+use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
 use p1_host::catalog::{
     build_catalog, chat_route, resolve_environment, responses_route, route_provider,
@@ -1325,10 +1325,11 @@ async fn two_routes_that_share_one_profile_differ_only_in_their_declared_fields(
     assert_ne!(origins[0], origins[1], "two accounts are two origins");
 }
 
-/// A session recorded on one route cannot silently continue on the other: the origins
-/// differ, so the resume decision (ADR-0033) refuses it.
+/// A session recorded on one route continues on the other when that route's adapter
+/// accepts the recorded history (ADR-0049, superseding ADR-0033's refusal): the
+/// origin change is reported as an environment change, committed at the next turn.
 #[tokio::test]
-async fn a_session_recorded_on_one_route_is_refused_by_the_other() {
+async fn a_session_recorded_on_one_route_resumes_on_the_other_as_an_environment_change() {
     let scratch = split_scratch();
     let alpha = scratch
         .resolve("alpha-env")
@@ -1341,29 +1342,15 @@ async fn a_session_recorded_on_one_route_is_refused_by_the_other() {
     let records = recorded_turn(provider_of(&alpha, transport)).await;
     assert!(!records.is_empty(), "the turn was journalled");
 
-    let error = match Agent::resume(
+    let (_, report) = Agent::resume(
         parts(
             provider_of(&beta, ScriptedTransport::new(vec![])),
             Arc::new(RecordingJournal::new()),
         ),
         &records,
-    ) {
-        Ok(_) => panic!("a session recorded on alpha must not resume on beta"),
-        Err(error) => error,
-    };
-    assert_eq!(
-        error,
-        ResumeError::RouteChanged {
-            journalled: Origin {
-                route: ALPHA_ORIGIN.into(),
-                model: ALPHA_WIRE.into(),
-            },
-            assembled: Origin {
-                route: BETA_ORIGIN.into(),
-                model: BETA_WIRE.into(),
-            },
-        }
-    );
+    )
+    .expect("beta's adapter carries alpha's history");
+    assert!(report.environment_changed, "another origin is a change");
 }
 
 /// A helper kept next to the split tests: the endpoint a route file declares is what the
