@@ -314,6 +314,67 @@ async fn reasoning_is_emitted_and_activity_is_not_observable() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_provider_notice_is_forwarded_in_order_and_is_nothing_else() {
+    // ADR-0048: a notice is display-only. It becomes `ProviderNotice` where it
+    // arrived, and it is neither history, nor a journal record, nor partial text.
+    let notice = "transport: WebSocket unavailable (HTTP 501) — using HTTP (SSE) for the rest of this session";
+    let (mut agent, fixture) = agent_with(vec![Step::Events(vec![
+        StreamEvent::Notice {
+            text: notice.into(),
+        },
+        StreamEvent::TextDelta {
+            block: 0,
+            text: "answer".into(),
+        },
+        StreamEvent::Notice {
+            text: "second notice".into(),
+        },
+        StreamEvent::Finished(completed(
+            vec![text_block("answer")],
+            StopReason::EndTurn,
+            None,
+        )),
+    ])]);
+    run(&mut agent, "q", CancellationToken::new()).await;
+
+    assert_eq!(
+        fixture.events.events(),
+        vec![
+            AgentEvent::TurnStarted,
+            AgentEvent::RequestStarted { request_index: 0 },
+            AgentEvent::ProviderNotice {
+                text: notice.into()
+            },
+            AgentEvent::TextDelta {
+                text: "answer".into()
+            },
+            AgentEvent::ProviderNotice {
+                text: "second notice".into()
+            },
+            AgentEvent::ResponseCompleted {
+                model: "fake-model".into(),
+                stop: StopReason::EndTurn,
+                usage: None
+            },
+            AgentEvent::TurnFinished {
+                end: TurnEnd::Completed {
+                    stop: StopReason::EndTurn
+                }
+            },
+        ]
+    );
+    // Exactly the three records of a plain text turn: no notice record, and the
+    // notice text is not part of the completed item either.
+    let records = fixture.journal.records();
+    assert_eq!(records.len(), 3);
+    assert!(matches!(
+        records[2].body,
+        RecordBody::AssistantCompleted { .. }
+    ));
+    assert_eq!(agent.history().len(), 2, "no notice entered the history");
+}
+
+#[tokio::test(start_paused = true)]
 async fn response_usage_is_passed_through_unchanged() {
     // Spec §3e: known usage is passed unchanged to the record and event.
     let usage = Usage {
