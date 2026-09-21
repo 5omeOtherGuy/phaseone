@@ -238,3 +238,49 @@ fn an_explicit_cache_key_on_an_anthropic_route_fails_assembly() {
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("takes no cache key"), "{stderr}");
 }
+
+// ------------------------------------------------------ the Responses transport
+
+/// ADR-0047 §1 through the host: a route that asks for `transport = "websocket"` is
+/// composed with the real connector and resolves exactly like an SSE one — the
+/// transport is not part of a response's origin — and an unknown value fails the
+/// load before anything is composed.
+#[test]
+fn a_websocket_route_resolves_and_an_unknown_transport_fails_the_load() {
+    let root = codex_root();
+    let path = root.path().join("routes/openai-codex-subscription.toml");
+    let shipped = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !shipped.contains("transport"),
+        "the shipped route stays on SSE"
+    );
+
+    std::fs::write(
+        &path,
+        shipped.replace(
+            "account = \"codex-subscription\"",
+            "account = \"codex-subscription\"\ntransport = \"websocket\"",
+        ),
+    )
+    .unwrap();
+    write_environment(
+        root.path(),
+        "ws",
+        "route = \"openai-codex-subscription\"\nprofile = \"gpt-5.6-sol\"\n",
+    );
+    let (code, stderr) = show_in(root.path(), "ws");
+    assert_eq!(code, 0, "{stderr}");
+
+    std::fs::write(
+        &path,
+        shipped.replace(
+            "account = \"codex-subscription\"",
+            "account = \"codex-subscription\"\ntransport = \"quic\"",
+        ),
+    )
+    .unwrap();
+    let (code, stderr) = show_in(root.path(), "ws");
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("invalid `[adapter_settings]`"), "{stderr}");
+    assert!(stderr.contains("websocket"), "{stderr}");
+}

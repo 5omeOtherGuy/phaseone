@@ -27,7 +27,9 @@ use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource};
-use p1_provider_openai::{ROUTE, ResponsesAccount, ResponsesAdapterSettings, build_request};
+use p1_provider_openai::{
+    ROUTE, ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport, build_request,
+};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
 
@@ -185,6 +187,7 @@ fn the_shipped_responses_route_holds_what_the_host_used_to_compile() {
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
             account: ResponsesAccount::CodexSubscription,
+            transport: ResponsesTransport::Sse,
         })
     );
     assert!(route.headers.is_empty(), "no static headers on this route");

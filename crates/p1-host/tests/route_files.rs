@@ -20,13 +20,16 @@ use p1_contracts::{
 };
 use p1_core::{Agent, AgentParts, ResumeError};
 use p1_host::activity::CompletionHub;
-use p1_host::catalog::{build_catalog, chat_route, resolve_environment, route_provider};
+use p1_host::catalog::{
+    build_catalog, chat_route, resolve_environment, responses_route, route_provider,
+};
 use p1_host::cli::SandboxMode;
 use p1_host::routes::{AdapterSettings, RouteFile, load_all_routes, load_route, load_route_by_id};
 use p1_model_profile::ModelProfile;
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
+use p1_provider_openai::{ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport};
 use p1_provider_openai_chat::{ChatAdapterSettings, ChatDialect, build_request};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
@@ -1373,5 +1376,155 @@ fn a_declared_endpoint_is_used_verbatim() {
     assert_eq!(
         alpha.route.credential.env.as_deref(),
         Some("P1_ROUTE_FILES_TEST_KEY")
+    );
+}
+
+// ---------------------------------------------- the Responses `transport` setting
+
+/// A scratch root holding the shipped Codex route and the profile it serves, with
+/// one environment selecting them: the Responses adapter's own composition path.
+fn codex_scratch() -> Scratch {
+    let scratch = Scratch::new();
+    scratch.copy_shipped_routes();
+    scratch.copy_shipped_profiles();
+    scratch.write_environment(
+        "codex",
+        &environment_file("openai-codex-subscription", "gpt-5.6-sol"),
+    );
+    scratch
+}
+
+/// The shipped Responses route file with one `[adapter_settings]` line added.
+fn codex_route_with(scratch: &Scratch, settings: &str) {
+    let shipped = std::fs::read_to_string(repo("routes/openai-codex-subscription.toml"))
+        .expect("the shipped route file");
+    let body = with(
+        &shipped,
+        "account = \"codex-subscription\"",
+        &format!("account = \"codex-subscription\"\n{settings}"),
+    );
+    scratch.write_route("openai-codex-subscription", &body);
+}
+
+fn codex_settings(scratch: &Scratch) -> AdapterSettings {
+    load_route(&scratch.route_path("openai-codex-subscription"))
+        .expect("the route loads")
+        .settings()
+        .expect("the adapter parses its settings")
+}
+
+/// ADR-0047 §1: `transport` is route data. Absent means `sse` — which is what the
+/// SHIPPED route file still says, because the shipped route switches only after the
+/// lead's live probe.
+#[test]
+fn a_responses_route_declares_its_transport_and_absent_means_sse() {
+    let scratch = codex_scratch();
+    let shipped = std::fs::read_to_string(repo("routes/openai-codex-subscription.toml"))
+        .expect("the shipped route file");
+    assert!(
+        !shipped.contains("transport"),
+        "the shipped route stays on SSE until the live probe has passed"
+    );
+
+    assert_eq!(
+        codex_settings(&scratch),
+        AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+            account: ResponsesAccount::CodexSubscription,
+            transport: ResponsesTransport::Sse,
+        })
+    );
+    let route = load_route(&scratch.route_path("openai-codex-subscription")).unwrap();
+    assert_eq!(
+        responses_route(&route)
+            .expect("the route composes")
+            .transport,
+        ResponsesTransport::Sse
+    );
+
+    for (value, expected) in [
+        ("sse", ResponsesTransport::Sse),
+        ("websocket", ResponsesTransport::Websocket),
+    ] {
+        codex_route_with(&scratch, &format!("transport = \"{value}\""));
+        assert_eq!(
+            codex_settings(&scratch),
+            AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+                account: ResponsesAccount::CodexSubscription,
+                transport: expected,
+            }),
+            "{value}"
+        );
+        // The route the provider is composed from carries it: the transport is
+        // route data, never a compiled decision.
+        let route = load_route(&scratch.route_path("openai-codex-subscription")).unwrap();
+        assert_eq!(
+            responses_route(&route)
+                .expect("the route composes")
+                .transport,
+            expected,
+            "{value}"
+        );
+    }
+}
+
+/// Any other value fails the load, like every other unknown setting (ADR-0047 §1).
+#[test]
+fn an_unknown_transport_is_a_route_file_error() {
+    for value in ["quic", "WebSocket", "ws", ""] {
+        let scratch = codex_scratch();
+        codex_route_with(&scratch, &format!("transport = \"{value}\""));
+        let error = load_route(&scratch.route_path("openai-codex-subscription"))
+            .expect_err("only the two documented values load");
+        assert!(
+            error.contains("invalid `[adapter_settings]`"),
+            "{value}: {error}"
+        );
+        assert!(
+            error.contains("websocket") && error.contains("sse"),
+            "{value}: the error names the values that exist: {error}"
+        );
+    }
+}
+
+/// The host hands the REAL connector to a route that asks for WebSocket: assembly
+/// succeeds, which it cannot do without one (the provider refuses a WebSocket route
+/// that has none). Composition opens no socket and reads no credential.
+#[test]
+fn a_websocket_route_assembles_with_the_real_connector_and_an_unchanged_origin() {
+    let scratch = codex_scratch();
+    codex_route_with(&scratch, "transport = \"websocket\"");
+
+    let assembled = assemble_scratch(&scratch, "codex").expect("the route composes");
+    assert_eq!(
+        assembled.resolved.route.origin,
+        Origin {
+            route: "openai-responses/codex-subscription".into(),
+            model: "gpt-5.6-sol".into(),
+        },
+        "the transport is not part of a response's origin (§7): the same route keeps the same origin"
+    );
+
+    // The same through the catalog factory the host itself uses.
+    let resolved = scratch
+        .resolve("codex")
+        .expect("the route serves the profile");
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let provider = route_provider(
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(ScriptedTransport::new(Vec::new())),
+        Arc::new(Fixed),
+    )
+    .expect("a websocket route composes with the real connector");
+    assert_eq!(
+        provider.describe().origin,
+        Origin {
+            route: "openai-responses/codex-subscription".into(),
+            model: "gpt-5.6-sol".into(),
+        }
     );
 }
