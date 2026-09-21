@@ -4,7 +4,7 @@ title: Model selection and switching a session to another model
 status: proposed
 date: 2026-09-21
 deciders: owner+lead
-supersedes: [33]
+supersedes: []
 superseded_by: []
 sources: [docs/design/model-selection.md, docs/adr/0033-a-session-resumes-only-on-the-route-and-model-that-recorded-it.md, crates/p1-core/src/resume.rs]
 ---
@@ -33,6 +33,8 @@ as before) and rejects the rest with a reason. The same rule decides resume, so
 
 ## Consequences
 
+- On acceptance this ADR supersedes ADR-0033 (`supersedes: [33]` is set then, with ADR-0033's
+  `superseded_by`).
 - A switch or a resume on another model can be refused, with a reason, before anything is
   sent or committed; it is never silently lossy beyond dropping foreign reasoning.
 - Every adapter's `validate` must inspect history items, and conformance gains checks for
