@@ -9,6 +9,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -21,9 +22,10 @@ use p1_assembly::Catalog;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
     AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
-    ContextInput, ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, TurnEnd,
+    ContextInput, ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, Tool,
+    TurnEnd,
 };
-use p1_core::{Agent, AgentParts, ResumeReport};
+use p1_core::{Agent, AgentParts, Reconfiguration, ResumeReport};
 #[cfg(feature = "delegation")]
 use p1_journal::MemoryJournal;
 
@@ -220,21 +222,7 @@ fn selection(deps: &HostDeps, options: &Options) -> Result<crate::models::Choice
 /// environment then profile. Every failure is a usage error: the reference, the
 /// scope or `settings.toml` is what the operator fixes.
 fn models_command(deps: &HostDeps, options: &Options, search: Option<&str>) -> i32 {
-    let locations = crate::auth::locations(deps);
-    let outcome = (|| -> Result<String, String> {
-        let settings = crate::models::load_settings(&locations)?;
-        let all = crate::models::enumerate(&deps.environment_dirs)?;
-        let scope = crate::models::scope(options.models.as_deref(), &settings, &all)?;
-        let default = crate::models::default_model(&settings, &deps.environment_dirs, &all)?;
-        let rows: Vec<crate::models::Model> = crate::models::search(&all, search)
-            .into_iter()
-            .cloned()
-            .collect();
-        crate::models::table(&rows, &scope, default.as_deref(), |route| {
-            crate::catalog::credential_line_for_route(route, &deps.environment_dirs, &locations)
-        })
-    })();
-    match outcome {
+    match model_table(deps, options.models.as_deref(), search) {
         Ok(table) => {
             write_stdout(deps, &table);
             EXIT_OK
@@ -244,6 +232,27 @@ fn models_command(deps: &HostDeps, options: &Options, search: Option<&str>) -> i
             EXIT_USAGE
         }
     }
+}
+
+/// The `p1 models` table for one scope flag and one optional search — the ONE
+/// computation, shared by the command and by the line mode's bare `/model` line.
+fn model_table(
+    deps: &HostDeps,
+    scope_flag: Option<&str>,
+    search: Option<&str>,
+) -> Result<String, String> {
+    let locations = crate::auth::locations(deps);
+    let settings = crate::models::load_settings(&locations)?;
+    let all = crate::models::enumerate(&deps.environment_dirs)?;
+    let scope = crate::models::scope(scope_flag, &settings, &all)?;
+    let default = crate::models::default_model(&settings, &deps.environment_dirs, &all)?;
+    let rows: Vec<crate::models::Model> = crate::models::search(&all, search)
+        .into_iter()
+        .cloned()
+        .collect();
+    crate::models::table(&rows, &scope, default.as_deref(), |route| {
+        crate::catalog::credential_line_for_route(route, &deps.environment_dirs, &locations)
+    })
 }
 
 /// `p1 env show NAME`: assemble with the real catalog and print the resolved
@@ -474,6 +483,10 @@ pub async fn run_with_front_end(
     let context = agent_context(&assembled)?;
     let route = assembled.resolved.route.origin.route.clone();
     let model = assembled.resolved.route.origin.model.clone();
+    // The session's model, for a later switch (ADR-0049 stage 3): the environment it
+    // runs, the profile it selected and the `finish` tool it keeps.
+    let session_environment = assembled.resolved.environment.clone();
+    let session_finish = finish_tool(&assembled);
 
     // Announce the assembled parent before the agent is built: the front end
     // builds its parent renderer from this.
@@ -496,17 +509,18 @@ pub async fn run_with_front_end(
         Some(completion) => completion.log.clone(),
         None => Arc::new(ActivityLog::default()),
     };
-    let events: Arc<dyn EventSink> = Arc::new(ActivityTee::new(
+    let activity = Arc::new(ParentActivity::new(
         front_end.event_sink(),
-        log.clone(),
+        log,
         &assembled.tools,
     ));
+    let events: Arc<dyn EventSink> = activity.clone();
     // The guard is headless-only (completion.md §3c); an interactive user sees the
     // summaries and decides.
     let mut stall: Option<Arc<StallGuard>> = None;
     let events: Arc<dyn EventSink> = if headless {
         let guard = Arc::new(StallGuard::new(
-            log,
+            activity.clone(),
             options.max_idle_summaries,
             cancel.clone(),
         ));
@@ -556,6 +570,25 @@ pub async fn run_with_front_end(
         .map(|service| service.clone() as Arc<dyn crate::frontend::WorkerService>);
     #[cfg(not(feature = "delegation"))]
     let workers: Option<Arc<dyn crate::frontend::WorkerService>> = None;
+
+    // The model-switch context (ADR-0049 stage 3): the SAME catalog, cache-key
+    // policy and completion plumbing the start path used, plus the session's own
+    // `finish` tool. The line mode uses it between turns; the TUI's run loop will.
+    deps.model_switch = Some(Arc::new(ModelSwitch {
+        catalog: catalog.clone(),
+        completion: completion_hub.clone(),
+        activity: activity.clone(),
+        environment_dirs: deps.environment_dirs.clone(),
+        workspace: workspace.clone(),
+        substitutions: substitutions.clone(),
+        scope: options.models.clone(),
+        session: Mutex::new(SessionModel {
+            environment: session_environment,
+            profile: choice.profile.clone(),
+            finish: session_finish,
+        }),
+    }));
+
     let code = front_end
         .run(deps, &mut agent, &cancel, workers, stall)
         .await;
@@ -805,6 +838,10 @@ async fn inbox_turn(
     }
 }
 
+/// The interactive line loop: one turn per line, `/exit` to stop, and — ADR-0049
+/// stage 3 — `/model` and `/effort` to switch the model of the running session.
+/// The loop only ever runs between turns, so a switch never lands inside a tool
+/// loop. Every other `/…` line stays what it is today: a prompt for the model.
 pub(crate) async fn run_interactive(
     deps: &HostDeps,
     agent: &mut Agent,
@@ -849,6 +886,31 @@ pub(crate) async fn run_interactive(
         if text == "/exit" {
             break;
         }
+        if let Some(switch) = &deps.model_switch
+            && let Some(reference) = argument(text, "/model")
+        {
+            if reference.is_empty() {
+                match model_table(deps, switch.scope_flag(), None) {
+                    Ok(table) => write_stderr(deps, &table),
+                    Err(reason) => write_stderr(deps, &format!("· {reason}\n")),
+                }
+            } else {
+                report_model(
+                    deps,
+                    switch_model(switch, agent, SwitchRequest::Model(reference)),
+                );
+            }
+            continue;
+        }
+        if let Some(switch) = &deps.model_switch
+            && let Some(level) = argument(text, "/effort")
+        {
+            report_model(
+                deps,
+                switch_model(switch, agent, SwitchRequest::Effort(level)),
+            );
+            continue;
+        }
         let end = match race_turn(agent.run_turn(text.to_string(), cancel.clone()), &second).await {
             Some(end) => end,
             None => return EXIT_CANCELLED,
@@ -868,6 +930,206 @@ pub(crate) async fn run_interactive(
         }
     }
     EXIT_OK
+}
+
+/// The argument of a `/name` line: `Some("")` for the bare command, `Some(rest)`
+/// when whitespace follows it, and `None` for anything else — so `/models` is not
+/// `/model` and stays a prompt for the model.
+fn argument<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(name)?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest.trim())
+    } else {
+        None
+    }
+}
+
+/// What a `/model` or `/effort` line did, on the host's own channel.
+fn report_model(deps: &HostDeps, outcome: Result<String, String>) {
+    match outcome {
+        Ok(model) => write_stderr(deps, &format!("· model: {model}\n")),
+        Err(reason) => write_stderr(deps, &format!("· model not changed: {reason}\n")),
+    }
+}
+
+// ------------------------------------------ the model switch (ADR-0049 stage 3)
+//
+// A switch does not touch the renderer. The per-response line already names the
+// model that produced THAT response — `ResponseCompleted` carries the response
+// item's own origin model — but its ROUTE prefix is the parent's assembled route,
+// and no event carries a route: a switch between profiles of one route shows no
+// mismatch, and naming the route of a switched response would need the front-end
+// seam.
+
+/// The catalog key of the `finish` tool (`catalog.rs`). Its activity log and its
+/// outcome are SESSION state — fed from the event stream and read by the run — so a
+/// switch keeps the session's instance of it.
+const FINISH_MODULE: &str = "finish";
+
+/// Where the `finish` tool sits in an assembly: `resolved.tools` and `tools` are
+/// built from the same environment list, in order.
+fn finish_index(assembled: &Assembled) -> Option<usize> {
+    assembled
+        .resolved
+        .tools
+        .iter()
+        .position(|tool| tool.module == FINISH_MODULE)
+}
+
+/// The session's `finish` tool in an assembly, when the environment declares one.
+fn finish_tool(assembled: &Assembled) -> Option<Arc<dyn Tool>> {
+    finish_index(assembled).map(|index| assembled.tools[index].clone())
+}
+
+/// The session's model (ADR-0049 stage 3): what a `/model` or `/effort` line
+/// changes, plus the `finish` tool the session keeps.
+struct SessionModel {
+    /// The environment the session runs now: §1 rule 2's "current environment".
+    environment: String,
+    /// The profile the session selected (`None` keeps the environment's own).
+    profile: Option<String>,
+    /// The `finish` tool the session keeps, when its environment assembles one.
+    finish: Option<Arc<dyn Tool>>,
+}
+
+/// Everything a model switch needs of the host (ADR-0049 stage 3, spec §4). `run`
+/// builds it once the catalog and the parent's activity plumbing exist and stores it
+/// on [`HostDeps`], so the line mode switches now and the TUI's run loop can call
+/// [`switch_model`] with it.
+pub(crate) struct ModelSwitch {
+    /// The session's catalog: a switch assembles exactly as the start path did.
+    catalog: Arc<Catalog>,
+    /// The hub the catalog's `finish` factory issues into.
+    completion: Arc<CompletionHub>,
+    /// The parent's activity plumbing, re-pointed when the switched `finish` is not
+    /// the session's own.
+    activity: Arc<ParentActivity>,
+    /// The parent's environment search path, workspace and substitutions.
+    environment_dirs: Vec<PathBuf>,
+    workspace: PathBuf,
+    substitutions: Substitutions,
+    /// The run's `--models` scope, for the bare `/model` table.
+    scope: Option<String>,
+    session: Mutex<SessionModel>,
+}
+
+impl ModelSwitch {
+    /// The `--models` value this run was given, if any.
+    fn scope_flag(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+}
+
+/// What a `/model` or `/effort` line asks for (spec §4).
+pub(crate) enum SwitchRequest<'a> {
+    /// `/model REF`: a model reference — `E/P`, a bare `P`, optionally `:effort`.
+    Model(&'a str),
+    /// `/effort LEVEL`: the model the session runs now, with a new effort only.
+    Effort(&'a str),
+}
+
+/// The ONE model-switch entry point (ADR-0049 stage 3, spec §1 and §4): resolve the
+/// reference against the CURRENT session environment, load the environment, apply
+/// the selection, resolve the route binding and assemble EXACTLY as the start path
+/// does — the same catalog, the same cache-key policy with the parent's ordinal —
+/// then hand the result to `Agent::reconfigure`, which validates it against the
+/// current history.
+///
+/// On success the new `E/P[:effort]` is returned and the session's model state is
+/// updated. On any failure the reason is returned and NOTHING changes: the agent
+/// keeps its model.
+pub(crate) fn switch_model(
+    switch: &ModelSwitch,
+    agent: &mut Agent,
+    request: SwitchRequest<'_>,
+) -> Result<String, String> {
+    let mut session = switch.session.lock().unwrap();
+    let choice = match request {
+        SwitchRequest::Model(reference) => {
+            let models = crate::models::enumerate(&switch.environment_dirs)?;
+            let resolved = crate::models::resolve(reference, &session.environment, &models)?;
+            crate::models::Choice {
+                environment: resolved.environment,
+                profile: Some(resolved.profile),
+                effort: resolved.effort,
+            }
+        }
+        // `/effort LEVEL` keeps the model and replaces only the effort.
+        SwitchRequest::Effort(level) => crate::models::Choice {
+            environment: session.environment.clone(),
+            profile: session.profile.clone(),
+            effort: Some(crate::models::parse_effort(level)?),
+        },
+    };
+    let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
+        .map_err(|error| error.to_string())?;
+    crate::models::apply(&mut environment, &choice, &switch.environment_dirs)?;
+    crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
+    let assembled = assemble_with_cache_key(
+        &switch.catalog,
+        &environment,
+        &switch.workspace,
+        &switch.substitutions,
+        PARENT_ORDINAL,
+    )?;
+    // The catalog's `finish` factory issued this assembly its own completion. Take
+    // it, so the hub cannot hand a stale one to a later worker assembly, and so it
+    // is there for the switched tool set's own `finish` (below).
+    let issued = switch.completion.take();
+    let finish_at = finish_index(&assembled);
+    let context = agent_context(&assembled)?;
+    let mut tools = assembled.tools;
+    // The switched tool set's `finish` must reach the completion the run reads. The
+    // session keeps ITS `finish` — the whole session's activity is in that tool's
+    // log — when the environment declares it under the same model-facing name;
+    // otherwise the switched tool set's own is the session's from now on, and the
+    // plumbing follows the completion the catalog just issued it (which the `finish`
+    // factory always does).
+    let adopted = match (&session.finish, finish_at) {
+        (Some(kept), Some(index)) if kept.declaration().name == tools[index].declaration().name => {
+            tools[index] = kept.clone();
+            None
+        }
+        (_, Some(_)) => issued,
+        _ => None,
+    };
+    // `reconfigure` validates against the CURRENT history and, on failure, changes
+    // nothing at all — so the session state below is only updated once it is `Ok`.
+    agent
+        .reconfigure(Reconfiguration {
+            provider: assembled.provider,
+            tools: tools.clone(),
+            system_prompt: assembled.system_prompt,
+            options: assembled.options,
+            context,
+        })
+        .map_err(|error| error.to_string())?;
+    if let Some(completion) = adopted {
+        // The switched `finish` writes the completion the catalog issued: point the
+        // parent's activity plumbing (and the §3c guard, which reads it) at it, so
+        // file changes and summaries reach the log that tool reads.
+        switch.activity.repoint(completion.log.clone(), &tools);
+        session.finish = finish_at.map(|index| tools[index].clone());
+    }
+    session.environment = environment.name.clone();
+    session.profile = environment
+        .profile
+        .as_ref()
+        .map(|profile| profile.id.clone());
+    Ok(model_name(&environment))
+}
+
+/// The model a loaded environment runs, as the operator writes it: `E/P`, with the
+/// effort its `[options]` carry when they carry one.
+fn model_name(environment: &p1_assembly::EnvironmentFile) -> String {
+    let model = match &environment.profile {
+        Some(profile) => format!("{}/{}", environment.name, profile.id),
+        None => environment.name.clone(),
+    };
+    match environment.options.reasoning_effort {
+        Some(effort) => format!("{model}:{}", crate::models::effort_name(effort)),
+        None => model,
+    }
 }
 
 /// Run inbox turns until the inbox is empty, without blocking on running
@@ -930,6 +1192,58 @@ where
     }
 }
 
+// ------------------------------------------------------ the parent's activity
+
+/// The parent's activity plumbing (ADR-0049 stage 3): every event goes to the front
+/// end unchanged and is recorded into the log of the assembly that is CURRENT, and
+/// the §3c guard counts that log's replacements. A model switch re-points it at the
+/// completion the switched tool set's `finish` writes, so the activity log and the
+/// `finish` outcome stay the session's, not the switched-to model's.
+struct ParentActivity {
+    /// The front end's sink, to build the next tee with.
+    front: Arc<dyn EventSink>,
+    current: Mutex<CurrentActivity>,
+}
+
+struct CurrentActivity {
+    /// The log the current `finish` tool writes; the guard reads it.
+    log: Arc<ActivityLog>,
+    /// Records into that log (its own clone of it) and forwards to the front end.
+    tee: ActivityTee,
+}
+
+impl ParentActivity {
+    fn new(front: Arc<dyn EventSink>, log: Arc<ActivityLog>, tools: &[Arc<dyn Tool>]) -> Self {
+        let tee = ActivityTee::new(front.clone(), log.clone(), tools);
+        Self {
+            front,
+            current: Mutex::new(CurrentActivity { log, tee }),
+        }
+    }
+
+    /// Follow another assembly's completion: its log and its tools (the effect of a
+    /// call comes from the tool that will actually run it).
+    fn repoint(&self, log: Arc<ActivityLog>, tools: &[Arc<dyn Tool>]) {
+        let tee = ActivityTee::new(self.front.clone(), log.clone(), tools);
+        *self.current.lock().unwrap() = CurrentActivity { log, tee };
+    }
+
+    /// One committed context replacement, in the CURRENT log (completion.md §3c).
+    fn record_replacement(&self) {
+        self.current.lock().unwrap().log.record_replacement();
+    }
+
+    fn consecutive_replacements(&self) -> u64 {
+        self.current.lock().unwrap().log.consecutive_replacements()
+    }
+}
+
+impl EventSink for ParentActivity {
+    fn emit(&self, event: AgentEvent) {
+        self.current.lock().unwrap().tee.emit(event);
+    }
+}
+
 // ------------------------------------------------------ stall guard (completion.md §3c)
 
 /// The headless §3c guard: count consecutive context replacements and cancel the
@@ -939,16 +1253,16 @@ where
 /// Opaque to a front end: it is handed to [`crate::frontend::FrontEnd::run`] so the
 /// line drivers can report a stall, and a custom front end may ignore it.
 pub struct StallGuard {
-    log: Arc<ActivityLog>,
+    activity: Arc<ParentActivity>,
     max: usize,
     cancel: CancellationToken,
     stalled: AtomicBool,
 }
 
 impl StallGuard {
-    fn new(log: Arc<ActivityLog>, max: usize, cancel: CancellationToken) -> Self {
+    fn new(activity: Arc<ParentActivity>, max: usize, cancel: CancellationToken) -> Self {
         Self {
-            log,
+            activity,
             max,
             cancel,
             stalled: AtomicBool::new(false),
@@ -958,8 +1272,8 @@ impl StallGuard {
     /// One committed `ContextReplaced` was observed. On reaching the bound the
     /// guard latches and cancels the turn; the driver then reports the stall.
     fn on_context_replaced(&self) {
-        self.log.record_replacement();
-        if self.max > 0 && self.log.consecutive_replacements() >= self.max as u64 {
+        self.activity.record_replacement();
+        if self.max > 0 && self.activity.consecutive_replacements() >= self.max as u64 {
             self.stalled.store(true, Ordering::SeqCst);
             self.cancel.cancel();
         }
