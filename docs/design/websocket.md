@@ -124,7 +124,10 @@ process starts with a new connection and a full body.
   busy connection → SSE; cancellation drops the socket; `transport` absent → byte-identical SSE.
 - **Stage C — continuation**: §6, with tests for each of the three rules failing and for the
   full-body recovery rows of §5.
-- **Live probe (lead only, few requests)**: `environments/gpt` with a scratch route set to
-  `websocket`: a connect succeeds; a two-turn task reports a lower `input_uncached` on turn ≥ 2
-  than the SSE arm with the same accepted result. Only then does the shipped route switch.
-  No latency claim is made from this.
+- **Live probe (lead only) — RUN 2026-09-21, see `docs/research/41-websocket.md`.** The
+  subscription backend accepts the upgrade and the continuation. The criterion first written
+  here (a lower `input_uncached` on turn ≥ 2) was the wrong metric: the server counts the
+  remembered context as input, so reported usage does not change; on a small task neither cache
+  share nor wall time differed between the arms. The shipped route therefore stays `sse`.
+  A comparison on long sessions (upload size) is open and needs the transport to be visible to
+  the operator first. No latency claim is made.

@@ -266,6 +266,12 @@ impl p1_provider_http::ws::WsConnection for CountingConnection {
         &'a mut self,
         text: String,
     ) -> futures_util::future::BoxFuture<'a, Result<(), p1_provider_http::ws::WsError>> {
+        // Sizes and one flag only — never the frame's content.
+        println!(
+            "   frame sent: {} bytes, continuation: {}",
+            text.len(),
+            text.contains("\"previous_response_id\"")
+        );
         self.inner.send_text(text)
     }
 
