@@ -26,7 +26,7 @@ use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_anthropic::{MessagesAccount, MessagesAdapterSettings, ROUTE, build_request};
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
-use p1_provider_http::testing::ScriptedTransport;
+use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
@@ -112,7 +112,9 @@ fn composed(environment: &str) -> Composed {
     }
 }
 
-/// The provider the catalog factory would build for this composition.
+/// The provider the catalog factory would build for this composition. The connector
+/// is injected next to the transport (ADR-0047 §1); a Messages route never asks for
+/// WebSocket, so it ignores it.
 fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = composed
         .route
@@ -123,6 +125,7 @@ fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Pro
         binding,
         composed.profile.clone(),
         Arc::new(transport),
+        Arc::new(RefusingWsConnector::default()),
         Arc::new(Fixed),
     )
     .expect("the shipped route composes")

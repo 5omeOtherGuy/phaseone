@@ -27,7 +27,9 @@ use p1_host::catalog::route_provider;
 use p1_host::routes::{RouteFile, load_route_by_id};
 use p1_model_profile::ModelProfile;
 use p1_provider_http::Transport;
-use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
+use p1_provider_http::testing::{
+    BodyEnd, RefusingWsConnector, ScriptedResponse, ScriptedTransport,
+};
 
 const SSE_TEXT: &str = r#"event: response.output_item.done
 data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"ok"}]}}
@@ -56,6 +58,12 @@ fn profile(id: &str) -> Arc<ModelProfile> {
 
 /// The provider the host's own catalog factory builds for this route: the shipped
 /// route file, its binding and the REAL credential source over a scratch home.
+///
+/// The connector is injected like the transport (ADR-0047 §1). The shipped Codex
+/// route asks for WebSocket, so this test must hand it one that REFUSES every
+/// upgrade: §5 then falls back to SSE at once and the scripted HTTP transport serves
+/// the request, exactly as these expectations were recorded. The real connector —
+/// what the host composes — would reach the internet, which no test may do.
 fn provider(
     route_id: &str,
     profile_id: &str,
@@ -74,6 +82,7 @@ fn provider(
         &binding,
         profile(profile_id),
         transport,
+        Arc::new(RefusingWsConnector::default()),
         credentials,
     )
     .expect("the shipped route and profile compose")

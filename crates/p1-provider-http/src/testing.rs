@@ -251,6 +251,59 @@ impl WsConnector for ScriptedWsConnector {
     }
 }
 
+/// A connector that REFUSES every connect with one status forever.
+///
+/// `ScriptedWsConnector` consumes one scripted attempt per connect, so a test that
+/// only wants "this route never reaches a socket" would have to guess how many
+/// attempts the provider makes. This one answers every handshake the same way — the
+/// upgrade is refused with status 404 by default, which §5 of
+/// `docs/design/websocket.md` turns into an immediate fall back to SSE — and counts
+/// the handshakes so a test can prove the connector was never used at all.
+#[derive(Clone, Debug)]
+pub struct RefusingWsConnector {
+    status: u16,
+    handshakes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RefusingWsConnector {
+    /// Refuse every upgrade with `status`.
+    pub fn new(status: u16) -> Self {
+        Self {
+            status,
+            handshakes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// How many handshakes were attempted.
+    pub fn handshakes(&self) -> usize {
+        self.handshakes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Default for RefusingWsConnector {
+    /// The "the endpoint says no" refusal: §5 falls back to SSE at once.
+    fn default() -> Self {
+        Self::new(404)
+    }
+}
+
+impl WsConnector for RefusingWsConnector {
+    fn connect<'a>(
+        &'a self,
+        _request: WsHandshake,
+    ) -> BoxFuture<'a, Result<Box<dyn WsConnection>, WsConnectError>> {
+        self.handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let status = self.status;
+        Box::pin(async move {
+            Err(WsConnectError::Status {
+                status,
+                body: Vec::new(),
+            })
+        })
+    }
+}
+
 /// One scripted connection attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScriptedConnection {
@@ -538,5 +591,39 @@ mod tests {
     async fn ws_panics_when_asked_for_more_connections_than_scripted() {
         let connector = ScriptedWsConnector::new(Vec::new());
         let _ = connector.connect(handshake("wss://a.test")).await;
+    }
+
+    #[tokio::test]
+    async fn refusing_connector_refuses_every_attempt_and_counts_them() {
+        let connector = RefusingWsConnector::default();
+        for _ in 0..3 {
+            let error = connector
+                .connect(handshake("wss://a.test"))
+                .await
+                .err()
+                .expect("a refusing connector never opens a connection");
+            assert_eq!(
+                error,
+                WsConnectError::Status {
+                    status: 404,
+                    body: Vec::new(),
+                }
+            );
+        }
+        assert_eq!(connector.handshakes(), 3);
+        let unauthorized = RefusingWsConnector::new(401);
+        let error = unauthorized
+            .connect(handshake("wss://a.test"))
+            .await
+            .err()
+            .expect("a refusing connector never opens a connection");
+        assert_eq!(
+            error,
+            WsConnectError::Status {
+                status: 401,
+                body: Vec::new(),
+            },
+            "the refusal status is the caller's"
+        );
     }
 }

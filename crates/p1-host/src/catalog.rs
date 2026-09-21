@@ -227,6 +227,11 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
             ));
         }
         let transport = deps.transport.clone();
+        // ADR-0047 §1: the host composes the REAL WebSocket connector next to the
+        // HTTP transport, once per catalog. Composition opens no socket: only a
+        // request on a route that asks for `transport = "websocket"` connects.
+        let ws: Arc<dyn p1_provider_http::ws::WsConnector> =
+            Arc::new(p1_provider_http::ws::TungsteniteConnector::new());
         let locations = locations.clone();
         let route = Arc::new(route);
         let data = route.clone();
@@ -237,7 +242,14 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
                 let binding = data.binding(&profile.id)?;
                 let credentials =
                     crate::auth::credential_source_at(&data, transport.clone(), &locations);
-                route_provider(&data, binding, profile, transport.clone(), credentials)
+                route_provider(
+                    &data,
+                    binding,
+                    profile,
+                    transport.clone(),
+                    ws.clone(),
+                    credentials,
+                )
             }),
         );
     }
@@ -315,11 +327,17 @@ pub fn reject_profile(spec: &ProviderSpec) -> Result<(), String> {
 /// file names builds its provider from the file's own data (spec §2 step 4). The
 /// catalog factory, the live checks and the tests all come through here, so a route
 /// has exactly one construction path.
+///
+/// `ws` is the WebSocket connector, next to the HTTP transport (ADR-0047 §1): the
+/// production factory passes the real one and a test or live check injects its own,
+/// so a test that composes a shipped WebSocket route never opens a socket. A route
+/// that does not ask for WebSocket ignores it.
 pub fn route_provider(
     route: &crate::routes::RouteFile,
     binding: &crate::routes::ModelBinding,
     profile: Arc<p1_model_profile::ModelProfile>,
     transport: Arc<dyn p1_provider_http::Transport>,
+    ws: Arc<dyn p1_provider_http::ws::WsConnector>,
     credentials: Arc<dyn p1_provider_http::CredentialSource>,
 ) -> Result<Arc<dyn Provider>, String> {
     use crate::routes::AdapterSettings;
@@ -348,7 +366,7 @@ pub fn route_provider(
         }
         AdapterSettings::OpenAiResponses(settings) => {
             // ADR-0047 §1: a route that asks for `transport = "websocket"` gets the
-            // real connector here, at composition. The provider refuses a
+            // injected connector here, at composition. The provider refuses a
             // WebSocket route without one, so the two cannot drift apart.
             let transport_mode = settings.transport;
             let mut composition = p1_provider_openai::OpenAiCodexProvider::builder(
@@ -359,8 +377,7 @@ pub fn route_provider(
                 credentials,
             );
             if transport_mode == p1_provider_openai::ResponsesTransport::Websocket {
-                composition = composition
-                    .with_ws_connector(Arc::new(p1_provider_http::ws::TungsteniteConnector::new()));
+                composition = composition.with_ws_connector(ws);
             }
             let provider = composition.build().map_err(|error| error.to_string())?;
             Ok(Arc::new(provider) as Arc<dyn Provider>)

@@ -16,6 +16,8 @@ kind = "codex-oauth"
 
 [adapter_settings]
 account = "codex-subscription"
+# ADR-0047 §1, owner decision 2026-09-21: WebSocket is the default; §5 falls back to SSE.
+transport = "websocket"
 
 # Only profiles the host ships a policy for; any other profile is refused. A dated
 # snapshot is a binding (`wire_model`), not a profile.
