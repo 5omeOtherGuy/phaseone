@@ -107,6 +107,12 @@ pub enum AgentEvent {
         call_id: String,
         text: String,
     },
+    /// A display-only notice from the provider's adapter (ADR-0048): the operator
+    /// is told what the adapter did, nothing else. Never history, never journaled,
+    /// never sent to the model; the text is the adapter's own constant.
+    ProviderNotice {
+        text: String,
+    },
     /// A response completed. `usage` is `None` when unknown — never zero.
     ResponseCompleted {
         model: String,
