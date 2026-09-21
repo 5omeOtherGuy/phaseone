@@ -10,10 +10,12 @@
 //!
 //! §5 is `drive()`'s failure policy re-expressed for a handshake and for error
 //! frames: one forced credential refresh on a refused upgrade, no fallback for a
-//! rate limit, one reconnect per request, and a fallback to today's SSE path —
-//! which also turns WebSocket off for this provider instance. After model-visible
-//! output every failure is an ordinary `Transport` failure of that response. Every
-//! row of that table has a named test in `tests/websocket.rs`.
+//! rate limit, one reconnect for each of the three "once" rows, a reconnect inside
+//! the adapter's retry budget — waiting the same backoff `drive` waits — for a
+//! transient failure, and a fallback to today's SSE path, which also turns
+//! WebSocket off for this provider instance. After model-visible output every
+//! failure is an ordinary `Transport` failure of that response. Every row of that
+//! table has a named test in `tests/websocket.rs`.
 //!
 //! §6 (continuation, stage C): the connection also remembers the response it
 //! completed last, and the next request whose body continues that response is sent
@@ -35,7 +37,7 @@ use p1_contracts::{
     CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream, StreamEvent,
 };
 use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsHandshake};
-use p1_provider_http::{Credential, CredentialSource, ResponseParser, SseEvent};
+use p1_provider_http::{Credential, CredentialSource, ResponseParser, RetryPolicy, SseEvent};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -59,6 +61,10 @@ const MAX_IDLE: Duration = Duration::from_secs(5 * 60);
 pub(crate) struct WebSocket {
     connector: Arc<dyn WsConnector>,
     clock: Clock,
+    /// §5's transient row waits this policy's backoff, up to its `max_retries`: the
+    /// adapter's default policy — 3 retries, 2 s doubling, so the same backoff the
+    /// SSE driver waits.
+    retry: RetryPolicy,
     slot: Arc<Mutex<Slot>>,
     /// Set when a request fell back to SSE: this instance speaks SSE from then on.
     disabled: AtomicBool,
@@ -272,6 +278,7 @@ impl WebSocket {
         Self {
             connector,
             clock,
+            retry: RetryPolicy::default(),
             slot: Arc::new(Mutex::new(Slot { connection: None })),
             disabled: AtomicBool::new(false),
         }
@@ -335,6 +342,8 @@ enum Phase {
     Send,
     /// Read frames until the parser's terminal event.
     Read,
+    /// Wait out the backoff of §5's transient row, racing cancellation.
+    Wait { delay: Duration },
     /// Run today's SSE path for this request (§5).
     Fallback,
     /// The terminal event has been queued; the next poll ends the stream.
@@ -362,12 +371,44 @@ struct State {
     /// Once true, every failure is this response's own failure: no retry, no
     /// fallback (§5).
     visible: bool,
-    /// Reconnects used. §5 allows at most one per request.
-    reconnects: u32,
+    /// §5's transient row: the reconnects (each after the retry policy's backoff)
+    /// this request has already used.
+    transient_retries: u32,
+    /// §5's three "once" rows, each of which reconnects at most once per request.
+    once: OnceRows,
     /// Whether the one forced credential refresh has been used.
     refreshed: bool,
     /// The fallback stream, built the first time `Phase::Fallback` is reached.
     sse: Option<ProviderStream>,
+}
+
+/// §5's three "once" rows: each of them reconnects at most ONCE per request,
+/// independently of the transient budget ("Reconnects per request: one for each of
+/// the three 'once' rows, and up to `max_retries` for the transient row").
+#[derive(Default)]
+struct OnceRows {
+    /// "A reused socket closes before its first frame".
+    reused_close: bool,
+    /// The two error events that say the CONNECTION, not the request, cannot carry
+    /// this response. Slotted by [`ReconnectRow::slot`].
+    error_event: [bool; 2],
+}
+
+/// The two error events §5 reconnects for, each an "once" row of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectRow {
+    PreviousResponseNotFound,
+    ConnectionLimitReached,
+}
+
+impl ReconnectRow {
+    /// The slot this row's once-flag lives in.
+    fn slot(self) -> usize {
+        match self {
+            Self::PreviousResponseNotFound => 0,
+            Self::ConnectionLimitReached => 1,
+        }
+    }
 }
 
 impl State {
@@ -384,7 +425,8 @@ impl State {
             slot,
             awaiting_first_frame: false,
             visible: false,
-            reconnects: 0,
+            transient_retries: 0,
+            once: OnceRows::default(),
             refreshed: false,
             sse: None,
         }
@@ -414,17 +456,42 @@ impl State {
         self.finish(outcome)
     }
 
-    /// §5: drop the connection — a socket we have read from is never reused, and
-    /// §6's memory goes with it — and open a new one, which sends the FULL body. At
-    /// most once per request.
+    /// §5's "once" rows: drop the connection — a socket we have read from is never
+    /// reused, and §6's memory goes with it — and open a new one at once, which
+    /// sends the FULL body. The caller has already spent that row's one allowance.
     fn reconnect(mut self) -> Self {
-        self.reconnects += 1;
+        self.restart();
+        self.phase = Phase::Connect;
+        self
+    }
+
+    /// §5's transient row: a connect error or timeout, or a read/send error or a
+    /// close before any model-visible output, which is not one of the "once" rows.
+    /// Reconnect with the FULL body after the retry policy's backoff, inside
+    /// `max_retries`; the budget spent, fall back to SSE.
+    fn transient(mut self) -> Self {
+        if self.transient_retries >= self.request.ws.retry.max_retries {
+            return self.fall_back();
+        }
+        self.transient_retries += 1;
+        let delay = self.request.ws.retry.delay(self.transient_retries, None);
+        // Stream rule 4: a back-off yields `Activity`, so the consumer sees life
+        // before the first content event of the next attempt — `drive` does the
+        // same on its own transient path.
+        self.pending.push_back(StreamEvent::Activity);
+        self.restart();
+        self.phase = Phase::Wait { delay };
+        self
+    }
+
+    /// Drop the connection and everything that belonged to this attempt, so the
+    /// next one starts from the beginning of the response on a NEW socket (§4:
+    /// a half-read socket is never reused, and §6's memory lives in the socket).
+    fn restart(&mut self) {
         self.live = None;
         self.parser = new_parser(&self.request);
         self.facts = ResponseFacts::default();
         self.awaiting_first_frame = false;
-        self.phase = Phase::Connect;
-        self
     }
 
     /// §5: run today's `drive()` path for THIS request, and turn WebSocket off for
@@ -451,6 +518,7 @@ async fn step(mut state: State) -> (Option<StreamEvent>, State) {
             Phase::Connect => connect(state).await,
             Phase::Send => send(state).await,
             Phase::Read => read(state).await,
+            Phase::Wait { delay } => wait(state, delay).await,
             Phase::Fallback => fallback(state).await,
         };
     }
@@ -521,11 +589,12 @@ async fn connect(mut state: State) -> State {
     let cancel = state.request.cancel.clone();
     match race_bounded(&cancel, connector.connect(handshake)).await {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
-        // §5: a connect error or a timeout falls back to SSE.
-        Raced::Done(Err(_elapsed)) => state.fall_back(),
+        // §5: a connect error or a timeout is the transient row, whatever the
+        // failure class: the socket never came up, so nothing was sent.
+        Raced::Done(Err(_elapsed)) => state.transient(),
         Raced::Done(Ok(Err(error))) => match error {
             WsConnectError::Status { status, body } => refused_upgrade(state, status, &body),
-            WsConnectError::Failed(_) => state.fall_back(),
+            WsConnectError::Failed(_) => state.transient(),
         },
         Raced::Done(Ok(Ok(connection))) => {
             let now = (state.request.ws.clock)();
@@ -558,8 +627,6 @@ fn refused_upgrade(mut state: State, status: u16, body: &[u8]) -> State {
                 return state.finish(Outcome::Failed(error));
             }
             state.refreshed = true;
-            // The reconnect the refresh buys is the one §5 allows per request.
-            state.reconnects += 1;
             let rejected = state
                 .credential
                 .clone()
@@ -600,10 +667,13 @@ async fn send(mut state: State) -> State {
             state
         }
         // A send that fails on a connection we reused is that socket having gone
-        // away before our first frame: §5 reconnects once for it. On a fresh
-        // connection it is an ordinary send failure, which falls back.
-        Raced::Done(_) if reused(&state) && state.reconnects == 0 => state.reconnect(),
-        Raced::Done(_) => state.fall_back(),
+        // away before our first frame: §5 reconnects once for it — the third
+        // "once" row. Any other send failure is the transient row.
+        Raced::Done(_) if reused(&state) && !state.once.reused_close => {
+            state.once.reused_close = true;
+            state.reconnect()
+        }
+        Raced::Done(_) => state.transient(),
     }
 }
 
@@ -630,9 +700,13 @@ impl State {
     /// event name (§3).
     fn on_frame(mut self, text: &str) -> State {
         // §5: the two error events that say "this connection cannot carry this
-        // request" reconnect once and resend the FULL body — which is the only body
-        // this stage sends. After output they are ordinary failures.
-        if !self.visible && self.reconnects == 0 && reconnect_code(text) {
+        // request" reconnect once each and resend the FULL body — which is the only
+        // body this stage sends. After output they are ordinary failures.
+        if !self.visible
+            && let Some(row) = reconnect_row(text)
+            && !self.once.error_event[row.slot()]
+        {
+            self.once.error_event[row.slot()] = true;
             return self.reconnect();
         }
         self.awaiting_first_frame = false;
@@ -656,7 +730,8 @@ impl State {
 
     /// The connection closed or the read failed.
     fn on_close(mut self) -> State {
-        if self.awaiting_first_frame && reused(&self) && !self.visible && self.reconnects == 0 {
+        if self.awaiting_first_frame && reused(&self) && !self.visible && !self.once.reused_close {
+            self.once.reused_close = true;
             return self.reconnect();
         }
         let outcome = self.parser.on_end();
@@ -665,9 +740,9 @@ impl State {
             // Transport failure of that response: no retry, no fallback.
             self.terminal(outcome)
         } else {
-            // §5's last row: a read error or a close before any output, with the
-            // reconnects above exhausted, falls back to SSE.
-            self.fall_back()
+            // §5's last row: a read error or a close before any output is the
+            // transient row — reconnect inside the retry budget, then fall back.
+            self.transient()
         }
     }
 }
@@ -675,6 +750,20 @@ impl State {
 /// Whether the connection this attempt is using was already open.
 fn reused(state: &State) -> bool {
     state.live.as_ref().is_some_and(|live| live.reused)
+}
+
+/// Wait out §5's transient-row backoff, racing cancellation. The same wait the SSE
+/// driver performs (`tokio::time::sleep`), so a test drives it on the paused clock
+/// and no test ever sleeps for real.
+async fn wait(mut state: State, delay: Duration) -> State {
+    let cancel = state.request.cancel.clone();
+    match race(&cancel, tokio::time::sleep(delay)).await {
+        Raced::Cancelled => state.finish(Outcome::Cancelled),
+        Raced::Done(()) => {
+            state.phase = Phase::Connect;
+            state
+        }
+    }
 }
 
 async fn fallback(mut state: State) -> State {
@@ -816,23 +905,22 @@ fn same_shape(remembered: &Value, body: &Value) -> bool {
     }
 }
 
-/// Whether a frame is one of the two error events §5 reconnects for. The parser
-/// stays the authority for every other event; this only asks whether the
+/// The "once" row a frame names, if any: the two error events §5 reconnects for.
+/// The parser stays the authority for every other event; this only asks whether the
 /// connection, not the request, is the problem.
-fn reconnect_code(text: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return false;
-    };
+fn reconnect_row(text: &str) -> Option<ReconnectRow> {
+    let value: Value = serde_json::from_str(text).ok()?;
     if !matches!(
         value.get("type").and_then(Value::as_str),
         Some("error") | Some("response.failed")
     ) {
-        return false;
+        return None;
     }
-    matches!(
-        frame_error_code(&value).as_deref(),
-        Some("previous_response_not_found") | Some("websocket_connection_limit_reached")
-    )
+    match frame_error_code(&value).as_deref() {
+        Some("previous_response_not_found") => Some(ReconnectRow::PreviousResponseNotFound),
+        Some("websocket_connection_limit_reached") => Some(ReconnectRow::ConnectionLimitReached),
+        _ => None,
+    }
 }
 
 /// The code of an error frame: `response.failed` carries it under
@@ -908,20 +996,28 @@ mod tests {
 
     #[test]
     fn only_the_two_connection_error_events_are_reconnectable() {
-        for code in [
-            "previous_response_not_found",
-            "websocket_connection_limit_reached",
+        for (code, row) in [
+            (
+                "previous_response_not_found",
+                ReconnectRow::PreviousResponseNotFound,
+            ),
+            (
+                "websocket_connection_limit_reached",
+                ReconnectRow::ConnectionLimitReached,
+            ),
         ] {
-            assert!(
-                reconnect_code(&format!(
+            assert_eq!(
+                reconnect_row(&format!(
                     r#"{{"type":"error","error":{{"code":"{code}"}}}}"#
                 )),
+                Some(row),
                 "{code}"
             );
-            assert!(
-                reconnect_code(&format!(
+            assert_eq!(
+                reconnect_row(&format!(
                     r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}"}}}}}}"#
                 )),
+                Some(row),
                 "{code} as response.failed"
             );
         }
@@ -931,7 +1027,7 @@ mod tests {
             r#"{"type":"response.completed","response":{}}"#,
             "not json",
         ] {
-            assert!(!reconnect_code(text), "{text}");
+            assert_eq!(reconnect_row(text), None, "{text}");
         }
     }
 

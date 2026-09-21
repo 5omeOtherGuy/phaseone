@@ -30,7 +30,7 @@ use p1_provider_http::testing::{
     ScriptedConnection, ScriptedFrame, ScriptedResponse, ScriptedTransport, ScriptedWsConnector,
 };
 use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsError, WsHandshake};
-use p1_provider_http::{Credential, CredentialSource};
+use p1_provider_http::{Credential, CredentialSource, RetryPolicy};
 use p1_provider_openai::{
     Clock, OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesAdapterSettings, ResponsesRoute,
     ResponsesTransport,
@@ -1094,9 +1094,15 @@ async fn a_connect_that_never_answers_is_bounded_and_falls_back() {
     let events = turn(&provider).await;
     completed(&events);
     assert_eq!(
+        peer.handshakes(),
+        4,
+        "a connect timeout is the transient row: the first attempt and the three \
+         reconnects the default policy's max_retries allows"
+    );
+    assert_eq!(
         sse.requests().len(),
         1,
-        "the connect bound fell back to SSE"
+        "the retry budget spent, the connect bound fell back to SSE"
     );
 }
 
@@ -1113,6 +1119,11 @@ async fn a_send_that_never_answers_is_bounded_and_falls_back() {
 
     let events = turn(&provider).await;
     completed(&events);
+    assert_eq!(
+        peer.handshakes(),
+        4,
+        "a send bound is the transient row: the first attempt and the three reconnects"
+    );
     assert_eq!(sse.requests().len(), 1, "the send bound fell back to SSE");
 }
 
@@ -1189,7 +1200,7 @@ async fn an_upgrade_refused_with_429_is_rate_limited_without_fallback() {
     assert_eq!(connector.handshakes().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_upgrade_refused_with_another_status_falls_back_to_sse() {
     for status in [400, 404, 500, 503] {
         let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
@@ -1197,50 +1208,143 @@ async fn an_upgrade_refused_with_another_status_falls_back_to_sse() {
             vec![ScriptedConnection::refuse(status, REFUSAL_BODY)],
             sse.clone(),
         );
+        // ONE scripted connection only: a reconnect would panic the peer's script.
+        let start = tokio::time::Instant::now();
         let events = turn(&provider).await;
         completed(&events);
         assert_eq!(sse.requests().len(), 1, "{status}: fell back to SSE");
-        assert_eq!(connector.handshakes().len(), 1, "{status}");
+        assert_eq!(connector.handshakes().len(), 1, "{status}: no reconnect");
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "{status}: the endpoint says no — SSE is next, without even a backoff wait"
+        );
     }
 }
 
-#[tokio::test]
-async fn a_connect_error_falls_back_to_sse() {
+/// §5's transient row: a connect error reconnects with the FULL body for the retry
+/// policy's `max_retries` (3 by default), waiting the policy's backoff between
+/// attempts; the budget spent, the SSE path serves the request.
+#[tokio::test(start_paused = true)]
+async fn a_connect_error_retries_within_the_budget_then_falls_back_to_sse() {
     let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
-    let (provider, connector) =
-        websocket_provider(vec![ScriptedConnection::fail("dns")], sse.clone());
-    let events = turn(&provider).await;
-    completed(&events);
-    assert_eq!(sse.requests().len(), 1);
-    assert_eq!(connector.handshakes().len(), 1);
-}
-
-#[tokio::test]
-async fn a_read_error_before_any_output_falls_back_to_sse() {
-    let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
-    // One connection only: a reconnect would panic the scripted peer.
+    // One scripted connection per attempt: the first and the three `max_retries`
+    // allows. A fourth reconnect would panic the peer's script.
     let (provider, connector) = websocket_provider(
-        vec![ScriptedConnection::accept(vec![ScriptedFrame::error(
-            "reset",
-        )])],
+        vec![
+            ScriptedConnection::fail("dns"),
+            ScriptedConnection::fail("dns"),
+            ScriptedConnection::fail("dns"),
+            ScriptedConnection::fail("dns"),
+        ],
         sse.clone(),
     );
+    let start = tokio::time::Instant::now();
     let events = turn(&provider).await;
     completed(&events);
-    assert_eq!(sse.requests().len(), 1);
-    assert_eq!(connector.handshakes().len(), 1);
+
+    assert_eq!(
+        connector.handshakes().len(),
+        4,
+        "the first attempt and max_retries (3) reconnects"
+    );
+    assert_eq!(sse.requests().len(), 1, "the budget spent, SSE serves it");
+    let policy = RetryPolicy::default();
+    assert_eq!(
+        start.elapsed(),
+        policy.delay(1, None) + policy.delay(2, None) + policy.delay(3, None),
+        "the waits are the retry policy's backoff on the paused clock, not real sleeps"
+    );
 }
 
-#[tokio::test]
-async fn a_close_before_any_output_falls_back_to_sse() {
+/// §5's transient row, and its happy shape: ONE connect error, then the reconnect
+/// succeeds over WebSocket — no fallback — and the frame that goes out again is the
+/// FULL body (§6: `previous_response_id` is scoped to the connection).
+#[tokio::test(start_paused = true)]
+async fn a_transient_connect_error_reconnects_and_the_retry_succeeds() {
+    let sse = ScriptedTransport::new(Vec::new());
+    let (provider, connector) = websocket_provider(
+        vec![
+            ScriptedConnection::fail("dns"),
+            ScriptedConnection::accept(text_frames(fixtures::TEXT_TURN)),
+        ],
+        sse.clone(),
+    );
+    let start = tokio::time::Instant::now();
+    let events = turn(&provider).await;
+    completed(&events);
+
+    assert_eq!(connector.handshakes().len(), 2, "one reconnect");
+    assert_eq!(
+        sse.requests().len(),
+        0,
+        "the retry recovered it: no fallback"
+    );
+    let policy = RetryPolicy::default();
+    assert_eq!(
+        start.elapsed(),
+        policy.delay(1, None),
+        "the wait is the first backoff of the retry policy on the paused clock"
+    );
+    // Stream rule 4: the back-off yields `Activity`, so the consumer sees life
+    // before the first content event of the retry — exactly as `drive` does.
+    let first_activity = events
+        .iter()
+        .position(|event| matches!(event, StreamEvent::Activity))
+        .expect("a back-off activity event");
+    let first_content = events
+        .iter()
+        .position(|event| matches!(event, StreamEvent::TextDelta { .. }))
+        .expect("the retry's content");
+    assert!(first_activity < first_content, "{events:?}");
+    // The failed attempt sent nothing, so the only texts are the retry's one frame.
+    let sent = connector.sent_texts();
+    assert_eq!(sent.len(), 1, "only the accepted connection was written to");
+    assert!(
+        frame(&sent, 0, 0).get("previous_response_id").is_none(),
+        "the FULL body goes out again"
+    );
+}
+
+/// §5's transient row for a read that fails before any output: retry inside the
+/// budget, then SSE.
+#[tokio::test(start_paused = true)]
+async fn a_read_error_before_any_output_retries_within_the_budget_then_falls_back_to_sse() {
     let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
-    let (provider, _) = websocket_provider(
-        vec![ScriptedConnection::accept(vec![ScriptedFrame::close()])],
+    let (provider, connector) = websocket_provider(
+        vec![
+            ScriptedConnection::accept(vec![ScriptedFrame::error("reset")]),
+            ScriptedConnection::accept(vec![ScriptedFrame::error("reset")]),
+            ScriptedConnection::accept(vec![ScriptedFrame::error("reset")]),
+            ScriptedConnection::accept(vec![ScriptedFrame::error("reset")]),
+        ],
         sse.clone(),
     );
     let events = turn(&provider).await;
     completed(&events);
-    assert_eq!(sse.requests().len(), 1);
+    assert_eq!(connector.handshakes().len(), 4);
+    assert_eq!(sse.requests().len(), 1, "the budget spent, SSE serves it");
+}
+
+/// The same for a close before any output — and on a FRESH connection, where §5 has
+/// no "once" row: a reused socket closing before its first frame is the once row
+/// (its own test), every later close is the transient row.
+#[tokio::test(start_paused = true)]
+async fn a_close_before_any_output_retries_within_the_budget_then_falls_back_to_sse() {
+    let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
+    let (provider, connector) = websocket_provider(
+        vec![
+            ScriptedConnection::accept(vec![ScriptedFrame::close()]),
+            ScriptedConnection::accept(vec![ScriptedFrame::close()]),
+            ScriptedConnection::accept(vec![ScriptedFrame::close()]),
+            ScriptedConnection::accept(vec![ScriptedFrame::close()]),
+        ],
+        sse.clone(),
+    );
+    let events = turn(&provider).await;
+    completed(&events);
+    assert_eq!(connector.handshakes().len(), 4);
+    assert_eq!(sse.requests().len(), 1, "the budget spent, SSE serves it");
 }
 
 #[tokio::test]
@@ -1343,11 +1447,19 @@ async fn a_reused_socket_that_closes_before_its_first_frame_reconnects_once() {
     assert_eq!(sse.requests().len(), 0, "the reconnect recovered it");
 }
 
-#[tokio::test]
-async fn at_most_one_reconnect_per_request() {
+/// §5 budgets reconnects per ROW: the reused socket that closes before its first
+/// frame spends its one "once" reconnect, and the FRESH sockets that follow it —
+/// no "once" row covers those — are the transient row, three of them, before the
+/// budget is spent and SSE takes over.
+#[tokio::test(start_paused = true)]
+async fn a_reused_close_spends_its_once_row_and_the_fresh_ones_the_transient_budget() {
     let connector = ScriptedWsConnector::new(vec![
         ScriptedConnection::accept(turn_frames(1)),
-        // The reconnect's socket also closes before its first frame.
+        // The reconnect the "once" row buys.
+        ScriptedConnection::accept(Vec::new()),
+        // The three the transient row buys.
+        ScriptedConnection::accept(Vec::new()),
+        ScriptedConnection::accept(Vec::new()),
         ScriptedConnection::accept(Vec::new()),
     ]);
     let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
@@ -1359,14 +1471,53 @@ async fn at_most_one_reconnect_per_request() {
     .expect("the route composes");
 
     completed(&turn(&provider).await);
+    // The first connection's script is exhausted, so the reused socket is gone
+    // before the second turn's first frame: §5 reconnects once for it, and each
+    // fresh socket after that closes too.
     let events = turn(&provider).await;
     completed(&events);
 
-    assert_eq!(connector.handshakes().len(), 2, "one reconnect, no more");
+    assert_eq!(
+        connector.handshakes().len(),
+        5,
+        "the first connection, the once row and max_retries (3)"
+    );
     assert_eq!(
         sse.requests().len(),
         1,
-        "the second failure fell back to SSE"
+        "the transient budget spent, SSE serves the request"
+    );
+}
+
+/// §5's "once" rows stay once: the SAME error event on the reconnected socket is
+/// not another reconnect — that row's allowance is spent, so the event is exactly
+/// what the existing parser makes of it (and no fallback happens: this is a
+/// response-level failure now).
+#[tokio::test]
+async fn a_connection_error_row_reconnects_once_and_the_second_time_is_the_parsers() {
+    let code = "previous_response_not_found";
+    let (provider, connector) = websocket_provider(
+        vec![
+            ScriptedConnection::accept(vec![ScriptedFrame::text(format!(
+                r#"{{"type":"error","error":{{"code":"{code}"}}}}"#
+            ))]),
+            ScriptedConnection::accept(vec![ScriptedFrame::text(format!(
+                r#"{{"type":"error","error":{{"code":"{code}"}}}}"#
+            ))]),
+        ],
+        ScriptedTransport::new(Vec::new()),
+    );
+    let events = turn(&provider).await;
+
+    assert_eq!(
+        failed(&events).kind,
+        ProviderErrorKind::Transport,
+        "{events:?}"
+    );
+    assert_eq!(
+        connector.handshakes().len(),
+        2,
+        "the row's ONE reconnect, and no third connection"
     );
 }
 
@@ -1895,11 +2046,12 @@ async fn a_cancelled_turn_clears_the_continuation() {
     assert_eq!(after["input"].as_array().unwrap().len(), 3);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_fallback_to_sse_clears_the_continuation() {
     // The first connection answers turn 1 and then closes, so the reused socket is
-    // gone before turn 2's first frame (§5 reconnects); the fresh one closes too, so
-    // the last row of §5's table falls back to SSE — which drops both sockets.
+    // gone before turn 2's first frame (§5's one "once" reconnect); every fresh
+    // socket after that closes too, so the transient row's budget is spent and the
+    // last row of §5's table falls back to SSE — which drops all of them.
     let sse = ScriptedTransport::new(vec![
         ScriptedResponse::ok_sse(fixtures::NO_USAGE),
         ScriptedResponse::ok_sse(fixtures::NO_USAGE),
@@ -1911,6 +2063,9 @@ async fn a_fallback_to_sse_clears_the_continuation() {
                 .chain([ScriptedFrame::close()])
                 .collect(),
         ),
+        ScriptedConnection::accept(vec![ScriptedFrame::close()]),
+        ScriptedConnection::accept(vec![ScriptedFrame::close()]),
+        ScriptedConnection::accept(vec![ScriptedFrame::close()]),
         ScriptedConnection::accept(vec![ScriptedFrame::close()]),
     ]);
     let provider = compose(

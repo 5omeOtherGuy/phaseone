@@ -389,6 +389,9 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
 /// reads the file and `catalog::route_provider` builds the provider from the file's
 /// data, so a live check runs exactly what the host runs. `wire_model` is the live
 /// knob's model, which overrides the file's binding for the run.
+///
+/// The connector is injected next to the transport (ADR-0047 §1); a live check gets
+/// the REAL one, because the shipped Codex route asks for WebSocket.
 fn live_route(route_id: &str, profile_id: &str, wire_model: &str) -> Arc<dyn Provider> {
     let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
     let route = p1_host::routes::load_route_by_id(&dirs, route_id).expect("the shipped route file");
@@ -404,6 +407,7 @@ fn live_route(route_id: &str, profile_id: &str, wire_model: &str) -> Arc<dyn Pro
         &binding,
         profile,
         Arc::new(ReqwestTransport::new()),
+        Arc::new(p1_provider_http::ws::TungsteniteConnector::new()),
         credentials,
     )
     .expect("valid route/profile binding")

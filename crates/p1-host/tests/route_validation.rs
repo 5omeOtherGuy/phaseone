@@ -241,28 +241,21 @@ fn an_explicit_cache_key_on_an_anthropic_route_fails_assembly() {
 
 // ------------------------------------------------------ the Responses transport
 
-/// ADR-0047 §1 through the host: a route that asks for `transport = "websocket"` is
-/// composed with the real connector and resolves exactly like an SSE one — the
-/// transport is not part of a response's origin — and an unknown value fails the
-/// load before anything is composed.
+/// ADR-0047 §1 through the host: the SHIPPED route asks for
+/// `transport = "websocket"` (owner decision 2026-09-21: WebSocket is the default
+/// wherever a route supports it), it is composed with the host's real connector and
+/// resolves exactly like an SSE one — the transport is not part of a response's
+/// origin — and an unknown value fails the load before anything is composed.
 #[test]
 fn a_websocket_route_resolves_and_an_unknown_transport_fails_the_load() {
     let root = codex_root();
     let path = root.path().join("routes/openai-codex-subscription.toml");
     let shipped = std::fs::read_to_string(&path).unwrap();
     assert!(
-        !shipped.contains("transport"),
-        "the shipped route stays on SSE"
+        shipped.contains("transport = \"websocket\""),
+        "ADR-0047 §1: the shipped route asks for WebSocket"
     );
 
-    std::fs::write(
-        &path,
-        shipped.replace(
-            "account = \"codex-subscription\"",
-            "account = \"codex-subscription\"\ntransport = \"websocket\"",
-        ),
-    )
-    .unwrap();
     write_environment(
         root.path(),
         "ws",
@@ -273,10 +266,7 @@ fn a_websocket_route_resolves_and_an_unknown_transport_fails_the_load() {
 
     std::fs::write(
         &path,
-        shipped.replace(
-            "account = \"codex-subscription\"",
-            "account = \"codex-subscription\"\ntransport = \"quic\"",
-        ),
+        shipped.replace("transport = \"websocket\"", "transport = \"quic\""),
     )
     .unwrap();
     let (code, stderr) = show_in(root.path(), "ws");

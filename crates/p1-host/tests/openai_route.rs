@@ -25,7 +25,7 @@ use p1_host::cli::SandboxMode;
 use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
-use p1_provider_http::testing::ScriptedTransport;
+use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 use p1_provider_openai::{
     ROUTE, ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport, build_request,
@@ -115,7 +115,10 @@ fn composed(environment: &str) -> Composed {
     }
 }
 
-/// The provider the catalog factory would build for this composition.
+/// The provider the catalog factory would build for this composition. The connector
+/// is injected next to the transport (ADR-0047 §1): it REFUSES every upgrade, so the
+/// shipped route — which asks for WebSocket — falls back to SSE at once and this
+/// scripted transport serves every request. No test opens a socket.
 fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = composed
         .route
@@ -126,6 +129,7 @@ fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Pro
         binding,
         composed.profile.clone(),
         Arc::new(transport),
+        Arc::new(RefusingWsConnector::default()),
         Arc::new(Fixed),
     )
     .expect("the shipped route composes")
@@ -187,7 +191,9 @@ fn the_shipped_responses_route_holds_what_the_host_used_to_compile() {
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
             account: ResponsesAccount::CodexSubscription,
-            transport: ResponsesTransport::Sse,
+            // ADR-0047 §1 (owner decision 2026-09-21): WebSocket is the default
+            // wherever a route supports it, so the shipped Codex route asks for it.
+            transport: ResponsesTransport::Websocket,
         })
     );
     assert!(route.headers.is_empty(), "no static headers on this route");
