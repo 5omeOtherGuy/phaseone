@@ -157,6 +157,10 @@ struct ChildEntry {
     /// same critical section, so a cancel can never land on a finished turn's
     /// token while the next turn is accepted but not yet polled.
     turn_cancel: Arc<Mutex<CancellationToken>>,
+    /// Set by [`InProcessWorkers::stall_child`] while a turn runs: the reason that
+    /// turn was stopped by the host's own guard, so the child ends `Failed` with
+    /// that sentence instead of `Cancelled` (completion.md §3c).
+    stall: Arc<Mutex<Option<String>>>,
     description: String,
 }
 
@@ -198,6 +202,29 @@ impl InProcessWorkers {
     /// A completion with no parent inbox set is still retained.
     pub fn set_parent_inbox(&self, inbox: Inbox) {
         *self.shared.parent_inbox.lock().unwrap() = Some(inbox);
+    }
+
+    /// Stop one child's RUNNING turn with a terminal `Failed(message)`, instead of
+    /// the `Cancelled` any other cancel produces. The child's turn token lives here,
+    /// in the service — the child factory that builds the agent cannot reach it —
+    /// so a host guard that stops a child of its own ([completion.md §3c]) calls in
+    /// here. Idempotent, and harmless for a turn that already ended.
+    pub fn stall_child(&self, id: &ChildId, message: String) -> Result<(), WorkerError> {
+        if self.shared.is_shut_down() {
+            return Err(WorkerError::ShutDown);
+        }
+        let (turn_cancel, stall) = {
+            let state = self.shared.state.lock().unwrap();
+            let Some(entry) = state.children.get(&id.0) else {
+                return Err(WorkerError::UnknownChild);
+            };
+            (Arc::clone(&entry.turn_cancel), Arc::clone(&entry.stall))
+        };
+        // The reason is stored BEFORE the cancel, so the task waking on the
+        // cancelled token always reads it.
+        *stall.lock().unwrap() = Some(message);
+        turn_cancel.lock().unwrap().cancel();
+        Ok(())
     }
 
     /// Cancel every running child, then join every child task. Afterwards every
@@ -265,7 +292,7 @@ impl WorkerService for InProcessWorkers {
             // std lock across the `yield_now` (invariant 7d). The factory is
             // synchronous, so holding the lock across it keeps the RUNNING count
             // and the id assignment atomic under concurrent `start` calls.
-            let (id, status, command_rx, token, agent) = {
+            let (id, status, command_rx, token, stall, agent) = {
                 let mut state = self.shared.state.lock().unwrap();
                 if state.shut_down || self.shared.shutdown.is_cancelled() {
                     return Err(WorkerError::ShutDown);
@@ -282,22 +309,33 @@ impl WorkerService for InProcessWorkers {
                 let (status, _) = watch::channel(ChildStatus::Running);
                 let (commands, command_rx) = mpsc::unbounded_channel();
                 let token = CancellationToken::new();
+                let stall = Arc::new(Mutex::new(None));
                 state.children.insert(
                     id.clone(),
                     ChildEntry {
                         status: status.clone(),
                         commands,
                         turn_cancel: Arc::new(Mutex::new(token.clone())),
+                        stall: Arc::clone(&stall),
                         description: child.description.clone(),
                     },
                 );
-                (id, status, command_rx, token, child.agent)
+                (id, status, command_rx, token, stall, child.agent)
             };
 
             let task_id = id.clone();
             let shared = Arc::clone(&self.shared);
             let handle = tokio::spawn(run_child(
-                shared, task_id, agent, spec.task, token, command_rx, status,
+                shared,
+                ChildTask {
+                    id: task_id,
+                    agent,
+                    task: spec.task,
+                    token,
+                    commands: command_rx,
+                    stall,
+                    status,
+                },
             ));
             self.tasks.lock().unwrap().push(handle);
             // Give the fresh task one turn before returning: `start` promises the
@@ -408,6 +446,8 @@ impl WorkerService for InProcessWorkers {
                 .send(ChildCommand::Continue(message, token.clone()))
                 .map_err(|_| WorkerError::ShutDown)?;
             *entry.turn_cancel.lock().unwrap() = token;
+            // A reason left over from the previous turn must not colour this one.
+            *entry.stall.lock().unwrap() = None;
             entry.status.send_replace(ChildStatus::Running);
             Ok(())
         })
@@ -438,17 +478,32 @@ impl WorkerService for InProcessWorkers {
     }
 }
 
+/// Everything one child task owns: the agent, the turn it currently runs, and the
+/// state the service shares with it.
+struct ChildTask {
+    id: String,
+    agent: Agent,
+    task: String,
+    token: CancellationToken,
+    commands: mpsc::UnboundedReceiver<ChildCommand>,
+    /// [`InProcessWorkers::stall_child`] writes the reason here; the task reads it
+    /// when the turn ends.
+    stall: Arc<Mutex<Option<String>>>,
+    status: watch::Sender<ChildStatus>,
+}
+
 /// The whole life of one child, owned by one task. `task` is replaced by each
 /// `continue_child`; the `Agent` is never moved and its turns never overlap.
-async fn run_child(
-    shared: Arc<Shared>,
-    id: String,
-    mut agent: Agent,
-    mut task: String,
-    mut token: CancellationToken,
-    mut commands: mpsc::UnboundedReceiver<ChildCommand>,
-    status: watch::Sender<ChildStatus>,
-) {
+async fn run_child(shared: Arc<Shared>, child: ChildTask) {
+    let ChildTask {
+        id,
+        mut agent,
+        mut task,
+        mut token,
+        mut commands,
+        stall,
+        status,
+    } = child;
     loop {
         // The status is already Running and `token` already installed: whoever
         // accepted this turn did both before the task could see it.
@@ -460,7 +515,13 @@ async fn run_child(
                 None => break,
             }
         }
-        let child_status = status_from_end(&end, last_assistant_text(&agent));
+        // A guard of the host's own stopped this turn ([`InProcessWorkers::stall_child`]):
+        // the child ends `Failed` with the host's sentence, not `Cancelled`.
+        let child_status = child_status(
+            &end,
+            stall.lock().unwrap().take(),
+            last_assistant_text(&agent),
+        );
         // (1) store the status and (2) wake every waiter: one `send_replace`.
         status.send_replace(child_status.clone());
         // (3) exactly ONE notification, and only after the result is retrievable.
@@ -479,6 +540,18 @@ async fn run_child(
             }
             _ => break,
         }
+    }
+}
+
+/// The child's terminal status for one turn: a `Cancelled` turn the host's own
+/// guard stopped carries that guard's reason as `Failed(reason)`, so the parent
+/// reads the host's sentence instead of "cancelled" (completion.md §3c). Every
+/// other end maps as [`status_from_end`] always did, and a reason set for a turn
+/// that ended some other way is dropped — it can never colour a later turn.
+fn child_status(end: &TurnEnd, stall: Option<String>, final_text: String) -> ChildStatus {
+    match (stall, end) {
+        (Some(message), TurnEnd::Cancelled) => ChildStatus::Failed(message),
+        _ => status_from_end(end, final_text),
     }
 }
 
@@ -580,6 +653,37 @@ mod tests {
                 "x".into()
             ),
             ChildStatus::Failed("too big".into())
+        );
+    }
+
+    /// A guard-stopped turn is `Failed` with the guard's own sentence, not
+    /// `Cancelled` — and a reason that arrives for a turn ending any other way is
+    /// dropped instead of leaking into the next one.
+    #[test]
+    fn a_guard_stopped_turn_is_failed_with_its_reason() {
+        let reason = "stalled: 2 context summaries without a change to the workspace";
+        assert_eq!(
+            child_status(&TurnEnd::Cancelled, Some(reason.into()), "x".into()),
+            ChildStatus::Failed(reason.into())
+        );
+        assert_eq!(
+            child_status(&TurnEnd::Cancelled, None, "x".into()),
+            ChildStatus::Cancelled
+        );
+        assert_eq!(
+            child_status(
+                &TurnEnd::Completed {
+                    stop: StopReason::EndTurn
+                },
+                Some(reason.into()),
+                "answer".into()
+            ),
+            status_from_end(
+                &TurnEnd::Completed {
+                    stop: StopReason::EndTurn
+                },
+                "answer".into()
+            )
         );
     }
 }

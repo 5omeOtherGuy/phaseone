@@ -295,7 +295,16 @@ fn show_env(name: &str) -> (i32, String, String) {
 
 #[test]
 fn the_two_shipped_claude_environments_assemble_through_the_catalog_unchanged() {
-    for name in ["claude", "claude-delegating"] {
+    // `claude-delegating` names the `worker_*` tools, which only the `delegation`
+    // feature registers. With it both environments assemble unchanged; without it
+    // `claude-delegating` cannot assemble at all, and the error says exactly which
+    // module is missing, while `claude` is untouched.
+    #[cfg(feature = "delegation")]
+    let assembled_here = ["claude", "claude-delegating"];
+    #[cfg(not(feature = "delegation"))]
+    let assembled_here = ["claude"];
+
+    for name in assembled_here {
         let (code, stdout, stderr) = show_env(name);
         assert_eq!(code, 0, "{name}: {stderr}");
         let resolved: serde_json::Value = common::env_show_json(&stdout);
@@ -315,6 +324,16 @@ fn the_two_shipped_claude_environments_assemble_through_the_catalog_unchanged() 
             "{name}"
         );
         assert_eq!(resolved["route"]["cache_key"], "unsupported", "{name}");
+    }
+
+    #[cfg(not(feature = "delegation"))]
+    {
+        let (code, _stdout, stderr) = show_env("claude-delegating");
+        assert_ne!(code, 0, "claude-delegating needs the delegation feature");
+        assert!(
+            stderr.starts_with("unknown tool module `worker_start`; available: "),
+            "the error names the compiled-out module: {stderr}"
+        );
     }
 
     // And the provider the catalog builds for `claude` reports the same origin.

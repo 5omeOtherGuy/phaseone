@@ -118,7 +118,15 @@ fn show_in(root: &Path, name: &str) -> (i32, String) {
 
 #[test]
 fn every_shipped_environment_still_assembles() {
-    for name in ["claude", "claude-delegating", "gpt", "deepseek", "glm"] {
+    // `claude-delegating` names the `worker_*` tools, which only the `delegation`
+    // feature registers: without it that environment cannot assemble (its exact
+    // error is pinned in `anthropic_route.rs`). Every other shipped environment
+    // assembles either way.
+    #[cfg(feature = "delegation")]
+    let shipped = ["claude", "claude-delegating", "gpt", "deepseek", "glm"];
+    #[cfg(not(feature = "delegation"))]
+    let shipped = ["claude", "gpt", "deepseek", "glm"];
+    for name in shipped {
         let (code, stdout, stderr) = show_env(name);
         assert_eq!(code, 0, "{name}: {stderr}");
         let resolved: Value = common::env_show_json(&stdout);
