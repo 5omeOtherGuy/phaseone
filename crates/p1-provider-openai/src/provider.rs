@@ -6,14 +6,21 @@
 //! and terminal-event policy lives in [`p1_provider_http::drive`]; this module
 //! only decides whether a request is buildable at all, through the same pure
 //! lowering function the request builder uses (ADR-0039, spec §7.3).
+//!
+//! A route that asks for `transport = "websocket"` sends the same request over
+//! [`crate::websocket`] instead, whose failure policy is `drive`'s re-expressed
+//! (ADR-0047, `docs/design/websocket.md` §4–§5). Both transports end in the same
+//! [`p1_contracts::StreamEvent`]s.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use p1_contracts::{
     BoxFuture, CacheKeySupport, CancellationToken, ModelOptions, Provider, ProviderError,
     ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription,
 };
 use p1_model_profile::ModelProfile;
+use p1_provider_http::ws::WsConnector;
 use p1_provider_http::{
     Credential, CredentialSource, DriveRequest, HttpRequest, ResponseParser, RetryPolicy,
     Transport, drive,
@@ -25,6 +32,9 @@ use crate::request::{
     build_headers, build_request, clamped_cache_key, lower, resolve_base_url,
     validate as validate_options,
 };
+use crate::websocket::{self, WebSocket};
+
+pub use crate::websocket::Clock;
 
 /// Namespaces the OTHER compiled adapters own inside `ModelOptions::native`. An
 /// explicit option from one of them was silently dropped on a route switch
@@ -43,12 +53,33 @@ pub struct OpenAiCodexProvider {
     transport: Arc<dyn Transport>,
     credentials: Arc<dyn CredentialSource>,
     retry: RetryPolicy,
+    /// The WebSocket half, when the route asks for it (ADR-0047 §1). `None` on an
+    /// SSE route, where every request takes today's `drive()` path unchanged.
+    ws: Option<Arc<WebSocket>>,
+}
+
+/// The composition of one Responses provider: the constructor's inputs plus the
+/// connector a route that asks for `transport = "websocket"` speaks through.
+///
+/// [`build`](OpenAiCodexProviderBuilder::build) is where the two halves are
+/// paired, so a WebSocket route can never be composed without a connector (the
+/// mistake fails at construction, never at the first request) and an SSE route can
+/// never carry one.
+pub struct OpenAiCodexProviderBuilder {
+    route: ResponsesRoute,
+    wire_model: String,
+    profile: Arc<ModelProfile>,
+    transport: Arc<dyn Transport>,
+    credentials: Arc<dyn CredentialSource>,
+    connector: Option<Arc<dyn WsConnector>>,
+    clock: Clock,
 }
 
 impl OpenAiCodexProvider {
     /// Compose the adapter from its three inputs (ADR-0039). A profile whose
     /// thinking policy the Responses wire cannot express fails HERE, before any
-    /// request exists.
+    /// request exists; so does a route that asks for WebSocket, which needs its
+    /// connector (see [`OpenAiCodexProvider::builder`]).
     ///
     /// Construction reads no credential file: the token file is only opened by
     /// the first `access` call, inside the driver. The credential source is
@@ -61,20 +92,28 @@ impl OpenAiCodexProvider {
         transport: Arc<dyn Transport>,
         credentials: Arc<dyn CredentialSource>,
     ) -> Result<Self, ProviderError> {
-        validate_composition(&route, wire_model, &profile)?;
-        let credentials = if route.account.requires_account_id() {
-            Arc::new(AccountIdGuard { inner: credentials }) as Arc<dyn CredentialSource>
-        } else {
-            credentials
-        };
-        Ok(Self {
+        Self::builder(route, wire_model, profile, transport, credentials).build()
+    }
+
+    /// The composition builder: the same inputs as [`OpenAiCodexProvider::new`],
+    /// plus the connector a `websocket` route needs. Everything the constructor
+    /// checks is checked by [`build`](OpenAiCodexProviderBuilder::build).
+    pub fn builder(
+        route: ResponsesRoute,
+        wire_model: &str,
+        profile: Arc<ModelProfile>,
+        transport: Arc<dyn Transport>,
+        credentials: Arc<dyn CredentialSource>,
+    ) -> OpenAiCodexProviderBuilder {
+        OpenAiCodexProviderBuilder {
             route,
             wire_model: wire_model.to_string(),
             profile,
             transport,
             credentials,
-            retry: RetryPolicy::default(),
-        })
+            connector: None,
+            clock: Arc::new(Instant::now),
+        }
     }
 
     /// Override the transient retry policy (tests and hosts).
@@ -89,6 +128,122 @@ impl OpenAiCodexProvider {
     pub fn with_base_url(mut self, url: &str) -> Self {
         self.route.endpoint = url.to_string();
         self
+    }
+
+    /// Today's path for one request, as something callable more than once: an SSE
+    /// route returns it directly, and the WebSocket arm runs it for the request
+    /// that fell back (§5). Nothing in it depends on the transport the route asks
+    /// for, which is why the SSE arm stays byte for byte what it was.
+    fn sse_path(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        cache_key: Option<String>,
+        cancel: CancellationToken,
+    ) -> Box<dyn Fn() -> ProviderStream + Send> {
+        let transport = self.transport.clone();
+        let credentials = self.credentials.clone();
+        let model = self.wire_model.clone();
+        let account = self.route.account;
+        let origin_route = self.route.origin_route.clone();
+        let retry = self.retry;
+        let url = url.to_string();
+        Box::new(move || {
+            let url = url.clone();
+            let body = body.clone();
+            let cache_key = cache_key.clone();
+            let origin_route = origin_route.clone();
+            let model = model.clone();
+            drive(DriveRequest {
+                transport: transport.clone(),
+                credentials: credentials.clone(),
+                build: Box::new(move |credential: &Credential| {
+                    // Unreachable by construction: `AccountIdGuard` turns a
+                    // credential without an account id into an authentication
+                    // failure before the driver can build a request.
+                    let headers = build_headers(account, credential, cache_key.as_deref())
+                        .expect("the credential guard guarantees a ChatGPT account id");
+                    HttpRequest {
+                        url: url.clone(),
+                        headers,
+                        body: body.clone(),
+                    }
+                }),
+                new_parser: Box::new(move || {
+                    Box::new(CodexResponseParser::new(&origin_route, &model))
+                        as Box<dyn ResponseParser>
+                }),
+                retry,
+                cancel: cancel.clone(),
+            })
+        })
+    }
+}
+
+impl OpenAiCodexProviderBuilder {
+    /// Hand the provider the connector its route asks for (ADR-0047 §1). A route
+    /// that does not ask for WebSocket is refused at
+    /// [`build`](OpenAiCodexProviderBuilder::build): the connector belongs to the
+    /// route's transport, so the two cannot drift apart.
+    pub fn with_ws_connector(mut self, connector: Arc<dyn WsConnector>) -> Self {
+        self.connector = Some(connector);
+        self
+    }
+
+    /// The clock the WebSocket connection-reuse policy reads
+    /// (`docs/design/websocket.md` §4). Tests inject one; the default is the real
+    /// clock.
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Finish the composition, pairing the route's transport with its connector.
+    pub fn build(self) -> Result<OpenAiCodexProvider, ProviderError> {
+        let Self {
+            route,
+            wire_model,
+            profile,
+            transport,
+            credentials,
+            connector,
+            clock,
+        } = self;
+        validate_composition(&route, &wire_model, &profile)?;
+        let ws = match (route.transport, connector) {
+            (crate::ResponsesTransport::Sse, None) => None,
+            (crate::ResponsesTransport::Websocket, Some(connector)) => {
+                Some(Arc::new(WebSocket::new(connector, clock)))
+            }
+            (crate::ResponsesTransport::Websocket, None) => {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "the route asks for `transport = \"websocket\"`, which needs a WebSocket \
+                     connector: compose this provider with `with_ws_connector`",
+                ));
+            }
+            (crate::ResponsesTransport::Sse, Some(_)) => {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "this route speaks SSE, so it takes no WebSocket connector: write \
+                     `transport = \"websocket\"` in its route file first",
+                ));
+            }
+        };
+        let credentials = if route.account.requires_account_id() {
+            Arc::new(AccountIdGuard { inner: credentials }) as Arc<dyn CredentialSource>
+        } else {
+            credentials
+        };
+        Ok(OpenAiCodexProvider {
+            route,
+            wire_model,
+            profile,
+            transport,
+            credentials,
+            retry: RetryPolicy::default(),
+            ws,
+        })
     }
 }
 
@@ -166,7 +321,7 @@ impl Provider for OpenAiCodexProvider {
             self.validate(&request)?;
             let url = resolve_base_url(&self.route.endpoint)?;
             let body = build_request(&self.route, &self.wire_model, &self.profile, &request)?;
-            let body = serde_json::to_vec(&body).map_err(|_| {
+            let body_bytes = serde_json::to_vec(&body).map_err(|_| {
                 ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
                     "failed to serialize the request body",
@@ -176,33 +331,38 @@ impl Provider for OpenAiCodexProvider {
             // the session identity headers.
             let cache_key = clamped_cache_key(&request.options);
 
-            let transport = self.transport.clone();
-            let credentials = self.credentials.clone();
-            let model = self.wire_model.clone();
-            let account = self.route.account;
-            let origin_route = self.route.origin_route.clone();
-            Ok(drive(DriveRequest {
-                transport,
-                credentials,
-                build: Box::new(move |credential: &Credential| {
-                    // Unreachable by construction: `AccountIdGuard` turns a
-                    // credential without an account id into an authentication
-                    // failure before the driver can build a request.
-                    let headers = build_headers(account, credential, cache_key.as_deref())
-                        .expect("the credential guard guarantees a ChatGPT account id");
-                    HttpRequest {
-                        url: url.clone(),
-                        headers,
-                        body: body.clone(),
-                    }
-                }),
-                new_parser: Box::new(move || {
-                    Box::new(CodexResponseParser::new(&origin_route, &model))
-                        as Box<dyn ResponseParser>
-                }),
-                retry: self.retry,
-                cancel,
-            }))
+            // Today's request, byte for byte: the same body bytes, the same
+            // headers and the same driver. A WebSocket failure before any output
+            // runs exactly this for the request that hit it (§5).
+            let sse = self.sse_path(&url, body_bytes, cache_key.clone(), cancel.clone());
+
+            // §1/§4: WebSocket only when the route asks for it, this instance has
+            // not fallen back already, and the connection is not busy with another
+            // request. A busy connection is never waited for and never doubled.
+            let Some(ws) = self.ws.as_ref() else {
+                return Ok(sse());
+            };
+            if ws.is_disabled() {
+                return Ok(sse());
+            }
+            let Some(slot) = ws.try_take() else {
+                return Ok(sse());
+            };
+            Ok(websocket::stream(
+                websocket::WebSocketRequest {
+                    ws: ws.clone(),
+                    url,
+                    body,
+                    account: self.route.account,
+                    cache_key,
+                    credentials: self.credentials.clone(),
+                    origin_route: self.route.origin_route.clone(),
+                    model: self.wire_model.clone(),
+                    sse,
+                    cancel,
+                },
+                slot,
+            ))
         })
     }
 }
@@ -295,6 +455,7 @@ mod tests {
             origin_route: crate::ROUTE.to_string(),
             endpoint: "https://chatgpt.com/backend-api".to_string(),
             account: crate::ResponsesAccount::CodexSubscription,
+            transport: crate::ResponsesTransport::Sse,
         }
     }
 

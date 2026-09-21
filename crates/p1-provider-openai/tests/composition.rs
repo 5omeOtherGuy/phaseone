@@ -46,6 +46,7 @@ fn route() -> ResponsesRoute {
         origin_route: p1_provider_openai::ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
         account: ResponsesAccount::CodexSubscription,
+        transport: p1_provider_openai::ResponsesTransport::Sse,
     }
 }
 
