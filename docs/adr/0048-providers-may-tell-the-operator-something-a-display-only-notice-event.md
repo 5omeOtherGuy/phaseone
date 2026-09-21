@@ -1,7 +1,7 @@
 ---
 adr: 48
 title: Providers may tell the operator something: a display-only notice event
-status: proposed
+status: accepted
 date: 2026-09-21
 deciders: lead
 supersedes: []
@@ -46,5 +46,7 @@ HTTP (SSE) for the rest of this session` once, when it falls back (websocket.md 
 
 ## Evidence
 
-To be recorded when merged: a scripted-connector test that refuses the upgrade and asserts one
-`Notice` before the SSE response's events; the renderer test for the printed line.
+Merged `d78380b` (CI green). Tests: `cargo test -p p1-provider-openai --test websocket`
+(`a_refused_upgrade_announces_the_fallback_once_and_only_for_that_request`,
+`a_transient_failure_past_the_budget_announces_a_connection_failure`), `p1-core`
+`a_provider_notice_is_forwarded_in_order_and_is_nothing_else`, renderer and TUI note tests.

@@ -11,7 +11,7 @@ An **environment** fixes the prompt family, the tools and `[context]`; its **rou
 fixes the provider (ADR-0039). A *model* the operator selects is therefore a pair:
 
 ```
-<environment>/<profile>[:<effort>]        e.g.  gpt/gpt-5.6-sol-mini:high
+<environment>/<profile>[:<effort>]        e.g.  gpt/gpt-5.6-luna:high
 ```
 
 The candidates are exactly: every environment E, every profile P bound in E's route file
@@ -66,10 +66,9 @@ The candidates are exactly: every environment E, every profile P bound in E's ro
   tools the new environment does not declare stay in the history as they are.
 - Switching happens only at a turn boundary, never inside a tool loop (Anthropic requires the
   current tool loop's thinking blocks; a boundary has none pending).
-- Live acceptance (lead, before ADR-0049 is accepted): one short session per switch —
-  `claude/claude-sonnet-5 → claude/claude-opus-5`, `gpt/gpt-5.6-sol → gpt/gpt-5.6-sol-mini`,
-  `claude → gpt`, `gpt → claude`, `gpt → deepseek2`; each switched turn must complete and use a
-  tool. A route that refuses a history shape turns that shape into a `validate` rejection.
+- Live acceptance — PASSED 2026-09-21 (table in ADR-0049): sonnet-5 → opus-5, sol → luna,
+  claude → gpt, gpt → claude, gpt → deepseek2; every switched turn completed with tools. A route
+  that later refuses a history shape turns that shape into a `validate` rejection.
 
 ## 4. Stage 3 — interactive (TUI owner, issue #12; line mode by the lead)
 

@@ -1,11 +1,11 @@
 ---
 adr: 33
 title: A session resumes only on the route and model that recorded it
-status: accepted
+status: superseded
 date: 2026-09-20
 deciders: lead
 supersedes: []
-superseded_by: []
+superseded_by: [49]
 sources: [docs/review-2026-09-20-dispositions.md, docs/design/seams.md, docs/design/journal.md, crates/p1-core/src/resume.rs]
 ---
 # ADR-0033: A session resumes only on the route and model that recorded it
