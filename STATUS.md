@@ -92,27 +92,26 @@ IN FLIGHT:
 * OWNER RAN `p1 login opencode-go-2-subscription` (2026-09-21): the key is in the p1 store —
   dispatch deepseek2 jobs WITHOUT the `OPENCODE_GO_2_API_KEY=…` prefix from now on (fall back
   to it only if a run cannot find the key, then investigate p1-auth).
-* OWNER DIRECTIVES 2026-09-21 (WebSocket / iris / prompt caching) = RESEARCH BATCH 3, state 02:45:
-  - #43 caching — USED, closed. Parser counts cache-write tokens; cache key stable
-    (hash(workspace, environment, agent ordinal)). Live probe A B B A: our header names 63.7/64.1 %
-    cached vs upstream's hyphen names 32.2/50.0 % — names retained. Anthropic untouched (right as
-    is). Record: `docs/research/43-prompt-caching.md`.
-  - #42 iris — E1 shell output filters MERGED (`raw:true` opt-out, fail-safe contract, donor named
-    in the commit). STILL OWED: measure E1 on p1 (runs before `e1229fe` = no filter; records now
-    carry `binary_sha256`), THEN brief E2 (`read` skim, donor `src/tools/skim.rs`, needs a NOTICE
-    line: design ported from rtk-ai/rtk Apache-2.0), then close #42. TOML engine rejected. There
-    is NO "token optimizer" in iris — it is this family of output reducers; tell the owner.
-  - #41 WebSocket — ADR-0047 (proposed). Stage A seam + stage B framing MERGED, CI green. LIVE
-    CHECK PASSED: the subscription backend accepts the upgrade (3 requests, ONE connection, 48
-    frames; test `codex_subscription_route_over_websocket` in p1-live, `P1_LIVE=1`). Stage C
-    continuation = job `ws-continuation` RUNNING (`../phaseone-ws-continuation`, brief
-    `../phaseone-briefs/ws-continuation.md`). AFTER it lands: two-arm live comparison
-    (websocket.md §8: scratch config dir with `transport = "websocket"` via
-    `P1_ENVIRONMENTS_DIR=<scratch>/environments`, routes are `<that>/../routes`; fixture task in
-    the session scratchpad `probe/`), and only if `input_uncached` falls on turn >= 2 with the same
-    accepted result: set `transport = "websocket"` in `routes/openai-codex-subscription.toml`,
-    ADR-0047 accepted, update routes.md §B + the adapter's module comment, close #41.
-    A fallback to SSE is currently INVISIBLE to the operator — add a notice (small follow-up).
+* OWNER DIRECTIVES 2026-09-21 = RESEARCH BATCH 3 — ALL THREE USED AND CLOSED (records in
+  `docs/research/{41-websocket,42-iris-inventory,43-prompt-caching}.md`):
+  - #41 WebSocket: stages A+B+C merged, ADR-0047 accepted. LIVE: the subscription backend accepts
+    the upgrade and the continuation. But the continuation does NOT lower reported input tokens
+    (the server counts remembered context as input) and a small task shows no cache or wall-time
+    difference (8 runs) -> the SHIPPED ROUTE STAYS `sse`; `transport = "websocket"` is one line
+    under `[adapter_settings]` of `routes/openai-codex-subscription.toml`. OWNER MAY WANT IT ON
+    ANYWAY — ask/tell him. Open: long-session comparison (upload size); needs the transport to
+    be visible to the operator (a fallback to SSE is silent today) — on #6.
+  - #42 iris: shell output filters merged; measured ceiling on p1 = 2.2 % of tool-result bytes
+    (kept: fail-safe, stops models piping checks). `read` skim + TOML engine discarded. No
+    "token optimizer" exists in iris.
+  - #43 caching: parser counts cache-write tokens, cache key stable; header-name probe: ours
+    63.7/64.1 % vs upstream's 32.2/50.0 % -> retained. Anthropic right as is.
+  HARNESS BUG FOUND+FIXED that night (`2827aaa`): DeepSeek route answered HTTP 400 when a
+  tool-call-only assistant message was replayed without `reasoning_content`; now replayed empty;
+  chat adapter names the endpoint's short error code.
+  NEXT RESEARCH (queued, NOT dispatched): the re-read issue (see the newest `research:queued`
+  issue): read = 74.8 % of tool-result bytes, exact re-reads happen ONLY after context summaries
+  (0 summaries -> 0 %, 40 -> 61.7 %). This is the real cost lever; design work is the lead's.
 * RESEARCH BATCH 2 DECIDED (2026-09-21): #36 grep bounding — USED, merged. #37 summarizer prompt —
   USED as a negative result (prompt unchanged); by-product merged: run records carry
   `harness_head` + `binary_sha256`. #35 out-of-credit diagnosis — USED, merged (ADR-0046 accepted).
