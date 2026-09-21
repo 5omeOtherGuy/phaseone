@@ -37,7 +37,7 @@ use crate::{HostDeps, InterruptSource};
 use p1_tool_finish::Accepted;
 
 #[cfg(feature = "delegation")]
-use p1_workers::{AgentFactory, ChildAgent, ChildSpec, ChildStatus, InProcessWorkers};
+use p1_workers::{AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers};
 
 /// Exit codes (the process contract).
 pub const EXIT_OK: i32 = 0;
@@ -300,6 +300,10 @@ pub async fn run_with_front_end(
     let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
     #[cfg(feature = "delegation")]
     let child_counter = Arc::new(AtomicUsize::new(0));
+    // The child factory's §3c guard stops a child's turn through the service, which
+    // does not exist yet — the factory is its argument. Same slot pattern.
+    #[cfg(feature = "delegation")]
+    let service_slot: Arc<OnceLock<Arc<InProcessWorkers>>> = Arc::new(OnceLock::new());
     #[cfg(feature = "delegation")]
     let service: Option<Arc<InProcessWorkers>> = {
         let factory = make_child_factory(
@@ -310,8 +314,11 @@ pub async fn run_with_front_end(
             child_counter.clone(),
             completion_hub.clone(),
             options.session.clone(),
+            options.max_idle_summaries,
+            service_slot.clone(),
         );
         let service = InProcessWorkers::new(factory, 2);
+        let _ = service_slot.set(service.clone());
         deps.worker_service = Some(service.clone());
         Some(service)
     };
@@ -858,6 +865,50 @@ impl EventSink for StallWatcher {
     }
 }
 
+// -------------------------------------------------- the same guard for a child
+
+/// The per-child §3c guard. A delegated worker is always unattended — nobody
+/// reads its summaries and decides — so the parent's `--max-idle-summaries` bound
+/// applies to EVERY child, whatever the parent's own mode is (0 disables, as for
+/// the parent).
+///
+/// It counts the CHILD's committed replacements in the child's own
+/// [`ActivityLog`], the same log [`ActivityTee`] already feeds for that child, and
+/// progress (a workspace mutation or a `finish` call) resets the count exactly as
+/// it does for the parent. At the bound it stops that child's running turn through
+/// the worker service: the child's turn token lives there and this factory cannot
+/// reach it. The child then ends [`ChildStatus::Failed`] with the parent's own
+/// sentence — the parent model and the operator read the same words, and the
+/// worker is not merely "cancelled". Nothing here touches the run's cancellation:
+/// one child's stall leaves the parent and every other child running.
+#[cfg(feature = "delegation")]
+struct ChildStallWatcher {
+    inner: Arc<dyn EventSink>,
+    log: Arc<ActivityLog>,
+    max: usize,
+    message: String,
+    service: Arc<OnceLock<Arc<InProcessWorkers>>>,
+    worker_id: String,
+}
+
+#[cfg(feature = "delegation")]
+impl EventSink for ChildStallWatcher {
+    fn emit(&self, event: AgentEvent) {
+        if matches!(event, AgentEvent::ContextReplaced { .. }) {
+            self.log.record_replacement();
+            if self.log.consecutive_replacements() >= self.max as u64 {
+                // The service is built AFTER this factory (the factory is its
+                // argument), so the slot is how the guard reaches the child's turn.
+                if let Some(service) = self.service.get() {
+                    let _ =
+                        service.stall_child(&ChildId(self.worker_id.clone()), self.message.clone());
+                }
+            }
+        }
+        self.inner.emit(event);
+    }
+}
+
 /// §3c: a cancellation caused by the stall guard is reported as a stall, not as an
 /// ordinary Ctrl-C.
 fn stalled_exit(deps: &HostDeps, stall: &StallGuard) -> Option<i32> {
@@ -1141,7 +1192,13 @@ async fn running_children(deps: &HostDeps) -> usize {
 /// the parent's workspace unless the spec overrides it, the front end's shared
 /// authorization policy, its own session journal, and the front end's labelled
 /// sink for its id.
+///
+/// Every argument is a separate composition seam (the front end, the catalog and
+/// service slots that break the factory/service cycle, the counter that keeps ids
+/// in step, the completion hub, the session, the parent's §3c bound), so the list
+/// is long by nature.
 #[cfg(feature = "delegation")]
+#[allow(clippy::too_many_arguments)]
 fn make_child_factory(
     deps: &HostDeps,
     parent_workspace: &Path,
@@ -1150,6 +1207,8 @@ fn make_child_factory(
     counter: Arc<AtomicUsize>,
     completion_hub: Arc<CompletionHub>,
     session: Option<PathBuf>,
+    max_idle_summaries: usize,
+    service_slot: Arc<OnceLock<Arc<InProcessWorkers>>>,
 ) -> AgentFactory {
     let environment_dirs = deps.environment_dirs.clone();
     let date = deps.date.clone();
@@ -1205,13 +1264,27 @@ fn make_child_factory(
         // The front end builds the labelled child sink; under delegation it also
         // feeds the run's worker-usage aggregate.
         let renderer = front_end.child_event_sink(&worker_id, &route, &model);
-        let events: Arc<dyn EventSink> = match &child_completion {
-            Some(completion) => Arc::new(ActivityTee::new(
-                renderer,
-                completion.log.clone(),
-                &assembled.tools,
-            )),
-            None => renderer,
+        // Every child gets its OWN activity log, whether or not its environment
+        // assembles `finish`: the child's §3c guard reads that log for its
+        // replacements and its progress, exactly as the parent's guard reads the
+        // parent's.
+        let log = match &child_completion {
+            Some(completion) => completion.log.clone(),
+            None => Arc::new(ActivityLog::default()),
+        };
+        let events: Arc<dyn EventSink> =
+            Arc::new(ActivityTee::new(renderer, log.clone(), &assembled.tools));
+        let events: Arc<dyn EventSink> = if max_idle_summaries > 0 {
+            Arc::new(ChildStallWatcher {
+                inner: events,
+                log,
+                max: max_idle_summaries,
+                message: stall_message(max_idle_summaries),
+                service: service_slot.clone(),
+                worker_id: worker_id.clone(),
+            })
+        } else {
+            events
         };
         // With `--session`, worker `w{n}` gets its OWN new JSONL file next to the
         // parent's (`FILE.w{n}.jsonl`). Without one it stays in memory like before.
