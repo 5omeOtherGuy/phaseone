@@ -92,23 +92,27 @@ IN FLIGHT:
 * OWNER RAN `p1 login opencode-go-2-subscription` (2026-09-21): the key is in the p1 store —
   dispatch deepseek2 jobs WITHOUT the `OPENCODE_GO_2_API_KEY=…` prefix from now on (fall back
   to it only if a run cannot find the key, then investigate p1-auth).
-* OWNER DIRECTIVES 2026-09-21 ~00:45 (owner asleep, work on) = RESEARCH BATCH 3, ALL ACCEPTED
-  (memos `../phaseone-briefs/research/{41,42,43}/memo.md`; implement cap lifted for this batch,
-  at most two p1 jobs at a time; no batch 4 before these are used):
-  - #41 WebSocket: ADR-0047 (proposed) + `docs/design/websocket.md`. Codex route only (no vendor
-    documents WS for the others). Stage A connector seam = job `ws-seam` RUNNING
-    (`../phaseone-ws-seam`); then stage B framing (brief NOT yet written: spec §1,§3,§4,§5 in
-    `p1-provider-openai` + host route parsing of `transport`), stage C continuation (§6), then
-    the LEAD's live probe (§8) before the shipped route switches to `websocket`.
-  - #43 caching: job `cache-fixes` RUNNING (`../phaseone-cache-fixes`): parser reads
-    `cache_write_tokens`; cache key = hash(workspace, environment, agent ordinal). AFTER merge:
-    lead-run live probe, ~4 short gpt runs: header names `session_id`/`conversation_id` (ours)
-    vs `session-id`/`thread-id` (upstream Codex). Anthropic: nothing to change.
-  - #42 iris: E1 shell output filters — spec in tools.md, brief
-    `../phaseone-briefs/shell-filters.md` READY, dispatch when a lane frees
-    (`scripts/new-worktree.sh shell-filters`, `shell-filters-jobs.json`); then measure on p1;
-    then E2 `read` skim. TOML engine rejected. There is no "token optimizer" in iris — tell the owner.
-  Both running jobs authenticate from the p1 store (no env var) — the login chain works live.
+* OWNER DIRECTIVES 2026-09-21 (WebSocket / iris / prompt caching) = RESEARCH BATCH 3, state 02:45:
+  - #43 caching — USED, closed. Parser counts cache-write tokens; cache key stable
+    (hash(workspace, environment, agent ordinal)). Live probe A B B A: our header names 63.7/64.1 %
+    cached vs upstream's hyphen names 32.2/50.0 % — names retained. Anthropic untouched (right as
+    is). Record: `docs/research/43-prompt-caching.md`.
+  - #42 iris — E1 shell output filters MERGED (`raw:true` opt-out, fail-safe contract, donor named
+    in the commit). STILL OWED: measure E1 on p1 (runs before `e1229fe` = no filter; records now
+    carry `binary_sha256`), THEN brief E2 (`read` skim, donor `src/tools/skim.rs`, needs a NOTICE
+    line: design ported from rtk-ai/rtk Apache-2.0), then close #42. TOML engine rejected. There
+    is NO "token optimizer" in iris — it is this family of output reducers; tell the owner.
+  - #41 WebSocket — ADR-0047 (proposed). Stage A seam + stage B framing MERGED, CI green. LIVE
+    CHECK PASSED: the subscription backend accepts the upgrade (3 requests, ONE connection, 48
+    frames; test `codex_subscription_route_over_websocket` in p1-live, `P1_LIVE=1`). Stage C
+    continuation = job `ws-continuation` RUNNING (`../phaseone-ws-continuation`, brief
+    `../phaseone-briefs/ws-continuation.md`). AFTER it lands: two-arm live comparison
+    (websocket.md §8: scratch config dir with `transport = "websocket"` via
+    `P1_ENVIRONMENTS_DIR=<scratch>/environments`, routes are `<that>/../routes`; fixture task in
+    the session scratchpad `probe/`), and only if `input_uncached` falls on turn >= 2 with the same
+    accepted result: set `transport = "websocket"` in `routes/openai-codex-subscription.toml`,
+    ADR-0047 accepted, update routes.md §B + the adapter's module comment, close #41.
+    A fallback to SSE is currently INVISIBLE to the operator — add a notice (small follow-up).
 * RESEARCH BATCH 2 DECIDED (2026-09-21): #36 grep bounding — USED, merged. #37 summarizer prompt —
   USED as a negative result (prompt unchanged); by-product merged: run records carry
   `harness_head` + `binary_sha256`. #35 out-of-credit diagnosis — USED, merged (ADR-0046 accepted).

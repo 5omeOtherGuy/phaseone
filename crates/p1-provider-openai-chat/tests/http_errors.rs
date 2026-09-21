@@ -232,7 +232,13 @@ async fn an_unrecognised_body_keeps_todays_authentication_error() {
         let error = failed(finish(&provider).await);
 
         assert_eq!(error.kind, ProviderErrorKind::Authentication, "{name}");
-        assert_eq!(error.message, "chat HTTP status 401", "{name}");
+        // A short token-shaped code is named (as the sibling adapters do); nothing else is.
+        let expected = if name == "non-listed word" {
+            "chat HTTP status 401 (bad_key)"
+        } else {
+            "chat HTTP status 401"
+        };
+        assert_eq!(error.message, expected, "{name}");
         assert_eq!(
             transport.requests().len(),
             2,
@@ -285,5 +291,31 @@ async fn the_server_text_never_reaches_the_error() {
             !error.message.contains(SENTINEL) && !rendered.contains(SENTINEL),
             "{name}: the body text leaked into {rendered}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_request_names_a_short_code_and_never_free_text() {
+    let cases: [(&[u8], &str); 4] = [
+        (
+            br#"{"error":{"message":"SENTINEL free text","type":"invalid_request_error","code":"string_above_max_length"}}"#,
+            "chat HTTP status 400 (string_above_max_length)",
+        ),
+        (
+            br#"{"error":{"message":"SENTINEL free text","type":"invalid_request_error"}}"#,
+            "chat HTTP status 400 (invalid_request_error)",
+        ),
+        (
+            br#"{"error":{"code":"this code is a whole SENTINEL sentence, not a token"}}"#,
+            "chat HTTP status 400",
+        ),
+        (b"SENTINEL not json", "chat HTTP status 400"),
+    ];
+    for (body, expected) in cases {
+        let (provider, _transport, _credentials) = provider(vec![error_response(400, body)]);
+        let error = failed(finish(&provider).await);
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert_eq!(error.message, expected);
+        assert!(!format!("{error} {error:?}").contains("SENTINEL"));
     }
 }
