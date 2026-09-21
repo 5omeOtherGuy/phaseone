@@ -1063,7 +1063,7 @@ mod tests {
         );
 
         // Agreeing forms parse; a bare profile is left to the routes.
-        assert!(parse(&args(&["--env", "gpt", "--model", "gpt/gpt-5.6-sol-mini"])).is_ok());
+        assert!(parse(&args(&["--env", "gpt", "--model", "gpt/gpt-5.5"])).is_ok());
         assert!(parse(&args(&["--env", "claude", "--model", "claude-opus-5"])).is_ok());
         assert!(parse(&args(&["--model", "claude/claude-opus-5"])).is_ok());
     }
