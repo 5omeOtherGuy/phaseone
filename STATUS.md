@@ -97,9 +97,10 @@ IN FLIGHT:
   - #41 WebSocket: stages A+B+C merged, ADR-0047 accepted. LIVE: the subscription backend accepts
     the upgrade and the continuation. But the continuation does NOT lower reported input tokens
     (the server counts remembered context as input) and a small task shows no cache or wall-time
-    difference (8 runs) -> the SHIPPED ROUTE STAYS `sse`; `transport = "websocket"` is one line
-    under `[adapter_settings]` of `routes/openai-codex-subscription.toml`. OWNER MAY WANT IT ON
-    ANYWAY — ask/tell him. Open: long-session comparison (upload size); needs the transport to
+    difference (8 runs). OWNER DECIDED (2026-09-21): WebSocket is the DEFAULT — the shipped
+    Codex route now sets `transport = "websocket"`, with iris-style retries (up to 3, backoff)
+    before the SSE fallback; tests inject a refusing connector (`route_provider` takes the
+    connector). Open: long-session comparison (upload size); needs the transport to
     be visible to the operator (a fallback to SSE is silent today) — on #6.
   - #42 iris: shell output filters merged; measured ceiling on p1 = 2.2 % of tool-result bytes
     (kept: fail-safe, stops models piping checks). `read` skim + TOML engine discarded. No
@@ -109,8 +110,9 @@ IN FLIGHT:
   HARNESS BUG FOUND+FIXED that night (`2827aaa`): DeepSeek route answered HTTP 400 when a
   tool-call-only assistant message was replayed without `reasoning_content`; now replayed empty;
   chat adapter names the endpoint's short error code.
-  NEXT RESEARCH (queued, NOT dispatched): the re-read issue (see the newest `research:queued`
-  issue): read = 74.8 % of tool-result bytes, exact re-reads happen ONLY after context summaries
+  #45 (re-reads after context summaries) is ON HOLD BY THE OWNER — he digs into it himself;
+  label `blocked`; do not dispatch. Caveat told to him: 96 % of the re-read bytes come from
+  split4a + split3b, which ran on the old too-tight [context]; token-weighted numbers not done. Evidence: read = 74.8 % of tool-result bytes, exact re-reads happen ONLY after context summaries
   (0 summaries -> 0 %, 40 -> 61.7 %). This is the real cost lever; design work is the lead's.
 * RESEARCH BATCH 2 DECIDED (2026-09-21): #36 grep bounding — USED, merged. #37 summarizer prompt —
   USED as a negative result (prompt unchanged); by-product merged: run records carry

@@ -49,3 +49,11 @@ place a benefit is still plausible: long sessions, where each SSE turn uploads h
 kilobytes and a continuation uploads a few. Before that comparison p1 needs to SAY which
 transport served a request — today a fallback to SSE is invisible (follow-up on #6).
 Limits: one account, one day, prompts of 2–3k tokens, two to four runs per arm.
+
+## Owner decision (2026-09-21, after this record)
+
+"Set transport to websocket as default with reasonable http fallback." The shipped Codex route
+sets `transport = "websocket"` (merged with the ws-default job); transient failures before any
+visible output retry up to the retry budget with backoff before falling back to SSE, modelled on
+the donor's `WsRecoveryState`. A live gpt task through the shipped configuration completed and
+passed its tests. Still open: a fallback to SSE is not visible to the operator (#6).
