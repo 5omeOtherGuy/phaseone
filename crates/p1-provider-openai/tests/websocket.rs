@@ -1,16 +1,19 @@
 //! The WebSocket transport of the Responses adapter (ADR-0047,
-//! `docs/design/websocket.md` §1, §3, §4, §5), entirely offline: a scripted peer,
-//! a scripted HTTP transport for the fallback arm, and an injected clock. No test
-//! here touches the network or a credential file.
+//! `docs/design/websocket.md` §1, §3, §4, §5, §6), entirely offline: a scripted
+//! peer, a scripted HTTP transport for the fallback arm, and an injected clock. No
+//! test here touches the network or a credential file.
 //!
 //! Every row of §5's table is a named test, §3's handshake and frame are pinned
-//! byte for byte, and §4's lifetime rules (reuse, busy, cancellation, the slot)
-//! each have their own. The SSE arm of a WebSocket provider is a
+//! byte for byte, §4's lifetime rules (reuse, busy, cancellation, the slot) each
+//! have their own, and §6's continuation — its one success shape, every rule that
+//! turns it back into a FULL body, and the memory that goes with a dropped
+//! connection — is the last section. The SSE arm of a WebSocket provider is a
 //! [`ScriptedTransport`] with NO scripted response wherever a fallback must NOT
 //! happen: asking for one panics, so "no fallback" is asserted, not assumed.
 
 mod fixtures;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,8 +21,9 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use p1_contracts::{
-    BoxFuture, CancellationToken, Effort, Item, ModelOptions, Outcome, Provider, ProviderError,
-    ProviderErrorKind, ProviderRequest, ProviderStream, StreamEvent,
+    AssistantBlock, AssistantItem, BoxFuture, CancellationToken, DeclarationKind, Effort, Item,
+    ModelOptions, Origin, Outcome, Provider, ProviderError, ProviderErrorKind, ProviderRequest,
+    ProviderStream, ReplayData, StreamEvent, ToolCall, ToolDeclaration, ToolInput,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_http::testing::{
@@ -60,14 +64,25 @@ fn text_frames(sse: &str) -> Vec<ScriptedFrame> {
         .collect()
 }
 
-/// `turns` complete turns of the "no usage" transcript, for a connection that
-/// serves several.
-fn turn_frames(turns: usize) -> Vec<ScriptedFrame> {
+/// `turns` complete turns of one transcript, for a connection that serves several.
+fn turns_of(fixture: &str, turns: usize) -> Vec<ScriptedFrame> {
     let mut frames = Vec::new();
     for _ in 0..turns {
-        frames.extend(text_frames(fixtures::NO_USAGE));
+        frames.extend(text_frames(fixture));
     }
     frames
+}
+
+/// `turns` complete turns of the "no usage" transcript (response id `resp_no_usage`,
+/// one assistant message).
+fn turn_frames(turns: usize) -> Vec<ScriptedFrame> {
+    turns_of(fixtures::NO_USAGE, turns)
+}
+
+/// `turns` complete turns of the tool-call transcript (response id `resp_tool`: an
+/// assistant message "I will read it." and the call `call_1`).
+fn tool_turn_frames(turns: usize) -> Vec<ScriptedFrame> {
+    turns_of(fixtures::TOOL_CALL_TURN, turns)
 }
 
 fn route(transport: ResponsesTransport) -> ResponsesRoute {
@@ -235,13 +250,81 @@ async fn collect(mut stream: ProviderStream) -> Vec<StreamEvent> {
 
 /// One whole turn through a provider.
 async fn turn(provider: &OpenAiCodexProvider) -> Vec<StreamEvent> {
+    turn_of(provider, request()).await
+}
+
+/// One whole turn for a request this test builds itself (the §6 tests run two turns
+/// of the SAME conversation through one provider).
+async fn turn_of(provider: &OpenAiCodexProvider, request: ProviderRequest) -> Vec<StreamEvent> {
     collect(
         provider
-            .stream(request(), CancellationToken::new())
+            .stream(request, CancellationToken::new())
             .await
             .expect("the request is buildable"),
     )
     .await
+}
+
+/// A request with this history, the system prompt and no options: the shape every
+/// §6 test varies by history alone.
+fn history_request(history: Vec<Item>) -> ProviderRequest {
+    ProviderRequest {
+        system_prompt: "SYS".to_string(),
+        history,
+        tools: Vec::new(),
+        options: ModelOptions::default(),
+    }
+}
+
+fn user(text: &str) -> Item {
+    Item::User {
+        text: text.to_string(),
+    }
+}
+
+/// The assistant item the NEXT request's history holds: the previous response as the
+/// core would have recorded it.
+fn assistant(blocks: Vec<AssistantBlock>) -> Item {
+    Item::Assistant(AssistantItem {
+        origin: Origin {
+            route: ROUTE.to_string(),
+            model: MODEL.to_string(),
+        },
+        blocks,
+    })
+}
+
+fn text(text: &str) -> AssistantBlock {
+    AssistantBlock::Text {
+        text: text.to_string(),
+    }
+}
+
+fn call(call_id: &str, name: &str, arguments: &str) -> AssistantBlock {
+    AssistantBlock::ToolCall(ToolCall {
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        input: ToolInput::Json(arguments.to_string()),
+    })
+}
+
+/// One `input` item as `build_request` writes it.
+fn wire_message(role: &str, text: &str) -> Value {
+    let content_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    json!({
+        "type": "message",
+        "role": role,
+        "content": [{ "type": content_type, "text": text }],
+    })
+}
+
+/// The `index`-th text frame the `connection`-th accepted connection sent.
+fn frame(sent: &[Vec<String>], connection: usize, index: usize) -> Value {
+    serde_json::from_str(&sent[connection][index]).expect("a frame is JSON")
 }
 
 fn finished_count(events: &[StreamEvent]) -> usize {
@@ -375,6 +458,96 @@ impl WsConnection for PendingConnection {
 impl Drop for PendingConnection {
     fn drop(&mut self) {
         self.state.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A peer whose connections replay their frames and then go SILENT — a read that
+/// never answers — so a test can cancel a turn in the middle of its read. The
+/// scripted connector cannot do that: an exhausted script is a close.
+struct StallAfterFrames {
+    state: Arc<Mutex<StallState>>,
+}
+
+#[derive(Default)]
+struct StallState {
+    /// One script per accepted connection, consumed in connect order.
+    scripts: VecDeque<Vec<ScriptedFrame>>,
+    /// Texts sent, per accepted connection.
+    sent: Vec<Vec<String>>,
+    dropped: usize,
+}
+
+impl StallAfterFrames {
+    fn new(scripts: Vec<Vec<ScriptedFrame>>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::new(Mutex::new(StallState {
+                scripts: scripts.into(),
+                ..StallState::default()
+            })),
+        })
+    }
+
+    fn sent(&self) -> Vec<Vec<String>> {
+        self.state.lock().unwrap().sent.clone()
+    }
+
+    fn dropped(&self) -> usize {
+        self.state.lock().unwrap().dropped
+    }
+}
+
+impl WsConnector for StallAfterFrames {
+    fn connect<'a>(
+        &'a self,
+        _request: WsHandshake,
+    ) -> BoxFuture<'a, Result<Box<dyn WsConnection>, WsConnectError>> {
+        let (index, frames) = {
+            let mut state = self.state.lock().unwrap();
+            state.sent.push(Vec::new());
+            let frames = state
+                .scripts
+                .pop_front()
+                .expect("StallAfterFrames: one script per connect");
+            (state.sent.len() - 1, frames)
+        };
+        let state = self.state.clone();
+        Box::pin(async move {
+            Ok(Box::new(StalledConnection {
+                state,
+                index,
+                frames: frames.into(),
+            }) as Box<dyn WsConnection>)
+        })
+    }
+}
+
+struct StalledConnection {
+    state: Arc<Mutex<StallState>>,
+    index: usize,
+    frames: VecDeque<ScriptedFrame>,
+}
+
+impl WsConnection for StalledConnection {
+    fn send_text<'a>(&'a mut self, text: String) -> BoxFuture<'a, Result<(), WsError>> {
+        Box::pin(async move {
+            self.state.lock().unwrap().sent[self.index].push(text);
+            Ok(())
+        })
+    }
+
+    fn next_text<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<String>, WsError>> {
+        match self.frames.pop_front() {
+            Some(ScriptedFrame::Text(text)) => Box::pin(async move { Ok(Some(text)) }),
+            Some(ScriptedFrame::Error(message)) => Box::pin(async move { Err(WsError(message)) }),
+            // Past its script this connection never answers again.
+            Some(ScriptedFrame::Close) | None => Box::pin(std::future::pending()),
+        }
+    }
+}
+
+impl Drop for StalledConnection {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().dropped += 1;
     }
 }
 
@@ -1239,6 +1412,618 @@ async fn fallback_turns_websocket_off_for_this_provider_instance() {
     assert_eq!(sse.requests().len(), 2, "both requests used SSE");
 }
 
+// ------------------------------------------------------------------ §6: continuation
+//
+// `NO_USAGE` is one complete turn: response id `resp_no_usage`, one output item —
+// the assistant message "ok". Two turns of a conversation therefore look like: the
+// first request carries `[user "hi"]`, and the second one the SAME item, the
+// assistant message the response completed, and one new user item.
+
+/// The second turn of that conversation, exactly as the next request encodes the
+/// first response's output item.
+fn continued() -> Vec<Item> {
+    vec![user("hi"), assistant(vec![text("ok")]), user("again")]
+}
+
+#[tokio::test]
+async fn a_second_turn_on_one_connection_sends_only_the_new_items() {
+    let (provider, connector) = websocket_provider(
+        vec![ScriptedConnection::accept(turn_frames(2))],
+        ScriptedTransport::new(Vec::new()),
+    );
+
+    completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+    completed(&turn_of(&provider, history_request(continued())).await);
+
+    let sent = connector.sent_texts();
+    assert_eq!(sent.len(), 1, "one connection carried both turns");
+    assert_eq!(sent[0].len(), 2, "one frame per turn");
+    assert_eq!(
+        connector.handshakes().len(),
+        1,
+        "a continuation is not a new connection"
+    );
+
+    let first = frame(&sent, 0, 0);
+    assert!(first.get("previous_response_id").is_none(), "{first}");
+    assert_eq!(first["input"], json!([wire_message("user", "hi")]));
+
+    let second = frame(&sent, 0, 1);
+    assert_eq!(
+        second["type"],
+        json!("response.create"),
+        "a continuation is still a response.create"
+    );
+    assert_eq!(
+        second["previous_response_id"],
+        json!("resp_no_usage"),
+        "the id of the response this input continues (§6 rule 1)"
+    );
+    assert_eq!(
+        second["input"],
+        json!([wire_message("user", "again")]),
+        "ONLY the items after the echoed output item"
+    );
+    for field in ["model", "instructions", "text"] {
+        assert_eq!(
+            second[field], first[field],
+            "{field} is the full body's, unchanged (§6 rule 2)"
+        );
+    }
+    assert!(second.get("stream").is_none() && second.get("background").is_none());
+}
+
+#[tokio::test]
+async fn a_changed_top_level_field_sends_the_full_body() {
+    // One variation of the second request (a plain fn pointer so the table has one
+    // type).
+    type Change = fn(&mut ProviderRequest);
+    // (a) of §6's rule 2: anything but `input` differing — here the instructions,
+    // and a field that APPEARS (tools) where the remembered body had none.
+    let changes: [(&str, Change); 2] = [
+        ("instructions", |request| {
+            request.system_prompt = "SYS-CHANGED".to_string();
+        }),
+        ("tools", |request| {
+            request.tools = vec![ToolDeclaration {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                kind: DeclarationKind::Function {
+                    input_schema: json!({ "type": "object" }),
+                },
+            }];
+        }),
+    ];
+    for (label, change) in changes {
+        let (provider, connector) = websocket_provider(
+            vec![ScriptedConnection::accept(turn_frames(2))],
+            ScriptedTransport::new(Vec::new()),
+        );
+        completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+
+        let mut second = history_request(continued());
+        change(&mut second);
+        completed(&turn_of(&provider, second).await);
+
+        let sent = connector.sent_texts();
+        assert_eq!(sent[0].len(), 2, "{label}: one frame, no reconnect");
+        let second = frame(&sent, 0, 1);
+        assert!(
+            second.get("previous_response_id").is_none(),
+            "{label}: {second}"
+        );
+        assert_eq!(
+            second["input"].as_array().unwrap().len(),
+            3,
+            "{label}: the WHOLE context goes out"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_context_replacement_sends_the_full_body() {
+    // (b): the new input does not start with the remembered one — a different first
+    // user item, so rule 3 fails by construction and the full body goes out.
+    let (provider, connector) = websocket_provider(
+        vec![ScriptedConnection::accept(turn_frames(2))],
+        ScriptedTransport::new(Vec::new()),
+    );
+    completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+    completed(
+        &turn_of(
+            &provider,
+            history_request(vec![
+                user("a different start"),
+                assistant(vec![text("ok")]),
+                user("again"),
+            ]),
+        )
+        .await,
+    );
+
+    let sent = connector.sent_texts();
+    let second = frame(&sent, 0, 1);
+    assert!(
+        second.get("previous_response_id").is_none(),
+        "a replaced context is never continued: {second}"
+    );
+    assert_eq!(
+        second["input"][0],
+        wire_message("user", "a different start")
+    );
+    assert_eq!(second["input"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn an_input_with_nothing_after_the_echo_sends_the_full_body() {
+    // (c): the history ends where the response did, so there is no NEW item — §6
+    // requires at least one more.
+    let (provider, connector) = websocket_provider(
+        vec![ScriptedConnection::accept(turn_frames(2))],
+        ScriptedTransport::new(Vec::new()),
+    );
+    completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+    completed(
+        &turn_of(
+            &provider,
+            history_request(vec![user("hi"), assistant(vec![text("ok")])]),
+        )
+        .await,
+    );
+
+    let sent = connector.sent_texts();
+    let second = frame(&sent, 0, 1);
+    assert!(
+        second.get("previous_response_id").is_none(),
+        "nothing new to send: the FULL body: {second}"
+    );
+    assert_eq!(second["input"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn echoed_items_that_do_not_match_the_response_send_the_full_body() {
+    // (d): the items after the remembered input are not the output items the stream
+    // reported. `TOOL_CALL_TURN` completes an assistant message "I will read it."
+    // and the call `call_1`; each history below echoes something else, and the third
+    // element is the size of the FULL input it must send instead.
+    type History = fn() -> Vec<Item>;
+    let mismatches: [(&str, History, usize); 3] = [
+        (
+            "a different call id",
+            || {
+                vec![
+                    user("hi"),
+                    assistant(vec![
+                        text("I will read it."),
+                        call("call_other", "read", "{}"),
+                    ]),
+                    user("again"),
+                ]
+            },
+            4,
+        ),
+        (
+            "the echoed message dropped",
+            || {
+                vec![
+                    user("hi"),
+                    assistant(vec![call("call_1", "read", r#"{"path":"a.txt"}"#)]),
+                    user("again"),
+                ]
+            },
+            3,
+        ),
+        (
+            "the echoed items swapped",
+            || {
+                vec![
+                    user("hi"),
+                    assistant(vec![
+                        call("call_1", "read", r#"{"path":"a.txt"}"#),
+                        text("I will read it."),
+                    ]),
+                    user("again"),
+                ]
+            },
+            4,
+        ),
+    ];
+    for (label, history, input_items) in mismatches {
+        let (provider, connector) = websocket_provider(
+            vec![ScriptedConnection::accept(tool_turn_frames(2))],
+            ScriptedTransport::new(Vec::new()),
+        );
+        completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+        completed(&turn_of(&provider, history_request(history())).await);
+
+        let sent = connector.sent_texts();
+        let second = frame(&sent, 0, 1);
+        assert!(
+            second.get("previous_response_id").is_none(),
+            "{label}: {second}"
+        );
+        assert_eq!(
+            second["input"].as_array().unwrap().len(),
+            input_items,
+            "{label}: the whole context"
+        );
+    }
+
+    // The control: the SAME two turns with the response's own items echoed do
+    // continue, so none of the rejections above is vacuous.
+    let (provider, connector) = websocket_provider(
+        vec![ScriptedConnection::accept(tool_turn_frames(2))],
+        ScriptedTransport::new(Vec::new()),
+    );
+    completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+    completed(
+        &turn_of(
+            &provider,
+            history_request(vec![
+                user("hi"),
+                assistant(vec![
+                    text("I will read it."),
+                    call("call_1", "read", r#"{"path":"a.txt"}"#),
+                ]),
+                user("again"),
+            ]),
+        )
+        .await,
+    );
+    let second = frame(&connector.sent_texts(), 0, 1);
+    assert_eq!(second["previous_response_id"], json!("resp_tool"));
+    assert_eq!(second["input"], json!([wire_message("user", "again")]));
+}
+
+#[tokio::test]
+async fn a_reasoning_item_is_echoed_through_its_replay_payload() {
+    // The GPT route replays reasoning as `{type: reasoning, encrypted_content,
+    // summary: []}`, which is exactly the item rule 3 has to recognise in the echo.
+    let connector = ScriptedWsConnector::new(vec![ScriptedConnection::accept(turns_of(
+        fixtures::REASONING_TURN,
+        2,
+    ))]);
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        ScriptedTransport::new(Vec::new()),
+        Some(Arc::new(connector.clone())),
+    )
+    .expect("the route composes");
+
+    let history = || {
+        vec![
+            user("hi"),
+            assistant(vec![
+                AssistantBlock::Reasoning {
+                    text: "first part\n\nsecond part".to_string(),
+                    replay: Some(ReplayData {
+                        origin: Origin {
+                            route: ROUTE.to_string(),
+                            model: MODEL.to_string(),
+                        },
+                        version: 1,
+                        payload: json!({
+                            "type": "reasoning",
+                            "encrypted_content": "enc-1",
+                        }),
+                    }),
+                },
+                text("answer"),
+            ]),
+            user("again"),
+        ]
+    };
+    // An effort level on BOTH turns: it is what puts `reasoning` and `include` in the
+    // body, so rule 2 holds and the echo below is the only thing being tested.
+    let with_effort = |history| {
+        let mut request = history_request(history);
+        request.options.reasoning_effort = Some(Effort::Low);
+        request
+    };
+    completed(&turn_of(&provider, with_effort(vec![user("hi")])).await);
+    completed(&turn_of(&provider, with_effort(history())).await);
+
+    let sent = connector.sent_texts();
+    let second = frame(&sent, 0, 1);
+    assert_eq!(
+        second["previous_response_id"],
+        json!("resp_reasoning"),
+        "the reasoning item and the message after it are the echo, both of them"
+    );
+    assert_eq!(second["input"], json!([wire_message("user", "again")]));
+    assert_eq!(
+        second["include"],
+        json!(["reasoning.encrypted_content"]),
+        "the full body's own fields are untouched"
+    );
+}
+
+#[tokio::test]
+async fn an_idle_connection_never_continues() {
+    let clock = FakeClock::new();
+    let connector = ScriptedWsConnector::new(vec![
+        ScriptedConnection::accept(turn_frames(1)),
+        ScriptedConnection::accept(turn_frames(1)),
+    ]);
+    let provider = compose_with(
+        ResponsesTransport::Websocket,
+        ScriptedTransport::new(Vec::new()),
+        Some(Arc::new(connector.clone())),
+        Some(clock.handle()),
+        Arc::new(FixedCredentials::default()),
+    )
+    .expect("the route composes");
+
+    completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+    clock.advance(Duration::from_secs(6 * 60));
+    completed(&turn_of(&provider, history_request(continued())).await);
+
+    let sent = connector.sent_texts();
+    assert_eq!(sent.len(), 2, "past the idle bound: connect anew");
+    let first_of_new = frame(&sent, 1, 0);
+    assert!(
+        first_of_new.get("previous_response_id").is_none(),
+        "a new connection remembers nothing: {first_of_new}"
+    );
+    assert_eq!(
+        first_of_new["input"].as_array().unwrap().len(),
+        3,
+        "the FULL body"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_past_its_max_age_never_continues() {
+    // Four minutes between turns keeps every turn inside the idle bound, so the
+    // 15th turn is the first whose connection is older than 55 minutes.
+    let clock = FakeClock::new();
+    let connector = ScriptedWsConnector::new(vec![
+        ScriptedConnection::accept(turn_frames(14)),
+        ScriptedConnection::accept(turn_frames(1)),
+    ]);
+    let provider = compose_with(
+        ResponsesTransport::Websocket,
+        ScriptedTransport::new(Vec::new()),
+        Some(Arc::new(connector.clone())),
+        Some(clock.handle()),
+        Arc::new(FixedCredentials::default()),
+    )
+    .expect("the route composes");
+
+    for _ in 0..14 {
+        completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+        clock.advance(Duration::from_secs(4 * 60));
+    }
+    assert_eq!(connector.handshakes().len(), 1, "14 turns, one connection");
+    completed(&turn_of(&provider, history_request(continued())).await);
+
+    let sent = connector.sent_texts();
+    assert_eq!(sent.len(), 2, "56 minutes old: connect anew");
+    let first_of_new = frame(&sent, 1, 0);
+    assert!(
+        first_of_new.get("previous_response_id").is_none(),
+        "the expired connection's memory died with it: {first_of_new}"
+    );
+    assert_eq!(first_of_new["input"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_failed_turn_clears_the_continuation() {
+    let connector = ScriptedWsConnector::new(vec![
+        ScriptedConnection::accept(
+            turn_frames(1)
+                .into_iter()
+                .chain([ScriptedFrame::text(DELTA), ScriptedFrame::error("reset")])
+                .collect(),
+        ),
+        ScriptedConnection::accept(turn_frames(1)),
+    ]);
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        ScriptedTransport::new(Vec::new()),
+        Some(Arc::new(connector.clone())),
+    )
+    .expect("the route composes");
+
+    completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+    // The second turn IS a continuation, and its response fails after output: §4
+    // drops the connection, so §6's memory goes with it.
+    let events = turn_of(&provider, history_request(continued())).await;
+    assert_eq!(failed(&events).kind, ProviderErrorKind::Transport);
+
+    // The retry of that turn opens a NEW connection and sends the FULL body.
+    completed(&turn_of(&provider, history_request(continued())).await);
+
+    let sent = connector.sent_texts();
+    assert_eq!(sent.len(), 2, "the failed response dropped its socket");
+    assert_eq!(
+        frame(&sent, 0, 1)["previous_response_id"],
+        json!("resp_no_usage"),
+        "the failed turn had been a continuation"
+    );
+    let retry = frame(&sent, 1, 0);
+    assert!(
+        retry.get("previous_response_id").is_none(),
+        "a fresh connection starts from the FULL body: {retry}"
+    );
+    assert_eq!(retry["input"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_clears_the_continuation() {
+    let peer = StallAfterFrames::new(vec![turn_frames(1), turn_frames(1)]);
+    let connector: Arc<dyn WsConnector> = peer.clone();
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        ScriptedTransport::new(Vec::new()),
+        Some(connector),
+    )
+    .expect("the route composes");
+
+    completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+
+    // The second turn is a continuation whose read never answers; cancelling it
+    // drops the socket (§4) and clears the continuation (§6).
+    let cancel = CancellationToken::new();
+    let mut stream = provider
+        .stream(history_request(continued()), cancel.clone())
+        .await
+        .expect("the request is buildable");
+    poll_once(&mut stream).await;
+    cancel.cancel();
+    let events = collect(stream).await;
+    assert!(
+        matches!(terminal(&events), Outcome::Cancelled),
+        "{events:?}"
+    );
+    assert_eq!(peer.dropped(), 1, "the cancelled turn dropped its socket");
+
+    completed(&turn_of(&provider, history_request(continued())).await);
+
+    let sent = peer.sent();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        frame(&sent, 0, 1)["previous_response_id"],
+        json!("resp_no_usage"),
+        "the cancelled turn had been a continuation"
+    );
+    let after = frame(&sent, 1, 0);
+    assert!(
+        after.get("previous_response_id").is_none(),
+        "the cancelled turn's memory died with its socket: {after}"
+    );
+    assert_eq!(after["input"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_fallback_to_sse_clears_the_continuation() {
+    // The first connection answers turn 1 and then closes, so the reused socket is
+    // gone before turn 2's first frame (§5 reconnects); the fresh one closes too, so
+    // the last row of §5's table falls back to SSE — which drops both sockets.
+    let sse = ScriptedTransport::new(vec![
+        ScriptedResponse::ok_sse(fixtures::NO_USAGE),
+        ScriptedResponse::ok_sse(fixtures::NO_USAGE),
+    ]);
+    let connector = ScriptedWsConnector::new(vec![
+        ScriptedConnection::accept(
+            turn_frames(1)
+                .into_iter()
+                .chain([ScriptedFrame::close()])
+                .collect(),
+        ),
+        ScriptedConnection::accept(vec![ScriptedFrame::close()]),
+    ]);
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        sse.clone(),
+        Some(Arc::new(connector.clone())),
+    )
+    .expect("the route composes");
+
+    completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+    completed(&turn_of(&provider, history_request(continued())).await);
+
+    let sent = connector.sent_texts();
+    assert_eq!(
+        frame(&sent, 0, 1)["previous_response_id"],
+        json!("resp_no_usage"),
+        "turn 2 started as a continuation"
+    );
+    let resent = frame(&sent, 1, 0);
+    assert!(
+        resent.get("previous_response_id").is_none(),
+        "the reconnect after the close sends the FULL body: {resent}"
+    );
+
+    // The SSE request that actually produced the turn, and the next turn (WebSocket
+    // is off for this instance now), both carry the whole context and no id.
+    assert_eq!(sse.requests().len(), 1, "the fallback ran the turn");
+    completed(&turn_of(&provider, history_request(continued())).await);
+    let requests = sse.requests();
+    assert_eq!(requests.len(), 2);
+    for (index, request) in requests.iter().enumerate() {
+        let body: Value = serde_json::from_slice(&request.body).expect("the body is JSON");
+        assert!(
+            body.get("previous_response_id").is_none(),
+            "request {index}: {body}"
+        );
+        assert_eq!(
+            body["input"].as_array().unwrap().len(),
+            3,
+            "request {index}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_connection_error_rows_on_a_continuation_reconnect_and_resend_the_full_body_once() {
+    for code in [
+        "previous_response_not_found",
+        "websocket_connection_limit_reached",
+    ] {
+        let (provider, connector) = websocket_provider(
+            vec![
+                ScriptedConnection::accept(
+                    turn_frames(1)
+                        .into_iter()
+                        .chain([ScriptedFrame::text(format!(
+                            r#"{{"type":"error","error":{{"code":"{code}"}}}}"#
+                        ))])
+                        .collect(),
+                ),
+                ScriptedConnection::accept(turn_frames(1)),
+            ],
+            ScriptedTransport::new(Vec::new()),
+        );
+        completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+        completed(&turn_of(&provider, history_request(continued())).await);
+
+        assert_eq!(connector.handshakes().len(), 2, "{code}: reconnect once");
+        let sent = connector.sent_texts();
+        assert_eq!(sent.len(), 2, "{code}");
+        assert_eq!(
+            frame(&sent, 0, 1)["previous_response_id"],
+            json!("resp_no_usage"),
+            "{code}: the frame that got the error was a continuation"
+        );
+        let resent = frame(&sent, 1, 0);
+        assert!(
+            resent.get("previous_response_id").is_none(),
+            "{code}: the FULL body goes out again: {resent}"
+        );
+        assert_eq!(resent["input"].as_array().unwrap().len(), 3, "{code}");
+        // The resend succeeded: `completed` above pinned the terminal event.
+    }
+}
+
+#[tokio::test]
+async fn the_sse_arm_never_continues_across_turns() {
+    // The frozen assertion: whatever the history looks like, the SSE path sends the
+    // whole context and no `previous_response_id`.
+    let sse = ScriptedTransport::new(vec![
+        ScriptedResponse::ok_sse(fixtures::NO_USAGE),
+        ScriptedResponse::ok_sse(fixtures::NO_USAGE),
+    ]);
+    let provider = compose(ResponsesTransport::Sse, sse.clone(), None).expect("the route composes");
+    completed(&turn_of(&provider, history_request(vec![user("hi")])).await);
+    completed(&turn_of(&provider, history_request(continued())).await);
+
+    let requests = sse.requests();
+    assert_eq!(requests.len(), 2);
+    for (index, expected_items) in [(0, 1), (1, 3)] {
+        let body: Value = serde_json::from_slice(&requests[index].body).expect("the body is JSON");
+        assert!(
+            body.get("previous_response_id").is_none(),
+            "request {index}: {body}"
+        );
+        assert_eq!(
+            body["input"].as_array().unwrap().len(),
+            expected_items,
+            "request {index}: the SSE body always carries the whole context"
+        );
+    }
+}
+
 // ----------------------------------------------------------------- no leaked values
 
 #[tokio::test]
@@ -1276,6 +2061,36 @@ async fn no_debug_or_error_text_carries_a_header_value() {
         format!("{:?}", connector.handshakes()),
     ] {
         for sentinel in [BEARER, REFRESHED, ACCOUNT_ID, CACHE_KEY, "SENTINEL-WS-BODY"] {
+            assert!(!text.contains(sentinel), "{sentinel} leaked into: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_debug_output_carries_remembered_message_content() {
+    let (provider, connector) = websocket_provider(
+        vec![ScriptedConnection::accept(turn_frames(2))],
+        ScriptedTransport::new(Vec::new()),
+    );
+    let mut first = history_request(vec![user("hi")]);
+    first.system_prompt = "SENTINEL-INSTRUCTIONS".to_string();
+    completed(&turn_of(&provider, first).await);
+    let mut second = history_request(vec![
+        user("hi"),
+        assistant(vec![text("ok")]),
+        user("SENTINEL-NEW-ITEM"),
+    ]);
+    second.system_prompt = "SENTINEL-INSTRUCTIONS".to_string();
+    let events = turn_of(&provider, second).await;
+    completed(&events);
+
+    // The continuation happened, so the connection is holding the remembered body.
+    assert_eq!(
+        frame(&connector.sent_texts(), 0, 1)["previous_response_id"],
+        json!("resp_no_usage")
+    );
+    for text in [format!("{provider:?}"), format!("{events:?}")] {
+        for sentinel in ["SENTINEL-INSTRUCTIONS", "SENTINEL-NEW-ITEM"] {
             assert!(!text.contains(sentinel), "{sentinel} leaked into: {text}");
         }
     }

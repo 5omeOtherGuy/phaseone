@@ -15,8 +15,12 @@
 //! output every failure is an ordinary `Transport` failure of that response. Every
 //! row of that table has a named test in `tests/websocket.rs`.
 //!
-//! §6 (continuation) is the NEXT stage: this one always sends the FULL body.
-//! [`request_frame`] is the single place that decision lands.
+//! §6 (continuation, stage C): the connection also remembers the response it
+//! completed last, and the next request whose body continues that response is sent
+//! with `previous_response_id` and only the new items. [`request_frame`] is the
+//! single place that decision lands, and [`Memory`] is everything it reads. The
+//! memory lives in the connection itself, so §4's rule — every drop, every
+//! reconnect, every fallback — clears it without a second bookkeeping path.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -32,7 +36,7 @@ use p1_contracts::{
 };
 use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsHandshake};
 use p1_provider_http::{Credential, CredentialSource, ResponseParser, SseEvent};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::ResponsesAccount;
@@ -77,6 +81,190 @@ struct Live {
     /// only a REUSED socket can do: a fresh one that never answered is an ordinary
     /// connect failure.
     reused: bool,
+    /// §6: what the response this connection completed last lets the next request
+    /// continue from. It lives HERE, so it cannot outlive the connection: every
+    /// drop, every reconnect and every fallback throws it away with the socket.
+    memory: Option<Memory>,
+}
+
+/// §6: what one connection remembers about the response it completed last. Each
+/// field is read by exactly one of §6's rules.
+struct Memory {
+    /// The FULL body that response answered. Its `input` array is the prefix rule 3
+    /// requires the next `input` to start with, and every other top-level field is
+    /// what rule 2 compares. A continuation's own body IS this body — rule 3 makes
+    /// its `input` the same array — so the memory stays valid turn after turn.
+    body: Value,
+    /// The id the continuation sends as `previous_response_id` (§6 rule 1).
+    response_id: String,
+    /// The output items of that response, in order, as the next request's `input`
+    /// re-encodes them. They are where the echo rule 3 requires ends.
+    items: Vec<EchoedItem>,
+}
+
+impl std::fmt::Debug for Memory {
+    /// Lengths and the response id only: the remembered body holds the whole
+    /// conversation, and no `Debug` output may carry it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let input_items = self
+            .body
+            .get("input")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        f.debug_struct("Memory")
+            .field("input_items", &input_items)
+            .field("output_items", &self.items.len())
+            .field("response_id", &self.response_id)
+            .finish()
+    }
+}
+
+/// One output item of a remembered response, reduced to the fields the next
+/// request's `input` re-encodes of it (§6 rule 3).
+#[derive(Clone)]
+struct EchoedItem {
+    /// The `type` the next request writes for this item.
+    kind: &'static str,
+    /// The `role` it writes, for a message: what tells the echoed assistant message
+    /// from the user message that follows it.
+    role: Option<&'static str>,
+    /// The item's wire `id`. The encoding does not carry one, so it is only
+    /// compared when a new item happens to have one.
+    id: Option<String>,
+    /// The call id the next request writes — `call_id`, or the `id` the wire put it
+    /// there instead (the parser's own rule, so the two cannot disagree).
+    call_id: Option<String>,
+}
+
+impl EchoedItem {
+    /// Whether `item` is THIS remembered output item as the next request encodes it.
+    /// `type` and `role` are what the encoding writes, and a call's id comes back
+    /// under either of the wire's two spellings (the parser's rule). A plain item
+    /// `id` is NOT re-encoded: one is compared only when a new item has one.
+    fn answers(&self, item: &Value) -> bool {
+        if item.get("type").and_then(Value::as_str) != Some(self.kind) {
+            return false;
+        }
+        item.get("role").and_then(Value::as_str) == self.role
+            && self
+                .call_id
+                .as_deref()
+                .is_none_or(|call_id| item_call_id(item) == call_id)
+            && item
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| self.id.as_deref() == Some(id))
+    }
+}
+
+/// The output item a completed response would contribute to the next request's
+/// `input`, or `None` for one it would not contribute at all: the parser only
+/// builds a block for the four known item types, `input_items` skips an empty
+/// assistant text and a reasoning item without encrypted content, and an unknown
+/// type is nothing on both sides. Only items that DO come back are part of the
+/// echo rule 3 looks for.
+fn echoed_item(item: &Value) -> Option<EchoedItem> {
+    let kind = item.get("type").and_then(Value::as_str)?;
+    let id = item.get("id").and_then(Value::as_str).map(str::to_string);
+    match kind {
+        "message" => has_output_text(item).then_some(EchoedItem {
+            kind: "message",
+            role: Some("assistant"),
+            id,
+            call_id: None,
+        }),
+        "reasoning" => item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|encrypted| !encrypted.is_empty())
+            .then_some(EchoedItem {
+                kind: "reasoning",
+                role: None,
+                id,
+                call_id: None,
+            }),
+        "function_call" => Some(EchoedItem {
+            kind: "function_call",
+            role: None,
+            id,
+            call_id: Some(item_call_id(item)),
+        }),
+        "custom_tool_call" => Some(EchoedItem {
+            kind: "custom_tool_call",
+            role: None,
+            id,
+            call_id: Some(item_call_id(item)),
+        }),
+        _ => None,
+    }
+}
+
+/// Whether a message item carries any `output_text` (the only part kind that
+/// becomes a text block, and therefore the next request's assistant message).
+fn has_output_text(item: &Value) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("output_text")
+                    && part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            })
+        })
+}
+
+/// The call id the parser would take from this item, so the fingerprint and the
+/// re-encoded `call_id` are the same string.
+fn item_call_id(item: &Value) -> String {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The response id and the re-encodable output items ONE attempt's stream has
+/// reported, in arrival order. Recorded per frame, read when the response ends.
+#[derive(Default)]
+struct ResponseFacts {
+    id: Option<String>,
+    items: Vec<EchoedItem>,
+}
+
+impl ResponseFacts {
+    /// Read the two envelope facts §6 needs out of one event frame. The parser stays
+    /// the only reader of the event VOCABULARY (`docs/design/websocket.md` §3: no
+    /// second parser); this reads only the fields the continuation rules name, and a
+    /// frame it cannot read changes nothing.
+    fn record(&mut self, text: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.created")
+            | Some("response.completed")
+            | Some("response.done")
+            | Some("response.incomplete") => {
+                if let Some(id) = value
+                    .get("response")
+                    .and_then(|response| response.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    self.id = Some(id.to_string());
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = value.get("item")
+                    && let Some(echoed) = echoed_item(item)
+                {
+                    self.items.push(echoed);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl WebSocket {
@@ -162,6 +350,9 @@ struct State {
     /// A fresh parser per attempt, exactly as `drive` builds one.
     parser: Box<dyn ResponseParser>,
     live: Option<Live>,
+    /// What THIS attempt's stream has reported for §6: its response id and its
+    /// re-encodable output items. Reset with the parser on every attempt.
+    facts: ResponseFacts,
     /// The slot this request owns for its whole life.
     slot: OwnedMutexGuard<Slot>,
     /// Whether this attempt has seen no frame yet: the state §5's
@@ -189,6 +380,7 @@ impl State {
             credential: None,
             parser,
             live: None,
+            facts: ResponseFacts::default(),
             slot,
             awaiting_first_frame: false,
             visible: false,
@@ -209,23 +401,27 @@ impl State {
     }
 
     /// The end of a response: a completed one returns the connection to its slot
-    /// (§4), every other ending drops it with this state.
+    /// (§4) — with §6's memory of what it just answered — and every other ending
+    /// drops both.
     fn terminal(mut self, outcome: Outcome) -> Self {
         if matches!(outcome, Outcome::Completed(_))
             && let Some(mut live) = self.live.take()
         {
             live.last_used_at = (self.request.ws.clock)();
+            live.memory = remember(&self.request, &self.facts);
             self.slot.connection = Some(live);
         }
         self.finish(outcome)
     }
 
-    /// §5: drop the connection — a socket we have read from is never reused — and
-    /// open a new one, which sends the FULL body. At most once per request.
+    /// §5: drop the connection — a socket we have read from is never reused, and
+    /// §6's memory goes with it — and open a new one, which sends the FULL body. At
+    /// most once per request.
     fn reconnect(mut self) -> Self {
         self.reconnects += 1;
         self.live = None;
         self.parser = new_parser(&self.request);
+        self.facts = ResponseFacts::default();
         self.awaiting_first_frame = false;
         self.phase = Phase::Connect;
         self
@@ -338,6 +534,9 @@ async fn connect(mut state: State) -> State {
                 connected_at: now,
                 last_used_at: now,
                 reused: false,
+                // A new connection has answered nothing yet: §6's memory is per
+                // connection, so the next frame is necessarily a FULL body.
+                memory: None,
             });
             state.phase = Phase::Send;
             state
@@ -381,8 +580,10 @@ async fn send(mut state: State) -> State {
         return state.finish(Outcome::Cancelled);
     }
     // Sending always precedes any output of this request, so §5's "after visible
-    // output" rule cannot apply here.
-    let frame = request_frame(&state.request);
+    // output" rule cannot apply here. §6: what this connection remembers about the
+    // response it completed last decides this frame's shape.
+    let memory = state.live.as_ref().and_then(|live| live.memory.as_ref());
+    let frame = request_frame(&state.request, memory);
     let cancel = state.request.cancel.clone();
     let sent = {
         let live = state
@@ -435,6 +636,7 @@ impl State {
             return self.reconnect();
         }
         self.awaiting_first_frame = false;
+        self.facts.record(text);
         let events = self.parser.on_event(SseEvent {
             event: None,
             data: text.to_string(),
@@ -501,6 +703,20 @@ async fn fallback(mut state: State) -> State {
     }
 }
 
+/// §6: what this connection remembers now that the response ended cleanly. `None`
+/// when there is nothing to continue from — the stream named no response id, or the
+/// body this request sent has no `input` array — and then the next request sends the
+/// FULL body, which is never an error.
+fn remember(request: &WebSocketRequest, facts: &ResponseFacts) -> Option<Memory> {
+    let response_id = facts.id.clone()?;
+    request.body.get("input")?.as_array()?;
+    Some(Memory {
+        body: request.body.clone(),
+        response_id,
+        items: facts.items.clone(),
+    })
+}
+
 fn new_parser(request: &WebSocketRequest) -> Box<dyn ResponseParser> {
     Box::new(CodexResponseParser::new(
         &request.origin_route,
@@ -533,15 +749,71 @@ fn websocket_url(url: &str) -> String {
     }
 }
 
-/// The ONE frame this request sends.
+/// The ONE frame this request sends (`docs/design/websocket.md` §3).
 ///
-/// §6's continuation decision lands EXACTLY here: it will consult the live
-/// connection's remembered body, response id and output items, and when all three
-/// of §6's rules hold it will send only the new items with `previous_response_id`
-/// set. This stage keeps no such memory, so the FULL body always goes out and
-/// `previous_response_id` is never sent.
-fn request_frame(request: &WebSocketRequest) -> String {
-    ws_frame(&request.body)
+/// §6's continuation decision lands EXACTLY here: when the connection remembers a
+/// response that this request's body continues, the frame is that body with `input`
+/// reduced to the new items and `previous_response_id` set; otherwise it is the FULL
+/// body, which is never an error.
+fn request_frame(request: &WebSocketRequest, memory: Option<&Memory>) -> String {
+    let body = &request.body;
+    let continuation = memory.and_then(|memory| continuation_body(memory, body));
+    ws_frame(continuation.as_ref().unwrap_or(body))
+}
+
+/// §6 rules 2 and 3, and what a continuation sends: the body to send with
+/// `previous_response_id` and only the new items, or `None` for the FULL body.
+///
+/// Rule 3 is decided on JSON VALUES, in three steps:
+/// 1. the new `input` starts with the remembered `input` (call it A);
+/// 2. the items after A ARE the output items the remembered response completed, in
+///    order, as this adapter's `input_items` re-encodes them — the echo;
+/// 3. at least one further item follows the echo, and those are the items to send.
+///
+/// Any step failing means the FULL body. Rule 1 holds before this is ever reached:
+/// the memory only exists on the connection that produced the response and
+/// completed it cleanly.
+fn continuation_body(memory: &Memory, body: &Value) -> Option<Value> {
+    if !same_shape(&memory.body, body) {
+        return None;
+    }
+    let base = memory.body.get("input")?.as_array()?;
+    let input = body.get("input")?.as_array()?;
+    let echo = input.get(base.len()..)?;
+    if input.get(..base.len())? != base.as_slice() || echo.len() <= memory.items.len() {
+        return None;
+    }
+    for (item, expected) in echo.iter().zip(&memory.items) {
+        if !expected.answers(item) {
+            return None;
+        }
+    }
+    let mut continuation = body.clone();
+    let fields = continuation.as_object_mut()?;
+    fields.insert(
+        "input".to_string(),
+        Value::Array(echo[memory.items.len()..].to_vec()),
+    );
+    fields.insert(
+        "previous_response_id".to_string(),
+        json!(memory.response_id),
+    );
+    Some(continuation)
+}
+
+/// §6 rule 2: every top-level field of the new body except `input` equals the
+/// remembered one. The key SET counts: a field that appeared or vanished is a
+/// different shape, and then the full body goes out.
+fn same_shape(remembered: &Value, body: &Value) -> bool {
+    fn fields(value: &Value) -> Option<Map<String, Value>> {
+        let mut fields = value.as_object()?.clone();
+        fields.remove("input");
+        Some(fields)
+    }
+    match (fields(remembered), fields(body)) {
+        (Some(remembered), Some(body)) => remembered == body,
+        _ => false,
+    }
 }
 
 /// Whether a frame is one of the two error events §5 reconnects for. The parser
@@ -660,6 +932,108 @@ mod tests {
             "not json",
         ] {
             assert!(!reconnect_code(text), "{text}");
+        }
+    }
+
+    /// §6's memory is only ever read by the rules; its `Debug` is for a trace, so it
+    /// carries lengths and the response id and never one word of the conversation.
+    #[test]
+    fn remembered_state_debug_is_lengths_and_the_response_id_only() {
+        let memory = Memory {
+            body: json!({
+                "instructions": "SENTINEL-INSTRUCTIONS",
+                "input": [
+                    { "type": "message", "role": "user",
+                      "content": [{ "type": "input_text", "text": "SENTINEL-TEXT" }] },
+                    { "type": "message", "role": "user",
+                      "content": [{ "type": "input_text", "text": "SENTINEL-TEXT-2" }] },
+                ],
+            }),
+            response_id: "resp_1".to_string(),
+            items: vec![EchoedItem {
+                kind: "message",
+                role: Some("assistant"),
+                id: Some("msg_1".to_string()),
+                call_id: None,
+            }],
+        };
+        let text = format!("{memory:?}");
+        assert!(!text.contains("SENTINEL"), "{text}");
+        for field in ["input_items: 2", "output_items: 1", "resp_1"] {
+            assert!(text.contains(field), "{field} missing from {text}");
+        }
+    }
+
+    /// Rule 3's echo is made of the items the next request WOULD carry: the four
+    /// item types the parser turns into blocks, minus the two the request builder
+    /// drops again (an empty assistant message, reasoning with no encrypted content).
+    #[test]
+    fn only_items_the_next_request_re_encodes_are_echoed() {
+        let echo = |text: &str| {
+            let item: Value = serde_json::from_str(text).unwrap();
+            echoed_item(&item).map(|echoed| {
+                (
+                    echoed.kind,
+                    echoed.role,
+                    echoed.call_id.clone(),
+                    echoed.answers(&item),
+                )
+            })
+        };
+        assert_eq!(
+            echo(
+                r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}"#
+            ),
+            Some(("message", Some("assistant"), None, true)),
+            "a message with text comes back as an assistant message"
+        );
+        assert_eq!(
+            echo(r#"{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"}"#),
+            Some(("function_call", None, Some("call_1".to_string()), true))
+        );
+        assert_eq!(
+            echo(r#"{"type":"function_call","id":"fc_1","name":"read","arguments":"{}"}"#),
+            Some(("function_call", None, Some("fc_1".to_string()), true)),
+            "without a call_id the wire's id is the call id, as in the parser"
+        );
+        assert_eq!(
+            echo(r#"{"type":"custom_tool_call","call_id":"c","name":"patch","input":"***"}"#),
+            Some(("custom_tool_call", None, Some("c".to_string()), true))
+        );
+        assert_eq!(
+            echo(r#"{"type":"reasoning","encrypted_content":"enc-1","summary":[]}"#),
+            Some(("reasoning", None, None, true))
+        );
+        for dropped in [
+            r#"{"type":"message","role":"assistant","content":[]}"#,
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]}"#,
+            r#"{"type":"reasoning","summary":[{"type":"summary_text","text":"s"}]}"#,
+            r#"{"type":"reasoning","encrypted_content":""}"#,
+            r#"{"type":"web_search_call","id":"ws_1"}"#,
+        ] {
+            assert_eq!(echo(dropped), None, "{dropped} is not in the next input");
+        }
+    }
+
+    /// An item only answers the fingerprint if the fields the next request
+    /// re-encodes come back; the item `id` comes back only when a client sends one.
+    #[test]
+    fn a_fingerprint_requires_the_fields_the_encoding_carries() {
+        let item: Value =
+            serde_json::from_str(r#"{"type":"function_call","call_id":"call_1","name":"read"}"#)
+                .unwrap();
+        let fingerprint = echoed_item(&item).unwrap();
+        assert!(fingerprint.answers(&item));
+        for wrong in [
+            r#"{"type":"message","call_id":"call_1"}"#,
+            r#"{"type":"function_call","call_id":"call_2"}"#,
+            r#"{"type":"function_call"}"#,
+            r#"{"type":"function_call","call_id":"call_1","id":"fc_1"}"#,
+        ] {
+            assert!(
+                !fingerprint.answers(&serde_json::from_str::<Value>(wrong).unwrap()),
+                "{wrong}"
+            );
         }
     }
 }
