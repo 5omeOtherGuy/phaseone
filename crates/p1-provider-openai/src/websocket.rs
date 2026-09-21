@@ -56,6 +56,20 @@ const MAX_AGE: Duration = Duration::from_secs(55 * 60);
 /// … and was last used less than this ago.
 const MAX_IDLE: Duration = Duration::from_secs(5 * 60);
 
+/// The `<reason>` of a fallback notice when no HTTP status refused the upgrade:
+/// a connect failure, a timeout, or a connection that broke before any output.
+const NO_CONNECTION: &str = "connection failed";
+
+/// The notice a fallback emits (ADR-0048), and the ONE place its wording lives:
+/// display-only, the adapter's own constant, never history, journal or model input.
+fn fallback_notice(reason: &str) -> StreamEvent {
+    StreamEvent::Notice {
+        text: format!(
+            "transport: WebSocket unavailable ({reason}) — using HTTP (SSE) for the rest of this session"
+        ),
+    }
+}
+
 /// The WebSocket half of one provider instance: one connector, one connection
 /// slot, and the switch a fallback turns off for good (§5).
 pub(crate) struct WebSocket {
@@ -471,7 +485,7 @@ impl State {
     /// `max_retries`; the budget spent, fall back to SSE.
     fn transient(mut self) -> Self {
         if self.transient_retries >= self.request.ws.retry.max_retries {
-            return self.fall_back();
+            return self.fall_back(NO_CONNECTION);
         }
         self.transient_retries += 1;
         let delay = self.request.ws.retry.delay(self.transient_retries, None);
@@ -495,10 +509,16 @@ impl State {
     }
 
     /// §5: run today's `drive()` path for THIS request, and turn WebSocket off for
-    /// this provider instance until the process ends.
-    fn fall_back(mut self) -> Self {
+    /// this provider instance until the process ends. The operator is told, ONCE,
+    /// right here: the notice is queued before the SSE request is even started
+    /// (ADR-0048), so it precedes the response's first event. Every fallback of a
+    /// request that had already fallen back is impossible — a disabled instance
+    /// never starts a WebSocket request again — so one request announces at most
+    /// once, and a later request, already on SSE, announces nothing.
+    fn fall_back(mut self, reason: &str) -> Self {
         self.request.ws.disabled.store(true, Ordering::SeqCst);
         self.live = None;
+        self.pending.push_back(fallback_notice(reason));
         self.phase = Phase::Fallback;
         self
     }
@@ -638,7 +658,7 @@ fn refused_upgrade(mut state: State, status: u16, body: &[u8]) -> State {
         // limit, and the caller should see the limit rather than a retry storm.
         429 => state.finish(Outcome::Failed(error)),
         // Any other refusal says nothing about SSE: fall back to it.
-        _ => state.fall_back(),
+        _ => state.fall_back(&format!("HTTP {status}")),
     }
 }
 
@@ -766,6 +786,9 @@ async fn wait(mut state: State, delay: Duration) -> State {
     }
 }
 
+/// Today's SSE path for this request (§5). The fallback's notice is already in the
+/// queue when this is reached, so the operator sees it before the response's first
+/// event (ADR-0048).
 async fn fallback(mut state: State) -> State {
     if state.sse.is_none() {
         let stream = (state.request.sse)();

@@ -575,6 +575,13 @@ fn end_of_first_visible_event(body: &str) -> usize {
         .map_or(body.len(), |index| hello + index + 2)
 }
 
+/// ADR-0048: a `Notice` is display-only and carries no model output and no outcome,
+/// so it is not one of the events a response is made of. These two cancellation
+/// checks ignore it; every other check sees the events of a response.
+fn is_notice(event: &StreamEvent) -> bool {
+    matches!(event, StreamEvent::Notice { .. })
+}
+
 async fn cancelled_events(
     route: &RouteUnderTest,
     response: ScriptedResponse,
@@ -595,18 +602,32 @@ async fn cancelled_events(
                 .map_err(str::to_string)?
                 .ok_or("stream ended before mid-stream cancellation")?;
             let visible = matches!(event, StreamEvent::TextDelta { .. });
-            events.push(event);
+            if !is_notice(&event) {
+                events.push(event);
+            }
             if visible {
                 break;
             }
         }
     } else {
-        let pending = stream.next();
-        tokio::pin!(pending);
-        tokio::select! {
-            biased;
-            item = &mut pending => return Err(format!("stream produced before cancellation: {item:?}")),
-            _ = tokio::task::yield_now() => {}
+        // Nothing of the RESPONSE may be produced before the body's first byte. A
+        // display-only notice is not part of a response, so it is skipped here and
+        // the wait for that byte goes on.
+        loop {
+            let pending = stream.next();
+            tokio::pin!(pending);
+            let produced = tokio::select! {
+                biased;
+                item = &mut pending => Some(item),
+                _ = tokio::task::yield_now() => None,
+            };
+            match produced {
+                None => break,
+                Some(Some(event)) if is_notice(&event) => {}
+                Some(item) => {
+                    return Err(format!("stream produced before cancellation: {item:?}"));
+                }
+            }
         }
     }
     cancel.cancel();

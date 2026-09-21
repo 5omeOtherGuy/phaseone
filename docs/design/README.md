@@ -27,3 +27,5 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 | `delegation.md` | Optional worker service and delegation tools |
 | `core.md` | Agent core behaviour specification (authoritative for `p1-core`) |
 | `research-program.md` | How research fans out: issue states, caps, curator limits, experiment design (ADR-0045) |
+| `websocket.md` | WebSocket transport for the Responses adapter, SSE fallback, continuation (ADR-0047) |
+| `model-selection.md` | Choosing, scoping and switching models: `--model`, `p1 models`, `settings.toml`, `/model` (ADR-0049) |

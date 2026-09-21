@@ -264,6 +264,27 @@ fn worker_events_stay_out_of_the_parent_transcript_but_mark_start_and_end() {
     );
 }
 
+/// ADR-0048: a provider notice is one quiet transcript note and nothing else — no
+/// prose block, no turn state moved.
+#[test]
+fn a_provider_notice_becomes_one_transcript_note() {
+    let (mut d, _auth) = driver();
+    let text = "transport: WebSocket unavailable (HTTP 500) — using HTTP (SSE) for the rest of \
+                this session";
+    d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 0,
+        worker: None,
+        event: p1_contracts::AgentEvent::ProviderNotice { text: text.into() },
+    }));
+    assert_eq!(
+        d.screen.transcript.blocks,
+        vec![p1_tui::transcript::Block::Meta {
+            text: format!("· {text}")
+        }]
+    );
+    assert!(d.screen.working.is_none());
+}
+
 #[test]
 fn a_live_worker_promotes_the_pane_and_a_finished_one_releases_it() {
     use p1_tui::render::workers::{WorkerRow, WorkerState};

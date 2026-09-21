@@ -179,6 +179,13 @@ pub enum StreamEvent {
         call_id: String,
         text: String,
     },
+    /// Something the provider's ADAPTER wants the OPERATOR to know (ADR-0048).
+    /// DISPLAY ONLY: it is never part of the history, never journaled, never sent
+    /// to the model and adds nothing to the response. The text is the adapter's
+    /// own constant — a wire event never puts text here.
+    Notice {
+        text: String,
+    },
     /// Progress without content (ping, retry back-off) so a live stream is not
     /// mistaken for a stalled one.
     Activity,
