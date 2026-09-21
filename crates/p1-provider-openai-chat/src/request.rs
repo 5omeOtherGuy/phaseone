@@ -134,7 +134,12 @@ pub fn build_request(
                     }
                 }
                 let mut message = json!({"role":"assistant","content":text});
-                if has_reasoning {
+                // A thinking-mode endpoint expects `reasoning_content` on every assistant
+                // message that carries tool calls; a response that reasoned nothing still
+                // has to replay the field, empty. Omitting it was answered with HTTP 400
+                // (`invalid_request_error`) by some replicas of the DeepSeek route
+                // (run ws-continuation, 2026-09-21).
+                if has_reasoning || !calls.is_empty() {
                     message["reasoning_content"] = json!(reasoning);
                 }
                 if !calls.is_empty() {
@@ -249,6 +254,58 @@ mod tests {
             assert!(!foreign.contains("display must"));
         }
     }
+    /// A response that called a tool without reasoning anything still replays the
+    /// field, empty: a thinking-mode endpoint refused the request without it (HTTP 400
+    /// `invalid_request_error`, run ws-continuation 2026-09-21). An assistant message
+    /// WITHOUT tool calls and without reasoning stays as it was.
+    #[test]
+    fn a_tool_call_without_reasoning_replays_an_empty_reasoning_field() {
+        for retained in [false, true] {
+            let route = crate::test_config::route(retained);
+            let profile = crate::test_config::profile(retained);
+            let mut r = request();
+            let origin = route.origin("model");
+            r.history = vec![
+                Item::User {
+                    text: "inspect".into(),
+                },
+                Item::Assistant(AssistantItem {
+                    origin: origin.clone(),
+                    blocks: vec![AssistantBlock::Text {
+                        text: "plain answer".into(),
+                    }],
+                }),
+                Item::User {
+                    text: "now read".into(),
+                },
+                Item::Assistant(AssistantItem {
+                    origin,
+                    blocks: vec![AssistantBlock::ToolCall(ToolCall {
+                        call_id: "call".into(),
+                        name: "read".into(),
+                        input: ToolInput::Json("{}".into()),
+                    })],
+                }),
+                Item::ToolResult(ToolResultItem {
+                    call_id: "call".into(),
+                    name: "read".into(),
+                    status: ToolStatus::Ok,
+                    content: "text".into(),
+                }),
+            ];
+            let body = build_request(&route, "model", &profile, &r).unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(
+                messages[2],
+                json!({"role":"assistant","content":"plain answer"})
+            );
+            assert_eq!(
+                messages[4],
+                json!({"role":"assistant","content":"","reasoning_content":"","tool_calls":[{"id":"call","type":"function","function":{"name":"read","arguments":"{}"}}]})
+            );
+        }
+    }
+
     #[test]
     fn rejects_unrepresentable_options_and_tools() {
         let route = crate::test_config::route(false);
