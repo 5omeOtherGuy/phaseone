@@ -582,6 +582,7 @@ pub async fn run_with_front_end(
         workspace: workspace.clone(),
         substitutions: substitutions.clone(),
         scope: options.models.clone(),
+        route_label: front_end.route_label(),
         session: Mutex::new(SessionModel {
             environment: session_environment,
             profile: choice.profile.clone(),
@@ -954,12 +955,11 @@ fn report_model(deps: &HostDeps, outcome: Result<String, String>) {
 
 // ------------------------------------------ the model switch (ADR-0049 stage 3)
 //
-// A switch does not touch the renderer. The per-response line already names the
-// model that produced THAT response — `ResponseCompleted` carries the response
-// item's own origin model — but its ROUTE prefix is the parent's assembled route,
-// and no event carries a route: a switch between profiles of one route shows no
-// mismatch, and naming the route of a switched response would need the front-end
-// seam.
+// A switch moves the parent renderer's route label (the same way the session's
+// environment moves) so the per-response line names the route that produced THAT
+// response: `ResponseCompleted` carries the response item's own model, and the
+// renderer's label is the route the session is assembled on. A switch that fails
+// changes nothing, the label included.
 
 /// The catalog key of the `finish` tool (`catalog.rs`). Its activity log and its
 /// outcome are SESSION state — fed from the event stream and read by the run — so a
@@ -1010,6 +1010,9 @@ pub(crate) struct ModelSwitch {
     substitutions: Substitutions,
     /// The run's `--models` scope, for the bare `/model` table.
     scope: Option<String>,
+    /// The parent renderer's route label, when the front end has one: a successful
+    /// switch moves it to the new assembly's route label.
+    route_label: Option<Arc<Mutex<String>>>,
     session: Mutex<SessionModel>,
 }
 
@@ -1077,6 +1080,9 @@ pub(crate) fn switch_model(
     // is there for the switched tool set's own `finish` (below).
     let issued = switch.completion.take();
     let finish_at = finish_index(&assembled);
+    // The label the renderer names after this switch, exactly as the start path
+    // named it (`Origin.route`, `<adapter>/<account>`).
+    let route = assembled.resolved.route.origin.route.clone();
     let context = agent_context(&assembled)?;
     let mut tools = assembled.tools;
     // The switched tool set's `finish` must reach the completion the run reads. The
@@ -1116,6 +1122,10 @@ pub(crate) fn switch_model(
         .profile
         .as_ref()
         .map(|profile| profile.id.clone());
+    // The session's route label moves only now: a failed switch changed nothing.
+    if let Some(label) = &switch.route_label {
+        *label.lock().unwrap() = route;
+    }
     Ok(model_name(&environment))
 }
 

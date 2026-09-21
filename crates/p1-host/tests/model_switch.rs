@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{Harness, run_args};
+use futures_util::StreamExt;
 use p1_assembly::{Catalog, ProviderSpec};
 use p1_contracts::{
-    AssistantBlock, BoxFuture, CacheKeySupport, CancellationToken, Effort, Item, Origin, Provider,
-    ProviderError, ProviderRequest, ProviderStream, RecordBody, RouteDescription,
+    AssistantBlock, BoxFuture, CacheKeySupport, CancellationToken, Effort, Item, Origin, Outcome,
+    Provider, ProviderError, ProviderRequest, ProviderStream, RecordBody, RouteDescription,
+    StreamEvent,
 };
 use p1_host::models::Model;
 use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
@@ -228,6 +230,12 @@ impl Scratch {
 }
 
 /// A [`ScriptedProvider`] that describes itself as one concrete route + wire model.
+///
+/// A real route also builds each response ITEM with that same origin
+/// (`route.origin(wire_model)`), which is the model the per-response line names. The
+/// scripted provider stamps its own fixed fake origin instead, so the wrapper
+/// relabels the finished item here — otherwise the fixture would report a model no
+/// route ever served.
 struct Described {
     inner: ScriptedProvider,
     origin: Origin,
@@ -255,7 +263,19 @@ impl Provider for Described {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ProviderStream, ProviderError>> {
-        self.inner.stream(request, cancel)
+        let inner = self.inner.clone();
+        let origin = self.origin.clone();
+        Box::pin(async move {
+            let stream = inner.stream(request, cancel).await?;
+            let relabelled = stream.map(move |event| match event {
+                StreamEvent::Finished(Outcome::Completed(mut response)) => {
+                    response.item.origin = origin.clone();
+                    StreamEvent::Finished(Outcome::Completed(response))
+                }
+                other => other,
+            });
+            Ok(Box::pin(relabelled) as ProviderStream)
+        })
     }
 }
 
@@ -328,6 +348,37 @@ fn user_texts(provider: &ScriptedProvider, request: usize) -> Vec<String> {
         })
         .collect()
 }
+
+/// The per-response usage lines of a run, in order. The host's own `· model: …`
+/// line and the totals line are not response lines.
+fn model_lines(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .map(rendered)
+        .filter(|line| line.starts_with("model "))
+        .map(|line| line.to_string())
+        .collect()
+}
+
+/// The totals line of a run.
+fn total_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(rendered)
+        .find(|line| line.starts_with("total"))
+        .unwrap_or_else(|| panic!("no totals line in:\n{stderr}"))
+        .to_string()
+}
+
+/// A line as the renderer wrote it, without the interactive prompt. The loop prints
+/// `p1> ` before reading a line, so the rendered line that follows it on the same
+/// terminal row carries that prompt.
+fn rendered(line: &str) -> &str {
+    line.strip_prefix("p1> ").unwrap_or(line)
+}
+
+/// The usage every `text_response` reports: nothing.
+const UNKNOWN_USAGE: &str = "· in ? (cached ?) · out ? · cost unknown";
 
 // ------------------------------------------------------------------ the switch
 
@@ -862,5 +913,206 @@ fn the_fixture_offers_the_models_the_tests_switch_between() {
             "e-three/p-two",
             "e-two/p-two"
         ]
+    );
+}
+
+// ------------------------------------------------------- the usage lines
+
+/// The per-response line names the route AND the model that produced THAT response:
+/// after a switch to another route, the second line carries the new route's label
+/// (`<adapter>/<account>`, the form the renderer is built with at start), not the
+/// one the session started on.
+#[tokio::test]
+async fn after_a_cross_route_switch_the_response_line_names_the_new_route() {
+    let workspace = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let one = ScriptedProvider::new(vec![text_response("first reply")]);
+    let two = ScriptedProvider::new(vec![text_response("second reply")]);
+    let mut harness = scratch.harness(&["hello", "/model e-two/p-two", "go", "/exit"]);
+    harness.deps.catalog_hook =
+        Some(scratch.fakes(&[("route-one", one.clone()), ("route-two", two.clone())]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "e-one",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert!(
+        harness
+            .stderr
+            .text()
+            .contains("· model: e-two/p-two:medium"),
+        "the switch itself succeeded: {}",
+        harness.stderr.text()
+    );
+    assert_eq!(
+        model_lines(&harness.stderr.text()),
+        vec![
+            format!("model openai-chat/one/wire-one {UNKNOWN_USAGE}"),
+            format!("model openai-chat/two/wire-two {UNKNOWN_USAGE}"),
+        ],
+        "stderr: {}",
+        harness.stderr.text()
+    );
+}
+
+/// A switch that FAILED left the route label alone: both response lines still name
+/// the route the session is assembled on.
+#[tokio::test]
+async fn a_failed_switch_leaves_the_response_line_on_the_start_route() {
+    let workspace = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let one = ScriptedProvider::new(vec![text_response("one"), text_response("two")]);
+    let two = ScriptedProvider::new(vec![]);
+    let mut harness = scratch.harness(&["hello", "/model nope/nope", "go", "/exit"]);
+    harness.deps.catalog_hook =
+        Some(scratch.fakes(&[("route-one", one.clone()), ("route-two", two.clone())]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "e-one",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert!(
+        harness
+            .stderr
+            .text()
+            .contains("· model not changed: unknown model `nope/nope`"),
+        "stderr: {}",
+        harness.stderr.text()
+    );
+    assert_eq!(
+        model_lines(&harness.stderr.text()),
+        vec![
+            format!("model openai-chat/one/wire-one {UNKNOWN_USAGE}"),
+            format!("model openai-chat/one/wire-one {UNKNOWN_USAGE}"),
+        ],
+        "stderr: {}",
+        harness.stderr.text()
+    );
+}
+
+/// A session whose responses came from TWO routes cannot name one of them: the
+/// totals line drops the `model <route>/<model>` part entirely.
+#[tokio::test]
+async fn a_two_route_session_totals_line_names_no_single_model() {
+    let workspace = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let one = ScriptedProvider::new(vec![text_response("first reply")]);
+    let two = ScriptedProvider::new(vec![text_response("second reply")]);
+    let mut harness = scratch.harness(&["hello", "/model e-two/p-two", "go", "/exit"]);
+    harness.deps.catalog_hook =
+        Some(scratch.fakes(&[("route-one", one.clone()), ("route-two", two.clone())]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "e-one",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let stderr = harness.stderr.text();
+    assert!(
+        !stderr.contains("total model"),
+        "the totals line named a model: {stderr}"
+    );
+    assert_eq!(total_line(&stderr), format!("total {UNKNOWN_USAGE}"));
+}
+
+/// The same on ONE route: a switch between two profiles of it is two models, so the
+/// totals line names neither — the per-response lines still name their own route.
+#[tokio::test]
+async fn a_two_model_session_on_one_route_totals_line_names_no_single_model() {
+    let workspace = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let one = ScriptedProvider::new(vec![text_response("one"), text_response("two")]);
+    let two = ScriptedProvider::new(vec![]);
+    let mut harness = scratch.harness(&["hello", "/model p-two", "go", "/exit"]);
+    harness.deps.catalog_hook =
+        Some(scratch.fakes(&[("route-one", one.clone()), ("route-two", two.clone())]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "e-one",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let stderr = harness.stderr.text();
+    assert_eq!(
+        model_lines(&stderr),
+        vec![
+            format!("model openai-chat/one/wire-one {UNKNOWN_USAGE}"),
+            format!("model openai-chat/one/wire-two {UNKNOWN_USAGE}"),
+        ],
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("total model"), "{stderr}");
+    assert_eq!(total_line(&stderr), format!("total {UNKNOWN_USAGE}"));
+}
+
+/// A session on ONE model is unchanged: every response line and the totals line name
+/// today's `model <route>/<model>` part, in the same words.
+#[tokio::test]
+async fn a_one_model_session_names_its_model_on_every_line() {
+    let workspace = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let one = ScriptedProvider::new(vec![text_response("one"), text_response("two")]);
+    let mut harness = scratch.harness(&["hello", "go", "/exit"]);
+    harness.deps.catalog_hook = Some(scratch.fakes(&[("route-one", one.clone())]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "e-one",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let stderr = harness.stderr.text();
+    assert_eq!(
+        model_lines(&stderr),
+        vec![
+            format!("model openai-chat/one/wire-one {UNKNOWN_USAGE}"),
+            format!("model openai-chat/one/wire-one {UNKNOWN_USAGE}"),
+        ],
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        total_line(&stderr),
+        format!("total model openai-chat/one/wire-one {UNKNOWN_USAGE}")
     );
 }
