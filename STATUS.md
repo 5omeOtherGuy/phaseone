@@ -92,17 +92,16 @@ IN FLIGHT:
 * OWNER RAN `p1 login opencode-go-2-subscription` (2026-09-21): the key is in the p1 store —
   dispatch deepseek2 jobs WITHOUT the `OPENCODE_GO_2_API_KEY=…` prefix from now on (fall back
   to it only if a run cannot find the key, then investigate p1-auth).
-* OWNER REQUEST 2026-09-21 (evening): "handle what is still open" + "model selection / scoped
-  models like in pi". Spec `docs/design/model-selection.md`, ADR-0049 PROPOSED (supersedes
-  ADR-0033 only on acceptance, after live switches). DONE: #6 debts (worker stall guard,
-  no-default-features, ADR-0048 provider notice = WS fallback visible); stage 1 (`--model
-  E/P[:effort]`, `--effort`, `--models`, `p1 models`, `~/.config/p1/settings.toml`). IN FLIGHT:
-  `model-switch-core` (Agent::reconfigure, resume by history validation; the two FROZEN lead
-  tests lead_resume_route / lead_resume_decisions fail by design — LEAD rewrites them), then
-  host line-mode `/model` + `/effort`, then live switches, then accept ADR-0049. `codex-models`:
-  sol-mini is NOT served by the Codex endpoint (live 400) — route gets astra/sol/terra/luna/5.5.
-  TUI picker (§4) is the TUI session's, posted on #12; ContextStats narrowed to the total row
-  (host data, no contract change) on #12.
+* OWNER REQUEST 2026-09-21 (evening) — DONE: "handle what is still open" + "model selection /
+  scoped models like in pi". ADR-0048 (provider notice; WS fallback visible) and ADR-0049
+  (model selection + switching; supersedes ADR-0033) ACCEPTED. Shipped: `--model E/P[:effort]`,
+  `--effort`, `--models`, `p1 models`, `~/.config/p1/settings.toml`; `Agent::reconfigure`;
+  resume onto another model when the provider validates the history; interactive `/model`,
+  `/model REF`, `/effort` via ONE host entry point `switch_model` (TUI must call it); usage lines
+  follow a switch. Live: 5 cross-model switches passed (table in ADR-0049). Codex route now binds
+  gpt-6-astra, gpt-5.6-sol/terra/luna, gpt-5.5 (sol-mini was never served). #6 debts closed
+  (worker stall guard, no-default-features). OPEN: TUI `/model` picker + cycle key + save default
+  + LEDGER context total — TUI session's (#12), pane %48 idle; owner to nudge.
 * OWNER DIRECTIVES 2026-09-21 = RESEARCH BATCH 3 — ALL THREE USED AND CLOSED (records in
   `docs/research/{41-websocket,42-iris-inventory,43-prompt-caching}.md`):
   - #41 WebSocket: stages A+B+C merged, ADR-0047 accepted. LIVE: the subscription backend accepts
