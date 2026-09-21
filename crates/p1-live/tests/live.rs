@@ -73,6 +73,9 @@ async fn respond(provider: &dyn Provider, request: ProviderRequest) -> Completed
             StreamEvent::TextDelta { text: t, .. } => text += t.len(),
             StreamEvent::ReasoningDelta { text: t, .. } => reasoning += t.len(),
             StreamEvent::ToolInputDelta { .. } => tool_deltas += 1,
+            // ADR-0048: display-only, but a live probe is exactly where the operator
+            // wants to see which transport is in use.
+            StreamEvent::Notice { text } => println!("  notice: {text}"),
             StreamEvent::Activity => {}
             StreamEvent::Finished(Outcome::Completed(done)) => {
                 println!(

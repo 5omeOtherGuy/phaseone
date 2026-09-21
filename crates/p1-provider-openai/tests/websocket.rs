@@ -27,7 +27,8 @@ use p1_contracts::{
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_http::testing::{
-    ScriptedConnection, ScriptedFrame, ScriptedResponse, ScriptedTransport, ScriptedWsConnector,
+    BodyEnd, ScriptedConnection, ScriptedFrame, ScriptedResponse, ScriptedTransport,
+    ScriptedWsConnector,
 };
 use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsError, WsHandshake};
 use p1_provider_http::{Credential, CredentialSource, RetryPolicy};
@@ -1561,6 +1562,142 @@ async fn fallback_turns_websocket_off_for_this_provider_instance() {
         "no connect after a fallback"
     );
     assert_eq!(sse.requests().len(), 2, "both requests used SSE");
+}
+
+/// ADR-0048: a fallback announces itself ONCE, before the SSE response's first
+/// event, and names the status that refused the upgrade. A later request of the same
+/// instance is already on SSE and says nothing.
+#[tokio::test]
+async fn a_refused_upgrade_announces_the_fallback_once_and_only_for_that_request() {
+    let sse = ScriptedTransport::new(vec![
+        ScriptedResponse::ok_sse(fixtures::TEXT_TURN),
+        ScriptedResponse::ok_sse(fixtures::TEXT_TURN),
+    ]);
+    let (provider, connector) = websocket_provider(
+        vec![ScriptedConnection::refuse(500, REFUSAL_BODY)],
+        sse.clone(),
+    );
+
+    let first = turn(&provider).await;
+    completed(&first);
+    assert_eq!(
+        first[0],
+        StreamEvent::Notice {
+            text: "transport: WebSocket unavailable (HTTP 500) — using HTTP (SSE) for the rest \
+                   of this session"
+                .to_string()
+        },
+        "the notice precedes the SSE response's first event: {first:?}"
+    );
+    assert!(
+        matches!(first[1], StreamEvent::TextDelta { .. }),
+        "the SSE response follows it: {first:?}"
+    );
+    assert_eq!(
+        notices(&first).len(),
+        1,
+        "exactly one notice for the request that fell back: {first:?}"
+    );
+
+    let second = turn(&provider).await;
+    completed(&second);
+    assert!(
+        notices(&second).is_empty(),
+        "a disabled instance never announces again: {second:?}"
+    );
+    assert_eq!(connector.handshakes().len(), 1, "no further connect");
+    assert_eq!(sse.requests().len(), 2);
+}
+
+/// The other §5 fallback: transient failures past the retry budget name the
+/// connection, not a status.
+#[tokio::test(start_paused = true)]
+async fn a_transient_failure_past_the_budget_announces_a_connection_failure() {
+    let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
+    let (provider, connector) = websocket_provider(
+        vec![
+            ScriptedConnection::fail("no route to host"),
+            ScriptedConnection::fail("no route to host"),
+            ScriptedConnection::fail("no route to host"),
+            ScriptedConnection::fail("no route to host"),
+        ],
+        sse.clone(),
+    );
+    let events = turn(&provider).await;
+
+    completed(&events);
+    assert_eq!(
+        notices(&events),
+        vec![
+            "transport: WebSocket unavailable (connection failed) — using HTTP (SSE) for the \
+             rest of this session"
+        ],
+        "{events:?}"
+    );
+    assert_eq!(connector.handshakes().len(), 4, "the retry budget first");
+    assert_eq!(sse.requests().len(), 1, "then SSE serves the request");
+}
+
+/// ADR-0048: the notice is emitted when the adapter decides on the fallback, not
+/// when the response answers — it needs no byte from the response, so a fallback
+/// whose response is cancelled before its first byte still told the operator.
+#[tokio::test]
+async fn a_fallback_announces_itself_before_the_response_produces_anything() {
+    let sse = ScriptedTransport::new(vec![ScriptedResponse {
+        status: 200,
+        headers: Vec::new(),
+        chunks: Vec::new(),
+        end: BodyEnd::Hang,
+    }]);
+    let (provider, connector) = websocket_provider(
+        vec![ScriptedConnection::refuse(404, REFUSAL_BODY)],
+        sse.clone(),
+    );
+    let cancel = CancellationToken::new();
+    let mut stream = provider
+        .stream(request(), cancel.clone())
+        .await
+        .expect("the request is buildable");
+
+    let first = stream.next().await.expect("the notice");
+    assert_eq!(
+        first,
+        StreamEvent::Notice {
+            text: "transport: WebSocket unavailable (HTTP 404) — using HTTP (SSE) for the rest \
+                   of this session"
+                .to_string()
+        },
+        "the fallback is announced without a byte from the response"
+    );
+
+    // The response's byte never comes: the next poll starts the fallback request and
+    // stalls in its read — the notice came first — and then the turn is cancelled.
+    poll_once(&mut stream).await;
+    assert_eq!(sse.requests().len(), 1, "the fallback request is out");
+    cancel.cancel();
+    let mut events = vec![first];
+    events.extend(collect(stream).await);
+    assert_eq!(notices(&events).len(), 1, "{events:?}");
+    assert!(
+        matches!(terminal(&events), Outcome::Cancelled),
+        "{events:?}"
+    );
+    assert_eq!(
+        connector.handshakes().len(),
+        1,
+        "no connect after a fallback"
+    );
+}
+
+/// Every notice in an event sequence, in order.
+fn notices(events: &[StreamEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::Notice { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------------ §6: continuation

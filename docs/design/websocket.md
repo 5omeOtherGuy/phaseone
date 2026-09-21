@@ -92,7 +92,8 @@ Before any model-visible output of this request:
 | Connect error or timeout; read/send error or close before visible output | reconnect with the FULL body, with the adapter's retry policy's backoff, up to its `max_retries` (default 3) — then fall back to SSE |
 
 "Fall back to SSE" = run today's `drive()` path for THIS request and turn WebSocket off for this
-provider instance (until the process ends). Reconnects per request: one for each of the three
+provider instance (until the process ends). The adapter emits ONE `StreamEvent::Notice` when it falls back
+(ADR-0048), so the operator sees which transport the run uses. Reconnects per request: one for each of the three
 "once" rows, and up to `max_retries` for the transient row [donor `WsRecoveryState`: retries
 within the budget, then `FallbackSse` + `disable_ws_for_session`; after visible output `Fatal`]. After
 model-visible output, every failure is an ordinary `Transport` failure of that response — no

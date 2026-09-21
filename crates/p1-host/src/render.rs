@@ -341,6 +341,12 @@ impl EventSink for Renderer {
                 }
             }
             AgentEvent::ToolInputDelta { .. } => {}
+            // ADR-0048: display-only, so it goes to stderr like the other lines the
+            // model's own text never mixes with — one line, nothing recorded.
+            AgentEvent::ProviderNotice { text } => {
+                self.close_line(&mut inner);
+                self.write_line(&mut inner, true, &format!("· {text}"));
+            }
             AgentEvent::ResponseCompleted { model, usage, .. } => {
                 self.close_line(&mut inner);
                 let line = usage_line(&self.route, &model, usage);
@@ -558,6 +564,37 @@ mod tests {
             String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap(),
             "context: summarized 9 → 3 items · model r/m · in 10 (cached ?) · out ? · cost unknown\n\
              context: summarized 4 → 4 items\n"
+        );
+    }
+
+    /// ADR-0048: a provider notice is one stderr line, `· ` and the adapter's own
+    /// text. It is display only, so stdout — where the model's words go — stays
+    /// untouched.
+    #[test]
+    fn renders_a_provider_notice_as_one_stderr_line() {
+        let stdout = Capture::default();
+        let stderr = Capture::default();
+        let renderer = Renderer::new(
+            Arc::new(Mutex::new(Box::new(stdout.clone()))),
+            Arc::new(Mutex::new(Box::new(stderr.clone()))),
+            false,
+            "r".into(),
+            "m".into(),
+            Arc::new(Mutex::new(String::new())),
+        );
+        renderer.emit(AgentEvent::ProviderNotice {
+            text: "transport: WebSocket unavailable (HTTP 500) — using HTTP (SSE) for the rest \
+                   of this session"
+                .into(),
+        });
+        assert_eq!(
+            String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap(),
+            "· transport: WebSocket unavailable (HTTP 500) — using HTTP (SSE) for the rest of \
+             this session\n"
+        );
+        assert_eq!(
+            String::from_utf8(stdout.0.lock().unwrap().clone()).unwrap(),
+            ""
         );
     }
 

@@ -113,12 +113,14 @@ impl Transcript {
     /// Apply one observed event. Deltas extend open stream blocks; lifecycle
     /// events open and close them. `ToolInputDelta` is display-only freeform
     /// preview and intentionally ignored: a row appears at `ToolStarted`.
+    /// `ProviderNotice` is display-only too, and is added as a note by the driver
+    /// (`p1-host`), so it makes no block here.
     pub fn apply(&mut self, event: &AgentEvent, elapsed_ms: Option<u64>) {
         match event {
             AgentEvent::TurnStarted | AgentEvent::RequestStarted { .. } => {}
             AgentEvent::TextDelta { text } => self.text_delta(text),
             AgentEvent::ReasoningDelta { text } => self.reasoning_delta(text),
-            AgentEvent::ToolInputDelta { .. } => {}
+            AgentEvent::ToolInputDelta { .. } | AgentEvent::ProviderNotice { .. } => {}
             AgentEvent::ResponseCompleted { .. } => self.close_streams(),
             AgentEvent::InboxDelivered { count } => {
                 self.blocks.push(Block::Meta {
