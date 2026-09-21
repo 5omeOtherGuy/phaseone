@@ -1,6 +1,7 @@
 //! The two explicit resume decisions after the review of 2026-09-20, end to end
-//! through the host: a changed route is rejected without touching the session
-//! (issue #2, ADR-0033), and workers of the earlier process are declared gone — to
+//! through the host: a changed route continues the session when its provider accepts
+//! the recorded history and is rejected — without touching the session — when it does
+//! not (issue #2; ADR-0049, which supersedes ADR-0033's blanket refusal), and workers of the earlier process are declared gone — to
 //! the user and to the model — with their ids never reused (issue #3, ADR-0034).
 
 mod common;
@@ -8,19 +9,20 @@ mod common;
 use std::sync::Arc;
 
 use common::{Harness, provider_hook_arc, run_args, write_environment};
-#[cfg(feature = "delegation")]
 use p1_contracts::Item;
 use p1_contracts::{
-    BoxFuture, CancellationToken, Origin, Provider, ProviderError, ProviderRequest, ProviderStream,
-    RouteDescription,
+    BoxFuture, CancellationToken, Origin, Provider, ProviderError, ProviderErrorKind,
+    ProviderRequest, ProviderStream, RouteDescription,
 };
 use p1_testkit::{ScriptedProvider, text_response};
 use tempfile::tempdir;
 
-/// A scripted provider that describes itself as another origin.
+/// A scripted provider that describes itself as another origin and, when
+/// `refuse_history`, refuses any request that carries a history.
 struct Elsewhere {
     inner: ScriptedProvider,
     origin: Origin,
+    refuse_history: bool,
 }
 
 impl Provider for Elsewhere {
@@ -31,6 +33,12 @@ impl Provider for Elsewhere {
         }
     }
     fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
+        if self.refuse_history && !request.history.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "the history holds an item this route cannot carry",
+            ));
+        }
         self.inner.validate(request)
     }
     fn stream<'a>(
@@ -42,8 +50,12 @@ impl Provider for Elsewhere {
     }
 }
 
-#[tokio::test]
-async fn resuming_on_another_route_is_refused_and_leaves_the_session_untouched() {
+/// Record one turn on `here`, then resume the session on `moved` (another route and
+/// model). Returns the exit code, stderr, the session bytes before and after, and the
+/// requests the other route received.
+async fn resume_elsewhere(
+    refuse_history: bool,
+) -> (i32, String, Vec<u8>, Vec<u8>, Vec<ProviderRequest>) {
     let workspace = tempdir().unwrap();
     let environments = tempdir().unwrap();
     write_environment(environments.path(), "here", "fake", "m", &[], "prompt");
@@ -56,7 +68,7 @@ async fn resuming_on_another_route_is_refused_and_leaves_the_session_untouched()
         "prompt",
     );
     let session = workspace.path().join("session.jsonl");
-    let elsewhere = ScriptedProvider::new(vec![text_response("must never be asked")]);
+    let elsewhere = ScriptedProvider::new(vec![text_response("continued elsewhere")]);
     let hook = |first: ScriptedProvider, elsewhere: ScriptedProvider| {
         provider_hook_arc(vec![
             ("fake", Arc::new(first) as Arc<dyn Provider>),
@@ -68,6 +80,7 @@ async fn resuming_on_another_route_is_refused_and_leaves_the_session_untouched()
                         route: "another-route".into(),
                         model: "another-model".into(),
                     },
+                    refuse_history,
                 }) as Arc<dyn Provider>,
             ),
         ])
@@ -112,23 +125,60 @@ async fn resuming_on_another_route_is_refused_and_leaves_the_session_untouched()
         ],
     )
     .await;
-
-    assert_eq!(code, 1, "stderr: {}", harness.stderr.text());
-    let stderr = harness.stderr.text();
-    assert!(
-        stderr.contains("recorded on fake-route/fake-model")
-            && stderr.contains("cannot continue on another-route/another-model"),
-        "{stderr}"
-    );
-    assert!(
-        elsewhere.requests().is_empty(),
-        "no request on the new route"
-    );
-    assert_eq!(
-        std::fs::read(&session).unwrap(),
+    let after = std::fs::read(&session).unwrap();
+    (
+        code,
+        harness.stderr.text(),
         before,
-        "session untouched"
+        after,
+        elsewhere.requests(),
+    )
+}
+
+#[tokio::test]
+async fn resuming_on_another_route_that_accepts_the_history_continues_the_session() {
+    let (code, stderr, before, after, requests) = resume_elsewhere(false).await;
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("environment changed"),
+        "the operator is told the environment changed: {stderr}"
     );
+    assert_eq!(requests.len(), 1, "the other route is asked once");
+    let history = &requests[0].history;
+    assert!(
+        matches!(&history[0], Item::User { text } if text == "first"),
+        "the recorded transcript travels to the new route: {history:?}"
+    );
+    assert!(
+        matches!(history.last(), Some(Item::User { text }) if text == "second"),
+        "{history:?}"
+    );
+    assert!(
+        after.starts_with(&before),
+        "the session is only appended to"
+    );
+    let appended = String::from_utf8(after[before.len()..].to_vec()).unwrap();
+    let first_new = appended.lines().next().unwrap();
+    assert!(
+        first_new.contains("\"record\":\"environment\"")
+            && first_new.contains("another-route")
+            && first_new.contains("another-model"),
+        "the new environment is committed first: {first_new}"
+    );
+}
+
+#[tokio::test]
+async fn resuming_on_another_route_that_refuses_the_history_leaves_the_session_untouched() {
+    let (code, stderr, before, after, requests) = resume_elsewhere(true).await;
+
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot carry"),
+        "the route's own reason reaches the operator: {stderr}"
+    );
+    assert!(requests.is_empty(), "no request on the new route");
+    assert_eq!(after, before, "session untouched");
 }
 
 #[cfg(feature = "delegation")]

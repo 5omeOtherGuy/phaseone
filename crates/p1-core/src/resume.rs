@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use p1_contracts::{
-    Item, JournalRecord, Origin, RecordBody, ToolCall, ToolDeclaration, ToolIdentity, Usage,
+    Item, JournalRecord, RecordBody, ToolCall, ToolDeclaration, ToolIdentity, Usage,
 };
 
 use crate::{Agent, AgentParts, BuildError};
@@ -48,20 +48,11 @@ pub enum ResumeError {
     Sequence { expected: u64, got: u64 },
     #[error("journal has a `ToolFinished` for unknown call id `{call_id}`")]
     UnknownCall { call_id: String },
+    /// The assembled parts could not be validated against the projected history.
+    /// A changed origin is no longer its own error (ADR-0049): the provider decides,
+    /// exactly as it does for a live switch, and says what it cannot carry.
     #[error("the resumed environment is invalid: {0}")]
     Build(#[from] BuildError),
-    /// Nothing establishes that a transcript produced on one route and model is a
-    /// valid continuation on another (tool names and call shapes, replay data), and
-    /// no translation exists — so a changed origin is rejected, never guessed around.
-    #[error(
-        "this session was recorded on {}/{} and cannot continue on {}/{}; \
-         resume it with the environment it was recorded with, or start a new session",
-        journalled.route, journalled.model, assembled.route, assembled.model
-    )]
-    RouteChanged {
-        journalled: Origin,
-        assembled: Origin,
-    },
 }
 
 /// What changed between the journalled environment and the newly assembled parts.
@@ -186,9 +177,13 @@ impl Agent {
     ///
     /// Construction is exactly `Agent::new`'s (same `BuildError`s, wrapped), with
     /// the projected history, sequence, environment flag and started calls
-    /// installed. This commits NOTHING: the unresolved calls are answered by R5 at
-    /// the start of the next turn, and a changed environment is committed then,
-    /// before that turn's input.
+    /// installed. The parts are validated against the PROJECTED history — the
+    /// transcript this agent would send — so a session resumes on another model or
+    /// route exactly when that provider accepts what the journal holds, and a
+    /// refusal is `ResumeError::Build(ProviderRejected)` before anything is
+    /// committed (ADR-0049). This commits NOTHING: the unresolved calls are
+    /// answered by R5 at the start of the next turn, and a changed environment is
+    /// committed then, before that turn's input.
     pub fn resume(
         parts: AgentParts,
         records: &[JournalRecord],
@@ -221,7 +216,10 @@ impl Agent {
     }
 }
 
-/// Compare the LAST journalled `Environment` with the newly assembled parts.
+/// Compare the LAST journalled `Environment` with the newly assembled parts. A
+/// changed origin is an ordinary environment change here: whether the transcript
+/// can continue on it is the provider's own `validate`, run by `assemble` against
+/// the projected history (ADR-0049).
 fn compare_environment(
     parts: &AgentParts,
     records: &[JournalRecord],
@@ -256,16 +254,12 @@ fn compare_environment(
                     None => missing_tools.push(declaration.name.clone()),
                 }
             }
-            if route.origin != new_route.origin {
-                return Err(ResumeError::RouteChanged {
-                    journalled: route.origin.clone(),
-                    assembled: new_route.origin,
-                });
-            }
             return Ok(ResumeReport {
                 unresolved_calls,
                 changed_tools,
                 missing_tools,
+                // `route` carries the origin, so another route or model is a change
+                // like any other: the next turn commits the new `Environment`.
                 environment_changed: *route != new_route
                     || *system_prompt != parts.system_prompt
                     || *tools != new_tools

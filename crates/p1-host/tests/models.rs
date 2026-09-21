@@ -1078,11 +1078,11 @@ fn the_selected_profiles_binding_supplies_the_wire_model() {
 }
 
 #[tokio::test]
-async fn resume_onto_another_model_is_refused_by_the_core() {
+async fn resume_onto_another_model_continues_the_session() {
     let scratch = Scratch::new();
     let workspace = tempfile::tempdir().unwrap();
     let session = workspace.path().join("session.jsonl");
-    let provider = ScriptedProvider::new(vec![text_response("one")]);
+    let provider = ScriptedProvider::new(vec![text_response("one"), text_response("two")]);
     let mut harness = scratch.harness(&[]);
     harness.deps.catalog_hook = Some(routed_hook(&scratch.route_file(), provider.clone()));
 
@@ -1101,8 +1101,8 @@ async fn resume_onto_another_model_is_refused_by_the_core() {
     .await;
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
 
-    // A session recorded on `wire-one` cannot continue on `wire-two` (ADR-0033 is
-    // still the rule in stage 1) — the reference itself is accepted.
+    // A session recorded on `wire-one` continues on `wire-two` (ADR-0049): the
+    // provider accepts the recorded history, and the new model gets it.
     let code = run_args(
         &mut harness,
         &[
@@ -1117,10 +1117,19 @@ async fn resume_onto_another_model_is_refused_by_the_core() {
         ],
     )
     .await;
-    assert_eq!(code, 1, "stderr: {}", harness.stderr.text());
-    let stderr = harness.stderr.text();
-    assert!(stderr.contains("cannot continue on"), "{stderr}");
-    assert!(stderr.contains("wire-two"), "{stderr}");
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "one request per turn");
+    assert_eq!(
+        requests[1].history.len(),
+        3,
+        "the second model sees the first turn and the new input"
+    );
+    let journal = std::fs::read_to_string(&session).unwrap();
+    assert!(
+        journal.contains("wire-two"),
+        "the new environment is journalled"
+    );
 }
 
 // ------------------------------------------------------------------ env show

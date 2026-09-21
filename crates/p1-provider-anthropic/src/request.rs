@@ -6,7 +6,7 @@
 //! `docs/design/routes.md` §A, the policy split is `docs/design/routes-and-profiles.md`
 //! §7.
 
-use p1_contracts::history::{AssistantBlock, Item, ReplayData, ToolCall, ToolStatus};
+use p1_contracts::history::{AssistantBlock, Item, ReplayData, ToolCall, ToolInput, ToolStatus};
 use p1_contracts::tool::{DeclarationKind, ToolDeclaration};
 use p1_contracts::{ModelOptions, ProviderError, ProviderErrorKind, ProviderRequest};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
@@ -252,8 +252,10 @@ fn tool_declarations(tools: &[ToolDeclaration]) -> Vec<Value> {
 
 /// Map the flat history onto strictly alternating messages. Adjacent same-role
 /// items coalesce into one message's `content[]`; an assistant item whose blocks
-/// all drop contributes no message at all.
-fn build_messages(
+/// all drop contributes no message at all. The ONLY history this route cannot
+/// carry is one whose first message would be an assistant turn, so `validate`
+/// calls this too and the two can never disagree.
+pub(crate) fn build_messages(
     origin_route: &str,
     wire_model: &str,
     history: &[Item],
@@ -323,13 +325,19 @@ fn build_messages(
     Ok(messages)
 }
 
-/// A `tool_use` block carries a JSON object. The raw input is preserved when it
-/// already is one; anything else (invalid JSON, a non-object, a freeform string)
-/// becomes `{}`. The call already failed at the tool, whose error result follows.
+/// A `tool_use` block carries a JSON object. A `Json` input is preserved when it
+/// already is an object; anything else (invalid JSON, a non-object) becomes `{}` —
+/// the call already failed at the tool, whose error result follows. A `Text` input
+/// is a call of a kind this route has no shape for (a freeform call made on another
+/// route), so it travels as a function-shaped call whose input is the object
+/// `{"input": <raw text>}` (ADR-0049).
 fn tool_use_block(call: &ToolCall) -> Value {
-    let input = match serde_json::from_str::<Value>(call.input.raw()) {
-        Ok(Value::Object(object)) => Value::Object(object),
-        _ => json!({}),
+    let input = match &call.input {
+        ToolInput::Json(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(Value::Object(object)) => Value::Object(object),
+            _ => json!({}),
+        },
+        ToolInput::Text(raw) => json!({ "input": raw }),
     };
     json!({
         "type": "tool_use",
