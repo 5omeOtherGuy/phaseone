@@ -213,6 +213,124 @@ async fn codex_subscription_route() {
     round_trip(&*provider, vec![read_tool()], effort()).await;
 }
 
+/// A connector that delegates to the real one and counts what happened on the wire, so
+/// a silent fallback to SSE cannot pass for a WebSocket success.
+struct CountingConnector {
+    inner: p1_provider_http::ws::TungsteniteConnector,
+    connected: Arc<std::sync::atomic::AtomicUsize>,
+    frames: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct CountingConnection {
+    inner: Box<dyn p1_provider_http::ws::WsConnection>,
+    frames: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl p1_provider_http::ws::WsConnector for CountingConnector {
+    fn connect<'a>(
+        &'a self,
+        request: p1_provider_http::ws::WsHandshake,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Box<dyn p1_provider_http::ws::WsConnection>, p1_provider_http::ws::WsConnectError>,
+    > {
+        Box::pin(async move {
+            let inner = match self.inner.connect(request).await {
+                Ok(inner) => inner,
+                Err(p1_provider_http::ws::WsConnectError::Status { status, body }) => {
+                    // The status is the finding; the body is not printed (it is the server's text).
+                    println!(
+                        "   websocket upgrade REFUSED with HTTP {status} ({} body bytes)",
+                        body.len()
+                    );
+                    return Err(p1_provider_http::ws::WsConnectError::Status { status, body });
+                }
+                Err(other) => {
+                    println!("   websocket connect FAILED");
+                    return Err(other);
+                }
+            };
+            self.connected
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(CountingConnection {
+                inner,
+                frames: self.frames.clone(),
+            })
+                as Box<dyn p1_provider_http::ws::WsConnection>)
+        })
+    }
+}
+
+impl p1_provider_http::ws::WsConnection for CountingConnection {
+    fn send_text<'a>(
+        &'a mut self,
+        text: String,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), p1_provider_http::ws::WsError>> {
+        self.inner.send_text(text)
+    }
+
+    fn next_text<'a>(
+        &'a mut self,
+    ) -> futures_util::future::BoxFuture<'a, Result<Option<String>, p1_provider_http::ws::WsError>>
+    {
+        Box::pin(async move {
+            let next = self.inner.next_text().await;
+            if matches!(next, Ok(Some(_))) {
+                self.frames
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            next
+        })
+    }
+}
+
+/// websocket.md §8: does the SUBSCRIPTION backend accept the WebSocket upgrade, and does a
+/// whole tool round trip arrive over it? Two requests on one provider instance: the second
+/// must reuse the connection (exactly ONE successful connect).
+#[tokio::test]
+async fn codex_subscription_route_over_websocket() {
+    if !live() {
+        return;
+    }
+    let wire_model = model("P1_LIVE_GPT_MODEL", "gpt-5.6-sol");
+    println!("== openai-responses/codex-subscription over WebSocket · {wire_model}");
+    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+    let route_file = p1_host::routes::load_route_by_id(&dirs, "openai-codex-subscription")
+        .expect("the shipped route file");
+    let mut route = p1_host::catalog::responses_route(&route_file).expect("a responses route");
+    route.transport = p1_provider_openai::ResponsesTransport::Websocket;
+    let credentials =
+        p1_host::auth::credential_source(&route_file, Arc::new(ReqwestTransport::new()));
+    let connected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider = p1_provider_openai::OpenAiCodexProvider::builder(
+        route,
+        &wire_model,
+        profile("gpt-5.6-sol"),
+        Arc::new(ReqwestTransport::new()),
+        credentials,
+    )
+    .with_ws_connector(Arc::new(CountingConnector {
+        inner: p1_provider_http::ws::TungsteniteConnector::new(),
+        connected: connected.clone(),
+        frames: frames.clone(),
+    }))
+    .build()
+    .expect("a websocket route with a connector");
+    round_trip(&provider, vec![read_tool()], effort()).await;
+    let connects = connected.load(std::sync::atomic::Ordering::SeqCst);
+    let received = frames.load(std::sync::atomic::Ordering::SeqCst);
+    println!("   websocket connects: {connects} · text frames received: {received}");
+    assert_eq!(
+        connects, 1,
+        "both requests of the round trip must share ONE connection"
+    );
+    assert!(
+        received > 0,
+        "the responses must have arrived as WebSocket frames"
+    );
+}
+
 /// routes.md [todo-live]: does the Codex subscription route accept a freeform/grammar
 /// tool, and does the model answer with a `custom_tool_call` carrying raw patch text?
 #[tokio::test]
