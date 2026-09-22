@@ -194,6 +194,7 @@ fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
         "claude-fable-5",
         "claude-opus-4-6",
         "claude-opus-5",
+        "claude-opus-5-5",
         "claude-sonnet-4-6",
         "claude-sonnet-5",
     ] {
@@ -332,6 +333,7 @@ fn every_shipped_claude_profile_carries_its_thinking_policy_and_budgets() {
     for (id, thinking) in [
         ("claude-fable-5", ThinkingPolicy::EffortLevel),
         ("claude-opus-5", ThinkingPolicy::EffortLevel),
+        ("claude-opus-5-5", ThinkingPolicy::EffortLevel),
         ("claude-sonnet-5", ThinkingPolicy::EffortLevel),
         ("claude-opus-4-6", ThinkingPolicy::Budget),
         ("claude-sonnet-4-6", ThinkingPolicy::Budget),

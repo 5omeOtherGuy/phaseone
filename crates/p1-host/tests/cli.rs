@@ -201,9 +201,9 @@ fn models_lists_every_shipped_model() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     // One row per model: every environment × every profile its route binds. The
-    // anthropic-subscription route binds 5 profiles, and `claude-delegating` is gone
-    // (ADR-0050), so 18 − 5 = 13.
-    assert_eq!(lines.len(), 13, "one row per model: {stdout}");
+    // anthropic-subscription route binds 6 profiles, and `claude-delegating` is gone
+    // (ADR-0050), so 6 Claude + 8 others = 14.
+    assert_eq!(lines.len(), 14, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(
