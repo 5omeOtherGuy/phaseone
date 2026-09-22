@@ -1,0 +1,22 @@
+<!-- @dsCard group="Components" viewport="700x300" name="Composer + statusline + pane" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
+<script src="../../ds.js"></script>
+<style>body{margin:0;background:var(--h-ground);color:var(--h-ink);font-family:var(--font-mono);font-size:12px;line-height:1.5;}</style></head>
+<body><div id="root"></div>
+<script type="text/babel">
+slab().then(({ Composer, Statusline, Pane }) => {
+  const Gap = () => <div style={{ height: "1lh" }} />;
+  ReactDOM.createRoot(document.getElementById("root")).render(
+    <div style={{ padding: "1lh 2ch", display: "grid", gap: "1lh" }}>
+      <div style={{ display: "flex", gap: "2ch" }}>
+        <div style={{ display: "grid", gap: "1lh", alignContent: "end" }}><Composer width={50} value="" /></div>
+        <div style={{ height: "9lh" }}><Pane width={30} sections={[{ title: "LEDGER", rows: [["calls", "14"], ["tokens", "38.2k"], ["spend", "—"]] }, { title: "FOLDS", rows: [["h-2b14", "shell", "ref"]] }]} /></div>
+      </div>
+      <Statusline width={82} added={12} removed={3} />
+    </div>
+  );
+});
+</script></body></html>

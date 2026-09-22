@@ -1,0 +1,20 @@
+/* vendored from SLAB Core — keep in sync */
+:root {
+  --font-mono: "JetBrains Mono", ui-monospace, "DejaVu Sans Mono", monospace;
+  --font-ui: var(--font-mono);          /* one family, everywhere */
+
+  --type-ui-size: 13px;       /* 10pt — menus, labels, entries, lists */
+  --type-ui-line: 1.45;
+  --type-title-size: 12px;    /* 9pt 500 — window titles */
+  --type-title-weight: 500;
+  --type-term-size: 13px;     /* terminal cell text in mock-ups (11pt on device) */
+  --type-term-line: 1.5;
+  --type-label-size: 10px;    /* CAPS section labels */
+  --type-label-tracking: 0.22em;
+  --type-label-weight: 500;
+  --type-small-size: 11px;    /* panel, tooltips, notes */
+  --type-display-size: 44px;  /* spec headers only */
+  --type-weight-regular: 400;
+  --type-weight-medium: 500;
+  --type-weight-bold: 700;
+}

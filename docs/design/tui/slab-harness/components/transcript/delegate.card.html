@@ -1,0 +1,23 @@
+<!-- @dsCard group="Components" viewport="700x400" name="Delegate + ask" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
+<script src="../../ds.js"></script>
+<style>body{margin:0;background:var(--h-ground);color:var(--h-ink);font-family:var(--font-mono);font-size:12px;line-height:1.5;}</style></head>
+<body><div id="root"></div>
+<script type="text/babel">
+slab().then(({ Block, Worker, Picker, Band }) => {
+  const Gap = () => <div style={{ height: "1lh" }} />;
+  ReactDOM.createRoot(document.getElementById("root")).render(
+    <div style={{ padding: "1lh 2ch" }}>
+      <Block name="delegate" arg="2 workers" outcome="ceiling 40 calls" />
+      <Worker name="s1-cache" route="deepseek · v4.1-flash" state="review" elapsed="4m02s" cost="$0.06" owns="spikes/s1-cache/**" activity="returned — 3 files, all inside owned paths" />
+      <Band bg="var(--h-block)" />
+      <Worker name="s2-docs" route="kimi · k3" state="running" elapsed="1m12s" cost="—" owns="docs/spikes/**" activity="drafting S2-cache-notes.md" />
+      <Gap />
+      <Picker question="Which retry policy?" options={[{ label: "fixed 3", description: "simplest, matches test" }, { label: "exponential", description: "matches upstream client" }, { label: "configurable", description: "adds a field to agent.toml" }]} focused={1} note="changes src/run.rs and agent.toml" />
+    </div>
+  );
+});
+</script></body></html>
