@@ -2,7 +2,9 @@
 
 Delegation is a TOOL MODULE plus a worker service. Nothing in the core knows about it;
 without these crates in the composition the harness is a plain coding agent (acceptance:
-the host builds and works with the `delegation` cargo feature off).
+the host builds and works with the `delegation` cargo feature off). Every main agent has the
+worker tools and a worker gets exactly the tools its parent grants (ADR-0050), so delegation is
+no longer an environment property: no delegating environment exists.
 
 ## Crates
 

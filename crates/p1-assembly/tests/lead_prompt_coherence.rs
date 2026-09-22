@@ -29,6 +29,16 @@ const ALL_TOOL_MODULES: [&str; 11] = [
     "worker_cancel",
 ];
 
+/// The four worker tools the host appends to every main agent (ADR-0050 item 1), in
+/// the order it appends them. A worker never gets them, so a shipped prompt's own
+/// `[[tools]]` list does not carry them — but the main-agent render must.
+const WORKER_MODULES: [&str; 4] = [
+    "worker_start",
+    "worker_result",
+    "worker_continue",
+    "worker_cancel",
+];
+
 fn shipped() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")
 }
@@ -189,6 +199,26 @@ fn check(name: &str) {
         let rendered = render(name, &environment, subset);
         assert_renders_coherently(name, &environment, subset, &rendered);
     }
+
+    // The main-agent case (ADR-0050 item 1): the host appends the four worker tools
+    // to every top-level agent, so each shipped prompt must render for the
+    // environment's FULL tool set PLUS the four worker modules, name every worker
+    // tool, and carry the "Workers (optional)" heading.
+    let mut main_agent = assembled.clone();
+    for module in WORKER_MODULES {
+        main_agent.push((module.to_string(), module.to_string()));
+    }
+    let rendered = render(name, &environment, &main_agent);
+    for module in WORKER_MODULES {
+        assert!(
+            rendered.contains(&format!("`{module}`")),
+            "{name}: the main-agent render does not name the worker tool `{module}`"
+        );
+    }
+    assert!(
+        rendered.contains("# Workers (optional)"),
+        "{name}: the main-agent render does not carry the Workers section"
+    );
 }
 
 #[test]
@@ -199,11 +229,6 @@ fn the_claude_prompt_mentions_exactly_its_own_tools() {
 #[test]
 fn the_gpt_prompt_mentions_exactly_its_own_tools() {
     check("gpt");
-}
-
-#[test]
-fn the_delegating_claude_prompt_mentions_exactly_its_own_tools() {
-    check("claude-delegating");
 }
 
 #[test]
@@ -235,14 +260,7 @@ fn every_shipped_prompt_renders_for_every_subset_of_its_tools() {
     checked.sort();
     assert_eq!(
         checked,
-        [
-            "claude",
-            "claude-delegating",
-            "deepseek",
-            "deepseek2",
-            "glm",
-            "gpt"
-        ],
+        ["claude", "deepseek", "deepseek2", "glm", "gpt"],
         "a shipped environment was added or removed without this test being updated"
     );
     for name in &checked {

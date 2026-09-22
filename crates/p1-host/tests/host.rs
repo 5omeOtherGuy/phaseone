@@ -355,7 +355,23 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         .iter()
         .map(|t| t.name.as_str())
         .collect();
-    assert_eq!(names, ["read", "edit", "write", "grep", "shell", "finish"]);
+    // The environment's own tools, then the four worker tools the host appends to
+    // every main agent (ADR-0050 item 1).
+    assert_eq!(
+        names,
+        [
+            "read",
+            "edit",
+            "write",
+            "grep",
+            "shell",
+            "finish",
+            "worker_start",
+            "worker_result",
+            "worker_continue",
+            "worker_cancel"
+        ]
+    );
     assert!(claude_request.system_prompt.contains("`edit`"));
     assert!(!claude_request.system_prompt.contains("apply_patch"));
 
@@ -373,7 +389,18 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
     assert_eq!(code, 0);
     let gpt_request = &gpt.requests()[0];
     let names: Vec<&str> = gpt_request.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, ["shell", "apply_patch", "finish"]);
+    assert_eq!(
+        names,
+        [
+            "shell",
+            "apply_patch",
+            "finish",
+            "worker_start",
+            "worker_result",
+            "worker_continue",
+            "worker_cancel"
+        ]
+    );
     assert!(gpt_request.system_prompt.contains("apply_patch"));
     assert!(!gpt_request.system_prompt.contains("`edit`"));
     assert!(!gpt_request.system_prompt.contains("`write`"));
