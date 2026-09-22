@@ -15,8 +15,9 @@ fixes the provider (ADR-0039). A *model* the operator selects is therefore a pai
 ```
 
 The candidates are exactly: every environment E, every profile P bound in E's route file
-(`[models."P"]`). `claude/claude-opus-5` and `claude-delegating/claude-opus-5` are two models
-(same provider, different tools). Nothing else is selectable; there is no free-text model id.
+(`[models."P"]`). Every main agent has the worker tools (ADR-0050), so delegation is no longer an
+environment property: a model is listed once per environment, and `claude/claude-opus-5` is one
+model, not two. Nothing else is selectable; there is no free-text model id.
 
 **Reference resolution** (`--model`, `/model`, `default_model`), in order:
 1. `E/P` — that pair; unknown pair → error listing the pairs whose P or E matches.

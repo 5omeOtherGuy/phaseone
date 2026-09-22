@@ -154,6 +154,39 @@ fn env_show_prints_the_resolved_model() {
     );
 }
 
+/// Every main agent gets the worker tools from the host (ADR-0050 item 1): `env show
+/// claude` lists the four worker modules and its rendered prompt carries the Workers
+/// section, even though `claude`'s environment file names none of them.
+#[test]
+fn env_show_gives_claude_the_worker_tools() {
+    let home = tempfile::tempdir().unwrap();
+    let output = isolated(home.path())
+        .args(["env", "show", "claude"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "env show claude failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for module in [
+        "worker_start",
+        "worker_result",
+        "worker_continue",
+        "worker_cancel",
+    ] {
+        assert!(
+            stdout.contains(&format!("\"module\": \"{module}\"")),
+            "env show claude must list `{module}`: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("# Workers (optional)"),
+        "the claude prompt must carry the Workers section: {stdout}"
+    );
+}
+
 /// `p1 models` against the shipped `environments/`, `routes/` and `profiles/`: one
 /// aligned row per model, the default marked, no scope and no credential value.
 #[test]
@@ -167,7 +200,10 @@ fn models_lists_every_shipped_model() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 18, "one row per model: {stdout}");
+    // One row per model: every environment × every profile its route binds. The
+    // anthropic-subscription route binds 5 profiles, and `claude-delegating` is gone
+    // (ADR-0050), so 18 − 5 = 13.
+    assert_eq!(lines.len(), 13, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(

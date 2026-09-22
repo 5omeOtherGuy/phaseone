@@ -21,7 +21,7 @@ use std::sync::atomic::AtomicUsize;
 use p1_assembly::Catalog;
 #[cfg(feature = "delegation")]
 use p1_assembly::ToolSpec;
-use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
+use p1_assembly::{Assembled, EnvironmentFile, Substitutions, assemble, load_environment};
 use p1_contracts::{
     AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
     ContextInput, ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, Tool,
@@ -306,6 +306,7 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             return EXIT_FAILURE;
         }
     };
+    with_worker_tools(&mut environment);
     // Resolve the route binding before assembling: the wire model and the route's
     // own output ceiling come from the route file (spec §2).
     if let Err(message) =
@@ -468,6 +469,7 @@ pub async fn run_with_front_end(
     let choice = selection(deps, options).map_err(RunError::usage)?;
     let mut environment = load_environment(&choice.environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
+    with_worker_tools(&mut environment);
     crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
         .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
@@ -968,6 +970,39 @@ fn report_model(deps: &HostDeps, outcome: Result<String, String>) {
 /// switch keeps the session's instance of it.
 const FINISH_MODULE: &str = "finish";
 
+/// The four worker tools, in the order the host appends them to a main agent.
+#[cfg(feature = "delegation")]
+const WORKER_MODULES: [&str; 4] = [
+    "worker_start",
+    "worker_result",
+    "worker_continue",
+    "worker_cancel",
+];
+
+/// Give every MAIN agent the worker tools (ADR-0050 item 1). Appends a default-face
+/// [`ToolSpec`] for each worker module the environment does not already list, in
+/// `worker_start`, `worker_result`, `worker_continue`, `worker_cancel` order; an
+/// environment that lists one keeps its own entry (which carries a face). Called only
+/// at the three main-agent assembly sites — never in the child factory, so a worker
+/// never gets the worker tools. A no-op when the `delegation` feature is not compiled.
+#[cfg(feature = "delegation")]
+fn with_worker_tools(environment: &mut EnvironmentFile) {
+    for module in WORKER_MODULES {
+        if environment.tools.iter().any(|tool| tool.module == module) {
+            continue;
+        }
+        environment.tools.push(ToolSpec {
+            module: module.to_string(),
+            name: None,
+            description: None,
+            variant: None,
+        });
+    }
+}
+
+#[cfg(not(feature = "delegation"))]
+fn with_worker_tools(_environment: &mut EnvironmentFile) {}
+
 /// Where the `finish` tool sits in an assembly: `resolved.tools` and `tools` are
 /// built from the same environment list, in order.
 fn finish_index(assembled: &Assembled) -> Option<usize> {
@@ -1068,6 +1103,7 @@ pub(crate) fn switch_model(
     };
     let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
         .map_err(|error| error.to_string())?;
+    with_worker_tools(&mut environment);
     crate::models::apply(&mut environment, &choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
     let assembled = assemble_with_cache_key(
