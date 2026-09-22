@@ -17,6 +17,12 @@ Only the lead edits this file (D13). Started 2026-09-19.
 - BOTH adapters pass the ONE conformance suite (15 checks) and the LIVE smoke checks
   (2026-09-20): text, tool call, tool-result follow-up; Codex route accepts freeform apply_patch.
 - `environments/{claude,gpt}`: config + family prompts, coherence-tested.
+- 2026-09-22 (owner: "design a workflow … to audit our codebase … with deepseek v4.1 flash
+  workers"): `scripts/workflow.py` (Claude-Code-Workflow shape on fanout: schema-checked outputs,
+  same-session repair, resume) + `scripts/audits/modularity.py` (Scout → Find → Verify → Critic,
+  design reviewed with pane %39). Run on 1c93432: 104 DeepSeek jobs, architecture holds; report
+  `docs/research/modularity-audit-2026-09-22.md`; follow-ups #46 (tool-name coupling, live
+  apply_patch defect), #47 (provider-http helpers), #48 (cleanups), TUI terminal I/O on #12.
 
 ## In progress
 - nothing. The first slice is DONE (2026-09-20): every seams.md §10 acceptance item is
