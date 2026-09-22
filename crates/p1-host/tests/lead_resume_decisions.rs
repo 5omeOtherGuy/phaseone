@@ -204,7 +204,7 @@ async fn a_resumed_parent_is_told_its_earlier_workers_are_gone_and_ids_are_not_r
         tool_call_response(vec![json_call(
             call_id,
             "worker_start",
-            r#"{"environment":"b","task":"work"}"#,
+            r#"{"environment":"b","task":"work","tools":["read"]}"#,
         )])
     };
     // Two or three requests, depending on whether the completion lands inside the

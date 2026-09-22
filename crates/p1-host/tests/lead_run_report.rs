@@ -344,7 +344,7 @@ async fn the_report_reads_worker_session_files() {
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            r#"{"environment":"b","task":"do it"}"#,
+            r#"{"environment":"b","task":"do it","tools":["read"]}"#,
         )]),
         text_with_usage("parent started", parent_usage),
         p1_testkit::text_response("ack"),

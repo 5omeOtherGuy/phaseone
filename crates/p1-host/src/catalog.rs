@@ -163,7 +163,7 @@ pub fn build_catalog_with_workers(
         env_pass,
         completion,
     );
-    register_delegation_tools(&mut catalog, service);
+    register_delegation_tools(&mut catalog, deps, service)?;
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
@@ -628,20 +628,36 @@ fn register_standard_tools(
 #[cfg(feature = "delegation")]
 fn register_delegation_tools(
     catalog: &mut Catalog,
+    deps: &HostDeps,
     service: Option<Arc<dyn p1_workers::WorkerService>>,
-) {
+) -> Result<(), String> {
     // Without a service the keys are not registered at all, so an environment naming
     // one gets the ordinary `UnknownToolModule`.
     let Some(service) = service else {
-        return;
+        return Ok(());
     };
+
+    // What a parent may grant is the host's own knowledge, never a compiled list in
+    // the tool crate: every tool module this catalog registers, minus `finish` (the
+    // factory adds it to every worker) and the `worker_*` modules (a worker never
+    // delegates). The environments a worker may run are the host's environment dirs.
+    let grantable: Vec<String> = catalog
+        .tool_keys()
+        .into_iter()
+        .filter(|key| key != "finish" && !key.starts_with("worker_"))
+        .collect();
+    let environments = crate::models::environment_names(&deps.environment_dirs)?;
 
     let service_for = service.clone();
     catalog.tool(
         "worker_start",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
             Ok(apply_delegate_face!(
-                p1_tool_delegate::WorkerStartTool::new(service_for.clone()),
+                p1_tool_delegate::WorkerStartTool::new(
+                    service_for.clone(),
+                    grantable.clone(),
+                    environments.clone(),
+                ),
                 spec
             ))
         }),
@@ -678,4 +694,5 @@ fn register_delegation_tools(
             ))
         }),
     );
+    Ok(())
 }

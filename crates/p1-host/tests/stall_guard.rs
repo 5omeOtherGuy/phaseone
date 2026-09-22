@@ -422,11 +422,16 @@ mod delegated {
         std::fs::write(dir.join("prompt.md"), "test").unwrap();
     }
 
-    fn worker_start(id: &str, environment: &str) -> Step {
+    fn worker_start(id: &str, environment: &str, tools: &[&str]) -> Step {
+        let tools: Vec<String> = tools.iter().map(|tool| format!("\"{tool}\"")).collect();
         tool_call_response(vec![json_call(
             id,
             "worker_start",
-            &format!(r#"{{"environment":"{environment}","task":"{}"}}"#, task()),
+            &format!(
+                r#"{{"environment":"{environment}","task":"{}","tools":[{}]}}"#,
+                task(),
+                tools.join(",")
+            ),
         )])
     }
 
@@ -511,7 +516,7 @@ mod delegated {
             environments.path(),
             workspace.path(),
             vec![
-                worker_start("c1", "child"),
+                worker_start("c1", "child", &["read"]),
                 worker_result("c2", "w1"),
                 finish_blocked("f1"),
                 text_response("parent done"),
@@ -569,7 +574,7 @@ mod delegated {
             environments.path(),
             workspace.path(),
             vec![
-                worker_start("c1", "child"),
+                worker_start("c1", "child", &["read", "write"]),
                 worker_result("c2", "w1"),
                 finish_done("f1"),
                 text_response("parent done"),
@@ -609,7 +614,7 @@ mod delegated {
             environments.path(),
             workspace.path(),
             vec![
-                worker_start("c1", "child"),
+                worker_start("c1", "child", &["read"]),
                 worker_result("c2", "w1"),
                 finish_done("f1"),
                 text_response("parent done"),
@@ -660,8 +665,8 @@ mod delegated {
         );
 
         let parent = ScriptedProvider::new(vec![
-            worker_start("c1", "stalling"),
-            worker_start("c2", "working"),
+            worker_start("c1", "stalling", &["read"]),
+            worker_start("c2", "working", &["read", "write"]),
             worker_result("c3", "w1"),
             worker_result("c4", "w2"),
             finish_blocked("f1"),

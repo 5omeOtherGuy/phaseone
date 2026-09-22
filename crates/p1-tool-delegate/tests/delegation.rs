@@ -40,8 +40,21 @@ fn spec() -> ChildSpec {
     ChildSpec {
         environment: "child".into(),
         task: "do it".into(),
+        tools: vec!["read".into()],
         workspace: None,
     }
+}
+
+/// The tool modules a test parent may grant — the host supplies this list; the tool
+/// crate itself names no concrete tool. `finish` and `worker_*` are deliberately
+/// absent, exactly as the host builds it.
+fn grantable() -> Vec<String> {
+    vec!["edit".into(), "read".into(), "shell".into()]
+}
+
+/// The environments a test worker may run.
+fn environments() -> Vec<String> {
+    vec!["child".into()]
 }
 
 // ---------------------------------------------------------------- agents
@@ -234,13 +247,13 @@ async fn child_finishing_mid_turn_reaches_parent_next_request() {
     );
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
 
     let parent_provider = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            r#"{"environment":"child","task":"do it"}"#,
+            r#"{"environment":"child","task":"do it","tools":["read"]}"#,
         )]),
         text_response("parent done"),
     ]);
@@ -296,7 +309,7 @@ async fn child_finishing_while_parent_idle_wakes_it() {
     );
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
 
     let parent_provider = ScriptedProvider::new(vec![text_response("after inbox")]);
     let mut parent = build_agent(Arc::new(parent_provider.clone()), "parent prompt", tools);
@@ -336,7 +349,7 @@ async fn child_finishing_while_parent_waits_in_worker_result() {
     });
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
 
     let parent_provider = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call(
@@ -399,7 +412,7 @@ async fn missed_notification_still_leaves_the_result_retrievable() {
     );
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
 
     // No parent inbox is ever set: the notification has nowhere to go.
     let id = within(workers.start(spec())).await.unwrap();
@@ -431,14 +444,14 @@ async fn child_sees_only_its_own_prompt_and_tools() {
     );
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let mut tools = all(service);
+    let mut tools = all(service, grantable(), environments());
     tools.push(Arc::new(FakeTool::new("parent_tool")));
 
     let parent_provider = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            r#"{"environment":"child","task":"the only task"}"#,
+            r#"{"environment":"child","task":"the only task","tools":["read"]}"#,
         )]),
         text_response("parent done"),
     ]);
@@ -481,7 +494,7 @@ async fn worker_continue_keeps_the_child_history() {
     );
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
 
     let parent_provider = ScriptedProvider::new(vec![text_response("ack")]);
     let mut parent = build_agent(Arc::new(parent_provider), "parent prompt", tools);
@@ -544,7 +557,7 @@ async fn limit_reached_then_a_start_succeeds_after_completion() {
     );
     let workers = InProcessWorkers::new(factory, 1);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
 
     let first = within(workers.start(spec())).await.unwrap();
     assert!(matches!(
@@ -559,7 +572,7 @@ async fn limit_reached_then_a_start_succeeds_after_completion() {
     let outcome = exec_tool(
         &tool_by_name(&tools, "worker_start"),
         "worker_start",
-        r#"{"environment":"child","task":"do it"}"#,
+        r#"{"environment":"child","task":"do it","tools":["read"]}"#,
     )
     .await;
     assert_eq!(outcome.status, ToolStatus::Error);
@@ -592,7 +605,7 @@ async fn cancel_of_a_hanging_child_reports_cancelled() {
     );
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
 
     let parent_provider = ScriptedProvider::new(vec![text_response("ack")]);
     let mut parent = build_agent(Arc::new(parent_provider), "parent prompt", tools.clone());
@@ -738,7 +751,7 @@ async fn invalid_input_is_reported_for_every_tool() {
     let (factory, _) = scripted_factory("child", vec![], vec![], "route/model");
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
 
     let garbage: [&str; 6] = [
         "",
@@ -860,7 +873,7 @@ async fn invalid_environment_and_describe_are_reported() {
     let factory: AgentFactory = Arc::new(|_spec: &ChildSpec| Err("no such route".to_string()));
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
 
     assert_eq!(
         within(workers.start(spec())).await,
@@ -869,7 +882,7 @@ async fn invalid_environment_and_describe_are_reported() {
     let outcome = exec_tool(
         &tool_by_name(&tools, "worker_start"),
         "worker_start",
-        r#"{"environment":"child","task":"do it"}"#,
+        r#"{"environment":"child","task":"do it","tools":["read"]}"#,
     )
     .await;
     assert_eq!(outcome.status, ToolStatus::Error);
@@ -884,17 +897,18 @@ async fn invalid_environment_and_describe_are_reported() {
     );
     let workers = InProcessWorkers::new(factory, 2);
     let service: Arc<dyn WorkerService> = workers.clone();
-    let tools = all(service);
+    let tools = all(service, grantable(), environments());
     let outcome = exec_tool(
         &tool_by_name(&tools, "worker_start"),
         "worker_start",
-        r#"{"environment":"child","task":"do it"}"#,
+        r#"{"environment":"child","task":"do it","tools":["read"]}"#,
     )
     .await;
     assert_eq!(outcome.status, ToolStatus::Ok);
     assert_eq!(
         outcome.content,
-        "Started worker w1 on openai-codex-responses/gpt-5.6-sol. You will be notified when it finishes."
+        "Started worker w1 on openai-codex-responses/gpt-5.6-sol with tools: read, finish. \
+         You will be notified when it finishes."
     );
 }
 
@@ -957,5 +971,176 @@ async fn review_cancel_immediately_after_continue_is_retained() {
     assert!(
         matches!(result, Ok(Ok(ChildStatus::Cancelled))),
         "immediate cancellation was lost: {result:?}"
+    );
+}
+
+// ================================================================ the grant (ADR-0050 item 3)
+
+/// A factory that records every `ChildSpec` it is asked to build, so a test can see
+/// the grant the tool passed on. Each child answers with one text response.
+fn recording_factory() -> (AgentFactory, Arc<Mutex<Vec<ChildSpec>>>) {
+    let specs = Arc::new(Mutex::new(Vec::new()));
+    let specs_for_factory = Arc::clone(&specs);
+    let factory: AgentFactory = Arc::new(move |spec: &ChildSpec| {
+        specs_for_factory.lock().unwrap().push(spec.clone());
+        Ok(child_agent(
+            Arc::new(ScriptedProvider::new(vec![text_response("child done")])),
+            "child",
+            vec![],
+            "route/model",
+        ))
+    });
+    (factory, specs)
+}
+
+fn start_schema_of(tool: &Arc<dyn Tool>) -> serde_json::Value {
+    match &tool.declaration().kind {
+        p1_contracts::DeclarationKind::Function { input_schema } => input_schema.clone(),
+        other => panic!("worker_start must be a function tool, got {other:?}"),
+    }
+}
+
+/// The `tools` schema is the grant: required, at least one, unique, and every item
+/// one of the host's module names; `environment` is the host's environment list.
+#[tokio::test(start_paused = true)]
+async fn worker_start_schema_is_the_grant_and_the_environments() {
+    let factory: AgentFactory = Arc::new(|_spec: &ChildSpec| Err("unused".to_string()));
+    let workers = InProcessWorkers::new(factory, 1);
+    let service: Arc<dyn WorkerService> = workers;
+    let tools = all(service, grantable(), environments());
+    let schema = start_schema_of(&tool_by_name(&tools, "worker_start"));
+
+    assert_eq!(
+        schema["required"],
+        serde_json::json!(["environment", "task", "tools"]),
+        "all three fields are required"
+    );
+    assert_eq!(
+        schema["properties"]["tools"]["minItems"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["tools"]["uniqueItems"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        schema["properties"]["tools"]["items"]["enum"],
+        serde_json::json!(["edit", "read", "shell"])
+    );
+    assert_eq!(
+        schema["properties"]["environment"]["enum"],
+        serde_json::json!(["child"])
+    );
+    assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+}
+
+/// An empty, missing or unknown grant is refused with the exact text the model can
+/// act on, and NOTHING is started (the service keeps no child).
+#[tokio::test(start_paused = true)]
+async fn worker_start_refuses_a_missing_empty_or_unknown_grant_without_starting() {
+    let (factory, specs) = recording_factory();
+    let workers = InProcessWorkers::new(factory, 2);
+    let service: Arc<dyn WorkerService> = workers.clone();
+    let tools = all(service, grantable(), environments());
+    let start = tool_by_name(&tools, "worker_start");
+    let expected = "`tools` is required: list every tool module the worker needs, from: \
+                    edit, read, shell";
+
+    for input in [
+        r#"{"environment":"child","task":"do it"}"#,
+        r#"{"environment":"child","task":"do it","tools":[]}"#,
+    ] {
+        let outcome = exec_tool(&start, "worker_start", input).await;
+        assert_eq!(outcome.status, ToolStatus::Error, "{input}");
+        assert_eq!(outcome.content, expected, "{input}");
+    }
+
+    let outcome = exec_tool(
+        &start,
+        "worker_start",
+        r#"{"environment":"child","task":"do it","tools":["bogus"]}"#,
+    )
+    .await;
+    assert_eq!(outcome.status, ToolStatus::Error);
+    assert!(
+        outcome.content.contains("`bogus`") && outcome.content.contains("edit, read, shell"),
+        "an unknown module names it and the valid list: {}",
+        outcome.content
+    );
+
+    assert!(
+        specs.lock().unwrap().is_empty(),
+        "a refused start must not reach the factory"
+    );
+    assert!(within(workers.list()).await.is_empty());
+}
+
+/// Duplicates are removed keeping the first occurrence's order, and the grant is
+/// passed into the child spec exactly once per module.
+#[tokio::test(start_paused = true)]
+async fn worker_start_removes_duplicate_tools_keeping_first_order() {
+    let (factory, specs) = recording_factory();
+    let workers = InProcessWorkers::new(factory, 2);
+    let service: Arc<dyn WorkerService> = workers;
+    let tools = all(service, grantable(), environments());
+    let outcome = exec_tool(
+        &tool_by_name(&tools, "worker_start"),
+        "worker_start",
+        r#"{"environment":"child","task":"do it","tools":["shell","read","shell","edit","read"]}"#,
+    )
+    .await;
+    assert_eq!(outcome.status, ToolStatus::Ok);
+    assert_eq!(
+        outcome.content,
+        "Started worker w1 on route/model with tools: shell, read, edit, finish. You will be \
+         notified when it finishes."
+    );
+    assert_eq!(
+        specs.lock().unwrap()[0].tools,
+        vec!["shell".to_string(), "read".to_string(), "edit".to_string()]
+    );
+}
+
+/// The grant reaches the factory as the child's spec, and the success text names the
+/// grant plus `finish` (the prefix `workers_started_in` reads is unchanged).
+#[tokio::test(start_paused = true)]
+async fn worker_start_passes_the_grant_into_the_child_spec() {
+    let (factory, specs) = recording_factory();
+    let workers = InProcessWorkers::new(factory, 2);
+    let service: Arc<dyn WorkerService> = workers.clone();
+    let tools = all(service, grantable(), environments());
+
+    let parent_provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "worker_start",
+            r#"{"environment":"child","task":"do it","tools":["read","shell"]}"#,
+        )]),
+        text_response("parent done"),
+    ]);
+    let mut parent = build_agent(Arc::new(parent_provider.clone()), "parent", tools);
+    workers.set_parent_inbox(parent.inbox());
+    within(parent.run_turn("go".into(), CancellationToken::new())).await;
+
+    let recorded = specs.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].tools,
+        vec!["read".to_string(), "shell".to_string()]
+    );
+    // The same grant the child is assembled with is named back to the parent.
+    assert!(
+        parent_provider.requests()[1]
+            .history
+            .iter()
+            .any(|item| matches!(
+                item,
+                Item::ToolResult(result)
+                    if result.content
+                        == "Started worker w1 on route/model with tools: read, shell, finish. You \
+                            will be notified when it finishes."
+            )),
+        "request 2 history: {:?}",
+        parent_provider.requests()[1].history
     );
 }

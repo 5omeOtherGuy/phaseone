@@ -627,7 +627,7 @@ async fn a_workers_shell_runs_in_the_sandbox_too() {
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            "{\"environment\":\"child\",\"task\":\"work\"}",
+            "{\"environment\":\"child\",\"task\":\"work\",\"tools\":[\"shell\"]}",
         )]),
         // `wait` makes the child's whole turn finish before the parent continues,
         // so the test needs no gate and no timing assumption.

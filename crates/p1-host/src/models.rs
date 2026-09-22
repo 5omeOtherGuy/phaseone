@@ -177,8 +177,9 @@ pub fn enumerate(environment_dirs: &[PathBuf]) -> Result<Vec<Model>, String> {
 
 /// The environment names the directories hold, highest priority first, sorted. A
 /// name found in more than one directory resolves to the first one, exactly like
-/// `load_environment` and `load_all_routes`.
-fn environment_names(environment_dirs: &[PathBuf]) -> Result<Vec<String>, String> {
+/// `load_environment` and `load_all_routes`. Also the `worker_start` schema's
+/// environment enum (`catalog.rs`).
+pub(crate) fn environment_names(environment_dirs: &[PathBuf]) -> Result<Vec<String>, String> {
     let mut names: Vec<String> = Vec::new();
     for dir in environment_dirs {
         let entries = match std::fs::read_dir(dir) {

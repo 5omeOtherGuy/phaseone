@@ -281,7 +281,7 @@ async fn recording_front_end_sees_parent_and_worker_events_and_worker_authorizat
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            r#"{"environment":"b","task":"do it"}"#,
+            r#"{"environment":"b","task":"do it","tools":["read"]}"#,
         )]),
         // `wait` makes the child finish before the parent continues: no gate and
         // no timing assumption (the shape used by `run_worker_write`).
