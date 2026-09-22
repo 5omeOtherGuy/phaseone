@@ -223,7 +223,8 @@ compiled behaviour strategies:
   (Messages needs `max_tokens`: default 32_000, margin 8_192 over a budget) stay in the adapter.
   `text.verbosity` stays in the Responses adapter until a second consumer exists.
 - Model-name prefix matching (`is_adaptive`) is deleted. Profiles are explicit records:
-  `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5` (`effort-level`, all five efforts);
+  `claude-fable-5`, `claude-opus-5`, `claude-opus-5-5`, `claude-sonnet-5` (`effort-level`, all
+  five efforts);
   `claude-opus-4-6`, `claude-sonnet-4-6` (`budget`); `gpt-5.6-sol` and every other GPT model a
   shipped file or test names (`effort-level`, efforts low/medium/high — which is what makes
   `extra_high`/`max` an error there, replacing the adapter's hard-coded rejection with the same

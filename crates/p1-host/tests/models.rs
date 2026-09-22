@@ -224,6 +224,7 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "claude/claude-fable-5",
             "claude/claude-opus-4-6",
             "claude/claude-opus-5",
+            "claude/claude-opus-5-5",
             "claude/claude-sonnet-4-6",
             "claude/claude-sonnet-5",
             "deepseek/deepseek-v4.1-flash",
@@ -383,7 +384,7 @@ fn a_pattern_without_a_slash_matches_the_profile_part() {
         .iter()
         .filter(|model| models::in_scope(&patterns, model))
         .count();
-    assert_eq!(claude, 5, "only the `claude` environment");
+    assert_eq!(claude, 6, "only the `claude` environment");
     // An empty scope holds every model.
     assert!(models.iter().all(|model| models::in_scope(&[], model)));
 }
@@ -708,8 +709,8 @@ fn the_table_is_aligned_and_marked() {
         1,
         "exactly one model is the default: {table}"
     );
-    assert!(lines[4].starts_with("claude/claude-sonnet-5"));
-    assert!(lines[4].ends_with("default"));
+    assert!(lines[5].starts_with("claude/claude-sonnet-5"));
+    assert!(lines[5].ends_with("default"));
 
     // Every column starts at the same offset in every row.
     let route_at = lines[0].find("anthropic-subscription").unwrap();
