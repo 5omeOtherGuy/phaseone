@@ -928,7 +928,8 @@ fn status_groups(driver: &Driver) -> Vec<p1_tui::render::status::StatusGroup> {
 mod tests;
 
 /// The worker-end wiring (ADR-0050 item 6): the sentence the line front end prints
-/// reaches the TUI as the note the driver already renders for a provider notice.
+/// reaches the TUI as the note the driver already renders for a provider notice, so
+/// the TUI shows exactly the host's own line — evidence included (ADR-0051 item 3).
 #[cfg(all(test, feature = "delegation"))]
 mod worker_end_tests {
     use super::*;
@@ -960,25 +961,50 @@ mod worker_end_tests {
                     status: "blocked".into(),
                     needs: Some("edit".into()),
                     summary: Some("cannot write".into()),
+                    evidence: None,
                 }),
                 missing_tool_calls: vec![("edit".into(), 2)],
             },
         );
-
-        let Some(UiEvent::Agent(stamped)) = events.try_recv().ok() else {
-            panic!("the note must reach the UI loop");
-        };
-        assert!(
-            stamped.worker.is_none(),
-            "the note is the parent's, so the driver renders it in the transcript"
+        // A `done` the worker could not verify: the note carries the same sentence the
+        // host's `worker_end_note` prints.
+        front_end.worker_ended(
+            "w2",
+            "deepseek2",
+            &WorkerReport {
+                tools: vec!["read".into(), "edit".into(), "finish".into()],
+                finish: Some(FinishReport {
+                    status: "done".into(),
+                    needs: None,
+                    summary: Some("edited the file".into()),
+                    evidence: Some("not verified; parent verification required".into()),
+                }),
+                missing_tool_calls: Vec::new(),
+            },
         );
+
+        let mut notices = Vec::new();
+        while let Ok(UiEvent::Agent(stamped)) = events.try_recv() {
+            assert!(
+                stamped.worker.is_none(),
+                "the note is the parent's, so the driver renders it in the transcript"
+            );
+            notices.push(stamped.event);
+        }
         assert_eq!(
-            stamped.event,
-            p1_contracts::AgentEvent::ProviderNotice {
-                text: "worker w1 (claude/sonnet; read, finish) blocked: needs edit — tried \
-                       edit x2"
-                    .into()
-            }
+            notices,
+            vec![
+                p1_contracts::AgentEvent::ProviderNotice {
+                    text: "worker w1 (claude/sonnet; read, finish) blocked: needs edit — tried \
+                           edit x2"
+                        .into()
+                },
+                p1_contracts::AgentEvent::ProviderNotice {
+                    text: "worker w2 (deepseek2; read, edit, finish) done — not verified; parent \
+                           verification required"
+                        .into()
+                },
+            ]
         );
     }
 }

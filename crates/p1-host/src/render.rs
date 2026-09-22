@@ -543,8 +543,11 @@ pub fn status_name(status: ToolStatus) -> &'static str {
 /// note) cannot drift (ADR-0050 item 6):
 ///
 /// `worker w1 (route/model; read, grep, finish) blocked: needs edit — tried edit x2`
+/// `worker w1 (route/model; read, edit, finish) done — commands passed: cargo test -p x`
+/// `worker w1 (route/model; read, edit, finish) done — not verified; parent verification required`
 ///
-/// The state is `done`, `blocked: needs …` or `ended without finish`; the
+/// The state is `done`, `blocked: needs …` or `ended without finish`; a `done`
+/// carries the evidence the accepted outcome established (ADR-0051 item 3), and the
 /// `— tried …` part appears only when the worker called a tool it was not given.
 #[cfg(feature = "delegation")]
 pub fn worker_end_note(
@@ -558,7 +561,11 @@ pub fn worker_end_note(
             Some(needs) => format!("blocked: needs {needs}"),
             None => "blocked".to_string(),
         },
-        Some(finish) => finish.status.clone(),
+        // "Verified" is never printed for a result without passed commands.
+        Some(finish) => match &finish.evidence {
+            Some(evidence) => format!("{} — {evidence}", finish.status),
+            None => finish.status.clone(),
+        },
     };
     let mut line = format!(
         "worker {worker_id} ({description}; {}) {state}",
@@ -684,7 +691,8 @@ mod tests {
         assert_eq!(summarize_input(&"x".repeat(200)).chars().count(), 100);
     }
 
-    /// The ONE sentence every front end shows for a worker's end (ADR-0050 item 6).
+    /// The ONE sentence every front end shows for a worker's end (ADR-0050 item 6,
+    /// ADR-0051 item 3).
     #[cfg(feature = "delegation")]
     #[test]
     fn the_worker_end_note_names_the_grant_the_finish_and_what_it_tried() {
@@ -696,6 +704,8 @@ mod tests {
                 status: "blocked".to_string(),
                 needs: Some("edit".to_string()),
                 summary: Some("cannot write".to_string()),
+                // A `blocked` outcome carries no evidence line.
+                evidence: None,
             }),
             missing_tool_calls: vec![("edit".to_string(), 2)],
         };
@@ -704,12 +714,48 @@ mod tests {
             "worker w1 (claude/sonnet; read, grep, finish) blocked: needs edit — tried edit x2"
         );
 
+        // A `done` the worker could not verify says so, in the accepted outcome's own
+        // words: this is a worker assembled without a command tool (ADR-0051).
+        let unverified = WorkerReport {
+            tools: tools(),
+            finish: Some(FinishReport {
+                status: "done".to_string(),
+                needs: None,
+                summary: None,
+                evidence: Some("not verified; parent verification required".to_string()),
+            }),
+            missing_tool_calls: Vec::new(),
+        };
+        assert_eq!(
+            worker_end_note("w1", "deepseek2", &unverified),
+            "worker w1 (deepseek2; read, grep, finish) done — not verified; parent verification \
+             required"
+        );
+
+        // A `done` with a recorded command names it.
+        let verified = WorkerReport {
+            tools: tools(),
+            finish: Some(FinishReport {
+                status: "done".to_string(),
+                needs: None,
+                summary: None,
+                evidence: Some("commands passed: cargo test -p x".to_string()),
+            }),
+            missing_tool_calls: Vec::new(),
+        };
+        assert_eq!(
+            worker_end_note("w1", "claude/sonnet", &verified),
+            "worker w1 (claude/sonnet; read, grep, finish) done — commands passed: cargo test -p x"
+        );
+
+        // A report built without an outcome keeps today's bare form.
         let done = WorkerReport {
             tools: tools(),
             finish: Some(FinishReport {
                 status: "done".to_string(),
                 needs: None,
                 summary: None,
+                evidence: None,
             }),
             missing_tool_calls: Vec::new(),
         };

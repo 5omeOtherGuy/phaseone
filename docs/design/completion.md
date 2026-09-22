@@ -35,10 +35,23 @@ pub trait SessionActivity: Send + Sync {
     /// Every finished `Executes` call so far, oldest first.
     fn shell_runs(&self) -> Vec<ShellRun>;
 }
-pub struct FinishTool; impl FinishTool { pub fn new(activity: Arc<dyn SessionActivity>, outcome: FinishOutcome) -> Self; }
+pub struct FinishTool;
+impl FinishTool {
+    /// The default policy is `RecordedCommands` (below); the HOST chooses one for an
+    /// agent it assembles (ADR-0051 item 1).
+    pub fn new(activity: Arc<dyn SessionActivity>, outcome: FinishOutcome) -> Self;
+    pub fn with_policy(self, policy: CompletionPolicy) -> Self;
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionPolicy { RecordedCommands, ReportToParent }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Evidence { CommandsPassed(Vec<String>), NotRun(String) }
 #[derive(Clone, Default)] pub struct FinishOutcome;   // shared cell the host reads
 impl FinishOutcome { pub fn get(&self) -> Option<Accepted>; pub fn clear(&self); }
-pub enum Accepted { Done { summary: String }, Blocked { summary: String, needs: String, tried: Vec<String> } }
+pub enum Accepted {
+    Done { summary: String, evidence: Evidence },
+    Blocked { summary: String, needs: String, tried: Vec<String> },
+}
 ```
 Rules, each with its exact model-visible text:
 1. `done` with an empty or missing `verification` →
@@ -55,6 +68,27 @@ Rules, each with its exact model-visible text:
 5. Accepted `done` → Ok `Finished.`; accepted `blocked` → Ok `Recorded as blocked.` The outcome
    is stored in `FinishOutcome` (last accepted call wins). A rejected call stores nothing.
 An Error is an ordinary tool result: the model reads it and keeps working in the same turn.
+
+**The completion policy (ADR-0051 item 1).** `RecordedCommands` is the rule above, exactly.
+`ReportToParent` exists for an agent the host assembled WITHOUT any tool that records command
+runs: there `["none"]` is accepted whether or not files changed (`Verification may be ["none"]`
+on that ground in the prompt), while an empty/missing `verification` and every named command go
+through the SAME checks as above — a fabricated command is rejected with the same text, so valid
+evidence is never downgraded. The two policies present the same tool under the same name with a
+different DESCRIPTION: the strict one asks for the command, the other says that no command tool
+is available, that `["none"]` is accepted, that `summary` must say what was done and what
+remains unchecked, and that the result is reported to the parent as not verified. The host
+chooses from the assembled tools' identities — no policy is derived inside the tool from a name.
+Main agents always get `RecordedCommands`.
+
+**Evidence (ADR-0051 item 2) and the worker line (item 3).** An accepted `done` records what was
+established, host-owned: `Evidence::CommandsPassed(the named commands, as the trailer spells
+them)` or `Evidence::NotRun(reason)` — `"no file changed"` under the strict rule for an accepted
+`["none"]`, `"no command tool granted"` under `ReportToParent`. The child's report
+(`worker_result` and the host's own line) carries it: `done — commands passed: cargo test -p x`
+or `done — not verified; parent verification required`; `blocked: needs …` and `ended without
+finish` are unchanged. "Verified" is never printed for a result without passed commands, and a
+child's `done` alone never satisfies the parent's own gate.
 
 **Revision after dogfood run 3 (2026-09-20).** A real model needed TEN `finish` calls: seven
 omitted `verification` although the error asked for it, two named a command in a different
@@ -114,7 +148,9 @@ the interactive prompt never continues on its own (the user is there). After eve
   `You ended your turn without calling finish. You are running unattended: nobody will answer a question or confirm a plan, and this task authorizes you to continue on your own. Continue the work now. When it is complete and verified, call finish with status "done"; if something outside your control stops you, call finish with status "blocked".`
   It is committed as a normal `UserInput` record, so the journal shows every continuation.
 - Workers: a child agent's environment may contain `finish` too; the worker service is
-  unchanged in this increment (a child's turn end is its completion, the parent verifies).
+  unchanged in this increment (a child's turn end is its completion, the parent verifies). The
+  host chooses the child's policy (§2, ADR-0051), and the child's accepted outcome labels the
+  report the parent reads.
 The host implements `SessionActivity` from the event stream it already receives
 (`ToolStarted`/`ToolFinished`), looking up each call's `effect` on the assembled tool and
 parsing the shell footer `[exit code: N]`. No new core or contract surface. On `--resume` the
