@@ -45,7 +45,9 @@ fn all() -> &'static BTreeMap<String, Mock> {
         let root: serde_json::Value = serde_json::from_str(GRIDS).expect("grids.json parses");
         let mut out = BTreeMap::new();
         for group in ["elements", "screens"] {
-            let entries = root[group].as_object().expect("grids.json group is an object");
+            let entries = root[group]
+                .as_object()
+                .expect("grids.json group is an object");
             for (id, mock) in entries {
                 let strings = |key: &str| -> Vec<String> {
                     mock[key]
@@ -174,7 +176,9 @@ pub fn expand_runs(row: &str) -> Vec<(char, char)> {
         let count = count
             .strip_prefix('×')
             .unwrap_or_else(|| panic!("run `{run}` has no ×"));
-        let count: usize = count.parse().unwrap_or_else(|_| panic!("run `{run}` count"));
+        let count: usize = count
+            .parse()
+            .unwrap_or_else(|_| panic!("run `{run}` count"));
         cells.extend(std::iter::repeat_n((bg, fg), count));
     }
     cells
@@ -193,6 +197,38 @@ pub fn assert_mock(buffer: &Buffer, area: Rect, id: &str) {
 pub fn assert_mock_rows(buffer: &Buffer, area: Rect, id: &str, rows: std::ops::Range<usize>) {
     let mock = mock(id);
     assert_rows(buffer, area, &mock, rows);
+}
+
+/// Compare `area` of `buffer` with the same-sized region of mock `id` whose top-left cell is
+/// (`top`, `left`). For elements that only exist inside a full-screen mock (menus, the composer,
+/// the full diff review, the pane mode strip): render the element alone and check it against
+/// the cells it occupies in the screen.
+pub fn assert_mock_region(buffer: &Buffer, area: Rect, id: &str, top: usize, left: usize) {
+    let full = mock(id);
+    let (w, h) = (area.width as usize, area.height as usize);
+    assert!(
+        top + h <= full.height() && left + w <= full.width(),
+        "{id}: region {w}×{h} at ({top},{left}) exceeds the {}×{} mock",
+        full.width(),
+        full.height()
+    );
+    let region = Mock {
+        id: format!("{id}[rows {top}..{}, cols {left}..{}]", top + h, left + w),
+        title: full.title.clone(),
+        text: full.text[top..top + h]
+            .iter()
+            .map(|row| row.chars().skip(left).take(w).collect())
+            .collect(),
+        runs: full.runs[top..top + h]
+            .iter()
+            .map(|row| {
+                let cells: Vec<(char, char)> =
+                    expand_runs(row).into_iter().skip(left).take(w).collect();
+                encode_runs(&cells)
+            })
+            .collect(),
+    };
+    assert_rows(buffer, area, &region, 0..h);
 }
 
 fn assert_rows(buffer: &Buffer, area: Rect, mock: &Mock, rows: std::ops::Range<usize>) {
