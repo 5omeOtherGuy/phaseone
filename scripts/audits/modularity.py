@@ -13,7 +13,8 @@ Stages (design: ../phaseone-briefs/modularity-audit/workflow.md, reviewed with p
   Verify  — two refuters per finding (rule lens, code lens) on deepseek2-audit-max; upheld
             only if both uphold; a split high-severity finding gets a third vote.
   Critic  — coverage gaps become new Find units; at most two rounds, stops when dry.
-The auditor environments live in scripts/audits/environments (set as P1_ENVIRONMENTS_DIR).
+The auditor environments live in scripts/audits/environments; each run links them with the
+repository's profiles and routes into <out>/p1-share and checks they resolve before any job.
 Every job runs in its own detached worktree at the pinned commit; a job that leaves its
 worktree dirty is voided. Every finding ends in exactly one bucket: confirmed, discarded,
 unverified (over the verify cap) — and every unit that produced nothing usable is listed
@@ -407,8 +408,23 @@ def run(wf, args):
     git_lock = threading.Lock()
     state_lock = threading.Lock()
 
-    # the auditor environments are not shipped (they would show up in `p1 models`)
-    os.environ["P1_ENVIRONMENTS_DIR"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "environments")
+    # The auditor environments are not shipped (they would show up in `p1 models`). p1 finds
+    # profiles and routes at `<environments dir>/../{profiles,routes}`, so the run gets its own
+    # share directory: the auditor environments plus links to the repository's profiles and routes.
+    # (`environments` is a real directory: `..` of a linked directory is the link target's parent.)
+    share = os.path.join(wf.out_dir, "p1-share")
+    ours = os.path.join(os.path.dirname(os.path.abspath(__file__)), "environments")
+    links = {os.path.join(share, "profiles"): os.path.join(repo, "profiles"),
+             os.path.join(share, "routes"): os.path.join(repo, "routes")}
+    links.update({os.path.join(share, "environments", name): os.path.join(ours, name)
+                  for name in os.listdir(ours)})
+    os.makedirs(os.path.join(share, "environments"), exist_ok=True)
+    for link, target in links.items():
+        if os.path.islink(link):
+            os.remove(link)
+        os.symlink(target, link)
+    os.environ["P1_ENVIRONMENTS_DIR"] = os.path.join(share, "environments")
+    preflight(wf, repo)
 
     wf.phase("Scout")
     reference = os.path.join(trees_root, "_reference")
@@ -556,6 +572,17 @@ def run(wf, args):
     return {"commit": sha, "units": [{k: u[k] for k in ("label", "lens", "files")} for u in done_units],
             "confirmed": confirmed, "discarded": discarded, "unverified": unverified,
             "facts_file": os.path.join(wf.out_dir, "facts.md")}
+
+
+def preflight(wf, repo):
+    """Resolve every environment the run uses before any job starts: a broken environment
+    would otherwise fail every job the same way."""
+    binary = os.environ.get("P1_BIN") or os.path.join(os.path.dirname(repo), "phaseone-target", "debug", "p1")
+    for env in (wf.env, VERIFY_ENV):
+        done = subprocess.run([binary, "env", "show", env], capture_output=True, text=True)
+        if done.returncode != 0:
+            raise wf.Error(f"preflight: environment {env} does not resolve: {done.stderr.strip()[:500]}")
+    wf.log(f"preflight: {wf.env} and {VERIFY_ENV} resolve")
 
 
 def SAFE(label):
