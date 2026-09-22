@@ -82,6 +82,24 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
 Unknown id → error `No worker <id>.` Execution completed is not work accepted: the
 description tells the model to verify a child's result before relying on it.
 
+## Completion policy for workers (ADR-0051)
+
+A child's `finish` is built by the catalog but its POLICY is the host's, chosen after the child's
+tools are assembled and from their identities: if none of them is the shell tool
+(`identity().implementation == "p1-tool-shell"`, the technique the report tap uses to find
+`finish`), the child gets `CompletionPolicy::ReportToParent` — `["none"]` is accepted after a
+file change too — and the strict `RecordedCommands` rule otherwise. A re-grant
+(`worker_continue add_tools`) decides it again, so `add_tools: ["shell"]` puts the worker back on
+the strict rule for its next turn. Main agents are never affected: their `finish` stays strict.
+
+The label travels with the report instead of depending on the parent's cooperation.
+`WorkerReport`'s `finish` carries `evidence`, taken from the accepted outcome the child's
+`finish` tool wrote (never from the model's input): `commands passed: <commands>` or `not
+verified; parent verification required`. `worker_result` prints it on the status line and the
+host prints the same sentence for every worker's end — `worker w1 (deepseek2; read, edit,
+finish) done — not verified; parent verification required` — so a restricted worker ends with a
+true report and the parent still verifies the work.
+
 ## Behaviour tests (from the owner's observed failures)
 - F2: a child finishing while the parent is mid-turn, idle, or blocked in `worker_result{wait}`
   always reaches the parent; with the notification dropped on purpose, `worker_result` still

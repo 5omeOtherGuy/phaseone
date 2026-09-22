@@ -45,7 +45,8 @@ Run verification commands standalone: no output pipes, trailing echo, or combine
 {{#tool:shell}}Once all requested work is done, run a meaningful verification command through `{{tool:shell}}`
 after the last file edit.{{/tool:shell}}
 Call `{{tool:finish}}` with status "done", summary and verification: list the exact commands that
-actually succeeded. Use ["none"] only if no files changed.
+actually succeeded. Verification may be ["none"] only when the task changed no files or you have
+no tool that runs commands; the result is then reported as not verified.
 If completion requires something outside your control, call `{{tool:finish}}` with status
 "blocked", needs and tried. An unattended task must end with this explicit outcome, never
 "shall I proceed?". Give a compact handoff: changed files, verified results and remaining gaps.

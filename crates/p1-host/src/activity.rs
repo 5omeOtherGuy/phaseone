@@ -23,7 +23,7 @@ use p1_contracts::{
     AgentEvent, Effect, EventSink, JournalRecord, RecordBody, Tool, ToolCall, ToolInput,
     ToolResultItem, ToolStatus,
 };
-use p1_tool_finish::{FinishOutcome, SessionActivity, ShellRun};
+use p1_tool_finish::{Accepted, Evidence, FinishOutcome, SessionActivity, ShellRun};
 
 #[cfg(feature = "delegation")]
 use p1_workers::{FinishReport, WorkerReport};
@@ -298,7 +298,10 @@ impl EventSink for ActivityTee {
 ///   and its name is on that result, so the tap counts result names;
 /// - a successful call of the `finish` tool is identified by the tool's identity
 ///   implementation, and its JSON input (kept from its `ToolStarted`) is what says
-///   `status`, `needs` and `summary`: the tool's own content does not carry them.
+///   `status`, `needs` and `summary`: the tool's own content does not carry them;
+/// - the EVIDENCE is not the model's word: it is read from the child's own
+///   [`FinishOutcome`] cell, which the child's `finish` tool wrote from what it
+///   accepted (ADR-0051 item 2/3).
 #[cfg(feature = "delegation")]
 pub struct WorkerReportTap {
     inner: Arc<dyn EventSink>,
@@ -311,6 +314,10 @@ pub struct WorkerReportTap {
     /// The input of a `finish` call that has started, by call id, until its result
     /// says whether it was accepted.
     pending_finish: Mutex<HashMap<String, String>>,
+    /// The child's `finish` outcome cell: where the accepted evidence is read. The
+    /// child's `finish` tool (re-wrapped, never replaced, across a re-grant) writes
+    /// this same cell for the child's whole life.
+    outcome: FinishOutcome,
     front_end: Arc<dyn FrontEnd>,
     worker_id: String,
     description: String,
@@ -320,12 +327,14 @@ pub struct WorkerReportTap {
 impl WorkerReportTap {
     /// `tools` are the child's ASSEMBLED tools: their model-facing names become the
     /// report's `tools`, and the one whose identity implementation is `finish` is the
-    /// one whose calls are read. `description` is the child's route/model, shown by
-    /// the front end.
+    /// one whose calls are read. `outcome` is the completion cell the child's `finish`
+    /// tool writes — [`FinishOutcome::default`] when the child has no `finish` tool.
+    /// `description` is the child's route/model, shown by the front end.
     pub fn new(
         inner: Arc<dyn EventSink>,
         report: Arc<Mutex<WorkerReport>>,
         tools: &[Arc<dyn Tool>],
+        outcome: FinishOutcome,
         front_end: Arc<dyn FrontEnd>,
         worker_id: String,
         description: String,
@@ -335,6 +344,7 @@ impl WorkerReportTap {
             report,
             finish_names: Mutex::new(std::collections::HashSet::new()),
             pending_finish: Mutex::new(HashMap::new()),
+            outcome,
             front_end,
             worker_id,
             description,
@@ -360,6 +370,16 @@ impl WorkerReportTap {
             .map(|tool| tool.declaration().name.clone())
             .collect();
     }
+
+    /// What the child's ACCEPTED `finish` call established (ADR-0051 item 3), read
+    /// from the child's own outcome cell: the model's input cannot produce it, and a
+    /// `blocked` outcome — or none at all — has no evidence line.
+    fn accepted_evidence(&self) -> Option<String> {
+        match self.outcome.get()? {
+            Accepted::Done { evidence, .. } => Some(evidence_text(&evidence)),
+            Accepted::Blocked { .. } => None,
+        }
+    }
 }
 
 #[cfg(feature = "delegation")]
@@ -367,8 +387,12 @@ impl EventSink for WorkerReportTap {
     fn emit(&self, event: AgentEvent) {
         let turn_finished = matches!(event, AgentEvent::TurnFinished { .. });
         match &event {
-            // A continue is a new turn: everything but the granted tools starts over.
-            AgentEvent::TurnStarted => self.report.lock().unwrap().reset_turn(),
+            // A continue is a new turn: everything but the granted tools starts over,
+            // and the previous turn's evidence is dropped with it.
+            AgentEvent::TurnStarted => {
+                self.report.lock().unwrap().reset_turn();
+                self.outcome.clear();
+            }
             AgentEvent::ToolStarted { call } => {
                 if self.finish_names.lock().unwrap().contains(&call.name) {
                     self.pending_finish
@@ -384,10 +408,12 @@ impl EventSink for WorkerReportTap {
                     report.note_missing_tool(&result.name);
                 } else if result.status == ToolStatus::Ok
                     && let Some(input) = input
-                    && let Some(finish) = parse_finish_call(&input)
+                    && let Some(mut finish) = parse_finish_call(&input)
                 {
                     // "its LAST successful finish call this turn": an accepted call
-                    // replaces an earlier one.
+                    // replaces an earlier one. The evidence comes from what the tool
+                    // ACCEPTED, never from the input above.
+                    finish.evidence = self.accepted_evidence();
                     report.finish = Some(finish);
                 }
             }
@@ -403,9 +429,20 @@ impl EventSink for WorkerReportTap {
     }
 }
 
+/// The one sentence a `done` is labelled with. `NotRun` is never printed as verified,
+/// whatever it did not run (ADR-0051 item 3).
+#[cfg(feature = "delegation")]
+fn evidence_text(evidence: &Evidence) -> String {
+    match evidence {
+        Evidence::CommandsPassed(commands) => format!("commands passed: {}", commands.join(", ")),
+        Evidence::NotRun(_) => "not verified; parent verification required".to_string(),
+    }
+}
+
 /// The `status`, `needs` and `summary` of one `finish` call's input. `needs` may be
 /// a string or an array (joined with `", "`); a blank `needs` is none. Input that is
 /// not an object with a string `status` yields no report — the tool rejected it too.
+/// The evidence is NOT read here: it is not the model's to state (ADR-0051 item 3).
 #[cfg(feature = "delegation")]
 fn parse_finish_call(raw: &str) -> Option<FinishReport> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
@@ -430,6 +467,7 @@ fn parse_finish_call(raw: &str) -> Option<FinishReport> {
         status,
         needs,
         summary,
+        evidence: None,
     })
 }
 
@@ -793,6 +831,7 @@ mod tests {
             raw.clone(),
             report.clone(),
             &tools,
+            FinishOutcome::default(),
             front_end.clone(),
             "w1".to_string(),
             "route/model".to_string(),
@@ -857,6 +896,8 @@ mod tests {
                 // The array form joins with ", ".
                 needs: Some("edit, write".to_string()),
                 summary: Some("needs a writer".to_string()),
+                // A `blocked` outcome carries no evidence line.
+                evidence: None,
             })
         );
         assert_eq!(
@@ -886,6 +927,7 @@ mod tests {
             Arc::new(p1_testkit::RecordingEvents::new()),
             report.clone(),
             &tools,
+            FinishOutcome::default(),
             Arc::new(RecordingWorkerEnds::default()),
             "w1".to_string(),
             "route/model".to_string(),
@@ -939,9 +981,112 @@ mod tests {
                 status: "done".to_string(),
                 needs: None,
                 summary: None,
+                // The model's input never carries evidence (ADR-0051 item 3).
+                evidence: None,
             }
         );
         assert_eq!(parse_finish_call("not json"), None);
         assert_eq!(parse_finish_call(r#"{"summary":"s"}"#), None);
+    }
+
+    /// The evidence line comes from the child's ACCEPTED outcome — the cell the
+    /// child's `finish` tool wrote — never from the model's input, and the next turn
+    /// clears it (ADR-0051 item 3).
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn the_tap_labels_the_accepted_outcome_and_clears_it_next_turn() {
+        use p1_contracts::{CancellationToken, ToolContext};
+
+        struct Fixed {
+            change: Option<u64>,
+            runs: Vec<ShellRun>,
+        }
+
+        impl SessionActivity for Fixed {
+            fn last_file_change(&self) -> Option<u64> {
+                self.change
+            }
+
+            fn shell_runs(&self) -> Vec<ShellRun> {
+                self.runs.clone()
+            }
+        }
+
+        // `verification` as the model named it, the session's record, and the line the
+        // report must carry.
+        let cases = [
+            (
+                r#"["none"]"#,
+                Fixed {
+                    change: None,
+                    runs: Vec::new(),
+                },
+                "not verified; parent verification required",
+            ),
+            (
+                r#"["cargo test"]"#,
+                Fixed {
+                    change: None,
+                    runs: vec![ShellRun {
+                        command: "cargo test".to_string(),
+                        exit_code: Some(0),
+                        order: 1,
+                    }],
+                },
+                "commands passed: cargo test",
+            ),
+        ];
+        for (verification, activity, expected) in cases {
+            let outcome = FinishOutcome::default();
+            let finish = p1_tool_finish::FinishTool::new(Arc::new(activity), outcome.clone());
+            let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
+                FakeTool::new("finish").with_identity(FINISH_IMPLEMENTATION, "claude"),
+            )];
+            let report = Arc::new(Mutex::new(WorkerReport::new(vec!["finish".to_string()])));
+            let tap = WorkerReportTap::new(
+                Arc::new(p1_testkit::RecordingEvents::new()),
+                report.clone(),
+                &tools,
+                outcome.clone(),
+                Arc::new(RecordingWorkerEnds::default()),
+                "w1".to_string(),
+                "route/model".to_string(),
+            );
+
+            tap.emit(AgentEvent::TurnStarted);
+            let raw =
+                format!(r#"{{"status":"done","summary":"did it","verification":{verification}}}"#);
+            // The model calls `finish`: the tool accepts and writes the outcome cell.
+            let accepted = finish
+                .execute(
+                    &call("f1", "finish", &raw),
+                    ToolContext {
+                        cancel: CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert_eq!(accepted.status, ToolStatus::Ok, "{}", accepted.content);
+            // The tap sees the same call through the child's events.
+            tap.emit(AgentEvent::ToolStarted {
+                call: call("f1", "finish", &raw),
+            });
+            tap.emit(AgentEvent::ToolFinished {
+                result: result("f1", "finish", ToolStatus::Ok, "Finished."),
+            });
+            let snapshot = report.lock().unwrap().clone();
+            assert_eq!(
+                snapshot
+                    .finish
+                    .and_then(|finish| finish.evidence)
+                    .as_deref(),
+                Some(expected),
+                "verification: {verification}"
+            );
+
+            // A continue is a new turn: the previous turn's evidence goes with it.
+            tap.emit(AgentEvent::TurnStarted);
+            assert_eq!(report.lock().unwrap().finish, None);
+            assert_eq!(outcome.get(), None, "the outcome cell is cleared too");
+        }
     }
 }

@@ -612,14 +612,22 @@ fn render_status(id: &str, status: &ChildStatus) -> String {
 }
 
 /// The report lines a finished worker's result begins with. The missing-call line
-/// is omitted entirely when the worker called no tool it was not given.
+/// is omitted entirely when the worker called no tool it was not given, and the
+/// evidence (ADR-0051 item 3) is appended to the status line — the accepted outcome's
+/// own words, so a `done` the worker could not verify says so here.
 fn render_report(report: &WorkerReport) -> String {
     let mut lines = vec![format!("tools: {}", report.tools.join(", "))];
     lines.push(match &report.finish {
-        Some(finish) => match (finish.status.as_str(), &finish.needs) {
-            ("blocked", Some(needs)) => format!("finish: blocked — needs: {needs}"),
-            (status, _) => format!("finish: {status}"),
-        },
+        Some(finish) => {
+            let status = match (finish.status.as_str(), &finish.needs) {
+                ("blocked", Some(needs)) => format!("blocked — needs: {needs}"),
+                (status, _) => status.to_string(),
+            };
+            match &finish.evidence {
+                Some(evidence) => format!("finish: {status} — {evidence}"),
+                None => format!("finish: {status}"),
+            }
+        }
         None => "finish: not called".to_string(),
     });
     if !report.missing_tool_calls.is_empty() {

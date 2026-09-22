@@ -40,11 +40,50 @@ pub trait SessionActivity: Send + Sync {
     fn shell_runs(&self) -> Vec<ShellRun>;
 }
 
+/// Which completion rule a `finish` tool applies (ADR-0051 item 1). The HOST chooses
+/// it at construction, from the assembled tools' identities; the tool never inspects
+/// grant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionPolicy {
+    /// Today's rule (ADR-0037), unchanged: `done` needs a command whose successful
+    /// run is recorded after the last file change, and `["none"]` is accepted only in
+    /// a session that changed no file.
+    RecordedCommands,
+    /// For an agent with no tool that runs commands: `["none"]` is accepted after a
+    /// file change too, and the accepted result is labelled unverified for the parent.
+    ReportToParent,
+}
+
+impl CompletionPolicy {
+    /// The model-facing description that carries this policy. The default face of a
+    /// tool built under the policy, so a host that switches the policy late can
+    /// present the tool the model would have got from the factory.
+    fn description(self) -> &'static str {
+        match self {
+            Self::RecordedCommands => DESCRIPTION,
+            Self::ReportToParent => REPORT_DESCRIPTION,
+        }
+    }
+}
+
+/// What an accepted `done` established (ADR-0051 item 2). Host-owned: it is built
+/// from the session's own record, never from the model's input, and it is what the
+/// parent is told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Evidence {
+    /// These commands all have a recorded successful run after the last file change,
+    /// spelled as the trailer spells them (normalised).
+    CommandsPassed(Vec<String>),
+    /// Nothing was established, and why. Never printed as "verified".
+    NotRun(String),
+}
+
 /// A `finish` call the tool accepted. Last accepted call wins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Accepted {
     Done {
         summary: String,
+        evidence: Evidence,
     },
     Blocked {
         summary: String,
@@ -96,6 +135,10 @@ impl ToolFace {
 const NAME: &str = "finish";
 const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.";
 
+/// The `ReportToParent` face (ADR-0051 item 1): the same tool and the same checks,
+/// presented to an agent that has no tool that runs commands.
+const REPORT_DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\nYou have no tool that runs commands, so no command can verify this work: call `done` with `verification: [\"none\"]`, and say in `summary` what you did and what remains unchecked. The result is reported to your parent as \"not verified; parent verification required\".\n`done`: `verification` is `[\"none\"]` — a command you cannot run proves nothing.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.";
+
 /// The three exact rule texts, model-visible.
 const ERR_MISSING_VERIFICATION: &str = "Name the commands you ran to verify the work in \"verification\". If nothing can be verified by a command, say why in \"summary\" and pass [\"none\"].";
 const ERR_NONE_CHANGED_FILES: &str =
@@ -111,23 +154,38 @@ const TRAILER_HEADING: &str =
 const TRAILER_NONE: &str =
     "No run counts right now: run your checks (without a pipe) after your last file change.";
 
-/// The `finish` tool. Holds the session view and the outcome cell.
+/// The `finish` tool. Holds the session view, the outcome cell and the completion
+/// policy the host chose for this agent.
 pub struct FinishTool {
     activity: Arc<dyn SessionActivity>,
     outcome: FinishOutcome,
+    policy: CompletionPolicy,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl FinishTool {
-    /// Build the tool with the default (`finish`, Claude-family) face.
+    /// Build the tool with the default (`finish`, Claude-family) face and the
+    /// default policy, [`CompletionPolicy::RecordedCommands`].
     pub fn new(activity: Arc<dyn SessionActivity>, outcome: FinishOutcome) -> Self {
+        let policy = CompletionPolicy::RecordedCommands;
         Self {
             activity,
             outcome,
+            policy,
             declaration: declaration(default_face()),
             identity: identity("claude"),
         }
+    }
+
+    /// Apply the policy the host chose for this agent (ADR-0051 item 1). The
+    /// model-facing description follows the policy, because it is what tells the
+    /// model which completion rule applies to it; a later [`FinishTool::with_face`]
+    /// still overrides it.
+    pub fn with_policy(mut self, policy: CompletionPolicy) -> Self {
+        self.policy = policy;
+        self.declaration.description = policy.description().to_string();
+        self
     }
 
     /// Present the same implementation under another name/description and
@@ -136,6 +194,7 @@ impl FinishTool {
         Self {
             activity: self.activity,
             outcome: self.outcome,
+            policy: self.policy,
             declaration: declaration(face),
             identity: identity(variant),
         }
@@ -266,7 +325,9 @@ fn invalid(tool: &str, reason: &str) -> String {
 
 impl FinishTool {
     /// Apply the §2 rules. `Ok` is the accepted model-visible text and stores the
-    /// outcome; `Err` is a rule violation that stores nothing.
+    /// outcome; `Err` is a rule violation that stores nothing. The policy decides
+    /// what `["none"]` means (ADR-0051 item 1); every other rule is shared, so
+    /// invalid evidence never downgrades to an accepted unverified result.
     fn evaluate(&self, input: FinishInput) -> Result<String, String> {
         match input.status {
             Status::Done => {
@@ -274,15 +335,33 @@ impl FinishTool {
                 if verification.is_empty() {
                     return Err(self.error_one(ERR_MISSING_VERIFICATION));
                 }
-                if verification.len() == 1 && verification[0].trim() == "none" {
-                    if self.activity.last_file_change().is_some() {
-                        return Err(self.with_trailer(ERR_NONE_CHANGED_FILES));
+                let evidence = if verification.len() == 1 && verification[0].trim() == "none" {
+                    match self.policy {
+                        // An agent with no command tool cannot verify anything itself;
+                        // it ends honestly and the parent verifies (ADR-0051 item 1).
+                        CompletionPolicy::ReportToParent => {
+                            Evidence::NotRun("no command tool granted".to_string())
+                        }
+                        CompletionPolicy::RecordedCommands => {
+                            if self.activity.last_file_change().is_some() {
+                                return Err(self.with_trailer(ERR_NONE_CHANGED_FILES));
+                            }
+                            // Not writing a file is no proof that an answer is right.
+                            Evidence::NotRun("no file changed".to_string())
+                        }
                     }
                 } else {
                     self.verify(&verification)?;
-                }
+                    Evidence::CommandsPassed(
+                        verification
+                            .iter()
+                            .map(|named| normalise_command(named))
+                            .collect(),
+                    )
+                };
                 self.outcome.set(Accepted::Done {
                     summary: input.summary,
+                    evidence,
                 });
                 Ok("Finished.".to_string())
             }
