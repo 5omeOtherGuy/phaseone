@@ -1,7 +1,7 @@
 ---
 adr: 51
 title: A worker without a command tool may finish done; the result says it was not verified
-status: proposed
+status: accepted
 date: 2026-09-23
 deciders: owner+lead
 supersedes: []
@@ -76,5 +76,14 @@ small change first ("add the small fix now") and, with the lead and Astra's revi
 
 ## Evidence
 
-<filled when merged: `cargo test -p p1-tool-finish`, `cargo test -p p1-host --test worker_*`,
-and a live re-run of the ADR-0050 acceptance scenario ending `done — not verified`.>
+`scripts/gate.sh` green on `5121536` (merge of `task/finish-policy`): `cargo test -p
+p1-tool-finish` (new `tests/policy.rs`, the frozen `tests/finish.rs` changed only by the new
+`evidence` field in its existing assertions) and `cargo test -p p1-host --test
+worker_evidence` (six scenarios: no command tool → done/not verified; fabricated command still
+rejected; a worker with shell stays strict; regrant with shell → strict next turn; regrant
+without → still unverified; a main agent is unaffected). Live, 2026-09-23, deepseek2 main agent
+and a deepseek2 worker granted `[read, edit]`: the worker changed `config.toml` and finished
+`done` with `["none"]`; the host printed `· worker w1 (…/deepseek-v4.1-flash; read, edit,
+finish) done — not verified; parent verification required` and `worker_result` carried the
+same line — the ADR-0050 acceptance scenario that had ended `blocked` now ends honestly.
+Run recorded in `docs/dogfood/runs.jsonl` (label `finish-policy`).
