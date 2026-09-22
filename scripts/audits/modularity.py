@@ -34,7 +34,7 @@ META = {"name": "p1-modularity-audit",
 LINE_BUDGET = 2600
 VERIFY_ENV = "deepseek2-audit-max"
 REPRO_PROGRAMS = (("rg",), ("grep",), ("git", "grep"), ("cargo", "tree"), ("cargo", "metadata"))
-SHELL_META = re.compile(r"[|;&<>`$]")
+SHELL_OPERATOR = re.compile(r"^[|&;<>()]+$")
 
 # seams.md §2: the piece each crate is, and what it must not own.
 PIECES = {
@@ -352,12 +352,17 @@ def evidence_errors(repo, evidence):
 
 def repro_output(repo, command):
     """(output, error) — the command runs WITHOUT a shell, in the pinned reference tree."""
-    if SHELL_META.search(command):
-        return None, f"repro {command!r} must be one command without pipes, redirections or $"
+    # It never reaches a shell, so only an UNQUOTED operator is a mistake (`-> String` inside a
+    # quoted regex is fine).
     try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
         argv = shlex.split(command)
     except ValueError as error:
         return None, f"repro {command!r}: {error}"
+    if any(SHELL_OPERATOR.match(token) for token in tokens):
+        return None, f"repro {command!r} must be one command without pipes, redirections or `;`"
     if not any(tuple(argv[:len(p)]) == p for p in REPRO_PROGRAMS):
         return None, f"repro {command!r} must start with one of: {', '.join(' '.join(p) for p in REPRO_PROGRAMS)}"
     if argv[0] == "cargo" and "--offline" not in argv:
@@ -628,7 +633,8 @@ COMMON = """Rules for this job:
   "AGENTS.md Architecture", "seams.md §N" or "ADR-NNNN" — read the rule before citing it,
   and check `docs/adr/` for an accepted ADR that chose this design (then it is NOT a finding),
   (3) `repro`: ONE command starting with `rg`, `grep`, `git grep`, `cargo tree` or
-  `cargo metadata`, without pipes, redirections or `$`, whose output shows the problem.
+  `cargo metadata`, without pipes or redirections (it runs without a shell), whose output
+  shows the problem.
 - The workflow re-checks every quote and re-runs every repro; a finding that fails is
   rejected. Accuracy matters more than count.
 """
