@@ -649,13 +649,14 @@ fn register_delegation_tools(
     let environments = crate::models::environment_names(&deps.environment_dirs)?;
 
     let service_for = service.clone();
+    let grantable_for_start = grantable.clone();
     catalog.tool(
         "worker_start",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
             Ok(apply_delegate_face!(
                 p1_tool_delegate::WorkerStartTool::new(
                     service_for.clone(),
-                    grantable.clone(),
+                    grantable_for_start.clone(),
                     environments.clone(),
                 ),
                 spec
@@ -679,7 +680,7 @@ fn register_delegation_tools(
         "worker_continue",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
             Ok(apply_delegate_face!(
-                p1_tool_delegate::WorkerContinueTool::new(service_for.clone()),
+                p1_tool_delegate::WorkerContinueTool::new(service_for.clone(), grantable.clone()),
                 spec
             ))
         }),

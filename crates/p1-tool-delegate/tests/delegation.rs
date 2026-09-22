@@ -85,6 +85,9 @@ fn child_agent(
         // These test agents have no host tap; an empty report is what a factory
         // without one returns (ADR-0050 item 6).
         report: Arc::new(WorkerReport::default),
+        // No host assembly behind them either, so nothing can re-assemble them with
+        // a larger grant (ADR-0050 item 6): `add_tools` is refused.
+        regrant: None,
     }
 }
 
@@ -521,7 +524,7 @@ async fn worker_continue_keeps_the_child_history() {
     ));
 
     // Repair in the SAME session.
-    within(workers.continue_child(&id, "please fix it".into()))
+    within(workers.continue_child(&id, "please fix it".into(), Vec::new()))
         .await
         .unwrap();
     let status = within(workers.wait(&id, CancellationToken::new()))
@@ -706,7 +709,7 @@ async fn shutdown_ends_every_child_and_later_calls_fail() {
         Err(WorkerError::ShutDown)
     );
     assert_eq!(
-        within(workers.continue_child(&w1, "x".into())).await,
+        within(workers.continue_child(&w1, "x".into(), Vec::new())).await,
         Err(WorkerError::ShutDown)
     );
     assert_eq!(
@@ -944,7 +947,9 @@ async fn review_continuation_obeys_global_limit() {
         .await
         .unwrap();
     let _second = workers.start(spec()).await.unwrap();
-    let result = workers.continue_child(&first, "repair".into()).await;
+    let result = workers
+        .continue_child(&first, "repair".into(), Vec::new())
+        .await;
     tokio::task::yield_now().await;
     let running = workers
         .list()
@@ -974,7 +979,10 @@ async fn review_cancel_immediately_after_continue_is_retained() {
     let workers = InProcessWorkers::new(factory, 1);
     let id = workers.start(spec()).await.unwrap();
     workers.wait(&id, CancellationToken::new()).await.unwrap();
-    workers.continue_child(&id, "repair".into()).await.unwrap();
+    workers
+        .continue_child(&id, "repair".into(), Vec::new())
+        .await
+        .unwrap();
     workers.cancel(&id).await.unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -1159,6 +1167,60 @@ async fn worker_start_passes_the_grant_into_the_child_spec() {
     );
 }
 
+// ================================================================ adding tools (ADR-0050 item 6)
+
+/// `worker_continue`'s `add_tools` is the same grantable list `worker_start` uses:
+/// optional, unique items, every one a host module name. An unknown module is
+/// refused with the valid list, and nothing reaches the worker service.
+#[tokio::test(start_paused = true)]
+async fn worker_continue_add_tools_is_the_grantable_list() {
+    let (factory, specs) = recording_factory();
+    let workers = InProcessWorkers::new(factory, 2);
+    let service: Arc<dyn WorkerService> = workers.clone();
+    let tools = all(service, grantable(), environments());
+    let continue_tool = tool_by_name(&tools, "worker_continue");
+
+    let schema = match &continue_tool.declaration().kind {
+        p1_contracts::DeclarationKind::Function { input_schema } => input_schema.clone(),
+        other => panic!("worker_continue must be a function tool, got {other:?}"),
+    };
+    assert_eq!(schema["required"], serde_json::json!(["id", "message"]));
+    assert_eq!(
+        schema["properties"]["add_tools"]["uniqueItems"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        schema["properties"]["add_tools"]["items"]["enum"],
+        serde_json::json!(["edit", "read", "shell"])
+    );
+    assert!(
+        continue_tool
+            .declaration()
+            .description
+            .contains("add_tools"),
+        "the description tells the model what add_tools is for"
+    );
+
+    // An unknown module names it and the valid list, and is refused before the
+    // service sees anything: no child is re-assembled, none is even started here.
+    let outcome = exec_tool(
+        &continue_tool,
+        "worker_continue",
+        r#"{"id":"w1","message":"m","add_tools":["bogus"]}"#,
+    )
+    .await;
+    assert_eq!(outcome.status, ToolStatus::Error);
+    assert!(
+        outcome.content.contains("`bogus`") && outcome.content.contains("edit, read, shell"),
+        "an unknown module names it and the valid list: {}",
+        outcome.content
+    );
+    assert!(
+        specs.lock().unwrap().is_empty(),
+        "a refused add_tools must not reach the factory"
+    );
+}
+
 // ================================================================ the worker report (ADR-0050 item 6)
 
 /// A factory whose child reports exactly this (a fixed snapshot, as a host tap
@@ -1176,6 +1238,7 @@ fn reporting_factory(report: WorkerReport) -> AgentFactory {
                 let report = report.clone();
                 move || report.clone()
             }),
+            regrant: None,
         })
     })
 }

@@ -239,20 +239,34 @@ fn parse_exit_code(content: &str) -> Option<i32> {
 
 /// Forwards every event to the renderer unchanged, and records tool activity into
 /// one agent's [`ActivityLog`]. The assembled tools are held here so the effect of
-/// each call comes from the tool that will actually run it.
+/// each call comes from the tool that will actually run it — behind a lock, because a
+/// re-grant replaces that set (ADR-0050 item 6).
 pub struct ActivityTee {
     inner: Arc<dyn EventSink>,
     log: Arc<ActivityLog>,
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: Mutex<HashMap<String, Arc<dyn Tool>>>,
 }
 
 impl ActivityTee {
     pub fn new(inner: Arc<dyn EventSink>, log: Arc<ActivityLog>, tools: &[Arc<dyn Tool>]) -> Self {
-        let tools = tools
+        let tee = Self {
+            inner,
+            log,
+            tools: Mutex::new(HashMap::new()),
+        };
+        tee.retool(tools);
+        tee
+    }
+
+    /// The agent was re-assembled with another tool set (ADR-0050 item 6): the effect
+    /// of every later call comes from the tool that will actually run it, so a
+    /// re-granted `write` still counts as a file change and a re-granted `shell` run
+    /// still counts for `finish`'s verification.
+    pub fn retool(&self, tools: &[Arc<dyn Tool>]) {
+        *self.tools.lock().unwrap() = tools
             .iter()
             .map(|tool| (tool.declaration().name.clone(), tool.clone()))
             .collect();
-        Self { inner, log, tools }
     }
 }
 
@@ -260,10 +274,8 @@ impl EventSink for ActivityTee {
     fn emit(&self, event: AgentEvent) {
         match &event {
             AgentEvent::ToolStarted { call } => {
-                let effect = self
-                    .tools
-                    .get(&call.name)
-                    .map_or(Effect::ReadOnly, |tool| tool.effect(call));
+                let tool = self.tools.lock().unwrap().get(&call.name).cloned();
+                let effect = tool.map_or(Effect::ReadOnly, |tool| tool.effect(call));
                 self.log.record_started(call, effect);
             }
             AgentEvent::ToolFinished { result } => self.log.record_finished(result),
@@ -293,8 +305,9 @@ pub struct WorkerReportTap {
     /// Shared with the child's `report` closure, so the service snapshots the same
     /// value the front end was told.
     report: Arc<Mutex<WorkerReport>>,
-    /// Model-facing names of this child's `finish` tool (a face may rename it).
-    finish_names: std::collections::HashSet<String>,
+    /// Model-facing names of this child's `finish` tool (a face may rename it). A
+    /// re-grant replaces the child's tool set, so this is behind a lock.
+    finish_names: Mutex<std::collections::HashSet<String>>,
     /// The input of a `finish` call that has started, by call id, until its result
     /// says whether it was accepted.
     pending_finish: Mutex<HashMap<String, String>>,
@@ -317,20 +330,35 @@ impl WorkerReportTap {
         worker_id: String,
         description: String,
     ) -> Self {
-        let finish_names = tools
-            .iter()
-            .filter(|tool| tool.identity().implementation == FINISH_IMPLEMENTATION)
-            .map(|tool| tool.declaration().name.clone())
-            .collect();
-        Self {
+        let tap = Self {
             inner,
             report,
-            finish_names,
+            finish_names: Mutex::new(std::collections::HashSet::new()),
             pending_finish: Mutex::new(HashMap::new()),
             front_end,
             worker_id,
             description,
-        }
+        };
+        tap.retool(tools);
+        tap
+    }
+
+    /// The child was re-assembled with a larger grant (ADR-0050 item 6): the report's
+    /// `tools` becomes the new assembly's model-facing names, and the `finish` tool is
+    /// found again by its identity implementation, so a new tool set keeps reporting
+    /// correctly. The report's other fields (the `finish` of the turn, the missing
+    /// calls) are the turn's, and stay.
+    pub fn retool(&self, tools: &[Arc<dyn Tool>]) {
+        let names: std::collections::HashSet<String> = tools
+            .iter()
+            .filter(|tool| tool.identity().implementation == FINISH_IMPLEMENTATION)
+            .map(|tool| tool.declaration().name.clone())
+            .collect();
+        *self.finish_names.lock().unwrap() = names;
+        self.report.lock().unwrap().tools = tools
+            .iter()
+            .map(|tool| tool.declaration().name.clone())
+            .collect();
     }
 }
 
@@ -342,7 +370,7 @@ impl EventSink for WorkerReportTap {
             // A continue is a new turn: everything but the granted tools starts over.
             AgentEvent::TurnStarted => self.report.lock().unwrap().reset_turn(),
             AgentEvent::ToolStarted { call } => {
-                if self.finish_names.contains(&call.name) {
+                if self.finish_names.lock().unwrap().contains(&call.name) {
                     self.pending_finish
                         .lock()
                         .unwrap()

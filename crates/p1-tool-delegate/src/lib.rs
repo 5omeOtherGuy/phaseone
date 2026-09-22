@@ -8,7 +8,8 @@
 //! Descriptions tell the model the four facts that matter: a worker gets ONLY the
 //! task text, workers share this workspace, completion arrives as a notification
 //! (so polling is pointless), and the worker has ONLY the tools the parent lists in
-//! `tools`, plus `finish`. `worker_result` adds: verify first.
+//! `tools`, plus `finish`. `worker_continue` adds: `add_tools` can give a worker the
+//! tools it lacks, and it keeps its context. `worker_result` adds: verify first.
 
 use std::sync::Arc;
 
@@ -44,7 +45,7 @@ const RESULT_NAME: &str = "worker_result";
 const RESULT_DESCRIPTION: &str = "Read a worker's status and its final text.\nSet wait to true to block until the worker is no longer running (you can be cancelled while waiting).\nVerify the worker's result before relying on it.";
 
 const CONTINUE_NAME: &str = "worker_continue";
-const CONTINUE_DESCRIPTION: &str = "Send another message into a worker's session to repair or extend its work.\nFails while the worker is still running a turn.";
+const CONTINUE_DESCRIPTION: &str = "Send another message into a worker's session to repair or extend its work.\nFails while the worker is still running a turn.\nUse add_tools to give the worker tools it lacks (e.g. after it finished blocked naming a missing tool); it keeps its context.";
 
 const CANCEL_NAME: &str = "worker_cancel";
 const CANCEL_DESCRIPTION: &str =
@@ -115,11 +116,13 @@ pub fn all(
     vec![
         Arc::new(WorkerStartTool::new(
             Arc::clone(&service),
-            grantable,
+            grantable.clone(),
             environments,
         )),
         Arc::new(WorkerResultTool::new(Arc::clone(&service))),
-        Arc::new(WorkerContinueTool::new(Arc::clone(&service))),
+        // `worker_continue` can ADD to a worker's grant, so it carries the same
+        // grantable list `worker_start` does.
+        Arc::new(WorkerContinueTool::new(Arc::clone(&service), grantable)),
         Arc::new(WorkerCancelTool::new(service)),
     ]
 }
@@ -353,28 +356,48 @@ impl Tool for WorkerResultTool {
 
 // ---------------------------------------------------------------- worker_continue
 
-/// `worker_continue`: another turn in the SAME child session.
+/// `worker_continue`: another turn in the SAME child session, optionally with a
+/// larger tool grant (ADR-0050 item 6).
 pub struct WorkerContinueTool {
     service: Arc<dyn WorkerService>,
+    /// Tool module names a worker may be granted; the schema's `add_tools` enum and
+    /// the list `execute` validates against. Never contains `finish` or `worker_*`.
+    grantable: Vec<String>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkerContinueTool {
-    pub fn new(service: Arc<dyn WorkerService>) -> Self {
+    pub fn new(service: Arc<dyn WorkerService>, grantable: Vec<String>) -> Self {
         Self {
             service,
-            declaration: declaration(CONTINUE_NAME, CONTINUE_DESCRIPTION, continue_schema()),
+            declaration: declaration(
+                CONTINUE_NAME,
+                CONTINUE_DESCRIPTION,
+                continue_schema(&grantable),
+            ),
             identity: identity("default"),
+            grantable,
         }
     }
 
     pub fn with_face(self, face: ToolFace, variant: &str) -> Self {
+        let declaration = declaration(
+            &face.name,
+            &face.description,
+            continue_schema(&self.grantable),
+        );
         Self {
             service: self.service,
-            declaration: declaration(&face.name, &face.description, continue_schema()),
+            grantable: self.grantable,
+            declaration,
             identity: identity(variant),
         }
+    }
+
+    /// The grantable modules joined for a model-readable message.
+    fn grantable_list(&self) -> String {
+        self.grantable.join(", ")
     }
 }
 
@@ -383,6 +406,9 @@ impl WorkerContinueTool {
 struct ContinueInput {
     id: String,
     message: String,
+    /// `serde(default)` so a continue without added tools is the ordinary repair.
+    #[serde(default)]
+    add_tools: Vec<String>,
 }
 
 impl Tool for WorkerContinueTool {
@@ -409,8 +435,37 @@ impl Tool for WorkerContinueTool {
                 Err(outcome) => return outcome,
             };
             let id = ChildId(input.id.clone());
-            match self.service.continue_child(&id, input.message).await {
-                Ok(()) => ToolOutcome::ok(format!("Worker {} continues.", input.id)),
+            // Models do not always honour the schema, so the rules are enforced here
+            // too: an unknown module is refused with the valid list, and nothing is
+            // sent to the worker.
+            let mut add_tools = Vec::with_capacity(input.add_tools.len());
+            for module in input.add_tools {
+                if !self.grantable.contains(&module) {
+                    return ToolOutcome::error(format!(
+                        "Cannot add tools to worker {}: `{module}` is not a tool module a worker \
+                         can be granted. Valid tools: {}",
+                        input.id,
+                        self.grantable_list()
+                    ));
+                }
+                // Duplicates are removed, keeping the first occurrence's order.
+                if !add_tools.contains(&module) {
+                    add_tools.push(module);
+                }
+            }
+            match self
+                .service
+                .continue_child(&id, input.message, add_tools.clone())
+                .await
+            {
+                Ok(()) if add_tools.is_empty() => {
+                    ToolOutcome::ok(format!("Worker {} continues.", input.id))
+                }
+                Ok(()) => ToolOutcome::ok(format!(
+                    "Added tools: {}. Message sent to worker {}.",
+                    add_tools.join(", "),
+                    input.id
+                )),
                 Err(error) => id_error(&input.id, error),
             }
         })
@@ -523,6 +578,11 @@ fn id_error(id: &str, error: WorkerError) -> ToolOutcome {
     match error {
         WorkerError::UnknownChild => ToolOutcome::error(format!("No worker {id}.")),
         WorkerError::Busy => ToolOutcome::error(format!("Worker {id} is still running.")),
+        // The re-grant was refused: no turn ran and the worker kept its tools, so the
+        // parent can act on the reason (ADR-0050 item 6).
+        WorkerError::Regrant(reason) => ToolOutcome::error(format!(
+            "Cannot add tools to worker {id}: {reason}. The worker keeps its tools."
+        )),
         WorkerError::ShutDown => ToolOutcome::error(format!(
             "Worker {id} is unavailable: the service has shut down."
         )),
@@ -624,7 +684,7 @@ fn result_schema() -> serde_json::Value {
     })
 }
 
-fn continue_schema() -> serde_json::Value {
+fn continue_schema(grantable: &[String]) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -635,6 +695,15 @@ fn continue_schema() -> serde_json::Value {
             "message": {
                 "type": "string",
                 "description": "The message to send into the worker's session."
+            },
+            "add_tools": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                    "type": "string",
+                    "enum": grantable
+                },
+                "description": "Tool modules to ADD to the worker's grant for this and every later turn. The worker keeps its context."
             }
         },
         "required": ["id", "message"],
