@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use p1_contracts::{AuthorizationPolicy, BoxFuture, CancellationToken, EventSink};
 use p1_core::Agent;
 
+#[cfg(feature = "delegation")]
+use p1_workers::WorkerReport;
+
 use crate::activity::Completion;
 use crate::cli::Options;
 use crate::policy::HostPolicy;
@@ -51,6 +54,14 @@ pub trait FrontEnd: Send + Sync {
     /// Called at exactly the point the old host called
     /// `WorkerUsage::worker_started`, so a failed start never counts.
     fn child_started(&self, worker_id: &str);
+
+    /// A delegated worker's turn ENDED (ADR-0050 item 6): show it, whatever the
+    /// parent says about it later. `report` is the snapshot the child's own tap
+    /// built for that turn, and `description` is the child's route/model. The host's
+    /// report tap calls this; a front end that renders nothing (a test, a headless
+    /// driver) does nothing.
+    #[cfg(feature = "delegation")]
+    fn worker_ended(&self, worker_id: &str, description: &str, report: &WorkerReport);
 
     /// The authorization policy for the parent and, shared, for every worker.
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy>;
@@ -181,6 +192,18 @@ impl FrontEnd for LineFrontEnd {
     fn child_started(&self, _worker_id: &str) {
         #[cfg(feature = "delegation")]
         self.worker_usage.worker_started();
+    }
+
+    /// One stderr line per worker end (ADR-0050 item 6), `· ` and the sentence the
+    /// TUI shows too: `· worker w1 (claude/sonnet; read, grep, finish) blocked:
+    /// needs edit — tried edit x2`. The child's own lines carry its `[w1] ` prefix
+    /// through its renderer; this summary names the worker itself, so it does not.
+    #[cfg(feature = "delegation")]
+    fn worker_ended(&self, worker_id: &str, description: &str, report: &WorkerReport) {
+        let line = crate::render::worker_end_note(worker_id, description, report);
+        let mut writer = self.stderr.lock().unwrap();
+        let _ = writeln!(writer, "· {line}");
+        let _ = writer.flush();
     }
 
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {

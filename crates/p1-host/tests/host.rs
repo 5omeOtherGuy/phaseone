@@ -355,7 +355,23 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         .iter()
         .map(|t| t.name.as_str())
         .collect();
-    assert_eq!(names, ["read", "edit", "write", "grep", "shell", "finish"]);
+    // The environment's own tools, then the four worker tools the host appends to
+    // every main agent (ADR-0050 item 1).
+    assert_eq!(
+        names,
+        [
+            "read",
+            "edit",
+            "write",
+            "grep",
+            "shell",
+            "finish",
+            "worker_start",
+            "worker_result",
+            "worker_continue",
+            "worker_cancel"
+        ]
+    );
     assert!(claude_request.system_prompt.contains("`edit`"));
     assert!(!claude_request.system_prompt.contains("apply_patch"));
 
@@ -373,7 +389,18 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
     assert_eq!(code, 0);
     let gpt_request = &gpt.requests()[0];
     let names: Vec<&str> = gpt_request.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, ["shell", "apply_patch", "finish"]);
+    assert_eq!(
+        names,
+        [
+            "shell",
+            "apply_patch",
+            "finish",
+            "worker_start",
+            "worker_result",
+            "worker_continue",
+            "worker_cancel"
+        ]
+    );
     assert!(gpt_request.system_prompt.contains("apply_patch"));
     assert!(!gpt_request.system_prompt.contains("`edit`"));
     assert!(!gpt_request.system_prompt.contains("`write`"));
@@ -715,7 +742,7 @@ async fn delegation_end_to_end_with_fakes() {
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            "{\"environment\":\"b\",\"task\":\"do it\"}",
+            "{\"environment\":\"b\",\"task\":\"do it\",\"tools\":[\"read\"]}",
         )]),
         text_response("parent started"),
         tool_call_response(vec![json_call("c2", "worker_result", "{\"id\":\"w1\"}")]),
@@ -783,7 +810,7 @@ async fn delegation_end_to_end_with_fakes() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect();
-    assert_eq!(child_names, ["read"]);
+    assert_eq!(child_names, ["read", "finish"]);
     assert!(child_requests[0].system_prompt.contains("CHILD PROMPT"));
     assert!(!child_requests[0].system_prompt.contains("PARENT PROMPT"));
 
@@ -827,7 +854,7 @@ async fn run_worker_write(ask: bool) -> (i32, bool, Vec<ProviderRequest>, Vec<Pr
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            "{\"environment\":\"child\",\"task\":\"work\"}",
+            "{\"environment\":\"child\",\"task\":\"work\",\"tools\":[\"write\"]}",
         )]),
         // `wait` makes the child finish before the parent continues, so the test
         // needs no gate and no timing assumption.
@@ -932,7 +959,7 @@ async fn interactive_reports_a_running_worker_without_blocking() {
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            "{\"environment\":\"b\",\"task\":\"do it\"}",
+            "{\"environment\":\"b\",\"task\":\"do it\",\"tools\":[\"read\"]}",
         )]),
         text_response("parent started"),
     ]);
@@ -1284,7 +1311,7 @@ async fn review_interactive_idle_parent_wakes_on_child_completion() {
             tool_call_response(vec![json_call(
                 "c1",
                 "worker_start",
-                r#"{"environment":"b","task":"work"}"#,
+                r#"{"environment":"b","task":"work","tools":["read"]}"#,
             )]),
             text_response("started"),
             text_response("verified"),

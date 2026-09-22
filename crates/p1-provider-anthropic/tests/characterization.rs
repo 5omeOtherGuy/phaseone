@@ -323,10 +323,9 @@ fn explicit_output_cap_below_the_thinking_budget_is_rejected() {
     }
 }
 
-/// The shipped environment's model (`environments/claude/environment.toml` and
-/// `claude-delegating`) resolves to the adaptive lane, so the whole body of a
-/// medium-effort request is pinned here. This is the request the shipped
-/// environment actually produces.
+/// The shipped environment's model (`environments/claude/environment.toml`) resolves
+/// to the adaptive lane, so the whole body of a medium-effort request is pinned here.
+/// This is the request the shipped environment actually produces.
 #[test]
 fn golden_shipped_model_medium_request_whole_body() {
     let mut req = request();
@@ -526,10 +525,9 @@ fn provider(model: &str) -> AnthropicProvider {
 /// each environment selects, bound to its wire model by the shipped route file.
 /// ADR-0039 step 4 replaced the environments' `model` key with `route` + `profile`.
 fn shipped_models() -> Vec<&'static str> {
-    const ENVIRONMENTS: &[&str] = &[
-        include_str!("../../../environments/claude/environment.toml"),
-        include_str!("../../../environments/claude-delegating/environment.toml"),
-    ];
+    const ENVIRONMENTS: &[&str] = &[include_str!(
+        "../../../environments/claude/environment.toml"
+    )];
     const SHIPPED_ROUTE: &str = include_str!("../../../routes/anthropic-subscription.toml");
     ENVIRONMENTS
         .iter()
@@ -550,7 +548,7 @@ fn shipped_models() -> Vec<&'static str> {
 #[test]
 fn describe_matches_every_shipped_model() {
     let models = shipped_models();
-    assert_eq!(models, vec!["claude-sonnet-5", "claude-sonnet-5"]);
+    assert_eq!(models, vec!["claude-sonnet-5"]);
     for model in models {
         let expected = RouteDescription {
             origin: Origin {

@@ -19,7 +19,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 
 use p1_assembly::Catalog;
-use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
+#[cfg(feature = "delegation")]
+use p1_assembly::ToolSpec;
+use p1_assembly::{Assembled, EnvironmentFile, Substitutions, assemble, load_environment};
 use p1_contracts::{
     AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
     ContextInput, ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, Tool,
@@ -29,6 +31,8 @@ use p1_core::{Agent, AgentParts, Reconfiguration, ResumeReport};
 #[cfg(feature = "delegation")]
 use p1_journal::MemoryJournal;
 
+#[cfg(feature = "delegation")]
+use crate::activity::WorkerReportTap;
 use crate::activity::{ActivityLog, ActivityTee, Completion, CompletionHub};
 use crate::catalog::build_catalog;
 use crate::cli::{self, Command, Options};
@@ -39,7 +43,9 @@ use crate::{HostDeps, InterruptSource};
 use p1_tool_finish::Accepted;
 
 #[cfg(feature = "delegation")]
-use p1_workers::{AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers};
+use p1_workers::{
+    AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers, WorkerReport,
+};
 
 /// Exit codes (the process contract).
 pub const EXIT_OK: i32 = 0;
@@ -304,6 +310,7 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             return EXIT_FAILURE;
         }
     };
+    with_worker_tools(&mut environment);
     // Resolve the route binding before assembling: the wire model and the route's
     // own output ceiling come from the route file (spec §2).
     if let Err(message) =
@@ -466,6 +473,7 @@ pub async fn run_with_front_end(
     let choice = selection(deps, options).map_err(RunError::usage)?;
     let mut environment = load_environment(&choice.environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
+    with_worker_tools(&mut environment);
     crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
         .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
@@ -966,6 +974,39 @@ fn report_model(deps: &HostDeps, outcome: Result<String, String>) {
 /// switch keeps the session's instance of it.
 const FINISH_MODULE: &str = "finish";
 
+/// The four worker tools, in the order the host appends them to a main agent.
+#[cfg(feature = "delegation")]
+const WORKER_MODULES: [&str; 4] = [
+    "worker_start",
+    "worker_result",
+    "worker_continue",
+    "worker_cancel",
+];
+
+/// Give every MAIN agent the worker tools (ADR-0050 item 1). Appends a default-face
+/// [`ToolSpec`] for each worker module the environment does not already list, in
+/// `worker_start`, `worker_result`, `worker_continue`, `worker_cancel` order; an
+/// environment that lists one keeps its own entry (which carries a face). Called only
+/// at the three main-agent assembly sites — never in the child factory, so a worker
+/// never gets the worker tools. A no-op when the `delegation` feature is not compiled.
+#[cfg(feature = "delegation")]
+fn with_worker_tools(environment: &mut EnvironmentFile) {
+    for module in WORKER_MODULES {
+        if environment.tools.iter().any(|tool| tool.module == module) {
+            continue;
+        }
+        environment.tools.push(ToolSpec {
+            module: module.to_string(),
+            name: None,
+            description: None,
+            variant: None,
+        });
+    }
+}
+
+#[cfg(not(feature = "delegation"))]
+fn with_worker_tools(_environment: &mut EnvironmentFile) {}
+
 /// Where the `finish` tool sits in an assembly: `resolved.tools` and `tools` are
 /// built from the same environment list, in order.
 fn finish_index(assembled: &Assembled) -> Option<usize> {
@@ -1066,6 +1107,7 @@ pub(crate) fn switch_model(
     };
     let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
         .map_err(|error| error.to_string())?;
+    with_worker_tools(&mut environment);
     crate::models::apply(&mut environment, &choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
     let assembled = assemble_with_cache_key(
@@ -1662,13 +1704,54 @@ fn make_child_factory(
     Arc::new(move |spec: &ChildSpec| -> Result<ChildAgent, String> {
         let mut environment = load_environment(&spec.environment, &environment_dirs)
             .map_err(|error| error.to_string())?;
-        if environment
+        // A worker is assembled with EXACTLY the tools its parent granted, plus
+        // `finish` (every worker gets it, last, to report done or blocked). The
+        // environment's own `[[tools]]` list does not add or remove anything: an
+        // entry there only supplies the face the granted module is presented under.
+        // A module the environment does not mention is assembled with its default
+        // face, so a grant is never silently dropped.
+        debug_assert!(
+            spec.tools
+                .iter()
+                .all(|module| !module.starts_with("worker_")),
+            "the worker tools are not grantable: {:?}",
+            spec.tools
+        );
+        let mut granted = Vec::with_capacity(spec.tools.len() + 1);
+        for module in &spec.tools {
+            // A worker can never start workers: the worker tools are not grantable,
+            // but a direct [`ChildSpec`] could still name one. Refuse plainly rather
+            // than assemble a delegating child.
+            if module.starts_with("worker_") {
+                return Err(format!(
+                    "a worker cannot be granted the worker tool `{module}`"
+                ));
+            }
+            let own = environment
+                .tools
+                .iter()
+                .find(|tool| &tool.module == module)
+                .cloned();
+            granted.push(own.unwrap_or_else(|| ToolSpec {
+                module: module.clone(),
+                name: None,
+                description: None,
+                variant: None,
+            }));
+        }
+        let finish = environment
             .tools
             .iter()
-            .any(|tool| tool.module.starts_with("worker_"))
-        {
-            return Err("delegation inside a worker is not supported".to_string());
-        }
+            .find(|tool| tool.module == FINISH_MODULE)
+            .cloned()
+            .unwrap_or_else(|| ToolSpec {
+                module: FINISH_MODULE.to_string(),
+                name: None,
+                description: None,
+                variant: None,
+            });
+        granted.push(finish);
+        environment.tools = granted;
         let catalog = catalog_slot
             .get()
             .ok_or_else(|| "the host catalog is not ready".to_string())?
@@ -1731,6 +1814,25 @@ fn make_child_factory(
         } else {
             events
         };
+        // The worker's report (ADR-0050 item 6): the tap is the OUTERMOST sink, so it
+        // sees the whole turn — the child's own rendering and the stall guard have
+        // had their say before the operator is told the worker's end. The service
+        // reads the same cell through `ChildAgent::report`.
+        let report = Arc::new(Mutex::new(WorkerReport::new(
+            assembled
+                .tools
+                .iter()
+                .map(|tool| tool.declaration().name.clone())
+                .collect(),
+        )));
+        let events: Arc<dyn EventSink> = Arc::new(WorkerReportTap::new(
+            events,
+            report.clone(),
+            &assembled.tools,
+            front_end.clone(),
+            worker_id.clone(),
+            description.clone(),
+        ));
         // With `--session`, worker `w{n}` gets its OWN new JSONL file next to the
         // parent's (`FILE.w{n}.jsonl`). Without one it stays in memory like before.
         // Created last among the fallible steps so a later failure cannot leave a
@@ -1768,7 +1870,15 @@ fn make_child_factory(
         };
         counter.fetch_add(1, Ordering::SeqCst);
         front_end.child_started(&worker_id);
-        Ok(ChildAgent { agent, description })
+        // The service snapshots this when a child's turn ends; it reads the SAME cell
+        // the tap just filled and the front end was told about.
+        let report: Arc<dyn Fn() -> WorkerReport + Send + Sync> =
+            Arc::new(move || report.lock().unwrap().clone());
+        Ok(ChildAgent {
+            agent,
+            description,
+            report,
+        })
     })
 }
 

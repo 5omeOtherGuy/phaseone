@@ -118,13 +118,8 @@ fn show_in(root: &Path, name: &str) -> (i32, String) {
 
 #[test]
 fn every_shipped_environment_still_assembles() {
-    // `claude-delegating` names the `worker_*` tools, which only the `delegation`
-    // feature registers: without it that environment cannot assemble (its exact
-    // error is pinned in `anthropic_route.rs`). Every other shipped environment
-    // assembles either way.
-    #[cfg(feature = "delegation")]
-    let shipped = ["claude", "claude-delegating", "gpt", "deepseek", "glm"];
-    #[cfg(not(feature = "delegation"))]
+    // Every main agent gets the worker tools from the host (ADR-0050), so every
+    // shipped environment assembles with or without the `delegation` feature.
     let shipped = ["claude", "gpt", "deepseek", "glm"];
     for name in shipped {
         let (code, stdout, stderr) = show_env(name);

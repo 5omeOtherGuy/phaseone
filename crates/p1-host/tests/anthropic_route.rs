@@ -282,8 +282,7 @@ fn the_shipped_messages_route_passes_the_conformance_suite() {
 
 // ------------------------------------------------------------- the shipped environments
 
-/// `p1 env show NAME` through the real CLI and catalog: the delegating environment
-/// needs the `env show` worker stub, so both shipped environments go this way.
+/// `p1 env show NAME` through the real CLI and catalog.
 fn show_env(name: &str) -> (i32, String, String) {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     common::isolated_environment(&mut harness);
@@ -295,47 +294,27 @@ fn show_env(name: &str) -> (i32, String, String) {
 }
 
 #[test]
-fn the_two_shipped_claude_environments_assemble_through_the_catalog_unchanged() {
-    // `claude-delegating` names the `worker_*` tools, which only the `delegation`
-    // feature registers. With it both environments assemble unchanged; without it
-    // `claude-delegating` cannot assemble at all, and the error says exactly which
-    // module is missing, while `claude` is untouched.
-    #[cfg(feature = "delegation")]
-    let assembled_here = ["claude", "claude-delegating"];
-    #[cfg(not(feature = "delegation"))]
-    let assembled_here = ["claude"];
-
-    for name in assembled_here {
-        let (code, stdout, stderr) = show_env(name);
-        assert_eq!(code, 0, "{name}: {stderr}");
-        let resolved: serde_json::Value = common::env_show_json(&stdout);
-        assert_eq!(resolved["environment"], name, "{name}");
-        assert_eq!(resolved["family"], "claude", "{name}");
-        assert_eq!(
-            resolved["route"]["origin"],
-            serde_json::json!({
-                "route": TODAYS_ORIGIN_ROUTE,
-                "model": "claude-sonnet-5",
-            }),
-            "{name}: the origin string is byte for byte the pre-split one"
-        );
-        assert_eq!(
-            resolved["route"]["mandatory_prompt_prefix"],
-            "You are Claude Code, Anthropic's official CLI for Claude.",
-            "{name}"
-        );
-        assert_eq!(resolved["route"]["cache_key"], "unsupported", "{name}");
-    }
-
-    #[cfg(not(feature = "delegation"))]
-    {
-        let (code, _stdout, stderr) = show_env("claude-delegating");
-        assert_ne!(code, 0, "claude-delegating needs the delegation feature");
-        assert!(
-            stderr.starts_with("unknown tool module `worker_start`; available: "),
-            "the error names the compiled-out module: {stderr}"
-        );
-    }
+fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
+    // Every main agent gets the worker tools from the host (ADR-0050), so `claude`
+    // assembles unchanged with or without the `delegation` feature.
+    let (code, stdout, stderr) = show_env("claude");
+    assert_eq!(code, 0, "claude: {stderr}");
+    let resolved: serde_json::Value = common::env_show_json(&stdout);
+    assert_eq!(resolved["environment"], "claude");
+    assert_eq!(resolved["family"], "claude");
+    assert_eq!(
+        resolved["route"]["origin"],
+        serde_json::json!({
+            "route": TODAYS_ORIGIN_ROUTE,
+            "model": "claude-sonnet-5",
+        }),
+        "the origin string is byte for byte the pre-split one"
+    );
+    assert_eq!(
+        resolved["route"]["mandatory_prompt_prefix"],
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+    assert_eq!(resolved["route"]["cache_key"], "unsupported");
 
     // And the provider the catalog builds for `claude` reports the same origin.
     let assembled = assemble_shipped("claude");

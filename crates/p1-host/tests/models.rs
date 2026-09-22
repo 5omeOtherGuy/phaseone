@@ -227,12 +227,6 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "claude/claude-opus-5-5",
             "claude/claude-sonnet-4-6",
             "claude/claude-sonnet-5",
-            "claude-delegating/claude-fable-5",
-            "claude-delegating/claude-opus-4-6",
-            "claude-delegating/claude-opus-5",
-            "claude-delegating/claude-opus-5-5",
-            "claude-delegating/claude-sonnet-4-6",
-            "claude-delegating/claude-sonnet-5",
             "deepseek/deepseek-v4.1-flash",
             "deepseek2/deepseek-v4.1-flash",
             "glm/glm-5.3",
@@ -244,16 +238,16 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         ],
         "sorted by environment then profile"
     );
-    // The same provider reached with different tools is two models, not one.
+    // Every main agent carries the worker tools (ADR-0050), so delegation is not an
+    // environment property: a model is listed once per environment, not once per
+    // delegating twin.
     let opus: Vec<&Model> = models
         .iter()
         .filter(|model| model.profile == "claude-opus-5")
         .collect();
-    assert_eq!(opus.len(), 2);
-    assert!(
-        opus.iter()
-            .all(|model| model.route == "anthropic-subscription")
-    );
+    assert_eq!(opus.len(), 1);
+    assert_eq!(opus[0].environment, "claude");
+    assert_eq!(opus[0].route, "anthropic-subscription");
     // The efforts are the profile's own, in its own order.
     let older = models
         .iter()
@@ -301,8 +295,10 @@ fn a_pair_reference_resolves_to_that_pair() {
 #[test]
 fn a_bare_profile_prefers_the_current_environment() {
     let models = shipped_models();
-    for environment in ["claude", "claude-delegating"] {
-        let resolved = models::resolve("claude-sonnet-5", environment, &models).unwrap();
+    // `deepseek` and `deepseek2` both bind `deepseek-v4.1-flash`; the current
+    // environment decides which one.
+    for environment in ["deepseek", "deepseek2"] {
+        let resolved = models::resolve("deepseek-v4.1-flash", environment, &models).unwrap();
         assert_eq!(resolved.environment, environment, "the current environment");
     }
     // Exactly one candidate needs no preference.
@@ -320,12 +316,11 @@ fn every_resolution_failure_lists_the_candidates() {
     assert!(error.contains("claude/claude-opus-5"), "{error}");
     assert!(error.contains("claude/claude-sonnet-5"), "{error}");
     assert!(
-        !error.contains("claude-delegating") && !error.contains("gpt/gpt-5.6-sol"),
+        !error.contains("gpt/gpt-5.6-sol"),
         "only the pairs whose environment or profile matches: {error}"
     );
     let error = models::resolve("nope/claude-opus-5", "claude", &models).unwrap_err();
     assert!(error.contains("claude/claude-opus-5"), "{error}");
-    assert!(error.contains("claude-delegating/claude-opus-5"), "{error}");
     assert!(!error.contains("claude-sonnet-5"), "{error}");
 
     // A pair that matches nothing at all lists every model.
@@ -333,12 +328,9 @@ fn every_resolution_failure_lists_the_candidates() {
     assert!(error.contains("gpt/gpt-5.5"), "{error}");
 
     // An ambiguous bare profile lists both pairs and never guesses.
-    let error = models::resolve("claude-sonnet-5", "gpt", &models).unwrap_err();
-    assert!(error.contains("claude/claude-sonnet-5"), "{error}");
-    assert!(
-        error.contains("claude-delegating/claude-sonnet-5"),
-        "{error}"
-    );
+    let error = models::resolve("deepseek-v4.1-flash", "glm", &models).unwrap_err();
+    assert!(error.contains("deepseek/deepseek-v4.1-flash"), "{error}");
+    assert!(error.contains("deepseek2/deepseek-v4.1-flash"), "{error}");
     assert!(error.contains("environment/profile"), "{error}");
 
     // A bare profile that is nobody's lists every model.
@@ -362,7 +354,7 @@ fn every_resolution_failure_lists_the_candidates() {
 #[test]
 fn the_glob_matches_stars_and_questions_only() {
     assert!(models::glob("claude/*", "claude/claude-opus-5"));
-    assert!(!models::glob("claude/*", "claude-delegating/claude-opus-5"));
+    assert!(!models::glob("claude/*", "gpt/claude-opus-5"));
     assert!(models::glob("*/*", "claude/claude-opus-5"));
     assert!(models::glob("gpt/gpt-5.6-sol*", "gpt/gpt-5.6-sol"));
     assert!(models::glob("gpt/gpt-5.6-sol*", "gpt/gpt-5.6-sol-mini"));
@@ -385,10 +377,7 @@ fn a_pattern_without_a_slash_matches_the_profile_part() {
         .filter(|model| models::in_scope(&patterns, model))
         .map(Model::id)
         .collect::<Vec<_>>();
-    assert_eq!(
-        opus,
-        ["claude/claude-opus-5", "claude-delegating/claude-opus-5"]
-    );
+    assert_eq!(opus, ["claude/claude-opus-5"]);
 
     let patterns = models::check_scope("claude/*", &models).unwrap();
     let claude = models
@@ -599,12 +588,13 @@ fn an_env_that_disagrees_with_the_model_is_an_error() {
     assert!(error.contains("--env `claude`"), "{error}");
     assert!(error.contains("--model `gpt/gpt-5.6-sol`"), "{error}");
 
-    // A bare profile the current environment does not bind is the same disagreement.
+    // A bare profile bound in more than one environment is ambiguous, and the
+    // current environment decides only when it binds the profile itself.
     let error = models::choose(
         &dirs,
         &locations,
         Some("gpt"),
-        Some("claude-sonnet-5"),
+        Some("deepseek-v4.1-flash"),
         None,
     )
     .unwrap_err();
@@ -614,12 +604,12 @@ fn an_env_that_disagrees_with_the_model_is_an_error() {
     let choice = models::choose(
         &dirs,
         &locations,
-        Some("claude-delegating"),
+        Some("claude"),
         Some("claude-sonnet-5"),
         None,
     )
     .unwrap();
-    assert_eq!(choice.environment, "claude-delegating");
+    assert_eq!(choice.environment, "claude");
     assert_eq!(choice.profile.as_deref(), Some("claude-sonnet-5"));
     let choice = models::choose(&dirs, &locations, Some("gpt"), Some("gpt/gpt-5.5"), None).unwrap();
     assert_eq!(choice.environment, "gpt");

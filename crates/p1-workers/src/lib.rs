@@ -24,6 +24,11 @@ pub struct ChildId(pub String);
 
 /// The state a child is in. `Finished` carries the retained result; `Cancelled`
 /// and `Failed` are terminal until `continue_child` starts another turn.
+///
+/// `Finished` is much larger than the other variants because a finished turn carries
+/// its text, its end AND its report (ADR-0050 item 6). The enum is moved a handful of
+/// times per turn, so an indirection would buy nothing and cost every reader a deref.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChildStatus {
     Running,
@@ -41,6 +46,68 @@ pub struct ChildResult {
     /// Always `None` in this slice: summing usage needs an event tap the factory
     /// contract does not carry yet. Unknown, never zero.
     pub usage_total: Option<Usage>,
+    /// What the child's own tap recorded for this turn (ADR-0050 item 6), so a
+    /// short-handed worker is visible without the parent's cooperation.
+    pub report: WorkerReport,
+}
+
+/// What one worker says about itself (ADR-0050 item 6): the tools it was assembled
+/// with, the `finish` it reported, and every call it made to a tool it did NOT have.
+///
+/// The host builds it from the child's event stream (its tap shares the cell with
+/// [`ChildAgent::report`]); a factory that has no tap returns
+/// [`WorkerReport::default`]. `tools` describes the worker for its whole life;
+/// `finish` and `missing_tool_calls` describe ONE turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerReport {
+    /// The model-facing names of the tools the worker was assembled with, in
+    /// assembly order. Never changes between turns.
+    pub tools: Vec<String>,
+    /// The worker's LAST successful `finish` call this turn; `None` if it made none.
+    pub finish: Option<FinishReport>,
+    /// Every tool name the worker called that it did not have, with how many times,
+    /// in first-seen order.
+    pub missing_tool_calls: Vec<(String, u32)>,
+}
+
+/// One accepted `finish` call, as its input described it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FinishReport {
+    pub status: String,
+    /// `needs` as the worker wrote it: a string, or an array joined with `", "`.
+    pub needs: Option<String>,
+    pub summary: Option<String>,
+}
+
+impl WorkerReport {
+    /// The report of a worker assembled with these model-facing tool names. The rest
+    /// starts empty; the tap fills it as the turn runs.
+    pub fn new(tools: Vec<String>) -> Self {
+        Self {
+            tools,
+            finish: None,
+            missing_tool_calls: Vec::new(),
+        }
+    }
+
+    /// Start a fresh turn: a continue is a new turn, so `finish` and the
+    /// missing-tool calls go; the granted tools stay.
+    pub fn reset_turn(&mut self) {
+        self.finish = None;
+        self.missing_tool_calls.clear();
+    }
+
+    /// One call to a tool this worker was not given, counted under its name.
+    pub fn note_missing_tool(&mut self, name: &str) {
+        match self
+            .missing_tool_calls
+            .iter_mut()
+            .find(|(seen, _)| seen == name)
+        {
+            Some((_, count)) => *count += 1,
+            None => self.missing_tool_calls.push((name.to_string(), 1)),
+        }
+    }
 }
 
 /// What the parent asks a worker service to run.
@@ -51,6 +118,11 @@ pub struct ChildSpec {
     /// The task text. It is the ONLY thing the child receives; the parent's
     /// transcript is never forwarded.
     pub task: String,
+    /// The tool MODULE names the parent granted the worker, in the parent's order
+    /// and without duplicates. Never `finish` (the factory adds it to every worker,
+    /// last) and never a `worker_*` module: the worker tools are not grantable, so a
+    /// child can never start workers of its own.
+    pub tools: Vec<String>,
     /// Workspace override, if the host supports one.
     pub workspace: Option<PathBuf>,
 }
@@ -70,20 +142,24 @@ pub enum WorkerError {
     ShutDown,
 }
 
-/// A built child: the agent plus the route/model description shown to the parent
-/// (e.g. `openai-codex-responses/gpt-5.6-sol`).
+/// A built child: the agent, the route/model description shown to the parent
+/// (e.g. `openai-codex-responses/gpt-5.6-sol`), and how to read its report.
 pub struct ChildAgent {
     pub agent: Agent,
     pub description: String,
+    /// The child's report AS OF NOW. The host's tap and this closure share one cell,
+    /// and the service snapshots it when a turn ends; a factory with no tap (a test)
+    /// returns [`WorkerReport::default`].
+    pub report: Arc<dyn Fn() -> WorkerReport + Send + Sync>,
 }
 
 /// Builds a child `Agent` from its spec. Injected by the host and the SAME
 /// assembly path a top-level agent uses, so a child on another route gets that
 /// route's prompt and tools and nothing of the parent's.
 ///
-/// In this slice the factory MUST build children WITHOUT the delegation tools:
-/// nothing in this crate hands a child a [`WorkerService`], so a child cannot
-/// start workers (no recursion).
+/// The factory assembles a child with exactly the modules in
+/// [`ChildSpec::tools`] plus `finish`. The worker tools are not grantable, so a
+/// child can never start workers (no recursion) however the parent asks.
 pub type AgentFactory = Arc<dyn Fn(&ChildSpec) -> Result<ChildAgent, String> + Send + Sync>;
 
 /// The typed worker API a delegation tool depends on.
@@ -292,7 +368,7 @@ impl WorkerService for InProcessWorkers {
             // std lock across the `yield_now` (invariant 7d). The factory is
             // synchronous, so holding the lock across it keeps the RUNNING count
             // and the id assignment atomic under concurrent `start` calls.
-            let (id, status, command_rx, token, stall, agent) = {
+            let (id, status, command_rx, token, stall, agent, report) = {
                 let mut state = self.shared.state.lock().unwrap();
                 if state.shut_down || self.shared.shutdown.is_cancelled() {
                     return Err(WorkerError::ShutDown);
@@ -301,8 +377,11 @@ impl WorkerService for InProcessWorkers {
                 // not build (and then discard) a child it cannot run.
                 self.shared.reserve_running_slot(&state)?;
                 // Factory failure is an invalid environment, not a service fault.
-                let child =
-                    (self.shared.factory)(&spec).map_err(WorkerError::InvalidEnvironment)?;
+                let ChildAgent {
+                    agent,
+                    description,
+                    report,
+                } = (self.shared.factory)(&spec).map_err(WorkerError::InvalidEnvironment)?;
                 let id = format!("w{}", state.next_id + 1);
                 state.next_id += 1;
 
@@ -317,10 +396,10 @@ impl WorkerService for InProcessWorkers {
                         commands,
                         turn_cancel: Arc::new(Mutex::new(token.clone())),
                         stall: Arc::clone(&stall),
-                        description: child.description.clone(),
+                        description,
                     },
                 );
-                (id, status, command_rx, token, stall, child.agent)
+                (id, status, command_rx, token, stall, agent, report)
             };
 
             let task_id = id.clone();
@@ -335,6 +414,7 @@ impl WorkerService for InProcessWorkers {
                     commands: command_rx,
                     stall,
                     status,
+                    report,
                 },
             ));
             self.tasks.lock().unwrap().push(handle);
@@ -490,6 +570,8 @@ struct ChildTask {
     /// when the turn ends.
     stall: Arc<Mutex<Option<String>>>,
     status: watch::Sender<ChildStatus>,
+    /// The child's report read at a turn end, sharing one cell with the host's tap.
+    report: Arc<dyn Fn() -> WorkerReport + Send + Sync>,
 }
 
 /// The whole life of one child, owned by one task. `task` is replaced by each
@@ -503,6 +585,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         mut commands,
         stall,
         status,
+        report,
     } = child;
     loop {
         // The status is already Running and `token` already installed: whoever
@@ -521,6 +604,9 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
             &end,
             stall.lock().unwrap().take(),
             last_assistant_text(&agent),
+            // The tap recorded this turn as it ran; the snapshot describes the turn
+            // that just ended, and the NEXT turn starts from a fresh one.
+            (report)(),
         );
         // (1) store the status and (2) wake every waiter: one `send_replace`.
         status.send_replace(child_status.clone());
@@ -548,10 +634,15 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
 /// reads the host's sentence instead of "cancelled" (completion.md §3c). Every
 /// other end maps as [`status_from_end`] always did, and a reason set for a turn
 /// that ended some other way is dropped — it can never colour a later turn.
-fn child_status(end: &TurnEnd, stall: Option<String>, final_text: String) -> ChildStatus {
+fn child_status(
+    end: &TurnEnd,
+    stall: Option<String>,
+    final_text: String,
+    report: WorkerReport,
+) -> ChildStatus {
     match (stall, end) {
         (Some(message), TurnEnd::Cancelled) => ChildStatus::Failed(message),
-        _ => status_from_end(end, final_text),
+        _ => status_from_end(end, final_text, report),
     }
 }
 
@@ -569,13 +660,15 @@ fn last_assistant_text(agent: &Agent) -> String {
 }
 
 /// `Completed` → `Finished`, `Cancelled` → `Cancelled`, anything else → `Failed`
-/// with the failure message. `usage_total` is always `None` (unknown).
-fn status_from_end(end: &TurnEnd, final_text: String) -> ChildStatus {
+/// with the failure message. `usage_total` is always `None` (unknown). `report` is
+/// kept only by `Finished`: the other statuses carry no result to read it from.
+fn status_from_end(end: &TurnEnd, final_text: String, report: WorkerReport) -> ChildStatus {
     match end {
         TurnEnd::Completed { .. } => ChildStatus::Finished(ChildResult {
             final_text,
             turn_end: end.clone(),
             usage_total: None,
+            report,
         }),
         TurnEnd::Cancelled => ChildStatus::Cancelled,
         TurnEnd::ProviderFailed { error } => ChildStatus::Failed(error.to_string()),
@@ -607,11 +700,13 @@ mod tests {
 
     #[test]
     fn status_from_end_maps_every_turn_end() {
+        let report = WorkerReport::new(vec!["read".into(), "finish".into()]);
         let completed = status_from_end(
             &TurnEnd::Completed {
                 stop: StopReason::EndTurn,
             },
             "answer".into(),
+            report.clone(),
         );
         assert_eq!(
             completed,
@@ -621,10 +716,11 @@ mod tests {
                     stop: StopReason::EndTurn,
                 },
                 usage_total: None,
+                report,
             })
         );
         assert_eq!(
-            status_from_end(&TurnEnd::Cancelled, "x".into()),
+            status_from_end(&TurnEnd::Cancelled, "x".into(), WorkerReport::default()),
             ChildStatus::Cancelled
         );
         assert_eq!(
@@ -633,6 +729,7 @@ mod tests {
                     error: ProviderError::new(ProviderErrorKind::Transport, "broke"),
                 },
                 "x".into(),
+                WorkerReport::default(),
             ),
             ChildStatus::Failed("Transport: broke".into())
         );
@@ -641,7 +738,8 @@ mod tests {
                 &TurnEnd::CommitFailed {
                     message: "no disk".into()
                 },
-                "x".into()
+                "x".into(),
+                WorkerReport::default()
             ),
             ChildStatus::Failed("no disk".into())
         );
@@ -650,7 +748,8 @@ mod tests {
                 &TurnEnd::ContextFailed {
                     message: "too big".into()
                 },
-                "x".into()
+                "x".into(),
+                WorkerReport::default()
             ),
             ChildStatus::Failed("too big".into())
         );
@@ -663,11 +762,21 @@ mod tests {
     fn a_guard_stopped_turn_is_failed_with_its_reason() {
         let reason = "stalled: 2 context summaries without a change to the workspace";
         assert_eq!(
-            child_status(&TurnEnd::Cancelled, Some(reason.into()), "x".into()),
+            child_status(
+                &TurnEnd::Cancelled,
+                Some(reason.into()),
+                "x".into(),
+                WorkerReport::default()
+            ),
             ChildStatus::Failed(reason.into())
         );
         assert_eq!(
-            child_status(&TurnEnd::Cancelled, None, "x".into()),
+            child_status(
+                &TurnEnd::Cancelled,
+                None,
+                "x".into(),
+                WorkerReport::default()
+            ),
             ChildStatus::Cancelled
         );
         assert_eq!(
@@ -676,14 +785,40 @@ mod tests {
                     stop: StopReason::EndTurn
                 },
                 Some(reason.into()),
-                "answer".into()
+                "answer".into(),
+                WorkerReport::default()
             ),
             status_from_end(
                 &TurnEnd::Completed {
                     stop: StopReason::EndTurn
                 },
-                "answer".into()
+                "answer".into(),
+                WorkerReport::default()
             )
         );
+    }
+
+    /// A missing tool is counted under its name, first-seen order kept, and a new
+    /// turn starts from nothing — the granted tools stay.
+    #[test]
+    fn the_report_counts_missing_tools_and_resets_per_turn() {
+        let mut report = WorkerReport::new(vec!["read".into(), "finish".into()]);
+        report.note_missing_tool("edit");
+        report.note_missing_tool("shell");
+        report.note_missing_tool("edit");
+        report.finish = Some(FinishReport {
+            status: "blocked".into(),
+            needs: Some("edit".into()),
+            summary: Some("cannot write".into()),
+        });
+        assert_eq!(
+            report.missing_tool_calls,
+            vec![("edit".to_string(), 2), ("shell".to_string(), 1)]
+        );
+
+        report.reset_turn();
+        assert_eq!(report.finish, None);
+        assert!(report.missing_tool_calls.is_empty());
+        assert_eq!(report.tools, vec!["read".to_string(), "finish".to_string()]);
     }
 }

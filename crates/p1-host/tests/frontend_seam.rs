@@ -171,6 +171,13 @@ impl FrontEnd for RecordingFrontEnd {
         self.inner.child_started(worker_id);
     }
 
+    /// A worker's end goes to the real line front end, exactly as the run loop and
+    /// the child count do.
+    #[cfg(feature = "delegation")]
+    fn worker_ended(&self, worker_id: &str, description: &str, report: &p1_workers::WorkerReport) {
+        self.inner.worker_ended(worker_id, description, report);
+    }
+
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
         self.policy.clone()
     }
@@ -222,6 +229,16 @@ impl FrontEnd for SentinelFrontEnd {
     }
 
     fn child_started(&self, _worker_id: &str) {}
+
+    /// This front end renders nothing, so a worker's end is a no-op.
+    #[cfg(feature = "delegation")]
+    fn worker_ended(
+        &self,
+        _worker_id: &str,
+        _description: &str,
+        _report: &p1_workers::WorkerReport,
+    ) {
+    }
 
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
         self.policy.clone()
@@ -281,7 +298,7 @@ async fn recording_front_end_sees_parent_and_worker_events_and_worker_authorizat
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            r#"{"environment":"b","task":"do it"}"#,
+            r#"{"environment":"b","task":"do it","tools":["read"]}"#,
         )]),
         // `wait` makes the child finish before the parent continues: no gate and
         // no timing assumption (the shape used by `run_worker_write`).
