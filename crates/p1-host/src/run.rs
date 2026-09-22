@@ -31,6 +31,8 @@ use p1_core::{Agent, AgentParts, Reconfiguration, ResumeReport};
 #[cfg(feature = "delegation")]
 use p1_journal::MemoryJournal;
 
+#[cfg(feature = "delegation")]
+use crate::activity::WorkerReportTap;
 use crate::activity::{ActivityLog, ActivityTee, Completion, CompletionHub};
 use crate::catalog::build_catalog;
 use crate::cli::{self, Command, Options};
@@ -41,7 +43,9 @@ use crate::{HostDeps, InterruptSource};
 use p1_tool_finish::Accepted;
 
 #[cfg(feature = "delegation")]
-use p1_workers::{AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers};
+use p1_workers::{
+    AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers, WorkerReport,
+};
 
 /// Exit codes (the process contract).
 pub const EXIT_OK: i32 = 0;
@@ -1810,6 +1814,25 @@ fn make_child_factory(
         } else {
             events
         };
+        // The worker's report (ADR-0050 item 6): the tap is the OUTERMOST sink, so it
+        // sees the whole turn — the child's own rendering and the stall guard have
+        // had their say before the operator is told the worker's end. The service
+        // reads the same cell through `ChildAgent::report`.
+        let report = Arc::new(Mutex::new(WorkerReport::new(
+            assembled
+                .tools
+                .iter()
+                .map(|tool| tool.declaration().name.clone())
+                .collect(),
+        )));
+        let events: Arc<dyn EventSink> = Arc::new(WorkerReportTap::new(
+            events,
+            report.clone(),
+            &assembled.tools,
+            front_end.clone(),
+            worker_id.clone(),
+            description.clone(),
+        ));
         // With `--session`, worker `w{n}` gets its OWN new JSONL file next to the
         // parent's (`FILE.w{n}.jsonl`). Without one it stays in memory like before.
         // Created last among the fallible steps so a later failure cannot leave a
@@ -1847,7 +1870,15 @@ fn make_child_factory(
         };
         counter.fetch_add(1, Ordering::SeqCst);
         front_end.child_started(&worker_id);
-        Ok(ChildAgent { agent, description })
+        // The service snapshots this when a child's turn ends; it reads the SAME cell
+        // the tap just filled and the front end was told about.
+        let report: Arc<dyn Fn() -> WorkerReport + Send + Sync> =
+            Arc::new(move || report.lock().unwrap().clone());
+        Ok(ChildAgent {
+            agent,
+            description,
+            report,
+        })
     })
 }
 

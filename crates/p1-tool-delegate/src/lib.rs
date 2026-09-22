@@ -16,7 +16,7 @@ use p1_contracts::{
     BoxFuture, DeclarationKind, Effect, JournalRecord, RecordBody, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
-use p1_workers::{ChildId, ChildSpec, ChildStatus, WorkerError, WorkerService};
+use p1_workers::{ChildId, ChildSpec, ChildStatus, WorkerError, WorkerReport, WorkerService};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -533,13 +533,47 @@ fn id_error(id: &str, error: WorkerError) -> ToolOutcome {
 
 /// Status line, then the retained text: final text for `finished`, the failure
 /// message for `failed`. `cancelled` retains no text, so it is the status line.
+///
+/// A FINISHED worker's result begins with its report (ADR-0050 item 6): the tools it
+/// was assembled with, its `finish`, and every call it made to a tool it was not
+/// given — then a `---` line, then today's status line and text. A short-handed
+/// worker is therefore visible whatever the parent does with the result.
 fn render_status(id: &str, status: &ChildStatus) -> String {
     match status {
         ChildStatus::Running => format!("Worker {id}: running"),
-        ChildStatus::Finished(result) => format!("Worker {id}: finished\n\n{}", result.final_text),
+        ChildStatus::Finished(result) => format!(
+            "{}\n---\nWorker {id}: finished\n\n{}",
+            render_report(&result.report),
+            result.final_text
+        ),
         ChildStatus::Failed(message) => format!("Worker {id}: failed\n\n{message}"),
         ChildStatus::Cancelled => format!("Worker {id}: cancelled"),
     }
+}
+
+/// The report lines a finished worker's result begins with. The missing-call line
+/// is omitted entirely when the worker called no tool it was not given.
+fn render_report(report: &WorkerReport) -> String {
+    let mut lines = vec![format!("tools: {}", report.tools.join(", "))];
+    lines.push(match &report.finish {
+        Some(finish) => match (finish.status.as_str(), &finish.needs) {
+            ("blocked", Some(needs)) => format!("finish: blocked — needs: {needs}"),
+            (status, _) => format!("finish: {status}"),
+        },
+        None => "finish: not called".to_string(),
+    });
+    if !report.missing_tool_calls.is_empty() {
+        let calls: Vec<String> = report
+            .missing_tool_calls
+            .iter()
+            .map(|(name, count)| format!("{name} x{count}"))
+            .collect();
+        lines.push(format!(
+            "calls to tools it was not given: {}",
+            calls.join(", ")
+        ));
+    }
+    lines.join("\n")
 }
 
 fn start_schema(grantable: &[String], environments: &[String]) -> serde_json::Value {

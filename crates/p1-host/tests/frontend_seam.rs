@@ -171,6 +171,13 @@ impl FrontEnd for RecordingFrontEnd {
         self.inner.child_started(worker_id);
     }
 
+    /// A worker's end goes to the real line front end, exactly as the run loop and
+    /// the child count do.
+    #[cfg(feature = "delegation")]
+    fn worker_ended(&self, worker_id: &str, description: &str, report: &p1_workers::WorkerReport) {
+        self.inner.worker_ended(worker_id, description, report);
+    }
+
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
         self.policy.clone()
     }
@@ -222,6 +229,16 @@ impl FrontEnd for SentinelFrontEnd {
     }
 
     fn child_started(&self, _worker_id: &str) {}
+
+    /// This front end renders nothing, so a worker's end is a no-op.
+    #[cfg(feature = "delegation")]
+    fn worker_ended(
+        &self,
+        _worker_id: &str,
+        _description: &str,
+        _report: &p1_workers::WorkerReport,
+    ) {
+    }
 
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
         self.policy.clone()
