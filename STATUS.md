@@ -25,18 +25,13 @@ Only the lead edits this file (D13). Started 2026-09-19.
   apply_patch defect), #47 (provider-http helpers), #48 (cleanups), TUI terminal I/O on #12.
 
 ## In progress
-- 2026-09-22 evening, ADR-0050 (proposed; owner decisions in the ADR): MERGED — conditional prompt
-  sections, required `tools` grants on worker_start (+finish), worker tools on every main agent,
-  `claude-delegating` removed, worker report (worker_result lines + host `· worker w1 …` line),
-  Claude Opus 5.5 profile+binding (live-verified, listed once). OPEN — job `worker-add-tools`
-  (`worker_continue add_tools`, brief `../phaseone-briefs/worker-add-tools.md`, worktree
-  `../phaseone-worker-add-tools`, run dir `../phaseone-briefs/runs/worker-add-tools-*`): review diff,
-  gate, merge, record run, `cargo build -p p1-host`. THEN lead live acceptance: a claude main agent
-  starts a deepseek2 worker granted [read]; empty/unknown grant refused; a worker lacking `edit`
-  finishes blocked and the host line shows it; `add_tools` repairs it in place. Then set ADR-0050
-  accepted, `supersedes: [26]` (ADR-0026 status superseded), fill its Evidence.
-  Open risk (not tested): Opus 5.5 preserved-thinking prefix check vs p1 context summarization —
-  applies only to Anthropic accounts created on/after 2026-08-31.
+- 2026-09-22 evening: ADR-0050 DONE and accepted (supersedes ADR-0026), live-verified on
+  claude/claude-opus-5-5: every main agent has the worker tools, `claude-delegating` removed,
+  required `tools` grants (+finish), conditional prompt sections, worker report + host line,
+  `worker_continue add_tools`. Claude Opus 5.5 shipped, listed once. OPEN decision for the owner:
+  a worker with edit but no shell cannot finish `done` (ADR-0037 finish check needs a recorded
+  command). Open risk (untested): Opus 5.5 preserved-thinking prefix check vs context
+  summarization (Anthropic accounts created on/after 2026-08-31 only).
   LESSON: after any merge that changes prompts/assembly, rebuild the fanout binary at once
   (`cargo build -p p1-host`), or every p1 fanout job fails at start-up.
 - nothing. The first slice is DONE (2026-09-20): every seams.md §10 acceptance item is
