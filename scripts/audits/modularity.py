@@ -529,7 +529,9 @@ def run(wf, args):
         output, _ = repro_output(reference, finding["repro"])
         votes = wf.parallel([lambda lens=lens: refute(finding, lens, output) for lens in ("rule", "code")])
         upheld = [v for v in votes if v and v["verdict"] == "upheld"]
-        if len(upheld) == 1 and finding["severity"] == "high":
+        # a split vote on anything above low gets a third look (run2: a split medium finding
+        # hid a live defect, docs/research/modularity-audit-2026-09-22.md)
+        if len(upheld) == 1 and finding["severity"] in ("high", "medium"):
             third = refute(finding, "code-second", output)
             votes.append(third)
             upheld += [third] if third and third["verdict"] == "upheld" else []
