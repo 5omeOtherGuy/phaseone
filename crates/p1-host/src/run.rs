@@ -44,7 +44,8 @@ use p1_tool_finish::Accepted;
 
 #[cfg(feature = "delegation")]
 use p1_workers::{
-    AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers, WorkerReport,
+    AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers, Regrant,
+    WorkerReport,
 };
 
 /// Exit codes (the process contract).
@@ -1674,6 +1675,76 @@ async fn running_children(deps: &HostDeps) -> usize {
     }
 }
 
+/// Assemble one child: load its environment, give it EXACTLY the tool modules the
+/// parent granted plus `finish`, resolve its route binding and assemble it under the
+/// host's cache-key policy at the child's own ordinal.
+///
+/// The START path and a re-grant (`worker_continue` with `add_tools`, ADR-0050 item
+/// 6) both go through this, so both build the tool list identically — and a re-grant
+/// passes the child's original ordinal, so its provider-side prompt cache survives
+/// where the route takes a key.
+#[cfg(feature = "delegation")]
+fn assemble_child(
+    environment_dirs: &[PathBuf],
+    catalog: &Catalog,
+    environment_name: &str,
+    grant: &[String],
+    workspace: &Path,
+    substitutions: &Substitutions,
+    ordinal: u64,
+) -> Result<Assembled, String> {
+    let mut environment =
+        load_environment(environment_name, environment_dirs).map_err(|error| error.to_string())?;
+    environment.tools = child_tools(&environment, grant)?;
+    crate::catalog::resolve_environment(&mut environment, environment_dirs)?;
+    assemble_with_cache_key(catalog, &environment, workspace, substitutions, ordinal)
+}
+
+/// The tool list of a child: the granted modules in the parent's order, each with the
+/// environment's own `ToolSpec` when it has one (an entry there only supplies the face
+/// the module is presented under) and the module's default face otherwise, then
+/// `finish` LAST — every worker gets it, because it is how a worker reports done or
+/// blocked. The environment's own `[[tools]]` list neither limits nor extends the
+/// grant, so a grant is never silently dropped.
+#[cfg(feature = "delegation")]
+fn child_tools(environment: &EnvironmentFile, grant: &[String]) -> Result<Vec<ToolSpec>, String> {
+    let mut granted = Vec::with_capacity(grant.len() + 1);
+    for module in grant {
+        // A worker can never start workers: the worker tools are not grantable, but a
+        // direct [`ChildSpec`] — or a service call — could still name one. Refuse
+        // plainly rather than assemble a delegating child.
+        if module.starts_with("worker_") {
+            return Err(format!(
+                "a worker cannot be granted the worker tool `{module}`"
+            ));
+        }
+        let own = environment
+            .tools
+            .iter()
+            .find(|tool| &tool.module == module)
+            .cloned();
+        granted.push(own.unwrap_or_else(|| ToolSpec {
+            module: module.clone(),
+            name: None,
+            description: None,
+            variant: None,
+        }));
+    }
+    let finish = environment
+        .tools
+        .iter()
+        .find(|tool| tool.module == FINISH_MODULE)
+        .cloned()
+        .unwrap_or_else(|| ToolSpec {
+            module: FINISH_MODULE.to_string(),
+            name: None,
+            description: None,
+            variant: None,
+        });
+    granted.push(finish);
+    Ok(granted)
+}
+
 /// Build the child `Agent` through the SAME load + assemble path the top-level
 /// agent uses. The child gets its own fresh `ToolServices` (inside `assemble`),
 /// the parent's workspace unless the spec overrides it, the front end's shared
@@ -1702,56 +1773,6 @@ fn make_child_factory(
     let parent_workspace = parent_workspace.to_path_buf();
 
     Arc::new(move |spec: &ChildSpec| -> Result<ChildAgent, String> {
-        let mut environment = load_environment(&spec.environment, &environment_dirs)
-            .map_err(|error| error.to_string())?;
-        // A worker is assembled with EXACTLY the tools its parent granted, plus
-        // `finish` (every worker gets it, last, to report done or blocked). The
-        // environment's own `[[tools]]` list does not add or remove anything: an
-        // entry there only supplies the face the granted module is presented under.
-        // A module the environment does not mention is assembled with its default
-        // face, so a grant is never silently dropped.
-        debug_assert!(
-            spec.tools
-                .iter()
-                .all(|module| !module.starts_with("worker_")),
-            "the worker tools are not grantable: {:?}",
-            spec.tools
-        );
-        let mut granted = Vec::with_capacity(spec.tools.len() + 1);
-        for module in &spec.tools {
-            // A worker can never start workers: the worker tools are not grantable,
-            // but a direct [`ChildSpec`] could still name one. Refuse plainly rather
-            // than assemble a delegating child.
-            if module.starts_with("worker_") {
-                return Err(format!(
-                    "a worker cannot be granted the worker tool `{module}`"
-                ));
-            }
-            let own = environment
-                .tools
-                .iter()
-                .find(|tool| &tool.module == module)
-                .cloned();
-            granted.push(own.unwrap_or_else(|| ToolSpec {
-                module: module.clone(),
-                name: None,
-                description: None,
-                variant: None,
-            }));
-        }
-        let finish = environment
-            .tools
-            .iter()
-            .find(|tool| tool.module == FINISH_MODULE)
-            .cloned()
-            .unwrap_or_else(|| ToolSpec {
-                module: FINISH_MODULE.to_string(),
-                name: None,
-                description: None,
-                variant: None,
-            });
-        granted.push(finish);
-        environment.tools = granted;
         let catalog = catalog_slot
             .get()
             .ok_or_else(|| "the host catalog is not ready".to_string())?
@@ -1765,13 +1786,17 @@ fn make_child_factory(
             date: date.clone(),
             os: std::env::consts::OS.to_string(),
         };
-        crate::catalog::resolve_environment(&mut environment, &environment_dirs)?;
-        let assembled = assemble_with_cache_key(
+        // This child's own cache-key ordinal, kept for its whole life: a re-grant
+        // assembles at the SAME ordinal, never a new one.
+        let ordinal = next_agent_ordinal();
+        let assembled = assemble_child(
+            &environment_dirs,
             &catalog,
-            &environment,
+            &spec.environment,
+            &spec.tools,
             &workspace,
             &substitutions,
-            next_agent_ordinal(),
+            ordinal,
         )?;
         // `InProcessWorkers` assigns `w{n}` after a SUCCESSFUL factory call and
         // factory calls are serialised, so this is the id the service will hand
@@ -1800,8 +1825,10 @@ fn make_child_factory(
             Some(completion) => completion.log.clone(),
             None => Arc::new(ActivityLog::default()),
         };
-        let events: Arc<dyn EventSink> =
-            Arc::new(ActivityTee::new(renderer, log.clone(), &assembled.tools));
+        // The typed handle is kept too: a re-grant re-points the tee at the new tool
+        // set, so the effect of a re-granted tool is read from that tool.
+        let tee = Arc::new(ActivityTee::new(renderer, log.clone(), &assembled.tools));
+        let events: Arc<dyn EventSink> = tee.clone();
         let events: Arc<dyn EventSink> = if max_idle_summaries > 0 {
             Arc::new(ChildStallWatcher {
                 inner: events,
@@ -1825,7 +1852,9 @@ fn make_child_factory(
                 .map(|tool| tool.declaration().name.clone())
                 .collect(),
         )));
-        let events: Arc<dyn EventSink> = Arc::new(WorkerReportTap::new(
+        // The typed handle is kept too: a re-grant re-points the tap at the new tool
+        // set (below).
+        let tap = Arc::new(WorkerReportTap::new(
             events,
             report.clone(),
             &assembled.tools,
@@ -1833,6 +1862,59 @@ fn make_child_factory(
             worker_id.clone(),
             description.clone(),
         ));
+        let events: Arc<dyn EventSink> = tap.clone();
+        // Re-assembly for a repair (ADR-0050 item 6): `worker_continue` with
+        // `add_tools` hands over the child's FULL new grant, and this rebuilds exactly
+        // what the start built — the same environment, the same assembly path, the
+        // same cache-key ordinal — with that grant. The service applies it through
+        // `Agent::reconfigure` BEFORE the new turn, so the worker keeps its context.
+        let regrant: Regrant = {
+            let catalog = catalog.clone();
+            let environment_dirs = environment_dirs.clone();
+            let environment_name = spec.environment.clone();
+            let workspace = workspace.clone();
+            let substitutions = substitutions.clone();
+            let completion_hub = completion_hub.clone();
+            let tap = tap.clone();
+            let tee = tee.clone();
+            // The worker's OWN `finish` tool survives every re-grant: its activity
+            // log is the worker's whole history, which `finish` reads to verify a
+            // claim, and a freshly assembled one would see an empty session.
+            let finish = finish_tool(&assembled);
+            Arc::new(move |grant: &[String]| -> Result<Reconfiguration, String> {
+                let assembled = assemble_child(
+                    &environment_dirs,
+                    &catalog,
+                    &environment_name,
+                    grant,
+                    &workspace,
+                    &substitutions,
+                    ordinal,
+                )?;
+                // The catalog's `finish` factory issued THIS assembly its own
+                // completion: take it, so the hub cannot hand a stale one to a later
+                // worker assembly.
+                let _issued = completion_hub.take();
+                let context = agent_context(&assembled)?;
+                let finish_at = finish_index(&assembled);
+                let mut tools = assembled.tools;
+                if let (Some(finish), Some(index)) = (&finish, finish_at) {
+                    tools[index] = finish.clone();
+                }
+                // The report's `tools` becomes the new assembly's names, its `finish`
+                // tool is found again by identity, and the child's activity records
+                // the effect of a re-granted tool from that tool itself.
+                tap.retool(&tools);
+                tee.retool(&tools);
+                Ok(Reconfiguration {
+                    provider: assembled.provider,
+                    tools,
+                    system_prompt: assembled.system_prompt,
+                    options: assembled.options,
+                    context,
+                })
+            })
+        };
         // With `--session`, worker `w{n}` gets its OWN new JSONL file next to the
         // parent's (`FILE.w{n}.jsonl`). Without one it stays in memory like before.
         // Created last among the fallible steps so a later failure cannot leave a
@@ -1878,6 +1960,7 @@ fn make_child_factory(
             agent,
             description,
             report,
+            regrant: Some(regrant),
         })
     })
 }
