@@ -21,6 +21,35 @@
 //! does not have. Substituted values are inserted verbatim and are NOT rescanned.
 //! There is no escape sequence, so a literal `{{` cannot be written in a prompt in
 //! this slice — it would be scanned as the start of a placeholder.
+//!
+//! # Conditional sections
+//!
+//! `{{#tool:<module>}}` opens a conditional section and `{{/tool:<module>}}` closes
+//! it. The enclosed text — placeholders inside it included — is kept whole when the
+//! module is assembled in this environment and dropped entirely when it is not, so a
+//! prompt can talk about a tool a narrower agent (a worker granted only some
+//! modules) does not have, and a `{{tool:<module>}}` inside a dropped section is not
+//! an error. Sections nest, for different modules.
+//!
+//! A dropped section also drops ONE newline directly after its closing tag, so a
+//! section written on its own lines leaves no blank line behind. For the template
+//!
+//! ```text
+//! A
+//! {{#tool:m}}
+//! B
+//! {{/tool:m}}
+//! C
+//! ```
+//!
+//! with `m` assembled the render is `A`, a blank line, `B`, a blank line, `C` (the
+//! tags' own line breaks stay); with `m` absent it is `A`, `C` — the section and the
+//! newline after `{{/tool:m}}` go, so nothing is left between them.
+//!
+//! An unclosed section, a close with no open section, and a close naming a module
+//! other than the innermost open one are errors
+//! ([`AssemblyError::ToolSectionMismatch`]); `{{tool:<module>}}` OUTSIDE any section
+//! for a module that is not assembled stays an error, as before.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -332,6 +361,11 @@ pub enum AssemblyError {
         "prompt refers to `{{{{tool:{module}}}}}` but module `{module}` is not assembled in this environment"
     )]
     ToolNotInEnvironment { module: String },
+    /// A conditional section `{{#tool:<module>}}` … `{{/tool:<module>}}` that is not
+    /// balanced: an open left unclosed, a close with no open section, or a close
+    /// naming another module than the innermost open one.
+    #[error("prompt has an unclosed or mismatched conditional section for tool module `{module}`")]
+    ToolSectionMismatch { module: String },
     #[error("provider rejected the assembled environment: {0}")]
     ProviderRejected(ProviderError),
     #[error("invalid [context] configuration: {message}")]
@@ -786,8 +820,22 @@ pub fn assemble_with_route_options(
     })
 }
 
-/// Substitute exactly the documented placeholders. A literal `{{` cannot be
-/// escaped in this slice: any `{{` starts a placeholder.
+/// Render a prompt template against an assembled `(module, model-facing name)` list.
+///
+/// This is the substitution [`assemble`] performs, exposed so a caller can render
+/// the same template for a different tool set — the tools one worker was granted —
+/// without assembling a second agent. The rules are the ones in the crate docs,
+/// conditional sections included.
+pub fn render_prompt(
+    template: &str,
+    modules: &[(String, String)],
+    substitutions: &Substitutions,
+) -> Result<String, AssemblyError> {
+    substitute_prompt(template, modules, substitutions)
+}
+
+/// Substitute exactly the documented placeholders and conditional sections. A literal
+/// `{{` cannot be escaped in this slice: any `{{` starts a placeholder or a tag.
 fn substitute_prompt(
     template: &str,
     modules: &[(String, String)],
@@ -795,8 +843,14 @@ fn substitute_prompt(
 ) -> Result<String, AssemblyError> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
+    // The open conditional sections, outermost first, each with whether the text it
+    // encloses is kept. `kept` is false as soon as one enclosing section goes.
+    let mut open: Vec<(String, bool)> = Vec::new();
+    let mut kept = true;
     while let Some(start) = rest.find("{{") {
-        out.push_str(&rest[..start]);
+        if kept {
+            out.push_str(&rest[..start]);
+        }
         let after = &rest[start + 2..];
         let Some(end) = after.find("}}") else {
             return Err(AssemblyError::UnknownPlaceholder {
@@ -804,29 +858,59 @@ fn substitute_prompt(
             });
         };
         let placeholder = &after[..end];
-        match placeholder {
-            "workspace" => out.push_str(&substitutions.workspace),
-            "date" => out.push_str(&substitutions.date),
-            "os" => out.push_str(&substitutions.os),
-            "tool_names" => {
-                let names: Vec<&str> = modules.iter().map(|(_, name)| name.as_str()).collect();
-                out.push_str(&names.join(", "));
-            }
-            other => {
-                let Some(module) = other.strip_prefix("tool:") else {
-                    return Err(AssemblyError::UnknownPlaceholder {
-                        placeholder: other.to_string(),
-                    });
-                };
-                let Some((_, name)) = modules.iter().find(|(key, _)| key == module) else {
-                    return Err(AssemblyError::ToolNotInEnvironment {
+        let mut next = &after[end + 2..];
+        if let Some(module) = placeholder.strip_prefix("#tool:") {
+            let assembled = modules.iter().any(|(key, _)| key == module);
+            open.push((module.to_string(), kept && assembled));
+            kept = kept && assembled;
+        } else if let Some(module) = placeholder.strip_prefix("/tool:") {
+            match open.pop() {
+                Some((name, was_kept)) if name == module => {
+                    if !was_kept {
+                        // A dropped section also drops one newline directly after its
+                        // closing tag (crate docs).
+                        next = next.strip_prefix('\n').unwrap_or(next);
+                    }
+                    kept = open.iter().all(|(_, kept)| *kept);
+                }
+                // A close with no open section, or one naming another module than the
+                // innermost open section.
+                _ => {
+                    return Err(AssemblyError::ToolSectionMismatch {
                         module: module.to_string(),
                     });
-                };
-                out.push_str(name);
+                }
+            }
+        } else if kept {
+            match placeholder {
+                "workspace" => out.push_str(&substitutions.workspace),
+                "date" => out.push_str(&substitutions.date),
+                "os" => out.push_str(&substitutions.os),
+                "tool_names" => {
+                    let names: Vec<&str> = modules.iter().map(|(_, name)| name.as_str()).collect();
+                    out.push_str(&names.join(", "));
+                }
+                other => {
+                    let Some(module) = other.strip_prefix("tool:") else {
+                        return Err(AssemblyError::UnknownPlaceholder {
+                            placeholder: other.to_string(),
+                        });
+                    };
+                    let Some((_, name)) = modules.iter().find(|(key, _)| key == module) else {
+                        return Err(AssemblyError::ToolNotInEnvironment {
+                            module: module.to_string(),
+                        });
+                    };
+                    out.push_str(name);
+                }
             }
         }
-        rest = &after[end + 2..];
+        rest = next;
+    }
+    if let Some((module, _)) = open.last() {
+        return Err(AssemblyError::ToolSectionMismatch {
+            module: module.clone(),
+        });
     }
     out.push_str(rest);
     Ok(out)
