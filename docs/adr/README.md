@@ -65,6 +65,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0049 | [Model selection and switching a session to another model](0049-model-selection-and-switching-a-session-to-another-model.md) | accepted | 2026-09-21 | owner+lead |
 | ADR-0050 | [Every main agent can start workers; a worker gets exactly the tools its parent grants](0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md) | accepted | 2026-09-22 | owner+lead |
 | ADR-0051 | [A worker without a command tool may finish done; the result says it was not verified](0051-a-worker-without-a-command-tool-may-finish-done-the-result-says-it-was-not-verified.md) | accepted | 2026-09-23 | owner+lead |
+| ADR-0052 | [Workflows are an optional module: a sandboxed script orchestrates workers under roles and caps](0052-workflows-are-an-optional-module-a-sandboxed-script-orchestrates-workers-under-roles-and-caps.md) | proposed | 2026-09-23 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

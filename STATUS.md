@@ -88,6 +88,13 @@ OPEN ITEMS (issue numbers)
 - **First slice** — every `seams.md` §10 item demonstrated by a command in `docs/SLICE-REPORT.md`;
   the independent review's defects all fixed (`docs/review-2026-09-20-dispositions.md`).
 
+## Workflows (orchestrator session)
+
+Owned by the Fable 5.1 Claude Code orchestrator session (brief:
+`../phaseone-briefs/workflows-orchestrator.md`; ADR-0052 proposed; engine rhai per the spikes in
+`../phaseone-spikes/`). The orchestrator writes its progress HERE and nowhere else in this file:
+- (not started)
+
 ## Open decisions and risks
 
 - DONE (ADR-0051, accepted 2026-09-23): a worker without a command tool finishes `done` and the
