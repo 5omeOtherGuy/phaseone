@@ -70,13 +70,19 @@ pub struct WorkerReport {
     pub missing_tool_calls: Vec<(String, u32)>,
 }
 
-/// One accepted `finish` call, as its input described it.
+/// One accepted `finish` call, as its input described it and as the host's own
+/// evidence labelled it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FinishReport {
     pub status: String,
     /// `needs` as the worker wrote it: a string, or an array joined with `", "`.
     pub needs: Option<String>,
     pub summary: Option<String>,
+    /// What the ACCEPTED outcome established (ADR-0051 item 3), never parsed out of
+    /// the model's input: `commands passed: …` or
+    /// `not verified; parent verification required`. `None` when the outcome carried
+    /// none (a report the host built without an outcome, or a `blocked` finish).
+    pub evidence: Option<String>,
 }
 
 impl WorkerReport {
@@ -958,6 +964,7 @@ mod tests {
             status: "blocked".into(),
             needs: Some("edit".into()),
             summary: Some("cannot write".into()),
+            evidence: None,
         });
         assert_eq!(
             report.missing_tool_calls,

@@ -1256,6 +1256,8 @@ async fn a_finished_workers_result_begins_with_its_report() {
                 status: "blocked".into(),
                 needs: Some("edit".into()),
                 summary: Some("cannot write".into()),
+                // A `blocked` outcome carries no evidence line (ADR-0051 item 3).
+                evidence: None,
             }),
             missing_tool_calls: vec![("edit".into(), 2)],
         }),
@@ -1292,8 +1294,9 @@ async fn a_finished_workers_result_begins_with_its_report() {
     );
 }
 
-/// A worker that called `finish` with `done` and no missing calls: the third line
-/// is omitted and the finish line says `done`.
+/// A worker that called `finish` with `done` and no missing calls: the third line is
+/// omitted, and the finish line carries what the accepted outcome established — here a
+/// `done` from a worker with no command tool (ADR-0051 items 1 and 3).
 #[tokio::test(start_paused = true)]
 async fn a_worker_that_finished_done_has_no_missing_call_line() {
     let workers = InProcessWorkers::new(
@@ -1303,6 +1306,7 @@ async fn a_worker_that_finished_done_has_no_missing_call_line() {
                 status: "done".into(),
                 needs: None,
                 summary: Some("did it".into()),
+                evidence: Some("not verified; parent verification required".into()),
             }),
             missing_tool_calls: Vec::new(),
         }),
@@ -1320,6 +1324,8 @@ async fn a_worker_that_finished_done_has_no_missing_call_line() {
     .await;
     assert_eq!(
         result.content,
-        "tools: read, finish\nfinish: done\n---\nWorker w1: finished\n\nchild answer"
+        "tools: read, finish\n\
+         finish: done — not verified; parent verification required\n\
+         ---\nWorker w1: finished\n\nchild answer"
     );
 }

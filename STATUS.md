@@ -90,12 +90,11 @@ OPEN ITEMS (issue numbers)
 
 ## Open decisions and risks
 
-- OWNER DECISION OPEN: a worker granted `edit` but not `shell` cannot finish `done` — the ADR-0037
-  finish check wants a recorded command it cannot run, so it finishes `blocked` after a correct
-  change (found live; ADR-0050 Evidence).
-  Recommendation (lead + Astra, `../phaseone-briefs/finish-design-answer.md`): host-chosen finish
-  policy — a worker with no command tool may finish `done`, reported as "not verified; parent
-  verification required"; never grant `shell` implicitly; parent-defined checks and profiles later.
+- DONE (ADR-0051, accepted 2026-09-23): a worker without a command tool finishes `done` and the
+  host reports it `not verified; parent verification required`; `shell` is never granted
+  implicitly. Next: workflows as a module (design with Astra in `../phaseone-briefs/
+  workflows-design-*.md`, v1 scope in `workflows-design-v1-scope.md`; engine spikes rhai vs
+  rune running; then a Fable 5.1 Claude Code session orchestrates the implementation).
 - Risk (untested): the Opus 5.5 preserved-thinking prefix check vs p1's context summarization —
   applies only to Anthropic accounts created on/after 2026-08-31.
 - #45 is the owner's; do not dispatch. #46–#48 are `ready` and unclaimed. Small debts:

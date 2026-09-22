@@ -40,7 +40,7 @@ use crate::frontend::{FrontEnd, LineFrontEnd};
 use crate::render::Renderer;
 use crate::session;
 use crate::{HostDeps, InterruptSource};
-use p1_tool_finish::Accepted;
+use p1_tool_finish::{Accepted, CompletionPolicy};
 
 #[cfg(feature = "delegation")]
 use p1_workers::{
@@ -143,7 +143,7 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
         Command::Models { search } => models_command(deps, &options, search.as_deref()),
         // The login surface (ADR-0044, spec §6): no catalog, no provider and no
         // network — the store is written and the "which source" report is printed.
-        // The route quota ledger (ADR-0051): route metadata and p1-auth credential
+        // The route quota ledger (ADR-0052): route metadata and p1-auth credential
         // references go to `p1-usage`; no catalog, no provider.
         Command::Usage(usage) => crate::usage::usage(deps, &usage).await,
         Command::Login { route } => crate::login::login(deps, &route).await,
@@ -1026,6 +1026,72 @@ fn finish_tool(assembled: &Assembled) -> Option<Arc<dyn Tool>> {
     finish_index(assembled).map(|index| assembled.tools[index].clone())
 }
 
+/// The shell tool's identity implementation: the one identity the host's completion
+/// policy reads (ADR-0052 item 1) to decide whether a child can verify anything
+/// itself. Never a model-facing name, which an environment's face may change.
+#[cfg(feature = "delegation")]
+const SHELL_IMPLEMENTATION: &str = "p1-tool-shell";
+
+/// The completion policy a CHILD's assembled tools call for (ADR-0052 item 1): a
+/// worker whose tools include no tool that records command runs cannot verify
+/// anything itself, so it reports to its parent instead of naming a command it cannot
+/// run. The check is on the tools' IDENTITIES — the technique `WorkerReportTap` uses
+/// to find `finish` — never on grant names, so a face cannot hide the shell tool.
+///
+/// MAIN agents never come through here: their `finish` keeps the strict rule.
+#[cfg(feature = "delegation")]
+fn completion_policy(tools: &[Arc<dyn Tool>]) -> CompletionPolicy {
+    let can_run_commands = tools
+        .iter()
+        .any(|tool| tool.identity().implementation == SHELL_IMPLEMENTATION);
+    if can_run_commands {
+        CompletionPolicy::RecordedCommands
+    } else {
+        CompletionPolicy::ReportToParent
+    }
+}
+
+/// Apply the child's policy to the `finish` tool the catalog assembled (ADR-0052 item
+/// 1). The catalog builds the tool before the host knows the assembled tools, and the
+/// policy follows from THEM, so it is applied here: the tool keeps the child's own
+/// activity log and outcome cell — its whole history, which a freshly assembled
+/// `finish` would not see — and its model-facing name and variant.
+#[cfg(feature = "delegation")]
+fn apply_completion_policy(assembled: &mut Assembled, completion: &Completion) {
+    let Some(index) = finish_index(assembled) else {
+        return;
+    };
+    let policy = completion_policy(&assembled.tools);
+    let finish = finish_under_policy(
+        &assembled.tools[index],
+        completion.log.clone(),
+        completion.outcome.clone(),
+        policy,
+    );
+    // `resolved` is what the host journals and prints: keep the declaration in step
+    // with the tool the model is actually given.
+    assembled.resolved.tools[index].declaration = finish.declaration().clone();
+    assembled.tools[index] = finish;
+}
+
+/// The same `finish` tool under `policy`, on the given activity log and outcome cell.
+/// The description follows the policy — it is what tells the model which completion
+/// rule applies to it — while the name and variant stay the ones the agent was
+/// assembled with.
+#[cfg(feature = "delegation")]
+fn finish_under_policy(
+    finish: &Arc<dyn Tool>,
+    log: Arc<ActivityLog>,
+    outcome: p1_tool_finish::FinishOutcome,
+    policy: CompletionPolicy,
+) -> Arc<dyn Tool> {
+    let name = finish.declaration().name.clone();
+    let variant = finish.identity().variant.clone();
+    let tool = p1_tool_finish::FinishTool::new(log, outcome).with_policy(policy);
+    let face = p1_tool_finish::ToolFace::new(name, tool.declaration().description.clone());
+    Arc::new(tool.with_face(face, &variant))
+}
+
 /// The session's model (ADR-0049 stage 3): what a `/model` or `/effort` line
 /// changes, plus the `finish` tool the session keeps.
 struct SessionModel {
@@ -1792,7 +1858,7 @@ fn make_child_factory(
         // This child's own cache-key ordinal, kept for its whole life: a re-grant
         // assembles at the SAME ordinal, never a new one.
         let ordinal = next_agent_ordinal();
-        let assembled = assemble_child(
+        let mut assembled = assemble_child(
             &environment_dirs,
             &catalog,
             &spec.environment,
@@ -1809,9 +1875,18 @@ fn make_child_factory(
         let id = counter.load(Ordering::SeqCst) + 1;
         let worker_id = format!("w{id}");
         // The child gets its OWN activity log and outcome, issued by the shared
-        // catalog for this assembly. The worker service does not read the
-        // outcome: a child's turn end is its completion, the parent verifies.
+        // catalog for this assembly. The worker service does not read the outcome:
+        // a child's turn end is its completion, the parent verifies.
         let child_completion = completion_hub.take();
+        let outcome = child_completion
+            .as_ref()
+            .map(|completion| completion.outcome.clone())
+            .unwrap_or_default();
+        // ADR-0052 item 1: the policy follows the assembled tools' identities, so it
+        // is applied here, after assembly, to the `finish` tool the catalog built.
+        if let Some(completion) = &child_completion {
+            apply_completion_policy(&mut assembled, completion);
+        }
         let context = agent_context(&assembled)?;
         let route = assembled.resolved.route.origin.route.clone();
         let model = assembled.resolved.route.origin.model.clone();
@@ -1835,7 +1910,7 @@ fn make_child_factory(
         let events: Arc<dyn EventSink> = if max_idle_summaries > 0 {
             Arc::new(ChildStallWatcher {
                 inner: events,
-                log,
+                log: log.clone(),
                 max: max_idle_summaries,
                 message: stall_message(max_idle_summaries),
                 service: service_slot.clone(),
@@ -1861,6 +1936,7 @@ fn make_child_factory(
             events,
             report.clone(),
             &assembled.tools,
+            outcome.clone(),
             front_end.clone(),
             worker_id.clone(),
             description.clone(),
@@ -1880,6 +1956,8 @@ fn make_child_factory(
             let completion_hub = completion_hub.clone();
             let tap = tap.clone();
             let tee = tee.clone();
+            let log = log.clone();
+            let outcome = outcome.clone();
             // The worker's OWN `finish` tool survives every re-grant: its activity
             // log is the worker's whole history, which `finish` reads to verify a
             // claim, and a freshly assembled one would see an empty session.
@@ -1900,9 +1978,14 @@ fn make_child_factory(
                 let _issued = completion_hub.take();
                 let context = agent_context(&assembled)?;
                 let finish_at = finish_index(&assembled);
+                // A re-grant is a new tool set, so the policy is chosen again from it
+                // (ADR-0052 item 1): `add_tools: ["shell"]` puts the worker back on the
+                // strict rule for every later turn.
+                let policy = completion_policy(&assembled.tools);
                 let mut tools = assembled.tools;
                 if let (Some(finish), Some(index)) = (&finish, finish_at) {
-                    tools[index] = finish.clone();
+                    tools[index] =
+                        finish_under_policy(finish, log.clone(), outcome.clone(), policy);
                 }
                 // The report's `tools` becomes the new assembly's names, its `finish`
                 // tool is found again by identity, and the child's activity records

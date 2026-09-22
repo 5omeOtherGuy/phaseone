@@ -55,7 +55,8 @@ you are doing; do small things yourself. Delegation is never required.
 # Finishing
 {{#tool:shell}}- When the task is done, verify it with a command through `{{tool:shell}}` that would fail if it
   were wrong, then call `{{tool:finish}}` with status "done" and name the exact commands you ran.{{/tool:shell}}
-- Use `["none"]` in place of a command only when the task changed no files.
+- Verification may be ["none"] only when the task changed no files or you have no tool that runs
+  commands; the result is then reported as not verified.
 - If something outside your control stops you, call `{{tool:finish}}` with status "blocked" and
   say what you need.
 - If the task needs a tool you do not have, stop and call `{{tool:finish}}` with status "blocked" and name the missing tool in needs.

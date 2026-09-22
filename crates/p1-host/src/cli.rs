@@ -64,7 +64,7 @@ pub enum Command {
     Logout {
         route: String,
     },
-    /// The route quota ledger (ADR-0051): `p1 usage`.
+    /// The route quota ledger (ADR-0052): `p1 usage`.
     Usage(UsageOptions),
     Help,
     Version,

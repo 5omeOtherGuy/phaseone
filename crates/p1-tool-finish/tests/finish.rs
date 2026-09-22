@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use p1_contracts::{
     CancellationToken, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome, ToolStatus,
 };
-use p1_tool_finish::{Accepted, FinishOutcome, FinishTool, SessionActivity, ShellRun, ToolFace};
+use p1_tool_finish::{
+    Accepted, Evidence, FinishOutcome, FinishTool, SessionActivity, ShellRun, ToolFace,
+};
 
 const MISSING_VERIFICATION: &str = "Name the commands you ran to verify the work in \"verification\". If nothing can be verified by a command, say why in \"summary\" and pass [\"none\"].";
 const NONE_CHANGED_FILES: &str =
@@ -176,7 +178,9 @@ async fn none_is_accepted_only_without_a_file_change() {
     assert_eq!(
         outcome.get(),
         Some(Accepted::Done {
-            summary: "s".to_string()
+            summary: "s".to_string(),
+            // Not writing a file is no proof that an answer is right (ADR-0051 item 2).
+            evidence: Evidence::NotRun("no file changed".to_string()),
         })
     );
 
@@ -256,7 +260,9 @@ async fn a_successful_run_is_accepted_and_commands_are_trimmed() {
     assert_eq!(
         outcome.get(),
         Some(Accepted::Done {
-            summary: "s".to_string()
+            summary: "s".to_string(),
+            // The named command is recorded as the trailer spells it.
+            evidence: Evidence::CommandsPassed(vec!["cargo test".to_string()]),
         })
     );
 }
@@ -516,7 +522,8 @@ async fn a_redirected_stream_counts_and_is_listed() {
         assert_eq!(
             outcome.get(),
             Some(Accepted::Done {
-                summary: "s".to_string()
+                summary: "s".to_string(),
+                evidence: Evidence::CommandsPassed(vec![recorded.to_string()]),
             })
         );
 
@@ -541,15 +548,17 @@ async fn a_redirected_stream_counts_and_is_listed() {
 async fn honest_and_quoted_sequencing_is_not_masked() {
     let cases = [
         // The `cd <path> &&` prefix is dropped for matching, and `&&` is honest anyway.
-        ("cd /w && cargo test", r#"["cargo test"]"#),
+        // The third field is the command the accepted evidence carries.
+        ("cd /w && cargo test", r#"["cargo test"]"#, "cargo test"),
         (
             "cargo fmt --check && cargo test",
             r#"["cargo fmt --check && cargo test"]"#,
+            "cargo fmt --check && cargo test",
         ),
-        ("echo \"a;b\"", r#"["echo \"a;b\""]"#),
-        ("echo 'x || y'", r#"["echo 'x || y'"]"#),
+        ("echo \"a;b\"", r#"["echo \"a;b\""]"#, "echo \"a;b\""),
+        ("echo 'x || y'", r#"["echo 'x || y'"]"#, "echo 'x || y'"),
     ];
-    for (recorded, json) in cases {
+    for (recorded, json, named) in cases {
         let activity = FakeActivity::new();
         activity.ran(recorded, Some(0), 1);
         let (finish, outcome) = tool(activity);
@@ -566,7 +575,8 @@ async fn honest_and_quoted_sequencing_is_not_masked() {
         assert_eq!(
             outcome.get(),
             Some(Accepted::Done {
-                summary: "s".to_string()
+                summary: "s".to_string(),
+                evidence: Evidence::CommandsPassed(vec![named.to_string()]),
             })
         );
     }
@@ -682,7 +692,13 @@ async fn every_named_command_passing_is_still_accepted() {
     assert_eq!(
         outcome.get(),
         Some(Accepted::Done {
-            summary: "s".to_string()
+            summary: "s".to_string(),
+            // Every named command, in the order named.
+            evidence: Evidence::CommandsPassed(vec![
+                "cargo test".to_string(),
+                "cargo fmt --check".to_string(),
+                "cargo clippy -- -D warnings".to_string(),
+            ]),
         })
     );
 }

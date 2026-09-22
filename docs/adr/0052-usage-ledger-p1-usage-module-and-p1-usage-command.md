@@ -1,5 +1,5 @@
 ---
-adr: 51
+adr: 52
 title: Usage ledger: p1-usage module and p1 usage command
 status: proposed
 date: 2026-09-23
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: []
 ---
-# ADR-0051: Usage ledger: p1-usage module and p1 usage command
+# ADR-0052: Usage ledger: p1-usage module and p1 usage command
 
 ## Context
 
