@@ -1,0 +1,12 @@
+# What the model is, independent of the route that reaches it (ADR-0039).
+id       = "claude-opus-5-5"
+revision = 1
+model_id = "claude-opus-5-5"
+family   = "claude"
+thinking = "effort-level"
+
+efforts = ["low", "medium", "high", "extra_high", "max"]
+
+# default_effort: absent — the API's own default for this model is medium, so an
+# effort-less request carries no thinking fields and the server picks.
+# context_tokens and max_output_tokens: unknown for this model, so stated nowhere.
