@@ -1,10 +1,10 @@
 ---
 adr: 50
 title: Every main agent can start workers; a worker gets exactly the tools its parent grants
-status: proposed
+status: accepted
 date: 2026-09-22
 deciders: owner+lead
-supersedes: []
+supersedes: [26]
 superseded_by: []
 sources: [docs/adr/0026-delegation-is-optional.md, docs/design/delegation.md, docs/design/pillars.md, crates/p1-tool-delegate/src/lib.rs, crates/p1-host/src/run.rs]
 ---
@@ -79,4 +79,18 @@ worker failed and the main agent did not report it).
 
 ## Evidence
 
-(to be filled on acceptance)
+Merged 2026-09-22 (CI green on `97ea43f`): `task/prompt-sections`, `task/worker-grants`,
+`task/main-agent-workers`, `task/worker-report`, `task/worker-add-tools`, all implemented by DeepSeek
+V4.1 Flash workers through p1 and reviewed by the lead. Offline: `cargo test -p p1-assembly --test
+lead_prompt_coherence --test prompt_sections`, `cargo test -p p1-host --test worker_grants --test
+worker_report --test worker_add_tools`, `cargo test -p p1-tool-delegate -p p1-workers`.
+
+Live, lead, `claude/claude-opus-5-5` main agent: it started a `deepseek2` worker granted only
+`read` (assembled: read, finish) to change a file; the worker finished `blocked` naming a writing
+tool and the host printed `· worker w1 (…; read, finish) blocked: needs …` on its own; the parent
+granted `edit` with `worker_continue add_tools`, the same worker (context kept) made the change,
+and the parent verified the file. `p1 models` lists each Claude model once.
+
+Found live: a worker granted `edit` but not `shell` cannot finish `done` — the ADR-0037 finish
+check requires a recorded successful command, which it cannot run — so it finished `blocked`
+asking for a shell after a correct change. Follow-up decision recorded outside this ADR.

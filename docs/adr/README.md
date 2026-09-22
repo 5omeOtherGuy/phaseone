@@ -39,7 +39,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0023 | [Cancellation precedence and sequential tool execution](0023-cancellation-precedence-and-sequential-tools.md) | accepted | 2026-09-20 | lead |
 | ADR-0024 | [Authorization is Permit/Deny at the core; ask lives in the host](0024-authorization-permit-deny-at-the-core.md) | accepted | 2026-09-20 | lead |
 | ADR-0025 | [Always-on workspace confinement and read-before-mutate, with apply_patch exempt](0025-workspace-confinement-and-read-before-mutate.md) | accepted | 2026-09-20 | lead |
-| ADR-0026 | [Delegation is an optional module, never imposed](0026-delegation-is-optional.md) | accepted | 2026-09-20 | owner+lead |
+| ADR-0026 | [Delegation is an optional module, never imposed](0026-delegation-is-optional.md) | superseded by ADR-0050 | 2026-09-20 | owner+lead |
 | ADR-0027 | [Workers are dispatched directly, with a machine-wide bounded pool](0027-workers-dispatched-directly-with-a-bounded-pool.md) | accepted | 2026-09-20 | owner+lead |
 | ADR-0028 | [Lead authority while the owner is away](0028-lead-authority-while-owner-is-away.md) | accepted | 2026-09-20 | owner |
 | ADR-0029 | [Test-first with independent authors and frozen suites](0029-test-first-with-independent-authors-and-frozen-suites.md) | accepted | 2026-09-20 | lead |
@@ -63,7 +63,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0047 | [The Codex route may speak WebSocket: an adapter-local transport with SSE as the fallback](0047-the-codex-route-may-speak-websocket-an-adapter-local-transport-with-sse-as-the-fallback.md) | accepted | 2026-09-21 | owner+lead |
 | ADR-0048 | [Providers may tell the operator something: a display-only notice event](0048-providers-may-tell-the-operator-something-a-display-only-notice-event.md) | accepted | 2026-09-21 | lead |
 | ADR-0049 | [Model selection and switching a session to another model](0049-model-selection-and-switching-a-session-to-another-model.md) | accepted | 2026-09-21 | owner+lead |
-| ADR-0050 | [Every main agent can start workers; a worker gets exactly the tools its parent grants](0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md) | proposed | 2026-09-22 | owner+lead |
+| ADR-0050 | [Every main agent can start workers; a worker gets exactly the tools its parent grants](0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md) | accepted | 2026-09-22 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
