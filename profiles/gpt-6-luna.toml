@@ -1,0 +1,11 @@
+# GPT-6 Luna supports these reasoning efforts on the Responses API. The subscription
+# route's context and output limits are not independently established.
+id       = "gpt-6-luna"
+revision = 1
+model_id = "gpt-6-luna"
+family   = "gpt"
+thinking = "effort-level"
+
+efforts = ["low", "medium", "high", "extra_high", "max"]
+
+# No default_effort: an effort-less request carries no reasoning fields.

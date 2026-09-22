@@ -202,8 +202,8 @@ fn models_lists_every_shipped_model() {
     let lines: Vec<&str> = stdout.lines().collect();
     // One row per model: every environment × every profile its route binds. The
     // anthropic-subscription route binds 6 profiles, and `claude-delegating` is gone
-    // (ADR-0050), so 6 Claude + 8 others = 14.
-    assert_eq!(lines.len(), 14, "one row per model: {stdout}");
+    // (ADR-0050), so 6 Claude + 10 others = 16.
+    assert_eq!(lines.len(), 16, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(
@@ -267,7 +267,7 @@ fn models_scopes_the_listing() {
         .lines()
         .filter(|line| line.ends_with("scoped"))
         .collect();
-    assert_eq!(scoped.len(), 5, "{stdout}");
+    assert_eq!(scoped.len(), 7, "{stdout}");
     assert!(scoped.iter().all(|line| line.starts_with("gpt/")));
 
     let output = isolated(home.path())
