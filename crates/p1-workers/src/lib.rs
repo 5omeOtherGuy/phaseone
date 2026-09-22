@@ -51,6 +51,11 @@ pub struct ChildSpec {
     /// The task text. It is the ONLY thing the child receives; the parent's
     /// transcript is never forwarded.
     pub task: String,
+    /// The tool MODULE names the parent granted the worker, in the parent's order
+    /// and without duplicates. Never `finish` (the factory adds it to every worker,
+    /// last) and never a `worker_*` module: the worker tools are not grantable, so a
+    /// child can never start workers of its own.
+    pub tools: Vec<String>,
     /// Workspace override, if the host supports one.
     pub workspace: Option<PathBuf>,
 }
@@ -81,9 +86,9 @@ pub struct ChildAgent {
 /// assembly path a top-level agent uses, so a child on another route gets that
 /// route's prompt and tools and nothing of the parent's.
 ///
-/// In this slice the factory MUST build children WITHOUT the delegation tools:
-/// nothing in this crate hands a child a [`WorkerService`], so a child cannot
-/// start workers (no recursion).
+/// The factory assembles a child with exactly the modules in
+/// [`ChildSpec::tools`] plus `finish`. The worker tools are not grantable, so a
+/// child can never start workers (no recursion) however the parent asks.
 pub type AgentFactory = Arc<dyn Fn(&ChildSpec) -> Result<ChildAgent, String> + Send + Sync>;
 
 /// The typed worker API a delegation tool depends on.

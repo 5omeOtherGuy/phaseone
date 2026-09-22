@@ -53,7 +53,7 @@ fn one_worker_parent() -> ScriptedProvider {
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            r#"{"environment":"b","task":"do it"}"#,
+            r#"{"environment":"b","task":"do it","tools":["read"]}"#,
         )]),
         text_response("parent started"),
         text_response("parent done"),
@@ -172,13 +172,13 @@ async fn a_second_worker_gets_the_next_session_file() {
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            r#"{"environment":"b","task":"first"}"#,
+            r#"{"environment":"b","task":"first","tools":["read"]}"#,
         )]),
         text_response("first started"),
         tool_call_response(vec![json_call(
             "c2",
             "worker_start",
-            r#"{"environment":"b","task":"second"}"#,
+            r#"{"environment":"b","task":"second","tools":["read"]}"#,
         )]),
         text_response("second started"),
         text_response("ack"),

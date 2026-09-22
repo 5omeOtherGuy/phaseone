@@ -734,7 +734,7 @@ async fn a0_a_parent_waiting_for_its_worker_is_not_continued() {
         tool_call_response(vec![json_call(
             "c1",
             "worker_start",
-            r#"{"environment":"child","task":"do it"}"#,
+            r#"{"environment":"child","task":"do it","tools":["read"]}"#,
         )]),
         text_response("waiting for the worker"),
         tool_call_response(vec![json_call(

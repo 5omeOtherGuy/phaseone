@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 
 use p1_assembly::Catalog;
+#[cfg(feature = "delegation")]
+use p1_assembly::ToolSpec;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
     AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
@@ -1662,13 +1664,54 @@ fn make_child_factory(
     Arc::new(move |spec: &ChildSpec| -> Result<ChildAgent, String> {
         let mut environment = load_environment(&spec.environment, &environment_dirs)
             .map_err(|error| error.to_string())?;
-        if environment
+        // A worker is assembled with EXACTLY the tools its parent granted, plus
+        // `finish` (every worker gets it, last, to report done or blocked). The
+        // environment's own `[[tools]]` list does not add or remove anything: an
+        // entry there only supplies the face the granted module is presented under.
+        // A module the environment does not mention is assembled with its default
+        // face, so a grant is never silently dropped.
+        debug_assert!(
+            spec.tools
+                .iter()
+                .all(|module| !module.starts_with("worker_")),
+            "the worker tools are not grantable: {:?}",
+            spec.tools
+        );
+        let mut granted = Vec::with_capacity(spec.tools.len() + 1);
+        for module in &spec.tools {
+            // A worker can never start workers: the worker tools are not grantable,
+            // but a direct [`ChildSpec`] could still name one. Refuse plainly rather
+            // than assemble a delegating child.
+            if module.starts_with("worker_") {
+                return Err(format!(
+                    "a worker cannot be granted the worker tool `{module}`"
+                ));
+            }
+            let own = environment
+                .tools
+                .iter()
+                .find(|tool| &tool.module == module)
+                .cloned();
+            granted.push(own.unwrap_or_else(|| ToolSpec {
+                module: module.clone(),
+                name: None,
+                description: None,
+                variant: None,
+            }));
+        }
+        let finish = environment
             .tools
             .iter()
-            .any(|tool| tool.module.starts_with("worker_"))
-        {
-            return Err("delegation inside a worker is not supported".to_string());
-        }
+            .find(|tool| tool.module == FINISH_MODULE)
+            .cloned()
+            .unwrap_or_else(|| ToolSpec {
+                module: FINISH_MODULE.to_string(),
+                name: None,
+                description: None,
+                variant: None,
+            });
+        granted.push(finish);
+        environment.tools = granted;
         let catalog = catalog_slot
             .get()
             .ok_or_else(|| "the host catalog is not ready".to_string())?

@@ -5,9 +5,10 @@
 //! declaration, parses its own input and renders its own output. Invalid input is
 //! an `Error` outcome the model can act on — never a panic.
 //!
-//! Descriptions tell the model the three facts that matter: a worker gets ONLY the
-//! task text, workers share this workspace, and completion arrives as a
-//! notification (so polling is pointless). `worker_result` adds: verify first.
+//! Descriptions tell the model the four facts that matter: a worker gets ONLY the
+//! task text, workers share this workspace, completion arrives as a notification
+//! (so polling is pointless), and the worker has ONLY the tools the parent lists in
+//! `tools`, plus `finish`. `worker_result` adds: verify first.
 
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ impl ToolFace {
 }
 
 const START_NAME: &str = "worker_start";
-const START_DESCRIPTION: &str = "Start a worker agent on an environment with a self-contained task.\nThe worker gets ONLY the task text — no conversation history — so the task must contain everything it needs.\nWorkers share this workspace: do not give two workers overlapping files.\nYou will be notified when it finishes; do not poll for it.";
+const START_DESCRIPTION: &str = "Start a worker agent on an environment with a self-contained task.\nThe worker gets ONLY the task text — no conversation history — so the task must contain everything it needs.\nWorkers share this workspace: do not give two workers overlapping files.\nYou will be notified when it finishes; do not poll for it.\nThe worker has ONLY the tools you list in `tools` (plus finish); tools you do not list do not exist for it. List every tool the task needs; if you are unsure whether it needs one, include it.";
 
 const RESULT_NAME: &str = "worker_result";
 const RESULT_DESCRIPTION: &str = "Read a worker's status and its final text.\nSet wait to true to block until the worker is no longer running (you can be cancelled while waiting).\nVerify the worker's result before relying on it.";
@@ -101,9 +102,22 @@ fn declaration(name: &str, description: &str, schema: serde_json::Value) -> Tool
 }
 
 /// The four tools, all backed by one service. Order matches the spec table.
-pub fn all(service: Arc<dyn WorkerService>) -> Vec<Arc<dyn Tool>> {
+///
+/// `grantable` is the tool MODULE names a parent may grant (`worker_start`'s
+/// `tools` enum) and `environments` the environment names it may run (its
+/// `environment` enum). Both come from the host: this crate still names no
+/// concrete tool, provider or environment.
+pub fn all(
+    service: Arc<dyn WorkerService>,
+    grantable: Vec<String>,
+    environments: Vec<String>,
+) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(WorkerStartTool::new(Arc::clone(&service))),
+        Arc::new(WorkerStartTool::new(
+            Arc::clone(&service),
+            grantable,
+            environments,
+        )),
         Arc::new(WorkerResultTool::new(Arc::clone(&service))),
         Arc::new(WorkerContinueTool::new(Arc::clone(&service))),
         Arc::new(WorkerCancelTool::new(service)),
@@ -115,26 +129,54 @@ pub fn all(service: Arc<dyn WorkerService>) -> Vec<Arc<dyn Tool>> {
 /// `worker_start`: starts one worker NOW and reports where it runs.
 pub struct WorkerStartTool {
     service: Arc<dyn WorkerService>,
+    /// Tool module names a worker may be granted; the schema's `tools` enum and
+    /// the list `execute` validates against. Never contains `finish` or `worker_*`.
+    grantable: Vec<String>,
+    /// Environment names a worker may run; the schema's `environment` enum.
+    environments: Vec<String>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkerStartTool {
-    pub fn new(service: Arc<dyn WorkerService>) -> Self {
+    pub fn new(
+        service: Arc<dyn WorkerService>,
+        grantable: Vec<String>,
+        environments: Vec<String>,
+    ) -> Self {
         Self {
             service,
-            declaration: declaration(START_NAME, START_DESCRIPTION, start_schema()),
+            declaration: declaration(
+                START_NAME,
+                START_DESCRIPTION,
+                start_schema(&grantable, &environments),
+            ),
             identity: identity("default"),
+            grantable,
+            environments,
         }
     }
 
     /// Present the same implementation under another name/description/variant.
+    /// Both lists are kept: the face changes only how the model sees the tool.
     pub fn with_face(self, face: ToolFace, variant: &str) -> Self {
+        let declaration = declaration(
+            &face.name,
+            &face.description,
+            start_schema(&self.grantable, &self.environments),
+        );
         Self {
             service: self.service,
-            declaration: declaration(&face.name, &face.description, start_schema()),
+            grantable: self.grantable,
+            environments: self.environments,
+            declaration,
             identity: identity(variant),
         }
+    }
+
+    /// The grantable modules joined for a model-readable message.
+    fn grantable_list(&self) -> String {
+        self.grantable.join(", ")
     }
 }
 
@@ -143,6 +185,10 @@ impl WorkerStartTool {
 struct StartInput {
     environment: String,
     task: String,
+    /// `serde(default)` so a missing `tools` reaches `execute` as an empty list and
+    /// gets the actionable "`tools` is required" message rather than a serde error.
+    #[serde(default)]
+    tools: Vec<String>,
 }
 
 impl Tool for WorkerStartTool {
@@ -168,9 +214,33 @@ impl Tool for WorkerStartTool {
                 Ok(input) => input,
                 Err(outcome) => return outcome,
             };
+            // Models do not always honour the schema, so the rules are enforced here
+            // too. An empty or missing grant is the same refusal, and nothing is
+            // started until every module is known and the grant is non-empty.
+            let mut tools = Vec::with_capacity(input.tools.len());
+            for module in input.tools {
+                if !self.grantable.contains(&module) {
+                    return ToolOutcome::error(format!(
+                        "Cannot start worker: `{module}` is not a tool module a worker can be \
+                         granted. Valid tools: {}",
+                        self.grantable_list()
+                    ));
+                }
+                // Duplicates are removed, keeping the first occurrence's order.
+                if !tools.contains(&module) {
+                    tools.push(module);
+                }
+            }
+            if tools.is_empty() {
+                return ToolOutcome::error(format!(
+                    "`tools` is required: list every tool module the worker needs, from: {}",
+                    self.grantable_list()
+                ));
+            }
             let spec = ChildSpec {
                 environment: input.environment,
                 task: input.task,
+                tools: tools.clone(),
                 workspace: None,
             };
             match self.service.start(spec).await {
@@ -182,9 +252,14 @@ impl Tool for WorkerStartTool {
                         .describe(&id)
                         .await
                         .unwrap_or_else(|_| String::new());
+                    // Every worker also gets `finish`, so the grant named here is the
+                    // grant plus it — the same list the worker's own prompt carries.
+                    tools.push("finish".to_string());
                     ToolOutcome::ok(format!(
-                        "{STARTED_PREFIX}{} on {description}. You will be notified when it finishes.",
-                        id.0
+                        "{STARTED_PREFIX}{} on {description} with tools: {}. You will be notified \
+                         when it finishes.",
+                        id.0,
+                        tools.join(", ")
                     ))
                 }
                 Err(error) => start_error(error),
@@ -467,20 +542,31 @@ fn render_status(id: &str, status: &ChildStatus) -> String {
     }
 }
 
-fn start_schema() -> serde_json::Value {
+fn start_schema(grantable: &[String], environments: &[String]) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
             "environment": {
                 "type": "string",
+                "enum": environments,
                 "description": "Environment (prompt, model and tools) the worker runs on."
             },
             "task": {
                 "type": "string",
                 "description": "The complete, self-contained task for the worker."
+            },
+            "tools": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                    "type": "string",
+                    "enum": grantable
+                },
+                "description": "Every tool module the worker needs. The worker gets ONLY these, plus finish."
             }
         },
-        "required": ["environment", "task"],
+        "required": ["environment", "task", "tools"],
         "additionalProperties": false
     })
 }
