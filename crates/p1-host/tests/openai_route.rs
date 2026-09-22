@@ -201,6 +201,8 @@ fn the_shipped_responses_route_holds_what_the_host_used_to_compile() {
     // be a different `wire_model` here, not a different profile.
     for id in [
         "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -344,11 +346,31 @@ fn the_shipped_gpt_environment_assembles_through_the_catalog_unchanged() {
 
 #[test]
 fn every_shipped_gpt_profile_carries_its_thinking_policy() {
-    // The efforts the ChatGPT/Codex subscription endpoint lists for this account (Codex
-    // CLI model cache, 2026-09-21); `ultra` has no p1 effort, so no profile lists it.
+    // Earlier profiles follow the Codex CLI cache (2026-09-21); GPT-6 Sol and Luna
+    // follow OpenAI's model docs. `ultra` has no p1 effort, so no profile lists it.
     for (id, efforts) in [
         (
             "gpt-6-astra",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-6-sol",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-6-luna",
             vec![
                 Effort::Low,
                 Effort::Medium,
@@ -397,7 +419,7 @@ fn every_shipped_gpt_profile_carries_its_thinking_policy() {
         assert_eq!(profile.family, "gpt", "{id}");
         assert_eq!(
             profile.efforts, efforts,
-            "{id}: the endpoint listed these efforts for this account"
+            "{id}: the profile lists the supported efforts"
         );
         // Spec §7.1: an effort-less request carries no reasoning fields, so no default.
         assert_eq!(profile.default_effort, None, "{id}");
@@ -405,6 +427,24 @@ fn every_shipped_gpt_profile_carries_its_thinking_policy() {
         // Unknown capacity is stated nowhere, never as zero.
         assert_eq!(profile.context_tokens, None, "{id}");
         assert_eq!(profile.max_output_tokens, None, "{id}");
+    }
+}
+
+#[test]
+fn new_gpt_6_models_build_requests_with_their_wire_ids_and_efforts() {
+    let route = load_route_by_id(&environment_dirs(), "openai-codex-subscription").unwrap();
+    let responses = responses_route(&route).unwrap();
+    let mut request = invalid_request();
+    request.options.max_output_tokens = None;
+
+    for id in ["gpt-6-sol", "gpt-6-luna"] {
+        let profile = shipped_profile(id);
+        for (effort, wire) in [(Effort::ExtraHigh, "xhigh"), (Effort::Max, "max")] {
+            request.options.reasoning_effort = Some(effort);
+            let body = build_request(&responses, id, &profile, &request).unwrap();
+            assert_eq!(body["model"], id);
+            assert_eq!(body["reasoning"]["effort"], wire);
+        }
     }
 }
 

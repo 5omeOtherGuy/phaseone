@@ -235,6 +235,8 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "gpt/gpt-5.6-sol",
             "gpt/gpt-5.6-terra",
             "gpt/gpt-6-astra",
+            "gpt/gpt-6-luna",
+            "gpt/gpt-6-sol",
         ],
         "sorted by environment then profile"
     );
@@ -743,7 +745,7 @@ fn the_table_is_aligned_and_marked() {
         .lines()
         .filter(|line| line.ends_with("scoped"))
         .collect();
-    assert_eq!(scoped.len(), 5);
+    assert_eq!(scoped.len(), 7);
     assert!(scoped.iter().all(|line| line.starts_with("gpt/")));
 }
 
