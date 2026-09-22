@@ -143,6 +143,9 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
         Command::Models { search } => models_command(deps, &options, search.as_deref()),
         // The login surface (ADR-0044, spec §6): no catalog, no provider and no
         // network — the store is written and the "which source" report is printed.
+        // The route quota ledger (ADR-0051): route metadata and p1-auth credential
+        // references go to `p1-usage`; no catalog, no provider.
+        Command::Usage(usage) => crate::usage::usage(deps, &usage).await,
         Command::Login { route } => crate::login::login(deps, &route).await,
         Command::LoginList => crate::login::list(deps),
         Command::Logout { route } => crate::login::logout(deps, &route).await,

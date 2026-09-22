@@ -64,6 +64,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0048 | [Providers may tell the operator something: a display-only notice event](0048-providers-may-tell-the-operator-something-a-display-only-notice-event.md) | accepted | 2026-09-21 | lead |
 | ADR-0049 | [Model selection and switching a session to another model](0049-model-selection-and-switching-a-session-to-another-model.md) | accepted | 2026-09-21 | owner+lead |
 | ADR-0050 | [Every main agent can start workers; a worker gets exactly the tools its parent grants](0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md) | accepted | 2026-09-22 | owner+lead |
+| ADR-0051 | [Usage ledger: p1-usage module and p1 usage command](0051-usage-ledger-p1-usage-module-and-p1-usage-command.md) | proposed | 2026-09-23 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

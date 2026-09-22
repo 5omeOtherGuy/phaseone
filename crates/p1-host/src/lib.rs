@@ -27,6 +27,7 @@ pub mod routes;
 pub mod run;
 pub mod session;
 pub mod tui;
+pub mod usage;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};

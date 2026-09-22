@@ -64,8 +64,20 @@ pub enum Command {
     Logout {
         route: String,
     },
+    /// The route quota ledger (ADR-0051): `p1 usage`.
+    Usage(UsageOptions),
     Help,
     Version,
+}
+
+/// Parsed arguments for `p1 usage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageOptions {
+    pub json: bool,
+    pub watch: Option<u64>,
+    pub plain: bool,
+    pub grid: usize,
+    pub search: Option<String>,
 }
 
 /// Parsed command line.
@@ -144,6 +156,7 @@ pub fn usage() -> String {
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str("  p1 env show NAME\n");
+    out.push_str("  p1 usage [--json] [--watch SECONDS] [--plain] [--grid N] [SEARCH]   route quota ledger\n");
     out.push_str("  p1 login <route>     read one API key from stdin and store it for ROUTE\n");
     out.push_str("  p1 login --list      every route, its credential kind and its source\n");
     out.push_str("  p1 logout <route>    remove ROUTE's entry from p1's store\n");
@@ -202,7 +215,7 @@ pub fn version() -> String {
 /// Parse the arguments after the program name.
 pub fn parse(args: &[String]) -> Result<Options, CliError> {
     if let Some(first) = args.first() {
-        if first == "--help" || first == "-h" {
+        if first == "--help" || first == "-h" || first == "help" {
             return Ok(defaults(Command::Help));
         }
         if first == "--version" || first == "-V" {
@@ -213,6 +226,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         }
         if first == "models" {
             return parse_models(args);
+        }
+        if first == "usage" {
+            return parse_usage(args);
         }
         if first == "login" {
             return parse_login(args);
@@ -454,6 +470,63 @@ fn parse_models(args: &[String]) -> Result<Options, CliError> {
     let mut options = defaults(Command::Models { search });
     options.models = models;
     Ok(options)
+}
+
+fn parse_usage(args: &[String]) -> Result<Options, CliError> {
+    let (mut json, mut plain, mut watch, mut grid, mut search) = (false, false, None, 32, None);
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--plain" => plain = true,
+            "--watch" => {
+                let value = take_value(args, &mut index, "--watch")?;
+                let seconds = value.parse::<u64>().map_err(|_| CliError {
+                    message: "--watch requires SECONDS >= 5".into(),
+                })?;
+                if seconds < 5 {
+                    return Err(CliError {
+                        message: "--watch requires SECONDS >= 5".into(),
+                    });
+                }
+                watch = Some(seconds);
+            }
+            "--grid" => {
+                let value = take_value(args, &mut index, "--grid")?;
+                grid = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| CliError {
+                        message: "--grid requires a positive number".into(),
+                    })?;
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError {
+                    message: format!("unknown flag `{other}`"),
+                });
+            }
+            other if search.is_none() => search = Some(other.to_string()),
+            other => {
+                return Err(CliError {
+                    message: format!("unexpected argument `{other}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    if json && watch.is_some() {
+        return Err(CliError {
+            message: "--json and --watch cannot be combined".into(),
+        });
+    }
+    Ok(defaults(Command::Usage(UsageOptions {
+        json,
+        watch,
+        plain,
+        grid,
+        search,
+    })))
 }
 
 /// `p1 login <route>` and `p1 login --list` (ADR-0044, spec §6). The key is never an
@@ -1066,6 +1139,37 @@ mod tests {
         assert!(parse(&args(&["--env", "gpt", "--model", "gpt/gpt-5.5"])).is_ok());
         assert!(parse(&args(&["--env", "claude", "--model", "claude-opus-5"])).is_ok());
         assert!(parse(&args(&["--model", "claude/claude-opus-5"])).is_ok());
+    }
+
+    #[test]
+    fn parses_usage_subcommand() {
+        let options = parse(&args(&[
+            "usage", "--plain", "--grid", "48", "--watch", "5", "claude",
+        ]))
+        .unwrap();
+        assert_eq!(
+            options.command,
+            Command::Usage(UsageOptions {
+                plain: true,
+                grid: 48,
+                watch: Some(5),
+                json: false,
+                search: Some("claude".into()),
+            })
+        );
+        assert!(!options.is_headless());
+        assert!(matches!(
+            parse(&args(&["usage", "--json"])).unwrap().command,
+            Command::Usage(UsageOptions { json: true, .. })
+        ));
+        assert!(parse(&args(&["usage", "--json", "--watch", "5"])).is_err());
+        assert!(parse(&args(&["usage", "--watch", "4"])).is_err());
+        assert!(parse(&args(&["usage", "--watch", "oops"])).is_err());
+        assert!(parse(&args(&["usage", "--grid", "oops"])).is_err());
+        assert!(parse(&args(&["usage", "--bogus"])).is_err());
+        assert!(parse(&args(&["usage", "a", "b"])).is_err());
+        assert!(usage().contains("p1 usage [--json]"));
+        assert_eq!(parse(&args(&["help"])).unwrap().command, Command::Help);
     }
 
     #[test]
