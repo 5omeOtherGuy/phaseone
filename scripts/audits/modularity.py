@@ -461,12 +461,11 @@ def run(wf, args):
         return path
 
     def after_run(label):
+        # checks only: a repair round resumes in the same tree; clean trees go at the end
         path = trees.get(label)
         status = git(path, "status", "--porcelain", "--untracked-files=all")
         if status.strip():
             return f"worker changed its worktree (kept for inspection at {path}): {status.strip()[:300]}"
-        with git_lock:
-            git(repo, "worktree", "remove", path)
         return None
 
     seen, confirmed, discarded, unverified = [], [], [], []
@@ -564,7 +563,7 @@ def run(wf, args):
                     lambda found, *_: wf.pipeline(found, lambda f, *_: verify(f)))
 
     with git_lock:
-        # trees of jobs reused from an earlier run were never handed to after_run
+        # every clean tree goes; a dirty one stays as evidence of a voided job
         for path in trees.values():
             if os.path.isdir(path) and not git(path, "status", "--porcelain", "--untracked-files=all").strip():
                 git(repo, "worktree", "remove", path, check=False)
