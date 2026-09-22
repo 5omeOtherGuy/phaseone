@@ -435,7 +435,43 @@ fn build_request(request: &ProviderRequest) -> serde_json::Value {
             _ => None,
         })
         .collect();
-    serde_json::json!({"prompt": request.system_prompt, "replay": replay})
+    // ADR-0049: the reference carries every call and result of the history, its own
+    // or another origin's. It has no freeform shape, so a freeform call travels as a
+    // function-shaped call whose arguments are `{"input": <raw text>}`.
+    let mut calls = Vec::new();
+    let mut results = Vec::new();
+    for item in &request.history {
+        match item {
+            Item::Assistant(item) => {
+                for block in &item.blocks {
+                    if let AssistantBlock::ToolCall(call) = block {
+                        let arguments = match &call.input {
+                            p1_contracts::ToolInput::Json(raw) => raw.clone(),
+                            p1_contracts::ToolInput::Text(raw) => {
+                                serde_json::json!({ "input": raw }).to_string()
+                            }
+                        };
+                        calls.push(serde_json::json!({
+                            "id": call.call_id,
+                            "name": call.name,
+                            "arguments": arguments,
+                        }));
+                    }
+                }
+            }
+            Item::ToolResult(result) => results.push(serde_json::json!({
+                "id": result.call_id,
+                "content": result.content,
+            })),
+            _ => {}
+        }
+    }
+    serde_json::json!({
+        "prompt": request.system_prompt,
+        "replay": replay,
+        "calls": calls,
+        "results": results,
+    })
 }
 
 fn invalid_request() -> ProviderRequest {

@@ -1,7 +1,7 @@
 use crate::{ChatDialect, ChatRoute};
 use p1_contracts::{
-    AssistantBlock, DeclarationKind, Effort, Item, ProviderError, ProviderErrorKind,
-    ProviderRequest, ToolInput,
+    AssistantBlock, AssistantItem, DeclarationKind, Effort, Item, Origin, ProviderError,
+    ProviderErrorKind, ProviderRequest, ToolInput,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use serde_json::{Value, json};
@@ -12,6 +12,7 @@ pub(crate) fn invalid(message: &str) -> ProviderError {
 
 pub(crate) fn validate(
     route: &ChatRoute,
+    model: &str,
     profile: &ModelProfile,
     request: &ProviderRequest,
 ) -> Result<(), ProviderError> {
@@ -75,12 +76,86 @@ pub(crate) fn validate(
             )));
         }
     }
+    // ADR-0049: the chat wire carries every tool input (a freeform call from
+    // another route becomes a function call whose arguments are `{"input": …}`) and
+    // drops foreign reasoning. Whatever is left that cannot be lowered is refused
+    // here, by the ONE lowering, before anything is sent.
+    let origin = route.origin(model);
+    for item in &request.history {
+        if let Item::Assistant(item) = item {
+            lower_item(&origin, item)?;
+        }
+    }
     Ok(())
 }
 
 /// Namespaces the OTHER compiled adapters own inside `ModelOptions::native`.
 /// Keys in no adapter's namespace keep their meaning: ignored.
 const FOREIGN_NATIVE_PREFIXES: &[&str] = &["anthropic-messages.", "openai-responses."];
+
+/// One assistant item as the chat wire carries it.
+struct LoweredItem {
+    text: String,
+    reasoning: String,
+    has_reasoning: bool,
+    calls: Vec<Value>,
+}
+
+/// The ONE lowering of one assistant item. Text is joined, an own-origin reasoning
+/// replay is replayed byte-exact, a FOREIGN reasoning block is dropped, never
+/// rendered as assistant text, and a tool call becomes a function call. A
+/// `ToolInput::Text` — a freeform call made on a route that has such a shape — has
+/// no freeform shape here, so its arguments are the JSON object
+/// `{"input": <raw text>}` (ADR-0049, model-selection.md §3). Everything else is
+/// refused with a sentence naming the item. `validate` and `build_request` share
+/// this, so `validate` can never accept a request the builder would reject.
+fn lower_item(origin: &Origin, item: &AssistantItem) -> Result<LoweredItem, ProviderError> {
+    let mut lowered = LoweredItem {
+        text: String::new(),
+        reasoning: String::new(),
+        has_reasoning: false,
+        calls: Vec::new(),
+    };
+    for block in &item.blocks {
+        match block {
+            AssistantBlock::Text { text } => lowered.text.push_str(text),
+            AssistantBlock::Reasoning {
+                replay: Some(data), ..
+            } if data.origin == *origin => {
+                if data.version != 1 {
+                    return Err(invalid(&format!(
+                        "cannot replay the reasoning block of the assistant item from {}/{}: \
+                         its replay data is version {}, this route reads version 1",
+                        data.origin.route, data.origin.model, data.version
+                    )));
+                }
+                let part = data.payload.as_str().ok_or_else(|| {
+                    invalid(&format!(
+                        "cannot replay the reasoning block of the assistant item from {}/{}: \
+                         its replay payload is not text",
+                        data.origin.route, data.origin.model
+                    ))
+                })?;
+                lowered.reasoning.push_str(part);
+                lowered.has_reasoning = true;
+            }
+            // Foreign reasoning: dropped entirely (providers.md "Replay").
+            AssistantBlock::Reasoning { .. } => {}
+            AssistantBlock::ToolCall(call) => {
+                let arguments = match &call.input {
+                    ToolInput::Json(raw) => raw.clone(),
+                    ToolInput::Text(raw) => json!({ "input": raw }).to_string(),
+                };
+                lowered.calls.push(json!({
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": { "name": call.name, "arguments": arguments },
+                }));
+            }
+        }
+    }
+    Ok(lowered)
+}
 
 /// Pure wire builder. Foreign reasoning is dropped, never rendered as assistant text.
 pub fn build_request(
@@ -90,7 +165,7 @@ pub fn build_request(
     request: &ProviderRequest,
 ) -> Result<Value, ProviderError> {
     crate::validate_composition(route, model, profile)?;
-    validate(route, profile, request)?;
+    validate(route, model, profile, request)?;
     let origin = route.origin(model);
     let mut messages = vec![json!({"role":"system", "content": request.system_prompt})];
     for item in &request.history {
@@ -102,39 +177,19 @@ pub fn build_request(
                 json!({"role":"tool", "tool_call_id":result.call_id, "content":result.content}),
             ),
             Item::Assistant(item) => {
-                let mut text = String::new();
-                let mut reasoning = String::new();
-                let mut has_reasoning = false;
-                let mut calls = Vec::new();
-                for block in &item.blocks {
-                    match block {
-                        AssistantBlock::Text { text: part } => text.push_str(part),
-                        AssistantBlock::Reasoning {
-                            replay: Some(data), ..
-                        } if data.origin == origin => {
-                            if data.version != 1 {
-                                return Err(invalid("unsupported reasoning replay version"));
-                            }
-                            let part = data
-                                .payload
-                                .as_str()
-                                .ok_or_else(|| invalid("invalid reasoning replay payload"))?;
-                            reasoning.push_str(part);
-                            has_reasoning = true;
-                        }
-                        AssistantBlock::Reasoning { .. } => {}
-                        AssistantBlock::ToolCall(call) => {
-                            let ToolInput::Json(raw) = &call.input else {
-                                return Err(invalid(
-                                    "cannot replay freeform tool input on a function route",
-                                ));
-                            };
-                            calls.push(json!({"id":call.call_id,"type":"function","function":{"name":call.name,"arguments":raw}}));
-                        }
-                    }
-                }
+                let LoweredItem {
+                    text,
+                    reasoning,
+                    has_reasoning,
+                    calls,
+                } = lower_item(&origin, item)?;
                 let mut message = json!({"role":"assistant","content":text});
-                if has_reasoning {
+                // A thinking-mode endpoint expects `reasoning_content` on every assistant
+                // message that carries tool calls; a response that reasoned nothing still
+                // has to replay the field, empty. Omitting it was answered with HTTP 400
+                // (`invalid_request_error`) by some replicas of the DeepSeek route
+                // (run ws-continuation, 2026-09-21).
+                if has_reasoning || !calls.is_empty() {
                     message["reasoning_content"] = json!(reasoning);
                 }
                 if !calls.is_empty() {
@@ -177,7 +232,7 @@ pub fn build_request(
 mod tests {
     use super::*;
     use p1_contracts::{
-        AssistantItem, ModelOptions, ReplayData, ToolCall, ToolDeclaration, ToolResultItem,
+        AssistantItem, ModelOptions, Origin, ReplayData, ToolCall, ToolDeclaration, ToolResultItem,
         ToolStatus,
     };
     fn request() -> ProviderRequest {
@@ -249,6 +304,58 @@ mod tests {
             assert!(!foreign.contains("display must"));
         }
     }
+    /// A response that called a tool without reasoning anything still replays the
+    /// field, empty: a thinking-mode endpoint refused the request without it (HTTP 400
+    /// `invalid_request_error`, run ws-continuation 2026-09-21). An assistant message
+    /// WITHOUT tool calls and without reasoning stays as it was.
+    #[test]
+    fn a_tool_call_without_reasoning_replays_an_empty_reasoning_field() {
+        for retained in [false, true] {
+            let route = crate::test_config::route(retained);
+            let profile = crate::test_config::profile(retained);
+            let mut r = request();
+            let origin = route.origin("model");
+            r.history = vec![
+                Item::User {
+                    text: "inspect".into(),
+                },
+                Item::Assistant(AssistantItem {
+                    origin: origin.clone(),
+                    blocks: vec![AssistantBlock::Text {
+                        text: "plain answer".into(),
+                    }],
+                }),
+                Item::User {
+                    text: "now read".into(),
+                },
+                Item::Assistant(AssistantItem {
+                    origin,
+                    blocks: vec![AssistantBlock::ToolCall(ToolCall {
+                        call_id: "call".into(),
+                        name: "read".into(),
+                        input: ToolInput::Json("{}".into()),
+                    })],
+                }),
+                Item::ToolResult(ToolResultItem {
+                    call_id: "call".into(),
+                    name: "read".into(),
+                    status: ToolStatus::Ok,
+                    content: "text".into(),
+                }),
+            ];
+            let body = build_request(&route, "model", &profile, &r).unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(
+                messages[2],
+                json!({"role":"assistant","content":"plain answer"})
+            );
+            assert_eq!(
+                messages[4],
+                json!({"role":"assistant","content":"","reasoning_content":"","tool_calls":[{"id":"call","type":"function","function":{"name":"read","arguments":"{}"}}]})
+            );
+        }
+    }
+
     #[test]
     fn rejects_unrepresentable_options_and_tools() {
         let route = crate::test_config::route(false);
@@ -287,6 +394,135 @@ mod tests {
             .is_err()
         );
     }
+    /// ADR-0049: a freeform call made on a route that has such a shape travels here
+    /// as a function call whose arguments are `{"input": <raw text>}`, a JSON call is
+    /// unchanged, and the foreign reasoning replay data stays dropped. `validate`
+    /// accepts what the builder lowers.
+    #[test]
+    fn a_foreign_history_lowers_freeform_calls_and_drops_foreign_reasoning() {
+        for retained in [false, true] {
+            let route = crate::test_config::route(retained);
+            let profile = crate::test_config::profile(retained);
+            let foreign = Origin {
+                route: "elsewhere/foreign-route".into(),
+                model: "foreign-model".into(),
+            };
+            let mut r = request();
+            r.history = vec![
+                Item::User { text: "go".into() },
+                Item::Assistant(AssistantItem {
+                    origin: foreign.clone(),
+                    blocks: vec![
+                        AssistantBlock::Reasoning {
+                            text: "foreign thought".into(),
+                            replay: Some(ReplayData {
+                                origin: foreign,
+                                version: 1,
+                                payload: json!("FOREIGN-REPLAY-LEAF"),
+                            }),
+                        },
+                        AssistantBlock::ToolCall(ToolCall {
+                            call_id: "call_json".into(),
+                            name: "read".into(),
+                            input: ToolInput::Json(r#"{"path":"a.txt"}"#.into()),
+                        }),
+                        AssistantBlock::ToolCall(ToolCall {
+                            call_id: "call_text".into(),
+                            name: "apply_patch".into(),
+                            input: ToolInput::Text("*** Begin Patch ***".into()),
+                        }),
+                    ],
+                }),
+                Item::ToolResult(ToolResultItem {
+                    call_id: "call_json".into(),
+                    name: "read".into(),
+                    status: ToolStatus::Ok,
+                    content: "file body".into(),
+                }),
+                Item::ToolResult(ToolResultItem {
+                    call_id: "call_text".into(),
+                    name: "apply_patch".into(),
+                    status: ToolStatus::Ok,
+                    content: "patch applied".into(),
+                }),
+            ];
+            validate(&route, "model", &profile, &r).expect("a foreign history lowers");
+            let body = build_request(&route, "model", &profile, &r).unwrap();
+            let calls = body["messages"][2]["tool_calls"].as_array().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["id"], json!("call_json"));
+            assert_eq!(
+                calls[0]["function"]["arguments"],
+                json!(r#"{"path":"a.txt"}"#)
+            );
+            assert_eq!(calls[1]["id"], json!("call_text"));
+            assert_eq!(
+                calls[1]["function"]["arguments"],
+                json!(r#"{"input":"*** Begin Patch ***"}"#)
+            );
+            assert_eq!(body["messages"][3]["tool_call_id"], json!("call_json"));
+            assert_eq!(body["messages"][4]["tool_call_id"], json!("call_text"));
+            let rendered = body.to_string();
+            assert!(!rendered.contains("FOREIGN-REPLAY-LEAF"), "{rendered}");
+            assert!(!rendered.contains("foreign thought"), "{rendered}");
+            // A foreign replay at another VERSION is dropped with the rest, never
+            // refused: only this route's own data can be unreadable.
+            let mut foreign_v2 = r.clone();
+            if let Item::Assistant(item) = &mut foreign_v2.history[1]
+                && let AssistantBlock::Reasoning {
+                    replay: Some(data), ..
+                } = &mut item.blocks[0]
+            {
+                data.version = 2;
+            }
+            assert!(validate(&route, "model", &profile, &foreign_v2).is_ok());
+            assert!(build_request(&route, "model", &profile, &foreign_v2).is_ok());
+        }
+    }
+
+    /// The one history this route still cannot lower is its OWN reasoning replay in
+    /// a shape it does not read; the refusal names the item (ADR-0049).
+    #[test]
+    fn validate_refuses_an_own_reasoning_replay_it_cannot_read_and_names_it() {
+        let route = crate::test_config::route(false);
+        let profile = crate::test_config::profile(false);
+        let origin = route.origin("model");
+        for (version, payload, expected) in [
+            (2u32, json!("reasoning"), "version 2"),
+            (1, json!({ "parts": ["x"] }), "is not text"),
+        ] {
+            let mut r = request();
+            r.history = vec![
+                Item::User { text: "go".into() },
+                Item::Assistant(AssistantItem {
+                    origin: origin.clone(),
+                    blocks: vec![AssistantBlock::Reasoning {
+                        text: "shown".into(),
+                        replay: Some(ReplayData {
+                            origin: origin.clone(),
+                            version,
+                            payload,
+                        }),
+                    }],
+                }),
+            ];
+            let error = validate(&route, "model", &profile, &r).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+            for part in [
+                "assistant item from",
+                origin.route.as_str(),
+                origin.model.as_str(),
+                expected,
+            ] {
+                assert!(error.message.contains(part), "{}: {part}", error.message);
+            }
+            assert_eq!(
+                build_request(&route, "model", &profile, &r).unwrap_err(),
+                error
+            );
+        }
+    }
+
     #[test]
     fn a_native_option_in_another_adapters_namespace_is_an_error() {
         let route = crate::test_config::route(false);

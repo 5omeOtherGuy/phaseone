@@ -16,7 +16,13 @@ transport = "sse"        # default when absent; or "websocket"
 
 Any other value, or the key on another adapter, is a route-file error (fail fast, as every other
 unknown setting). `"websocket"` means: try WebSocket, fall back to SSE by the rules of §5.
-The shipped Codex route keeps `sse` until the lead's live probe (§8) has passed.
+**Owner decision 2026-09-21: WebSocket is the default wherever a route supports it** — the
+shipped Codex route sets `transport = "websocket"` (the adapter's own default for a route file
+without the key stays `sse`, so a new Responses route opts in explicitly).
+
+The host composes the real connector; `catalog::route_provider` takes the connector as a
+parameter next to the HTTP transport, so tests and live checks inject theirs (a test that
+composes a shipped route must never open a real socket — AGENTS.md: no live network in tests).
 
 ## 2. The connector seam — `p1-provider-http::ws`
 
@@ -78,15 +84,18 @@ Before any model-visible output of this request:
 |---|---|
 | Upgrade refused 401/403 | ONE forced credential refresh, reconnect once; refused again → `Authentication` |
 | Upgrade refused 429 | `RateLimited` (no fallback: SSE would hit the same limit) |
-| Upgrade refused, any other status; connect error or timeout | fall back to SSE |
+| Upgrade refused, any other status (the endpoint says no) | fall back to SSE at once |
 | Error event `previous_response_not_found` | reconnect, send FULL input, once |
 | Error event `websocket_connection_limit_reached` | reconnect, send FULL input, once |
 | A reused socket closes before its first frame | reconnect, send FULL input, once |
 | Any other error event | what the existing parser makes of it (same kinds as SSE) |
-| Read/send error or close mid-handshake, retries above exhausted | fall back to SSE |
+| Connect error or timeout; read/send error or close before visible output | reconnect with the FULL body, with the adapter's retry policy's backoff, up to its `max_retries` (default 3) — then fall back to SSE |
 
 "Fall back to SSE" = run today's `drive()` path for THIS request and turn WebSocket off for this
-provider instance (until the process ends). At most one reconnect per request. After
+provider instance (until the process ends). The adapter emits ONE `StreamEvent::Notice` when it falls back
+(ADR-0048), so the operator sees which transport the run uses. Reconnects per request: one for each of the three
+"once" rows, and up to `max_retries` for the transient row [donor `WsRecoveryState`: retries
+within the budget, then `FallbackSse` + `disable_ws_for_session`; after visible output `Fatal`]. After
 model-visible output, every failure is an ordinary `Transport` failure of that response — no
 retry inside the adapter, no fallback (the host's turn-level retry, completion.md §3b, applies).
 `InsufficientBalance` (ADR-0046) is emitted wherever the SSE path would emit it.
@@ -124,7 +133,10 @@ process starts with a new connection and a full body.
   busy connection → SSE; cancellation drops the socket; `transport` absent → byte-identical SSE.
 - **Stage C — continuation**: §6, with tests for each of the three rules failing and for the
   full-body recovery rows of §5.
-- **Live probe (lead only, few requests)**: `environments/gpt` with a scratch route set to
-  `websocket`: a connect succeeds; a two-turn task reports a lower `input_uncached` on turn ≥ 2
-  than the SSE arm with the same accepted result. Only then does the shipped route switch.
-  No latency claim is made from this.
+- **Live probe (lead only) — RUN 2026-09-21, see `docs/research/41-websocket.md`.** The
+  subscription backend accepts the upgrade and the continuation. The criterion first written
+  here (a lower `input_uncached` on turn ≥ 2) was the wrong metric: the server counts the
+  remembered context as input, so reported usage does not change; on a small task neither cache
+  share nor wall time differed between the arms. The shipped route therefore stays `sse`.
+  A comparison on long sessions (upload size) is open and needs the transport to be visible to
+  the operator first. No latency claim is made.

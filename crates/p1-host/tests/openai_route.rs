@@ -25,9 +25,11 @@ use p1_host::cli::SandboxMode;
 use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
-use p1_provider_http::testing::ScriptedTransport;
+use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
-use p1_provider_openai::{ROUTE, ResponsesAccount, ResponsesAdapterSettings, build_request};
+use p1_provider_openai::{
+    ROUTE, ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport, build_request,
+};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
 
@@ -113,7 +115,10 @@ fn composed(environment: &str) -> Composed {
     }
 }
 
-/// The provider the catalog factory would build for this composition.
+/// The provider the catalog factory would build for this composition. The connector
+/// is injected next to the transport (ADR-0047 §1): it REFUSES every upgrade, so the
+/// shipped route — which asks for WebSocket — falls back to SSE at once and this
+/// scripted transport serves every request. No test opens a socket.
 fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = composed
         .route
@@ -124,6 +129,7 @@ fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Pro
         binding,
         composed.profile.clone(),
         Arc::new(transport),
+        Arc::new(RefusingWsConnector::default()),
         Arc::new(Fixed),
     )
     .expect("the shipped route composes")
@@ -185,12 +191,23 @@ fn the_shipped_responses_route_holds_what_the_host_used_to_compile() {
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
             account: ResponsesAccount::CodexSubscription,
+            // ADR-0047 §1 (owner decision 2026-09-21): WebSocket is the default
+            // wherever a route supports it, so the shipped Codex route asks for it.
+            transport: ResponsesTransport::Websocket,
         })
     );
     assert!(route.headers.is_empty(), "no static headers on this route");
     // Every shipped GPT profile is reachable by its own name; a dated snapshot would
     // be a different `wire_model` here, not a different profile.
-    for id in ["gpt-5.6-sol", "gpt-5.6-sol-mini"] {
+    for id in [
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+    ] {
         assert_eq!(route.binding(id).expect("served").wire_model, id);
     }
 }
@@ -329,15 +346,80 @@ fn the_shipped_gpt_environment_assembles_through_the_catalog_unchanged() {
 
 #[test]
 fn every_shipped_gpt_profile_carries_its_thinking_policy() {
-    for id in ["gpt-5.6-sol", "gpt-5.6-sol-mini"] {
+    // Earlier profiles follow the Codex CLI cache (2026-09-21); GPT-6 Sol and Luna
+    // follow OpenAI's model docs. `ultra` has no p1 effort, so no profile lists it.
+    for (id, efforts) in [
+        (
+            "gpt-6-astra",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-6-sol",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-6-luna",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-5.6-sol",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-5.6-terra",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-5.6-luna",
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max,
+            ],
+        ),
+        (
+            "gpt-5.5",
+            vec![Effort::Low, Effort::Medium, Effort::High, Effort::ExtraHigh],
+        ),
+    ] {
         let profile = shipped_profile(id);
         assert_eq!(profile.thinking, ThinkingPolicy::EffortLevel, "{id}");
         assert_eq!(profile.family, "gpt", "{id}");
         assert_eq!(
-            profile.efforts,
-            vec![Effort::Low, Effort::Medium, Effort::High],
-            "{id}: the adapter rejected extra_high/max outright, so the profile lists \
-             no higher lane"
+            profile.efforts, efforts,
+            "{id}: the profile lists the supported efforts"
         );
         // Spec §7.1: an effort-less request carries no reasoning fields, so no default.
         assert_eq!(profile.default_effort, None, "{id}");
@@ -345,6 +427,24 @@ fn every_shipped_gpt_profile_carries_its_thinking_policy() {
         // Unknown capacity is stated nowhere, never as zero.
         assert_eq!(profile.context_tokens, None, "{id}");
         assert_eq!(profile.max_output_tokens, None, "{id}");
+    }
+}
+
+#[test]
+fn new_gpt_6_models_build_requests_with_their_wire_ids_and_efforts() {
+    let route = load_route_by_id(&environment_dirs(), "openai-codex-subscription").unwrap();
+    let responses = responses_route(&route).unwrap();
+    let mut request = invalid_request();
+    request.options.max_output_tokens = None;
+
+    for id in ["gpt-6-sol", "gpt-6-luna"] {
+        let profile = shipped_profile(id);
+        for (effort, wire) in [(Effort::ExtraHigh, "xhigh"), (Effort::Max, "max")] {
+            request.options.reasoning_effort = Some(effort);
+            let body = build_request(&responses, id, &profile, &request).unwrap();
+            assert_eq!(body["model"], id);
+            assert_eq!(body["reasoning"]["effort"], wire);
+        }
     }
 }
 
@@ -480,7 +580,7 @@ fn budget_table() -> &'static str {
 /// the adapter (spec §7.1/§7.4). The route file is the shipped one.
 #[test]
 fn assembly_refuses_each_adapter_and_profile_variant_pair() {
-    // `openai-codex-subscription` binds `gpt-5.6-sol` and `gpt-5.6-sol-mini`.
+    // `openai-codex-subscription` binds every GPT profile the host ships.
     let cases = [
         ("budget", budget_table()),
         ("enabled", ""),

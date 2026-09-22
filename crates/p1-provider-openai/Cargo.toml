@@ -15,6 +15,11 @@ p1-model-profile = { path = "../p1-model-profile" }
 p1-provider-http = { path = "../p1-provider-http" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The WebSocket transport (`src/websocket.rs`) is their only user: an async mutex
+# for the one connection slot, `time::timeout` for §4's bounds, and
+# `unfold`/`select` for the hand-written stream.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 
 [dev-dependencies]
 p1-provider-conformance = { path = "../p1-provider-conformance" }

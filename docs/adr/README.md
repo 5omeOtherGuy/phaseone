@@ -39,14 +39,14 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0023 | [Cancellation precedence and sequential tool execution](0023-cancellation-precedence-and-sequential-tools.md) | accepted | 2026-09-20 | lead |
 | ADR-0024 | [Authorization is Permit/Deny at the core; ask lives in the host](0024-authorization-permit-deny-at-the-core.md) | accepted | 2026-09-20 | lead |
 | ADR-0025 | [Always-on workspace confinement and read-before-mutate, with apply_patch exempt](0025-workspace-confinement-and-read-before-mutate.md) | accepted | 2026-09-20 | lead |
-| ADR-0026 | [Delegation is an optional module, never imposed](0026-delegation-is-optional.md) | accepted | 2026-09-20 | owner+lead |
+| ADR-0026 | [Delegation is an optional module, never imposed](0026-delegation-is-optional.md) | superseded by ADR-0050 | 2026-09-20 | owner+lead |
 | ADR-0027 | [Workers are dispatched directly, with a machine-wide bounded pool](0027-workers-dispatched-directly-with-a-bounded-pool.md) | accepted | 2026-09-20 | owner+lead |
 | ADR-0028 | [Lead authority while the owner is away](0028-lead-authority-while-owner-is-away.md) | accepted | 2026-09-20 | owner |
 | ADR-0029 | [Test-first with independent authors and frozen suites](0029-test-first-with-independent-authors-and-frozen-suites.md) | accepted | 2026-09-20 | lead |
 | ADR-0030 | [Decisions are recorded as ADRs](0030-decisions-are-recorded-as-adrs.md) | accepted | 2026-09-20 | owner+lead |
 | ADR-0031 | [A session file is owned before it is read](0031-a-session-file-is-owned-before-it-is-read.md) | accepted | 2026-09-20 | lead |
 | ADR-0032 | [Agents sharing a directory serialize their file mutations](0032-agents-sharing-a-directory-serialize-their-file-mutations.md) | accepted | 2026-09-20 | lead |
-| ADR-0033 | [A session resumes only on the route and model that recorded it](0033-a-session-resumes-only-on-the-route-and-model-that-recorded-it.md) | accepted | 2026-09-20 | lead |
+| ADR-0033 | [A session resumes only on the route and model that recorded it](0033-a-session-resumes-only-on-the-route-and-model-that-recorded-it.md) | superseded by ADR-0049 | 2026-09-20 | lead |
 | ADR-0034 | [Workers are not restored when their parent session resumes](0034-workers-are-not-restored-when-their-parent-session-resumes.md) | accepted | 2026-09-20 | lead |
 | ADR-0035 | [The shell tool can run inside a bubblewrap execution boundary](0035-the-shell-tool-can-run-inside-a-bubblewrap-execution-boundary.md) | accepted | 2026-09-20 | lead |
 | ADR-0036 | [Context control is a summarizing policy module with a durable, validated replacement](0036-context-control-is-a-summarizing-policy-module-with-a-durable-validated-replacement.md) | accepted | 2026-09-20 | lead |
@@ -60,7 +60,10 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0044 | [p1 login stores pasted API keys in p1's own store](0044-p1-login-stores-pasted-api-keys-in-p1-s-own-store.md) | accepted | 2026-09-20 | owner |
 | ADR-0045 | [Research items are issues that end used or discarded; a curator organises research, the lead alone develops](0045-research-items-are-issues-that-end-used-or-discarded-a-curator-organises-research-the-lead-alone-develops.md) | accepted | 2026-09-20 | owner+lead |
 | ADR-0046 | [An exhausted account is its own provider error kind; it is never refreshed or retried](0046-an-exhausted-account-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md) | accepted | 2026-09-21 | lead |
-| ADR-0047 | [The Codex route may speak WebSocket: an adapter-local transport with SSE as the fallback](0047-the-codex-route-may-speak-websocket-an-adapter-local-transport-with-sse-as-the-fallback.md) | proposed | 2026-09-21 | owner+lead |
+| ADR-0047 | [The Codex route may speak WebSocket: an adapter-local transport with SSE as the fallback](0047-the-codex-route-may-speak-websocket-an-adapter-local-transport-with-sse-as-the-fallback.md) | accepted | 2026-09-21 | owner+lead |
+| ADR-0048 | [Providers may tell the operator something: a display-only notice event](0048-providers-may-tell-the-operator-something-a-display-only-notice-event.md) | accepted | 2026-09-21 | lead |
+| ADR-0049 | [Model selection and switching a session to another model](0049-model-selection-and-switching-a-session-to-another-model.md) | accepted | 2026-09-21 | owner+lead |
+| ADR-0050 | [Every main agent can start workers; a worker gets exactly the tools its parent grants](0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md) | accepted | 2026-09-22 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

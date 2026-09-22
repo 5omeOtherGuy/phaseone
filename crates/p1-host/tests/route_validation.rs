@@ -118,7 +118,10 @@ fn show_in(root: &Path, name: &str) -> (i32, String) {
 
 #[test]
 fn every_shipped_environment_still_assembles() {
-    for name in ["claude", "claude-delegating", "gpt", "deepseek", "glm"] {
+    // Every main agent gets the worker tools from the host (ADR-0050), so every
+    // shipped environment assembles with or without the `delegation` feature.
+    let shipped = ["claude", "gpt", "deepseek", "glm"];
+    for name in shipped {
         let (code, stdout, stderr) = show_env(name);
         assert_eq!(code, 0, "{name}: {stderr}");
         let resolved: Value = common::env_show_json(&stdout);
@@ -237,4 +240,40 @@ fn an_explicit_cache_key_on_an_anthropic_route_fails_assembly() {
     let (code, stderr) = show_in(root.path(), "keyed");
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("takes no cache key"), "{stderr}");
+}
+
+// ------------------------------------------------------ the Responses transport
+
+/// ADR-0047 §1 through the host: the SHIPPED route asks for
+/// `transport = "websocket"` (owner decision 2026-09-21: WebSocket is the default
+/// wherever a route supports it), it is composed with the host's real connector and
+/// resolves exactly like an SSE one — the transport is not part of a response's
+/// origin — and an unknown value fails the load before anything is composed.
+#[test]
+fn a_websocket_route_resolves_and_an_unknown_transport_fails_the_load() {
+    let root = codex_root();
+    let path = root.path().join("routes/openai-codex-subscription.toml");
+    let shipped = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        shipped.contains("transport = \"websocket\""),
+        "ADR-0047 §1: the shipped route asks for WebSocket"
+    );
+
+    write_environment(
+        root.path(),
+        "ws",
+        "route = \"openai-codex-subscription\"\nprofile = \"gpt-5.6-sol\"\n",
+    );
+    let (code, stderr) = show_in(root.path(), "ws");
+    assert_eq!(code, 0, "{stderr}");
+
+    std::fs::write(
+        &path,
+        shipped.replace("transport = \"websocket\"", "transport = \"quic\""),
+    )
+    .unwrap();
+    let (code, stderr) = show_in(root.path(), "ws");
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("invalid `[adapter_settings]`"), "{stderr}");
+    assert!(stderr.contains("websocket"), "{stderr}");
 }

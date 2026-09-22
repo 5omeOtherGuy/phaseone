@@ -77,15 +77,14 @@ impl ResponsesAccount {
     }
 }
 
-/// Build the fixed header set this account requires from the credential and the
-/// request's cache key. When `cache_key` is set it is also sent as `session_id`
-/// and `conversation_id`, so the wire's session identity matches the body. The
-/// credential is the only other input; an absent account id on an account that
-/// needs one is an authentication failure.
-pub fn build_headers(
+/// The credential-and-identity headers BOTH transports send, in this order:
+/// `Authorization`, the account-id header (for an account that needs one),
+/// `originator` and `User-Agent`. The SSE header set and the WebSocket handshake
+/// each append their own protocol headers to exactly this prefix, so the two
+/// cannot drift apart on what identifies the credential and the client.
+fn identity_headers(
     account: ResponsesAccount,
     credential: &Credential,
-    cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
     let mut headers = vec![(
         "Authorization".to_string(),
@@ -106,6 +105,22 @@ pub fn build_headers(
             "User-Agent".to_string(),
             format!("p1/{}", env!("CARGO_PKG_VERSION")),
         ),
+    ]);
+    Ok(headers)
+}
+
+/// Build the fixed header set this account requires from the credential and the
+/// request's cache key. When `cache_key` is set it is also sent as `session_id`
+/// and `conversation_id`, so the wire's session identity matches the body. The
+/// credential is the only other input; an absent account id on an account that
+/// needs one is an authentication failure.
+pub fn build_headers(
+    account: ResponsesAccount,
+    credential: &Credential,
+    cache_key: Option<&str>,
+) -> Result<Vec<(String, String)>, ProviderError> {
+    let mut headers = identity_headers(account, credential)?;
+    headers.extend([
         (
             "OpenAI-Beta".to_string(),
             "responses=experimental".to_string(),
@@ -118,6 +133,44 @@ pub fn build_headers(
         headers.push(("conversation_id".to_string(), key.to_string()));
     }
     Ok(headers)
+}
+
+/// The header set of a WebSocket handshake (`docs/design/websocket.md` §3): the
+/// shared identity headers, the WebSocket `OpenAI-Beta` value, and — when the
+/// request has a cache key — the session identity under the WebSocket spelling.
+/// Deliberately NO `Content-Type` and no `Accept`: one text frame replaces the
+/// HTTP request, and the answer is not an event stream.
+pub(crate) fn build_ws_headers(
+    account: ResponsesAccount,
+    credential: &Credential,
+    cache_key: Option<&str>,
+) -> Result<Vec<(String, String)>, ProviderError> {
+    let mut headers = identity_headers(account, credential)?;
+    headers.push((
+        "OpenAI-Beta".to_string(),
+        "responses_websockets=2026-02-06".to_string(),
+    ));
+    if let Some(key) = cache_key {
+        headers.push(("session-id".to_string(), key.to_string()));
+        headers.push(("x-client-request-id".to_string(), format!("p1-{key}")));
+    }
+    Ok(headers)
+}
+
+/// The ONE text frame a WebSocket request sends (`docs/design/websocket.md` §3):
+/// the JSON body the SSE path would send, minus the fields the vendor does not use
+/// in WebSocket mode, plus the frame's own `type`.
+///
+/// This is the pure half of §3; which BODY goes into it (today always the full
+/// one, later a continuation) is decided by the connection owner.
+pub(crate) fn ws_frame(body: &Value) -> String {
+    let mut frame = body.clone();
+    if let Value::Object(fields) = &mut frame {
+        fields.remove("stream");
+        fields.remove("background");
+        fields.insert("type".to_string(), json!("response.create"));
+    }
+    frame.to_string()
 }
 
 fn invalid(message: &str) -> ProviderError {
@@ -430,6 +483,7 @@ mod tests {
             origin_route: crate::ROUTE.to_string(),
             endpoint: "https://chatgpt.com/backend-api".to_string(),
             account: crate::ResponsesAccount::CodexSubscription,
+            transport: crate::ResponsesTransport::Sse,
         }
     }
 
@@ -556,6 +610,89 @@ mod tests {
         let error = build_headers(account(), &credential(None), None).unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::Authentication);
         assert!(!error.message.contains("SENTINEL-ACCESS"));
+    }
+
+    #[test]
+    fn builds_the_exact_websocket_header_set() {
+        let headers = build_ws_headers(account(), &credential(Some("acct_1")), None).unwrap();
+        assert_eq!(
+            headers,
+            vec![
+                (
+                    "Authorization".to_string(),
+                    "Bearer SENTINEL-ACCESS".to_string()
+                ),
+                ("chatgpt-account-id".to_string(), "acct_1".to_string()),
+                ("originator".to_string(), "p1".to_string()),
+                (
+                    "User-Agent".to_string(),
+                    format!("p1/{}", env!("CARGO_PKG_VERSION"))
+                ),
+                (
+                    "OpenAI-Beta".to_string(),
+                    "responses_websockets=2026-02-06".to_string()
+                ),
+            ],
+            "the shared identity prefix, the WebSocket beta value, and nothing else"
+        );
+        for absent in ["Content-Type", "Accept"] {
+            assert!(
+                header(&headers, absent).is_none(),
+                "{absent} must not be sent on a WebSocket handshake"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_session_headers_need_a_cache_key() {
+        let mut request = request_with(vec![user("hi")], Vec::new());
+        request.options.cache_key = Some("agent-a-key".to_string());
+        let key = clamped_cache_key(&request.options).unwrap();
+        let headers = build_ws_headers(account(), &credential(Some("acct_1")), Some(&key)).unwrap();
+        assert_eq!(header(&headers, "session-id"), Some("agent-a-key"));
+        assert_eq!(
+            header(&headers, "x-client-request-id"),
+            Some("p1-agent-a-key")
+        );
+        assert!(header(&headers, "session_id").is_none());
+        assert!(header(&headers, "conversation_id").is_none());
+
+        let headers = build_ws_headers(account(), &credential(Some("acct_1")), None).unwrap();
+        assert!(header(&headers, "session-id").is_none());
+        assert!(header(&headers, "x-client-request-id").is_none());
+    }
+
+    #[test]
+    fn the_websocket_frame_is_the_body_without_stream_and_background_plus_a_type() {
+        let request = request_with(vec![user("hello")], Vec::new());
+        let body = build("gpt-test", &request).unwrap();
+        assert_eq!(body["stream"], json!(true), "the SSE body streams");
+        let frame: Value = serde_json::from_str(&ws_frame(&body)).unwrap();
+        assert_eq!(
+            frame,
+            json!({
+                "model": "gpt-test",
+                "store": false,
+                "instructions": "You are a coding assistant.",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "hello" }],
+                }],
+                "text": { "verbosity": "low" },
+                "type": "response.create",
+            })
+        );
+        assert!(frame.get("stream").is_none());
+        assert!(frame.get("background").is_none());
+
+        // A body that DOES carry `background` loses it too: the frame is the SSE
+        // body minus both fields, whether or not this route sets one.
+        let with_background = json!({ "stream": true, "background": true, "model": "gpt-test" });
+        assert_eq!(
+            serde_json::from_str::<Value>(&ws_frame(&with_background)).unwrap(),
+            json!({ "model": "gpt-test", "type": "response.create" })
+        );
     }
 
     #[test]

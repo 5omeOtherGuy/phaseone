@@ -1,7 +1,7 @@
 ---
 adr: 47
 title: The Codex route may speak WebSocket: an adapter-local transport with SSE as the fallback
-status: proposed
+status: accepted
 date: 2026-09-21
 deciders: owner+lead
 supersedes: []

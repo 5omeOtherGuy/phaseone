@@ -1,183 +1,113 @@
-# Status
+# Status — 2026-09-22
 
-Handoff: `/home/phaseonebig/projects/phaseone-collab/fable-orchestrator-prompt.md`.
-After any context compaction: re-read this file and `DECISIONS.md` first.
-Remote: github.com/5omeOtherGuy/phaseone (PUBLIC). Trunk-based: `task/*` branches, merge to
-`main` when the gate is green, push (D6, D11). Shared target dir, one compile at a time (D12).
-Only the lead edits this file (D13). Started 2026-09-19.
+Handoff: `/home/phaseonebig/projects/phaseone-collab/fable-orchestrator-prompt.md`; after any
+context compaction re-read this file and `DECISIONS.md` first.
+Remote: github.com/5omeOtherGuy/phaseone (PUBLIC), trunk-based (`task/*` → `main` on green, push;
+D6, D11, ADR-0010); per-worktree seeded targets + rustc semaphore (D20, ADR-0014); only the lead
+edits this file (D13). Started 2026-09-19.
 
-## Done (all on main, gate green, pushed, CI green)
-- Build/infra: gate, core-isolation check, per-worktree seeded targets + global rustc semaphore
-  (D20, replaces the unsound shared target of D12), direct worker fan-out `scripts/fanout.py`.
-- Specs in `docs/design/`: routes (+ live results §D), core (R1-R6), tools, providers (+ origin
-  ruling), assembly, journal, delegation.
-- Crates (19): contracts, testkit, core (+ project/resume), workspace, tool-read/edit/write/
-  search/shell/patch, tool-tests (lead adversarial), provider-http, provider-conformance,
-  provider-anthropic, provider-openai, journal, assembly, workers, tool-delegate, live (lead).
-- BOTH adapters pass the ONE conformance suite (15 checks) and the LIVE smoke checks
-  (2026-09-20): text, tool call, tool-result follow-up; Codex route accepts freeform apply_patch.
-- `environments/{claude,gpt}`: config + family prompts, coherence-tested.
+**p1 today.** A working, lean Rust coding harness (27 crates; `scripts/gate.sh` green) on five
+environments — `claude`, `deepseek`, `deepseek2`, `glm`, `gpt`. A provider is one wire adapter ×
+route × model profile composed into ONE runtime `Provider` (ADR-0039); model selection and
+mid-session switching are live (ADR-0049); every main agent can start workers with explicit tool
+grants (ADR-0050); resume, context control, `finish` and the TUI are mounted.
 
-## In progress
-- nothing. The first slice is DONE (2026-09-20): every seams.md §10 acceptance item is
-  demonstrated by a command in `docs/SLICE-REPORT.md`, including live runs on both routes,
-  live cross-route delegation and live resume.
+**Where the lead stands.** `main` = `604604b`, CI green on that commit; ADRs 0001–0050 (0009→0010,
+0013→0014, 0026→0050, 0033→0049 superseded). Open work: #46–#48, #12, #45 (owner), #6, #25.
 
-- ADR system added after the slice (owner request): `docs/adr/` (30 ADRs), `scripts/adr.py`,
-  checked in the gate. New decisions are ADRs; `DECISIONS.md` is the frozen ledger (ADR-0030).
+## Next — READ FIRST
 
-## Next — READ FIRST after compaction
-State 2026-09-20 evening: main = green gate + green CI on the exact commit (always push with
-`scripts/push-main.sh`). ADRs 0031–0040. No lead worktree open; only Astra's
-`../phaseone-9-subscription-routes`. Owner messages arrive mid-turn; Astra sits in tmux pane %39 (codex).
+HOW THE LEAD WORKS (owner instructions)
+- Implementation goes to DeepSeek workers by default: `scripts/fanout.py <jobs.json>` with jobs
+  `{"runner": "p1", "env": "deepseek2", …}`; briefs/outputs in `../phaseone-briefs/`; repair in the
+  SAME session (`session` + `prompt_file`); multi-stage workflows with schema-checked outputs and
+  resume on `scripts/workflow.py`. The lead keeps specs, ADRs, diff review, lead tests, live checks,
+  merges.
+- One job ≈ one crate; short briefs, "work in this order, start editing early". A dead run cannot
+  move its journal between routes — a fresh session continues from the WORKSPACE ("NOTE ON STATE").
+- Accounts: `deepseek2` is the everyday route (owner rule); z.ai GLM is small — `--env glm` sparingly.
 
-HOW THE LEAD WORKS NOW (owner instructions, also in memory):
-- Implementation goes to deepseek workers by default (`scripts/fanout.py <jobs.json>`, briefs and
-  outputs in `../phaseone-briefs/`); same-session repairs via `session` + `prompt_file`. Lead
-  keeps: specs, ADRs, diff review, adversarial tests, live checks, merges. Typical job: $0.01–0.15.
-- Full access is the DEFAULT in p1 (ADR-0038, `--ask` opts out). The auto-mode classifier
-  BLOCKED dispatching a change that makes fanout's p1 runner unsandboxed by default — not worked
-  around; the runner sandboxes always; owner may authorise explicitly.
-- Goal (owner): as soon as the cheap routes exist, run development jobs THROUGH p1
-  (`"runner": "p1"` in a fanout job) and watch the harness closely; every job is a dogfood run
-  → record in `docs/dogfood/runs.jsonl` (`scripts/run-report.py`), group findings in issue #6.
+LANDING PROCEDURE (one task = one worktree)
+1. `scripts/new-worktree.sh <task-slug>`; worker edits; read the diff yourself.
+2. Run `scripts/gate.sh` (fmt, clippy `-D warnings`, all tests, core isolation); a test must check
+   the expected behaviour, not agree with the implementation.
+3. Commit explicit paths on `task/<issue>-<slug>` (never `git add -A`); merge to `main`; push with
+   `scripts/push-main.sh` (waits for CI of that commit) after `gh pr checks --watch` on the head.
+4. Record accepted runs (`docs/dogfood/runs.jsonl` via `scripts/run-report.py`, evidence in
+   `~/.agents/skills/model-cards/evidence.jsonl`); `git worktree remove <path>`.
 
-DONE since the review (all merged): review R1–R7 + dispositions; write gate (#1); resume
-decisions (#2/#3); shell sandbox (ADR-0035); context control (ADR-0036, live canary ok, shipped
-envs still WITHOUT `[context]`); shell env allow-list (#4); read tool streams + long lines +
-`file_path` (dogfood runs 1–3, all p1's own changes, all accepted, run 2 after a repair turn);
-Codex cache headers (#7: 9–27 % → 57–69 %); turn completion = `finish` tool + bounded
-continuation (ADR-0037) and its usability revision; worker usage files (#8); fanout p1 runner;
-full-access default + cache key OFFERED not imposed.
+OPEN ITEMS (issue numbers)
+- #46 tool-name coupling: `p1-tui/src/transcript.rs` and `p1-host/src/tui.rs` match literal tool
+  names and argument keys, so `apply_patch` is never recognised on GPT — the tool should describe
+  its own call target (audit finding 3).
+- #47 provider-http helpers: the error-code sanitiser (a security rule, copied twice),
+  `http_error_code` and the status→kind table move into `p1-provider-http` (audit finding 2).
+- #48 cleanups: explicit worker ordinal, delete the host's copy of credential validation, one
+  `ToolFace`, shared provider fixtures in conformance (audit findings 4–8).
+- #12 TUI (Kimi K3 session, `in-progress`; coordinate only on the issue; do not edit `p1-tui`):
+  the terminal guard inside `p1-tui` contradicts ADR-0043; the `/model` picker must call
+  `switch_model` in `p1-host/src/run.rs`, which `p1-tui` does not reference yet.
+- #45 re-reading after a context summary — ON HOLD BY THE OWNER (`blocked`); do not dispatch.
+- #6 dogfooding group (`ready`): no harness debt left from its list. (unverified: the long-session
+  WebSocket upload comparison is still open here.)
+- #25 fan-out program (`owner`): research is organised per ADR-0045; nothing active, #45 is queued.
 
-OWNER DECISIONS 2026-09-20 (ADR-0039, ADR-0040; note `docs/design/notes/2026-09-20-provider-split.md`):
-- Provider = wire adapter × route (data) × model profile (data + few compiled strategies, new
-  crate `p1-model-profile`), ONE runtime `Provider`; environment names `route` + `profile`.
-- RESHAPE FIRST: Astra reshapes `p1-provider-openai-chat` (note's step 2) BEFORE merging; told
-  so on issue #9 — CHECK #9 between jobs, Astra only talks there.
-- Credentials: `~/.config/p1/auth.json` keyed by route, env var wins, borrow other tools' logins
-  for now, no login command yet, macOS later.
+## Done (all on main, gate + CI green; history is in git)
 
-STATE 2026-09-20 ~22:00 — READ THIS FIRST. main = CI green on 61f0a84 (+ local docs commits:
-p1-auth spec, ADR-0044 proposed, login spec — push them with the next gated merge).
+- **Core & contracts** — one small core depending only on contracts (ADR-0002, isolation check);
+  contracts/state: Send-capable interfaces, flat history, one terminal stream event, opaque
+  reasoning replay, usage unknown ≠ zero, journal as the only truth, interrupted calls reconciled,
+  confinement + read-before-mutate, session ownership and serialized writes
+  (ADR-0015–0019, 0021–0025, 0031/0032).
+- **Providers & routes** — adapter × route × model profile in ONE runtime `Provider` (ADR-0039);
+  credentials keyed by route with `p1 login`/`logout` (ADR-0040, ADR-0044); ONE conformance suite
+  with a seeded-bug self-test per check (ADR-0017); DeepSeek + GLM routes (#9); WebSocket default
+  on Codex with a visible SSE fallback (ADR-0047, ADR-0048); an exhausted account as its own error
+  kind (ADR-0046); Claude Opus 5.5 live-verified (`f289845`); Codex binds gpt-6-astra, gpt-5.6-sol/
+  terra/luna, gpt-5.5 (`sol-mini` refused live).
+- **Tools** — one crate per tool, composed only in the composition root (ADR-0004); shell sandbox
+  (ADR-0035) + environment allow-list (#4); shell output filters measured on p1 (#42).
+- **Delegation** — optional module, machine-wide bounded pool, workers not restored on parent
+  resume (ADR-0027, ADR-0034); ADR-0050 supersedes ADR-0026: every main agent has the worker tools;
+  a worker gets exactly its parent's grant plus `finish`; conditional prompts, worker report + host
+  line, `worker_continue add_tools`.
+- **Model selection** — ADR-0049 supersedes ADR-0033: `--model E/P[:effort]`, `--effort`,
+  `--models`, `p1 models`, `~/.config/p1/settings.toml`; `Agent::reconfigure`; resume onto another
+  model when the provider validates the history; `/model`, `/model REF`, `/effort` through one host
+  entry point. Live: 5 cross-model switches.
+- **Context & completion** — durable validated summary replacement, turn-level retry, stall guard
+  for runs and workers, `finish` + bounded continuation (ADR-0036, ADR-0041, ADR-0042, ADR-0037).
+- **TUI** — ADR-0043: pure state machine in `p1-tui`, terminal driver + `FrontEnd` seam in
+  `p1-host`; milestones M1–M4c merged by the TUI session (#12).
+- **Tooling** — gate as the single definition of green (ADR-0011); ADRs validated in the gate
+  (ADR-0030); `scripts/fanout.py` (ADR-0027), `scripts/workflow.py` + `scripts/audits/modularity.py`,
+  `scripts/run-report.py` + `docs/dogfood/runs.jsonl` (#8, #26).
+- **Research** — ADR-0045 (items end `used` or `discarded`): #26–#28, #35–#37, #41–#43 all closed.
+- **Modularity audit 2026-09-22** — `docs/research/modularity-audit-2026-09-22.md`: 104 DeepSeek jobs
+  on `1c93432`; layering exact, swap cost low, architecture holds; follow-ups #46–#48.
+- **First slice** — every `seams.md` §10 item demonstrated by a command in `docs/SLICE-REPORT.md`;
+  the independent review's defects all fixed (`docs/review-2026-09-20-dispositions.md`).
 
-DONE TODAY (all merged, CI green on the exact commit): Astra's chat adapter + routes (#9);
-provider split ADR-0039 steps 1–4 COMPLETE — every shipped provider is wire adapter × route file
-× profile file, `WHOLE_PROVIDERS` empty (fakes only), environments name `route`+`profile`;
-ADR-0041 turn-level retry (Transport/RateLimited/Protocol); ADR-0042 stall guard
-(`--max-idle-summaries`); summary-quality fix; chat-parser tool-type fix; `--sandbox-read`;
-fanout p1 runner = full access by default; FrontEnd seam for the TUI (`p1-host/src/frontend.rs`);
-agentdash shows p1 runs (brain-tools). Owner set Claude Code to bypassPermissions — no
-classifier: AGENTS.md rules are the only guard.
+## Open decisions and risks
 
-ACCOUNTS: primary opencode-go is OUT OF CREDIT. Use `pi-worker deepseek2 …` and p1
-`--env deepseek2` (route `opencode-go-2-subscription`, DeepSeek V4.1 Flash ONLY — owner rule).
-p1 jobs need the key in the environment at dispatch:
-`OPENCODE_GO_2_API_KEY="$(tr -d '\n' < ~/.config/keys/opencode-go-2.key)" scripts/fanout.py <jobs.json>`
-(never print it). z.ai GLM plan is small — `--env glm` sparingly. Context values: deepseek/
-deepseek2 summarize at 300k of 1M; glm 150k of 260k. NEVER size [context] from one run's peak
-(run split4a thrashed 96 min, 0 edits, under a 90k threshold).
+- OWNER DECISION OPEN: a worker granted `edit` but not `shell` cannot finish `done` — the ADR-0037
+  finish check wants a recorded command it cannot run, so it finishes `blocked` after a correct
+  change (found live; ADR-0050 Evidence).
+  Recommendation (lead + Astra, `../phaseone-briefs/finish-design-answer.md`): host-chosen finish
+  policy — a worker with no command tool may finish `done`, reported as "not verified; parent
+  verification required"; never grant `shell` implicitly; parent-defined checks and profiles later.
+- Risk (untested): the Opus 5.5 preserved-thinking prefix check vs p1's context summarization —
+  applies only to Anthropic accounts created on/after 2026-08-31.
+- #45 is the owner's; do not dispatch. #46–#48 are `ready` and unclaimed. Small debts:
+  `codex exec` needs `< /dev/null`; after a merge use `git branch -D` (tracking makes `-d` refuse).
 
-IN FLIGHT:
-* `p1-auth` (ADR-0039 step 5): DONE, merged (`bb36fc8`), run recorded. `p1 env show` prints a
-  `credential  <source>` line.
-* `p1 login` / `p1 logout` (ADR-0044 accepted): DONE, merged. OWNER TO RUN ONCE:
-  `p1 login opencode-go-2-subscription < ~/.config/keys/opencode-go-2.key`; after that the
-  `OPENCODE_GO_2_API_KEY=…` prefix at dispatch can go (until then keep it).
-* `run-report-usage` (research #26): DONE, merged, #26 closed as used. Research batch 1 is fully
-  dispositioned (26 used, 27 used, 28 discarded); ADR-0045 accepted. No research item open.
-* #30 DONE: `finish` rejects masked checks (`;`, `||`, newline, backgrounding `&`; `2>&1` is
-  fine) and reports EVERY failing named command in one error (completion.md §2, last revision).
-* `[context]` tables for claude / claude-delegating / gpt: DONE (200k/120k, operational values).
-* OWNER RAN `p1 login opencode-go-2-subscription` (2026-09-21): the key is in the p1 store —
-  dispatch deepseek2 jobs WITHOUT the `OPENCODE_GO_2_API_KEY=…` prefix from now on (fall back
-  to it only if a run cannot find the key, then investigate p1-auth).
-* OWNER DIRECTIVES 2026-09-21 ~00:45 (owner asleep, work on): (1) WebSocket support wherever
-  possible (Codex first) — a DECISION, overrides the earlier 'no websocket for now'; (2) inventory
-  iris-agent for code worth taking (Rust token optimizer first); (3) prompt-caching optimisation
-  for the Anthropic and ChatGPT routes. = RESEARCH BATCH 3: #41, #42, #43, Opus subagent curator,
-  brief `../phaseone-briefs/research-curator-batch3.md`, memos `research/<n>/memo.md` (cap of two
-  lifted for this batch). NEXT: decide the memos; WebSocket needs lead spec + ADR (transport seam)
-  then p1 jobs; caching needs a small lead-run LIVE probe (few requests) before changing builders.
-* RESEARCH BATCH 2 DECIDED (2026-09-21): #36 grep bounding — USED, merged. #37 summarizer prompt —
-  USED as a negative result (prompt unchanged); by-product merged: run records carry
-  `harness_head` + `binary_sha256`. #35 out-of-credit diagnosis — USED, merged (ADR-0046 accepted).
-  Curator layer reviewed after two batches: KEEP (decision-ready memos, three corrected lead
-  premises, one unasked bug); one batch at a time.
-* MAIN WAS RED 23:38–00:05 (2026-09-20): the TUI session merged #32 while red (duplicate
-  `ellipsize` in `p1-tui/src/render/screen.rs`); its hotfix #33 (`8a873ec`, 11 deleted lines,
-  nothing else) is green. Second red TUI merge that night (#23 before). Rule posted on #12:
-  merge only after `gh pr checks --watch` passed on the final head. Before pushing, ALWAYS
-  re-gate or at least `cargo check --workspace` after merging origin/main — my 23:45 push went
-  out on a main I had not built. Several sessions now edit `p1-tui` (worktrees `12-tui`,
-  `12-tui-block-spec`, `neural-home-*`): stay out of those paths.
-* TUI: separate Kimi K3 session (tmux window `kimi-tui`, pane %48, worktree `../phaseone-12-tui`),
-  coordination ONLY via issue #12. It has merged M1–M4a itself; the seam it needed is on main and
-  it may edit exactly two spots of mine: `impl FrontEnd` in its `tui.rs`, the 5-line `--tui`
-  branch in `run_agent`. Still owed by the lead, not urgent: a small spec + ADR for
-  `ContextStats` (observation-only context budget numbers for the ledger). Check #12 between jobs.
+## Lessons
 
-* FAN-OUT PROGRAM (owner request 2026-09-20, issue #25): DECIDED — ADR-0045 (proposed) +
-  `docs/design/research-program.md`. Research item = issue labelled `research` + one
-  `research:queued|active|decision|implement|used|discarded`; every item ends USED or DISCARDED;
-  caps 3 active / 2 in decision / 1 in implement. Curator organises research, NEVER development
-  (owner); development, specs, briefs, review, merges stay with the lead.
-  BATCH 1 (offline, no build, no live experiment calls): #26 measurement + failure audit,
-  #27 context capacity inventory, #28 finish-nudge experiment design. Curator = ONE
-  Opus run as a Claude Code subagent (`pi-worker opus` FAILED: tool_calls 0, it wrote tool
-  calls as text and invented results — never use it for tool work) (brief `../phaseone-briefs/research-curator-batch1.md`, output
-  `../phaseone-briefs/research/curator-batch1.out`, memos `research/<n>/memo.md`), leaves =
-  `pi-worker deepseek2`. NEXT: `gh issue list --label research:decision`, decide each memo
-  (accept -> lead-owned brief, label `research:implement`; else discard with reopening
-  condition). Dev slice A (run-report.py usage aggregation + `scripts/test_run_report.py`)
-  enters as #26's implementation. Set ADR-0045 accepted after batch 1 ran under it. After two
-  batches: keep the curator layer only if it saves lead effort. Said no for now: websocket,
-  benchmark grids, new profile capabilities. Astra's full answer:
-  `../phaseone-briefs/fanout-program.answer.md`.
-
-HOW JOBS GO (what worked today): small briefs with a SHORT read-first list and "work in this
-order, start editing early"; one job ≈ one crate; p1 runner for implementation, pi-worker for
-harness-guard work and other repos; lead reviews the diff, runs the gate independently, merges.
-A journal cannot move between routes (ADR-0033): when a run dies, a fresh session continues
-from the WORKSPACE — put a "NOTE ON STATE" in the brief.
-
-NEXT, in order:
-1. Land p1-auth, then p1 login (above).
-2. `[context]` for the claude/gpt environments (no values yet) — #6. Harness debts on #6: the
-   chat adapter reports a 401 CreditsError as "key rejected" (surface the error type; distinct
-   no-balance message); a run with zero responses prints `in 0 … cost $0.0000`; stall guard
-   does not cover delegated workers; `--no-default-features` fails one host test
-   (claude-delegating names worker tools).
-3. T1 measurement (fixed task set, repeated), host cleanup around the state transitions, model
-   cards from `~/.agents/skills/model-cards/evidence.jsonl`.
-Known small debts: `codex exec` needs `< /dev/null`; owner's opencode auth.json may hold a
-`zai` entry opencode ignores (told the owner); local branch cleanup uses `git branch -D` after
-merge (tracking makes `-d` refuse).
-
-## Blocked
-- nothing
-
-## How to resume
-Briefs + job lists + worker outputs: `/home/phaseonebig/projects/phaseone-briefs/`.
-Worktrees: `git worktree list`. Dispatch: `scripts/fanout.py <jobs.json>` as ONE background task.
-Accept a result: rebuild + rerun tests yourself, adversarial cases, read diff, `git status`,
-commit explicit paths on the task branch, merge to main, gate, push, log evidence to
-`~/.agents/skills/model-cards/evidence.jsonl`, remove the worktree.
-
-## Worker runs
-| When | Profile/effort | Task | Run dir / out file | Result |
-|---|---|---|---|---|
-| 09-20 00:04 | deepseek/high | fan-out mechanism trial | `.worker-runs/20260920-000458-1394036` | ok, $0.0006 |
-| 09-20 00:14 | glm53/high | core acceptance tests (held-out) | `.worker-runs/20260920-001409-1410498` | ACCEPTED after 1 repair (10 false alarms), $1.02 |
-| 09-20 00:14 | sol/medium | core acceptance tests | `.worker-runs/20260920-001409-1410499` | ACCEPTED, 37 tests, $0.86 |
-| 09-20 00:16 | deepseek/high | workspace + read/edit/write | `.worker-runs/20260920-001631-1420700` | ACCEPTED, lead fixed 1 defect, $0.10 |
-| 09-20 00:20 | deepseek/high | p1-provider-http | `.worker-runs/20260920-001941-1429195` | ACCEPTED, lead fixed 2 defects, $0.08 |
-| 09-20 00:24 | deepseek/high | core implementation + R5 | `.worker-runs/20260920-002352-1451905` | ACCEPTED first pass, $0.11 |
-| 09-20 | deepseek/high | search + shell + patch tools | see evidence.jsonl | ACCEPTED, lead fixed 2, $0.16 |
-| 09-20 | sol/medium | conformance suite | `.worker-runs/20260920-003643-1491887` | ACCEPTED, $1.44 |
-| 09-20 | deepseek/high | anthropic adapter | `.worker-runs/20260920-003643-1491888` | ACCEPTED (lead brief error fixed), $0.12 |
-| 09-20 | deepseek/high | journal + resume | see evidence.jsonl | ACCEPTED first pass, $0.08 |
-| 09-20 | deepseek/high | assembly | see evidence.jsonl | ACCEPTED first pass, $0.07 |
-| 09-20 | deepseek/high | delegation | see evidence.jsonl | ACCEPTED first pass, $0.12 |
-| 09-20 | deepseek/high | codex adapter | see evidence.jsonl | ACCEPTED (same brief error fixed), $0.11 |
-| 09-20 | deepseek/high | host | `.worker-runs/20260920-010944-1597843` | ACCEPTED, lead fixed 3 from live runs, $0.32 |
+- After any merge that changes prompts/assembly, rebuild the fanout binary at once
+  (`cargo build -p p1-host`), or every p1 fanout job fails at start-up.
+- Re-gate (or at least `cargo check --workspace`) after merging `origin/main` BEFORE pushing — a
+  push once went out on an unbuilt `main`, and two TUI merges went red the same way.
+- Never size `[context]` from one run's peak (split4a: `[context]` 90k, 40 summaries, 698 reads,
+  0 edits). Shipped values: 300k of 1M (deepseek, deepseek2), 120k of 200k (claude, gpt), 150k of
+  260k (glm); every request re-sends the history, so cache-read dominates cost.
+- `pi-worker opus` is never for tool work: 0 tool_calls, invented results.

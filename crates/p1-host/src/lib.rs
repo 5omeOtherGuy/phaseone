@@ -20,6 +20,7 @@ pub mod catalog;
 pub mod cli;
 pub mod frontend;
 pub mod login;
+pub mod models;
 pub mod policy;
 pub mod render;
 pub mod routes;
@@ -166,6 +167,10 @@ pub struct HostDeps {
     /// catalog registers the `worker_*` tools only when it is present.
     #[cfg(feature = "delegation")]
     pub worker_service: Option<Arc<dyn p1_workers::WorkerService>>,
+    /// The parent's model-switch context (ADR-0049 stage 3). `run` sets it once the
+    /// catalog and the parent's activity plumbing exist, so the line mode — and the
+    /// TUI's run loop — can switch the model between turns.
+    pub(crate) model_switch: Option<Arc<run::ModelSwitch>>,
 }
 
 impl HostDeps {
@@ -200,6 +205,7 @@ impl HostDeps {
             wait: Arc::new(|duration| Box::pin(tokio::time::sleep(duration))),
             #[cfg(feature = "delegation")]
             worker_service: None,
+            model_switch: None,
         }
     }
 }

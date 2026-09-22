@@ -1,0 +1,27 @@
+# Read-only auditor on the deepseek2 route for scripts/audits/*.py — kept out of the shipped
+# environments/ (it would add rows to `p1 models`); a run sets P1_ENVIRONMENTS_DIR here. No edit/write tool:
+# the shell can still write, so the workflow runs each job in its own pinned worktree and
+# voids any job that leaves it dirty.
+route   = "opencode-go-2-subscription"
+profile = "deepseek-v4.1-flash"
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "finish"
+
+# As environments/deepseek2 (operational values, not capacity claims).
+[context]
+window_tokens = 1000000
+output_headroom_tokens = 32000
+summarize_at_tokens = 300000
+keep_recent_tokens = 60000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000

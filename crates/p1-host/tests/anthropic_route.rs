@@ -26,7 +26,7 @@ use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_anthropic::{MessagesAccount, MessagesAdapterSettings, ROUTE, build_request};
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
-use p1_provider_http::testing::ScriptedTransport;
+use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
@@ -112,7 +112,9 @@ fn composed(environment: &str) -> Composed {
     }
 }
 
-/// The provider the catalog factory would build for this composition.
+/// The provider the catalog factory would build for this composition. The connector
+/// is injected next to the transport (ADR-0047 §1); a Messages route never asks for
+/// WebSocket, so it ignores it.
 fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = composed
         .route
@@ -123,6 +125,7 @@ fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Pro
         binding,
         composed.profile.clone(),
         Arc::new(transport),
+        Arc::new(RefusingWsConnector::default()),
         Arc::new(Fixed),
     )
     .expect("the shipped route composes")
@@ -191,6 +194,7 @@ fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
         "claude-fable-5",
         "claude-opus-4-6",
         "claude-opus-5",
+        "claude-opus-5-5",
         "claude-sonnet-4-6",
         "claude-sonnet-5",
     ] {
@@ -278,8 +282,7 @@ fn the_shipped_messages_route_passes_the_conformance_suite() {
 
 // ------------------------------------------------------------- the shipped environments
 
-/// `p1 env show NAME` through the real CLI and catalog: the delegating environment
-/// needs the `env show` worker stub, so both shipped environments go this way.
+/// `p1 env show NAME` through the real CLI and catalog.
 fn show_env(name: &str) -> (i32, String, String) {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     common::isolated_environment(&mut harness);
@@ -291,28 +294,27 @@ fn show_env(name: &str) -> (i32, String, String) {
 }
 
 #[test]
-fn the_two_shipped_claude_environments_assemble_through_the_catalog_unchanged() {
-    for name in ["claude", "claude-delegating"] {
-        let (code, stdout, stderr) = show_env(name);
-        assert_eq!(code, 0, "{name}: {stderr}");
-        let resolved: serde_json::Value = common::env_show_json(&stdout);
-        assert_eq!(resolved["environment"], name, "{name}");
-        assert_eq!(resolved["family"], "claude", "{name}");
-        assert_eq!(
-            resolved["route"]["origin"],
-            serde_json::json!({
-                "route": TODAYS_ORIGIN_ROUTE,
-                "model": "claude-sonnet-5",
-            }),
-            "{name}: the origin string is byte for byte the pre-split one"
-        );
-        assert_eq!(
-            resolved["route"]["mandatory_prompt_prefix"],
-            "You are Claude Code, Anthropic's official CLI for Claude.",
-            "{name}"
-        );
-        assert_eq!(resolved["route"]["cache_key"], "unsupported", "{name}");
-    }
+fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
+    // Every main agent gets the worker tools from the host (ADR-0050), so `claude`
+    // assembles unchanged with or without the `delegation` feature.
+    let (code, stdout, stderr) = show_env("claude");
+    assert_eq!(code, 0, "claude: {stderr}");
+    let resolved: serde_json::Value = common::env_show_json(&stdout);
+    assert_eq!(resolved["environment"], "claude");
+    assert_eq!(resolved["family"], "claude");
+    assert_eq!(
+        resolved["route"]["origin"],
+        serde_json::json!({
+            "route": TODAYS_ORIGIN_ROUTE,
+            "model": "claude-sonnet-5",
+        }),
+        "the origin string is byte for byte the pre-split one"
+    );
+    assert_eq!(
+        resolved["route"]["mandatory_prompt_prefix"],
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+    assert_eq!(resolved["route"]["cache_key"], "unsupported");
 
     // And the provider the catalog builds for `claude` reports the same origin.
     let assembled = assemble_shipped("claude");
@@ -331,6 +333,7 @@ fn every_shipped_claude_profile_carries_its_thinking_policy_and_budgets() {
     for (id, thinking) in [
         ("claude-fable-5", ThinkingPolicy::EffortLevel),
         ("claude-opus-5", ThinkingPolicy::EffortLevel),
+        ("claude-opus-5-5", ThinkingPolicy::EffortLevel),
         ("claude-sonnet-5", ThinkingPolicy::EffortLevel),
         ("claude-opus-4-6", ThinkingPolicy::Budget),
         ("claude-sonnet-4-6", ThinkingPolicy::Budget),

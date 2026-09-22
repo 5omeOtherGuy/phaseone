@@ -302,8 +302,39 @@ impl ResponseParser for ChatParser {
                 _ => ProviderErrorKind::InvalidRequest,
             }
         };
-        ProviderError::new(kind, format!("chat HTTP status {status}"))
+        // The operator needs to know WHAT the endpoint refused (a 400 without a reason
+        // cannot be acted on). Only a short, token-shaped code is copied — never the
+        // server's free text — as the two sibling adapters already do.
+        match http_error_code(body) {
+            Some(code) => ProviderError::new(kind, format!("chat HTTP status {status} ({code})")),
+            None => ProviderError::new(kind, format!("chat HTTP status {status}")),
+        }
     }
+}
+
+/// A short, token-shaped error code from an error body: `/error/code`, `/error/type`,
+/// then top-level `code` / `type` (strings only). Anything longer, free-form or
+/// sensitive-looking is dropped: free text never reaches a `ProviderError`.
+fn http_error_code(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    ["/error/code", "/error/type", "/code", "/type"]
+        .iter()
+        .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .find_map(safe_code)
+        .map(str::to_string)
+}
+
+fn safe_code(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let sensitive = ["secret", "password", "sk-"];
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && !sensitive.iter().any(|fragment| lower.contains(fragment)))
+    .then_some(value)
 }
 
 /// The whole text of an exhausted-account error: the server's words are a lookup

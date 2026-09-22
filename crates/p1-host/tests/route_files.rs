@@ -18,15 +18,18 @@ use p1_contracts::{
     BoxFuture, CancellationToken, Effort, Item, JournalRecord, ModelOptions, Origin, Outcome,
     Provider, ProviderError, ProviderRequest, StreamEvent, TurnEnd,
 };
-use p1_core::{Agent, AgentParts, ResumeError};
+use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
-use p1_host::catalog::{build_catalog, chat_route, resolve_environment, route_provider};
+use p1_host::catalog::{
+    build_catalog, chat_route, resolve_environment, responses_route, route_provider,
+};
 use p1_host::cli::SandboxMode;
 use p1_host::routes::{AdapterSettings, RouteFile, load_all_routes, load_route, load_route_by_id};
 use p1_model_profile::ModelProfile;
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
-use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
+use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
+use p1_provider_openai::{ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport};
 use p1_provider_openai_chat::{ChatAdapterSettings, ChatDialect, build_request};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
@@ -122,6 +125,11 @@ fn shipped(environment: &str) -> Resolved {
 
 /// Build the provider the catalog factory would build: `catalog::route_provider` with
 /// the route's binding for the resolved profile. No constructor argument is hand-made.
+///
+/// The connector is injected next to the transport (ADR-0047 §1) and REFUSES every
+/// upgrade: a route that asks for WebSocket falls back to SSE at once (the shipped
+/// Codex route does — ADR-0047 §1 was revised to make WebSocket its default), an SSE
+/// route ignores it, and no test opens a socket.
 fn provider_of(resolved: &Resolved, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = resolved
         .route
@@ -132,6 +140,7 @@ fn provider_of(resolved: &Resolved, transport: ScriptedTransport) -> Arc<dyn Pro
         binding,
         resolved.profile.clone(),
         Arc::new(transport),
+        Arc::new(RefusingWsConnector::default()),
         Arc::new(Fixed),
     )
     .expect("the route composes")
@@ -1316,10 +1325,11 @@ async fn two_routes_that_share_one_profile_differ_only_in_their_declared_fields(
     assert_ne!(origins[0], origins[1], "two accounts are two origins");
 }
 
-/// A session recorded on one route cannot silently continue on the other: the origins
-/// differ, so the resume decision (ADR-0033) refuses it.
+/// A session recorded on one route continues on the other when that route's adapter
+/// accepts the recorded history (ADR-0049, superseding ADR-0033's refusal): the
+/// origin change is reported as an environment change, committed at the next turn.
 #[tokio::test]
-async fn a_session_recorded_on_one_route_is_refused_by_the_other() {
+async fn a_session_recorded_on_one_route_resumes_on_the_other_as_an_environment_change() {
     let scratch = split_scratch();
     let alpha = scratch
         .resolve("alpha-env")
@@ -1332,29 +1342,15 @@ async fn a_session_recorded_on_one_route_is_refused_by_the_other() {
     let records = recorded_turn(provider_of(&alpha, transport)).await;
     assert!(!records.is_empty(), "the turn was journalled");
 
-    let error = match Agent::resume(
+    let (_, report) = Agent::resume(
         parts(
             provider_of(&beta, ScriptedTransport::new(vec![])),
             Arc::new(RecordingJournal::new()),
         ),
         &records,
-    ) {
-        Ok(_) => panic!("a session recorded on alpha must not resume on beta"),
-        Err(error) => error,
-    };
-    assert_eq!(
-        error,
-        ResumeError::RouteChanged {
-            journalled: Origin {
-                route: ALPHA_ORIGIN.into(),
-                model: ALPHA_WIRE.into(),
-            },
-            assembled: Origin {
-                route: BETA_ORIGIN.into(),
-                model: BETA_WIRE.into(),
-            },
-        }
-    );
+    )
+    .expect("beta's adapter carries alpha's history");
+    assert!(report.environment_changed, "another origin is a change");
 }
 
 /// A helper kept next to the split tests: the endpoint a route file declares is what the
@@ -1374,4 +1370,242 @@ fn a_declared_endpoint_is_used_verbatim() {
         alpha.route.credential.env.as_deref(),
         Some("P1_ROUTE_FILES_TEST_KEY")
     );
+}
+
+// ---------------------------------------------- the Responses `transport` setting
+
+/// A scratch root holding the shipped Codex route and the profile it serves, with
+/// one environment selecting them: the Responses adapter's own composition path.
+fn codex_scratch() -> Scratch {
+    let scratch = Scratch::new();
+    scratch.copy_shipped_routes();
+    scratch.copy_shipped_profiles();
+    scratch.write_environment(
+        "codex",
+        &environment_file("openai-codex-subscription", "gpt-5.6-sol"),
+    );
+    scratch
+}
+
+/// The transport setting the SHIPPED Responses route file carries (ADR-0047 §1:
+/// WebSocket is the default wherever a route supports it).
+const SHIPPED_TRANSPORT: &str = "transport = \"websocket\"";
+
+/// The shipped Responses route file with its `transport` line replaced by
+/// `settings`; an empty `settings` removes the line, which is the "absent means
+/// sse" case.
+fn codex_route_with(scratch: &Scratch, settings: &str) {
+    let shipped = std::fs::read_to_string(repo("routes/openai-codex-subscription.toml"))
+        .expect("the shipped route file");
+    let body = with(&shipped, SHIPPED_TRANSPORT, settings);
+    scratch.write_route("openai-codex-subscription", &body);
+}
+
+fn codex_settings(scratch: &Scratch) -> AdapterSettings {
+    load_route(&scratch.route_path("openai-codex-subscription"))
+        .expect("the route loads")
+        .settings()
+        .expect("the adapter parses its settings")
+}
+
+/// ADR-0047 §1: `transport` is route data. The SHIPPED route file asks for
+/// `websocket` — the owner decision of 2026-09-21 made WebSocket the default
+/// wherever a route supports it — and a route file WITHOUT the key is `sse`.
+#[test]
+fn a_responses_route_declares_its_transport_and_absent_means_sse() {
+    let scratch = codex_scratch();
+    let shipped = std::fs::read_to_string(repo("routes/openai-codex-subscription.toml"))
+        .expect("the shipped route file");
+    assert!(
+        shipped.contains(SHIPPED_TRANSPORT),
+        "ADR-0047 §1: the shipped Codex route asks for WebSocket"
+    );
+
+    assert_eq!(
+        codex_settings(&scratch),
+        AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+            account: ResponsesAccount::CodexSubscription,
+            transport: ResponsesTransport::Websocket,
+        })
+    );
+    let route = load_route(&scratch.route_path("openai-codex-subscription")).unwrap();
+    assert_eq!(
+        responses_route(&route)
+            .expect("the route composes")
+            .transport,
+        ResponsesTransport::Websocket
+    );
+
+    // Absent means `sse`: the adapter's own default for a route file that says
+    // nothing, so a new Responses route opts in explicitly.
+    codex_route_with(&scratch, "");
+    assert_eq!(
+        codex_settings(&scratch),
+        AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+            account: ResponsesAccount::CodexSubscription,
+            transport: ResponsesTransport::Sse,
+        })
+    );
+
+    for (value, expected) in [
+        ("sse", ResponsesTransport::Sse),
+        ("websocket", ResponsesTransport::Websocket),
+    ] {
+        codex_route_with(&scratch, &format!("transport = \"{value}\""));
+        assert_eq!(
+            codex_settings(&scratch),
+            AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+                account: ResponsesAccount::CodexSubscription,
+                transport: expected,
+            }),
+            "{value}"
+        );
+        // The route the provider is composed from carries it: the transport is
+        // route data, never a compiled decision.
+        let route = load_route(&scratch.route_path("openai-codex-subscription")).unwrap();
+        assert_eq!(
+            responses_route(&route)
+                .expect("the route composes")
+                .transport,
+            expected,
+            "{value}"
+        );
+    }
+}
+
+/// Any other value fails the load, like every other unknown setting (ADR-0047 §1).
+#[test]
+fn an_unknown_transport_is_a_route_file_error() {
+    for value in ["quic", "WebSocket", "ws", ""] {
+        let scratch = codex_scratch();
+        codex_route_with(&scratch, &format!("transport = \"{value}\""));
+        let error = load_route(&scratch.route_path("openai-codex-subscription"))
+            .expect_err("only the two documented values load");
+        assert!(
+            error.contains("invalid `[adapter_settings]`"),
+            "{value}: {error}"
+        );
+        assert!(
+            error.contains("websocket") && error.contains("sse"),
+            "{value}: the error names the values that exist: {error}"
+        );
+    }
+}
+
+/// The host composes the real connector for a route that asks for WebSocket —
+/// assembly succeeds, which it cannot do without one (the provider refuses a
+/// WebSocket route that has none) — and hands the injected one to
+/// `catalog::route_provider`. Composition opens no socket and reads no credential.
+#[test]
+fn a_websocket_route_assembles_with_the_real_connector_and_an_unchanged_origin() {
+    let scratch = codex_scratch();
+    codex_route_with(&scratch, "transport = \"websocket\"");
+
+    let assembled = assemble_scratch(&scratch, "codex").expect("the route composes");
+    assert_eq!(
+        assembled.resolved.route.origin,
+        Origin {
+            route: "openai-responses/codex-subscription".into(),
+            model: "gpt-5.6-sol".into(),
+        },
+        "the transport is not part of a response's origin (§7): the same route keeps the same origin"
+    );
+
+    // The same through the catalog factory the host itself uses, with the connector
+    // injected like the transport (ADR-0047 §1): a test never opens a socket.
+    let resolved = scratch
+        .resolve("codex")
+        .expect("the route serves the profile");
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let connector = Arc::new(RefusingWsConnector::default());
+    let provider = route_provider(
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(ScriptedTransport::new(Vec::new())),
+        connector.clone(),
+        Arc::new(Fixed),
+    )
+    .expect("a websocket route composes with the connector it is handed");
+    assert_eq!(
+        provider.describe().origin,
+        Origin {
+            route: "openai-responses/codex-subscription".into(),
+            model: "gpt-5.6-sol".into(),
+        }
+    );
+    assert_eq!(connector.handshakes(), 0, "composition opens no socket");
+}
+
+/// ADR-0047 §1: a route that does NOT ask for WebSocket ignores the connector. It
+/// composes through `route_provider` with a connector in hand (the provider REFUSES
+/// a connector on an SSE route, so handing it over would fail right here), and a
+/// whole turn on such a route is served by the scripted SSE transport with the
+/// connector never reached.
+#[tokio::test]
+async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
+    // A Responses route with no `transport` line: the adapter's `sse` default.
+    let scratch = codex_scratch();
+    codex_route_with(&scratch, "");
+    let resolved = scratch
+        .resolve("codex")
+        .expect("the route serves the profile");
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let provider = route_provider(
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(ScriptedTransport::new(Vec::new())),
+        Arc::new(RefusingWsConnector::default()),
+        Arc::new(Fixed),
+    )
+    .expect("an SSE route composes: the connector is ignored");
+    assert_eq!(provider.describe().origin.model, "gpt-5.6-sol");
+
+    // A whole turn on a route of another family, driven to its terminal event by the
+    // scripted transport: the connector sees no handshake at all.
+    let resolved = shipped("deepseek");
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let connector = Arc::new(RefusingWsConnector::default());
+    let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(TEXT_TURN)]);
+    let provider = route_provider(
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(transport.clone()),
+        connector.clone(),
+        Arc::new(Fixed),
+    )
+    .expect("a chat route composes");
+    let request = ProviderRequest {
+        system_prompt: "SYS".to_string(),
+        history: vec![Item::User {
+            text: "hi".to_string(),
+        }],
+        tools: Vec::new(),
+        options: ModelOptions::default(),
+    };
+    let events = drain(&provider, request).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(StreamEvent::Finished(Outcome::Completed(_)))
+        ),
+        "{events:?}"
+    );
+    assert_eq!(
+        transport.requests().len(),
+        1,
+        "the SSE path served the turn"
+    );
+    assert_eq!(connector.handshakes(), 0, "the connector was never reached");
 }

@@ -1,11 +1,11 @@
 ---
 adr: 26
 title: Delegation is an optional module, never imposed
-status: accepted
+status: superseded
 date: 2026-09-20
 deciders: owner+lead
 supersedes: []
-superseded_by: []
+superseded_by: [50]
 sources: [D1, docs/design/pillars.md, docs/design/delegation.md, docs/SLICE-REPORT.md]
 ---
 # ADR-0026: Delegation is an optional module, never imposed

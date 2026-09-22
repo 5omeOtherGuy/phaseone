@@ -1,10 +1,12 @@
 //! The ChatGPT/Codex subscription route of the OpenAI Responses API.
 //!
-//! This adapter translates the p1 provider contract into the HTTPS + SSE wire
-//! shape documented in `docs/design/routes.md` §B. The donor's WebSocket
-//! transport, continuation, native compaction, structured summaries and login
-//! flow are deliberately not taken; where the credential comes from is
-//! `p1-auth`'s business, never a login flow here.
+//! This adapter translates the p1 provider contract into the wire shape
+//! documented in `docs/design/routes.md` §B: HTTPS + SSE, or — when a route asks
+//! for `transport = "websocket"` — the vendor's WebSocket mode with SSE as its
+//! fallback (ADR-0047, `docs/design/websocket.md`). The donor's continuation,
+//! native compaction, structured summaries and login flow are still deliberately
+//! not taken; where the credential comes from is `p1-auth`'s business, never a
+//! login flow here.
 //!
 //! The adapter is composed from three independent inputs (ADR-0039): this wire
 //! adapter, a [`ResponsesRoute`] (an account and endpoint, data in
@@ -18,13 +20,16 @@
 //! Layout:
 //! - [`request`]: the pure request builder, header builder and base-URL resolver.
 //! - `parser`: the pure SSE state machine, surfaced through [`p1_provider_http::drive`].
+//! - `websocket`: the WebSocket transport — handshake, framing, connection
+//!   lifetime and the failure policy of `docs/design/websocket.md` §5.
 //! - [`provider`]: the [`p1_contracts::Provider`] implementation.
 
 mod parser;
 mod provider;
 mod request;
+mod websocket;
 
-pub use provider::OpenAiCodexProvider;
+pub use provider::{Clock, OpenAiCodexProvider, OpenAiCodexProviderBuilder};
 pub use request::{build_headers, build_request, resolve_base_url};
 
 /// The `origin_route` of the shipped `routes/openai-codex-subscription.toml`, byte for
@@ -53,6 +58,21 @@ pub enum ResponsesAccount {
 #[serde(deny_unknown_fields)]
 pub struct ResponsesAdapterSettings {
     pub account: ResponsesAccount,
+    /// Absent means [`ResponsesTransport::Sse`], today's transport (ADR-0047 §1).
+    #[serde(default)]
+    pub transport: ResponsesTransport,
+}
+
+/// How a Responses route reaches the model (ADR-0047, `docs/design/websocket.md`
+/// §1): HTTPS + SSE, or the vendor's WebSocket mode, which falls back to SSE by
+/// the rules of that document's §5. A route file that omits the key gets
+/// [`ResponsesTransport::Sse`]; any other value is a route-file error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponsesTransport {
+    #[default]
+    Sse,
+    Websocket,
 }
 
 /// How one ChatGPT account and endpoint are reached: the data a route file supplies and
@@ -67,6 +87,10 @@ pub struct ResponsesRoute {
     /// (see [`resolve_base_url`]).
     pub endpoint: String,
     pub account: ResponsesAccount,
+    /// The transport this route asks for. It is route data, like the account: the
+    /// WebSocket transport changes only how a request travels, never what it says
+    /// (`docs/design/websocket.md` §3), so `Origin` and replay are untouched.
+    pub transport: ResponsesTransport,
 }
 
 impl ResponsesRoute {

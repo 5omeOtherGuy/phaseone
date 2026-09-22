@@ -1,0 +1,14 @@
+# What the model is, independent of the route that reaches it (ADR-0039). The ChatGPT/
+# Codex subscription endpoint serves this model with every effort the Codex CLI model
+# cache listed for this account (2026-09-21): low, medium, high, xhigh, max, ultra —
+# `ultra` has no p1 effort, so it is left out.
+id       = "gpt-6-astra"
+revision = 1
+model_id = "gpt-6-astra"
+family   = "gpt"
+thinking = "effort-level"
+
+efforts = ["low", "medium", "high", "extra_high", "max"]
+
+# default_effort: absent — an effort-less request carries no reasoning fields.
+# context_tokens and max_output_tokens: unknown for this model, so stated nowhere.

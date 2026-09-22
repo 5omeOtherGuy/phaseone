@@ -11,6 +11,7 @@ use futures_util::stream;
 use p1_contracts::BoxFuture;
 
 use crate::http::{ByteStream, HttpRequest, HttpResponse, Transport, TransportError};
+use crate::ws::{WsConnectError, WsConnection, WsConnector, WsError, WsHandshake};
 
 /// A queue of canned responses plus a record of every request received.
 ///
@@ -159,6 +160,233 @@ fn body_stream(chunks: Vec<Vec<u8>>, end: BodyEnd) -> ByteStream {
     }
 }
 
+/// A queue of scripted WebSocket connections plus a record of every handshake
+/// received and every text frame sent.
+///
+/// `Clone` shares the queue and the record, so a clone handed to a provider
+/// still reports what the provider sent.
+#[derive(Clone, Debug)]
+pub struct ScriptedWsConnector {
+    inner: Arc<Mutex<ScriptedWsState>>,
+}
+
+#[derive(Debug)]
+struct ScriptedWsState {
+    connections: VecDeque<ScriptedConnection>,
+    handshakes: Vec<WsHandshake>,
+    /// Texts sent, one entry per ACCEPTED connection in connect order.
+    sent_texts: Vec<Vec<String>>,
+}
+
+impl ScriptedWsConnector {
+    /// Script `connections`, consumed one per `connect` in order.
+    pub fn new(connections: Vec<ScriptedConnection>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ScriptedWsState {
+                connections: connections.into(),
+                handshakes: Vec::new(),
+                sent_texts: Vec::new(),
+            })),
+        }
+    }
+
+    /// Every handshake received so far, in order, with its header names *and*
+    /// values (a test may assert on them; nothing here is logged).
+    pub fn handshakes(&self) -> Vec<WsHandshake> {
+        self.lock().handshakes.clone()
+    }
+
+    /// The texts sent on each accepted connection, in connect order. Refused or
+    /// failed connections never produced a connection, so they have no entry.
+    pub fn sent_texts(&self) -> Vec<Vec<String>> {
+        self.lock().sent_texts.clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ScriptedWsState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl WsConnector for ScriptedWsConnector {
+    fn connect<'a>(
+        &'a self,
+        request: WsHandshake,
+    ) -> BoxFuture<'a, Result<Box<dyn WsConnection>, WsConnectError>> {
+        let (scripted, connection) = {
+            let mut state = self.lock();
+            state.handshakes.push(request);
+            let handshake_number = state.handshakes.len();
+            let scripted = state.connections.pop_front().unwrap_or_else(|| {
+                panic!(
+                    "ScriptedWsConnector: no scripted connection left for handshake \
+                     #{handshake_number}; script one connection per expected connect"
+                )
+            });
+            let connection = match scripted {
+                ScriptedConnection::Accept(_) => {
+                    state.sent_texts.push(Vec::new());
+                    Some(state.sent_texts.len() - 1)
+                }
+                ScriptedConnection::Refuse { .. } | ScriptedConnection::Fail(_) => None,
+            };
+            (scripted, connection)
+        };
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            match scripted {
+                ScriptedConnection::Refuse { status, body } => {
+                    Err(WsConnectError::Status { status, body })
+                }
+                ScriptedConnection::Fail(message) => Err(WsConnectError::Failed(message)),
+                ScriptedConnection::Accept(frames) => Ok(Box::new(ScriptedWsConnection {
+                    frames: frames.into(),
+                    inner,
+                    connection: connection.expect("an accepted connection is recorded"),
+                })
+                    as Box<dyn WsConnection>),
+            }
+        })
+    }
+}
+
+/// A connector that REFUSES every connect with one status forever.
+///
+/// `ScriptedWsConnector` consumes one scripted attempt per connect, so a test that
+/// only wants "this route never reaches a socket" would have to guess how many
+/// attempts the provider makes. This one answers every handshake the same way — the
+/// upgrade is refused with status 404 by default, which §5 of
+/// `docs/design/websocket.md` turns into an immediate fall back to SSE — and counts
+/// the handshakes so a test can prove the connector was never used at all.
+#[derive(Clone, Debug)]
+pub struct RefusingWsConnector {
+    status: u16,
+    handshakes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RefusingWsConnector {
+    /// Refuse every upgrade with `status`.
+    pub fn new(status: u16) -> Self {
+        Self {
+            status,
+            handshakes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// How many handshakes were attempted.
+    pub fn handshakes(&self) -> usize {
+        self.handshakes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Default for RefusingWsConnector {
+    /// The "the endpoint says no" refusal: §5 falls back to SSE at once.
+    fn default() -> Self {
+        Self::new(404)
+    }
+}
+
+impl WsConnector for RefusingWsConnector {
+    fn connect<'a>(
+        &'a self,
+        _request: WsHandshake,
+    ) -> BoxFuture<'a, Result<Box<dyn WsConnection>, WsConnectError>> {
+        self.handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let status = self.status;
+        Box::pin(async move {
+            Err(WsConnectError::Status {
+                status,
+                body: Vec::new(),
+            })
+        })
+    }
+}
+
+/// One scripted connection attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptedConnection {
+    /// The upgrade is answered with this status and body.
+    Refuse { status: u16, body: Vec<u8> },
+    /// No HTTP answer at all (DNS, TCP or TLS failure).
+    Fail(String),
+    /// The upgrade succeeds, and the connection then replays `frames` in order.
+    Accept(Vec<ScriptedFrame>),
+}
+
+impl ScriptedConnection {
+    /// Answer the upgrade with `status` and `body`.
+    pub fn refuse(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self::Refuse {
+            status,
+            body: body.into(),
+        }
+    }
+
+    /// Fail before any HTTP answer, with this message.
+    pub fn fail(message: impl Into<String>) -> Self {
+        Self::Fail(message.into())
+    }
+
+    /// Accept the upgrade and replay `frames`.
+    pub fn accept(frames: Vec<ScriptedFrame>) -> Self {
+        Self::Accept(frames)
+    }
+}
+
+/// One scripted incoming message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptedFrame {
+    Text(String),
+    Error(String),
+    Close,
+}
+
+impl ScriptedFrame {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::Error(message.into())
+    }
+
+    pub fn close() -> Self {
+        Self::Close
+    }
+}
+
+struct ScriptedWsConnection {
+    frames: VecDeque<ScriptedFrame>,
+    inner: Arc<Mutex<ScriptedWsState>>,
+    connection: usize,
+}
+
+impl WsConnection for ScriptedWsConnection {
+    fn send_text<'a>(&'a mut self, text: String) -> BoxFuture<'a, Result<(), WsError>> {
+        Box::pin(async move {
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.sent_texts[self.connection].push(text);
+            Ok(())
+        })
+    }
+
+    fn next_text<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<String>, WsError>> {
+        Box::pin(async move {
+            match self.frames.pop_front() {
+                Some(ScriptedFrame::Text(text)) => Ok(Some(text)),
+                Some(ScriptedFrame::Error(message)) => Err(WsError(message)),
+                // A close frame, and an exhausted script, both end the stream.
+                Some(ScriptedFrame::Close) | None => Ok(None),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use futures_util::StreamExt;
@@ -260,5 +488,142 @@ mod tests {
                 body: Vec::new(),
             })
             .await;
+    }
+
+    fn handshake(url: &str) -> WsHandshake {
+        WsHandshake {
+            url: url.to_string(),
+            headers: vec![("Authorization".to_string(), "Bearer token".to_string())],
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_records_the_handshake_and_replays_frames_in_order() {
+        let connector = ScriptedWsConnector::new(vec![ScriptedConnection::accept(vec![
+            ScriptedFrame::text("one"),
+            ScriptedFrame::text("two"),
+            ScriptedFrame::close(),
+        ])]);
+
+        let mut connection = connector
+            .connect(handshake("wss://a.test/responses"))
+            .await
+            .unwrap();
+        connection.send_text("out".to_string()).await.unwrap();
+        assert_eq!(
+            connection.next_text().await.unwrap().as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            connection.next_text().await.unwrap().as_deref(),
+            Some("two")
+        );
+        assert_eq!(connection.next_text().await.unwrap(), None);
+
+        let handshakes = connector.handshakes();
+        assert_eq!(handshakes.len(), 1);
+        assert_eq!(handshakes[0].url, "wss://a.test/responses");
+        assert_eq!(
+            handshakes[0].headers,
+            vec![("Authorization".to_string(), "Bearer token".to_string())]
+        );
+        assert_eq!(connector.sent_texts(), vec![vec!["out".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn ws_scripted_error_frame_fails_the_read() {
+        let connector = ScriptedWsConnector::new(vec![ScriptedConnection::accept(vec![
+            ScriptedFrame::error("boom"),
+            ScriptedFrame::text("unreachable"),
+        ])]);
+        let mut connection = connector.connect(handshake("wss://a.test")).await.unwrap();
+        assert_eq!(
+            connection.next_text().await.unwrap_err(),
+            WsError("boom".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_refused_upgrade_keeps_the_status_and_body() {
+        let connector = ScriptedWsConnector::new(vec![ScriptedConnection::refuse(401, b"denied")]);
+        let error = connector
+            .connect(handshake("wss://a.test"))
+            .await
+            .err()
+            .expect("a refused upgrade is not a connection");
+        assert_eq!(
+            error,
+            WsConnectError::Status {
+                status: 401,
+                body: b"denied".to_vec(),
+            }
+        );
+        assert!(connector.sent_texts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ws_failed_connection_never_opens_a_connection() {
+        let connector = ScriptedWsConnector::new(vec![ScriptedConnection::fail("dns")]);
+        let error = connector
+            .connect(handshake("wss://a.test"))
+            .await
+            .err()
+            .expect("a failed connect is not a connection");
+        assert_eq!(error, WsConnectError::Failed("dns".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ws_exhausted_script_ends_the_stream() {
+        let connector =
+            ScriptedWsConnector::new(vec![ScriptedConnection::accept(vec![ScriptedFrame::text(
+                "only",
+            )])]);
+        let mut connection = connector.connect(handshake("wss://a.test")).await.unwrap();
+        assert_eq!(
+            connection.next_text().await.unwrap().as_deref(),
+            Some("only")
+        );
+        assert_eq!(connection.next_text().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "no scripted connection left")]
+    async fn ws_panics_when_asked_for_more_connections_than_scripted() {
+        let connector = ScriptedWsConnector::new(Vec::new());
+        let _ = connector.connect(handshake("wss://a.test")).await;
+    }
+
+    #[tokio::test]
+    async fn refusing_connector_refuses_every_attempt_and_counts_them() {
+        let connector = RefusingWsConnector::default();
+        for _ in 0..3 {
+            let error = connector
+                .connect(handshake("wss://a.test"))
+                .await
+                .err()
+                .expect("a refusing connector never opens a connection");
+            assert_eq!(
+                error,
+                WsConnectError::Status {
+                    status: 404,
+                    body: Vec::new(),
+                }
+            );
+        }
+        assert_eq!(connector.handshakes(), 3);
+        let unauthorized = RefusingWsConnector::new(401);
+        let error = unauthorized
+            .connect(handshake("wss://a.test"))
+            .await
+            .err()
+            .expect("a refusing connector never opens a connection");
+        assert_eq!(
+            error,
+            WsConnectError::Status {
+                status: 401,
+                body: Vec::new(),
+            },
+            "the refusal status is the caller's"
+        );
     }
 }

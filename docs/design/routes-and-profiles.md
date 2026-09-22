@@ -101,8 +101,9 @@ permanently. Rules, all load errors otherwise:
 
 A `provider` key that is actually a route id (or a `route` that is actually a whole-provider
 key) is an error that says which form to use — no fallback from one to the other.
-The shipped `deepseek` and `glm` environments move to the new form in this step; `claude`,
-`gpt`, `claude-delegating` move in step 4.
+The shipped `deepseek` and `glm` environments move to the new form in this step; `claude` and
+`gpt` move in step 4. (`claude-delegating` is gone: every main agent has the worker tools now,
+ADR-0050.)
 
 ## 2. Resolution
 
@@ -222,7 +223,8 @@ compiled behaviour strategies:
   (Messages needs `max_tokens`: default 32_000, margin 8_192 over a budget) stay in the adapter.
   `text.verbosity` stays in the Responses adapter until a second consumer exists.
 - Model-name prefix matching (`is_adaptive`) is deleted. Profiles are explicit records:
-  `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5` (`effort-level`, all five efforts);
+  `claude-fable-5`, `claude-opus-5`, `claude-opus-5-5`, `claude-sonnet-5` (`effort-level`, all
+  five efforts);
   `claude-opus-4-6`, `claude-sonnet-4-6` (`budget`); `gpt-5.6-sol` and every other GPT model a
   shipped file or test names (`effort-level`, efforts low/medium/high — which is what makes
   `extra_high`/`max` an error there, replacing the adapter's hard-coded rejection with the same
@@ -264,8 +266,8 @@ fields / error). Native-option namespaces and `describe()` facts are unchanged.
 - Conformance suites of both adapters run against providers composed from the SHIPPED route and
   profile files through the host's loading path.
 - Negative assembly tests for each refused adapter × variant pair, through `assemble`.
-- `claude`, `gpt`, `claude-delegating` environments use the new form; their journals' origin
-  strings are unchanged (a session recorded before this step resumes after it — test with a
-  recorded header).
+- `claude` and `gpt` environments use the new form; their journals' origin strings are unchanged
+  (a session recorded before this step resumes after it — test with a recorded header). The
+  `claude-delegating` environment is gone — every main agent has the worker tools (ADR-0050).
 - `WHOLE_PROVIDERS` in the host is empty or gone; the old environment form is exercised only by
   fakes registered through the test hook.

@@ -72,7 +72,7 @@ atomically (another tool — Claude Code itself — shares it). 401/403 → one 
 ## B. ChatGPT/Codex subscription — OpenAI Responses  (`openai-codex-responses`)
 
 **Request** [donor] `POST https://chatgpt.com/backend-api/codex/responses`, streaming SSE
-(the donor's WebSocket transport is NOT taken). Headers: `Authorization: Bearer <access>`,
+(default; a route may opt into the WebSocket transport — ADR-0047, `websocket.md`). Headers: `Authorization: Bearer <access>`,
 `chatgpt-account-id: <from the token's JWT claim https://api.openai.com/auth .chatgpt_account_id>`,
 `originator`, `User-Agent`, `OpenAI-Beta: responses=experimental`, `Content-Type: application/json`.
 The public `api.openai.com/v1/responses` API-key route is a different route, not built in this slice.

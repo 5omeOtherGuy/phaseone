@@ -1,15 +1,14 @@
-# What the model is, independent of the route that reaches it (ADR-0039). The
-# responses adapter's old rule — every model name took an effort level, and only
-# low/medium/high; an effort-less request carried no reasoning fields — is what this
-# profile records, byte for byte.
+# What the model is, independent of the route that reaches it (ADR-0039). The ChatGPT/
+# Codex subscription endpoint serves this model with every effort below (Codex CLI model
+# cache, 2026-09-21); the old low/medium/high-only rule was the pre-profile responses
+# adapter's wire behaviour, not the model's. `ultra` has no p1 effort, so it is left out.
 id       = "gpt-5.6-sol"
-revision = 1
+revision = 2
 model_id = "gpt-5.6-sol"
 family   = "gpt"
 thinking = "effort-level"
 
-# The adapter sent no reasoning fields without an explicit effort and rejected
-# extra_high/max outright, so there is no default_effort and no higher lane.
-efforts = ["low", "medium", "high"]
+efforts = ["low", "medium", "high", "extra_high", "max"]
 
+# default_effort: absent — an effort-less request carries no reasoning fields.
 # context_tokens and max_output_tokens: unknown for this model, so stated nowhere.

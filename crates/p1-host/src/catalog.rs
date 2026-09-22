@@ -163,7 +163,7 @@ pub fn build_catalog_with_workers(
         env_pass,
         completion,
     );
-    register_delegation_tools(&mut catalog, service);
+    register_delegation_tools(&mut catalog, deps, service)?;
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
@@ -227,6 +227,11 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
             ));
         }
         let transport = deps.transport.clone();
+        // ADR-0047 §1: the host composes the REAL WebSocket connector next to the
+        // HTTP transport, once per catalog. Composition opens no socket: only a
+        // request on a route that asks for `transport = "websocket"` connects.
+        let ws: Arc<dyn p1_provider_http::ws::WsConnector> =
+            Arc::new(p1_provider_http::ws::TungsteniteConnector::new());
         let locations = locations.clone();
         let route = Arc::new(route);
         let data = route.clone();
@@ -237,7 +242,14 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
                 let binding = data.binding(&profile.id)?;
                 let credentials =
                     crate::auth::credential_source_at(&data, transport.clone(), &locations);
-                route_provider(&data, binding, profile, transport.clone(), credentials)
+                route_provider(
+                    &data,
+                    binding,
+                    profile,
+                    transport.clone(),
+                    ws.clone(),
+                    credentials,
+                )
             }),
         );
     }
@@ -255,9 +267,18 @@ pub fn credential_line(
     if environment.profile.is_none() {
         return Ok(None);
     }
-    let route = crate::routes::load_route_by_id(environment_dirs, &environment.provider)?;
-    let report = p1_auth::describe(&route.id, &route.credential, locations);
-    Ok(Some(report.line()))
+    credential_line_for_route(&environment.provider, environment_dirs, locations).map(Some)
+}
+
+/// The same line for a route id alone: `p1 models` prints it for every model, so
+/// both commands show one wording from one probe.
+pub fn credential_line_for_route(
+    route_id: &str,
+    environment_dirs: &[PathBuf],
+    locations: &p1_auth::Locations,
+) -> Result<String, String> {
+    let route = crate::routes::load_route_by_id(environment_dirs, route_id)?;
+    Ok(p1_auth::describe(&route.id, &route.credential, locations).line())
 }
 
 /// Resolve a loaded environment against the route files, before `assemble` is
@@ -315,11 +336,17 @@ pub fn reject_profile(spec: &ProviderSpec) -> Result<(), String> {
 /// file names builds its provider from the file's own data (spec §2 step 4). The
 /// catalog factory, the live checks and the tests all come through here, so a route
 /// has exactly one construction path.
+///
+/// `ws` is the WebSocket connector, next to the HTTP transport (ADR-0047 §1): the
+/// production factory passes the real one and a test or live check injects its own,
+/// so a test that composes a shipped WebSocket route never opens a socket. A route
+/// that does not ask for WebSocket ignores it.
 pub fn route_provider(
     route: &crate::routes::RouteFile,
     binding: &crate::routes::ModelBinding,
     profile: Arc<p1_model_profile::ModelProfile>,
     transport: Arc<dyn p1_provider_http::Transport>,
+    ws: Arc<dyn p1_provider_http::ws::WsConnector>,
     credentials: Arc<dyn p1_provider_http::CredentialSource>,
 ) -> Result<Arc<dyn Provider>, String> {
     use crate::routes::AdapterSettings;
@@ -347,14 +374,21 @@ pub fn route_provider(
             Ok(Arc::new(provider) as Arc<dyn Provider>)
         }
         AdapterSettings::OpenAiResponses(settings) => {
-            let provider = p1_provider_openai::OpenAiCodexProvider::new(
+            // ADR-0047 §1: a route that asks for `transport = "websocket"` gets the
+            // injected connector here, at composition. The provider refuses a
+            // WebSocket route without one, so the two cannot drift apart.
+            let transport_mode = settings.transport;
+            let mut composition = p1_provider_openai::OpenAiCodexProvider::builder(
                 responses_route_from(route, settings),
                 &binding.wire_model,
                 profile,
                 transport,
                 credentials,
-            )
-            .map_err(|error| error.to_string())?;
+            );
+            if transport_mode == p1_provider_openai::ResponsesTransport::Websocket {
+                composition = composition.with_ws_connector(ws);
+            }
+            let provider = composition.build().map_err(|error| error.to_string())?;
             Ok(Arc::new(provider) as Arc<dyn Provider>)
         }
     }
@@ -462,6 +496,7 @@ fn responses_route_from(
         origin_route: route.origin_route.clone(),
         endpoint: route.endpoint.clone(),
         account: settings.account,
+        transport: settings.transport,
     }
 }
 
@@ -593,20 +628,37 @@ fn register_standard_tools(
 #[cfg(feature = "delegation")]
 fn register_delegation_tools(
     catalog: &mut Catalog,
+    deps: &HostDeps,
     service: Option<Arc<dyn p1_workers::WorkerService>>,
-) {
+) -> Result<(), String> {
     // Without a service the keys are not registered at all, so an environment naming
     // one gets the ordinary `UnknownToolModule`.
     let Some(service) = service else {
-        return;
+        return Ok(());
     };
 
+    // What a parent may grant is the host's own knowledge, never a compiled list in
+    // the tool crate: every tool module this catalog registers, minus `finish` (the
+    // factory adds it to every worker) and the `worker_*` modules (a worker never
+    // delegates). The environments a worker may run are the host's environment dirs.
+    let grantable: Vec<String> = catalog
+        .tool_keys()
+        .into_iter()
+        .filter(|key| key != "finish" && !key.starts_with("worker_"))
+        .collect();
+    let environments = crate::models::environment_names(&deps.environment_dirs)?;
+
     let service_for = service.clone();
+    let grantable_for_start = grantable.clone();
     catalog.tool(
         "worker_start",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
             Ok(apply_delegate_face!(
-                p1_tool_delegate::WorkerStartTool::new(service_for.clone()),
+                p1_tool_delegate::WorkerStartTool::new(
+                    service_for.clone(),
+                    grantable_for_start.clone(),
+                    environments.clone(),
+                ),
                 spec
             ))
         }),
@@ -628,7 +680,7 @@ fn register_delegation_tools(
         "worker_continue",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
             Ok(apply_delegate_face!(
-                p1_tool_delegate::WorkerContinueTool::new(service_for.clone()),
+                p1_tool_delegate::WorkerContinueTool::new(service_for.clone(), grantable.clone()),
                 spec
             ))
         }),
@@ -643,4 +695,5 @@ fn register_delegation_tools(
             ))
         }),
     );
+    Ok(())
 }
