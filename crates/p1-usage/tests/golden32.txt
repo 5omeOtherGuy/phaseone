@@ -1,0 +1,18 @@
+CHATGPT PRO LITE         prolite
+7d           69% · resets 3d 13h
+██████████████████████████   69%
+credits                        0
+reset credits                  1
+
+CLAUDE MAX                   max
+5h              67% · resets 24m
+██████████████████████████   67%
+7d fable      7% · resets 1d 18h
+██████████████████████████    7%
+extra usage         0 / 5000 EUR
+
+FAILED                     error
+http
+
+OPENCODE GO-2            unknown
+no usage endpoint

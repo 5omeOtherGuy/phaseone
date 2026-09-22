@@ -1439,6 +1439,7 @@ dependencies = [
  "p1-tool-shell",
  "p1-tool-write",
  "p1-tui",
+ "p1-usage",
  "p1-workers",
  "p1-workspace",
  "ratatui",
@@ -1685,6 +1686,21 @@ dependencies = [
  "crossterm",
  "p1-contracts",
  "ratatui",
+ "tokio",
+ "unicode-width",
+]
+
+[[package]]
+name = "p1-usage"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "p1-auth",
+ "p1-provider-http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "time",
  "tokio",
  "unicode-width",
 ]
