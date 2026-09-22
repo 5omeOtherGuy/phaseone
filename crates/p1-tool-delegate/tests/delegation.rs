@@ -22,8 +22,8 @@ use p1_testkit::{
 };
 use p1_tool_delegate::all;
 use p1_workers::{
-    AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers, WorkerError,
-    WorkerService,
+    AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, FinishReport, InProcessWorkers,
+    WorkerError, WorkerReport, WorkerService,
 };
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -82,6 +82,9 @@ fn child_agent(
     ChildAgent {
         agent: build_agent(provider, prompt, tools),
         description: description.to_string(),
+        // These test agents have no host tap; an empty report is what a factory
+        // without one returns (ADR-0050 item 6).
+        report: Arc::new(WorkerReport::default),
     }
 }
 
@@ -294,7 +297,12 @@ async fn child_finishing_mid_turn_reaches_parent_next_request() {
     )
     .await;
     assert_eq!(result.status, ToolStatus::Ok);
-    assert_eq!(result.content, "Worker w1: finished\n\nchild answer");
+    // An empty report (no tap): the three report lines are still there, the
+    // missing-call line is omitted, and the status and text are unchanged.
+    assert_eq!(
+        result.content,
+        "tools: \nfinish: not called\n---\nWorker w1: finished\n\nchild answer"
+    );
 }
 
 // ================================================================ b
@@ -395,7 +403,10 @@ async fn child_finishing_while_parent_waits_in_worker_result() {
     // The tool returned the retained result ...
     let result = tool_result(&parent, "worker_result").expect("worker_result in history");
     assert_eq!(result.status, ToolStatus::Ok);
-    assert_eq!(result.content, "Worker w1: finished\n\nchild answer");
+    assert_eq!(
+        result.content,
+        "tools: \nfinish: not called\n---\nWorker w1: finished\n\nchild answer"
+    );
     // ... and the notification still arrived exactly once afterwards.
     assert_eq!(notification_texts(&parent), vec![NOTICE_W1_COMPLETED]);
 }
@@ -425,7 +436,10 @@ async fn missed_notification_still_leaves_the_result_retrievable() {
     )
     .await;
     assert_eq!(result.status, ToolStatus::Ok);
-    assert_eq!(result.content, "Worker w1: finished\n\nlate answer");
+    assert_eq!(
+        result.content,
+        "tools: \nfinish: not called\n---\nWorker w1: finished\n\nlate answer"
+    );
     assert!(matches!(
         within(workers.status(&id)).await.unwrap(),
         ChildStatus::Finished(_)
@@ -1142,5 +1156,107 @@ async fn worker_start_passes_the_grant_into_the_child_spec() {
             )),
         "request 2 history: {:?}",
         parent_provider.requests()[1].history
+    );
+}
+
+// ================================================================ the worker report (ADR-0050 item 6)
+
+/// A factory whose child reports exactly this (a fixed snapshot, as a host tap
+/// would have built).
+fn reporting_factory(report: WorkerReport) -> AgentFactory {
+    Arc::new(move |_spec: &ChildSpec| {
+        Ok(ChildAgent {
+            agent: build_agent(
+                Arc::new(ScriptedProvider::new(vec![text_response("child answer")])),
+                "child prompt",
+                vec![],
+            ),
+            description: "route/model".to_string(),
+            report: Arc::new({
+                let report = report.clone();
+                move || report.clone()
+            }),
+        })
+    })
+}
+
+/// A short-handed worker's `worker_result` begins with its report — the granted
+/// tools, the `finish` it reported and every call to a tool it was not given —
+/// then `---`, then today's status line and final text. The report is stored in
+/// the retained result, so a later `worker_result` reads the same one.
+#[tokio::test(start_paused = true)]
+async fn a_finished_workers_result_begins_with_its_report() {
+    let workers = InProcessWorkers::new(
+        reporting_factory(WorkerReport {
+            tools: vec!["read".into(), "grep".into(), "finish".into()],
+            finish: Some(FinishReport {
+                status: "blocked".into(),
+                needs: Some("edit".into()),
+                summary: Some("cannot write".into()),
+            }),
+            missing_tool_calls: vec![("edit".into(), 2)],
+        }),
+        2,
+    );
+    let service: Arc<dyn WorkerService> = workers.clone();
+    let tools = all(service, grantable(), environments());
+
+    let id = within(workers.start(spec())).await.unwrap();
+    let status = within(workers.status(&id)).await.unwrap();
+    let ChildStatus::Finished(retained) = status else {
+        panic!("the child finishes: {status:?}");
+    };
+    assert_eq!(
+        retained.report.missing_tool_calls,
+        vec![("edit".to_string(), 2)]
+    );
+
+    let result = exec_tool(
+        &tool_by_name(&tools, "worker_result"),
+        "worker_result",
+        r#"{"id":"w1"}"#,
+    )
+    .await;
+    assert_eq!(result.status, ToolStatus::Ok);
+    assert_eq!(
+        result.content,
+        "tools: read, grep, finish\n\
+         finish: blocked — needs: edit\n\
+         calls to tools it was not given: edit x2\n\
+         ---\n\
+         Worker w1: finished\n\n\
+         child answer"
+    );
+}
+
+/// A worker that called `finish` with `done` and no missing calls: the third line
+/// is omitted and the finish line says `done`.
+#[tokio::test(start_paused = true)]
+async fn a_worker_that_finished_done_has_no_missing_call_line() {
+    let workers = InProcessWorkers::new(
+        reporting_factory(WorkerReport {
+            tools: vec!["read".into(), "finish".into()],
+            finish: Some(FinishReport {
+                status: "done".into(),
+                needs: None,
+                summary: Some("did it".into()),
+            }),
+            missing_tool_calls: Vec::new(),
+        }),
+        2,
+    );
+    let service: Arc<dyn WorkerService> = workers.clone();
+    let tools = all(service, grantable(), environments());
+    within(workers.start(spec())).await.unwrap();
+
+    let result = exec_tool(
+        &tool_by_name(&tools, "worker_result"),
+        "worker_result",
+        r#"{"id":"w1"}"#,
+    )
+    .await;
+    assert_eq!(
+        result.content,
+        "tools: read, finish\nfinish: done\n---\nWorker w1: finished\n\nchild answer"
     );
 }

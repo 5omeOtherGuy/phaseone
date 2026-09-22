@@ -83,6 +83,17 @@ impl FrontEnd for TuiFrontEnd {
         self.sink.worker_started(worker_id);
     }
 
+    /// A worker's end as ONE transcript note (ADR-0050 item 6), through the mechanism
+    /// the TUI already has for provider notices: a parent-tagged `ProviderNotice` the
+    /// driver renders `· …`. Display only — no history, no journal, nothing the model
+    /// sees — so a worker that lacked a tool is visible without the parent's help.
+    #[cfg(feature = "delegation")]
+    fn worker_ended(&self, worker_id: &str, description: &str, report: &p1_workers::WorkerReport) {
+        self.sink.emit(p1_contracts::AgentEvent::ProviderNotice {
+            text: crate::render::worker_end_note(worker_id, description, report),
+        });
+    }
+
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
         self.policy.clone()
     }
@@ -915,3 +926,59 @@ fn status_groups(driver: &Driver) -> Vec<p1_tui::render::status::StatusGroup> {
 
 #[cfg(test)]
 mod tests;
+
+/// The worker-end wiring (ADR-0050 item 6): the sentence the line front end prints
+/// reaches the TUI as the note the driver already renders for a provider notice.
+#[cfg(all(test, feature = "delegation"))]
+mod worker_end_tests {
+    use super::*;
+    use p1_workers::{FinishReport, WorkerReport};
+
+    #[test]
+    fn a_workers_end_becomes_one_parent_tagged_provider_notice() {
+        let front_end = TuiFrontEnd::new(
+            TuiOptions {
+                env: "claude".into(),
+                ask: false,
+                workspace: std::path::PathBuf::from("/workspace"),
+                sandbox: "off".into(),
+            },
+            CancellationToken::new(),
+        );
+        let mut events = front_end
+            .events
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the UI loop has not started");
+        front_end.worker_ended(
+            "w1",
+            "claude/sonnet",
+            &WorkerReport {
+                tools: vec!["read".into(), "finish".into()],
+                finish: Some(FinishReport {
+                    status: "blocked".into(),
+                    needs: Some("edit".into()),
+                    summary: Some("cannot write".into()),
+                }),
+                missing_tool_calls: vec![("edit".into(), 2)],
+            },
+        );
+
+        let Some(UiEvent::Agent(stamped)) = events.try_recv().ok() else {
+            panic!("the note must reach the UI loop");
+        };
+        assert!(
+            stamped.worker.is_none(),
+            "the note is the parent's, so the driver renders it in the transcript"
+        );
+        assert_eq!(
+            stamped.event,
+            p1_contracts::AgentEvent::ProviderNotice {
+                text: "worker w1 (claude/sonnet; read, finish) blocked: needs edit — tried \
+                       edit x2"
+                    .into()
+            }
+        );
+    }
+}

@@ -538,6 +538,43 @@ pub fn status_name(status: ToolStatus) -> &'static str {
     }
 }
 
+/// The sentence a worker's end is reported with, in ONE place so the line front end
+/// (which prefixes it `· ` on stderr) and the TUI (which shows it as a transcript
+/// note) cannot drift (ADR-0050 item 6):
+///
+/// `worker w1 (route/model; read, grep, finish) blocked: needs edit — tried edit x2`
+///
+/// The state is `done`, `blocked: needs …` or `ended without finish`; the
+/// `— tried …` part appears only when the worker called a tool it was not given.
+#[cfg(feature = "delegation")]
+pub fn worker_end_note(
+    worker_id: &str,
+    description: &str,
+    report: &p1_workers::WorkerReport,
+) -> String {
+    let state = match &report.finish {
+        None => "ended without finish".to_string(),
+        Some(finish) if finish.status == "blocked" => match &finish.needs {
+            Some(needs) => format!("blocked: needs {needs}"),
+            None => "blocked".to_string(),
+        },
+        Some(finish) => finish.status.clone(),
+    };
+    let mut line = format!(
+        "worker {worker_id} ({description}; {}) {state}",
+        report.tools.join(", ")
+    );
+    if !report.missing_tool_calls.is_empty() {
+        let tried: Vec<String> = report
+            .missing_tool_calls
+            .iter()
+            .map(|(name, count)| format!("{name} x{count}"))
+            .collect();
+        line.push_str(&format!(" — tried {}", tried.join(", ")));
+    }
+    line
+}
+
 /// Total input tokens of one response. Known as soon as the uncached part is known:
 /// the cache parts are ADDED when the route reports them, and a route that has no such
 /// concept (the Codex route never reports cache writes) does not make the total unknown.
@@ -645,6 +682,64 @@ mod tests {
     fn summarizes_and_bounds_the_input() {
         assert_eq!(summarize_input("a\nb"), "a␤b");
         assert_eq!(summarize_input(&"x".repeat(200)).chars().count(), 100);
+    }
+
+    /// The ONE sentence every front end shows for a worker's end (ADR-0050 item 6).
+    #[cfg(feature = "delegation")]
+    #[test]
+    fn the_worker_end_note_names_the_grant_the_finish_and_what_it_tried() {
+        use p1_workers::{FinishReport, WorkerReport};
+        let tools = || vec!["read".to_string(), "grep".to_string(), "finish".to_string()];
+        let blocked = WorkerReport {
+            tools: tools(),
+            finish: Some(FinishReport {
+                status: "blocked".to_string(),
+                needs: Some("edit".to_string()),
+                summary: Some("cannot write".to_string()),
+            }),
+            missing_tool_calls: vec![("edit".to_string(), 2)],
+        };
+        assert_eq!(
+            worker_end_note("w1", "claude/sonnet", &blocked),
+            "worker w1 (claude/sonnet; read, grep, finish) blocked: needs edit — tried edit x2"
+        );
+
+        let done = WorkerReport {
+            tools: tools(),
+            finish: Some(FinishReport {
+                status: "done".to_string(),
+                needs: None,
+                summary: None,
+            }),
+            missing_tool_calls: Vec::new(),
+        };
+        assert_eq!(
+            worker_end_note("w1", "claude/sonnet", &done),
+            "worker w1 (claude/sonnet; read, grep, finish) done"
+        );
+
+        // No finish at all: the end is still reported, and no `tried` part without
+        // missing-tool calls.
+        let stopped = WorkerReport {
+            tools: tools(),
+            finish: None,
+            missing_tool_calls: Vec::new(),
+        };
+        assert_eq!(
+            worker_end_note("w2", "route/model", &stopped),
+            "worker w2 (route/model; read, grep, finish) ended without finish"
+        );
+
+        // Missing calls with a `done` finish still name what it tried.
+        let done_with_misses = WorkerReport {
+            tools: tools(),
+            finish: done.finish.clone(),
+            missing_tool_calls: vec![("edit".to_string(), 2), ("shell".to_string(), 1)],
+        };
+        assert_eq!(
+            worker_end_note("w1", "claude/sonnet", &done_with_misses),
+            "worker w1 (claude/sonnet; read, grep, finish) done — tried edit x2, shell x1"
+        );
     }
 
     #[test]
