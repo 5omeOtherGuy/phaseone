@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, CancellationToken, DeclarationKind, Effect, Grammar, Tool,
     ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
@@ -260,6 +261,52 @@ impl Tool for PatchTool {
             verb: "edit",
             target,
             edit: None,
+            destructive: patch_text(&self.declaration.name, self.freeform, call)
+                .ok()
+                .and_then(|text| parse_patch(&text).ok())
+                .is_some_and(|hunks| patch_is_destructive(&self.workspace, &hunks)),
+        }
+    }
+
+    fn describe_result(
+        &self,
+        call: &ToolCall,
+        result: &p1_contracts::ToolResultItem,
+    ) -> ResultDescription {
+        if result.status != ToolStatus::Ok {
+            return plain_result(result);
+        }
+        let Ok(text) = patch_text(&self.declaration.name, self.freeform, call) else {
+            return plain_result(result);
+        };
+        let files = describe_patch_files(&text);
+        let added: usize = files.iter().map(|file| file.added).sum();
+        let removed = files
+            .iter()
+            .map(|file| file.removed)
+            .try_fold(0usize, |total, count| count.map(|count| total + count));
+        let summary = match removed {
+            Some(removed) => format!("+{added} −{removed} · {} files", files.len()),
+            None => format!("+{added} · {} files", files.len()),
+        };
+        ResultDescription {
+            summary,
+            detail: Some(ResultDetail::Files {
+                paths: files
+                    .into_iter()
+                    .map(|file| {
+                        let facts = if file.kind == 'D' {
+                            "D".to_string()
+                        } else {
+                            match file.removed {
+                                Some(removed) => format!("+{} −{removed}", file.added),
+                                None => format!("+{}", file.added),
+                            }
+                        };
+                        format!("{}\t{facts}", file.path)
+                    })
+                    .collect(),
+            }),
         }
     }
 
@@ -299,6 +346,80 @@ impl Tool for PatchTool {
             }
         })
     }
+}
+
+fn plain_result(result: &p1_contracts::ToolResultItem) -> ResultDescription {
+    ResultDescription {
+        summary: result
+            .content
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        detail: None,
+    }
+}
+
+fn patch_is_destructive(workspace: &Workspace, hunks: &[Hunk]) -> bool {
+    hunks.iter().any(|hunk| match hunk {
+        Hunk::Add { path, .. } | Hunk::Delete { path } => workspace.resolve(path).is_err(),
+        Hunk::Update { path, moveto, .. } => {
+            workspace.resolve(path).is_err()
+                || moveto
+                    .as_deref()
+                    .is_some_and(|path| workspace.resolve(path).is_err())
+        }
+    })
+}
+
+struct DescribedPatchFile {
+    path: String,
+    kind: char,
+    added: usize,
+    removed: Option<usize>,
+}
+
+fn describe_patch_files(text: &str) -> Vec<DescribedPatchFile> {
+    let mut files: Vec<DescribedPatchFile> = Vec::new();
+    for line in strip_wrapper(text).lines() {
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            files.push(DescribedPatchFile {
+                path: path.to_string(),
+                kind: 'A',
+                added: 0,
+                removed: Some(0),
+            });
+        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            files.push(DescribedPatchFile {
+                path: path.to_string(),
+                kind: 'D',
+                added: 0,
+                removed: None,
+            });
+        } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+            files.push(DescribedPatchFile {
+                path: path.to_string(),
+                kind: 'M',
+                added: 0,
+                removed: Some(0),
+            });
+        } else if line.starts_with("*** Move to: ")
+            || line.starts_with("*** End of File")
+            || line.starts_with("@@")
+            || line.starts_with("*** Begin Patch")
+            || line.starts_with("*** End Patch")
+        {
+            continue;
+        } else if let Some(file) = files.last_mut() {
+            match (file.kind, line.chars().next()) {
+                ('A', _) => file.added += 1,
+                ('M', Some('+')) => file.added += 1,
+                ('M', Some('-')) => *file.removed.get_or_insert(0) += 1,
+                _ => {}
+            }
+        }
+    }
+    files
 }
 
 /// Extract the patch text from the raw call, according to the current shape.
@@ -921,9 +1042,10 @@ fn apply(
 #[cfg(test)]
 mod tests {
     use super::{PATCH_GRAMMAR, PatchTool};
+    use p1_contracts::tool::ResultDetail;
     use p1_contracts::{
         CancellationToken, DeclarationKind, Effect, Grammar, Tool, ToolCall, ToolContext,
-        ToolInput, ToolOutcome, ToolStatus,
+        ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
     };
     use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace};
     use std::path::Path;
@@ -983,6 +1105,24 @@ mod tests {
         assert_eq!(
             outcome.content,
             "M path/to/file.rs\nA path/to/new_file.rs\nD path/to/old_file.rs"
+        );
+        let result = ToolResultItem {
+            call_id: "call-1".into(),
+            name: "apply_patch".into(),
+            status: outcome.status,
+            content: outcome.content,
+        };
+        let described = tool.describe_result(&text_call(patch), &result);
+        assert_eq!(described.summary, "+2 · 3 files");
+        assert_eq!(
+            described.detail,
+            Some(ResultDetail::Files {
+                paths: vec![
+                    "path/to/file.rs\t+1 −1".into(),
+                    "path/to/new_file.rs\t+1 −0".into(),
+                    "path/to/old_file.rs\tD".into(),
+                ],
+            })
         );
         assert_eq!(
             read(dir.path(), "path/to/file.rs"),
@@ -1444,11 +1584,34 @@ mod tests {
         ));
         assert_eq!(one.verb, "edit");
         assert_eq!(one.target.as_deref(), Some("src/a.rs"));
+        assert!(!one.destructive);
+        assert!(
+            !tool
+                .describe(&text_call(&format!(
+                    "*** Begin Patch\n*** Add File: {}\n+x\n*** End Patch\n",
+                    dir.path().join("inside").display()
+                )))
+                .destructive
+        );
 
         let two = tool.describe(&text_call(
             "*** Begin Patch\n*** Add File: a\n+x\n*** Add File: b\n+y\n*** End Patch\n",
         ));
         assert_eq!(two.target.as_deref(), Some("2 files"));
+        assert!(
+            tool.describe(&text_call(
+                "*** Begin Patch\n*** Add File: ../outside\n+x\n*** End Patch\n"
+            ))
+            .destructive
+        );
+        let outside = dir.path().parent().unwrap().join("outside");
+        assert!(
+            tool.describe(&text_call(&format!(
+                "*** Begin Patch\n*** Add File: {}\n+x\n*** End Patch\n",
+                outside.display()
+            )))
+            .destructive
+        );
 
         let renamed = tool.with_face(ToolFace::new("Patch", "custom"), "claude");
         assert_eq!(

@@ -17,6 +17,7 @@ use grep::searcher::{
 };
 use ignore::WalkBuilder;
 use ignore::overrides::{Override, OverrideBuilder};
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, CancellationToken, DeclarationKind, Effect, Tool, ToolCall,
     ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
@@ -169,19 +170,39 @@ impl Tool for GrepTool {
         Effect::ReadOnly
     }
 
-    /// ADR-0057: the pattern searched, or the scope when the pattern is empty
-    /// (`mode: "files"` lists the scope), from the tool's own parsed input.
+    /// ADR-0057: the pattern and scope searched, from the tool's own parsed
+    /// input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
         CallDescription {
             verb: "search",
             target: parse_input(&self.declaration.name, call).ok().map(|input| {
-                if input.pattern.is_empty() {
-                    input.path.unwrap_or_else(|| ".".to_string())
-                } else {
-                    input.pattern
-                }
+                let scope = input.path.unwrap_or_else(|| ".".to_string());
+                format!("{} {scope}", input.pattern)
             }),
             edit: None,
+            destructive: false,
+        }
+    }
+
+    fn describe_result(
+        &self,
+        call: &ToolCall,
+        result: &p1_contracts::ToolResultItem,
+    ) -> ResultDescription {
+        if result.status != ToolStatus::Ok {
+            return plain_result(result);
+        }
+        let files_mode =
+            parse_input(&self.declaration.name, call).is_ok_and(|input| input.mode == Mode::Files);
+        let (count, files) = describe_matches(&result.content, files_mode);
+        let summary = if files_mode {
+            format!("{} files", files.len())
+        } else {
+            format!("{count} hits · {} files", files.len())
+        };
+        ResultDescription {
+            summary,
+            detail: Some(ResultDetail::Matches { count, files }),
         }
     }
 
@@ -220,6 +241,39 @@ impl Tool for GrepTool {
             }
         })
     }
+}
+
+fn plain_result(result: &p1_contracts::ToolResultItem) -> ResultDescription {
+    ResultDescription {
+        summary: result
+            .content
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        detail: None,
+    }
+}
+
+fn describe_matches(content: &str, files_mode: bool) -> (usize, Vec<String>) {
+    if content.trim() == "No matches." {
+        return (0, Vec::new());
+    }
+    if files_mode {
+        let files = content.lines().map(str::to_string).collect::<Vec<_>>();
+        return (files.len(), files);
+    }
+    let blocks = content.split("\n\n").collect::<Vec<_>>();
+    let count = blocks
+        .iter()
+        .map(|block| block.lines().count().saturating_sub(1))
+        .sum();
+    let files = blocks
+        .iter()
+        .filter_map(|block| block.lines().next())
+        .map(str::to_string)
+        .collect();
+    (count, files)
 }
 
 fn parse_input(tool: &str, call: &ToolCall) -> Result<GrepInput, String> {
@@ -706,9 +760,10 @@ mod tests {
     use super::{
         GrepTool, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, newlines, parse_input, within_bound,
     };
+    use p1_contracts::tool::ResultDetail;
     use p1_contracts::{
         CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput,
-        ToolOutcome, ToolStatus,
+        ToolOutcome, ToolResultItem, ToolStatus,
     };
     use p1_workspace::{ToolFace, Workspace, bound_output};
     use std::path::Path;
@@ -769,6 +824,21 @@ mod tests {
         assert_eq!(
             outcome.content,
             "src/a.rs\n2:fn beta() {}\n\nsrc/b.rs\n1:fn beta() {}"
+        );
+        let result = ToolResultItem {
+            call_id: "call-1".into(),
+            name: "grep".into(),
+            status: outcome.status,
+            content: outcome.content,
+        };
+        let described = tool.describe_result(&call(r#"{"pattern": "beta"}"#), &result);
+        assert_eq!(described.summary, "2 hits · 2 files");
+        assert_eq!(
+            described.detail,
+            Some(ResultDetail::Matches {
+                count: 2,
+                files: vec!["src/a.rs".into(), "src/b.rs".into()],
+            })
         );
     }
 
@@ -981,10 +1051,16 @@ mod tests {
         let tool = tool(dir.path());
         let described = tool.describe(&call(r#"{"pattern": "beta", "path": "src"}"#));
         assert_eq!(described.verb, "search");
-        assert_eq!(described.target.as_deref(), Some("beta"));
-        // `mode: "files"` with an empty pattern lists the scope.
+        assert_eq!(described.target.as_deref(), Some("beta src"));
+        assert!(!described.destructive);
+        assert_eq!(
+            tool.describe(&call(r#"{"pattern": "beta"}"#))
+                .target
+                .as_deref(),
+            Some("beta .")
+        );
         let scoped = tool.describe(&call(r#"{"pattern": "", "path": "src"}"#));
-        assert_eq!(scoped.target.as_deref(), Some("src"));
+        assert_eq!(scoped.target.as_deref(), Some(" src"));
     }
 
     #[tokio::test]

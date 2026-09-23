@@ -11,6 +11,7 @@
 //! injected snapshot by [`ENV_ALLOW`], [`ENV_ALLOW_PREFIXES`] and the names added
 //! with [`ShellTool::with_env_pass`], sandboxed or not.
 
+mod destructive;
 mod filter;
 
 use std::collections::VecDeque;
@@ -23,9 +24,10 @@ use std::time::Duration;
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, CancellationToken, DeclarationKind, Effect, Tool, ToolCall,
-    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
+    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_workspace::{ToolFace, Workspace};
 use serde::Deserialize;
@@ -591,13 +593,61 @@ impl Tool for ShellTool {
     /// ADR-0057: the command's first line, trimmed to 80 characters, from the
     /// tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
+        let input = parse_input(&self.declaration.name, call).ok();
         CallDescription {
             verb: "run",
-            target: parse_input(&self.declaration.name, call).ok().map(|input| {
+            target: input.as_ref().map(|input| {
                 let first = input.command.lines().next().unwrap_or_default().trim();
                 first.chars().take(80).collect()
             }),
             edit: None,
+            // Invalid input is classified at the tool's worst case, as required
+            // by the Tool contract. Execution will still return the input error.
+            destructive: input.as_ref().is_none_or(|input| {
+                destructive::is_destructive(&input.command, self.workspace.root())
+            }),
+        }
+    }
+
+    fn describe_result(&self, _call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        let mut lines: Vec<&str> = result.content.lines().collect();
+        let exit_code = lines.last().and_then(|line| {
+            line.strip_prefix("[exit code: ")
+                .and_then(|code| code.strip_suffix(']'))
+                .and_then(|code| code.parse().ok())
+        });
+        // Shell terminal lines are framing, not command output. Only an exit
+        // footer carries an exit code, but timeout/cancellation/signal footers
+        // must not leak into the command tail either.
+        if lines.last().is_some_and(|line| {
+            exit_code.is_some()
+                || matches!(*line, "[cancelled]" | "[terminated by an unknown signal]")
+                || line.starts_with("[timed out after ")
+                || line.starts_with("[terminated by signal ")
+        }) {
+            lines.pop();
+        }
+        let line_count = lines.len();
+        let summary = if result.status == ToolStatus::Ok {
+            match exit_code {
+                Some(code) => format!("exit {code} · {line_count} lines"),
+                None => format!("{line_count} lines"),
+            }
+        } else {
+            result
+                .content
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        ResultDescription {
+            summary,
+            detail: Some(ResultDetail::Command {
+                exit_code,
+                elapsed_ms: None,
+                tail: lines.into_iter().map(str::to_string).collect(),
+            }),
         }
     }
 
@@ -1051,9 +1101,10 @@ mod tests {
     use super::{ENV_ALLOW, ENV_ALLOW_PREFIXES, ShellTool, Spawn, parse_input, run};
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
+    use p1_contracts::tool::ResultDetail;
     use p1_contracts::{
         CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput,
-        ToolOutcome, ToolStatus,
+        ToolOutcome, ToolResultItem, ToolStatus,
     };
     use p1_workspace::{ToolFace, Workspace};
     use std::ffi::OsString;
@@ -1322,6 +1373,65 @@ mod tests {
         let long = format!("echo {}", "x".repeat(200));
         let call = call(&serde_json::json!({ "command": long }).to_string());
         assert_eq!(tool.describe(&call).target.unwrap().chars().count(), 80);
+    }
+
+    #[test]
+    fn describe_classifies_destructive_real_call_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        for command in [
+            "rm -rf target/",
+            "git push --force origin main",
+            "git reset --hard",
+            "git clean -f",
+            "echo secret > /tmp/out",
+            "cargo test | tee ../outside.log",
+        ] {
+            let input = serde_json::json!({ "command": command }).to_string();
+            assert!(tool.describe(&call(&input)).destructive, "{command:?}");
+        }
+        for command in [
+            "grep -r needle target/",
+            "git push origin main",
+            "echo 'rm -rf /'",
+            "echo output > target/out",
+        ] {
+            let input = serde_json::json!({ "command": command }).to_string();
+            assert!(!tool.describe(&call(&input)).destructive, "{command:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_result_parses_a_real_shell_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        let call = call(r#"{"command":"printf 'one\\ntwo\\n'; exit 7"}"#);
+        let outcome = tool
+            .execute(
+                &call,
+                ToolContext {
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await;
+        let result = ToolResultItem {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            status: outcome.status,
+            content: outcome.content,
+        };
+
+        let described = tool.describe_result(&call, &result);
+
+        assert_eq!(described.summary, "exit 7 · 2 lines");
+        assert_eq!(
+            described.detail,
+            Some(ResultDetail::Command {
+                exit_code: Some(7),
+                elapsed_ms: None,
+                tail: vec!["one".into(), "two".into()],
+            })
+        );
     }
 
     #[tokio::test]

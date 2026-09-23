@@ -7,6 +7,7 @@
 use std::io::{ErrorKind, Read};
 use std::path::Path;
 
+use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
@@ -130,12 +131,38 @@ impl Tool for ReadTool {
 
     /// ADR-0057: the file this call reads, from the tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
+        let target = parse_input(&self.declaration.name, call).ok().map(|input| {
+            let mut target = input.file_path;
+            if input.offset.is_some() || input.limit.is_some() {
+                let start = input.offset.unwrap_or(DEFAULT_OFFSET);
+                let end = start + input.limit.unwrap_or(DEFAULT_LIMIT) - 1;
+                target = format!("{target}:{start}-{end}");
+            }
+            target
+        });
         CallDescription {
             verb: "read",
-            target: parse_input(&self.declaration.name, call)
-                .ok()
-                .map(|input| input.file_path),
+            target,
             edit: None,
+            destructive: false,
+        }
+    }
+
+    fn describe_result(
+        &self,
+        _call: &ToolCall,
+        result: &p1_contracts::ToolResultItem,
+    ) -> ResultDescription {
+        if result.status != ToolStatus::Ok {
+            return plain_result(result);
+        }
+        ResultDescription {
+            summary: format!(
+                "{} lines · {:.1} kB",
+                result.content.lines().count(),
+                result.content.len() as f64 / 1000.0
+            ),
+            detail: None,
         }
     }
 
@@ -168,6 +195,18 @@ impl Tool for ReadTool {
                 Err(error) => ToolOutcome::error(format!("{tool} failed: {error}")),
             }
         })
+    }
+}
+
+fn plain_result(result: &p1_contracts::ToolResultItem) -> ResultDescription {
+    ResultDescription {
+        summary: result
+            .content
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        detail: None,
     }
 }
 
@@ -526,7 +565,8 @@ fn read_windowed_impl<R: Read>(
 mod tests {
     use super::{MAX_OUTPUT_BYTES, READ_BUFFER_BYTES, ReadInput, ReadTool, parse_input};
     use p1_contracts::{
-        DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome, ToolStatus,
+        DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome,
+        ToolResultItem, ToolStatus,
     };
     use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace};
     use std::path::Path;
@@ -613,6 +653,19 @@ mod tests {
         let described = tool.describe(&call(r#"{"file_path": "src/a.rs"}"#));
         assert_eq!(described.verb, "read");
         assert_eq!(described.target.as_deref(), Some("src/a.rs"));
+        assert_eq!(
+            tool.describe(&call(r#"{"file_path": "src/a.rs", "offset": 10}"#))
+                .target
+                .as_deref(),
+            Some("src/a.rs:10-2009")
+        );
+        assert_eq!(
+            tool.describe(&call(r#"{"file_path": "src/a.rs", "limit": 25}"#))
+                .target
+                .as_deref(),
+            Some("src/a.rs:1-25")
+        );
+        assert!(!described.destructive);
         // Invalid input has no target — never a panic, never a guess.
         assert_eq!(tool.describe(&call("not json")).target, None);
     }
@@ -630,6 +683,15 @@ mod tests {
             outcome.content,
             "     1\talpha\n     2\tbeta\n     3\tgamma"
         );
+        let result = ToolResultItem {
+            call_id: "call-1".into(),
+            name: "read".into(),
+            status: outcome.status,
+            content: outcome.content,
+        };
+        let described = tool.describe_result(&call(r#"{"file_path": "a.txt"}"#), &result);
+        assert_eq!(described.summary, "3 lines · 0.0 kB");
+        assert_eq!(described.detail, None);
     }
 
     #[tokio::test]

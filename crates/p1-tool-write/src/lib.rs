@@ -4,6 +4,7 @@
 //! `p1-workspace`. This module owns the model-facing declaration, input
 //! validation and the read-before-mutate guard for an existing target.
 
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
@@ -111,6 +112,9 @@ impl Tool for WriteTool {
     /// ADR-0057: the file this call writes, from the tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
         let parsed = parse_input(&self.declaration.name, call).ok();
+        let destructive = parsed
+            .as_ref()
+            .is_some_and(|input| self.workspace.resolve(&input.file_path).is_err());
         CallDescription {
             verb: "edit",
             target: parsed.as_ref().map(|input| input.file_path.clone()),
@@ -118,6 +122,33 @@ impl Tool for WriteTool {
                 path: input.file_path,
                 old: String::new(),
                 new: input.content,
+            }),
+            destructive,
+        }
+    }
+
+    fn describe_result(
+        &self,
+        call: &ToolCall,
+        result: &p1_contracts::ToolResultItem,
+    ) -> ResultDescription {
+        if result.status != ToolStatus::Ok {
+            return plain_result(result);
+        }
+        let Ok(input) = parse_input(&self.declaration.name, call) else {
+            return plain_result(result);
+        };
+        let lines = input.content.lines().count();
+        let summary = parenthesized_count(&result.content, "bytes").map_or_else(
+            || format!("{lines} lines"),
+            |bytes| format!("{lines} lines · {:.1} kB", bytes as f64 / 1000.0),
+        );
+        ResultDescription {
+            summary,
+            detail: Some(ResultDetail::Diff {
+                path: input.file_path,
+                before: String::new(),
+                after: input.content,
             }),
         }
     }
@@ -153,6 +184,28 @@ impl Tool for WriteTool {
             }
         })
     }
+}
+
+fn plain_result(result: &p1_contracts::ToolResultItem) -> ResultDescription {
+    ResultDescription {
+        summary: result
+            .content
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        detail: None,
+    }
+}
+
+fn parenthesized_count(content: &str, unit: &str) -> Option<usize> {
+    let rest = &content[content.rfind('(')? + 1..];
+    let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
+    let count = rest[..digits_end].parse().ok()?;
+    rest[digits_end..]
+        .trim_start()
+        .starts_with(unit)
+        .then_some(count)
 }
 
 fn parse_input(tool: &str, call: &ToolCall) -> Result<WriteInput, String> {
@@ -215,9 +268,10 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::WriteTool;
+    use p1_contracts::tool::ResultDetail;
     use p1_contracts::{
         DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome,
-        ToolStatus,
+        ToolResultItem, ToolStatus,
     };
     use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace};
     use std::path::Path;
@@ -310,6 +364,31 @@ mod tests {
                 new: "hi".into(),
             })
         );
+        assert!(!tool.describe(&call).destructive);
+        assert!(
+            !tool
+                .describe(&super::tests::call(
+                    &serde_json::json!({
+                        "file_path": dir.path().join("inside.txt"),
+                        "content": "hi"
+                    })
+                    .to_string()
+                ))
+                .destructive
+        );
+        assert!(
+            tool.describe(&super::tests::call(
+                r#"{"file_path": "../outside.txt", "content": "hi"}"#
+            ))
+            .destructive
+        );
+        let absolute = dir.path().parent().unwrap().join("outside.txt");
+        assert!(
+            tool.describe(&super::tests::call(
+                &serde_json::json!({"file_path": absolute, "content": "hi"}).to_string()
+            ))
+            .destructive
+        );
     }
 
     #[tokio::test]
@@ -325,6 +404,39 @@ mod tests {
 
         assert_eq!(outcome.status, ToolStatus::Ok);
         assert_eq!(outcome.content, "Wrote nested/dir/file.txt (5 bytes).");
+        let result = ToolResultItem {
+            call_id: "call-1".into(),
+            name: "write".into(),
+            status: outcome.status,
+            content: outcome.content,
+        };
+        let described = tool.describe_result(
+            &call(r#"{"file_path": "nested/dir/file.txt", "content": "hello"}"#),
+            &result,
+        );
+        assert_eq!(described.summary, "1 lines · 0.0 kB");
+        assert_eq!(
+            described.detail,
+            Some(ResultDetail::Diff {
+                path: "nested/dir/file.txt".into(),
+                before: String::new(),
+                after: "hello".into(),
+            })
+        );
+        let reported = ToolResultItem {
+            call_id: "call-1".into(),
+            name: "write".into(),
+            status: ToolStatus::Ok,
+            content: "Wrote nested/dir/file.txt (5000 bytes).".into(),
+        };
+        assert_eq!(
+            tool.describe_result(
+                &call(r#"{"file_path": "nested/dir/file.txt", "content": "hello"}"#),
+                &reported,
+            )
+            .summary,
+            "1 lines · 5.0 kB"
+        );
         assert_eq!(
             std::fs::read(dir.path().join("nested/dir/file.txt")).unwrap(),
             b"hello"

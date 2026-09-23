@@ -301,3 +301,13 @@ ladder: exact → trailing-whitespace-insensitive → whitespace-insensitive); t
 atomically per file. Any failure → nothing written, error names the file and the hunk.
 Success: one line per file `A|M|D <path>`. The same implementation also offers a function
 face `{"patch": string}` for routes without freeform tools.
+# Result descriptions and destructiveness (ADR-0059)
+
+Tools describe their own execution results through `Tool::describe_result`:
+the summary is the result's first line by default, while `ResultDetail` can
+carry a diff, command facts, matches, files, or text. The host renders these
+descriptions without decoding a tool's private input or output.
+
+`CallDescription.destructive` is the tool's pre-execution judgement. The host
+uses it to show the destructive approval floor and disable persistent grants;
+the default is `false`.
