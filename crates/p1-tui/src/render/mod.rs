@@ -15,7 +15,6 @@ pub mod picker;
 pub mod review;
 pub mod screen;
 pub mod scroll;
-pub mod status;
 pub mod statusbar;
 pub mod transcript;
 pub mod workers;

@@ -37,15 +37,15 @@ const STEERING: &str = "steering";
 /// tail: blocks are append-only and only the LAST block can be streaming-open,
 /// so older blocks are immutable and off-screen rows need never be built.
 ///
-/// `working` is the screen's working state, `Some` while a turn is live; the
-/// turn working row (§6.5) takes its phase, clock and request from the
-/// transcript and is drawn after windowing while no started call runs.
+/// `turn_live` says a turn is running; the turn working row (§6.5) takes its
+/// phase, clock and request from the transcript and is drawn after windowing
+/// while no started call runs.
 /// `now_ms` drives every live clock and the `▪▪▪` pulse (fake time in tests).
 pub fn lines(
     transcript: &Transcript,
     width: usize,
     max_rows: usize,
-    working: Option<&str>,
+    turn_live: bool,
     now_ms: u64,
     reduced_motion: bool,
 ) -> Vec<Line<'static>> {
@@ -79,7 +79,7 @@ pub fn lines(
     if out.len() > max_rows {
         out.drain(..out.len() - max_rows);
     }
-    if working.is_some() && !transcript.call_running() {
+    if turn_live && !transcript.call_running() {
         let facts = transcript.turn_working(now_ms).unwrap_or(TurnWorking {
             phase: TurnPhase::Waiting,
             elapsed_ms: None,
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn a_tool_call_uses_three_bands() {
-        let rendered = lines(&transcript_with_call(), 60, usize::MAX, None, 0, true);
+        let rendered = lines(&transcript_with_call(), 60, usize::MAX, false, 0, true);
         let text: Vec<String> = plain(&rendered)
             .iter()
             .map(|row| row.trim_end().to_string())
@@ -626,11 +626,11 @@ mod tests {
 
     #[test]
     fn reduced_motion_freezes_the_chase() {
-        let frozen = lines(&Transcript::new(), 60, usize::MAX, Some(""), 0, true);
+        let frozen = lines(&Transcript::new(), 60, usize::MAX, true, 0, true);
         // Every cell at full LIVE: a static `▪▪▪`.
         assert_eq!(working_cells(&frozen[0]), vec![Some(palette::LIVE); 3]);
         // Live, the same instant dims cells toward the ground.
-        let live = lines(&Transcript::new(), 60, usize::MAX, Some(""), 0, false);
+        let live = lines(&Transcript::new(), 60, usize::MAX, true, 0, false);
         assert_ne!(working_cells(&live[0])[0], Some(palette::LIVE));
     }
 
@@ -647,13 +647,13 @@ mod tests {
             },
             Some(10_000),
         );
-        let at = |now_ms| plain(&lines(&t, 76, usize::MAX, Some("shell"), now_ms, true))[0].clone();
+        let at = |now_ms| plain(&lines(&t, 76, usize::MAX, true, now_ms, true))[0].clone();
         assert!(at(10_000).contains("0.0s  ▪▪▪"), "{}", at(10_000));
         // Whole tenths, truncated: 4.29 s is still 4.2 s.
         assert!(at(14_290).contains("4.2s  ▪▪▪"), "{}", at(14_290));
         assert!(at(14_300).contains("4.3s  ▪▪▪"), "{}", at(14_300));
         // The block's own ▪▪▪ replaces the turn working row.
-        assert_eq!(lines(&t, 76, usize::MAX, Some("shell"), 0, true).len(), 1);
+        assert_eq!(lines(&t, 76, usize::MAX, true, 0, true).len(), 1);
     }
 
     #[test]
@@ -714,7 +714,7 @@ mod tests {
         );
         for t in [transcript_with_call(), mixed, Transcript::new()] {
             for width in [1usize, 7, 40, 120] {
-                let built = lines(&t, width, usize::MAX, None, 0, true);
+                let built = lines(&t, width, usize::MAX, false, 0, true);
                 assert_eq!(
                     count_rows(&t, width),
                     built.len(),
@@ -735,9 +735,9 @@ mod tests {
         let width = 120;
         let max_rows = 40;
         // The pre-change reference: build everything, then window it.
-        let full = lines(&t, width, usize::MAX, None, 0, true);
+        let full = lines(&t, width, usize::MAX, false, 0, true);
         assert_eq!(full.len(), 9_999);
-        let tail = lines(&t, width, max_rows, Some("running tests"), 0, true);
+        let tail = lines(&t, width, max_rows, true, 0, true);
         // The working row and its separating blank row are appended after
         // windowing; the transcript rows never exceed the budget.
         assert!(
@@ -767,8 +767,8 @@ mod tests {
                 ],
             });
         }
-        let full = lines(&t, 40, usize::MAX, None, 0, true);
-        let tail = lines(&t, 40, 20, None, 0, true);
+        let full = lines(&t, 40, usize::MAX, false, 0, true);
+        let tail = lines(&t, 40, 20, false, 0, true);
         assert_eq!(tail.len(), 20);
         assert_eq!(plain(&tail), plain(&full[full.len() - 20..]));
     }

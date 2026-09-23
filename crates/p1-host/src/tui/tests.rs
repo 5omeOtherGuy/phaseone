@@ -292,30 +292,31 @@ fn a_provider_notice_becomes_one_transcript_note() {
 
 #[test]
 fn a_live_worker_promotes_the_pane_and_a_finished_one_releases_it() {
-    use p1_tui::render::workers::{WorkerRow, WorkerState};
+    use p1_tui::render::workers::{BlockState, WorkerBlock};
     use p1_tui::state::{PaneMode, PaneWidth};
     let (mut d, _auth) = driver();
-    let row = |state: WorkerState| WorkerRow {
+    let row = |state: BlockState| WorkerBlock {
         id: "w1".into(),
-        summary: "w1".into(),
+        task: String::new(),
         route: "deepseek/v4.1-flash".into(),
         state,
         elapsed: None,
         cost_micro_usd: None,
-        details: vec![],
+        grants: String::new(),
+        activity: String::new(),
     };
     d.screen.pane_width = PaneWidth::Off;
-    d.screen.sync_workers(vec![row(WorkerState::Running)]);
+    d.screen.sync_workers(vec![row(BlockState::Running)]);
     assert_eq!(d.screen.pane_mode, PaneMode::Workers);
-    assert_eq!(d.screen.pane_width, PaneWidth::Ch56);
+    assert_eq!(d.screen.pane_width, PaneWidth::Wide);
     // All done: an unpinned WORKERS pane falls back to the ledger.
-    d.screen.sync_workers(vec![row(WorkerState::Done)]);
+    d.screen.sync_workers(vec![row(BlockState::Done)]);
     assert_eq!(d.screen.pane_mode, PaneMode::Ledger);
     // …unless it is pinned.
     d.screen.pane_mode = PaneMode::Workers;
     d.screen.pinned = true;
-    d.screen.sync_workers(vec![row(WorkerState::Running)]);
+    d.screen.sync_workers(vec![row(BlockState::Running)]);
     assert_eq!(d.screen.pane_mode, PaneMode::Workers);
-    d.screen.sync_workers(vec![row(WorkerState::Done)]);
+    d.screen.sync_workers(vec![row(BlockState::Done)]);
     assert_eq!(d.screen.pane_mode, PaneMode::Workers, "pinning always wins");
 }

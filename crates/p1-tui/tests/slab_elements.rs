@@ -30,7 +30,14 @@ fn paint(lines: &[Line<'static>], width: u16) -> (Buffer, Rect) {
 
 /// The whole transcript at `width`, reduced motion (the mocks cannot pin a `▪` pulse).
 fn rows(t: &Transcript, width: u16, working: Option<&str>, now_ms: u64) -> Vec<Line<'static>> {
-    render::lines(t, width as usize, usize::MAX, working, now_ms, true)
+    render::lines(
+        t,
+        width as usize,
+        usize::MAX,
+        working.is_some(),
+        now_ms,
+        true,
+    )
 }
 
 fn assert_whole(lines: &[Line<'static>], width: u16, id: &str) {

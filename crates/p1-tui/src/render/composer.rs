@@ -3,13 +3,11 @@
 //! soft-wrap and `⌥⏎` lines break, growing the input upward. The cursor is the terminal's
 //! hardware cursor: this module says where it goes and never draws a cursor cell.
 
-use std::collections::VecDeque;
-
 use ratatui::text::Line;
 
 use crate::band::{Band, Seg};
 use crate::palette;
-use crate::state::{Composer, Queued};
+use crate::state::Composer;
 use crate::wrap::cell_width;
 
 /// Band padding on both sides of every composer row.
@@ -187,29 +185,6 @@ fn hints(composer: &Composer, mode: Mode<'_>) -> (&'static str, &'static str) {
         Mode::Working => ("⏎ queue steering   ⌥⏎ queue follow-up", "^C cancel"),
         Mode::Idle => ("⏎ send   ⌥⏎ newline", "^C quit"),
     }
-}
-
-/// The composer as `render/screen.rs` draws it until the screen stage places the queue in the
-/// transcript area: queue rows, then the composer rows, `width` cells wide.
-pub fn lines(
-    composer: &Composer,
-    queued: &VecDeque<Queued>,
-    working: bool,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let mode = if working { Mode::Working } else { Mode::Idle };
-    let mut out = super::scroll::queue_rows(queued, width);
-    out.extend(render(composer, mode, width, usize::MAX).lines);
-    out
-}
-
-/// The cursor's cell for [`lines`]: (column, row within those lines).
-pub fn cursor_cell(composer: &Composer, queued_rows: usize, width: usize) -> (usize, usize) {
-    // An editable composer always places its cursor.
-    let (x, y) = render(composer, Mode::Idle, width, usize::MAX)
-        .cursor
-        .unwrap_or_default();
-    (x as usize, queued_rows + y as usize)
 }
 
 #[cfg(test)]

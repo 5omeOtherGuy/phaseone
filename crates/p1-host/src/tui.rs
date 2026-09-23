@@ -207,7 +207,7 @@ impl FrontEnd for TuiFrontEnd {
             screen.route = route.clone();
             // A resumed session shows where it stands (issue #12, seam note).
             screen.transcript.paint_history(agent.history());
-            let worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>> =
+            let worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>> =
                 Arc::new(Mutex::new(Vec::new()));
             #[cfg(feature = "delegation")]
             if let Some(service) = &workers {
@@ -301,7 +301,7 @@ pub(crate) struct Driver {
     /// borrow lives in the loop, not in the driver).
     submit_pending: Option<String>,
     /// The worker snapshot the refresher task maintains (delegation only).
-    worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>>,
+    worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
     inbox: p1_core::Inbox,
     /// §10 `branch`: refreshed off the render loop (`spawn_branch_refresh`,
     /// called from the async loop, never from a `Driver` method a plain
@@ -324,7 +324,6 @@ impl Driver {
         // directly, so it owns the check `handle` used to make for it).
         if self.screen.approval.is_none()
             && self.screen.picker.is_none()
-            && self.screen.status.is_none()
             && self.screen.output.is_some()
             && key.modifiers.is_empty()
         {
@@ -420,7 +419,6 @@ impl Driver {
             }
             Command::Dismiss => {
                 self.screen.picker = None;
-                self.screen.status = None;
             }
             Command::PickerUp => {
                 if let Some(picker) = &mut self.screen.picker {
@@ -474,7 +472,8 @@ impl Driver {
                 self.screen.goal = (!arg.is_empty()).then(|| arg.to_string());
             }
             "status" => {
-                self.screen.status = Some(status_groups(self));
+                let output = status_output(self);
+                self.screen.transcript.command_output(output);
             }
             other => {
                 self.screen.transcript.operator(format!("/{other}"));
@@ -608,8 +607,7 @@ impl Driver {
                 self.task_added += get("new_string")
                     .or_else(|| get("content"))
                     .map_or(0, |s| s.lines().count() as u64);
-                self.screen.task_view = Some(p1_tui::render::ledger::Task {
-                    id: None,
+                self.screen.workspace = Some(p1_tui::render::ledger::WorkspaceView {
                     files: Some(self.task_files.len() as u64),
                     diff: Some((self.task_added, self.task_removed)),
                     journal: None,
@@ -897,10 +895,10 @@ where
 #[cfg(feature = "delegation")]
 fn spawn_worker_refresher(
     service: Arc<dyn WorkerService>,
-    rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>>,
+    rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
     cancel: CancellationToken,
 ) {
-    use p1_tui::render::workers::{WorkerRow, WorkerState};
+    use p1_tui::render::workers::{BlockState, WorkerBlock};
     use p1_workers::ChildStatus;
     tokio::spawn(async move {
         let mut started: HashMap<String, std::time::Instant> = HashMap::new();
@@ -925,20 +923,22 @@ fn spawn_worker_refresher(
                     }
                     _ => None,
                 };
-                let (state, details) = match &status {
-                    ChildStatus::Running => (WorkerState::Running, Vec::new()),
-                    ChildStatus::Finished(_) => (WorkerState::Done, Vec::new()),
-                    ChildStatus::Cancelled => (WorkerState::Done, vec!["cancelled".into()]),
-                    ChildStatus::Failed(e) => (WorkerState::Done, vec![format!("failed: {e}")]),
+                let (state, activity) = match &status {
+                    ChildStatus::Running => (BlockState::Running, String::new()),
+                    ChildStatus::Finished(_) => (BlockState::Done, String::new()),
+                    ChildStatus::Cancelled => (BlockState::Cancelled, String::new()),
+                    ChildStatus::Failed(e) => (BlockState::Failed, format!("failed: {e}")),
                 };
-                next.push(WorkerRow {
+                // The service reports no task text and no grants yet (handoff §14.3).
+                next.push(WorkerBlock {
                     id: id.0.clone(),
-                    summary: id.0.clone(),
+                    task: String::new(),
                     route: description,
                     state,
                     elapsed,
                     cost_micro_usd: None,
-                    details,
+                    grants: String::new(),
+                    activity,
                 });
             }
             *rows.lock().unwrap() = next;
@@ -972,18 +972,9 @@ fn draw<B: Backend>(
             if color_mode != ColorMode::TrueColor {
                 p1_tui::palette::degrade(frame.buffer_mut(), color_mode);
             }
-            // The text cursor lives in the composer, unless a modal owns keys.
-            if screen.approval.is_none() && screen.picker.is_none() && screen.status.is_none() {
-                let area = frame.area();
-                let queued = screen.queued.len();
-                let (col, row) = p1_tui::render::composer::cursor_cell(
-                    &screen.composer,
-                    queued,
-                    area.width as usize,
-                );
-                let composer_rows = 1 + queued + 1; // input line(s) + hints
-                let y = area.height.saturating_sub(composer_rows as u16) + row as u16;
-                frame.set_cursor_position((col.min(area.width as usize - 1) as u16, y));
+            // The hardware cursor sits on the composer's text cell (§8.1), when it is editable.
+            if let Some(cursor) = screen.cursor {
+                frame.set_cursor_position(cursor);
             }
         })
         .ok();
@@ -1042,37 +1033,33 @@ fn approval_view(
     })
 }
 
-/// The `/status` overlay from live state (SPEC §4.6 shape).
-fn status_groups(driver: &Driver) -> Vec<p1_tui::render::status::StatusGroup> {
-    use p1_tui::render::status::{StatusGroup, StatusRow};
-    let row = |label: &str, value: String| StatusRow {
-        label: label.into(),
-        value,
-        available: true,
+/// `/status` as command output in the transcript (handoff §6.9), from live state.
+fn status_output(driver: &Driver) -> p1_tui::transcript::CommandOutput {
+    use p1_tui::transcript::{CommandOutput, CommandRow};
+    let row = |label: &str, value: String| CommandRow::Entry {
+        key: label.into(),
+        text: value,
     };
     let spend = &driver.screen.spend;
     let or_unknown = |v: Option<u64>| {
         v.map(p1_tui::render::tokens)
             .unwrap_or_else(|| p1_tui::render::UNKNOWN.into())
     };
-    vec![
-        StatusGroup {
-            header: "ENVIRONMENT".into(),
-            rows: vec![
-                row("environment", driver.env.clone()),
-                row("route", driver.route.clone()),
-                row("profile", driver.model.clone()),
-            ],
-        },
-        StatusGroup {
-            header: "SPEND".into(),
-            rows: vec![
-                row("in", or_unknown(spend.input)),
-                row("out", or_unknown(spend.output)),
-                row("cost", or_unknown(spend.cost_micro_usd)),
-            ],
-        },
-    ]
+    CommandOutput {
+        command: "/status".into(),
+        argument: String::new(),
+        facts: String::new(),
+        body: vec![
+            CommandRow::Head("ENVIRONMENT".into()),
+            row("environment", driver.env.clone()),
+            row("route", driver.route.clone()),
+            row("profile", driver.model.clone()),
+            CommandRow::Head("SPEND".into()),
+            row("in", or_unknown(spend.input)),
+            row("out", or_unknown(spend.output)),
+            row("cost", or_unknown(spend.cost_micro_usd)),
+        ],
+    }
 }
 
 #[cfg(test)]

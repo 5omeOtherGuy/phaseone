@@ -91,9 +91,9 @@ fn run_git(workspace: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// §10 `▪ N workers`: the running count from the worker snapshot.
-pub fn running_workers(rows: &[p1_tui::render::workers::WorkerRow]) -> usize {
+pub fn running_workers(rows: &[p1_tui::render::workers::WorkerBlock]) -> usize {
     rows.iter()
-        .filter(|row| row.state == p1_tui::render::workers::WorkerState::Running)
+        .filter(|row| row.state == p1_tui::render::workers::BlockState::Running)
         .count()
 }
 
@@ -197,20 +197,21 @@ mod tests {
 
     #[test]
     fn running_workers_counts_only_the_running_state() {
-        use p1_tui::render::workers::{WorkerRow, WorkerState};
-        let row = |state| WorkerRow {
+        use p1_tui::render::workers::{BlockState, WorkerBlock};
+        let row = |state| WorkerBlock {
             id: "w1".into(),
-            summary: String::new(),
+            task: String::new(),
             route: String::new(),
             state,
             elapsed: None,
             cost_micro_usd: None,
-            details: vec![],
+            grants: String::new(),
+            activity: String::new(),
         };
         let rows = vec![
-            row(WorkerState::Running),
-            row(WorkerState::Done),
-            row(WorkerState::Running),
+            row(BlockState::Running),
+            row(BlockState::Done),
+            row(BlockState::Running),
         ];
         assert_eq!(running_workers(&rows), 2);
     }

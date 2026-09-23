@@ -1,7 +1,7 @@
 //! Screen state: everything the renderers read and the key handlers mutate.
 //!
 //! The right pane is a core feature, planned from M1 (owner direction): width
-//! cycles `off / 40ch / 56ch / split` on `^W`, mode cycles on `^Tab`, events
+//! cycles `narrow / wide / split / off` on `^W`, mode cycles on `^Tab`, events
 //! PROMOTE a mode, and pinning always wins (SPEC §5). Focus mode (owner
 //! direction, carried over from the iris TUI) folds passive chrome away so
 //! the transcript owns the screen; the first edit reveals the composer again.
@@ -10,56 +10,58 @@ use std::collections::VecDeque;
 
 use p1_contracts::{AgentEvent, Usage};
 
+use crate::render::home::HomePrelude;
+use crate::render::ledger::{
+    ContextView, FoldRef, LedgerPane, LedgerSpend, SessionView, WorkersSummary, WorkspaceView,
+};
 use crate::render::picker::Picker;
-use crate::render::status::StatusGroup;
-use crate::transcript::Transcript;
+use crate::render::workers::{BlockState, WorkerBlock, WorkersPane};
+use crate::transcript::{Block, Transcript};
 
-/// A pending approval: the blocking view that owns the screen until decided
-/// (SPEC §4.4 diff review, §4.5 permission prompt).
+/// A pending approval (handoff §7.5): inline as the transcript's running element, or the full
+/// diff review that owns the screen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Approval {
     Diff(crate::render::diff::DiffView),
     Permission(crate::render::permission::PermissionView),
 }
 
-/// Pane width states, in `^W` cycle order (SPEC §5).
+/// Pane width states (handoff §4.1). `^W` cycles `narrow → wide → split → off`; `Auto` is the
+/// start state: narrow below 160 columns, wide from 160.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneWidth {
-    Off,
     #[default]
-    Ch40,
-    Ch56,
+    Auto,
+    /// 38 columns.
+    Narrow,
+    /// 56 columns.
+    Wide,
+    /// Half of `W − 6`.
     Split,
+    Off,
 }
 
 impl PaneWidth {
+    /// The state at a terminal `cols` wide: `Auto` becomes narrow or wide.
+    pub fn resolve(self, cols: u16) -> Self {
+        match self {
+            Self::Auto if cols >= 160 => Self::Wide,
+            Self::Auto => Self::Narrow,
+            other => other,
+        }
+    }
+
+    /// The next `^W` state. `Auto` cycles like narrow; `Screen::cycle_width` resolves it at the
+    /// real width first, so at 160+ columns the start state steps on to split.
     pub fn cycle(self) -> Self {
         match self {
-            Self::Off => Self::Ch40,
-            Self::Ch40 => Self::Ch56,
-            Self::Ch56 => Self::Split,
+            Self::Off => Self::Narrow,
+            Self::Auto | Self::Narrow => Self::Wide,
+            Self::Wide => Self::Split,
             Self::Split => Self::Off,
         }
     }
-
-    /// The columns the pane occupies, at terminal width `cols`. `Split` takes
-    /// half; `None` when the pane is off or the terminal is under the floor.
-    pub fn columns(self, cols: usize) -> Option<usize> {
-        if cols < PANE_FLOOR_COLS {
-            return None;
-        }
-        match self {
-            Self::Off => None,
-            Self::Ch40 => Some(40),
-            Self::Ch56 => Some(56),
-            Self::Split => Some(cols / 2),
-        }
-    }
 }
-
-/// Below ~100 columns the pane collapses and the transcript takes full width
-/// (SPEC §6). `^L` forces it back as an overlay at any width.
-pub const PANE_FLOOR_COLS: usize = 100;
 
 /// Pane modes, in `^Tab` cycle order (SPEC §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -268,7 +270,7 @@ pub struct Screen {
     pub pane_width: PaneWidth,
     pub pane_mode: PaneMode,
     /// The width the operator held before a live worker forced the pane open
-    /// (`Off` → `Ch56`); the demotion gives it back. `None` when no such
+    /// (`Off` → `Wide`); the demotion gives it back. `None` when no such
     /// promotion is outstanding, or when a pin or an operator change owns the
     /// width instead.
     pub promotion_saved_width: Option<PaneWidth>,
@@ -293,26 +295,39 @@ pub struct Screen {
     pub ledger_overlay: bool,
     /// The OUTPUT pane's open fold, if any (SPEC §5 OUTPUT mode).
     pub output: Option<crate::render::output::OutputView>,
-    /// The WORKERS pane's rows, refreshed by the driver from the host's
-    /// worker service (p1-tui never names p1-workers).
-    pub workers: Vec<crate::render::workers::WorkerRow>,
+    /// The WORKERS pane: its rows are refreshed by the driver from the host's worker service
+    /// (p1-tui never names p1-workers) through `sync_workers`, which also counts the header;
+    /// the pool size and the `↑ ↓` focus are the driver's to set.
+    pub workers: WorkersPane,
     /// Whether a worker has ever run this session (handoff §9.1: WORKERS is
     /// available "when a worker was ever started" — unlike `workers`, this
     /// never goes back to `false` once the pane has something worth
     /// revisiting, even after every worker finishes and `sync_workers`
     /// reports an empty snapshot).
     pub workers_ever_started: bool,
-    /// A pending approval: the blocking, full-width review (SPEC §4.4/§4.5).
-    /// While this is `Some` the pane is hidden and the transcript waits.
+    /// A pending approval: drawn inline as the transcript's last element, or as the full diff
+    /// review (`review`) that owns the screen (handoff §7.5).
     pub approval: Option<Approval>,
-    /// A docked picker overlay above the composer (SPEC §4.6).
+    /// The tool the approval on screen is about: a `PermissionView` names only its command.
+    pub approval_tool: String,
+    /// Further approvals parked behind the one on screen (`1 of N pending`).
+    pub approvals_waiting: usize,
+    /// A menu docked above the composer (handoff §6.10).
     pub picker: Option<Picker>,
-    /// The `/status` overlay (SPEC §4.6).
-    pub status: Option<Vec<StatusGroup>>,
-    /// Ledger context/task views, filled by the driver (the context breakdown
-    /// arrives with the host's stats seam; until then these stay `None`).
-    pub context_view: Option<crate::render::ledger::Context>,
-    pub task_view: Option<crate::render::ledger::Task>,
+    /// Retired: `/status` is command output in the transcript now (handoff §6.9), so this can
+    /// never be `Some`. Kept only because `input.rs` still asks whether it is open.
+    pub status: Option<std::convert::Infallible>,
+    /// The home prelude (handoff §6.11): the first rows of the conversation.
+    pub home: Option<HomePrelude>,
+    /// LEDGER sections the driver fills (§9.2); each is absent until its data exists.
+    pub session: Option<SessionView>,
+    pub context: Option<ContextView>,
+    pub workspace: Option<WorkspaceView>,
+    /// The most recent fold handles, newest first (LEDGER FOLDS shows three).
+    pub folds: Vec<FoldRef>,
+    /// A worker the operator attached to (`a`, handoff §9.5): its transcript replaces the
+    /// parent's in the transcript area.
+    pub attached: Option<AttachedWorker>,
     /// Steering/follow-up text queued for the next boundary, shown above the
     /// composer hints so the operator sees what will land.
     pub queued: VecDeque<Queued>,
@@ -328,6 +343,12 @@ pub struct Screen {
     /// math needs it; the renderer records it each frame.
     #[doc(hidden)]
     pub last_rendered: (usize, usize),
+    /// Where the terminal's hardware cursor goes this frame (the composer's text cell, §8.1);
+    /// `None` while no editable composer is on screen. The renderer records it.
+    pub cursor: Option<(u16, u16)>,
+    /// The terminal width of the last frame: `^W` resolves the `Auto` start state at it.
+    #[doc(hidden)]
+    pub last_width: u16,
     /// `^F`: the pane owns `↑ ↓` (WORKERS select, OUTPUT scroll) until `esc` or `^F`.
     pub pane_focused: bool,
     /// The full diff review's view state (handoff §7.5).
@@ -348,6 +369,17 @@ pub struct FullReview {
     pub body_rows: usize,
 }
 
+/// The worker whose own transcript is on screen (handoff §9.5), buffered by the driver from
+/// the worker's event stream.
+#[derive(Debug)]
+pub struct AttachedWorker {
+    pub id: String,
+    /// `env/profile`: the attach band names it and the statusline chip shows it.
+    pub route: String,
+    pub state: BlockState,
+    pub transcript: Transcript,
+}
+
 /// One queued operator input (SPEC §4.2 hints: steering vs follow-up).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Queued {
@@ -364,7 +396,7 @@ impl Screen {
     }
 
     pub fn cycle_width(&mut self) {
-        self.pane_width = self.pane_width.cycle();
+        self.pane_width = self.pane_width.resolve(self.last_width).cycle();
     }
 
     /// The modes `^Tab` may land on right now (handoff §9.1): LEDGER always;
@@ -429,6 +461,7 @@ impl Screen {
                 working.label.clone_from(&call.name);
             }
             AgentEvent::ToolFinished { result } => {
+                self.record_fold(&result.call_id);
                 // The working indicator clears only at TurnFinished: a turn
                 // that streams after a tool call is still working (and ⏎
                 // must keep meaning "queue steering").
@@ -633,15 +666,22 @@ impl Screen {
     /// operator's turn); when none is live, nothing needs review, and
     /// nothing else pinned it, an UNPINNED WORKERS pane falls back to
     /// LEDGER.
-    pub fn sync_workers(&mut self, rows: Vec<crate::render::workers::WorkerRow>) {
+    pub fn sync_workers(&mut self, rows: Vec<WorkerBlock>) {
         self.workers_ever_started |= !rows.is_empty();
-        let live = rows
-            .iter()
-            .any(|w| w.state == crate::render::workers::WorkerState::Running);
-        let needs_review = rows
-            .iter()
-            .any(|w| w.state == crate::render::workers::WorkerState::Review);
-        self.workers = rows;
+        let count = |state| rows.iter().filter(|w| w.state == state).count() as u64;
+        let live = count(BlockState::Running);
+        let queued = count(BlockState::Queued);
+        let needs_review = count(BlockState::NeedsReview) > 0;
+        self.workers.header.live = live;
+        self.workers.header.queued = (queued > 0).then_some(queued);
+        // A focus on a worker that left the snapshot has nothing left to point at.
+        if let Some(focused) = &self.workers.focused
+            && !rows.iter().any(|w| &w.id == focused)
+        {
+            self.workers.focused = None;
+        }
+        self.workers.workers = rows;
+        let live = live > 0;
         // A parked approval is the operator's turn: SELF-pin, no `^P` needed,
         // so nothing later demotes it out from under them.
         let pinned_before = self.pinned;
@@ -657,14 +697,14 @@ impl Screen {
             // restore it.
             if !pinned_before && matches!(self.pane_width, PaneWidth::Off) {
                 self.promotion_saved_width = Some(self.pane_width);
-                self.pane_width = PaneWidth::Ch56;
+                self.pane_width = PaneWidth::Wide;
             }
         } else if self.pane_mode == PaneMode::Workers && !self.pinned {
             self.pane_mode = PaneMode::Ledger;
             // Give back the operator's width only while it is still the one
             // this promotion set: a `^W` since then is their choice to keep.
             if let Some(saved) = self.promotion_saved_width.take()
-                && self.pane_width == PaneWidth::Ch56
+                && self.pane_width == PaneWidth::Wide
             {
                 self.pane_width = saved;
             }
@@ -676,7 +716,7 @@ impl Screen {
         self.output = Some(view);
         self.pane_mode = PaneMode::Output;
         if matches!(self.pane_width, PaneWidth::Off) {
-            self.pane_width = PaneWidth::Ch56;
+            self.pane_width = PaneWidth::Wide;
         }
     }
 
@@ -699,21 +739,58 @@ impl Screen {
         };
     }
 
-    /// The LEDGER view, built from screen state. The context breakdown stays
-    /// `None` until the host's context-stats seam lands (issue #12 plan).
-    pub fn ledger(&self) -> crate::render::ledger::Ledger {
-        crate::render::ledger::Ledger {
+    /// The LEDGER pane from screen state (§9.2). SPEND appears with the first response; the
+    /// WORKERS summary while the worker snapshot holds anyone.
+    pub fn ledger(&self) -> LedgerPane {
+        let workers = &self.workers.workers;
+        let count = |states: &[BlockState]| {
+            workers.iter().filter(|w| states.contains(&w.state)).count() as u64
+        };
+        LedgerPane {
             goal: self.goal.clone(),
-            context: self.context_view.clone(),
-            task: self.task_view.clone(),
-            spend: crate::render::ledger::SpendView {
-                responses: self.spend.responses,
+            session: self.session.clone(),
+            context: self.context.clone(),
+            workspace: self.workspace.clone(),
+            spend: (self.spend.responses > 0).then(|| LedgerSpend {
                 input: self.spend.input,
                 output: self.spend.output,
                 cache_hit_percent: self.spend.cache_hit_percent(),
                 cost_micro_usd: self.spend.cost_micro_usd,
-            },
+            }),
+            workers: (!workers.is_empty()).then(|| WorkersSummary {
+                live: count(&[BlockState::Running]),
+                done: count(&[BlockState::Done, BlockState::DoneUnverified]),
+            }),
+            folds: self.folds.clone(),
         }
+    }
+
+    /// A settled call that registered a fold handle becomes the newest LEDGER fold.
+    fn record_fold(&mut self, call_id: &str) {
+        let row = self
+            .transcript
+            .blocks
+            .iter()
+            .rev()
+            .find_map(|block| match block {
+                Block::Call(row) if row.call_id == call_id => Some(row),
+                _ => None,
+            });
+        let Some(row) = row else {
+            return;
+        };
+        let Some(id) = &row.fold else {
+            return;
+        };
+        let handle = id.to_string();
+        let fold = FoldRef {
+            handle: handle.clone(),
+            kind: row.name.clone(),
+            lines: row.line_count as u64,
+        };
+        self.folds.retain(|f| f.handle != handle);
+        self.folds.insert(0, fold);
+        self.folds.truncate(FOLDS_SHOWN);
     }
 
     /// Expire a peek whose time has passed. Driven by the render tick's clock.
@@ -729,6 +806,9 @@ impl Screen {
 /// The peek banner's lifetime (SPEC §5: 3 s).
 pub const PEEK_MS: u64 = 3_000;
 
+/// LEDGER FOLDS lists this many handles (§9.2).
+const FOLDS_SHOWN: usize = 3;
+
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").chars().take(60).collect()
 }
@@ -737,6 +817,70 @@ fn first_line(text: &str) -> String {
 mod tests {
     use super::*;
     use p1_contracts::{ToolCall, ToolInput, ToolResultItem, ToolStatus};
+
+    fn worker(id: &str, state: BlockState) -> WorkerBlock {
+        WorkerBlock {
+            id: id.into(),
+            task: "task".into(),
+            route: "deepseek/v4.1-flash".into(),
+            state,
+            elapsed: None,
+            cost_micro_usd: None,
+            grants: "read finish".into(),
+            activity: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_worker_header_counts_running_and_queued_and_a_lost_focus_clears() {
+        let mut s = Screen::new(false);
+        s.workers.focused = Some("w9".into());
+        s.sync_workers(vec![
+            worker("w1", BlockState::Running),
+            worker("w2", BlockState::NeedsReview),
+            worker("w3", BlockState::Queued),
+            worker("w4", BlockState::Done),
+        ]);
+        assert_eq!(s.workers.header.live, 1);
+        assert_eq!(s.workers.header.queued, Some(1));
+        assert_eq!(s.workers.focused, None);
+        let summary = s.ledger().workers.expect("a snapshot with workers");
+        assert_eq!((summary.live, summary.done), (1, 1));
+        s.sync_workers(vec![worker("w4", BlockState::Done)]);
+        assert_eq!(s.workers.header.queued, None);
+    }
+
+    #[test]
+    fn a_folded_result_becomes_the_newest_ledger_fold() {
+        let mut s = Screen::new(false);
+        let big: String = (0..60).map(|n| format!("line {n}\n")).collect();
+        for (id, content) in [("c1", big.as_str()), ("c2", "short")] {
+            s.apply(
+                &AgentEvent::ToolStarted {
+                    call: ToolCall {
+                        call_id: id.into(),
+                        name: "shell".into(),
+                        input: ToolInput::Json("{}".into()),
+                    },
+                },
+                0,
+            );
+            s.apply(
+                &AgentEvent::ToolFinished {
+                    result: ToolResultItem {
+                        call_id: id.into(),
+                        name: "shell".into(),
+                        status: ToolStatus::Ok,
+                        content: content.into(),
+                    },
+                },
+                10,
+            );
+        }
+        assert_eq!(s.folds.len(), 1, "only the folded output has a handle");
+        assert_eq!((s.folds[0].kind.as_str(), s.folds[0].lines), ("shell", 60));
+        assert_eq!(s.ledger().folds, s.folds);
+    }
 
     #[test]
     fn paging_moves_by_the_transcript_rows_minus_two_and_returns_to_the_tail() {
@@ -861,21 +1005,30 @@ mod tests {
         assert_eq!(
             order,
             [
-                PaneWidth::Ch40,
-                PaneWidth::Ch56,
+                PaneWidth::Narrow,
+                PaneWidth::Wide,
                 PaneWidth::Split,
                 PaneWidth::Off,
-                PaneWidth::Ch40
+                PaneWidth::Narrow
             ]
         );
     }
 
     #[test]
-    fn the_pane_collapses_under_the_floor() {
-        assert_eq!(PaneWidth::Ch40.columns(120), Some(40));
-        assert_eq!(PaneWidth::Ch40.columns(80), None);
-        assert_eq!(PaneWidth::Split.columns(120), Some(60));
-        assert_eq!(PaneWidth::Off.columns(120), None);
+    fn the_start_width_is_narrow_below_160_columns_and_wide_from_160() {
+        assert_eq!(PaneWidth::default(), PaneWidth::Auto);
+        assert_eq!(PaneWidth::Auto.resolve(159), PaneWidth::Narrow);
+        assert_eq!(PaneWidth::Auto.resolve(160), PaneWidth::Wide);
+        assert_eq!(PaneWidth::Split.resolve(200), PaneWidth::Split);
+        // `^W` steps on from what the start state showed.
+        let mut s = Screen::new(false);
+        s.last_width = 120;
+        s.cycle_width();
+        assert_eq!(s.pane_width, PaneWidth::Wide);
+        let mut s = Screen::new(false);
+        s.last_width = 200;
+        s.cycle_width();
+        assert_eq!(s.pane_width, PaneWidth::Split);
     }
 
     #[test]
@@ -981,39 +1134,34 @@ mod tests {
 
     #[test]
     fn a_live_worker_promotes_the_width_and_restores_the_operator_width() {
-        use crate::render::workers::{WorkerRow, WorkerState};
-        let row = |state| WorkerRow {
-            id: "w1".into(),
-            summary: "w1".into(),
-            route: "deepseek/v4.1-flash".into(),
-            state,
-            elapsed: None,
-            cost_micro_usd: None,
-            details: vec![],
-        };
+        let row = |state| worker("w1", state);
         // Pinned: the width force never overrides the operator.
         let mut s = Screen::new(false);
         s.pinned = true;
         s.pane_width = PaneWidth::Off;
-        s.sync_workers(vec![row(WorkerState::Running)]);
+        s.sync_workers(vec![row(BlockState::Running)]);
         assert_eq!(s.pane_width, PaneWidth::Off, "pinning wins over the force");
         assert_eq!(s.promotion_saved_width, None, "a pin saves nothing");
-        // Unpinned Off: force to Ch56, remember Off, restore it on demotion.
+        // Unpinned Off: force to Wide, remember Off, restore it on demotion.
         let mut s = Screen::new(false);
         s.pane_width = PaneWidth::Off;
-        s.sync_workers(vec![row(WorkerState::Running)]);
-        assert_eq!(s.pane_width, PaneWidth::Ch56);
+        s.sync_workers(vec![row(BlockState::Running)]);
+        assert_eq!(s.pane_width, PaneWidth::Wide);
         assert_eq!(s.promotion_saved_width, Some(PaneWidth::Off));
-        s.sync_workers(vec![row(WorkerState::Done)]);
+        s.sync_workers(vec![row(BlockState::Done)]);
         assert_eq!(s.pane_width, PaneWidth::Off);
         assert_eq!(s.promotion_saved_width, None);
         // A `^W` during the promotion is the operator's; demotion keeps it.
         let mut s = Screen::new(false);
         s.pane_width = PaneWidth::Off;
-        s.sync_workers(vec![row(WorkerState::Running)]);
-        s.pane_width = PaneWidth::Ch40;
-        s.sync_workers(vec![row(WorkerState::Done)]);
-        assert_eq!(s.pane_width, PaneWidth::Ch40, "an operator change survives");
+        s.sync_workers(vec![row(BlockState::Running)]);
+        s.pane_width = PaneWidth::Narrow;
+        s.sync_workers(vec![row(BlockState::Done)]);
+        assert_eq!(
+            s.pane_width,
+            PaneWidth::Narrow,
+            "an operator change survives"
+        );
         assert_eq!(s.promotion_saved_width, None);
     }
 
@@ -1041,18 +1189,9 @@ mod tests {
 
     #[test]
     fn workers_ever_started_never_reverts_once_a_worker_ran() {
-        use crate::render::workers::{WorkerRow, WorkerState};
         let mut s = Screen::new(false);
         assert!(!s.workers_ever_started);
-        s.sync_workers(vec![WorkerRow {
-            id: "w1".into(),
-            summary: "w1".into(),
-            route: "r".into(),
-            state: WorkerState::Done,
-            elapsed: None,
-            cost_micro_usd: None,
-            details: vec![],
-        }]);
+        s.sync_workers(vec![worker("w1", BlockState::Done)]);
         assert!(s.workers_ever_started);
         // The worker service can report an empty snapshot later; the pane
         // stays available (there is history worth revisiting).
@@ -1085,24 +1224,15 @@ mod tests {
 
     #[test]
     fn a_worker_needing_review_self_pins_workers() {
-        use crate::render::workers::{WorkerRow, WorkerState};
-        let row = |state| WorkerRow {
-            id: "w1".into(),
-            summary: "w1".into(),
-            route: "r".into(),
-            state,
-            elapsed: None,
-            cost_micro_usd: None,
-            details: vec![],
-        };
+        let row = |state| worker("w1", state);
         let mut s = Screen::new(false);
         assert!(!s.pinned);
-        s.sync_workers(vec![row(WorkerState::Review)]);
+        s.sync_workers(vec![row(BlockState::NeedsReview)]);
         assert_eq!(s.pane_mode, PaneMode::Workers);
         assert!(s.pinned, "a parked approval self-pins, no ^P needed");
         // The self-pin holds even once the review resolves — only the
         // operator's `^P` releases a pin (SPEC §5/handoff §9.1).
-        s.sync_workers(vec![row(WorkerState::Done)]);
+        s.sync_workers(vec![row(BlockState::Done)]);
         assert_eq!(s.pane_mode, PaneMode::Workers);
         assert!(s.pinned);
     }

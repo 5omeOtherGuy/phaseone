@@ -267,8 +267,9 @@ fn fold_block_screen() {
     );
     let full = render(&mut s, 120, 40, 12_000);
     assert_palette_law(&mut s, 120, 40);
-    // The failure promoted a PEEK banner over the ledger (SPEC §5).
-    assert!(full[1].contains("shell failed"));
+    // The failure promoted a PEEK banner over the ledger (SPEC §5), under the pane's padding
+    // row (handoff §9.1).
+    assert!(full[2].contains("shell failed"));
     let text = left(&full, 80);
     assert!(text[1].starts_with("  ▸ shell"));
     // The generic face states the line count; elapsed and exit code come from the host describer.
@@ -280,13 +281,13 @@ fn fold_block_screen() {
 }
 
 #[test]
-fn diff_review_blocks_full_width() {
+fn a_diff_approval_is_inline_and_its_full_review_owns_the_screen() {
     let mut s = Screen::new(true);
     s.approval = Some(Approval::Diff(DiffView {
         tool: "edit".into(),
         file: "p1-context/src/edge.rs".into(),
         summary: "replace exact string · once".into(),
-        position: (1, 3),
+        position: (1, 1),
         rows: vec![
             DiffRow::Context {
                 line: 410,
@@ -303,15 +304,25 @@ fn diff_review_blocks_full_width() {
         ],
         grantable: true,
     }));
+    // Inline (handoff §7.5): the call's Block with `!` is the transcript's running element.
     let text = render(&mut s, 120, 40, 0);
     assert_palette_law(&mut s, 120, 40);
-    assert!(text[0].starts_with("! edit      p1-context/src/edge.rs"));
-    assert!(text[0].ends_with("1 of 3 files"));
-    assert!(text[3].starts_with(" 410"));
-    assert!(text[4].contains('−'));
-    assert!(text[5].contains('+'));
-    assert!(text[38].contains("y  allow once"));
-    assert!(text[39].contains("^D next file   ^A all files"));
+    assert!(text[1].starts_with("    ! edit      p1-context/src/edge.rs"));
+    assert!(text[1].contains("! +1 −1 · 1 of 1 files"), "{}", text[1]);
+    assert!(text[5].contains("y  allow once"));
+    assert!(text[36].contains("ledger"), "the pane stays: {}", text[36]);
+    // `^D`: the full review owns the screen from the top row to the statusline gap.
+    s.toggle_review();
+    let text = render(&mut s, 120, 40, 0);
+    assert_palette_law(&mut s, 120, 40);
+    assert!(text[1].starts_with("    ! edit      p1-context/src/edge.rs"));
+    assert!(text[1].ends_with("1 of 1 files"));
+    assert!(text[4].starts_with("    410"));
+    assert!(text[5].contains('−'));
+    assert!(text[6].contains('+'));
+    assert!(text[34].contains("y  allow once"));
+    assert!(text[36].contains("^D back"));
+    assert!(!text[36].contains("ledger"), "the pane is hidden");
 }
 
 #[test]
@@ -326,13 +337,19 @@ fn permission_prompt_with_destructive_floor() {
         ],
         grantable: false,
     }));
+    s.approval_tool = "shell".into();
     let text = render(&mut s, 120, 40, 0);
     assert_palette_law(&mut s, 120, 40);
-    assert_eq!(text[0], "  rm -rf target/");
-    // Decision keys pinned at the bottom; grant rows greyed above them.
-    assert!(text[37].contains("y  allow once"));
-    assert!(text[38].contains("not grantable — destructive floor"));
-    assert!(text[39].contains("not grantable — destructive floor"));
+    // Inline (handoff §7.5): the Block, its facts, the decision band, the reason rows.
+    assert!(
+        text[1].starts_with("    ! shell     rm -rf target/"),
+        "{}",
+        text[1]
+    );
+    assert!(text[1].ends_with("! awaiting approval"));
+    assert!(text[5].contains("y  allow once"));
+    assert!(text[6].contains("not grantable — destructive floor"));
+    assert!(text[7].contains("not grantable — destructive floor"));
 }
 
 #[test]
@@ -456,10 +473,11 @@ fn every_screen_renders_at_the_80x24_floor_without_overflow() {
         let text = render(&mut s, 80, 24, 0);
         assert_palette_law(&mut s, 80, 24);
         assert_eq!(text.len(), 24);
-        // A diff review's decision keys are ALWAYS on screen at the floor.
+        // The decision keys are ALWAYS on screen at the floor: inline under a short call, and
+        // pinned to the bottom of a full review that is taller than the transcript area.
         if s.approval.is_some() {
-            let tail = text[20..].join("\n");
-            assert!(tail.contains("allow once"), "decision keys visible: {tail}");
+            let all = text.join("\n");
+            assert!(all.contains("allow once"), "decision keys visible: {all}");
         }
     }
 }
@@ -476,13 +494,17 @@ fn output_pane_opens_the_fold_handle() {
     });
     let text = render(&mut s, 120, 40, 0);
     assert_palette_law(&mut s, 120, 40);
-    // The pane begins on the geometry top row, below the terminal's blank row.
-    assert!(text[1].contains(&format!("OUTPUT [{}]", id)));
-    assert!(text[2].contains("output line 0"));
+    // The pane's first row is padding; OUTPUT heads the next one, the handle on its right,
+    // then the source and range rows, a blank row, and the numbered lines (handoff §9.3).
+    assert!(text[2].contains("OUTPUT"));
+    assert!(text[2].contains(&format!("[{id}]")));
+    assert!(text[4].contains("1–30 of 60"), "{}", text[4]);
+    assert!(text[6].contains("   1  output line 0"));
     // Up/Down scroll the pane without moving its header.
     s.scroll_output_by(10);
     let text = render(&mut s, 120, 40, 0);
-    assert!(text[2].contains("output line 10"));
+    assert!(text[2].contains("OUTPUT"));
+    assert!(text[6].contains("  11  output line 10"));
 }
 
 #[test]
@@ -497,7 +519,7 @@ fn pane_width_cycling_changes_the_layout() {
             .width,
         38
     );
-    assert!(wide[1].contains("GOAL"));
+    assert!(wide[2].contains("GOAL"));
     s.cycle_width(); // wide: 56
     let wider = render(&mut s, 120, 40, 0);
     assert_eq!(
@@ -506,7 +528,7 @@ fn pane_width_cycling_changes_the_layout() {
             .width,
         56
     );
-    assert!(wider[1].contains("GOAL"));
+    assert!(wider[2].contains("GOAL"));
     s.cycle_width(); // split
     assert_eq!(
         p1_tui::geometry::layout(120, 40, s.pane_width, false, 2)
@@ -516,6 +538,6 @@ fn pane_width_cycling_changes_the_layout() {
     );
     s.cycle_width(); // off
     let off = render(&mut s, 120, 40, 0);
-    assert!(!off[1].contains("GOAL"));
+    assert!(!off[2].contains("GOAL"));
     assert_eq!(s.pane_width, PaneWidth::Off);
 }

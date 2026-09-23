@@ -82,11 +82,12 @@ fn small_or_offset_viewports_never_overwrite_surrounding_cells() {
 }
 
 #[test]
-fn working_and_status_overlays_suppress_the_home() {
+fn working_and_a_docked_menu_suppress_the_home() {
     let mut screen = Screen::new(false);
-    screen.status = Some(Vec::new());
+    // `/status` is transcript output now (handoff §6.9); the docked menu is the overlay left.
+    screen.open_completion();
     assert!(!has_dots(&render(&mut screen, 120, 40, 0)));
-    screen.status = None;
+    screen.picker = None;
     screen.working = Some(p1_tui::state::Working {
         label: "working".into(),
         started_ms: 0,

@@ -5,7 +5,7 @@
 
 use p1_contracts::{AgentEvent, ToolCall, ToolInput, ToolResultItem, ToolStatus};
 use p1_tui::render::diff::{DiffRow, DiffView};
-use p1_tui::render::ledger::{Context, ContextPart, SpendView, Task};
+use p1_tui::render::ledger::{ContextPartView, ContextView, SessionView, WorkspaceView};
 use p1_tui::render::permission::PermissionView;
 use p1_tui::render::picker::{Picker, PickerGroup, PickerRow};
 use p1_tui::render::screen::draw;
@@ -249,40 +249,44 @@ fn main() {
     if name == "streaming" {
         // Fill the ledger like §5's example.
         screen.goal = Some("fix compaction boundary stall".into());
-        screen.context_view = Some(Context {
-            used: 12_400,
+        screen.session = Some(SessionView {
+            model: "claude/opus-5.5".into(),
+            effort: "high".into(),
+            access: "full".into(),
+            sandbox: "bubblewrap".into(),
+        });
+        screen.context = Some(ContextView {
+            used: Some(12_400),
             window: 200_000,
-            warn_at: 120_000,
+            summarize_at: 120_000,
             parts: vec![
-                ContextPart {
+                ContextPartView {
                     label: "system".into(),
                     count: None,
                     tokens: 1_200,
                 },
-                ContextPart {
+                ContextPartView {
                     label: "files".into(),
                     count: Some(4),
                     tokens: 6_800,
                 },
-                ContextPart {
+                ContextPartView {
                     label: "tools".into(),
                     count: Some(11),
                     tokens: 3_100,
                 },
-                ContextPart {
+                ContextPartView {
                     label: "recent".into(),
                     count: None,
                     tokens: 1_300,
                 },
             ],
         });
-        screen.task_view = Some(Task {
-            id: Some("t-3f9a".into()),
+        screen.workspace = Some(WorkspaceView {
             files: Some(3),
             diff: Some((48, 12)),
             journal: Some("2m ago".into()),
         });
-        let _ = SpendView::default();
     }
     let (w, h) = (120u16, 40u16);
     let backend = TestBackend::new(w, h);
