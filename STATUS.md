@@ -98,9 +98,15 @@ Owned by the Fable 5.1 Claude Code orchestrator session (brief:
   `StepRunner`, envelope, journal record, `WorkflowService`, `WorkflowObserver`; frozen, additive
   changes only) and fanout's `"model"` job key (→ `p1 --model`). Shipped judge = `claude/claude-fable-5`
   (the Fable profile this route binds), cap 3 on `claude-fable-5`.
-- RUNNING: job 1 (`task/workers-prepared`, deepseek2) and job 2 (`task/finish-result`, deepseek2) —
-  implemented, in their gates. NEXT: jobs 3 (`claude/claude-opus-5-5:high`) and 4 (`gpt/gpt-6-sol`)
-  from the API commit; then 5 (Opus medium) and 6 (glm).
+- LANDED: job 2 `task/finish-result` (cb51b60, CI green): `OutputContract` + `result` on `finish`,
+  `FinishOutcome::structured()`; frozen tests untouched. Job 1 `task/workers-prepared` (this merge):
+  `start_prepared`, `wait_for_capacity`, `running`/`max_concurrent`. Both DeepSeek V4.1 Flash, one pass.
+- LANDED: job 4 `task/workflow-tools` (this merge): `crates/p1-tool-workflow` (four tools over the
+  `WorkflowService` trait) + "# Workflows (only when the user asks)" in every environment prompt.
+  gpt-6-sol:high (model-cards trial), one pass, delegated the prompt edits to a sub-worker.
+- RUNNING: job 3 `task/workflow-engine` (`claude/claude-opus-5-5:high`). NEXT: 5 (Opus medium) and
+  6 (glm) once 3 lands; then the five live checks.
+- FIXED by the lead (8483e64): fanout counted pi-worker wrapper processes; jobs 5–6 use the default pool.
 
 ## Open decisions and risks
 

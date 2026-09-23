@@ -1,0 +1,19 @@
+[package]
+name = "p1-tool-workflow"
+description = "The p1 workflow tools: start, inspect and cancel workflow runs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-workflow = { path = "../p1-workflow" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "test-util"] }

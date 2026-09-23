@@ -1720,6 +1720,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-tool-workflow"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-workflow",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "p1-tool-write"
 version = "0.0.1"
 dependencies = [
