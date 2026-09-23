@@ -71,22 +71,23 @@ impl Decision {
     /// The approval decision for one call: `y a p n`. The destructive floor takes `a` away;
     /// `p` has no trust store to write to yet (handoff §13, proposal §14.8).
     pub fn for_call(grantable: bool, files: usize) -> Self {
-        let key = |key, label: &str, reason: Option<&str>| DecisionKey {
+        let key = |key, label: &str, available: bool, reason: Option<&str>| DecisionKey {
             key,
             label: label.into(),
-            available: reason.is_none(),
+            available,
             reason: reason.map(str::to_string),
         };
         Self {
             keys: vec![
-                key('y', "allow once", None),
+                key('y', "allow once", true, None),
                 key(
                     'a',
                     "session",
+                    grantable,
                     (!grantable).then_some("not grantable — destructive floor"),
                 ),
-                key('p', "project", Some("not available — no trust store yet")),
-                key('n', "deny", None),
+                key('p', "project", false, None),
+                key('n', "deny", true, None),
             ],
             secondary: if files > 1 {
                 vec![format!("all {files} files")]
@@ -315,9 +316,9 @@ mod tests {
             .collect();
         assert_eq!(text.len(), 20);
         assert!(text[3].contains(" 1  + line 0"), "{}", text[3]);
-        // Decision band, the `p` reason row, the hints: the last three rows.
-        assert!(text[17].contains(" y  allow once"));
-        assert!(text[18].contains("p   project"));
+        // The `p` key stays faint in the decision band; only the hint follows it.
+        assert!(text[18].contains(" y  allow once"));
+        assert!(text[18].contains("p  project"));
         assert!(text[19].contains("^D back"));
         review.scroll = 1_000;
         let text: Vec<String> = lines(&files, &review, &decision, 76, 20)
@@ -327,7 +328,7 @@ mod tests {
         // Scrolled to the end: the last diff row sits right above the decision rows.
         let body = body_rows(&decision, 20);
         assert!(text[3 + body - 1].contains("+ line 39"));
-        assert!(text[17].contains(" y  allow once"));
+        assert!(text[18].contains(" y  allow once"));
     }
 
     #[test]
@@ -337,10 +338,10 @@ mod tests {
             .iter()
             .map(|l| l.to_string())
             .collect();
-        assert!(!rows[0].contains(" a "), "{}", rows[0]);
+        assert!(!rows[0].contains(" a  session"), "{}", rows[0]);
+        assert!(rows[0].contains("p  project"), "{}", rows[0]);
         assert!(rows[0].trim_end().ends_with("all 3 files"));
         assert!(rows[1].starts_with("   a   session    not grantable — destructive floor"));
-        assert!(rows[2].contains("no trust store yet"));
     }
 
     #[test]
