@@ -16,6 +16,7 @@
 //! returns the pair belonging to the assembly that just ran.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +25,8 @@ use p1_contracts::{
     ToolResultItem, ToolStatus,
 };
 use p1_tool_finish::{Accepted, Evidence, FinishOutcome, SessionActivity, ShellRun};
+
+use crate::fingerprint::{self, Fingerprint, FingerprintError};
 
 #[cfg(feature = "delegation")]
 use p1_workers::{FinishReport, WorkerReport};
@@ -44,12 +47,27 @@ struct Finished {
     order: u64,
     command: Option<String>,
     exit_code: Option<i32>,
+    /// ADR-0055: this successful `Executes` call changed the workspace. It is a file
+    /// change for the `finish` check and progress for the stall guard, exactly as a
+    /// `WritesFiles` call is.
+    changed_workspace: bool,
 }
 
 /// What was learned about a call when it started, keyed by call id.
 struct Pending {
     effect: Effect,
     command: Option<String>,
+}
+
+/// Where a command's workspace changes are measured (ADR-0055), and what the last
+/// fingerprint was.
+struct Watch {
+    workspace: PathBuf,
+    /// The paths the host itself appends to (its session journals).
+    ignored: Vec<PathBuf>,
+    /// The fingerprint after the last successful `Executes` call — or the baseline the
+    /// first such call took. `None` until that baseline exists.
+    last: Option<Fingerprint>,
 }
 
 /// The host's [`SessionActivity`]. One per agent; fed only through [`ActivityTee`].
@@ -65,6 +83,13 @@ pub struct ActivityLog {
     /// last progress. The difference is the host's §3c idle-summary count.
     replacements: AtomicU64,
     replacements_at_progress: AtomicU64,
+    /// The workspace a command's changes are measured in (ADR-0055). `None` until the
+    /// host sets it, so a log that rebuilds a resumed session is never fingerprinted:
+    /// the journal does not carry what a past command did to the workspace.
+    watch: Mutex<Option<Watch>>,
+    /// The FIRST workspace-fingerprint error of this session (ADR-0055 item 4): the
+    /// host falls back to the tool-declared rule, and says so once.
+    fingerprint_error: Mutex<Option<String>>,
 }
 
 impl ActivityLog {
@@ -80,6 +105,9 @@ impl ActivityLog {
             .lock()
             .unwrap()
             .insert(call.call_id.clone(), Pending { effect, command });
+        if effect == Effect::Executes {
+            self.take_baseline();
+        }
     }
 
     /// Record a finished call. `order` is assigned here, monotonically.
@@ -93,6 +121,12 @@ impl ActivityLog {
         } else {
             None
         };
+        // ADR-0055: a successful command that changed the workspace is a file change
+        // and progress, exactly as a `WritesFiles` call is. A failed command is never
+        // fingerprinted, and an unchanged workspace changes nothing.
+        let changed_workspace = effect == Effect::Executes
+            && result.status == ToolStatus::Ok
+            && self.workspace_changed();
         self.finished.lock().unwrap().push(Finished {
             name: result.name.clone(),
             effect,
@@ -100,16 +134,83 @@ impl ActivityLog {
             order,
             command,
             exit_code,
+            changed_workspace,
         });
-        // §3c progress: a workspace mutation, or a `finish` call of any status.
+        // §3c progress: a workspace mutation (a `WritesFiles` call or a command that
+        // changed the workspace), or a `finish` call of any status.
         let is_finish = self
             .finish_name
             .lock()
             .unwrap()
             .as_deref()
             .is_some_and(|name| name == result.name);
-        if is_finish || (effect == Effect::WritesFiles && result.status == ToolStatus::Ok) {
+        if is_finish
+            || changed_workspace
+            || (effect == Effect::WritesFiles && result.status == ToolStatus::Ok)
+        {
             self.note_progress();
+        }
+    }
+
+    /// Tell the log which directory a command's workspace changes are measured in,
+    /// and which paths the host itself writes there (ADR-0055). The host calls this
+    /// ONCE, after any replay: a replayed call is never fingerprinted, because the
+    /// journal does not carry what a past command did.
+    pub fn watch_workspace(&self, workspace: &Path, ignored: &[PathBuf]) {
+        *self.watch.lock().unwrap() = Some(Watch {
+            workspace: workspace.to_path_buf(),
+            ignored: ignored.to_vec(),
+            last: None,
+        });
+    }
+
+    /// The first workspace-fingerprint error of this session, if any. The host prints
+    /// it once, so a fallback to the tool-declared rule is never silent (ADR-0055
+    /// item 4).
+    pub fn fingerprint_error(&self) -> Option<String> {
+        self.fingerprint_error.lock().unwrap().clone()
+    }
+
+    /// The baseline the first `Executes` call of the session takes: the fingerprint is
+    /// computed once BEFORE the first command and after each successful one
+    /// (ADR-0055 item 1), so the first command's own change is seen too.
+    fn take_baseline(&self) {
+        let mut watch = self.watch.lock().unwrap();
+        let Some(watch) = watch.as_mut() else { return };
+        if watch.last.is_some() {
+            return;
+        }
+        match fingerprint::take_ignoring(&watch.workspace, &watch.ignored) {
+            Ok(baseline) => watch.last = Some(baseline),
+            Err(error) => self.remember_fingerprint_error(error),
+        }
+    }
+
+    /// Fingerprint the workspace now and compare it with the last one (ADR-0055
+    /// item 2). `false` — today's behaviour — whenever there is no workspace to
+    /// measure, no baseline yet, or the fingerprint failed.
+    fn workspace_changed(&self) -> bool {
+        let mut watch = self.watch.lock().unwrap();
+        let Some(watch) = watch.as_mut() else {
+            return false;
+        };
+        match fingerprint::take_ignoring(&watch.workspace, &watch.ignored) {
+            Ok(current) => {
+                let changed = watch.last.is_some_and(|last| last != current);
+                watch.last = Some(current);
+                changed
+            }
+            Err(error) => {
+                self.remember_fingerprint_error(error);
+                false
+            }
+        }
+    }
+
+    fn remember_fingerprint_error(&self, error: FingerprintError) {
+        let mut cell = self.fingerprint_error.lock().unwrap();
+        if cell.is_none() {
+            *cell = Some(error.to_string());
         }
     }
 
@@ -197,7 +298,10 @@ impl SessionActivity for ActivityLog {
             .unwrap()
             .iter()
             .rev()
-            .find(|entry| entry.effect == Effect::WritesFiles && entry.status == ToolStatus::Ok)
+            .find(|entry| {
+                entry.status == ToolStatus::Ok
+                    && (entry.effect == Effect::WritesFiles || entry.changed_workspace)
+            })
             .map(|entry| entry.order)
     }
 
@@ -210,7 +314,21 @@ impl SessionActivity for ActivityLog {
             .map(|entry| ShellRun {
                 command: entry.command.clone().unwrap_or_default(),
                 exit_code: entry.exit_code,
-                order: entry.order,
+                // ADR-0055 item 2, decided deliberately: a command that changed the
+                // workspace IS a file change (its own order above), and its run is
+                // reported one order PAST that change — the run and the change are one
+                // record, and the change is what the run produced, not something that
+                // happened before it. ADR-0037's rule ("a run older than the last file
+                // change is stale") then keeps the changing command's own run counting,
+                // which its acceptance test requires (`rm marker` stays a run that
+                // counts after it removed the file), while EVERY earlier run is stale:
+                // that is the point of the ADR — a `cargo test` before a heredoc write
+                // must be repeated.
+                order: if entry.changed_workspace {
+                    entry.order + 1
+                } else {
+                    entry.order
+                },
             })
             .collect()
     }
@@ -751,6 +869,159 @@ mod tests {
         );
         log.record_finished(&result("w2", "write", ToolStatus::Error, "denied"));
         assert_eq!(log.consecutive_replacements(), 1);
+    }
+
+    // ------------------------------------------------- the workspace fingerprint
+
+    /// A command whose work really landed: the file appears while the call runs, so
+    /// the post-command fingerprint differs from the baseline taken at its start.
+    fn shell_that_writes(workspace: &Path, call_id: &str, file: &str) -> ActivityLog {
+        let log = ActivityLog::default();
+        log.watch_workspace(workspace, &[]);
+        log.record_started(
+            &call(call_id, "shell", r#"{"command":"write it"}"#),
+            Effect::Executes,
+        );
+        std::fs::write(workspace.join(file), "hi\n").unwrap();
+        log.record_finished(&result(
+            call_id,
+            "shell",
+            ToolStatus::Ok,
+            "ok\n[exit code: 0]",
+        ));
+        log
+    }
+
+    /// ADR-0055: a successful command that changed the workspace is progress AND a
+    /// file change, exactly as a `WritesFiles` call is.
+    #[test]
+    fn a_command_that_changed_the_workspace_is_progress_and_a_file_change() {
+        let workspace = tempfile::tempdir().unwrap();
+        let log = shell_that_writes(workspace.path(), "s1", "out.txt");
+
+        assert_eq!(log.consecutive_replacements(), 0, "progress for §3c");
+        assert_eq!(
+            log.last_file_change(),
+            Some(1),
+            "the change is the command's own record"
+        );
+        assert_eq!(
+            log.shell_runs(),
+            vec![ShellRun {
+                command: "write it".into(),
+                exit_code: Some(0),
+                // Reported one order PAST the change it produced, so ADR-0037's rule
+                // does not invalidate the run that caused it, while every earlier run
+                // is stale (ADR-0055 item 2).
+                order: 2,
+            }]
+        );
+        assert_eq!(log.fingerprint_error(), None);
+    }
+
+    /// ADR-0055 item 3: an unchanged workspace changes nothing — a successful `ls` is
+    /// neither progress nor a file change, as today.
+    #[test]
+    fn a_command_that_changed_nothing_changes_nothing() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("note.txt"), "one\n").unwrap();
+        let log = ActivityLog::default();
+        log.watch_workspace(workspace.path(), &[]);
+        log.record_replacement();
+        log.record_replacement();
+        log.record_started(
+            &call("s1", "shell", r#"{"command":"ls"}"#),
+            Effect::Executes,
+        );
+        log.record_finished(&result(
+            "s1",
+            "shell",
+            ToolStatus::Ok,
+            "note.txt\n[exit code: 0]",
+        ));
+
+        assert_eq!(log.consecutive_replacements(), 2, "not progress");
+        assert_eq!(log.last_file_change(), None);
+        assert_eq!(log.shell_runs().len(), 1);
+    }
+
+    /// A failed command is never fingerprinted: nothing changed, and a command that
+    /// failed halfway is not progress either.
+    #[test]
+    fn a_failed_command_is_never_fingerprinted() {
+        let workspace = tempfile::tempdir().unwrap();
+        let log = ActivityLog::default();
+        log.watch_workspace(workspace.path(), &[]);
+        log.record_replacement();
+        log.record_started(
+            &call("s1", "shell", r#"{"command":"false"}"#),
+            Effect::Executes,
+        );
+        std::fs::write(workspace.path().join("half-written.txt"), "x").unwrap();
+        log.record_finished(&result(
+            "s1",
+            "shell",
+            ToolStatus::Error,
+            "boom\n[exit code: 1]",
+        ));
+
+        assert_eq!(
+            log.consecutive_replacements(),
+            1,
+            "a failed run is not progress"
+        );
+        assert_eq!(log.last_file_change(), None);
+        assert!(log.shell_runs().is_empty(), "a failed run is not a run");
+    }
+
+    /// ADR-0055 item 4: a fingerprint that cannot be taken falls back to today's rule
+    /// and the error is remembered ONCE, for the run report's one-line note.
+    #[test]
+    fn a_fingerprint_error_falls_back_and_is_remembered_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let missing = workspace.path().join("gone");
+        let log = ActivityLog::default();
+        log.watch_workspace(&missing, &[]);
+        log.record_replacement();
+        log.record_started(
+            &call("s1", "shell", r#"{"command":"ls"}"#),
+            Effect::Executes,
+        );
+        log.record_finished(&result(
+            "s1",
+            "shell",
+            ToolStatus::Ok,
+            "out\n[exit code: 0]",
+        ));
+
+        assert_eq!(
+            log.consecutive_replacements(),
+            1,
+            "today's rule still applies"
+        );
+        assert_eq!(log.last_file_change(), None);
+        let error = log.fingerprint_error().expect("the error is exposed");
+        assert!(
+            error.contains("gone"),
+            "the error names the workspace: {error}"
+        );
+    }
+
+    /// A log the host never told about a workspace — a replayed session — keeps
+    /// today's behaviour: nothing is fingerprinted.
+    #[test]
+    fn a_log_without_a_workspace_never_fingerprints() {
+        let workspace = tempfile::tempdir().unwrap();
+        let log = ActivityLog::default();
+        log.record_started(
+            &call("s1", "shell", r#"{"command":"write it"}"#),
+            Effect::Executes,
+        );
+        std::fs::write(workspace.path().join("out.txt"), "hi\n").unwrap();
+        log.record_finished(&result("s1", "shell", ToolStatus::Ok, "ok\n[exit code: 0]"));
+
+        assert_eq!(log.last_file_change(), None);
+        assert_eq!(log.fingerprint_error(), None);
     }
 
     // ------------------------------------------------------ the worker report tap
