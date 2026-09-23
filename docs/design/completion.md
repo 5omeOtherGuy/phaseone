@@ -277,6 +277,7 @@ verification run from before such a write must be repeated (`finish_fingerprint.
 `finish` joins the shipped environments' tool lists, and each family prompt gets a short
 "Finishing" section in its own voice: end by calling `finish`; verify first; if blocked say
 what you need; never end a turn with a question when running unattended.
+Issue #54 adds an explicit prompt rule: even an answer-only task ends with `finish(done)`, putting the answer in `summary` and using verification `["none"]`.
 
 ## 5. Must-pass (observable behaviour, scripted providers, no phrase matching)
 
