@@ -19,7 +19,8 @@ and an evidence record (scripts/run-report.py) in a run directory:
     {"label": "core-fix", "runner": "p1", "env": "claude",
      "dir": "/abs/worktree", "session": "<run>/session.jsonl",
      "prompt_file": "/abs/defects.md"}
-  optional "sandbox_write": ["/abs/path", ...] and "max_continuations": N reach the
+  optional "model": "E/P[:effort]" reaches `p1 --model` (the environment's own profile
+  otherwise); optional "sandbox_write": ["/abs/path", ...] and "max_continuations": N reach the
   matching p1 flags ("sandbox_write" only with "sandbox": true); `profile`/`effort` are
   unused by this runner. When a SANDBOXED job's `dir` is a git
   WORKTREE (its `--git-common-dir` is outside `dir`) the common directory is passed as
@@ -204,6 +205,10 @@ def p1_command(job, binary, session_path, brief, locks_dir, readable=()):
     """The exact p1 argv for one job (pure; the resume flag follows the session and the
     read-only paths are injected by the caller)."""
     cmd = [binary, "--env", job["env"], "--workspace", job["dir"], "--session", session_path]
+    # Owner policy 2026-09-23 (model-cards replacement trial): a job may pick the model inside
+    # its environment, `E/P[:effort]` exactly as `p1 --model` takes it.
+    if job.get("model"):
+        cmd += ["--model", job["model"]]
     if job.get("session"):
         cmd.append("--resume")
     cmd.append("--yes")

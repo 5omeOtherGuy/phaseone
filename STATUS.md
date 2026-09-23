@@ -91,9 +91,16 @@ OPEN ITEMS (issue numbers)
 ## Workflows (orchestrator session)
 
 Owned by the Fable 5.1 Claude Code orchestrator session (brief:
-`../phaseone-briefs/workflows-orchestrator.md`; ADR-0052 proposed; engine rhai per the spikes in
+`../phaseone-briefs/workflows-orchestrator.md`; ADR-0053 proposed; engine rhai per the spikes in
 `../phaseone-spikes/`). The orchestrator writes its progress HERE and nowhere else in this file:
-- (not started)
+- Briefs `../phaseone-briefs/wf1-…wf6-*.md`; questions/answers in `workflows-orchestrator-questions.md`.
+- LANDED: `task/workflow-api` — `crates/p1-workflow` API only (settings, `ModelResolver`,
+  `StepRunner`, envelope, journal record, `WorkflowService`, `WorkflowObserver`; frozen, additive
+  changes only) and fanout's `"model"` job key (→ `p1 --model`). Shipped judge = `claude/claude-fable-5`
+  (the Fable profile this route binds), cap 3 on `claude-fable-5`.
+- RUNNING: job 1 (`task/workers-prepared`, deepseek2) and job 2 (`task/finish-result`, deepseek2) —
+  implemented, in their gates. NEXT: jobs 3 (`claude/claude-opus-5-5:high`) and 4 (`gpt/gpt-6-sol`)
+  from the API commit; then 5 (Opus medium) and 6 (glm).
 
 ## Open decisions and risks
 

@@ -143,6 +143,9 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
         Command::Models { search } => models_command(deps, &options, search.as_deref()),
         // The login surface (ADR-0044, spec §6): no catalog, no provider and no
         // network — the store is written and the "which source" report is printed.
+        // The route quota ledger (ADR-0052): route metadata and p1-auth credential
+        // references go to `p1-usage`; no catalog, no provider.
+        Command::Usage(usage) => crate::usage::usage(deps, &usage).await,
         Command::Login { route } => crate::login::login(deps, &route).await,
         Command::LoginList => crate::login::list(deps),
         Command::Logout { route } => crate::login::logout(deps, &route).await,
@@ -1024,12 +1027,12 @@ fn finish_tool(assembled: &Assembled) -> Option<Arc<dyn Tool>> {
 }
 
 /// The shell tool's identity implementation: the one identity the host's completion
-/// policy reads (ADR-0051 item 1) to decide whether a child can verify anything
+/// policy reads (ADR-0052 item 1) to decide whether a child can verify anything
 /// itself. Never a model-facing name, which an environment's face may change.
 #[cfg(feature = "delegation")]
 const SHELL_IMPLEMENTATION: &str = "p1-tool-shell";
 
-/// The completion policy a CHILD's assembled tools call for (ADR-0051 item 1): a
+/// The completion policy a CHILD's assembled tools call for (ADR-0052 item 1): a
 /// worker whose tools include no tool that records command runs cannot verify
 /// anything itself, so it reports to its parent instead of naming a command it cannot
 /// run. The check is on the tools' IDENTITIES — the technique `WorkerReportTap` uses
@@ -1048,7 +1051,7 @@ fn completion_policy(tools: &[Arc<dyn Tool>]) -> CompletionPolicy {
     }
 }
 
-/// Apply the child's policy to the `finish` tool the catalog assembled (ADR-0051 item
+/// Apply the child's policy to the `finish` tool the catalog assembled (ADR-0052 item
 /// 1). The catalog builds the tool before the host knows the assembled tools, and the
 /// policy follows from THEM, so it is applied here: the tool keeps the child's own
 /// activity log and outcome cell — its whole history, which a freshly assembled
@@ -1879,7 +1882,7 @@ fn make_child_factory(
             .as_ref()
             .map(|completion| completion.outcome.clone())
             .unwrap_or_default();
-        // ADR-0051 item 1: the policy follows the assembled tools' identities, so it
+        // ADR-0052 item 1: the policy follows the assembled tools' identities, so it
         // is applied here, after assembly, to the `finish` tool the catalog built.
         if let Some(completion) = &child_completion {
             apply_completion_policy(&mut assembled, completion);
@@ -1976,7 +1979,7 @@ fn make_child_factory(
                 let context = agent_context(&assembled)?;
                 let finish_at = finish_index(&assembled);
                 // A re-grant is a new tool set, so the policy is chosen again from it
-                // (ADR-0051 item 1): `add_tools: ["shell"]` puts the worker back on the
+                // (ADR-0052 item 1): `add_tools: ["shell"]` puts the worker back on the
                 // strict rule for every later turn.
                 let policy = completion_policy(&assembled.tools);
                 let mut tools = assembled.tools;

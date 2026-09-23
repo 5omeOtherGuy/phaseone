@@ -178,6 +178,18 @@ class FanoutTest(unittest.TestCase):
             "--yes", "--max-continuations", "5", BRIEF,
         ])
 
+    def test_model_key_reaches_p1_model(self) -> None:
+        # Owner policy 2026-09-23: a job names the model inside its environment; without
+        # the key the argv is unchanged (the environment's own profile runs).
+        argv, entry = self.p1_argv(model="claude/claude-opus-5-5:high")
+        session = os.path.join(entry["run_dir"], "session.jsonl")
+        self.assertEqual(argv, [
+            self.bin, "--env", "plain", "--workspace", self.work, "--session", session,
+            "--model", "claude/claude-opus-5-5:high", "--yes", BRIEF,
+        ])
+        argv, _ = self.p1_argv()
+        self.assertNotIn("--model", argv)
+
     def test_sandbox_write_without_sandbox_is_a_job_error(self) -> None:
         for job in (self.p1_job(sandbox_write=["/tmp/extra-write"]),
                     self.p1_job(sandbox="yes")):
