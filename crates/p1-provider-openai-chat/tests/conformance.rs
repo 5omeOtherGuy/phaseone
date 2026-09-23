@@ -1,6 +1,7 @@
 //! Hand-written fixtures only; each subscription passes THE shared suite unchanged.
 use p1_contracts::{BoxFuture, Effort, ModelOptions, Provider, ProviderError, ProviderRequest};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
+use p1_provider_conformance::fixtures::chat as fixtures;
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource};
@@ -108,15 +109,15 @@ fn invalid() -> ProviderRequest {
 }
 fn fixtures() -> RouteFixtures {
     RouteFixtures {
-        text_turn: include_str!("fixtures/text.sse"),
-        tool_call_turn: include_str!("fixtures/tool.sse"),
-        two_tool_calls: include_str!("fixtures/two_tools.sse"),
-        truncated_tool_call: include_str!("fixtures/truncated.sse"),
-        invalid_tool_json: include_str!("fixtures/invalid_json.sse"),
-        error_event: include_str!("fixtures/error.sse"),
-        no_usage: include_str!("fixtures/no_usage.sse"),
-        reasoning_turn: include_str!("fixtures/reasoning.sse"),
-        events_after_terminal: include_str!("fixtures/after_terminal.sse"),
+        text_turn: fixtures::TEXT_TURN,
+        tool_call_turn: fixtures::TOOL_CALL_TURN,
+        two_tool_calls: fixtures::TWO_TOOL_CALLS,
+        truncated_tool_call: fixtures::TRUNCATED_TOOL_CALL,
+        invalid_tool_json: fixtures::INVALID_TOOL_JSON,
+        error_event: fixtures::ERROR_EVENT,
+        no_usage: fixtures::NO_USAGE,
+        reasoning_turn: fixtures::REASONING_TURN,
+        events_after_terminal: fixtures::EVENTS_AFTER_TERMINAL,
     }
 }
 #[test]
@@ -148,9 +149,7 @@ async fn subscription_endpoint_and_session_header_are_route_scoped() {
     use p1_provider_http::testing::ScriptedResponse;
     for retained in [false, true] {
         let (route, profile) = config(retained);
-        let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(include_str!(
-            "fixtures/no_usage.sse"
-        ))]);
+        let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
         let provider = ChatProvider::new(
             route.clone(),
             MODEL,
@@ -261,11 +260,11 @@ async fn replay_is_structurally_preserved_in_the_actual_second_request() {
     for retained in [false, true] {
         let transcript = format!(
             "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":\"exact reasoning 雪\"}},\"finish_reason\":null}}]}}\n\n{}",
-            include_str!("fixtures/tool.sse")
+            fixtures::TOOL_CALL_TURN
         );
         let transport = ScriptedTransport::new(vec![
             ScriptedResponse::ok_sse(&transcript),
-            ScriptedResponse::ok_sse(include_str!("fixtures/no_usage.sse")),
+            ScriptedResponse::ok_sse(fixtures::NO_USAGE),
         ]);
         let p = provider(retained, transport.clone());
         let mut r = invalid();

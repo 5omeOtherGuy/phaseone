@@ -1,8 +1,6 @@
 //! The shared provider conformance suite, run against the Claude subscription route.
 //! Lead-owned acceptance test.
 
-mod fixtures;
-
 use std::sync::Arc;
 
 use p1_contracts::{
@@ -13,7 +11,9 @@ use p1_model_profile::ModelProfile;
 use p1_provider_anthropic::{
     AnthropicProvider, MessagesAccount, MessagesRoute, ROUTE, build_request,
 };
-use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
+use p1_provider_conformance::{
+    RouteFixtures, RouteUnderTest, fixtures::anthropic as fixtures, run_all,
+};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource};
 

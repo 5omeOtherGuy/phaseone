@@ -6,9 +6,6 @@
 
 mod common;
 
-#[path = "../../p1-provider-anthropic/tests/fixtures/mod.rs"]
-mod messages_fixtures;
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,7 +22,9 @@ use p1_host::cli::SandboxMode;
 use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_anthropic::{MessagesAccount, MessagesAdapterSettings, ROUTE, build_request};
-use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
+use p1_provider_conformance::{
+    RouteFixtures, RouteUnderTest, fixtures::anthropic as messages_fixtures, run_all,
+};
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};

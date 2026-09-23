@@ -26,7 +26,9 @@ use p1_host::catalog::{
 use p1_host::cli::SandboxMode;
 use p1_host::routes::{AdapterSettings, RouteFile, load_all_routes, load_route, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
-use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
+use p1_provider_conformance::{
+    RouteFixtures, RouteUnderTest, fixtures::chat as chat_fixtures, run_all,
+};
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 use p1_provider_openai::{ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport};
@@ -40,21 +42,6 @@ const BEARER: &str = "ROUTE-FILES-FAKE-BEARER";
 
 /// The adapter's own fixtures, the ones its conformance suite runs on. The suite below
 /// must mean the same thing for the shipped composed routes as it does for the adapter.
-const TEXT_TURN: &str = include_str!("../../p1-provider-openai-chat/tests/fixtures/text.sse");
-const TOOL_CALL_TURN: &str = include_str!("../../p1-provider-openai-chat/tests/fixtures/tool.sse");
-const TWO_TOOL_CALLS: &str =
-    include_str!("../../p1-provider-openai-chat/tests/fixtures/two_tools.sse");
-const TRUNCATED_TOOL_CALL: &str =
-    include_str!("../../p1-provider-openai-chat/tests/fixtures/truncated.sse");
-const INVALID_TOOL_JSON: &str =
-    include_str!("../../p1-provider-openai-chat/tests/fixtures/invalid_json.sse");
-const ERROR_EVENT: &str = include_str!("../../p1-provider-openai-chat/tests/fixtures/error.sse");
-const NO_USAGE: &str = include_str!("../../p1-provider-openai-chat/tests/fixtures/no_usage.sse");
-const REASONING_TURN: &str =
-    include_str!("../../p1-provider-openai-chat/tests/fixtures/reasoning.sse");
-const EVENTS_AFTER_TERMINAL: &str =
-    include_str!("../../p1-provider-openai-chat/tests/fixtures/after_terminal.sse");
-
 struct Fixed;
 
 impl CredentialSource for Fixed {
@@ -187,15 +174,15 @@ fn kimi_request(request: &ProviderRequest) -> serde_json::Value {
 
 fn fixtures() -> RouteFixtures {
     RouteFixtures {
-        text_turn: TEXT_TURN,
-        tool_call_turn: TOOL_CALL_TURN,
-        two_tool_calls: TWO_TOOL_CALLS,
-        truncated_tool_call: TRUNCATED_TOOL_CALL,
-        invalid_tool_json: INVALID_TOOL_JSON,
-        error_event: ERROR_EVENT,
-        no_usage: NO_USAGE,
-        reasoning_turn: REASONING_TURN,
-        events_after_terminal: EVENTS_AFTER_TERMINAL,
+        text_turn: chat_fixtures::TEXT_TURN,
+        tool_call_turn: chat_fixtures::TOOL_CALL_TURN,
+        two_tool_calls: chat_fixtures::TWO_TOOL_CALLS,
+        truncated_tool_call: chat_fixtures::TRUNCATED_TOOL_CALL,
+        invalid_tool_json: chat_fixtures::INVALID_TOOL_JSON,
+        error_event: chat_fixtures::ERROR_EVENT,
+        no_usage: chat_fixtures::NO_USAGE,
+        reasoning_turn: chat_fixtures::REASONING_TURN,
+        events_after_terminal: chat_fixtures::EVENTS_AFTER_TERMINAL,
     }
 }
 
@@ -1334,7 +1321,8 @@ async fn two_routes_that_share_one_profile_differ_only_in_their_declared_fields(
             .resolve(environment)
             .expect("the route serves the profile");
         assert_eq!(resolved.wire_model, wire, "{id}");
-        let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(NO_USAGE)]);
+        let transport =
+            ScriptedTransport::new(vec![ScriptedResponse::ok_sse(chat_fixtures::NO_USAGE)]);
         let provider = provider_of(&resolved, transport.clone());
         let events = drain(&provider, request.clone()).await;
         assert!(
@@ -1418,7 +1406,8 @@ async fn a_session_recorded_on_one_route_resumes_on_the_other_as_an_environment_
         .resolve("beta-env")
         .expect("beta serves the profile");
 
-    let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(TEXT_TURN)]);
+    let transport =
+        ScriptedTransport::new(vec![ScriptedResponse::ok_sse(chat_fixtures::TEXT_TURN)]);
     let records = recorded_turn(provider_of(&alpha, transport)).await;
     assert!(!records.is_empty(), "the turn was journalled");
 
@@ -1656,7 +1645,8 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
         .binding(&resolved.profile.id)
         .expect("the route serves this profile");
     let connector = Arc::new(RefusingWsConnector::default());
-    let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(TEXT_TURN)]);
+    let transport =
+        ScriptedTransport::new(vec![ScriptedResponse::ok_sse(chat_fixtures::TEXT_TURN)]);
     let provider = route_provider(
         &resolved.route,
         binding,
