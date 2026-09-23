@@ -745,6 +745,24 @@ impl Driver {
                 // ADR-0048: a provider notice is display-only — one quiet
                 // transcript note, like every other note the driver adds.
                 if let p1_contracts::AgentEvent::ProviderNotice { text } = &stamped.event {
+                    if let Some(count) = text.strip_prefix("\0p1-idle-summary-count:")
+                        && let Ok(count) = count.parse::<usize>()
+                    {
+                        let warning = "context summaries since the last change";
+                        self.screen.transcript.blocks.retain(|block| {
+                            !matches!(
+                                block,
+                                p1_tui::transcript::Block::Meta { text }
+                                    if text.contains(warning)
+                            )
+                        });
+                        if count > 0 {
+                            self.screen.transcript.note(&format!(
+                                "· {count} context summaries since the last change"
+                            ));
+                        }
+                        return;
+                    }
                     self.screen.transcript.note(&format!("· {text}"));
                     return;
                 }

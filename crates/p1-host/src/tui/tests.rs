@@ -80,6 +80,60 @@ fn typing_and_enter_submits_a_prompt() {
 }
 
 #[test]
+fn streamed_tool_input_prepares_a_named_call_row() {
+    let (mut d, _auth) = driver();
+    d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 1,
+        worker: None,
+        event: p1_contracts::AgentEvent::TurnStarted,
+    }));
+    d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 1,
+        worker: None,
+        event: p1_contracts::AgentEvent::ToolInputDelta {
+            call_id: "c-patch".into(),
+            name: "apply_patch".into(),
+            text: "*** Begin Patch".into(),
+        },
+    }));
+    let Some(p1_tui::transcript::Block::Call(row)) = d.screen.transcript.blocks.first() else {
+        panic!("the streamed arguments should create a preparing block");
+    };
+    assert_eq!(row.name, "apply_patch");
+    assert_eq!(row.summary, "*** Begin Patch");
+    assert!(
+        row.call.is_none(),
+        "the block remains preparing until ToolStarted"
+    );
+    let rendered = p1_tui::render::block::lines(row, 76, false, 0, true);
+    assert!(rendered[0].to_string().contains("apply_patch"));
+}
+
+#[test]
+fn interactive_summary_notice_is_added_and_removed_by_host_control_events() {
+    let (mut d, _auth) = driver();
+    let notice = |text: &str| {
+        UiEvent::Agent(p1_tui::runtime::Stamped {
+            at_ms: 1,
+            worker: None,
+            event: p1_contracts::AgentEvent::ProviderNotice { text: text.into() },
+        })
+    };
+    d.on_ui_event(notice("\0p1-idle-summary-count:6"));
+    assert!(d.screen.transcript.blocks.iter().any(|block| matches!(
+        block,
+        p1_tui::transcript::Block::Meta { text }
+            if text == "· 6 context summaries since the last change"
+    )));
+    d.on_ui_event(notice("\0p1-idle-summary-count:0"));
+    assert!(!d.screen.transcript.blocks.iter().any(|block| matches!(
+        block,
+        p1_tui::transcript::Block::Meta { text }
+            if text.starts_with("· ") && text.contains("context summaries since the last change")
+    )));
+}
+
+#[test]
 fn home_prelude_is_attached_to_the_driver_screen_with_workspace_and_current_model() {
     let (mut d, _auth) = driver();
     let workspace = tempfile::tempdir().unwrap();

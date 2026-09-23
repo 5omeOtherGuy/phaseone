@@ -359,7 +359,7 @@ TEXT 76×9
 03                                                                             
 04   ▪▪▪  streaming · 6.0s                                          request 3  
 05                                                                             
-06   ▪▪▪  preparing · 2.4s                                          request 3  
+06   ▪▪▪  preparing apply_patch · 2.4s                              request 3  
 07                                                                             
 08   ▪▪▪  summarizing context · 8.1s                                request 9  
 ```
@@ -515,7 +515,7 @@ band C  BLOCK   meta: fold line / facts                                  [right 
 decision BLOCK+ only while awaiting approval (§7.5)
 ```
 - Glyph col 4 (text col): `▸ ` dim settled, `▸ ` live while running, `▸ ` dim + name `…` faint
-  while preparing (ToolInputDelta; the name is not in the event — proposal §14.1), `! ` attn
+  while preparing (ToolInputDelta; the model-facing name is in the event), `! ` attn
   while awaiting approval.
 - Name field: 10 cells, dim, the tool's call name verbatim. **A name of 10+ cells is never cut**:
   it takes `len + 1` cells and pushes the target right for that row only (`apply_patch`,
@@ -555,7 +555,7 @@ TEXT 76×25
 ```text
    0         1         2         3         4         5         6         7     
    0123456789012345678901234567890123456789012345678901234567890123456789012345
-00   ▸ …         *** Begin Patch                                       1.4 kB  
+00   ▸ apply_patch *** Begin Patch                                    1.4 kB  
 01     +    return self.apply_at_boundary(summary);                            
 02     +}                                                                      
 03      self.commit_boundary()                                                 
@@ -967,8 +967,8 @@ RUNS
 
 
 ### 7.6 Streaming a tool's arguments (ToolInputDelta)
-From the first `ToolInputDelta{call_id}` a preparing Block is the running element: `▸` dim, name
-`…` faint (unknown until ToolStarted), target = the last line of the accumulated input (dim,
+From the first `ToolInputDelta{call_id,name}` a preparing Block is the running element: `▸` dim,
+name `<name>` faint, target = the last line of the accumulated input (dim,
 tail-truncated from the LEFT so the newest text shows), right = accumulated size. For inputs over
 one line (write content, apply_patch) band B shows the last 3 lines dim. At `ToolStarted` with the
 same `call_id` the Block becomes the normal running Block (name and target from the call).
@@ -1593,7 +1593,7 @@ RUNS
 | `RequestStarted{request_index}` | `TurnWorking` right `request N` (1-based) | a retry shows the next index |
 | `TextDelta` | `ProseFlow` (running, grows) ; `TurnWorking` → `streaming` | new block after reasoning (existing rule) |
 | `ReasoningDelta` | `Reasoning` collapsed, live elapsed ; `TurnWorking` → `reasoning` | |
-| `ToolInputDelta{call_id,text}` | preparing Block (§7.6) ; `TurnWorking` → `preparing` | display only |
+| `ToolInputDelta{call_id,name,text}` | preparing Block (§7.6) ; `TurnWorking` → `preparing` | display only |
 | `ProviderNotice{text}` | `MetaRow` `· <text>` | never journalled; not replayed on resume |
 | `ResponseCompleted{model,stop,usage}` | closes streams; `Spend.record`; LEDGER CONTEXT; statusline ctx/spend; stop ≠ EndTurn/ToolUse → §7.8 row | usage `None` poisons spend parts |
 | `InboxDelivered{count}` | queued steering → `OperatorTurn` tag `steering`; remainder `MetaRow` | §8.2 |
@@ -1710,6 +1710,10 @@ RUNS
 9. **Tool-provided destructiveness** so the destructive floor is not a UI pattern match.
 10. **Context-stats seam** for the CONTEXT parts rows.
 11. **Kitty keyboard protocol** opt-in (`^Tab`, `⇧⏎` distinguishable).
+
+Batch 1 seams landed: §14.1 streams and displays the model-facing tool name while arguments are
+preparing; §14.7 warns interactive operators after the configured idle-summary bound and clears
+the warning when workspace progress resets the count. The interactive warning does not cancel.
 
 ## 15. Open questions for the owner
 1. Effort levels: the brief says `low medium high max`; `p1-contracts::Effort` also has

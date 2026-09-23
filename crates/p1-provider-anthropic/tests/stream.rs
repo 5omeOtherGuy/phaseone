@@ -368,18 +368,30 @@ async fn tool_call_turn_through_drive() {
     );
 
     // Display deltas carry the call id but no call is complete before Finished.
-    let deltas: Vec<(String, String)> = events
+    let deltas: Vec<(String, String, String)> = events
         .iter()
         .filter_map(|event| match event {
-            StreamEvent::ToolInputDelta { call_id, text } => Some((call_id.clone(), text.clone())),
+            StreamEvent::ToolInputDelta {
+                call_id,
+                name,
+                text,
+            } => Some((call_id.clone(), name.clone(), text.clone())),
             _ => None,
         })
         .collect();
     assert_eq!(
         deltas,
         vec![
-            ("call_1".to_string(), "{\"path\":".to_string()),
-            ("call_1".to_string(), "\"a.txt\"}".to_string()),
+            (
+                "call_1".to_string(),
+                "read".to_string(),
+                "{\"path\":".to_string()
+            ),
+            (
+                "call_1".to_string(),
+                "read".to_string(),
+                "\"a.txt\"}".to_string()
+            ),
         ]
     );
 }

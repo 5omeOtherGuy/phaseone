@@ -259,6 +259,19 @@ pub fn tool_call_order_is_preserved(route: &RouteUnderTest) {
 pub fn truncated_stream_is_failure_not_completion(route: &RouteUnderTest) {
     const NAME: &str = "truncated_stream_is_failure_not_completion";
     let events = ok(route, NAME, route.fixtures.truncated_tool_call);
+    let streamed_names: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ToolInputDelta { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    check!(
+        route,
+        NAME,
+        streamed_names.iter().all(|name| *name == "read"),
+        "expected streamed argument deltas to carry tool name `read`, saw {streamed_names:?}"
+    );
     check!(
         route,
         NAME,

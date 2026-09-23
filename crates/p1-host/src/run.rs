@@ -690,6 +690,13 @@ pub async fn run_with_front_end(
             inner: events,
             guard,
         })
+    } else if options.tui && options.max_idle_summaries > 0 {
+        Arc::new(InteractiveStallWatcher {
+            inner: events,
+            activity: activity.clone(),
+            max: options.max_idle_summaries,
+            warned: AtomicBool::new(false),
+        })
     } else {
         events
     };
@@ -1788,6 +1795,35 @@ impl EventSink for StallWatcher {
     }
 }
 
+/// The interactive counterpart to the headless guard: it reports the activity
+/// log's consecutive-summary count to the TUI but never cancels the operator's run.
+struct InteractiveStallWatcher {
+    inner: Arc<dyn EventSink>,
+    activity: Arc<ParentActivity>,
+    max: usize,
+    warned: AtomicBool,
+}
+
+impl EventSink for InteractiveStallWatcher {
+    fn emit(&self, event: AgentEvent) {
+        if matches!(event, AgentEvent::ContextReplaced { .. }) {
+            self.activity.record_replacement();
+        }
+        self.inner.emit(event);
+
+        let count = self.activity.consecutive_replacements() as usize;
+        let show = count >= self.max;
+        let was_shown = self.warned.swap(show, Ordering::SeqCst);
+        if show != was_shown || (show && count == self.max) {
+            // Private host-to-TUI control notice. The TUI turns it into (or removes)
+            // the single warning meta row; it is never exposed to the model.
+            self.inner.emit(AgentEvent::ProviderNotice {
+                text: format!("\0p1-idle-summary-count:{count}"),
+            });
+        }
+    }
+}
+
 // -------------------------------------------------- the same guard for a child
 
 /// The per-child §3c guard. A delegated worker is always unattended — nobody
@@ -2697,6 +2733,69 @@ fn next_agent_ordinal(ordinals: &AtomicUsize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct CapturedEvents(Mutex<Vec<AgentEvent>>);
+
+    impl EventSink for CapturedEvents {
+        fn emit(&self, event: AgentEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[test]
+    fn interactive_idle_summary_warning_is_display_only_and_clears_on_progress() {
+        let captured = Arc::new(CapturedEvents::default());
+        // Share the same activity counter for both observing and forwarding.
+        let workspace = tempfile::tempdir().unwrap();
+        let log = Arc::new(ActivityLog::default());
+        log.watch_workspace(workspace.path(), &[]);
+        let activity = Arc::new(ParentActivity::new(captured.clone(), log.clone(), &[]));
+        let watcher = InteractiveStallWatcher {
+            inner: activity.clone(),
+            activity,
+            max: 2,
+            warned: AtomicBool::new(false),
+        };
+        for _ in 0..2 {
+            watcher.emit(AgentEvent::ContextReplaced {
+                items_before: 100,
+                items_after: 10,
+                usage: None,
+            });
+        }
+        let call = p1_contracts::ToolCall {
+            call_id: "w1".into(),
+            name: "write".into(),
+            input: p1_contracts::ToolInput::Json("{}".into()),
+        };
+        log.record_started(&call, p1_contracts::Effect::WritesFiles);
+        std::fs::write(workspace.path().join("progress.txt"), "worked").unwrap();
+        watcher.emit(AgentEvent::ToolFinished {
+            result: p1_contracts::ToolResultItem {
+                call_id: "w1".into(),
+                name: "write".into(),
+                status: p1_contracts::ToolStatus::Ok,
+                content: "wrote".into(),
+            },
+        });
+
+        let notices: Vec<_> = captured
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ProviderNotice { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            ["\0p1-idle-summary-count:2", "\0p1-idle-summary-count:0"]
+        );
+    }
 
     /// The key is a pure function of its three inputs: same inputs, same key —
     /// in another process too, because nothing process-local (a pid, a clock, a

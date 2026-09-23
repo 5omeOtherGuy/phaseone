@@ -253,6 +253,7 @@ impl ResponseParser for ChatParser {
                         raw.push_str(part);
                         events.push(StreamEvent::ToolInputDelta {
                             call_id: buffer.call_id.clone(),
+                            name: buffer.name.clone(),
                             text: part.into(),
                         });
                     }

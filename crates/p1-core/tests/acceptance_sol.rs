@@ -595,6 +595,7 @@ async fn tool_input_delta_is_display_only() {
     let provider = Arc::new(ScriptedProvider::new(vec![Step::Events(vec![
         StreamEvent::ToolInputDelta {
             call_id: "draft-call".into(),
+            name: "alpha".into(),
             text: "{\"x\":".into(),
         },
         StreamEvent::Finished(completed(
@@ -612,6 +613,7 @@ async fn tool_input_delta_is_display_only() {
             .events()
             .contains(&AgentEvent::ToolInputDelta {
                 call_id: "draft-call".into(),
+                name: "alpha".into(),
                 text: "{\"x\":".into()
             })
     );

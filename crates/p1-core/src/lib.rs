@@ -501,10 +501,16 @@ impl Agent {
                     StreamEvent::ReasoningDelta { text, .. } => {
                         self.parts.events.emit(AgentEvent::ReasoningDelta { text });
                     }
-                    StreamEvent::ToolInputDelta { call_id, text } => {
-                        self.parts
-                            .events
-                            .emit(AgentEvent::ToolInputDelta { call_id, text });
+                    StreamEvent::ToolInputDelta {
+                        call_id,
+                        name,
+                        text,
+                    } => {
+                        self.parts.events.emit(AgentEvent::ToolInputDelta {
+                            call_id,
+                            name,
+                            text,
+                        });
                     }
                     // ADR-0048: a display-only notice is forwarded in order with
                     // the other events and touches nothing else — no history, no

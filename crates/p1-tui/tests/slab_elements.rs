@@ -237,6 +237,7 @@ fn el_working_real_path_follows_the_turn_events() {
         500,
         AgentEvent::ToolInputDelta {
             call_id: "c1".into(),
+            name: "apply_patch".into(),
             text: "*** Begin Patch".into(),
         },
     );

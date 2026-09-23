@@ -214,9 +214,9 @@ impl ToolRow {
     }
 
     /// A started call still running: it carries its own `▪▪▪`. A preparing
-    /// row (input deltas, no name yet) does not.
+    /// row (input deltas before ToolStarted) does not.
     fn is_running_call(&self) -> bool {
-        self.status == RowStatus::Running && !self.name.is_empty()
+        self.status == RowStatus::Running && !self.name.is_empty() && self.input_preview.is_none()
     }
 }
 
@@ -440,11 +440,15 @@ impl Transcript {
                 }
                 self.reasoning_delta(text, at_ms);
             }
-            AgentEvent::ToolInputDelta { call_id, text } => {
+            AgentEvent::ToolInputDelta {
+                call_id,
+                name,
+                text,
+            } => {
                 if let Some(turn) = &mut self.turn {
                     turn.phase = TurnPhase::Preparing;
                 }
-                self.tool_input_delta(call_id, text);
+                self.tool_input_delta(call_id, name, text);
             }
             // The host usually intercepts notices as its own notes; one that
             // reaches the model is the same meta row.
@@ -609,11 +613,14 @@ impl Transcript {
         }
     }
 
-    fn tool_input_delta(&mut self, call_id: &str, text: &str) {
+    fn tool_input_delta(&mut self, call_id: &str, name: &str, text: &str) {
         if let Some(index) = self.running.get(call_id).copied()
             && let Some(Block::Call(row)) = self.blocks.get_mut(index)
         {
             let preview = row.input_preview.get_or_insert_with(String::new);
+            if row.name.is_empty() {
+                row.name = name.to_string();
+            }
             preview.push_str(text);
             row.summary = summarize_input(preview.lines().last().unwrap_or(preview));
             row.input_preview = Some(preview.clone());
@@ -626,7 +633,7 @@ impl Transcript {
             kind: crate::face::TargetKind::Plain,
         };
         self.blocks.push(Block::Call(ToolRow {
-            name: String::new(),
+            name: name.to_string(),
             summary: face.target.clone(),
             status: RowStatus::Running,
             output: None,
