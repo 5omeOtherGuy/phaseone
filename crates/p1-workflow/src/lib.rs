@@ -9,8 +9,14 @@
 //!
 //! `api` is the frozen public surface: `p1-tool-workflow` depends on [`WorkflowService`],
 //! the host on [`StepRunner`], [`ModelResolver`], [`WorkflowSettings`] and [`WorkflowObserver`].
-//! The engine behind it lands separately.
+//! [`InProcessWorkflows`] is the engine behind it.
 
 pub mod api;
+mod caps;
+mod engine;
+mod error;
+mod journal;
+mod service;
 
 pub use api::*;
+pub use service::InProcessWorkflows;

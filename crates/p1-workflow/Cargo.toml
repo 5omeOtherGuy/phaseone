@@ -16,7 +16,14 @@ p1-contracts = { path = "../p1-contracts" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# The script engine (ADR-0053, spike-proven): `sync` makes Engine/AST/FnPtr Send + Sync so
+# thunks run on OS threads; `serde` converts envelopes and args to and from the VM.
+rhai = { version = "=1.26.1", features = ["sync", "serde"] }
+# No runtime of our own: `start` captures the caller's handle; `watch` carries run status.
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
 
 [dev-dependencies]
+# The tests drive runs on a multi-thread runtime: script threads block on its handle.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros"] }
 # The settings table is TOML in `settings.toml`; the parse-only build the host uses.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
