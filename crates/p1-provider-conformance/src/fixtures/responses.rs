@@ -1,4 +1,4 @@
-//! Hand-written, real-shaped Codex Responses SSE transcripts.
+//! Hand-written, real-shaped Codex Responses SSE transcripts, shared publicly.
 //!
 //! These are the nine route fixtures the shared conformance suite parameterises
 //! over (`docs/design/providers.md` `RouteFixtures`). They contain no captured

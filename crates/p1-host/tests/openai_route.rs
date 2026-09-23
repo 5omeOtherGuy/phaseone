@@ -6,9 +6,6 @@
 
 mod common;
 
-#[path = "../../p1-provider-openai/tests/fixtures/mod.rs"]
-mod responses_fixtures;
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,7 +21,9 @@ use p1_host::catalog::{build_catalog, resolve_environment, responses_route, rout
 use p1_host::cli::SandboxMode;
 use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
-use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
+use p1_provider_conformance::{
+    RouteFixtures, RouteUnderTest, fixtures::responses as responses_fixtures, run_all,
+};
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 use p1_provider_openai::{

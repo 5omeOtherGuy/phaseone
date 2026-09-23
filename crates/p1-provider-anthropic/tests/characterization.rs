@@ -19,7 +19,7 @@
 //! (`claude-sonnet-4-6`) — i.e. origin is the configured model, not the echo.
 
 #[allow(dead_code)]
-mod fixtures;
+use p1_provider_conformance::fixtures::anthropic as fixtures;
 
 use std::sync::Arc;
 

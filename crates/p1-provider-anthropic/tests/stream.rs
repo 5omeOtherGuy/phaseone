@@ -2,7 +2,7 @@
 //! invariants (no credential leaks, one terminal event, raw tool input, absent
 //! usage, replay gating).
 
-mod fixtures;
+use p1_provider_conformance::fixtures::anthropic as fixtures;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

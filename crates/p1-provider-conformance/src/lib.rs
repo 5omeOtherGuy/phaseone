@@ -1,5 +1,21 @@
 #![forbid(unsafe_code)]
 
+pub mod fixtures {
+    pub mod anthropic;
+    pub mod chat {
+        pub const TEXT_TURN: &str = include_str!("fixtures/chat/text.sse");
+        pub const TOOL_CALL_TURN: &str = include_str!("fixtures/chat/tool.sse");
+        pub const TWO_TOOL_CALLS: &str = include_str!("fixtures/chat/two_tools.sse");
+        pub const TRUNCATED_TOOL_CALL: &str = include_str!("fixtures/chat/truncated.sse");
+        pub const INVALID_TOOL_JSON: &str = include_str!("fixtures/chat/invalid_json.sse");
+        pub const ERROR_EVENT: &str = include_str!("fixtures/chat/error.sse");
+        pub const NO_USAGE: &str = include_str!("fixtures/chat/no_usage.sse");
+        pub const REASONING_TURN: &str = include_str!("fixtures/chat/reasoning.sse");
+        pub const EVENTS_AFTER_TERMINAL: &str = include_str!("fixtures/chat/after_terminal.sse");
+    }
+    pub mod responses;
+}
+
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -973,4 +989,49 @@ pub fn run_all(route: &RouteUnderTest) {
     no_retry_after_visible_output(route);
     setup_error_is_only_for_invalid_requests(route);
     credentials_never_leak(route);
+}
+
+#[cfg(test)]
+mod fixture_tests {
+    use super::fixtures;
+
+    #[test]
+    fn shared_fixture_lengths_are_pinned() {
+        let shared = [
+            fixtures::anthropic::text_turn,
+            fixtures::anthropic::tool_call_turn,
+            fixtures::anthropic::two_tool_calls,
+            fixtures::anthropic::truncated_tool_call,
+            fixtures::anthropic::invalid_tool_json,
+            fixtures::anthropic::error_event,
+            fixtures::anthropic::no_usage,
+            fixtures::anthropic::reasoning_turn,
+            fixtures::anthropic::events_after_terminal,
+            fixtures::responses::TEXT_TURN,
+            fixtures::responses::TOOL_CALL_TURN,
+            fixtures::responses::TWO_TOOL_CALLS,
+            fixtures::responses::TRUNCATED_TOOL_CALL,
+            fixtures::responses::INVALID_TOOL_JSON,
+            fixtures::responses::ERROR_EVENT,
+            fixtures::responses::NO_USAGE,
+            fixtures::responses::REASONING_TURN,
+            fixtures::responses::EVENTS_AFTER_TERMINAL,
+            fixtures::chat::TEXT_TURN,
+            fixtures::chat::TOOL_CALL_TURN,
+            fixtures::chat::TWO_TOOL_CALLS,
+            fixtures::chat::TRUNCATED_TOOL_CALL,
+            fixtures::chat::INVALID_TOOL_JSON,
+            fixtures::chat::ERROR_EVENT,
+            fixtures::chat::NO_USAGE,
+            fixtures::chat::REASONING_TURN,
+            fixtures::chat::EVENTS_AFTER_TERMINAL,
+        ];
+        assert_eq!(
+            shared.map(str::len),
+            [
+                958, 1356, 1190, 558, 822, 710, 703, 1245, 912, 1026, 851, 596, 427, 385, 324, 389,
+                658, 589, 439, 556, 363, 359, 493, 204, 150, 308, 567,
+            ]
+        );
+    }
 }

@@ -32,7 +32,7 @@ use p1_provider_openai::{
 };
 use serde_json::{Value, json};
 
-mod fixtures;
+use p1_provider_conformance::fixtures::responses as fixtures;
 
 const CASES: &str = include_str!("fixtures/characterization/request_cases.json");
 
