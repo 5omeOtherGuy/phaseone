@@ -62,7 +62,11 @@ fn every_mock_is_well_formed() {
     assert_eq!(ids.len(), 25 + 34, "25 element mocks and 34 screens");
     for id in ids {
         let mock = slab::mock(&id);
-        assert_eq!(mock.text.len(), mock.runs.len(), "{id}: TEXT and RUNS row counts");
+        assert_eq!(
+            mock.text.len(),
+            mock.runs.len(),
+            "{id}: TEXT and RUNS row counts"
+        );
         for (row, (text, runs)) in mock.text.iter().zip(&mock.runs).enumerate() {
             assert_eq!(
                 text.chars().count(),
@@ -90,6 +94,21 @@ fn a_painted_mock_captures_back_to_itself() {
         let buffer = paint(&mock);
         slab::assert_mock(&buffer, buffer.area, &id);
     }
+}
+
+#[test]
+fn a_region_of_a_screen_compares_like_a_mock() {
+    // The statusline row of the 120×40 reference screen, cut out of the painted screen.
+    let screen = slab::mock("S01");
+    let buffer = paint(&screen);
+    slab::assert_mock_region(&buffer, Rect::new(2, 38, 116, 1), "S01", 38, 2);
+    let wrong = std::panic::catch_unwind(|| {
+        slab::assert_mock_region(&buffer, Rect::new(2, 38, 116, 1), "S01", 37, 2)
+    });
+    assert!(
+        wrong.is_err(),
+        "a region compared against the wrong rows must fail"
+    );
 }
 
 #[test]

@@ -234,6 +234,7 @@ impl Composer {
 pub struct Screen {
     pub transcript: Transcript,
     pub composer: Composer,
+    pub statusbar: crate::render::statusbar::StatusBar,
     pub pane_width: PaneWidth,
     pub pane_mode: PaneMode,
     /// The width the operator held before a live worker forced the pane open

@@ -12,6 +12,7 @@ pub mod permission;
 pub mod picker;
 pub mod screen;
 pub mod status;
+pub mod statusbar;
 pub mod transcript;
 pub mod workers;
 
