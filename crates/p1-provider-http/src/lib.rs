@@ -14,6 +14,7 @@
 
 mod credential;
 mod drive;
+mod error_code;
 mod file_lock;
 mod http;
 mod retry;
@@ -22,6 +23,7 @@ pub mod ws;
 
 pub use credential::{Credential, CredentialSource};
 pub use drive::{DriveRequest, ResponseParser, drive};
+pub use error_code::{http_error_code, kind_for_status, safe_code};
 pub use file_lock::{LOCK_PATIENCE, lock_exclusive};
 pub use http::{
     ByteStream, HttpRequest, HttpResponse, ReqwestTransport, Transport, TransportError,

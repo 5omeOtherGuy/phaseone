@@ -446,22 +446,7 @@ fn truncate(text: String, limit: usize) -> String {
     cut
 }
 
-/// Model-facing name + description override, mirroring `p1-workspace::ToolFace`
-/// without taking a dependency on it.
-#[derive(Debug, Clone)]
-pub struct ToolFace {
-    pub name: String,
-    pub description: String,
-}
-
-impl ToolFace {
-    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-        }
-    }
-}
+pub use p1_contracts::tool::ToolFace;
 
 const NAME: &str = "finish";
 const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.";

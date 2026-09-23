@@ -12,9 +12,10 @@ route × model profile composed into ONE runtime `Provider` (ADR-0039); model se
 mid-session switching are live (ADR-0049); every main agent can start workers with explicit tool
 grants (ADR-0050); resume, context control, `finish` and the TUI are mounted.
 
-**Where the lead stands.** `main` = `96f92ca` + this commit; ADRs 0001–0056 (0009→0010,
+**Where the lead stands.** `main` = `92858d5` + this commit; ADRs 0001–0058 (0009→0010,
 0013→0014, 0026→0050, 0033→0049 superseded; 0052 usage ledger and 0056 SLAB TUI are other
-sessions'). Open work: #46–#48, #54, #12, #45 (owner), #6, #25; #53 closed by ADR-0055.
+sessions'; 0057 call target and 0058 shadow hook are `proposed` with workers running). Open
+work: #46 (Luna continuation), #48 item 5, #12, #45 (owner), #6, #25; #47, #53, #54 closed.
 
 ## Next — READ FIRST
 
@@ -73,6 +74,9 @@ OPEN ITEMS (issue numbers)
   workflow run`; the modularity audit ported (`scripts/audits/modularity.rhai`). Built by a Fable
   5.1 orchestrator session with one worker per job (DeepSeek, Opus 5.5, gpt-6-sol, GLM); five live
   checks passed. ADR-0051 (a worker without a command tool ends `done — not verified`) preceded it.
+- **Audit follow-ups (2026-09-23)** — #54 every task ends with `finish`; #47 one provider error-code
+  module in `p1-provider-http`; #48 items 1–4 (explicit ordinal, no host credential copy, one
+  `ToolFace`, workers doc). Workers: gpt-6-sol and gpt-6-luna at high, all accepted first pass.
 - **ADR-0054 / ADR-0055 (2026-09-23, owner decisions)** — workflow roles carry a fallback chain
   for route failures only (never on a cap); DeepSeek V4.1 Flash is the shipped worker, live-verified
   with the exhausted primary Go route hopping to deepseek2. The stall guard and the `finish` check
@@ -135,5 +139,11 @@ comment on #46; the ADR's deferred list is unchanged.
 - rhai scripts: never call a closure held in a variable or write a captured variable inside a
   `parallel`/`pipeline` thunk (rhai `sync` = "Data race detected", timing-dependent); curry the
   inputs, aggregate after the join. The prompts' example says so.
-- The stall guard sees only tool-declared writes (#53): a model editing through shell heredocs
-  (Opus 5.5 does) looks idle. Until fixed, briefs say "edit with the edit tool".
+- NEVER SIGSTOP a build or a worker: a paused rustc keeps its `rustc-serial` slot and every build on
+  the machine stalls (3 h lost 2026-09-23). To hold a job back, let its cargo step finish and
+  withhold the next; to free disk, remove landed worktrees' `target/` (8–15 GB each).
+- Each worktree's `target/` grows to 8–15 GB under clippy + tests; land and remove promptly, and
+  start no new worktree while three are live on this disk.
+- A rejected push or a CI wait that times out both exit 1 from `push-main.sh`: read the output.
+  After a route hits its weekly limit mid-run (DeepSeek 429 GoUsageLimitError), commit the WIP
+  by path and continue with a fresh session of another model in the same worktree.

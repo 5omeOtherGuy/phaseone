@@ -27,9 +27,12 @@ tool's knowledge, and only the tool can say it.
 1. **`p1-contracts` gains a call description.** `Tool` gets
    `fn describe(&self, call: &ToolCall) -> CallDescription` with a default implementation
    built from the declaration name alone. `CallDescription { verb: &'static str, target:
-   Option<String> }`: `verb` is a short word for the UI (`read`, `edit`, `run`, `search`,
-   `finish`, `worker`…), `target` the file, directory, command or worker the call is about,
-   already trimmed for display. No argument keys leave the tool.
+   Option<String>, edit: Option<EditPreview> }`: `verb` is a short word for the UI (`read`,
+   `edit`, `run`, `search`, `finish`, `worker`…), `target` the file, directory, command or
+   worker the call is about, already trimmed for display, and `edit` — filled only by a tool
+   that changes one file with a known before/after (`edit`, `write`) — the `{path, old, new}`
+   the approval UI shows as a diff. No argument keys leave the tool: the tool supplies what
+   the UI needs, the UI never parses the tool's input.
 2. **Every shipped tool implements it** from its own parsed input: read/grep → path or
    pattern; edit/write/apply_patch → the file(s) touched (apply_patch parses its freeform
    input, the same way it applies it); shell → the command's first line; finish → status;
