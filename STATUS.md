@@ -108,8 +108,13 @@ Owned by the Fable 5.1 Claude Code orchestrator session (brief:
   `InProcessWorkflows`; 28 integration tests + the prompts' example script pinned on the engine
   (`tests/prompt_example.rs`). Opus 5.5 high, one pass. Known: `observer.step_started` fires after
   the step (the worker ref exists only then); `args` can gain keys (never change existing ones).
-- RUNNING: job 5 `task/workflow-host` (`claude/claude-opus-5-5:medium`) and job 6
-  `task/workflow-docs` (`glm`). NEXT: the five live checks, the ADR evidence, the report.
+- LANDED: job 6 `task/workflow-docs` (this merge): `docs/design/workflows.md` (GLM 5.3, one pass;
+  its §7 grows with the host glue).
+- RUNNING: job 5 `task/workflow-host` — first attempt (Opus medium) stalled at 6 summaries because
+  it edited through shell heredocs (issue #53); resumed in the same session at Opus high.
+  READY: the audit port (`task/workflow-audit`: `scripts/audits/modularity-prep.py` +
+  `modularity.rhai`, engine-tested) and the four live-check scripts
+  (`../phaseone-briefs/workflows-live/`). NEXT: land 5, the five live checks, ADR evidence, report.
 - FIXED by the lead (8483e64): fanout counted pi-worker wrapper processes; jobs 5–6 use the default pool.
 
 ## Open decisions and risks
