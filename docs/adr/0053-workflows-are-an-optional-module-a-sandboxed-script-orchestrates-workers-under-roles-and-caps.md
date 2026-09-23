@@ -1,5 +1,5 @@
 ---
-adr: 52
+adr: 53
 title: Workflows are an optional module: a sandboxed script orchestrates workers under roles and caps
 status: proposed
 date: 2026-09-23
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [docs/adr/0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md, docs/adr/0051-a-worker-without-a-command-tool-may-finish-done-the-result-says-it-was-not-verified.md, docs/adr/0049-model-selection.md, docs/design/delegation.md, docs/design/completion.md, scripts/workflow.py]
 ---
-# ADR-0052: Workflows are an optional module: a sandboxed script orchestrates workers under roles and caps
+# ADR-0053: Workflows are an optional module: a sandboxed script orchestrates workers under roles and caps
 
 ## Context
 

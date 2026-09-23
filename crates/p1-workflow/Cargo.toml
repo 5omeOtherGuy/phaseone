@@ -1,0 +1,22 @@
+[package]
+name = "p1-workflow"
+description = "Optional workflows: a sandboxed script orchestrates workers under roles and caps (ADR-0053)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Value types and the cancellation token only. Never p1-core, p1-workers or a tool crate:
+# steps are driven through the `StepRunner` seam this crate owns.
+p1-contracts = { path = "../p1-contracts" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+# The settings table is TOML in `settings.toml`; the parse-only build the host uses.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
