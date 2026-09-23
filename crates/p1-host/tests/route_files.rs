@@ -1,7 +1,7 @@
 //! Route files (`routes/<id>.toml`): the host loads account and endpoint data instead of
 //! compiling it (`docs/design/routes-and-profiles.md` §1.2), registers one factory per
 //! file under its id (§2), and resolves a profile to the wire model the route reaches it
-//! by. The chat adapter's shared conformance suite also runs here, against the two
+//! by. The chat adapter's shared conformance suite also runs here, against the
 //! SHIPPED routes built from the shipped files through this same loading path.
 
 mod common;
@@ -25,7 +25,7 @@ use p1_host::catalog::{
 };
 use p1_host::cli::SandboxMode;
 use p1_host::routes::{AdapterSettings, RouteFile, load_all_routes, load_route, load_route_by_id};
-use p1_model_profile::ModelProfile;
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
@@ -177,6 +177,14 @@ fn glm_request(request: &ProviderRequest) -> serde_json::Value {
     shipped_request_body("glm", request)
 }
 
+fn shipped_kimi(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped("kimi"), transport)
+}
+
+fn kimi_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body("kimi", request)
+}
+
 fn fixtures() -> RouteFixtures {
     RouteFixtures {
         text_turn: TEXT_TURN,
@@ -212,7 +220,7 @@ struct ShippedRoute {
     follow_up_request: fn(&ProviderRequest) -> serde_json::Value,
 }
 
-fn shipped_routes() -> [ShippedRoute; 2] {
+fn shipped_routes() -> [ShippedRoute; 3] {
     [
         ShippedRoute {
             name: "opencode-go-subscription",
@@ -224,10 +232,15 @@ fn shipped_routes() -> [ShippedRoute; 2] {
             build: shipped_glm,
             follow_up_request: glm_request,
         },
+        ShippedRoute {
+            name: "kimi-coding-subscription",
+            build: shipped_kimi,
+            follow_up_request: kimi_request,
+        },
     ]
 }
 
-/// The conformance suite over the two shipped COMPOSED routes. Each provider comes from
+/// The conformance suite over the shipped COMPOSED chat routes. Each provider comes from
 /// `environments/` -> `routes/*.toml` -> `profiles/*.toml`; the only thing this file
 /// supplies is a scripted transport and a fake credential source.
 #[test]
@@ -497,6 +510,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         [
             "anthropic-subscription",
             "glm-subscription",
+            "kimi-coding-subscription",
             "openai-codex-subscription",
             // The owner's second OpenCode Go account: data only, no Rust change.
             "opencode-go-2-subscription",
@@ -570,6 +584,54 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
     );
     assert_eq!(glm.models["glm-5.3"].wire_model, "glm-5.3");
     assert!(glm.headers.is_empty(), "no static headers on this route");
+
+    let kimi = load_route_by_id(&dirs, "kimi-coding-subscription").expect("the shipped route file");
+    assert_eq!(kimi.origin_route, "openai-chat/kimi-coding-subscription");
+    assert_eq!(kimi.adapter, "openai-chat");
+    assert_eq!(
+        kimi.endpoint,
+        "https://api.kimi.ai/coding/v1/chat/completions"
+    );
+    assert_eq!(kimi.credential.kind, CredentialKind::ApiKey);
+    assert_eq!(kimi.credential.env.as_deref(), Some("KIMI_API_KEY"));
+    assert_eq!(
+        kimi.credential.borrow,
+        vec![
+            BorrowSource {
+                store: BorrowStore::Pi,
+                key: "kimi-coding".into(),
+            },
+            BorrowSource {
+                store: BorrowStore::Opencode,
+                key: "kimi-code-plan-global".into(),
+            },
+        ]
+    );
+    assert_eq!(
+        kimi.settings().expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiChat(ChatAdapterSettings {
+            dialect: ChatDialect::RetainedThinking,
+            session_header: None,
+        })
+    );
+    assert_eq!(kimi.models.len(), 1);
+    assert_eq!(kimi.models["kimi-k3"].wire_model, "k3");
+    assert!(kimi.headers.is_empty(), "no static headers on this route");
+
+    let resolved = shipped("kimi");
+    assert_eq!(resolved.profile.id, "kimi-k3");
+    assert_eq!(resolved.profile.model_id, "k3");
+    assert_eq!(resolved.profile.family, "kimi");
+    assert_eq!(resolved.profile.revision, 1);
+    assert_eq!(resolved.profile.thinking, ThinkingPolicy::Preserved);
+    assert_eq!(
+        resolved.profile.efforts,
+        [Effort::Low, Effort::High, Effort::Max]
+    );
+    assert_eq!(resolved.profile.default_effort, Some(Effort::High));
+    assert_eq!(resolved.profile.max_output_tokens, Some(131_072));
+    assert_eq!(resolved.profile.context_tokens, None);
+    assert_eq!(resolved.wire_model, "k3");
 }
 
 /// The endpoint, the session header and every model name of the two routes now live in
@@ -579,6 +641,10 @@ fn the_two_shipped_routes_have_no_compiled_literals() {
     let literals = [
         "opencode.ai",
         "api.z.ai",
+        "api.kimi.ai",
+        "KIMI_API_KEY",
+        "kimi-coding-subscription",
+        "kimi-k3",
         "x-opencode-session",
         "OPENCODE_API_KEY",
         "ZAI_API_KEY",
@@ -903,6 +969,10 @@ fn one_factory_per_route_file_serves_the_environment_that_names_it() {
         &environment_file("opencode-go-subscription", "deepseek-v4.1-flash"),
     );
     scratch.write_environment("glm", &environment_file("glm-subscription", "glm-5.3"));
+    scratch.write_environment(
+        "kimi",
+        &environment_file("kimi-coding-subscription", "kimi-k3"),
+    );
 
     let assembled = assemble_scratch(&scratch, "go").expect("the shipped route file serves it");
     assert_eq!(assembled.resolved.family, "deepseek");
@@ -921,6 +991,16 @@ fn one_factory_per_route_file_serves_the_environment_that_names_it() {
         Origin {
             route: "openai-chat/glm-subscription".into(),
             model: "glm-5.3".into(),
+        }
+    );
+
+    let assembled = assemble_scratch(&scratch, "kimi").expect("the shipped route file serves it");
+    assert_eq!(assembled.resolved.family, "kimi");
+    assert_eq!(
+        assembled.resolved.route.origin,
+        Origin {
+            route: "openai-chat/kimi-coding-subscription".into(),
+            model: "k3".into(),
         }
     );
 }
