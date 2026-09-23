@@ -628,8 +628,31 @@ fn command_output_real_path_matches_the_help_screen() {
             entry("^G  PgUp PgDn  esc", "goal · scroll · live tail / dismiss"),
         ],
     });
-    let (buffer, area) = paint(&rows(&t, 76, None, 0), 76);
-    slab::assert_mock_region(&buffer, area, "C04", 1, 2);
+    let (buffer, _) = paint(&rows(&t, 76, None, 0), 76);
+    // All mock cells except the repaired boundary remain pinned. The `esc` key occupies
+    // 18 cells; assert the two-cell gap, then the unchanged description and row remainder.
+    slab::assert_mock_region(&buffer, Rect::new(0, 0, 76, 20), "C04", 1, 2);
+    let expected = slab::mock("C04").text[21][2..78].to_string();
+    let actual = buffer.area;
+    let rendered: String = (0..actual.width)
+        .map(|x| buffer[(x, 20)].symbol())
+        .collect();
+    let key = "^G  PgUp PgDn  esc";
+    let key_start = expected.find(key).unwrap();
+    let description_start = key_start + key.len();
+    assert_eq!(p1_tui::wrap::cell_width(key), 18);
+    assert_eq!(
+        p1_tui::wrap::cell_width(&rendered[key_start..description_start]),
+        18
+    );
+    assert!(rendered[key_start + 18..].starts_with("  goal · scroll · live tail / dismiss"));
+    let description = "goal · scroll · live tail / dismiss";
+    assert!(rendered[key_start + 20..].starts_with(description));
+    assert_eq!(
+        &rendered[key_start + 20..key_start + 20 + description.len()],
+        description,
+        "the description remains unchanged after the gap"
+    );
 }
 
 // ---------- Monogram (§6.11) ----------
