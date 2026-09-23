@@ -16,10 +16,13 @@ use crate::cli::SandboxMode;
 /// its fake provider factory here, replacing a real provider key.
 pub type CatalogHook = Box<dyn Fn(&mut Catalog) + Send + Sync>;
 
-/// Apply a `ToolSpec`'s optional face override to a `p1-workspace`-based tool.
+/// Apply a `ToolSpec`'s optional face override to a tool.
 /// No override at all keeps the constructor's default face and identity.
 macro_rules! apply_face {
-    ($tool:expr, $spec:expr) => {{
+    ($tool:expr, $spec:expr) => {
+        apply_face!($tool, $spec, p1_contracts::tool::ToolFace)
+    };
+    ($tool:expr, $spec:expr, $face:ty) => {{
         let tool = $tool;
         if $spec.name.is_none() && $spec.description.is_none() && $spec.variant.is_none() {
             Arc::new(tool) as Arc<dyn Tool>
@@ -36,88 +39,7 @@ macro_rules! apply_face {
                 .variant
                 .clone()
                 .unwrap_or_else(|| tool.identity().variant.clone());
-            Arc::new(tool.with_face(p1_workspace::ToolFace::new(name, description), &variant))
-                as Arc<dyn Tool>
-        }
-    }};
-}
-
-/// Same override rules as [`apply_face`], for the delegation tools' own
-/// `ToolFace` type.
-#[cfg(feature = "delegation")]
-macro_rules! apply_delegate_face {
-    ($tool:expr, $spec:expr) => {{
-        let tool = $tool;
-        if $spec.name.is_none() && $spec.description.is_none() && $spec.variant.is_none() {
-            Arc::new(tool) as Arc<dyn Tool>
-        } else {
-            let name = $spec
-                .name
-                .clone()
-                .unwrap_or_else(|| tool.declaration().name.clone());
-            let description = $spec
-                .description
-                .clone()
-                .unwrap_or_else(|| tool.declaration().description.clone());
-            let variant = $spec
-                .variant
-                .clone()
-                .unwrap_or_else(|| tool.identity().variant.clone());
-            Arc::new(tool.with_face(p1_tool_delegate::ToolFace::new(name, description), &variant))
-                as Arc<dyn Tool>
-        }
-    }};
-}
-
-/// Same override rules as [`apply_face`], for the workflow tools' own `ToolFace`
-/// type.
-#[cfg(feature = "workflows")]
-macro_rules! apply_workflow_face {
-    ($tool:expr, $spec:expr) => {{
-        let tool = $tool;
-        if $spec.name.is_none() && $spec.description.is_none() && $spec.variant.is_none() {
-            Arc::new(tool) as Arc<dyn Tool>
-        } else {
-            let name = $spec
-                .name
-                .clone()
-                .unwrap_or_else(|| tool.declaration().name.clone());
-            let description = $spec
-                .description
-                .clone()
-                .unwrap_or_else(|| tool.declaration().description.clone());
-            let variant = $spec
-                .variant
-                .clone()
-                .unwrap_or_else(|| tool.identity().variant.clone());
-            Arc::new(tool.with_face(p1_tool_workflow::ToolFace::new(name, description), &variant))
-                as Arc<dyn Tool>
-        }
-    }};
-}
-
-/// Same override rules as [`apply_face`], for the `finish` tool's own `ToolFace`
-/// type.
-macro_rules! apply_finish_face {
-    ($tool:expr, $spec:expr) => {{
-        let tool = $tool;
-        if $spec.name.is_none() && $spec.description.is_none() && $spec.variant.is_none() {
-            Arc::new(tool) as Arc<dyn Tool>
-        } else {
-            let name = $spec
-                .name
-                .clone()
-                .unwrap_or_else(|| tool.declaration().name.clone());
-            let description = $spec
-                .description
-                .clone()
-                .unwrap_or_else(|| tool.declaration().description.clone());
-            let variant = $spec
-                .variant
-                .clone()
-                .unwrap_or_else(|| tool.identity().variant.clone());
-            Arc::new(tool.with_face(p1_tool_finish::ToolFace::new(name, description), &variant))
-                as Arc<dyn Tool>
+            Arc::new(tool.with_face(<$face>::new(name, description), &variant)) as Arc<dyn Tool>
         }
     }};
 }
@@ -642,7 +564,7 @@ fn register_standard_tools(
         "finish",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
             let completion = hub.issue();
-            let tool = apply_finish_face!(
+            let tool = apply_face!(
                 p1_tool_finish::FinishTool::new(completion.log.clone(), completion.outcome.clone()),
                 spec
             );
@@ -684,7 +606,7 @@ fn register_delegation_tools(
     catalog.tool(
         "worker_start",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_delegate_face!(
+            Ok(apply_face!(
                 p1_tool_delegate::WorkerStartTool::new(
                     service_for.clone(),
                     grantable_for_start.clone(),
@@ -699,7 +621,7 @@ fn register_delegation_tools(
     catalog.tool(
         "worker_result",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_delegate_face!(
+            Ok(apply_face!(
                 p1_tool_delegate::WorkerResultTool::new(service_for.clone()),
                 spec
             ))
@@ -710,7 +632,7 @@ fn register_delegation_tools(
     catalog.tool(
         "worker_continue",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_delegate_face!(
+            Ok(apply_face!(
                 p1_tool_delegate::WorkerContinueTool::new(service_for.clone(), grantable.clone()),
                 spec
             ))
@@ -720,7 +642,7 @@ fn register_delegation_tools(
     catalog.tool(
         "worker_cancel",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_delegate_face!(
+            Ok(apply_face!(
                 p1_tool_delegate::WorkerCancelTool::new(service.clone()),
                 spec
             ))
@@ -745,9 +667,10 @@ pub(crate) fn register_workflow_tools(
     catalog.tool(
         "workflow_start",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_workflow_face!(
+            Ok(apply_face!(
                 p1_tool_workflow::WorkflowStartTool::new(service_for.clone()),
-                spec
+                spec,
+                p1_tool_workflow::ToolFace
             ))
         }),
     );
@@ -756,9 +679,10 @@ pub(crate) fn register_workflow_tools(
     catalog.tool(
         "workflow_status",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_workflow_face!(
+            Ok(apply_face!(
                 p1_tool_workflow::WorkflowStatusTool::new(service_for.clone()),
-                spec
+                spec,
+                p1_tool_workflow::ToolFace
             ))
         }),
     );
@@ -767,9 +691,10 @@ pub(crate) fn register_workflow_tools(
     catalog.tool(
         "workflow_result",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_workflow_face!(
+            Ok(apply_face!(
                 p1_tool_workflow::WorkflowResultTool::new(service_for.clone()),
-                spec
+                spec,
+                p1_tool_workflow::ToolFace
             ))
         }),
     );
@@ -777,9 +702,10 @@ pub(crate) fn register_workflow_tools(
     catalog.tool(
         "workflow_cancel",
         Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_workflow_face!(
+            Ok(apply_face!(
                 p1_tool_workflow::WorkflowCancelTool::new(service.clone()),
-                spec
+                spec,
+                p1_tool_workflow::ToolFace
             ))
         }),
     );

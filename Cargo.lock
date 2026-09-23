@@ -1805,6 +1805,7 @@ dependencies = [
 name = "p1-workspace"
 version = "0.0.1"
 dependencies = [
+ "p1-contracts",
  "tempfile",
  "thiserror 2.0.20",
 ]

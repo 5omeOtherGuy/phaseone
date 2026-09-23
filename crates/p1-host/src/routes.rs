@@ -158,13 +158,6 @@ impl RouteFile {
                 ));
             }
         }
-        if let Some(env) = &self.credential.env
-            && !is_env_var_name(env)
-        {
-            return Err(format!(
-                "`[credential]` env \"{env}\" is not an environment variable name"
-            ));
-        }
         self.credential.validate()?;
         for (id, binding) in &self.models {
             if id.trim().is_empty() || binding.wire_model.trim().is_empty() {
@@ -311,10 +304,4 @@ fn is_header_name(name: &str) -> bool {
             name.to_ascii_lowercase().as_str(),
             "content-type" | "accept" | "host" | "content-length" | "transfer-encoding"
         )
-}
-
-fn is_env_var_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && !name.as_bytes()[0].is_ascii_digit()
 }
