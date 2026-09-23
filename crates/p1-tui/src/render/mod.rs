@@ -8,6 +8,7 @@ pub mod diff;
 mod home;
 pub mod ledger;
 pub mod output;
+pub mod pane;
 pub mod permission;
 pub mod picker;
 pub mod screen;

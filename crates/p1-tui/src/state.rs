@@ -266,6 +266,12 @@ pub struct Screen {
     /// The WORKERS pane's rows, refreshed by the driver from the host's
     /// worker service (p1-tui never names p1-workers).
     pub workers: Vec<crate::render::workers::WorkerRow>,
+    /// Whether a worker has ever run this session (handoff §9.1: WORKERS is
+    /// available "when a worker was ever started" — unlike `workers`, this
+    /// never goes back to `false` once the pane has something worth
+    /// revisiting, even after every worker finishes and `sync_workers`
+    /// reports an empty snapshot).
+    pub workers_ever_started: bool,
     /// A pending approval: the blocking, full-width review (SPEC §4.4/§4.5).
     /// While this is `Some` the pane is hidden and the transcript waits.
     pub approval: Option<Approval>,
@@ -313,8 +319,29 @@ impl Screen {
         self.pane_width = self.pane_width.cycle();
     }
 
+    /// The modes `^Tab` may land on right now (handoff §9.1): LEDGER always;
+    /// OUTPUT once a handle was opened; WORKERS once a worker has ever run.
+    /// DIFF needs the session-diff seam (§14.4) — not available yet.
+    pub fn available_modes(&self) -> Vec<PaneMode> {
+        let mut modes = vec![PaneMode::Ledger];
+        if self.output.is_some() {
+            modes.push(PaneMode::Output);
+        }
+        if self.workers_ever_started {
+            modes.push(PaneMode::Workers);
+        }
+        modes
+    }
+
+    /// `^Tab` cycles only through `available_modes` (handoff §9.1): a mode
+    /// with nothing to show is never landed on, and the current one always
+    /// appears in the list it cycles through (it is showing something).
     pub fn cycle_mode(&mut self) {
-        self.pane_mode = self.pane_mode.cycle();
+        let available = self.available_modes();
+        self.pane_mode = match available.iter().position(|m| *m == self.pane_mode) {
+            Some(at) => available[(at + 1) % available.len()],
+            None => available.first().copied().unwrap_or(self.pane_mode),
+        };
         // A deliberate choice is not a pin, but it outlives a transient peek.
         if matches!(self.promotion, Promotion::Peek { .. }) {
             self.promotion = Promotion::None;
@@ -395,21 +422,35 @@ impl Screen {
     }
 
     /// Sync the WORKERS pane from a fresh snapshot, handling the promotion
-    /// rule (SPEC §5): a live delegate promotes the pane to WORKERS while any
-    /// worker runs; when none is live and nothing needs review, an UNPINNED
-    /// WORKERS pane falls back to LEDGER.
+    /// rule (SPEC §5, handoff §9.1): a live delegate promotes the pane to
+    /// WORKERS while any worker runs; a worker needing review SELF-PINS
+    /// WORKERS (`^P` need not be pressed — a parked approval is the
+    /// operator's turn); when none is live, nothing needs review, and
+    /// nothing else pinned it, an UNPINNED WORKERS pane falls back to
+    /// LEDGER.
     pub fn sync_workers(&mut self, rows: Vec<crate::render::workers::WorkerRow>) {
+        self.workers_ever_started |= !rows.is_empty();
         let live = rows
             .iter()
             .any(|w| w.state == crate::render::workers::WorkerState::Running);
+        let needs_review = rows
+            .iter()
+            .any(|w| w.state == crate::render::workers::WorkerState::Review);
         self.workers = rows;
-        if live {
-            if !self.pinned && self.pane_mode != PaneMode::Workers {
+        // A parked approval is the operator's turn: SELF-pin, no `^P` needed,
+        // so nothing later demotes it out from under them.
+        let pinned_before = self.pinned;
+        if needs_review {
+            self.pinned = true;
+        }
+        if needs_review || live {
+            if self.pane_mode != PaneMode::Workers && (needs_review || !pinned_before) {
                 self.pane_mode = PaneMode::Workers;
             }
-            // The width force is a promotion and a pin always wins it. Save
-            // what the operator had so the demotion can restore it.
-            if !self.pinned && matches!(self.pane_width, PaneWidth::Off) {
+            // The width force is a promotion and a pin from BEFORE this sync
+            // always wins it. Save what the operator had so the demotion can
+            // restore it.
+            if !pinned_before && matches!(self.pane_width, PaneWidth::Off) {
                 self.promotion_saved_width = Some(self.pane_width);
                 self.pane_width = PaneWidth::Ch56;
             }
@@ -658,5 +699,95 @@ mod tests {
         s.sync_workers(vec![row(WorkerState::Done)]);
         assert_eq!(s.pane_width, PaneWidth::Ch40, "an operator change survives");
         assert_eq!(s.promotion_saved_width, None);
+    }
+
+    #[test]
+    fn available_modes_gate_on_what_the_pane_has_to_show() {
+        let mut s = Screen::new(false);
+        assert_eq!(s.available_modes(), vec![PaneMode::Ledger]);
+        s.output = Some(crate::render::output::OutputView {
+            id: crate::fold::FoldId::of("x"),
+            lines: vec!["a".into()],
+            scroll: 0,
+        });
+        assert_eq!(
+            s.available_modes(),
+            vec![PaneMode::Ledger, PaneMode::Output]
+        );
+        s.workers_ever_started = true;
+        assert_eq!(
+            s.available_modes(),
+            vec![PaneMode::Ledger, PaneMode::Output, PaneMode::Workers]
+        );
+        // DIFF has no seam yet (handoff §14.4): never available.
+        assert!(!s.available_modes().contains(&PaneMode::Diff));
+    }
+
+    #[test]
+    fn workers_ever_started_never_reverts_once_a_worker_ran() {
+        use crate::render::workers::{WorkerRow, WorkerState};
+        let mut s = Screen::new(false);
+        assert!(!s.workers_ever_started);
+        s.sync_workers(vec![WorkerRow {
+            id: "w1".into(),
+            summary: "w1".into(),
+            route: "r".into(),
+            state: WorkerState::Done,
+            elapsed: None,
+            cost_micro_usd: None,
+            details: vec![],
+        }]);
+        assert!(s.workers_ever_started);
+        // The worker service can report an empty snapshot later; the pane
+        // stays available (there is history worth revisiting).
+        s.sync_workers(vec![]);
+        assert!(s.workers_ever_started);
+        assert_eq!(s.available_modes().last(), Some(&PaneMode::Workers));
+    }
+
+    #[test]
+    fn tab_cycles_only_through_available_modes_and_wraps() {
+        let mut s = Screen::new(false);
+        // Only LEDGER is available: cycling is a no-op, never lands on a mode
+        // with nothing to show.
+        s.cycle_mode();
+        assert_eq!(s.pane_mode, PaneMode::Ledger);
+        s.workers_ever_started = true;
+        s.cycle_mode();
+        assert_eq!(s.pane_mode, PaneMode::Workers);
+        s.cycle_mode();
+        assert_eq!(s.pane_mode, PaneMode::Ledger, "wraps back to the start");
+        // Opening OUTPUT mid-cycle inserts it into the rotation.
+        s.output = Some(crate::render::output::OutputView {
+            id: crate::fold::FoldId::of("x"),
+            lines: vec![],
+            scroll: 0,
+        });
+        s.cycle_mode();
+        assert_eq!(s.pane_mode, PaneMode::Output);
+    }
+
+    #[test]
+    fn a_worker_needing_review_self_pins_workers() {
+        use crate::render::workers::{WorkerRow, WorkerState};
+        let row = |state| WorkerRow {
+            id: "w1".into(),
+            summary: "w1".into(),
+            route: "r".into(),
+            state,
+            elapsed: None,
+            cost_micro_usd: None,
+            details: vec![],
+        };
+        let mut s = Screen::new(false);
+        assert!(!s.pinned);
+        s.sync_workers(vec![row(WorkerState::Review)]);
+        assert_eq!(s.pane_mode, PaneMode::Workers);
+        assert!(s.pinned, "a parked approval self-pins, no ^P needed");
+        // The self-pin holds even once the review resolves — only the
+        // operator's `^P` releases a pin (SPEC §5/handoff §9.1).
+        s.sync_workers(vec![row(WorkerState::Done)]);
+        assert_eq!(s.pane_mode, PaneMode::Workers);
+        assert!(s.pinned);
     }
 }
