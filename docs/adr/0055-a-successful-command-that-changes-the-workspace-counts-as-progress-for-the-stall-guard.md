@@ -1,7 +1,7 @@
 ---
 adr: 55
 title: A successful command that changes the workspace counts as progress for the stall guard
-status: proposed
+status: accepted
 date: 2026-09-23
 deciders: lead
 supersedes: []
@@ -60,5 +60,13 @@ successful command as progress is not acceptable: an agent looping on `ls` would
 
 ## Evidence
 
-<filled when merged: `cargo test -p p1-host --test stall_guard --test completion` plus the new
-fingerprint tests; a live re-run of a heredoc-writing worker that ends `done`.>
+Merged as e1850d2 (task/stall-fingerprint; DeepSeek V4.1 Flash worker, reviewed by the lead;
+gate green, run recorded in `docs/dogfood/runs.jsonl`). Tests: `crates/p1-host/tests/
+stall_fingerprint.rs` (a worker editing only through shell heredocs is not stalled; a worker
+running only `ls` still is), `tests/finish_fingerprint.rs` (a verification run before a heredoc
+write must be repeated; the changing command's own run counts and every earlier run is stale)
+and the unit tests of `src/fingerprint.rs` (ignored paths, untracked files, a second edit, a
+commit, the non-git walk, the entry bound, the host's own session journal, a missing
+workspace). The frozen ADR-0037/0042 tests are untouched. Live, 2026-09-23, deepseek2 worker in
+a temporary git workspace, shell tool only: `cat > notes.txt <<'EOF'` → `cat notes.txt` →
+`finish done` accepted (exit 0), fingerprinting on (no fallback note), file content verified.
