@@ -1,7 +1,7 @@
 ---
 adr: 57
 title: A tool describes each call's target; the host and the UI stop matching tool names
-status: proposed
+status: accepted
 date: 2026-09-23
 deciders: lead
 supersedes: []
@@ -62,5 +62,14 @@ tool's knowledge, and only the tool can say it.
 
 ## Evidence
 
-Pending: the gate and CI of the merge of task/call-target, the per-tool `describe()` tests and
-the host test with a renamed face and an `apply_patch` call; filled at acceptance.
+Merged from task/call-target (gate green on the branch merged with main; runs recorded in
+`docs/dogfood/runs.jsonl`: a DeepSeek V4.1 Flash worker did three quarters of the work before
+its route hit the weekly limit, a gpt-6-luna session finished it from the committed WIP and
+then made the one repair the lead asked for — the edit tool supplies the `EditPreview` the
+approval view shows as a diff — reviewed by the lead). Tests: `describe()` per tool crate on
+real inputs including `apply_patch`'s freeform patch and a renamed face;
+`crates/p1-host/tests/call_description.rs` (a renamed edit face and an `apply_patch` call are
+both tracked; an edit call yields the diff approval view, `apply_patch` the permission form);
+the `p1-host/src/tui` tests; a `p1-workers` test that a renamed result-tool face appears in
+the parent's notification. `crates/p1-host/src/tui.rs` no longer matches `"edit" | "patch" |
+"write"` nor reads `file_path`/`command`; `p1-tui`'s own matcher is left to #12.
