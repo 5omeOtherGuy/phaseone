@@ -214,6 +214,7 @@ impl Tool for WorkerStartTool {
             target: parse_input::<StartInput>(&self.declaration.name, call)
                 .ok()
                 .map(|input| input.environment),
+            edit: None,
         }
     }
 
@@ -341,6 +342,7 @@ impl Tool for WorkerResultTool {
             target: parse_input::<ResultInput>(&self.declaration.name, call)
                 .ok()
                 .map(|input| input.id),
+            edit: None,
         }
     }
 
@@ -456,6 +458,7 @@ impl Tool for WorkerContinueTool {
             target: parse_input::<ContinueInput>(&self.declaration.name, call)
                 .ok()
                 .map(|input| input.id),
+            edit: None,
         }
     }
 
@@ -560,6 +563,7 @@ impl Tool for WorkerCancelTool {
             target: parse_input::<CancelInput>(&self.declaration.name, call)
                 .ok()
                 .map(|input| input.id),
+            edit: None,
         }
     }
 

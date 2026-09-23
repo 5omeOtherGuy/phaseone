@@ -181,6 +181,7 @@ impl Tool for GrepTool {
                     input.pattern
                 }
             }),
+            edit: None,
         }
     }
 

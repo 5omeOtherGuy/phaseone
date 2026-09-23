@@ -808,6 +808,7 @@ impl Driver {
             None => CallDescription {
                 verb: "call",
                 target: Some(call.name.clone()),
+                edit: None,
             },
         }
     }
@@ -833,7 +834,8 @@ impl Driver {
         self.screen.approval_tool = request.call.name.clone();
         let description = self.describe_call(&request.call);
         self.screen.approval = Some(approval_view(
-            request,
+            &request.call,
+            request.effect,
             &description,
             &self.workspace,
             &self.sandbox,
@@ -1204,33 +1206,28 @@ pub fn tracked_target(tools: &[Arc<dyn Tool>], call: &ToolCall) -> Option<String
     tool.describe(call).target
 }
 
-/// Build the blocking approval view for a parked request. §7.1: the diff-vs-
-/// permission choice uses the tool's own description (ADR-0057) — an `edit`/`write`
-/// call is a file edit with an old/new pair to show; a `run` call shows its command;
-/// anything else takes the permission form. `apply_patch`'s multi-file patch text
-/// has no old/new pair, so it still takes the permission form (a full patch-diff
-/// review is a separate, unbuilt seam, §7.5).
+/// Build the blocking approval view for a parked request. §7.1 reuses the tool's
+/// own parsed description: edit tools supply their diff preview, run tools supply
+/// their command, and everything else takes the permission form. `apply_patch`
+/// intentionally has no single-file preview (§7.5), so it takes the permission
+/// form without the host interpreting its freeform patch text.
 fn approval_view(
-    request: &AuthRequest,
+    call: &ToolCall,
+    effect: Effect,
     description: &CallDescription,
     workspace: &std::path::Path,
     sandbox: &str,
 ) -> Approval {
-    let raw = request.call.input.raw();
-    let json: Option<serde_json::Value> = serde_json::from_str(raw).ok();
-    let get = |key: &str| json.as_ref()?.get(key)?.as_str().map(str::to_string);
-    let old = get("old_string");
-    let new = get("new_string").or_else(|| get("content"));
-    if description.verb == "edit" && (old.is_some() || new.is_some()) {
-        let path = description.target.clone().unwrap_or_default();
-        let old = old.unwrap_or_default();
-        let new = new.unwrap_or_default();
-        let current = std::fs::read_to_string(workspace.join(&path)).ok();
+    let raw = call.input.raw();
+    if description.verb == "edit"
+        && let Some(edit) = &description.edit
+    {
+        let current = std::fs::read_to_string(workspace.join(&edit.path)).ok();
         return Approval::Diff(DiffView::from_edit(
-            &request.call.name,
-            &path,
-            &old,
-            &new,
+            &call.name,
+            &edit.path,
+            &edit.old,
+            &edit.new,
             current.as_deref(),
             (1, 1),
         ));
@@ -1251,7 +1248,7 @@ fn approval_view(
             ("network".into(), "off".into()),
             (
                 "reason".into(),
-                match request.effect {
+                match effect {
                     p1_contracts::Effect::Executes => "runs a process".into(),
                     p1_contracts::Effect::WritesFiles => "writes files".into(),
                     p1_contracts::Effect::Delegates => "starts an agent".into(),

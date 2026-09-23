@@ -135,6 +135,7 @@ impl Tool for ReadTool {
             target: parse_input(&self.declaration.name, call)
                 .ok()
                 .map(|input| input.file_path),
+            edit: None,
         }
     }
 

@@ -28,8 +28,8 @@ pub use provider::{
     Usage,
 };
 pub use tool::{
-    CallDescription, DeclarationKind, Effect, Grammar, Tool, ToolContext, ToolDeclaration,
-    ToolIdentity, ToolOutcome,
+    CallDescription, DeclarationKind, EditPreview, Effect, Grammar, Tool, ToolContext,
+    ToolDeclaration, ToolIdentity, ToolOutcome,
 };
 
 /// Re-exported so modules and tests agree on the JSON value type.

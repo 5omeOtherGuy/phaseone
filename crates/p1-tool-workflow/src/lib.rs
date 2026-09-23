@@ -135,6 +135,7 @@ impl Tool for WorkflowStartTool {
                             .map(|line| line.trim().chars().take(80).collect())
                     })
                 }),
+            edit: None,
         }
     }
 
@@ -220,6 +221,7 @@ impl Tool for WorkflowStatusTool {
             target: parse_input::<IdInput>(&self.declaration.name, call)
                 .ok()
                 .map(|input| input.id),
+            edit: None,
         }
     }
 
@@ -301,6 +303,7 @@ impl Tool for WorkflowResultTool {
             target: parse_input::<ResultInput>(&self.declaration.name, call)
                 .ok()
                 .map(|input| input.id),
+            edit: None,
         }
     }
 
@@ -377,6 +380,7 @@ impl Tool for WorkflowCancelTool {
             target: parse_input::<IdInput>(&self.declaration.name, call)
                 .ok()
                 .map(|input| input.id),
+            edit: None,
         }
     }
 

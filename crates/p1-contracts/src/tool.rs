@@ -64,9 +64,18 @@ pub enum Effect {
 /// command or worker the call is about, already trimmed for display. No argument
 /// key leaves the tool: only the tool knows what its input means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditPreview {
+    pub path: String,
+    pub old: String,
+    pub new: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallDescription {
     pub verb: &'static str,
     pub target: Option<String>,
+    #[serde(default)]
+    pub edit: Option<EditPreview>,
 }
 
 pub struct ToolContext {
@@ -114,6 +123,7 @@ pub trait Tool: Send + Sync {
         CallDescription {
             verb: "call",
             target: Some(self.declaration().name.clone()),
+            edit: None,
         }
     }
 

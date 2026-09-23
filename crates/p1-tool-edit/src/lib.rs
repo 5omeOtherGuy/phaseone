@@ -7,7 +7,7 @@
 use std::io::ErrorKind;
 
 use p1_contracts::{
-    BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
+    BoxFuture, CallDescription, DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_workspace::{Observation, ObservedFiles, Workspace, bound_output, write_atomic};
@@ -125,11 +125,15 @@ impl Tool for EditTool {
 
     /// ADR-0057: the file this call edits, from the tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
+        let parsed = parse_input(&self.declaration.name, call).ok();
         CallDescription {
             verb: "edit",
-            target: parse_input(&self.declaration.name, call)
-                .ok()
-                .map(|input| input.file_path),
+            target: parsed.as_ref().map(|input| input.file_path.clone()),
+            edit: parsed.map(|input| EditPreview {
+                path: input.file_path,
+                old: input.old_string,
+                new: input.new_string,
+            }),
         }
     }
 
@@ -345,7 +349,8 @@ fn restore_line_endings(text: &str, ending: &str) -> String {
 mod tests {
     use super::EditTool;
     use p1_contracts::{
-        DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome, ToolStatus,
+        DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome,
+        ToolStatus,
     };
     use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace};
     use std::path::Path;
@@ -434,6 +439,14 @@ mod tests {
         let call = call(r#"{"file_path": "src/a.rs", "old_string": "a", "new_string": "b"}"#);
         assert_eq!(tool.describe(&call).verb, "edit");
         assert_eq!(tool.describe(&call).target.as_deref(), Some("src/a.rs"));
+        assert_eq!(
+            tool.describe(&call).edit,
+            Some(EditPreview {
+                path: "src/a.rs".into(),
+                old: "a".into(),
+                new: "b".into(),
+            })
+        );
 
         let renamed = tool.with_face(ToolFace::new("EditFile", "custom"), "gpt");
         let described = renamed.describe(&call);

@@ -597,6 +597,7 @@ impl Tool for ShellTool {
                 let first = input.command.lines().next().unwrap_or_default().trim();
                 first.chars().take(80).collect()
             }),
+            edit: None,
         }
     }
 

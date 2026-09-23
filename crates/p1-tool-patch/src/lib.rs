@@ -259,6 +259,7 @@ impl Tool for PatchTool {
         CallDescription {
             verb: "edit",
             target,
+            edit: None,
         }
     }
 

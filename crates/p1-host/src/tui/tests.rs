@@ -456,6 +456,54 @@ async fn an_auth_request_becomes_the_approval_view_and_answers() {
 }
 
 #[test]
+fn edit_approval_uses_tool_preview_and_patch_keeps_permission_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = p1_workspace::Workspace::new(dir.path()).unwrap();
+    let observed = p1_workspace::ObservedFiles::new();
+    std::fs::write(dir.path().join("a.txt"), "old").unwrap();
+    let edit_tool = p1_tool_edit::EditTool::new(workspace.clone(), observed.clone());
+    let edit_call = ToolCall {
+        call_id: "edit".into(),
+        name: "edit".into(),
+        input: p1_contracts::ToolInput::Json(
+            r#"{"file_path":"a.txt","old_string":"old","new_string":"new"}"#.into(),
+        ),
+    };
+    let edit_description = edit_tool.describe(&edit_call);
+    assert!(matches!(
+        approval_view(
+            &edit_call,
+            Effect::WritesFiles,
+            &edit_description,
+            dir.path(),
+            "off"
+        ),
+        Approval::Diff(_)
+    ));
+
+    let patch_tool = p1_tool_patch::PatchTool::new(workspace, observed);
+    let patch_call = ToolCall {
+        call_id: "patch".into(),
+        name: "apply_patch".into(),
+        input: p1_contracts::ToolInput::Text(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n".into(),
+        ),
+    };
+    let patch_description = patch_tool.describe(&patch_call);
+    assert_eq!(patch_description.edit, None);
+    assert!(matches!(
+        approval_view(
+            &patch_call,
+            Effect::WritesFiles,
+            &patch_description,
+            dir.path(),
+            "off"
+        ),
+        Approval::Permission(_)
+    ));
+}
+
+#[test]
 fn worker_events_stay_out_of_the_parent_transcript_but_mark_start_and_end() {
     let (mut d, _auth) = driver();
     d.on_ui_event(UiEvent::WorkerStarted("w1".into()));

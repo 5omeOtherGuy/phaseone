@@ -701,6 +701,7 @@ impl Tool for FinishTool {
                     Status::Blocked => "blocked".to_string(),
                 }
             }),
+            edit: None,
         }
     }
 
@@ -1091,6 +1092,7 @@ mod tests {
             CallDescription {
                 verb: "finish",
                 target: Some("done".into()),
+                edit: None,
             }
         );
         assert_eq!(
