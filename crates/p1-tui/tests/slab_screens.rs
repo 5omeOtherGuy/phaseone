@@ -1023,12 +1023,17 @@ fn t02_streaming_tool_arguments() {
     s.apply(
         &AgentEvent::ToolInputDelta {
             call_id: "c-patch".into(),
+            name: "apply_patch".into(),
             text: "*** Begin Patch\n+if let Some(summary) = ready {\n+    return \
                    self.apply_at_boundary(summary);\n+}"
                 .into(),
         },
         1_000,
     );
+    assert!(matches!(
+        s.transcript.blocks.last(),
+        Some(Block::Call(row)) if row.name == "apply_patch"
+    ));
     let buf = render(&mut s, 120, 40, 2_400);
     assert_rows_except(&buf, "T02", &[11]);
     assert_cells(&buf, "T02", 11..12, 78..120);

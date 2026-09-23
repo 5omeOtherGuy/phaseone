@@ -25,6 +25,8 @@ pub(crate) struct CodexResponseParser {
     /// Remembered for diagnostics only; the contract has no response-id field.
     #[allow(dead_code)]
     response_id: Option<String>,
+    /// Model-facing names observed when function-call output items are announced.
+    call_names: std::collections::HashMap<String, String>,
     /// Whether a reasoning summary delta has been emitted for the item currently
     /// being produced, used to insert a section break on a later summary part.
     reasoning_emitted_in_item: bool,
@@ -40,6 +42,7 @@ impl CodexResponseParser {
             blocks: Vec::new(),
             terminal: None,
             response_id: None,
+            call_names: std::collections::HashMap::new(),
             reasoning_emitted_in_item: false,
         }
     }
@@ -336,10 +339,31 @@ impl ResponseParser for CodexResponseParser {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                let name = self.call_names.get(&call_id).cloned().unwrap_or_default();
                 vec![StreamEvent::ToolInputDelta {
                     call_id,
+                    name,
                     text: delta.to_string(),
                 }]
+            }
+            Some("response.output_item.added") => {
+                if let Some(item) = value.get("item")
+                    && matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("function_call" | "custom_tool_call")
+                    )
+                    && let (Some(id), Some(name)) = (
+                        item.get("id").and_then(Value::as_str),
+                        item.get("name").and_then(Value::as_str),
+                    )
+                {
+                    self.call_names.insert(id.to_string(), name.to_string());
+                    if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                        self.call_names
+                            .insert(call_id.to_string(), name.to_string());
+                    }
+                }
+                Vec::new()
             }
             Some("response.output_item.done") => {
                 if let Some(item) = value.get("item") {
@@ -651,6 +675,7 @@ mod tests {
             ),
             vec![StreamEvent::ToolInputDelta {
                 call_id: "call_1".to_string(),
+                name: String::new(),
                 text: "*** Begin".to_string()
             }]
         );
@@ -661,6 +686,7 @@ mod tests {
             ),
             vec![StreamEvent::ToolInputDelta {
                 call_id: "call_2".to_string(),
+                name: String::new(),
                 text: "{\"p".to_string()
             }]
         );

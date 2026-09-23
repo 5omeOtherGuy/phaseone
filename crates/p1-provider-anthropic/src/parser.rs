@@ -242,13 +242,14 @@ impl AnthropicParser {
                 };
                 if let OpenKind::Tool {
                     call_id,
+                    name,
                     partial_json,
-                    ..
                 } = &mut open.kind
                 {
                     partial_json.push_str(partial);
                     events.push(StreamEvent::ToolInputDelta {
                         call_id: call_id.clone(),
+                        name: name.clone(),
                         text: partial.to_string(),
                     });
                 }

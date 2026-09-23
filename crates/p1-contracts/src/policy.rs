@@ -105,6 +105,7 @@ pub enum AgentEvent {
     },
     ToolInputDelta {
         call_id: String,
+        name: String,
         text: String,
     },
     /// A display-only notice from the provider's adapter (ADR-0048): the operator

@@ -177,6 +177,7 @@ pub enum StreamEvent {
     /// executed, never part of the history; the complete call arrives in `Finished`.
     ToolInputDelta {
         call_id: String,
+        name: String,
         text: String,
     },
     /// Something the provider's ADAPTER wants the OPERATOR to know (ADR-0048).

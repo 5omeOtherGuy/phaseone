@@ -89,7 +89,7 @@ pub fn lines_with_approval(
             palette::ATTN,
             "! awaiting approval".into(),
         ),
-        RowStatus::Running if row.name.is_empty() => (
+        RowStatus::Running if row.input_preview.is_some() || row.name.is_empty() => (
             glyphs::TOOL,
             palette::DIM,
             row.result_face
@@ -172,7 +172,7 @@ pub fn lines_with_approval(
     let mut left = vec![
         seg(left_color, format!("{left_glyph} ")),
         seg(
-            if row.name.is_empty() {
+            if row.input_preview.is_some() || row.name.is_empty() {
                 palette::FAINT
             } else {
                 palette::DIM
@@ -180,7 +180,7 @@ pub fn lines_with_approval(
             format!("{name:<name_width$}"),
         ),
         seg(
-            if row.name.is_empty() {
+            if row.input_preview.is_some() || row.name.is_empty() {
                 palette::DIM
             } else if row.face.kind == TargetKind::Path {
                 palette::REF
@@ -195,6 +195,7 @@ pub fn lines_with_approval(
     } else if matches!(row.status, RowStatus::Running)
         && approval.is_none()
         && !row.name.is_empty()
+        && row.input_preview.is_none()
         && !awaiting
     {
         let mut live = vec![seg(

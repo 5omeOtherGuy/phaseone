@@ -785,6 +785,7 @@ async fn tool_input_delta_is_emitted_but_never_executed_or_stored() {
     let step = Step::Events(vec![
         StreamEvent::ToolInputDelta {
             call_id: "c1".into(),
+            name: "alpha".into(),
             text: "{\"x\":".into(),
         },
         StreamEvent::Finished(completed(
@@ -810,6 +811,7 @@ async fn tool_input_delta_is_emitted_but_never_executed_or_stored() {
             AgentEvent::RequestStarted { request_index: 0 },
             AgentEvent::ToolInputDelta {
                 call_id: "c1".into(),
+                name: "alpha".into(),
                 text: "{\"x\":".into()
             },
             AgentEvent::ResponseCompleted {
