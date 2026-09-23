@@ -198,6 +198,37 @@ fn check(name: &str) {
     for subset in &subsets {
         let rendered = render(name, &environment, subset);
         assert_renders_coherently(name, &environment, subset, &rendered);
+        // Answer-only workers still need an explicit finish, even with no edit tool.
+        if !subset
+            .iter()
+            .any(|(module, _)| matches!(module.as_str(), "edit" | "write" | "apply_patch"))
+        {
+            let sentence = format!(
+                "Every task ends with a `{}` call, also a task that changed no file and only produced an answer: put the answer in `summary`, status \"done\", verification [\"none\"].",
+                face_of(&environment, "finish")
+            );
+            assert!(
+                rendered.contains(&sentence),
+                "{name}: an answer-only worker is not told to finish for {subset:?}"
+            );
+        }
+
+        let without_finish: Vec<_> = subset
+            .iter()
+            .filter(|(module, _)| module != "finish")
+            .cloned()
+            .collect();
+        let rendered_without_finish = render(name, &environment, &without_finish);
+        assert_renders_coherently(
+            name,
+            &environment,
+            &without_finish,
+            &rendered_without_finish,
+        );
+        assert!(
+            !rendered_without_finish.contains("# Finishing"),
+            "{name}: the Finishing section must be absent without the finish tool for {without_finish:?}"
+        );
     }
 
     // The main-agent case (ADR-0050 item 1): the host appends the four worker tools
