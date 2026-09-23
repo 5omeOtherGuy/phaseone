@@ -1,7 +1,7 @@
 ---
 adr: 58
 title: p1 spawns the brain shadow hook, detached and fail-open, as an optional module
-status: proposed
+status: accepted
 date: 2026-09-23
 deciders: owner+lead
 supersedes: []
@@ -78,5 +78,18 @@ provider crate involved, compile-time composition with a constructor.
 
 ## Evidence
 
-Pending: the gate and CI of the merge of task/shadow-hook, the unit tests in
-`crates/p1-hook-shadow`, the host tests, and the lead's live check; filled at acceptance.
+Merged as cbcaf17's parent merge of task/shadow-hook (gpt-6-sol worker, reviewed by the lead;
+gate green; run recorded in `docs/dogfood/runs.jsonl`). Unit tests in `crates/p1-hook-shadow/
+tests/hook.rs`: kill file → no file, no spawn; each of the five recursion variables → no spawn
+(and `0`/empty do not guard); a dispatch and a user input → one spawn each with the exact argv
+and a private (0600) task file holding the exact bytes; explicit `Episode:` and derived session
+key honoured; nonexistent binary → only the new task file removed; HOME fallback and `PATH`
+discovery use only the injected environment; 20 calls with the p95 printed. Host tests
+(`crates/p1-host/tests/shadow_hook.rs`): typed `[shadow]` settings rejecting unknown keys; a
+committed parent input is observed; a worker dispatch is observed after its own commit. Live,
+2026-09-23, the spec's recipe: scratch STATE and HOME, brain engine `/nonexistent`, a wrapper
+around `brain-tools-wt/l5a/scripts/brain-packet-shadow`, `[shadow] brain_packet_shadow` naming
+it, one prompt on gpt-6-sol with the feature on and one with it off (PATH without `~/.local/bin`):
+both exit 0, the ledger holds one `harness: p1` row, `STATE/inbox` is empty afterwards (the
+shadow took the task file), and the two session journals' environment and user-input records
+are byte-identical.
