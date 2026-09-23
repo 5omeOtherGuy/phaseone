@@ -3,7 +3,7 @@ use p1_contracts::{
     AssistantBlock, AssistantItem, CompletedResponse, Origin, Outcome, ProviderError,
     ProviderErrorKind, ReplayData, StopReason, StreamEvent, ToolCall, ToolInput, Usage,
 };
-use p1_provider_http::{ResponseParser, SseEvent};
+use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -295,12 +295,7 @@ impl ResponseParser for ChatParser {
         let kind = if context {
             ProviderErrorKind::ContextWindowExceeded
         } else {
-            match status {
-                401 | 403 => ProviderErrorKind::Authentication,
-                429 => ProviderErrorKind::RateLimited,
-                408 | 425 | 500..=599 => ProviderErrorKind::Transport,
-                _ => ProviderErrorKind::InvalidRequest,
-            }
+            kind_for_status(status).unwrap_or(ProviderErrorKind::InvalidRequest)
         };
         // The operator needs to know WHAT the endpoint refused (a 400 without a reason
         // cannot be acted on). Only a short, token-shaped code is copied — never the
@@ -310,31 +305,6 @@ impl ResponseParser for ChatParser {
             None => ProviderError::new(kind, format!("chat HTTP status {status}")),
         }
     }
-}
-
-/// A short, token-shaped error code from an error body: `/error/code`, `/error/type`,
-/// then top-level `code` / `type` (strings only). Anything longer, free-form or
-/// sensitive-looking is dropped: free text never reaches a `ProviderError`.
-fn http_error_code(body: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    ["/error/code", "/error/type", "/code", "/type"]
-        .iter()
-        .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-        .find_map(safe_code)
-        .map(str::to_string)
-}
-
-fn safe_code(value: &str) -> Option<&str> {
-    let value = value.trim();
-    let lower = value.to_ascii_lowercase();
-    let sensitive = ["secret", "password", "sk-"];
-    (!value.is_empty()
-        && value.len() <= 64
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-        && !sensitive.iter().any(|fragment| lower.contains(fragment)))
-    .then_some(value)
 }
 
 /// The whole text of an exhausted-account error: the server's words are a lookup
@@ -397,6 +367,14 @@ mod tests {
             ChatDialect::ThinkingWithReasoningAlias,
         )
     }
+
+    #[test]
+    fn rejected_http_error_code_is_not_displayed() {
+        let error = parser().on_http_error(400, &[], br#"{"error":{"code":"has spaces"}}"#);
+        assert_eq!(error.message, "chat HTTP status 400");
+        assert!(!error.message.contains("has spaces"));
+    }
+
     fn send(p: &mut ChatParser, value: Value) -> Vec<StreamEvent> {
         p.on_event(SseEvent {
             event: None,

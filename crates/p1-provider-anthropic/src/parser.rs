@@ -19,7 +19,7 @@ use p1_contracts::history::{
 use p1_contracts::{
     CompletedResponse, Outcome, ProviderError, ProviderErrorKind, StopReason, StreamEvent, Usage,
 };
-use p1_provider_http::{ResponseParser, SseEvent};
+use p1_provider_http::{ResponseParser, SseEvent, kind_for_status};
 use serde_json::{Value, json};
 
 /// Parse one streaming Messages response into contract events.
@@ -445,12 +445,10 @@ impl ResponseParser for AnthropicParser {
         let context_window = error_type.as_deref().is_some_and(is_context_window_type)
             || is_context_window(&message_text);
 
-        let kind = match status {
-            401 | 403 => ProviderErrorKind::Authentication,
-            429 => ProviderErrorKind::RateLimited,
-            408 | 425 | 500..=599 => ProviderErrorKind::Transport,
-            400 | 413 | 422 if context_window => ProviderErrorKind::ContextWindowExceeded,
-            _ => ProviderErrorKind::InvalidRequest,
+        let kind = if matches!(status, 400 | 413 | 422) && context_window {
+            ProviderErrorKind::ContextWindowExceeded
+        } else {
+            kind_for_status(status).unwrap_or(ProviderErrorKind::InvalidRequest)
         };
 
         // Status, enumerated error type and the request id only: never body text.
