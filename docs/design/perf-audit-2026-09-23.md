@@ -1,8 +1,8 @@
 # p1 performance and maintainability audit — 2026-09-23 (partial; stopped at the quota line)
 
 Owner-directed (via XO) under the operational hold. Numbers first, then the ranked fixes.
-Scope items 1–2 are measured; items 3–5 are NOT done (see "Resume note"): the lead's Claude
-weekly window reached the 88 % stop line. No Astra review yet.
+Items 1, 2, 4 and 5 are measured; item 3 has two live samples and otherwise needs
+instrumentation. Astra's review verdict is folded in at the end.
 
 ## 1. Prompt caching — measured on today's 22 headless runs
 
@@ -74,39 +74,84 @@ Reading:
   the stall guard's count. The DeepSeek routes compact rarely (300 k) but every request then
   carries ~180 k cached tokens (38 M input over 212 requests) — cheap in money, heavy in latency.
 
-## 3. Latency — NOT measured (blocked by instrumentation)
+## 3. Latency — two live samples; the rest needs instrumentation
 
 The journal has no timestamps (`assistant_completed`, `tool_started`, `tool_finished` carry
-`seq` only), and the stderr trailers carry token counts only. Time to first token and time to
-first tool call per provider/effort, split into network / prompt build / render, need two
-additions before anyone can measure them: a monotonic `at_ms` on every journal record (journal
-contract → ADR), and a `first_token_ms` / `request_sent_ms` pair on `assistant_completed` from
-the adapter's stream. Until then only wall time per run is known (`docs/dogfood/runs.jsonl`).
+`seq` only) and the stderr trailers carry token counts only, so TTFT and time-to-first-tool-call
+per provider/effort cannot be derived from today's 22 runs. Two live interactive probes
+(gpt-6-sol at `low`, a one-line prompt, the SLAB TUI in tmux, sampled from `/proc`) give the
+only numbers: **time from Enter to the first visible text ≈ 20–22 s in both runs** (0 bytes
+written to the terminal during that window; the process was waiting on the response), then
+60 numbered lines streamed in ~13 s. Whether those 20 s are the model's reasoning, the Codex
+WebSocket route, or p1's prompt build cannot be split without the timestamps of fix 2.
 
-## 4. TUI smoothness — NOT measured
+## 4. TUI smoothness — measured live (idle machine, no build load)
 
-Needs a live TTY session with a frame-timing probe (a debug counter of redraws per event and
-the time in the render thread); code reading of `p1-tui/src/render` and `p1-host/src/tui.rs`
-was not started. The 7 GB build-load behaviour is a live test.
+Probe: `p1 --env gpt --model gpt/gpt-6-sol:low` in a tmux window, `/proc/<pid>/io` (`wchar`),
+`/proc/<pid>/stat` CPU ticks and `VmRSS` sampled every 1–5 s while a 60-line response streamed.
+- Process: 2 threads, RSS 23 MB throughout.
+- Before the first token: one 21 kB frame (the prompt echo and the working indicator), then
+  0 bytes for ~20 s — no redraws while nothing changes, which is the right behaviour.
+- While streaming: ~21 kB per 5 s (≈ 4 kB/s) written to the terminal, CPU 2–5 %, the screen
+  advancing 4 → 29 → 51 numbered lines across three 5-second samples; no stalls, no bursts.
+- Redraw scope: `p1-host/src/tui.rs` draws one frame per event batch and on a worker-sync tick
+  (`draw(terminal, …)` at lines 1107 and 1196; `sync_workers` on `tick.tick()`); the write
+  volume says the frames are small (diffed by the terminal backend).
+- Not measured: frame timing itself (needs a counter: frames per second and time inside `draw`
+  per event kind — a `P1_TUI_FRAME_LOG` debug env var would do) and behaviour under the 7 GB
+  build load (no builds were allowed during the hold).
 
-## 5. Maintainability after today's landings — NOT done
+## 5. Maintainability after today's landings — measured
 
-Changed crates today: `p1-contracts`, `p1-core` (one forward), `p1-host`, `p1-workers`,
-`p1-workflow`, `p1-tool-workflow`, `p1-hook-shadow`, `p1-tool-finish`, every tool crate,
-`p1-provider-http`, the three adapters, `p1-provider-conformance`. To audit: duplication
-(the describer vs. the line renderer), dead paths after ADR-0057/0059 (old name matches, the
-`ToolFace` macros), error handling in the new crates, test quality (fake-runner tests vs.
-scenario coverage). Not started.
+Metrics over the changed crates (`src` non-test lines; tests = `tests/` + `#[cfg(test)]`;
+`unwrap()`/`expect(` counted outside `#[cfg(test)]`):
 
-## Ranked fixes (evidence-based; items 3–5 will add to this list)
+| crate | src | test lines | tests | unwrap/expect | notes |
+|---|---|---|---|---|---|
+| p1-host | 13 535 | 20 495 | 379 | 120 | 3 `allow(dead_code)` (none found by grep in src — attribute in tests) |
+| p1-workers | 1 838 | 774 | 5 | **31** | mutex `lock().unwrap()` pattern; scenario coverage lives in `p1-host/tests/worker_*` |
+| p1-workflow | 2 627 | 2 568 | 11 | 0 | large scenario tests over a fake runner |
+| p1-tool-shell | 3 948 | 3 700 | 129 | 19 | |
+| p1-tool-edit / p1-tool-write | 929 / 674 | 529 / 407 | 22 / 17 | 0 | **147 identical lines (44 % of write, 40 % of edit)** |
+| p1-tool-patch | 1 708 | 667 | 30 | 0 | |
+| p1-tool-finish | 1 217 | 2 113 | 79 | 6 | |
+| p1-hook-shadow | 333 | 380 | 10 | 0 | std-only |
+| p1-provider-http | 2 996 | 1 817 | 40 | 3 | |
+| p1-provider-openai | 4 073 | 5 367 | 131 | 6 | 1 `allow(dead_code)` (`parser.rs:26`) |
+| p1-provider-conformance | 1 466 | 724 | 22 | 1 | `#![allow(dead_code)]` on the moved fixtures module (`fixtures/responses.rs:8`) |
+| p1-contracts / p1-core | 879 / 1 173 | 69 / 6 720 | 4 / 17 | 0 / 5 | |
+
+Findings:
+- **Duplication:** the edit and write tools share 147 of ~300 non-trivial lines each (path
+  confinement, read-before-mutate, the `EditPreview`/describe code) — the one real
+  duplication today's landings added to. The host's describer and line renderer share no
+  line (0 of 60/228), and the provider adapters lost their triplicated error-code helpers
+  (#47).
+- **Dead paths:** none left from ADR-0057/0059 (the only remaining name match is on the
+  tool-supplied verb, `describer.rs:53`); two `allow(dead_code)` attributes deserve a look
+  (`p1-provider-openai/src/parser.rs:26`; the whole moved `fixtures/responses.rs` module,
+  which should export only what is used).
+- **Error handling:** `p1-workers` carries 31 `unwrap`/`expect` in non-test code, nearly all
+  `Mutex::lock().unwrap()`; a poisoned lock (a panicking child task, exactly the class the
+  ADR-0053 panic guard handles) would take the whole service down with it.
+- **Test quality:** the new crates are scenario-tested (workflow engine 28 integration tests,
+  shadow hook a test per spec rule, fallback 12 tests, fingerprint with a real git repo); the
+  thin spots are `p1-workers` in-crate (5 tests; its behaviour is covered from the host) and
+  `p1-tool-delegate` (3 in-crate tests behind 1.4 k lines of scenario tests). No `TODO`,
+  `todo!` or `unimplemented!` anywhere in the changed crates.
+
+## Ranked fixes (evidence-based)
 
 | # | fix | expected gain | cost | contract |
 |---|---|---|---|---|
-| 1 | **Summarize from the session's own prefix**: build the compaction request as the live prompt (same system prompt, same tools, same history) plus ONE appended instruction, so the provider serves it from cache; keep the replacement logic unchanged | per compaction: 11.8 k mean / up to 104 k (DeepSeek) uncached input → cached; one fewer cold request in the loop; latency of every compaction drops with it | small: `p1-context` request construction; verify with the existing `context_replaced` usage — target `cache_read > 0` on Codex/DeepSeek | none (prompt bytes unchanged) |
-| 2 | **Timestamps in the journal** (`at_ms` monotonic on every record; `request_sent_ms`, `first_token_ms` on `assistant_completed`); `scripts/run-report.py` derives TTFT and time-to-first-tool-call per provider/effort | makes item 3 measurable; no runtime gain by itself | small; every adapter sets two fields | journal contract → ADR (draft below) |
-| 3 | **Tune `summarize_at_tokens` per route from data, after fix 1**: DeepSeek at 300 k means ~180 k tokens re-sent per request (38 M for 212 requests); a lower threshold trades more (then cheap) compactions for shorter requests | lower TTFT on long DeepSeek runs (unquantified until fix 2) | data only (`environments/*/environment.toml`) | none |
-| 4 | **Anthropic compaction frequency**: 11 compactions in one run at 120 k of 200 k; raising `summarize_at` toward 150 k (Opus 5.5 has 1 M) halves them | fewer round trips, fewer stall-guard ticks | data only | none |
-| 5 | Items 3–5 of the scope | — | — | — |
+| 1 | **Summarize from the session's own prefix**: build the compaction request as the live prompt (same system prompt, tools and history) plus ONE appended instruction so the provider serves it from cache; replacement logic unchanged | per compaction 11.8 k mean / up to 104 k (DeepSeek) uncached input → cached; every compaction's round trip shortens with it | small: `p1-context` request construction; verify `cache_read > 0` in `context_replaced.usage` on Codex/DeepSeek | none (prompt bytes unchanged) |
+| 2 | **Timestamps in the journal** (`at_ms` monotonic on every record; `request_sent_ms`, `first_token_ms` on completions); `run-report.py` derives TTFT and time-to-first-tool-call per provider/effort | makes the 20 s TTFT samples explainable and every later latency fix measurable | small; each adapter sets two fields | journal contract → ADR draft below |
+| 3 | **Merge the edit/write tools' shared core** (confinement, read-before-mutate, preview) into one module used by both (in `p1-workspace`, which both already depend on) | −147 duplicated lines; one place for the write-safety rules | small–medium; behaviour unchanged, tests stay | none |
+| 4 | **Poison-safe locks in `p1-workers`** (one helper: `lock().unwrap_or_else(PoisonError::into_inner)`) | a panicking child can no longer take the worker service down | small | none |
+| 5 | **Tune `summarize_at_tokens` per route from data, after fix 1** (DeepSeek at 300 k re-sends ~180 k tokens per request: 38 M input for 212 requests) | lower TTFT on long DeepSeek runs (quantify with fix 2) | data only | none |
+| 6 | **Raise Anthropic's threshold** toward 150 k (Opus 5.5 has 1 M; one run compacted 11 times at 120 k of 200 k) | fewer round trips, fewer stall-guard ticks | data only | none |
+| 7 | **TUI frame counter** behind a debug env var (frames/s, time in `draw` per event kind) | turns §4 from "looks fine" into numbers, incl. under build load | small | none |
+| 8 | Drop the two `allow(dead_code)` (export only the used fixtures; remove the unused field) | hygiene | trivial | none |
 
 ## ADR draft (touches the journal contract)
 
@@ -115,15 +160,9 @@ and first-token times. **Decision:** `JournalRecord` gains `at_ms: u64` (monoton
 session start, never wall-clock, so resume and replay stay deterministic);
 `assistant_completed.usage` gains `request_sent_ms` and `first_token_ms` (adapter-set;
 `None` when unknown, never 0). Old journals load with `None`. **Consequences:** latency per
-provider/effort becomes a run-report field; the fixture journals in frozen tests gain the
-fields only. **Not decided here:** the prompt-contract itself is unchanged by fixes 1, 3, 4.
+provider/effort becomes a run-report field; frozen fixture journals gain the fields only.
+Fixes 1, 3–8 change no contract.
 
-## Resume note (for the lead's next session, after the Claude reset Thu 17:00)
+## Astra review (gpt-6-astra, xhigh, read-only)
 
-Done: §1, §2 measured (script inline in the session transcript; re-run over
-`../phaseone-briefs/runs/*-20260923-*/session.jsonl`). Next: (a) code-read `p1-context`'s
-summarizer request to confirm fix 1's cause; (b) §5 maintainability pass over the changed crates
-(cheap: grep + clippy `--all-targets -W dead_code`); (c) §4 TUI code reading and a probe design;
-(d) ADR for fix 2; (e) Astra review at xhigh (`codex exec --skip-git-repo-check -m gpt-6-astra
--c model_reasoning_effort='"xhigh"' -s read-only`, wrapped in `usage-meter wrap`, read-only,
-max 2 rounds), fold in, summary to XO. Implementation waits for the resets.
+(folded in below when received)
