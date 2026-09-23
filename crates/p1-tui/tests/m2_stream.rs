@@ -155,7 +155,10 @@ fn after_failure_the_evidence_block_and_peek_show() {
     let mut s = Screen::new(true);
     play(&mut s, &script(), 15_500);
     let text = render(&mut s, 120, 40, 15_600);
-    assert!(text.iter().any(|l| l.contains("✗ shell")));
+    assert!(
+        text.iter()
+            .any(|l| l.contains("▸ shell") && l.contains("✗ 50 lines"))
+    );
     assert!(text.iter().any(|l| l.contains("more lines folded → [h-")));
     // The failure promoted a peek over the ledger…
     assert!(matches!(s.promotion, p1_tui::state::Promotion::Peek { .. }));
@@ -202,11 +205,12 @@ fn the_80_column_floor_keeps_everything_readable() {
     let mut s = Screen::new(true);
     play(&mut s, &script(), 16_600);
     let text = render(&mut s, 80, 24, 16_600);
-    // Same glyphs, same shapes — nothing reflows into a different shape (§6).
+    // The call is now a three-band Block; command failures retain their tail evidence.
     assert!(
         text.iter()
-            .any(|l| { l.contains("✗ shell") && l.contains("test case 0") })
+            .any(|l| l.contains("▸ shell") && l.contains("✗ 50 lines"))
     );
+    assert!(text.iter().any(|l| l.contains("test case 0 ... ok")));
     assert!(text.iter().any(|l| l.contains("· 42 more lines folded")));
     // The statusline replaces the old floor line; the pane is gone.
     assert!(text.last().unwrap().contains("diff —"));

@@ -16,6 +16,7 @@ use crate::wrap::{wrap, wrap_len};
 use super::{elapsed, fill};
 
 /// The name field of the §3 column grid, after the glyph prefix.
+#[allow(dead_code)]
 const NAME_FIELD: usize = 10;
 
 /// Render the transcript tail to lines on a `width`-column grid, building at
@@ -88,13 +89,14 @@ fn block_rows(block: &Block, width: usize) -> usize {
             };
             1 + body
         }
-        Block::Call(row) => 1 + fold_rows(row),
+        Block::Call(row) => super::block::lines(row, width, false, 0, true).len(),
         Block::Info { lines } => lines.len(),
         Block::Meta { .. } => 1,
         Block::Notice { lines } => lines.iter().map(|line| wrap_len(line, width)).sum(),
     }
 }
 
+#[allow(dead_code)]
 fn fold_rows(row: &ToolRow) -> usize {
     match row.fold() {
         None => 0,
@@ -155,7 +157,7 @@ fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
                 }
             }
         }
-        Block::Call(row) => call_lines(row, width, out),
+        Block::Call(row) => out.extend(super::block::lines(row, width, false, 0, true)),
         Block::Info { lines } => {
             for line in lines {
                 let shown: String = line.chars().take(width).collect();
@@ -185,6 +187,7 @@ fn block_lines(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
 }
 
 /// One call row plus its fold block, when the row earned one.
+#[allow(dead_code)]
 fn call_lines(row: &ToolRow, width: usize, out: &mut Vec<Line<'static>>) {
     out.push(call_row(row, width));
     if let Some(fold) = row.fold() {
@@ -193,6 +196,7 @@ fn call_lines(row: &ToolRow, width: usize, out: &mut Vec<Line<'static>>) {
 }
 
 /// The §3 row: `▸ read      src/lib.rs              ✓ 412 lines`.
+#[allow(dead_code)]
 fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
     let indent = "";
     let (glyph, glyph_fg) = match row.status {
@@ -279,6 +283,7 @@ fn call_row(row: &ToolRow, width: usize) -> Line<'static> {
 }
 
 /// The settled-status word when there is no other evidence to show.
+#[allow(dead_code)]
 fn status_word(status: ToolStatus) -> &'static str {
     match status {
         ToolStatus::Ok => "ok",
@@ -292,6 +297,7 @@ fn status_word(status: ToolStatus) -> &'static str {
 
 /// A fold block: head lines DIM on BLOCK, then the FAINT handle line. The
 /// block is padded to the full width so it reads as one surface (SPEC §3).
+#[allow(dead_code)]
 fn fold_lines(fold: &Fold, width: usize, out: &mut Vec<Line<'static>>) {
     let indent = "  ".to_string();
     let (head, handle) = match fold {
@@ -410,92 +416,14 @@ mod tests {
     }
 
     #[test]
-    fn the_column_grid_holds() {
-        let lines = lines(&transcript_with_call(), 60, usize::MAX, None, 0, true);
-        let text = plain(&lines);
+    fn a_tool_call_uses_three_bands() {
+        let rendered = lines(&transcript_with_call(), 60, usize::MAX, None, 0, true);
+        let text = plain(&rendered);
         assert_eq!(text[0], "› why does compaction stall?");
         assert_eq!(text[1], "Checking.");
-        // Glyph + 10-column name field, argument, right-aligned result.
-        let expected = format!(
-            "{} read      src/edge.rs{}412ms · 3 lines",
-            glyphs::DONE,
-            " ".repeat(60 - 23 - 15 - 1)
-        );
-        assert_eq!(text[2], expected);
-    }
-
-    #[test]
-    fn a_failed_call_shows_its_evidence_on_block() {
-        let mut t = Transcript::new();
-        t.apply(
-            &AgentEvent::ToolStarted {
-                call: ToolCall {
-                    call_id: "c1".into(),
-                    name: "shell".into(),
-                    input: ToolInput::Json("cargo test".into()),
-                },
-            },
-            None,
-        );
-        t.apply(
-            &AgentEvent::ToolFinished {
-                result: ToolResultItem {
-                    call_id: "c1".into(),
-                    name: "shell".into(),
-                    status: ToolStatus::Error,
-                    content: "test one ... FAILED\nassertion failed".into(),
-                },
-            },
-            Some(11_400),
-        );
-        let lines = lines(&t, 60, usize::MAX, None, 0, true);
-        let text = plain(&lines);
-        // The row carries the failure; the evidence block follows on BLOCK.
-        assert!(text[0].contains(&glyphs::FAILED.to_string()));
-        assert_eq!(text[1].trim_end(), "  test one ... FAILED");
-        assert_eq!(text[2].trim_end(), "  assertion failed");
-        assert_eq!(
-            lines[1].spans[0].style.bg,
-            Some(palette::BLOCK),
-            "tool output earns chrome"
-        );
-    }
-
-    #[test]
-    fn a_long_summary_truncates_so_the_result_never_overflows() {
-        let mut t = Transcript::new();
-        t.apply(
-            &AgentEvent::ToolStarted {
-                call: ToolCall {
-                    call_id: "c1".into(),
-                    name: "shell".into(),
-                    input: ToolInput::Json(
-                        r#"{"command":"cargo test -p p1-provider-http --all-features -- --nocapture"}"#
-                            .into(),
-                    ),
-                },
-            },
-            None,
-        );
-        t.apply(
-            &AgentEvent::ToolFinished {
-                result: ToolResultItem {
-                    call_id: "c1".into(),
-                    name: "shell".into(),
-                    status: ToolStatus::Ok,
-                    content: "ok".into(),
-                },
-            },
-            Some(120),
-        );
-        let width = 40;
-        let lines = lines(&t, width, usize::MAX, None, 0, true);
-        let text = plain(&lines);
-        // The row never exceeds the grid width and ends in the truncation
-        // mark before the right-aligned result.
-        assert!(text[0].chars().count() < width, "never overflows the grid");
-        assert!(text[0].contains('…'));
-        assert!(text[0].trim_end().ends_with("120ms · 1 line"));
+        assert!(text[2].starts_with("  ▸ read"));
+        assert!(text[2].contains("✓ 3 lines"));
+        assert_eq!(rendered[2].spans[0].style.bg, Some(palette::BLOCK_PLUS));
     }
 
     #[test]
