@@ -12,8 +12,9 @@ route × model profile composed into ONE runtime `Provider` (ADR-0039); model se
 mid-session switching are live (ADR-0049); every main agent can start workers with explicit tool
 grants (ADR-0050); resume, context control, `finish` and the TUI are mounted.
 
-**Where the lead stands.** `main` = `604604b`, CI green on that commit; ADRs 0001–0050 (0009→0010,
-0013→0014, 0026→0050, 0033→0049 superseded). Open work: #46–#48, #12, #45 (owner), #6, #25.
+**Where the lead stands.** `main` = `45411f1` + this commit; ADRs 0001–0053 (0009→0010,
+0013→0014, 0026→0050, 0033→0049 superseded). Open work: #46–#48, #53, #54, #12, #45 (owner), #6,
+#25.
 
 ## Next — READ FIRST
 
@@ -67,6 +68,11 @@ OPEN ITEMS (issue numbers)
   terra/luna, gpt-5.5 (`sol-mini` refused live).
 - **Tools** — one crate per tool, composed only in the composition root (ADR-0004); shell sandbox
   (ADR-0035) + environment allow-list (#4); shell output filters measured on p1 (#42).
+- **Workflows (ADR-0053, 2026-09-23)** — `p1-workflow` (rhai engine, Claude Code's script shape,
+  roles + per-model caps, journal + replay) and `p1-tool-workflow` on every main agent; `p1
+  workflow run`; the modularity audit ported (`scripts/audits/modularity.rhai`). Built by a Fable
+  5.1 orchestrator session with one worker per job (DeepSeek, Opus 5.5, gpt-6-sol, GLM); five live
+  checks passed. ADR-0051 (a worker without a command tool ends `done — not verified`) preceded it.
 - **Delegation** — optional module, machine-wide bounded pool, workers not restored on parent
   resume (ADR-0027, ADR-0034); ADR-0050 supersedes ADR-0026: every main agent has the worker tools;
   a worker gets exactly its parent's grant plus `finish`; conditional prompts, worker report + host
@@ -88,41 +94,11 @@ OPEN ITEMS (issue numbers)
 - **First slice** — every `seams.md` §10 item demonstrated by a command in `docs/SLICE-REPORT.md`;
   the independent review's defects all fixed (`docs/review-2026-09-20-dispositions.md`).
 
-## Workflows (orchestrator session)
+## Workflows (orchestrator session) — CLOSED 2026-09-23
 
-Owned by the Fable 5.1 Claude Code orchestrator session (brief:
-`../phaseone-briefs/workflows-orchestrator.md`; ADR-0053 proposed; engine rhai per the spikes in
-`../phaseone-spikes/`). The orchestrator writes its progress HERE and nowhere else in this file:
-- Briefs `../phaseone-briefs/wf1-…wf6-*.md`; questions/answers in `workflows-orchestrator-questions.md`.
-- LANDED: `task/workflow-api` — `crates/p1-workflow` API only (settings, `ModelResolver`,
-  `StepRunner`, envelope, journal record, `WorkflowService`, `WorkflowObserver`; frozen, additive
-  changes only) and fanout's `"model"` job key (→ `p1 --model`). Shipped judge = `claude/claude-fable-5`
-  (the Fable profile this route binds), cap 3 on `claude-fable-5`.
-- LANDED: job 2 `task/finish-result` (cb51b60, CI green): `OutputContract` + `result` on `finish`,
-  `FinishOutcome::structured()`; frozen tests untouched. Job 1 `task/workers-prepared` (this merge):
-  `start_prepared`, `wait_for_capacity`, `running`/`max_concurrent`. Both DeepSeek V4.1 Flash, one pass.
-- LANDED: job 4 `task/workflow-tools` (this merge): `crates/p1-tool-workflow` (four tools over the
-  `WorkflowService` trait) + "# Workflows (only when the user asks)" in every environment prompt.
-  gpt-6-sol:high (model-cards trial), one pass, delegated the prompt edits to a sub-worker.
-- LANDED: job 3 `task/workflow-engine` (this merge): the rhai engine, journal + prefix replay, caps,
-  `InProcessWorkflows`; 28 integration tests + the prompts' example script pinned on the engine
-  (`tests/prompt_example.rs`). Opus 5.5 high, one pass. Known: `observer.step_started` fires after
-  the step (the worker ref exists only then); `args` can gain keys (never change existing ones).
-- LANDED: job 6 `task/workflow-docs` (this merge): `docs/design/workflows.md` (GLM 5.3, one pass;
-  its §7 grows with the host glue).
-- LANDED: the audit port (`scripts/audits/modularity-prep.py` + `modularity.rhai`, engine-tested) and,
-  after it turned main red on CI (rhai `sync` data race: parallel thunks method-calling one captured
-  closure), the fix `task/audit-race` (DeepSeek): `Fn("fn").curry(values)` thunks, the rule in the
-  five prompts, `tests/audit_script_race.rs`.
-- LANDED: job 5 `task/workflow-host` (this merge; Opus: medium stalled on shell-made edits, issue #53;
-  high finished): settings, `HostModelResolver`, `HostStepRunner` over the prepared start, one line per
-  step + ONE inbox notification, tools on every main agent, `p1 workflow run … --args FILE`,
-  run-report `workflows`, nine host tests. Its gate hung once: a REAL p1-workers race —
-  `continue_child` stored `Running` after handing the turn over, so a fast `Finished` was overwritten
-  (gpt-6-sol found and fixed it, regression test + 60 s timeouts in the run-waiting tests); and a
-  dying child task used to strand every `wait` (orchestrator: abnormal-end guard, 8756f17).
-- NEXT: the five live checks (`../phaseone-briefs/workflows-live/`), ADR-0053 evidence, the report.
-- FIXED by the lead (8483e64): fanout counted pi-worker wrapper processes; jobs 5–6 use the default pool.
+Everything is on main; the session's report is `../phaseone-briefs/workflows-orchestrator-report.md`
+(what was built, deviations, live checks, what remains). Remaining items became #53, #54 and a
+comment on #46; the ADR's deferred list is unchanged.
 
 ## Open decisions and risks
 
@@ -146,3 +122,12 @@ Owned by the Fable 5.1 Claude Code orchestrator session (brief:
   0 edits). Shipped values: 300k of 1M (deepseek, deepseek2), 120k of 200k (claude, gpt), 150k of
   260k (glm); every request re-sends the history, so cache-read dominates cost.
 - `pi-worker opus` is never for tool work: 0 tool_calls, invented results.
+- Never pipe `scripts/push-main.sh` (`| tail`): the pipe hid a rejected push and a red CI. Read
+  its exit code. And merge `origin/main` BEFORE numbering a new ADR (0052 was taken concurrently).
+- A hung test held a gate 37 min: `gate.sh` now bounds `cargo test` to an hour; tests that wait
+  on a run carry their own timeouts (a hang must be a failure, never a parked gate).
+- rhai scripts: never call a closure held in a variable or write a captured variable inside a
+  `parallel`/`pipeline` thunk (rhai `sync` = "Data race detected", timing-dependent); curry the
+  inputs, aggregate after the join. The prompts' example says so.
+- The stall guard sees only tool-declared writes (#53): a model editing through shell heredocs
+  (Opus 5.5 does) looks idle. Until fixed, briefs say "edit with the edit tool".

@@ -1,7 +1,7 @@
 ---
 adr: 53
 title: Workflows are an optional module: a sandboxed script orchestrates workers under roles and caps
-status: proposed
+status: accepted
 date: 2026-09-23
 deciders: owner+lead
 supersedes: []
@@ -104,5 +104,18 @@ bounded by the worker pool and a thread cap.
 
 ## Evidence
 
-<filled when merged: gate + CI on the merge commits of the six jobs; the five live checks in
-`../phaseone-briefs/workflows-orchestrator.md`; runs in `docs/dogfood/runs.jsonl`.>
+Implemented 2026-09-23 by a Fable 5.1 Claude Code orchestrator session with one worker per job
+(brief `../phaseone-briefs/workflows-orchestrator.md`, report
+`workflows-orchestrator-report.md`): API f099e51, job 1 1c56a49, job 2 cb51b60, job 3 d7c0066,
+job 4 af68a55, job 5 2e1b471, docs a291c43, audit port d430f7e (race fix 31dc790); every
+landing gate + CI green, main green on 45411f1. Runs in `docs/dogfood/runs.jsonl` (wf1–wf6,
+audit, repairs) and in the model-cards evidence file. Live checks, all passed: (1) the same
+small workflow on a deepseek2 and on an Opus 5.5 main agent, one inbox notification each;
+(2) the cap refusing the (cap+1)th attempt before dispatch for gpt-6-sol at 3 and for Fable
+at 1; (3) schema repair in the same worker, in-turn and via the engine's repair turn;
+(4) `resume_from` after editing one call — step 1 replayed, 2 and 3 re-run; (5) the reduced
+modularity audit through `p1 workflow run` — 4/4 steps with `commands passed`, a split vote
+resolved by a third vote, one real finding (issue #46). Found and fixed on the way: a
+`continue_child` ordering race in `p1-workers` (a9a6967) and a dying child task stranding
+every `wait` (4822e30); found and filed: #53 (stall guard blind to shell-made writes), #54
+(workers that change nothing must still call `finish`).
