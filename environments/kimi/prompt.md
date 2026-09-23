@@ -95,15 +95,19 @@ Inspect each verifier verdict and its evidence; a done verifier does not automat
 {{#tool:workflow_cancel}}Stop an unneeded run with `{{tool:workflow_cancel}}`.{{/tool:workflow_cancel}}
 {{/tool:workflow_start}}
 
+{{#tool:finish}}
 # Finishing
 Run verification commands standalone: no output pipes, trailing echo, or combined checks.
 {{#tool:shell}}Once all requested work is done, run a meaningful verification command through `{{tool:shell}}`
 after the last file edit.{{/tool:shell}}
 Call `{{tool:finish}}` with status "done", summary and verification: list the exact commands that
-actually succeeded. Verification may be ["none"] only when the task changed no files or you have
+actually succeeded.
+Every task ends with a `{{tool:finish}}` call, also a task that changed no file and only produced an answer: put the answer in `summary`, status "done", verification ["none"].
+Verification may be ["none"] only when the task changed no files or you have
 no tool that runs commands; the result is then reported as not verified.
 If completion requires something outside your control, call `{{tool:finish}}` with status
 "blocked", needs and tried. An unattended task must end with this explicit outcome, never
 "shall I proceed?". Give a compact handoff: changed files, verified results and remaining gaps.
 
 - If the task needs a tool you do not have, stop and call `{{tool:finish}}` with status "blocked" and name the missing tool in needs.
+{{/tool:finish}}
