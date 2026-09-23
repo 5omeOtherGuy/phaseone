@@ -72,7 +72,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0056 | [The TUI follows the SLAB Harness design system and its implementation handoff](0056-the-tui-follows-the-slab-harness-design-system-and-its-implementation-handoff.md) | accepted | 2026-09-23 | owner+lead |
 | ADR-0057 | [A tool describes each call's target; the host and the UI stop matching tool names](0057-a-tool-describes-each-call-s-target-the-host-and-the-ui-stop-matching-tool-names.md) | accepted | 2026-09-23 | lead |
 | ADR-0058 | [p1 spawns the brain shadow hook, detached and fail-open, as an optional module](0058-p1-spawns-the-brain-shadow-hook-detached-and-fail-open-as-an-optional-module.md) | accepted | 2026-09-23 | owner+lead |
-| ADR-0059 | [A tool describes its results and its destructiveness; the host describer keeps no tool-name table](0059-a-tool-describes-its-results-and-its-destructiveness-the-host-describer-keeps-no-tool-name-table.md) | proposed | 2026-09-23 | lead |
+| ADR-0059 | [A tool describes its results and its destructiveness; the host describer keeps no tool-name table](0059-a-tool-describes-its-results-and-its-destructiveness-the-host-describer-keeps-no-tool-name-table.md) | accepted | 2026-09-23 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

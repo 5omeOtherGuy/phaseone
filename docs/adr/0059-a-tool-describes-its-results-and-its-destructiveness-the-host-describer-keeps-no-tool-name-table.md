@@ -1,7 +1,7 @@
 ---
 adr: 59
 title: A tool describes its results and its destructiveness; the host describer keeps no tool-name table
-status: proposed
+status: accepted
 date: 2026-09-23
 deciders: lead
 supersedes: []
@@ -64,6 +64,12 @@ the host and the UI never know tool internals.
 
 ## Evidence
 
-Pending: the gate and CI of the merge of task/describe-results, the per-tool tests, the host
-test with a renamed face and an unknown tool, and the SLAB oracle unchanged; filled at
-acceptance.
+Merged from task/describe-results (gpt-6-sol worker, reviewed by the lead; gate green on the
+branch merged with main; run recorded in `docs/dogfood/runs.jsonl`). `Tool::describe_result`
+and `CallDescription.destructive` in `p1-contracts`; every shipped tool implements both from
+its own input/output with tests on real values (the shell tool's destructiveness test covers
+positives such as `rm -rf`, force push and hard reset and negatives such as `grep -r`);
+`crates/p1-host/src/tui/describer.rs` no longer matches tool names — its only match is on the
+tool-supplied `verb` — and every private-shape decode is gone; the SLAB oracle screens and
+the host tui tests pass unchanged; `crates/p1-host/tests/describe_results.rs` renders a
+renamed edit face and a tool unknown to the describer from the defaults; `p1-tui` untouched.
