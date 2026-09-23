@@ -95,7 +95,7 @@ child's `done` alone never satisfies the parent's own gate.
 `type` (one of object, array, string, integer, number, boolean, null), `enum`, `required`,
 `properties`, `additionalProperties: false` only, `items`, `minItems`, `minimum`, and the
 ignored `description`/`title` — validated once at construction, so a malformed schema fails
-BEFORE any worker is started. It is exactly the subset `scripts/workflow.py::schema_errors`
+BEFORE any worker is started. It is exactly the subset the retired `scripts/workflow.py::schema_errors`
 checks, so a brief's schema means the same thing in both runners. With a contract set:
 1. The input schema gains `"result": <the contract's schema>`, its `description` prefixed
    `Required with "done": ` + the contract's own; `required` stays `["status", "summary"]`
@@ -121,7 +121,7 @@ was requested for this task; remove "result".` The cell is
 after `clear`, or before any call) with `pub enum SchemaCheck { NotRequested, Passed,
 Failed(Vec<String>) }` and `pub struct StructuredResult { pub value: Option<serde_json::Value>,
 pub schema: SchemaCheck }`; `value` is `None` only under `NotRequested`. `clear` drops both
-values. Errors are worded as `workflow.py` words them, with JSON type names: `$: expected
+values. Errors are worded as the retired `workflow.py` worded them, with JSON type names: `$: expected
 object, got string`, `$.kind: "x" is not one of ["a","b"]`, `$: missing required key "id"`,
 `$: unexpected key "extra"`, `$.items: needs at least 1 items`, `$.score: -1 is below 0`, paths
 like `$.findings[2].file` — at most 32 of them, each at most 300 characters. Clearing the cell

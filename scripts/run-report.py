@@ -280,7 +280,7 @@ def natural_key(text):
     return [int(chunk) if chunk.isdigit() else chunk for chunk in re.split(r"(\d+)", text)]
 
 
-# The fields a `RunReport` (p1's Rust struct, serialized by scripts/workflow.py) always
+# The fields a `RunReport` (p1's Rust struct, written by `p1 workflow run`) always
 # has; a result.json missing one of these is not a `RunReport` at all.
 RUN_REPORT_FIELDS = ("id", "outcome", "counts", "steps", "run_dir")
 

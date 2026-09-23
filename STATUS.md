@@ -22,7 +22,7 @@ HOW THE LEAD WORKS (owner instructions)
 - Implementation goes to DeepSeek workers by default: `scripts/fanout.py <jobs.json>` with jobs
   `{"runner": "p1", "env": "deepseek2", …}`; briefs/outputs in `../phaseone-briefs/`; repair in the
   SAME session (`session` + `prompt_file`); multi-stage workflows with schema-checked outputs and
-  resume on `scripts/workflow.py`. The lead keeps specs, ADRs, diff review, lead tests, live checks,
+  resume through `p1 workflow run` (ADR-0053; the Python `workflow.py` is retired). The lead keeps specs, ADRs, diff review, lead tests, live checks,
   merges.
 - One job ≈ one crate; short briefs, "work in this order, start editing early". A dead run cannot
   move its journal between routes — a fresh session continues from the WORKSPACE ("NOTE ON STATE").
@@ -86,7 +86,8 @@ OPEN ITEMS (issue numbers)
 - **TUI** — ADR-0043: pure state machine in `p1-tui`, terminal driver + `FrontEnd` seam in
   `p1-host`; milestones M1–M4c merged by the TUI session (#12).
 - **Tooling** — gate as the single definition of green (ADR-0011); ADRs validated in the gate
-  (ADR-0030); `scripts/fanout.py` (ADR-0027), `scripts/workflow.py` + `scripts/audits/modularity.py`,
+  (ADR-0030); `scripts/fanout.py` (ADR-0027), `scripts/audits/modularity.rhai` (+ `modularity-prep.py`; the Python
+  `workflow.py` retired 2026-09-23 on the owner's decision),
   `scripts/run-report.py` + `docs/dogfood/runs.jsonl` (#8, #26).
 - **Research** — ADR-0045 (items end `used` or `discarded`): #26–#28, #35–#37, #41–#43 all closed.
 - **Modularity audit 2026-09-22** — `docs/research/modularity-audit-2026-09-22.md`: 104 DeepSeek jobs
