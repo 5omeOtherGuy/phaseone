@@ -176,11 +176,36 @@ pub struct Composer {
     pub text: String,
     /// Cursor as a CHAR index into `text`.
     pub cursor: usize,
-    /// Revealed while focus mode would hide it (an edit, a paste, `esc` down).
+    /// Revealed while focus mode would hide it (an edit, a paste, `^G`).
     pub revealed: bool,
+    /// While `^G` edits the goal: the text the composer held before, which `esc` restores.
+    pub goal_edit: Option<String>,
 }
 
 impl Composer {
+    /// `^G`: put `/goal <current goal>` in the composer, cursor at the end (handoff §8.4).
+    pub fn begin_goal_edit(&mut self, goal: Option<&str>) {
+        if self.goal_edit.is_none() {
+            self.goal_edit = Some(std::mem::take(&mut self.text));
+        }
+        self.text = format!("/goal {}", goal.unwrap_or_default());
+        self.cursor = self.text.chars().count();
+        self.revealed = true;
+    }
+
+    /// `esc` during a goal edit: the previous composer text comes back.
+    pub fn keep(&mut self) {
+        if let Some(previous) = self.goal_edit.take() {
+            self.cursor = previous.chars().count();
+            self.revealed = !previous.is_empty();
+            self.text = previous;
+        }
+    }
+
+    pub fn editing_goal(&self) -> bool {
+        self.goal_edit.is_some()
+    }
+
     pub fn insert(&mut self, ch: char) {
         let byte = self.byte_index();
         self.text.insert(byte, ch);
@@ -196,6 +221,10 @@ impl Composer {
         let prev = self.text[..byte].chars().last().unwrap();
         self.text.replace_range(byte - prev.len_utf8()..byte, "");
         self.cursor -= 1;
+        // Clearing the composer hides it again in focus mode (handoff §8.5).
+        if self.text.is_empty() {
+            self.revealed = false;
+        }
     }
 
     pub fn left(&mut self) {
@@ -211,6 +240,7 @@ impl Composer {
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         self.revealed = false;
+        self.goal_edit = None;
         std::mem::take(&mut self.text)
     }
 
@@ -298,6 +328,24 @@ pub struct Screen {
     /// math needs it; the renderer records it each frame.
     #[doc(hidden)]
     pub last_rendered: (usize, usize),
+    /// `^F`: the pane owns `↑ ↓` (WORKERS select, OUTPUT scroll) until `esc` or `^F`.
+    pub pane_focused: bool,
+    /// The full diff review's view state (handoff §7.5).
+    pub review: FullReview,
+}
+
+/// The full diff review: shown over a diff approval while `open`. Paging files and scrolling
+/// are view-only; the decision is about the whole call.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FullReview {
+    pub open: bool,
+    /// The file on screen, an index into the call's files.
+    pub file: usize,
+    /// The first diff row shown.
+    pub scroll: usize,
+    /// Diff body rows of the last frame (`review::body_rows`), recorded by the screen like
+    /// `last_rendered`, so paging moves by what is visible.
+    pub body_rows: usize,
 }
 
 /// One queued operator input (SPEC §4.2 hints: steering vs follow-up).
@@ -409,6 +457,165 @@ impl Screen {
     /// Queue operator input for the next boundary (SPEC §4.2).
     pub fn queue(&mut self, follow_up: bool, text: String) {
         self.queued.push_back(Queued { follow_up, text });
+    }
+
+    /// `PgUp` (`pages` > 0) / `PgDn`: scroll by the transcript rows minus two, so two rows of
+    /// context stay on screen (handoff §8.3). Paging past the end returns to the live tail.
+    pub fn page(&mut self, pages: isize) {
+        let step = self.last_rendered.1.saturating_sub(2).max(1) as isize;
+        self.scroll_by(pages * step);
+    }
+
+    /// `esc` while scrolled back: follow the newest rows again.
+    pub fn live_tail(&mut self) {
+        self.scroll_top = None;
+    }
+
+    /// The scroll mark while the view is pinned above the live tail. It takes the view's last
+    /// row, so the rows below are counted from one row higher.
+    pub fn scroll_mark(&self) -> Option<crate::render::scroll::ScrollMark> {
+        let top = self.scroll_top?;
+        let (total, fits) = self.last_rendered;
+        let shown = fits.saturating_sub(1);
+        // The working label names the latest started tool; it runs while any call is open.
+        let running = self
+            .working
+            .as_ref()
+            .filter(|w| !self.call_started.is_empty() && !w.label.is_empty())
+            .map(|w| format!("{} running", w.label));
+        Some(crate::render::scroll::ScrollMark {
+            below: total.saturating_sub(top + shown),
+            running,
+            row: top + 1,
+            total,
+        })
+    }
+
+    /// `/` in an empty composer: type it and open command completion over the composer text.
+    pub fn open_completion(&mut self) {
+        self.composer.insert('/');
+        let mut menu = Picker::commands();
+        let model = self.statusbar.model.clone().unwrap_or_else(|| "—".into());
+        let effort = self
+            .statusbar
+            .effort
+            .clone()
+            .unwrap_or_else(|| "default".into());
+        menu.set_value("/model", format!("{model}:{effort}"));
+        menu.set_value("/effort", effort);
+        menu.set_value("/focus", if self.focus { "on" } else { "off" });
+        menu.filter = self.composer.text.clone();
+        menu.select_first();
+        self.picker = Some(menu);
+    }
+
+    /// A key typed while a menu is open: completion edits the composer and filters by its
+    /// text; any other menu filters by what is typed into it.
+    pub fn menu_input(&mut self, ch: Option<char>) {
+        let Some(menu) = &mut self.picker else {
+            return;
+        };
+        if menu.completion {
+            match ch {
+                Some(ch) => self.composer.insert(ch),
+                None => self.composer.backspace(),
+            }
+            if self.composer.text.is_empty() {
+                self.picker = None;
+                return;
+            }
+            menu.filter = self.composer.text.clone();
+        } else {
+            match ch {
+                Some(ch) => menu.filter.push(ch),
+                None => {
+                    menu.filter.pop();
+                }
+            }
+        }
+        menu.select_first();
+    }
+
+    /// `tab`: complete the composer to the focused command and close the menu.
+    pub fn complete_menu(&mut self) {
+        if let Some(label) = self.picker.as_ref().and_then(Picker::completion) {
+            self.composer.text = format!("{label} ");
+            self.composer.cursor = self.composer.text.chars().count();
+            self.composer.revealed = true;
+            self.picker = None;
+        }
+    }
+
+    /// `^G`: edit the goal in the composer, prefilled with the current goal.
+    pub fn edit_goal(&mut self) {
+        self.composer.begin_goal_edit(self.goal.as_deref());
+    }
+
+    /// Files in the call under review. An approval carries one prepared diff today.
+    fn review_files(&self) -> usize {
+        usize::from(matches!(self.approval, Some(Approval::Diff(_))))
+    }
+
+    /// `^D`: open or close the full review of the diff on screen.
+    pub fn toggle_review(&mut self) {
+        if self.review_files() == 0 {
+            return;
+        }
+        self.review = FullReview {
+            open: !self.review.open,
+            ..FullReview::default()
+        };
+    }
+
+    /// `tab` / `⇧tab` in the full review: the next / previous file, wrapping.
+    pub fn review_file(&mut self, delta: isize) {
+        let files = self.review_files();
+        if files == 0 {
+            return;
+        }
+        let next = (self.review.file as isize + delta).rem_euclid(files as isize);
+        self.review.file = next as usize;
+        self.review.scroll = 0;
+    }
+
+    /// `PgUp` (`pages` > 0) / `PgDn` in the full review: page the diff body, clamped to it.
+    pub fn review_page(&mut self, pages: isize) {
+        let Some(Approval::Diff(view)) = &self.approval else {
+            return;
+        };
+        let body = self.review.body_rows.max(1);
+        let step = body.saturating_sub(2).max(1) as isize;
+        let last = view.rows.len().saturating_sub(body);
+        self.review.scroll = self
+            .review
+            .scroll
+            .saturating_add_signed(-pages * step)
+            .min(last);
+    }
+
+    /// Perform a view-only key decision (`input::decide`): nothing here reaches the agent.
+    pub fn apply_view(&mut self, command: crate::input::ViewCommand) {
+        use crate::input::ViewCommand as V;
+        match command {
+            V::PageUp => self.page(1),
+            V::PageDown => self.page(-1),
+            V::LiveTail => self.live_tail(),
+            V::OpenCompletion => self.open_completion(),
+            V::MenuInput(ch) => self.menu_input(Some(ch)),
+            V::MenuBackspace => self.menu_input(None),
+            V::Complete => self.complete_menu(),
+            V::Effort(delta) => {
+                if let Some(menu) = &mut self.picker {
+                    menu.step_effort(delta);
+                }
+            }
+            V::TogglePaneFocus => self.pane_focused = !self.pane_focused,
+            V::EditGoal => self.edit_goal(),
+            V::KeepComposer => self.composer.keep(),
+            V::ToggleReview => self.toggle_review(),
+            V::ReviewFile(delta) => self.review_file(delta),
+            V::ReviewPage(pages) => self.review_page(pages),
+        }
     }
 
     /// Scroll the transcript `delta` rows up (positive) or down (negative).
@@ -532,6 +739,117 @@ fn first_line(text: &str) -> String {
 mod tests {
     use super::*;
     use p1_contracts::{ToolCall, ToolInput, ToolResultItem, ToolStatus};
+
+    #[test]
+    fn paging_moves_by_the_transcript_rows_minus_two_and_returns_to_the_tail() {
+        let mut s = Screen::new(false);
+        s.last_rendered = (100, 20);
+        s.page(1);
+        assert_eq!(s.scroll_top, Some(62), "80 − 18");
+        s.page(1);
+        assert_eq!(s.scroll_top, Some(44));
+        s.page(-1);
+        s.page(-1);
+        assert_eq!(s.scroll_top, None, "paging past the end is the live tail");
+        s.page(1);
+        s.live_tail();
+        assert_eq!(s.scroll_top, None);
+    }
+
+    #[test]
+    fn the_scroll_mark_counts_rows_below_and_names_the_running_tool() {
+        let mut s = Screen::new(false);
+        s.last_rendered = (47, 33);
+        assert_eq!(s.scroll_mark(), None, "no mark at the live tail");
+        s.scroll_top = Some(0);
+        let mark = s.scroll_mark().unwrap();
+        // The mark takes the view's last row: 32 rows shown, 15 below.
+        assert_eq!((mark.below, mark.row, mark.total), (15, 1, 47));
+        assert_eq!(mark.running, None);
+        s.apply(
+            &AgentEvent::ToolStarted {
+                call: ToolCall {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    input: ToolInput::Json("{}".into()),
+                },
+            },
+            0,
+        );
+        assert_eq!(
+            s.scroll_mark().unwrap().running.as_deref(),
+            Some("shell running")
+        );
+    }
+
+    #[test]
+    fn completion_types_filters_and_completes_through_the_composer() {
+        use crate::input::ViewCommand as V;
+        let mut s = Screen::new(false);
+        s.apply_view(V::OpenCompletion);
+        assert_eq!(s.composer.text, "/");
+        s.apply_view(V::MenuInput('m'));
+        s.apply_view(V::MenuInput('o'));
+        let menu = s.picker.as_ref().unwrap();
+        assert_eq!(menu.filter, "/mo");
+        assert_eq!(menu.visible().len(), 2, "/model and /models");
+        s.apply_view(V::Complete);
+        assert_eq!(s.composer.text, "/model ");
+        assert!(s.picker.is_none());
+        // Deleting the `/` closes completion.
+        s.composer = Composer::default();
+        s.apply_view(V::OpenCompletion);
+        s.apply_view(V::MenuBackspace);
+        assert!(s.picker.is_none());
+        assert_eq!(s.composer.text, "");
+    }
+
+    #[test]
+    fn the_full_review_toggles_only_over_a_diff_and_pages_within_it() {
+        use crate::render::diff::{DiffRow, DiffView};
+        let mut s = Screen::new(false);
+        s.toggle_review();
+        assert!(!s.review.open, "nothing to review");
+        s.approval = Some(Approval::Diff(DiffView {
+            tool: "edit".into(),
+            file: "a.rs".into(),
+            summary: String::new(),
+            position: (1, 1),
+            rows: (0..30)
+                .map(|n| DiffRow::Add {
+                    line: n + 1,
+                    text: String::new(),
+                })
+                .collect(),
+            grantable: true,
+        }));
+        s.toggle_review();
+        assert!(s.review.open);
+        s.review.body_rows = 12;
+        s.review_page(-1);
+        assert_eq!(s.review.scroll, 10);
+        s.review_page(-5);
+        assert_eq!(s.review.scroll, 18, "clamped at the last full body");
+        s.review_page(1);
+        assert_eq!(s.review.scroll, 8);
+        s.review_file(1);
+        assert_eq!((s.review.file, s.review.scroll), (0, 0), "one file wraps");
+        s.toggle_review();
+        assert!(!s.review.open);
+    }
+
+    #[test]
+    fn a_goal_edit_restores_the_draft_on_esc_and_ends_on_submit() {
+        let mut c = Composer::default();
+        c.insert('d');
+        c.begin_goal_edit(None);
+        assert_eq!(c.text, "/goal ");
+        c.keep();
+        assert_eq!(c.text, "d");
+        c.begin_goal_edit(Some("g"));
+        assert_eq!(c.take(), "/goal g");
+        assert!(!c.editing_goal());
+    }
 
     #[test]
     fn width_cycles_through_the_four_states() {
