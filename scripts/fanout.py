@@ -94,19 +94,28 @@ def mem_available_mb():
     return 0
 
 
-def pi_workers_alive():
-    """pi-worker processes on the whole machine (other batches and sessions included)."""
-    out = subprocess.run(["pgrep", "-fc", "scripts/pi-worker "], capture_output=True, text=True).stdout
-    return int(out.strip() or 0)
+def is_pi_worker(argv):
+    """A real pi-worker process: the script itself (`python3 …/pi-worker <profile> …` or
+    `pi-worker <profile> …`), never a wrapper whose command LINE merely mentions it — a
+    `bash -c "… pi-worker …"` loop or a `usage-meter wrap … -- pi-worker …` parent. Counting
+    those once made two real workers look like six and filled the pool."""
+    if not argv:
+        return False
+    head = os.path.basename(argv[0])
+    if head == "pi-worker":
+        return True
+    return head.startswith("python") and len(argv) > 1 and os.path.basename(argv[1]) == "pi-worker"
 
 
-def p1_agents_alive():
-    """Running p1 agents machine-wide: argv[0] basename `p1` with `--env` in the args.
+def is_p1_agent(argv):
+    """A running p1 agent: argv[0] basename `p1` with `--env` in the args. A `python3
+    scripts/fanout.py` process or an editor is never counted, and neither is anything else
+    that merely mentions p1."""
+    return bool(argv) and os.path.basename(argv[0]) == "p1" and "--env" in argv[1:]
 
-    An /proc scan (no psutil): a `python3 scripts/fanout.py` process or an editor is
-    never counted, and neither is anything else that merely mentions p1.
-    """
-    count = 0
+
+def processes():
+    """argv of every process on the machine (a /proc scan, no psutil)."""
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -115,9 +124,17 @@ def p1_agents_alive():
                 argv = [part.decode("utf-8", "replace") for part in handle.read().split(b"\0") if part]
         except OSError:
             continue
-        if argv and os.path.basename(argv[0]) == "p1" and "--env" in argv[1:]:
-            count += 1
-    return count
+        yield argv
+
+
+def pi_workers_alive():
+    """pi-worker processes on the whole machine (other batches and sessions included)."""
+    return sum(1 for argv in processes() if is_pi_worker(argv))
+
+
+def p1_agents_alive():
+    """Running p1 agents machine-wide."""
+    return sum(1 for argv in processes() if is_p1_agent(argv))
 
 
 def workers_alive():

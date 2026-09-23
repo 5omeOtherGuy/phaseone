@@ -323,6 +323,24 @@ class FanoutTest(unittest.TestCase):
                          ["pi-worker", "deepseek", "--dir", "/work", "--effort", "high",
                           "--session", "abc", "--prompt", "fix it"])
 
+    def test_live_worker_count_ignores_wrapper_processes(self) -> None:
+        real = [["python3", "/home/u/brain-tools/scripts/pi-worker", "glm", "--dir", "/w"],
+                ["python3", "/home/u/.local/bin/pi-worker", "sol6", "--dir", "/w"],
+                ["pi-worker", "glm", "--dir", "/w"]]
+        wrappers = [["bash", "-c", "for t in a b; do pi-worker glm --dir $t; done"],
+                    ["python3", "/home/u/brain-tools/scripts/usage-meter", "wrap", "x", "--",
+                     "/home/u/brain-tools/scripts/pi-worker", "sol6"],
+                    ["/bin/bash", "-c", "source snapshot.sh && scripts/pi-worker glm --dir /w"],
+                    ["python3", "scripts/fanout.py", "jobs.json"],
+                    []]
+        for argv in real:
+            self.assertTrue(fanout.is_pi_worker(argv), argv)
+        for argv in wrappers:
+            self.assertFalse(fanout.is_pi_worker(argv), argv)
+        self.assertTrue(fanout.is_p1_agent(["/x/phaseone-target/debug/p1", "--env", "deepseek2"]))
+        self.assertFalse(fanout.is_p1_agent(["python3", "scripts/fanout.py", "--env"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "models"]))
+
 
 if __name__ == "__main__":
     unittest.main()
