@@ -10,6 +10,23 @@ use serde::{Deserialize, Serialize};
 use crate::history::{ToolCall, ToolStatus};
 use crate::{BoxFuture, CancellationToken};
 
+/// The model-facing name and description of a tool. The schema and semantics
+/// stay the same when an environment presents a different face.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFace {
+    pub name: String,
+    pub description: String,
+}
+
+impl ToolFace {
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DeclarationKind {

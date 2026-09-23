@@ -15,27 +15,8 @@ use std::path::{Path, PathBuf};
 
 pub use gate::{Mutation, WriteGate};
 pub use observe::{Observation, ObservedFiles, StreamingHash};
+pub use p1_contracts::tool::ToolFace;
 pub use text::{bound_output, write_atomic};
-
-/// The model-facing name and description of a tool.
-///
-/// One implementation can present differently to different model families;
-/// only this text changes, never the schema or the semantics. Defined here so
-/// every tool module re-exports the same type.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolFace {
-    pub name: String,
-    pub description: String,
-}
-
-impl ToolFace {
-    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-        }
-    }
-}
 
 /// Why a workspace path could not be used.
 #[derive(Debug, thiserror::Error)]

@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+pub use p1_contracts::tool::ToolFace;
 use p1_contracts::{
     BoxFuture, DeclarationKind, Effect, JournalRecord, RecordBody, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
@@ -20,23 +21,6 @@ use p1_contracts::{
 use p1_workers::{ChildId, ChildSpec, ChildStatus, WorkerError, WorkerReport, WorkerService};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-
-/// Model-facing name + description override, mirroring `p1-workspace::ToolFace`
-/// without taking a dependency on it.
-#[derive(Debug, Clone)]
-pub struct ToolFace {
-    pub name: String,
-    pub description: String,
-}
-
-impl ToolFace {
-    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-        }
-    }
-}
 
 const START_NAME: &str = "worker_start";
 const START_DESCRIPTION: &str = "Start a worker agent on an environment with a self-contained task.\nThe worker gets ONLY the task text — no conversation history — so the task must contain everything it needs.\nWorkers share this workspace: do not give two workers overlapping files.\nYou will be notified when it finishes; do not poll for it.\nThe worker has ONLY the tools you list in `tools` (plus finish); tools you do not list do not exist for it. List every tool the task needs; if you are unsure whether it needs one, include it.";
