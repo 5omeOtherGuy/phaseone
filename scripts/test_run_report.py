@@ -310,6 +310,65 @@ class RunReportTest(unittest.TestCase):
         self.assertEqual(report["workers_started"], [])
         self.assertIsNone(report["worker_usage_known"])
 
+    # --- workflows -----------------------------------------------------------
+
+    def write_result(self, session_path: str, run_id: str, result: dict) -> str:
+        """`FILE.workflows/<run_id>/result.json`, matching `scripts/workflow.py`'s layout."""
+        run_dir = os.path.join(session_path + ".workflows", run_id)
+        os.makedirs(run_dir, exist_ok=True)
+        path = os.path.join(run_dir, "result.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(result, handle)
+        return path
+
+    def run_report(self, run_id: str, outcome: str = "completed", steps: int = 2,
+                   run_dir: str | None = None) -> dict:
+        return {
+            "id": run_id, "outcome": outcome, "value": None,
+            "counts": {"steps": steps, "replayed": 0, "done": steps, "blocked": 0,
+                      "failed": 0, "cancelled": 0, "not_verified": 0, "capped": 0,
+                      "invalid_output": 0},
+            "steps": [{"call": f"c{i}", "label": "x", "role": "worker",
+                      "model": "claude/claude-opus-5-5", "worker": "w1", "status": "done",
+                      "schema": "not requested", "evidence": "not verified", "attempts": 1,
+                      "replayed": False, "error": None} for i in range(steps)],
+            "error": None, "run_dir": run_dir or f"/tmp/{run_id}",
+        }
+
+    def test_no_workflows_directory_is_empty(self) -> None:
+        path = self.write_journal("session.jsonl", PARENT_RECORDS)
+        report = self.report(path)
+        self.assertEqual(report["workflows"], [])
+        self.assertEqual(report["workflows_started"], 0)
+
+    def test_workflow_runs_are_discovered_and_sorted_naturally(self) -> None:
+        path = self.write_journal("session.jsonl", PARENT_RECORDS)
+        self.write_result(path, "wf10", self.run_report("wf10", steps=3, run_dir="/r/wf10"))
+        self.write_result(path, "wf2", self.run_report(
+            "wf2", outcome="completed_with_issues", steps=1, run_dir="/r/wf2"))
+        report = self.report(path)
+        self.assertEqual(report["workflows_started"], 2)
+        # wf2 before wf10: natural order, not lexical.
+        self.assertEqual([w["id"] for w in report["workflows"]], ["wf2", "wf10"])
+        self.assertEqual(report["workflows"][0], {
+            "id": "wf2", "outcome": "completed_with_issues",
+            "counts": self.run_report("wf2", steps=1)["counts"], "steps": 1, "run_dir": "/r/wf2",
+        })
+        self.assertEqual(report["workflows"][1]["steps"], 3)
+        self.assertEqual(report["workflows"][1]["run_dir"], "/r/wf10")
+
+    def test_malformed_result_json_exits_instead_of_crashing_with_a_traceback(self) -> None:
+        path = self.write_journal("session.jsonl", PARENT_RECORDS)
+        run_dir = os.path.join(path + ".workflows", "wf1")
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, "result.json"), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        with self.assertRaises(SystemExit):
+            self.report(path)
+        done = subprocess.run([sys.executable, SCRIPT, path], capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("Traceback", done.stderr)
+
     # --- the CLI -----------------------------------------------------------
 
     def test_cli_prints_the_new_fields(self) -> None:

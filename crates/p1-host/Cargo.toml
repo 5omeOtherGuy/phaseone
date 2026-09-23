@@ -16,8 +16,11 @@ workspace = true
 [features]
 # Delegation tools and the in-process worker service. Off => the four
 # `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
-default = ["delegation"]
+default = ["delegation", "workflows"]
 delegation = ["dep:p1-workers", "dep:p1-tool-delegate"]
+# Workflows (ADR-0053): the engine and its four tools, composed over the worker
+# service. Off => the four `workflow_*` catalog keys are unknown modules.
+workflows = ["delegation", "dep:p1-workflow", "dep:p1-tool-workflow"]
 
 [dependencies]
 p1-assembly = { path = "../p1-assembly" }
@@ -42,6 +45,8 @@ p1-provider-openai-chat = { path = "../p1-provider-openai-chat" }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-workers = { path = "../p1-workers", optional = true }
 p1-tool-delegate = { path = "../p1-tool-delegate", optional = true }
+p1-workflow = { path = "../p1-workflow", optional = true }
+p1-tool-workflow = { path = "../p1-tool-workflow", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Route files are TOML data; `parse` is all this crate needs, exactly like the profile

@@ -69,6 +69,33 @@ macro_rules! apply_delegate_face {
     }};
 }
 
+/// Same override rules as [`apply_face`], for the workflow tools' own `ToolFace`
+/// type.
+#[cfg(feature = "workflows")]
+macro_rules! apply_workflow_face {
+    ($tool:expr, $spec:expr) => {{
+        let tool = $tool;
+        if $spec.name.is_none() && $spec.description.is_none() && $spec.variant.is_none() {
+            Arc::new(tool) as Arc<dyn Tool>
+        } else {
+            let name = $spec
+                .name
+                .clone()
+                .unwrap_or_else(|| tool.declaration().name.clone());
+            let description = $spec
+                .description
+                .clone()
+                .unwrap_or_else(|| tool.declaration().description.clone());
+            let variant = $spec
+                .variant
+                .clone()
+                .unwrap_or_else(|| tool.identity().variant.clone());
+            Arc::new(tool.with_face(p1_tool_workflow::ToolFace::new(name, description), &variant))
+                as Arc<dyn Tool>
+        }
+    }};
+}
+
 /// Same override rules as [`apply_face`], for the `finish` tool's own `ToolFace`
 /// type.
 macro_rules! apply_finish_face {
@@ -164,6 +191,8 @@ pub fn build_catalog_with_workers(
         completion,
     );
     register_delegation_tools(&mut catalog, deps, service)?;
+    #[cfg(feature = "workflows")]
+    register_workflow_tools(&mut catalog, deps.workflow_service.clone());
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
@@ -639,12 +668,14 @@ fn register_delegation_tools(
 
     // What a parent may grant is the host's own knowledge, never a compiled list in
     // the tool crate: every tool module this catalog registers, minus `finish` (the
-    // factory adds it to every worker) and the `worker_*` modules (a worker never
-    // delegates). The environments a worker may run are the host's environment dirs.
+    // factory adds it to every worker), the `worker_*` modules (a worker never
+    // delegates) and the `workflow_*` modules (a worker never orchestrates). The environments a worker may run are the host's environment dirs.
     let grantable: Vec<String> = catalog
         .tool_keys()
         .into_iter()
-        .filter(|key| key != "finish" && !key.starts_with("worker_"))
+        .filter(|key| {
+            key != "finish" && !key.starts_with("worker_") && !key.starts_with("workflow_")
+        })
         .collect();
     let environments = crate::models::environment_names(&deps.environment_dirs)?;
 
@@ -696,4 +727,60 @@ fn register_delegation_tools(
         }),
     );
     Ok(())
+}
+
+/// The four `workflow_*` tools over `service` (ADR-0053 item 7). Without a service the
+/// keys are not registered at all, so an environment naming one gets the ordinary
+/// `UnknownToolModule`.
+#[cfg(feature = "workflows")]
+pub(crate) fn register_workflow_tools(
+    catalog: &mut Catalog,
+    service: Option<Arc<dyn p1_workflow::WorkflowService>>,
+) {
+    let Some(service) = service else {
+        return;
+    };
+
+    let service_for = service.clone();
+    catalog.tool(
+        "workflow_start",
+        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
+            Ok(apply_workflow_face!(
+                p1_tool_workflow::WorkflowStartTool::new(service_for.clone()),
+                spec
+            ))
+        }),
+    );
+
+    let service_for = service.clone();
+    catalog.tool(
+        "workflow_status",
+        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
+            Ok(apply_workflow_face!(
+                p1_tool_workflow::WorkflowStatusTool::new(service_for.clone()),
+                spec
+            ))
+        }),
+    );
+
+    let service_for = service.clone();
+    catalog.tool(
+        "workflow_result",
+        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
+            Ok(apply_workflow_face!(
+                p1_tool_workflow::WorkflowResultTool::new(service_for.clone()),
+                spec
+            ))
+        }),
+    );
+
+    catalog.tool(
+        "workflow_cancel",
+        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
+            Ok(apply_workflow_face!(
+                p1_tool_workflow::WorkflowCancelTool::new(service.clone()),
+                spec
+            ))
+        }),
+    );
 }

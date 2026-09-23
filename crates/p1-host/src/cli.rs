@@ -5,6 +5,7 @@
 //! [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
 //! `p1 models [SEARCH]`
 //! `p1 env show NAME`
+//! `p1 workflow run FILE [--arg k=v]… [--args FILE] [--role r=E/P[:effort]]…`
 //! `p1 login <route>` / `p1 login --list` / `p1 logout <route>`
 //! `p1 --help` / `p1 --version`
 
@@ -66,9 +67,31 @@ pub enum Command {
     },
     /// The route quota ledger (ADR-0052): `p1 usage`.
     Usage(UsageOptions),
+    /// Run one workflow script with no parent agent (ADR-0053): `p1 workflow run`.
+    WorkflowRun(WorkflowRunOptions),
     Help,
     Version,
 }
+
+/// Parsed arguments for `p1 workflow run`. `args` and `args_file` stay text here: the
+/// file is read and the JSON built when the command runs, so `parse` touches no file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunOptions {
+    pub file: PathBuf,
+    /// `--arg k=v`, in order; laid over `--args FILE`.
+    pub args: Vec<(String, String)>,
+    /// `--args FILE`: a JSON object (arguments too large for a command line).
+    pub args_file: Option<PathBuf>,
+    /// `--role r=E/P[:effort]`, in order.
+    pub roles: Vec<(String, String)>,
+    pub resume_from: Option<String>,
+    /// `--out DIR`: where the run's directory goes.
+    pub out: Option<PathBuf>,
+    pub max_workers: usize,
+}
+
+/// `--max-workers` when it is not given.
+pub const DEFAULT_MAX_WORKERS: usize = 2;
 
 /// Parsed arguments for `p1 usage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,9 +149,13 @@ pub struct Options {
 }
 
 impl Options {
-    /// Headless means a PROMPT was supplied. Used by the authorization policy.
+    /// Headless means a PROMPT was supplied, or a workflow runs unattended. Used by
+    /// the authorization policy.
     pub fn is_headless(&self) -> bool {
-        matches!(self.command, Command::Run { prompt: Some(_) })
+        matches!(
+            self.command,
+            Command::Run { prompt: Some(_) } | Command::WorkflowRun(_)
+        )
     }
 }
 
@@ -156,6 +183,9 @@ pub fn usage() -> String {
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str("  p1 env show NAME\n");
+    out.push_str(
+        "  p1 workflow run FILE [--arg K=V]… [--args FILE] [--role R=E/P[:effort]]…\n     [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]\n     [--max-workers N] [--yes]\n                       run a workflow script without a parent agent; `--arg`\n                       values that parse as JSON are passed as JSON, and lie over\n                       the JSON object in `--args FILE`; exit 0 completed,\n                       2 completed with issues, 1 failed, 130 cancelled\n",
+    );
     out.push_str("  p1 usage [--json] [--watch SECONDS] [--plain] [--grid N] [SEARCH]   route quota ledger\n");
     out.push_str("  p1 login <route>     read one API key from stdin and store it for ROUTE\n");
     out.push_str("  p1 login --list      every route, its credential kind and its source\n");
@@ -235,6 +265,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         }
         if first == "logout" {
             return parse_logout(args);
+        }
+        if first == "workflow" {
+            return parse_workflow(args);
         }
     }
 
@@ -527,6 +560,92 @@ fn parse_usage(args: &[String]) -> Result<Options, CliError> {
         grid,
         search,
     })))
+}
+
+/// `p1 workflow run FILE …` (ADR-0053). Only `run` exists; the sub-command is still
+/// required so `p1 workflow FILE` is not silently a run.
+fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
+    const USAGE: &str = "usage: p1 workflow run FILE [--arg K=V]… [--args FILE] \
+                         [--role R=E/P[:effort]]… [--resume-from ID] [--out DIR] \
+                         [--workspace DIR] [--session FILE] [--max-workers N] [--yes]";
+    if args.get(1).map(String::as_str) != Some("run") {
+        return Err(CliError {
+            message: USAGE.to_string(),
+        });
+    }
+    let pair = |flag: &str, value: String| -> Result<(String, String), CliError> {
+        match value.split_once('=') {
+            Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
+            _ => Err(CliError {
+                message: format!("{flag} requires KEY=VALUE, got `{value}`"),
+            }),
+        }
+    };
+    let mut file: Option<PathBuf> = None;
+    let mut workflow = WorkflowRunOptions {
+        file: PathBuf::new(),
+        args: Vec::new(),
+        args_file: None,
+        roles: Vec::new(),
+        resume_from: None,
+        out: None,
+        max_workers: DEFAULT_MAX_WORKERS,
+    };
+    let (mut workspace, mut session) = (None, None);
+    let mut index = 2;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--arg" => workflow
+                .args
+                .push(pair(arg, take_value(args, &mut index, arg)?)?),
+            "--args" => {
+                workflow.args_file = Some(PathBuf::from(take_value(args, &mut index, arg)?))
+            }
+            "--role" => workflow
+                .roles
+                .push(pair(arg, take_value(args, &mut index, arg)?)?),
+            "--resume-from" => workflow.resume_from = Some(take_value(args, &mut index, arg)?),
+            "--out" => workflow.out = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
+            "--workspace" => workspace = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
+            "--session" => session = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
+            "--max-workers" => {
+                let value = take_value(args, &mut index, arg)?;
+                workflow.max_workers =
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| CliError {
+                            message: "--max-workers requires a positive number".into(),
+                        })?;
+            }
+            // Full access is already the default; accepted like the run's `--yes`.
+            "--yes" => {}
+            other if other.starts_with('-') => {
+                return Err(CliError {
+                    message: format!("unknown flag `{other}`"),
+                });
+            }
+            other if file.is_none() => file = Some(PathBuf::from(other)),
+            other => {
+                return Err(CliError {
+                    message: format!("unexpected argument `{other}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    let Some(file) = file else {
+        return Err(CliError {
+            message: USAGE.to_string(),
+        });
+    };
+    workflow.file = file;
+    let mut options = defaults(Command::WorkflowRun(workflow));
+    options.workspace = workspace;
+    options.session = session;
+    Ok(options)
 }
 
 /// `p1 login <route>` and `p1 login --list` (ADR-0044, spec §6). The key is never an
