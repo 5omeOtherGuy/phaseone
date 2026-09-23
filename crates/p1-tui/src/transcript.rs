@@ -8,12 +8,16 @@
 //! plain data, so the whole transcript is fixture-testable without a runtime.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::face::{CallFace, GenericDescriber, ResultFace, ToolDescriber};
 
 use p1_contracts::{AgentEvent, ToolCall, ToolResultItem, ToolStatus, TurnEnd};
 
 use crate::fold::{Fold, FoldId};
 
 /// One block in the transcript. Order is history; nothing is re-sorted.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     /// `›` operator input — the one marked turn.
@@ -54,6 +58,11 @@ pub struct ToolRow {
     /// The fold handle when the output was registered (the `^O open` hint).
     pub fold: Option<crate::fold::FoldId>,
     pub elapsed_ms: Option<u64>,
+    pub call_id: String,
+    pub call: Option<ToolCall>,
+    pub face: CallFace,
+    pub result_face: Option<ResultFace>,
+    pub input_preview: Option<String>,
 }
 
 /// The lifecycle of a call row: running, then settled with the tool's status.
@@ -72,7 +81,11 @@ impl ToolRow {
         let output = self.output.as_deref()?;
         match self.status {
             RowStatus::Settled(ToolStatus::Ok) => None,
-            RowStatus::Settled(_) => Some(Fold::present(output)),
+            RowStatus::Settled(_) => Some(Fold::present_bounded(
+                output,
+                false,
+                self.face.kind == crate::face::TargetKind::Command,
+            )),
             RowStatus::Running => None,
         }
     }
@@ -80,7 +93,6 @@ impl ToolRow {
 
 /// The transcript: blocks in order, plus the registry of full outputs behind
 /// fold handles so `^O` opens the same object the transcript folded away.
-#[derive(Debug, Default)]
 pub struct Transcript {
     pub blocks: Vec<Block>,
     outputs: HashMap<FoldId, String>,
@@ -92,11 +104,39 @@ pub struct Transcript {
     /// Call rows not yet settled, by provider call id, so a result settles the
     /// row its call started.
     running: HashMap<String, usize>,
+    describer: Arc<dyn ToolDescriber>,
+}
+
+impl std::fmt::Debug for Transcript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transcript")
+            .field("blocks", &self.blocks)
+            .field("latest_fold", &self.latest_fold)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Transcript {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Transcript {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_describer(Arc::new(GenericDescriber))
+    }
+
+    pub fn with_describer(describer: Arc<dyn ToolDescriber>) -> Self {
+        Self {
+            blocks: Vec::new(),
+            outputs: HashMap::new(),
+            latest_fold: None,
+            open_text: None,
+            open_reasoning: None,
+            running: HashMap::new(),
+            describer,
+        }
     }
 
     /// The full output behind a fold handle (`^O` opens it in the pane).
@@ -120,7 +160,8 @@ impl Transcript {
             AgentEvent::TurnStarted | AgentEvent::RequestStarted { .. } => {}
             AgentEvent::TextDelta { text } => self.text_delta(text),
             AgentEvent::ReasoningDelta { text } => self.reasoning_delta(text),
-            AgentEvent::ToolInputDelta { .. } | AgentEvent::ProviderNotice { .. } => {}
+            AgentEvent::ToolInputDelta { call_id, text } => self.tool_input_delta(call_id, text),
+            AgentEvent::ProviderNotice { .. } => {}
             AgentEvent::ResponseCompleted { .. } => self.close_streams(),
             AgentEvent::InboxDelivered { count } => {
                 self.blocks.push(Block::Meta {
@@ -139,7 +180,7 @@ impl Transcript {
                     text: format!("context: summarized {items_before} → {items_after} items"),
                 });
             }
-            AgentEvent::ToolStarted { call } => self.tool_started(call),
+            AgentEvent::ToolStarted { call } => self.tool_started(call, elapsed_ms),
             AgentEvent::ToolFinished { result } => self.tool_finished(result, elapsed_ms),
             AgentEvent::TurnFinished { end } => self.turn_finished(end),
         }
@@ -186,19 +227,68 @@ impl Transcript {
         }
     }
 
-    fn tool_started(&mut self, call: &ToolCall) {
+    fn tool_started(&mut self, call: &ToolCall, elapsed_ms: Option<u64>) {
         self.close_streams();
-        self.blocks.push(Block::Call(ToolRow {
+        let face = self.describer.call(call);
+        let existing = self
+            .running
+            .remove(&call.call_id)
+            .filter(|index| matches!(self.blocks.get(*index), Some(Block::Call(_))));
+        let row = ToolRow {
             name: call.name.clone(),
-            summary: summarize_call(&call.name, call.input.raw()),
+            summary: face.target.clone(),
+            status: RowStatus::Running,
+            output: None,
+            line_count: 0,
+            fold: None,
+            elapsed_ms,
+            call_id: call.call_id.clone(),
+            call: Some(call.clone()),
+            face,
+            result_face: None,
+            input_preview: None,
+        };
+        let index = if let Some(index) = existing {
+            self.blocks[index] = Block::Call(row);
+            index
+        } else {
+            self.blocks.push(Block::Call(row));
+            self.blocks.len() - 1
+        };
+        self.running.insert(call.call_id.clone(), index);
+    }
+
+    fn tool_input_delta(&mut self, call_id: &str, text: &str) {
+        if let Some(index) = self.running.get(call_id).copied()
+            && let Some(Block::Call(row)) = self.blocks.get_mut(index)
+        {
+            let preview = row.input_preview.get_or_insert_with(String::new);
+            preview.push_str(text);
+            row.summary = summarize_input(preview.lines().last().unwrap_or(preview));
+            row.input_preview = Some(preview.clone());
+            return;
+        }
+        let preview = text.to_string();
+        let face = CallFace {
+            target: summarize_input(preview.lines().last().unwrap_or(&preview)),
+            kind: crate::face::TargetKind::Plain,
+        };
+        self.blocks.push(Block::Call(ToolRow {
+            name: String::new(),
+            summary: face.target.clone(),
             status: RowStatus::Running,
             output: None,
             line_count: 0,
             fold: None,
             elapsed_ms: None,
+            call_id: call_id.to_string(),
+            call: None,
+            face,
+            result_face: None,
+            input_preview: Some(preview),
         }));
         self.running
-            .insert(call.call_id.clone(), self.blocks.len() - 1);
+            .insert(call_id.to_string(), self.blocks.len() - 1);
     }
 
     fn tool_finished(&mut self, result: &ToolResultItem, elapsed_ms: Option<u64>) {
@@ -208,6 +298,7 @@ impl Transcript {
             RowStatus::Settled(result.status),
             &result.content,
             elapsed_ms,
+            Some(result),
         );
     }
 
@@ -221,6 +312,7 @@ impl Transcript {
         status: RowStatus,
         content: &str,
         elapsed_ms: Option<u64>,
+        result: Option<&ToolResultItem>,
     ) {
         let index = match self.running.remove(call_id) {
             Some(index) => index,
@@ -233,6 +325,14 @@ impl Transcript {
                     line_count: 0,
                     fold: None,
                     elapsed_ms: None,
+                    call_id: call_id.to_string(),
+                    call: None,
+                    face: CallFace {
+                        target: String::new(),
+                        kind: crate::face::TargetKind::Plain,
+                    },
+                    result_face: None,
+                    input_preview: None,
                 }));
                 self.blocks.len() - 1
             }
@@ -242,6 +342,11 @@ impl Transcript {
         };
         row.status = status;
         row.elapsed_ms = elapsed_ms;
+        if let Some(result) = result
+            && let Some(call) = row.call.as_ref()
+        {
+            row.result_face = Some(self.describer.result(call, result));
+        }
         row.line_count = content.lines().count();
         if !content.is_empty() {
             match status {
@@ -308,7 +413,7 @@ impl Transcript {
                                     elapsed_ms: None,
                                 });
                             }
-                            AssistantBlock::ToolCall(call) => self.tool_started(call),
+                            AssistantBlock::ToolCall(call) => self.tool_started(call, None),
                         }
                     }
                 }
@@ -318,6 +423,7 @@ impl Transcript {
                     RowStatus::Settled(result.status),
                     &result.content,
                     None,
+                    Some(result),
                 ),
             }
         }
@@ -334,6 +440,7 @@ impl Transcript {
                 "?",
                 RowStatus::Settled(ToolStatus::Unknown),
                 "",
+                None,
                 None,
             );
         }
@@ -373,24 +480,20 @@ pub fn summarize_input(raw: &str) -> String {
 
 /// The display summary for a call: the salient field when the input is JSON
 /// with one, else the bounded raw input.
-pub fn summarize_call(name: &str, raw: &str) -> String {
-    let key = match name {
-        "shell" => "command",
-        "edit" | "patch" | "write" | "read" => "file_path",
-        "search" => "pattern",
-        "finish" => "status",
-        "worker_start" => "task",
-        _ => "",
-    };
-    if let Some(value) = json_string_field(raw, key) {
-        return summarize_input(value);
-    }
-    summarize_input(raw)
+pub fn summarize_call(_name: &str, raw: &str) -> String {
+    crate::face::GenericDescriber
+        .call(&ToolCall {
+            call_id: String::new(),
+            name: String::new(),
+            input: p1_contracts::ToolInput::Text(raw.to_string()),
+        })
+        .target
 }
 
 /// Extract a string field's value from flat JSON, for DISPLAY only: this is a
 /// summary, not a parse — a miss or an escape edge case shows the raw input
 /// instead. p1-tui carries no JSON dependency for a display hint.
+#[allow(dead_code)]
 fn json_string_field<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
     if key.is_empty() {
         return None;
@@ -465,14 +568,8 @@ mod tests {
     fn summarize_call_falls_back_to_the_raw_input() {
         // An unmapped tool, or a miss on the salient key, shows the bounded
         // raw input rather than nothing.
-        assert_eq!(
-            summarize_call("worker_stop", r#"{"id":"w1"}"#),
-            r#"{"id":"w1"}"#
-        );
-        assert_eq!(
-            summarize_call("shell", r#"{"cmd":"ls"}"#),
-            r#"{"cmd":"ls"}"#
-        );
+        assert_eq!(summarize_call("unmapped", r#"{"id":"w1"}"#), "w1");
+        assert_eq!(summarize_call("unmapped", r#"{"cmd":"ls"}"#), "ls");
     }
 
     #[test]

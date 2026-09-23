@@ -9,9 +9,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// Output of at most this many lines renders in full as a bounded block.
-pub const FULL_BLOCK_MAX_LINES: usize = 40;
-/// A folded block shows this many head lines above its handle line.
+/// Outputs through this threshold render in full.
+pub const FULL_BLOCK_MAX_LINES: usize = 12;
+/// Folded blocks keep this many lines (four in short screens).
 pub const FOLD_HEAD_LINES: usize = 8;
 
 /// A stable fold handle, e.g. `h-7c21ab90`. Stable because it is a content
@@ -51,14 +51,24 @@ impl Fold {
     /// Decide the presentation of one tool output. `content` is EXACTLY what
     /// the model saw; the transcript never invents a shorter truth, it folds.
     pub fn present(content: &str) -> Self {
+        Self::present_bounded(content, false, false)
+    }
+
+    /// `short` is the compact-height keep rule; `tail` preserves the latest shell evidence.
+    pub fn present_bounded(content: &str, short: bool, tail: bool) -> Self {
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
         if lines.len() <= FULL_BLOCK_MAX_LINES {
             return Self::Full { lines };
         }
-        let head = lines[..FOLD_HEAD_LINES].to_vec();
+        let keep = if short { 4 } else { FOLD_HEAD_LINES };
+        let kept = if tail {
+            lines[lines.len() - keep..].to_vec()
+        } else {
+            lines[..keep].to_vec()
+        };
         Self::Folded {
-            head,
-            folded: lines.len() - FOLD_HEAD_LINES,
+            head: kept,
+            folded: lines.len() - keep,
             id: FoldId::of(content),
         }
     }

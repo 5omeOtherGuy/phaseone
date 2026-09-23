@@ -7,6 +7,7 @@
 //! those sections are not negotiable.
 
 pub mod band;
+pub mod face;
 pub mod fold;
 pub mod geometry;
 pub mod glyphs;

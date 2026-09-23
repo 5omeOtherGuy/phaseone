@@ -3,6 +3,7 @@
 //! placement) is the caller's one mechanical step. Keeping renderers line-
 //! shaped makes every screen snapshot-testable against `TestBackend`.
 
+pub mod block;
 pub mod composer;
 pub mod diff;
 mod home;

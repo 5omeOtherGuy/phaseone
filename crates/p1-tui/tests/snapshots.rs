@@ -173,9 +173,12 @@ fn streaming_at_120x40() {
     assert!(text[2].starts_with("· reasoning"));
     assert!(text[2].ends_with("^R expand"));
     assert!(text[3].starts_with("The hard-pressure wait"));
-    assert!(text[5].starts_with("✓ read      p1-context/src/edge.rs"));
-    assert!(text[5].ends_with("412 lines"));
-    assert_eq!(text[6], "▸ shell     cargo test -p p1-context boundary");
+    // Tool calls are three-band Blocks (handoff §7): `▸` left, the outcome right.
+    assert!(text[5].starts_with("  ▸ read      p1-context/src/edge.rs"));
+    assert!(text[5].ends_with("✓ 412 lines"));
+    // An ok call's 412-line output is registered for ^O, never folded inline (§7.1).
+    assert!(!text.iter().any(|row| row.contains("folded")));
+    assert!(text[6].starts_with("  ▸ shell     cargo test -p p1-context boundary"));
     assert!(text[7].starts_with("▪▪▪ shell"));
     // The inset transcript, composer and statusline occupy the §4 geometry rows.
     let layout = p1_tui::geometry::layout(120, 40, s.pane_width, false, 2);
@@ -261,8 +264,11 @@ fn fold_block_screen() {
     // The failure promoted a PEEK banner over the ledger (SPEC §5).
     assert!(full[1].contains("shell failed"));
     let text = left(&full, 80);
-    assert!(text[1].starts_with("✗ shell"));
-    assert_eq!(text[2], "  test line 0");
+    assert!(text[1].starts_with("  ▸ shell"));
+    // The generic face states the line count; elapsed and exit code come from the host describer.
+    assert!(text[1].ends_with("✗ 94 lines"), "{}", text[1]);
+    // Body rows sit at the band padding plus the 2-cell body indent (§7.1).
+    assert_eq!(text[2], "    test line 0");
     // The fold handle is stable, addressable, FAINT metadata.
     assert!(text[10].contains("more lines folded → [h-"));
 }
