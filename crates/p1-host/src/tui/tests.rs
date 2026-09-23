@@ -56,6 +56,8 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             )),
             context_window: None,
             context_warn_at: None,
+            pending_worker_starts: HashMap::new(),
+            worker_details: Arc::new(Mutex::new(HashMap::new())),
             model_switch: None,
             environment_dirs: Vec::new(),
             route_label: Arc::new(Mutex::new(String::new())),
@@ -80,6 +82,38 @@ fn typing_and_enter_submits_a_prompt() {
         d.screen.transcript.blocks[0],
         p1_tui::transcript::Block::Operator { .. }
     ));
+}
+
+#[test]
+fn home_prelude_is_attached_to_the_driver_screen_with_workspace_and_current_model() {
+    let (mut d, _auth) = driver();
+    let workspace = tempfile::tempdir().unwrap();
+    d.screen.home = Some(home_prelude(
+        workspace.path(),
+        Some("task/test".into()),
+        "claude",
+        "sonnet-4.5",
+        false,
+    ));
+    let home = d.screen.home.as_ref().unwrap();
+    assert_eq!(home.path, workspace.path().to_string_lossy());
+    assert_eq!(
+        display_workspace_path(
+            std::path::Path::new("/tmp/fake-home/project"),
+            Some(std::ffi::OsStr::new("/tmp/fake-home")),
+        ),
+        "~/project"
+    );
+    assert_eq!(home.branch.as_deref(), Some("task/test"));
+    assert!(
+        home.items
+            .iter()
+            .any(|(command, text)| command == "/env" && text == "claude · sonnet-4.5")
+    );
+    assert_eq!(
+        home.items[0],
+        ("/resume".into(), "reopen a previous session".into())
+    );
 }
 
 #[test]
@@ -286,6 +320,8 @@ fn report_switch_ok_renders_the_transition_and_moves_the_driver_state() {
     assert_eq!(d.env, "gpt");
     assert_eq!(d.model, "gpt/5.1:high");
     assert_eq!(d.screen.statusbar.effort.as_deref(), Some("high"));
+    assert_eq!(d.screen.session.as_ref().unwrap().effort, "high");
+    assert_eq!(d.screen.session.as_ref().unwrap().model, "gpt/5.1:high");
     let p1_tui::transcript::Block::Meta { text } = &d.screen.transcript.blocks[0] else {
         panic!(
             "expected a meta row, got {:?}",
@@ -323,6 +359,13 @@ fn response_completed_computes_ctx_from_the_configured_window() {
     let (mut d, _auth) = driver();
     d.context_window = Some(120_000);
     d.context_warn_at = Some(90_000);
+    d.screen.context = Some(p1_tui::render::ledger::ContextView {
+        used: None,
+        window: 120_000,
+        summarize_at: 90_000,
+        parts: vec![],
+    });
+    assert_eq!(d.screen.context.as_ref().unwrap().used, None);
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
         worker: None,
         at_ms: 1_000,
@@ -337,6 +380,9 @@ fn response_completed_computes_ctx_from_the_configured_window() {
     }));
     assert_eq!(d.screen.statusbar.ctx.as_deref(), Some("50%"));
     assert!(!d.screen.statusbar.ctx_warn);
+    assert_eq!(d.screen.context.as_ref().unwrap().used, Some(60_000));
+    assert_eq!(d.screen.context.as_ref().unwrap().window, 120_000);
+    assert!(d.screen.context.as_ref().unwrap().parts.is_empty());
 }
 
 /// A driver plus the agent whose inbox handle it holds.
@@ -458,6 +504,32 @@ async fn an_auth_request_becomes_the_approval_view_and_answers() {
     assert_eq!(pending.await.unwrap(), Decision::Permit);
     assert!(d.screen.approval.is_none());
     assert!(!d.screen.pinned);
+}
+
+#[cfg(feature = "delegation")]
+#[test]
+fn worker_start_event_supplies_task_and_grants_to_the_worker_snapshot() {
+    let (mut d, _auth) = driver();
+    let call = p1_contracts::ToolCall {
+        call_id: "start-1".into(),
+        name: "worker_start".into(),
+        input: p1_contracts::ToolInput::Json(
+            r#"{"task":"Inspect the parser\nsecond line","tools":["read","edit"]}"#.into(),
+        ),
+    };
+    d.track_task(&p1_contracts::AgentEvent::ToolStarted { call });
+    d.track_task(&p1_contracts::AgentEvent::ToolFinished {
+        result: p1_contracts::ToolResultItem {
+            call_id: "start-1".into(),
+            name: "worker_start".into(),
+            status: p1_contracts::ToolStatus::Ok,
+            content: "Started worker w1 on deepseek/v4.1-flash with tools: read, edit, finish. You will be notified when it finishes.".into(),
+        },
+    });
+    assert_eq!(
+        d.worker_details.lock().unwrap().get("w1"),
+        Some(&("Inspect the parser".into(), "read, edit, finish".into()))
+    );
 }
 
 #[test]
