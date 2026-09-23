@@ -91,7 +91,7 @@ OPEN ITEMS (issue numbers)
 ## Workflows (orchestrator session)
 
 Owned by the Fable 5.1 Claude Code orchestrator session (brief:
-`../phaseone-briefs/workflows-orchestrator.md`; ADR-0052 proposed; engine rhai per the spikes in
+`../phaseone-briefs/workflows-orchestrator.md`; ADR-0053 proposed; engine rhai per the spikes in
 `../phaseone-spikes/`). The orchestrator writes its progress HERE and nowhere else in this file:
 - (not started)
 
