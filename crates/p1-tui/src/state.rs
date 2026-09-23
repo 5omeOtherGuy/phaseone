@@ -401,21 +401,19 @@ impl Screen {
     }
 
     /// Observe one agent event: transcript first, then the state the event
-    /// moves (working indicator, spend, promotion). `now_ms` times the call
-    /// rows: a result's elapsed is measured from its start's stamp.
+    /// moves (working indicator, spend, promotion). `now_ms` is the event's
+    /// stamp: the transcript times the turn, reasoning and call rows from it.
     pub fn apply(&mut self, event: &AgentEvent, now_ms: u64) {
-        let elapsed = match event {
+        match event {
             AgentEvent::ToolStarted { call } => {
                 self.call_started.insert(call.call_id.clone(), now_ms);
-                None
             }
-            AgentEvent::ToolFinished { result } => self
-                .call_started
-                .remove(&result.call_id)
-                .map(|started| now_ms.saturating_sub(started)),
-            _ => None,
-        };
-        self.transcript.apply(event, elapsed);
+            AgentEvent::ToolFinished { result } => {
+                self.call_started.remove(&result.call_id);
+            }
+            _ => {}
+        }
+        self.transcript.apply(event, Some(now_ms));
         match event {
             AgentEvent::TurnStarted => {
                 self.working = Some(Working {

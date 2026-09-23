@@ -1,4 +1,5 @@
-//! Static synapse mark for the unused welcome area.
+//! The home monogram (handoff §6.11): the `p1` node layout drawn as BLOCK+
+//! cells in the unused transcript rows, with the name and the motto below.
 use crate::palette;
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
@@ -9,8 +10,19 @@ const GLYPH_ONE: [&str; 9] = [
     "00100", "01100", "00100", "00100", "00100", "00100", "01110", "00000", "00000",
 ];
 
+/// Each node is two cells wide, so it reads square in a terminal cell grid.
+const NODE_CELLS: u16 = 2;
+/// Two 5-node letters, one node apart.
+const MARK_WIDTH: u16 = (5 + 1 + 5) * NODE_CELLS;
+const MARK_HEIGHT: u16 = GLYPH_P.len() as u16;
+/// The mark, a blank row, `phaseone`, a blank row, the motto.
+const HOME_HEIGHT: u16 = MARK_HEIGHT + 4;
+/// Below this free area there is no mark and no words (§6.11).
+const MIN_WIDTH: u16 = 30;
+const MIN_HEIGHT: u16 = 14;
+
 fn centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) {
-    let width = text.chars().count() as u16;
+    let width = crate::wrap::cell_width(text) as u16;
     if width <= area.width && y < area.bottom() {
         buf.set_string(
             area.x + (area.width - width) / 2,
@@ -21,52 +33,34 @@ fn centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) {
     }
 }
 
-pub(super) fn draw(area: Rect, buf: &mut Buffer) {
-    if area.height < 5 || area.width < 11 {
+/// Draw the monogram centred in `area`, the free transcript rows. The mark is
+/// background only — no glyph — so NO_COLOR, which drops backgrounds, shows no mark.
+pub fn draw(area: Rect, buf: &mut Buffer) {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         return;
     }
-    let show_mark = area.width >= 19 && area.height >= 13;
-    let step_y = if area.width >= 37 && area.height >= 21 {
-        2
-    } else {
-        1
-    };
-    let step_x = step_y * 2;
-    let mark_height = if show_mark { 8 * step_y + 1 } else { 1 };
-    let top = area.y + (area.height - (mark_height + 4)) / 2;
-    if show_mark {
-        let left = area.x + (area.width - (9 * step_x + 1)) / 2;
-        // Same node coordinates and cardinal connections as the approved SVG.
-        for (letter, rows) in [GLYPH_P, GLYPH_ONE].iter().enumerate() {
-            for (y, row) in rows.iter().enumerate() {
-                for (x, byte) in row.bytes().enumerate() {
-                    if byte != b'1' {
-                        continue;
-                    }
-                    let px = left + (x + letter * 6) as u16 * step_x;
-                    let py = top + y as u16 * step_y;
-                    buf[(px, py)].set_char('●').set_fg(palette::INK);
-                    if row.as_bytes().get(x + 1) == Some(&b'1') {
-                        for dx in 1..step_x {
-                            buf[(px + dx, py)].set_char('─').set_fg(palette::DIM);
-                        }
-                    }
-                    if rows.get(y + 1).is_some_and(|r| r.as_bytes()[x] == b'1') {
-                        for dy in 1..step_y {
-                            buf[(px, py + dy)].set_char('│').set_fg(palette::DIM);
-                        }
-                    }
+    let top = area.y + (area.height - HOME_HEIGHT) / 2;
+    let left = area.x + (area.width - MARK_WIDTH) / 2;
+    for (letter, rows) in [GLYPH_P, GLYPH_ONE].iter().enumerate() {
+        for (y, row) in rows.iter().enumerate() {
+            for (x, byte) in row.bytes().enumerate() {
+                if byte != b'1' {
+                    continue;
+                }
+                let px = left + (x + letter * 6) as u16 * NODE_CELLS;
+                for dx in 0..NODE_CELLS {
+                    buf[(px + dx, top + y as u16)]
+                        .set_char(' ')
+                        .set_bg(palette::BLOCK_PLUS);
                 }
             }
         }
-    } else {
-        centered(buf, area, top, "p1", palette::INK);
     }
-    centered(buf, area, top + mark_height + 1, "phaseone", palette::INK);
+    centered(buf, area, top + MARK_HEIGHT + 1, "phaseone", palette::INK);
     centered(
         buf,
         area,
-        top + mark_height + 3,
+        top + MARK_HEIGHT + 3,
         "We love pie",
         palette::DIM,
     );

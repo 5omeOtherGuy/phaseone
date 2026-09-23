@@ -132,20 +132,34 @@ fn mid_stream_working_indicator_and_running_call() {
     let mut s = Screen::new(false);
     play(&mut s, &script(), 4_100);
     let text = render(&mut s, 120, 40, 5_000);
-    // Reasoning is collapsed; the working indicator runs on its own line.
+    // Reasoning is collapsed; the running call carries the working indicator
+    // in its own header, counting from its start stamp (handoff §7.1).
     assert!(text.iter().any(|l| l.contains("· reasoning")));
-    assert!(text.iter().any(|l| l.contains("▪▪▪ shell")));
-    // The running call row has no result yet.
-    assert!(text.iter().any(|l| l.contains("▸ shell")));
+    assert!(
+        text.iter()
+            .any(|l| l.contains("▸ shell") && l.contains("0.9s  ▪▪▪"))
+    );
     // The LED chase is alive: the same cell's brightness differs between two
     // fake times (0 = floor, 275 = cell 0's peak).
-    let styled_early =
-        p1_tui::render::transcript::lines(&s.transcript, 80, usize::MAX, Some("shell"), 0, false);
-    let styled_later =
-        p1_tui::render::transcript::lines(&s.transcript, 80, usize::MAX, Some("shell"), 275, false);
-    let last = styled_early.len() - 1;
+    let first_cell = |now_ms| {
+        let lines = p1_tui::render::transcript::lines(
+            &s.transcript,
+            80,
+            usize::MAX,
+            Some("shell"),
+            now_ms,
+            false,
+        );
+        let header = lines.last().unwrap().clone();
+        header
+            .spans
+            .iter()
+            .find(|span| span.content.contains('▪'))
+            .map(|span| span.style.fg)
+    };
     assert_ne!(
-        styled_early[last].spans[0].style.fg, styled_later[last].spans[0].style.fg,
+        first_cell(0),
+        first_cell(275),
         "the chase cell changes brightness between fake times"
     );
 }
@@ -219,7 +233,8 @@ fn scrolling_reaches_back_and_new_output_never_yanks_the_view() {
     play(&mut s, &script(), 16_600);
     // A small transcript area so the content overflows it.
     render(&mut s, 80, 8, 16_600); // records last_rendered
-    s.scroll_by(6);
+    // The transcript now includes the required ground separator after every event.
+    s.scroll_by(12);
     let text = render(&mut s, 80, 8, 16_600);
     assert!(text.iter().any(|l| l.contains("the summary is held.")));
     // New output while scrolled: the view does NOT snap to the tail.

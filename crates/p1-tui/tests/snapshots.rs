@@ -169,17 +169,22 @@ fn streaming_at_120x40() {
     let screen = render(&mut s, 120, 40, 11_400);
     let text = left(&screen, 80);
     assert_palette_law(&mut s, 120, 40);
-    assert_eq!(text[1], "› why does compaction stall at the turn edge?");
-    assert!(text[2].starts_with("· reasoning"));
-    assert!(text[2].ends_with("^R expand"));
-    assert!(text[3].starts_with("The hard-pressure wait"));
+    // Elements sit at the band padding, one blank row between events (handoff §5, §6.1).
+    assert_eq!(text[1], "  › why does compaction stall at the turn edge?");
+    assert_eq!(text[2], "");
+    assert!(text[3].starts_with("  · reasoning 4.2s"));
+    assert!(text[3].ends_with("^R expand"));
+    assert!(text[5].starts_with("  The hard-pressure wait"));
     // Tool calls are three-band Blocks (handoff §7): `▸` left, the outcome right.
-    assert!(text[5].starts_with("  ▸ read      p1-context/src/edge.rs"));
-    assert!(text[5].ends_with("✓ 412 lines"));
+    assert!(text[8].starts_with("  ▸ read      p1-context/src/edge.rs"));
+    assert!(text[8].ends_with("✓ 412 lines"));
     // An ok call's 412-line output is registered for ^O, never folded inline (§7.1).
     assert!(!text.iter().any(|row| row.contains("folded")));
-    assert!(text[6].starts_with("  ▸ shell     cargo test -p p1-context boundary"));
-    assert!(text[7].starts_with("▪▪▪ shell"));
+    // The running Block counts from its start stamp and carries the `▪▪▪`; no
+    // separate working row while it runs (§6.5, §7.1).
+    assert!(text[10].starts_with("  ▸ shell     cargo test -p p1-context boundary"));
+    assert!(text[10].ends_with("6.0s  ▪▪▪"), "{}", text[10]);
+    assert_eq!(text[11], "");
     // The inset transcript, composer and statusline occupy the §4 geometry rows.
     let layout = p1_tui::geometry::layout(120, 40, s.pane_width, false, 2);
     assert!(
@@ -397,7 +402,7 @@ fn a_failure_states_what_broke_without_a_banner() {
     let text = left(&render(&mut s, 120, 40, 0), 80);
     assert!(
         text.iter()
-            .any(|row| row == "provider failed: Transport: connection dropped")
+            .any(|row| row == "  ✗ connection failed · Transport: connection dropped")
     );
 }
 

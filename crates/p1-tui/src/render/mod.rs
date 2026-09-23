@@ -6,7 +6,7 @@
 pub mod block;
 pub mod composer;
 pub mod diff;
-mod home;
+pub mod home;
 pub mod ledger;
 pub mod output;
 pub mod pane;

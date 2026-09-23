@@ -17,11 +17,22 @@ fn text(buffer: &Buffer) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+/// The slab monogram is BLOCK+ cells inside the transcript area (handoff §6.11).
 fn has_dots(buffer: &Buffer) -> bool {
-    buffer
-        .content
-        .iter()
-        .any(|cell| cell.symbol().chars().any(|ch| ch == '●'))
+    let area = buffer.area;
+    let t = p1_tui::geometry::layout(
+        area.width,
+        area.height,
+        p1_tui::state::PaneWidth::default(),
+        false,
+        2,
+    )
+    .transcript;
+    (t.top()..t.bottom()).any(|y| {
+        (t.left()..t.right()).any(|x| {
+            buffer[(x, y)].bg == p1_tui::palette::BLOCK_PLUS && buffer[(x, y)].symbol() == " "
+        })
+    })
 }
 #[test]
 fn welcome_is_static_without_changing_the_composer() {

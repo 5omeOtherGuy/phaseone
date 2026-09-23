@@ -44,6 +44,26 @@ fn full(line: Line<'static>, width: usize, bg: ratatui::style::Color) -> Line<'s
     Line::from(spans)
 }
 
+/// The three `▪` cells of a live element on `bg` (§3.4).
+pub fn working_segments(bg: ratatui::style::Color, now_ms: u64, reduced_motion: bool) -> Vec<Seg> {
+    (0..glyphs::WORKING_CELLS)
+        .map(|cell| {
+            let fg = glyphs::working_color(palette::LIVE, bg, cell, now_ms, reduced_motion);
+            Seg::new(fg, glyphs::WORKING.to_string())
+        })
+        .collect()
+}
+
+/// A live elapsed time in whole tenths (`4.2s`, never rounded up), minutes
+/// past one (`2m10s`); `—` before the clock is known.
+pub fn live_elapsed(ms: Option<u64>) -> String {
+    match ms {
+        None => crate::render::UNKNOWN.into(),
+        Some(ms) if ms < 60_000 => format!("{}.{}s", ms / 1_000, ms % 1_000 / 100),
+        Some(ms) => crate::render::elapsed(ms),
+    }
+}
+
 pub fn lines(
     row: &ToolRow,
     width: usize,
@@ -58,12 +78,17 @@ pub fn lines_with_approval(
     row: &ToolRow,
     width: usize,
     short: bool,
-    _now_ms: u64,
-    _reduced_motion: bool,
+    now_ms: u64,
+    reduced_motion: bool,
     approval: Option<&InlineApproval>,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let (left_glyph, left_color, mut right) = match row.status {
+        RowStatus::AwaitingApproval => (
+            glyphs::APPROVAL,
+            palette::ATTN,
+            "! awaiting approval".into(),
+        ),
         RowStatus::Running if row.name.is_empty() => (
             glyphs::TOOL,
             palette::DIM,
@@ -75,10 +100,7 @@ pub fn lines_with_approval(
         RowStatus::Running => (
             glyphs::TOOL,
             palette::LIVE,
-            format!(
-                "{}  ▪▪▪",
-                crate::render::elapsed(row.elapsed_ms.unwrap_or(0))
-            ),
+            format!("{}  ▪▪▪", live_elapsed(row.elapsed_ms)),
         ),
         RowStatus::Settled(status) => {
             let (g, _c) = match status {
@@ -112,11 +134,7 @@ pub fn lines_with_approval(
             )
         }
     };
-    let awaiting = approval.is_some()
-        || row
-            .result_face
-            .as_ref()
-            .is_some_and(|f| f.outcome.as_deref() == Some("awaiting approval"));
+    let awaiting = approval.is_some() || row.status == RowStatus::AwaitingApproval;
     if awaiting {
         right = if approval.is_some_and(|a| a.diff) {
             format!(
@@ -179,13 +197,16 @@ pub fn lines_with_approval(
         && !row.name.is_empty()
         && !awaiting
     {
-        vec![
-            seg(
-                palette::DIM,
-                format!("{}  ", crate::render::elapsed(row.elapsed_ms.unwrap_or(0))),
-            ),
-            seg(palette::LIVE, "▪▪▪"),
-        ]
+        let mut live = vec![seg(
+            palette::DIM,
+            format!("{}  ", live_elapsed(row.elapsed_ms)),
+        )];
+        live.extend(working_segments(
+            palette::BLOCK_PLUS,
+            now_ms,
+            reduced_motion,
+        ));
+        live
     } else {
         let (status_glyph, fact) = right.split_once(' ').unwrap_or((&right, ""));
         let color = match status_glyph {

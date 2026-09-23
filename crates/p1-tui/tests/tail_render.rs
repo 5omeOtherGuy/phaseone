@@ -52,5 +52,5 @@ fn a_5000_block_screen_draws_only_the_last_screenful() {
         "the visible rows are consecutive: {nums:?}"
     );
     // The scroll math still sees the whole transcript, not the rendered tail.
-    assert_eq!(s.last_rendered.0, 5_000);
+    assert_eq!(s.last_rendered.0, 9_999);
 }
