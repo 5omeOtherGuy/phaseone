@@ -106,6 +106,7 @@ fn report() -> RunReport {
             not_verified: 1,
             capped: 1,
             invalid_output: 0,
+            fell_back: 0,
         },
         steps: vec![
             StepLine {
@@ -120,6 +121,7 @@ fn report() -> RunReport {
                 attempts: 2,
                 replayed: true,
                 error: None,
+                models: Vec::new(),
             },
             StepLine {
                 call: CallId("c2".into()),
@@ -133,6 +135,7 @@ fn report() -> RunReport {
                 attempts: 0,
                 replayed: false,
                 error: Some("quota_exceeded: cap 3".into()),
+                models: Vec::new(),
             },
         ],
         error: Some("script error".into()),
@@ -281,7 +284,7 @@ async fn status_and_result_rendering() {
     assert_eq!(execute(&result, r#"{"id":"wf1"}"#).await.content, running);
 
     fake.set_status(RunStatus::Ended(report()));
-    let first = "Workflow wf1: completed with issues — 2 steps (1 replayed): 1 done, 0 blocked, 1 failed, 0 cancelled; 1 not verified; 1 capped; 0 invalid output";
+    let first = "Workflow wf1: completed with issues — 2 steps (1 replayed): 1 done, 0 blocked, 1 failed, 0 cancelled; 1 not verified; 1 capped; 0 invalid output; 0 fell back";
     assert_eq!(execute(&status, r#"{"id":"wf1"}"#).await.content, first);
     assert_eq!(
         execute(&result, r#"{"id":"wf1"}"#).await.content,

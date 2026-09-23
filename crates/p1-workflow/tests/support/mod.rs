@@ -127,12 +127,17 @@ impl ScriptedRunner {
 
     /// A repair of the worker that ran `prompt`.
     pub fn queue_repair(&self, prompt: &str, end: StepEnd) {
+        self.queue_repair_result(prompt, Ok(end));
+    }
+
+    /// A repair that ends another way: a route failure, or the runner's own `Err`.
+    pub fn queue_repair_result(&self, prompt: &str, end: Result<StepEnd, String>) {
         let mut script = self.script.lock().unwrap();
         script
             .repairs
             .entry(prompt.to_string())
             .or_default()
-            .push_back(Ok(end));
+            .push_back(end);
     }
 
     pub fn hold(&self, prompt: &str) -> Arc<Hold> {
@@ -304,6 +309,8 @@ impl WorkflowObserver for Recorder {
 pub fn settings() -> WorkflowSettings {
     let role = |model: &str, tools: &[&str]| RoleSpec {
         model: model.to_string(),
+        // No fallback by default (ADR-0054 item 2): a test that wants a chain sets one.
+        fallback: Vec::new(),
         tools: tools.iter().map(|tool| tool.to_string()).collect(),
     };
     let mut roles = BTreeMap::new();
@@ -422,6 +429,7 @@ pub fn kinds(records: &[JournalRecord]) -> Vec<&'static str> {
             JournalRecord::Phase { .. } => "phase",
             JournalRecord::Dispatch { .. } => "dispatch",
             JournalRecord::Capped { .. } => "capped",
+            JournalRecord::Fallback { .. } => "fallback",
             JournalRecord::Replayed { .. } => "replayed",
             JournalRecord::Result { .. } => "result",
             JournalRecord::Ended { .. } => "ended",

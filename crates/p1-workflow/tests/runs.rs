@@ -531,6 +531,7 @@ async fn preflight_refuses_an_empty_grant_bad_args_and_an_unknown_resume() {
         "idle".to_string(),
         RoleSpec {
             model: "claude/claude-opus-5-5".to_string(),
+            fallback: Vec::new(),
             tools: Vec::new(),
         },
     );
@@ -614,34 +615,44 @@ async fn every_step_end_has_its_envelope_shape() {
         envelope
     };
     let worker = |n: u32, prompt: &str| format!("w{n}|{prompt} (claude/claude-opus-5-5)");
+    // The chain each step walked (ADR-0054 item 4): one link here, none for a step
+    // refused before dispatch.
+    let walked = json!([{"model": "claude/claude-opus-5-5", "moved_on": null}]);
     assert_eq!(
         without_step(0),
         json!({"label": "plain", "status": "done", "value": "did: summary",
                "schema": "not_requested", "evidence": "commands passed: cargo test",
-               "attempts": 1, "worker": worker(1, "summary"), "needs": null, "error": null})
+               "attempts": 1, "worker": worker(1, "summary"), "needs": null, "error": null,
+               "models": walked})
     );
     assert_eq!(
         without_step(1),
         json!({"label": null, "status": "done", "value": {"ok": true}, "schema": "passed",
                "evidence": "commands passed: cargo test", "attempts": 1,
-               "worker": worker(2, "structured"), "needs": null, "error": null})
+               "worker": worker(2, "structured"), "needs": null, "error": null,
+               "models": walked})
     );
     assert_eq!(
         without_step(2),
         json!({"label": null, "status": "blocked", "value": null, "schema": "not_requested",
                "evidence": null, "attempts": 1, "worker": worker(3, "blocked"),
-               "needs": "a token", "error": null})
+               "needs": "a token", "error": null, "models": walked})
     );
     assert_eq!(
         without_step(3),
         json!({"label": null, "status": "failed", "value": "I stopped",
                "schema": "not_requested", "evidence": null, "attempts": 1,
-               "worker": worker(4, "silent"), "needs": null, "error": "ended without finish"})
+               "worker": worker(4, "silent"), "needs": null, "error": "ended without finish",
+               "models": walked})
     );
     assert_eq!(report.value[5]["status"], "failed");
     assert_eq!(report.value[5]["error"], "no such environment");
     assert_eq!(report.value[5]["attempts"], 1);
     assert_eq!(report.value[5]["worker"], Value::Null);
+    assert_eq!(
+        report.value[5]["models"], walked,
+        "the dispatch happened, the worker did not start"
+    );
     assert_eq!(report.outcome, RunOutcome::CompletedWithIssues);
     assert_eq!(report.counts.done, 3);
     assert_eq!(report.counts.not_verified, 1);

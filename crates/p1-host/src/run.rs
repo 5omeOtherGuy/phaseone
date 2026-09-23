@@ -1705,6 +1705,31 @@ impl EventSink for ChildStallWatcher {
     }
 }
 
+/// The last turn end of ONE workflow step worker (ADR-0054 item 3). A step's fallback
+/// chain turns on the ROUTE failing, and `ChildStatus::Failed`'s message cannot say
+/// whether the failure was the route's or the worker's own work; this cell can.
+#[cfg(feature = "delegation")]
+pub(crate) type TurnEndCell = Arc<Mutex<Option<TurnEnd>>>;
+
+/// Records each finished turn's end into a step's cell and forwards the event
+/// unchanged. It sits OUTSIDE the worker report tap, so it sees every turn of the
+/// worker, a repair included.
+#[cfg(feature = "delegation")]
+struct TurnEndTap {
+    inner: Arc<dyn EventSink>,
+    cell: TurnEndCell,
+}
+
+#[cfg(feature = "delegation")]
+impl EventSink for TurnEndTap {
+    fn emit(&self, event: AgentEvent) {
+        if let AgentEvent::TurnFinished { end } = &event {
+            *self.cell.lock().unwrap() = Some(end.clone());
+        }
+        self.inner.emit(event);
+    }
+}
+
 /// §3c: a cancellation caused by the stall guard is reported as a stall, not as an
 /// ordinary Ctrl-C.
 fn stalled_exit(deps: &HostDeps, stall: &StallGuard) -> Option<i32> {
@@ -2144,7 +2169,9 @@ impl ChildBuilder {
     /// `choice` selects a profile/effort on top of the environment (a workflow role's
     /// model); `contract` is the output contract the child's `finish` checks; with
     /// `silent_end` the front end is not told the turn ended (a workflow step, whose
-    /// end the workflow observer reports). Returns the child's `finish` outcome cell
+    /// end the workflow observer reports); `turn_end` is a workflow step's cell for the
+    /// worker's last turn end, which is how a step tells a route failure from a failure
+    /// of its own work (ADR-0054 item 3). Returns the child's `finish` outcome cell
     /// too: a step runner reads the structured result from it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_child(
@@ -2156,6 +2183,7 @@ impl ChildBuilder {
         worker_id: &str,
         contract: Option<p1_tool_finish::OutputContract>,
         silent_end: bool,
+        turn_end: Option<TurnEndCell>,
     ) -> Result<(ChildAgent, p1_tool_finish::FinishOutcome), String> {
         let front_end = &self.front_end;
         let completion_hub = &self.completion_hub;
@@ -2260,6 +2288,17 @@ impl ChildBuilder {
             silent_end,
         ));
         let events: Arc<dyn EventSink> = tap.clone();
+        // A workflow step keeps its worker's last turn end (ADR-0054 item 3): a turn
+        // that ended on a provider failure is a ROUTE failure, which the step runner
+        // must tell from a failure of the worker's own work. A direct worker passes no
+        // cell and the event goes straight on.
+        let events: Arc<dyn EventSink> = match turn_end {
+            Some(cell) => Arc::new(TurnEndTap {
+                inner: events,
+                cell,
+            }),
+            None => events,
+        };
         // Re-assembly for a repair (ADR-0050 item 6): `worker_continue` with
         // `add_tools` hands over the child's FULL new grant, and this rebuilds exactly
         // what the start built — the same environment, the same assembly path, the
@@ -2407,6 +2446,7 @@ fn make_child_factory(builder: Arc<ChildBuilder>) -> AgentFactory {
                 &worker_id,
                 None,
                 false,
+                None,
             )
             .map(|(child, _outcome)| child)
     })

@@ -422,7 +422,7 @@ fn report_line(report: &RunReport) -> String {
     };
     let c = &report.counts;
     format!(
-        "Workflow {}: {outcome} — {} steps ({} replayed): {} done, {} blocked, {} failed, {} cancelled; {} not verified; {} capped; {} invalid output",
+        "Workflow {}: {outcome} — {} steps ({} replayed): {} done, {} blocked, {} failed, {} cancelled; {} not verified; {} capped; {} invalid output; {} fell back",
         report.id.0,
         c.steps,
         c.replayed,
@@ -432,7 +432,8 @@ fn report_line(report: &RunReport) -> String {
         c.cancelled,
         c.not_verified,
         c.capped,
-        c.invalid_output
+        c.invalid_output,
+        c.fell_back
     )
 }
 
@@ -443,11 +444,12 @@ fn render_step(step: &StepLine) -> String {
         StepStatus::Failed => "failed",
         StepStatus::Cancelled => "cancelled",
     };
+    // The model part is the chain the step walked (ADR-0054 item 4).
     let mut line = format!(
         "  {} {} → {}",
         step.label.as_deref().unwrap_or(&step.call.0),
         step.role,
-        step.model
+        step.model_chain()
     );
     if let Some(worker) = &step.worker {
         line.push_str(&format!(" [{worker}]"));

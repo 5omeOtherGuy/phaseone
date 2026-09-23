@@ -596,7 +596,8 @@ pub fn worker_end_note(
 pub fn workflow_step_note(run: &str, line: &p1_workflow::StepLine, needs: Option<&str>) -> String {
     use p1_workflow::StepStatus;
     let label = line.label.as_deref().unwrap_or(&line.call.0);
-    // The step line carries `<id> (<route/model>)`; the model is already named.
+    // `<id> (<route/model>)` names the worker; the MODEL part is the chain the step
+    // walked (ADR-0054 item 4), so a step that fell back names every model it tried.
     let worker = line
         .worker
         .as_deref()
@@ -641,7 +642,8 @@ pub fn workflow_step_note(run: &str, line: &p1_workflow::StepLine, needs: Option
     };
     format!(
         "workflow {run} {label} ({} → {}{worker}) {state}",
-        line.role, line.model
+        line.role,
+        line.model_chain()
     )
 }
 
@@ -658,7 +660,7 @@ pub fn workflow_run_note(report: &p1_workflow::RunReport) -> String {
     };
     let c = &report.counts;
     format!(
-        "workflow {} {outcome} — {} steps ({} replayed): {} done, {} blocked, {} failed, {} cancelled; {} not verified; {} capped; {} invalid output",
+        "workflow {} {outcome} — {} steps ({} replayed): {} done, {} blocked, {} failed, {} cancelled; {} not verified; {} capped; {} invalid output; {} fell back",
         report.id.0,
         c.steps,
         c.replayed,
@@ -668,7 +670,8 @@ pub fn workflow_run_note(report: &p1_workflow::RunReport) -> String {
         c.cancelled,
         c.not_verified,
         c.capped,
-        c.invalid_output
+        c.invalid_output,
+        c.fell_back
     )
 }
 
