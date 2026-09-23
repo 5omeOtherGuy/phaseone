@@ -815,6 +815,16 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         status,
         report,
     } = child;
+    // Armed for the length of every turn: a panic inside the turn ends this task
+    // (tokio catches it and drops the future) while the service still holds a clone
+    // of the status sender, so without the guard the child would stay `Running` for
+    // ever and every `wait` on it would park. Seen live in a host test that hung.
+    let mut guard = AbnormalEnd {
+        shared: Arc::clone(&shared),
+        id: id.clone(),
+        status: status.clone(),
+        armed: true,
+    };
     loop {
         // The status is already Running and `token` already installed: whoever
         // accepted this turn did both before the task could see it.
@@ -836,6 +846,9 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
             // that just ended, and the NEXT turn starts from a fresh one.
             (report)(),
         );
+        // The turn ended on its own: the guard must not overwrite this status if the
+        // task is dropped while it waits for a command (shutdown).
+        guard.armed = false;
         // (1) store the status and (2) wake every `wait`er: one `send_replace`.
         status.send_replace(child_status.clone());
         // (3) a slot is given back: wake everyone waiting for capacity, too.
@@ -887,8 +900,37 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
             }
             task = message;
             token = next_token;
+            // A new turn: whoever accepted it already set the status to `Running`.
+            guard.armed = true;
             break;
         }
+    }
+}
+
+/// Ends a child whose task dies mid-turn. Tokio catches a panic inside a task and drops
+/// its future; the service's own clone of the status sender keeps the watch alive, so
+/// only this drop can turn the stranded `Running` into a terminal status and wake the
+/// waiters, the capacity waiters and the parent.
+struct AbnormalEnd {
+    shared: Arc<Shared>,
+    id: String,
+    status: watch::Sender<ChildStatus>,
+    /// True while a turn runs; false while the task waits for its next command.
+    armed: bool,
+}
+
+impl Drop for AbnormalEnd {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let failed = ChildStatus::Failed(
+            "the worker's task ended abnormally during its turn (a panic inside the agent)"
+                .to_string(),
+        );
+        self.status.send_replace(failed.clone());
+        self.shared.capacity.notify_waiters();
+        notify_parent(&self.shared, &self.id, &failed);
     }
 }
 
@@ -1580,5 +1622,41 @@ mod tests {
         workers.cancel(&id).await.unwrap();
         workers.wait(&id, CancellationToken::new()).await.unwrap();
         assert_eq!(workers.running(), 0, "an ended turn frees the slot");
+    }
+
+    /// A panic inside a turn (here: a provider asked for more than it scripted) must not
+    /// strand the child in `Running`: the guard marks it `Failed`, `wait` returns, the
+    /// slot is free again. Under paused time a `timeout` fires as soon as nothing is
+    /// runnable, so a hang would fail this test at once instead of parking it.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_turn_ends_the_child_failed_instead_of_hanging() {
+        let factory: AgentFactory = Arc::new(|spec: &ChildSpec| {
+            // No scripted response at all: the first request panics inside the task.
+            let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+            Ok(ChildAgent {
+                agent: child_agent(provider, &spec.tools),
+                description: "route/model".into(),
+                report: Arc::new(WorkerReport::default),
+                regrant: None,
+            })
+        });
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(60),
+            workers.wait(&id, CancellationToken::new()),
+        )
+        .await
+        .expect("a dying child must end its wait")
+        .unwrap();
+        assert!(
+            matches!(&status, ChildStatus::Failed(message) if message.contains("abnormally")),
+            "{status:?}"
+        );
+        assert_eq!(workers.running(), 0, "the slot is free again");
+        assert_eq!(
+            workers.wait_for_capacity(CancellationToken::new()).await,
+            Ok(true)
+        );
     }
 }
