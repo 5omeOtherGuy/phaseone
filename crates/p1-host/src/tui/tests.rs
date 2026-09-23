@@ -450,6 +450,9 @@ async fn an_auth_request_becomes_the_approval_view_and_answers() {
     let request = auth_rx.recv().await.unwrap();
     d.on_auth(request);
     assert!(matches!(d.screen.approval, Some(Approval::Permission(_))));
+    // The inline Block names the tool it asks about (handoff §7.5); nothing waits behind it.
+    assert_eq!(d.screen.approval_tool, "shell");
+    assert_eq!(d.screen.approvals_waiting, 0);
     assert!(d.screen.pinned);
     d.on_key(key(KeyCode::Char('y')), None);
     assert_eq!(pending.await.unwrap(), Decision::Permit);

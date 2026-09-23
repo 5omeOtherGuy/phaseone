@@ -800,12 +800,15 @@ impl Driver {
 
     /// Show the queue's front request, if none is on screen.
     fn show_next_auth(&mut self) {
+        // The front request is the one on screen; the rest wait behind it (`N of M pending`).
+        self.screen.approvals_waiting = self.pending_auth.len().saturating_sub(1);
         if self.screen.approval.is_some() {
             return;
         }
         let Some(request) = self.pending_auth.front() else {
             return;
         };
+        self.screen.approval_tool = request.call.name.clone();
         self.screen.approval = Some(approval_view(
             request,
             &self.describer,
