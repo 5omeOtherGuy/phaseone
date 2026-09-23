@@ -1,7 +1,7 @@
 //! Screen state: everything the renderers read and the key handlers mutate.
 //!
 //! The right pane is a core feature, planned from M1 (owner direction): width
-//! cycles `off / 40ch / 56ch / split` on `^W`, mode cycles on `^Tab`, events
+//! cycles `narrow / wide / split / off` on `^W`, mode cycles on `^Tab`, events
 //! PROMOTE a mode, and pinning always wins (SPEC §5). Focus mode (owner
 //! direction, carried over from the iris TUI) folds passive chrome away so
 //! the transcript owns the screen; the first edit reveals the composer again.
@@ -10,56 +10,58 @@ use std::collections::VecDeque;
 
 use p1_contracts::{AgentEvent, Usage};
 
+use crate::render::home::HomePrelude;
+use crate::render::ledger::{
+    ContextView, FoldRef, LedgerPane, LedgerSpend, SessionView, WorkersSummary, WorkspaceView,
+};
 use crate::render::picker::Picker;
-use crate::render::status::StatusGroup;
-use crate::transcript::Transcript;
+use crate::render::workers::{BlockState, WorkerBlock, WorkersPane};
+use crate::transcript::{Block, Transcript};
 
-/// A pending approval: the blocking view that owns the screen until decided
-/// (SPEC §4.4 diff review, §4.5 permission prompt).
+/// A pending approval (handoff §7.5): inline as the transcript's running element, or the full
+/// diff review that owns the screen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Approval {
     Diff(crate::render::diff::DiffView),
     Permission(crate::render::permission::PermissionView),
 }
 
-/// Pane width states, in `^W` cycle order (SPEC §5).
+/// Pane width states (handoff §4.1). `^W` cycles `narrow → wide → split → off`; `Auto` is the
+/// start state: narrow below 160 columns, wide from 160.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneWidth {
-    Off,
     #[default]
-    Ch40,
-    Ch56,
+    Auto,
+    /// 38 columns.
+    Narrow,
+    /// 56 columns.
+    Wide,
+    /// Half of `W − 6`.
     Split,
+    Off,
 }
 
 impl PaneWidth {
+    /// The state at a terminal `cols` wide: `Auto` becomes narrow or wide.
+    pub fn resolve(self, cols: u16) -> Self {
+        match self {
+            Self::Auto if cols >= 160 => Self::Wide,
+            Self::Auto => Self::Narrow,
+            other => other,
+        }
+    }
+
+    /// The next `^W` state. `Auto` cycles like narrow; `Screen::cycle_width` resolves it at the
+    /// real width first, so at 160+ columns the start state steps on to split.
     pub fn cycle(self) -> Self {
         match self {
-            Self::Off => Self::Ch40,
-            Self::Ch40 => Self::Ch56,
-            Self::Ch56 => Self::Split,
+            Self::Off => Self::Narrow,
+            Self::Auto | Self::Narrow => Self::Wide,
+            Self::Wide => Self::Split,
             Self::Split => Self::Off,
         }
     }
-
-    /// The columns the pane occupies, at terminal width `cols`. `Split` takes
-    /// half; `None` when the pane is off or the terminal is under the floor.
-    pub fn columns(self, cols: usize) -> Option<usize> {
-        if cols < PANE_FLOOR_COLS {
-            return None;
-        }
-        match self {
-            Self::Off => None,
-            Self::Ch40 => Some(40),
-            Self::Ch56 => Some(56),
-            Self::Split => Some(cols / 2),
-        }
-    }
 }
-
-/// Below ~100 columns the pane collapses and the transcript takes full width
-/// (SPEC §6). `^L` forces it back as an overlay at any width.
-pub const PANE_FLOOR_COLS: usize = 100;
 
 /// Pane modes, in `^Tab` cycle order (SPEC §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -176,11 +178,36 @@ pub struct Composer {
     pub text: String,
     /// Cursor as a CHAR index into `text`.
     pub cursor: usize,
-    /// Revealed while focus mode would hide it (an edit, a paste, `esc` down).
+    /// Revealed while focus mode would hide it (an edit, a paste, `^G`).
     pub revealed: bool,
+    /// While `^G` edits the goal: the text the composer held before, which `esc` restores.
+    pub goal_edit: Option<String>,
 }
 
 impl Composer {
+    /// `^G`: put `/goal <current goal>` in the composer, cursor at the end (handoff §8.4).
+    pub fn begin_goal_edit(&mut self, goal: Option<&str>) {
+        if self.goal_edit.is_none() {
+            self.goal_edit = Some(std::mem::take(&mut self.text));
+        }
+        self.text = format!("/goal {}", goal.unwrap_or_default());
+        self.cursor = self.text.chars().count();
+        self.revealed = true;
+    }
+
+    /// `esc` during a goal edit: the previous composer text comes back.
+    pub fn keep(&mut self) {
+        if let Some(previous) = self.goal_edit.take() {
+            self.cursor = previous.chars().count();
+            self.revealed = !previous.is_empty();
+            self.text = previous;
+        }
+    }
+
+    pub fn editing_goal(&self) -> bool {
+        self.goal_edit.is_some()
+    }
+
     pub fn insert(&mut self, ch: char) {
         let byte = self.byte_index();
         self.text.insert(byte, ch);
@@ -196,6 +223,10 @@ impl Composer {
         let prev = self.text[..byte].chars().last().unwrap();
         self.text.replace_range(byte - prev.len_utf8()..byte, "");
         self.cursor -= 1;
+        // Clearing the composer hides it again in focus mode (handoff §8.5).
+        if self.text.is_empty() {
+            self.revealed = false;
+        }
     }
 
     pub fn left(&mut self) {
@@ -211,6 +242,7 @@ impl Composer {
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         self.revealed = false;
+        self.goal_edit = None;
         std::mem::take(&mut self.text)
     }
 
@@ -234,10 +266,11 @@ impl Composer {
 pub struct Screen {
     pub transcript: Transcript,
     pub composer: Composer,
+    pub statusbar: crate::render::statusbar::StatusBar,
     pub pane_width: PaneWidth,
     pub pane_mode: PaneMode,
     /// The width the operator held before a live worker forced the pane open
-    /// (`Off` → `Ch56`); the demotion gives it back. `None` when no such
+    /// (`Off` → `Wide`); the demotion gives it back. `None` when no such
     /// promotion is outstanding, or when a pin or an operator change owns the
     /// width instead.
     pub promotion_saved_width: Option<PaneWidth>,
@@ -262,20 +295,39 @@ pub struct Screen {
     pub ledger_overlay: bool,
     /// The OUTPUT pane's open fold, if any (SPEC §5 OUTPUT mode).
     pub output: Option<crate::render::output::OutputView>,
-    /// The WORKERS pane's rows, refreshed by the driver from the host's
-    /// worker service (p1-tui never names p1-workers).
-    pub workers: Vec<crate::render::workers::WorkerRow>,
-    /// A pending approval: the blocking, full-width review (SPEC §4.4/§4.5).
-    /// While this is `Some` the pane is hidden and the transcript waits.
+    /// The WORKERS pane: its rows are refreshed by the driver from the host's worker service
+    /// (p1-tui never names p1-workers) through `sync_workers`, which also counts the header;
+    /// the pool size and the `↑ ↓` focus are the driver's to set.
+    pub workers: WorkersPane,
+    /// Whether a worker has ever run this session (handoff §9.1: WORKERS is
+    /// available "when a worker was ever started" — unlike `workers`, this
+    /// never goes back to `false` once the pane has something worth
+    /// revisiting, even after every worker finishes and `sync_workers`
+    /// reports an empty snapshot).
+    pub workers_ever_started: bool,
+    /// A pending approval: drawn inline as the transcript's last element, or as the full diff
+    /// review (`review`) that owns the screen (handoff §7.5).
     pub approval: Option<Approval>,
-    /// A docked picker overlay above the composer (SPEC §4.6).
+    /// The tool the approval on screen is about: a `PermissionView` names only its command.
+    pub approval_tool: String,
+    /// Further approvals parked behind the one on screen (`1 of N pending`).
+    pub approvals_waiting: usize,
+    /// A menu docked above the composer (handoff §6.10).
     pub picker: Option<Picker>,
-    /// The `/status` overlay (SPEC §4.6).
-    pub status: Option<Vec<StatusGroup>>,
-    /// Ledger context/task views, filled by the driver (the context breakdown
-    /// arrives with the host's stats seam; until then these stay `None`).
-    pub context_view: Option<crate::render::ledger::Context>,
-    pub task_view: Option<crate::render::ledger::Task>,
+    /// Retired: `/status` is command output in the transcript now (handoff §6.9), so this can
+    /// never be `Some`. Kept only because `input.rs` still asks whether it is open.
+    pub status: Option<std::convert::Infallible>,
+    /// The home prelude (handoff §6.11): the first rows of the conversation.
+    pub home: Option<HomePrelude>,
+    /// LEDGER sections the driver fills (§9.2); each is absent until its data exists.
+    pub session: Option<SessionView>,
+    pub context: Option<ContextView>,
+    pub workspace: Option<WorkspaceView>,
+    /// The most recent fold handles, newest first (LEDGER FOLDS shows three).
+    pub folds: Vec<FoldRef>,
+    /// A worker the operator attached to (`a`, handoff §9.5): its transcript replaces the
+    /// parent's in the transcript area.
+    pub attached: Option<AttachedWorker>,
     /// Steering/follow-up text queued for the next boundary, shown above the
     /// composer hints so the operator sees what will land.
     pub queued: VecDeque<Queued>,
@@ -291,6 +343,41 @@ pub struct Screen {
     /// math needs it; the renderer records it each frame.
     #[doc(hidden)]
     pub last_rendered: (usize, usize),
+    /// Where the terminal's hardware cursor goes this frame (the composer's text cell, §8.1);
+    /// `None` while no editable composer is on screen. The renderer records it.
+    pub cursor: Option<(u16, u16)>,
+    /// The terminal width of the last frame: `^W` resolves the `Auto` start state at it.
+    #[doc(hidden)]
+    pub last_width: u16,
+    /// `^F`: the pane owns `↑ ↓` (WORKERS select, OUTPUT scroll) until `esc` or `^F`.
+    pub pane_focused: bool,
+    /// The full diff review's view state (handoff §7.5).
+    pub review: FullReview,
+}
+
+/// The full diff review: shown over a diff approval while `open`. Paging files and scrolling
+/// are view-only; the decision is about the whole call.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FullReview {
+    pub open: bool,
+    /// The file on screen, an index into the call's files.
+    pub file: usize,
+    /// The first diff row shown.
+    pub scroll: usize,
+    /// Diff body rows of the last frame (`review::body_rows`), recorded by the screen like
+    /// `last_rendered`, so paging moves by what is visible.
+    pub body_rows: usize,
+}
+
+/// The worker whose own transcript is on screen (handoff §9.5), buffered by the driver from
+/// the worker's event stream.
+#[derive(Debug)]
+pub struct AttachedWorker {
+    pub id: String,
+    /// `env/profile`: the attach band names it and the statusline chip shows it.
+    pub route: String,
+    pub state: BlockState,
+    pub transcript: Transcript,
 }
 
 /// One queued operator input (SPEC §4.2 hints: steering vs follow-up).
@@ -309,11 +396,32 @@ impl Screen {
     }
 
     pub fn cycle_width(&mut self) {
-        self.pane_width = self.pane_width.cycle();
+        self.pane_width = self.pane_width.resolve(self.last_width).cycle();
     }
 
+    /// The modes `^Tab` may land on right now (handoff §9.1): LEDGER always;
+    /// OUTPUT once a handle was opened; WORKERS once a worker has ever run.
+    /// DIFF needs the session-diff seam (§14.4) — not available yet.
+    pub fn available_modes(&self) -> Vec<PaneMode> {
+        let mut modes = vec![PaneMode::Ledger];
+        if self.output.is_some() {
+            modes.push(PaneMode::Output);
+        }
+        if self.workers_ever_started {
+            modes.push(PaneMode::Workers);
+        }
+        modes
+    }
+
+    /// `^Tab` cycles only through `available_modes` (handoff §9.1): a mode
+    /// with nothing to show is never landed on, and the current one always
+    /// appears in the list it cycles through (it is showing something).
     pub fn cycle_mode(&mut self) {
-        self.pane_mode = self.pane_mode.cycle();
+        let available = self.available_modes();
+        self.pane_mode = match available.iter().position(|m| *m == self.pane_mode) {
+            Some(at) => available[(at + 1) % available.len()],
+            None => available.first().copied().unwrap_or(self.pane_mode),
+        };
         // A deliberate choice is not a pin, but it outlives a transient peek.
         if matches!(self.promotion, Promotion::Peek { .. }) {
             self.promotion = Promotion::None;
@@ -325,21 +433,19 @@ impl Screen {
     }
 
     /// Observe one agent event: transcript first, then the state the event
-    /// moves (working indicator, spend, promotion). `now_ms` times the call
-    /// rows: a result's elapsed is measured from its start's stamp.
+    /// moves (working indicator, spend, promotion). `now_ms` is the event's
+    /// stamp: the transcript times the turn, reasoning and call rows from it.
     pub fn apply(&mut self, event: &AgentEvent, now_ms: u64) {
-        let elapsed = match event {
+        match event {
             AgentEvent::ToolStarted { call } => {
                 self.call_started.insert(call.call_id.clone(), now_ms);
-                None
             }
-            AgentEvent::ToolFinished { result } => self
-                .call_started
-                .remove(&result.call_id)
-                .map(|started| now_ms.saturating_sub(started)),
-            _ => None,
-        };
-        self.transcript.apply(event, elapsed);
+            AgentEvent::ToolFinished { result } => {
+                self.call_started.remove(&result.call_id);
+            }
+            _ => {}
+        }
+        self.transcript.apply(event, Some(now_ms));
         match event {
             AgentEvent::TurnStarted => {
                 self.working = Some(Working {
@@ -355,6 +461,7 @@ impl Screen {
                 working.label.clone_from(&call.name);
             }
             AgentEvent::ToolFinished { result } => {
+                self.record_fold(&result.call_id);
                 // The working indicator clears only at TurnFinished: a turn
                 // that streams after a tool call is still working (and ⏎
                 // must keep meaning "queue steering").
@@ -383,6 +490,165 @@ impl Screen {
         self.queued.push_back(Queued { follow_up, text });
     }
 
+    /// `PgUp` (`pages` > 0) / `PgDn`: scroll by the transcript rows minus two, so two rows of
+    /// context stay on screen (handoff §8.3). Paging past the end returns to the live tail.
+    pub fn page(&mut self, pages: isize) {
+        let step = self.last_rendered.1.saturating_sub(2).max(1) as isize;
+        self.scroll_by(pages * step);
+    }
+
+    /// `esc` while scrolled back: follow the newest rows again.
+    pub fn live_tail(&mut self) {
+        self.scroll_top = None;
+    }
+
+    /// The scroll mark while the view is pinned above the live tail. It takes the view's last
+    /// row, so the rows below are counted from one row higher.
+    pub fn scroll_mark(&self) -> Option<crate::render::scroll::ScrollMark> {
+        let top = self.scroll_top?;
+        let (total, fits) = self.last_rendered;
+        let shown = fits.saturating_sub(1);
+        // The working label names the latest started tool; it runs while any call is open.
+        let running = self
+            .working
+            .as_ref()
+            .filter(|w| !self.call_started.is_empty() && !w.label.is_empty())
+            .map(|w| format!("{} running", w.label));
+        Some(crate::render::scroll::ScrollMark {
+            below: total.saturating_sub(top + shown),
+            running,
+            row: top + 1,
+            total,
+        })
+    }
+
+    /// `/` in an empty composer: type it and open command completion over the composer text.
+    pub fn open_completion(&mut self) {
+        self.composer.insert('/');
+        let mut menu = Picker::commands();
+        let model = self.statusbar.model.clone().unwrap_or_else(|| "—".into());
+        let effort = self
+            .statusbar
+            .effort
+            .clone()
+            .unwrap_or_else(|| "default".into());
+        menu.set_value("/model", format!("{model}:{effort}"));
+        menu.set_value("/effort", effort);
+        menu.set_value("/focus", if self.focus { "on" } else { "off" });
+        menu.filter = self.composer.text.clone();
+        menu.select_first();
+        self.picker = Some(menu);
+    }
+
+    /// A key typed while a menu is open: completion edits the composer and filters by its
+    /// text; any other menu filters by what is typed into it.
+    pub fn menu_input(&mut self, ch: Option<char>) {
+        let Some(menu) = &mut self.picker else {
+            return;
+        };
+        if menu.completion {
+            match ch {
+                Some(ch) => self.composer.insert(ch),
+                None => self.composer.backspace(),
+            }
+            if self.composer.text.is_empty() {
+                self.picker = None;
+                return;
+            }
+            menu.filter = self.composer.text.clone();
+        } else {
+            match ch {
+                Some(ch) => menu.filter.push(ch),
+                None => {
+                    menu.filter.pop();
+                }
+            }
+        }
+        menu.select_first();
+    }
+
+    /// `tab`: complete the composer to the focused command and close the menu.
+    pub fn complete_menu(&mut self) {
+        if let Some(label) = self.picker.as_ref().and_then(Picker::completion) {
+            self.composer.text = format!("{label} ");
+            self.composer.cursor = self.composer.text.chars().count();
+            self.composer.revealed = true;
+            self.picker = None;
+        }
+    }
+
+    /// `^G`: edit the goal in the composer, prefilled with the current goal.
+    pub fn edit_goal(&mut self) {
+        self.composer.begin_goal_edit(self.goal.as_deref());
+    }
+
+    /// Files in the call under review. An approval carries one prepared diff today.
+    fn review_files(&self) -> usize {
+        usize::from(matches!(self.approval, Some(Approval::Diff(_))))
+    }
+
+    /// `^D`: open or close the full review of the diff on screen.
+    pub fn toggle_review(&mut self) {
+        if self.review_files() == 0 {
+            return;
+        }
+        self.review = FullReview {
+            open: !self.review.open,
+            ..FullReview::default()
+        };
+    }
+
+    /// `tab` / `⇧tab` in the full review: the next / previous file, wrapping.
+    pub fn review_file(&mut self, delta: isize) {
+        let files = self.review_files();
+        if files == 0 {
+            return;
+        }
+        let next = (self.review.file as isize + delta).rem_euclid(files as isize);
+        self.review.file = next as usize;
+        self.review.scroll = 0;
+    }
+
+    /// `PgUp` (`pages` > 0) / `PgDn` in the full review: page the diff body, clamped to it.
+    pub fn review_page(&mut self, pages: isize) {
+        let Some(Approval::Diff(view)) = &self.approval else {
+            return;
+        };
+        let body = self.review.body_rows.max(1);
+        let step = body.saturating_sub(2).max(1) as isize;
+        let last = view.rows.len().saturating_sub(body);
+        self.review.scroll = self
+            .review
+            .scroll
+            .saturating_add_signed(-pages * step)
+            .min(last);
+    }
+
+    /// Perform a view-only key decision (`input::decide`): nothing here reaches the agent.
+    pub fn apply_view(&mut self, command: crate::input::ViewCommand) {
+        use crate::input::ViewCommand as V;
+        match command {
+            V::PageUp => self.page(1),
+            V::PageDown => self.page(-1),
+            V::LiveTail => self.live_tail(),
+            V::OpenCompletion => self.open_completion(),
+            V::MenuInput(ch) => self.menu_input(Some(ch)),
+            V::MenuBackspace => self.menu_input(None),
+            V::Complete => self.complete_menu(),
+            V::Effort(delta) => {
+                if let Some(menu) = &mut self.picker {
+                    menu.step_effort(delta);
+                }
+            }
+            V::TogglePaneFocus => self.pane_focused = !self.pane_focused,
+            V::EditGoal => self.edit_goal(),
+            V::KeepComposer => self.composer.keep(),
+            V::ToggleReview => self.toggle_review(),
+            V::ReviewFile(delta) => self.review_file(delta),
+            V::ReviewPage(pages) => self.review_page(pages),
+        }
+    }
+
     /// Scroll the transcript `delta` rows up (positive) or down (negative).
     /// Scrolling to the newest rows releases the pin back to the live tail.
     pub fn scroll_by(&mut self, delta: isize) {
@@ -394,30 +660,51 @@ impl Screen {
     }
 
     /// Sync the WORKERS pane from a fresh snapshot, handling the promotion
-    /// rule (SPEC §5): a live delegate promotes the pane to WORKERS while any
-    /// worker runs; when none is live and nothing needs review, an UNPINNED
-    /// WORKERS pane falls back to LEDGER.
-    pub fn sync_workers(&mut self, rows: Vec<crate::render::workers::WorkerRow>) {
-        let live = rows
-            .iter()
-            .any(|w| w.state == crate::render::workers::WorkerState::Running);
-        self.workers = rows;
-        if live {
-            if !self.pinned && self.pane_mode != PaneMode::Workers {
+    /// rule (SPEC §5, handoff §9.1): a live delegate promotes the pane to
+    /// WORKERS while any worker runs; a worker needing review SELF-PINS
+    /// WORKERS (`^P` need not be pressed — a parked approval is the
+    /// operator's turn); when none is live, nothing needs review, and
+    /// nothing else pinned it, an UNPINNED WORKERS pane falls back to
+    /// LEDGER.
+    pub fn sync_workers(&mut self, rows: Vec<WorkerBlock>) {
+        self.workers_ever_started |= !rows.is_empty();
+        let count = |state| rows.iter().filter(|w| w.state == state).count() as u64;
+        let live = count(BlockState::Running);
+        let queued = count(BlockState::Queued);
+        let needs_review = count(BlockState::NeedsReview) > 0;
+        self.workers.header.live = live;
+        self.workers.header.queued = (queued > 0).then_some(queued);
+        // A focus on a worker that left the snapshot has nothing left to point at.
+        if let Some(focused) = &self.workers.focused
+            && !rows.iter().any(|w| &w.id == focused)
+        {
+            self.workers.focused = None;
+        }
+        self.workers.workers = rows;
+        let live = live > 0;
+        // A parked approval is the operator's turn: SELF-pin, no `^P` needed,
+        // so nothing later demotes it out from under them.
+        let pinned_before = self.pinned;
+        if needs_review {
+            self.pinned = true;
+        }
+        if needs_review || live {
+            if self.pane_mode != PaneMode::Workers && (needs_review || !pinned_before) {
                 self.pane_mode = PaneMode::Workers;
             }
-            // The width force is a promotion and a pin always wins it. Save
-            // what the operator had so the demotion can restore it.
-            if !self.pinned && matches!(self.pane_width, PaneWidth::Off) {
+            // The width force is a promotion and a pin from BEFORE this sync
+            // always wins it. Save what the operator had so the demotion can
+            // restore it.
+            if !pinned_before && matches!(self.pane_width, PaneWidth::Off) {
                 self.promotion_saved_width = Some(self.pane_width);
-                self.pane_width = PaneWidth::Ch56;
+                self.pane_width = PaneWidth::Wide;
             }
         } else if self.pane_mode == PaneMode::Workers && !self.pinned {
             self.pane_mode = PaneMode::Ledger;
             // Give back the operator's width only while it is still the one
             // this promotion set: a `^W` since then is their choice to keep.
             if let Some(saved) = self.promotion_saved_width.take()
-                && self.pane_width == PaneWidth::Ch56
+                && self.pane_width == PaneWidth::Wide
             {
                 self.pane_width = saved;
             }
@@ -429,7 +716,7 @@ impl Screen {
         self.output = Some(view);
         self.pane_mode = PaneMode::Output;
         if matches!(self.pane_width, PaneWidth::Off) {
-            self.pane_width = PaneWidth::Ch56;
+            self.pane_width = PaneWidth::Wide;
         }
     }
 
@@ -452,21 +739,58 @@ impl Screen {
         };
     }
 
-    /// The LEDGER view, built from screen state. The context breakdown stays
-    /// `None` until the host's context-stats seam lands (issue #12 plan).
-    pub fn ledger(&self) -> crate::render::ledger::Ledger {
-        crate::render::ledger::Ledger {
+    /// The LEDGER pane from screen state (§9.2). SPEND appears with the first response; the
+    /// WORKERS summary while the worker snapshot holds anyone.
+    pub fn ledger(&self) -> LedgerPane {
+        let workers = &self.workers.workers;
+        let count = |states: &[BlockState]| {
+            workers.iter().filter(|w| states.contains(&w.state)).count() as u64
+        };
+        LedgerPane {
             goal: self.goal.clone(),
-            context: self.context_view.clone(),
-            task: self.task_view.clone(),
-            spend: crate::render::ledger::SpendView {
-                responses: self.spend.responses,
+            session: self.session.clone(),
+            context: self.context.clone(),
+            workspace: self.workspace.clone(),
+            spend: (self.spend.responses > 0).then(|| LedgerSpend {
                 input: self.spend.input,
                 output: self.spend.output,
                 cache_hit_percent: self.spend.cache_hit_percent(),
                 cost_micro_usd: self.spend.cost_micro_usd,
-            },
+            }),
+            workers: (!workers.is_empty()).then(|| WorkersSummary {
+                live: count(&[BlockState::Running]),
+                done: count(&[BlockState::Done, BlockState::DoneUnverified]),
+            }),
+            folds: self.folds.clone(),
         }
+    }
+
+    /// A settled call that registered a fold handle becomes the newest LEDGER fold.
+    fn record_fold(&mut self, call_id: &str) {
+        let row = self
+            .transcript
+            .blocks
+            .iter()
+            .rev()
+            .find_map(|block| match block {
+                Block::Call(row) if row.call_id == call_id => Some(row),
+                _ => None,
+            });
+        let Some(row) = row else {
+            return;
+        };
+        let Some(id) = &row.fold else {
+            return;
+        };
+        let handle = id.to_string();
+        let fold = FoldRef {
+            handle: handle.clone(),
+            kind: row.name.clone(),
+            lines: row.line_count as u64,
+        };
+        self.folds.retain(|f| f.handle != handle);
+        self.folds.insert(0, fold);
+        self.folds.truncate(FOLDS_SHOWN);
     }
 
     /// Expire a peek whose time has passed. Driven by the render tick's clock.
@@ -482,6 +806,9 @@ impl Screen {
 /// The peek banner's lifetime (SPEC §5: 3 s).
 pub const PEEK_MS: u64 = 3_000;
 
+/// LEDGER FOLDS lists this many handles (§9.2).
+const FOLDS_SHOWN: usize = 3;
+
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").chars().take(60).collect()
 }
@@ -490,6 +817,181 @@ fn first_line(text: &str) -> String {
 mod tests {
     use super::*;
     use p1_contracts::{ToolCall, ToolInput, ToolResultItem, ToolStatus};
+
+    fn worker(id: &str, state: BlockState) -> WorkerBlock {
+        WorkerBlock {
+            id: id.into(),
+            task: "task".into(),
+            route: "deepseek/v4.1-flash".into(),
+            state,
+            elapsed: None,
+            cost_micro_usd: None,
+            grants: "read finish".into(),
+            activity: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_worker_header_counts_running_and_queued_and_a_lost_focus_clears() {
+        let mut s = Screen::new(false);
+        s.workers.focused = Some("w9".into());
+        s.sync_workers(vec![
+            worker("w1", BlockState::Running),
+            worker("w2", BlockState::NeedsReview),
+            worker("w3", BlockState::Queued),
+            worker("w4", BlockState::Done),
+        ]);
+        assert_eq!(s.workers.header.live, 1);
+        assert_eq!(s.workers.header.queued, Some(1));
+        assert_eq!(s.workers.focused, None);
+        let summary = s.ledger().workers.expect("a snapshot with workers");
+        assert_eq!((summary.live, summary.done), (1, 1));
+        s.sync_workers(vec![worker("w4", BlockState::Done)]);
+        assert_eq!(s.workers.header.queued, None);
+    }
+
+    #[test]
+    fn a_folded_result_becomes_the_newest_ledger_fold() {
+        let mut s = Screen::new(false);
+        let big: String = (0..60).map(|n| format!("line {n}\n")).collect();
+        for (id, content) in [("c1", big.as_str()), ("c2", "short")] {
+            s.apply(
+                &AgentEvent::ToolStarted {
+                    call: ToolCall {
+                        call_id: id.into(),
+                        name: "shell".into(),
+                        input: ToolInput::Json("{}".into()),
+                    },
+                },
+                0,
+            );
+            s.apply(
+                &AgentEvent::ToolFinished {
+                    result: ToolResultItem {
+                        call_id: id.into(),
+                        name: "shell".into(),
+                        status: ToolStatus::Ok,
+                        content: content.into(),
+                    },
+                },
+                10,
+            );
+        }
+        assert_eq!(s.folds.len(), 1, "only the folded output has a handle");
+        assert_eq!((s.folds[0].kind.as_str(), s.folds[0].lines), ("shell", 60));
+        assert_eq!(s.ledger().folds, s.folds);
+    }
+
+    #[test]
+    fn paging_moves_by_the_transcript_rows_minus_two_and_returns_to_the_tail() {
+        let mut s = Screen::new(false);
+        s.last_rendered = (100, 20);
+        s.page(1);
+        assert_eq!(s.scroll_top, Some(62), "80 − 18");
+        s.page(1);
+        assert_eq!(s.scroll_top, Some(44));
+        s.page(-1);
+        s.page(-1);
+        assert_eq!(s.scroll_top, None, "paging past the end is the live tail");
+        s.page(1);
+        s.live_tail();
+        assert_eq!(s.scroll_top, None);
+    }
+
+    #[test]
+    fn the_scroll_mark_counts_rows_below_and_names_the_running_tool() {
+        let mut s = Screen::new(false);
+        s.last_rendered = (47, 33);
+        assert_eq!(s.scroll_mark(), None, "no mark at the live tail");
+        s.scroll_top = Some(0);
+        let mark = s.scroll_mark().unwrap();
+        // The mark takes the view's last row: 32 rows shown, 15 below.
+        assert_eq!((mark.below, mark.row, mark.total), (15, 1, 47));
+        assert_eq!(mark.running, None);
+        s.apply(
+            &AgentEvent::ToolStarted {
+                call: ToolCall {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    input: ToolInput::Json("{}".into()),
+                },
+            },
+            0,
+        );
+        assert_eq!(
+            s.scroll_mark().unwrap().running.as_deref(),
+            Some("shell running")
+        );
+    }
+
+    #[test]
+    fn completion_types_filters_and_completes_through_the_composer() {
+        use crate::input::ViewCommand as V;
+        let mut s = Screen::new(false);
+        s.apply_view(V::OpenCompletion);
+        assert_eq!(s.composer.text, "/");
+        s.apply_view(V::MenuInput('m'));
+        s.apply_view(V::MenuInput('o'));
+        let menu = s.picker.as_ref().unwrap();
+        assert_eq!(menu.filter, "/mo");
+        assert_eq!(menu.visible().len(), 2, "/model and /models");
+        s.apply_view(V::Complete);
+        assert_eq!(s.composer.text, "/model ");
+        assert!(s.picker.is_none());
+        // Deleting the `/` closes completion.
+        s.composer = Composer::default();
+        s.apply_view(V::OpenCompletion);
+        s.apply_view(V::MenuBackspace);
+        assert!(s.picker.is_none());
+        assert_eq!(s.composer.text, "");
+    }
+
+    #[test]
+    fn the_full_review_toggles_only_over_a_diff_and_pages_within_it() {
+        use crate::render::diff::{DiffRow, DiffView};
+        let mut s = Screen::new(false);
+        s.toggle_review();
+        assert!(!s.review.open, "nothing to review");
+        s.approval = Some(Approval::Diff(DiffView {
+            tool: "edit".into(),
+            file: "a.rs".into(),
+            summary: String::new(),
+            position: (1, 1),
+            rows: (0..30)
+                .map(|n| DiffRow::Add {
+                    line: n + 1,
+                    text: String::new(),
+                })
+                .collect(),
+            grantable: true,
+        }));
+        s.toggle_review();
+        assert!(s.review.open);
+        s.review.body_rows = 12;
+        s.review_page(-1);
+        assert_eq!(s.review.scroll, 10);
+        s.review_page(-5);
+        assert_eq!(s.review.scroll, 18, "clamped at the last full body");
+        s.review_page(1);
+        assert_eq!(s.review.scroll, 8);
+        s.review_file(1);
+        assert_eq!((s.review.file, s.review.scroll), (0, 0), "one file wraps");
+        s.toggle_review();
+        assert!(!s.review.open);
+    }
+
+    #[test]
+    fn a_goal_edit_restores_the_draft_on_esc_and_ends_on_submit() {
+        let mut c = Composer::default();
+        c.insert('d');
+        c.begin_goal_edit(None);
+        assert_eq!(c.text, "/goal ");
+        c.keep();
+        assert_eq!(c.text, "d");
+        c.begin_goal_edit(Some("g"));
+        assert_eq!(c.take(), "/goal g");
+        assert!(!c.editing_goal());
+    }
 
     #[test]
     fn width_cycles_through_the_four_states() {
@@ -503,21 +1005,30 @@ mod tests {
         assert_eq!(
             order,
             [
-                PaneWidth::Ch40,
-                PaneWidth::Ch56,
+                PaneWidth::Narrow,
+                PaneWidth::Wide,
                 PaneWidth::Split,
                 PaneWidth::Off,
-                PaneWidth::Ch40
+                PaneWidth::Narrow
             ]
         );
     }
 
     #[test]
-    fn the_pane_collapses_under_the_floor() {
-        assert_eq!(PaneWidth::Ch40.columns(120), Some(40));
-        assert_eq!(PaneWidth::Ch40.columns(80), None);
-        assert_eq!(PaneWidth::Split.columns(120), Some(60));
-        assert_eq!(PaneWidth::Off.columns(120), None);
+    fn the_start_width_is_narrow_below_160_columns_and_wide_from_160() {
+        assert_eq!(PaneWidth::default(), PaneWidth::Auto);
+        assert_eq!(PaneWidth::Auto.resolve(159), PaneWidth::Narrow);
+        assert_eq!(PaneWidth::Auto.resolve(160), PaneWidth::Wide);
+        assert_eq!(PaneWidth::Split.resolve(200), PaneWidth::Split);
+        // `^W` steps on from what the start state showed.
+        let mut s = Screen::new(false);
+        s.last_width = 120;
+        s.cycle_width();
+        assert_eq!(s.pane_width, PaneWidth::Wide);
+        let mut s = Screen::new(false);
+        s.last_width = 200;
+        s.cycle_width();
+        assert_eq!(s.pane_width, PaneWidth::Split);
     }
 
     #[test]
@@ -623,39 +1134,106 @@ mod tests {
 
     #[test]
     fn a_live_worker_promotes_the_width_and_restores_the_operator_width() {
-        use crate::render::workers::{WorkerRow, WorkerState};
-        let row = |state| WorkerRow {
-            id: "w1".into(),
-            summary: "w1".into(),
-            route: "deepseek/v4.1-flash".into(),
-            state,
-            elapsed: None,
-            cost_micro_usd: None,
-            details: vec![],
-        };
+        let row = |state| worker("w1", state);
         // Pinned: the width force never overrides the operator.
         let mut s = Screen::new(false);
         s.pinned = true;
         s.pane_width = PaneWidth::Off;
-        s.sync_workers(vec![row(WorkerState::Running)]);
+        s.sync_workers(vec![row(BlockState::Running)]);
         assert_eq!(s.pane_width, PaneWidth::Off, "pinning wins over the force");
         assert_eq!(s.promotion_saved_width, None, "a pin saves nothing");
-        // Unpinned Off: force to Ch56, remember Off, restore it on demotion.
+        // Unpinned Off: force to Wide, remember Off, restore it on demotion.
         let mut s = Screen::new(false);
         s.pane_width = PaneWidth::Off;
-        s.sync_workers(vec![row(WorkerState::Running)]);
-        assert_eq!(s.pane_width, PaneWidth::Ch56);
+        s.sync_workers(vec![row(BlockState::Running)]);
+        assert_eq!(s.pane_width, PaneWidth::Wide);
         assert_eq!(s.promotion_saved_width, Some(PaneWidth::Off));
-        s.sync_workers(vec![row(WorkerState::Done)]);
+        s.sync_workers(vec![row(BlockState::Done)]);
         assert_eq!(s.pane_width, PaneWidth::Off);
         assert_eq!(s.promotion_saved_width, None);
         // A `^W` during the promotion is the operator's; demotion keeps it.
         let mut s = Screen::new(false);
         s.pane_width = PaneWidth::Off;
-        s.sync_workers(vec![row(WorkerState::Running)]);
-        s.pane_width = PaneWidth::Ch40;
-        s.sync_workers(vec![row(WorkerState::Done)]);
-        assert_eq!(s.pane_width, PaneWidth::Ch40, "an operator change survives");
+        s.sync_workers(vec![row(BlockState::Running)]);
+        s.pane_width = PaneWidth::Narrow;
+        s.sync_workers(vec![row(BlockState::Done)]);
+        assert_eq!(
+            s.pane_width,
+            PaneWidth::Narrow,
+            "an operator change survives"
+        );
         assert_eq!(s.promotion_saved_width, None);
+    }
+
+    #[test]
+    fn available_modes_gate_on_what_the_pane_has_to_show() {
+        let mut s = Screen::new(false);
+        assert_eq!(s.available_modes(), vec![PaneMode::Ledger]);
+        s.output = Some(crate::render::output::OutputView {
+            id: crate::fold::FoldId::of("x"),
+            lines: vec!["a".into()],
+            scroll: 0,
+        });
+        assert_eq!(
+            s.available_modes(),
+            vec![PaneMode::Ledger, PaneMode::Output]
+        );
+        s.workers_ever_started = true;
+        assert_eq!(
+            s.available_modes(),
+            vec![PaneMode::Ledger, PaneMode::Output, PaneMode::Workers]
+        );
+        // DIFF has no seam yet (handoff §14.4): never available.
+        assert!(!s.available_modes().contains(&PaneMode::Diff));
+    }
+
+    #[test]
+    fn workers_ever_started_never_reverts_once_a_worker_ran() {
+        let mut s = Screen::new(false);
+        assert!(!s.workers_ever_started);
+        s.sync_workers(vec![worker("w1", BlockState::Done)]);
+        assert!(s.workers_ever_started);
+        // The worker service can report an empty snapshot later; the pane
+        // stays available (there is history worth revisiting).
+        s.sync_workers(vec![]);
+        assert!(s.workers_ever_started);
+        assert_eq!(s.available_modes().last(), Some(&PaneMode::Workers));
+    }
+
+    #[test]
+    fn tab_cycles_only_through_available_modes_and_wraps() {
+        let mut s = Screen::new(false);
+        // Only LEDGER is available: cycling is a no-op, never lands on a mode
+        // with nothing to show.
+        s.cycle_mode();
+        assert_eq!(s.pane_mode, PaneMode::Ledger);
+        s.workers_ever_started = true;
+        s.cycle_mode();
+        assert_eq!(s.pane_mode, PaneMode::Workers);
+        s.cycle_mode();
+        assert_eq!(s.pane_mode, PaneMode::Ledger, "wraps back to the start");
+        // Opening OUTPUT mid-cycle inserts it into the rotation.
+        s.output = Some(crate::render::output::OutputView {
+            id: crate::fold::FoldId::of("x"),
+            lines: vec![],
+            scroll: 0,
+        });
+        s.cycle_mode();
+        assert_eq!(s.pane_mode, PaneMode::Output);
+    }
+
+    #[test]
+    fn a_worker_needing_review_self_pins_workers() {
+        let row = |state| worker("w1", state);
+        let mut s = Screen::new(false);
+        assert!(!s.pinned);
+        s.sync_workers(vec![row(BlockState::NeedsReview)]);
+        assert_eq!(s.pane_mode, PaneMode::Workers);
+        assert!(s.pinned, "a parked approval self-pins, no ^P needed");
+        // The self-pin holds even once the review resolves — only the
+        // operator's `^P` releases a pin (SPEC §5/handoff §9.1).
+        s.sync_workers(vec![row(BlockState::Done)]);
+        assert_eq!(s.pane_mode, PaneMode::Workers);
+        assert!(s.pinned);
     }
 }

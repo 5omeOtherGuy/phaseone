@@ -17,11 +17,22 @@ fn text(buffer: &Buffer) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+/// The slab monogram is BLOCK+ cells inside the transcript area (handoff §6.11).
 fn has_dots(buffer: &Buffer) -> bool {
-    buffer
-        .content
-        .iter()
-        .any(|cell| cell.symbol().chars().any(|ch| ch == '●'))
+    let area = buffer.area;
+    let t = p1_tui::geometry::layout(
+        area.width,
+        area.height,
+        p1_tui::state::PaneWidth::default(),
+        false,
+        2,
+    )
+    .transcript;
+    (t.top()..t.bottom()).any(|y| {
+        (t.left()..t.right()).any(|x| {
+            buffer[(x, y)].bg == p1_tui::palette::BLOCK_PLUS && buffer[(x, y)].symbol() == " "
+        })
+    })
 }
 #[test]
 fn welcome_is_static_without_changing_the_composer() {
@@ -50,7 +61,7 @@ fn welcome_does_not_replace_history_or_focus_mode() {
         lines: vec!["welcome metadata".into()],
     });
     let greeting = render(&mut screen, 80, 24, 0);
-    assert!(text(&greeting).starts_with("welcome metadata"));
+    assert!(text(&greeting).contains("welcome metadata"));
     assert!(has_dots(&greeting));
     screen.transcript.operator("start work");
     assert!(!has_dots(&render(&mut screen, 80, 24, 0)));
@@ -71,11 +82,12 @@ fn small_or_offset_viewports_never_overwrite_surrounding_cells() {
 }
 
 #[test]
-fn working_and_status_overlays_suppress_the_home() {
+fn working_and_a_docked_menu_suppress_the_home() {
     let mut screen = Screen::new(false);
-    screen.status = Some(Vec::new());
+    // `/status` is transcript output now (handoff §6.9); the docked menu is the overlay left.
+    screen.open_completion();
     assert!(!has_dots(&render(&mut screen, 120, 40, 0)));
-    screen.status = None;
+    screen.picker = None;
     screen.working = Some(p1_tui::state::Working {
         label: "working".into(),
         started_ms: 0,

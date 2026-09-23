@@ -124,9 +124,74 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// `wrap` for text that may hold newlines: each line wraps on its own.
+pub fn wrap_paragraphs(text: &str, width: usize) -> Vec<String> {
+    text.split('\n')
+        .flat_map(|line| wrap(line, width))
+        .collect()
+}
+
+/// The number of rows `wrap_paragraphs(text, width)` would produce.
+pub(crate) fn wrap_paragraphs_len(text: &str, width: usize) -> usize {
+    text.split('\n').map(|line| wrap_len(line, width)).sum()
+}
+
+/// `wrap` over styled runs. Wrapping only drops and re-inserts spaces, so the
+/// wrapped rows hold the text's other characters in their original order and
+/// each gets its run's style back; a space takes the style before it (a blank
+/// cell shows no colour). The row count is `wrap_len` of the joined text.
+pub fn wrap_styled<S: Copy + PartialEq>(
+    runs: &[(String, S)],
+    width: usize,
+) -> Vec<Vec<(String, S)>> {
+    let Some(first) = runs.first().map(|(_, style)| *style) else {
+        return vec![Vec::new()];
+    };
+    let plain: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+    let mut styles = runs
+        .iter()
+        .flat_map(|(text, style)| text.chars().filter(|c| *c != ' ').map(move |_| *style));
+    wrap(&plain, width)
+        .into_iter()
+        .map(|line| {
+            let mut row: Vec<(String, S)> = Vec::new();
+            let mut style = first;
+            for ch in line.chars() {
+                if ch != ' ' {
+                    style = styles.next().unwrap_or(style);
+                }
+                match row.last_mut() {
+                    Some((text, last)) if *last == style || ch == ' ' => text.push(ch),
+                    _ => row.push((ch.to_string(), style)),
+                }
+            }
+            row
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn styled_wrap_keeps_each_word_in_its_run() {
+        let runs = vec![
+            ("see ".to_string(), 'i'),
+            ("a/b.rs".to_string(), 'r'),
+            (" now".to_string(), 'i'),
+        ];
+        let rows = wrap_styled(&runs, 6);
+        assert_eq!(
+            rows,
+            vec![
+                vec![("see".to_string(), 'i')],
+                vec![("a/b.rs".to_string(), 'r')],
+                vec![("now".to_string(), 'i')],
+            ]
+        );
+        assert_eq!(rows.len(), wrap_len("see a/b.rs now", 6));
+    }
 
     #[test]
     fn wraps_at_spaces() {

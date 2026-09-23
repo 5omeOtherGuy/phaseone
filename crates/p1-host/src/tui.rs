@@ -17,11 +17,14 @@ use p1_contracts::{
     AuthorizationPolicy, CancellationToken, Decision, EventSink, InboxKind, TurnEnd,
 };
 use p1_core::Agent;
+use p1_tui::face::{TargetKind, ToolDescriber};
 use p1_tui::input::{self, Command};
+use p1_tui::palette::ColorMode;
 use p1_tui::render::diff::DiffView;
 use p1_tui::render::permission::PermissionView;
 use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
 use p1_tui::state::{Approval, Screen};
+use p1_tui::transcript::Transcript;
 use ratatui::backend::Backend;
 use tokio::sync::mpsc;
 
@@ -30,6 +33,11 @@ use crate::activity::Completion;
 use crate::cli::Options;
 use crate::frontend::{FrontEnd, WorkerService};
 use crate::run::StallGuard;
+
+mod describer;
+mod status;
+
+use describer::HostDescriber;
 
 /// What the host knows at construction time. The resolved route and model
 /// arrive later, through [`FrontEnd::parent_assembled`].
@@ -41,6 +49,12 @@ pub struct TuiOptions {
     pub workspace: std::path::PathBuf,
     /// The shell sandbox posture, shown in §4.5 permission prompts.
     pub sandbox: String,
+    /// §10 `effort`: an explicit `--effort`, already resolved at CLI parse time.
+    /// `None` is the adapter default, which the statusline already renders as
+    /// `default` (§10's "known default" rule) — never re-resolved from the
+    /// assembled environment, which is not known this early (`run_agent`
+    /// builds this before `assemble`).
+    pub effort: Option<String>,
 }
 
 /// The TUI front end. Created before the agent so its sink and policy install
@@ -53,6 +67,14 @@ pub struct TuiFrontEnd {
     auth: Mutex<Option<mpsc::UnboundedReceiver<AuthRequest>>>,
     /// (route, model), announced by the host once assembly has happened.
     labels: Mutex<Option<(String, String)>>,
+    /// (window_tokens, summarize_at_tokens), from `FrontEnd::context_configured`
+    /// (§10 `ctx`'s denominator); `None` fields when the environment has no
+    /// `[context]` section.
+    context: Mutex<(Option<u64>, Option<u64>)>,
+    /// The parent's route label (ADR-0049 stage 3): a `/model`/`/effort` switch
+    /// moves it, the same seam `LineFrontEnd` already uses — the assembled
+    /// route fills it in, `route_label()` shares it with `crate::run::ModelSwitch`.
+    route_label: Arc<Mutex<String>>,
 }
 
 impl TuiFrontEnd {
@@ -66,6 +88,8 @@ impl TuiFrontEnd {
             events: Mutex::new(Some(events)),
             auth: Mutex::new(Some(auth)),
             labels: Mutex::new(None),
+            context: Mutex::new((None, None)),
+            route_label: Arc::new(Mutex::new(String::new())),
         }
     }
 }
@@ -100,6 +124,18 @@ impl FrontEnd for TuiFrontEnd {
 
     fn parent_assembled(&self, route: &str, model: &str, _completion: Option<Completion>) {
         *self.labels.lock().unwrap() = Some((route.to_string(), model.to_string()));
+        *self.route_label.lock().unwrap() = route.to_string();
+    }
+
+    fn context_configured(&self, window_tokens: Option<u64>, summarize_at_tokens: Option<u64>) {
+        *self.context.lock().unwrap() = (window_tokens, summarize_at_tokens);
+    }
+
+    /// ADR-0049 stage 3: shared with `crate::run::ModelSwitch`, so a
+    /// successful `/model`/`/effort` switch moves the label the driver reads
+    /// back into `route` — the same mechanism `LineFrontEnd` uses.
+    fn route_label(&self) -> Option<Arc<Mutex<String>>> {
+        Some(self.route_label.clone())
     }
 
     /// A TUI is interactive by definition: the host's §3c stall guard and the
@@ -110,7 +146,7 @@ impl FrontEnd for TuiFrontEnd {
 
     fn run<'a>(
         &'a self,
-        _deps: &'a HostDeps,
+        deps: &'a HostDeps,
         agent: &'a mut Agent,
         cancel: &'a CancellationToken,
         workers: Option<Arc<dyn WorkerService>>,
@@ -131,10 +167,39 @@ impl FrontEnd for TuiFrontEnd {
                     return 1;
                 }
             };
+            // §2: the process environment decides once; every frame degrades to it
+            // (`draw` below) — truecolor stays a no-op.
+            let color_mode = ColorMode::detect(&std::env::vars().collect());
 
             let mut screen = Screen::new(std::env::var_os("P1_REDUCED_MOTION").is_some());
+            // §7.1/§7.3: the ONE describer, installed once (and shared with the
+            // driver below — `approval_view` reuses its classification instead of
+            // a second tool-name list). `p1-tui` never sees a tool name from here on.
+            let describer = Arc::new(HostDescriber::new(
+                self.options.workspace.clone(),
+                self.options.sandbox.clone(),
+            ));
+            screen.transcript = Transcript::with_describer(describer.clone());
             let (route, model) = self.labels.lock().unwrap().clone().unwrap_or_default();
-            // The §4.1 idle prelude: version line, one sentence of state, the
+            // §10 statusline: the chip and the static fields the driver never
+            // recomputes (workers/ctx/spend/clock move every frame instead).
+            screen.statusbar.model = Some(format!("{route}/{model}"));
+            screen.statusbar.effort = self.options.effort.clone();
+            screen.statusbar.repo = status::repo_name(&self.options.workspace);
+            // Bounded and off the render loop: a `git` that hangs must not hang
+            // the first frame, and a missing/slow `git` just omits `branch`.
+            let workspace = self.options.workspace.clone();
+            let initial_branch = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                tokio::task::spawn_blocking(move || status::git_branch(&workspace)),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+            let branch = Arc::new(Mutex::new(initial_branch));
+            screen.statusbar.branch = branch.lock().unwrap().clone();
+            // §4.1 idle prelude: version line, one sentence of state, the
             // four affordances — then the transcript takes over.
             screen
                 .transcript
@@ -164,7 +229,7 @@ impl FrontEnd for TuiFrontEnd {
             screen.route = route.clone();
             // A resumed session shows where it stands (issue #12, seam note).
             screen.transcript.paint_history(agent.history());
-            let worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>> =
+            let worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>> =
                 Arc::new(Mutex::new(Vec::new()));
             #[cfg(feature = "delegation")]
             if let Some(service) = &workers {
@@ -177,6 +242,7 @@ impl FrontEnd for TuiFrontEnd {
                 model,
                 workspace: self.options.workspace.clone(),
                 sandbox: self.options.sandbox.clone(),
+                ask: self.options.ask,
                 policy: self.policy.clone(),
                 pending_auth: VecDeque::new(),
                 pinned_by_approval: false,
@@ -189,6 +255,17 @@ impl FrontEnd for TuiFrontEnd {
                 exit: None,
                 inbox: agent.inbox(),
                 worker_rows,
+                branch,
+                describer,
+                context_window: self.context.lock().unwrap().0,
+                context_warn_at: self.context.lock().unwrap().1,
+                // ADR-0049 stage 3: `deps.model_switch` is set (in `run.rs`, this
+                // crate) right before `FrontEnd::run` is called — the same
+                // instant the line mode's `run_interactive` starts reading it.
+                model_switch: deps.model_switch.clone(),
+                environment_dirs: deps.environment_dirs.clone(),
+                route_label: self.route_label.clone(),
+                pending_switch: None,
                 _workers: workers,
             };
 
@@ -213,6 +290,7 @@ impl FrontEnd for TuiFrontEnd {
                 auth_rx.take().expect("run once"),
                 cancel,
                 &self.sink,
+                color_mode,
             )
             .await
         })
@@ -233,6 +311,10 @@ pub(crate) struct Driver {
     model: String,
     workspace: std::path::PathBuf,
     sandbox: String,
+    /// ADR-0038: full access is the default; prompts appear only under --ask.
+    /// §6.9's `/status`/`/access` read it (the policy itself carries no
+    /// public getter — `p1-tui::runtime` is not an owned path here).
+    ask: bool,
     policy: Arc<TuiPolicy>,
     /// Parked authorizations; the front one is on screen. Two workers can
     /// park at once (they share this policy) — a second request must QUEUE,
@@ -255,42 +337,110 @@ pub(crate) struct Driver {
     /// borrow lives in the loop, not in the driver).
     submit_pending: Option<String>,
     /// The worker snapshot the refresher task maintains (delegation only).
-    worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>>,
+    worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
     inbox: p1_core::Inbox,
+    /// §10 `branch`: refreshed off the render loop (`spawn_branch_refresh`,
+    /// called from the async loop, never from a `Driver` method a plain
+    /// `#[test]` calls directly) at start and after every `TurnFinished`.
+    branch: Arc<Mutex<Option<String>>>,
+    /// The same describer installed on `screen.transcript` (§7.1): the one
+    /// other host-side place that used to know a tool name by matching it
+    /// (`approval_view`'s diff-vs-permission choice) reuses its classification
+    /// instead of a second list.
+    describer: Arc<HostDescriber>,
+    /// §10 `ctx`'s denominator (`FrontEnd::context_configured`): the
+    /// assembled `[context]` window and its summarize threshold, in tokens.
+    /// Both `None` when the environment has no `[context]` section.
+    context_window: Option<u64>,
+    context_warn_at: Option<u64>,
+    /// ADR-0049 stage 3: `/model`/`/effort`'s switch context, already plumbed
+    /// onto `HostDeps` for the line mode (`deps.model_switch`) — `None` only
+    /// when the run never reached that point (never true once `run` starts).
+    model_switch: Option<Arc<crate::run::ModelSwitch>>,
+    /// For `/models`' listing: `crate::models::enumerate` needs only the
+    /// search path, not the whole `HostDeps`.
+    environment_dirs: Vec<std::path::PathBuf>,
+    /// Shared with `crate::run::ModelSwitch` (`FrontEnd::route_label`): a
+    /// successful switch moves it; the driver reads it back into `route`.
+    route_label: Arc<Mutex<String>>,
+    /// A `/model`/`/effort` typed while a turn is running: applied at the
+    /// next boundary (§11: "while a turn runs the switch applies at the next
+    /// boundary"), since `agent` is exclusively borrowed by the turn future
+    /// until then.
+    pending_switch: Option<PendingSwitch>,
     _workers: Option<Arc<dyn WorkerService>>,
 }
 
+/// A `/model`/`/effort` switch queued while a turn was running.
+enum PendingSwitch {
+    Model(String),
+    Effort(String),
+}
+
 impl Driver {
-    fn on_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::KeyModifiers;
-        let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
-        // The picker filters as you type (SPEC §4.6).
-        if let Some(picker) = &mut self.screen.picker {
-            match (key.code, plain) {
-                (crossterm::event::KeyCode::Char(c), true) => {
-                    picker.filter.push(c);
-                    picker.selected = 0;
-                    return;
-                }
-                (crossterm::event::KeyCode::Backspace, _) => {
-                    picker.filter.pop();
-                    picker.selected = 0;
-                    return;
-                }
+    fn on_key(&mut self, key: crossterm::event::KeyEvent, agent: Option<&mut Agent>) {
+        use crossterm::event::KeyCode;
+        // `input::handle`'s own pre-check, replicated: until `^F` is applied
+        // through `apply_view`, an open OUTPUT pane with no modal on screen
+        // keeps scrolling on the bare arrows (this driver now calls `decide`
+        // directly, so it owns the check `handle` used to make for it).
+        if self.screen.approval.is_none()
+            && self.screen.picker.is_none()
+            && self.screen.output.is_some()
+            && key.modifiers.is_empty()
+        {
+            match key.code {
+                KeyCode::Up => return self.dispatch(Command::PaneUp, None),
+                KeyCode::Down => return self.dispatch(Command::PaneDown, None),
                 _ => {}
             }
         }
-        let Some(command) = input::handle(&self.screen, key) else {
+        let Some(action) = input::decide(&self.screen, key) else {
             return;
         };
+        match action {
+            input::Action::Command(command) => self.dispatch(command, agent),
+            // These keep `input::handle`'s exact historical mapping: opening
+            // the command-completion picker isn't wired to submit on `Enter`
+            // anywhere yet, so routing it through `apply_view` would silently
+            // swallow a typed slash command's submission instead of running
+            // it (§6.10's completion flow is a `Enter`-to-complete-then-
+            // `Enter`-to-submit two-step, which no test or caller here uses).
+            input::Action::View(input::ViewCommand::PageUp) => {
+                self.dispatch(Command::ScrollUp, None)
+            }
+            input::Action::View(input::ViewCommand::PageDown) => {
+                self.dispatch(Command::ScrollDown, None)
+            }
+            input::Action::View(input::ViewCommand::OpenCompletion) => {
+                self.dispatch(Command::Insert('/'), None)
+            }
+            input::Action::View(input::ViewCommand::EditGoal) => self.screen.edit_goal(),
+            // Every other view key (§12) the screen applies to itself: full
+            // review paging, menu filtering/effort-stepping, pane focus, the
+            // goal editor's `esc` — none of which `input::handle` ever reached
+            // (it dropped them; that is the wiring gap this task closes).
+            input::Action::View(other) => self.screen.apply_view(other),
+        }
+    }
+
+    /// `agent` is `Some` only when no turn is running (the loop's idle key
+    /// arm): a `/model`/`/effort` switch needs it; mid-turn (`pump`'s key
+    /// arm) it is exclusively borrowed by the turn future, so callers pass
+    /// `None` and a switch request queues instead (§11).
+    fn dispatch(&mut self, command: Command, agent: Option<&mut Agent>) {
         match command {
             Command::Submit(text) => {
                 self.screen.composer.take();
-                self.submit(text);
+                self.submit(text, agent);
             }
             Command::QueueSteering(text) => {
                 self.screen.composer.take();
                 self.screen.queue(false, text.clone());
+                // §8.2: delivery (`InboxDelivered`) renders the queued text as a
+                // tagged `OperatorTurn` — the transcript keeps its own copy so it
+                // can drain exactly what the inbox actually delivered.
+                self.screen.transcript.queue_steering(text.clone());
                 self.inbox.send(InboxKind::Steering, text);
             }
             Command::QueueFollowUp(text) => {
@@ -298,11 +448,11 @@ impl Driver {
                 self.screen.queue(true, text.clone());
                 self.follow_ups.push_back(text);
             }
-            Command::EditGoal => {
-                self.screen.composer.text = "/goal ".into();
-                self.screen.composer.cursor = 6;
-                self.screen.composer.revealed = true;
-            }
+            // Never produced by `decide` (`^G` maps to `ViewCommand::EditGoal`,
+            // handled directly in `on_key`); kept so the match stays
+            // exhaustive over every `Command` variant, and correct — not the
+            // blank `/goal ` this used to insert — if it ever is.
+            Command::EditGoal => self.screen.edit_goal(),
             Command::Newline => self.screen.composer.insert('\n'),
             Command::Insert(c) => self.screen.composer.insert(c),
             Command::Backspace => self.screen.composer.backspace(),
@@ -343,7 +493,6 @@ impl Driver {
             }
             Command::Dismiss => {
                 self.screen.picker = None;
-                self.screen.status = None;
             }
             Command::PickerUp => {
                 if let Some(picker) = &mut self.screen.picker {
@@ -368,17 +517,18 @@ impl Driver {
     /// A submitted line: a slash command, or a prompt for the agent. The
     /// prompt waits in `submit_pending` for the loop (the agent borrow lives
     /// there, not here).
-    fn submit(&mut self, text: String) {
+    fn submit(&mut self, text: String, agent: Option<&mut Agent>) {
         if let Some(command) = text.strip_prefix('/') {
-            self.slash(command);
+            self.slash(command, agent);
             return;
         }
         self.screen.transcript.operator(text.clone());
         self.submit_pending = Some(text);
     }
 
-    fn slash(&mut self, command: &str) {
+    fn slash(&mut self, command: &str, agent: Option<&mut Agent>) {
         let (name, arg) = command.split_once(' ').unwrap_or((command, ""));
+        let arg = arg.trim();
         match name {
             "exit" | "quit" => self.exit = Some(0),
             // `/focus` toggles; `/focus on|off` are deterministic, and `off`
@@ -396,13 +546,111 @@ impl Driver {
             "goal" => {
                 self.screen.goal = (!arg.is_empty()).then(|| arg.to_string());
             }
+            // §11: `/env` is an alias of `/model` (open question §15.3, resolved
+            // — the idle prelude already advertises `/env`).
+            "model" | "env" => self.slash_model(arg, agent),
+            "effort" => self.slash_effort(arg, agent),
+            "models" => self.slash_models((!arg.is_empty()).then_some(arg)),
             "status" => {
-                self.screen.status = Some(status_groups(self));
+                let output = status_command_output(self);
+                self.screen.transcript.command_output(output);
             }
+            "access" => {
+                let output = access_command_output(self);
+                self.screen.transcript.command_output(output);
+            }
+            "help" => self.screen.transcript.command_output(help_command_output()),
             other => {
-                self.screen.transcript.operator(format!("/{other}"));
+                self.screen
+                    .transcript
+                    .note(&format!("· /{other} is not a command · /help"));
+            }
+        }
+    }
+
+    /// `/model` bare lists every model (the same listing `/models` shows);
+    /// `/model REF` switches.
+    fn slash_model(&mut self, reference: &str, agent: Option<&mut Agent>) {
+        if reference.is_empty() {
+            self.slash_models(None);
+            return;
+        }
+        self.request_switch(PendingSwitch::Model(reference.to_string()), agent);
+    }
+
+    fn slash_effort(&mut self, level: &str, agent: Option<&mut Agent>) {
+        if level.is_empty() {
+            self.screen
+                .transcript
+                .note("· /effort needs a level · low medium high max");
+            return;
+        }
+        self.request_switch(PendingSwitch::Effort(level.to_string()), agent);
+    }
+
+    fn slash_models(&mut self, search: Option<&str>) {
+        match models_command_output(&self.environment_dirs, search) {
+            Ok(output) => self.screen.transcript.command_output(output),
+            Err(reason) => self.screen.transcript.note(&format!("· /models: {reason}")),
+        }
+    }
+
+    /// §11: while a turn runs the switch applies at the next boundary —
+    /// `agent` is `None` exactly then (mid-`pump`, borrowed by the turn).
+    fn request_switch(&mut self, request: PendingSwitch, agent: Option<&mut Agent>) {
+        let Some(agent) = agent else {
+            self.screen
+                .transcript
+                .note("· model switch queued · applies at the next boundary");
+            self.pending_switch = Some(request);
+            return;
+        };
+        self.apply_switch(request, agent);
+    }
+
+    fn apply_switch(&mut self, request: PendingSwitch, agent: &mut Agent) {
+        let Some(switch) = self.model_switch.clone() else {
+            self.screen
+                .transcript
+                .note("· switch refused · no model switch is available this run");
+            return;
+        };
+        let before = self.model.clone();
+        let outcome = match &request {
+            PendingSwitch::Model(reference) => crate::run::switch_model(
+                &switch,
+                agent,
+                crate::run::SwitchRequest::Model(reference),
+            ),
+            PendingSwitch::Effort(level) => {
+                crate::run::switch_model(&switch, agent, crate::run::SwitchRequest::Effort(level))
+            }
+        };
+        self.report_switch(before, outcome);
+    }
+
+    /// §11: `switch_model` result → `MetaRow · model a → b · from the next
+    /// turn`, or `✗ switch refused · <reason> · kept still on a`.
+    fn report_switch(&mut self, before: String, outcome: Result<String, String>) {
+        match outcome {
+            Ok(after) => {
+                self.screen
+                    .transcript
+                    .note(&format!("· model {before} → {after} · from the next turn"));
+                if let Some(env) = after.split('/').next() {
+                    self.env = env.to_string();
+                    self.screen.env = self.env.clone();
+                }
+                self.screen.statusbar.effort = after.split(':').nth(1).map(str::to_string);
+                self.model = after;
+                // `switch_model` moved the shared route label; the chip and
+                // `/status`'s `route` row follow it.
+                self.route = self.route_label.lock().unwrap().clone();
+                self.screen.statusbar.model = Some(format!("{}/{}", self.route, self.model));
+            }
+            Err(reason) => {
                 self.screen.transcript.note(&format!(
-                    "· /{other} is not a TUI command yet — try /status, /focus, /goal, /exit"
+                    "✗ switch refused · {reason} · kept still on {before}"
                 ));
             }
         }
@@ -436,9 +684,11 @@ impl Driver {
         }
     }
 
-    /// Pull the refresher's snapshot into the screen (SPEC §5 promotion).
+    /// Pull the refresher's snapshot into the screen (SPEC §5 promotion) and
+    /// the statusline's §10 `▪ N workers` count.
     fn sync_workers(&mut self) {
         let rows = self.worker_rows.lock().unwrap().clone();
+        self.screen.statusbar.workers = status::running_workers(&rows);
         self.screen.sync_workers(rows);
     }
 
@@ -477,8 +727,26 @@ impl Driver {
                     self.screen.transcript.note(&format!("· {text}"));
                     return;
                 }
+                if let p1_contracts::AgentEvent::ResponseCompleted { usage, .. } = &stamped.event {
+                    // §10 `ctx`: `FrontEnd::context_configured` carries the
+                    // assembled `[context]` window and threshold; unknown (no
+                    // `[context]` section) stays `None`, never a guessed `0`.
+                    let (ctx, warn) = status::ctx_status(
+                        status::usage_input_total(usage.as_ref()),
+                        self.context_window,
+                        self.context_warn_at,
+                    );
+                    self.screen.statusbar.ctx = ctx;
+                    self.screen.statusbar.ctx_warn = warn;
+                }
                 self.track_task(&stamped.event);
                 self.screen.apply(&stamped.event, stamped.at_ms);
+                // §10 `spend`: `Screen::apply` above just updated `screen.spend`
+                // (`ResponseCompleted`/every event); mirror it into the
+                // statusline's compact `$0.00` (or `—`, e.g. a subscription
+                // route, which never reports a cost).
+                self.screen.statusbar.spend =
+                    status::spend_string(self.screen.spend.cost_micro_usd);
             }
         }
     }
@@ -512,8 +780,7 @@ impl Driver {
                 self.task_added += get("new_string")
                     .or_else(|| get("content"))
                     .map_or(0, |s| s.lines().count() as u64);
-                self.screen.task_view = Some(p1_tui::render::ledger::Task {
-                    id: None,
+                self.screen.workspace = Some(p1_tui::render::ledger::WorkspaceView {
                     files: Some(self.task_files.len() as u64),
                     diff: Some((self.task_added, self.task_removed)),
                     journal: None,
@@ -533,13 +800,21 @@ impl Driver {
 
     /// Show the queue's front request, if none is on screen.
     fn show_next_auth(&mut self) {
+        // The front request is the one on screen; the rest wait behind it (`N of M pending`).
+        self.screen.approvals_waiting = self.pending_auth.len().saturating_sub(1);
         if self.screen.approval.is_some() {
             return;
         }
         let Some(request) = self.pending_auth.front() else {
             return;
         };
-        self.screen.approval = Some(approval_view(request, &self.workspace, &self.sandbox));
+        self.screen.approval_tool = request.call.name.clone();
+        self.screen.approval = Some(approval_view(
+            request,
+            &self.describer,
+            &self.workspace,
+            &self.sandbox,
+        ));
         // An approval self-pins (SPEC §5): nothing may swap it away.
         if !self.screen.pinned {
             self.screen.pinned = true;
@@ -565,6 +840,28 @@ impl Driver {
         self.screen.transcript.operator(next.clone());
         Some(next)
     }
+
+    /// §10 fields that move every frame regardless of what event caused it:
+    /// the clock (from the session-relative `now_ms` every draw already
+    /// carries) and the branch (a background task keeps `self.branch`
+    /// current; this just republishes its latest value).
+    fn sync_status(&mut self, now_ms: u64) {
+        self.screen.statusbar.clock = Some(status::clock(now_ms));
+        self.screen.statusbar.branch = self.branch.lock().unwrap().clone();
+    }
+}
+
+/// §10 `branch`: re-read `git` in the background and publish it once done —
+/// called from the async loop only (at start, and after every `TurnFinished`),
+/// never from a `Driver` method a plain `#[test]` calls directly (a bare
+/// `#[test]` has no tokio runtime for `tokio::spawn` to run on).
+fn spawn_branch_refresh(workspace: std::path::PathBuf, branch: Arc<Mutex<Option<String>>>) {
+    tokio::spawn(async move {
+        let next = tokio::task::spawn_blocking(move || status::git_branch(&workspace))
+            .await
+            .unwrap_or(None);
+        *branch.lock().unwrap() = next;
+    });
 }
 
 /// The render/input loop over a borrowed agent. Turns are pinned futures
@@ -579,6 +876,7 @@ async fn drive_loop<B, K>(
     mut auth: mpsc::UnboundedReceiver<AuthRequest>,
     cancel: &CancellationToken,
     sink: &TuiSink,
+    color_mode: ColorMode,
 ) -> i32
 where
     B: Backend,
@@ -612,10 +910,12 @@ where
                 &mut auth,
                 sink,
                 &child,
+                color_mode,
                 Box::pin(agent.run_turn(text, child.clone())),
             )
             .await;
             driver.note_turn_end(&end);
+            spawn_branch_refresh(driver.workspace.clone(), driver.branch.clone());
             while !child.is_cancelled() && agent.has_pending_inbox() {
                 end = pump(
                     terminal,
@@ -625,6 +925,7 @@ where
                     &mut auth,
                     sink,
                     &child,
+                    color_mode,
                     Box::pin(async {
                         agent
                             .run_inbox_turn(child.clone())
@@ -636,8 +937,14 @@ where
                 )
                 .await;
                 driver.note_turn_end(&end);
+                spawn_branch_refresh(driver.workspace.clone(), driver.branch.clone());
             }
             driver.policy.set_turn(None);
+            // §11: a `/model`/`/effort` typed mid-turn applies here, at the
+            // first boundary `agent` is free again.
+            if let Some(pending) = driver.pending_switch.take() {
+                driver.apply_switch(pending, agent);
+            }
             if matches!(end, TurnEnd::Cancelled) {
                 continue;
             }
@@ -649,7 +956,8 @@ where
             continue;
         }
         // Idle: draw, then wait for anything.
-        draw(terminal, &mut driver.screen, sink.now_ms());
+        driver.sync_status(sink.now_ms());
+        draw(terminal, &mut driver.screen, sink.now_ms(), color_mode);
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return 130,
@@ -659,7 +967,7 @@ where
                     driver.exit = Some(0);
                     continue;
                 }
-                driver.on_key(key);
+                driver.on_key(key, Some(agent));
                 if let Some(text) = driver.submit_pending.take() {
                     prompt = Some(text);
                 }
@@ -690,6 +998,7 @@ where
                         &mut auth,
                         sink,
                         &child,
+                        color_mode,
                         Box::pin(async {
                             agent
                                 .run_inbox_turn(child.clone())
@@ -701,8 +1010,12 @@ where
                     )
                     .await;
                     driver.note_turn_end(&end);
+                    spawn_branch_refresh(driver.workspace.clone(), driver.branch.clone());
                 }
                 driver.policy.set_turn(None);
+                if let Some(pending) = driver.pending_switch.take() {
+                    driver.apply_switch(pending, agent);
+                }
             }
         }
     }
@@ -720,6 +1033,7 @@ async fn pump<B, K, F>(
     auth: &mut mpsc::UnboundedReceiver<AuthRequest>,
     sink: &TuiSink,
     turn_cancel: &CancellationToken,
+    color_mode: ColorMode,
     mut turn: std::pin::Pin<Box<F>>,
 ) -> TurnEnd
 where
@@ -731,7 +1045,8 @@ where
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut keys_done = false;
     loop {
-        draw(terminal, &mut driver.screen, sink.now_ms());
+        driver.sync_status(sink.now_ms());
+        draw(terminal, &mut driver.screen, sink.now_ms(), color_mode);
         tokio::select! {
             biased;
             end = &mut turn => return end,
@@ -742,7 +1057,9 @@ where
                     turn_cancel.cancel();
                     continue;
                 }
-                driver.on_key(key);
+                // A turn's future owns `agent`; a `/model`/`/effort` mid-turn
+                // queues instead (§11).
+                driver.on_key(key, None);
             }
             ui = events.recv() => {
                 if let Some(ui) = ui {
@@ -764,10 +1081,10 @@ where
 #[cfg(feature = "delegation")]
 fn spawn_worker_refresher(
     service: Arc<dyn WorkerService>,
-    rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerRow>>>,
+    rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
     cancel: CancellationToken,
 ) {
-    use p1_tui::render::workers::{WorkerRow, WorkerState};
+    use p1_tui::render::workers::{BlockState, WorkerBlock};
     use p1_workers::ChildStatus;
     tokio::spawn(async move {
         let mut started: HashMap<String, std::time::Instant> = HashMap::new();
@@ -792,20 +1109,22 @@ fn spawn_worker_refresher(
                     }
                     _ => None,
                 };
-                let (state, details) = match &status {
-                    ChildStatus::Running => (WorkerState::Running, Vec::new()),
-                    ChildStatus::Finished(_) => (WorkerState::Done, Vec::new()),
-                    ChildStatus::Cancelled => (WorkerState::Done, vec!["cancelled".into()]),
-                    ChildStatus::Failed(e) => (WorkerState::Done, vec![format!("failed: {e}")]),
+                let (state, activity) = match &status {
+                    ChildStatus::Running => (BlockState::Running, String::new()),
+                    ChildStatus::Finished(_) => (BlockState::Done, String::new()),
+                    ChildStatus::Cancelled => (BlockState::Cancelled, String::new()),
+                    ChildStatus::Failed(e) => (BlockState::Failed, format!("failed: {e}")),
                 };
-                next.push(WorkerRow {
+                // The service reports no task text and no grants yet (handoff §14.3).
+                next.push(WorkerBlock {
                     id: id.0.clone(),
-                    summary: id.0.clone(),
+                    task: String::new(),
                     route: description,
                     state,
                     elapsed,
                     cost_micro_usd: None,
-                    details,
+                    grants: String::new(),
+                    activity,
                 });
             }
             *rows.lock().unwrap() = next;
@@ -821,107 +1140,209 @@ fn is_cancel(key: &crossterm::event::KeyEvent) -> bool {
             .contains(crossterm::event::KeyModifiers::CONTROL)
 }
 
-/// Draw one frame.
-fn draw<B: Backend>(terminal: &mut ratatui::Terminal<B>, screen: &mut Screen, now_ms: u64) {
+/// Draw one frame, then degrade the whole buffer to the process's colour mode
+/// (§2): truecolor needs no pass (`palette::degrade`'s RGB→indexed path is
+/// for 256/no-colour only), so it is skipped rather than called as a no-op.
+fn draw<B: Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    screen: &mut Screen,
+    now_ms: u64,
+    color_mode: ColorMode,
+) {
     terminal
         .draw(|frame| {
             // Focus mode: explicit (/focus) wins; otherwise automatic at 12
             // rows or fewer (SPEC §4.3a).
             screen.focus = screen.focus_explicit.unwrap_or(frame.area().height <= 12);
             p1_tui::render::screen::draw(screen, frame.area(), frame.buffer_mut(), now_ms);
-            // The text cursor lives in the composer, unless a modal owns keys.
-            if screen.approval.is_none() && screen.picker.is_none() && screen.status.is_none() {
-                let area = frame.area();
-                let queued = screen.queued.len();
-                let (col, row) = p1_tui::render::composer::cursor_cell(
-                    &screen.composer,
-                    queued,
-                    area.width as usize,
-                );
-                let composer_rows = 1 + queued + 1; // input line(s) + hints
-                let y = area.height.saturating_sub(composer_rows as u16) + row as u16;
-                frame.set_cursor_position((col.min(area.width as usize - 1) as u16, y));
+            if color_mode != ColorMode::TrueColor {
+                p1_tui::palette::degrade(frame.buffer_mut(), color_mode);
+            }
+            // The hardware cursor sits on the composer's text cell (§8.1), when it is editable.
+            if let Some(cursor) = screen.cursor {
+                frame.set_cursor_position(cursor);
             }
         })
         .ok();
 }
 
-/// Build the blocking approval view for a parked request.
-fn approval_view(request: &AuthRequest, workspace: &std::path::Path, sandbox: &str) -> Approval {
+/// Build the blocking approval view for a parked request. §7.1: the diff-vs-
+/// permission choice reuses the describer's own classification (a path
+/// target with an old/new pair to show) instead of a second tool-name list
+/// — `edit`/`write` supply both; `apply_patch`'s multi-file patch text has
+/// neither key, so it still takes the permission form (unchanged from
+/// before: a full patch-diff review is a separate, unbuilt seam, §7.5).
+fn approval_view(
+    request: &AuthRequest,
+    describer: &HostDescriber,
+    workspace: &std::path::Path,
+    sandbox: &str,
+) -> Approval {
     let raw = request.call.input.raw();
     let json: Option<serde_json::Value> = serde_json::from_str(raw).ok();
     let get = |key: &str| json.as_ref()?.get(key)?.as_str().map(str::to_string);
-    match request.call.name.as_str() {
-        // The edit-shaped tools review as diffs (SPEC §4.4).
-        name @ ("edit" | "patch" | "write") => {
-            let path = get("file_path").unwrap_or_default();
-            let old = get("old_string").unwrap_or_default();
-            let new = get("new_string")
-                .or_else(|| get("content"))
-                .unwrap_or_default();
-            let current = std::fs::read_to_string(workspace.join(&path)).ok();
-            Approval::Diff(DiffView::from_edit(
-                name,
-                &path,
-                &old,
-                &new,
-                current.as_deref(),
-                (1, 1),
-            ))
-        }
-        // Commands prompt per SPEC §4.5: cwd, sandbox, network, reason.
-        _ => Approval::Permission(PermissionView {
-            command: get("command").unwrap_or_else(|| p1_tui::transcript::summarize_input(raw)),
-            rows: vec![
-                ("cwd".into(), workspace.display().to_string()),
-                ("sandbox".into(), sandbox.to_string()),
-                ("network".into(), "off".into()),
-                (
-                    "reason".into(),
-                    match request.effect {
-                        p1_contracts::Effect::Executes => "runs a process".into(),
-                        p1_contracts::Effect::WritesFiles => "writes files".into(),
-                        p1_contracts::Effect::Delegates => "starts an agent".into(),
-                        p1_contracts::Effect::ReadOnly => "read".into(),
-                    },
-                ),
-            ],
-            grantable: true,
-        }),
+    let is_path_target = describer.call(&request.call).kind == TargetKind::Path;
+    let old = get("old_string");
+    let new = get("new_string").or_else(|| get("content"));
+    if is_path_target && (old.is_some() || new.is_some()) {
+        let path = get("file_path").unwrap_or_default();
+        let old = old.unwrap_or_default();
+        let new = new.unwrap_or_default();
+        let current = std::fs::read_to_string(workspace.join(&path)).ok();
+        return Approval::Diff(DiffView::from_edit(
+            &request.call.name,
+            &path,
+            &old,
+            &new,
+            current.as_deref(),
+            (1, 1),
+        ));
+    }
+    // Commands prompt per SPEC §4.5: cwd, sandbox, network, reason.
+    Approval::Permission(PermissionView {
+        command: get("command").unwrap_or_else(|| p1_tui::transcript::summarize_input(raw)),
+        rows: vec![
+            ("cwd".into(), workspace.display().to_string()),
+            ("sandbox".into(), sandbox.to_string()),
+            ("network".into(), "off".into()),
+            (
+                "reason".into(),
+                match request.effect {
+                    p1_contracts::Effect::Executes => "runs a process".into(),
+                    p1_contracts::Effect::WritesFiles => "writes files".into(),
+                    p1_contracts::Effect::Delegates => "starts an agent".into(),
+                    p1_contracts::Effect::ReadOnly => "read".into(),
+                },
+            ),
+        ],
+        grantable: true,
+    })
+}
+
+/// §6.9/§11: `/status` is a settled `CommandOutput`, not the retired overlay
+/// — the facts today's overlay showed (environment, route, model, effort,
+/// access, sandbox, spend), one row each.
+fn status_command_output(driver: &Driver) -> p1_tui::transcript::CommandOutput {
+    use p1_tui::transcript::{CommandOutput, CommandRow};
+    let entry = |key: &str, text: String| CommandRow::Entry {
+        key: key.into(),
+        text,
+    };
+    let spend = status::spend_string(driver.screen.spend.cost_micro_usd)
+        .unwrap_or_else(|| p1_tui::render::UNKNOWN.into());
+    CommandOutput {
+        command: "/status".into(),
+        argument: String::new(),
+        facts: String::new(),
+        body: vec![
+            entry("environment", driver.env.clone()),
+            entry("route", driver.route.clone()),
+            entry("model", driver.model.clone()),
+            entry(
+                "effort",
+                driver
+                    .screen
+                    .statusbar
+                    .effort
+                    .clone()
+                    .unwrap_or_else(|| "default".into()),
+            ),
+            entry(
+                "access",
+                if driver.ask {
+                    "ask · prompts on".into()
+                } else {
+                    "full · --ask to confirm".into()
+                },
+            ),
+            entry("sandbox", driver.sandbox.clone()),
+            entry("spend", spend),
+        ],
     }
 }
 
-/// The `/status` overlay from live state (SPEC §4.6 shape).
-fn status_groups(driver: &Driver) -> Vec<p1_tui::render::status::StatusGroup> {
-    use p1_tui::render::status::{StatusGroup, StatusRow};
-    let row = |label: &str, value: String| StatusRow {
-        label: label.into(),
-        value,
-        available: true,
-    };
-    let spend = &driver.screen.spend;
-    let or_unknown = |v: Option<u64>| {
-        v.map(p1_tui::render::tokens)
-            .unwrap_or_else(|| p1_tui::render::UNKNOWN.into())
-    };
-    vec![
-        StatusGroup {
-            header: "ENVIRONMENT".into(),
-            rows: vec![
-                row("environment", driver.env.clone()),
-                row("route", driver.route.clone()),
-                row("profile", driver.model.clone()),
-            ],
-        },
-        StatusGroup {
-            header: "SPEND".into(),
-            rows: vec![
-                row("in", or_unknown(spend.input)),
-                row("out", or_unknown(spend.output)),
-                row("cost", or_unknown(spend.cost_micro_usd)),
-            ],
-        },
-    ]
+/// §11: `/access` — policy facts; `--ask` restarts to change (ADR-0038: the
+/// access mode is fixed per process, never switched live).
+fn access_command_output(driver: &Driver) -> p1_tui::transcript::CommandOutput {
+    use p1_tui::transcript::{CommandOutput, CommandRow};
+    CommandOutput {
+        command: "/access".into(),
+        argument: String::new(),
+        facts: String::new(),
+        body: vec![
+            CommandRow::Entry {
+                key: "mode".into(),
+                text: if driver.ask {
+                    "ask · every tool prompts".into()
+                } else {
+                    "full · every tool runs".into()
+                },
+            },
+            CommandRow::Entry {
+                key: "sandbox".into(),
+                text: driver.sandbox.clone(),
+            },
+            CommandRow::Entry {
+                key: "change".into(),
+                text: "--ask restarts the session to change it".into(),
+            },
+        ],
+    }
+}
+
+/// §11: `/help` — the command list with descriptions. `/resume` is left off:
+/// the TUI does not implement it yet (a listed-but-inert command would be
+/// worse than an incomplete list).
+fn help_command_output() -> p1_tui::transcript::CommandOutput {
+    use p1_tui::transcript::{CommandOutput, CommandRow};
+    const COMMANDS: &[(&str, &str)] = &[
+        ("/model [REF]", "switch model or effort · alias /env"),
+        ("/effort LEVEL", "low medium high max"),
+        (
+            "/goal [TEXT]",
+            "set or clear the session objective · ^G edits",
+        ),
+        ("/focus [on|off]", "transcript only"),
+        ("/status", "session facts"),
+        ("/access", "access and sandbox · fixed per process"),
+        ("/models [SEARCH]", "every model p1 can run"),
+        ("/exit", "quit"),
+    ];
+    let mut body = vec![CommandRow::Head("COMMANDS".into())];
+    body.extend(COMMANDS.iter().map(|(key, text)| CommandRow::Entry {
+        key: (*key).into(),
+        text: (*text).into(),
+    }));
+    CommandOutput {
+        command: "/help".into(),
+        argument: String::new(),
+        // `/help` itself is the one command not listed as a row.
+        facts: format!("{} commands", COMMANDS.len() + 1),
+        body,
+    }
+}
+
+/// §11: `/models` — the `p1 models` listing, without the credential column
+/// (that probe reads the auth store; §7.3's fact rule applies just the same
+/// — a name it cannot derive here is omitted, not guessed).
+fn models_command_output(
+    environment_dirs: &[std::path::PathBuf],
+    search: Option<&str>,
+) -> Result<p1_tui::transcript::CommandOutput, String> {
+    use p1_tui::transcript::{CommandOutput, CommandRow};
+    let all = crate::models::enumerate(environment_dirs)?;
+    let rows = crate::models::search(&all, search);
+    let mut body = vec![CommandRow::Head("MODELS".into())];
+    body.extend(rows.iter().map(|model| CommandRow::Entry {
+        key: model.id(),
+        text: model.efforts_line(),
+    }));
+    Ok(CommandOutput {
+        command: "/models".into(),
+        argument: search.unwrap_or_default().to_string(),
+        facts: format!("{} models", rows.len()),
+        body,
+    })
 }
 
 #[cfg(test)]
@@ -943,6 +1364,7 @@ mod worker_end_tests {
                 ask: false,
                 workspace: std::path::PathBuf::from("/workspace"),
                 sandbox: "off".into(),
+                effort: None,
             },
             CancellationToken::new(),
         );
