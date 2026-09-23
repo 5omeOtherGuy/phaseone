@@ -1,0 +1,4 @@
+:root { font-variant-ligatures: none; }
+::selection { background: var(--selection-bg); color: var(--selection-fg); }
+a { color: var(--link); text-decoration: underline; text-decoration-color: var(--border-frame); }
+a:hover { color: var(--slab-ref-bright); }

@@ -1,0 +1,73 @@
+/* vendored from SLAB Core — keep in sync */
+/* SLAB/SIGNAL — colour tokens. Neutrals from SLAB/MONO v0.2, signal hues from v0.3. */
+:root {
+  /* surfaces — the step ladder */
+  --slab-bg-0: #0a0a0a;
+  --slab-bg-1: #121212;
+  --slab-bg-2: #181818;
+  --slab-bg-3: #202020;
+  --slab-rule: #2a2a2a;
+  --slab-rule-strong: #3d3d3d;
+  --slab-black: #000000;          /* GRUB / console only */
+
+  /* ink — three roles */
+  --slab-fg: #e8e8e8;
+  --slab-dim: #9a9a9a;
+  --slab-faint: #6a6a6a;
+
+  /* signal — one meaning each, equal lightness */
+  --slab-attn: #e2a03f;           /* ! your turn: focus, cursor, prompt, approval, warning */
+  --slab-fail: #e0705f;           /* ✗ error, failed, destructive, deletion */
+  --slab-ok: #8fb573;             /* ✓ passed, done, approved, addition */
+  --slab-live: #72b8b0;           /* ▸ running, in progress, streaming */
+  --slab-ref: #7fa7d6;            /* ↳ path, file:line, link */
+  --slab-syntax: #c08fc8;         /* keywords in code only */
+
+  --slab-attn-bright: #f2c078;
+  --slab-fail-bright: #f0948a;
+  --slab-ok-bright: #aed19a;
+  --slab-live-bright: #98d2ca;
+  --slab-ref-bright: #a3c3e8;
+  --slab-syntax-bright: #d5b0dc;
+
+  --slab-on-signal: #0a0a0a;      /* ink on any signal fill */
+  --slab-attn-wash: #1c1a16;      /* blocking-approval row only */
+
+  /* diff — body rows only */
+  --slab-diff-add-bg: #3a4a3a;
+  --slab-diff-add-fg: #d8e8d0;
+  --slab-diff-del-bg: #4a3535;
+  --slab-diff-del-fg: #e8d0d0;
+
+  /* ANSI 16 */
+  --slab-ansi-0: #1a1a1a;  --slab-ansi-8: #6a6a6a;
+  --slab-ansi-1: #e0705f;  --slab-ansi-9: #f0948a;
+  --slab-ansi-2: #8fb573;  --slab-ansi-10: #aed19a;
+  --slab-ansi-3: #e2a03f;  --slab-ansi-11: #f2c078;
+  --slab-ansi-4: #7fa7d6;  --slab-ansi-12: #a3c3e8;
+  --slab-ansi-5: #c08fc8;  --slab-ansi-13: #d5b0dc;
+  --slab-ansi-6: #72b8b0;  --slab-ansi-14: #98d2ca;
+  --slab-ansi-7: #bfbfbf;  --slab-ansi-15: #eaeaea;
+
+  /* semantic aliases */
+  --surface-ground: var(--slab-bg-0);
+  --surface-chrome: var(--slab-bg-1);
+  --surface-raised: var(--slab-bg-2);
+  --surface-control: var(--slab-bg-3);
+  --surface-inactive-title: var(--slab-bg-2);
+  --border-hairline: var(--slab-rule);
+  --border-frame: var(--slab-rule-strong);
+  --text-content: var(--slab-fg);
+  --text-label: var(--slab-dim);
+  --text-hint: var(--slab-faint);
+  --text-disabled: var(--slab-faint);
+  --focus: var(--slab-attn);
+  --selection-bg: var(--slab-attn);
+  --selection-fg: var(--slab-on-signal);
+  --cursor: var(--slab-attn);
+  --state-warn: var(--slab-attn);
+  --state-fail: var(--slab-fail);
+  --state-ok: var(--slab-ok);
+  --state-live: var(--slab-live);
+  --link: var(--slab-ref);
+}

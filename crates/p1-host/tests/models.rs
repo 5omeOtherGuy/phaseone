@@ -240,6 +240,7 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "gpt/gpt-6-astra",
             "gpt/gpt-6-luna",
             "gpt/gpt-6-sol",
+            "kimi/kimi-k3",
         ],
         "sorted by environment then profile"
     );
@@ -265,6 +266,12 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         .expect("the second account serves the same profile");
     assert_eq!(deepseek.efforts_line(), "high,max");
     assert_eq!(deepseek.route, "opencode-go-2-subscription");
+    let kimi = models
+        .iter()
+        .find(|model| model.id() == "kimi/kimi-k3")
+        .expect("the shipped Kimi model");
+    assert_eq!(kimi.route, "kimi-coding-subscription");
+    assert_eq!(kimi.efforts_line(), "low,high,max");
 }
 
 #[test]
@@ -1167,4 +1174,19 @@ async fn env_show_against_the_shipped_dirs_names_the_shipped_model() {
         Some("model  deepseek2/deepseek-v4.1-flash:high"),
         "{stdout}"
     );
+
+    let mut harness = Harness::new(shipped(), &[]);
+    common::isolated_environment(&mut harness);
+    let code = run_args(&mut harness, &["env", "show", "kimi"]).await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let stdout = harness.stdout.text();
+    assert!(
+        stdout
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .starts_with("credential  ")
+    );
+    assert_eq!(stdout.lines().nth(1), Some("model  kimi/kimi-k3:high"));
+    assert!(stdout.contains("\"model\": \"k3\""), "{stdout}");
 }

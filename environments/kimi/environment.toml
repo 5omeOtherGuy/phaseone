@@ -1,0 +1,27 @@
+route   = "kimi-coding-subscription"
+profile = "kimi-k3"
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "finish"
+
+# K3 claims 1M; nothing proven yet on this route — raise after a measured run.
+[context]
+window_tokens = 260000
+output_headroom_tokens = 32000
+summarize_at_tokens = 150000
+keep_recent_tokens = 50000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000

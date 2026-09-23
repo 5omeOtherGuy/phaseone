@@ -1,6 +1,11 @@
 //! Inspect the actual terminal cells without a provider, credentials or network.
 //! cargo run -p p1-tui --example home_preview -- 80 24 6000 > /tmp/home.svg
-use p1_tui::{render::screen::draw, state::Screen, transcript::Block};
+use p1_tui::{
+    band::Seg,
+    palette::INK,
+    render::{home::HomePrelude, screen::draw},
+    state::Screen,
+};
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
 fn color(c: Color) -> String {
@@ -15,15 +20,20 @@ fn main() {
     let height = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(40);
     let time = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut screen = Screen::new(false);
-    screen.transcript.blocks.push(Block::Info {
-        lines: vec![
-            "p1 · phaseone".into(),
-            String::new(),
-            "  /resume     reopen a previous session".into(),
-            "  /env        choose a model".into(),
-            "  /access     access policy".into(),
-            "  /goal       set the session objective".into(),
-        ],
+    screen.home = Some(HomePrelude {
+        version: "0.1.0".into(),
+        path: "~/dev/phaseone".into(),
+        branch: Some("main".into()),
+        state: vec![vec![Seg::new(INK, "no journal in this directory.")]],
+        items: [
+            ("/resume", "reopen a previous session"),
+            ("/model", "choose a model"),
+            ("/access", "full · --ask to confirm"),
+            ("/goal", "set the session objective"),
+        ]
+        .iter()
+        .map(|(command, what)| (command.to_string(), what.to_string()))
+        .collect(),
     });
     let area = Rect::new(0, 0, width, height);
     let mut buffer = Buffer::empty(area);

@@ -1,0 +1,20 @@
+<!-- @dsCard group="Components" viewport="700x160" name="Band" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
+<script src="../../ds.js"></script>
+<style>body{margin:0;background:var(--h-ground);color:var(--h-ink);font-family:var(--font-mono);font-size:12px;line-height:1.5;}</style></head>
+<body><div id="root"></div>
+<script type="text/babel">
+slab().then(({ Band, Span }) => {
+  const Gap = () => <div style={{ height: "1lh" }} />;
+  ReactDOM.createRoot(document.getElementById("root")).render(
+    <div style={{ padding: "1lh 2ch", display: "grid" }}>
+      <Band bg="var(--h-block-plus)" width={72} left={[["dim", "▸ "], ["dim", "shell     "], ["ink", "cargo test -p harness run:: --no-fail-fast --features retry,backoff,tracing"]]} right={[["fail", "✗"], ["dim", " 11.4s · exit 101"]]} />
+      <Band bg="var(--h-block)" width={72} left={[["dim", "argument truncates with … — the outcome never does"]]} />
+      <Band bg="var(--h-block)" width={72} left={[["faint", "· 86 more lines folded → [h-2b14]"]]} right={[["faint", "^O open in pane"]]} />
+    </div>
+  );
+});
+</script></body></html>

@@ -6,7 +6,10 @@
 //! The visual vocabulary is fixed by `docs/design/tui/SPEC.md` §1–3 and §8;
 //! those sections are not negotiable.
 
+pub mod band;
+pub mod face;
 pub mod fold;
+pub mod geometry;
 pub mod glyphs;
 pub mod grid;
 pub mod input;

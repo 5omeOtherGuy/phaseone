@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 
 use crate::grid;
 use crate::palette;
+use crate::render::block::{DecisionOption, InlineApproval};
 
 use super::{FLOOR_REASON, decision_key, fill};
 
@@ -19,6 +20,49 @@ pub struct PermissionView {
     pub rows: Vec<(String, String)>,
     /// The destructive floor: `a`/`p` grey out with the reason inline.
     pub grantable: bool,
+}
+
+pub fn inline_approval(view: &PermissionView, pending: Option<(usize, usize)>) -> InlineApproval {
+    let mut options = vec![DecisionOption {
+        key: "y".into(),
+        label: "allow once".into(),
+        unavailable: None,
+    }];
+    for (key, label) in [("a", "session"), ("p", "project")] {
+        let unavailable = if !view.grantable {
+            Some(FLOOR_REASON.to_string())
+        } else if key == "p" {
+            Some("not available — no trust store yet".into())
+        } else {
+            None
+        };
+        options.push(DecisionOption {
+            key: key.into(),
+            label: label.into(),
+            unavailable,
+        });
+    }
+    options.push(DecisionOption {
+        key: "n".into(),
+        label: "deny".into(),
+        unavailable: None,
+    });
+    let mut hints = Vec::new();
+    if let Some((current, total)) = pending
+        && total > 1
+    {
+        hints.push(format!("{current} of {total} pending"));
+    }
+    InlineApproval {
+        permission_rows: view
+            .rows
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone(), k == "cwd"))
+            .collect(),
+        diff: false,
+        options,
+        hints,
+    }
 }
 
 pub fn lines(view: &PermissionView, width: usize) -> Vec<Line<'static>> {

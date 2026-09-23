@@ -1,0 +1,12 @@
+<!-- @dsCard group="UI kits" viewport="1000x800" name="Harness session" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Harness session</title><link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
+<script src="../../ds.js"></script>
+<style>html,body{margin:0;height:100%;background:var(--h-ground);color:var(--h-ink);}</style></head>
+<body><div id="root"></div>
+<script type="text/babel" src="Session.jsx"></script>
+<script type="text/babel">
+slab().then(ns => { window.SLAB = ns; ReactDOM.createRoot(document.getElementById("root")).render(<Session />); });
+</script></body></html>

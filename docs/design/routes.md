@@ -317,3 +317,17 @@ and `~/projects/phaseone-dogfood/routes9-glm.run/`; each has an `accepted-report
 original `report.json` and `changes.diff`. The independent harness is
 `/tmp/p1-route-checks/verify.py`. These are integration checks, not a controlled model
 comparison or evidence of hours-long reliability.
+
+## E. Kimi K3 on the Kimi coding subscription (`openai-chat/kimi-coding-subscription`)
+
+`POST https://api.kimi.ai/coding/v1/chat/completions` with wire model `k3`.
+A non-streaming probe returned both `content` and `reasoning_content`, matching the
+GLM coding-plan shape. The `retained-thinking` dialect preserves and replays that
+reasoning across turns, including tool turns; `thinking-with-reasoning-alias` cannot
+encode the profile's preserved-thinking requirement. Streaming and replay on this
+endpoint still need a live check. Credentials are references: `KIMI_API_KEY`, then
+Pi's `kimi-coding` login, then OpenCode's `kimi-code-plan-global` login. Do not use
+OpenCode's stale `kimi-for-coding` entry (401). The catalog claims a 1,048,576-token
+context, but no context capacity has been measured on this route; the profile leaves
+it unknown and the environment uses a conservative 260,000-token window pending a
+measured run. Subscription cost is unknown, never zero.

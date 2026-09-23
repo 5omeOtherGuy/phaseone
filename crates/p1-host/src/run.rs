@@ -424,6 +424,12 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
                 ask: options.ask,
                 workspace,
                 sandbox: format!("{:?}", options.sandbox).to_lowercase(),
+                // §10 `effort`: only an explicit `--effort` (already parsed by
+                // `cli.rs`); `None` is the adapter default, which the statusline
+                // already renders as `default`.
+                effort: options
+                    .effort
+                    .map(|effort| crate::models::effort_name(effort).to_string()),
             },
             cancel.clone(),
         ))
@@ -544,6 +550,16 @@ pub async fn run_with_front_end(
     // Announce the assembled parent before the agent is built: the front end
     // builds its parent renderer from this.
     front_end.parent_assembled(&route, &model, completion.clone());
+    // §10 `ctx`'s denominator: unknown (no `[context]` section) stays `None`,
+    // never a guessed window.
+    front_end.context_configured(
+        assembled.resolved.context.as_ref().map(|c| c.window_tokens),
+        assembled
+            .resolved
+            .context
+            .as_ref()
+            .map(|c| c.summarize_at_tokens),
+    );
 
     let (journal, records): OpenedSession = open_session(deps, options)?;
     // On resume the journal holds the earlier turns; rebuild this agent's activity
@@ -562,9 +578,14 @@ pub async fn run_with_front_end(
         Some(completion) => completion.log.clone(),
         None => Arc::new(ActivityLog::default()),
     };
+    // ADR-0055: this agent's commands are measured in `workspace`, and the host's own
+    // session journals inside it are not workspace content. Set AFTER the replay
+    // above, so a replayed call is never fingerprinted: the journal does not carry
+    // what a past command did.
+    log.watch_workspace(&workspace, &session_journals(options.session.as_deref()));
     let activity = Arc::new(ParentActivity::new(
         front_end.event_sink(),
-        log,
+        log.clone(),
         &assembled.tools,
     ));
     let events: Arc<dyn EventSink> = activity.clone();
@@ -642,6 +663,7 @@ pub async fn run_with_front_end(
         environment_dirs: deps.environment_dirs.clone(),
         workspace: workspace.clone(),
         substitutions: substitutions.clone(),
+        ignored: session_journals(options.session.as_deref()),
         scope: options.models.clone(),
         route_label: front_end.route_label(),
         session: Mutex::new(SessionModel {
@@ -654,6 +676,16 @@ pub async fn run_with_front_end(
     let code = front_end
         .run(deps, &mut agent, &cancel, workers, stall)
         .await;
+
+    // ADR-0055 item 4: a workspace fingerprint that could not be taken means the run
+    // fell back to the tool-declared rule. Say so once, so a silent downgrade is never
+    // invisible to the operator or the run report.
+    if let Some(error) = log.fingerprint_error() {
+        write_stderr(
+            deps,
+            &format!("note: workspace fingerprinting is off: {error}\n"),
+        );
+    }
 
     // Runs first: a run cancelled here cancels its step workers through the worker
     // service, which must still be up to do it and to let the journal get `Ended`.
@@ -1358,6 +1390,9 @@ pub(crate) struct ModelSwitch {
     environment_dirs: Vec<PathBuf>,
     workspace: PathBuf,
     substitutions: Substitutions,
+    /// The host's own session journals inside the workspace (ADR-0055): a switch
+    /// assembles a new log, which must ignore them exactly as the first one did.
+    ignored: Vec<PathBuf>,
     /// The run's `--models` scope, for the bare `/model` table.
     scope: Option<String>,
     /// The parent renderer's route label, when the front end has one: a successful
@@ -1464,7 +1499,11 @@ pub(crate) fn switch_model(
     if let Some(completion) = adopted {
         // The switched `finish` writes the completion the catalog issued: point the
         // parent's activity plumbing (and the §3c guard, which reads it) at it, so
-        // file changes and summaries reach the log that tool reads.
+        // file changes and summaries reach the log that tool reads. The new log
+        // measures the same workspace, minus the host's own journals (ADR-0055).
+        completion
+            .log
+            .watch_workspace(&switch.workspace, &switch.ignored);
         switch.activity.repoint(completion.log.clone(), &tools);
         session.finish = finish_at.map(|index| tools[index].clone());
     }
@@ -1996,6 +2035,17 @@ fn resolve_workspace(options: &Options) -> Result<PathBuf, String> {
     }
 }
 
+/// The paths the host itself appends to inside the workspace (ADR-0055): the
+/// `--session` journal, which a run writes a record to for every event, and — by the
+/// name rule the fingerprint applies — the `FILE.w{n}.jsonl` journals beside it.
+/// They are the host's bookkeeping, not workspace content: counting them would call
+/// every command a workspace change.
+fn session_journals(session: Option<&Path>) -> Vec<PathBuf> {
+    session
+        .map(|session| vec![session.to_path_buf()])
+        .unwrap_or_default()
+}
+
 fn substitutions(deps: &HostDeps, workspace: &Path) -> Substitutions {
     Substitutions {
         workspace: workspace.display().to_string(),
@@ -2248,6 +2298,10 @@ impl ChildBuilder {
             Some(completion) => completion.log.clone(),
             None => Arc::new(ActivityLog::default()),
         };
+        // ADR-0055: the child's commands are measured in ITS workspace, with the
+        // host's own session journals (the parent's and every worker's, which sit
+        // beside it) excluded.
+        log.watch_workspace(&workspace, &session_journals(self.session.as_deref()));
         // The typed handle is kept too: a re-grant re-points the tee at the new tool
         // set, so the effect of a re-granted tool is read from that tool.
         let tee = Arc::new(ActivityTee::new(renderer, log.clone(), &assembled.tools));

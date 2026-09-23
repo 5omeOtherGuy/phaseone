@@ -1,0 +1,30 @@
+/* vendored from SLAB Core — keep in sync */
+:root {
+  --radius: 0px;              /* everywhere. no exceptions */
+  --rule-w: 1px;
+  --severity-rule-w: 3px;     /* notification / urgent left rule */
+
+  /* GUI (px) */
+  --titlebar-h: 30px;
+  --titlebar-button-w: 30px;
+  --panel-h: 28px;
+  --scrollbar-w: 9px;
+  --control-pad-y: 7px;
+  --control-pad-x: 16px;
+  --entry-pad-y: 8px;
+  --entry-pad-x: 10px;
+  --menu-row-pad-y: 7px;
+  --menu-row-pad-x: 12px;
+  --panel-item-pad-x: 12px;
+  --gap-1: 4px;
+  --gap-2: 8px;
+  --gap-3: 12px;
+  --gap-4: 16px;
+  --gap-5: 24px;
+
+  /* Cell grid (terminal) */
+  --cell-inset-x: 2ch;        /* GROUND inset: 2 columns each side */
+  --cell-inset-y: 1lh;        /* 1 row top and bottom */
+  --term-padding: 18px;       /* alacritty padding ≈ 2 cols / 1 row at 11pt */
+  --tmux-gutter: 1ch;         /* pane-border-lines spaces */
+}
