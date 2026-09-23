@@ -119,7 +119,7 @@ pub fn inline_approval(view: &DiffView, pending: Option<(usize, usize)>) -> Inli
         DecisionOption {
             key: "p".into(),
             label: "project".into(),
-            unavailable: None,
+            unavailable: Some("not available — no trust store yet".into()),
         },
         DecisionOption {
             key: "n".into(),

@@ -1266,13 +1266,17 @@ fn edge_diff(tool: &str, summary: &str, rows: Vec<DiffRow>) -> Approval {
     })
 }
 
-/// A03 — whole: `p` is faint in the decision band with no separate reason row.
+/// A03 — whole except row 21. Mock data, not a renderer defect: el-approval-edit passes `p` as
+/// `disabled` without a reason, where the product follows handoff §7.5 ("`p` is shown faint with
+/// `no trust store yet`") like A04 and the permission mocks — so a reason row follows the band.
 #[test]
 fn a03_edit_diff_inline() {
     let approval = edge_diff("edit", "replace exact string · once", diff_rows(0));
     let mut s = approval_screen(vec![ask(), reason(), prose(), read()], "edit", approval);
     let buf = render(&mut s, 120, 40, 0);
-    slab::assert_mock(&buf, Rect::new(0, 0, 120, 40), "A03");
+    assert_rows_except(&buf, "A03", &[21]);
+    assert_cells(&buf, "A03", 21..22, 78..120);
+    assert!(row_text(&buf, 21).contains("p   project    not available"));
 }
 
 /// A04 — whole except rows 1, 2, 34 and 36. Seam: an approval carries ONE prepared diff
@@ -1295,8 +1299,10 @@ fn a04_full_review_three_files() {
     assert_eq!(s.cursor, None);
 }
 
-/// A05 — whole except row 1. Seam as A04: the summary row counts the rows shown (`+6 −6`),
-/// not the call's `+3 −3`; the decision and hint rows are checked whole.
+/// A05 — whole except rows 1, 20 and 21. Seam as A04: the summary row counts the rows shown
+/// (`+6 −6`), not the call's `+3 −3`. Defect outside this change: `Decision::for_call`
+/// (render/review.rs) gives `p` its reason row per handoff §7.5 (as A04 shows); the A05 mock data passes
+/// `p` as `disabled` without a reason — so the band sits one row higher (20), the reason row at 21.
 #[test]
 fn a05_full_review_80x24() {
     let rows = [diff_rows(0), diff_rows(0)].concat();
@@ -1307,8 +1313,8 @@ fn a05_full_review_80x24() {
     );
     s.review.open = true;
     let buf = render(&mut s, 80, 24, 0);
-    assert_rows_except(&buf, "A05", &[1]);
-    assert!(row_text(&buf, 21).contains(" y  allow once    a  session    p  project    n  deny"));
+    assert_rows_except(&buf, "A05", &[1, 20, 21]);
+    assert!(row_text(&buf, 20).contains(" y  allow once    a  session    n  deny"));
 }
 
 // ---------- W: workers ----------
