@@ -90,6 +90,43 @@ or `done — not verified; parent verification required`; `blocked: needs …` a
 finish` are unchanged. "Verified" is never printed for a result without passed commands, and a
 child's `done` alone never satisfies the parent's own gate.
 
+**Structured result (ADR-0053 item 5).** A host may give the tool an `OutputContract`
+(`FinishTool::with_output_contract`, read back with `output_contract`): a JSON-Schema subset —
+`type` (one of object, array, string, integer, number, boolean, null), `enum`, `required`,
+`properties`, `additionalProperties: false` only, `items`, `minItems`, `minimum`, and the
+ignored `description`/`title` — validated once at construction, so a malformed schema fails
+BEFORE any worker is started. It is exactly the subset `scripts/workflow.py::schema_errors`
+checks, so a brief's schema means the same thing in both runners. With a contract set:
+1. The input schema gains `"result": <the contract's schema>`, its `description` prefixed
+   `Required with "done": ` + the contract's own; `required` stays `["status", "summary"]`
+   because a `blocked` call needs no result. The description is the policy's, byte-identical,
+   plus ONE paragraph: `This task requires a structured result: pass it as "result" together
+   with "done". It is checked against the schema of the "result" parameter; the check is
+   reported to your parent with the outcome.`
+2. `done` goes through the verification rules FIRST (same errors, same trailers). Then an
+   absent `result` → Error `This task requires a structured "result". Call finish again with
+   "result" filled in to match this schema:` followed by the schema as pretty JSON (at most
+   4 KiB, truncated with `…`), no trailer, storing nothing.
+3. A present `result` is checked AFTER the `done` is accepted: `Accepted::Done { summary,
+   evidence }` is stored as today AND `StructuredResult { value: Some(result), schema }` in the
+   same critical section. Reply on `Passed`: `Finished.` (unchanged). Reply on `Failed(errors)`
+   — the call is still accepted, the turn may end here, and the errors travel with the outcome:
+   `Finished. The result does not match the schema:` + one `- <error>` line each + `You may call
+   finish again with a corrected result before you stop.` A second accepted `done` replaces the
+   first, as today.
+4. `blocked` ignores a present `result` and leaves the structured cell empty.
+Without a contract a present `result` → Error `Invalid input for finish: no structured result
+was requested for this task; remove "result".` The cell is
+`FinishOutcome::structured() -> Option<StructuredResult>` (`None` after an accepted `blocked`,
+after `clear`, or before any call) with `pub enum SchemaCheck { NotRequested, Passed,
+Failed(Vec<String>) }` and `pub struct StructuredResult { pub value: Option<serde_json::Value>,
+pub schema: SchemaCheck }`; `value` is `None` only under `NotRequested`. `clear` drops both
+values. Errors are worded as `workflow.py` words them, with JSON type names: `$: expected
+object, got string`, `$.kind: "x" is not one of ["a","b"]`, `$: missing required key "id"`,
+`$: unexpected key "extra"`, `$.items: needs at least 1 items`, `$.score: -1 is below 0`, paths
+like `$.findings[2].file` — at most 32 of them, each at most 300 characters. Clearing the cell
+on `TurnStarted` stays the host's job.
+
 **Revision after dogfood run 3 (2026-09-20).** A real model needed TEN `finish` calls: seven
 omitted `verification` although the error asked for it, two named a command in a different
 spelling than it had run (`cargo fmt --check` vs `cd <dir> && cargo fmt --check`). And the
