@@ -134,9 +134,9 @@ fn mid_stream_working_indicator_and_running_call() {
     let text = render(&mut s, 120, 40, 5_000);
     // Reasoning is collapsed; the working indicator runs on its own line.
     assert!(text.iter().any(|l| l.contains("· reasoning")));
-    assert!(text.iter().any(|l| l.starts_with("▪▪▪ shell")));
+    assert!(text.iter().any(|l| l.contains("▪▪▪ shell")));
     // The running call row has no result yet.
-    assert!(text.iter().any(|l| l.starts_with("▸ shell")));
+    assert!(text.iter().any(|l| l.contains("▸ shell")));
     // The LED chase is alive: the same cell's brightness differs between two
     // fake times (0 = floor, 275 = cell 0's peak).
     let styled_early =
@@ -155,7 +155,7 @@ fn after_failure_the_evidence_block_and_peek_show() {
     let mut s = Screen::new(true);
     play(&mut s, &script(), 15_500);
     let text = render(&mut s, 120, 40, 15_600);
-    assert!(text.iter().any(|l| l.starts_with("✗ shell")));
+    assert!(text.iter().any(|l| l.contains("✗ shell")));
     assert!(text.iter().any(|l| l.contains("more lines folded → [h-")));
     // The failure promoted a peek over the ledger…
     assert!(matches!(s.promotion, p1_tui::state::Promotion::Peek { .. }));
@@ -173,7 +173,11 @@ fn the_turn_settles_with_spend_totals() {
     assert_eq!(s.spend.cost_micro_usd, Some(3_400));
     let text = render(&mut s, 120, 40, 16_600);
     assert!(text.iter().any(|l| l.contains("Confirmed.")));
-    assert_eq!(text[39], "⏎ send   ⌥⏎ newline   ^C quit");
+    assert!(
+        text.iter()
+            .any(|l| l.contains("⏎ send   ⌥⏎ newline   ^C quit"))
+    );
+    assert!(text[38].contains("diff —"));
 }
 
 #[test]
@@ -201,12 +205,11 @@ fn the_80_column_floor_keeps_everything_readable() {
     // Same glyphs, same shapes — nothing reflows into a different shape (§6).
     assert!(
         text.iter()
-            .any(|l| { l.starts_with("✗ shell") && l.contains("test case 0") })
+            .any(|l| { l.contains("✗ shell") && l.contains("test case 0") })
     );
     assert!(text.iter().any(|l| l.contains("· 42 more lines folded")));
-    // The floor line appears under the composer; the pane is gone.
-    let last = text.last().unwrap();
-    assert!(last.ends_with("^L ledger   ^C cancel"));
+    // The statusline replaces the old floor line; the pane is gone.
+    assert!(text.last().unwrap().contains("diff —"));
 }
 
 #[test]
@@ -226,7 +229,7 @@ fn scrolling_reaches_back_and_new_output_never_yanks_the_view() {
     // Over-scrolling past the top clamps: the oldest row stays visible.
     s.scroll_by(10_000);
     let text = render(&mut s, 80, 8, 17_000);
-    assert!(text[0].starts_with("· reasoning"));
+    assert!(text[0].contains("· reasoning"));
     // Scrolling back down releases the pin to the live tail.
     s.scroll_by(-10_000);
     assert_eq!(s.scroll_top, None);

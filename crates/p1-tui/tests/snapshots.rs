@@ -1,9 +1,6 @@
-//! Snapshot tests: every SPEC §4 screen at 120x40 (typical) and 80x24 (the
-//! floor), rendered through the real composition into a `TestBackend` cell
-//! buffer. Two global rules are tested for every screen at once:
-//!
-//! - the palette is closed (SPEC §1/§8: no third hue, ever), and
-//! - every state still reads with colour stripped (the glyph carries it).
+//! Snapshot tests: handoff geometry at 120x40 and 80x24, rendered through
+//! the real composition into a `TestBackend` cell buffer. Global rules check
+//! the closed §2 token palette and glyph-readable state.
 
 use p1_contracts::{AgentEvent, ToolCall, ToolInput, ToolResultItem, ToolStatus};
 use p1_tui::render::diff::{DiffRow, DiffView};
@@ -40,6 +37,7 @@ fn left(text: &[String], cols: usize) -> Vec<String> {
     text.iter()
         .map(|l| {
             l.chars()
+                .skip(2)
                 .take(cols)
                 .collect::<String>()
                 .trim_end()
@@ -67,8 +65,7 @@ fn colors_used(screen: &mut Screen, width: u16, height: u16) -> Vec<Color> {
     colors
 }
 
-/// The closed palette (SPEC §1): the monochrome ramp, the two diff hues,
-/// and nothing else.
+/// Independent copy of the handoff §2 24-bit token colors.
 const ALLOWED: &[Color] = &[
     Color::Rgb(0x0a, 0x0a, 0x0a), // GROUND
     Color::Rgb(0x12, 0x12, 0x12), // BLOCK
@@ -77,11 +74,17 @@ const ALLOWED: &[Color] = &[
     Color::Rgb(0xe8, 0xe8, 0xe8), // INK
     Color::Rgb(0x9a, 0x9a, 0x9a), // DIM
     Color::Rgb(0x6a, 0x6a, 0x6a), // FAINT
-    Color::Rgb(0x3a, 0x4a, 0x3a), // DIFF-ADD bg
-    Color::Rgb(0xd8, 0xe8, 0xd0), // DIFF-ADD fg
-    Color::Rgb(0x4a, 0x35, 0x35), // DIFF-DEL bg
-    Color::Rgb(0xe8, 0xd0, 0xd0), // DIFF-DEL fg
-    Color::Reset,
+    Color::Rgb(0xe2, 0xa0, 0x3f), // ATTN / amber fill
+    Color::Rgb(0xe0, 0x70, 0x5f), // FAIL
+    Color::Rgb(0x8f, 0xb5, 0x73), // OK
+    Color::Rgb(0x72, 0xb8, 0xb0), // LIVE
+    Color::Rgb(0x7f, 0xa7, 0xd6), // REF
+    Color::Rgb(0xc0, 0x8f, 0xc8), // SYNTAX
+    Color::Rgb(0x3a, 0x4a, 0x3a), // DIFF_ADD_BG
+    Color::Rgb(0xd8, 0xe8, 0xd0), // DIFF_ADD_FG
+    Color::Rgb(0x4a, 0x35, 0x35), // DIFF_DEL_BG
+    Color::Rgb(0xe8, 0xd0, 0xd0), // DIFF_DEL_FG
+    Color::Reset,                 // Unstyled blank-cell foreground.
 ];
 
 fn assert_palette_law(screen: &mut Screen, width: u16, height: u16) {
@@ -161,22 +164,29 @@ fn streaming_screen() -> Screen {
 #[test]
 fn streaming_at_120x40() {
     let mut s = streaming_screen();
-    let text = left(&render(&mut s, 120, 40, 11_400), 80);
+    s.statusbar.model = Some("claude/sonnet-4.5".into());
+    s.statusbar.ctx = Some("—".into());
+    let screen = render(&mut s, 120, 40, 11_400);
+    let text = left(&screen, 80);
     assert_palette_law(&mut s, 120, 40);
-    assert_eq!(text[0], "› why does compaction stall at the turn edge?");
-    assert!(text[1].starts_with("· reasoning"));
-    assert!(text[1].ends_with("^R expand"));
-    assert!(text[2].starts_with("The hard-pressure wait"));
-    assert!(text[4].starts_with("✓ read      p1-context/src/edge.rs"));
-    assert!(text[4].ends_with("412 lines"));
-    assert_eq!(text[5], "▸ shell     cargo test -p p1-context boundary");
-    assert!(text[6].starts_with("▪▪▪ shell"));
-    // The pane is up by default: LEDGER on the right, composer at the bottom.
-    assert!(text[38].starts_with('›'));
-    assert_eq!(
-        text[39],
-        "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel"
+    assert_eq!(text[1], "› why does compaction stall at the turn edge?");
+    assert!(text[2].starts_with("· reasoning"));
+    assert!(text[2].ends_with("^R expand"));
+    assert!(text[3].starts_with("The hard-pressure wait"));
+    assert!(text[5].starts_with("✓ read      p1-context/src/edge.rs"));
+    assert!(text[5].ends_with("412 lines"));
+    assert_eq!(text[6], "▸ shell     cargo test -p p1-context boundary");
+    assert!(text[7].starts_with("▪▪▪ shell"));
+    // The inset transcript, composer and statusline occupy the §4 geometry rows.
+    let layout = p1_tui::geometry::layout(120, 40, s.pane_width, false, 2);
+    assert!(
+        text[layout.composer.y as usize..layout.composer.bottom() as usize]
+            .iter()
+            .any(|row| row.contains('›'))
     );
+    assert!(screen[layout.statusline.y as usize].contains("claude/sonnet-4.5"));
+    assert!(screen[layout.statusline.y as usize].contains("ctx"));
+    assert_eq!(text[39], "");
 }
 
 #[test]
@@ -184,15 +194,23 @@ fn streaming_at_80x24_collapses_the_pane() {
     let mut s = streaming_screen();
     let text = render(&mut s, 80, 24, 11_400);
     assert_palette_law(&mut s, 80, 24);
-    // Newest rows stay visible; the pane is gone and the floor line appears.
-    assert!(text[21].starts_with('›'));
-    assert_eq!(
-        text[22],
-        "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel"
+    // Newest rows stay visible; the statusline replaces the old floor line.
+    let layout = p1_tui::geometry::layout(80, 24, s.pane_width, false, 2);
+    assert!(
+        text[layout.composer.y as usize..layout.composer.bottom() as usize]
+            .iter()
+            .any(|row| row.contains("›"))
     );
-    let floor = &text[23];
-    assert!(floor.ends_with("^L ledger   ^C cancel"));
-    assert!(floor.starts_with("ask · claude · —"));
+    assert!(
+        text[layout.composer.y as usize..layout.composer.bottom() as usize]
+            .iter()
+            .any(|row| row.contains("⏎ queue steering"))
+    );
+    s.statusbar.model = Some("claude/sonnet-4.5".into());
+    s.statusbar.ctx = Some("—".into());
+    let text = render(&mut s, 80, 24, 11_400);
+    assert!(text[layout.statusline.y as usize].contains("claude/sonnet-4.5"));
+    assert!(text[layout.statusline.y as usize].contains("ctx"));
 }
 
 #[test]
@@ -212,10 +230,14 @@ fn idle_screen_affordances() {
     });
     let text = left(&render(&mut s, 120, 40, 0), 80);
     assert_palette_law(&mut s, 120, 40);
-    assert_eq!(text[0], "p1 0.1.0   ~/dev/phaseone   main");
-    assert_eq!(text[2], "  no journal in this directory.");
-    assert_eq!(text[4], "  /resume     reopen a previous session");
-    assert_eq!(text[39], "⏎ send   ⌥⏎ newline   ^C quit");
+    assert_eq!(text[1], "p1 0.1.0   ~/dev/phaseone   main");
+    assert_eq!(text[3], "  no journal in this directory.");
+    assert_eq!(text[5], "  /resume     reopen a previous session");
+    let layout = p1_tui::geometry::layout(120, 40, s.pane_width, false, 2);
+    assert_eq!(
+        text[layout.composer.y as usize + 1],
+        "⏎ send   ⌥⏎ newline   ^C quit"
+    );
 }
 
 #[test]
@@ -237,12 +259,12 @@ fn fold_block_screen() {
     let full = render(&mut s, 120, 40, 12_000);
     assert_palette_law(&mut s, 120, 40);
     // The failure promoted a PEEK banner over the ledger (SPEC §5).
-    assert!(full[0].contains("shell failed"));
+    assert!(full[1].contains("shell failed"));
     let text = left(&full, 80);
-    assert!(text[0].starts_with("✗ shell"));
-    assert_eq!(text[1], "  test line 0");
+    assert!(text[1].starts_with("✗ shell"));
+    assert_eq!(text[2], "  test line 0");
     // The fold handle is stable, addressable, FAINT metadata.
-    assert!(text[9].contains("more lines folded → [h-"));
+    assert!(text[10].contains("more lines folded → [h-"));
 }
 
 #[test]
@@ -330,9 +352,22 @@ fn picker_and_status_overlays_dock_above_the_composer() {
     });
     let text = left(&render(&mut s, 120, 40, 0), 80);
     assert_palette_law(&mut s, 120, 40);
-    assert_eq!(text[1], "ANTHROPIC ROUTE");
-    assert!(text[2].contains("claude · sonnet-4.5"));
-    assert!(text[4].contains("quota exhausted"));
+    let header = text
+        .iter()
+        .position(|row| row == "ANTHROPIC ROUTE")
+        .unwrap();
+    let available = text
+        .iter()
+        .position(|row| row.contains("claude · sonnet-4.5"))
+        .unwrap();
+    let unavailable = text
+        .iter()
+        .position(|row| row.contains("quota exhausted"))
+        .unwrap();
+    assert!(
+        header < available && available < unavailable,
+        "picker order"
+    );
 }
 
 #[test]
@@ -350,24 +385,22 @@ fn a_failure_states_what_broke_without_a_banner() {
         0,
     );
     let text = left(&render(&mut s, 120, 40, 0), 80);
-    assert_eq!(text[0], "provider failed: Transport: connection dropped");
+    assert!(
+        text.iter()
+            .any(|row| row == "provider failed: Transport: connection dropped")
+    );
 }
 
 #[test]
 fn every_state_reads_with_colour_stripped() {
-    // The monochrome-legibility rule (SPEC §2/§8): with all styles stripped —
-    // which is exactly what the text snapshots above are — the glyphs must
-    // still carry the state. This test pins the glyph per state.
+    // Glyphs remain the state carrier without relying on terminal colors.
     let mut s = streaming_screen();
-    let text = render(&mut s, 120, 40, 0);
-    assert!(text.iter().any(|l| l.starts_with('›')), "operator turn");
-    assert!(text.iter().any(|l| l.starts_with('✓')), "settled call");
-    assert!(text.iter().any(|l| l.starts_with('▸')), "running call");
-    assert!(
-        text.iter().any(|l| l.starts_with("▪▪▪")),
-        "working indicator"
-    );
-    assert!(text.iter().any(|l| l.starts_with('·')), "folded reasoning");
+    let text = left(&render(&mut s, 120, 40, 0), 80);
+    assert!(text.iter().any(|l| l.contains('›')), "operator turn");
+    assert!(text.iter().any(|l| l.contains('✓')), "settled call");
+    assert!(text.iter().any(|l| l.contains('▸')), "running call");
+    assert!(text.iter().any(|l| l.contains("▪▪▪")), "working indicator");
+    assert!(text.iter().any(|l| l.contains('·')), "folded reasoning");
 }
 
 #[test]
@@ -428,13 +461,13 @@ fn output_pane_opens_the_fold_handle() {
     });
     let text = render(&mut s, 120, 40, 0);
     assert_palette_law(&mut s, 120, 40);
-    // The pane header names the handle; the body starts at the top.
-    assert!(text[0].contains(&format!("OUTPUT [{}]", id)));
-    assert!(text[1].contains("output line 0"));
-    // Up/Down scroll the pane.
+    // The pane begins on the geometry top row, below the terminal's blank row.
+    assert!(text[1].contains(&format!("OUTPUT [{}]", id)));
+    assert!(text[2].contains("output line 0"));
+    // Up/Down scroll the pane without moving its header.
     s.scroll_output_by(10);
     let text = render(&mut s, 120, 40, 0);
-    assert!(text[1].contains("output line 10"));
+    assert!(text[2].contains("output line 10"));
 }
 
 #[test]
@@ -442,14 +475,32 @@ fn pane_width_cycling_changes_the_layout() {
     let mut s = Screen::new(true);
     s.goal = Some("fix compaction boundary stall".into());
     let wide = render(&mut s, 120, 40, 0);
-    // Default 40ch pane: the ledger sits at the right.
-    assert!(wide[0].contains("GOAL"));
-    s.cycle_width(); // 56
+    // The narrow pane is 38 columns; each enabled width retains the goal.
+    assert_eq!(
+        p1_tui::geometry::layout(120, 40, s.pane_width, false, 2)
+            .pane
+            .width,
+        38
+    );
+    assert!(wide[1].contains("GOAL"));
+    s.cycle_width(); // wide: 56
     let wider = render(&mut s, 120, 40, 0);
-    assert!(wider[0].contains("GOAL"));
+    assert_eq!(
+        p1_tui::geometry::layout(120, 40, s.pane_width, false, 2)
+            .pane
+            .width,
+        56
+    );
+    assert!(wider[1].contains("GOAL"));
     s.cycle_width(); // split
+    assert_eq!(
+        p1_tui::geometry::layout(120, 40, s.pane_width, false, 2)
+            .pane
+            .width,
+        57
+    );
     s.cycle_width(); // off
     let off = render(&mut s, 120, 40, 0);
-    assert!(!off[0].contains("GOAL"));
+    assert!(!off[1].contains("GOAL"));
     assert_eq!(s.pane_width, PaneWidth::Off);
 }

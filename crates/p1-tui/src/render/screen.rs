@@ -9,7 +9,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 
 use crate::palette;
-use crate::state::{PANE_FLOOR_COLS, PaneMode, Promotion, Screen};
+use crate::state::{PaneMode, Promotion, Screen};
 
 use super::{
     composer, diff, home, ledger, output, permission, picker, status, transcript, workers,
@@ -27,6 +27,17 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
         return;
     }
     fill_bg(area, buf, palette::GROUND);
+    let status_line = screen.statusbar.line(area.width.saturating_sub(4) as usize);
+    let status_y =
+        crate::geometry::layout(area.width, area.height, screen.pane_width, screen.focus, 2)
+            .statusline
+            .y;
+    buf.set_line(
+        area.x.saturating_add(2),
+        area.y + status_y,
+        &status_line,
+        area.width.saturating_sub(4),
+    );
 
     // A pending approval owns the screen: full width, pane hidden (SPEC §4.4).
     // The decision footer is pinned to the bottom rows — a tall diff must
@@ -66,12 +77,15 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     }
 
     let focus = screen.focus;
+    let geometry = crate::geometry::layout(area.width, area.height, screen.pane_width, focus, 2);
     let pane_cols = if focus {
         None
     } else if screen.ledger_overlay {
-        Some(40usize.min(area.width as usize))
+        Some(38usize.min(area.width as usize))
+    } else if geometry.pane.width > 0 {
+        Some(geometry.pane.width as usize)
     } else {
-        screen.pane_width.columns(area.width as usize)
+        None
     };
 
     // Composer: hidden in focus mode while empty.
@@ -85,20 +99,6 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     } else {
         Vec::new()
     };
-    if (area.width as usize) < PANE_FLOOR_COLS && pane_cols.is_none() && !screen.ledger_overlay {
-        // §6: the one bottom-of-screen line, only when the ledger is gone.
-        let context = screen
-            .spend
-            .input
-            .map(super::tokens)
-            .unwrap_or_else(|| super::UNKNOWN.into());
-        composer_lines.push(composer::floor_line(
-            &screen.env,
-            &screen.route,
-            &context,
-            area.width as usize,
-        ));
-    }
     // The composer never eats the screen: at most a third, keeping the
     // newest input rows and always the hint line (a paste of 2 KB must not
     // push the transcript area to zero — that panicked the buffer).
@@ -112,11 +112,18 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     }
     let composer_height = composer_lines.len() as u16;
 
+    let geometry = crate::geometry::layout(
+        area.width,
+        area.height,
+        screen.pane_width,
+        focus,
+        composer_height,
+    );
     let transcript_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width - pane_cols.unwrap_or(0) as u16,
-        height: area.height.saturating_sub(composer_height),
+        x: area.x + geometry.transcript.x,
+        y: area.y + geometry.transcript.y,
+        width: geometry.transcript.width,
+        height: geometry.transcript.height,
     };
 
     // The transcript pins to the bottom: the newest rows are always visible.
@@ -196,9 +203,9 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     }
 
     let composer_area = Rect {
-        x: area.x,
-        y: area.y + transcript_area.height,
-        width: area.width - pane_cols.unwrap_or(0) as u16,
+        x: area.x + geometry.composer.x,
+        y: area.y + geometry.composer.y,
+        width: geometry.composer.width,
         height: composer_height,
     };
     draw_lines(&composer_lines, composer_area, buf);
@@ -211,11 +218,13 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
 /// The right pane: BLOCK background, content on its inner grid, PEEK banner
 /// on BLOCK+ when promoted (SPEC §5).
 fn draw_pane(screen: &Screen, area: Rect, buf: &mut Buffer, cols: usize) {
+    let pane_layout =
+        crate::geometry::layout(area.width, area.height, screen.pane_width, screen.focus, 2).pane;
     let pane = Rect {
-        x: area.x + area.width - cols as u16,
-        y: area.y,
+        x: area.x + pane_layout.x,
+        y: area.y + pane_layout.y,
         width: cols as u16,
-        height: area.height,
+        height: pane_layout.height.max(1),
     };
     fill_bg(pane, buf, palette::BLOCK);
     let grid = cols.saturating_sub(2 * PANE_PAD);
