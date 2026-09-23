@@ -16,8 +16,9 @@ workspace = true
 [features]
 # Delegation tools and the in-process worker service. Off => the four
 # `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
-default = ["delegation", "workflows"]
+default = ["delegation", "workflows", "shadow-hook"]
 delegation = ["dep:p1-workers", "dep:p1-tool-delegate"]
+shadow-hook = ["dep:p1-hook-shadow"]
 # Workflows (ADR-0053): the engine and its four tools, composed over the worker
 # service. Off => the four `workflow_*` catalog keys are unknown modules.
 workflows = ["delegation", "dep:p1-workflow", "dep:p1-tool-workflow"]
@@ -39,6 +40,7 @@ p1-tool-search = { path = "../p1-tool-search" }
 p1-tool-shell = { path = "../p1-tool-shell" }
 p1-tool-patch = { path = "../p1-tool-patch" }
 p1-tool-finish = { path = "../p1-tool-finish" }
+p1-hook-shadow = { path = "../p1-hook-shadow", optional = true }
 p1-provider-anthropic = { path = "../p1-provider-anthropic" }
 p1-provider-openai = { path = "../p1-provider-openai" }
 p1-provider-openai-chat = { path = "../p1-provider-openai-chat" }

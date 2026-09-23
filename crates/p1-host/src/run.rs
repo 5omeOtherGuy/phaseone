@@ -42,6 +42,72 @@ use crate::session;
 use crate::{HostDeps, InterruptSource};
 use p1_tool_finish::{Accepted, CompletionPolicy};
 
+/// Observe the record only after the underlying journal has accepted it. The
+/// wrapper also covers TUI prompts, which bypass the line-mode turn driver.
+#[cfg(feature = "shadow-hook")]
+struct ShadowJournal {
+    inner: Arc<dyn CommitSink>,
+    hook: Arc<p1_hook_shadow::ShadowHook>,
+    workspace: PathBuf,
+    journal: PathBuf,
+    cache_key: Mutex<Option<String>>,
+    origin: ShadowOrigin,
+}
+
+#[cfg(feature = "shadow-hook")]
+enum ShadowOrigin {
+    Parent,
+    Child { family: String, provider: String },
+}
+
+#[cfg(feature = "shadow-hook")]
+impl CommitSink for ShadowJournal {
+    fn commit<'a>(
+        &'a self,
+        record: &'a JournalRecord,
+    ) -> BoxFuture<'a, Result<(), p1_contracts::CommitError>> {
+        Box::pin(async move {
+            self.inner.commit(record).await?;
+            if let p1_contracts::RecordBody::Environment { options, .. } = &record.body
+                && let Ok(mut key) = self.cache_key.lock()
+            {
+                *key = options.cache_key.clone();
+            }
+            if let p1_contracts::RecordBody::UserInput { text } = &record.body {
+                let origin = match &self.origin {
+                    ShadowOrigin::Parent
+                        if text == CONTINUATION_MESSAGE || text == PROVIDER_RETRY_MESSAGE =>
+                    {
+                        return Ok(());
+                    }
+                    ShadowOrigin::Parent => p1_hook_shadow::Origin::UserInput,
+                    // Only the initial brief is a dispatch; subsequent user_input
+                    // records in a child are repair/continuation messages.
+                    ShadowOrigin::Child { .. } if record.seq != 1 => return Ok(()),
+                    ShadowOrigin::Child { family, provider } => p1_hook_shadow::Origin::Dispatch {
+                        family: family.clone(),
+                        provider: provider.clone(),
+                    },
+                };
+                self.hook.observe(p1_hook_shadow::ShadowEvent {
+                    text: text.clone(),
+                    workspace: Some(self.workspace.clone()),
+                    journal: self.journal.clone(),
+                    cache_key: self.cache_key.lock().ok().and_then(|key| key.clone()),
+                    origin,
+                    source_ref: match self.origin {
+                        ShadowOrigin::Child { .. } if self.journal.is_file() => {
+                            Some(format!("{}:{}", self.journal.display(), record.seq))
+                        }
+                        _ => None,
+                    },
+                });
+            }
+            Ok(())
+        })
+    }
+}
+
 #[cfg(feature = "delegation")]
 use p1_workers::{
     AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers, Regrant,
@@ -562,6 +628,21 @@ pub async fn run_with_front_end(
     );
 
     let (journal, records): OpenedSession = open_session(deps, options)?;
+    #[cfg(feature = "shadow-hook")]
+    let journal: Arc<dyn CommitSink> = match &deps.shadow {
+        Some(hook) => Arc::new(ShadowJournal {
+            inner: journal,
+            hook: hook.clone(),
+            workspace: workspace.clone(),
+            journal: options
+                .session
+                .clone()
+                .unwrap_or_else(|| workspace.join("p1-memory")),
+            cache_key: Mutex::new(assembled.options.cache_key.clone()),
+            origin: ShadowOrigin::Parent,
+        }),
+        None => journal,
+    };
     // On resume the journal holds the earlier turns; rebuild this agent's activity
     // from them so a verification run before the restart still counts and a file
     // change before it still invalidates (completion.md §3).
@@ -2180,6 +2261,8 @@ pub(crate) struct ChildBuilder {
     session: Option<PathBuf>,
     max_idle_summaries: usize,
     service_slot: Arc<OnceLock<Arc<InProcessWorkers>>>,
+    #[cfg(feature = "shadow-hook")]
+    shadow: Option<Arc<p1_hook_shadow::ShadowHook>>,
 }
 
 #[cfg(feature = "delegation")]
@@ -2208,6 +2291,8 @@ impl ChildBuilder {
             session,
             max_idle_summaries,
             service_slot,
+            #[cfg(feature = "shadow-hook")]
+            shadow: deps.shadow.clone(),
         }
     }
 
@@ -2436,6 +2521,30 @@ impl ChildBuilder {
                 )
             })?,
             None => Arc::new(MemoryJournal::new()),
+        };
+        #[cfg(feature = "shadow-hook")]
+        let journal: Arc<dyn CommitSink> = match &self.shadow {
+            Some(hook) => Arc::new(ShadowJournal {
+                inner: journal,
+                hook: hook.clone(),
+                workspace: workspace.clone(),
+                journal: created_file
+                    .clone()
+                    .unwrap_or_else(|| workspace.join(format!("p1-memory-{worker_id}"))),
+                cache_key: Mutex::new(assembled.options.cache_key.clone()),
+                origin: ShadowOrigin::Child {
+                    family: "worker".to_string(),
+                    provider: choice
+                        .and_then(|choice| choice.profile.clone())
+                        .or_else(|| {
+                            load_environment(environment, environment_dirs)
+                                .ok()
+                                .and_then(|env| env.profile.map(|profile| profile.id.clone()))
+                        })
+                        .unwrap_or_else(|| "p1".to_string()),
+                },
+            }),
+            None => journal,
         };
         let parts = AgentParts {
             provider: assembled.provider,

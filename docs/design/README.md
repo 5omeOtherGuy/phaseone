@@ -30,3 +30,4 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 | `websocket.md` | WebSocket transport for the Responses adapter, SSE fallback, continuation (ADR-0047) |
 | `model-selection.md` | Choosing, scoping and switching models: `--model`, `p1 models`, `settings.toml`, `/model` (ADR-0049) |
 | `workflows.md` | Optional workflows: a sandboxed script orchestrates workers under roles and caps (ADR-0053) |
+| `hooks.md` | Optional detached brain shadow hook for user inputs and worker briefs (ADR-0058) |
