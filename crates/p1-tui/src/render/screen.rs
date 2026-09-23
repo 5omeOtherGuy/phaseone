@@ -390,6 +390,7 @@ fn approval_rows(screen: &Screen, width: usize, now_ms: u64) -> Vec<Line<'static
                 outcome: Some(outcome),
                 body: FaceBody::Diff(view.rows.clone()),
                 meta: None,
+                target: None,
             };
             (
                 row(&view.tool, &view.file, TargetKind::Path, Some(face)),

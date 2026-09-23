@@ -113,8 +113,13 @@ impl ToolDescriber for Describer {
         }
     }
 
-    fn result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultFace {
-        GenericDescriber.result(call, result)
+    fn result(
+        &self,
+        call: &ToolCall,
+        result: &ToolResultItem,
+        elapsed_ms: Option<u64>,
+    ) -> ResultFace {
+        GenericDescriber.result(call, result, elapsed_ms)
     }
 }
 
@@ -262,6 +267,7 @@ fn call(
             outcome: outcome.map(str::to_string),
             body,
             meta: None,
+            target: None,
         }),
         input_preview: None,
     })

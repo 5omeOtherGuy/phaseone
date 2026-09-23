@@ -10,7 +10,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::face::{CallFace, GenericDescriber, ResultFace, ToolDescriber};
+use crate::face::{CallFace, FaceBody, GenericDescriber, ResultFace, ToolDescriber};
+use crate::render::diff::DiffRow;
 
 use p1_contracts::{
     AgentEvent, ProviderErrorKind, StopReason, ToolCall, ToolResultItem, ToolStatus, TurnEnd, Usage,
@@ -704,12 +705,44 @@ impl Transcript {
         };
         row.status = status;
         row.elapsed_ms = elapsed_ms;
+        row.line_count = content.lines().count();
         if let Some(result) = result
             && let Some(call) = row.call.as_ref()
         {
-            row.result_face = Some(self.describer.result(call, result));
+            let face = self.describer.result(call, result, elapsed_ms);
+            // A result-time target (`worker_start`'s `w1 · env/profile`)
+            // replaces the frozen call target; the call face otherwise never
+            // changes after `ToolStarted`.
+            if let Some(target) = &face.target {
+                row.face.target = target.clone();
+            }
+            // A Diff/Files body's own row/file count — not the raw content's
+            // line count, which is a one-line success message for these tools
+            // — decides whether §7.3's diff/apply_patch cap cuts it; its full
+            // text (not the tool's own success line) is what `^O` must open.
+            // Direct field writes (not a helper method): `row` borrows only
+            // `self.blocks`, so `self.outputs`/`self.latest_fold` stay free.
+            match &face.body {
+                FaceBody::Diff(rows) if rows.len() > crate::fold::FULL_BLOCK_MAX_LINES => {
+                    row.line_count = rows.len();
+                    let text = diff_plain_text(rows);
+                    let id = FoldId::of(&text);
+                    self.outputs.insert(id.clone(), text);
+                    row.fold = Some(id.clone());
+                    self.latest_fold = Some(id);
+                }
+                FaceBody::Files(files) if files.len() > crate::fold::FULL_BLOCK_MAX_LINES => {
+                    row.line_count = files.len();
+                    let text = files_plain_text(files);
+                    let id = FoldId::of(&text);
+                    self.outputs.insert(id.clone(), text);
+                    row.fold = Some(id.clone());
+                    self.latest_fold = Some(id);
+                }
+                _ => {}
+            }
+            row.result_face = Some(face);
         }
-        row.line_count = content.lines().count();
         if !content.is_empty() {
             match status {
                 // Failures keep the output on the row (the evidence block reads
@@ -1020,6 +1053,28 @@ fn turn_notice(
 }
 
 /// Append streamed text to a line buffer, splitting on newlines.
+/// A `FaceBody::Diff` overflow's full text, for the fold handle `^O` opens
+/// (§7.1's diff sign column: `+`, `−` U+2212, or a space for context).
+fn diff_plain_text(rows: &[DiffRow]) -> String {
+    rows.iter()
+        .map(|row| match row {
+            DiffRow::Context { line, text } => format!("{line:>4}   {text}"),
+            DiffRow::Add { line, text } => format!("{line:>4} + {text}"),
+            DiffRow::Del { line, text } => format!("{line:>4} − {text}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A `FaceBody::Files` overflow's full text, for the fold handle `^O` opens.
+fn files_plain_text(files: &[(String, String)]) -> String {
+    files
+        .iter()
+        .map(|(path, facts)| format!("{path}  {facts}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn append_text(lines: &mut Vec<String>, text: &str) {
     for (n, part) in text.split('\n').enumerate() {
         if n > 0 || lines.is_empty() {

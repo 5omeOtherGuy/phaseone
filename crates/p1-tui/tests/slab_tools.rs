@@ -46,6 +46,7 @@ fn row(
             outcome: outcome.map(str::to_owned),
             body,
             meta: None,
+            target: None,
         }),
         input_preview: None,
     }

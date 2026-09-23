@@ -71,6 +71,15 @@ pub trait FrontEnd: Send + Sync {
     /// (`None` when the environment does not assemble `finish`).
     fn parent_assembled(&self, route: &str, model: &str, completion: Option<Completion>);
 
+    /// The assembled `[context]` window and its summarize threshold, in tokens
+    /// (handoff §10 `ctx`): a sibling of [`FrontEnd::parent_assembled`], called
+    /// once at the same point, so a front end that shows a live percentage (the
+    /// TUI's statusline) has the denominator `ResponseCompleted`'s own usage
+    /// never carries. Both `None` when the environment has no `[context]`
+    /// section — unknown, never a guessed window. The default does nothing: a
+    /// front end that never shows `ctx` (the line renderer) need not override it.
+    fn context_configured(&self, _window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {}
+
     /// The route label the parent renderer names, when this front end has one: the
     /// host moves it after a successful model switch, so the per-response line names
     /// the route that produced the response (ADR-0049 stage 3). `None` — the default

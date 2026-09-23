@@ -22,6 +22,11 @@ pub struct ResultFace {
     pub outcome: Option<String>,
     pub body: FaceBody,
     pub meta: Option<String>,
+    /// Replaces the frozen call target once the result settles (`worker_start`'s
+    /// `w1 · env/profile`: `w1` and the resolved profile only exist at the
+    /// result, after `CallFace` was already built and drawn). `None` keeps the
+    /// call-time target.
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +39,15 @@ pub enum FaceBody {
 
 pub trait ToolDescriber: Send + Sync {
     fn call(&self, call: &ToolCall) -> CallFace;
-    fn result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultFace;
+    /// `elapsed_ms` is the call's own clock (`ToolStarted` to `ToolFinished`),
+    /// the same measurement `ToolRow.elapsed_ms` carries — the describer never
+    /// keeps its own clock (§7.3 shell: `D · exit C · N lines`).
+    fn result(
+        &self,
+        call: &ToolCall,
+        result: &ToolResultItem,
+        elapsed_ms: Option<u64>,
+    ) -> ResultFace;
 }
 
 /// Name-agnostic fallback for tools the host has not described.
@@ -50,12 +63,18 @@ impl ToolDescriber for GenericDescriber {
         }
     }
 
-    fn result(&self, _call: &ToolCall, result: &ToolResultItem) -> ResultFace {
+    fn result(
+        &self,
+        _call: &ToolCall,
+        result: &ToolResultItem,
+        _elapsed_ms: Option<u64>,
+    ) -> ResultFace {
         let count = result.content.lines().count();
         ResultFace {
             outcome: Some(format!("{count} lines")),
             body: FaceBody::None,
             meta: None,
+            target: None,
         }
     }
 }
