@@ -71,6 +71,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0055 | [A successful command that changes the workspace counts as progress for the stall guard](0055-a-successful-command-that-changes-the-workspace-counts-as-progress-for-the-stall-guard.md) | accepted | 2026-09-23 | lead |
 | ADR-0056 | [The TUI follows the SLAB Harness design system and its implementation handoff](0056-the-tui-follows-the-slab-harness-design-system-and-its-implementation-handoff.md) | accepted | 2026-09-23 | owner+lead |
 | ADR-0057 | [A tool describes each call's target; the host and the UI stop matching tool names](0057-a-tool-describes-each-call-s-target-the-host-and-the-ui-stop-matching-tool-names.md) | proposed | 2026-09-23 | lead |
+| ADR-0058 | [p1 spawns the brain shadow hook, detached and fail-open, as an optional module](0058-p1-spawns-the-brain-shadow-hook-detached-and-fail-open-as-an-optional-module.md) | proposed | 2026-09-23 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
