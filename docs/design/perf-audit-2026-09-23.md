@@ -1,4 +1,4 @@
-# p1 performance and maintainability audit — 2026-09-23 (partial; stopped at the quota line)
+# p1 performance and maintainability audit — 2026-09-23
 
 Owner-directed (via XO) under the operational hold. Numbers first, then the ranked fixes.
 Items 1, 2, 4 and 5 are measured; item 3 has two live samples and otherwise needs
@@ -29,8 +29,8 @@ Source: every `assistant_completed` record's `usage` in `../phaseone-briefs/runs
 | provider-http-helpers | gpt-6-luna | 29 | 0.8 M | 0.861 | 0.865 | 0 |
 | finish-always | gpt-6-sol | 16 | 0.3 M | 0.823 | 0.833 | 0 |
 | wf6-workflow-docs | glm-5.3 | 82 | 6.6 M | 0.968 | 0.968 | 1 |
-| wf5-workflow-host | claude-opus-5-5 | 281 | 23.3 M | 1.000 | 1.000 | 11 |
-| wf3-workflow-engine | claude-opus-5-5 | 54 | 3.9 M | 1.000 | 1.000 | 2 |
+| wf5-workflow-host | claude-opus-5-5 | 281 | 24.8 M | 0.942 (corrected, see review) | — | 11 |
+| wf3-workflow-engine | claude-opus-5-5 | 54 | 4.3 M | 0.910 (corrected, see review) | — | 2 |
 
 Reading:
 - **Steady-state caching works on every route.** Long runs sit at 0.96–0.99; the share is lower
@@ -43,9 +43,9 @@ Reading:
   injected (the host's own continuation and retry messages are ordinary user-role items appended
   at the end). Anthropic gets `cache_control: ephemeral` on the last blocks
   (`p1-provider-anthropic/src/request.rs:198–229`); Codex takes an optional `cache_key`.
-- **Anthropic's 1.000 is accounting, not magic**: its `usage` reports cache reads and only 4
-  uncached tokens per request, including the summarizer's own request; the Codex and OpenCode
-  routes report the true uncached prefix each time it changes.
+- **Anthropic's share needs `cache_write` in the denominator** (`read / (uncached + read + write)`);
+  the first version of this table showed 1.000 because it ignored cache writes. Corrected: 94.2 %
+  and 91.0 % (Astra's recomputation from the same journals).
 
 ## 2. Compaction — measured
 
@@ -64,14 +64,16 @@ summarize_at_tokens` (300 k on deepseek/deepseek2 with a 1 M window, 120 k on cl
 Reading:
 - **The summarizer's request is fully uncached on every non-Anthropic route** (`cache_read` = 0
   on all seven): it is built as a fresh prompt instead of as the session's own prefix plus one
-  instruction. Mean 11.8 k uncached input and 6 k output per compaction; on DeepSeek at 300 k the
-  one measured compaction cost 104 k uncached input.
+  instruction. The seven non-Anthropic compactions average 33.7 k uncached input and 2.6 k output (the
+  earlier pooled 11.8 k mixed in Anthropic's near-zero `input_uncached`); on DeepSeek at 300 k
+  the one measured compaction cost 104 k uncached input.
 - **After a compaction only the static prefix survives**: the first request afterwards hits 4–14 %
   (the system prompt + tools), which is the expected floor once the history is replaced; nothing
   to gain there beyond making the summary itself cheap.
-- **Anthropic compactions are nearly free in tokens** but there were 11 of them in one 281-request
-  run (wf5-workflow-host, the run that stalled): each costs a full round trip and, on that run,
-  the stall guard's count. The DeepSeek routes compact rarely (300 k) but every request then
+- **Anthropic compactions are NOT free** (corrected): all 13 have zero cache reads and total
+  368 k cache-write tokens plus 102 k output tokens (the largest summary 10.8 k); the first
+  request afterwards reuses only 7–11 % when non-zero, twice 0 %. 11 of them in one 281-request
+  run (wf5-workflow-host, the run that stalled). The DeepSeek routes compact rarely (300 k) but every request then
   carries ~180 k cached tokens (38 M input over 212 requests) — cheap in money, heavy in latency.
 
 ## 3. Latency — two live samples; the rest needs instrumentation
@@ -91,7 +93,10 @@ Probe: `p1 --env gpt --model gpt/gpt-6-sol:low` in a tmux window, `/proc/<pid>/i
 `/proc/<pid>/stat` CPU ticks and `VmRSS` sampled every 1–5 s while a 60-line response streamed.
 - Process: 2 threads, RSS 23 MB throughout.
 - Before the first token: one 21 kB frame (the prompt echo and the working indicator), then
-  0 bytes for ~20 s — no redraws while nothing changes, which is the right behaviour.
+  0 bytes for ~20 s. Corrected reading: `draw` runs unconditionally on a 50 ms tick and on every
+  event (`tui.rs` lines 1107/1133, 1196/1221), so frames ARE drawn; the terminal backend's
+  double-buffer diff wrote nothing because nothing changed. Draw suppression / event coalescing
+  is therefore a concrete candidate (fix 7), not a solved problem.
 - While streaming: ~21 kB per 5 s (≈ 4 kB/s) written to the terminal, CPU 2–5 %, the screen
   advancing 4 → 29 → 51 numbered lines across three 5-second samples; no stalls, no bursts.
 - Redraw scope: `p1-host/src/tui.rs` draws one frame per event batch and on a worker-sync tick
@@ -103,8 +108,10 @@ Probe: `p1 --env gpt --model gpt/gpt-6-sol:low` in a tmux window, `/proc/<pid>/i
 
 ## 5. Maintainability after today's landings — measured
 
-Metrics over the changed crates (`src` non-test lines; tests = `tests/` + `#[cfg(test)]`;
-`unwrap()`/`expect(` counted outside `#[cfg(test)]`):
+Metrics over the changed crates (CAVEAT from the review: the `src` column includes inline
+`#[cfg(test)]` modules — pre-test lines are e.g. workers 1 064, edit 400, write 267 — and the
+`tests` column counts bare `#[test]`/`#[tokio::test]` attributes only, missing parameterized
+tests: workers has 19, not 5. Re-run with the corrected script before quoting):
 
 | crate | src | test lines | tests | unwrap/expect | notes |
 |---|---|---|---|---|---|
@@ -163,6 +170,58 @@ session start, never wall-clock, so resume and replay stay deterministic);
 provider/effort becomes a run-report field; frozen fixture journals gain the fields only.
 Fixes 1, 3–8 change no contract.
 
-## Astra review (gpt-6-astra, xhigh, read-only)
+## Astra review (gpt-6-astra, xhigh, read-only, one round, 352 s) — verdict and corrections
 
-(folded in below when received)
+Verdict: "revise before using this audit to prioritize work." Astra recomputed the usage
+from the same 22 journals and read the code at 7a7299a. Every correction below is accepted
+and folded into the sections above; the raw review is in the session's scratchpad.
+
+1. **Accounting.** Cache share must include `cache_write`; Anthropic is 94.2 % / 91.0 %, not
+   100 %. The non-Anthropic compaction mean is 33.7 k in / 2.6 k out; Anthropic compactions cost
+   368 k cache-write + 102 k output across 13 and reuse only 7–11 % afterwards. The
+   "first request dominates" explanation for short runs is at best partial (removing it moves
+   finish-always from 82.3 % to 83.3 %); equal overall/after-first shares do not prove prefix
+   stability — only the timestamps and a per-request `cache_write` trace can.
+2. **§3** samples show a symptom (Enter → first visible text ≈ 20 s), not provider TTFT.
+3. **§4** the loop draws unconditionally on 50 ms ticks; zero bytes = backend diff, not
+   suppression. Draw suppression/event coalescing is a real candidate.
+4. **§5** the line and test counts were computed wrongly (see the caveat above).
+5. **Fix 1 changes the prompt contract**: the summarizer today has a dedicated system prompt,
+   one rendered user message and no tools, pinned by a frozen acceptance test in
+   `crates/p1-context/tests`; sending the full history is an experiment with more cold-cache
+   exposure, not a guaranteed win. It needs an ADR and a measured A/B, after fix 2.
+6. **Fix 4** as a blanket `into_inner` helper is insufficient: the build and regrant callbacks
+   run under the lock, so recovering access does not recover invariants; the fix is to shrink
+   the critical sections (build outside the lock) and then decide poison policy.
+7. **Fixes 5/6** change model-visible history and stall behaviour (contract-relevant); the
+   Anthropic window is the configured 200 k, and 11 compactions in 281 requests is not proven
+   excessive. Run them as controlled experiments after fix 2.
+8. **The timestamp ADR does not hold as drafted**: `at_ms: u64` cannot carry "unknown"; a
+   process-local monotonic clock does not survive restart (define an epoch per process start
+   and resume offsets); keep timings outside `Usage` (optional, summed) as their own record
+   fields with request/attempt identity; separate first-reasoning, first-text and first-tool-
+   input events; include failures, retries, cancellation and summarization.
+9. **Missing work**: reproducible accounting (a script in `scripts/`), successful-task
+   latency/cost/quality comparisons, profiling of request construction, journal commits and
+   worker lock contention.
+
+### Corrected ranking
+
+| # | fix | why here | contract |
+|---|---|---|---|
+| 1 | **Timing instrumentation** (Astra's corrected design of old fix 2): per-record monotonic time with a per-process epoch, request/attempt identity, first-reasoning/text/tool-input marks, failures and retries included, outside `Usage`; `run-report.py` derives TTFT and time-to-first-tool-call | makes the 20 s symptom diagnosable and every later change measurable | journal contract → ADR (re-drafted per item 8) |
+| 2 | **Reproducible accounting script** (`scripts/usage-audit.py`: per-run cache share WITH cache_write, per-compaction cost, per-route means) | the two accounting errors above happened because the numbers lived in a one-off script | none |
+| 3 | **TUI draw suppression / event coalescing + frame counter** (old fix 7): measure draw duration, event backlog and input latency, including long histories and build load; suppress draws when the screen model is unchanged | directly addresses the unconditional-draw finding | none |
+| 4 | **Compaction experiment** (old fix 1) behind an ADR: summarize from the session prefix vs today's dedicated prompt, A/B on cache_write, latency and summary quality | 33.7 k uncached per compaction on Codex/DeepSeek is real, but the fix is unproven | prompt contract → ADR + frozen-test change |
+| 5 | **`p1-workers` critical sections**: build and regrant outside the mutex, then decide poison policy | a panicking build under the lock takes the service down | none |
+| 6 | Threshold experiments (old 5/6), only with 1 in place | history-visible; measure, don't guess | model-visible history → note in the ADR of 4 |
+| 7 | Edit/write shared core — extract only the genuinely common parts (confinement/observation already live in `p1-workspace`) | modest | tool schemas unchanged |
+| 8 | Dead-code allowances | hygiene; no deletions identified | none |
+
+Astra's single first fix: corrected fix 1 (timing). Agreed.
+
+## Resume note
+
+Implementation waits for the resets (XO order). Next lead actions when released: write the
+timing ADR from item 8 above; write `scripts/usage-audit.py` and regenerate §1–§2 from it;
+then dispatch fixes 1–3 as bounded briefs (Sol/Luna).
