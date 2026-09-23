@@ -27,7 +27,10 @@ HOW THE LEAD WORKS (owner instructions)
   merges.
 - One job ≈ one crate; short briefs, "work in this order, start editing early". A dead run cannot
   move its journal between routes — a fresh session continues from the WORKSPACE ("NOTE ON STATE").
-- Accounts: `deepseek2` is the everyday route (owner rule); z.ai GLM is small — `--env glm` sparingly.
+- Accounts (XO route notice 2026-09-23 22:50): DeepSeek V4.1 Flash on the primary Go subscription
+  (`env: deepseek`) is the main worker again, `deepseek2` its fallback (ADR-0054 chain); Claude-side
+  dispatch/review → Fable, never Opus/Sonnet; Astra is consultant/lead, never a worker without an
+  owner directive; z.ai GLM off until Friday. HOLD until the Thursday 2026-09-25 19:00 reset.
 
 LANDING PROCEDURE (one task = one worktree)
 1. `scripts/new-worktree.sh <task-slug>`; worker edits; read the diff yourself.
@@ -38,17 +41,20 @@ LANDING PROCEDURE (one task = one worktree)
 4. Record accepted runs (`docs/dogfood/runs.jsonl` via `scripts/run-report.py`, evidence in
    `~/.agents/skills/model-cards/evidence.jsonl`); `git worktree remove <path>`.
 
-OPEN ITEMS (issue numbers)
-- #46 tool-name coupling: `p1-tui/src/transcript.rs` and `p1-host/src/tui.rs` match literal tool
-  names and argument keys, so `apply_patch` is never recognised on GPT — the tool should describe
-  its own call target (audit finding 3).
-- #47 provider-http helpers: the error-code sanitiser (a security rule, copied twice),
-  `http_error_code` and the status→kind table move into `p1-provider-http` (audit finding 2).
-- #48 cleanups: explicit worker ordinal, delete the host's copy of credential validation, one
-  `ToolFace`, shared provider fixtures in conformance (audit findings 4–8).
-- #12 TUI (Kimi K3 session, `in-progress`; coordinate only on the issue; do not edit `p1-tui`):
-  the terminal guard inside `p1-tui` contradicts ADR-0043; the `/model` picker must call
-  `switch_model` in `p1-host/src/run.rs`, which `p1-tui` does not reference yet.
+OPEN ITEMS (in order, after the hold lifts)
+1. Perf audit fixes (`docs/design/perf-audit-2026-09-23.md`, corrected ranking): (1) timing
+   instrumentation ADR — Enter-to-first-text is ~20 s on Codex low and nobody can say where it goes;
+   (2) `scripts/usage-audit.py` (cache share incl. cache_write); (3) TUI draw suppression + frame
+   counter (draws unconditionally on 50 ms ticks); (4) compaction experiment behind an ADR
+   (non-Anthropic compaction requests are fully uncached); (5) p1-workers critical sections;
+   (6) threshold experiments; (7) edit/write extraction; (8) dead-code hygiene.
+2. ADR-0060 (proposed): salt spike (two worktrees, one shared target, stub never linked), then
+   `local-cargo-config.sh` + `rustc-serial` + profile changes; supersedes ADR-0014.
+3. #12 TUI host seams still open in the handoff: §14.3/§14.4/§14.5/§14.10 (coordinate on the
+   issue; the TUI session may request changes to the mechanical p1-tui hunks posted on #12);
+   §15 owner questions await the owner.
+4. Leftovers: one `#[path]` include in `crates/p1-host/tests/credentials_end_to_end.rs`; two
+   `allow(dead_code)` allowances; #48 item 5 (shared provider fixtures) if not yet folded in.
 - #45 re-reading after a context summary — ON HOLD BY THE OWNER (`blocked`); do not dispatch.
 - #6 dogfooding group (`ready`): no harness debt left from its list. (unverified: the long-session
   WebSocket upload comparison is still open here.)
