@@ -46,25 +46,44 @@ anything that claims a latency gain), then the rest.
 1. **#61 ADR-0060** — salt spike as the first DeepSeek job after the reset, then the scripts and
    profiles. Astra's audit of the ADR, spike protocol and 48-hour plan land in
    `~/scratch/p1-next/PLAN.md` (XO, 2026-09-23); the lead reads it first.
-2. **#63 timing instrumentation** (ADR) and **#64 usage-audit script** — independent, run in
-   parallel.
-3. **#62 session history** — the gap the owner asked about; small, host-only.
-4. **#65 TUI draw suppression** and **#67 workers critical sections** — independent.
-5. **#68 seams batch 2**, then **#69 diff seam** — with the TUI session on #12.
-6. **#66 compaction experiment** — after #63, because its A/B needs the timing marks.
-7. **#70 hygiene** — any idle worker slot.
-8. **#71** — owner answers whenever convenient; nothing blocks on it except the `/resume` picker.
+2. **#73 finish chains**, **#74 edit staleness**, **#75 argument bounds** — the per-run taxes
+   the scan found; small, independent, one worker each.
+3. **#63 timing instrumentation** (ADR) and **#64 usage-audit script** (+ **#80** usage fields)
+   — independent, run in parallel.
+4. **#78 run endings** and **#79 compaction validation** — correctness.
+5. **#77 long builds** and **#81 sandbox git** — before the next large fanout.
+6. **#62 session history** — the gap the owner asked about; small, host-only.
+7. **#65 TUI draw suppression** and **#67 workers critical sections** — independent.
+8. **#76 read-only paths** (ADR), **#68 seams batch 2**, then **#69 diff seam** — with #12.
+9. **#66 compaction experiment** — after #63, because its A/B needs the timing marks.
+10. **#70 hygiene**, **#82 ergonomics** — any idle worker slot.
+11. **#71** — owner answers whenever convenient; nothing blocks on it except the `/resume` picker.
 
 Routing (owner/XO 2026-09-23): DeepSeek V4.1 Flash on the primary Go subscription is the
 worker; verification protocols by Sol; Claude-side reviews by Fable; Astra consults, never works.
 The operational hold stands until Thursday 2026-09-25 19:00.
 
-## Session-log scan (2026-09-23, in progress)
+## Session-log scan (2026-09-23) — what the journals say
 
-Seven DeepSeek workers are scanning the 76 journals for tool failures, wasted work, provider
-trouble, compaction losses, finish honesty, instruction following, usage anomalies and harness
-ergonomics (brief: `../phaseone-logscan/BRIEF.md`). Their findings become issues in the same
-template and are appended below with the date.
+Seven DeepSeek workers scanned the 76 journals (99 findings, mapping in
+`docs/research/session-log-scan-2026-09-23.md`). The recurring costs, in order of runs affected:
+
+| what the journals show | issue |
+|---|---|
+| `finish` rejects `done` in most runs because the check ran in an `&&` chain; the suite is re-run | #73 |
+| edits refused as unread or stale, even after the model's own edit; whole-file re-reads follow | #74 |
+| argument bounds live only in the schema; `context` > 10 rejected 19 times across every model family | #75 |
+| `read` refuses files outside the workspace that the brief names; the shell reads them | #76 |
+| hours lost to shell timeouts on cargo and to two cargo calls deadlocking in one session | #77 |
+| runs end on provider failures without a finish or a journal record; startup aborts leave nothing | #78 |
+| summaries came back as raw markup or truncated; a resume re-summarized nothing into nothing | #79 |
+| `cache_write` never reported on chat routes; uncached re-sends up to 1 134× without a compaction | #80 |
+| git exits 128 inside sandboxed worktrees | #81 |
+| shell summaries hide the failing lines; a worker's result arrives twice | #82 |
+
+Placement in the order: #73, #74 and #75 are cheap and cost every run, so they go right after
+ADR-0060 and alongside the measurement chain; #78 and #79 are correctness and follow; #77 and
+#81 before the next large fanout; #76 needs an ADR; #80 rides with #64; #82 fills idle slots.
 
 ## Not on the list (on purpose)
 

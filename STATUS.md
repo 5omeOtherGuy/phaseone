@@ -41,7 +41,11 @@ LANDING PROCEDURE (one task = one worktree)
 4. Record accepted runs (`docs/dogfood/runs.jsonl` via `scripts/run-report.py`, evidence in
    `~/.agents/skills/model-cards/evidence.jsonl`); `git worktree remove <path>`.
 
-OPEN ITEMS (in order, after the hold lifts)
+OPEN ITEMS — the ordered list is `docs/design/roadmap.md` (epic #72, children #61–#82, template
+issues: current state @ commit, implementation, tests, measurable DoD, state after). Owner priority
+2026-09-23: #61 ADR-0060 first; read `~/scratch/p1-next/PLAN.md` (Astra's ADR-0060 audit + spike
+protocol, via XO) before dispatching it. Session-log scan done (99 findings → #73–#82,
+`docs/research/session-log-scan-2026-09-23.md`). Short form:
 1. Perf audit fixes (`docs/design/perf-audit-2026-09-23.md`, corrected ranking): (1) timing
    instrumentation ADR — Enter-to-first-text is ~20 s on Codex low and nobody can say where it goes;
    (2) `scripts/usage-audit.py` (cache share incl. cache_write); (3) TUI draw suppression + frame
