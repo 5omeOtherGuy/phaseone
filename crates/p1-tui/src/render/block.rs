@@ -293,8 +293,10 @@ pub fn lines_with_approval(
             ));
         }
     }
+    let mut files_fold_meta = None;
     if let Some(FaceBody::Files(files)) = body {
-        for (path, facts) in files {
+        let visible = files.len().min(8);
+        for (path, facts) in files.iter().take(visible) {
             out.push(
                 Band {
                     bg: palette::BLOCK,
@@ -305,6 +307,13 @@ pub fn lines_with_approval(
                 }
                 .render(),
             );
+        }
+        if files.len() > visible {
+            let id = row
+                .fold
+                .clone()
+                .unwrap_or_else(|| FoldId::of(&row.output.clone().unwrap_or_default()));
+            files_fold_meta = Some(format!("· {} more files → [{}]", files.len() - visible, id));
         }
     }
     if let Some(FaceBody::Lines(lines)) = body {
@@ -372,7 +381,7 @@ pub fn lines_with_approval(
             palette::BLOCK,
         ));
     }
-    if let Some(meta) = fold_meta.or(diff_fold_meta) {
+    if let Some(meta) = fold_meta.or(diff_fold_meta).or(files_fold_meta) {
         let line = Band {
             bg: palette::BLOCK,
             left: vec![seg(palette::FAINT, meta)],
@@ -543,4 +552,51 @@ fn decision_line(approval: &InlineApproval, width: usize) -> Line<'static> {
         pad: 2,
     }
     .render()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        face::{CallFace, ResultFace},
+        fold::FoldId,
+    };
+
+    #[test]
+    fn apply_patch_files_body_keeps_eight_rows_and_folds_the_rest() {
+        let files = (0..11)
+            .map(|n| (format!("src/file{n}.rs"), format!("+{n} −0")))
+            .collect();
+        let row = ToolRow {
+            name: "apply_patch".into(),
+            summary: "11 files".into(),
+            status: RowStatus::Settled(p1_contracts::ToolStatus::Ok),
+            output: None,
+            line_count: 0,
+            fold: Some(FoldId("h-12345678".into())),
+            elapsed_ms: None,
+            call_id: "patch".into(),
+            call: None,
+            face: CallFace {
+                target: "11 files".into(),
+                kind: TargetKind::Plain,
+            },
+            result_face: Some(ResultFace {
+                outcome: Some("+11 −0 · 11 files".into()),
+                body: FaceBody::Files(files),
+                meta: None,
+                target: None,
+            }),
+            input_preview: None,
+        };
+        let rendered = lines(&row, 76, false, 0, true);
+        let text: Vec<String> = rendered.iter().map(ToString::to_string).collect();
+        assert_eq!(rendered.len(), 10, "header, eight files, fold row");
+        for index in 0..8 {
+            assert!(text[index + 1].contains(&format!("src/file{index}.rs")));
+        }
+        assert!(!text.iter().any(|line| line.contains("src/file8.rs")));
+        assert!(text[9].contains("· 3 more files → [h-12345678]"));
+        assert!(text[9].contains("^O open in pane"));
+    }
 }
