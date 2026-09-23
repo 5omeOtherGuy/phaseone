@@ -1,0 +1,13 @@
+# The model policy, independent of the coding-plan route. Thinking is preserved
+# across turns because this route returns reasoning_content with its answers.
+id        = "kimi-k3"
+revision  = 1
+model_id  = "k3"
+family    = "kimi"
+thinking  = "preserved"
+
+efforts        = ["low", "high", "max"]
+default_effort = "high"
+
+max_output_tokens = 131072
+# context_tokens: the vendor claims 1,048,576; unverified on this route.
