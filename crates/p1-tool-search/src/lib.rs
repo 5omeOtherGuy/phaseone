@@ -18,8 +18,8 @@ use grep::searcher::{
 use ignore::WalkBuilder;
 use ignore::overrides::{Override, OverrideBuilder};
 use p1_contracts::{
-    BoxFuture, CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
-    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
+    BoxFuture, CallDescription, CancellationToken, DeclarationKind, Effect, Tool, ToolCall,
+    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_workspace::{ToolFace, Workspace};
 use serde::Deserialize;
@@ -167,6 +167,22 @@ impl Tool for GrepTool {
 
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::ReadOnly
+    }
+
+    /// ADR-0057: the pattern searched, or the scope when the pattern is empty
+    /// (`mode: "files"` lists the scope), from the tool's own parsed input.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "search",
+            target: parse_input(&self.declaration.name, call).ok().map(|input| {
+                if input.pattern.is_empty() {
+                    input.path.unwrap_or_else(|| ".".to_string())
+                } else {
+                    input.pattern
+                }
+            }),
+            edit: None,
+        }
     }
 
     fn execute<'a>(
@@ -956,6 +972,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = tool(dir.path());
         assert_eq!(tool.effect(&call("{}")), Effect::ReadOnly);
+    }
+
+    /// ADR-0057: the pattern searched, or the scope when the pattern is empty.
+    #[test]
+    fn describe_names_the_pattern_or_the_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        let described = tool.describe(&call(r#"{"pattern": "beta", "path": "src"}"#));
+        assert_eq!(described.verb, "search");
+        assert_eq!(described.target.as_deref(), Some("beta"));
+        // `mode: "files"` with an empty pattern lists the scope.
+        let scoped = tool.describe(&call(r#"{"pattern": "", "path": "src"}"#));
+        assert_eq!(scoped.target.as_deref(), Some("src"));
     }
 
     #[tokio::test]

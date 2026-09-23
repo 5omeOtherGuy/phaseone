@@ -45,15 +45,10 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             worker_rows: Arc::new(Mutex::new(Vec::new())),
             pending_calls: HashMap::new(),
             task_files: HashSet::new(),
-            task_added: 0,
-            task_removed: 0,
             exit: None,
             inbox: agent.inbox(),
             branch: Arc::new(Mutex::new(None)),
-            describer: Arc::new(HostDescriber::new(
-                std::env::current_dir().unwrap(),
-                "off".into(),
-            )),
+            tools: Arc::new(Vec::new()),
             context_window: None,
             context_warn_at: None,
             pending_worker_starts: HashMap::new(),
@@ -533,6 +528,54 @@ fn worker_start_event_supplies_task_and_grants_to_the_worker_snapshot() {
 }
 
 #[test]
+fn edit_approval_uses_tool_preview_and_patch_keeps_permission_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = p1_workspace::Workspace::new(dir.path()).unwrap();
+    let observed = p1_workspace::ObservedFiles::new();
+    std::fs::write(dir.path().join("a.txt"), "old").unwrap();
+    let edit_tool = p1_tool_edit::EditTool::new(workspace.clone(), observed.clone());
+    let edit_call = ToolCall {
+        call_id: "edit".into(),
+        name: "edit".into(),
+        input: p1_contracts::ToolInput::Json(
+            r#"{"file_path":"a.txt","old_string":"old","new_string":"new"}"#.into(),
+        ),
+    };
+    let edit_description = edit_tool.describe(&edit_call);
+    assert!(matches!(
+        approval_view(
+            &edit_call,
+            Effect::WritesFiles,
+            &edit_description,
+            dir.path(),
+            "off"
+        ),
+        Approval::Diff(_)
+    ));
+
+    let patch_tool = p1_tool_patch::PatchTool::new(workspace, observed);
+    let patch_call = ToolCall {
+        call_id: "patch".into(),
+        name: "apply_patch".into(),
+        input: p1_contracts::ToolInput::Text(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n".into(),
+        ),
+    };
+    let patch_description = patch_tool.describe(&patch_call);
+    assert_eq!(patch_description.edit, None);
+    assert!(matches!(
+        approval_view(
+            &patch_call,
+            Effect::WritesFiles,
+            &patch_description,
+            dir.path(),
+            "off"
+        ),
+        Approval::Permission(_)
+    ));
+}
+
+#[test]
 fn worker_events_stay_out_of_the_parent_transcript_but_mark_start_and_end() {
     let (mut d, _auth) = driver();
     d.on_ui_event(UiEvent::WorkerStarted("w1".into()));
@@ -623,4 +666,64 @@ fn a_live_worker_promotes_the_pane_and_a_finished_one_releases_it() {
     assert_eq!(d.screen.pane_mode, PaneMode::Workers);
     d.screen.sync_workers(vec![row(BlockState::Done)]);
     assert_eq!(d.screen.pane_mode, PaneMode::Workers, "pinning always wins");
+}
+
+/// ADR-0057: the WORKSPACE section tracks the files a session writes from the
+/// tool that owns each call (`effect` + `describe`), so a RENAMED edit face and
+/// the freeform `apply_patch` (no `file_path` key at all) both count.
+#[test]
+fn a_renamed_edit_face_and_an_apply_patch_call_track_both_files() {
+    use p1_contracts::{AgentEvent, ToolInput, ToolResultItem, ToolStatus};
+
+    let (mut d, _auth) = driver();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = p1_workspace::Workspace::new(dir.path()).unwrap();
+    let observed = p1_workspace::ObservedFiles::new();
+    let edit = Arc::new(
+        p1_tool_edit::EditTool::new(workspace.clone(), observed.clone())
+            .with_face(p1_tool_edit::ToolFace::new("EditFile", "renamed"), "gpt"),
+    ) as Arc<dyn Tool>;
+    let patch = Arc::new(p1_tool_patch::PatchTool::new(workspace, observed)) as Arc<dyn Tool>;
+    d.tools = Arc::new(vec![edit, patch]);
+
+    let started = |call_id: &str, name: &str, input: ToolInput| AgentEvent::ToolStarted {
+        call: ToolCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            input,
+        },
+    };
+    let finished = |call_id: &str, name: &str| AgentEvent::ToolFinished {
+        result: ToolResultItem {
+            call_id: call_id.into(),
+            name: name.into(),
+            status: ToolStatus::Ok,
+            content: String::new(),
+        },
+    };
+
+    d.track_task(&started(
+        "c1",
+        "EditFile",
+        ToolInput::Json(r#"{"file_path":"src/a.rs","old_string":"a","new_string":"b"}"#.into()),
+    ));
+    d.track_task(&finished("c1", "EditFile"));
+    assert!(d.task_files.contains("src/a.rs"));
+
+    d.track_task(&started(
+        "c2",
+        "apply_patch",
+        ToolInput::Text(
+            "*** Begin Patch\n*** Update File: src/b.rs\n@@\n-a\n+b\n*** End Patch\n".into(),
+        ),
+    ));
+    d.track_task(&finished("c2", "apply_patch"));
+
+    assert!(d.task_files.contains("src/b.rs"));
+    assert_eq!(d.task_files.len(), 2);
+    assert_eq!(
+        d.screen.workspace.as_ref().and_then(|w| w.files),
+        Some(2),
+        "the WORKSPACE section counts both files"
+    );
 }

@@ -24,8 +24,8 @@ use std::time::Duration;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use p1_contracts::{
-    BoxFuture, CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
-    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
+    BoxFuture, CallDescription, CancellationToken, DeclarationKind, Effect, Tool, ToolCall,
+    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_workspace::{ToolFace, Workspace};
 use serde::Deserialize;
@@ -586,6 +586,19 @@ impl Tool for ShellTool {
 
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::Executes
+    }
+
+    /// ADR-0057: the command's first line, trimmed to 80 characters, from the
+    /// tool's own parsed input.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "run",
+            target: parse_input(&self.declaration.name, call).ok().map(|input| {
+                let first = input.command.lines().next().unwrap_or_default().trim();
+                first.chars().take(80).collect()
+            }),
+            edit: None,
+        }
     }
 
     fn execute<'a>(
@@ -1295,6 +1308,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = tool(dir.path());
         assert_eq!(tool.effect(&call("{}")), Effect::Executes);
+    }
+
+    /// ADR-0057: the command's first line, trimmed to 80 characters.
+    #[test]
+    fn describe_names_the_command_first_line_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+        let described = tool.describe(&call(r#"{"command": "echo one\necho two"}"#));
+        assert_eq!(described.verb, "run");
+        assert_eq!(described.target.as_deref(), Some("echo one"));
+
+        let long = format!("echo {}", "x".repeat(200));
+        let call = call(&serde_json::json!({ "command": long }).to_string());
+        assert_eq!(tool.describe(&call).target.unwrap().chars().count(), 80);
     }
 
     #[tokio::test]

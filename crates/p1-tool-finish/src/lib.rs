@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use p1_contracts::{
-    BoxFuture, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
-    ToolInput, ToolOutcome,
+    BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome,
 };
 use serde::Deserialize;
 
@@ -675,6 +675,21 @@ impl Tool for FinishTool {
         Effect::ReadOnly
     }
 
+    /// ADR-0057: the status this call reports (`done`/`blocked`), from the tool's
+    /// own parsed input.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "finish",
+            target: parse_input(&self.declaration.name, call).ok().map(|input| {
+                match input.status {
+                    Status::Done => "done".to_string(),
+                    Status::Blocked => "blocked".to_string(),
+                }
+            }),
+            edit: None,
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
@@ -1030,6 +1045,50 @@ fn is_masked(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session with no recorded activity, for the description test.
+    struct NoActivity;
+
+    impl SessionActivity for NoActivity {
+        fn last_file_change(&self) -> Option<u64> {
+            None
+        }
+        fn shell_runs(&self) -> Vec<ShellRun> {
+            Vec::new()
+        }
+    }
+
+    fn call(raw: &str) -> ToolCall {
+        ToolCall {
+            call_id: "c1".into(),
+            name: "finish".into(),
+            input: ToolInput::Json(raw.into()),
+        }
+    }
+
+    /// ADR-0057: the status this call reports, from this tool's own parsed input.
+    #[test]
+    fn describe_names_the_reported_status() {
+        let tool = FinishTool::new(Arc::new(NoActivity), FinishOutcome::default());
+        assert_eq!(
+            tool.describe(&call(
+                r#"{"status":"done","summary":"x","verification":["cargo test"]}"#
+            )),
+            CallDescription {
+                verb: "finish",
+                target: Some("done".into()),
+                edit: None,
+            }
+        );
+        assert_eq!(
+            tool.describe(&call(
+                r#"{"status":"blocked","summary":"x","needs":"edit"}"#
+            ))
+            .target
+            .as_deref(),
+            Some("blocked")
+        );
+    }
 
     #[test]
     fn normalise_trims_collapses_and_drops_one_leading_cd() {

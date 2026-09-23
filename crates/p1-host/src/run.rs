@@ -619,6 +619,9 @@ pub async fn run_with_front_end(
     // Announce the assembled parent before the agent is built: the front end
     // builds its parent renderer from this.
     front_end.parent_assembled(&route, &model, completion.clone());
+    // ADR-0057: the same announcement carries the assembled tools, so a front end
+    // can describe a call from the tool that owns it instead of matching a name.
+    front_end.parent_tools(&assembled.tools);
     // §10 `ctx`'s denominator: unknown (no `[context]` section) stays `None`,
     // never a guessed window.
     front_end.context_configured(

@@ -15,7 +15,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use p1_contracts::{AuthorizationPolicy, BoxFuture, CancellationToken, EventSink};
+use p1_contracts::{AuthorizationPolicy, BoxFuture, CancellationToken, EventSink, Tool};
 use p1_core::Agent;
 
 #[cfg(feature = "delegation")]
@@ -77,6 +77,14 @@ pub trait FrontEnd: Send + Sync {
     /// and before any event: its resolved route/model and its `finish` state
     /// (`None` when the environment does not assemble `finish`).
     fn parent_assembled(&self, route: &str, model: &str, completion: Option<Completion>);
+
+    /// The parent's assembled tools, announced once right after
+    /// [`FrontEnd::parent_assembled`], so a front end can describe a call from the
+    /// tool that owns it (`Tool::describe`, ADR-0057) instead of matching a
+    /// model-facing name or decoding another tool's argument keys. The default
+    /// does nothing: a front end that never needs a tool's target (the line
+    /// renderer) need not override it.
+    fn parent_tools(&self, _tools: &[Arc<dyn Tool>]) {}
 
     /// The assembled `[context]` window and its summarize threshold, in tokens
     /// (handoff §10 `ctx`): a sibling of [`FrontEnd::parent_assembled`], called

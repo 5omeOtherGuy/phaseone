@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use p1_contracts::{
-    BoxFuture, CancellationToken, DeclarationKind, Effect, Grammar, Tool, ToolCall, ToolContext,
-    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
+    BoxFuture, CallDescription, CancellationToken, DeclarationKind, Effect, Grammar, Tool,
+    ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_workspace::{ObservedFiles, ToolFace, Workspace, bound_output, write_atomic};
 use serde::Deserialize;
@@ -155,6 +155,19 @@ enum Hunk {
     },
 }
 
+/// The paths a parsed patch touches, in patch order (the source path of an
+/// `Update File` hunk, even when it also moves).
+fn hunk_paths(hunks: &[Hunk]) -> Vec<String> {
+    hunks
+        .iter()
+        .map(|hunk| match hunk {
+            Hunk::Add { path, .. } | Hunk::Delete { path } | Hunk::Update { path, .. } => {
+                path.clone()
+            }
+        })
+        .collect()
+}
+
 /// One `@@`-delimited search group inside an Update File hunk.
 struct UpdateGroup {
     /// The `@@ <header>` seek line, if one was given.
@@ -228,6 +241,26 @@ impl Tool for PatchTool {
 
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::WritesFiles
+    }
+
+    /// ADR-0057: parse the patch's own freeform (or function) input the same way
+    /// `execute` does, and name the first file it touches — or the count, for a
+    /// multi-file patch.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        let target = patch_text(&self.declaration.name, self.freeform, call)
+            .ok()
+            .and_then(|text| parse_patch(&text).ok())
+            .map(|hunks| hunk_paths(&hunks));
+        let target = match target.as_deref() {
+            None | Some([]) => None,
+            Some([only]) => Some(only.clone()),
+            Some(paths) => Some(format!("{} files", paths.len())),
+        };
+        CallDescription {
+            verb: "edit",
+            target,
+            edit: None,
+        }
     }
 
     fn execute<'a>(
@@ -1397,6 +1430,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tool, _) = tool(dir.path());
         assert_eq!(tool.effect(&text_call("")), Effect::WritesFiles);
+    }
+
+    /// ADR-0057: the freeform patch is parsed the same way `execute` parses it, so
+    /// `describe` names the first file it touches — or the count. A renamed face
+    /// changes nothing.
+    #[test]
+    fn describe_parses_the_freeform_text_for_the_file_or_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _) = tool(dir.path());
+        let one = tool.describe(&text_call(
+            "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-a\n+b\n*** End Patch\n",
+        ));
+        assert_eq!(one.verb, "edit");
+        assert_eq!(one.target.as_deref(), Some("src/a.rs"));
+
+        let two = tool.describe(&text_call(
+            "*** Begin Patch\n*** Add File: a\n+x\n*** Add File: b\n+y\n*** End Patch\n",
+        ));
+        assert_eq!(two.target.as_deref(), Some("2 files"));
+
+        let renamed = tool.with_face(ToolFace::new("Patch", "custom"), "claude");
+        assert_eq!(
+            renamed
+                .describe(&text_call(
+                    "*** Begin Patch\n*** Delete File: old.rs\n*** End Patch\n"
+                ))
+                .target
+                .as_deref(),
+            Some("old.rs")
+        );
     }
 
     #[tokio::test]

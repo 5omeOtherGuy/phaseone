@@ -5,8 +5,8 @@
 //! validation and the read-before-mutate guard for an existing target.
 
 use p1_contracts::{
-    BoxFuture, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
-    ToolInput, ToolOutcome, ToolStatus,
+    BoxFuture, CallDescription, DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_workspace::{Observation, ObservedFiles, Workspace, bound_output, write_atomic};
 use serde::Deserialize;
@@ -108,6 +108,20 @@ impl Tool for WriteTool {
         Effect::WritesFiles
     }
 
+    /// ADR-0057: the file this call writes, from the tool's own parsed input.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        let parsed = parse_input(&self.declaration.name, call).ok();
+        CallDescription {
+            verb: "edit",
+            target: parsed.as_ref().map(|input| input.file_path.clone()),
+            edit: parsed.map(|input| EditPreview {
+                path: input.file_path,
+                old: String::new(),
+                new: input.content,
+            }),
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
@@ -202,7 +216,8 @@ fn run(
 mod tests {
     use super::WriteTool;
     use p1_contracts::{
-        DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome, ToolStatus,
+        DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome,
+        ToolStatus,
     };
     use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace};
     use std::path::Path;
@@ -277,6 +292,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tool, _) = tool(dir.path());
         assert_eq!(tool.effect(&call("{}")), Effect::WritesFiles);
+    }
+
+    /// ADR-0057: the description comes from this tool's own parsed input.
+    #[test]
+    fn describe_names_the_file_it_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _) = tool(dir.path());
+        let call = call(r#"{"file_path": "out.txt", "content": "hi"}"#);
+        assert_eq!(tool.describe(&call).verb, "edit");
+        assert_eq!(tool.describe(&call).target.as_deref(), Some("out.txt"));
+        assert_eq!(
+            tool.describe(&call).edit,
+            Some(EditPreview {
+                path: "out.txt".into(),
+                old: String::new(),
+                new: "hi".into(),
+            })
+        );
     }
 
     #[tokio::test]

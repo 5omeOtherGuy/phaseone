@@ -1329,3 +1329,57 @@ async fn a_worker_that_finished_done_has_no_missing_call_line() {
          ---\nWorker w1: finished\n\nchild answer"
     );
 }
+
+// ================================================================ ADR-0057
+
+/// Every delegation tool describes its own call's target from its own parsed
+/// input (ADR-0057): the environment for `worker_start`, the id for the rest.
+#[test]
+fn describe_names_each_tools_own_target() {
+    let workers = InProcessWorkers::new(Arc::new(|_spec: &ChildSpec| Err("unused".to_string())), 1);
+    let service: Arc<dyn WorkerService> = workers;
+    let tools = all(service, grantable(), environments());
+    let describe = |name: &str, json: &str| {
+        let call = ToolCall {
+            call_id: "c".into(),
+            name: name.into(),
+            input: ToolInput::Json(json.into()),
+        };
+        tool_by_name(&tools, name).describe(&call)
+    };
+
+    let start = describe(
+        "worker_start",
+        r#"{"environment":"child","task":"x","tools":["read"]}"#,
+    );
+    assert_eq!(
+        (start.verb, start.target.as_deref()),
+        ("worker", Some("child"))
+    );
+    let result = describe("worker_result", r#"{"id":"w1"}"#);
+    assert_eq!(
+        (result.verb, result.target.as_deref()),
+        ("worker", Some("w1"))
+    );
+    let cont = describe("worker_continue", r#"{"id":"w2","message":"go"}"#);
+    assert_eq!((cont.verb, cont.target.as_deref()), ("worker", Some("w2")));
+    let cancel = describe("worker_cancel", r#"{"id":"w3"}"#);
+    assert_eq!(
+        (cancel.verb, cancel.target.as_deref()),
+        ("worker", Some("w3"))
+    );
+}
+
+/// A renamed result face moves the name the service points its completion
+/// notification at (ADR-0057): the tool owns the name, not `p1-workers`.
+#[test]
+fn a_renamed_result_face_moves_the_services_notification_name() {
+    let workers = InProcessWorkers::new(Arc::new(|_spec: &ChildSpec| Err("unused".to_string())), 1);
+    let service: Arc<dyn WorkerService> = workers.clone();
+    let tool = p1_tool_delegate::WorkerResultTool::new(Arc::clone(&service)).with_face(
+        p1_tool_delegate::ToolFace::new("ResultTool", "renamed"),
+        "gpt",
+    );
+    assert_eq!(tool.declaration().name, "ResultTool");
+    assert_eq!(workers.result_tool_name().as_deref(), Some("ResultTool"));
+}

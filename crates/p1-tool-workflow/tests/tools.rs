@@ -408,3 +408,44 @@ async fn invalid_json_and_text_are_tool_errors() {
         assert_eq!(execute(&start, input).await.status, ToolStatus::Error);
     }
 }
+
+/// ADR-0057: each workflow tool describes its own call's target — the run id, or
+/// (for a start) the resumed id or the script's first line.
+#[test]
+fn describe_names_the_run_or_the_script() {
+    let fake = FakeService::new(RunStatus::Running(progress()));
+    let tools = tools(&fake);
+    let describe = |name: &str, input: serde_json::Value| {
+        let call = ToolCall {
+            call_id: "c".into(),
+            name: name.into(),
+            input: ToolInput::Json(input.to_string()),
+        };
+        tool(&tools, name).describe(&call)
+    };
+
+    let start = describe(
+        "workflow_start",
+        json!({ "script": "phase(\"one\");\nphase(\"two\");" }),
+    );
+    assert_eq!(start.verb, "workflow");
+    assert_eq!(start.target.as_deref(), Some("phase(\"one\");"));
+
+    let resumed = describe(
+        "workflow_start",
+        json!({ "script": "x", "resume_from": "wf0" }),
+    );
+    assert_eq!(resumed.target.as_deref(), Some("wf0"));
+
+    for (name, id) in [
+        ("workflow_status", "wf1"),
+        ("workflow_result", "wf2"),
+        ("workflow_cancel", "wf3"),
+    ] {
+        let described = describe(name, json!({ "id": id }));
+        assert_eq!(
+            (described.verb, described.target.as_deref()),
+            ("workflow", Some(id))
+        );
+    }
+}
