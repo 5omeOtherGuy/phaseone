@@ -101,10 +101,12 @@ Owned by the Fable 5.1 Claude Code orchestrator session (brief:
 - LANDED: job 2 `task/finish-result` (cb51b60, CI green): `OutputContract` + `result` on `finish`,
   `FinishOutcome::structured()`; frozen tests untouched. Job 1 `task/workers-prepared` (this merge):
   `start_prepared`, `wait_for_capacity`, `running`/`max_concurrent`. Both DeepSeek V4.1 Flash, one pass.
-- RUNNING: job 3 `task/workflow-engine` (`claude/claude-opus-5-5:high`), job 4 `task/workflow-tools`
-  (`gpt/gpt-6-sol:high`). NEXT: 5 (Opus medium) and 6 (glm) once 3–4 land.
-- Found: `scripts/fanout.py` counts pi-worker WRAPPER processes (`bash -c`, `usage-meter wrap`) as
-  workers, so two real pi-workers filled the default pool of 6; batch 2b ran with `--max-parallel 12`.
+- LANDED: job 4 `task/workflow-tools` (this merge): `crates/p1-tool-workflow` (four tools over the
+  `WorkflowService` trait) + "# Workflows (only when the user asks)" in every environment prompt.
+  gpt-6-sol:high (model-cards trial), one pass, delegated the prompt edits to a sub-worker.
+- RUNNING: job 3 `task/workflow-engine` (`claude/claude-opus-5-5:high`). NEXT: 5 (Opus medium) and
+  6 (glm) once 3 lands; then the five live checks.
+- FIXED by the lead (8483e64): fanout counted pi-worker wrapper processes; jobs 5–6 use the default pool.
 
 ## Open decisions and risks
 
