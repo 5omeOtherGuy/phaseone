@@ -522,7 +522,15 @@ fn command_output_lines(output: &CommandOutput, width: usize, out: &mut Vec<Line
             CommandRow::Entry { key, text } => vec![
                 Seg::new(
                     palette::INK,
-                    format!("{:HANG$}{}", "", pad_cells(key, COMMAND_KEY)),
+                    format!(
+                        "{:HANG$}{}",
+                        "",
+                        if cell_width(key) >= COMMAND_KEY {
+                            format!("{key}  ")
+                        } else {
+                            pad_cells(key, COMMAND_KEY)
+                        }
+                    ),
                 ),
                 Seg::new(palette::DIM, text.clone()),
             ],

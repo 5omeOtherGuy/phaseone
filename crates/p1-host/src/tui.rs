@@ -21,6 +21,8 @@ use p1_tui::face::{TargetKind, ToolDescriber};
 use p1_tui::input::{self, Command};
 use p1_tui::palette::ColorMode;
 use p1_tui::render::diff::DiffView;
+use p1_tui::render::home::HomePrelude;
+use p1_tui::render::ledger::{ContextView, SessionView};
 use p1_tui::render::permission::PermissionView;
 use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
 use p1_tui::state::{Approval, Screen};
@@ -199,31 +201,27 @@ impl FrontEnd for TuiFrontEnd {
             .flatten();
             let branch = Arc::new(Mutex::new(initial_branch));
             screen.statusbar.branch = branch.lock().unwrap().clone();
-            // §4.1 idle prelude: version line, one sentence of state, the
-            // four affordances — then the transcript takes over.
-            screen
-                .transcript
-                .blocks
-                .push(p1_tui::transcript::Block::Info {
-                    lines: vec![
-                        format!(
-                            "p1 {}   {}",
-                            env!("CARGO_PKG_VERSION"),
-                            self.options.workspace.display()
-                        ),
-                        String::new(),
-                        "  /resume     reopen a previous session".into(),
-                        format!("  /env        {route} · {model}"),
-                        format!(
-                            "  /access     {}",
-                            if self.options.ask {
-                                "ask · prompts on"
-                            } else {
-                                "full · --ask to confirm"
-                            }
-                        ),
-                        "  /goal       set the session objective".into(),
-                    ],
+            screen.home = Some(home_prelude(
+                &self.options.workspace,
+                branch.lock().unwrap().clone(),
+                &route,
+                &model,
+                self.options.ask,
+            ));
+            screen.session = Some(session_view(
+                &model,
+                self.options.effort.as_deref(),
+                self.options.ask,
+                &self.options.sandbox,
+            ));
+            let (window, summarize_at) = *self.context.lock().unwrap();
+            screen.context = window
+                .zip(summarize_at)
+                .map(|(window, summarize_at)| ContextView {
+                    used: None,
+                    window,
+                    summarize_at,
+                    parts: vec![],
                 });
             screen.env = self.options.env.clone();
             screen.route = route.clone();
@@ -231,9 +229,15 @@ impl FrontEnd for TuiFrontEnd {
             screen.transcript.paint_history(agent.history());
             let worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>> =
                 Arc::new(Mutex::new(Vec::new()));
+            let worker_details = Arc::new(Mutex::new(HashMap::new()));
             #[cfg(feature = "delegation")]
             if let Some(service) = &workers {
-                spawn_worker_refresher(service.clone(), worker_rows.clone(), cancel.child_token());
+                spawn_worker_refresher(
+                    service.clone(),
+                    worker_rows.clone(),
+                    worker_details.clone(),
+                    cancel.child_token(),
+                );
             }
             let mut driver = Driver {
                 screen,
@@ -259,6 +263,8 @@ impl FrontEnd for TuiFrontEnd {
                 describer,
                 context_window: self.context.lock().unwrap().0,
                 context_warn_at: self.context.lock().unwrap().1,
+                pending_worker_starts: HashMap::new(),
+                worker_details,
                 // ADR-0049 stage 3: `deps.model_switch` is set (in `run.rs`, this
                 // crate) right before `FrontEnd::run` is called — the same
                 // instant the line mode's `run_interactive` starts reading it.
@@ -353,6 +359,8 @@ pub(crate) struct Driver {
     /// Both `None` when the environment has no `[context]` section.
     context_window: Option<u64>,
     context_warn_at: Option<u64>,
+    pending_worker_starts: HashMap<String, String>,
+    worker_details: Arc<Mutex<HashMap<String, (String, String)>>>,
     /// ADR-0049 stage 3: `/model`/`/effort`'s switch context, already plumbed
     /// onto `HostDeps` for the line mode (`deps.model_switch`) — `None` only
     /// when the run never reached that point (never true once `run` starts).
@@ -643,6 +651,12 @@ impl Driver {
                 }
                 self.screen.statusbar.effort = after.split(':').nth(1).map(str::to_string);
                 self.model = after;
+                self.screen.session = Some(session_view(
+                    &self.model,
+                    self.screen.statusbar.effort.as_deref(),
+                    self.ask,
+                    &self.sandbox,
+                ));
                 // `switch_model` moved the shared route label; the chip and
                 // `/status`'s `route` row follow it.
                 self.route = self.route_label.lock().unwrap().clone();
@@ -731,11 +745,17 @@ impl Driver {
                     // §10 `ctx`: `FrontEnd::context_configured` carries the
                     // assembled `[context]` window and threshold; unknown (no
                     // `[context]` section) stays `None`, never a guessed `0`.
-                    let (ctx, warn) = status::ctx_status(
-                        status::usage_input_total(usage.as_ref()),
-                        self.context_window,
-                        self.context_warn_at,
+                    let used = status::usage_input_total(usage.as_ref());
+                    self.screen.context = self.context_window.zip(self.context_warn_at).map(
+                        |(window, summarize_at)| ContextView {
+                            used,
+                            window,
+                            summarize_at,
+                            parts: vec![],
+                        },
                     );
+                    let (ctx, warn) =
+                        status::ctx_status(used, self.context_window, self.context_warn_at);
                     self.screen.statusbar.ctx = ctx;
                     self.screen.statusbar.ctx_warn = warn;
                 }
@@ -758,8 +778,28 @@ impl Driver {
             p1_contracts::AgentEvent::ToolStarted { call } => {
                 self.pending_calls
                     .insert(call.call_id.clone(), call.clone());
+                #[cfg(feature = "delegation")]
+                if call.name == "worker_start"
+                    && let Ok(input) = serde_json::from_str::<serde_json::Value>(call.input.raw())
+                {
+                    let task = input.get("task").and_then(|v| v.as_str()).unwrap_or("");
+                    self.pending_worker_starts.insert(
+                        call.call_id.clone(),
+                        task.lines().next().unwrap_or("").to_string(),
+                    );
+                }
             }
             p1_contracts::AgentEvent::ToolFinished { result } => {
+                #[cfg(feature = "delegation")]
+                if let Some(task) = self.pending_worker_starts.remove(&result.call_id)
+                    && result.status == p1_contracts::ToolStatus::Ok
+                    && let Some((id, grants)) = worker_start_result(&result.content)
+                {
+                    self.worker_details
+                        .lock()
+                        .unwrap()
+                        .insert(id, (task, grants));
+                }
                 let Some(call) = self.pending_calls.remove(&result.call_id) else {
                     return;
                 };
@@ -855,6 +895,68 @@ impl Driver {
 /// called from the async loop only (at start, and after every `TurnFinished`),
 /// never from a `Driver` method a plain `#[test]` calls directly (a bare
 /// `#[test]` has no tokio runtime for `tokio::spawn` to run on).
+fn home_prelude(
+    workspace: &std::path::Path,
+    branch: Option<String>,
+    route: &str,
+    model: &str,
+    ask: bool,
+) -> HomePrelude {
+    let path = display_workspace_path(workspace, std::env::var_os("HOME").as_deref());
+    HomePrelude {
+        version: env!("CARGO_PKG_VERSION").into(),
+        path,
+        branch,
+        state: vec![],
+        items: vec![
+            ("/resume".into(), "reopen a previous session".into()),
+            ("/env".into(), format!("{route} · {model}")),
+            (
+                "/access".into(),
+                if ask {
+                    "ask · prompts on"
+                } else {
+                    "full · --ask to confirm"
+                }
+                .into(),
+            ),
+            ("/goal".into(), "set the session objective".into()),
+        ],
+    }
+}
+
+fn display_workspace_path(workspace: &std::path::Path, home: Option<&std::ffi::OsStr>) -> String {
+    home.and_then(|home| workspace.strip_prefix(std::path::Path::new(home)).ok())
+        .map(|tail| {
+            let tail = tail.to_string_lossy();
+            if tail.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", tail.trim_start_matches('/'))
+            }
+        })
+        .unwrap_or_else(|| workspace.to_string_lossy().into_owned())
+}
+
+fn session_view(model: &str, effort: Option<&str>, ask: bool, sandbox: &str) -> SessionView {
+    SessionView {
+        model: model.to_string(),
+        effort: effort.unwrap_or("default").to_string(),
+        access: if ask { "ask" } else { "full" }.into(),
+        sandbox: sandbox.to_string(),
+    }
+}
+
+#[cfg(feature = "delegation")]
+fn worker_start_result(content: &str) -> Option<(String, String)> {
+    let rest = content.strip_prefix("Started worker ")?;
+    let (identity, remainder) = rest.split_once(" on ")?;
+    let id = identity.trim();
+    let (_, tools) = remainder.split_once(" with tools: ")?;
+    let grants = tools.split(". You will be notified").next()?.trim();
+    (!id.is_empty() && !grants.is_empty()).then(|| (id.to_string(), grants.to_string()))
+}
+
 fn spawn_branch_refresh(workspace: std::path::PathBuf, branch: Arc<Mutex<Option<String>>>) {
     tokio::spawn(async move {
         let next = tokio::task::spawn_blocking(move || status::git_branch(&workspace))
@@ -1082,6 +1184,7 @@ where
 fn spawn_worker_refresher(
     service: Arc<dyn WorkerService>,
     rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
+    details: Arc<Mutex<HashMap<String, (String, String)>>>,
     cancel: CancellationToken,
 ) {
     use p1_tui::render::workers::{BlockState, WorkerBlock};
@@ -1115,15 +1218,20 @@ fn spawn_worker_refresher(
                     ChildStatus::Cancelled => (BlockState::Cancelled, String::new()),
                     ChildStatus::Failed(e) => (BlockState::Failed, format!("failed: {e}")),
                 };
-                // The service reports no task text and no grants yet (handoff §14.3).
+                let (task, grants) = details
+                    .lock()
+                    .unwrap()
+                    .get(&id.0)
+                    .cloned()
+                    .unwrap_or_default();
                 next.push(WorkerBlock {
                     id: id.0.clone(),
-                    task: String::new(),
+                    task,
                     route: description,
                     state,
                     elapsed,
                     cost_micro_usd: None,
-                    grants: String::new(),
+                    grants,
                     activity,
                 });
             }

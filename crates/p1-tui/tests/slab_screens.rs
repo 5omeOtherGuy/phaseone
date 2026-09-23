@@ -881,10 +881,8 @@ fn c03_model_menu_80x24() {
     slab::assert_mock(&render(&mut s, 80, 24, 0), Rect::new(0, 0, 80, 24), "C03");
 }
 
-/// C04 — whole except row 21's transcript cells. Lead decision: the `CommandOutput` key column
-/// keeps a 2-cell gap, where the mock runs `esc` into `goal` (an 18-cell key in the 18-cell
-/// column). The key column is `render/transcript.rs` (`COMMAND_KEY`), outside this change, and
-/// still draws the mock's defect — so the row is left unasserted rather than pinning it.
+/// C04 — whole. Row 21 keeps the mock's key column and description, with a 2-cell gap after
+/// `^G  PgUp PgDn  esc`; the description is therefore shifted two cells right.
 #[test]
 fn c04_help_command_output() {
     let mut s = screen();
@@ -928,7 +926,28 @@ fn c04_help_command_output() {
     ];
     let buf = render(&mut s, 120, 40, 0);
     assert_rows_except(&buf, "C04", &[21]);
-    assert_cells(&buf, "C04", 21..22, 78..120);
+    let actual = row_text(&buf, 21);
+    let expected = slab::mock("C04").text[21].clone();
+    let key = "^G  PgUp PgDn  esc";
+    let key_start = expected.find(key).unwrap();
+    let description_start = key_start + key.len();
+    assert_eq!(p1_tui::wrap::cell_width(key), 18);
+    assert_eq!(
+        p1_tui::wrap::cell_width(&actual[key_start..description_start]),
+        18
+    );
+    assert!(actual[key_start + 18..].starts_with("  goal · scroll · live tail / dismiss"));
+    let description = "goal · scroll · live tail / dismiss";
+    assert!(actual[key_start + 20..].starts_with(description));
+    let facts = "in                     38.1k";
+    let expected_facts = expected.find(facts).unwrap();
+    let actual_facts = actual.find(facts).unwrap();
+    assert_eq!(
+        p1_tui::wrap::cell_width(&expected[..expected_facts]),
+        p1_tui::wrap::cell_width(&actual[..actual_facts]),
+        "right-hand facts retain their mock column"
+    );
+    assert_eq!(&actual[actual_facts..], &expected[expected_facts..]);
 }
 
 const C05_GOAL: &str = "fix compaction boundary stall without changing the summary format";
@@ -1247,9 +1266,9 @@ fn edge_diff(tool: &str, summary: &str, rows: Vec<DiffRow>) -> Approval {
     })
 }
 
-/// A03 — whole except row 21. Defect outside this change: `diff::inline_approval` gives `p` a
-/// reason (`not available — no trust store yet`), so the Block adds a reason row under the
-/// decision band; the mock shows `p` faint in the band and no reason row (el-approval-edit).
+/// A03 — whole except row 21. Mock data, not a renderer defect: el-approval-edit passes `p` as
+/// `disabled` without a reason, where the product follows handoff §7.5 ("`p` is shown faint with
+/// `no trust store yet`") like A04 and the permission mocks — so a reason row follows the band.
 #[test]
 fn a03_edit_diff_inline() {
     let approval = edge_diff("edit", "replace exact string · once", diff_rows(0));
@@ -1282,8 +1301,8 @@ fn a04_full_review_three_files() {
 
 /// A05 — whole except rows 1, 20 and 21. Seam as A04: the summary row counts the rows shown
 /// (`+6 −6`), not the call's `+3 −3`. Defect outside this change: `Decision::for_call`
-/// (render/review.rs) gives `p` its own reason row, where the mock keeps `p` faint in the band
-/// with no reason — so the decision band sits one row higher (20) and a reason row follows (21).
+/// (render/review.rs) gives `p` its reason row per handoff §7.5 (as A04 shows); the A05 mock data passes
+/// `p` as `disabled` without a reason — so the band sits one row higher (20), the reason row at 21.
 #[test]
 fn a05_full_review_80x24() {
     let rows = [diff_rows(0), diff_rows(0)].concat();

@@ -11,7 +11,7 @@ use p1_contracts::{
     CompletedResponse, Outcome, ProviderError, ProviderErrorKind, StopReason, StreamEvent, Usage,
     serde_json,
 };
-use p1_provider_http::{ResponseParser, SseEvent};
+use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status, safe_code};
 use serde_json::Value;
 
 /// Route-native parser. One instance per request attempt.
@@ -263,44 +263,11 @@ fn stream_error_code(value: &Value, from_failed: bool) -> Option<&str> {
     value.get("code").and_then(Value::as_str)
 }
 
-/// Only copy wire strings that are short, token-shaped and non-sensitive into a
-/// diagnostic. Free-form provider text never reaches a `ProviderError`.
-fn safe_field(value: &str) -> Option<&str> {
-    let value = value.trim();
-    let lower = value.to_ascii_lowercase();
-    let sensitive = ["secret", "password", "sk-"];
-    (!value.is_empty()
-        && value.len() <= 64
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-        && !sensitive.iter().any(|fragment| lower.contains(fragment)))
-    .then_some(value)
-}
-
-/// Parse an error body for a code/type only. The body is classification input
-/// and never copied into the message.
-fn http_error_code(body: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    let error = value.get("error");
-    let code = error
-        .and_then(|error| error.get("code"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            error
-                .and_then(|error| error.get("type"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| value.get("code").and_then(Value::as_str))
-        .or_else(|| value.get("type").and_then(Value::as_str));
-    code.map(str::to_string)
-}
-
 fn request_id(headers: &[(String, String)]) -> Option<String> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
-        .and_then(|(_, value)| safe_field(value).map(str::to_string))
+        .and_then(|(_, value)| safe_code(value).map(str::to_string))
 }
 
 impl ResponseParser for CodexResponseParser {
@@ -400,13 +367,13 @@ impl ResponseParser for CodexResponseParser {
             Some("response.failed") => {
                 let code = stream_error_code(&value, true);
                 let kind = classify_error_code(code);
-                let label = code.and_then(safe_field).unwrap_or("unknown");
+                let label = code.and_then(safe_code).unwrap_or("unknown");
                 self.fail(kind, &format!("provider error: {label}"))
             }
             Some("error") => {
                 let code = stream_error_code(&value, false);
                 let kind = classify_error_code(code);
-                let label = code.and_then(safe_field).unwrap_or("unknown");
+                let label = code.and_then(safe_code).unwrap_or("unknown");
                 self.fail(kind, &format!("provider error: {label}"))
             }
             _ => Vec::new(),
@@ -429,17 +396,15 @@ impl ResponseParser for CodexResponseParser {
         body: &[u8],
     ) -> ProviderError {
         let raw_code = http_error_code(body);
-        let kind = match status {
-            401 | 403 => ProviderErrorKind::Authentication,
-            429 => ProviderErrorKind::RateLimited,
-            408 | 425 | 500..=599 => ProviderErrorKind::Transport,
-            400 | 413 | 422 if raw_code.as_deref() == Some("context_length_exceeded") => {
-                ProviderErrorKind::ContextWindowExceeded
-            }
-            _ => ProviderErrorKind::InvalidRequest,
+        let kind = if matches!(status, 400 | 413 | 422)
+            && raw_code.as_deref() == Some("context_length_exceeded")
+        {
+            ProviderErrorKind::ContextWindowExceeded
+        } else {
+            kind_for_status(status).unwrap_or(ProviderErrorKind::InvalidRequest)
         };
         let mut message = format!("http {status}");
-        if let Some(code) = raw_code.as_deref().and_then(safe_field) {
+        if let Some(code) = raw_code.as_deref() {
             message.push(' ');
             message.push_str(code);
         }
@@ -915,6 +880,7 @@ mod tests {
         match terminal(&events) {
             Outcome::Failed(error) => {
                 assert_eq!(error.kind, ProviderErrorKind::Transport);
+                assert!(error.message.contains("unknown"));
                 assert!(!error.message.contains("sk-secret"));
                 assert!(!error.message.contains("has spaces"));
             }
