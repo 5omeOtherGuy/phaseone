@@ -112,6 +112,15 @@ pub struct Settings {
     #[cfg(feature = "workflows")]
     #[serde(default)]
     pub workflows: Option<p1_workflow::WorkflowSettings>,
+    #[serde(default)]
+    pub shadow: Option<ShadowSettings>,
+}
+
+/// The optional brain shadow binary in `[shadow]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowSettings {
+    pub brain_packet_shadow: Option<PathBuf>,
 }
 
 // ------------------------------------------------------------------ settings

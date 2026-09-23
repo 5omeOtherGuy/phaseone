@@ -41,6 +41,17 @@ fn main() -> std::process::ExitCode {
         environment_dirs(),
         stdout_is_tty,
     );
+    #[cfg(feature = "shadow-hook")]
+    {
+        let env = Arc::new(|name: &str| std::env::var_os(name));
+        let configured = p1_host::models::load_settings(&p1_host::auth::locations(&deps))
+            .ok()
+            .and_then(|settings| settings.shadow)
+            .and_then(|shadow| shadow.brain_packet_shadow);
+        if let Some(binary) = configured.or_else(|| p1_hook_shadow::find_binary(env.as_ref())) {
+            deps.shadow = Some(Arc::new(p1_hook_shadow::ShadowHook::new(binary, env)));
+        }
+    }
 
     let code = runtime.block_on(run::run(&mut deps, options));
     std::process::ExitCode::from(code as u8)

@@ -161,6 +161,9 @@ pub struct HostDeps {
     /// process environment at construction; tests inject a fixture here instead
     /// of mutating the process environment.
     pub shell_env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    /// Optional, detached observer of committed prompts and worker briefs.
+    #[cfg(feature = "shadow-hook")]
+    pub shadow: Option<Arc<p1_hook_shadow::ShadowHook>>,
     /// Test-only hook: called with the fully built catalog, after the built-in
     /// providers and tools are registered, so a test can add or replace entries.
     pub catalog_hook: Option<CatalogHook>,
@@ -213,6 +216,8 @@ impl HostDeps {
             home: std::env::var_os("HOME").map(std::path::PathBuf::from),
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
             shell_env: None,
+            #[cfg(feature = "shadow-hook")]
+            shadow: None,
             catalog_hook: None,
             wait: Arc::new(|duration| Box::pin(tokio::time::sleep(duration))),
             #[cfg(feature = "delegation")]
