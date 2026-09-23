@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use p1_contracts::{BoxFuture, CancellationToken, InboxKind, Item, TurnEnd, Usage};
 use p1_core::{Agent, Inbox, Reconfiguration};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 /// Identifier of one child within one service: `w1`, `w2`, … never reused.
@@ -70,13 +70,19 @@ pub struct WorkerReport {
     pub missing_tool_calls: Vec<(String, u32)>,
 }
 
-/// One accepted `finish` call, as its input described it.
+/// One accepted `finish` call, as its input described it and as the host's own
+/// evidence labelled it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FinishReport {
     pub status: String,
     /// `needs` as the worker wrote it: a string, or an array joined with `", "`.
     pub needs: Option<String>,
     pub summary: Option<String>,
+    /// What the ACCEPTED outcome established (ADR-0051 item 3), never parsed out of
+    /// the model's input: `commands passed: …` or
+    /// `not verified; parent verification required`. `None` when the outcome carried
+    /// none (a report the host built without an outcome, or a `blocked` finish).
+    pub evidence: Option<String>,
 }
 
 impl WorkerReport {
@@ -125,6 +131,32 @@ pub struct ChildSpec {
     pub tools: Vec<String>,
     /// Workspace override, if the host supports one.
     pub workspace: Option<PathBuf>,
+}
+
+/// What the service needs to know about a child BEFORE its agent exists (ADR-0053 item
+/// 2): the closure that builds the agent runs only once a running slot is reserved and the
+/// id is allocated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedStart {
+    /// The first turn's message: the task text, the only thing the child receives.
+    pub task: String,
+    /// The tool MODULE names granted, exactly as `ChildSpec::tools` (never `finish`,
+    /// never a `worker_*` module); stored as the child's grant for a later re-grant.
+    pub tools: Vec<String>,
+    /// Whether each ended turn sends the parent its completion notification. A
+    /// workflow step's turns end inside a run whose OWN end is the one notification
+    /// the parent gets (ADR-0053 item 7), so the host starts steps with `false`.
+    pub notify_parent: bool,
+}
+
+impl Default for PreparedStart {
+    fn default() -> Self {
+        Self {
+            task: String::new(),
+            tools: Vec::new(),
+            notify_parent: true,
+        }
+    }
 }
 
 /// Every way a worker service call can fail.
@@ -241,6 +273,9 @@ struct Shared {
     /// Cancelled by `shutdown` (and best-effort `Drop`); every child task races
     /// this against its next command.
     shutdown: CancellationToken,
+    /// Wakes `wait_for_capacity`. A slot is *observed* free, never reserved, so the
+    /// only alternative to this notification is polling.
+    capacity: Notify,
 }
 
 struct State {
@@ -301,6 +336,7 @@ impl InProcessWorkers {
                     shut_down: false,
                 }),
                 shutdown: CancellationToken::new(),
+                capacity: Notify::new(),
             }),
             tasks: Mutex::new(Vec::new()),
         })
@@ -343,6 +379,145 @@ impl InProcessWorkers {
         Ok(())
     }
 
+    /// Prepared start: the child is built only once it can actually run (ADR-0053 item
+    /// 2). A workflow step is a worker whose environment the SERVICE has already
+    /// allocated, so the caller must not have to guess the next `w<N>` — and a step that
+    /// cannot run must never be built.
+    ///
+    /// Order, under the state lock: refuse when shut down, reserve a running slot
+    /// (`LimitReached` BEFORE `build`), allocate the next id, then call `build` with that
+    /// id. `build` runs synchronously under the lock — as `start`'s factory always did —
+    /// which is what makes the RUNNING count and the id assignment atomic under
+    /// concurrent starts. A failed `build` becomes [`WorkerError::InvalidEnvironment`]
+    /// and consumes NOTHING: not the id, not the slot.
+    pub async fn start_prepared(
+        &self,
+        prepared: PreparedStart,
+        build: impl FnOnce(&ChildId) -> Result<ChildAgent, String> + Send,
+    ) -> Result<ChildId, WorkerError> {
+        let PreparedStart {
+            task,
+            tools,
+            notify_parent,
+        } = prepared;
+        // The state lock lives only inside this block: nothing below holds a std lock
+        // across the `yield_now` (invariant 7d).
+        let (id, status, command_rx, token, stall, agent, report) = {
+            let mut state = self.shared.state.lock().unwrap();
+            if state.shut_down || self.shared.shutdown.is_cancelled() {
+                return Err(WorkerError::ShutDown);
+            }
+            // Count RUNNING children before building: a rejected start must not build
+            // (and then discard) a child it cannot run.
+            self.shared.reserve_running_slot(&state)?;
+            // The id the build is handed is the id this call returns, and it is claimed
+            // only once the child exists: the counter moves after a successful build, so
+            // the next start is offered this same id.
+            let id = format!("w{}", state.next_id + 1);
+            // Build failure is an invalid environment, not a service fault.
+            let ChildAgent {
+                agent,
+                description,
+                report,
+                regrant,
+            } = build(&ChildId(id.clone())).map_err(WorkerError::InvalidEnvironment)?;
+            state.next_id += 1;
+
+            let (status, _) = watch::channel(ChildStatus::Running);
+            let (commands, command_rx) = mpsc::unbounded_channel();
+            let token = CancellationToken::new();
+            let stall = Arc::new(Mutex::new(None));
+            state.children.insert(
+                id.clone(),
+                ChildEntry {
+                    status: status.clone(),
+                    commands,
+                    turn_cancel: Arc::new(Mutex::new(token.clone())),
+                    stall: Arc::clone(&stall),
+                    // The grant the child was built with, kept as `continue_child`
+                    // grows it.
+                    grant: tools,
+                    regrant,
+                    description,
+                },
+            );
+            (id, status, command_rx, token, stall, agent, report)
+        };
+
+        let task_id = id.clone();
+        let shared = Arc::clone(&self.shared);
+        let handle = tokio::spawn(run_child(
+            shared,
+            ChildTask {
+                id: task_id,
+                agent,
+                task,
+                token,
+                commands: command_rx,
+                stall,
+                status,
+                report,
+                notify_parent,
+            },
+        ));
+        self.tasks.lock().unwrap().push(handle);
+        // Give the fresh task one turn before returning: the caller is promised the
+        // child is running now, and a child that can complete without waiting has then
+        // actually started. A yield is not a clock.
+        tokio::task::yield_now().await;
+        Ok(ChildId(id))
+    }
+
+    /// Wait until a child COULD be started (ADR-0053 item 2): `Ok(true)` as soon as
+    /// fewer than `max_concurrent` children are `Running`, `Ok(false)` when `cancel`
+    /// fires first, `Err(ShutDown)` once the service has shut down — also when it shuts
+    /// down while this call waits.
+    ///
+    /// A slot observed free here is NOT reserved: a concurrent start can still take it.
+    /// The caller therefore loops `wait_for_capacity` → [`InProcessWorkers::start_prepared`]
+    /// and treats `LimitReached` as "wait again". Capacity is the same count direct
+    /// `worker_start` calls use.
+    pub async fn wait_for_capacity(&self, cancel: CancellationToken) -> Result<bool, WorkerError> {
+        if self.shared.is_shut_down() {
+            return Err(WorkerError::ShutDown);
+        }
+        loop {
+            // Subscribe BEFORE reading the count: a turn that ends between the two wakes
+            // every waiter registered at that moment, and this one already is — so no
+            // wake-up is lost. (`notify_waiters` stores no permit: the loop registers a
+            // fresh waiter after every wake for the same reason.)
+            let notified = self.shared.capacity.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.shared.state.lock().unwrap();
+                if state.shut_down {
+                    return Err(WorkerError::ShutDown);
+                }
+                if self.shared.running_count(&state) < self.shared.max_concurrent {
+                    return Ok(true);
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(false),
+                _ = &mut notified => {}
+            }
+        }
+    }
+
+    /// Children `Running` now. A report, not a lease: a caller that starts on the
+    /// strength of this reading can still lose the slot to a concurrent start.
+    pub fn running(&self) -> usize {
+        let state = self.shared.state.lock().unwrap();
+        self.shared.running_count(&state)
+    }
+
+    /// The bound the service was built with; shared by every way of starting a child.
+    pub fn max_concurrent(&self) -> usize {
+        self.shared.max_concurrent
+    }
+
     /// Cancel every running child, then join every child task. Afterwards every
     /// fallible call returns [`WorkerError::ShutDown`].
     pub async fn shutdown(&self) {
@@ -356,6 +531,9 @@ impl InProcessWorkers {
             }
         }
         self.shared.shutdown.cancel();
+        // Wake the capacity waiters with it: a service that is shutting down has no
+        // slot to offer, and a waiter must not be left waiting on its own cancel token.
+        self.shared.capacity.notify_waiters();
         // Take the handles out first: awaiting must not hold the tasks lock.
         let tasks: Vec<JoinHandle<()>> = std::mem::take(&mut *self.tasks.lock().unwrap());
         for handle in tasks {
@@ -365,15 +543,21 @@ impl InProcessWorkers {
 }
 
 impl Shared {
+    /// Children `Running` right now. Called with the state lock held: the count is only
+    /// meaningful as part of the same critical section that changes a status.
+    fn running_count(&self, state: &State) -> usize {
+        state
+            .children
+            .values()
+            .filter(|entry| matches!(&*entry.status.borrow(), ChildStatus::Running))
+            .count()
+    }
+
     /// `Err(LimitReached)` when `max_concurrent` children are already Running.
     /// Called with the state lock held, by everything that sets a child Running.
     /// A turn ending concurrently only lowers the count, so the check is safe.
     fn reserve_running_slot(&self, state: &State) -> Result<(), WorkerError> {
-        let running = state
-            .children
-            .values()
-            .filter(|entry| matches!(&*entry.status.borrow(), ChildStatus::Running))
-            .count();
+        let running = self.running_count(state);
         if running >= self.max_concurrent {
             return Err(WorkerError::LimitReached {
                 max: self.max_concurrent,
@@ -404,70 +588,17 @@ impl Drop for InProcessWorkers {
 impl WorkerService for InProcessWorkers {
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
         Box::pin(async move {
-            // The state lock lives only inside this block: nothing below holds a
-            // std lock across the `yield_now` (invariant 7d). The factory is
-            // synchronous, so holding the lock across it keeps the RUNNING count
-            // and the id assignment atomic under concurrent `start` calls.
-            let (id, status, command_rx, token, stall, agent, report) = {
-                let mut state = self.shared.state.lock().unwrap();
-                if state.shut_down || self.shared.shutdown.is_cancelled() {
-                    return Err(WorkerError::ShutDown);
-                }
-                // Count RUNNING children before building: a rejected start must
-                // not build (and then discard) a child it cannot run.
-                self.shared.reserve_running_slot(&state)?;
-                // Factory failure is an invalid environment, not a service fault.
-                let ChildAgent {
-                    agent,
-                    description,
-                    report,
-                    regrant,
-                } = (self.shared.factory)(&spec).map_err(WorkerError::InvalidEnvironment)?;
-                let id = format!("w{}", state.next_id + 1);
-                state.next_id += 1;
-
-                let (status, _) = watch::channel(ChildStatus::Running);
-                let (commands, command_rx) = mpsc::unbounded_channel();
-                let token = CancellationToken::new();
-                let stall = Arc::new(Mutex::new(None));
-                state.children.insert(
-                    id.clone(),
-                    ChildEntry {
-                        status: status.clone(),
-                        commands,
-                        turn_cancel: Arc::new(Mutex::new(token.clone())),
-                        stall: Arc::clone(&stall),
-                        // The grant the factory assembled the child with, kept as
-                        // `continue_child` grows it.
-                        grant: spec.tools.clone(),
-                        regrant,
-                        description,
-                    },
-                );
-                (id, status, command_rx, token, stall, agent, report)
+            // `start` is the general seam specialised to the host's factory: everything
+            // else — the slot check before the build, the id allocation, the spawn, the
+            // yield, the error mapping, the retained grant — lives in `start_prepared`.
+            let prepared = PreparedStart {
+                task: spec.task.clone(),
+                tools: spec.tools.clone(),
+                notify_parent: true,
             };
-
-            let task_id = id.clone();
-            let shared = Arc::clone(&self.shared);
-            let handle = tokio::spawn(run_child(
-                shared,
-                ChildTask {
-                    id: task_id,
-                    agent,
-                    task: spec.task,
-                    token,
-                    commands: command_rx,
-                    stall,
-                    status,
-                    report,
-                },
-            ));
-            self.tasks.lock().unwrap().push(handle);
-            // Give the fresh task one turn before returning: `start` promises the
-            // child is running now, and a child that can complete without waiting
-            // has then actually started. A yield is not a clock.
-            tokio::task::yield_now().await;
-            Ok(ChildId(id))
+            let factory = Arc::clone(&self.shared.factory);
+            self.start_prepared(prepared, move |_id| factory(&spec))
+                .await
         })
     }
 
@@ -602,19 +733,27 @@ impl WorkerService for InProcessWorkers {
                 let entry = state.children.get_mut(&id.0).expect("checked above");
                 let previous = entry.status.borrow().clone();
                 let token = CancellationToken::new();
-                entry
+                *entry.turn_cancel.lock().unwrap() = token.clone();
+                // A reason left over from the previous turn must not colour this one.
+                *entry.stall.lock().unwrap() = None;
+                // Publish Running BEFORE handing the turn to the task. Once the
+                // command is sent it may complete and publish Finished immediately;
+                // publishing Running afterwards would overwrite that completion and
+                // leave `wait` parked forever.
+                entry.status.send_replace(ChildStatus::Running);
+                if entry
                     .commands
                     .send(ChildCommand::Continue {
                         message,
-                        token: token.clone(),
+                        token,
                         reconfig,
                         reply: reply_tx,
                     })
-                    .map_err(|_| WorkerError::ShutDown)?;
-                *entry.turn_cancel.lock().unwrap() = token;
-                // A reason left over from the previous turn must not colour this one.
-                *entry.stall.lock().unwrap() = None;
-                entry.status.send_replace(ChildStatus::Running);
+                    .is_err()
+                {
+                    entry.status.send_replace(previous);
+                    return Err(WorkerError::ShutDown);
+                }
                 (reply, grant, previous)
             };
             let Some(reply) = reply else {
@@ -635,11 +774,13 @@ impl WorkerService for InProcessWorkers {
                 }
                 Ok(Err(reason)) => {
                     // `reconfigure` refused: no turn ran, and the worker keeps the
-                    // tools it had.
+                    // tools it had. It was Running for a moment, so that slot goes
+                    // back now and whoever waits for capacity is woken.
                     let mut state = self.shared.state.lock().unwrap();
                     if let Some(entry) = state.children.get_mut(&id.0) {
                         entry.status.send_replace(previous);
                     }
+                    self.shared.capacity.notify_waiters();
                     Err(WorkerError::Regrant(reason))
                 }
                 // The child task is gone (shutdown): nothing was applied.
@@ -687,6 +828,7 @@ struct ChildTask {
     status: watch::Sender<ChildStatus>,
     /// The child's report read at a turn end, sharing one cell with the host's tap.
     report: Arc<dyn Fn() -> WorkerReport + Send + Sync>,
+    notify_parent: bool,
 }
 
 /// The whole life of one child, owned by one task. `task` is replaced by each
@@ -701,7 +843,19 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         stall,
         status,
         report,
+        notify_parent: notifies_parent,
     } = child;
+    // Armed for the length of every turn: a panic inside the turn ends this task
+    // (tokio catches it and drops the future) while the service still holds a clone
+    // of the status sender, so without the guard the child would stay `Running` for
+    // ever and every `wait` on it would park. Seen live in a host test that hung.
+    let mut guard = AbnormalEnd {
+        shared: Arc::clone(&shared),
+        id: id.clone(),
+        status: status.clone(),
+        notify_parent: notifies_parent,
+        armed: true,
+    };
     loop {
         // The status is already Running and `token` already installed: whoever
         // accepted this turn did both before the task could see it.
@@ -723,10 +877,17 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
             // that just ended, and the NEXT turn starts from a fresh one.
             (report)(),
         );
-        // (1) store the status and (2) wake every waiter: one `send_replace`.
+        // The turn ended on its own: the guard must not overwrite this status if the
+        // task is dropped while it waits for a command (shutdown).
+        guard.armed = false;
+        // (1) store the status and (2) wake every `wait`er: one `send_replace`.
         status.send_replace(child_status.clone());
-        // (3) exactly ONE notification, and only after the result is retrievable.
-        notify_parent(&shared, &id, &child_status);
+        // (3) a slot is given back: wake everyone waiting for capacity, too.
+        shared.capacity.notify_waiters();
+        // (4) exactly ONE notification, and only after the result is retrievable.
+        if notifies_parent {
+            notify_parent(&shared, &id, &child_status);
+        }
         // The session is retained for repair: wait for `continue_child` or
         // shutdown instead of exiting. A continue that ADDS tools carries the
         // reconfiguration for the next turn (ADR-0050 item 6); the turn's message is
@@ -772,7 +933,40 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
             }
             task = message;
             token = next_token;
+            // A new turn: whoever accepted it already set the status to `Running`.
+            guard.armed = true;
             break;
+        }
+    }
+}
+
+/// Ends a child whose task dies mid-turn. Tokio catches a panic inside a task and drops
+/// its future; the service's own clone of the status sender keeps the watch alive, so
+/// only this drop can turn the stranded `Running` into a terminal status and wake the
+/// waiters, the capacity waiters and the parent.
+struct AbnormalEnd {
+    shared: Arc<Shared>,
+    id: String,
+    status: watch::Sender<ChildStatus>,
+    /// As the child was started: a workflow step's parent hears of the run, not of it.
+    notify_parent: bool,
+    /// True while a turn runs; false while the task waits for its next command.
+    armed: bool,
+}
+
+impl Drop for AbnormalEnd {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let failed = ChildStatus::Failed(
+            "the worker's task ended abnormally during its turn (a panic inside the agent)"
+                .to_string(),
+        );
+        self.status.send_replace(failed.clone());
+        self.shared.capacity.notify_waiters();
+        if self.notify_parent {
+            notify_parent(&self.shared, &self.id, &failed);
         }
     }
 }
@@ -958,6 +1152,7 @@ mod tests {
             status: "blocked".into(),
             needs: Some("edit".into()),
             summary: Some("cannot write".into()),
+            evidence: None,
         });
         assert_eq!(
             report.missing_tool_calls,
@@ -1218,6 +1413,359 @@ mod tests {
             tool_names(&requests[1]),
             ["read"],
             "the tool set is unchanged"
+        );
+    }
+
+    /// A caller on a script thread can hand off a fast turn while the runtime
+    /// completes it; the completion must never be overwritten by Running.
+    #[tokio::test]
+    async fn a_fast_continue_retains_its_terminal_status() {
+        let (factory, providers, _) = factory(129, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        for _ in 0..128 {
+            let workers_for_thread = workers.clone();
+            let id_for_thread = id.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(workers_for_thread.continue_child(
+                    &id_for_thread,
+                    "again".into(),
+                    Vec::new(),
+                ))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let status = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                workers.wait(&id, CancellationToken::new()),
+            )
+            .await
+            .expect("a fast turn must wake its waiter")
+            .unwrap();
+            assert!(matches!(status, ChildStatus::Finished(_)), "{status:?}");
+        }
+        assert_eq!(providers.lock().unwrap()[0].requests().len(), 129);
+    }
+
+    // ------------------------------- prepared start and capacity (ADR-0053 item 2)
+
+    use std::time::Duration;
+
+    use p1_testkit::Step;
+
+    /// What `start` builds from its spec for the prepared seam: the task text and the
+    /// granted modules, the only two things the service needs before an agent exists.
+    fn prepared() -> PreparedStart {
+        PreparedStart {
+            task: "do it".into(),
+            tools: vec!["read".into()],
+            ..PreparedStart::default()
+        }
+    }
+
+    /// One child whose FIRST turn waits for cancellation: the running slot stays held
+    /// until the test cancels it, which is the only way to observe the bound.
+    fn hanging_child(spec: &ChildSpec) -> Result<ChildAgent, String> {
+        let provider = Arc::new(ScriptedProvider::new(vec![Step::EventsThenAwaitCancel(
+            vec![],
+        )]));
+        Ok(ChildAgent {
+            agent: child_agent(provider, &spec.tools),
+            description: "route/model".into(),
+            report: Arc::new(WorkerReport::default),
+            regrant: None,
+        })
+    }
+
+    /// The service still wants a factory; these tests build every child through the
+    /// prepared seam's `build` closure instead, so calling this one is a bug.
+    fn unused_factory() -> AgentFactory {
+        Arc::new(|_spec: &ChildSpec| unreachable!("the prepared seam supplies the build closure"))
+    }
+
+    /// The future `start_prepared` returns is `Send`, like every public async interface
+    /// (ADR-0015) — the compile-time assertion the rhai spike used, since a future that
+    /// only becomes `!Send` later is caught by no ordinary test.
+    fn require_send<F: Send>(future: F) -> F {
+        future
+    }
+
+    #[test]
+    fn the_start_prepared_future_is_send() {
+        let (factory, _, _) = factory(1, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(factory, 1);
+        let future = require_send(workers.start_prepared(prepared(), |_| Err("no".to_string())));
+        drop(future);
+    }
+
+    /// `build` is handed the id `start_prepared` then returns, and the children it builds
+    /// run and finish exactly as `start`'s do.
+    #[tokio::test(start_paused = true)]
+    async fn start_prepared_builds_with_the_id_it_returns() {
+        let (factory, _, _) = factory(1, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(Arc::clone(&factory), 2);
+        let built: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let built = Arc::clone(&built);
+            let factory = Arc::clone(&factory);
+            let id = workers
+                .start_prepared(prepared(), move |child_id| {
+                    built.lock().unwrap().push(child_id.0.clone());
+                    factory(&spec())
+                })
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        assert_eq!(ids, [ChildId("w1".into()), ChildId("w2".into())]);
+        assert_eq!(
+            *built.lock().unwrap(),
+            ["w1", "w2"],
+            "the build sees the id the call then returns"
+        );
+        for id in &ids {
+            match workers.wait(id, CancellationToken::new()).await.unwrap() {
+                ChildStatus::Finished(result) => assert_eq!(result.final_text, "answered"),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// A `build` that refuses is an invalid environment, and it consumes NOTHING: no
+    /// child, no slot, and the id it was offered is still the next one.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_build_consumes_nothing() {
+        let (factory, _, _) = factory(1, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(Arc::clone(&factory), 2);
+
+        let error = workers
+            .start_prepared(prepared(), |_| Err("no such environment".to_string()))
+            .await
+            .expect_err("an unknown environment is an invalid environment");
+        assert_eq!(
+            error,
+            WorkerError::InvalidEnvironment("no such environment".into())
+        );
+        assert!(workers.list().await.is_empty(), "no child was inserted");
+        assert_eq!(workers.running(), 0, "the slot was given back");
+
+        let id = workers
+            .start_prepared(prepared(), |_| factory(&spec()))
+            .await
+            .unwrap();
+        assert_eq!(id, ChildId("w1".into()), "the id was not consumed");
+    }
+
+    /// At the bound the slot check runs BEFORE the build: `LimitReached`, and the build
+    /// closure is never called.
+    #[tokio::test(start_paused = true)]
+    async fn a_prepared_start_at_the_bound_never_builds() {
+        let workers = InProcessWorkers::new(unused_factory(), 1);
+        let id = workers
+            .start_prepared(prepared(), |_| hanging_child(&spec()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            workers.status(&id).await.unwrap(),
+            ChildStatus::Running
+        ));
+
+        let built = Arc::new(Mutex::new(false));
+        let built_for_build = Arc::clone(&built);
+        let error = workers
+            .start_prepared(prepared(), move |_| {
+                *built_for_build.lock().unwrap() = true;
+                Err("the bound must be refused before the build".to_string())
+            })
+            .await
+            .expect_err("the bound is reached");
+        assert_eq!(error, WorkerError::LimitReached { max: 1 });
+        assert!(!*built.lock().unwrap(), "the build was not called");
+
+        workers.cancel(&id).await.unwrap();
+    }
+
+    /// `wait_for_capacity`: at once with a slot free, pending at the bound — proved with
+    /// a test-util clock, which is not a sleep — `true` when the running child gives the
+    /// slot back, and `false` when the caller's cancel token fires first.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_capacity_resolves_on_a_free_slot_a_turn_end_or_cancel() {
+        let workers = InProcessWorkers::new(unused_factory(), 1);
+        assert_eq!(
+            workers.wait_for_capacity(CancellationToken::new()).await,
+            Ok(true),
+            "nothing is running, so the slot is free at once"
+        );
+
+        let id = workers
+            .start_prepared(prepared(), |_| hanging_child(&spec()))
+            .await
+            .unwrap();
+        let waiting = workers.wait_for_capacity(CancellationToken::new());
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), &mut waiting)
+                .await
+                .is_err(),
+            "the bound is reached, so the wait stays pending"
+        );
+
+        // The child's turn ends: the slot is free and the waiter is woken — no polling.
+        workers.cancel(&id).await.unwrap();
+        assert_eq!(waiting.await, Ok(true));
+
+        let id = workers
+            .start_prepared(prepared(), |_| hanging_child(&spec()))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let waiting = workers.wait_for_capacity(cancel.clone());
+        tokio::pin!(waiting);
+        cancel.cancel();
+        assert_eq!(waiting.await, Ok(false), "the cancel token wins");
+        workers.cancel(&id).await.unwrap();
+    }
+
+    /// After `shutdown` neither a slot nor a child is on offer.
+    #[tokio::test(start_paused = true)]
+    async fn a_shut_down_service_offers_no_capacity_and_builds_nothing() {
+        let workers = InProcessWorkers::new(unused_factory(), 1);
+        workers.shutdown().await;
+
+        assert_eq!(
+            workers.wait_for_capacity(CancellationToken::new()).await,
+            Err(WorkerError::ShutDown)
+        );
+        let built = Arc::new(Mutex::new(false));
+        let built_for_build = Arc::clone(&built);
+        let started = workers
+            .start_prepared(prepared(), move |_| {
+                *built_for_build.lock().unwrap() = true;
+                hanging_child(&spec())
+            })
+            .await;
+        assert_eq!(started, Err(WorkerError::ShutDown));
+        assert!(!*built.lock().unwrap(), "nothing was built");
+    }
+
+    /// A waiter that is already waiting is woken by the shutdown itself.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_wakes_a_capacity_waiter() {
+        let workers = InProcessWorkers::new(unused_factory(), 1);
+        let id = workers
+            .start_prepared(prepared(), |_| hanging_child(&spec()))
+            .await
+            .unwrap();
+        let waiting = workers.wait_for_capacity(CancellationToken::new());
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), &mut waiting)
+                .await
+                .is_err(),
+            "the bound is reached, so the wait stays pending"
+        );
+
+        workers.shutdown().await;
+        assert_eq!(waiting.await, Err(WorkerError::ShutDown));
+        assert_eq!(workers.running(), 0, "every child was stopped");
+        drop(id);
+    }
+
+    /// `running` and `max_concurrent` report the live count and the bound the service was
+    /// built with.
+    #[tokio::test(start_paused = true)]
+    async fn running_and_max_concurrent_report_the_live_count() {
+        let workers = InProcessWorkers::new(unused_factory(), 1);
+        assert_eq!(workers.max_concurrent(), 1);
+        assert_eq!(workers.running(), 0, "nothing has started");
+
+        let id = workers
+            .start_prepared(prepared(), |_| hanging_child(&spec()))
+            .await
+            .unwrap();
+        assert_eq!(workers.running(), 1);
+
+        workers.cancel(&id).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert_eq!(workers.running(), 0, "an ended turn frees the slot");
+    }
+
+    /// `notify_parent: false` keeps every turn of that child out of the parent's inbox —
+    /// the first and a continued one — while a default prepared start still notifies.
+    #[tokio::test(start_paused = true)]
+    async fn a_prepared_start_without_notify_parent_sends_no_notification() {
+        let (factory, _, _) = factory(2, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(Arc::clone(&factory), 2);
+        let parent = child_agent(
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            &["read".to_string()],
+        );
+        workers.set_parent_inbox(parent.inbox());
+
+        let quiet = PreparedStart {
+            notify_parent: false,
+            ..prepared()
+        };
+        let id = workers
+            .start_prepared(quiet, |_| factory(&spec()))
+            .await
+            .unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        workers
+            .continue_child(&id, "again".into(), Vec::new())
+            .await
+            .unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert!(!parent.has_pending_inbox(), "a quiet child notifies nobody");
+
+        let id = workers
+            .start_prepared(prepared(), |_| factory(&spec()))
+            .await
+            .unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert!(parent.has_pending_inbox(), "the default still notifies");
+    }
+
+    /// A panic inside a turn (here: a provider asked for more than it scripted) must not
+    /// strand the child in `Running`: the guard marks it `Failed`, `wait` returns, the
+    /// slot is free again. Under paused time a `timeout` fires as soon as nothing is
+    /// runnable, so a hang would fail this test at once instead of parking it.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_turn_ends_the_child_failed_instead_of_hanging() {
+        let factory: AgentFactory = Arc::new(|spec: &ChildSpec| {
+            // No scripted response at all: the first request panics inside the task.
+            let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+            Ok(ChildAgent {
+                agent: child_agent(provider, &spec.tools),
+                description: "route/model".into(),
+                report: Arc::new(WorkerReport::default),
+                regrant: None,
+            })
+        });
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(60),
+            workers.wait(&id, CancellationToken::new()),
+        )
+        .await
+        .expect("a dying child must end its wait")
+        .unwrap();
+        assert!(
+            matches!(&status, ChildStatus::Failed(message) if message.contains("abnormally")),
+            "{status:?}"
+        );
+        assert_eq!(workers.running(), 0, "the slot is free again");
+        assert_eq!(
+            workers.wait_for_capacity(CancellationToken::new()).await,
+            Ok(true)
         );
     }
 }

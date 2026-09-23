@@ -35,10 +35,23 @@ pub trait SessionActivity: Send + Sync {
     /// Every finished `Executes` call so far, oldest first.
     fn shell_runs(&self) -> Vec<ShellRun>;
 }
-pub struct FinishTool; impl FinishTool { pub fn new(activity: Arc<dyn SessionActivity>, outcome: FinishOutcome) -> Self; }
+pub struct FinishTool;
+impl FinishTool {
+    /// The default policy is `RecordedCommands` (below); the HOST chooses one for an
+    /// agent it assembles (ADR-0051 item 1).
+    pub fn new(activity: Arc<dyn SessionActivity>, outcome: FinishOutcome) -> Self;
+    pub fn with_policy(self, policy: CompletionPolicy) -> Self;
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionPolicy { RecordedCommands, ReportToParent }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Evidence { CommandsPassed(Vec<String>), NotRun(String) }
 #[derive(Clone, Default)] pub struct FinishOutcome;   // shared cell the host reads
 impl FinishOutcome { pub fn get(&self) -> Option<Accepted>; pub fn clear(&self); }
-pub enum Accepted { Done { summary: String }, Blocked { summary: String, needs: String, tried: Vec<String> } }
+pub enum Accepted {
+    Done { summary: String, evidence: Evidence },
+    Blocked { summary: String, needs: String, tried: Vec<String> },
+}
 ```
 Rules, each with its exact model-visible text:
 1. `done` with an empty or missing `verification` →
@@ -55,6 +68,64 @@ Rules, each with its exact model-visible text:
 5. Accepted `done` → Ok `Finished.`; accepted `blocked` → Ok `Recorded as blocked.` The outcome
    is stored in `FinishOutcome` (last accepted call wins). A rejected call stores nothing.
 An Error is an ordinary tool result: the model reads it and keeps working in the same turn.
+
+**The completion policy (ADR-0051 item 1).** `RecordedCommands` is the rule above, exactly.
+`ReportToParent` exists for an agent the host assembled WITHOUT any tool that records command
+runs: there `["none"]` is accepted whether or not files changed (`Verification may be ["none"]`
+on that ground in the prompt), while an empty/missing `verification` and every named command go
+through the SAME checks as above — a fabricated command is rejected with the same text, so valid
+evidence is never downgraded. The two policies present the same tool under the same name with a
+different DESCRIPTION: the strict one asks for the command, the other says that no command tool
+is available, that `["none"]` is accepted, that `summary` must say what was done and what
+remains unchecked, and that the result is reported to the parent as not verified. The host
+chooses from the assembled tools' identities — no policy is derived inside the tool from a name.
+Main agents always get `RecordedCommands`.
+
+**Evidence (ADR-0051 item 2) and the worker line (item 3).** An accepted `done` records what was
+established, host-owned: `Evidence::CommandsPassed(the named commands, as the trailer spells
+them)` or `Evidence::NotRun(reason)` — `"no file changed"` under the strict rule for an accepted
+`["none"]`, `"no command tool granted"` under `ReportToParent`. The child's report
+(`worker_result` and the host's own line) carries it: `done — commands passed: cargo test -p x`
+or `done — not verified; parent verification required`; `blocked: needs …` and `ended without
+finish` are unchanged. "Verified" is never printed for a result without passed commands, and a
+child's `done` alone never satisfies the parent's own gate.
+
+**Structured result (ADR-0053 item 5).** A host may give the tool an `OutputContract`
+(`FinishTool::with_output_contract`, read back with `output_contract`): a JSON-Schema subset —
+`type` (one of object, array, string, integer, number, boolean, null), `enum`, `required`,
+`properties`, `additionalProperties: false` only, `items`, `minItems`, `minimum`, and the
+ignored `description`/`title` — validated once at construction, so a malformed schema fails
+BEFORE any worker is started. It is exactly the subset the retired `scripts/workflow.py::schema_errors`
+checks, so a brief's schema means the same thing in both runners. With a contract set:
+1. The input schema gains `"result": <the contract's schema>`, its `description` prefixed
+   `Required with "done": ` + the contract's own; `required` stays `["status", "summary"]`
+   because a `blocked` call needs no result. The description is the policy's, byte-identical,
+   plus ONE paragraph: `This task requires a structured result: pass it as "result" together
+   with "done". It is checked against the schema of the "result" parameter; the check is
+   reported to your parent with the outcome.`
+2. `done` goes through the verification rules FIRST (same errors, same trailers). Then an
+   absent `result` → Error `This task requires a structured "result". Call finish again with
+   "result" filled in to match this schema:` followed by the schema as pretty JSON (at most
+   4 KiB, truncated with `…`), no trailer, storing nothing.
+3. A present `result` is checked AFTER the `done` is accepted: `Accepted::Done { summary,
+   evidence }` is stored as today AND `StructuredResult { value: Some(result), schema }` in the
+   same critical section. Reply on `Passed`: `Finished.` (unchanged). Reply on `Failed(errors)`
+   — the call is still accepted, the turn may end here, and the errors travel with the outcome:
+   `Finished. The result does not match the schema:` + one `- <error>` line each + `You may call
+   finish again with a corrected result before you stop.` A second accepted `done` replaces the
+   first, as today.
+4. `blocked` ignores a present `result` and leaves the structured cell empty.
+Without a contract a present `result` → Error `Invalid input for finish: no structured result
+was requested for this task; remove "result".` The cell is
+`FinishOutcome::structured() -> Option<StructuredResult>` (`None` after an accepted `blocked`,
+after `clear`, or before any call) with `pub enum SchemaCheck { NotRequested, Passed,
+Failed(Vec<String>) }` and `pub struct StructuredResult { pub value: Option<serde_json::Value>,
+pub schema: SchemaCheck }`; `value` is `None` only under `NotRequested`. `clear` drops both
+values. Errors are worded as the retired `workflow.py` worded them, with JSON type names: `$: expected
+object, got string`, `$.kind: "x" is not one of ["a","b"]`, `$: missing required key "id"`,
+`$: unexpected key "extra"`, `$.items: needs at least 1 items`, `$.score: -1 is below 0`, paths
+like `$.findings[2].file` — at most 32 of them, each at most 300 characters. Clearing the cell
+on `TurnStarted` stays the host's job.
 
 **Revision after dogfood run 3 (2026-09-20).** A real model needed TEN `finish` calls: seven
 omitted `verification` although the error asked for it, two named a command in a different
@@ -114,7 +185,9 @@ the interactive prompt never continues on its own (the user is there). After eve
   `You ended your turn without calling finish. You are running unattended: nobody will answer a question or confirm a plan, and this task authorizes you to continue on your own. Continue the work now. When it is complete and verified, call finish with status "done"; if something outside your control stops you, call finish with status "blocked".`
   It is committed as a normal `UserInput` record, so the journal shows every continuation.
 - Workers: a child agent's environment may contain `finish` too; the worker service is
-  unchanged in this increment (a child's turn end is its completion, the parent verifies).
+  unchanged in this increment (a child's turn end is its completion, the parent verifies). The
+  host chooses the child's policy (§2, ADR-0051), and the child's accepted outcome labels the
+  report the parent reads.
 The host implements `SessionActivity` from the event stream it already receives
 (`ToolStarted`/`ToolFinished`), looking up each call's `effect` on the assembled tool and
 parsing the shell footer `[exit code: N]`. No new core or contract surface. On `--resume` the

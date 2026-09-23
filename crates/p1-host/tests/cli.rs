@@ -28,6 +28,7 @@ fn isolated(home: &Path) -> Command {
         "OPENCODE_API_KEY",
         "OPENCODE_GO_2_API_KEY",
         "ZAI_API_KEY",
+        "KIMI_API_KEY",
     ] {
         command.env_remove(name);
     }
@@ -72,7 +73,7 @@ fn yes_with_ask_is_a_usage_error() {
 #[test]
 fn env_show_runs_without_credentials_or_network() {
     let home = tempfile::tempdir().unwrap();
-    for name in ["claude", "gpt"] {
+    for name in ["claude", "gpt", "kimi"] {
         let output = isolated(home.path())
             .args(["env", "show", name])
             .output()
@@ -152,6 +153,23 @@ fn env_show_prints_the_resolved_model() {
         "model  claude/claude-sonnet-5:medium",
         "{stdout}"
     );
+
+    let output = isolated(home.path())
+        .args(["env", "show", "kimi"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("credential  none — set KIMI_API_KEY"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.lines().nth(1), Some("model  kimi/kimi-k3:high"));
+    assert!(stdout.contains("\"model\": \"k3\""), "{stdout}");
 }
 
 /// Every main agent gets the worker tools from the host (ADR-0050 item 1): `env show
@@ -202,8 +220,8 @@ fn models_lists_every_shipped_model() {
     let lines: Vec<&str> = stdout.lines().collect();
     // One row per model: every environment × every profile its route binds. The
     // anthropic-subscription route binds 6 profiles, and `claude-delegating` is gone
-    // (ADR-0050), so 6 Claude + 10 others = 16.
-    assert_eq!(lines.len(), 16, "one row per model: {stdout}");
+    // (ADR-0050), so 6 Claude + 11 others = 17.
+    assert_eq!(lines.len(), 17, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(
@@ -235,6 +253,14 @@ fn models_lists_every_shipped_model() {
                 && line.contains("low,medium,high,extra_high ")),
         "{stdout}"
     );
+    let kimi: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.starts_with("kimi/kimi-k3 "))
+        .collect();
+    assert_eq!(kimi.len(), 1, "{stdout}");
+    assert!(kimi[0].contains("kimi-coding-subscription"), "{stdout}");
+    assert!(kimi[0].contains("low,high,max"), "{stdout}");
+    assert!(kimi[0].contains("KIMI_API_KEY"), "{stdout}");
     for secret in ["accessToken", "refreshToken", "Bearer", "sk-"] {
         assert!(!stdout.contains(secret), "p1 models leaked {secret}");
     }
@@ -251,6 +277,15 @@ fn models_lists_every_shipped_model() {
         stdout.starts_with("deepseek2/deepseek-v4.1-flash"),
         "{stdout}"
     );
+
+    let output = isolated(home.path())
+        .args(["models", "kimi"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.starts_with("kimi/kimi-k3"), "{stdout}");
 }
 
 /// `--models` scopes the listing; a pattern that matches nothing is an error.

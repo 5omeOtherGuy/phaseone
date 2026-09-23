@@ -19,7 +19,8 @@ and an evidence record (scripts/run-report.py) in a run directory:
     {"label": "core-fix", "runner": "p1", "env": "claude",
      "dir": "/abs/worktree", "session": "<run>/session.jsonl",
      "prompt_file": "/abs/defects.md"}
-  optional "sandbox_write": ["/abs/path", ...] and "max_continuations": N reach the
+  optional "model": "E/P[:effort]" reaches `p1 --model` (the environment's own profile
+  otherwise); optional "sandbox_write": ["/abs/path", ...] and "max_continuations": N reach the
   matching p1 flags ("sandbox_write" only with "sandbox": true); `profile`/`effort` are
   unused by this runner. When a SANDBOXED job's `dir` is a git
   WORKTREE (its `--git-common-dir` is outside `dir`) the common directory is passed as
@@ -93,19 +94,28 @@ def mem_available_mb():
     return 0
 
 
-def pi_workers_alive():
-    """pi-worker processes on the whole machine (other batches and sessions included)."""
-    out = subprocess.run(["pgrep", "-fc", "scripts/pi-worker "], capture_output=True, text=True).stdout
-    return int(out.strip() or 0)
+def is_pi_worker(argv):
+    """A real pi-worker process: the script itself (`python3 …/pi-worker <profile> …` or
+    `pi-worker <profile> …`), never a wrapper whose command LINE merely mentions it — a
+    `bash -c "… pi-worker …"` loop or a `usage-meter wrap … -- pi-worker …` parent. Counting
+    those once made two real workers look like six and filled the pool."""
+    if not argv:
+        return False
+    head = os.path.basename(argv[0])
+    if head == "pi-worker":
+        return True
+    return head.startswith("python") and len(argv) > 1 and os.path.basename(argv[1]) == "pi-worker"
 
 
-def p1_agents_alive():
-    """Running p1 agents machine-wide: argv[0] basename `p1` with `--env` in the args.
+def is_p1_agent(argv):
+    """A running p1 agent: argv[0] basename `p1` with `--env` in the args. A `python3
+    scripts/fanout.py` process or an editor is never counted, and neither is anything else
+    that merely mentions p1."""
+    return bool(argv) and os.path.basename(argv[0]) == "p1" and "--env" in argv[1:]
 
-    An /proc scan (no psutil): a `python3 scripts/fanout.py` process or an editor is
-    never counted, and neither is anything else that merely mentions p1.
-    """
-    count = 0
+
+def processes():
+    """argv of every process on the machine (a /proc scan, no psutil)."""
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -114,9 +124,17 @@ def p1_agents_alive():
                 argv = [part.decode("utf-8", "replace") for part in handle.read().split(b"\0") if part]
         except OSError:
             continue
-        if argv and os.path.basename(argv[0]) == "p1" and "--env" in argv[1:]:
-            count += 1
-    return count
+        yield argv
+
+
+def pi_workers_alive():
+    """pi-worker processes on the whole machine (other batches and sessions included)."""
+    return sum(1 for argv in processes() if is_pi_worker(argv))
+
+
+def p1_agents_alive():
+    """Running p1 agents machine-wide."""
+    return sum(1 for argv in processes() if is_p1_agent(argv))
 
 
 def workers_alive():
@@ -204,6 +222,10 @@ def p1_command(job, binary, session_path, brief, locks_dir, readable=()):
     """The exact p1 argv for one job (pure; the resume flag follows the session and the
     read-only paths are injected by the caller)."""
     cmd = [binary, "--env", job["env"], "--workspace", job["dir"], "--session", session_path]
+    # Owner policy 2026-09-23 (model-cards replacement trial): a job may pick the model inside
+    # its environment, `E/P[:effort]` exactly as `p1 --model` takes it.
+    if job.get("model"):
+        cmd += ["--model", job["model"]]
     if job.get("session"):
         cmd.append("--resume")
     cmd.append("--yes")

@@ -63,6 +63,13 @@ pub trait FrontEnd: Send + Sync {
     #[cfg(feature = "delegation")]
     fn worker_ended(&self, worker_id: &str, description: &str, report: &WorkerReport);
 
+    /// One workflow line (ADR-0053 item 7): a step's end, a phase, a log line or the
+    /// run's end, already worded by `render`. Workflow steps do not report through
+    /// [`FrontEnd::worker_ended`], so this is where a front end shows them; the
+    /// default shows nothing.
+    #[cfg(feature = "workflows")]
+    fn workflow_line(&self, _line: &str) {}
+
     /// The authorization policy for the parent and, shared, for every worker.
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy>;
 
@@ -210,6 +217,15 @@ impl FrontEnd for LineFrontEnd {
     #[cfg(feature = "delegation")]
     fn worker_ended(&self, worker_id: &str, description: &str, report: &WorkerReport) {
         let line = crate::render::worker_end_note(worker_id, description, report);
+        let mut writer = self.stderr.lock().unwrap();
+        let _ = writeln!(writer, "· {line}");
+        let _ = writer.flush();
+    }
+
+    /// Same channel and prefix as a worker's end line: the operator reads both as
+    /// the host's own notes, not the model's output.
+    #[cfg(feature = "workflows")]
+    fn workflow_line(&self, line: &str) {
         let mut writer = self.stderr.lock().unwrap();
         let _ = writeln!(writer, "· {line}");
         let _ = writer.flush();

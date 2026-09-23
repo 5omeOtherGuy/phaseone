@@ -279,7 +279,7 @@ fn h03_resume_menu() {
     check_composer("H03", 35, &typed("/resume"), Mode::Idle);
 }
 
-// Lead decision on the ADR-0051 handoff (deviation: C05 text row): §8.1's prose wins over the
+// Lead decision on the ADR-0056 handoff (deviation: C05 text row): §8.1's prose wins over the
 // C05 mock. The mock cuts the long goal with `…` only because the designer's generator ran every
 // row through the Band rule; the composer soft-wraps instead, so what the operator types stays
 // visible and the cursor always has a cell. C05's hint row is checked as drawn; its text row is

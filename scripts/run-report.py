@@ -45,6 +45,15 @@ doing the same for summarization usage. `includes_worker_usage` is true exactly 
 least one worker file was read (no worker file means no workers — a child session without
 `--session` stays in memory and cannot be read back).
 
+A workflow run (`p1 workflow run`, or `workflow_start` in a session) writes its `RunReport` to
+`FILE.workflows/<id>/result.json`, one directory per run, next to the session. Those are
+discovered too and reported under `workflows` — `{id, outcome, counts, steps, run_dir}` per
+run, `steps` being the number of entries in the run's `steps` array — sorted by run id in
+natural order (`wf2` before `wf10`); `workflows_started` is how many were found. Empty when
+there is no `.workflows` directory. A `result.json` that is not valid JSON, or is missing a
+field a `RunReport` always has, is a hard error — the same convention a malformed worker
+journal already gets, above: a clear `sys.exit`, never a raw traceback.
+
 `worker_usage_known` answers the question `includes_worker_usage: false` leaves open:
 
     true   at least one worker journal file was read
@@ -265,6 +274,43 @@ def worker_files(path):
     return found
 
 
+def natural_key(text):
+    """Sort key for natural order: runs of digits compare numerically, so `wf2` sorts
+    before `wf10`."""
+    return [int(chunk) if chunk.isdigit() else chunk for chunk in re.split(r"(\d+)", text)]
+
+
+# The fields a `RunReport` (p1's Rust struct, written by `p1 workflow run`) always
+# has; a result.json missing one of these is not a `RunReport` at all.
+RUN_REPORT_FIELDS = ("id", "outcome", "counts", "steps", "run_dir")
+
+
+def workflow_reports(path):
+    """The `FILE.workflows/<id>/result.json` run reports next to a session, sorted by id
+    in natural order. A malformed result.json is a hard error — the same convention a
+    malformed worker journal already gets in `analyze()`: a clear `sys.exit`, never a raw
+    traceback."""
+    found = []
+    for result_path in glob.glob(glob.escape(path) + ".workflows/*/result.json"):
+        with open(result_path, encoding="utf-8") as handle:
+            try:
+                run = json.load(handle)
+            except json.JSONDecodeError as error:
+                sys.exit(f"{result_path}: not a valid run report ({error})")
+        missing = [field for field in RUN_REPORT_FIELDS if field not in run]
+        if missing or not isinstance(run.get("steps"), list):
+            sys.exit(f"{result_path}: not a valid run report (missing {missing or 'steps'})")
+        found.append({
+            "id": run["id"],
+            "outcome": run["outcome"],
+            "counts": run["counts"],
+            "steps": len(run["steps"]),
+            "run_dir": run["run_dir"],
+        })
+    found.sort(key=lambda run: natural_key(run["id"]))
+    return found
+
+
 def report(path, max_idle_summaries=DEFAULT_MAX_IDLE_SUMMARIES):
     parent = analyze(path, max_idle_summaries)
     workers = []
@@ -291,6 +337,7 @@ def report(path, max_idle_summaries=DEFAULT_MAX_IDLE_SUMMARIES):
         worker_usage_known = False
     else:
         worker_usage_known = None
+    workflows = workflow_reports(path)
     return {
         "session": path,
         **parent,
@@ -302,6 +349,8 @@ def report(path, max_idle_summaries=DEFAULT_MAX_IDLE_SUMMARIES):
         "input_total_all_with_workers": input_total_of(usage_total_with_workers),
         "includes_worker_usage": bool(workers),
         "worker_usage_known": worker_usage_known,
+        "workflows": workflows,
+        "workflows_started": len(workflows),
     }
 
 

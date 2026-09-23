@@ -178,6 +178,18 @@ class FanoutTest(unittest.TestCase):
             "--yes", "--max-continuations", "5", BRIEF,
         ])
 
+    def test_model_key_reaches_p1_model(self) -> None:
+        # Owner policy 2026-09-23: a job names the model inside its environment; without
+        # the key the argv is unchanged (the environment's own profile runs).
+        argv, entry = self.p1_argv(model="claude/claude-opus-5-5:high")
+        session = os.path.join(entry["run_dir"], "session.jsonl")
+        self.assertEqual(argv, [
+            self.bin, "--env", "plain", "--workspace", self.work, "--session", session,
+            "--model", "claude/claude-opus-5-5:high", "--yes", BRIEF,
+        ])
+        argv, _ = self.p1_argv()
+        self.assertNotIn("--model", argv)
+
     def test_sandbox_write_without_sandbox_is_a_job_error(self) -> None:
         for job in (self.p1_job(sandbox_write=["/tmp/extra-write"]),
                     self.p1_job(sandbox="yes")):
@@ -310,6 +322,24 @@ class FanoutTest(unittest.TestCase):
         self.assertEqual(fanout.command_for(resume, "pi-worker"),
                          ["pi-worker", "deepseek", "--dir", "/work", "--effort", "high",
                           "--session", "abc", "--prompt", "fix it"])
+
+    def test_live_worker_count_ignores_wrapper_processes(self) -> None:
+        real = [["python3", "/home/u/brain-tools/scripts/pi-worker", "glm", "--dir", "/w"],
+                ["python3", "/home/u/.local/bin/pi-worker", "sol6", "--dir", "/w"],
+                ["pi-worker", "glm", "--dir", "/w"]]
+        wrappers = [["bash", "-c", "for t in a b; do pi-worker glm --dir $t; done"],
+                    ["python3", "/home/u/brain-tools/scripts/usage-meter", "wrap", "x", "--",
+                     "/home/u/brain-tools/scripts/pi-worker", "sol6"],
+                    ["/bin/bash", "-c", "source snapshot.sh && scripts/pi-worker glm --dir /w"],
+                    ["python3", "scripts/fanout.py", "jobs.json"],
+                    []]
+        for argv in real:
+            self.assertTrue(fanout.is_pi_worker(argv), argv)
+        for argv in wrappers:
+            self.assertFalse(fanout.is_pi_worker(argv), argv)
+        self.assertTrue(fanout.is_p1_agent(["/x/phaseone-target/debug/p1", "--env", "deepseek2"]))
+        self.assertFalse(fanout.is_p1_agent(["python3", "scripts/fanout.py", "--env"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "models"]))
 
 
 if __name__ == "__main__":

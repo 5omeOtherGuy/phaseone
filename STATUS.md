@@ -12,8 +12,9 @@ route × model profile composed into ONE runtime `Provider` (ADR-0039); model se
 mid-session switching are live (ADR-0049); every main agent can start workers with explicit tool
 grants (ADR-0050); resume, context control, `finish` and the TUI are mounted.
 
-**Where the lead stands.** `main` = `604604b`, CI green on that commit; ADRs 0001–0050 (0009→0010,
-0013→0014, 0026→0050, 0033→0049 superseded). Open work: #46–#48, #12, #45 (owner), #6, #25.
+**Where the lead stands.** `main` = `45411f1` + this commit; ADRs 0001–0053 (0009→0010,
+0013→0014, 0026→0050, 0033→0049 superseded). Open work: #46–#48, #53, #54, #12, #45 (owner), #6,
+#25.
 
 ## Next — READ FIRST
 
@@ -21,7 +22,7 @@ HOW THE LEAD WORKS (owner instructions)
 - Implementation goes to DeepSeek workers by default: `scripts/fanout.py <jobs.json>` with jobs
   `{"runner": "p1", "env": "deepseek2", …}`; briefs/outputs in `../phaseone-briefs/`; repair in the
   SAME session (`session` + `prompt_file`); multi-stage workflows with schema-checked outputs and
-  resume on `scripts/workflow.py`. The lead keeps specs, ADRs, diff review, lead tests, live checks,
+  resume through `p1 workflow run` (ADR-0053; the Python `workflow.py` is retired). The lead keeps specs, ADRs, diff review, lead tests, live checks,
   merges.
 - One job ≈ one crate; short briefs, "work in this order, start editing early". A dead run cannot
   move its journal between routes — a fresh session continues from the WORKSPACE ("NOTE ON STATE").
@@ -67,6 +68,11 @@ OPEN ITEMS (issue numbers)
   terra/luna, gpt-5.5 (`sol-mini` refused live).
 - **Tools** — one crate per tool, composed only in the composition root (ADR-0004); shell sandbox
   (ADR-0035) + environment allow-list (#4); shell output filters measured on p1 (#42).
+- **Workflows (ADR-0053, 2026-09-23)** — `p1-workflow` (rhai engine, Claude Code's script shape,
+  roles + per-model caps, journal + replay) and `p1-tool-workflow` on every main agent; `p1
+  workflow run`; the modularity audit ported (`scripts/audits/modularity.rhai`). Built by a Fable
+  5.1 orchestrator session with one worker per job (DeepSeek, Opus 5.5, gpt-6-sol, GLM); five live
+  checks passed. ADR-0051 (a worker without a command tool ends `done — not verified`) preceded it.
 - **Delegation** — optional module, machine-wide bounded pool, workers not restored on parent
   resume (ADR-0027, ADR-0034); ADR-0050 supersedes ADR-0026: every main agent has the worker tools;
   a worker gets exactly its parent's grant plus `finish`; conditional prompts, worker report + host
@@ -80,7 +86,8 @@ OPEN ITEMS (issue numbers)
 - **TUI** — ADR-0043: pure state machine in `p1-tui`, terminal driver + `FrontEnd` seam in
   `p1-host`; milestones M1–M4c merged by the TUI session (#12).
 - **Tooling** — gate as the single definition of green (ADR-0011); ADRs validated in the gate
-  (ADR-0030); `scripts/fanout.py` (ADR-0027), `scripts/workflow.py` + `scripts/audits/modularity.py`,
+  (ADR-0030); `scripts/fanout.py` (ADR-0027), `scripts/audits/modularity.rhai` (+ `modularity-prep.py`; the Python
+  `workflow.py` retired 2026-09-23 on the owner's decision),
   `scripts/run-report.py` + `docs/dogfood/runs.jsonl` (#8, #26).
 - **Research** — ADR-0045 (items end `used` or `discarded`): #26–#28, #35–#37, #41–#43 all closed.
 - **Modularity audit 2026-09-22** — `docs/research/modularity-audit-2026-09-22.md`: 104 DeepSeek jobs
@@ -88,14 +95,19 @@ OPEN ITEMS (issue numbers)
 - **First slice** — every `seams.md` §10 item demonstrated by a command in `docs/SLICE-REPORT.md`;
   the independent review's defects all fixed (`docs/review-2026-09-20-dispositions.md`).
 
+## Workflows (orchestrator session) — CLOSED 2026-09-23
+
+Everything is on main; the session's report is `../phaseone-briefs/workflows-orchestrator-report.md`
+(what was built, deviations, live checks, what remains). Remaining items became #53, #54 and a
+comment on #46; the ADR's deferred list is unchanged.
+
 ## Open decisions and risks
 
-- OWNER DECISION OPEN: a worker granted `edit` but not `shell` cannot finish `done` — the ADR-0037
-  finish check wants a recorded command it cannot run, so it finishes `blocked` after a correct
-  change (found live; ADR-0050 Evidence).
-  Recommendation (lead + Astra, `../phaseone-briefs/finish-design-answer.md`): host-chosen finish
-  policy — a worker with no command tool may finish `done`, reported as "not verified; parent
-  verification required"; never grant `shell` implicitly; parent-defined checks and profiles later.
+- DONE (ADR-0051, accepted 2026-09-23): a worker without a command tool finishes `done` and the
+  host reports it `not verified; parent verification required`; `shell` is never granted
+  implicitly. Next: workflows as a module (design with Astra in `../phaseone-briefs/
+  workflows-design-*.md`, v1 scope in `workflows-design-v1-scope.md`; engine spikes rhai vs
+  rune running; then a Fable 5.1 Claude Code session orchestrates the implementation).
 - Risk (untested): the Opus 5.5 preserved-thinking prefix check vs p1's context summarization —
   applies only to Anthropic accounts created on/after 2026-08-31.
 - #45 is the owner's; do not dispatch. #46–#48 are `ready` and unclaimed. Small debts:
@@ -111,3 +123,12 @@ OPEN ITEMS (issue numbers)
   0 edits). Shipped values: 300k of 1M (deepseek, deepseek2), 120k of 200k (claude, gpt), 150k of
   260k (glm); every request re-sends the history, so cache-read dominates cost.
 - `pi-worker opus` is never for tool work: 0 tool_calls, invented results.
+- Never pipe `scripts/push-main.sh` (`| tail`): the pipe hid a rejected push and a red CI. Read
+  its exit code. And merge `origin/main` BEFORE numbering a new ADR (0052 was taken concurrently).
+- A hung test held a gate 37 min: `gate.sh` now bounds `cargo test` to an hour; tests that wait
+  on a run carry their own timeouts (a hang must be a failure, never a parked gate).
+- rhai scripts: never call a closure held in a variable or write a captured variable inside a
+  `parallel`/`pipeline` thunk (rhai `sync` = "Data race detected", timing-dependent); curry the
+  inputs, aggregate after the join. The prompts' example says so.
+- The stall guard sees only tool-declared writes (#53): a model editing through shell heredocs
+  (Opus 5.5 does) looks idle. Until fixed, briefs say "edit with the edit tool".

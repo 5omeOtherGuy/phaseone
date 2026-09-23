@@ -1,4 +1,4 @@
-//! The snapshot oracle for the SLAB Harness redesign (ADR-0051).
+//! The snapshot oracle for the SLAB Harness redesign (ADR-0056).
 //!
 //! `docs/design/tui/slab/grids.json` holds every mock of the handoff as TEXT (one string per
 //! row) and RUNS (run-length `<bg><fg>×<n>` codes per row). This module encodes a rendered

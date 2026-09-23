@@ -458,7 +458,7 @@ async fn a_regranted_tools_effect_reaches_finish() {
              child gave up"
                 .to_string(),
             "tools: read, shell, finish\n\
-             finish: done\n\
+             finish: done — commands passed: true\n\
              ---\n\
              Worker w1: finished\n\n\
              child verified it"

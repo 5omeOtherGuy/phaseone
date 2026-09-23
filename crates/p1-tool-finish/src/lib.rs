@@ -9,6 +9,10 @@
 //! The accepted outcome is stored in a shared [`FinishOutcome`] cell the host
 //! reads after the turn; a rejected call stores nothing. Invalid input is an
 //! ordinary tool result the model can act on — never a panic.
+//!
+//! A host may also give the tool an [`OutputContract`] (ADR-0053 item 5): then an
+//! accepted `done` must carry `result`, checked in Rust after the `done` is accepted,
+//! and the verdict travels next to the outcome in the same cell.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -40,11 +44,50 @@ pub trait SessionActivity: Send + Sync {
     fn shell_runs(&self) -> Vec<ShellRun>;
 }
 
+/// Which completion rule a `finish` tool applies (ADR-0051 item 1). The HOST chooses
+/// it at construction, from the assembled tools' identities; the tool never inspects
+/// grant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionPolicy {
+    /// Today's rule (ADR-0037), unchanged: `done` needs a command whose successful
+    /// run is recorded after the last file change, and `["none"]` is accepted only in
+    /// a session that changed no file.
+    RecordedCommands,
+    /// For an agent with no tool that runs commands: `["none"]` is accepted after a
+    /// file change too, and the accepted result is labelled unverified for the parent.
+    ReportToParent,
+}
+
+impl CompletionPolicy {
+    /// The model-facing description that carries this policy. The default face of a
+    /// tool built under the policy, so a host that switches the policy late can
+    /// present the tool the model would have got from the factory.
+    fn description(self) -> &'static str {
+        match self {
+            Self::RecordedCommands => DESCRIPTION,
+            Self::ReportToParent => REPORT_DESCRIPTION,
+        }
+    }
+}
+
+/// What an accepted `done` established (ADR-0051 item 2). Host-owned: it is built
+/// from the session's own record, never from the model's input, and it is what the
+/// parent is told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Evidence {
+    /// These commands all have a recorded successful run after the last file change,
+    /// spelled as the trailer spells them (normalised).
+    CommandsPassed(Vec<String>),
+    /// Nothing was established, and why. Never printed as "verified".
+    NotRun(String),
+}
+
 /// A `finish` call the tool accepted. Last accepted call wins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Accepted {
     Done {
         summary: String,
+        evidence: Evidence,
     },
     Blocked {
         summary: String,
@@ -53,27 +96,354 @@ pub enum Accepted {
     },
 }
 
+/// A host-supplied JSON-Schema SUBSET the `result` of an accepted `done` is checked
+/// against (ADR-0053 item 5). Exactly the subset `scripts/workflow.py::schema_errors`
+/// validates, so a brief's schema means the same thing in both runners.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputContract {
+    schema: serde_json::Value,
+}
+
+impl OutputContract {
+    /// Validate the schema ONCE, here: a malformed contract fails before any worker is
+    /// started, and every rejection names the JSON path and the reason.
+    /// Accepts `type` (one of object, array, string, integer, number, boolean, null),
+    /// `enum`, `required`, `properties`, `additionalProperties: false`, `items`,
+    /// `minItems`, `minimum`, and the ignored documentation keywords `description` and
+    /// `title`.
+    pub fn new(schema: serde_json::Value) -> Result<Self, String> {
+        validate_schema(&schema)?;
+        Ok(Self { schema })
+    }
+
+    /// The validated schema, for a host that wants to show or journal it.
+    pub fn schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    /// The errors of `value` against the schema, empty when it conforms. The wording
+    /// and the order mirror `workflow.py::schema_errors` with JSON type names:
+    /// `$: expected object, got string`, `$.kind: "x" is not one of ["a","b"]`,
+    /// `$: missing required key "id"`, `$: unexpected key "extra"`,
+    /// `$.items: needs at least 1 items`, `$.score: -1 is below 0`. At most
+    /// [`MAX_ERRORS`] errors, each at most [`MAX_ERROR_CHARS`] characters.
+    pub fn errors(&self, value: &serde_json::Value) -> Vec<String> {
+        let mut errors = Vec::new();
+        collect_errors(value, &self.schema, "$", &mut errors);
+        errors
+    }
+}
+
+/// Whether an accepted `done`'s `result` met the contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaCheck {
+    /// No contract was set, so nothing was asked for.
+    NotRequested,
+    Passed,
+    Failed(Vec<String>),
+}
+
+/// The `result` of the LAST accepted `done`, with its check. `value` is `None` only
+/// under [`SchemaCheck::NotRequested`] (no contract, so nothing was asked for).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredResult {
+    pub value: Option<serde_json::Value>,
+    pub schema: SchemaCheck,
+}
+
+/// Both values an accepted call writes, under ONE lock, so the host can never read a
+/// `get` and a `structured` that belong to different calls.
+#[derive(Default)]
+struct OutcomeCell {
+    accepted: Option<Accepted>,
+    structured: Option<StructuredResult>,
+}
+
 /// The shared cell the host reads after a turn. Cheap to clone; all clones share
 /// one value. The tool writes it; the host reads and clears it.
 #[derive(Clone, Default)]
 pub struct FinishOutcome {
-    inner: Arc<Mutex<Option<Accepted>>>,
+    inner: Arc<Mutex<OutcomeCell>>,
 }
 
 impl FinishOutcome {
     /// The last accepted outcome, if any.
     pub fn get(&self) -> Option<Accepted> {
-        self.inner.lock().unwrap().clone()
+        self.inner.lock().unwrap().accepted.clone()
     }
 
-    /// Drop any outcome, so an earlier turn cannot end a later one.
+    /// The `result` of the last accepted `done` with its check; `None` after an
+    /// accepted `blocked`, after [`FinishOutcome::clear`], or before any call.
+    pub fn structured(&self) -> Option<StructuredResult> {
+        self.inner.lock().unwrap().structured.clone()
+    }
+
+    /// Drop both values, so an earlier turn cannot end a later one.
     pub fn clear(&self) {
-        *self.inner.lock().unwrap() = None;
+        let mut cell = self.inner.lock().unwrap();
+        cell.accepted = None;
+        cell.structured = None;
     }
 
-    fn set(&self, accepted: Accepted) {
-        *self.inner.lock().unwrap() = Some(accepted);
+    fn set(&self, accepted: Accepted, structured: Option<StructuredResult>) {
+        let mut cell = self.inner.lock().unwrap();
+        cell.accepted = Some(accepted);
+        cell.structured = structured;
     }
+}
+
+/// Keywords the contract accepts, as a rejection lists them.
+const CONTRACT_KEYWORDS: &str = "type, enum, required, properties, additionalProperties, items, minItems, minimum, description, title";
+/// The nesting a contract may reach before it is refused: a schema deeper than this
+/// is a mistake, not a brief.
+const MAX_SCHEMA_DEPTH: usize = 32;
+/// Bounds on what a mismatch sends back, so one huge value cannot flood the model.
+const MAX_ERRORS: usize = 32;
+const MAX_ERROR_CHARS: usize = 300;
+const MAX_SCHEMA_PRINT_CHARS: usize = 4096;
+
+/// Validate the contract's schema, depth-first, reporting the FIRST problem with the
+/// JSON path that names it.
+fn validate_schema(schema: &serde_json::Value) -> Result<(), String> {
+    validate_subschema(schema, "$", 1)
+}
+
+fn validate_subschema(schema: &serde_json::Value, path: &str, depth: usize) -> Result<(), String> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(format!("{path}: nesting deeper than {MAX_SCHEMA_DEPTH}"));
+    }
+    let Some(object) = schema.as_object() else {
+        return Err(format!(
+            "{path}: expected object, got {}",
+            json_type_name(schema)
+        ));
+    };
+    for (keyword, value) in object {
+        match keyword.as_str() {
+            "description" | "title" => {
+                if !value.is_string() {
+                    return Err(format!(
+                        "{path}.{keyword}: expected string, got {}",
+                        json_type_name(value)
+                    ));
+                }
+            }
+            "type" => {
+                let Some(name) = value.as_str() else {
+                    return Err(format!(
+                        "{path}.type: expected string, got {}",
+                        json_type_name(value)
+                    ));
+                };
+                if !matches!(
+                    name,
+                    "object" | "array" | "string" | "integer" | "number" | "boolean" | "null"
+                ) {
+                    return Err(format!(
+                        "{path}.type: unknown type {name:?}; expected one of object, array, string, integer, number, boolean, null"
+                    ));
+                }
+            }
+            "enum" => {
+                if !value.is_array() {
+                    return Err(format!(
+                        "{path}.enum: expected array, got {}",
+                        json_type_name(value)
+                    ));
+                }
+            }
+            "required" => {
+                let strings = value
+                    .as_array()
+                    .is_some_and(|entries| entries.iter().all(serde_json::Value::is_string));
+                if !strings {
+                    return Err(format!(
+                        "{path}.required: expected an array of strings, got {}",
+                        json_type_name(value)
+                    ));
+                }
+            }
+            "properties" => {
+                let Some(properties) = value.as_object() else {
+                    return Err(format!(
+                        "{path}.properties: expected object, got {}",
+                        json_type_name(value)
+                    ));
+                };
+                for (key, sub_schema) in properties {
+                    validate_subschema(sub_schema, &format!("{path}.properties.{key}"), depth + 1)?;
+                }
+            }
+            "additionalProperties" => {
+                if value != &serde_json::Value::Bool(false) {
+                    return Err(format!(
+                        "{path}.additionalProperties: only false is supported, got {}",
+                        compact(value)
+                    ));
+                }
+            }
+            "items" => validate_subschema(value, &format!("{path}.items"), depth + 1)?,
+            "minItems" => {
+                if value.as_u64().is_none() {
+                    return Err(format!(
+                        "{path}.minItems: expected a non-negative integer, got {}",
+                        compact(value)
+                    ));
+                }
+            }
+            "minimum" => {
+                if !value.is_number() {
+                    return Err(format!(
+                        "{path}.minimum: expected a number, got {}",
+                        json_type_name(value)
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "{path}.{other}: unknown keyword; supported: {CONTRACT_KEYWORDS}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The errors of `value` under `schema` at `path`, in the order `workflow.py` reports
+/// them; a wrong type is the whole answer for that node, as there.
+fn collect_errors(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if errors.len() >= MAX_ERRORS {
+        return;
+    }
+    if let Some(kind) = schema.get("type").and_then(serde_json::Value::as_str)
+        && !matches_type(kind, value)
+    {
+        push_error(
+            errors,
+            format!("{path}: expected {kind}, got {}", json_type_name(value)),
+        );
+        return;
+    }
+    if let Some(allowed) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !allowed.contains(value)
+    {
+        push_error(
+            errors,
+            format!(
+                "{path}: {} is not one of {}",
+                compact(value),
+                compact(schema.get("enum").unwrap())
+            ),
+        );
+    }
+    if let Some(object) = value.as_object() {
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        if let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) {
+            for key in required.iter().filter_map(serde_json::Value::as_str) {
+                if !object.contains_key(key) {
+                    push_error(errors, format!("{path}: missing required key {key:?}"));
+                }
+            }
+        }
+        for (key, item) in object {
+            match properties.and_then(|properties| properties.get(key)) {
+                Some(sub_schema) => {
+                    collect_errors(item, sub_schema, &format!("{path}.{key}"), errors);
+                }
+                None if schema.get("additionalProperties")
+                    == Some(&serde_json::Value::Bool(false)) =>
+                {
+                    push_error(errors, format!("{path}: unexpected key {key:?}"));
+                }
+                None => {}
+            }
+        }
+    }
+    if let Some(array) = value.as_array() {
+        let needed = schema
+            .get("minItems")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if (array.len() as u64) < needed {
+            push_error(errors, format!("{path}: needs at least {needed} items"));
+        }
+        if let Some(items) = schema.get("items") {
+            for (index, item) in array.iter().enumerate() {
+                collect_errors(item, items, &format!("{path}[{index}]"), errors);
+            }
+        }
+    }
+    // Only a number can be below a minimum; `true` is not a number here, as in Python.
+    if let Some(minimum) = schema.get("minimum").and_then(serde_json::Value::as_f64)
+        && let Some(number) = value.as_f64()
+        && number < minimum
+    {
+        push_error(
+            errors,
+            format!(
+                "{path}: {} is below {}",
+                compact(value),
+                compact(schema.get("minimum").unwrap())
+            ),
+        );
+    }
+}
+
+fn push_error(errors: &mut Vec<String>, message: String) {
+    if errors.len() < MAX_ERRORS {
+        errors.push(truncate(message, MAX_ERROR_CHARS));
+    }
+}
+
+/// The JSON type name of a value, for a message a model reads.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// The same test `workflow.py::schema_errors` makes for each `type`. `true` is not an
+/// integer here, as `isinstance(True, int)` is guarded against there.
+fn matches_type(kind: &str, value: &serde_json::Value) -> bool {
+    match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    }
+}
+
+/// A value as one compact JSON line, for quoting it back in an error.
+fn compact(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+}
+
+/// `text` cut to `limit` characters with a trailing `…`, so one value cannot flood the
+/// model's context.
+fn truncate(text: String, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text;
+    }
+    let mut cut: String = text.chars().take(limit - 1).collect();
+    cut.push('…');
+    cut
 }
 
 /// Model-facing name + description override, mirroring `p1-workspace::ToolFace`
@@ -96,11 +466,19 @@ impl ToolFace {
 const NAME: &str = "finish";
 const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.";
 
+/// The `ReportToParent` face (ADR-0051 item 1): the same tool and the same checks,
+/// presented to an agent that has no tool that runs commands.
+const REPORT_DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\nYou have no tool that runs commands, so no command can verify this work: call `done` with `verification: [\"none\"]`, and say in `summary` what you did and what remains unchecked. The result is reported to your parent as \"not verified; parent verification required\".\n`done`: `verification` is `[\"none\"]` — a command you cannot run proves nothing.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.";
+
 /// The three exact rule texts, model-visible.
 const ERR_MISSING_VERIFICATION: &str = "Name the commands you ran to verify the work in \"verification\". If nothing can be verified by a command, say why in \"summary\" and pass [\"none\"].";
 const ERR_NONE_CHANGED_FILES: &str =
     "This session changed files; verify the result with a command before finishing.";
 const ERR_NEEDS: &str = "Say what you need in \"needs\".";
+
+/// The one paragraph a contract appends to the policy's description, so the model
+/// knows its answer must be data and that the verdict goes to the parent.
+const STRUCTURED_RESULT_PARAGRAPH: &str = "\nThis task requires a structured result: pass it as \"result\" together with \"done\". It is checked against the schema of the \"result\" parameter; the check is reported to your parent with the outcome.";
 
 /// Error 1 additionally shows the call shape, so the model has a template.
 const CALL_SHAPE: &str =
@@ -111,34 +489,95 @@ const TRAILER_HEADING: &str =
 const TRAILER_NONE: &str =
     "No run counts right now: run your checks (without a pipe) after your last file change.";
 
-/// The `finish` tool. Holds the session view and the outcome cell.
+/// The `finish` tool. Holds the session view, the outcome cell, the completion policy
+/// and the optional output contract the host chose for this agent.
 pub struct FinishTool {
     activity: Arc<dyn SessionActivity>,
     outcome: FinishOutcome,
-    declaration: ToolDeclaration,
+    policy: CompletionPolicy,
+    contract: Option<OutputContract>,
+    name: String,
+    /// `Some` once the host pinned the description with [`FinishTool::with_face`]: the
+    /// environment's own words replace the policy's, and never gain the contract
+    /// paragraph. `None` means the description follows the policy.
+    description_override: Option<String>,
     identity: ToolIdentity,
+    declaration: ToolDeclaration,
 }
 
 impl FinishTool {
-    /// Build the tool with the default (`finish`, Claude-family) face.
+    /// Build the tool with the default (`finish`, Claude-family) face and the
+    /// default policy, [`CompletionPolicy::RecordedCommands`].
     pub fn new(activity: Arc<dyn SessionActivity>, outcome: FinishOutcome) -> Self {
+        let face = default_face();
         Self {
             activity,
             outcome,
-            declaration: declaration(default_face()),
+            policy: CompletionPolicy::RecordedCommands,
+            contract: None,
+            name: face.name.clone(),
+            description_override: None,
             identity: identity("claude"),
+            declaration: declaration(face, None),
         }
+    }
+
+    /// Apply the policy the host chose for this agent (ADR-0051 item 1). The
+    /// model-facing description follows the policy, because it is what tells the
+    /// model which completion rule applies to it; a later [`FinishTool::with_face`]
+    /// still overrides it.
+    pub fn with_policy(mut self, policy: CompletionPolicy) -> Self {
+        self.policy = policy;
+        self.refresh();
+        self
+    }
+
+    /// Require a structured `result` with `done`, checked against `contract`
+    /// (ADR-0053 item 5). The input schema gains the contract's schema as `result`,
+    /// and the description gains the one paragraph that says so.
+    pub fn with_output_contract(mut self, contract: OutputContract) -> Self {
+        self.contract = Some(contract);
+        self.refresh();
+        self
+    }
+
+    /// The contract the host set, if any.
+    pub fn output_contract(&self) -> Option<&OutputContract> {
+        self.contract.as_ref()
     }
 
     /// Present the same implementation under another name/description and
     /// variant. The input schema and the semantics do not change.
-    pub fn with_face(self, face: ToolFace, variant: &str) -> Self {
-        Self {
-            activity: self.activity,
-            outcome: self.outcome,
-            declaration: declaration(face),
-            identity: identity(variant),
+    pub fn with_face(mut self, face: ToolFace, variant: &str) -> Self {
+        self.name = face.name;
+        self.description_override = Some(face.description);
+        self.identity = identity(variant);
+        self.refresh();
+        self
+    }
+
+    /// Rebuild the declaration from the policy, the contract and the face, in ONE
+    /// place, so `with_policy`, `with_output_contract` and `with_face` work in any
+    /// order.
+    fn refresh(&mut self) {
+        self.declaration.name = self.name.clone();
+        self.declaration.description = self.description();
+        self.declaration.kind = DeclarationKind::Function {
+            input_schema: input_schema(self.contract.as_ref()),
+        };
+    }
+
+    /// The policy's own words, plus the contract paragraph when a contract is set. A
+    /// description the host pinned with `with_face` stands as it is.
+    fn description(&self) -> String {
+        if let Some(pinned) = &self.description_override {
+            return pinned.clone();
         }
+        let mut text = self.policy.description().to_string();
+        if self.contract.is_some() {
+            text.push_str(STRUCTURED_RESULT_PARAGRAPH);
+        }
+        text
     }
 }
 
@@ -146,12 +585,12 @@ fn default_face() -> ToolFace {
     ToolFace::new(NAME, DESCRIPTION)
 }
 
-fn declaration(face: ToolFace) -> ToolDeclaration {
+fn declaration(face: ToolFace, contract: Option<&OutputContract>) -> ToolDeclaration {
     ToolDeclaration {
         name: face.name,
         description: face.description,
         kind: DeclarationKind::Function {
-            input_schema: input_schema(),
+            input_schema: input_schema(contract),
         },
     }
 }
@@ -163,8 +602,8 @@ fn identity(variant: &str) -> ToolIdentity {
     }
 }
 
-fn input_schema() -> serde_json::Value {
-    serde_json::json!({
+fn input_schema(contract: Option<&OutputContract>) -> serde_json::Value {
+    let mut schema = serde_json::json!({
         "type": "object",
         "properties": {
             "status": {
@@ -193,7 +632,25 @@ fn input_schema() -> serde_json::Value {
         },
         "required": ["status", "summary"],
         "additionalProperties": false
-    })
+    });
+    if let Some(contract) = contract {
+        schema["properties"]["result"] = result_property(contract);
+    }
+    schema
+}
+
+/// The contract's own schema as the `result` parameter. Its `description`, if it has
+/// one, says when the parameter is required; `required` stays `["status","summary"]`
+/// because a `blocked` call needs no result.
+fn result_property(contract: &OutputContract) -> serde_json::Value {
+    let mut result = contract.schema().clone();
+    let own = contract
+        .schema()
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    result["description"] = serde_json::Value::String(format!("Required with \"done\": {own}"));
+    result
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -214,6 +671,10 @@ struct FinishInput {
     needs: Option<String>,
     #[serde(default)]
     tried: Option<Vec<String>>,
+    /// The structured answer a contract asks for (ADR-0053 item 5); unknown without
+    /// one, and ignored by `blocked`.
+    #[serde(default)]
+    result: Option<serde_json::Value>,
 }
 
 impl Tool for FinishTool {
@@ -264,9 +725,38 @@ fn invalid(tool: &str, reason: &str) -> String {
     format!("Invalid input for {tool}: {reason}")
 }
 
+/// Rule 6's error: the task asked for data, so the call is incomplete. It shows the
+/// schema itself, because that is what the model has to fill in.
+fn missing_result_error(schema: &serde_json::Value) -> String {
+    let pretty = serde_json::to_string_pretty(schema).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "This task requires a structured \"result\". Call finish again with \"result\" filled in to match this schema:\n{}",
+        truncate(pretty, MAX_SCHEMA_PRINT_CHARS)
+    )
+}
+
+/// The reply to a `result` that does not match: the call is accepted, the errors travel
+/// with the outcome, and one more call may correct it before the turn ends.
+fn failed_result_reply(errors: &[String]) -> String {
+    let mut text = String::from("Finished. The result does not match the schema:");
+    for error in errors {
+        text.push_str("\n- ");
+        text.push_str(error);
+    }
+    text.push_str("\nYou may call finish again with a corrected result before you stop.");
+    text
+}
+
 impl FinishTool {
     /// Apply the §2 rules. `Ok` is the accepted model-visible text and stores the
-    /// outcome; `Err` is a rule violation that stores nothing.
+    /// outcome; `Err` is a rule violation that stores nothing. The policy decides
+    /// what `["none"]` means (ADR-0051 item 1); every other rule is shared, so
+    /// invalid evidence never downgrades to an accepted unverified result.
+    ///
+    /// With an output contract (ADR-0053 item 5) the verification rules run FIRST, as
+    /// before; then `result` is required and checked, and the verdict is stored next to
+    /// the accepted outcome — a mismatch is still an ACCEPTED call, so the turn may end
+    /// and the parent reads the errors.
     fn evaluate(&self, input: FinishInput) -> Result<String, String> {
         match input.status {
             Status::Done => {
@@ -274,28 +764,94 @@ impl FinishTool {
                 if verification.is_empty() {
                     return Err(self.error_one(ERR_MISSING_VERIFICATION));
                 }
-                if verification.len() == 1 && verification[0].trim() == "none" {
-                    if self.activity.last_file_change().is_some() {
-                        return Err(self.with_trailer(ERR_NONE_CHANGED_FILES));
+                let evidence = if verification.len() == 1 && verification[0].trim() == "none" {
+                    match self.policy {
+                        // An agent with no command tool cannot verify anything itself;
+                        // it ends honestly and the parent verifies (ADR-0051 item 1).
+                        CompletionPolicy::ReportToParent => {
+                            Evidence::NotRun("no command tool granted".to_string())
+                        }
+                        CompletionPolicy::RecordedCommands => {
+                            if self.activity.last_file_change().is_some() {
+                                return Err(self.with_trailer(ERR_NONE_CHANGED_FILES));
+                            }
+                            // Not writing a file is no proof that an answer is right.
+                            Evidence::NotRun("no file changed".to_string())
+                        }
                     }
                 } else {
                     self.verify(&verification)?;
-                }
-                self.outcome.set(Accepted::Done {
-                    summary: input.summary,
-                });
-                Ok("Finished.".to_string())
+                    Evidence::CommandsPassed(
+                        verification
+                            .iter()
+                            .map(|named| normalise_command(named))
+                            .collect(),
+                    )
+                };
+                let (structured, reply) = match &self.contract {
+                    None => {
+                        if input.result.is_some() {
+                            return Err(invalid(
+                                &self.declaration.name,
+                                "no structured result was requested for this task; remove \"result\".",
+                            ));
+                        }
+                        (
+                            StructuredResult {
+                                value: None,
+                                schema: SchemaCheck::NotRequested,
+                            },
+                            "Finished.".to_string(),
+                        )
+                    }
+                    Some(contract) => match input.result {
+                        None => return Err(missing_result_error(contract.schema())),
+                        Some(value) => {
+                            let errors = contract.errors(&value);
+                            let reply = if errors.is_empty() {
+                                "Finished.".to_string()
+                            } else {
+                                failed_result_reply(&errors)
+                            };
+                            let schema = if errors.is_empty() {
+                                SchemaCheck::Passed
+                            } else {
+                                SchemaCheck::Failed(errors)
+                            };
+                            (
+                                StructuredResult {
+                                    value: Some(value),
+                                    schema,
+                                },
+                                reply,
+                            )
+                        }
+                    },
+                };
+                self.outcome.set(
+                    Accepted::Done {
+                        summary: input.summary,
+                        evidence,
+                    },
+                    Some(structured),
+                );
+                Ok(reply)
             }
             Status::Blocked => {
                 let needs = input.needs.unwrap_or_default();
                 if needs.trim().is_empty() {
                     return Err(ERR_NEEDS.to_string());
                 }
-                self.outcome.set(Accepted::Blocked {
-                    summary: input.summary,
-                    needs,
-                    tried: input.tried.unwrap_or_default(),
-                });
+                // A blocked call needs no result: a present one is ignored, and the
+                // structured cell is emptied so it cannot describe this call.
+                self.outcome.set(
+                    Accepted::Blocked {
+                        summary: input.summary,
+                        needs,
+                        tried: input.tried.unwrap_or_default(),
+                    },
+                    None,
+                );
                 Ok("Recorded as blocked.".to_string())
             }
         }

@@ -21,6 +21,18 @@ use p1_testkit::{
 };
 use tempfile::tempdir;
 
+/// The workflow tools every main agent gets after the worker tools; none when the
+/// `workflows` feature is off.
+#[cfg(feature = "workflows")]
+const WORKFLOW_TOOLS: [&str; 4] = [
+    "workflow_start",
+    "workflow_status",
+    "workflow_result",
+    "workflow_cancel",
+];
+#[cfg(not(feature = "workflows"))]
+const WORKFLOW_TOOLS: [&str; 0] = [];
+
 // ------------------------------------------------------------------ (a) text
 
 #[tokio::test]
@@ -356,22 +368,21 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         .map(|t| t.name.as_str())
         .collect();
     // The environment's own tools, then the four worker tools the host appends to
-    // every main agent (ADR-0050 item 1).
-    assert_eq!(
-        names,
-        [
-            "read",
-            "edit",
-            "write",
-            "grep",
-            "shell",
-            "finish",
-            "worker_start",
-            "worker_result",
-            "worker_continue",
-            "worker_cancel"
-        ]
-    );
+    // every main agent (ADR-0050 item 1), then the four workflow tools (ADR-0053).
+    let mut expected = vec![
+        "read",
+        "edit",
+        "write",
+        "grep",
+        "shell",
+        "finish",
+        "worker_start",
+        "worker_result",
+        "worker_continue",
+        "worker_cancel",
+    ];
+    expected.extend(WORKFLOW_TOOLS);
+    assert_eq!(names, expected);
     assert!(claude_request.system_prompt.contains("`edit`"));
     assert!(!claude_request.system_prompt.contains("apply_patch"));
 
@@ -389,18 +400,17 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
     assert_eq!(code, 0);
     let gpt_request = &gpt.requests()[0];
     let names: Vec<&str> = gpt_request.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(
-        names,
-        [
-            "shell",
-            "apply_patch",
-            "finish",
-            "worker_start",
-            "worker_result",
-            "worker_continue",
-            "worker_cancel"
-        ]
-    );
+    let mut expected = vec![
+        "shell",
+        "apply_patch",
+        "finish",
+        "worker_start",
+        "worker_result",
+        "worker_continue",
+        "worker_cancel",
+    ];
+    expected.extend(WORKFLOW_TOOLS);
+    assert_eq!(names, expected);
     assert!(gpt_request.system_prompt.contains("apply_patch"));
     assert!(!gpt_request.system_prompt.contains("`edit`"));
     assert!(!gpt_request.system_prompt.contains("`write`"));

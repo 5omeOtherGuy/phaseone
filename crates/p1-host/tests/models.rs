@@ -5,6 +5,9 @@
 //! No test reads the real `~/.config`: every harness here points `XDG_CONFIG_HOME`
 //! and `HOME` at a scratch directory, and every environment, route and profile it
 //! loads is written into a tempdir (or is the repo's shipped one, read-only).
+// `Settings` has a `workflows` field only with that feature; the struct updates below
+// fill it with the feature on and are empty with it off.
+#![cfg_attr(not(feature = "workflows"), allow(clippy::needless_update))]
 
 mod common;
 
@@ -237,6 +240,7 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "gpt/gpt-6-astra",
             "gpt/gpt-6-luna",
             "gpt/gpt-6-sol",
+            "kimi/kimi-k3",
         ],
         "sorted by environment then profile"
     );
@@ -262,6 +266,12 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         .expect("the second account serves the same profile");
     assert_eq!(deepseek.efforts_line(), "high,max");
     assert_eq!(deepseek.route, "opencode-go-2-subscription");
+    let kimi = models
+        .iter()
+        .find(|model| model.id() == "kimi/kimi-k3")
+        .expect("the shipped Kimi model");
+    assert_eq!(kimi.route, "kimi-coding-subscription");
+    assert_eq!(kimi.efforts_line(), "low,high,max");
 }
 
 #[test]
@@ -407,6 +417,7 @@ fn a_pattern_that_matches_nothing_is_an_error() {
     let settings = Settings {
         default_model: None,
         enabled_models: vec!["nope/*".to_string()],
+        ..Settings::default()
     };
     let error = models::scope(None, &settings, &models).unwrap_err();
     assert!(error.contains("settings.toml `enabled_models`"), "{error}");
@@ -418,6 +429,7 @@ fn the_flag_scope_replaces_the_settings_scope() {
     let settings = Settings {
         default_model: None,
         enabled_models: vec!["gpt/*".to_string()],
+        ..Settings::default()
     };
     assert_eq!(
         models::scope(None, &settings, &models).unwrap(),
@@ -506,6 +518,7 @@ fn default_model_is_the_model_a_bare_run_would_use() {
     let settings = Settings {
         default_model: Some("gpt/gpt-5.5".to_string()),
         enabled_models: Vec::new(),
+        ..Settings::default()
     };
     assert_eq!(
         models::default_model(&settings, &shipped(), &models).unwrap(),
@@ -1161,4 +1174,19 @@ async fn env_show_against_the_shipped_dirs_names_the_shipped_model() {
         Some("model  deepseek2/deepseek-v4.1-flash:high"),
         "{stdout}"
     );
+
+    let mut harness = Harness::new(shipped(), &[]);
+    common::isolated_environment(&mut harness);
+    let code = run_args(&mut harness, &["env", "show", "kimi"]).await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let stdout = harness.stdout.text();
+    assert!(
+        stdout
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .starts_with("credential  ")
+    );
+    assert_eq!(stdout.lines().nth(1), Some("model  kimi/kimi-k3:high"));
+    assert!(stdout.contains("\"model\": \"k3\""), "{stdout}");
 }

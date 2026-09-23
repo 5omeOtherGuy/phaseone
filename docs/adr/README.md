@@ -64,7 +64,12 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0048 | [Providers may tell the operator something: a display-only notice event](0048-providers-may-tell-the-operator-something-a-display-only-notice-event.md) | accepted | 2026-09-21 | lead |
 | ADR-0049 | [Model selection and switching a session to another model](0049-model-selection-and-switching-a-session-to-another-model.md) | accepted | 2026-09-21 | owner+lead |
 | ADR-0050 | [Every main agent can start workers; a worker gets exactly the tools its parent grants](0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md) | accepted | 2026-09-22 | owner+lead |
-| ADR-0051 | [The TUI follows the SLAB Harness design system and its implementation handoff](0051-the-tui-follows-the-slab-harness-design-system-and-its-implementation-handoff.md) | proposed | 2026-09-23 | owner+lead |
+| ADR-0051 | [A worker without a command tool may finish done; the result says it was not verified](0051-a-worker-without-a-command-tool-may-finish-done-the-result-says-it-was-not-verified.md) | accepted | 2026-09-23 | owner+lead |
+| ADR-0052 | [Usage ledger: p1-usage module and p1 usage command](0052-usage-ledger-p1-usage-module-and-p1-usage-command.md) | proposed | 2026-09-23 | lead |
+| ADR-0053 | [Workflows are an optional module: a sandboxed script orchestrates workers under roles and caps](0053-workflows-are-an-optional-module-a-sandboxed-script-orchestrates-workers-under-roles-and-caps.md) | accepted | 2026-09-23 | owner+lead |
+| ADR-0054 | [Workflow roles have a fallback chain for route failures; DeepSeek is the shipped worker](0054-workflow-roles-have-a-fallback-chain-for-route-failures-deepseek-is-the-shipped-worker.md) | proposed | 2026-09-23 | owner+lead |
+| ADR-0055 | [A successful command that changes the workspace counts as progress for the stall guard](0055-a-successful-command-that-changes-the-workspace-counts-as-progress-for-the-stall-guard.md) | proposed | 2026-09-23 | lead |
+| ADR-0056 | [The TUI follows the SLAB Harness design system and its implementation handoff](0056-the-tui-follows-the-slab-harness-design-system-and-its-implementation-handoff.md) | proposed | 2026-09-23 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

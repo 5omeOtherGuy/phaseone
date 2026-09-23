@@ -1,5 +1,5 @@
 ---
-adr: 51
+adr: 56
 title: The TUI follows the SLAB Harness design system and its implementation handoff
 status: proposed
 date: 2026-09-23
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [docs/design/tui/slab/TUI-HANDOFF.md, docs/design/tui/slab-harness/readme.md]
 ---
-# ADR-0051: The TUI follows the SLAB Harness design system and its implementation handoff
+# ADR-0056: The TUI follows the SLAB Harness design system and its implementation handoff
 
 ## Context
 

@@ -19,7 +19,7 @@ tokio = { version = "1", default-features = false, features = ["sync", "macros"]
 unicode-width = "0.2"
 
 [dev-dependencies]
-# The SLAB snapshot oracle reads docs/design/tui/slab/grids.json (ADR-0051).
+# The SLAB snapshot oracle reads docs/design/tui/slab/grids.json (ADR-0056).
 serde_json = "1"
 ratatui = { version = "0.30", features = ["unstable"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

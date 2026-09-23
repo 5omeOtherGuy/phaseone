@@ -1,6 +1,6 @@
 # p1 TUI — SLAB Harness handoff
 
-The build contract for the TUI redesign (ADR-0051). Where it and `../SPEC.md` disagree,
+The build contract for the TUI redesign (ADR-0056). Where it and `../SPEC.md` disagree,
 `TUI-HANDOFF.md` wins; every such place is listed in its §13.
 
 | File | What |
