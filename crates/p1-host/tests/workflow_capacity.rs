@@ -9,6 +9,7 @@ mod workflow_common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use common::{provider_hook_arc, run_args};
 use p1_contracts::{
@@ -79,6 +80,14 @@ impl Provider for Tail {
 
 #[tokio::test]
 async fn a_step_waits_for_a_slot_held_by_a_direct_worker() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        capacity_body().await;
+    })
+    .await
+    .expect("capacity workflow run hung");
+}
+
+async fn capacity_body() {
     // Steps run on `fake/other`, direct workers on the environment's default `main`.
     let scratch = Scratch::with_settings(&ROLES.replacen(
         "[workflows.roles.worker]\nmodel = \"fake/main\"",

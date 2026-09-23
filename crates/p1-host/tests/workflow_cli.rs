@@ -7,6 +7,7 @@ mod common;
 mod workflow_common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::{ChannelInterrupt, run_args};
 use p1_contracts::{
@@ -36,6 +37,14 @@ fn base_args(scratch: &Scratch, script: &str, out: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn a_two_step_script_runs_without_a_parent() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        two_step_body().await;
+    })
+    .await
+    .expect("two-step workflow run hung");
+}
+
+async fn two_step_body() {
     let scratch = Scratch::new();
     let script = scratch.script("two.rhai", TWO_STEPS);
     let args_file = scratch.workspace.path().join("args.json");
@@ -100,6 +109,14 @@ async fn a_two_step_script_runs_without_a_parent() {
 
 #[tokio::test]
 async fn a_role_override_reaches_the_step_and_items_come_from_the_args_file() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        role_override_body().await;
+    })
+    .await
+    .expect("role-override workflow run hung");
+}
+
+async fn role_override_body() {
     let scratch = Scratch::new();
     let script = scratch.script("two.rhai", TWO_STEPS);
     let args_file = scratch.workspace.path().join("args.json");
@@ -149,6 +166,14 @@ async fn a_role_override_reaches_the_step_and_items_come_from_the_args_file() {
 
 #[tokio::test]
 async fn a_failing_script_exits_1_and_issues_exit_2() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        failing_script_body().await;
+    })
+    .await
+    .expect("failing workflow run hung");
+}
+
+async fn failing_script_body() {
     let scratch = Scratch::new();
     let out = scratch.root.path().join("runs");
 
@@ -209,6 +234,14 @@ impl Provider for Interrupting {
 
 #[tokio::test]
 async fn ctrl_c_cancels_the_run_and_exits_130() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        ctrl_c_body().await;
+    })
+    .await
+    .expect("cancelled workflow run hung");
+}
+
+async fn ctrl_c_body() {
     let scratch = Scratch::new();
     let script = scratch.script("stuck.rhai", r#"agent("never ends")"#);
     let out = scratch.root.path().join("runs");

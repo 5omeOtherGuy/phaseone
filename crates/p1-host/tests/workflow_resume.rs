@@ -7,6 +7,8 @@
 mod common;
 mod workflow_common;
 
+use std::time::Duration;
+
 use common::run_args;
 use workflow_common::{Fakes, Scratch, done, read_json};
 
@@ -18,6 +20,14 @@ let b = agent("second from " + a.value, #{ label: "b" });
 
 #[tokio::test]
 async fn resuming_the_same_script_replays_every_step() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        resume_body().await;
+    })
+    .await
+    .expect("resume workflow run hung");
+}
+
+async fn resume_body() {
     let scratch = Scratch::new();
     let script = scratch.script("resume.rhai", SCRIPT);
     let out = scratch.root.path().join("runs");

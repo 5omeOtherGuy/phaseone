@@ -733,19 +733,27 @@ impl WorkerService for InProcessWorkers {
                 let entry = state.children.get_mut(&id.0).expect("checked above");
                 let previous = entry.status.borrow().clone();
                 let token = CancellationToken::new();
-                entry
+                *entry.turn_cancel.lock().unwrap() = token.clone();
+                // A reason left over from the previous turn must not colour this one.
+                *entry.stall.lock().unwrap() = None;
+                // Publish Running BEFORE handing the turn to the task. Once the
+                // command is sent it may complete and publish Finished immediately;
+                // publishing Running afterwards would overwrite that completion and
+                // leave `wait` parked forever.
+                entry.status.send_replace(ChildStatus::Running);
+                if entry
                     .commands
                     .send(ChildCommand::Continue {
                         message,
-                        token: token.clone(),
+                        token,
                         reconfig,
                         reply: reply_tx,
                     })
-                    .map_err(|_| WorkerError::ShutDown)?;
-                *entry.turn_cancel.lock().unwrap() = token;
-                // A reason left over from the previous turn must not colour this one.
-                *entry.stall.lock().unwrap() = None;
-                entry.status.send_replace(ChildStatus::Running);
+                    .is_err()
+                {
+                    entry.status.send_replace(previous);
+                    return Err(WorkerError::ShutDown);
+                }
                 (reply, grant, previous)
             };
             let Some(reply) = reply else {
@@ -1359,6 +1367,41 @@ mod tests {
             ["read"],
             "the tool set is unchanged"
         );
+    }
+
+    /// A caller on a script thread can hand off a fast turn while the runtime
+    /// completes it; the completion must never be overwritten by Running.
+    #[tokio::test]
+    async fn a_fast_continue_retains_its_terminal_status() {
+        let (factory, providers, _) = factory(129, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        for _ in 0..128 {
+            let workers_for_thread = workers.clone();
+            let id_for_thread = id.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(workers_for_thread.continue_child(
+                    &id_for_thread,
+                    "again".into(),
+                    Vec::new(),
+                ))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let status = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                workers.wait(&id, CancellationToken::new()),
+            )
+            .await
+            .expect("a fast turn must wake its waiter")
+            .unwrap();
+            assert!(matches!(status, ChildStatus::Finished(_)), "{status:?}");
+        }
+        assert_eq!(providers.lock().unwrap()[0].requests().len(), 129);
     }
 
     // ------------------------------- prepared start and capacity (ADR-0053 item 2)

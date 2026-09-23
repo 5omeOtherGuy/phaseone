@@ -9,6 +9,7 @@ mod workflow_common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use common::{provider_hook_arc, run_args};
 use p1_contracts::{
@@ -67,6 +68,14 @@ impl LineSource for Lines {
 
 #[tokio::test]
 async fn exiting_mid_run_cancels_the_run_and_its_worker() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        shutdown_body().await;
+    })
+    .await
+    .expect("shutdown workflow run hung");
+}
+
+async fn shutdown_body() {
     let scratch = Scratch::new();
     let parent = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call(

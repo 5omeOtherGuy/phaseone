@@ -7,6 +7,8 @@
 mod common;
 mod workflow_common;
 
+use std::time::Duration;
+
 use common::run_args;
 use workflow_common::{
     Fakes, Scratch, done, history_text, parent_that_runs, read_json, results_of, step_lines,
@@ -21,6 +23,14 @@ let b = agent("second task", #{ label: "two" });
 
 #[tokio::test]
 async fn a_parent_runs_a_two_step_workflow_and_hears_of_it_once() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        parent_run_body().await;
+    })
+    .await
+    .expect("parent workflow run hung");
+}
+
+async fn parent_run_body() {
     let scratch = Scratch::new();
     let fakes = Fakes::new(
         parent_that_runs(TWO_STEPS, ""),

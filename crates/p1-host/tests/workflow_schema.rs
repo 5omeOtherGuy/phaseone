@@ -6,6 +6,8 @@
 mod common;
 mod workflow_common;
 
+use std::time::Duration;
+
 use common::run_args;
 use workflow_common::{Fakes, Scratch, done_with, history_text, read_json};
 
@@ -39,6 +41,14 @@ async fn run(scratch: &Scratch, fakes: &Fakes) -> (i32, serde_json::Value) {
 
 #[tokio::test]
 async fn an_invalid_result_is_repaired_by_the_same_worker() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        repaired_body().await;
+    })
+    .await
+    .expect("schema repair workflow hung");
+}
+
+async fn repaired_body() {
     let scratch = Scratch::new();
     let fakes = Fakes::new(
         Vec::new(),
@@ -90,6 +100,14 @@ async fn an_invalid_result_is_repaired_by_the_same_worker() {
 
 #[tokio::test]
 async fn an_invalid_result_twice_fails_the_step_as_invalid_output() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        invalid_output_body().await;
+    })
+    .await
+    .expect("invalid-output workflow hung");
+}
+
+async fn invalid_output_body() {
     let scratch = Scratch::new();
     let fakes = Fakes::new(
         Vec::new(),

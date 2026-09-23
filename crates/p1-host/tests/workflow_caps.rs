@@ -6,11 +6,21 @@
 mod common;
 mod workflow_common;
 
+use std::time::Duration;
+
 use common::run_args;
 use workflow_common::{Fakes, ROLES, Scratch, done, read_json};
 
 #[tokio::test]
 async fn a_capped_wire_model_refuses_the_second_step_before_any_worker() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        capped_body().await;
+    })
+    .await
+    .expect("capped workflow run hung");
+}
+
+async fn capped_body() {
     let scratch =
         Scratch::with_settings(&format!("{ROLES}\n[workflows.caps]\n\"wire-main\" = 1\n"));
     let fakes = Fakes::new(Vec::new(), [done("one"), done("two")].concat(), Vec::new());
