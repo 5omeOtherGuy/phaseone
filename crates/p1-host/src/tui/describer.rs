@@ -23,7 +23,6 @@ use serde::de::DeserializeOwned;
 /// reused everywhere this module falls back to "the first output line").
 const FACT_CELLS: usize = 40;
 /// §7.3 edit: up to this many diff rows inline before folding.
-const DIFF_ROW_CAP: usize = 8;
 /// `read`'s schema default for `limit` (`p1-tool-read::DEFAULT_LIMIT`, private to
 /// that crate) — a known default, not a guess (§10's "adapter default" rule).
 const READ_DEFAULT_LIMIT: i64 = 2_000;
@@ -57,20 +56,25 @@ impl ToolDescriber for HostDescriber {
         }
     }
 
-    fn result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultFace {
+    fn result(
+        &self,
+        call: &ToolCall,
+        result: &ToolResultItem,
+        elapsed_ms: Option<u64>,
+    ) -> ResultFace {
         match call.name.as_str() {
             "read" => read_result(result),
             "write" => write_result(call, result),
             "edit" => edit_result(&self.workspace, call, result),
             "apply_patch" => patch_result(call, result),
             "grep" => grep_result(call, result),
-            "shell" => shell_result(&self.workspace, &self.sandbox, result),
+            "shell" => shell_result(&self.workspace, &self.sandbox, result, elapsed_ms),
             "finish" => finish_result(call, result),
             "worker_start" => worker_start_result(call, result),
             "worker_continue" => worker_continue_result(call, result),
             "worker_result" => worker_result_result(result),
             "worker_cancel" => worker_cancel_result(result),
-            _ => GenericDescriber.result(call, result),
+            _ => GenericDescriber.result(call, result, elapsed_ms),
         }
     }
 }
@@ -101,6 +105,7 @@ fn error_outcome(result: &ToolResultItem) -> ResultFace {
         outcome: Some(first_line_bounded(&result.content)),
         body: FaceBody::None,
         meta: None,
+        target: None,
     }
 }
 
@@ -111,6 +116,7 @@ fn no_face() -> ResultFace {
         outcome: None,
         body: FaceBody::None,
         meta: None,
+        target: None,
     }
 }
 
@@ -183,6 +189,7 @@ fn read_result(result: &ToolResultItem) -> ResultFace {
             )),
             body: FaceBody::None,
             meta: None,
+            target: None,
         },
         ToolStatus::Error => error_outcome(result),
         _ => no_face(),
@@ -223,6 +230,7 @@ fn write_result(call: &ToolCall, result: &ToolResultItem) -> ResultFace {
                 outcome: (!parts.is_empty()).then(|| parts.join(" · ")),
                 body: FaceBody::None,
                 meta: None,
+                target: None,
             }
         }
         ToolStatus::Error => error_outcome(result),
@@ -257,11 +265,15 @@ fn edit_result(workspace: &Path, call: &ToolCall, result: &ToolResultItem) -> Re
                 &args.old_string,
                 &args.new_string,
             );
-            let (rows, meta) = cap_diff_rows(rows);
             ResultFace {
                 outcome: Some(format!("+{added} −{removed}")),
+                // Full, uncapped rows (§7.3's 8-row inline cap is `render/block.rs`'s
+                // own job, reading `row.line_count`); `p1-tui`'s `Transcript::settle`
+                // is the ONE place that registers the fold `^O` opens, from the same
+                // full rows, so this describer no longer caps or names a handle.
                 body: FaceBody::Diff(rows),
-                meta,
+                meta: None,
+                target: None,
             }
         }
         ToolStatus::Error => error_outcome(result),
@@ -318,27 +330,6 @@ fn edit_diff_rows(workspace: &Path, path: &str, old: &str, new: &str) -> Vec<Dif
         });
     }
     rows
-}
-
-/// §7.3: "up to 8 diff rows ..., then band C `· N more diff rows → [h-…]`".
-/// Known defect: the handle names a fold `p1-tui`'s own registry never fills for
-/// a `Diff` body (only `settle()`'s content-based registration does, and
-/// `content` here is the tool's one-line success text) — `^O` will not open it.
-/// Needs a `p1-tui`-side seam (Transcript exposing fold registration to a
-/// describer, or `FaceBody::Diff` registering itself) — not an owned path here.
-fn cap_diff_rows(mut rows: Vec<DiffRow>) -> (Vec<DiffRow>, Option<String>) {
-    if rows.len() <= DIFF_ROW_CAP {
-        return (rows, None);
-    }
-    let hashed = rows
-        .iter()
-        .map(|row| format!("{row:?}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let extra = rows.len() - DIFF_ROW_CAP;
-    rows.truncate(DIFF_ROW_CAP);
-    let id = p1_tui::fold::FoldId::of(&hashed);
-    (rows, Some(format!("· {extra} more diff rows → [{id}]")))
 }
 
 // --------------------------------------------------------------- apply_patch
@@ -435,8 +426,6 @@ fn patch_call(call: &ToolCall) -> CallFace {
     }
 }
 
-const PATCH_ROW_CAP: usize = 8;
-
 fn patch_result(call: &ToolCall, result: &ToolResultItem) -> ResultFace {
     match result.status {
         ToolStatus::Ok => {
@@ -456,9 +445,11 @@ fn patch_result(call: &ToolCall, result: &ToolResultItem) -> ResultFace {
                 Some(removed) => format!("+{added} −{removed} · {} files", files.len()),
                 None => format!("+{added} · {} files", files.len()),
             };
+            // Full, uncapped rows: `Transcript::settle` reads `files.len()` to
+            // decide the §7.3 cap and registers the fold `^O` opens from these
+            // same rows — a pre-capped vec would hide the true count from it.
             let rows: Vec<(String, String)> = files
                 .iter()
-                .take(PATCH_ROW_CAP)
                 .map(|f| {
                     let facts = match f.removed {
                         _ if f.kind == 'D' => "D".to_string(),
@@ -468,12 +459,11 @@ fn patch_result(call: &ToolCall, result: &ToolResultItem) -> ResultFace {
                     (f.path.clone(), facts)
                 })
                 .collect();
-            let meta = (files.len() > PATCH_ROW_CAP)
-                .then(|| format!("· {} more files", files.len() - PATCH_ROW_CAP));
             ResultFace {
                 outcome: Some(outcome),
                 body: FaceBody::Files(rows),
-                meta,
+                meta: None,
+                target: None,
             }
         }
         ToolStatus::Error => error_outcome(result),
@@ -537,6 +527,7 @@ fn grep_result(call: &ToolCall, result: &ToolResultItem) -> ResultFace {
                 outcome: Some(outcome),
                 body: FaceBody::None,
                 meta: None,
+                target: None,
             }
         }
         ToolStatus::Error => error_outcome(result),
@@ -560,30 +551,39 @@ fn shell_call(call: &ToolCall) -> CallFace {
     }
 }
 
-/// §7.3: "`D · exit C · N lines`". Known defect: `D` (elapsed) is omitted —
-/// `ToolDescriber::result` receives `call`/`result` only, never `elapsed_ms`
-/// (that lives on `ToolRow`, filled by `Screen::apply`'s own call-started
-/// map); showing it needs `p1-tui` to thread elapsed into `ToolDescriber`
-/// (not an owned path here).
-fn shell_result(workspace: &Path, sandbox: &str, result: &ToolResultItem) -> ResultFace {
+/// §7.3: "`D · exit C · N lines`". `D` and `exit C` are each omitted when
+/// unknown — `D` when the call carried no stamp, `exit C` when the footer
+/// (read from the tool's own `[exit code: N]` line, `p1-tool-shell`'s
+/// `render`) is not that shape (a timeout's content has none).
+fn shell_result(
+    workspace: &Path,
+    sandbox: &str,
+    result: &ToolResultItem,
+    elapsed_ms: Option<u64>,
+) -> ResultFace {
     match result.status {
         ToolStatus::Ok => {
             let lines: Vec<&str> = result.content.lines().collect();
             let footer = lines.last().copied().unwrap_or_default();
             let body_lines = lines.len().saturating_sub(1);
-            let outcome = match footer
+            let mut parts = Vec::new();
+            if let Some(ms) = elapsed_ms {
+                parts.push(p1_tui::render::elapsed(ms));
+            }
+            if let Some(code) = footer
                 .strip_prefix("[exit code: ")
                 .and_then(|s| s.strip_suffix(']'))
             {
-                Some(code) => format!("exit {code} · {body_lines} lines"),
-                None => format!("{body_lines} lines"),
-            };
+                parts.push(format!("exit {code}"));
+            }
+            parts.push(format!("{body_lines} lines"));
             let meta =
                 (sandbox != "off").then(|| format!("cwd {} · {sandbox}", workspace.display()));
             ResultFace {
-                outcome: Some(outcome),
+                outcome: Some(parts.join(" · ")),
                 body: FaceBody::None,
                 meta,
+                target: None,
             }
         }
         ToolStatus::Error => error_outcome(result),
@@ -630,6 +630,7 @@ fn finish_result(call: &ToolCall, result: &ToolResultItem) -> ResultFace {
             outcome: Some(format!("verified · {}", args.verification.join(", "))),
             body: FaceBody::Lines(args.verification.iter().map(|c| format!("✓ {c}")).collect()),
             meta: None,
+            target: None,
         },
         ToolStatus::Ok => ResultFace {
             outcome: Some(format!(
@@ -638,6 +639,7 @@ fn finish_result(call: &ToolCall, result: &ToolResultItem) -> ResultFace {
             )),
             body: FaceBody::Lines(vec![args.summary]),
             meta: None,
+            target: None,
         },
         ToolStatus::Error => ResultFace {
             outcome: Some(format!(
@@ -646,6 +648,7 @@ fn finish_result(call: &ToolCall, result: &ToolResultItem) -> ResultFace {
             )),
             body: FaceBody::None,
             meta: None,
+            target: None,
         },
         _ => no_face(),
     }
@@ -662,12 +665,11 @@ struct StartArgs {
     tools: Vec<String>,
 }
 
-/// Known defect: §7.3's target is `w1 · env/profile`, but `w1` (the id) and
-/// the resolved `env/profile` description only exist once the service starts
-/// the worker — after this call's own `CallFace` is built and frozen
-/// (`Transcript::tool_started` calls `describer.call` once, at `ToolStarted`;
-/// `ToolRow.face` is never rebuilt from the settled result). The target is
-/// the one fact actually known at call time: the requested environment.
+/// §7.3's target is `w1 · env/profile`, but `w1` (the id) and the resolved
+/// `env/profile` description only exist once the service starts the worker
+/// — after this call's own `CallFace` is built and frozen. The call-time
+/// target is the one fact actually known then: the requested environment;
+/// `worker_start_result` below supplies the result-time override.
 fn worker_start_call(call: &ToolCall) -> CallFace {
     CallFace {
         target: parse::<StartArgs>(call)
@@ -693,11 +695,23 @@ fn worker_start_result(call: &ToolCall, result: &ToolResultItem) -> ResultFace {
                 outcome: Some(format!("started · {}", grants.join(", "))),
                 body: FaceBody::Lines(vec![task_line, format!("grants  {}", grants.join(" "))]),
                 meta: None,
+                target: worker_start_target(&result.content),
             }
         }
         ToolStatus::Error => error_outcome(result),
         _ => no_face(),
     }
+}
+
+/// `w1 · env/profile`, read from the tool's own success line ("Started worker
+/// w1 on claude/sonnet with tools: …") — the ONE place `id` and the resolved
+/// route exist together. `None` when the text does not have that shape
+/// (never guessed).
+fn worker_start_target(content: &str) -> Option<String> {
+    let rest = content.strip_prefix("Started worker ")?;
+    let (id, rest) = rest.split_once(" on ")?;
+    let (route, _) = rest.split_once(" with tools")?;
+    Some(format!("{id} · {route}"))
 }
 
 // ------------------------------------------------------------ worker_continue
@@ -742,6 +756,7 @@ fn worker_continue_result(call: &ToolCall, result: &ToolResultItem) -> ResultFac
                 outcome: Some(outcome),
                 body: FaceBody::None,
                 meta: None,
+                target: None,
             }
         }
         ToolStatus::Error => error_outcome(result),
@@ -799,6 +814,7 @@ fn worker_result_result(result: &ToolResultItem) -> ResultFace {
                 outcome: Some(outcome),
                 body,
                 meta: None,
+                target: None,
             }
         }
         ToolStatus::Error => error_outcome(result),
@@ -812,6 +828,7 @@ fn worker_cancel_result(result: &ToolResultItem) -> ResultFace {
             outcome: Some("cancelled".to_string()),
             body: FaceBody::None,
             meta: None,
+            target: None,
         },
         ToolStatus::Error => error_outcome(result),
         _ => no_face(),
