@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use p1_contracts::{
-    BoxFuture, DeclarationKind, Effect, JournalRecord, RecordBody, Tool, ToolCall, ToolContext,
-    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
+    BoxFuture, CallDescription, DeclarationKind, Effect, JournalRecord, RecordBody, Tool, ToolCall,
+    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_workers::{ChildId, ChildSpec, ChildStatus, WorkerError, WorkerReport, WorkerService};
 use serde::Deserialize;
@@ -207,6 +207,16 @@ impl Tool for WorkerStartTool {
         Effect::Delegates
     }
 
+    /// ADR-0057: the environment this call starts a worker on.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "worker",
+            target: parse_input::<StartInput>(&self.declaration.name, call)
+                .ok()
+                .map(|input| input.environment),
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
@@ -282,6 +292,9 @@ pub struct WorkerResultTool {
 
 impl WorkerResultTool {
     pub fn new(service: Arc<dyn WorkerService>) -> Self {
+        // The service points its completion notification at this tool's name
+        // (ADR-0057); the default face is `worker_result`.
+        service.set_result_tool_name(RESULT_NAME);
         Self {
             service,
             declaration: declaration(RESULT_NAME, RESULT_DESCRIPTION, result_schema()),
@@ -290,6 +303,8 @@ impl WorkerResultTool {
     }
 
     pub fn with_face(self, face: ToolFace, variant: &str) -> Self {
+        // A renamed face moves the notification's tool name too (ADR-0057).
+        self.service.set_result_tool_name(&face.name);
         Self {
             service: self.service,
             declaration: declaration(&face.name, &face.description, result_schema()),
@@ -317,6 +332,16 @@ impl Tool for WorkerResultTool {
 
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::Delegates
+    }
+
+    /// ADR-0057: the worker this call reads.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "worker",
+            target: parse_input::<ResultInput>(&self.declaration.name, call)
+                .ok()
+                .map(|input| input.id),
+        }
     }
 
     fn execute<'a>(
@@ -424,6 +449,16 @@ impl Tool for WorkerContinueTool {
         Effect::Delegates
     }
 
+    /// ADR-0057: the worker this call continues.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "worker",
+            target: parse_input::<ContinueInput>(&self.declaration.name, call)
+                .ok()
+                .map(|input| input.id),
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
@@ -516,6 +551,16 @@ impl Tool for WorkerCancelTool {
 
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::Delegates
+    }
+
+    /// ADR-0057: the worker this call cancels.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "worker",
+            target: parse_input::<CancelInput>(&self.declaration.name, call)
+                .ok()
+                .map(|input| input.id),
+        }
     }
 
     fn execute<'a>(

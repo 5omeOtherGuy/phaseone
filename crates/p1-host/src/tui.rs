@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
 use p1_contracts::{
-    AuthorizationPolicy, CancellationToken, Decision, EventSink, InboxKind, TurnEnd,
+    AuthorizationPolicy, CallDescription, CancellationToken, Decision, Effect, EventSink,
+    InboxKind, Tool, ToolCall, TurnEnd,
 };
 use p1_core::Agent;
-use p1_tui::face::{TargetKind, ToolDescriber};
 use p1_tui::input::{self, Command};
 use p1_tui::palette::ColorMode;
 use p1_tui::render::diff::DiffView;
@@ -75,6 +75,9 @@ pub struct TuiFrontEnd {
     /// moves it, the same seam `LineFrontEnd` already uses — the assembled
     /// route fills it in, `route_label()` shares it with `crate::run::ModelSwitch`.
     route_label: Arc<Mutex<String>>,
+    /// The assembled parent's tools, from `FrontEnd::parent_tools` (ADR-0057):
+    /// the driver describes a call from the tool that owns it, never by name.
+    tools: Mutex<Arc<Vec<Arc<dyn Tool>>>>,
 }
 
 impl TuiFrontEnd {
@@ -90,6 +93,7 @@ impl TuiFrontEnd {
             labels: Mutex::new(None),
             context: Mutex::new((None, None)),
             route_label: Arc::new(Mutex::new(String::new())),
+            tools: Mutex::new(Arc::new(Vec::new())),
         }
     }
 }
@@ -125,6 +129,12 @@ impl FrontEnd for TuiFrontEnd {
     fn parent_assembled(&self, route: &str, model: &str, _completion: Option<Completion>) {
         *self.labels.lock().unwrap() = Some((route.to_string(), model.to_string()));
         *self.route_label.lock().unwrap() = route.to_string();
+    }
+
+    /// ADR-0057: keep the assembled tools so the driver can describe a call from
+    /// the tool that owns it. Announced once, right after `parent_assembled`.
+    fn parent_tools(&self, tools: &[Arc<dyn Tool>]) {
+        *self.tools.lock().unwrap() = Arc::new(tools.to_vec());
     }
 
     fn context_configured(&self, window_tokens: Option<u64>, summarize_at_tokens: Option<u64>) {
@@ -250,13 +260,11 @@ impl FrontEnd for TuiFrontEnd {
                 submit_pending: None,
                 pending_calls: HashMap::new(),
                 task_files: HashSet::new(),
-                task_added: 0,
-                task_removed: 0,
                 exit: None,
                 inbox: agent.inbox(),
                 worker_rows,
                 branch,
-                describer,
+                tools: self.tools.lock().unwrap().clone(),
                 context_window: self.context.lock().unwrap().0,
                 context_warn_at: self.context.lock().unwrap().1,
                 // ADR-0049 stage 3: `deps.model_switch` is set (in `run.rs`, this
@@ -326,12 +334,11 @@ pub(crate) struct Driver {
     pinned_by_approval: bool,
     /// Follow-ups fire only when the agent would otherwise stop (SPEC §7).
     follow_ups: VecDeque<String>,
-    /// Task stats for the LEDGER's TASK section: call inputs arrive on
-    /// `ToolStarted`; the counts settle on `ToolFinished`.
+    /// Task stats for the LEDGER's WORKSPACE section: call inputs arrive on
+    /// `ToolStarted`; a successful write-shaped call is tracked from the tool
+    /// that owns it on `ToolFinished` (ADR-0057).
     pending_calls: HashMap<String, p1_contracts::ToolCall>,
     task_files: HashSet<String>,
-    task_added: u64,
-    task_removed: u64,
     exit: Option<i32>,
     /// A submitted prompt waiting for the loop to start the turn (the agent
     /// borrow lives in the loop, not in the driver).
@@ -343,11 +350,10 @@ pub(crate) struct Driver {
     /// called from the async loop, never from a `Driver` method a plain
     /// `#[test]` calls directly) at start and after every `TurnFinished`.
     branch: Arc<Mutex<Option<String>>>,
-    /// The same describer installed on `screen.transcript` (§7.1): the one
-    /// other host-side place that used to know a tool name by matching it
-    /// (`approval_view`'s diff-vs-permission choice) reuses its classification
-    /// instead of a second list.
-    describer: Arc<HostDescriber>,
+    /// The assembled parent's tools, from `FrontEnd::parent_tools` (ADR-0057):
+    /// `track_task` and `approval_view` describe a call from the tool that owns
+    /// it, so no code here matches a tool name or an argument key.
+    tools: Arc<Vec<Arc<dyn Tool>>>,
     /// §10 `ctx`'s denominator (`FrontEnd::context_configured`): the
     /// assembled `[context]` window and its summarize threshold, in tokens.
     /// Both `None` when the environment has no `[context]` section.
@@ -751,8 +757,10 @@ impl Driver {
         }
     }
 
-    /// Successful edit-shaped calls move the TASK section. Reads only the
-    /// call's own input; a denied or failed call counts nothing.
+    /// Successful write-shaped calls move the WORKSPACE section. The tool that
+    /// owns the call says what it touches (`effect` + `describe`, ADR-0057); a
+    /// denied or failed call counts nothing, and a call whose tool is no longer
+    /// assembled is not guessed at.
     fn track_task(&mut self, event: &p1_contracts::AgentEvent) {
         match event {
             p1_contracts::AgentEvent::ToolStarted { call } => {
@@ -766,27 +774,41 @@ impl Driver {
                 if result.status != p1_contracts::ToolStatus::Ok {
                     return;
                 }
-                if !matches!(call.name.as_str(), "edit" | "patch" | "write") {
-                    return;
-                }
-                let Ok(json) = serde_json::from_str::<serde_json::Value>(call.input.raw()) else {
+                let Some(target) = tracked_target(&self.tools, &call) else {
                     return;
                 };
-                let get = |key: &str| json.get(key).and_then(|v| v.as_str());
-                if let Some(path) = get("file_path") {
-                    self.task_files.insert(path.to_string());
-                }
-                self.task_removed += get("old_string").map_or(0, |s| s.lines().count() as u64);
-                self.task_added += get("new_string")
-                    .or_else(|| get("content"))
-                    .map_or(0, |s| s.lines().count() as u64);
+                self.task_files.insert(target);
                 self.screen.workspace = Some(p1_tui::render::ledger::WorkspaceView {
                     files: Some(self.task_files.len() as u64),
-                    diff: Some((self.task_added, self.task_removed)),
+                    // The line counts are the tool's own knowledge and are not part
+                    // of `describe`; the diff seam that counts every workspace change
+                    // is unbuilt (§10, §14.4), so it stays unknown, never guessed.
+                    diff: None,
                     journal: None,
                 });
             }
             _ => {}
+        }
+    }
+
+    /// The assembled tool that owns a call, by its model-facing name. `None` when
+    /// the name is not assembled (a re-grant or a model switch may have replaced
+    /// the set); such a call is never described by a guess.
+    fn tool_for(&self, call: &ToolCall) -> Option<&Arc<dyn Tool>> {
+        self.tools
+            .iter()
+            .find(|tool| tool.declaration().name == call.name)
+    }
+
+    /// The call's own description (`Tool::describe`, ADR-0057). A call whose tool
+    /// is not assembled falls back to the trait's default: the name in `target`.
+    fn describe_call(&self, call: &ToolCall) -> CallDescription {
+        match self.tool_for(call) {
+            Some(tool) => tool.describe(call),
+            None => CallDescription {
+                verb: "call",
+                target: Some(call.name.clone()),
+            },
         }
     }
 
@@ -809,9 +831,10 @@ impl Driver {
             return;
         };
         self.screen.approval_tool = request.call.name.clone();
+        let description = self.describe_call(&request.call);
         self.screen.approval = Some(approval_view(
             request,
-            &self.describer,
+            &description,
             &self.workspace,
             &self.sandbox,
         ));
@@ -1166,26 +1189,40 @@ fn draw<B: Backend>(
         .ok();
 }
 
+/// The file a successful call writes, from the tool that owns it (ADR-0057):
+/// `effect()` says the call changes files, `describe()` says which one. `None` for
+/// a call that does not write, whose tool is not assembled, or whose tool has no
+/// target — never a guess from another tool's argument keys. The LEDGER's
+/// WORKSPACE tracking is exactly this, so it is one testable function.
+pub fn tracked_target(tools: &[Arc<dyn Tool>], call: &ToolCall) -> Option<String> {
+    let tool = tools
+        .iter()
+        .find(|tool| tool.declaration().name == call.name)?;
+    if tool.effect(call) != Effect::WritesFiles {
+        return None;
+    }
+    tool.describe(call).target
+}
+
 /// Build the blocking approval view for a parked request. §7.1: the diff-vs-
-/// permission choice reuses the describer's own classification (a path
-/// target with an old/new pair to show) instead of a second tool-name list
-/// — `edit`/`write` supply both; `apply_patch`'s multi-file patch text has
-/// neither key, so it still takes the permission form (unchanged from
-/// before: a full patch-diff review is a separate, unbuilt seam, §7.5).
+/// permission choice uses the tool's own description (ADR-0057) — an `edit`/`write`
+/// call is a file edit with an old/new pair to show; a `run` call shows its command;
+/// anything else takes the permission form. `apply_patch`'s multi-file patch text
+/// has no old/new pair, so it still takes the permission form (a full patch-diff
+/// review is a separate, unbuilt seam, §7.5).
 fn approval_view(
     request: &AuthRequest,
-    describer: &HostDescriber,
+    description: &CallDescription,
     workspace: &std::path::Path,
     sandbox: &str,
 ) -> Approval {
     let raw = request.call.input.raw();
     let json: Option<serde_json::Value> = serde_json::from_str(raw).ok();
     let get = |key: &str| json.as_ref()?.get(key)?.as_str().map(str::to_string);
-    let is_path_target = describer.call(&request.call).kind == TargetKind::Path;
     let old = get("old_string");
     let new = get("new_string").or_else(|| get("content"));
-    if is_path_target && (old.is_some() || new.is_some()) {
-        let path = get("file_path").unwrap_or_default();
+    if description.verb == "edit" && (old.is_some() || new.is_some()) {
+        let path = description.target.clone().unwrap_or_default();
         let old = old.unwrap_or_default();
         let new = new.unwrap_or_default();
         let current = std::fs::read_to_string(workspace.join(&path)).ok();
@@ -1198,9 +1235,16 @@ fn approval_view(
             (1, 1),
         ));
     }
-    // Commands prompt per SPEC §4.5: cwd, sandbox, network, reason.
+    // Commands prompt per SPEC §4.5: cwd, sandbox, network, reason. The command is
+    // the tool's own description of the call; a tool that is not a `run` shows the
+    // generic input summary.
+    let command = if description.verb == "run" {
+        description.target.clone().unwrap_or_default()
+    } else {
+        p1_tui::transcript::summarize_input(raw)
+    };
     Approval::Permission(PermissionView {
-        command: get("command").unwrap_or_else(|| p1_tui::transcript::summarize_input(raw)),
+        command,
         rows: vec![
             ("cwd".into(), workspace.display().to_string()),
             ("sandbox".into(), sandbox.to_string()),

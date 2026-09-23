@@ -254,6 +254,13 @@ pub trait WorkerService: Send + Sync {
     /// extension of the spec trait: `ChildAgent::description` exists to be shown to
     /// the parent, and `start` returns only the id.
     fn describe<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<String, WorkerError>>;
+
+    /// The model-facing name of the tool that reads a result, so the completion
+    /// notification can point the parent at it (ADR-0057). The delegation tool
+    /// passes its own face's name in; a service with no delegate tool keeps the
+    /// default and names no tool. Not a worker operation: it is the ONE string this
+    /// crate would otherwise have to hard-code.
+    fn set_result_tool_name(&self, _name: &str) {}
 }
 
 /// The in-process [`WorkerService`]. One tokio task per child owns that child's
@@ -269,6 +276,9 @@ struct Shared {
     /// Set after construction: the delegate tools must exist before the parent
     /// `Agent` is built, and the parent's `Inbox` only exists after `Agent::new`.
     parent_inbox: Mutex<Option<Inbox>>,
+    /// The model-facing name of the result tool, set by the delegation tool that
+    /// owns it (ADR-0057). `None` until then: this crate names no tool.
+    result_tool_name: Mutex<Option<String>>,
     state: Mutex<State>,
     /// Cancelled by `shutdown` (and best-effort `Drop`); every child task races
     /// this against its next command.
@@ -330,6 +340,7 @@ impl InProcessWorkers {
                 factory,
                 max_concurrent,
                 parent_inbox: Mutex::new(None),
+                result_tool_name: Mutex::new(None),
                 state: Mutex::new(State {
                     children: BTreeMap::new(),
                     next_id: 0,
@@ -354,6 +365,12 @@ impl InProcessWorkers {
     /// A completion with no parent inbox set is still retained.
     pub fn set_parent_inbox(&self, inbox: Inbox) {
         *self.shared.parent_inbox.lock().unwrap() = Some(inbox);
+    }
+
+    /// The model-facing name of the result tool, as the delegation tool set it
+    /// (ADR-0057). `None` when no delegate tool is assembled.
+    pub fn result_tool_name(&self) -> Option<String> {
+        self.shared.result_tool_name.lock().unwrap().clone()
     }
 
     /// Stop one child's RUNNING turn with a terminal `Failed(message)`, instead of
@@ -812,6 +829,10 @@ impl WorkerService for InProcessWorkers {
             Ok(entry.description.clone())
         })
     }
+
+    fn set_result_tool_name(&self, name: &str) {
+        *self.shared.result_tool_name.lock().unwrap() = Some(name.to_string());
+    }
 }
 
 /// Everything one child task owns: the agent, the turn it currently runs, and the
@@ -1030,7 +1051,12 @@ fn notify_parent(shared: &Shared, id: &str, status: &ChildStatus) {
     };
     let inbox = shared.parent_inbox.lock().unwrap().clone();
     if let Some(inbox) = inbox {
-        let text = format!("Worker {id} finished ({word}). Use worker_result to read its result.");
+        // The result tool's model-facing name comes from the delegation tool that
+        // owns it (ADR-0057); with none assembled, the notification names no tool.
+        let text = match shared.result_tool_name.lock().unwrap().as_deref() {
+            Some(name) => format!("Worker {id} finished ({word}). Use {name} to read its result."),
+            None => format!("Worker {id} finished ({word})."),
+        };
         let _ = inbox.send(InboxKind::Notification, text);
     }
 }
@@ -1731,6 +1757,46 @@ mod tests {
             .unwrap();
         workers.wait(&id, CancellationToken::new()).await.unwrap();
         assert!(parent.has_pending_inbox(), "the default still notifies");
+    }
+
+    /// ADR-0057: the completion notification names the result tool the delegation
+    /// tool set (its face), not a name hard-coded here. With no delegate tool, the
+    /// notification names no tool at all.
+    #[tokio::test(start_paused = true)]
+    async fn the_result_tool_name_set_by_the_delegate_tool_reaches_the_notification() {
+        let (factory, _, _) = factory(2, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(Arc::clone(&factory), 2);
+        let mut parent = child_agent(
+            Arc::new(ScriptedProvider::new(vec![text_response("ack")])),
+            &["read".to_string()],
+        );
+        workers.set_parent_inbox(parent.inbox());
+        // Stand in for the delegate tool's face: `worker_result` renamed.
+        workers.set_result_tool_name("ResultTool");
+        assert_eq!(workers.result_tool_name().as_deref(), Some("ResultTool"));
+
+        let id = workers.start(spec()).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        parent
+            .run_inbox_turn(CancellationToken::new())
+            .await
+            .expect("the notification turn runs");
+        let text = parent
+            .history()
+            .iter()
+            .find_map(|item| match item {
+                Item::Inbox { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("the completion notification was delivered");
+        assert!(
+            text.contains("Use ResultTool to read its result."),
+            "{text:?}"
+        );
+
+        // A service with no delegate tool keeps the default and names no tool.
+        let bare = InProcessWorkers::new(Arc::clone(&factory), 1);
+        assert_eq!(bare.result_tool_name(), None);
     }
 
     /// A panic inside a turn (here: a provider asked for more than it scripted) must not

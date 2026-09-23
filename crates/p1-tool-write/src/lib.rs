@@ -5,8 +5,8 @@
 //! validation and the read-before-mutate guard for an existing target.
 
 use p1_contracts::{
-    BoxFuture, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
-    ToolInput, ToolOutcome, ToolStatus,
+    BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_workspace::{Observation, ObservedFiles, Workspace, bound_output, write_atomic};
 use serde::Deserialize;
@@ -106,6 +106,16 @@ impl Tool for WriteTool {
 
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::WritesFiles
+    }
+
+    /// ADR-0057: the file this call writes, from the tool's own parsed input.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "edit",
+            target: parse_input(&self.declaration.name, call)
+                .ok()
+                .map(|input| input.file_path),
+        }
     }
 
     fn execute<'a>(
@@ -277,6 +287,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tool, _) = tool(dir.path());
         assert_eq!(tool.effect(&call("{}")), Effect::WritesFiles);
+    }
+
+    /// ADR-0057: the description comes from this tool's own parsed input.
+    #[test]
+    fn describe_names_the_file_it_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _) = tool(dir.path());
+        let call = call(r#"{"file_path": "out.txt", "content": "hi"}"#);
+        assert_eq!(tool.describe(&call).verb, "edit");
+        assert_eq!(tool.describe(&call).target.as_deref(), Some("out.txt"));
     }
 
     #[tokio::test]

@@ -58,6 +58,17 @@ pub enum Effect {
     Delegates,
 }
 
+/// A tool's own description of one call's target, for the host and the UI
+/// (ADR-0057). `verb` is a short word the UI can show (`read`, `edit`, `run`,
+/// `search`, `finish`, `worker`, `workflow`…); `target` is the file, directory,
+/// command or worker the call is about, already trimmed for display. No argument
+/// key leaves the tool: only the tool knows what its input means.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallDescription {
+    pub verb: &'static str,
+    pub target: Option<String>,
+}
+
 pub struct ToolContext {
     pub cancel: CancellationToken,
 }
@@ -93,6 +104,18 @@ pub trait Tool: Send + Sync {
     /// Classify a call for authorization. Must not have side effects. Invalid input
     /// is classified by the tool's worst case; `execute` reports the input error.
     fn effect(&self, call: &ToolCall) -> Effect;
+
+    /// Describe what this call is about, for the host and the UI (ADR-0057). Must
+    /// not have side effects; invalid input yields a best-effort or empty target.
+    /// The default names the declaration in `target`: `verb` is the neutral `"call"`
+    /// because a `&'static str` verb cannot borrow the declaration's own `String`
+    /// name, so the name goes in `target` instead.
+    fn describe(&self, _call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "call",
+            target: Some(self.declaration().name.clone()),
+        }
+    }
 
     /// Validate the raw input and run. Invalid input is an `Error` outcome with a
     /// message the model can act on — never a panic and never a guessed repair.

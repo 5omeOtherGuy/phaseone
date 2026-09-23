@@ -92,6 +92,11 @@ what it wrote.
 - `declaration()` text below is the Claude-family variant (`variant: "claude"`). Constructors
   take a `ToolFace { name, description }` override so another family can present the same
   implementation differently (seams §4 variant rule); schema stays with the implementation.
+- `describe(call)` (ADR-0057) returns the tool's own `CallDescription { verb, target }` for one
+  call — a short UI verb (`read`, `edit`, `run`, `search`, `finish`, `worker`, `workflow`…) and
+  the file, directory, command or worker the call is about, already trimmed for display. It is
+  parsed from the tool's own input, never from another tool's argument keys; the host and the UI
+  consume it so a renamed face changes nothing. The default names the declaration in `target`.
 
 ## `read`  — `{"file_path": string, "offset"?: int>=1 (default 1), "limit"?: int>=1 (default 2000)}`
 Returns lines `offset..offset+limit` formatted `<line number right-aligned to 6>\t<text>`

@@ -8,8 +8,8 @@ use std::io::{ErrorKind, Read};
 use std::path::Path;
 
 use p1_contracts::{
-    BoxFuture, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
-    ToolInput, ToolOutcome, ToolStatus,
+    BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_workspace::{ObservedFiles, StreamingHash, Workspace};
 use serde::Deserialize;
@@ -126,6 +126,16 @@ impl Tool for ReadTool {
 
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::ReadOnly
+    }
+
+    /// ADR-0057: the file this call reads, from the tool's own parsed input.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "read",
+            target: parse_input(&self.declaration.name, call)
+                .ok()
+                .map(|input| input.file_path),
+        }
     }
 
     fn execute<'a>(
@@ -591,6 +601,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tool, _) = tool(dir.path());
         assert_eq!(tool.effect(&call("{}")), Effect::ReadOnly);
+    }
+
+    /// ADR-0057: the description comes from this tool's own parsed input.
+    #[test]
+    fn describe_names_the_file_it_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let described = tool.describe(&call(r#"{"file_path": "src/a.rs"}"#));
+        assert_eq!(described.verb, "read");
+        assert_eq!(described.target.as_deref(), Some("src/a.rs"));
+        // Invalid input has no target — never a panic, never a guess.
+        assert_eq!(tool.describe(&call("not json")).target, None);
     }
 
     #[tokio::test]

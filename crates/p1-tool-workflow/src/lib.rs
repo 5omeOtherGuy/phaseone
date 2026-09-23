@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use p1_contracts::{
-    BoxFuture, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
-    ToolInput, ToolOutcome, ToolStatus,
+    BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_workflow::{
     RunId, RunOutcome, RunProgress, RunReport, RunStatus, StartRequest, StepLine, StepStatus,
@@ -119,6 +119,25 @@ impl Tool for WorkflowStartTool {
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::Delegates
     }
+
+    /// ADR-0057: the resumed run's id, or the script's first line as its name.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "workflow",
+            target: parse_input::<StartInput>(&self.declaration.name, call)
+                .ok()
+                .and_then(|input| {
+                    input.resume_from.or_else(|| {
+                        input
+                            .script
+                            .lines()
+                            .find(|line| !line.trim().is_empty())
+                            .map(|line| line.trim().chars().take(80).collect())
+                    })
+                }),
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
@@ -193,6 +212,17 @@ impl Tool for WorkflowStatusTool {
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::Delegates
     }
+
+    /// ADR-0057: the run this call reads the status of.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "workflow",
+            target: parse_input::<IdInput>(&self.declaration.name, call)
+                .ok()
+                .map(|input| input.id),
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
@@ -263,6 +293,17 @@ impl Tool for WorkflowResultTool {
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::Delegates
     }
+
+    /// ADR-0057: the run this call reads the result of.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "workflow",
+            target: parse_input::<ResultInput>(&self.declaration.name, call)
+                .ok()
+                .map(|input| input.id),
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
@@ -328,6 +369,17 @@ impl Tool for WorkflowCancelTool {
     fn effect(&self, _call: &ToolCall) -> Effect {
         Effect::Delegates
     }
+
+    /// ADR-0057: the run this call cancels.
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        CallDescription {
+            verb: "workflow",
+            target: parse_input::<IdInput>(&self.declaration.name, call)
+                .ok()
+                .map(|input| input.id),
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
