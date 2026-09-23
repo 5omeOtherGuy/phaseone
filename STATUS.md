@@ -12,9 +12,9 @@ route × model profile composed into ONE runtime `Provider` (ADR-0039); model se
 mid-session switching are live (ADR-0049); every main agent can start workers with explicit tool
 grants (ADR-0050); resume, context control, `finish` and the TUI are mounted.
 
-**Where the lead stands.** `main` = `45411f1` + this commit; ADRs 0001–0053 (0009→0010,
-0013→0014, 0026→0050, 0033→0049 superseded). Open work: #46–#48, #53, #54, #12, #45 (owner), #6,
-#25.
+**Where the lead stands.** `main` = `96f92ca` + this commit; ADRs 0001–0056 (0009→0010,
+0013→0014, 0026→0050, 0033→0049 superseded; 0052 usage ledger and 0056 SLAB TUI are other
+sessions'). Open work: #46–#48, #54, #12, #45 (owner), #6, #25; #53 closed by ADR-0055.
 
 ## Next — READ FIRST
 
@@ -73,6 +73,11 @@ OPEN ITEMS (issue numbers)
   workflow run`; the modularity audit ported (`scripts/audits/modularity.rhai`). Built by a Fable
   5.1 orchestrator session with one worker per job (DeepSeek, Opus 5.5, gpt-6-sol, GLM); five live
   checks passed. ADR-0051 (a worker without a command tool ends `done — not verified`) preceded it.
+- **ADR-0054 / ADR-0055 (2026-09-23, owner decisions)** — workflow roles carry a fallback chain
+  for route failures only (never on a cap); DeepSeek V4.1 Flash is the shipped worker, live-verified
+  with the exhausted primary Go route hopping to deepseek2. The stall guard and the `finish` check
+  see workspace changes made through shell commands (git-status fingerprint; #53). The Python
+  `workflow.py` runner is retired.
 - **Delegation** — optional module, machine-wide bounded pool, workers not restored on parent
   resume (ADR-0027, ADR-0034); ADR-0050 supersedes ADR-0026: every main agent has the worker tools;
   a worker gets exactly its parent's grant plus `finish`; conditional prompts, worker report + host

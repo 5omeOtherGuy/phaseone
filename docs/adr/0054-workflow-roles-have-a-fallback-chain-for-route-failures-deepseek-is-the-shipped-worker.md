@@ -1,7 +1,7 @@
 ---
 adr: 54
 title: Workflow roles have a fallback chain for route failures; DeepSeek is the shipped worker
-status: proposed
+status: accepted
 date: 2026-09-23
 deciders: owner+lead
 supersedes: []
@@ -61,5 +61,17 @@ model the owner capped.
 
 ## Evidence
 
-<filled when merged: `cargo test -p p1-workflow` and `-p p1-host --test workflow_*` including
-the new fallback tests; one live run on `deepseek2` with the route forced to fail.>
+Merged as 96f92ca (task/role-fallback; DeepSeek V4.1 Flash worker, reviewed by the lead; gate
+green on the branch merged with main; run recorded in `docs/dogfood/runs.jsonl`). Tests:
+`crates/p1-workflow/tests/fallback.rs` and `crates/p1-host/tests/workflow_fallback.rs` — a
+route failure on the head hands the step to the next link; a capped link is skipped and
+counted; a whole chain failing or capped ends `failed`; a chain cannot pass a capped model past
+its cap; a step that ran and failed does not fall back; a schema repair stays on the worker that
+produced it; a repair turn that loses its route does not hop; resume replays the recorded chain
+and re-runs from the head; the shipped worker is DeepSeek with the chains above. Live,
+2026-09-23, `p1 workflow run` with a settings table whose worker head sits on the exhausted
+primary OpenCode Go route and `deepseek2` as fallback: `hop (worker →
+deepseek/deepseek-v4.1-flash route failed → deepseek2/deepseek-v4.1-flash; w2) done — not
+verified; attempts 2`, run `completed — 1 done … 1 fell back`. Two earlier attempts failed for
+reasons that were correctly NOT treated as route failures (a config dir p1's store refused, a
+leftover worker journal): `0 fell back`.
