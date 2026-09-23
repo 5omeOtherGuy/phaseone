@@ -11,7 +11,7 @@
 //! [`ScriptedTransport`] with NO scripted response wherever a fallback must NOT
 //! happen: asking for one panics, so "no fallback" is asserted, not assumed.
 
-mod fixtures;
+use p1_provider_conformance::fixtures::responses as fixtures;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};

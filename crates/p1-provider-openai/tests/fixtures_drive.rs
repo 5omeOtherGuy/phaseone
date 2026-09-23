@@ -1,7 +1,7 @@
 //! End-to-end checks: every route fixture driven through `drive` with a
 //! `ScriptedTransport`, asserting the contract-shaped events.
 
-mod fixtures;
+use p1_provider_conformance::fixtures::responses as fixtures;
 
 use std::sync::Arc;
 

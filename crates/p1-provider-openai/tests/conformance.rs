@@ -1,13 +1,13 @@
 //! The shared provider conformance suite, run against the Codex subscription route.
 //! Lead-owned acceptance test.
 
-mod fixtures;
-
 use std::sync::Arc;
 
 use p1_contracts::{BoxFuture, Item, ModelOptions, Provider, ProviderError, ProviderRequest};
 use p1_model_profile::ModelProfile;
-use p1_provider_conformance::{RouteFixtures, RouteUnderTest, run_all};
+use p1_provider_conformance::{
+    RouteFixtures, RouteUnderTest, fixtures::responses as fixtures, run_all,
+};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource};
 use p1_provider_openai::{
