@@ -54,7 +54,10 @@ them rather than trusting only the script's returned value.
 
 Use Rhai idioms: maps are `#{ key: value }`; `|| agent(...)` defers work for `parallel`; call a
 function held in a variable as `f.call(...)`; test optional entries with `has(map, key)`; there
-is no `null`; concatenate strings with `+`.
+is no `null`; concatenate strings with `+`. Thunks in `parallel` and stages in `pipeline` run on
+other threads — never call a closure held in a variable or write to a captured variable inside
+one; pass inputs as values (`Fn("name").curry(..)`) and aggregate the results after the call
+returns.
 
 For example, review and then verify the user's task:
 ```rhai
