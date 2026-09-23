@@ -397,6 +397,12 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
                 ask: options.ask,
                 workspace,
                 sandbox: format!("{:?}", options.sandbox).to_lowercase(),
+                // §10 `effort`: only an explicit `--effort` (already parsed by
+                // `cli.rs`); `None` is the adapter default, which the statusline
+                // already renders as `default`.
+                effort: options
+                    .effort
+                    .map(|effort| crate::models::effort_name(effort).to_string()),
             },
             cancel.clone(),
         ))

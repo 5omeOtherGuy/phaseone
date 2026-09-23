@@ -48,6 +48,11 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             task_removed: 0,
             exit: None,
             inbox: agent.inbox(),
+            branch: Arc::new(Mutex::new(None)),
+            describer: Arc::new(HostDescriber::new(
+                std::env::current_dir().unwrap(),
+                "off".into(),
+            )),
             _workers: None,
         },
         auth,
