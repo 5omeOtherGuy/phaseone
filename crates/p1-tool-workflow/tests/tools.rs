@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CancellationToken, DeclarationKind, Effect, Tool, ToolCall, ToolContext, ToolInput,
-    ToolOutcome, ToolStatus,
+    ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_tool_workflow::{
     ToolFace, WorkflowCancelTool, WorkflowResultTool, WorkflowStartTool, WorkflowStatusTool, all,
@@ -40,6 +41,38 @@ impl FakeService {
     fn set_status(&self, status: RunStatus) {
         *self.status.lock().unwrap() = Ok(status);
     }
+}
+
+#[tokio::test]
+async fn workflow_describes_real_result_text_and_is_not_destructive() {
+    let tool = WorkflowStartTool::new(FakeService::new(RunStatus::Running(progress())));
+    let call = ToolCall {
+        call_id: "c1".into(),
+        name: tool.declaration().name.clone(),
+        input: ToolInput::Json(r#"{"script":"agent(\"task\")"}"#.into()),
+    };
+    assert!(!tool.describe(&call).destructive);
+    let outcome = tool
+        .execute(
+            &call,
+            ToolContext {
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    let result = ToolResultItem {
+        call_id: "c1".into(),
+        name: call.name.clone(),
+        status: outcome.status,
+        content: outcome.content,
+    };
+    assert_eq!(
+        tool.describe_result(&call, &result),
+        ResultDescription {
+            summary: "1 lines".into(),
+            detail: Some(ResultDetail::Text(result.content)),
+        }
+    );
 }
 
 impl WorkflowService for FakeService {

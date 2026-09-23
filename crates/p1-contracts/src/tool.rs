@@ -93,6 +93,36 @@ pub struct CallDescription {
     pub target: Option<String>,
     #[serde(default)]
     pub edit: Option<EditPreview>,
+    #[serde(default)]
+    pub destructive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultDescription {
+    pub summary: String,
+    pub detail: Option<ResultDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResultDetail {
+    Diff {
+        path: String,
+        before: String,
+        after: String,
+    },
+    Command {
+        exit_code: Option<i32>,
+        elapsed_ms: Option<u64>,
+        tail: Vec<String>,
+    },
+    Matches {
+        count: usize,
+        files: Vec<String>,
+    },
+    Files {
+        paths: Vec<String>,
+    },
+    Text(String),
 }
 
 pub struct ToolContext {
@@ -141,6 +171,24 @@ pub trait Tool: Send + Sync {
             verb: "call",
             target: Some(self.declaration().name.clone()),
             edit: None,
+            destructive: false,
+        }
+    }
+
+    /// Describe this tool's result without requiring the host to decode private output.
+    fn describe_result(
+        &self,
+        _call: &ToolCall,
+        result: &crate::history::ToolResultItem,
+    ) -> ResultDescription {
+        ResultDescription {
+            summary: result
+                .content
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            detail: None,
         }
     }
 
@@ -152,4 +200,33 @@ pub trait Tool: Send + Sync {
         call: &'a ToolCall,
         context: ToolContext,
     ) -> BoxFuture<'a, ToolOutcome>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_call_descriptions_default_to_non_destructive() {
+        let description: CallDescription =
+            serde_json::from_str(r#"{"verb":"read","target":"src/lib.rs","edit":null}"#).unwrap();
+        assert!(!description.destructive);
+    }
+
+    #[test]
+    fn result_detail_round_trips() {
+        let result = ResultDescription {
+            summary: "+1 −1".into(),
+            detail: Some(ResultDetail::Diff {
+                path: "file.rs".into(),
+                before: "old".into(),
+                after: "new".into(),
+            }),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ResultDescription>(&json).unwrap(),
+            result
+        );
+    }
 }

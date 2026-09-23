@@ -6,6 +6,7 @@
 
 use std::io::ErrorKind;
 
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
@@ -126,6 +127,9 @@ impl Tool for EditTool {
     /// ADR-0057: the file this call edits, from the tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
         let parsed = parse_input(&self.declaration.name, call).ok();
+        let destructive = parsed
+            .as_ref()
+            .is_some_and(|input| self.workspace.resolve(&input.file_path).is_err());
         CallDescription {
             verb: "edit",
             target: parsed.as_ref().map(|input| input.file_path.clone()),
@@ -133,6 +137,33 @@ impl Tool for EditTool {
                 path: input.file_path,
                 old: input.old_string,
                 new: input.new_string,
+            }),
+            destructive,
+        }
+    }
+
+    fn describe_result(
+        &self,
+        call: &ToolCall,
+        result: &p1_contracts::ToolResultItem,
+    ) -> ResultDescription {
+        if result.status != ToolStatus::Ok {
+            return plain_result(result);
+        }
+        let Ok(input) = parse_input(&self.declaration.name, call) else {
+            return plain_result(result);
+        };
+        let replacements = parenthesized_count(&result.content, "replacement").unwrap_or(1);
+        ResultDescription {
+            summary: format!(
+                "+{} −{}",
+                input.new_string.lines().count() * replacements,
+                input.old_string.lines().count() * replacements
+            ),
+            detail: Some(ResultDetail::Diff {
+                path: input.file_path,
+                before: input.old_string,
+                after: input.new_string,
             }),
         }
     }
@@ -168,6 +199,28 @@ impl Tool for EditTool {
             }
         })
     }
+}
+
+fn plain_result(result: &p1_contracts::ToolResultItem) -> ResultDescription {
+    ResultDescription {
+        summary: result
+            .content
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        detail: None,
+    }
+}
+
+fn parenthesized_count(content: &str, unit: &str) -> Option<usize> {
+    let rest = &content[content.rfind('(')? + 1..];
+    let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
+    let count = rest[..digits_end].parse().ok()?;
+    rest[digits_end..]
+        .trim_start()
+        .starts_with(unit)
+        .then_some(count)
 }
 
 fn parse_input(tool: &str, call: &ToolCall) -> Result<EditInput, String> {
@@ -348,9 +401,10 @@ fn restore_line_endings(text: &str, ending: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::EditTool;
+    use p1_contracts::tool::ResultDetail;
     use p1_contracts::{
         DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome,
-        ToolStatus,
+        ToolResultItem, ToolStatus,
     };
     use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace};
     use std::path::Path;
@@ -447,6 +501,37 @@ mod tests {
                 new: "b".into(),
             })
         );
+        assert!(!tool.describe(&call).destructive);
+        assert!(
+            !tool
+                .describe(&super::tests::call(
+                    &serde_json::json!({
+                        "file_path": dir.path().join("inside.rs"),
+                        "old_string": "a",
+                        "new_string": "b"
+                    })
+                    .to_string()
+                ))
+                .destructive
+        );
+        assert!(
+            tool.describe(&super::tests::call(
+                r#"{"file_path": "../a.rs", "old_string": "a", "new_string": "b"}"#
+            ))
+            .destructive
+        );
+        let absolute = dir.path().parent().unwrap().join("a.rs");
+        assert!(
+            tool.describe(&super::tests::call(
+                &serde_json::json!({
+                    "file_path": absolute,
+                    "old_string": "a",
+                    "new_string": "b"
+                })
+                .to_string()
+            ))
+            .destructive
+        );
 
         let renamed = tool.with_face(ToolFace::new("EditFile", "custom"), "gpt");
         let described = renamed.describe(&call);
@@ -511,6 +596,25 @@ mod tests {
 
         assert_eq!(outcome.status, ToolStatus::Ok);
         assert_eq!(outcome.content, "Edited d.txt (1 replacement).");
+        let result = ToolResultItem {
+            call_id: "call-1".into(),
+            name: "edit".into(),
+            status: outcome.status,
+            content: outcome.content,
+        };
+        let described = tool.describe_result(
+            &call(r#"{"file_path": "d.txt", "old_string": "two", "new_string": "TWO"}"#),
+            &result,
+        );
+        assert_eq!(described.summary, "+1 −1");
+        assert_eq!(
+            described.detail,
+            Some(ResultDetail::Diff {
+                path: "d.txt".into(),
+                before: "two".into(),
+                after: "TWO".into(),
+            })
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"one\nTWO\nthree\n");
     }
 

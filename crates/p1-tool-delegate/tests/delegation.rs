@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CancellationToken, Item, ModelOptions, Provider, ProviderError, ProviderRequest,
     ProviderStream, RouteDescription, StopReason, Tool, ToolCall, ToolContext, ToolInput,
-    ToolOutcome, ToolStatus, TurnEnd,
+    ToolOutcome, ToolResultItem, ToolStatus, TurnEnd,
 };
 use p1_core::{Agent, AgentParts};
 use p1_testkit::{
@@ -31,6 +32,42 @@ use tokio::time::timeout;
 const LIMIT: Duration = Duration::from_secs(30);
 const NOTICE_W1_COMPLETED: &str =
     "Worker w1 finished (completed). Use worker_result to read its result.";
+
+#[tokio::test]
+async fn worker_describes_its_real_result_and_calls_are_not_destructive() {
+    let (factory, _) = scripted_factory("prompt", vec![], vec![], "child");
+    let service: Arc<dyn WorkerService> = InProcessWorkers::new(factory, 2);
+    let tools = all(service, grantable(), environments());
+    let start = tools[0].clone();
+    let call = json_call(
+        "c1",
+        "worker_start",
+        r#"{"environment":"child","task":"do it\nmore","tools":["read"]}"#,
+    );
+    assert!(!start.describe(&call).destructive);
+    let outcome = within(start.execute(
+        &call,
+        ToolContext {
+            cancel: CancellationToken::new(),
+        },
+    ))
+    .await;
+    let result = ToolResultItem {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        status: outcome.status,
+        content: outcome.content,
+    };
+    assert_eq!(
+        start.describe_result(&call, &result),
+        ResultDescription {
+            summary: "started · read, finish".into(),
+            detail: Some(ResultDetail::Text(
+                "target\tw1 · child\ndo it\ngrants  read finish".into()
+            )),
+        }
+    );
+}
 
 async fn within<F: std::future::Future>(future: F) -> F::Output {
     timeout(LIMIT, future).await.expect("operation timed out")

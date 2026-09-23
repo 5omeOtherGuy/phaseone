@@ -190,6 +190,7 @@ impl FrontEnd for TuiFrontEnd {
             let describer = Arc::new(HostDescriber::new(
                 self.options.workspace.clone(),
                 self.options.sandbox.clone(),
+                self.tools.lock().unwrap().clone(),
             ));
             screen.transcript = Transcript::with_describer(describer.clone());
             let (route, model) = self.labels.lock().unwrap().clone().unwrap_or_default();
@@ -849,6 +850,7 @@ impl Driver {
                 verb: "call",
                 target: Some(call.name.clone()),
                 edit: None,
+                destructive: false,
             },
         }
     }
@@ -1331,14 +1333,16 @@ fn approval_view(
         && let Some(edit) = &description.edit
     {
         let current = std::fs::read_to_string(workspace.join(&edit.path)).ok();
-        return Approval::Diff(DiffView::from_edit(
+        let mut view = DiffView::from_edit(
             &call.name,
             &edit.path,
             &edit.old,
             &edit.new,
             current.as_deref(),
             (1, 1),
-        ));
+        );
+        view.grantable = !description.destructive;
+        return Approval::Diff(view);
     }
     // Commands prompt per SPEC §4.5: cwd, sandbox, network, reason. The command is
     // the tool's own description of the call; a tool that is not a `run` shows the
@@ -1356,15 +1360,23 @@ fn approval_view(
             ("network".into(), "off".into()),
             (
                 "reason".into(),
-                match effect {
-                    p1_contracts::Effect::Executes => "runs a process".into(),
-                    p1_contracts::Effect::WritesFiles => "writes files".into(),
-                    p1_contracts::Effect::Delegates => "starts an agent".into(),
-                    p1_contracts::Effect::ReadOnly => "read".into(),
-                },
+                format!(
+                    "{}{}",
+                    match effect {
+                        p1_contracts::Effect::Executes => "runs a process",
+                        p1_contracts::Effect::WritesFiles => "writes files",
+                        p1_contracts::Effect::Delegates => "starts an agent",
+                        p1_contracts::Effect::ReadOnly => "read",
+                    },
+                    if description.destructive {
+                        " · destructive"
+                    } else {
+                        ""
+                    }
+                ),
             ),
         ],
-        grantable: true,
+        grantable: !description.destructive,
     })
 }
 

@@ -17,9 +17,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
-    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use serde::Deserialize;
 
@@ -687,6 +688,49 @@ impl Tool for FinishTool {
                 }
             }),
             edit: None,
+            destructive: false,
+        }
+    }
+
+    fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        let first = result.content.lines().next().unwrap_or_default();
+        if result.status == ToolStatus::Error {
+            return ResultDescription {
+                summary: format!("rejected · {first}"),
+                detail: None,
+            };
+        }
+        if result.status != ToolStatus::Ok {
+            return ResultDescription {
+                summary: first.into(),
+                detail: None,
+            };
+        }
+        match parse_input(&self.declaration.name, call) {
+            Ok(input) => match input.status {
+                Status::Done => {
+                    let commands = input.verification.unwrap_or_default();
+                    ResultDescription {
+                        summary: format!("verified · {}", commands.join(", ")),
+                        detail: Some(ResultDetail::Text(format!(
+                            "lines\t{}",
+                            commands
+                                .iter()
+                                .map(|cmd| format!("✓ {cmd}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        ))),
+                    }
+                }
+                Status::Blocked => ResultDescription {
+                    summary: format!("blocked · needs {}", input.needs.unwrap_or_default()),
+                    detail: Some(ResultDetail::Text(format!("lines\t{}", input.summary))),
+                },
+            },
+            Err(_) => ResultDescription {
+                summary: first.into(),
+                detail: None,
+            },
         }
     }
 
@@ -1045,6 +1089,7 @@ fn is_masked(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p1_contracts::CancellationToken;
 
     /// A session with no recorded activity, for the description test.
     struct NoActivity;
@@ -1078,6 +1123,7 @@ mod tests {
                 verb: "finish",
                 target: Some("done".into()),
                 edit: None,
+                destructive: false,
             }
         );
         assert_eq!(
@@ -1087,6 +1133,34 @@ mod tests {
             .target
             .as_deref(),
             Some("blocked")
+        );
+    }
+
+    #[tokio::test]
+    async fn describes_real_accepted_result_without_host_parsing_input() {
+        let tool = FinishTool::new(Arc::new(NoActivity), FinishOutcome::default());
+        let call = call(r#"{"status":"blocked","summary":"cannot write","needs":"edit tool"}"#);
+        assert!(!tool.describe(&call).destructive);
+        let outcome = tool
+            .execute(
+                &call,
+                ToolContext {
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await;
+        let result = ToolResultItem {
+            call_id: "c1".into(),
+            name: "finish".into(),
+            status: outcome.status,
+            content: outcome.content,
+        };
+        assert_eq!(
+            tool.describe_result(&call, &result),
+            ResultDescription {
+                summary: "blocked · needs edit tool".into(),
+                detail: Some(ResultDetail::Text("lines\tcannot write".into())),
+            }
         );
     }
 

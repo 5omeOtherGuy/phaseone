@@ -14,9 +14,10 @@
 use std::sync::Arc;
 
 pub use p1_contracts::tool::ToolFace;
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, Effect, JournalRecord, RecordBody, Tool, ToolCall,
-    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
+    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_workers::{ChildId, ChildSpec, ChildStatus, WorkerError, WorkerReport, WorkerService};
 use serde::Deserialize;
@@ -37,6 +38,13 @@ const CANCEL_DESCRIPTION: &str =
 
 /// How a successful `worker_start` result begins; [`workers_started_in`] reads it back.
 const STARTED_PREFIX: &str = "Started worker ";
+
+fn plain_result(result: &ToolResultItem) -> ResultDescription {
+    ResultDescription {
+        summary: result.content.lines().next().unwrap_or_default().to_owned(),
+        detail: None,
+    }
+}
 
 /// The ids of every worker a journalled session started, in order. Workers live in
 /// the process that started them, so after a resume these ids name nothing — the
@@ -199,7 +207,35 @@ impl Tool for WorkerStartTool {
                 .ok()
                 .map(|input| input.environment),
             edit: None,
+            destructive: false,
         }
+    }
+
+    fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        let mut description = plain_result(result);
+        if result.status == ToolStatus::Ok
+            && let Ok(input) = parse_input::<StartInput>(&self.declaration.name, call)
+        {
+            let mut grants = input.tools;
+            grants.push("finish".into());
+            description.summary = format!("started · {}", grants.join(", "));
+            let target = result
+                .content
+                .strip_prefix(STARTED_PREFIX)
+                .and_then(|rest| rest.split_once(" on "))
+                .and_then(|(id, rest)| {
+                    rest.split_once(" with tools")
+                        .map(|(route, _)| format!("{id} · {route}"))
+                });
+            let mut lines = Vec::new();
+            if let Some(target) = target {
+                lines.push(format!("target\t{target}"));
+            }
+            lines.push(input.task.lines().next().unwrap_or_default().to_string());
+            lines.push(format!("grants  {}", grants.join(" ")));
+            description.detail = Some(ResultDetail::Text(lines.join("\n")));
+        }
+        description
     }
 
     fn execute<'a>(
@@ -327,7 +363,38 @@ impl Tool for WorkerResultTool {
                 .ok()
                 .map(|input| input.id),
             edit: None,
+            destructive: false,
         }
+    }
+
+    fn describe_result(&self, _call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        let mut description = plain_result(result);
+        if result.status == ToolStatus::Ok {
+            let lines = result.content.lines().count();
+            let status = if result.content.contains(": running") {
+                Some("running")
+            } else if result.content.contains(": cancelled") {
+                Some("cancelled")
+            } else if result.content.contains(": failed") {
+                Some("failed")
+            } else {
+                result.content.lines().find_map(|line| {
+                    line.strip_prefix("finish: ")
+                        .map(|rest| rest.split([' ', '—']).next().unwrap_or(rest))
+                })
+            };
+            description.summary = status.map_or_else(
+                || format!("{lines} lines"),
+                |word| format!("{word} · {lines} lines"),
+            );
+            description.detail = result.content.split_once("\n---\n").map(|(report, _)| {
+                ResultDetail::Text(format!(
+                    "lines\t{}",
+                    report.lines().take(8).collect::<Vec<_>>().join("\n")
+                ))
+            });
+        }
+        description
     }
 
     fn execute<'a>(
@@ -441,9 +508,31 @@ impl Tool for WorkerContinueTool {
             verb: "worker",
             target: parse_input::<ContinueInput>(&self.declaration.name, call)
                 .ok()
-                .map(|input| input.id),
+                .map(|input| {
+                    if input.add_tools.is_empty() {
+                        input.id
+                    } else {
+                        format!("{} +{}", input.id, input.add_tools.join(" +"))
+                    }
+                }),
             edit: None,
+            destructive: false,
         }
+    }
+
+    fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        let mut description = plain_result(result);
+        if result.status == ToolStatus::Ok {
+            let grants = parse_input::<ContinueInput>(&self.declaration.name, call)
+                .map(|input| input.add_tools)
+                .unwrap_or_default();
+            description.summary = if grants.is_empty() {
+                "resumed".into()
+            } else {
+                format!("resumed · +{}", grants.join(" +"))
+            };
+        }
+        description
     }
 
     fn execute<'a>(
@@ -548,7 +637,16 @@ impl Tool for WorkerCancelTool {
                 .ok()
                 .map(|input| input.id),
             edit: None,
+            destructive: false,
         }
+    }
+
+    fn describe_result(&self, _call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        let mut description = plain_result(result);
+        if result.status == ToolStatus::Ok {
+            description.summary = "cancelled".into();
+        }
+        description
     }
 
     fn execute<'a>(

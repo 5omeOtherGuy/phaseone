@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
+use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
-    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_workflow::{
     RunId, RunOutcome, RunProgress, RunReport, RunStatus, StartRequest, StepLine, StepStatus,
@@ -14,6 +15,13 @@ use p1_workflow::{
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+
+fn text_result(result: &ToolResultItem) -> ResultDescription {
+    ResultDescription {
+        summary: format!("{} lines", result.content.lines().count()),
+        detail: Some(ResultDetail::Text(result.content.clone())),
+    }
+}
 
 /// Model-facing name and description override without a dependency on the host.
 #[derive(Debug, Clone)]
@@ -136,7 +144,12 @@ impl Tool for WorkflowStartTool {
                     })
                 }),
             edit: None,
+            destructive: false,
         }
+    }
+
+    fn describe_result(&self, _call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        text_result(result)
     }
 
     fn execute<'a>(
@@ -222,7 +235,12 @@ impl Tool for WorkflowStatusTool {
                 .ok()
                 .map(|input| input.id),
             edit: None,
+            destructive: false,
         }
+    }
+
+    fn describe_result(&self, _call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        text_result(result)
     }
 
     fn execute<'a>(
@@ -304,7 +322,12 @@ impl Tool for WorkflowResultTool {
                 .ok()
                 .map(|input| input.id),
             edit: None,
+            destructive: false,
         }
+    }
+
+    fn describe_result(&self, _call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        text_result(result)
     }
 
     fn execute<'a>(
@@ -381,7 +404,12 @@ impl Tool for WorkflowCancelTool {
                 .ok()
                 .map(|input| input.id),
             edit: None,
+            destructive: false,
         }
+    }
+
+    fn describe_result(&self, _call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        text_result(result)
     }
 
     fn execute<'a>(
