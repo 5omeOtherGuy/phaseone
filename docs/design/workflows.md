@@ -115,7 +115,11 @@ let verdicts = pipeline(findings, |f| agent(
 naming it) has four keys: `roles` (a map of name → `RoleSpec`), `caps` (a map of WIRE
 model → attempts per run; absent = unlimited), `max_steps` (`agent()` calls one run may
 make, replayed calls included; default 200) and `max_threads` (thunk threads at once;
-default 64). The shipped defaults, as TOML:
+default 64). A `RoleSpec` is `model` (`environment/profile[:effort]`, ADR-0049),
+`fallback` (an ordered list of the same references, the chain §3 "Fallback" walks,
+ADR-0054) and `tools` (tool MODULE names granted in addition to `finish`, which every
+worker always gets; the call's own `tools` replaces them for one step). The shipped
+defaults, as TOML:
 
 ```toml
 [workflows]
@@ -126,8 +130,9 @@ max_threads = 64
 "claude-fable-5" = 3
 
 [workflows.roles.worker]
-model = "claude/claude-opus-5-5"
-tools = ["read", "grep", "edit", "write", "shell"]
+model = "deepseek2/deepseek-v4.1-flash"
+fallback = ["gpt/gpt-6-sol", "claude/claude-opus-5-5"]
+tools = ["read", "grep", "edit", "shell"]
 
 [workflows.roles.reviewer]
 model = "claude/claude-opus-5-5:high"
@@ -135,6 +140,7 @@ tools = ["read", "grep", "shell"]
 
 [workflows.roles.verifier]
 model = "deepseek2/deepseek-v4.1-flash"
+fallback = ["gpt/gpt-6-sol"]
 tools = ["read", "grep", "shell"]
 
 [workflows.roles.judge]
@@ -143,29 +149,54 @@ tools = ["read", "grep"]
 ```
 
 A user table is laid OVER the shipped defaults (`WorkflowSettings::overridden_by`): a
-role or a cap the user names replaces the shipped one of that name, the others stay;
+role or a cap the user names replaces the shipped one of that name — WHOLESALE, so a role
+whose table names a `model` and no `fallback` has an EMPTY chain — the others stay;
 `max_steps` and `max_threads` come from the user table (200/64 when it omits them — the
-same values). A role's `model` is a reference `environment/profile[:effort]` (ADR-0049);
-its `tools` are tool MODULE names granted in addition to `finish`, which every worker
-always gets. `StartRequest::role_models` maps a role name to another model reference for
-one run — the role KEEPS its tool grant; `workflow_start` does not expose it, it is the
-caller's (host) field, and a name not in the table is a preflight error
-(`role_models names unknown role …`).
+same values). `StartRequest::role_models` maps a role name to another model reference for
+one run — the role KEEPS its tool grant and its chain, the override replaces the head
+only; `workflow_start` does not expose it, it is the caller's (host) field, and a name not
+in the table is a preflight error (`role_models names unknown role …`).
 
-At preflight, BEFORE any worker starts, EVERY role of the effective table is resolved
-through `ModelResolver` — used by the script or not, a broken table fails the start. The
-resolver returns the `ResolvedModel` (`reference`, `environment`, `profile`, `effort`,
-`wire_model`); caps count the WIRE model, so two roles or two profiles of one model
-share one counter and no renaming in settings can multiply a scarce model's budget.
+At preflight, BEFORE any worker starts, EVERY reference of EVERY role's chain — the head
+and each fallback, used by the script or not — is resolved through `ModelResolver`: a
+broken table fails the start. The resolver returns the `ResolvedModel` (`reference`,
+`environment`, `profile`, `effort`, `wire_model`); caps count the WIRE model, so two roles
+or two profiles of one model share one counter and no renaming in settings can multiply a
+scarce model's budget.
 
 **What a cap counts.** Attempts = starts + repairs, per run, per wire model, checked and
 spent under one lock (two concurrent thunks can never both take the last attempt). The
-(cap+1)th attempt writes a `Capped` journal line and returns a `failed` envelope with
-`error: quota_exceeded: <wire_model> used=<u> limit=<l>` and `attempts: 0` — no worker
-was built; a refused repair keeps the invalid `value` and `attempts: 1`, its error ends
-with ` (repair)`. There is no substitute model. `max_steps` is checked even earlier: the
-(max_steps+1)th `agent()` call returns `failed` with `error: max_steps: <n> reached`, no
-dispatch, but a `Result` journal line.
+(cap+1)th attempt writes a `Capped` journal line and is refused: an envelope's `error` is
+`quota_exceeded: <wire_model> used=<u> limit=<l>` and `attempts: 0` for a refused start —
+no worker was built; a refused repair keeps the invalid `value` and the attempts already
+spent, its error ends with ` (repair)`. A cap is NOT a route failure: a link a cap refuses
+is skipped — the next link of a chain may run (§3 "Fallback"), and a role with no fallback
+fails as it always did — and that skip costs one `Capped` line and one count, never an
+attempt. `max_steps` is checked even earlier: the (max_steps+1)th `agent()` call returns
+`failed` with `error: max_steps: <n> reached`, no dispatch, but a `Result` journal line.
+
+### Fallback (ADR-0054)
+
+A role's `fallback` list is walked by ONE step when the model before it failed on its
+ROUTE — the host's `StepRunner` reports `StepEnd::RouteFailed` when the worker could not
+run at all or its turn ended on a provider failure (an exhausted account, ADR-0046's
+kind; an unreachable route; a route refusing the model — a `TurnEnd::ProviderFailed`
+after the host's own retries). Nothing else moves the step on: a `failed` step that ran (a
+wrong answer), a `blocked` one, a cap (`quota_exceeded` stays final for that link), a
+schema failure and a cancellation do not; the one schema repair stays in the worker that
+produced the invalid result, so a repair turn that loses its route ends the step instead
+of hopping.
+
+Every model the chain turns to is a `Dispatch` of its own — one worker, charged to that
+model's cap — and each hop is a `Fallback` journal line (`{call, from, to, error}`)
+written BEFORE the next model is dispatched. A capped link is skipped as `capped`; if no
+link ends the step, the step ends `failed`: `route: <last error>` when a link's route
+failed, else the last cap refusal (`quota_exceeded: …`). The step line and the envelope
+name the chain walked — `worker → deepseek2/deepseek-v4.1-flash route failed →
+gpt/gpt-6-sol; w7` — the envelope's `models` carries every link with `moved_on`
+(`route_failed` / `capped`, absent on the one the step ended on), and the run counts
+`fell back`. Each link is one more attempt. A replayed step keeps the chain it recorded; a
+re-run step starts from the head again.
 
 ## 4. The step envelope
 
@@ -183,6 +214,7 @@ dispatch, but a `Result` journal line.
 | `worker` | `<id> (<route/model>)` of the worker that ran it, or `()`. |
 | `needs` | A blocked step's need, or `()`. |
 | `error` | A typed failure, or `()`. |
+| `models` | The chain the step walked (§3 "Fallback"), head first: `[{model, moved_on}]`, `moved_on` `route_failed`/`capped` where the step moved on. `[]` only when the step was refused before it reached a model (an unknown role, `max_steps`). |
 
 The `schema` states mirror the `finish` tool's own check (§5).
 
@@ -200,6 +232,7 @@ and every step refused before dispatch: `()`.
 | `invalid_output: <e1>; <e2>` | The result failed the contract twice, after the one repair (§5). |
 | `max_steps: <n> reached` | The run's `agent()` budget is spent. |
 | `unknown_role: <name>` | The role is not in the effective table. |
+| `route: <error>` | No model of the role's chain could run the step — the last link's route failure. |
 | `ended without finish` | The worker's turn completed with no accepted `finish` call. |
 | anything else | The host's `StepRunner` reason (its `Err` string, e.g. an unknown environment), or `journal: …` when the `Dispatch` line could not be written. |
 
@@ -239,8 +272,9 @@ silently skipping a `Dispatch` would under-charge the caps.
 |---|---|---|
 | `started` | run, script_hash, args, resumed_from | The first line. |
 | `phase` | name | Every `phase()`. |
-| `dispatch` | call, label, role, model, wire_model, attempt, prompt, opts | **Before the worker starts.** |
+| `dispatch` | call, label, role, model, wire_model, attempt, prompt, opts | **Before the worker starts** — one per model a chain turns to. |
 | `capped` | call, wire_model, used, limit | A dispatch refused by a cap, before anything ran. |
+| `fallback` | call, from, to, error | One hop of a role's chain, BEFORE the next model is dispatched. |
 | `replayed` | call, from | A call answered from the old journal without a worker. |
 | `result` | call, envelope | After each step. |
 | `ended` | outcome, counts, error | The last line. |
@@ -308,19 +342,21 @@ the script's returned value.
 ended answer):
 
 ```
-Workflow wf1: completed with issues — 2 steps (1 replayed): 1 done, 0 blocked, 1 failed, 0 cancelled; 1 not verified; 1 capped; 0 invalid output
+Workflow wf1: completed with issues — 2 steps (1 replayed): 1 done, 0 blocked, 1 failed, 0 cancelled; 1 not verified; 1 capped; 0 invalid output; 1 fell back
   review reviewer → route/model [w3 (route/model)] done — schema passed; not verified; parent verification required; replayed; attempts 2
   c2 judge → other/model failed — schema not requested; quota_exceeded: cap 3
+  c3 worker → deepseek2/deepseek-v4.1-flash route failed → gpt/gpt-6-sol [w7 (gpt/gpt-6-sol)] done — not verified; parent verification required
 ```
 
-A step line is `  ` + label (or call id) + ` ` + role + ` → ` + model + ` [<worker>]` +
+A step line is `  ` + label (or call id) + ` ` + role + ` → ` + the model chain + ` [<worker>]` +
 ` ` + status + ` — schema <schema>` +, only when present and in this order, `; <evidence>`,
-`; replayed`, `; attempts N`, `; <error>`. "Verified" is never printed; the evidence is
-copied as is. The counts make a script unable to hide failed, blocked, not-verified or
-capped workers: `Completed` only when none of them is non-zero, `CompletedWithIssues`
-when the script returned but some are, `Failed` when the script itself did not return
-(parse is refused before a run exists; runtime error, limit, panic, non-JSON return),
-`Cancelled`.
+`; replayed`, `; attempts N`, `; <error>`. The chain is the role's model, then every link
+the step moved on from as `<model> route failed` or `<model> capped` before ` → `
+(ADR-0054). "Verified" is never printed; the evidence is copied as is. The counts make a
+script unable to hide failed, blocked, not-verified, capped or fell-back workers:
+`Completed` only when none of them is non-zero, `CompletedWithIssues` when the script
+returned but some are, `Failed` when the script itself did not return (parse is refused
+before a run exists; runtime error, limit, panic, non-JSON return), `Cancelled`.
 
 **The ONE notification.** The engine reports through `WorkflowObserver` (every method a
 no-op by default): `run_started`, `phase`, `log`, `step_started`, `step_ended`,
@@ -344,9 +380,10 @@ threads, and afterwards every fallible call returns `ShutDown`.
 `HostModelResolver` resolves `environment/profile[:effort]` through `p1 models` and takes the wire
 model from the environment's route; `HostStepRunner` waits for capacity, starts each step through
 `start_prepared` with the role's or the call's grant (never a worker or workflow tool), gives the
-worker's `finish` the contract, and reads the structured result from the worker's own outcome
-cell; a repair is `continue_child` on the same worker. One `ChildBuilder::build_child` serves
-direct workers and steps. `HostWorkflowObserver` prints one stderr line per step
+worker's `finish` the contract, reads the structured result from the worker's own outcome cell, and
+reports the worker's last turn end (`TurnEnd::ProviderFailed` → `StepEnd::RouteFailed`, ADR-0054) so
+a chain can hop; a repair is `continue_child` on the same worker. One `ChildBuilder::build_child`
+serves direct workers and steps. `HostWorkflowObserver` prints one stderr line per step
 (`· workflow wf1 review:bugs (reviewer → claude/claude-opus-5-5:high; w3) done — schema passed; not
 verified; parent verification required`), one per phase/log, one run line, and sends the parent ONE
 inbox notification (`Workflow wf1 ended (completed). Use workflow_result to read its result.`);
@@ -394,9 +431,18 @@ proves the replay rules: an unchanged run replays everything, an edited middle c
 re-runs it and everything after, caps are rebuilt from every old dispatch, failed steps
 are not replayed, parallel calls match by content. `sandbox.rs` proves every escape
 vector fails and every engine limit holds; `prompt_example.rs` runs the prompts'
-example on the shipped settings. `crates/p1-tool-workflow/tests/tools.rs` proves the
-four declarations and faces, every Ok and error text, the wait semantics and the two
+example on the shipped settings; `fallback.rs` proves the chains (ADR-0054): a route
+failure on the head hands the step to the next link with
+`dispatch/fallback/dispatch` journalled and `fell_back` counted, a capped link is skipped
+and counted (a chain can never pass a capped model past its cap), a whole chain failing
+ends `failed — route: …`, a step that ran and failed does not fall back, a schema repair
+stays in its worker, and resume replays the recorded chain while a re-run starts at the
+head. `crates/p1-tool-workflow/tests/tools.rs` proves
+the four declarations and faces, every Ok and error text, the wait semantics and the two
 rendering bounds; `crates/p1-tool-finish/tests/result.rs` proves the `OutputContract`
 subset and its path-worded errors; `p1-workers`' in-crate tests prove the prepared
-start; `api.rs`'s unit tests pin the shipped defaults, the override rule and the
-journal round-trip.
+start; `api.rs`'s unit tests pin the shipped defaults (DeepSeek worker with its chain),
+the override rule and the journal round-trip. The host's own suites prove the seams:
+`crates/p1-host/tests/workflow_fallback.rs` runs `p1 workflow run` over scripted providers
+and shows a provider failure becoming a hop (and a `finish`-less turn staying a plain
+failure), `workflow_settings.rs` the table over the shipped defaults.

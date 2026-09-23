@@ -22,7 +22,7 @@ use p1_workflow::{
 
 use crate::HostDeps;
 use crate::frontend::FrontEnd;
-use crate::run::ChildBuilder;
+use crate::run::{ChildBuilder, TurnEndCell};
 
 /// The evidence of a `done` whose outcome established none (ADR-0051 item 3).
 const NOT_VERIFIED: &str = "not verified; parent verification required";
@@ -74,12 +74,22 @@ impl ModelResolver for HostModelResolver {
 pub struct HostStepRunner {
     builder: Arc<ChildBuilder>,
     service: Arc<InProcessWorkers>,
-    /// Each step worker's `finish` outcome cell: the structured result is read from it
-    /// after the start AND after a repair, which is another turn of the same worker.
-    outcomes: Mutex<HashMap<String, FinishOutcome>>,
+    /// What the runner keeps about one step worker: the `finish` outcome cell the
+    /// structured result is read from after the start AND after a repair (another turn
+    /// of the same worker), the model the step ran on — the chain's fallback needs it —
+    /// and the worker's last turn end (ADR-0054 item 3).
+    workers: Mutex<HashMap<String, StepWorker>>,
     /// What a blocked step asked for, by worker id: the step line carries no `needs`,
     /// and the observer words the line.
     needs: Arc<Mutex<HashMap<String, String>>>,
+}
+
+/// One step worker, as its runner keeps it.
+struct StepWorker {
+    outcome: FinishOutcome,
+    /// The `environment/profile[:effort]` reference this worker ran on.
+    model: String,
+    turn_end: TurnEndCell,
 }
 
 impl HostStepRunner {
@@ -117,7 +127,30 @@ impl HostStepRunner {
         Ok(end)
     }
 
+    /// One worker's kept state, read under one lock: the `finish` outcome cell, the model
+    /// it ran on and whether its last turn ended on a provider failure — the ROUTE's
+    /// failure, and the one end that walks a fallback chain (ADR-0054 item 3).
+    fn worker_state(
+        &self,
+        id: &ChildId,
+    ) -> (Option<p1_tool_finish::StructuredResult>, String, bool) {
+        let workers = self.workers.lock().unwrap();
+        let Some(worker) = workers.get(&id.0) else {
+            return (None, String::new(), false);
+        };
+        let route_failed = matches!(
+            worker.turn_end.lock().unwrap().as_ref(),
+            Some(p1_contracts::TurnEnd::ProviderFailed { .. })
+        );
+        (
+            worker.outcome.structured(),
+            worker.model.clone(),
+            route_failed,
+        )
+    }
+
     fn step_end(&self, id: &ChildId, status: ChildStatus) -> StepEnd {
+        let (structured, model, route_failed) = self.worker_state(id);
         match status {
             ChildStatus::Finished(result) => match &result.report.finish {
                 Some(finish) if finish.status == "blocked" => {
@@ -131,34 +164,35 @@ impl HostStepRunner {
                         needs,
                     }
                 }
-                Some(finish) => {
-                    let structured = self
-                        .outcomes
-                        .lock()
-                        .unwrap()
-                        .get(&id.0)
-                        .and_then(|outcome| outcome.structured());
-                    StepEnd::Done {
-                        summary: finish.summary.clone().unwrap_or_default(),
-                        evidence: finish
-                            .evidence
-                            .clone()
-                            .unwrap_or_else(|| NOT_VERIFIED.to_string()),
-                        result: structured.as_ref().and_then(|s| s.value.clone()),
-                        schema: match structured.map(|s| s.schema) {
-                            None | Some(p1_tool_finish::SchemaCheck::NotRequested) => {
-                                SchemaCheck::NotRequested
-                            }
-                            Some(p1_tool_finish::SchemaCheck::Passed) => SchemaCheck::Passed,
-                            Some(p1_tool_finish::SchemaCheck::Failed(errors)) => {
-                                SchemaCheck::Failed(errors)
-                            }
-                        },
-                    }
-                }
+                Some(finish) => StepEnd::Done {
+                    summary: finish.summary.clone().unwrap_or_default(),
+                    evidence: finish
+                        .evidence
+                        .clone()
+                        .unwrap_or_else(|| NOT_VERIFIED.to_string()),
+                    result: structured.as_ref().and_then(|s| s.value.clone()),
+                    schema: match structured.map(|s| s.schema) {
+                        None | Some(p1_tool_finish::SchemaCheck::NotRequested) => {
+                            SchemaCheck::NotRequested
+                        }
+                        Some(p1_tool_finish::SchemaCheck::Passed) => SchemaCheck::Passed,
+                        Some(p1_tool_finish::SchemaCheck::Failed(errors)) => {
+                            SchemaCheck::Failed(errors)
+                        }
+                    },
+                },
                 None => StepEnd::EndedWithoutFinish {
                     text: result.final_text,
                 },
+            },
+            // A turn that ended on a provider failure is the ROUTE's failure, whatever
+            // kind (ADR-0046's exhausted account included): the only failure a
+            // fallback chain is for (ADR-0054 item 3). The stall guard's sentence, a
+            // panic in the child's own task or a change of the worker's own grant are
+            // NOT — they stay an ordinary `Failed`.
+            ChildStatus::Failed(message) if route_failed => StepEnd::RouteFailed {
+                model,
+                error: message,
             },
             ChildStatus::Failed(message) => StepEnd::Failed(message),
             ChildStatus::Cancelled | ChildStatus::Running => StepEnd::Cancelled,
@@ -225,6 +259,9 @@ impl StepRunner for HostStepRunner {
                     Err(error) => return Err(error.to_string()),
                 }
                 let mut built: Option<FinishOutcome> = None;
+                // The worker's last turn end, read after the turn: a route failure is
+                // the one failure a fallback chain is for (ADR-0054 item 3).
+                let turn_end: TurnEndCell = Arc::new(Mutex::new(None));
                 let started = self
                     .service
                     .start_prepared(
@@ -243,6 +280,7 @@ impl StepRunner for HostStepRunner {
                                 &id.0,
                                 contract.clone(),
                                 true,
+                                Some(turn_end.clone()),
                             )?;
                             built = Some(outcome);
                             Ok(child)
@@ -252,7 +290,14 @@ impl StepRunner for HostStepRunner {
                 match started {
                     Ok(id) => {
                         if let Some(outcome) = built {
-                            self.outcomes.lock().unwrap().insert(id.0.clone(), outcome);
+                            self.workers.lock().unwrap().insert(
+                                id.0.clone(),
+                                StepWorker {
+                                    outcome,
+                                    model: request.model.reference.clone(),
+                                    turn_end,
+                                },
+                            );
                         }
                         break id;
                     }
@@ -432,7 +477,7 @@ pub(crate) fn compose(
     let runner = Arc::new(HostStepRunner {
         builder,
         service: workers,
-        outcomes: Mutex::new(HashMap::new()),
+        workers: Mutex::new(HashMap::new()),
         needs,
     });
     let service = InProcessWorkflows::new(runner, resolver, observer.clone(), settings, run_root);

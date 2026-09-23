@@ -108,8 +108,9 @@ impl InProcessWorkflows {
             .ok_or(WorkflowError::UnknownRun)
     }
 
-    /// The settings roles with `role_models` applied, each resolved. Every role is
-    /// resolved, used by the script or not: a broken table fails before anything runs.
+    /// The settings roles with `role_models` applied, each resolved — the whole fallback
+    /// chain of each role, head first (ADR-0054 item 2). Every role is resolved, used by
+    /// the script or not: a broken table fails before anything runs.
     fn resolve_roles(
         &self,
         role_models: &BTreeMap<String, String>,
@@ -120,6 +121,8 @@ impl InProcessWorkflows {
             let spec = specs
                 .get_mut(role)
                 .ok_or_else(|| preflight(format!("role_models names unknown role \"{role}\"")))?;
+            // A `--role r=E/P` override changes the head only: the role keeps its tool
+            // grant and its fallback chain.
             spec.model = model.clone();
         }
         let mut roles = BTreeMap::new();
@@ -134,13 +137,18 @@ impl InProcessWorkflows {
                     "role \"{name}\" grants \"{tool}\", which a step may not have"
                 )));
             }
-            let model = self.resolver.resolve(&spec.model).map_err(|reason| {
-                preflight(format!("role \"{name}\" ({}): {reason}", spec.model))
-            })?;
+            let chain = std::iter::once(&spec.model)
+                .chain(spec.fallback.iter())
+                .map(|reference| {
+                    self.resolver.resolve(reference).map_err(|reason| {
+                        preflight(format!("role \"{name}\" ({reference}): {reason}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             roles.insert(
                 name,
                 Role {
-                    model,
+                    chain,
                     tools: spec.tools,
                 },
             );

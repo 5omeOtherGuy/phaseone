@@ -253,6 +253,7 @@ mod tests {
             worker: None,
             needs: None,
             error: None,
+            models: Vec::new(),
         };
         let records: Vec<JournalRecord> = ["a", "b", "c"]
             .iter()

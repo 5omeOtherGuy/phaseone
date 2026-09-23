@@ -25,9 +25,9 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::api::{
-    CallId, Counts, JournalRecord, ResolvedModel, RunId, RunOutcome, RunProgress, RunReport,
-    SchemaCheck, StepEnd, StepEnvelope, StepLine, StepRequest, StepRunner, StepStatus, WorkerRef,
-    WorkflowError, WorkflowObserver,
+    CallId, Counts, JournalRecord, ModelTry, MovedOn, ResolvedModel, RunId, RunOutcome,
+    RunProgress, RunReport, SchemaCheck, StepEnd, StepEnvelope, StepLine, StepRequest, StepRunner,
+    StepStatus, WorkerRef, WorkflowError, WorkflowObserver,
 };
 use crate::caps::CapCounter;
 use crate::error::{parse_error, runtime_message};
@@ -40,8 +40,19 @@ const LOG_LINES: usize = 20;
 
 /// A role as preflight resolved it.
 pub(crate) struct Role {
-    pub(crate) model: ResolvedModel,
+    /// The chain, head first (ADR-0054 item 2): the role's model, then its fallbacks.
+    pub(crate) chain: Vec<ResolvedModel>,
     pub(crate) tools: Vec<String>,
+}
+
+impl Role {
+    /// The reference the role names first — what a step line shows whatever it walked.
+    pub(crate) fn head(&self) -> String {
+        self.chain
+            .first()
+            .map(|model| model.reference.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// Tool names a step may never be granted: `finish` is always added by the host, and a
@@ -167,7 +178,8 @@ impl RunState {
         })
     }
 
-    /// One `agent()` call, in the order ADR-0053 fixes. `Err` only for a cancelled run.
+    /// One `agent()` call, in the order ADR-0053 fixes, walking the role's fallback chain
+    /// on a route failure (ADR-0054). `Err` only for a cancelled run.
     fn step(
         &self,
         prompt: &str,
@@ -178,9 +190,7 @@ impl RunState {
         let role = self.roles.get(&opts.role);
         let line = LineContext {
             role: opts.role.clone(),
-            model: role
-                .map(|role| role.model.reference.clone())
-                .unwrap_or_default(),
+            model: role.map(Role::head).unwrap_or_default(),
         };
         let refused = |error: String| StepEnvelope {
             step: call.clone(),
@@ -193,12 +203,13 @@ impl RunState {
             worker: None,
             needs: None,
             error: Some(error),
+            models: Vec::new(),
         };
 
         let number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if number > self.max_steps {
             let envelope = refused(format!("max_steps: {} reached", self.max_steps));
-            return Ok(self.conclude(call, &line, envelope, false));
+            return Ok(self.conclude(call, &line, envelope, false, &StepCost::default()));
         }
 
         let replayed = lock(&self.replay).take(call);
@@ -207,63 +218,181 @@ impl RunState {
                 call: call.clone(),
                 from,
             });
-            return Ok(self.conclude(call, &line, envelope, true));
+            return Ok(self.conclude(call, &line, envelope, true, &StepCost::default()));
         }
 
         let Some(role) = role else {
             let envelope = refused(format!("unknown_role: {}", opts.role));
-            return Ok(self.conclude(call, &line, envelope, false));
+            return Ok(self.conclude(call, &line, envelope, false, &StepCost::default()));
         };
-        let request = StepRequest {
-            run: self.id.clone(),
-            call: call.clone(),
-            label: opts.label.clone(),
-            phase: opts
-                .phase
-                .clone()
-                .or_else(|| lock(&self.record).phase.clone()),
-            role: opts.role.clone(),
-            model: role.model.clone(),
-            tools: opts.tools.clone().unwrap_or_else(|| role.tools.clone()),
-            prompt: prompt.to_string(),
-            schema: opts.schema.clone(),
-            workspace: opts.workspace.clone().or_else(|| self.workspace.clone()),
-            attempt: 1,
-        };
+        let tools = opts.tools.clone().unwrap_or_else(|| role.tools.clone());
+        let phase = opts
+            .phase
+            .clone()
+            .or_else(|| lock(&self.record).phase.clone());
 
-        if let Some(error) = self.spend(&request, &opts.json, 1) {
-            return Ok(self.conclude(call, &line, refused(error), false));
+        // The chain, head first (ADR-0054 item 2). A link is left only for a route
+        // failure or a cap; every other end stops the step (ADR-0054 item 3).
+        let mut cost = StepCost::default();
+        let mut walked: Vec<ModelTry> = Vec::new();
+        let mut last_error = String::new();
+        let mut last_worker: Option<String> = None;
+        let mut route_failed = false;
+        let mut envelope: Option<StepEnvelope> = None;
+        for (index, model) in role.chain.iter().enumerate() {
+            if let Some(previous) = walked.last() {
+                // The hop is journalled BEFORE the next model is dispatched (ADR-0054
+                // item 4), so a journal always shows why a link was left.
+                self.write(&JournalRecord::Fallback {
+                    call: call.clone(),
+                    from: previous.model.clone(),
+                    to: model.reference.clone(),
+                    error: last_error.clone(),
+                });
+                cost.fell_back += 1;
+            }
+            let request = StepRequest {
+                run: self.id.clone(),
+                call: call.clone(),
+                label: opts.label.clone(),
+                phase: phase.clone(),
+                role: opts.role.clone(),
+                model: model.clone(),
+                tools: tools.clone(),
+                prompt: prompt.to_string(),
+                schema: opts.schema.clone(),
+                workspace: opts.workspace.clone().or_else(|| self.workspace.clone()),
+                attempt: 1,
+            };
+            match self.link(&request, &opts.json, &mut cost) {
+                Link::Ended(end) => {
+                    walked.push(ModelTry {
+                        model: request.model.reference.clone(),
+                        moved_on: None,
+                    });
+                    envelope = Some(end);
+                    break;
+                }
+                Link::MovedOn(moved) => {
+                    route_failed |= moved.reason == MovedOn::RouteFailed;
+                    last_error = moved.error;
+                    last_worker = moved.worker;
+                    // A reason is recorded only when the step really moves on: the LAST
+                    // link of an exhausted chain stays bare, as the head of a role with
+                    // no fallback does.
+                    walked.push(ModelTry {
+                        model: moved.model,
+                        moved_on: (index + 1 < role.chain.len()).then_some(moved.reason),
+                    });
+                }
+                // Cancelled: the run is over, whatever the chain still held.
+                Link::Cancelled(end) => {
+                    walked.push(ModelTry {
+                        model: request.model.reference.clone(),
+                        moved_on: None,
+                    });
+                    envelope = Some(end);
+                    break;
+                }
+            }
         }
-
-        let cancelled = |attempts: u32| StepEnvelope {
-            status: StepStatus::Cancelled,
-            attempts,
-            error: None,
+        let mut envelope = envelope.unwrap_or_else(|| StepEnvelope {
+            // Every link was skipped: nothing ended the step, so the chain is what
+            // failed (ADR-0054 item 4). The step names the worker of its LAST link.
+            worker: last_worker,
+            error: Some(if route_failed {
+                format!("route: {last_error}")
+            } else {
+                last_error.clone()
+            }),
+            attempts: cost.attempts,
             ..refused(String::new())
+        });
+        envelope.models = walked;
+        if envelope.status == StepStatus::Cancelled {
+            self.conclude(call, &line, envelope, false, &cost);
+            return Err(cancelled_error());
+        }
+        Ok(self.conclude(call, &line, envelope, false, &cost))
+    }
+
+    /// ONE link of a step's chain: the cap check, the dispatch and the turn, up to the
+    /// schema repair (which never leaves the worker that produced the invalid result).
+    fn link(&self, request: &StepRequest, opts: &Value, cost: &mut StepCost) -> Link {
+        let blank = |attempts: u32| StepEnvelope {
+            step: request.call.clone(),
+            label: request.label.clone(),
+            status: StepStatus::Failed,
+            value: Value::Null,
+            schema: SchemaCheck::NotRequested,
+            evidence: None,
+            attempts,
+            worker: None,
+            needs: None,
+            error: None,
+            models: Vec::new(),
         };
-        let outcome = match self.cancellable(self.runner.run(&request, self.token.clone())) {
+        match self.spend(request, opts, 1, cost) {
+            // A cap is the one refusal a step walks past (ADR-0054 item 4).
+            Some(Refused::Capped(error)) => {
+                return Link::MovedOn(Moved {
+                    reason: MovedOn::Capped,
+                    model: request.model.reference.clone(),
+                    error,
+                    worker: None,
+                });
+            }
+            // No `Dispatch` line: the attempt is unrecorded, so nothing runs.
+            Some(Refused::Journal(error)) => {
+                return Link::Ended(StepEnvelope {
+                    error: Some(error),
+                    ..blank(cost.attempts)
+                });
+            }
+            None => {}
+        }
+        let outcome = match self.cancellable(self.runner.run(request, self.token.clone())) {
             None => {
-                self.conclude(call, &line, cancelled(1), false);
-                return Err(cancelled_error());
+                cost.attempts += 1;
+                return Link::Cancelled(StepEnvelope {
+                    status: StepStatus::Cancelled,
+                    ..blank(cost.attempts)
+                });
             }
             Some(Err(reason)) => {
-                let envelope = StepEnvelope {
-                    attempts: 1,
-                    ..refused(reason)
-                };
-                return Ok(self.conclude(call, &line, envelope, false));
+                // The runner could not start the worker at all: the host's reason, never
+                // a hop (ADR-0054 item 3 — a route failure is a route's own report).
+                cost.attempts += 1;
+                return Link::Ended(StepEnvelope {
+                    error: Some(reason),
+                    ..blank(cost.attempts)
+                });
             }
             Some(Ok(outcome)) => outcome,
         };
+        cost.attempts += 1;
         self.observer
-            .step_started(&self.id, &request, &outcome.worker);
+            .step_started(&self.id, request, &outcome.worker);
         let worker = outcome.worker;
+        let worker_line = format!("{} ({})", worker.id, worker.description);
         let base = StepEnvelope {
-            worker: Some(format!("{} ({})", worker.id, worker.description)),
-            ..refused(String::new())
+            worker: Some(worker_line.clone()),
+            ..blank(cost.attempts)
         };
 
-        let envelope = match outcome.end {
+        match outcome.end {
+            StepEnd::RouteFailed { model, error } => Link::MovedOn(Moved {
+                reason: MovedOn::RouteFailed,
+                // The host names the model it could not run; the engine's own answer
+                // stands when a runner names none.
+                model: if model.is_empty() {
+                    request.model.reference.clone()
+                } else {
+                    model
+                },
+                error,
+                worker: Some(worker_line),
+            }),
             StepEnd::Done {
                 evidence,
                 result,
@@ -274,25 +403,31 @@ impl RunState {
                     value: result.unwrap_or(Value::Null),
                     schema: SchemaCheck::Failed(errors.clone()),
                     evidence: Some(evidence),
-                    attempts: 1,
                     error: None,
-                    ..base
+                    ..base.clone()
                 };
-                match self.repair(&request, &opts.json, &worker, &errors, rejected) {
-                    Some(envelope) => envelope,
-                    None => {
-                        self.conclude(call, &line, cancelled(2), false);
-                        return Err(cancelled_error());
-                    }
+                match self.repair(request, opts, &worker, &errors, rejected, cost) {
+                    Some(envelope) => Link::Ended(envelope),
+                    None => Link::Cancelled(StepEnvelope {
+                        status: StepStatus::Cancelled,
+                        attempts: cost.attempts,
+                        ..base
+                    }),
                 }
             }
-            end => envelope_from_end(end, 1, base),
-        };
-        Ok(self.conclude(call, &line, envelope, false))
+            end => Link::Ended(envelope_from_end(end, cost.attempts, base)),
+        }
     }
 
-    /// Cap check and `Dispatch` line for one attempt; `Some(error)` when refused.
-    fn spend(&self, request: &StepRequest, opts: &Value, attempt: u32) -> Option<String> {
+    /// Cap check and `Dispatch` line for one attempt; `Some` when the attempt could not
+    /// be dispatched, which also charges the step's capped count (ADR-0054 item 4).
+    fn spend(
+        &self,
+        request: &StepRequest,
+        opts: &Value,
+        attempt: u32,
+        cost: &mut StepCost,
+    ) -> Option<Refused> {
         let wire_model = &request.model.wire_model;
         if let Err((used, limit)) = self.caps.try_spend(wire_model) {
             self.write(&JournalRecord::Capped {
@@ -301,10 +436,11 @@ impl RunState {
                 used,
                 limit,
             });
+            cost.capped += 1;
             let repair = if attempt > 1 { " (repair)" } else { "" };
-            return Some(format!(
+            return Some(Refused::Capped(format!(
                 "quota_exceeded: {wire_model} used={used} limit={limit}{repair}"
-            ));
+            )));
         }
         // Written before the runner is called: a resumed run charges every dispatch, so
         // an attempt that crashed mid-step still counts against the cap.
@@ -319,13 +455,14 @@ impl RunState {
             opts: opts.clone(),
         };
         if let Err(error) = self.journal.append(&dispatch) {
-            return Some(format!("journal: {error}"));
+            return Some(Refused::Journal(format!("journal: {error}")));
         }
         None
     }
 
-    /// The one schema repair turn (item 5). `rejected` is the envelope if the repair
-    /// cannot run. `None` when the run is cancelled meanwhile.
+    /// The one schema repair turn (item 5): another turn in the SAME worker that produced
+    /// the invalid result, never a new model (ADR-0054 item 3). `rejected` is the envelope
+    /// if the repair cannot run. `None` when the run is cancelled meanwhile.
     fn repair(
         &self,
         request: &StepRequest,
@@ -333,13 +470,16 @@ impl RunState {
         worker: &WorkerRef,
         errors: &[String],
         rejected: StepEnvelope,
+        cost: &mut StepCost,
     ) -> Option<StepEnvelope> {
-        if let Some(error) = self.spend(request, opts, 2) {
+        if let Some(refused) = self.spend(request, opts, 2, cost) {
+            // A capped repair and an unwritable journal both keep the invalid value.
             return Some(StepEnvelope {
-                error: Some(error),
+                error: Some(refused.error()),
                 ..rejected
             });
         }
+        cost.attempts += 1;
         let end = self.cancellable(self.runner.repair(
             worker,
             repair_message(errors),
@@ -347,7 +487,7 @@ impl RunState {
         ))?;
         Some(match end {
             Err(reason) => StepEnvelope {
-                attempts: 2,
+                attempts: cost.attempts,
                 error: Some(reason),
                 ..rejected
             },
@@ -362,12 +502,12 @@ impl RunState {
                 error: Some(format!("invalid_output: {}", errors.join("; "))),
                 schema: SchemaCheck::Failed(errors),
                 evidence: Some(evidence),
-                attempts: 2,
+                attempts: cost.attempts,
                 ..rejected
             },
             Ok(end) => envelope_from_end(
                 end,
-                2,
+                cost.attempts,
                 StepEnvelope {
                     value: Value::Null,
                     schema: SchemaCheck::NotRequested,
@@ -385,6 +525,7 @@ impl RunState {
         line: &LineContext,
         envelope: StepEnvelope,
         replayed: bool,
+        cost: &StepCost,
     ) -> StepEnvelope {
         self.write(&JournalRecord::Result {
             call: call.clone(),
@@ -407,6 +548,7 @@ impl RunState {
             attempts: envelope.attempts,
             replayed,
             error: envelope.error.clone(),
+            models: envelope.models.clone(),
         };
         {
             let mut record = lock(&self.record);
@@ -429,7 +571,10 @@ impl RunState {
             {
                 counts.not_verified += 1;
             }
-            counts.capped += u32::from(error.starts_with("quota_exceeded:"));
+            // A cap counts every link it refused (ADR-0054 item 4), however the step
+            // ended: a skipped link is cost the run must be able to see.
+            counts.capped += cost.capped;
+            counts.fell_back += cost.fell_back;
             counts.invalid_output += u32::from(error.starts_with("invalid_output:"));
             record.steps.push(step_line.clone());
         }
@@ -482,6 +627,53 @@ struct LineContext {
     model: String,
 }
 
+/// Why ONE attempt was not dispatched.
+enum Refused {
+    /// The cap refused it: the step may walk past this link (ADR-0054 item 4).
+    Capped(String),
+    /// The `Dispatch` line could not be written: nothing ran and nothing is charged.
+    Journal(String),
+}
+
+impl Refused {
+    fn error(self) -> String {
+        match self {
+            Refused::Capped(error) | Refused::Journal(error) => error,
+        }
+    }
+}
+
+/// What ONE step's chain spent (ADR-0054 item 4): dispatches (starts plus repairs), the
+/// links a cap refused, and the hops between links.
+#[derive(Default)]
+struct StepCost {
+    attempts: u32,
+    capped: u32,
+    fell_back: u32,
+}
+
+/// One link of a step's chain the step moves on from.
+struct Moved {
+    reason: MovedOn,
+    /// The model the link ran (or was refused for), as the runner reported it.
+    model: String,
+    /// Why the step moves on: the route error, or the cap refusal.
+    error: String,
+    /// The worker the link ran, as a step line names it; `None` for a capped link,
+    /// where nothing was built.
+    worker: Option<String>,
+}
+
+/// What one link of a step's chain decided (ADR-0054 item 4).
+enum Link {
+    /// The step ended on this link.
+    Ended(StepEnvelope),
+    /// The step moves to the next link.
+    MovedOn(Moved),
+    /// The run was cancelled while this link ran.
+    Cancelled(StepEnvelope),
+}
+
 fn envelope_from_end(end: StepEnd, attempts: u32, base: StepEnvelope) -> StepEnvelope {
     let base = StepEnvelope { attempts, ..base };
     match end {
@@ -505,6 +697,12 @@ fn envelope_from_end(end: StepEnd, attempts: u32, base: StepEnvelope) -> StepEnv
             status: StepStatus::Blocked,
             needs: Some(needs),
             error: None,
+            ..base
+        },
+        StepEnd::RouteFailed { error, .. } => StepEnvelope {
+            status: StepStatus::Failed,
+            value: Value::Null,
+            error: Some(format!("route: {error}")),
             ..base
         },
         StepEnd::EndedWithoutFinish { text } => StepEnvelope {
