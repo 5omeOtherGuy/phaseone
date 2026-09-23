@@ -114,9 +114,13 @@ Owned by the Fable 5.1 Claude Code orchestrator session (brief:
   after it turned main red on CI (rhai `sync` data race: parallel thunks method-calling one captured
   closure), the fix `task/audit-race` (DeepSeek): `Fn("fn").curry(values)` thunks, the rule in the
   five prompts, `tests/audit_script_race.rs`.
-- Job 5 `task/workflow-host` (Opus: medium stalled on shell-made edits, issue #53; high finished):
-  reviewed, committed; its gate HUNG in `tests/workflow_schema` (rare race, 9 local runs pass) — a
-  gpt-6-sol repair is adding run-waiting timeouts and hunting the cause; then re-gate, merge.
+- LANDED: job 5 `task/workflow-host` (this merge; Opus: medium stalled on shell-made edits, issue #53;
+  high finished): settings, `HostModelResolver`, `HostStepRunner` over the prepared start, one line per
+  step + ONE inbox notification, tools on every main agent, `p1 workflow run … --args FILE`,
+  run-report `workflows`, nine host tests. Its gate hung once: a REAL p1-workers race —
+  `continue_child` stored `Running` after handing the turn over, so a fast `Finished` was overwritten
+  (gpt-6-sol found and fixed it, regression test + 60 s timeouts in the run-waiting tests); and a
+  dying child task used to strand every `wait` (orchestrator: abnormal-end guard, 8756f17).
 - NEXT: the five live checks (`../phaseone-briefs/workflows-live/`), ADR-0053 evidence, the report.
 - FIXED by the lead (8483e64): fanout counted pi-worker wrapper processes; jobs 5–6 use the default pool.
 
