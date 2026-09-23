@@ -1,0 +1,23 @@
+<!-- @dsCard group="Components" viewport="700x520" name="Transcript" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
+<script src="../../ds.js"></script>
+<style>body{margin:0;background:var(--h-ground);color:var(--h-ink);font-family:var(--font-mono);font-size:12px;line-height:1.5;}</style></head>
+<body><div id="root"></div>
+<script type="text/babel">
+slab().then(({ Block, OperatorInput, Prose, Worker, Picker, Band }) => {
+  const Gap = () => <div style={{ height: "1lh" }} />;
+  ReactDOM.createRoot(document.getElementById("root")).render(
+    <div style={{ padding: "1lh 2ch" }}>
+      <OperatorInput text="fix the flaky retry test in src/run.rs" /><Gap />
+      <Block name="read" arg="src/run.rs" argTone="ref" status="ok" outcome="212 lines · 6.1 kB" body={[{ diff: "ctx", line: 87, text: "let cfg = load(&path)?;" }, { diff: "ctx", line: 88, text: "let ctx = Context::new(cfg);" }]} /><Gap />
+      <Block name="edit" arg="src/run.rs" argTone="ref" status="attn" outcome="+1 −1 · 1 of 1 files" body={[{ diff: "del", line: 88, text: "let ctx = Context::new(cfg);" }, { diff: "add", line: 88, text: "let ctx = Context::new(cfg).retries(3);" }]} decision={{ options: [{ key: "y", label: "allow once" }, { key: "a", label: "session" }, { key: "n", label: "deny" }], secondary: ["^D diff"] }} /><Gap />
+      <Block name="shell" arg="cargo test retry" status="fail" outcome="11.4s · exit 101" body={["---- run::retry_backoff stdout ----", "assertion `left == right` failed", "   left: 2", "  right: 3"]} meta={{ left: [["faint", "· 86 more lines folded → [h-2b14]"]], right: [["faint", "^O open in pane"]] }} /><Gap />
+      <Block name="shell" arg="cargo test retry" running /><Gap />
+      <Prose lines={["The backoff loop exits one attempt early; the off-by-one is at src/run.rs:112."]} />
+    </div>
+  );
+});
+</script></body></html>

@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 
 use crate::glyphs;
 use crate::palette;
+use crate::render::block::{DecisionOption, InlineApproval};
 
 use super::{FLOOR_REASON, decision_key};
 
@@ -100,6 +101,43 @@ impl DiffView {
             rows,
             grantable: true,
         }
+    }
+}
+
+pub fn inline_approval(view: &DiffView, pending: Option<(usize, usize)>) -> InlineApproval {
+    let mut options = vec![
+        DecisionOption {
+            key: "y".into(),
+            label: "allow once".into(),
+            unavailable: None,
+        },
+        DecisionOption {
+            key: "a".into(),
+            label: "session".into(),
+            unavailable: (!view.grantable).then(|| FLOOR_REASON.into()),
+        },
+        DecisionOption {
+            key: "p".into(),
+            label: "project".into(),
+            unavailable: Some("not available — no trust store yet".into()),
+        },
+        DecisionOption {
+            key: "n".into(),
+            label: "deny".into(),
+            unavailable: None,
+        },
+    ];
+    let mut hints = vec!["^D review".to_string()];
+    if let Some((current, total)) = pending
+        && total > 1
+    {
+        hints.push(format!("{current} of {total} pending"));
+    }
+    InlineApproval {
+        permission_rows: Vec::new(),
+        diff: true,
+        options: std::mem::take(&mut options),
+        hints,
     }
 }
 

@@ -1751,6 +1751,7 @@ dependencies = [
  "crossterm",
  "p1-contracts",
  "ratatui",
+ "serde_json",
  "tokio",
  "unicode-width",
 ]

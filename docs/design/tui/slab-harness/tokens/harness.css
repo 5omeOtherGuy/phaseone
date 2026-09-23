@@ -1,0 +1,33 @@
+/* SLAB Harness — product layer. Band ladder + role mapping for the transcript. */
+:root {
+  --h-ground: var(--slab-bg-0);     /* #0a0a0a  operator input, prose, gutters, insets */
+  --h-block: var(--slab-bg-1);      /* #121212  band B body, band C meta, pane, hint row */
+  --h-block-plus: #1c1c1c;          /* band A header, decision row, composer input, statusline */
+  --h-rule: var(--slab-rule);       /* unfilled bar segments only */
+
+  --h-ink: var(--slab-fg);          /* arguments, values, decision labels */
+  --h-dim: var(--slab-dim);         /* tool names, body text, labels, outcomes */
+  --h-faint: var(--slab-faint);     /* line numbers, fold meta, key hints, timestamps, queued */
+
+  --h-decision-key-bg: var(--slab-attn);   /* ! blocking decision chips */
+  --h-focus-row-bg: var(--slab-attn);      /* focused picker row */
+  --h-route-chip-bg: var(--slab-fg);       /* statusline route chip — neutral, never amber */
+
+  --h-outcome-ok: var(--slab-ok);
+  --h-outcome-fail: var(--slab-fail);
+  --h-running: var(--slab-live);
+  --h-path: var(--slab-ref);
+
+  /* geometry in cells — reference at 120 columns */
+  --h-cols: 120;
+  --h-inset-cols: 2;
+  --h-band-pad-cols: 2;
+  --h-transcript-cols: 76;
+  --h-gutter-cols: 2;
+  --h-pane-cols: 38;
+  --h-pane-pad-cols: 4;
+  --h-name-field-cols: 10;
+  --h-fold-threshold: 40;
+  --h-fold-keep: 24;
+}
+@keyframes h-work { 0%, 100% { opacity: 0.18; } 50% { opacity: 1; } }

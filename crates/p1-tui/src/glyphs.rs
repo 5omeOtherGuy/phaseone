@@ -44,9 +44,44 @@ pub fn working_opacity(cell: usize, t_ms: u64) -> f32 {
     FLOOR + (1.0 - FLOOR) * (x * std::f32::consts::PI).sin()
 }
 
+/// The colour of working cell `cell` at `t_ms`: `fg` scaled toward the cell's
+/// `bg` by its opacity (§3.4), so the pulse never introduces a new hue. Reduced
+/// motion freezes every cell at full `fg`.
+pub fn working_color(
+    fg: ratatui::style::Color,
+    bg: ratatui::style::Color,
+    cell: usize,
+    t_ms: u64,
+    reduced_motion: bool,
+) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    if reduced_motion {
+        return fg;
+    }
+    let (Color::Rgb(r, g, b), Color::Rgb(br, bg, bb)) = (fg, bg) else {
+        return fg;
+    };
+    let opacity = working_opacity(cell, t_ms);
+    let mix = |front: u8, back: u8| (back as f32 + (front as f32 - back as f32) * opacity) as u8;
+    Color::Rgb(mix(r, br), mix(g, bg), mix(b, bb))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn working_color_pulses_toward_the_background_unless_reduced() {
+        use ratatui::style::Color;
+        let (fg, bg) = (Color::Rgb(200, 100, 50), Color::Rgb(10, 10, 10));
+        assert_eq!(working_color(fg, bg, 0, 0, true), fg);
+        let peak = WORKING_CYCLE_MS / 4;
+        assert_ne!(working_color(fg, bg, 0, 0, false), fg);
+        assert_ne!(
+            working_color(fg, bg, 0, 0, false),
+            working_color(fg, bg, 0, peak, false)
+        );
+    }
 
     #[test]
     fn working_cells_stagger_and_rest_on_the_floor() {

@@ -424,6 +424,12 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
                 ask: options.ask,
                 workspace,
                 sandbox: format!("{:?}", options.sandbox).to_lowercase(),
+                // §10 `effort`: only an explicit `--effort` (already parsed by
+                // `cli.rs`); `None` is the adapter default, which the statusline
+                // already renders as `default`.
+                effort: options
+                    .effort
+                    .map(|effort| crate::models::effort_name(effort).to_string()),
             },
             cancel.clone(),
         ))
@@ -544,6 +550,16 @@ pub async fn run_with_front_end(
     // Announce the assembled parent before the agent is built: the front end
     // builds its parent renderer from this.
     front_end.parent_assembled(&route, &model, completion.clone());
+    // §10 `ctx`'s denominator: unknown (no `[context]` section) stays `None`,
+    // never a guessed window.
+    front_end.context_configured(
+        assembled.resolved.context.as_ref().map(|c| c.window_tokens),
+        assembled
+            .resolved
+            .context
+            .as_ref()
+            .map(|c| c.summarize_at_tokens),
+    );
 
     let (journal, records): OpenedSession = open_session(deps, options)?;
     // On resume the journal holds the earlier turns; rebuild this agent's activity
