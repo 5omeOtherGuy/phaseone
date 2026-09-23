@@ -66,6 +66,10 @@ impl ColorMode {
 /// Reduce terminal attributes only after a complete frame has been rendered.
 pub fn degrade(buffer: &mut ratatui::buffer::Buffer, mode: ColorMode) {
     use ratatui::style::Modifier;
+    // Renderers draw 24-bit already; a truecolor terminal gets the frame untouched.
+    if mode == ColorMode::TrueColor {
+        return;
+    }
     for cell in buffer.content.iter_mut() {
         if mode == ColorMode::NoColor {
             if cell.fg == FAINT {
@@ -130,6 +134,15 @@ mod tests {
     use super::*;
     use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
     use std::collections::HashMap;
+
+    #[test]
+    fn truecolor_leaves_the_frame_untouched() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer[(0, 0)].set_fg(ATTN).set_bg(BLOCK_PLUS);
+        let before = buffer.clone();
+        degrade(&mut buffer, ColorMode::TrueColor);
+        assert_eq!(buffer, before);
+    }
 
     #[test]
     fn color_detection_precedence() {
