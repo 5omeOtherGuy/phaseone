@@ -1,7 +1,7 @@
 ---
 adr: 56
 title: The TUI follows the SLAB Harness design system and its implementation handoff
-status: proposed
+status: accepted
 date: 2026-09-23
 deciders: owner+lead
 supersedes: []

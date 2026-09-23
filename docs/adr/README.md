@@ -69,7 +69,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0053 | [Workflows are an optional module: a sandboxed script orchestrates workers under roles and caps](0053-workflows-are-an-optional-module-a-sandboxed-script-orchestrates-workers-under-roles-and-caps.md) | accepted | 2026-09-23 | owner+lead |
 | ADR-0054 | [Workflow roles have a fallback chain for route failures; DeepSeek is the shipped worker](0054-workflow-roles-have-a-fallback-chain-for-route-failures-deepseek-is-the-shipped-worker.md) | proposed | 2026-09-23 | owner+lead |
 | ADR-0055 | [A successful command that changes the workspace counts as progress for the stall guard](0055-a-successful-command-that-changes-the-workspace-counts-as-progress-for-the-stall-guard.md) | proposed | 2026-09-23 | lead |
-| ADR-0056 | [The TUI follows the SLAB Harness design system and its implementation handoff](0056-the-tui-follows-the-slab-harness-design-system-and-its-implementation-handoff.md) | proposed | 2026-09-23 | owner+lead |
+| ADR-0056 | [The TUI follows the SLAB Harness design system and its implementation handoff](0056-the-tui-follows-the-slab-harness-design-system-and-its-implementation-handoff.md) | accepted | 2026-09-23 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
