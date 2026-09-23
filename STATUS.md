@@ -110,11 +110,14 @@ Owned by the Fable 5.1 Claude Code orchestrator session (brief:
   the step (the worker ref exists only then); `args` can gain keys (never change existing ones).
 - LANDED: job 6 `task/workflow-docs` (this merge): `docs/design/workflows.md` (GLM 5.3, one pass;
   its §7 grows with the host glue).
-- RUNNING: job 5 `task/workflow-host` — first attempt (Opus medium) stalled at 6 summaries because
-  it edited through shell heredocs (issue #53); resumed in the same session at Opus high.
-  READY: the audit port (`task/workflow-audit`: `scripts/audits/modularity-prep.py` +
-  `modularity.rhai`, engine-tested) and the four live-check scripts
-  (`../phaseone-briefs/workflows-live/`). NEXT: land 5, the five live checks, ADR evidence, report.
+- LANDED: the audit port (`scripts/audits/modularity-prep.py` + `modularity.rhai`, engine-tested) and,
+  after it turned main red on CI (rhai `sync` data race: parallel thunks method-calling one captured
+  closure), the fix `task/audit-race` (DeepSeek): `Fn("fn").curry(values)` thunks, the rule in the
+  five prompts, `tests/audit_script_race.rs`.
+- Job 5 `task/workflow-host` (Opus: medium stalled on shell-made edits, issue #53; high finished):
+  reviewed, committed; its gate HUNG in `tests/workflow_schema` (rare race, 9 local runs pass) — a
+  gpt-6-sol repair is adding run-waiting timeouts and hunting the cause; then re-gate, merge.
+- NEXT: the five live checks (`../phaseone-briefs/workflows-live/`), ADR-0053 evidence, the report.
 - FIXED by the lead (8483e64): fanout counted pi-worker wrapper processes; jobs 5–6 use the default pool.
 
 ## Open decisions and risks
