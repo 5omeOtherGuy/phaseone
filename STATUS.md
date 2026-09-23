@@ -12,10 +12,10 @@ route × model profile composed into ONE runtime `Provider` (ADR-0039); model se
 mid-session switching are live (ADR-0049); every main agent can start workers with explicit tool
 grants (ADR-0050); resume, context control, `finish` and the TUI are mounted.
 
-**Where the lead stands.** `main` = `92858d5` + this commit; ADRs 0001–0058 (0009→0010,
-0013→0014, 0026→0050, 0033→0049 superseded; 0052 usage ledger and 0056 SLAB TUI are other
-sessions'; 0057 call target and 0058 shadow hook are `proposed` with workers running). Open
-work: #46 (Luna continuation), #48 item 5, #12, #45 (owner), #6, #25; #47, #53, #54 closed.
+**Where the lead stands.** `main` = `3ec3e26` + this commit; ADRs 0001–0058 all accepted
+(0009→0010, 0013→0014, 0026→0050, 0033→0049 superseded; 0052 usage ledger and 0056 SLAB TUI are
+other sessions'). Open work: #48 item 5 (shared provider fixtures), #12 TUI, #45 (owner), #6,
+#25; #46, #47, #53, #54 closed. No worktree of the lead's is live.
 
 ## Next — READ FIRST
 
@@ -76,7 +76,12 @@ OPEN ITEMS (issue numbers)
   checks passed. ADR-0051 (a worker without a command tool ends `done — not verified`) preceded it.
 - **Audit follow-ups (2026-09-23)** — #54 every task ends with `finish`; #47 one provider error-code
   module in `p1-provider-http`; #48 items 1–4 (explicit ordinal, no host credential copy, one
-  `ToolFace`, workers doc). Workers: gpt-6-sol and gpt-6-luna at high, all accepted first pass.
+  `ToolFace`, workers doc); #46 / ADR-0057 tools describe their own call target (`CallDescription`
+  with an `EditPreview` for the diff view; host and TUI stop matching tool names). Workers:
+  gpt-6-sol and gpt-6-luna at high, all accepted first pass or after one repair.
+- **ADR-0058 shadow hook (2026-09-23, owner via XO)** — `p1-hook-shadow`, std-only, feature
+  `shadow-hook`, mounted via `[shadow] brain_packet_shadow` or PATH; fires detached after every
+  committed user input and worker dispatch; live-verified with the brain-tools recipe.
 - **ADR-0054 / ADR-0055 (2026-09-23, owner decisions)** — workflow roles carry a fallback chain
   for route failures only (never on a cap); DeepSeek V4.1 Flash is the shipped worker, live-verified
   with the exhausted primary Go route hopping to deepseek2. The stall guard and the `finish` check
