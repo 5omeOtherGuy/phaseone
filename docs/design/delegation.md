@@ -70,6 +70,46 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
   their ids, so an old id answers `No worker <id>.` and is never given to a new worker
   (ADR-0034).
 
+### Prepared start (ADR-0053)
+
+A workflow step IS a worker, but its environment is the SERVICE's business: the host builds
+the child for an id the service has already allocated, after the service has already
+reserved a running slot. So the host never predicts the next `w<N>`, and a step that cannot
+run is never built.
+
+```rust
+pub struct PreparedStart { pub task: String, pub tools: Vec<String> }  // the task text, and the granted tool MODULE names
+
+impl InProcessWorkers {
+    /// Reserve a slot and allocate the id, THEN build; `Err(reason)` is InvalidEnvironment.
+    pub async fn start_prepared(&self, prepared: PreparedStart,
+        build: impl FnOnce(&ChildId) -> Result<ChildAgent, String> + Send)
+        -> Result<ChildId, WorkerError>;
+    /// Ok(true) when fewer than `max_concurrent` children are Running (at once if so
+    /// already), Ok(false) when `cancel` fires first, Err(ShutDown) after a shutdown.
+    pub async fn wait_for_capacity(&self, cancel: CancellationToken) -> Result<bool, WorkerError>;
+    pub fn running(&self) -> usize;
+    pub fn max_concurrent(&self) -> usize;
+}
+```
+
+- **Slot and id before build.** Under the state lock: refuse when shut down, reserve a
+  running slot (`LimitReached` BEFORE `build` is called), allocate the next id, then call
+  `build` with that id. `Ok(agent)` is inserted and spawned exactly as `start` does.
+- **A failed build consumes nothing.** `Err(reason)` becomes
+  `WorkerError::InvalidEnvironment(reason)` — the slot is free and the next start is offered
+  the same id.
+- **Capacity is shared, and a wake-up is never lost.** One `max_concurrent`, one count, for
+  direct `worker_start` calls and workflow steps alike (`continue_child` counts too). Every
+  transition out of `Running` — a turn ending, the rollback of a refused re-grant, shutdown —
+  wakes the waiters, and `wait_for_capacity` subscribes before it checks. A slot it observes
+  free is NOT reserved, so a caller loops `wait_for_capacity` → `start_prepared` and treats
+  `LimitReached` as wait again.
+
+`WorkerService::start(ChildSpec)` is this seam with the host's factory: every existing
+behaviour (the yield after spawn, the error mapping, the `w<N>` numbering, the retained
+grant) is unchanged.
+
 ## Model-facing tools (`p1-tool-delegate`, effect `Delegates`)
 
 | Tool | Input | Output content |
