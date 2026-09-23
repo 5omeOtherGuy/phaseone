@@ -85,6 +85,8 @@ impl WorkflowSettings {
             role("claude/claude-fable-5", &["read", "grep"]),
         );
         let mut caps = BTreeMap::new();
+        // The only Fable profile p1 ships today (routes/anthropic-subscription.toml). A
+        // `claude-fable-5-1` profile, if one is added, must be capped here too.
         caps.insert("claude-fable-5".to_string(), 3);
         Self {
             roles,
