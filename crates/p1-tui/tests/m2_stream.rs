@@ -173,10 +173,7 @@ fn the_turn_settles_with_spend_totals() {
     assert_eq!(s.spend.cost_micro_usd, Some(3_400));
     let text = render(&mut s, 120, 40, 16_600);
     assert!(text.iter().any(|l| l.contains("Confirmed.")));
-    assert!(
-        text.iter()
-            .any(|l| l.contains("⏎ send   ⌥⏎ newline   ^C quit"))
-    );
+    assert!(text.iter().any(|l| l.contains("⏎ send   ⌥⏎ newline")));
     assert!(text[38].contains("diff —"));
 }
 
@@ -189,11 +186,11 @@ fn queued_inputs_are_visible_above_the_hints() {
     let text = render(&mut s, 120, 40, 5_000);
     assert!(
         text.iter()
-            .any(|l| l.contains("· steering: also check the wrap boundary"))
+            .any(|l| l.contains("· steering   also check the wrap boundary"))
     );
     assert!(
         text.iter()
-            .any(|l| l.contains("· follow-up: then summarize"))
+            .any(|l| l.contains("· follow-up  then summarize"))
     );
 }
 

@@ -198,13 +198,16 @@ fn picker() -> Screen {
                         label: "claude · sonnet-4.5".into(),
                         value: "300k · $3/$15".into(),
                         available: true,
+                        ..PickerRow::default()
                     },
                     PickerRow {
                         label: "claude · opus-4.8".into(),
                         value: "300k · $15/$75".into(),
                         available: true,
+                        ..PickerRow::default()
                     },
                 ],
+                ..PickerGroup::default()
             },
             PickerGroup {
                 header: "OPENAI-CHAT ROUTE".into(),
@@ -213,17 +216,20 @@ fn picker() -> Screen {
                         label: "deepseek · v4.1-flash".into(),
                         value: "128k · $0.14/$0.28".into(),
                         available: true,
+                        ..PickerRow::default()
                     },
                     PickerRow {
                         label: "glm · 5.3".into(),
                         value: "quota exhausted".into(),
                         available: false,
+                        ..PickerRow::default()
                     },
                 ],
+                ..PickerGroup::default()
             },
         ],
-        filter: String::new(),
         selected: 1,
+        ..Picker::default()
     });
     s
 }

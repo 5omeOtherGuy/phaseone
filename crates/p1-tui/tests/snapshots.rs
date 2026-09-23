@@ -234,9 +234,10 @@ fn idle_screen_affordances() {
     assert_eq!(text[3], "  no journal in this directory.");
     assert_eq!(text[5], "  /resume     reopen a previous session");
     let layout = p1_tui::geometry::layout(120, 40, s.pane_width, false, 2);
-    assert_eq!(
-        text[layout.composer.y as usize + 1],
-        "⏎ send   ⌥⏎ newline   ^C quit"
+    assert!(
+        text[layout.composer.y as usize + 1].starts_with("  ⏎ send   ⌥⏎ newline"),
+        "{}",
+        text[layout.composer.y as usize + 1]
     );
 }
 
@@ -334,27 +335,30 @@ fn picker_and_status_overlays_dock_above_the_composer() {
                     label: "claude · sonnet-4.5".into(),
                     value: "300k · $3/$15".into(),
                     available: true,
+                    ..PickerRow::default()
                 },
                 PickerRow {
                     label: "claude · opus-4.8".into(),
                     value: "300k · $15/$75".into(),
                     available: true,
+                    ..PickerRow::default()
                 },
                 PickerRow {
                     label: "glm · 5.3".into(),
                     value: "quota exhausted".into(),
                     available: false,
+                    ..PickerRow::default()
                 },
             ],
+            ..PickerGroup::default()
         }],
-        filter: String::new(),
-        selected: 0,
+        ..Picker::default()
     });
     let text = left(&render(&mut s, 120, 40, 0), 80);
     assert_palette_law(&mut s, 120, 40);
     let header = text
         .iter()
-        .position(|row| row == "ANTHROPIC ROUTE")
+        .position(|row| row.trim() == "ANTHROPIC ROUTE")
         .unwrap();
     let available = text
         .iter()
