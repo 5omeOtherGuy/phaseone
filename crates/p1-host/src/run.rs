@@ -464,6 +464,8 @@ pub async fn run_with_front_end(
     let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
     #[cfg(feature = "delegation")]
     let child_counter = Arc::new(AtomicUsize::new(0));
+    #[cfg(feature = "delegation")]
+    let agent_ordinals = Arc::new(AtomicUsize::new(1));
     // The child factory's §3c guard stops a child's turn through the service, which
     // does not exist yet — the factory is its argument. Same slot pattern.
     #[cfg(feature = "delegation")]
@@ -475,6 +477,7 @@ pub async fn run_with_front_end(
         front_end.clone(),
         catalog_slot.clone(),
         child_counter.clone(),
+        agent_ordinals,
         completion_hub.clone(),
         options.session.clone(),
         options.max_idle_summaries,
@@ -735,6 +738,7 @@ async fn workflow_run(
         front_end.clone(),
         catalog_slot.clone(),
         Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(1)),
         completion_hub.clone(),
         options.session.clone(),
         options.max_idle_summaries,
@@ -2165,8 +2169,9 @@ fn child_tools(environment: &EnvironmentFile, grant: &[String]) -> Result<Vec<To
 
 /// What every child build shares: the composition seams `run_with_front_end` owns (the
 /// front end, the catalog and service slots that break the factory/service cycle, the
-/// counter that keeps ids in step, the completion hub, the session, the parent's §3c
-/// bound). The direct worker factory and the workflow step runner both build through
+/// counter that keeps ids in step, the per-run cache-key ordinal counter, the
+/// completion hub, the session, the parent's §3c bound). The direct worker
+/// factory and the workflow step runner both build through
 /// [`ChildBuilder::build_child`], so a step worker is assembled exactly as a direct one.
 #[cfg(feature = "delegation")]
 pub(crate) struct ChildBuilder {
@@ -2176,6 +2181,7 @@ pub(crate) struct ChildBuilder {
     pub(crate) front_end: Arc<dyn FrontEnd>,
     catalog_slot: Arc<OnceLock<Arc<Catalog>>>,
     counter: Arc<AtomicUsize>,
+    agent_ordinals: Arc<AtomicUsize>,
     completion_hub: Arc<CompletionHub>,
     session: Option<PathBuf>,
     max_idle_summaries: usize,
@@ -2192,6 +2198,7 @@ impl ChildBuilder {
         front_end: Arc<dyn FrontEnd>,
         catalog_slot: Arc<OnceLock<Arc<Catalog>>>,
         counter: Arc<AtomicUsize>,
+        agent_ordinals: Arc<AtomicUsize>,
         completion_hub: Arc<CompletionHub>,
         session: Option<PathBuf>,
         max_idle_summaries: usize,
@@ -2204,6 +2211,7 @@ impl ChildBuilder {
             front_end,
             catalog_slot,
             counter,
+            agent_ordinals,
             completion_hub,
             session,
             max_idle_summaries,
@@ -2252,7 +2260,7 @@ impl ChildBuilder {
         };
         // This child's own cache-key ordinal, kept for its whole life: a re-grant
         // assembles at the SAME ordinal, never a new one.
-        let ordinal = next_agent_ordinal();
+        let ordinal = next_agent_ordinal(&self.agent_ordinals);
         let mut assembled = assemble_child(
             environment_dirs,
             &catalog,
@@ -2569,9 +2577,9 @@ const PARENT_ORDINAL: u64 = 0;
 
 /// The next worker ordinal: 1, 2, … in start order, so each worker gets its own
 /// key while every worker of a given start order keeps it across processes.
-fn next_agent_ordinal() -> u64 {
-    static AGENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    AGENTS.fetch_add(1, Ordering::Relaxed)
+#[cfg(feature = "delegation")]
+fn next_agent_ordinal(ordinals: &AtomicUsize) -> u64 {
+    ordinals.fetch_add(1, Ordering::Relaxed) as u64
 }
 
 #[cfg(test)]
@@ -2601,9 +2609,10 @@ mod tests {
     #[test]
     fn the_parent_ordinal_is_zero_and_worker_ordinals_start_at_one() {
         assert_eq!(PARENT_ORDINAL, 0);
-        let first = next_agent_ordinal();
-        let second = next_agent_ordinal();
-        assert!(first >= 1, "a worker never gets the parent's ordinal");
+        let ordinals = AtomicUsize::new(1);
+        let first = next_agent_ordinal(&ordinals);
+        let second = next_agent_ordinal(&ordinals);
+        assert_eq!(first, 1, "a worker never gets the parent's ordinal");
         assert_eq!(second, first + 1);
         assert_ne!(
             generated_cache_key(Path::new("/tmp/ws"), "plain", PARENT_ORDINAL),

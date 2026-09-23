@@ -1,7 +1,8 @@
 //! Optional delegation: the typed worker service and its in-process implementation.
 //!
 //! `p1-tool-delegate` depends on this crate's [`WorkerService`] trait only. Nothing
-//! here names a model-facing tool, a prompt template, a provider or a UI.
+//! here implements a model-facing tool, a prompt template, a provider or a UI;
+//! completion notifications name the delegate tool's `worker_result` face.
 //!
 //! Lifecycle: every child is one tokio task that OWNS its `Agent` for the child's
 //! whole life, so turns can never overlap and there is no `Mutex<Agent>` anywhere.
