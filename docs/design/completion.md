@@ -63,7 +63,9 @@ Rules, each with its exact model-visible text:
    (the LAST run of that command counts: a failing re-run invalidates an earlier success).
 3. That run must be newer than the last file change → otherwise
    Error `You changed files after running \`<command>\`. Run it again, then finish.`
-   A shell command is itself not counted as a file change (it cannot be known); stated limit.
+   A shell command was once not counted as a file change (it could not be known); ADR-0055
+   removes that stated limit — a successful command that changes the workspace IS a file change
+   (§3c), and the run that caused the change shares its record with it.
 4. `blocked` requires non-empty `needs` → otherwise Error `Say what you need in "needs".`
 5. Accepted `done` → Ok `Finished.`; accepted `blocked` → Ok `Recorded as blocked.` The outcome
    is stored in `FinishOutcome` (last accepted call wins). A rejected call stores nothing.
@@ -192,7 +194,9 @@ The host implements `SessionActivity` from the event stream it already receives
 (`ToolStarted`/`ToolFinished`), looking up each call's `effect` on the assembled tool and
 parsing the shell footer `[exit code: N]`. No new core or contract surface. On `--resume` the
 log is REBUILT from the journal's `ToolStarted`/`ToolFinished` records, so a verification run
-before the restart still counts and a file change before it still invalidates.
+before the restart still counts and a file change before it still invalidates. A change a COMMAND
+made before the restart is not rebuilt — the journal does not carry ADR-0055's flag, and the
+rebuilt log is never fingerprinted — so only a later command or a `write` re-applies it.
 
 ## 3b. Provider failures in a headless run (issue #11)
 
@@ -243,12 +247,30 @@ successful `finish` calls), so it owns this guard too.
   malformed response (split4a ended on `unsupported chat tool type`) is the model's or the
   route's one-off, and the interrupted response is discarded as for any other failure.
 
+**Workspace fingerprint (ADR-0055, issue #53).** The host fingerprints the workspace around every
+successful command: in a git workspace a hash over the paths `git status --porcelain=v1 -uall`
+lists — so `.gitignore` decides, and `target/` never counts — together with each path's status,
+size and mtime, plus the HEAD sha, and outside git a walk of the workspace skipping `.git`,
+`target`, `node_modules` and every dot-directory; no file content is ever read, and past 50 000
+entries the fingerprint refuses rather than walking. A fingerprint that differs from the previous
+one is a workspace change: it is progress for this guard AND a file change for the `finish` check,
+exactly as a `WritesFiles` call is, and the activity record carries `changed_workspace: true` (a
+run that edits through shell heredocs is judged by what it did, not by which tool it used). An
+unchanged workspace still changes nothing (`ls`, `cargo test` and `git status` are neither progress
+nor a file change, as before), a failed command is never fingerprinted, the host's own session
+journals inside the workspace are never counted, and a fingerprint that cannot be taken falls back
+to the tool-declared rule and prints one `note: workspace fingerprinting is off: …` line at the end
+of the run — `run-report.py` prints no fingerprint line, because the journal does not carry the
+flag.
+
 Must-pass (scripted provider + scripted context policy that always replaces): N replacements with
 no mutation → exit 4 and the message, no further provider request after the Nth; a mutation
 between them resets the count (2N-2 replacements with one mutation in the middle → no stall; 2N-1 cannot avoid a run of N); a
 `finish` call resets it; `--max-idle-summaries 0` never stalls; interactive mode unchanged; the
 count survives nothing — a resumed run starts at 0; Protocol failure then success → run completes
-with one retry message.
+with one retry message. For the fingerprint (ADR-0055): a worker whose only edits are shell
+heredocs is NOT stalled and a worker running only `ls` still is (`stall_fingerprint.rs`), and a
+verification run from before such a write must be repeated (`finish_fingerprint.rs`).
 
 ## 4. Environments
 
