@@ -340,6 +340,24 @@ and returns only once `Ended` is journalled. `InProcessWorkflows::shutdown()` ca
 every running run (each journals `Ended { outcome: cancelled }`), joins the script
 threads, and afterwards every fallible call returns `ShutDown`.
 
+**The host, as landed (job 5).** `p1-host` feature `workflows` (default, over `delegation`).
+`HostModelResolver` resolves `environment/profile[:effort]` through `p1 models` and takes the wire
+model from the environment's route; `HostStepRunner` waits for capacity, starts each step through
+`start_prepared` with the role's or the call's grant (never a worker or workflow tool), gives the
+worker's `finish` the contract, and reads the structured result from the worker's own outcome
+cell; a repair is `continue_child` on the same worker. One `ChildBuilder::build_child` serves
+direct workers and steps. `HostWorkflowObserver` prints one stderr line per step
+(`· workflow wf1 review:bugs (reviewer → claude/claude-opus-5-5:high; w3) done — schema passed; not
+verified; parent verification required`), one per phase/log, one run line, and sends the parent ONE
+inbox notification (`Workflow wf1 ended (completed). Use workflow_result to read its result.`);
+step workers never notify the parent. `wait_for_work` keeps a headless parent alive while a run is
+in flight; runs shut down before workers. `p1 workflow run FILE [--arg K=V]… [--args FILE]
+[--role R=E/P[:effort]]… [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]
+[--max-workers N] [--yes]` composes the same services with no parent agent and exits 0 completed,
+2 completed with issues, 1 failed, 130 cancelled. Run root: `<session>.workflows/` next to a session
+file, else `$XDG_STATE_HOME/p1/workflows` (or `~/.local/state/p1/workflows`), `--out` overrides.
+`scripts/run-report.py` reports `workflows: [{id, outcome, counts, steps, run_dir}]` next to a session.
+
 **The run root rule**: the service is built with one `run_root`; every run gets
 `run_root/<run id>/` (§6). Choosing it is the host's composition; the module fixes only
 the layout and the numbering.
