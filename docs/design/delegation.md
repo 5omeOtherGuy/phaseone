@@ -75,7 +75,7 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
 A workflow step IS a worker, but its environment is the SERVICE's business: the host builds
 the child for an id the service has already allocated, after the service has already
 reserved a running slot. So the host never predicts the next `w<N>`, and a step that cannot
-run is never built.
+run is never built. See docs/design/workflows.md.
 
 ```rust
 pub struct PreparedStart { pub task: String, pub tools: Vec<String> }  // the task text, and the granted tool MODULE names
