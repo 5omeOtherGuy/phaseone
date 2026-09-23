@@ -5,6 +5,9 @@
 //! No test reads the real `~/.config`: every harness here points `XDG_CONFIG_HOME`
 //! and `HOME` at a scratch directory, and every environment, route and profile it
 //! loads is written into a tempdir (or is the repo's shipped one, read-only).
+// `Settings` has a `workflows` field only with that feature; the struct updates below
+// fill it with the feature on and are empty with it off.
+#![cfg_attr(not(feature = "workflows"), allow(clippy::needless_update))]
 
 mod common;
 
@@ -407,6 +410,7 @@ fn a_pattern_that_matches_nothing_is_an_error() {
     let settings = Settings {
         default_model: None,
         enabled_models: vec!["nope/*".to_string()],
+        ..Settings::default()
     };
     let error = models::scope(None, &settings, &models).unwrap_err();
     assert!(error.contains("settings.toml `enabled_models`"), "{error}");
@@ -418,6 +422,7 @@ fn the_flag_scope_replaces_the_settings_scope() {
     let settings = Settings {
         default_model: None,
         enabled_models: vec!["gpt/*".to_string()],
+        ..Settings::default()
     };
     assert_eq!(
         models::scope(None, &settings, &models).unwrap(),
@@ -506,6 +511,7 @@ fn default_model_is_the_model_a_bare_run_would_use() {
     let settings = Settings {
         default_model: Some("gpt/gpt-5.5".to_string()),
         enabled_models: Vec::new(),
+        ..Settings::default()
     };
     assert_eq!(
         models::default_model(&settings, &shipped(), &models).unwrap(),

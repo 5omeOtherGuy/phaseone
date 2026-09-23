@@ -143,6 +143,20 @@ pub struct PreparedStart {
     /// The tool MODULE names granted, exactly as `ChildSpec::tools` (never `finish`,
     /// never a `worker_*` module); stored as the child's grant for a later re-grant.
     pub tools: Vec<String>,
+    /// Whether each ended turn sends the parent its completion notification. A
+    /// workflow step's turns end inside a run whose OWN end is the one notification
+    /// the parent gets (ADR-0053 item 7), so the host starts steps with `false`.
+    pub notify_parent: bool,
+}
+
+impl Default for PreparedStart {
+    fn default() -> Self {
+        Self {
+            task: String::new(),
+            tools: Vec::new(),
+            notify_parent: true,
+        }
+    }
 }
 
 /// Every way a worker service call can fail.
@@ -381,7 +395,11 @@ impl InProcessWorkers {
         prepared: PreparedStart,
         build: impl FnOnce(&ChildId) -> Result<ChildAgent, String> + Send,
     ) -> Result<ChildId, WorkerError> {
-        let PreparedStart { task, tools } = prepared;
+        let PreparedStart {
+            task,
+            tools,
+            notify_parent,
+        } = prepared;
         // The state lock lives only inside this block: nothing below holds a std lock
         // across the `yield_now` (invariant 7d).
         let (id, status, command_rx, token, stall, agent, report) = {
@@ -439,6 +457,7 @@ impl InProcessWorkers {
                 stall,
                 status,
                 report,
+                notify_parent,
             },
         ));
         self.tasks.lock().unwrap().push(handle);
@@ -575,6 +594,7 @@ impl WorkerService for InProcessWorkers {
             let prepared = PreparedStart {
                 task: spec.task.clone(),
                 tools: spec.tools.clone(),
+                notify_parent: true,
             };
             let factory = Arc::clone(&self.shared.factory);
             self.start_prepared(prepared, move |_id| factory(&spec))
@@ -800,6 +820,7 @@ struct ChildTask {
     status: watch::Sender<ChildStatus>,
     /// The child's report read at a turn end, sharing one cell with the host's tap.
     report: Arc<dyn Fn() -> WorkerReport + Send + Sync>,
+    notify_parent: bool,
 }
 
 /// The whole life of one child, owned by one task. `task` is replaced by each
@@ -814,6 +835,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         stall,
         status,
         report,
+        notify_parent: notifies_parent,
     } = child;
     loop {
         // The status is already Running and `token` already installed: whoever
@@ -841,7 +863,9 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         // (3) a slot is given back: wake everyone waiting for capacity, too.
         shared.capacity.notify_waiters();
         // (4) exactly ONE notification, and only after the result is retrievable.
-        notify_parent(&shared, &id, &child_status);
+        if notifies_parent {
+            notify_parent(&shared, &id, &child_status);
+        }
         // The session is retained for repair: wait for `continue_child` or
         // shutdown instead of exiting. A continue that ADDS tools carries the
         // reconfiguration for the next turn (ADR-0050 item 6); the turn's message is
@@ -1349,6 +1373,7 @@ mod tests {
         PreparedStart {
             task: "do it".into(),
             tools: vec!["read".into()],
+            ..PreparedStart::default()
         }
     }
 
@@ -1580,5 +1605,41 @@ mod tests {
         workers.cancel(&id).await.unwrap();
         workers.wait(&id, CancellationToken::new()).await.unwrap();
         assert_eq!(workers.running(), 0, "an ended turn frees the slot");
+    }
+
+    /// `notify_parent: false` keeps every turn of that child out of the parent's inbox —
+    /// the first and a continued one — while a default prepared start still notifies.
+    #[tokio::test(start_paused = true)]
+    async fn a_prepared_start_without_notify_parent_sends_no_notification() {
+        let (factory, _, _) = factory(2, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(Arc::clone(&factory), 2);
+        let parent = child_agent(
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            &["read".to_string()],
+        );
+        workers.set_parent_inbox(parent.inbox());
+
+        let quiet = PreparedStart {
+            notify_parent: false,
+            ..prepared()
+        };
+        let id = workers
+            .start_prepared(quiet, |_| factory(&spec()))
+            .await
+            .unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        workers
+            .continue_child(&id, "again".into(), Vec::new())
+            .await
+            .unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert!(!parent.has_pending_inbox(), "a quiet child notifies nobody");
+
+        let id = workers
+            .start_prepared(prepared(), |_| factory(&spec()))
+            .await
+            .unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert!(parent.has_pending_inbox(), "the default still notifies");
     }
 }

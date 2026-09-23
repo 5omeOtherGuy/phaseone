@@ -582,6 +582,96 @@ pub fn worker_end_note(
     line
 }
 
+/// The sentence a workflow step's end is reported with (ADR-0053 item 7), shared by
+/// every front end like [`worker_end_note`]:
+///
+/// `workflow wf1 review:bugs (reviewer → claude/claude-opus-5-5:high; w3) done — schema passed; not verified; parent verification required`
+/// `workflow wf1 fix (worker → claude/claude-fable-5) failed — quota_exceeded: claude-fable-5 used=3 limit=3`
+/// `workflow wf1 fix (worker → claude/claude-opus-5-5; w4) blocked: needs shell`
+/// `workflow wf1 fix (worker → claude/claude-opus-5-5; w4) done — replayed`
+///
+/// The label falls back to the call id. `needs` is what a `blocked` step asked for:
+/// the step line does not carry it, the host's runner kept it.
+#[cfg(feature = "workflows")]
+pub fn workflow_step_note(run: &str, line: &p1_workflow::StepLine, needs: Option<&str>) -> String {
+    use p1_workflow::StepStatus;
+    let label = line.label.as_deref().unwrap_or(&line.call.0);
+    // The step line carries `<id> (<route/model>)`; the model is already named.
+    let worker = line
+        .worker
+        .as_deref()
+        .and_then(|worker| worker.split_whitespace().next())
+        .map(|id| format!("; {id}"))
+        .unwrap_or_default();
+    let status = match line.status {
+        StepStatus::Done => "done",
+        StepStatus::Blocked => "blocked",
+        StepStatus::Failed => "failed",
+        StepStatus::Cancelled => "cancelled",
+    };
+    let state = if line.replayed {
+        format!("{status} — replayed")
+    } else {
+        match line.status {
+            StepStatus::Blocked => match needs {
+                Some(needs) => format!("blocked: needs {needs}"),
+                None => "blocked".to_string(),
+            },
+            _ => {
+                let mut parts: Vec<String> = Vec::new();
+                if line.schema != "not_requested" {
+                    parts.push(format!("schema {}", line.schema));
+                }
+                if let Some(evidence) = &line.evidence {
+                    parts.push(evidence.clone());
+                }
+                if line.attempts > 1 {
+                    parts.push(format!("attempts {}", line.attempts));
+                }
+                if let Some(error) = &line.error {
+                    parts.push(error.clone());
+                }
+                if parts.is_empty() {
+                    status.to_string()
+                } else {
+                    format!("{status} — {}", parts.join("; "))
+                }
+            }
+        }
+    };
+    format!(
+        "workflow {run} {label} ({} → {}{worker}) {state}",
+        line.role, line.model
+    )
+}
+
+/// The first line of a run's `workflow_result` rendering, for the host's own end line.
+/// `p1-tool-workflow` keeps its version private, so the wording is repeated here.
+#[cfg(feature = "workflows")]
+pub fn workflow_run_note(report: &p1_workflow::RunReport) -> String {
+    use p1_workflow::RunOutcome;
+    let outcome = match report.outcome {
+        RunOutcome::Completed => "completed",
+        RunOutcome::CompletedWithIssues => "completed with issues",
+        RunOutcome::Failed => "failed",
+        RunOutcome::Cancelled => "cancelled",
+    };
+    let c = &report.counts;
+    format!(
+        "workflow {} {outcome} — {} steps ({} replayed): {} done, {} blocked, {} failed, {} cancelled; {} not verified; {} capped; {} invalid output",
+        report.id.0,
+        c.steps,
+        c.replayed,
+        c.done,
+        c.blocked,
+        c.failed,
+        c.cancelled,
+        c.not_verified,
+        c.capped,
+        c.invalid_output
+    )
+}
+
 /// Total input tokens of one response. Known as soon as the uncached part is known:
 /// the cache parts are ADDED when the route reports them, and a route that has no such
 /// concept (the Codex route never reports cache writes) does not make the total unknown.

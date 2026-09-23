@@ -108,6 +108,10 @@ pub struct Settings {
     pub default_model: Option<String>,
     #[serde(default)]
     pub enabled_models: Vec<String>,
+    /// `[workflows]` (ADR-0053 item 4): laid over the shipped roles and caps.
+    #[cfg(feature = "workflows")]
+    #[serde(default)]
+    pub workflows: Option<p1_workflow::WorkflowSettings>,
 }
 
 // ------------------------------------------------------------------ settings
@@ -135,6 +139,28 @@ pub fn load_settings(locations: &Locations) -> Result<Settings, String> {
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
     toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The effective workflow settings: the user's `[workflows]` table over the shipped
+/// defaults, the shipped defaults alone when the table is absent.
+#[cfg(feature = "workflows")]
+pub fn workflow_settings(locations: &Locations) -> Result<p1_workflow::WorkflowSettings, String> {
+    let shipped = p1_workflow::WorkflowSettings::shipped();
+    Ok(match load_settings(locations)?.workflows {
+        Some(user) => shipped.overridden_by(user),
+        None => shipped,
+    })
+}
+
+/// Where workflow runs keep their directories when no session file places them
+/// (ADR-0053 item 7): `$XDG_STATE_HOME/p1/workflows` else
+/// `~/.local/state/p1/workflows`, read like `settings_path`. `None` when the host has
+/// neither.
+#[cfg(feature = "workflows")]
+pub fn workflow_state_root(locations: &Locations) -> Option<PathBuf> {
+    let state = dir(locations.env("XDG_STATE_HOME"))
+        .or_else(|| dir(locations.env("HOME")).map(|home| home.join(".local").join("state")))?;
+    Some(state.join("p1").join("workflows"))
 }
 
 fn dir(value: Option<String>) -> Option<PathBuf> {

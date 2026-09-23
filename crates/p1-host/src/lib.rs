@@ -28,6 +28,8 @@ pub mod run;
 pub mod session;
 pub mod tui;
 pub mod usage;
+#[cfg(feature = "workflows")]
+pub mod workflow;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -168,6 +170,14 @@ pub struct HostDeps {
     /// catalog registers the `worker_*` tools only when it is present.
     #[cfg(feature = "delegation")]
     pub worker_service: Option<Arc<dyn p1_workers::WorkerService>>,
+    /// The workflow service (ADR-0053). `run` sets it right after the worker service;
+    /// the catalog registers the `workflow_*` tools only when it is present.
+    #[cfg(feature = "workflows")]
+    pub workflow_service: Option<Arc<dyn p1_workflow::WorkflowService>>,
+    /// The runs whose end has not reached the parent's inbox yet: the service already
+    /// reports a run ended before that notification is sent, so the host waits on this.
+    #[cfg(feature = "workflows")]
+    pub(crate) workflow_observer: Option<Arc<workflow::HostWorkflowObserver>>,
     /// The parent's model-switch context (ADR-0049 stage 3). `run` sets it once the
     /// catalog and the parent's activity plumbing exist, so the line mode — and the
     /// TUI's run loop — can switch the model between turns.
@@ -206,6 +216,10 @@ impl HostDeps {
             wait: Arc::new(|duration| Box::pin(tokio::time::sleep(duration))),
             #[cfg(feature = "delegation")]
             worker_service: None,
+            #[cfg(feature = "workflows")]
+            workflow_service: None,
+            #[cfg(feature = "workflows")]
+            workflow_observer: None,
             model_switch: None,
         }
     }

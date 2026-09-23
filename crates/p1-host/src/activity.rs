@@ -321,6 +321,9 @@ pub struct WorkerReportTap {
     front_end: Arc<dyn FrontEnd>,
     worker_id: String,
     description: String,
+    /// A workflow step's end is shown by the workflow observer's step line, which
+    /// knows the call, the role and the schema check; a second line would repeat it.
+    silent_end: bool,
 }
 
 #[cfg(feature = "delegation")]
@@ -329,7 +332,9 @@ impl WorkerReportTap {
     /// report's `tools`, and the one whose identity implementation is `finish` is the
     /// one whose calls are read. `outcome` is the completion cell the child's `finish`
     /// tool writes — [`FinishOutcome::default`] when the child has no `finish` tool.
-    /// `description` is the child's route/model, shown by the front end.
+    /// `description` is the child's route/model, shown by the front end. With
+    /// `silent_end` the front end is not told the turn ended (a workflow step).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         inner: Arc<dyn EventSink>,
         report: Arc<Mutex<WorkerReport>>,
@@ -338,6 +343,7 @@ impl WorkerReportTap {
         front_end: Arc<dyn FrontEnd>,
         worker_id: String,
         description: String,
+        silent_end: bool,
     ) -> Self {
         let tap = Self {
             inner,
@@ -348,6 +354,7 @@ impl WorkerReportTap {
             front_end,
             worker_id,
             description,
+            silent_end,
         };
         tap.retool(tools);
         tap
@@ -421,7 +428,7 @@ impl EventSink for WorkerReportTap {
         }
         // Every event reaches the child's own rendering unchanged, in order.
         self.inner.emit(event);
-        if turn_finished {
+        if turn_finished && !self.silent_end {
             let report = self.report.lock().unwrap().clone();
             self.front_end
                 .worker_ended(&self.worker_id, &self.description, &report);
@@ -835,6 +842,7 @@ mod tests {
             front_end.clone(),
             "w1".to_string(),
             "route/model".to_string(),
+            false,
         ));
 
         let provider = ScriptedProvider::new(vec![
@@ -931,6 +939,7 @@ mod tests {
             Arc::new(RecordingWorkerEnds::default()),
             "w1".to_string(),
             "route/model".to_string(),
+            false,
         );
 
         tap.emit(AgentEvent::TurnStarted);
@@ -1051,6 +1060,7 @@ mod tests {
                 Arc::new(RecordingWorkerEnds::default()),
                 "w1".to_string(),
                 "route/model".to_string(),
+                false,
             );
 
             tap.emit(AgentEvent::TurnStarted);
