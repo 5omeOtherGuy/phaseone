@@ -21,7 +21,10 @@ use std::sync::atomic::AtomicUsize;
 use p1_assembly::Catalog;
 #[cfg(feature = "delegation")]
 use p1_assembly::ToolSpec;
-use p1_assembly::{Assembled, EnvironmentFile, Substitutions, assemble, load_environment};
+use p1_assembly::{
+    Assembled, ContextSettings, EffectiveContext, EnvironmentFile, Role, RoleWindows, Substitutions,
+    assemble, load_environment,
+};
 use p1_contracts::{
     AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
     ContextInput, ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, Tool,
@@ -160,15 +163,27 @@ impl ContextPolicy for DefaultContext {
 /// The context policy for an assembled agent (context.md §3): a
 /// `SummarizingContext` when the environment opts in with `[context]`,
 /// passthrough otherwise. The host is the composition root: `p1-assembly` only
-/// carries the plain settings and the prompt override.
-fn agent_context(assembled: &Assembled) -> Result<Arc<dyn ContextPolicy>, String> {
+/// carries the plain settings and the prompt override. The window and threshold are
+/// the EFFECTIVE ones (ADR-0065): the environment's table supplies everything else.
+fn agent_context(
+    assembled: &Assembled,
+    context: AgentContext,
+) -> Result<Arc<dyn ContextPolicy>, String> {
     let Some(settings) = &assembled.resolved.context else {
         return Ok(Arc::new(DefaultContext));
     };
+    let Some(effective) = context.effective else {
+        return Err(format!(
+            "environment `{}` states a [context] table but no effective window was resolved \
+             for the {}",
+            assembled.resolved.environment,
+            context.role.name()
+        ));
+    };
     let config = p1_context::ContextConfig {
-        window_tokens: settings.window_tokens,
+        window_tokens: effective.window_tokens,
         output_headroom_tokens: settings.output_headroom_tokens,
-        summarize_at_tokens: settings.summarize_at_tokens,
+        summarize_at_tokens: effective.summarize_at_tokens,
         keep_recent_tokens: settings.keep_recent_tokens,
         user_verbatim_tokens: settings.user_verbatim_tokens,
         tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
@@ -186,6 +201,75 @@ fn agent_context(assembled: &Assembled) -> Result<Arc<dyn ContextPolicy>, String
     )?
     .with_summary_output_tokens(settings.summary_output_tokens)?;
     Ok(Arc::new(policy))
+}
+
+/// Which agent is running and what its context came out to (ADR-0065). The role
+/// rule is applied ONCE per agent — before anything is built — so an invalid
+/// combination is a load error, and the same numbers reach the context policy, the
+/// ledger, the journal and the wire.
+#[derive(Debug, Clone, Copy)]
+struct AgentContext {
+    role: Role,
+    /// `None` exactly when the environment states no `[context]` table: the window
+    /// is unknown, never guessed.
+    effective: Option<EffectiveContext>,
+}
+
+impl AgentContext {
+    /// Apply the role rule to a loaded environment. The error is the one
+    /// [`ContextSettings::effective`] builds: it names the environment, the role and
+    /// every number involved.
+    fn resolve(
+        environment: &EnvironmentFile,
+        role: Role,
+        windows: RoleWindows,
+    ) -> Result<Self, String> {
+        let effective = environment
+            .context
+            .as_ref()
+            .map(|settings| settings.effective(&environment.name, role, windows))
+            .transpose()?;
+        Ok(Self { role, effective })
+    }
+
+    /// The entries this agent's requests carry in `ModelOptions::native`: the role,
+    /// and — when the environment states a capacity — the effective window and
+    /// threshold. This is the ONE plain-data path from the host to an adapter and
+    /// into the journal's `environment` record (ADR-0065). The host is the only
+    /// writer: both values are removed first, so an environment file cannot spoof
+    /// them.
+    fn apply_to(&self, options: &mut p1_contracts::ModelOptions) {
+        for key in [
+            p1_contracts::CONTEXT_ROLE,
+            p1_contracts::CONTEXT_WINDOW_TOKENS,
+            p1_contracts::CONTEXT_SUMMARIZE_AT_TOKENS,
+        ] {
+            options.native.remove(key);
+        }
+        options.native.insert(
+            p1_contracts::CONTEXT_ROLE.to_string(),
+            serde_json::Value::String(self.role.name().to_string()),
+        );
+        if let Some(effective) = self.effective {
+            options.native.insert(
+                p1_contracts::CONTEXT_WINDOW_TOKENS.to_string(),
+                serde_json::Value::from(effective.window_tokens),
+            );
+            options.native.insert(
+                p1_contracts::CONTEXT_SUMMARIZE_AT_TOKENS.to_string(),
+                serde_json::Value::from(effective.summarize_at_tokens),
+            );
+        }
+    }
+}
+
+/// The TOP-LEVEL agent's role (ADR-0065): `--role` when given, else the lead for an
+/// interactive run and a worker for a headless one. Every child agent is a worker
+/// whatever this says.
+fn top_level_role(options: &Options, headless: bool) -> Role {
+    options
+        .role
+        .unwrap_or(if headless { Role::Worker } else { Role::Lead })
 }
 
 /// A session store plus the records to resume from (when resuming).
@@ -521,6 +605,12 @@ pub async fn run_with_front_end(
     // front end decides what "headless" means (the line front end uses the CLI
     // rule, a terminal UI is interactive by definition).
     let headless = front_end.is_headless(options);
+    // ADR-0065: which agent the top-level run is, and the windows the user's
+    // `[context]` table gives each role. Read once here, so the top-level agent and
+    // every child of this run are built from the same numbers. A bad table is the
+    // command line's to fix (settings.toml), a bad combination is the run's (below).
+    let role = top_level_role(options, headless);
+    let windows = crate::models::role_windows(&crate::auth::locations(deps)).map_err(RunError::usage)?;
 
     // The delegation service must exist before the catalog so the `worker_*`
     // tools can be registered; the child factory reaches the catalog lazily,
@@ -548,6 +638,7 @@ pub async fn run_with_front_end(
         options.session.clone(),
         options.max_idle_summaries,
         service_slot.clone(),
+        windows,
     ));
     #[cfg(feature = "delegation")]
     let service: Option<Arc<InProcessWorkers>> = {
@@ -597,6 +688,10 @@ pub async fn run_with_front_end(
     crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
         .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
+    // ADR-0065: the role rule, checked BEFORE anything is built, so an invalid
+    // combination is a load error naming the environment, the role and the numbers
+    // rather than a provider request that fails later.
+    let agent_context_values = AgentContext::resolve(&environment, role, windows)?;
     let substitutions = substitutions(deps, &workspace);
     let assembled = assemble_with_cache_key(
         &catalog,
@@ -604,11 +699,12 @@ pub async fn run_with_front_end(
         &workspace,
         &substitutions,
         PARENT_ORDINAL,
+        agent_context_values,
     )?;
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
     let completion = completion_hub.take();
-    let context = agent_context(&assembled)?;
+    let context = agent_context(&assembled, agent_context_values)?;
     let route = assembled.resolved.route.origin.route.clone();
     let model = assembled.resolved.route.origin.model.clone();
     // The session's model, for a later switch (ADR-0049 stage 3): the environment it
@@ -622,14 +718,13 @@ pub async fn run_with_front_end(
     // ADR-0057: the same announcement carries the assembled tools, so a front end
     // can describe a call from the tool that owns it instead of matching a name.
     front_end.parent_tools(&assembled.tools);
-    // §10 `ctx`'s denominator: unknown (no `[context]` section) stays `None`,
-    // never a guessed window.
+    // §10 `ctx`'s denominator: the EFFECTIVE window and threshold (ADR-0065) — the
+    // numbers this agent actually works in. Unknown (no `[context]` section) stays
+    // `None`, never a guessed window.
     front_end.context_configured(
-        assembled.resolved.context.as_ref().map(|c| c.window_tokens),
-        assembled
-            .resolved
-            .context
-            .as_ref()
+        agent_context_values.effective.map(|c| c.window_tokens),
+        agent_context_values
+            .effective
             .map(|c| c.summarize_at_tokens),
     );
 
@@ -760,6 +855,11 @@ pub async fn run_with_front_end(
         ignored: session_journals(options.session.as_deref()),
         scope: options.models.clone(),
         route_label: front_end.route_label(),
+        // ADR-0065: a switch keeps the session's role and the run's windows, and the
+        // front end hears the new environment's effective numbers.
+        role,
+        windows,
+        front_end: front_end.clone(),
         session: Mutex::new(SessionModel {
             environment: session_environment,
             profile: choice.profile.clone(),
@@ -815,6 +915,10 @@ async fn workflow_run(
     })?;
     let args = workflow_args(workflow).map_err(RunError::usage)?;
     let workspace = resolve_workspace(options)?;
+    // ADR-0065: a workflow run starts no top-level agent, so every agent of the run
+    // is a worker; the windows are the user's table over the shipped defaults.
+    let windows = crate::models::role_windows(&crate::auth::locations(deps))
+        .map_err(RunError::usage)?;
     let cancel = CancellationToken::new();
     let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone()));
 
@@ -834,6 +938,7 @@ async fn workflow_run(
         options.session.clone(),
         options.max_idle_summaries,
         service_slot.clone(),
+        windows,
     ));
     let service = InProcessWorkers::new(
         make_child_factory(child_builder.clone()),
@@ -1493,6 +1598,15 @@ pub(crate) struct ModelSwitch {
     /// The parent renderer's route label, when the front end has one: a successful
     /// switch moves it to the new assembly's route label.
     route_label: Option<Arc<Mutex<String>>>,
+    /// ADR-0065: the session's role and the run's role windows. A switch re-runs the
+    /// role rule against the NEW environment, so switching to a narrower route
+    /// narrows the window instead of keeping the old one.
+    role: Role,
+    windows: RoleWindows,
+    /// The front end, so a successful switch tells it the new effective window and
+    /// threshold (`FrontEnd::context_configured`) — the ledger must never show the
+    /// previous environment's numbers.
+    front_end: Arc<dyn FrontEnd>,
     session: Mutex<SessionModel>,
 }
 
@@ -1549,12 +1663,16 @@ pub(crate) fn switch_model(
     with_worker_tools(&mut environment);
     crate::models::apply(&mut environment, &choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
+    // The switched environment's own role rule (ADR-0065): same role, same windows,
+    // possibly a different capacity.
+    let agent_context_values = AgentContext::resolve(&environment, switch.role, switch.windows)?;
     let assembled = assemble_with_cache_key(
         &switch.catalog,
         &environment,
         &switch.workspace,
         &switch.substitutions,
         PARENT_ORDINAL,
+        agent_context_values,
     )?;
     // The catalog's `finish` factory issued this assembly its own completion. Take
     // it, so the hub cannot hand a stale one to a later worker assembly, and so it
@@ -1564,7 +1682,7 @@ pub(crate) fn switch_model(
     // The label the renderer names after this switch, exactly as the start path
     // named it (`Origin.route`, `<adapter>/<account>`).
     let route = assembled.resolved.route.origin.route.clone();
-    let context = agent_context(&assembled)?;
+    let context = agent_context(&assembled, agent_context_values)?;
     let mut tools = assembled.tools;
     // The switched tool set's `finish` must reach the completion the run reads. The
     // session keeps ITS `finish` — the whole session's activity is in that tool's
@@ -1611,6 +1729,14 @@ pub(crate) fn switch_model(
     if let Some(label) = &switch.route_label {
         *label.lock().unwrap() = route;
     }
+    // ADR-0065: and so do the effective window and threshold the ledger shows — the
+    // role rule ran against the switched environment.
+    switch.front_end.context_configured(
+        agent_context_values.effective.map(|c| c.window_tokens),
+        agent_context_values
+            .effective
+            .map(|c| c.summarize_at_tokens),
+    );
     Ok(model_name(&environment))
 }
 
@@ -2222,7 +2348,8 @@ fn assemble_child(
     workspace: &Path,
     substitutions: &Substitutions,
     ordinal: u64,
-) -> Result<Assembled, String> {
+    windows: RoleWindows,
+) -> Result<(Assembled, AgentContext), String> {
     let mut environment =
         load_environment(environment_name, environment_dirs).map_err(|error| error.to_string())?;
     environment.tools = child_tools(&environment, grant)?;
@@ -2232,7 +2359,12 @@ fn assemble_child(
         crate::models::apply(&mut environment, choice, environment_dirs)?;
     }
     crate::catalog::resolve_environment(&mut environment, environment_dirs)?;
-    assemble_with_cache_key(catalog, &environment, workspace, substitutions, ordinal)
+    // ADR-0065: EVERY child agent is a worker, whatever the top-level run is — a
+    // delegate worker, a workflow step and a fanout job alike.
+    let context = AgentContext::resolve(&environment, Role::Worker, windows)
+        .map_err(|error| format!("cannot build worker `{environment_name}`: {error}"))?;
+    let assembled = assemble_with_cache_key(catalog, &environment, workspace, substitutions, ordinal, context)?;
+    Ok((assembled, context))
 }
 
 /// The tool list of a child: the granted modules in the parent's order, each with the
@@ -2306,6 +2438,9 @@ pub(crate) struct ChildBuilder {
     session: Option<PathBuf>,
     max_idle_summaries: usize,
     service_slot: Arc<OnceLock<Arc<InProcessWorkers>>>,
+    /// ADR-0065: the run's role windows, so every child applies the worker rule with
+    /// the same numbers the top-level run read from `settings.toml`.
+    windows: RoleWindows,
     #[cfg(feature = "shadow-hook")]
     shadow: Option<Arc<p1_hook_shadow::ShadowHook>>,
 }
@@ -2325,6 +2460,7 @@ impl ChildBuilder {
         session: Option<PathBuf>,
         max_idle_summaries: usize,
         service_slot: Arc<OnceLock<Arc<InProcessWorkers>>>,
+        windows: RoleWindows,
     ) -> Self {
         Self {
             environment_dirs: deps.environment_dirs.clone(),
@@ -2338,6 +2474,7 @@ impl ChildBuilder {
             session,
             max_idle_summaries,
             service_slot,
+            windows,
             #[cfg(feature = "shadow-hook")]
             shadow: deps.shadow.clone(),
         }
@@ -2385,7 +2522,7 @@ impl ChildBuilder {
         // This child's own cache-key ordinal, kept for its whole life: a re-grant
         // assembles at the SAME ordinal, never a new one.
         let ordinal = next_agent_ordinal(&self.agent_ordinals);
-        let mut assembled = assemble_child(
+        let (mut assembled, agent_context_values) = assemble_child(
             environment_dirs,
             &catalog,
             environment,
@@ -2394,6 +2531,7 @@ impl ChildBuilder {
             &workspace,
             &substitutions,
             ordinal,
+            self.windows,
         )?;
         // The session file is numbered like the id the service hands out.
         let id: usize = worker_id
@@ -2414,7 +2552,7 @@ impl ChildBuilder {
         if let Some(completion) = &child_completion {
             apply_completion_policy(&mut assembled, completion, contract.clone());
         }
-        let context = agent_context(&assembled)?;
+        let context = agent_context(&assembled, agent_context_values)?;
         let route = assembled.resolved.route.origin.route.clone();
         let model = assembled.resolved.route.origin.model.clone();
         let description = format!("{route}/{model}");
@@ -2503,12 +2641,13 @@ impl ChildBuilder {
             let tee = tee.clone();
             let log = log.clone();
             let outcome = outcome.clone();
+            let windows = self.windows;
             // The worker's OWN `finish` tool survives every re-grant: its activity
             // log is the worker's whole history, which `finish` reads to verify a
             // claim, and a freshly assembled one would see an empty session.
             let finish = finish_tool(&assembled);
             Arc::new(move |grant: &[String]| -> Result<Reconfiguration, String> {
-                let assembled = assemble_child(
+                let (assembled, agent_context_values) = assemble_child(
                     &environment_dirs,
                     &catalog,
                     &environment_name,
@@ -2517,12 +2656,13 @@ impl ChildBuilder {
                     &workspace,
                     &substitutions,
                     ordinal,
+                    windows,
                 )?;
                 // The catalog's `finish` factory issued THIS assembly its own
                 // completion: take it, so the hub cannot hand a stale one to a later
                 // worker assembly.
                 let _issued = completion_hub.take();
-                let context = agent_context(&assembled)?;
+                let context = agent_context(&assembled, agent_context_values)?;
                 let finish_at = finish_index(&assembled);
                 // A re-grant is a new tool set, so the policy is chosen again from it
                 // (ADR-0052 item 1): `add_tools: ["shell"]` puts the worker back on the
@@ -2672,12 +2812,18 @@ fn make_child_factory(builder: Arc<ChildBuilder>) -> AgentFactory {
 /// to drop a key, because the description already said whether one is taken.
 /// `agent_ordinal` is the agent's position in the cache-key scheme: 0 for the
 /// parent, the worker's own ordinal otherwise.
+///
+/// `context` is this agent's resolved role rule (ADR-0065): its role and effective
+/// window/threshold become the plain-data `native` entries every request carries, so
+/// the adapter that must translate the window into wire behaviour reads them from the
+/// request and the journal's `environment` record shows them.
 fn assemble_with_cache_key(
     catalog: &Catalog,
     environment: &p1_assembly::EnvironmentFile,
     workspace: &std::path::Path,
     substitutions: &Substitutions,
     agent_ordinal: u64,
+    context: AgentContext,
 ) -> Result<p1_assembly::Assembled, String> {
     let name = environment.name.clone();
     let configured = environment.options.clone();
@@ -2691,6 +2837,7 @@ fn assemble_with_cache_key(
             if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {
                 options.cache_key = Some(generated_cache_key(workspace, &name, agent_ordinal));
             }
+            context.apply_to(&mut options);
             options
         },
     )

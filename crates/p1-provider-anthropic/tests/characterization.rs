@@ -197,7 +197,8 @@ fn model_effort_matrix_pins_thinking_output_config_max_tokens_and_beta() {
             Value::String(beta_header(&build_headers(
                 account(),
                 &test_credential(),
-                &body
+                &body,
+                None
             ))),
             case["beta"],
             "anthropic-beta: {model} {effort:?}"

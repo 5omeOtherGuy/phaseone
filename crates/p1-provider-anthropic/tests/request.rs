@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use p1_contracts::history::{
     AssistantBlock, AssistantItem, InboxKind, Item, Origin, ReplayData, ToolCall, ToolInput,
     ToolResultItem, ToolStatus,
@@ -14,8 +15,10 @@ use p1_contracts::{
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_anthropic::{
     AnthropicProvider, MessagesAccount, MessagesRoute, ROUTE, build_headers, build_request,
+    context_window_tokens,
 };
-use p1_provider_http::testing::ScriptedTransport;
+use p1_provider_conformance::fixtures::anthropic as fixtures;
+use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource, RetryPolicy, Transport};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -340,7 +343,7 @@ fn headers_carry_the_oauth_set_and_never_an_api_key() {
         bearer: "TEST-TOKEN".to_string(),
         account_id: None,
     };
-    let headers = build_headers(account(), &credential, &json!({ "stream": true }));
+    let headers = build_headers(account(), &credential, &json!({ "stream": true }), None);
     let expected = vec![
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "text/event-stream".to_string()),
@@ -378,6 +381,7 @@ fn interleaved_thinking_beta_is_present_only_for_manual_budget_thinking() {
         account(),
         &credential,
         &json!({ "thinking": { "type": "enabled", "budget_tokens": 4_096 } }),
+        None,
     );
     let beta = manual
         .iter()
@@ -394,6 +398,7 @@ fn interleaved_thinking_beta_is_present_only_for_manual_budget_thinking() {
         account(),
         &credential,
         &json!({ "thinking": { "type": "adaptive", "display": "summarized" } }),
+        None,
     );
     let beta = adaptive
         .iter()
@@ -402,6 +407,99 @@ fn interleaved_thinking_beta_is_present_only_for_manual_budget_thinking() {
         .1
         .clone();
     assert_eq!(beta, "oauth-2025-04-20,claude-code-20250219");
+}
+
+/// The `anthropic-beta` value a header set carries (always present on this route).
+fn beta(headers: &[(String, String)]) -> &str {
+    headers
+        .iter()
+        .find(|(name, _)| name == "anthropic-beta")
+        .map(|(_, value)| value.as_str())
+        .expect("the beta header is always present")
+}
+
+const BASE_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
+
+#[test]
+fn the_1m_beta_is_present_iff_the_window_exceeds_200k() {
+    let credential = Credential {
+        bearer: "T".to_string(),
+        account_id: None,
+    };
+    let body = json!({ "stream": true });
+    for window in [None, Some(1), Some(200_000)] {
+        let headers = build_headers(account(), &credential, &body, window);
+        assert_eq!(beta(&headers), BASE_BETA, "{window:?}");
+    }
+    for window in [Some(200_001), Some(500_000), Some(1_000_000)] {
+        let headers = build_headers(account(), &credential, &body, window);
+        assert_eq!(
+            beta(&headers),
+            format!("{BASE_BETA},context-1m-2025-08-07"),
+            "{window:?}"
+        );
+    }
+}
+
+#[test]
+fn the_1m_beta_joins_the_interleaved_beta_rather_than_replacing_it() {
+    let credential = Credential {
+        bearer: "T".to_string(),
+        account_id: None,
+    };
+    let body = json!({ "thinking": { "type": "enabled", "budget_tokens": 4_096 } });
+    let headers = build_headers(account(), &credential, &body, Some(500_000));
+    assert_eq!(
+        beta(&headers),
+        format!("{BASE_BETA},interleaved-thinking-2025-05-14,context-1m-2025-08-07")
+    );
+    // Exactly 200k is still the default window: no 1M beta, same two betas.
+    let headers = build_headers(account(), &credential, &body, Some(200_000));
+    assert_eq!(
+        beta(&headers),
+        format!("{BASE_BETA},interleaved-thinking-2025-05-14")
+    );
+}
+
+#[test]
+fn context_window_tokens_reads_only_its_own_key_and_refuses_a_malformed_value() {
+    let mut options = ModelOptions::default();
+    assert_eq!(context_window_tokens(&options).unwrap(), None);
+
+    options.native.insert(
+        p1_contracts::CONTEXT_WINDOW_TOKENS.to_string(),
+        json!(500_000),
+    );
+    assert_eq!(context_window_tokens(&options).unwrap(), Some(500_000));
+
+    // The other harness keys present change nothing: this reader knows only its own.
+    options
+        .native
+        .insert(p1_contracts::CONTEXT_ROLE.to_string(), json!("worker"));
+    options.native.insert(
+        p1_contracts::CONTEXT_SUMMARIZE_AT_TOKENS.to_string(),
+        json!(240_000),
+    );
+    assert_eq!(context_window_tokens(&options).unwrap(), Some(500_000));
+
+    for bad in [json!(0), json!("500000"), json!(1.5), json!(-1)] {
+        let mut options = ModelOptions::default();
+        options
+            .native
+            .insert(p1_contracts::CONTEXT_WINDOW_TOKENS.to_string(), bad.clone());
+        let error = context_window_tokens(&options).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{bad}");
+        assert!(
+            error.message.contains("p1.context.window_tokens"),
+            "{bad}: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("must be a positive integer"),
+            "{bad}: {}",
+            error.message
+        );
+    }
 }
 
 #[test]
@@ -618,6 +716,32 @@ impl CredentialSource for NoCredentials {
     }
 }
 
+/// Credentials that resolve without I/O, so the stream reaches the transport.
+struct FixedCredentials;
+
+impl CredentialSource for FixedCredentials {
+    fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async move {
+            Ok(Credential {
+                bearer: "TEST-TOKEN".to_string(),
+                account_id: None,
+            })
+        })
+    }
+
+    fn refresh<'a>(
+        &'a self,
+        _rejected: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async move {
+            Ok(Credential {
+                bearer: "TEST-TOKEN".to_string(),
+                account_id: None,
+            })
+        })
+    }
+}
+
 fn provider(model: &str) -> AnthropicProvider {
     let transport: Arc<dyn Transport> = Arc::new(ScriptedTransport::new(Vec::new()));
     AnthropicProvider::new(
@@ -816,4 +940,56 @@ fn with_base_url_and_with_retry_are_chainable() {
         });
     // Construction succeeded and nothing touched the network.
     assert_eq!(provider.describe().origin.model, "m");
+}
+
+// ---------------------------------------------------------------------------
+// The harness's context window reaching the wire (ADR-0065)
+// ---------------------------------------------------------------------------
+
+/// End to end and with NO network: the window the host wrote into `options.native`
+/// is a wire-visible consequence, and it reaches the request the transport recorded.
+/// `ScriptedTransport` never leaves the process.
+#[tokio::test]
+async fn the_streamed_request_carries_the_1m_beta_exactly_above_200k() {
+    for (window, expected) in [(500_000u64, true), (200_000u64, false)] {
+        let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::text_turn)]);
+        let provider = AnthropicProvider::new(
+            route(),
+            "claude-sonnet-4-6",
+            Arc::new(profile("claude-sonnet-4-6")),
+            Arc::new(transport.clone()),
+            Arc::new(FixedCredentials),
+        )
+        .expect("the profile is expressible on the Messages wire");
+
+        let mut request = request(vec![user("hi")]);
+        request.options.native.insert(
+            p1_contracts::CONTEXT_WINDOW_TOKENS.to_string(),
+            json!(window),
+        );
+        provider
+            .validate(&request)
+            .expect("a positive whole-number window is valid");
+
+        let mut stream = provider
+            .stream(request, CancellationToken::new())
+            .await
+            .expect("a valid request must start a stream");
+        while stream.next().await.is_some() {}
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1, "{window}");
+        let beta_header = requests[0]
+            .headers
+            .iter()
+            .find(|(name, _)| name == "anthropic-beta")
+            .expect("the request carries the beta header")
+            .1
+            .clone();
+        assert_eq!(
+            beta_header.contains("context-1m-2025-08-07"),
+            expected,
+            "{window}: {beta_header}"
+        );
+    }
 }

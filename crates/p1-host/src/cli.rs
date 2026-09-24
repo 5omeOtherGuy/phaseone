@@ -2,7 +2,8 @@
 //! messages are part of the interface.
 //!
 //! `p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]
-//! [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
+//! [--role lead|worker] [--workspace DIR] [--session FILE] [--resume] [--ask]
+//! [PROMPT…]`
 //! `p1 models [SEARCH]`
 //! `p1 env show NAME`
 //! `p1 workflow run FILE [--arg k=v]… [--args FILE] [--role r=E/P[:effort]]…`
@@ -11,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use p1_assembly::Role;
 use p1_contracts::Effort;
 
 use crate::models::parse_effort;
@@ -117,6 +119,10 @@ pub struct Options {
     pub effort: Option<Effort>,
     /// `--models PATTERNS`: the scope for this run, replacing `enabled_models`.
     pub models: Option<String>,
+    /// `--role lead|worker` (ADR-0065): the TOP-LEVEL agent's role. `None` means the
+    /// default rule — the lead when the run is interactive, a worker when it is
+    /// headless. Every child agent is a worker whatever this says.
+    pub role: Option<Role>,
     pub workspace: Option<PathBuf>,
     pub session: Option<PathBuf>,
     pub resume: bool,
@@ -179,7 +185,7 @@ pub fn usage() -> String {
     out.push_str("p1 — a lean, model-shaped coding harness\n\n");
     out.push_str("usage:\n");
     out.push_str(
-        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]\n     [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]\n",
+        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]\n     [--role lead|worker] [--workspace DIR] [--session FILE] [--resume] [--ask]\n     [PROMPT…]\n",
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str("  p1 env show NAME\n");
@@ -202,6 +208,9 @@ pub fn usage() -> String {
     );
     out.push_str(
         "  --models PATTERNS comma-separated globs (`*`, `?`) that scope the models this\n                    run may cycle through, replacing `enabled_models` from\n                    settings.toml; a pattern without `/` matches the profile part\n                    (`p1 models` takes it too)\n",
+    );
+    out.push_str(
+        "  --role ROLE       the top-level agent's role: `lead` or `worker`. The default\n                    is the lead for an interactive run and a worker for a headless\n                    one (a prompt, or `p1 workflow run`); every child agent is a\n                    worker whatever this says. `[context]` in settings.toml gives\n                    each role its window\n",
     );
     out.push_str("  --workspace DIR   workspace root (default: current directory)\n");
     out.push_str("  --session FILE    write the session journal to FILE as JSONL\n");
@@ -275,6 +284,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut model: Option<String> = None;
     let mut effort: Option<Effort> = None;
     let mut models: Option<String> = None;
+    let mut role: Option<Role> = None;
     let mut workspace: Option<PathBuf> = None;
     let mut session: Option<PathBuf> = None;
     let mut resume = false;
@@ -302,6 +312,10 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             "--models" => {
                 let value = take_value(args, &mut index, "--models")?;
                 models = Some(value);
+            }
+            "--role" => {
+                let value = take_value(args, &mut index, "--role")?;
+                role = Some(Role::parse(&value).map_err(|message| CliError { message })?);
             }
             "--workspace" => {
                 let value = take_value(args, &mut index, "--workspace")?;
@@ -403,6 +417,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         model,
         effort,
         models,
+        role,
         workspace,
         session,
         resume,
@@ -457,6 +472,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         model: None,
         effort: None,
         models: None,
+        role: None,
         workspace: None,
         session: None,
         resume: false,
@@ -897,6 +913,7 @@ fn defaults(command: Command) -> Options {
         model: None,
         effort: None,
         models: None,
+        role: None,
         workspace: None,
         session: None,
         resume: false,

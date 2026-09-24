@@ -25,7 +25,9 @@ mod provider;
 mod request;
 
 pub use provider::AnthropicProvider;
-pub use request::{build_headers, build_request};
+pub use request::{
+    CONTEXT_1M_BETA, CONTEXT_1M_BETA_THRESHOLD, build_headers, build_request, context_window_tokens,
+};
 
 /// The `origin_route` of the shipped `routes/anthropic-subscription.toml`, byte for
 /// byte what this adapter wrote into every [`p1_contracts::Origin`] before route data

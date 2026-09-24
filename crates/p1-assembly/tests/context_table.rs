@@ -26,7 +26,7 @@ fn a_context_table_is_parsed_and_exposed() {
     let settings = environment.context.clone().expect("the table is present");
     assert_eq!(settings.window_tokens, 200_000);
     assert_eq!(settings.output_headroom_tokens, 16_000);
-    assert_eq!(settings.summarize_at_tokens, 120_000);
+    assert_eq!(settings.summarize_at_tokens, Some(120_000));
     assert_eq!(settings.keep_recent_tokens, 30_000);
     assert_eq!(settings.user_verbatim_tokens, 8_000);
     // `tool_result_excerpt_chars` is optional and defaults to 2000.
@@ -38,6 +38,33 @@ fn a_context_table_is_parsed_and_exposed() {
     assert_eq!(assembled.resolved.context.as_ref(), Some(&settings));
     let json = serde_json::to_string(&assembled.resolved).unwrap();
     assert!(json.contains("\"summarize_at_tokens\":120000"), "{json}");
+}
+
+// The role rule (ADR-0065): the threshold is OPTIONAL, and an environment that pins
+// none says so on the resolved environment (the absent key, not a zero).
+#[test]
+fn the_threshold_is_optional_and_absent_means_the_role_rule_derives_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = "[context]\nwindow_tokens = 260000\noutput_headroom_tokens = 32000\nkeep_recent_tokens = 50000\nuser_verbatim_tokens = 8000\n";
+    write_environment(dir.path(), "ctx", &format!("{BASE}\n{table}"), "hi");
+    let environment = load_environment("ctx", &[dir.path().to_path_buf()]).unwrap();
+    let settings = environment.context.clone().expect("the table is present");
+    assert_eq!(settings.summarize_at_tokens, None);
+    assert_eq!(settings.window_tokens, 260_000);
+
+    let workspace = tempfile::tempdir().unwrap();
+    let assembled = assemble(&catalog(), &environment, workspace.path(), &substitutions()).unwrap();
+    let json = serde_json::to_string(&assembled.resolved).unwrap();
+    assert!(!json.contains("summarize_at_tokens"), "{json}");
+    // The threshold an agent would run with is derived from the role (260k route,
+    // worker window 300k -> 260k; 80% -> 208k).
+    assert_eq!(
+        settings
+            .effective("ctx", p1_assembly::Role::Worker, Default::default())
+            .unwrap()
+            .summarize_at_tokens,
+        208_000
+    );
 }
 
 #[test]

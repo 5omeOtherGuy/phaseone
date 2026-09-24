@@ -26,6 +26,14 @@ pub(crate) const BASE_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 /// Beta required only when the body carries a manual-budget `thinking` block.
 pub(crate) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
+/// The beta the subscription route requires above 200k tokens; the window arrives in
+/// `ModelOptions::native` under `p1_contracts::CONTEXT_WINDOW_TOKENS` (ADR-0065).
+pub const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
+
+/// The effective context window above which the subscription route requires
+/// [`CONTEXT_1M_BETA`]: a window of exactly 200k tokens is still the default window.
+pub const CONTEXT_1M_BETA_THRESHOLD: u64 = 200_000;
+
 /// `max_tokens` when the caller expresses no preference.
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
@@ -74,6 +82,26 @@ fn policy_name(policy: ThinkingPolicy) -> &'static str {
 
 fn invalid(message: &str) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
+}
+
+/// The effective context window this request carries, if any.
+///
+/// The window travels on the harness's plain-data channel: `ModelOptions::native`
+/// under [`p1_contracts::CONTEXT_WINDOW_TOKENS`] (ADR-0065). The key is absent from a
+/// request that carries no window (`Ok(None)`); a present value that is not a
+/// positive JSON integer is a malformed request, because the host is the key's only
+/// writer and a value this reader cannot read would silently drop the 1M beta.
+pub fn context_window_tokens(options: &ModelOptions) -> Result<Option<u64>, ProviderError> {
+    let Some(value) = options.native.get(p1_contracts::CONTEXT_WINDOW_TOKENS) else {
+        return Ok(None);
+    };
+    match value.as_u64() {
+        Some(tokens) if tokens > 0 => Ok(Some(tokens)),
+        _ => Err(invalid(&format!(
+            "`{}` must be a positive integer, got {value}",
+            p1_contracts::CONTEXT_WINDOW_TOKENS
+        ))),
+    }
 }
 
 /// The model-dependent part of one Messages request: what the model profile's
@@ -396,14 +424,17 @@ fn push_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
     messages.push(json!({ "role": role, "content": blocks }));
 }
 
-/// Build the request headers this account requires from the credential and the
-/// already-built body. The `anthropic-beta` set is payload-driven: the
-/// interleaved-thinking beta is present exactly when the body carries a
-/// manual-budget thinking block. This route never sends `x-api-key`.
+/// Build the request headers this account requires from the credential, the
+/// already-built body and the request's effective context window. The
+/// `anthropic-beta` set is payload-driven: the account's base betas, then the
+/// interleaved-thinking beta exactly when the body carries a manual-budget thinking
+/// block, then [`CONTEXT_1M_BETA`] exactly when `window_tokens` is above
+/// [`CONTEXT_1M_BETA_THRESHOLD`]. This route never sends `x-api-key`.
 pub fn build_headers(
     account: MessagesAccount,
     credential: &p1_provider_http::Credential,
     body: &Value,
+    window_tokens: Option<u64>,
 ) -> Vec<(String, String)> {
     let mut headers = vec![
         ("content-type".to_string(), "application/json".to_string()),
@@ -436,6 +467,10 @@ pub fn build_headers(
     {
         beta.push(',');
         beta.push_str(INTERLEAVED_THINKING_BETA);
+    }
+    if window_tokens.is_some_and(|window| window > CONTEXT_1M_BETA_THRESHOLD) {
+        beta.push(',');
+        beta.push_str(CONTEXT_1M_BETA);
     }
     headers.push(("anthropic-beta".to_string(), beta));
 

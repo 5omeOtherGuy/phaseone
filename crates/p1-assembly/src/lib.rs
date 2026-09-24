@@ -107,12 +107,17 @@ pub struct EnvironmentFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSettings {
-    /// Capacity of this model on this route.
+    /// CAPACITY of this model on this route — a ceiling, not the agent's window:
+    /// the role rule (ADR-0065) clamps it to the role's window (`[context]` in
+    /// `settings.toml`).
     pub window_tokens: u64,
     /// Reserved for the next response.
     pub output_headroom_tokens: u64,
-    /// The useful point: where summarizing starts. Below `window - headroom`.
-    pub summarize_at_tokens: u64,
+    /// The useful point: where summarizing starts, when the environment pins it.
+    /// ABSENT means the role rule derives it: `window_tokens * summarize_at_percent
+    /// / 100`, floored. Below `window - headroom`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarize_at_tokens: Option<u64>,
     /// Newest part of the history kept verbatim.
     pub keep_recent_tokens: u64,
     /// Budget for user messages kept verbatim.
@@ -134,13 +139,223 @@ fn default_summary_output_tokens() -> u64 {
     DEFAULT_SUMMARY_OUTPUT_TOKENS
 }
 
+// ------------------------------------------------------------------ the role rule
+
+/// Which agent is running (ADR-0065). The interactive top-level agent — the TUI and
+/// the interactive line loop — is the lead; every headless top-level run and every
+/// child agent (a delegate worker, a workflow step, a fanout job) is a worker.
+/// `--role` overrides the top-level role only; children are always workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Lead,
+    Worker,
+}
+
+impl Role {
+    /// The spelling `--role` accepts and the journal records.
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Lead => "lead",
+            Role::Worker => "worker",
+        }
+    }
+
+    /// Parse one `--role` value. Anything else is an error naming both roles.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "lead" => Ok(Role::Lead),
+            "worker" => Ok(Role::Worker),
+            other => Err(format!(
+                "unknown role `{other}`; the roles are lead, worker"
+            )),
+        }
+    }
+}
+
+/// The optional `[context]` table of the user's `settings.toml` (spec §2): the
+/// window each role works in and the percentage of it summarizing starts at
+/// (ADR-0065). The environment file states the route's CAPACITY; these are the
+/// windows the harness works in, so the effective window is
+/// `min(capacity, window(role))`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleWindows {
+    /// The interactive top-level agent's window.
+    #[serde(default = "default_lead_window_tokens")]
+    pub lead_window_tokens: u64,
+    /// Every worker's window.
+    #[serde(default = "default_worker_window_tokens")]
+    pub worker_window_tokens: u64,
+    /// Where summarizing starts, as a percentage of the effective window.
+    #[serde(default = "default_summarize_at_percent")]
+    pub summarize_at_percent: u64,
+}
+
+/// The lead's window when `settings.toml` says nothing (the owner's value).
+pub const DEFAULT_LEAD_WINDOW_TOKENS: u64 = 500_000;
+/// A worker's window when `settings.toml` says nothing (the owner's value).
+pub const DEFAULT_WORKER_WINDOW_TOKENS: u64 = 300_000;
+/// Where summarizing starts by default, as a percentage of the effective window.
+pub const DEFAULT_SUMMARIZE_AT_PERCENT: u64 = 80;
+/// The smallest `summarize_at_percent` that is accepted.
+pub const MIN_SUMMARIZE_AT_PERCENT: u64 = 1;
+/// The largest `summarize_at_percent` that is accepted: above it the derived
+/// threshold sits at (or above) the wall, which `validate` already refuses.
+pub const MAX_SUMMARIZE_AT_PERCENT: u64 = 95;
+
+fn default_lead_window_tokens() -> u64 {
+    DEFAULT_LEAD_WINDOW_TOKENS
+}
+
+fn default_worker_window_tokens() -> u64 {
+    DEFAULT_WORKER_WINDOW_TOKENS
+}
+
+fn default_summarize_at_percent() -> u64 {
+    DEFAULT_SUMMARIZE_AT_PERCENT
+}
+
+impl Default for RoleWindows {
+    fn default() -> Self {
+        Self {
+            lead_window_tokens: DEFAULT_LEAD_WINDOW_TOKENS,
+            worker_window_tokens: DEFAULT_WORKER_WINDOW_TOKENS,
+            summarize_at_percent: DEFAULT_SUMMARIZE_AT_PERCENT,
+        }
+    }
+}
+
+impl RoleWindows {
+    /// The window one role works in.
+    pub fn window(&self, role: Role) -> u64 {
+        match role {
+            Role::Lead => self.lead_window_tokens,
+            Role::Worker => self.worker_window_tokens,
+        }
+    }
+
+    /// The `settings.toml` `[context]` table's own checks: both windows positive,
+    /// the percentage inside 1..=95. The host calls this where the file is read, so
+    /// a nonsense table names the file it came from.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("lead_window_tokens", self.lead_window_tokens),
+            ("worker_window_tokens", self.worker_window_tokens),
+        ] {
+            if value == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+        }
+        if !(MIN_SUMMARIZE_AT_PERCENT..=MAX_SUMMARIZE_AT_PERCENT).contains(&self.summarize_at_percent)
+        {
+            return Err(format!(
+                "summarize_at_percent ({}) must be between {MIN_SUMMARIZE_AT_PERCENT} and \
+                 {MAX_SUMMARIZE_AT_PERCENT}",
+                self.summarize_at_percent
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What one agent runs with (ADR-0065): the role rule applied to an environment's
+/// capacity. The ledger, the journal's `environment` record and the wire all read
+/// these two numbers, so they are computed once per agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveContext {
+    /// The role this agent runs as.
+    pub role: Role,
+    /// `W = min(capacity, window(role))`.
+    pub window_tokens: u64,
+    /// The environment's explicit `summarize_at_tokens`, else the derived
+    /// percentage of `window_tokens`.
+    pub summarize_at_tokens: u64,
+}
+
 impl ContextSettings {
-    /// The checks `load_environment` enforces before an agent is built.
+    /// The role rule (ADR-0065): the environment states the route's capacity, the
+    /// role sets the working window.
+    ///
+    /// `W = min(window_tokens, windows.window(role))` and `summarize_at` is the
+    /// environment's explicit value when it pins one, else `W * percent / 100`
+    /// floored. Both the threshold and the summary-output cap are then checked
+    /// against `W` with the SAME rules [`ContextSettings::validate`] applies to the
+    /// capacity — a violation is a load error naming the environment, the role and
+    /// the numbers, never a silent clamp.
+    pub fn effective(
+        &self,
+        environment: &str,
+        role: Role,
+        windows: RoleWindows,
+    ) -> Result<EffectiveContext, String> {
+        let capacity = self.window_tokens;
+        let role_window = windows.window(role);
+        let window_tokens = capacity.min(role_window);
+        let derived = self
+            .summarize_at_tokens
+            .is_none()
+            .then(|| window_tokens.saturating_mul(windows.summarize_at_percent) / 100);
+        let summarize_at_tokens = self.summarize_at_tokens.or(derived).unwrap_or(0);
+        let wall = window_tokens.saturating_sub(self.output_headroom_tokens);
+        // One sentence carrying every number the operator needs to see, prefixed to
+        // each failure below: the environment, the role and where the values came
+        // from.
+        let rule = format!(
+            "environment `{environment}` as a {}: window_tokens {window_tokens} = \
+             min(environment capacity {capacity}, {} window {role_window}), \
+             output_headroom_tokens {}, so the wall is {wall}",
+            role.name(),
+            role.name(),
+            self.output_headroom_tokens,
+        );
+        if window_tokens == 0 {
+            return Err(format!("{rule}: window_tokens must be greater than zero"));
+        }
+        if summarize_at_tokens == 0 {
+            return Err(format!(
+                "{rule}: summarize_at_tokens must be greater than zero \
+                 (summarize_at_percent {})",
+                windows.summarize_at_percent
+            ));
+        }
+        if summarize_at_tokens >= wall {
+            let source = match self.summarize_at_tokens {
+                Some(_) => "the environment's explicit summarize_at_tokens".to_string(),
+                None => format!(
+                    "summarize_at_percent {} of the effective window",
+                    windows.summarize_at_percent
+                ),
+            };
+            return Err(format!(
+                "{rule}: {source} gives summarize_at_tokens ({summarize_at_tokens}) at or above \
+                 window_tokens - output_headroom_tokens ({wall})"
+            ));
+        }
+        if self.summary_output_tokens >= wall {
+            return Err(format!(
+                "{rule}: summary_output_tokens ({}) is at or above window_tokens - \
+                 output_headroom_tokens ({wall})",
+                self.summary_output_tokens
+            ));
+        }
+        Ok(EffectiveContext {
+            role,
+            window_tokens,
+            summarize_at_tokens,
+        })
+    }
+}
+
+impl ContextSettings {
+    /// The checks `load_environment` enforces before an agent is built: the
+    /// environment's own table, against its CAPACITY. The role rule re-checks the
+    /// threshold and the summary cap against the effective window
+    /// ([`ContextSettings::effective`]).
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
             ("window_tokens", self.window_tokens),
             ("output_headroom_tokens", self.output_headroom_tokens),
-            ("summarize_at_tokens", self.summarize_at_tokens),
             ("keep_recent_tokens", self.keep_recent_tokens),
             ("user_verbatim_tokens", self.user_verbatim_tokens),
             ("summary_output_tokens", self.summary_output_tokens),
@@ -155,11 +370,15 @@ impl ContextSettings {
         let wall = self
             .window_tokens
             .saturating_sub(self.output_headroom_tokens);
-        if self.summarize_at_tokens >= wall {
-            return Err(format!(
-                "summarize_at_tokens ({}) must be below window_tokens - output_headroom_tokens ({wall})",
-                self.summarize_at_tokens
-            ));
+        if let Some(summarize_at) = self.summarize_at_tokens {
+            if summarize_at == 0 {
+                return Err("summarize_at_tokens must be greater than zero".to_string());
+            }
+            if summarize_at >= wall {
+                return Err(format!(
+                    "summarize_at_tokens ({summarize_at}) must be below window_tokens - output_headroom_tokens ({wall})"
+                ));
+            }
         }
         if self.summary_output_tokens >= wall {
             return Err(format!(

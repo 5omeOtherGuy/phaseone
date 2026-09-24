@@ -174,6 +174,10 @@ impl Provider for AnthropicProvider {
                 "max_output_tokens must be greater than zero",
             ));
         }
+        // The harness's context window, when the request carries one: a value this
+        // reader cannot read is refused HERE, before anything is sent, so a
+        // malformed window never silently loses the 1M beta (ADR-0065).
+        crate::request::context_window_tokens(&request.options)?;
         // The model policy: the same lowering the request builder runs, so
         // `validate` can never accept a request the builder would reject.
         lower(&self.profile, &request.options)?;
@@ -207,9 +211,13 @@ impl Provider for AnthropicProvider {
             let account = self.route.account;
             let origin_route = self.route.origin_route.clone();
             let model = self.wire_model.clone();
+            // The window is read ONCE from this request's options and rides into the
+            // header builder: the 1M beta is a wire-visible consequence of it, and it
+            // stays the same across every retry of this request (ADR-0065).
+            let window_tokens = crate::request::context_window_tokens(&request.options)?;
             let build = Box::new(move |credential: &Credential| HttpRequest {
                 url: url.clone(),
-                headers: build_headers(account, credential, &body),
+                headers: build_headers(account, credential, &body, window_tokens),
                 body: encoded.clone(),
             });
             let new_parser = Box::new(move || {

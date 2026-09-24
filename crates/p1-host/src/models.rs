@@ -108,6 +108,12 @@ pub struct Settings {
     pub default_model: Option<String>,
     #[serde(default)]
     pub enabled_models: Vec<String>,
+    /// `[context]` (ADR-0065, spec §2): the window each ROLE works in and the
+    /// percentage of it summarizing starts at. The environment file states the
+    /// route's capacity; this table says how much of it an agent uses. Absent means
+    /// the shipped defaults ([`p1_assembly::RoleWindows::default`]).
+    #[serde(default)]
+    pub context: Option<p1_assembly::RoleWindows>,
     /// `[workflows]` (ADR-0053 item 4): laid over the shipped roles and caps.
     #[cfg(feature = "workflows")]
     #[serde(default)]
@@ -147,7 +153,24 @@ pub fn load_settings(locations: &Locations) -> Result<Settings, String> {
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
+    let settings: Settings =
+        toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    // `[context]`'s own checks (both windows positive, the percentage inside
+    // 1..=95) name the file they came from, like every other settings failure.
+    if let Some(context) = &settings.context {
+        context
+            .validate()
+            .map_err(|message| format!("{}: {message}", path.display()))?;
+    }
+    Ok(settings)
+}
+
+/// The effective role windows (ADR-0065): the user's `[context]` table over the
+/// shipped defaults, the defaults alone when the table is absent. Read where a run
+/// starts, so every agent of the run — the top-level one and every child — is built
+/// from the same numbers.
+pub fn role_windows(locations: &Locations) -> Result<p1_assembly::RoleWindows, String> {
+    Ok(load_settings(locations)?.context.unwrap_or_default())
 }
 
 /// The effective workflow settings: the user's `[workflows]` table over the shipped

@@ -1194,6 +1194,7 @@ async fn usage_errors_exit_2() {
         model: None,
         effort: None,
         models: None,
+        role: None,
         workspace: Some(workspace.path().to_path_buf()),
         session: None,
         resume: true,

@@ -46,6 +46,28 @@ pub struct ModelOptions {
     pub native: BTreeMap<String, serde_json::Value>,
 }
 
+// ------------------------------------------------- the harness's context keys
+
+/// The plain-data [`ModelOptions::native`] entries the HOST sets on every agent's
+/// request (ADR-0065): which agent this is and the context window its role gives it.
+/// They are harness data, not route options — every adapter ignores an
+/// un-namespaced key it does not know, so a route switch can never fail on them and
+/// none of them reaches the wire. Two readers exist, both deliberate:
+///
+/// - an adapter may translate [`CONTEXT_WINDOW_TOKENS`] into a wire-visible
+///   consequence (the Anthropic adapter sends the 1M-context beta above 200k);
+/// - the journal's `environment` record carries them, which is where the effective
+///   window and threshold of a past run stay observable. They are additive: a
+///   journal written before this existed simply has no such entries and loads.
+///
+/// The host is their only writer, and it writes them again on every assembly, so an
+/// environment file cannot spoof them.
+pub const CONTEXT_WINDOW_TOKENS: &str = "p1.context.window_tokens";
+/// The effective summarizing threshold of this agent, in tokens (ADR-0065).
+pub const CONTEXT_SUMMARIZE_AT_TOKENS: &str = "p1.context.summarize_at_tokens";
+/// The role this agent runs as: `"lead"` or `"worker"` (ADR-0065).
+pub const CONTEXT_ROLE: &str = "p1.context.role";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderRequest {
     /// The effective prompt text. Route-mandated wrapping (e.g. an identity block)
