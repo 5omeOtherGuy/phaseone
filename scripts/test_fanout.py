@@ -332,7 +332,7 @@ class FanoutTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("cargo build -p p1-host", err)
 
-    # --- which p1 is run (ADR-0062) ---------------------------------------
+    # --- which p1 is run (ADR-0063) ---------------------------------------
 
     def test_p1_bin_wins_over_p1_on_path(self) -> None:
         on_path = self.write_executable("onpath", "p1", FAKE_P1)

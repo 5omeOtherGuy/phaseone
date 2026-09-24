@@ -84,7 +84,7 @@ choices stay in commit messages. `scripts/adr.py check` runs in the gate.
   `cargo install`, no extra toolchains or targets unless your task says so.
 - The one exception, and it is CI's: `.github/workflows/release.yml` builds `p1` in release
   profile on a GitHub runner after a green `gate` on `main` and publishes `main-<shortsha>`,
-  so a user installs without a toolchain (ADR-0062). On a workstation the rule above is
+  so a user installs without a toolchain (ADR-0063). On a workstation the rule above is
   unchanged — a release build here fills the disk every agent shares.
 - Remove a finished worktree with `git worktree remove <path>`.
 

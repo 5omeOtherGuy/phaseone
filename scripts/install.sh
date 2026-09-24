@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install or update p1 from its public release channel (ADR-0062).
+# Install or update p1 from its public release channel (ADR-0063).
 #
 #   scripts/install.sh [--latest | --from-release TAG | --local] [--prefix DIR] [--force]
 #
@@ -280,7 +280,7 @@ stage_self_and_updater() {
   wrapper="$prefix/bin/.p1-update.new.$$"
   cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
-# Written by p1's install.sh (ADR-0062): update p1 to the latest release.
+# Written by p1's install.sh (ADR-0063): update p1 to the latest release.
 set -euo pipefail
 exec "$prefix/share/p1/install.sh" --latest --prefix "$prefix" "\$@"
 EOF

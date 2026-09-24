@@ -1,7 +1,7 @@
 name: release
 
 # After the gate is green on main, publish what that commit built — a user installs or
-# updates from the release, never from a checkout (ADR-0062). This is the only place
+# updates from the release, never from a checkout (ADR-0063). This is the only place
 # that builds in release profile (AGENTS.md).
 on:
   workflow_run:
