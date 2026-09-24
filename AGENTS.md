@@ -11,20 +11,21 @@ Use the global task/worktree claim procedure before dispatch or creation.
 Resume the task's existing worktree; create a new one only when the task has none.
 Use `scripts/new-worktree.sh <task-slug>` for a new task checkout at `../phaseone-<task-slug>`.
 Use task branches named `task/<issue>-<slug>`; verify the helper's generated branch.
-Claim an issue by assignment and `ready` → `in-progress`; add `blocked` with a specific need when blocked.
+Claim an issue by assignment and `ready` → `in-progress`; when blocked, add `blocked` and comment with the specific need.
 Reserve the `owner` label for owner decisions.
 Change only owned paths; do not reformat, rename or tidy another task's files.
 Keep shared-file edits minimal: `AGENTS.md`, `DECISIONS.md`, `Cargo.toml`, `Cargo.lock`, `scripts/`, `.github/`.
 Merge current main immediately before touching shared files.
 Keep `DECISIONS.md` append-only.
 Never `git add -A` or force-push main.
-Follow the global commit/PR/review/repair/merge order; do not bypass review with a local direct-to-main merge.
-Resolve conflicts without breaking either accepted behavior, then rerun the relevant gate.
+Commit often on the task branch; keep branches short-lived (no long-lived branches; main has no branch protection).
+Follow the global commit/PR/review/repair/merge order and merge as soon as review and the gate are green; do not bypass review with a local direct-to-main merge.
+A small diff is a mergeable diff; resolve conflicts without breaking either accepted behavior, then rerun the relevant gate.
 Remove a finished worktree with `git worktree remove <path>` only after authorized ownership release and preservation of its work.
 
 ## Workers
 
-Use `scripts/fanout.py <jobs.json>` under the global routing policy.
+Use `scripts/fanout.py <jobs.json>` under the global routing policy; it starts jobs up to a machine-wide pool bound and prints one JSON summary when the batch ends.
 A p1 job has full access by default; `"sandbox":true` confines its shell.
 Inspect the run directory's journal, stdout/stderr and `report.json` from `scripts/run-report.py`.
 Verify independently and record accepted dogfood runs in `docs/dogfood/runs.jsonl`.
@@ -33,7 +34,7 @@ Follow model-cards for briefing, nonblocking supervision, repairs and evidence.
 ## Gate and decisions
 
 Run `scripts/gate.sh` before merge: fmt check, clippy with `-D warnings`, all tests and core isolation.
-Treat it as the required automated suite, alongside independent review and exact-commit CI.
+Treat it as the required automated suite, alongside independent review and exact-commit CI; CI runs exactly the same script.
 Intermediate commits need not run the full gate.
 After merging main, use `scripts/push-main.sh` and verify the CI run for exactly that commit.
 Do not equate a green workstation gate with green CI; CI lacks bubblewrap and can start more slowly.
@@ -56,6 +57,7 @@ Ask before adding a crate absent from the workspace.
 
 ## Build
 
+The machine has a small SSD and 7 GB RAM (global rules: two build jobs, SSD floor).
 Use a distinct task target under the global `/mnt/build/cargo-target/` root.
 Never share another checkout's target; D20 records stale linking of worktree p1 crates.
 Keep `scripts/rustc-serial`; its machine-wide semaphore admits at most two rustc processes.
@@ -79,4 +81,4 @@ Make public async interfaces Send-capable; give each agent's mutable state one o
 Represent unknown usage/cost as None, never zero.
 Use Rust 2024; forbid unsafe; use thiserror for library errors.
 Use descriptive names, not mythology names.
-Explain why in comments; add no speculative abstraction or unused generality.
+Comments explain why, not what; add no speculative abstraction or unused generality.

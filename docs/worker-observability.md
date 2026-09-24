@@ -13,7 +13,7 @@ Deliver all seven owner requirements from 2026-09-24 09:31:
 Keep the quota dashboard and its repair; make worker performance a separate composable module.
 Deliver CLI tables, terminal charts, keyboard navigation and machine exports; no browser/React/Sites dependency.
 Do not call the programme complete after only design or handoff.
-Have the existing lead own implementation, independent review, integration and ongoing monitoring.
+The p1 lead owns delivery: workers implement, a different worker or model reviews independently, and the lead integrates and monitors.
 Start historical analysis independently of route/UI implementation.
 
 ## Architecture

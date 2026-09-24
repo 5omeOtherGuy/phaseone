@@ -23,7 +23,8 @@ The routes shipped in #107 (b3d0464); the p1 lead owns them and keeps the trial 
 Have XO verify `p1 login --list` and one live request per route.
 Require PR #107 merged and the resulting routes present in the trial configuration.
 Require the completed plan and XO approval/start under the owner's 22:45 delegation.
-Resolve the global free-route data-scope and Opus-judge execution questions before dependent dispatch; do not silently expand permissions.
+The owner's 22:45 order (via XO) settles the roles in §Roles; the Opus 5.5 medium judge is an authorized in-workflow role, not a new lead.
+Confirm the data scope before free models read non-public files (free providers may log prompts); do not silently expand permissions.
 
 ## Roles
 
