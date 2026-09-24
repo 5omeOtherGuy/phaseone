@@ -163,8 +163,15 @@ the tests pin under "explicit legacy configuration".
 
 Every shipped `routes/*.toml` is store-only: `anthropic-subscription` and
 `openai-codex-subscription` (the two OAuth kinds) and `glm-subscription`,
-`kimi-coding-subscription`, `opencode-go-subscription`, `opencode-go-2-subscription` (API keys,
-`borrow = []`). No shipped route reads another tool's login at runtime.
+`kimi-coding-subscription`, `opencode-go-subscription`, `opencode-go-1-subscription`,
+`opencode-go-2-subscription`, `opencode-go-3-subscription`, `opencode-zen-1`, `opencode-zen-2`,
+`opencode-zen-3`, `opencode-zen-free`, `cline-pass-1` and `cline-pass-2` (API keys, `borrow = []`). Each OpenCode account is its
+own route with its own variable and its own store entry; `opencode-go-subscription` (the Go-3
+account) and `opencode-zen-free` (the Zen-1 account) are compatibility aliases: each reaches the
+same account as its numbered route by owner convention, not a code feature. Each alias has its own
+store entry (or variable: `OPENCODE_API_KEY`, `OPENCODE_ZEN_API_KEY`) that must hold that account's
+key; nothing in p1 keeps the two entries equal — the operator's keys-sync writes both. No shipped route
+reads another tool's login at runtime.
 
 ### 8.3 Migration
 

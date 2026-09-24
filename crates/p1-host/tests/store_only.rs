@@ -173,9 +173,23 @@ fn every_shipped_key_route_is_store_only() {
         ("routes/kimi-coding-subscription.toml", "KIMI_API_KEY"),
         ("routes/opencode-go-subscription.toml", "OPENCODE_API_KEY"),
         (
+            "routes/opencode-go-1-subscription.toml",
+            "OPENCODE_GO_1_API_KEY",
+        ),
+        (
             "routes/opencode-go-2-subscription.toml",
             "OPENCODE_GO_2_API_KEY",
         ),
+        (
+            "routes/opencode-go-3-subscription.toml",
+            "OPENCODE_GO_3_API_KEY",
+        ),
+        ("routes/opencode-zen-1.toml", "OPENCODE_ZEN_1_API_KEY"),
+        ("routes/opencode-zen-2.toml", "OPENCODE_ZEN_2_API_KEY"),
+        ("routes/opencode-zen-3.toml", "OPENCODE_ZEN_3_API_KEY"),
+        ("routes/opencode-zen-free.toml", "OPENCODE_ZEN_API_KEY"),
+        ("routes/cline-pass-1.toml", "CLINE_PASS_1_API_KEY"),
+        ("routes/cline-pass-2.toml", "CLINE_PASS_2_API_KEY"),
     ];
     for (file, env) in expected {
         let route = p1_host::routes::load_route(&shipped(file))
