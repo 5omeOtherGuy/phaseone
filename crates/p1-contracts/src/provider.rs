@@ -132,6 +132,9 @@ pub enum ProviderErrorKind {
     /// valid, so a fresh credential cannot help and the request is not retried
     /// (ADR-0062).
     NotEntitled,
+    /// The account's usage allowance is used up, so retrying cannot help before
+    /// the provider's reset.
+    UsageLimitExhausted,
     RateLimited,
     ContextWindowExceeded,
     /// Network, 5xx, or a stream that broke (incl. EOF before the terminal event).
