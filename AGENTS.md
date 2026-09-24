@@ -7,7 +7,7 @@ Read `docs/worker-observability.md`, `docs/lead-queue.md` and `docs/iris-workflo
 
 ## Work ownership and landing
 
-Use the global task/worktree claim procedure before dispatch or creation.
+Before dispatch or creating a worktree, check `git worktree list`, the board's claims and the worktree inventory, then claim the path (`board-me claim --path <dir>`; no-duplicate-work order in `~/.agents/OWNER-ORDERS.md`).
 Resume the task's existing worktree; create a new one only when the task has none.
 Use `scripts/new-worktree.sh <task-slug>` for a new task checkout at `../phaseone-<task-slug>`.
 Use task branches named `task/<issue>-<slug>`; verify the helper's generated branch.
@@ -19,9 +19,9 @@ Merge current main immediately before touching shared files.
 Keep `DECISIONS.md` append-only.
 Stage and commit only explicit owned paths; never `git add -A`; never force-push main.
 Commit often on the task branch; keep branches short-lived (no long-lived branches; main has no branch protection).
-Follow the global commit/PR/review/repair/merge order and merge as soon as review and the gate are green; do not bypass review with a local direct-to-main merge.
+Land every slice as the owner's landing order requires (`~/.agents/OWNER-ORDERS.md`, 2026-09-24 21:00): `gh pr create --fill`, an independent cheap review, repair until it approves, then `gh pr merge --auto --squash --delete-branch` on green PR CI; do not bypass review with a local direct-to-main merge.
 A small diff is a mergeable diff; resolve conflicts without breaking either accepted behavior, then rerun the relevant gate.
-Remove a finished worktree with `git worktree remove <path>` only after authorized ownership release and preservation of its work.
+Remove a finished worktree with `git worktree remove <path>` only when its work is merged or pushed and its board claim is released by its owner or the lead.
 
 ## Workers
 
@@ -34,7 +34,7 @@ Follow model-cards for briefing, nonblocking supervision, repairs and evidence.
 ## Gate and decisions
 
 Run `scripts/gate.sh` before merge: fmt check, clippy with `-D warnings`, all tests and core isolation.
-Treat it as the required automated suite, alongside independent review and exact-commit CI; CI runs exactly the same script.
+Before a merge, the PR's CI (which runs exactly this script) and an independent review must both be green.
 Intermediate commits need not run the full gate.
 After merging main, use `scripts/push-main.sh` and verify the CI run for exactly that commit.
 Do not equate a green workstation gate with green CI; CI lacks bubblewrap and can start more slowly.
@@ -47,7 +47,7 @@ Reconcile obsolete SSD-target instructions in ADR-0060 with the owner order thro
 ## Project safety
 
 Use no sudo or package installs; raise the need in an issue.
-Never read, print, log, commit or put into fixtures any credential, token, Authorization header, private prompt or raw authenticated traffic.
+Never inspect, print, log, commit or put into fixtures credential values, tokens, Authorization headers, private prompts or raw authenticated traffic; p1's own authentication code may read its designated credential source at runtime, keeping values out of agent context and logs.
 Use no live network in unit/conformance tests.
 Use tempfile/scratch data, never real user data directories.
 Use fake time or explicit synchronization, not sleep-based timing assertions.
@@ -64,6 +64,7 @@ Never share another checkout's target; D20 records stale linking of worktree p1 
 Keep `scripts/rustc-serial`; its machine-wide semaphore admits at most two rustc processes.
 Wait for a slot; do not kill a waiting build or bypass the wrapper.
 Verify `scripts/local-cargo-config.sh` and the worktree helper honor the current HDD target rather than obsolete checkout-local target settings.
+`scripts/local-cargo-config.sh` writes an untracked `.cargo/config.toml`; never commit it.
 Use `cargo check -p <crate>` or `cargo test -p <crate> <filter>` while iterating, then the full gate at the integration boundary.
 Use no release build, cargo install, extra toolchain or target unless the task authorizes it.
 Do not move or remove a running build's target.

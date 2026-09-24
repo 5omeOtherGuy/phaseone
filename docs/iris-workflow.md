@@ -32,7 +32,7 @@ Use Space Bunny as the current implementation worker.
 Use MiMo/Muse only after the required client-identity route fixes and live verification.
 Spread eligible free work across Zen accounts.
 Use DeepSeek/GLM on Go and Cline Pass for review, verification and repair within each route's permitted models.
-Move a failed free-model task to DeepSeek after two failed attempts.
+After two failed free-model attempts, DeepSeek also implements that task.
 Use Opus 5.5 medium for workflow judgment as ordered at 22:45; free models make no acceptance or design decisions.
 Do not use Fable, Sol or Kimi as workers in this workflow.
 Keep verification independent of implementation by a different model or at least a separately briefed role using frozen cases.

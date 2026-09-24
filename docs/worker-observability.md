@@ -31,7 +31,7 @@ Record run, task, attempt, session and parent IDs, project, harness version and 
 Record requested and actual model, route and effort.
 Record request-level uncached input, cache-read, cache-write, output and reasoning usage with provider semantics.
 Do not add reasoning to output when it is already a subset.
-Record tool calls, results, errors and retries in appropriately protected run records.
+Record tool calls, outcomes, errors and retries as metadata in run records; credential values, private prompts and raw authenticated traffic never enter them.
 Record finish, interrupt, abandon and error states.
 Separate compaction/summary and child usage.
 Deduplicate resumes, recover crash tails and support rotating/incremental retention.
