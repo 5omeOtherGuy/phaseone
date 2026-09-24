@@ -200,11 +200,14 @@ async fn a_resumed_session_reserves_the_ids_of_worker_journals_a_workflow_left()
             "the journal already there is never written to"
         );
     }
+    // The resumed history replays the earlier process's own tool result first (it
+    // started `w1`), so the NEW result is selected by the call the resumed script
+    // made — the first tool result in this history names the old process's worker.
     let started = parent.requests()[1]
         .history
         .iter()
         .find_map(|item| match item {
-            Item::ToolResult(result) => Some(result.content.clone()),
+            Item::ToolResult(result) if result.call_id == "c7" => Some(result.content.clone()),
             _ => None,
         });
     assert!(
@@ -390,5 +393,206 @@ async fn a_resumed_session_without_worker_journals_hands_out_w1() {
             .as_deref()
             .is_some_and(|content| content.starts_with("Started worker w1 ")),
         "{started:?}"
+    );
+}
+
+/// A `Result` line as the workflow engine writes it (the only journal record that
+/// names the worker that ran a step: `"<id> (<route/model>)"`), built with the
+/// engine's own types so the test cannot drift from the journal's shape.
+#[cfg(feature = "workflows")]
+fn workflow_result_line(worker: &str) -> String {
+    use p1_workflow::{CallId, JournalRecord, SchemaCheck, StepEnvelope, StepStatus};
+
+    let envelope = StepEnvelope {
+        step: CallId("call".into()),
+        label: None,
+        status: StepStatus::Done,
+        value: serde_json::Value::Null,
+        schema: SchemaCheck::NotRequested,
+        evidence: None,
+        attempts: 1,
+        worker: Some(worker.to_string()),
+        needs: None,
+        error: None,
+        models: Vec::new(),
+    };
+    let record = JournalRecord::Result {
+        call: CallId("call".into()),
+        envelope,
+    };
+    let mut line = serde_json::to_string(&record).unwrap();
+    line.push('\n');
+    line
+}
+
+/// The `journal.jsonl` of run `wf<N>` beside the session, as the workflow service
+/// lays its run directories out.
+#[cfg(feature = "workflows")]
+fn workflow_run_journal(session: &Path, name: &str, content: &str) {
+    let mut root = session.as_os_str().to_os_string();
+    root.push(".workflows");
+    let run_dir = PathBuf::from(root).join(name);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("journal.jsonl"), content).unwrap();
+}
+
+/// Issue #98's own case: a workflow's journal names `w7` while NO `w7` worker file
+/// exists — neither the parent journal (the delegate tool recorded nothing) nor a
+/// sibling `FILE.w7.jsonl`. The reservation must still start past `w7`.
+#[cfg(feature = "workflows")]
+#[tokio::test]
+async fn a_resumed_session_with_a_workflow_journal_naming_w7_without_a_w7_file_hands_out_w8() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    declared_environments(environments.path());
+    let session = workspace.path().join("session.jsonl");
+    let session_arg = session.to_str().unwrap();
+    let workspace_arg = workspace.path().to_str().unwrap();
+
+    // No worker under this session: the journal names no worker id at all.
+    let (code, harness) = run(
+        environments.path(),
+        ScriptedProvider::new(vec![text_response("one")]),
+        ScriptedProvider::new(Vec::new()),
+        &[
+            "--yes",
+            "--env",
+            "a",
+            "--workspace",
+            workspace_arg,
+            "--session",
+            session_arg,
+            "go",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+
+    // A workflow run journalled a step on w7, and the step's own journal file is gone:
+    // the run journal is the only trace of the id.
+    workflow_run_journal(&session, "wf1", &workflow_result_line("w7 (fake-b/child)"));
+    assert!(
+        !worker_journal(&session, 7).exists(),
+        "the point is the id no file backs up"
+    );
+
+    let parent = ScriptedProvider::new(vec![
+        tool_call_response(vec![start_call("c1")]),
+        text_response("started"),
+        text_response("waiting"),
+        text_response("spare"),
+    ]);
+    let (code, harness) = run(
+        environments.path(),
+        parent.clone(),
+        ScriptedProvider::new(vec![text_response("done")]),
+        &[
+            "--yes",
+            "--env",
+            "a",
+            "--workspace",
+            workspace_arg,
+            "--session",
+            session_arg,
+            "--resume",
+            "again",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+
+    assert!(
+        !harness
+            .stdout
+            .text()
+            .contains("journal file already exists"),
+        "the journal-named id must not be handed out: {}",
+        harness.stdout.text()
+    );
+    assert!(
+        !worker_journal(&session, 7).exists(),
+        "no new journal is created for the id the run journal names"
+    );
+    let started = parent.requests()[1]
+        .history
+        .iter()
+        .find_map(|item| match item {
+            Item::ToolResult(result) => Some(result.content.clone()),
+            _ => None,
+        });
+    assert!(
+        started
+            .as_deref()
+            .is_some_and(|content| content.starts_with("Started worker w8 ")),
+        "the worker past the journal-named id gets w8: {started:?}"
+    );
+    assert!(
+        worker_journal(&session, 8).exists(),
+        "w8 is the worker that was started"
+    );
+}
+
+/// An unreadable or malformed run journal is a safety failure, never evidence that
+/// no ids are reserved: the resume must fail with a clear message instead of
+/// silently starting from w1.
+#[cfg(feature = "workflows")]
+#[tokio::test]
+async fn a_resumed_session_with_a_malformed_workflow_journal_fails_to_start() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    declared_environments(environments.path());
+    let session = workspace.path().join("session.jsonl");
+    let session_arg = session.to_str().unwrap();
+    let workspace_arg = workspace.path().to_str().unwrap();
+
+    let (code, harness) = run(
+        environments.path(),
+        ScriptedProvider::new(vec![text_response("one")]),
+        ScriptedProvider::new(Vec::new()),
+        &[
+            "--yes",
+            "--env",
+            "a",
+            "--workspace",
+            workspace_arg,
+            "--session",
+            session_arg,
+            "go",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+
+    workflow_run_journal(&session, "wf1", "{\"kind\":\"no-such-record\"}\n");
+
+    let (code, harness) = run(
+        environments.path(),
+        ScriptedProvider::new(Vec::new()),
+        ScriptedProvider::new(Vec::new()),
+        &[
+            "--yes",
+            "--env",
+            "a",
+            "--workspace",
+            workspace_arg,
+            "--session",
+            session_arg,
+            "--resume",
+            "again",
+        ],
+    )
+    .await;
+    assert_ne!(
+        code, 0,
+        "a journal that cannot be parsed must fail the resume"
+    );
+    assert!(
+        harness.stderr.text().contains("cannot reserve worker ids"),
+        "the failure says what could not be done: stderr: {}",
+        harness.stderr.text()
+    );
+    assert!(
+        !worker_journal(&session, 1).exists(),
+        "no worker was started from a reservation that could not be made"
     );
 }

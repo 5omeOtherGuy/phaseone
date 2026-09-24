@@ -147,6 +147,64 @@ fn worker_id_in(session_name: &OsStr, sibling: &OsStr) -> io::Result<Option<usiz
     Ok(parse_id(session_name, sibling))
 }
 
+/// The highest worker id any workflow run of `session` journalled, `0` when the
+/// session has no workflow runs (issue #98).
+///
+/// A workflow step is a worker, but only the run's own journal names it: the parent
+/// session holds no `worker_start` for it, and its `<session>.w<N>.jsonl` file may
+/// already be gone. On resume that journal is therefore the ONLY witness of ids the
+/// namespace must not hand out again — an unreadable or malformed journal is an
+/// error, never evidence that no ids are used. Only a run directory (`wf*`) with
+/// its `journal.jsonl` is read; anything else beside the session is not a run.
+#[cfg(feature = "workflows")]
+pub fn highest_workflow_worker_id(session: &Path) -> io::Result<usize> {
+    let mut root = session.as_os_str().to_os_string();
+    root.push(".workflows");
+    let runs = match std::fs::read_dir(PathBuf::from(root)) {
+        Ok(runs) => runs,
+        // No workflow directory: this session never ran a workflow.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut highest = 0;
+    for run in runs {
+        let run = run?;
+        let name = run.file_name();
+        // Run directories are `wf<N>` (the service's own allocation); anything else
+        // in the run root is not this session's run journal.
+        if !name.to_str().is_some_and(|name| name.starts_with("wf")) || !run.file_type()?.is_dir() {
+            continue;
+        }
+        let journal = run.path().join("journal.jsonl");
+        if !journal.is_file() {
+            continue;
+        }
+        for record in p1_workflow::read_journal(&journal)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?
+        {
+            if let p1_workflow::JournalRecord::Result { envelope, .. } = record
+                && let Some(id) = envelope.worker.as_deref().and_then(workflow_worker_id)
+            {
+                highest = highest.max(id);
+            }
+        }
+    }
+    Ok(highest)
+}
+
+/// The `<N>` a step envelope's worker line names: `w7 (route/model)` names worker 7.
+/// `None` for every other shape — a step cancelled before its worker exists names `-`,
+/// and the id, not the description, is what must never be reused.
+#[cfg(feature = "workflows")]
+fn workflow_worker_id(worker: &str) -> Option<usize> {
+    worker
+        .split_whitespace()
+        .next()?
+        .strip_prefix('w')?
+        .parse()
+        .ok()
+}
+
 /// Create the NEW JSONL journal for worker `<id>` next to its parent session.
 /// Same store and durability as [`create`], and the same refusal to overwrite: a
 /// worker's file is never truncated or appended to. It bypasses [`create`]'s
@@ -161,7 +219,7 @@ pub fn worker(session: &Path, id: usize) -> Result<Arc<dyn CommitSink>, SessionE
 
 #[cfg(test)]
 mod tests {
-    use super::highest_worker_id;
+    use super::{highest_worker_id, worker_path};
     use std::ffi::OsString;
     use std::fs;
     use tempfile::tempdir;
@@ -177,9 +235,107 @@ mod tests {
     fn a_usize_max_journal_is_a_clear_exhaustion_error() {
         let directory = tempdir().unwrap();
         let session = directory.path().join("session.jsonl");
-        fs::write(format!("{}w{}.jsonl", session.display(), usize::MAX), "").unwrap();
+        // The exact sibling name, built by the host's own path rule: highest_worker_id
+        // ignores anything else, so a hand-made name would test nothing.
+        fs::write(worker_path(&session, usize::MAX), "").unwrap();
         let error = highest_worker_id(&session).expect_err("the namespace is exhausted");
         assert!(error.to_string().contains("no generatable worker id"));
+    }
+
+    #[cfg(feature = "workflows")]
+    mod workflow_journals {
+        use crate::session::{highest_workflow_worker_id, worker_path};
+        use p1_workflow::{CallId, JournalRecord, SchemaCheck, StepEnvelope, StepStatus};
+        use std::fs;
+        use tempfile::tempdir;
+
+        /// A `Result` line as the workflow engine writes it: the only journal record
+        /// that names the worker that ran the step (`"<id> (<route/model>)"`).
+        fn result_line(worker: Option<&str>) -> String {
+            let envelope = StepEnvelope {
+                step: CallId("call".into()),
+                label: None,
+                status: StepStatus::Done,
+                value: serde_json::Value::Null,
+                schema: SchemaCheck::NotRequested,
+                evidence: None,
+                attempts: 1,
+                worker: worker.map(str::to_string),
+                needs: None,
+                error: None,
+                models: Vec::new(),
+            };
+            let record = JournalRecord::Result {
+                call: CallId("call".into()),
+                envelope,
+            };
+            let mut line = serde_json::to_string(&record).unwrap();
+            line.push('\n');
+            line
+        }
+
+        /// A run directory `wf<N>` with the given `journal.jsonl` content.
+        fn run(session: &std::path::Path, name: &str, journal: &str) {
+            let mut root = session.as_os_str().to_os_string();
+            root.push(".workflows");
+            let run_dir = std::path::PathBuf::from(root).join(name);
+            fs::create_dir_all(&run_dir).unwrap();
+            fs::write(run_dir.join("journal.jsonl"), journal).unwrap();
+        }
+
+        #[test]
+        fn a_session_without_workflow_runs_reserves_nothing() {
+            let directory = tempdir().unwrap();
+            let session = directory.path().join("session.jsonl");
+            assert_eq!(highest_workflow_worker_id(&session).unwrap(), 0);
+        }
+
+        #[test]
+        fn a_workflow_journal_naming_w7_is_reserved_even_without_a_w7_file() {
+            let directory = tempdir().unwrap();
+            let session = directory.path().join("session.jsonl");
+            // The step's own journal file is gone: the run journal is the only witness.
+            assert!(!worker_path(&session, 7).exists());
+            run(&session, "wf1", &result_line(Some("w7 (route/model)")));
+            assert_eq!(highest_workflow_worker_id(&session).unwrap(), 7);
+        }
+
+        #[test]
+        fn only_worker_ids_are_reserved_and_only_from_run_journals() {
+            let directory = tempdir().unwrap();
+            let session = directory.path().join("session.jsonl");
+            // A cancelled step names no worker; a later run names w3.
+            run(
+                &session,
+                "wf1",
+                &format!(
+                    "{}{}",
+                    result_line(None),
+                    result_line(Some("- (not started)"))
+                ),
+            );
+            run(&session, "wf2", &result_line(Some("w3 (route/model)")));
+            // Not a run directory: never read.
+            run(
+                &session,
+                "not-a-run",
+                &result_line(Some("w9 (route/model)")),
+            );
+            assert_eq!(highest_workflow_worker_id(&session).unwrap(), 3);
+        }
+
+        #[test]
+        fn a_malformed_workflow_journal_is_an_error_never_zero() {
+            let directory = tempdir().unwrap();
+            let session = directory.path().join("session.jsonl");
+            run(&session, "wf1", "{\"kind\":\"no-such-record\"}\n");
+            let error = highest_workflow_worker_id(&session)
+                .expect_err("a journal that cannot be parsed is a safety failure");
+            assert!(
+                error.to_string().contains("journal.jsonl"),
+                "the message names the journal: {error}"
+            );
+        }
     }
 
     #[cfg(unix)]

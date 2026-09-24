@@ -792,6 +792,36 @@ type ComposedChildren = (
     Arc<AtomicUsize>,
 );
 
+/// The ids already taken beside the session file, from every source that can hold
+/// them: the `<session>.w<N>.jsonl` worker journals on disk and — when workflows are
+/// composed in — the worker ids the session's run journals
+/// (`<session>.workflows/wf*/journal.jsonl`) name. One function, because a direct
+/// `worker_start` and a workflow step draw from one id namespace and must not
+/// disagree about its first free id (issue #98). A source that cannot be read is a
+/// failure, never evidence that no ids are reserved.
+#[cfg(feature = "delegation")]
+fn reserved_worker_ids(session: Option<&Path>) -> Result<usize, String> {
+    let Some(session) = session else {
+        return Ok(0);
+    };
+    let siblings = session::highest_worker_id(session).map_err(|error| {
+        format!(
+            "cannot reserve worker ids beside {}: {error}",
+            session.display()
+        )
+    })?;
+    #[cfg(feature = "workflows")]
+    let runs = session::highest_workflow_worker_id(session).map_err(|error| {
+        format!(
+            "cannot reserve worker ids from the workflow runs of {}: {error}",
+            session.display()
+        )
+    })?;
+    #[cfg(not(feature = "workflows"))]
+    let runs = 0;
+    Ok(siblings.max(runs))
+}
+
 /// Compose the child factory and worker service from one initial id reservation.
 /// Both direct workers and workflow steps consume this same service, so neither
 /// path may begin with an unexamined `w1` journal.
@@ -805,18 +835,7 @@ fn compose_children(
 ) -> Result<ComposedChildren, String> {
     let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
     let service_slot: Arc<OnceLock<Arc<InProcessWorkers>>> = Arc::new(OnceLock::new());
-    let reserved = options
-        .session
-        .as_deref()
-        .map(session::highest_worker_id)
-        .transpose()
-        .map_err(|error| {
-            format!(
-                "cannot reserve worker ids beside {}: {error}",
-                options.session.as_deref().unwrap().display()
-            )
-        })?
-        .unwrap_or(0);
+    let reserved = reserved_worker_ids(options.session.as_deref())?;
     if reserved >= usize::MAX - 1 {
         return Err("worker id namespace is exhausted: no id can be allocated".into());
     }
@@ -2116,27 +2135,16 @@ fn announce_lost_workers(
 ) -> Result<(), String> {
     let earlier = p1_tool_delegate::workers_started_in(records);
     // `workers_started_in` reads only the delegate tool's own results, so workers a
-    // WORKFLOW started are missing from it. Their journals are still on disk beside
-    // the session, one `<session>.w<N>.jsonl` per worker, and the next worker reuses
-    // the first free `N` — which would have to create a file that already exists
-    // (issue #98). The sibling journals therefore bound the reservation too, and the
-    // bound is taken BEFORE the message below can return early.
-    let sibling_max = session_file
-        .map(session::highest_worker_id)
-        .transpose()
-        .map_err(|error| {
-            format!(
-                "cannot reserve worker ids beside {}: {error}",
-                session_file.unwrap().display()
-            )
-        })?
-        .unwrap_or(0);
+    // WORKFLOW started are missing from it. Their run journals name them, and the
+    // step's own `<session>.w<N>.jsonl` file may be gone or still there; every source
+    // is bound below BEFORE the message can return early (issue #98).
+    let reserved = reserved_worker_ids(session_file)?;
     let used = earlier
         .iter()
         .filter_map(|id| id.strip_prefix('w')?.parse::<usize>().ok())
         .max()
         .unwrap_or(earlier.len())
-        .max(sibling_max);
+        .max(reserved);
     if used >= usize::MAX - 1 {
         return Err("worker id namespace is exhausted: no id can be allocated".into());
     }
