@@ -70,42 +70,33 @@ navigation bindings are not implemented in this slice. Existing live worker-pane
 rendering and controls remain unchanged.
 
 Lead verification: 233 tests in all 14 freshly built p1-tui test binaries passed,
-including five new dashboard tests; both preview dimensions/content passed.
+including five new dashboard tests (eight after the wf8 repairs below); both
+preview dimensions/content passed.
 After disk recovery, the full locked workspace gate **passed** offline with
 jobs=2 on 2026-09-24 (148.027 seconds, exit 0). Minimum sampled free space was
 15,404,658,688 bytes, above the 8 GiB stop floor. This supersedes the earlier
 disk-floor termination. No merge or visual-design acceptance is claimed;
-final acceptance remains required before landing.
+final acceptance remains required before landing. CI (`scripts/gate.sh`: fmt,
+clippy with warnings denied, all workspace tests) passed on PR #112.
 
 Final independent source review (wf7, DeepSeek V4.1 Flash on the primary Go
 subscription route) completed with no source-review blocker or fallback. Lead
 inspection confirms the composition boundary and preservation of the live worker
 footer/focus behavior. The review ran source/ADR checks only, not Rust tests;
 its workflow verification flag does not establish runtime or merge acceptance.
+Independent review of PR #112 (DeepSeek V4.1 Flash via ClinePass, 2026-09-24)
+approved with no blocker or major findings.
 
-The owner requires immediate fixes through separate cheap/free workers, not a
-deferred low-priority backlog. All three findings below are now in implementation
-workflow wf8 on the configured free worker role, with no fallback. It authors
-a patch for lead application/review; completion still requires runtime checks.
-The first proposal was rejected before application: lead inspection found
-incorrect partial-wide-character padding, conflicting existing filler assertions,
-an incorrect character-position assertion and string-method calls on Line.
-The same free worker is repairing all of these; no finding is considered closed.
+Implementation workflow wf8 resolved the three non-blocking wf7 findings:
 
-- Existing body lines retain their styles and are not padded; only missing rows
-  and the navigation strip explicitly fill BLOCK. Fix the shell to give complete
-  body rows a default BLOCK background while preserving explicit view styles,
-  and assert short/empty-row backgrounds and style precedence in TestBackend.
-- The dashboard worker-adapter tests cover 80/120 columns, not the `<56` compact
-  branch or its tiny-width boundary. Existing renderer tests do not substitute
-  for adapter-specific coverage.
-- Top-left anchoring intentionally forces left alignment even on fitting lines.
-  The current test asserts the clipped case; add the fitting-line case to make
-  this policy explicit.
+- Resolved: body rows have a default BLOCK background while explicit view
+  styles are kept in `view_lines_fill_short_empty_and_shell_rows_preserving_styles`.
+- Resolved: the adapter's `<56` compact branch and tiny widths are covered in
+  `workers_adapter_handles_compact_threshold_and_tiny_viewports_read_only`.
+- Resolved: the top-left policy for fitting lines is explicit in
+  `fitting_aligned_views_are_intentionally_top_left_and_keep_styles`.
 
-These are retained findings, not newly passing tests or a claim that the separate
-right-pane regression (#92) was reviewed by wf7. Runtime verification of that
-fix remains pending disk recovery; no source changes were made for this review.
+Regression #92 was fixed separately in #116.
 
 ## Ownership handoff — 2026-09-24
 
