@@ -708,7 +708,7 @@ pub async fn run_with_front_end(
     let parts = AgentParts {
         provider: assembled.provider,
         tools: assembled.tools,
-        system_prompt: assembled.system_prompt + &instructions,
+        system_prompt: assembled.system_prompt + instructions.as_str(),
         options: assembled.options,
         context,
         authorization: front_end.authorization(),
@@ -1594,7 +1594,7 @@ pub(crate) fn switch_model(
         .reconfigure(Reconfiguration {
             provider: assembled.provider,
             tools: tools.clone(),
-            system_prompt: assembled.system_prompt + &switch.instructions,
+            system_prompt: assembled.system_prompt + switch.instructions.as_str(),
             options: assembled.options,
             context,
         })
