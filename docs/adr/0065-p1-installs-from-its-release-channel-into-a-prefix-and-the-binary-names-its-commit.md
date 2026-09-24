@@ -124,16 +124,16 @@ p1 is installed from a published release, and the binary says which commit it is
 - Files: `.github/workflows/release.yml`, `scripts/install.sh`, `scripts/update.sh`,
   `crates/p1-host/build.rs`, `crates/p1-host/src/cli.rs` (`version`),
   `scripts/test_install.py`, `scripts/test_fanout.py`, `README.md`, `AGENTS.md`.
-- `python3 scripts/test_install.py -v` (36 tests, no network): a fixture release with stub
+- `python3 scripts/test_install.py -v` (38 tests, no network): a fixture release with stub
   `gh`, `curl` and `cargo` on `PATH` covers the successful install and its modes, gh
   fallback (including a `gh` that fails after writing a truncated asset), checksum refusals
   (nothing installed, the previous install intact), unsafe archive members, protected
   config prefixes, same-release no-op/force and downgrade behavior for `--latest`,
   `--from-release main-<sha>` and the `p1-update` wrapper, a missing or older python3
-  refused by name, failure-atomic binary/share/updater rollback with a rolled-back
-  SIGTERM during the commit, a failed restore reported with its fixed-slot leftovers,
-  `--from-release` routing, release-workflow repair/cache/tag-creation assertions, and the
-  `--local` target-dir probe.
+  refused by name, failure-atomic binary/share/updater rollback (including a colon-containing
+  prefix) with a rolled-back SIGTERM during the commit, a failed restore reported with its
+  fixed-slot leftovers and retained across another failure, release-workflow repair/cache/tag-
+  creation assertions, and the `--local` target-dir probe.
 - `python3 scripts/test_fanout.py -v`: `$P1_BIN` over `p1` on `PATH` over the debug
   fallback, and a job that runs the `p1` found on `PATH` without `P1_BIN`.
 - `bash -n scripts/install.sh scripts/update.sh`; `shellcheck scripts/install.sh scripts/update.sh`.
