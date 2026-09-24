@@ -58,6 +58,8 @@ Keep dependencies few; ask before adding a crate absent from the workspace.
 
 ## Build
 
+CI is the build farm: push the task branch and run `scripts/ci-build.sh`; local cargo only for `cargo check -p <crate>` and the lead's deployed-binary rebuild; never a local full gate while the Iris run is live.
+A `task/**` push runs `scripts/gate.sh` and builds `p1` (debug) in `.github/workflows/build.yml`, uploading `dist/p1`, its sha256 and the gate log as the `p1-build` artifact; `scripts/ci-build.sh` waits for that commit's run and downloads it to `ci-artifacts/<sha>/` (gitignored), where `p1` matches the uploaded `p1.sha256`.
 The machine has a small SSD and 7 GB RAM (global rules: two build jobs, SSD floor).
 Use a distinct task target under the global `/mnt/build/cargo-target/` root.
 Never share another checkout's target; D20 records stale linking of worktree p1 crates.
