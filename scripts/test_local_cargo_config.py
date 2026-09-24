@@ -206,6 +206,71 @@ class LocalCargoConfigTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.count("jobs = 2"), 1)
 
+    def test_dry_run_rejects_config_symlink_without_touching_victim(self) -> None:
+        config_dir = os.path.join(self.checkout, ".cargo")
+        victim = os.path.join(self.checkout, "Cargo.toml")
+        config = os.path.join(config_dir, "config.toml")
+        victim_contents = b"known Cargo manifest contents\n"
+        os.mkdir(config_dir)
+        with open(victim, "wb") as handle:
+            handle.write(victim_contents)
+        os.symlink("../Cargo.toml", config)
+
+        result = self.run_script("--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cargo config must not be a symlink", result.stderr)
+        with open(victim, "rb") as handle:
+            self.assertEqual(handle.read(), victim_contents)
+
+    def test_dry_run_rejects_config_directory_symlink_without_touching_file(self) -> None:
+        real_config_dir = os.path.join(self.checkout, "real-cargo-config")
+        config_dir_link = os.path.join(self.checkout, ".cargo")
+        victim = os.path.join(real_config_dir, "config.toml")
+        victim_contents = b"alternate config contents\n"
+        os.mkdir(real_config_dir)
+        with open(victim, "wb") as handle:
+            handle.write(victim_contents)
+        os.symlink("real-cargo-config", config_dir_link)
+
+        result = self.run_script("--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cargo config parent must not be a symlink", result.stderr)
+        with open(victim, "rb") as handle:
+            self.assertEqual(handle.read(), victim_contents)
+
+    def test_dry_run_rejects_dangling_config_symlink(self) -> None:
+        config_dir = os.path.join(self.checkout, ".cargo")
+        config = os.path.join(config_dir, "config.toml")
+        missing_target = os.path.join(config_dir, "missing.toml")
+        os.mkdir(config_dir)
+        os.symlink("missing.toml", config)
+
+        result = self.run_script("--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cargo config must not be a symlink", result.stderr)
+        self.assertEqual(os.readlink(config), "missing.toml")
+        self.assertFalse(os.path.exists(missing_target))
+
+    def test_regular_config_is_accepted_and_dry_runs_are_identical(self) -> None:
+        config_dir = os.path.join(self.checkout, ".cargo")
+        config = os.path.join(config_dir, "config.toml")
+        config_contents = b"existing config contents\n"
+        os.mkdir(config_dir)
+        with open(config, "wb") as handle:
+            handle.write(config_contents)
+
+        first = self.run_script("--dry-run")
+        second = self.run_script("--dry-run")
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first.stdout, second.stdout)
+        with open(config, "rb") as handle:
+            self.assertEqual(handle.read(), config_contents)
+
     def test_same_basename_checkouts_get_path_isolated_targets(self) -> None:
         first, _ = self.make_checkout("first/same-name")
         second, _ = self.make_checkout("second/same-name")
