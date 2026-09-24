@@ -157,6 +157,13 @@ impl ResponseParser for ChatParser {
                 return self.fail("unexpected chat choice index");
             }
             if self.stop.is_some() {
+                // OpenCode Zen's free tier repeats the terminal `finish_reason` choice
+                // beside the usage block (instead of `choices: []`). It carries no model
+                // output, so it is tolerated; a choice with content after the stop is
+                // still a protocol error.
+                if is_empty_terminator(choice) {
+                    continue;
+                }
                 return self.fail("choice after finish reason");
             }
             let Some(delta) = choice.get("delta").filter(|v| v.is_object()) else {
@@ -306,6 +313,31 @@ impl ResponseParser for ChatParser {
             None => ProviderError::new(kind, format!("chat HTTP status {status}")),
         }
     }
+}
+
+/// Whether a post-stop choice is an empty terminator: a repeated `finish_reason`
+/// with no content, reasoning or tool fragment in its delta. Some gateways send
+/// one together with the usage block; it must not become model output or an
+/// error.
+fn is_empty_terminator(choice: &Value) -> bool {
+    if choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return false;
+    }
+    let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
+        return false;
+    };
+    ["content", "reasoning_content", "reasoning", "tool_calls"]
+        .iter()
+        .all(|field| match delta.get(*field) {
+            None | Some(Value::Null) => true,
+            Some(Value::String(text)) => text.is_empty(),
+            Some(Value::Array(items)) => items.is_empty(),
+            Some(_) => false,
+        })
 }
 
 /// The whole text of an exhausted-account error: the server's words are a lookup
@@ -481,6 +513,52 @@ mod tests {
             })
         ));
     }
+    #[test]
+    fn a_repeated_empty_terminator_with_usage_completes_instead_of_failing() {
+        // `mimo-v2.6-flash-free` on the OpenCode Zen free tier sends: a content
+        // chunk, the stop chunk, a SECOND stop chunk carrying the usage block,
+        // then [DONE]. The repeat is not model output and must not be an error.
+        let mut p = parser();
+        send(&mut p, choice(json!({"content":"OK"}), json!(null)));
+        send(
+            &mut p,
+            choice(
+                json!({"role":"assistant","content":"","reasoning":null}),
+                json!("stop"),
+            ),
+        );
+        let events = send(
+            &mut p,
+            json!({
+                "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":131,"completion_tokens":38,
+                         "prompt_tokens_details":{"cached_tokens":0},
+                         "completion_tokens_details":{"reasoning_tokens":35}}
+            }),
+        );
+        assert!(events.is_empty(), "{events:?}");
+        let response = done(&mut p);
+        assert_eq!(response.stop, StopReason::EndTurn);
+        assert_eq!(
+            response.item.blocks,
+            [AssistantBlock::Text { text: "OK".into() }]
+        );
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.output, Some(38));
+        assert_eq!(usage.reasoning_output, Some(35));
+        // A genuine content choice after the stop is still refused.
+        let mut p = parser();
+        send(&mut p, choice(json!({}), json!("stop")));
+        let failed = send(&mut p, choice(json!({"content":"stray"}), json!(null)));
+        assert!(
+            matches!(
+                failed.as_slice(),
+                [StreamEvent::Finished(Outcome::Failed(_))]
+            ),
+            "{failed:?}"
+        );
+    }
+
     #[test]
     fn interleaved_call_fragments_preserve_order_and_raw_arguments() {
         let mut p = parser();
