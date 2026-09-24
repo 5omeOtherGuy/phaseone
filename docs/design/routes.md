@@ -209,7 +209,9 @@ compatibility alias for Zen-1. Every route binds the same three free wire ids �
 fallback exists) — and environments `zen`, `zen2`, `zen3` all default to `space-bunny-free`, so a
 workflow can spread work across accounts. **[live, 2026-09-24]** Space Bunny answers every account
 key from p1; MiMo and Muse answer HTTP 403 `FreeTierError` ("free tier can only be used from within
-OpenCode") to a non-OpenCode client, with or without a real Zen key — bound, but not usable from p1. No Zen usage endpoint is established, so these routes probe as
+OpenCode") on this chat endpoint to a non-OpenCode client, with or without a real Zen key — bound,
+but not usable from p1. (The Zen docs list Muse on `/zen/v1/responses`; which endpoint serves it
+past the gate is unverified — see its profile.) No Zen usage endpoint is established, so these routes probe as
 unsupported (`docs/design/usage.md`). The Muse Spark model's metadata hint (`@ai-sdk/openai`) is
 not yet confirmed by a live request on this endpoint.
 

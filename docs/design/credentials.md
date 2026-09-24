@@ -165,7 +165,7 @@ Every shipped `routes/*.toml` is store-only: `anthropic-subscription` and
 `openai-codex-subscription` (the two OAuth kinds) and `glm-subscription`,
 `kimi-coding-subscription`, `opencode-go-subscription`, `opencode-go-1-subscription`,
 `opencode-go-2-subscription`, `opencode-go-3-subscription`, `opencode-zen-1`, `opencode-zen-2`,
-`opencode-zen-3` and `opencode-zen-free` (API keys, `borrow = []`). Each OpenCode account is its
+`opencode-zen-3`, `opencode-zen-free`, `cline-pass-1` and `cline-pass-2` (API keys, `borrow = []`). Each OpenCode account is its
 own route with its own variable and its own store entry; `opencode-go-subscription` (the Go-3
 account) and `opencode-zen-free` (the Zen-1 account) are compatibility aliases — the same data
 under a name existing environments and briefs already use, not a code feature. No shipped route
