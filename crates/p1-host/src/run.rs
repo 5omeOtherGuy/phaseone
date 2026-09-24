@@ -781,6 +781,17 @@ pub async fn run_with_front_end(
     Ok(code)
 }
 
+/// What `compose_children` hands back: the completion hub, the catalog slot, the
+/// child builder, the worker service and the direct-child id counter.
+#[cfg(feature = "delegation")]
+type ComposedChildren = (
+    Arc<CompletionHub>,
+    Arc<OnceLock<Arc<Catalog>>>,
+    Arc<ChildBuilder>,
+    Arc<InProcessWorkers>,
+    Arc<AtomicUsize>,
+);
+
 /// Compose the child factory and worker service from one initial id reservation.
 /// Both direct workers and workflow steps consume this same service, so neither
 /// path may begin with an unexamined `w1` journal.
@@ -791,16 +802,7 @@ fn compose_children(
     front_end: Arc<dyn FrontEnd>,
     options: &Options,
     max_workers: usize,
-) -> Result<
-    (
-        Arc<CompletionHub>,
-        Arc<OnceLock<Arc<Catalog>>>,
-        Arc<ChildBuilder>,
-        Arc<InProcessWorkers>,
-        Arc<AtomicUsize>,
-    ),
-    String,
-> {
+) -> Result<ComposedChildren, String> {
     let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
     let service_slot: Arc<OnceLock<Arc<InProcessWorkers>>> = Arc::new(OnceLock::new());
     let reserved = options
