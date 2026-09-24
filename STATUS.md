@@ -1,5 +1,19 @@
 # Status — 2026-09-22
 
+## Iris TUI migration (#91, slice #93) — 2026-09-24 20:50, Iris lead
+
+Branch `task/iris-tui-migration` (base `5a4d126`). Slice #93 adapts the pinned donor
+sanitizer (`iris-agent@5b04a1ad`, `src/ui/textengine.rs`) as `p1-tui/src/text.rs` behind
+`Band::render`; frozen `tests/band_sanitize.rs` unchanged. wf6's two low findings and the
+wf1 zero-cell residual are fixed with tests. Lead checks: focused p1-tui suites green and
+the full guarded gate GREEN (457 s, 1856 tests) on the tree before the one-line residual
+fix; evidence in `docs/design/iris-tui-migration-evidence.md`. Landing per the owner's
+21:00 order: commit, merge `main`, full gate on the merged tree, PR, cheap-worker PR
+review, merge. The live TUI restart stays the owner's decision.
+Next: freeze the port scope into slices for the owner's ~50-worker workflow (read-only
+survey wf2 is evidence only), write and dry-run its Rhai script, and the plan in
+`unified-dashboard-trial/iris-massive-workflow-PLAN.md`. #94–#96 and #98 affect that run.
+
 Handoff: `/home/phaseonebig/projects/phaseone-collab/fable-orchestrator-prompt.md`; after any
 context compaction re-read this file and `DECISIONS.md` first.
 Remote: github.com/5omeOtherGuy/phaseone (PUBLIC), trunk-based (`task/*` → `main` on green, push;
