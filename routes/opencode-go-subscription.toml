@@ -4,6 +4,12 @@
 # compiled in `p1_host::catalog` where `env!("CARGO_PKG_VERSION")` is available, and a
 # route file cannot stale it. There are no other static headers on this route, so there
 # is no `[headers]` table.
+#
+# COMPATIBILITY ALIAS (2026-09-24): since the owner's switch at 20:40 this name's store entry holds
+# the Go-3 key, the same account as `opencode-go-3-subscription` (the current primary). The file
+# keeps its id, origin and `OPENCODE_API_KEY`, so every environment, brief and stored session that
+# names `opencode-go-subscription` keeps working. p1 has no alias mechanism in code: an alias is
+# simply another route file, and this is one.
 id           = "opencode-go-subscription"
 origin_route = "openai-chat/opencode-go-subscription"
 adapter      = "openai-chat"

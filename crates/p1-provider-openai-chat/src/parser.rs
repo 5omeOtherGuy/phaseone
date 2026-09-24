@@ -3,7 +3,7 @@ use p1_contracts::{
     AssistantBlock, AssistantItem, CompletedResponse, Origin, Outcome, ProviderError,
     ProviderErrorKind, ReplayData, StopReason, StreamEvent, ToolCall, ToolInput, Usage,
 };
-use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status};
+use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status, reset_after};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -275,14 +275,37 @@ impl ResponseParser for ChatParser {
     fn on_http_error(
         &self,
         status: u16,
-        _headers: &[(String, String)],
+        headers: &[(String, String)],
         body: &[u8],
     ) -> ProviderError {
+        // A usage-limit error is an exhausted allowance, not a short rate-limit
+        // window. Retrying it across the provider's reset only hides the failure.
+        if matches!(status, 402 | 429) && names_usage_limit(body) {
+            let message = match reset_after(headers) {
+                Some(delay) => format!(
+                    "{USAGE_LIMIT_MESSAGE} (resets in {})",
+                    human_duration(delay)
+                ),
+                None => USAGE_LIMIT_MESSAGE.to_string(),
+            };
+            return ProviderError::new(ProviderErrorKind::UsageLimitExhausted, message);
+        }
         // A 401/403 whose body says the account has no balance is not a rejected
         // key (ADR-0046): refreshing the credential cannot help, so the operator
-        // must read the balance, not a key error.
-        if matches!(status, 401 | 403) && names_no_balance(body) {
-            return ProviderError::new(ProviderErrorKind::InsufficientBalance, NO_BALANCE_MESSAGE);
+        // must read the balance, not a key error. A plan / free-tier refusal is
+        // the same shape with a different diagnosis (ADR-0062): the key is valid,
+        // the route is just not entitled to this model, so a refresh cannot help
+        // either.
+        if matches!(status, 401 | 403) {
+            if names_no_balance(body) {
+                return ProviderError::new(
+                    ProviderErrorKind::InsufficientBalance,
+                    NO_BALANCE_MESSAGE,
+                );
+            }
+            if names_plan_refusal(body) {
+                return ProviderError::new(ProviderErrorKind::NotEntitled, NOT_ENTITLED_MESSAGE);
+            }
         }
         let context = serde_json::from_slice::<Value>(body).ok().is_some_and(|v| {
             v.pointer("/error/code").and_then(Value::as_str) == Some("context_length_exceeded")
@@ -302,6 +325,48 @@ impl ResponseParser for ChatParser {
     }
 }
 
+/// The whole text of an exhausted usage allowance: only the provider's reset
+/// hint is formatted into it, never the server's free text.
+const USAGE_LIMIT_MESSAGE: &str = "the account's usage allowance is used up";
+
+/// Fixed usage-limit/quota words, read in the same four JSON positions as the
+/// no-balance and plan-refusal classifications.
+const USAGE_LIMIT_WORDS: [&str; 3] = [
+    "gousagelimiterror",
+    "insufficient_quota",
+    "usage_limit_exceeded",
+];
+
+fn names_usage_limit(body: &[u8]) -> bool {
+    names_any_position(body, &USAGE_LIMIT_WORDS)
+}
+
+fn human_duration(duration: std::time::Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let parts = [
+        (total_seconds / 86_400, "d"),
+        ((total_seconds % 86_400) / 3_600, "h"),
+        ((total_seconds % 3_600) / 60, "min"),
+        (total_seconds % 60, "s"),
+    ];
+    let mut out = String::new();
+    for (amount, unit) in parts {
+        if amount > 0 {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&amount.to_string());
+            out.push(' ');
+            out.push_str(unit);
+        }
+    }
+    if out.is_empty() {
+        "0 s".to_string()
+    } else {
+        out
+    }
+}
+
 /// The whole text of an exhausted-account error: the server's words are a lookup
 /// key only, never copied, sliced or formatted into the message (ADR-0046).
 const NO_BALANCE_MESSAGE: &str = "the account has no balance";
@@ -317,17 +382,39 @@ const NO_BALANCE_WORDS: [&str; 5] = [
     "billing_error",
 ];
 
+/// The whole text of a plan / free-tier refusal (ADR-0062): like the no-balance
+/// message it is a constant, never the server's free text.
+const NOT_ENTITLED_MESSAGE: &str = "the account's plan does not allow this model on this route";
+
+/// The fixed allow-list of error words that mean "the plan does not allow this".
+/// `freetiererror` is the observed OpenCode Zen shape (a valid key, a model gated
+/// to OpenCode's own client); the rest are the same fixed-guess kind the no-balance
+/// list is, an unknown shape falling back to the status-based classification.
+const NOT_ENTITLED_WORDS: [&str; 3] = ["freetiererror", "not_entitled", "plan_not_allowed"];
+
 /// Whether an error body names a no-balance word in one of the four fixed
 /// positions. The body is classification input: a non-JSON, empty or differently
 /// shaped body is simply not a hit.
 fn names_no_balance(body: &[u8]) -> bool {
+    names_any_position(body, &NO_BALANCE_WORDS)
+}
+
+/// Whether an error body names a plan-refusal word in one of the same four fixed
+/// positions `names_no_balance` reads (ADR-0062).
+fn names_plan_refusal(body: &[u8]) -> bool {
+    names_any_position(body, &NOT_ENTITLED_WORDS)
+}
+
+/// Read `/error/type`, `/error/code`, top-level `/type` and `/code` (strings
+/// only), lower-case them and look each up in `words`.
+fn names_any_position(body: &[u8], words: &[&str]) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
     ["/error/type", "/error/code", "/type", "/code"]
         .iter()
         .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-        .any(|word| NO_BALANCE_WORDS.contains(&word.to_ascii_lowercase().as_str()))
+        .any(|word| words.contains(&word.to_ascii_lowercase().as_str()))
 }
 
 fn map_usage(value: &Value) -> Usage {
@@ -371,6 +458,41 @@ mod tests {
         assert!(!error.message.contains("has spaces"));
     }
 
+    #[test]
+    fn an_unrecognised_429_body_stays_rate_limited() {
+        let error =
+            parser().on_http_error(429, &[], br#"{"error":{"type":"temporary_burst_limit"}}"#);
+        assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+    }
+
+    #[test]
+    fn a_free_tier_refusal_is_not_entitled_not_authentication() {
+        // The live OpenCode Zen shape: a valid key, but the model is gated to
+        // OpenCode's own client (ADR-0062).
+        let error = parser().on_http_error(
+            403,
+            &[],
+            br#"{"error":{"type":"FreeTierError","message":"this model is only available in the OpenCode client"}}"#,
+        );
+        assert_eq!(error.kind, ProviderErrorKind::NotEntitled);
+        assert_eq!(error.message, NOT_ENTITLED_MESSAGE);
+        // The server's free text is never copied into the message.
+        assert!(
+            !error
+                .message
+                .contains("only available in the OpenCode client")
+        );
+
+        // An unknown 403 body keeps today's status-based classification.
+        let unknown = parser().on_http_error(403, &[], br#"{"error":{"type":"invalid_api_key"}}"#);
+        assert_eq!(unknown.kind, ProviderErrorKind::Authentication);
+
+        // The no-balance classification is unchanged.
+        let balance = parser().on_http_error(401, &[], br#"{"error":{"type":"creditserror"}}"#);
+        assert_eq!(balance.kind, ProviderErrorKind::InsufficientBalance);
+        assert_eq!(balance.message, NO_BALANCE_MESSAGE);
+    }
+
     fn send(p: &mut ChatParser, value: Value) -> Vec<StreamEvent> {
         p.on_event(SseEvent {
             event: None,
@@ -393,6 +515,24 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+
+    #[test]
+    fn a_usage_limit_is_terminal_and_its_reset_hint_is_sanitised() {
+        for (header, value) in [("Retry-After", "187200"), ("X-RateLimit-Reset", "187200")] {
+            let error = parser().on_http_error(
+                429,
+                &[(header.into(), value.into())],
+                br#"{"error":{"type":"GoUsageLimitError","message":"wire text"}}"#,
+            );
+            assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
+            assert_eq!(
+                error.message,
+                "the account's usage allowance is used up (resets in 2 d 4 h)"
+            );
+            assert!(!error.message.contains("wire text"));
+        }
+    }
+
     #[test]
     fn a_null_or_empty_tool_type_on_a_continuation_chunk_is_not_a_protocol_error() {
         for filler in [json!(null), json!("")] {

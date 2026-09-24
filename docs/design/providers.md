@@ -47,7 +47,9 @@ Retry loop invariants (each has a test, with a fake clock — `tokio::time::paus
    was yielded) share one budget of `max_retries`.
 3. **Never retry once any `TextDelta`/`ReasoningDelta`/`ToolInputDelta` has been yielded** —
    the failure becomes the terminal `Finished(Failed(Transport))`.
-4. Back-off waits race cancellation and yield `StreamEvent::Activity` so the consumer sees life.
+4. Back-off waits race cancellation. Before each wait the driver emits a `StreamEvent::Notice`
+   (`provider returned HTTP <status>; retry <n>/<max> in <wait>`, or `provider request failed; …`
+   when there is no HTTP status), then `StreamEvent::Activity`, so the consumer sees life.
 5. Error messages and logs carry status, error type and request id only — never a request or
    response body, never a header value.
 
@@ -111,6 +113,38 @@ A 401/403 whose body says the account has no balance is NOT an authentication fa
 - The shared driver finishes immediately on this kind: no credential refresh, no retry, ONE
   HTTP request in total. The host's turn-level retry (completion.md §3b) does not cover it.
 - The host prints the message as it prints any provider error; exit code as for any failed run.
+
+## A plan that does not allow the model (ADR-0062)
+
+A 401/403 whose body says the account's plan does not allow this model on this route is NOT an
+authentication failure: the key is valid, so a credential refresh cannot help either. Observed
+live on the OpenCode Zen chat endpoint, which answers a model gated to OpenCode's own client with
+HTTP 403 and a `FreeTierError`-shaped body while the key is fine.
+- `ProviderErrorKind::NotEntitled`, message exactly
+  `the account's plan does not allow this model on this route` (a constant — the server's text is
+  never copied, sliced or formatted into it).
+- The chat adapter's `on_http_error` reads the same four positions and lookups as the no-balance
+  check, with a second fixed allow-list: `freetiererror`, `not_entitled`, `plan_not_allowed`.
+  A hit → the new kind. No hit, no JSON, empty body → exactly today's behaviour (a 401/403 stays
+  `Authentication`).
+- The shared driver finishes immediately on this kind, exactly as on `InsufficientBalance`: no
+  credential refresh, no retry, ONE HTTP request in total.
+- The TUI renders `✗ not included in the plan · <message> · not retried` and offers `/model`.
+
+## A used-up usage allowance
+
+A 402/429 whose body names a fixed usage-limit or quota word is not a short rate-limit window.
+- The chat adapter reads the same four JSON positions as the no-balance and plan-refusal checks.
+  The case-insensitive allow-list is `gousagelimiterror`, `insufficient_quota`, and
+  `usage_limit_exceeded`.
+- A hit becomes `ProviderErrorKind::UsageLimitExhausted` with the fixed message
+  `the account's usage allowance is used up`. An integer-seconds `Retry-After` (or rate-limit
+  reset header) appends `(resets in <duration>)`; provider free text is never copied.
+- The shared driver finishes on the first response, with no refresh or retry. The host's
+  turn-level retry does not cover this kind either. Unknown 402/429 bodies keep their existing
+  status classification (`RateLimited` for 429) and retry budget.
+- The TUI renders `✗ usage limit reached · <message> · not retried` and offers the reset or
+  `/model`.
 
 ## The ONE conformance suite — `p1-provider-conformance`
 
