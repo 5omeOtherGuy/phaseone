@@ -11,8 +11,8 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use p1_contracts::{
     BoxFuture, CancellationToken, CompletedResponse, ContextError, ContextInput, ContextPolicy,
-    Item, ModelOptions, Outcome, Prepared, Provider, ProviderRequest, StopReason, StreamEvent,
-    Usage,
+    Effort, Item, ModelOptions, Outcome, Prepared, Provider, ProviderRequest, StopReason,
+    StreamEvent, Usage,
 };
 
 pub use estimate::estimate_tokens;
@@ -146,6 +146,18 @@ impl SummarizingContext {
         self.config.validate_summary_output_tokens(tokens)?;
         self.summary_output_tokens = tokens;
         Ok(self)
+    }
+
+    /// Sets the reasoning effort the summarization request carries (#125). A summary
+    /// must NOT inherit the agent's effort: on a thinking model the route spends part
+    /// of the summary-output cap on reasoning before a single summary token, and the
+    /// transcript handed to the summarizer is already condensed. The host passes the
+    /// LOWEST effort the model profile supports, so the whole cap buys summary text;
+    /// the one cap-doubling retry is untouched. `None` keeps the effort the options
+    /// carried — the whole-provider form names no profile to read a floor from.
+    pub fn with_summary_effort(mut self, effort: Option<Effort>) -> Self {
+        self.options.reasoning_effort = effort;
+        self
     }
 }
 

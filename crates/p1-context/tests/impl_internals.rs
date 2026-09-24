@@ -13,10 +13,10 @@ use p1_context::{
 };
 use p1_contracts::{
     AssistantBlock, AssistantItem, BoxFuture, CancellationToken, ContextError, ContextInput,
-    ContextPolicy, Item, ModelOptions, Prepared, Provider, RouteDescription, ToolResultItem,
-    ToolStatus,
+    ContextPolicy, Effort, Item, ModelOptions, Prepared, Provider, RouteDescription, StopReason,
+    StreamEvent, ToolResultItem, ToolStatus,
 };
-use p1_testkit::{ScriptedProvider, json_call, origin, text_response};
+use p1_testkit::{ScriptedProvider, Step, completed, json_call, origin, text_block, text_response};
 use tokio::time::timeout;
 
 const LIMIT: Duration = Duration::from_secs(5);
@@ -438,4 +438,122 @@ async fn a_unitless_history_is_still_material() {
         .unwrap();
     assert!(prepared.is_some());
     assert_eq!(provider.requests().len(), 1);
+}
+
+// ------------------------------------------- #125: the summary's own effort
+
+/// A summary request that hit the output cap: text, then `MaxOutputTokens`.
+fn truncated() -> Step {
+    Step::Events(vec![
+        StreamEvent::TextDelta {
+            block: 0,
+            text: "cut off".into(),
+        },
+        StreamEvent::Finished(completed(
+            vec![text_block("cut off")],
+            StopReason::MaxOutputTokens,
+            None,
+        )),
+    ])
+}
+
+fn options_with(effort: Effort) -> ModelOptions {
+    ModelOptions {
+        reasoning_effort: Some(effort),
+        ..ModelOptions::default()
+    }
+}
+
+/// The two-item history the effort tests summarize: one summable unit and a tail.
+fn effort_history() -> Vec<Item> {
+    vec![assistant_text("x".repeat(500)), assistant_text("tail")]
+}
+
+/// A config that summarizes that history once `keep_recent_tokens = 80` leaves a one-unit tail.
+fn effort_config() -> ContextConfig {
+    let mut cfg = config();
+    cfg.summarize_at_tokens = 100;
+    cfg
+}
+
+// #125: the summarization request must not inherit the agent's reasoning effort, whatever
+// that effort is. The host passes the LOWEST effort the model profile supports; every
+// request then carries it, so the summary cap buys summary text and not reasoning.
+#[tokio::test(start_paused = true)]
+async fn the_summary_request_carries_the_lowered_effort_whatever_the_agents_effort_is() {
+    let history = effort_history();
+    for agent_effort in [Effort::Medium, Effort::High, Effort::ExtraHigh, Effort::Max] {
+        let provider = Arc::new(ScriptedProvider::new(vec![text_response("s")]));
+        let policy = SummarizingContext::new(
+            provider.clone(),
+            options_with(agent_effort),
+            effort_config(),
+            "summary prompt".into(),
+        )
+        .unwrap()
+        .with_summary_effort(Some(Effort::Low));
+        assert!(
+            prepare(&policy, &history).await.unwrap().is_some(),
+            "an agent at {agent_effort:?} still summarizes"
+        );
+        assert_eq!(
+            provider.requests()[0].options.reasoning_effort,
+            Some(Effort::Low),
+            "the summary request of an agent at {agent_effort:?}"
+        );
+    }
+}
+
+// Without the setting the request keeps the effort its options carry: the whole-provider
+// environment names no profile, so the module has no floor to read.
+#[tokio::test(start_paused = true)]
+async fn an_unset_summary_effort_keeps_the_effort_the_options_carry() {
+    let history = effort_history();
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response("s")]));
+    let policy = SummarizingContext::new(
+        provider.clone(),
+        options_with(Effort::Max),
+        effort_config(),
+        "summary prompt".into(),
+    )
+    .unwrap();
+    assert!(prepare(&policy, &history).await.unwrap().is_some());
+    assert_eq!(
+        provider.requests()[0].options.reasoning_effort,
+        Some(Effort::Max)
+    );
+}
+
+// The one cap-doubling retry of "Revision 2026-09-20" is unchanged by #125, and the retry
+// carries the same lowered effort as the first request.
+#[tokio::test(start_paused = true)]
+async fn the_cap_doubling_retry_keeps_the_lowered_effort() {
+    let history = effort_history();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        truncated(),
+        text_response("whole"),
+    ]));
+    let policy = SummarizingContext::new(
+        provider.clone(),
+        options_with(Effort::Max),
+        effort_config(),
+        "summary prompt".into(),
+    )
+    .unwrap()
+    .with_summary_effort(Some(Effort::Low));
+    assert!(prepare(&policy, &history).await.unwrap().is_some());
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "one retry");
+    assert_eq!(
+        requests[0].options.max_output_tokens,
+        Some(DEFAULT_SUMMARY_OUTPUT_TOKENS as u32)
+    );
+    assert_eq!(
+        requests[1].options.max_output_tokens,
+        Some(DEFAULT_SUMMARY_OUTPUT_TOKENS as u32 * 2),
+        "the retry doubles the cap"
+    );
+    assert_eq!(requests[0].options.reasoning_effort, Some(Effort::Low));
+    assert_eq!(requests[1].options.reasoning_effort, Some(Effort::Low));
 }

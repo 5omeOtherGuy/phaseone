@@ -24,12 +24,13 @@ use p1_assembly::ToolSpec;
 use p1_assembly::{Assembled, EnvironmentFile, Substitutions, assemble, load_environment};
 use p1_contracts::{
     AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
-    ContextInput, ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, Tool,
-    TurnEnd,
+    ContextInput, ContextPolicy, Effort, EventSink, JournalRecord, Prepared, ProviderErrorKind,
+    Tool, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, Reconfiguration, ResumeReport};
 #[cfg(feature = "delegation")]
 use p1_journal::MemoryJournal;
+use p1_model_profile::ModelProfile;
 
 #[cfg(feature = "delegation")]
 use crate::activity::WorkerReportTap;
@@ -160,8 +161,13 @@ impl ContextPolicy for DefaultContext {
 /// The context policy for an assembled agent (context.md §3): a
 /// `SummarizingContext` when the environment opts in with `[context]`,
 /// passthrough otherwise. The host is the composition root: `p1-assembly` only
-/// carries the plain settings and the prompt override.
-fn agent_context(assembled: &Assembled) -> Result<Arc<dyn ContextPolicy>, String> {
+/// carries the plain settings and the prompt override. `profile` is the model
+/// profile the environment selected (the whole-provider form has none), read
+/// here for the summarization request's own effort (#125).
+fn agent_context(
+    assembled: &Assembled,
+    profile: Option<&ModelProfile>,
+) -> Result<Arc<dyn ContextPolicy>, String> {
     let Some(settings) = &assembled.resolved.context else {
         return Ok(Arc::new(DefaultContext));
     };
@@ -184,8 +190,18 @@ fn agent_context(assembled: &Assembled) -> Result<Arc<dyn ContextPolicy>, String
         config,
         prompt,
     )?
-    .with_summary_output_tokens(settings.summary_output_tokens)?;
+    .with_summary_output_tokens(settings.summary_output_tokens)?
+    .with_summary_effort(lowest_effort(profile));
     Ok(Arc::new(policy))
+}
+
+/// The lowest reasoning effort a model profile supports (#125): what the
+/// summarization request carries so the summary-output cap is not spent on the
+/// agent's own level of reasoning before any summary text. `None` for a
+/// whole-provider environment, which names no profile; the request then keeps the
+/// effort the assembled options carry.
+fn lowest_effort(profile: Option<&ModelProfile>) -> Option<Effort> {
+    profile.and_then(|profile| profile.efforts.iter().copied().min())
 }
 
 /// A session store plus the records to resume from (when resuming).
@@ -608,7 +624,7 @@ pub async fn run_with_front_end(
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
     let completion = completion_hub.take();
-    let context = agent_context(&assembled)?;
+    let context = agent_context(&assembled, environment.profile.as_deref())?;
     let route = assembled.resolved.route.origin.route.clone();
     let model = assembled.resolved.route.origin.model.clone();
     // The session's model, for a later switch (ADR-0049 stage 3): the environment it
@@ -1564,7 +1580,7 @@ pub(crate) fn switch_model(
     // The label the renderer names after this switch, exactly as the start path
     // named it (`Origin.route`, `<adapter>/<account>`).
     let route = assembled.resolved.route.origin.route.clone();
-    let context = agent_context(&assembled)?;
+    let context = agent_context(&assembled, environment.profile.as_deref())?;
     let mut tools = assembled.tools;
     // The switched tool set's `finish` must reach the completion the run reads. The
     // session keeps ITS `finish` — the whole session's activity is in that tool's
@@ -2210,7 +2226,9 @@ async fn running_children(deps: &HostDeps) -> usize {
 /// The START path and a re-grant (`worker_continue` with `add_tools`, ADR-0050 item
 /// 6) both go through this, so both build the tool list identically — and a re-grant
 /// passes the child's original ordinal, so its provider-side prompt cache survives
-/// where the route takes a key.
+/// where the route takes a key. The child's profile comes back with the assembly: it
+/// is not otherwise reachable from an `Assembled`, and the child's summarizer needs
+/// its effort floor (#125).
 #[cfg(feature = "delegation")]
 #[allow(clippy::too_many_arguments)]
 fn assemble_child(
@@ -2222,7 +2240,7 @@ fn assemble_child(
     workspace: &Path,
     substitutions: &Substitutions,
     ordinal: u64,
-) -> Result<Assembled, String> {
+) -> Result<(Assembled, Option<Arc<ModelProfile>>), String> {
     let mut environment =
         load_environment(environment_name, environment_dirs).map_err(|error| error.to_string())?;
     environment.tools = child_tools(&environment, grant)?;
@@ -2232,7 +2250,10 @@ fn assemble_child(
         crate::models::apply(&mut environment, choice, environment_dirs)?;
     }
     crate::catalog::resolve_environment(&mut environment, environment_dirs)?;
-    assemble_with_cache_key(catalog, &environment, workspace, substitutions, ordinal)
+    let profile = environment.profile.clone();
+    let assembled =
+        assemble_with_cache_key(catalog, &environment, workspace, substitutions, ordinal)?;
+    Ok((assembled, profile))
 }
 
 /// The tool list of a child: the granted modules in the parent's order, each with the
@@ -2385,7 +2406,7 @@ impl ChildBuilder {
         // This child's own cache-key ordinal, kept for its whole life: a re-grant
         // assembles at the SAME ordinal, never a new one.
         let ordinal = next_agent_ordinal(&self.agent_ordinals);
-        let mut assembled = assemble_child(
+        let (mut assembled, child_profile) = assemble_child(
             environment_dirs,
             &catalog,
             environment,
@@ -2414,7 +2435,7 @@ impl ChildBuilder {
         if let Some(completion) = &child_completion {
             apply_completion_policy(&mut assembled, completion, contract.clone());
         }
-        let context = agent_context(&assembled)?;
+        let context = agent_context(&assembled, child_profile.as_deref())?;
         let route = assembled.resolved.route.origin.route.clone();
         let model = assembled.resolved.route.origin.model.clone();
         let description = format!("{route}/{model}");
@@ -2508,7 +2529,7 @@ impl ChildBuilder {
             // claim, and a freshly assembled one would see an empty session.
             let finish = finish_tool(&assembled);
             Arc::new(move |grant: &[String]| -> Result<Reconfiguration, String> {
-                let assembled = assemble_child(
+                let (assembled, child_profile) = assemble_child(
                     &environment_dirs,
                     &catalog,
                     &environment_name,
@@ -2522,7 +2543,7 @@ impl ChildBuilder {
                 // completion: take it, so the hub cannot hand a stale one to a later
                 // worker assembly.
                 let _issued = completion_hub.take();
-                let context = agent_context(&assembled)?;
+                let context = agent_context(&assembled, child_profile.as_deref())?;
                 let finish_at = finish_index(&assembled);
                 // A re-grant is a new tool set, so the policy is chosen again from it
                 // (ADR-0052 item 1): `add_tools: ["shell"]` puts the worker back on the
