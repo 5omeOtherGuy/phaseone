@@ -17,11 +17,11 @@ module = "shell"
 [[tools]]
 module = "finish"
 
-# Copied from environments/deepseek, not measured on this route: the runs behind these values
-# (split4a and its successors, docs/dogfood/runs.jsonl) ran on the other account's route. The 1M
-# window is what the model's vendor states for its own API; OpenCode Go documents no window for
-# this endpoint (research #27). Operational values, not capacity claims: summarize late, keep a
-# long tail — a task that must hold several large files at once thrashes below ~100k.
+# Same endpoint and model as environments/deepseek, the owner's second OpenCode Go account. Sources
+# (2026-09-24): gateway metadata (models.dev/api.json, provider `opencode-go`,
+# `deepseek-v4.1-flash`: context 1000000, output 384000) and the vendor api-docs.deepseek.com
+# ("CONTEXT LENGTH 1M"); 300k stays for the reason recorded in environments/deepseek. Summarize
+# late, keep a long tail — a task that must hold several large files at once thrashes below ~100k.
 [context]
 window_tokens = 1000000
 output_headroom_tokens = 32000

@@ -17,9 +17,15 @@ module = "shell"
 [[tools]]
 module = "finish"
 
-# K3 claims 1M; nothing proven yet on this route — raise after a measured run.
+# Vendor-documented, but TIER-DEPENDENT (www.kimi.com/code/docs/en/kimi-code/models.html, fetched
+# 2026-09-24): the coding plan's `k3` model has "Context window 1048576 (for higher-tier members)"
+# and "on a Moderato / Plus plan, k3 supports up to 256K context; up to 1M context is available on
+# Allegretto / Pro or above" (`k3-256k` is fixed at 262144). The owner's plan tier is not part of
+# this configuration, so the documented FLOOR (262144) is used and the environment stays one model
+# on every tier; raise to 1048576 once the tier is known (docs/design/context-windows.md).
+# Summarize at 150k = 60% of the floor (157,286) rounded down to 10k, keeping a long tail.
 [context]
-window_tokens = 260000
+window_tokens = 262144
 output_headroom_tokens = 32000
 summarize_at_tokens = 150000
 keep_recent_tokens = 50000

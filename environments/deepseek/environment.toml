@@ -17,10 +17,14 @@ module = "shell"
 [[tools]]
 module = "finish"
 
-# The route serves a 1M-token window. The first values here (170k window, summarize at 90k) were
-# taken from one run's peak and were far too tight: run split4a (docs/dogfood/runs.jsonl) read
-# 698 files in 855 requests, was summarized 40 times and never reached its first edit — a task
-# that must hold several large files at once thrashes below ~100k. Summarize late, keep a long tail.
+# The route serves a 1M-token window. Sources (2026-09-24): the gateway's own model metadata
+# (models.dev/api.json, provider `opencode-go`, model `deepseek-v4.1-flash`: context 1000000,
+# output 384000) and the vendor (api-docs.deepseek.com: "CONTEXT LENGTH 1M"). The first values
+# here (170k window, summarize at 90k) were taken from one run's peak and were far too tight: run
+# split4a (docs/dogfood/runs.jsonl) read 698 files in 855 requests, was summarized 40 times and
+# never reached its first edit — a task that must hold several large files at once thrashes below
+# ~100k. Summarize at 300k: no source argues for another point, and the 60% rule would cap at 500k
+# with no measured evidence for it (docs/design/context-windows.md). Keep a long tail.
 [context]
 window_tokens = 1000000
 output_headroom_tokens = 32000

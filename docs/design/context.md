@@ -107,7 +107,14 @@ re-summarized together with the newer material next time (rolling).
 `Item::User` holding the rendered transcript; `tools` = empty; `options` = the agent's options
 with `max_output_tokens = Some(min(existing, 4_000))` where the route validates it (if
 `provider.validate` rejects the request because of `max_output_tokens`, retry validation once
-without it — the Codex route refuses the field). Rendering, one block per item, in order:
+without it — the Codex route refuses the field), and `reasoning_effort` = the LOWEST effort the
+model profile supports (#125). The summary must not inherit the agent's effort: on a thinking
+model the route spends part of the cap on reasoning before a single summary token, and no adapter
+of ours can switch thinking off entirely (`None` means the route's default, which is the
+profile's own `default_effort`). The host supplies the floor
+(`SummarizingContext::with_summary_effort`, `crates/p1-host/src/run.rs`) because a
+`ModelProfile` is configuration the module does not see; an environment with no profile (the
+whole-provider form) keeps the effort its options carry. Rendering, one block per item, in order:
 `## Previous summary` (the old summary text), `## User` / `## Notification` / `## Steering`,
 `## Assistant` (text blocks; reasoning TEXT is omitted; each call as
 `→ <tool>(<input, first 500 chars>)`), `## Result of <tool> [<status>]` with the content cut
@@ -182,10 +189,12 @@ plus an optional `summarize.md` next to `prompt.md` (whole-file override of the 
 model-family seam). `ResolvedEnvironment` shows the table and the effective prompt.
 `AssemblyError::InvalidContext{message}` when `validate` fails. `p1-assembly` parses and
 resolves; the HOST constructs `SummarizingContext` (composition root) for the parent and for
-every worker from its own environment. The renderer prints
+every worker from its own environment, and passes it the lowest reasoning effort of the
+environment's model profile (#125). The renderer prints
 `context: summarized <before> → <after> items · <usage line>` on `ContextReplaced`.
-The shipped environments get measured values only after dogfooding; until then they ship
-WITHOUT `[context]`.
+The shipped environments now carry researched per-route values, each with its cited source, in
+`docs/design/context-windows.md`; a route whose window no public source states keeps its
+previous conservative value and says so in the env comment.
 
 ## 4. Must-pass behaviour (deterministic, scripted provider)
 
