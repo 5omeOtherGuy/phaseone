@@ -15,7 +15,15 @@ fn label(id: &str) -> String {
         "anthropic-subscription" => "claude max".into(),
         "openai-codex-subscription" => "chatgpt pro lite".into(),
         "opencode-go-subscription" => "opencode go".into(),
+        "opencode-go-1-subscription" => "opencode go-1".into(),
         "opencode-go-2-subscription" => "opencode go-2".into(),
+        "opencode-go-3-subscription" => "opencode go-3".into(),
+        // The free Zen accounts have no known usage endpoint (docs/design/usage.md), so their
+        // rows are `Unsupported`; the label still names the account rather than the route id.
+        "opencode-zen-1" => "opencode zen-1".into(),
+        "opencode-zen-2" => "opencode zen-2".into(),
+        "opencode-zen-3" => "opencode zen-3".into(),
+        "opencode-zen-free" => "opencode zen free".into(),
         "glm-subscription" => "glm".into(),
         _ => id
             .strip_suffix("-subscription")

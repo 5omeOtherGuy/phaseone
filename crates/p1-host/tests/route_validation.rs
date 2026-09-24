@@ -120,7 +120,18 @@ fn show_in(root: &Path, name: &str) -> (i32, String) {
 fn every_shipped_environment_still_assembles() {
     // Every main agent gets the worker tools from the host (ADR-0050), so every
     // shipped environment assembles with or without the `delegation` feature.
-    let shipped = ["claude", "gpt", "deepseek", "glm"];
+    let shipped = [
+        "claude",
+        "gpt",
+        "deepseek",
+        "deepseek1",
+        "deepseek2",
+        "deepseek3",
+        "glm",
+        "zen",
+        "zen2",
+        "zen3",
+    ];
     for name in shipped {
         let (code, stdout, stderr) = show_env(name);
         assert_eq!(code, 0, "{name}: {stderr}");

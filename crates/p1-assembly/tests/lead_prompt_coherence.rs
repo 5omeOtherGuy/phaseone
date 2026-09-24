@@ -291,7 +291,10 @@ fn every_shipped_prompt_renders_for_every_subset_of_its_tools() {
     checked.sort();
     assert_eq!(
         checked,
-        ["claude", "deepseek", "deepseek2", "glm", "gpt", "kimi"],
+        [
+            "claude", "deepseek", "deepseek1", "deepseek2", "deepseek3", "glm", "gpt", "kimi",
+            "zen", "zen2", "zen3"
+        ],
         "a shipped environment was added or removed without this test being updated"
     );
     for name in &checked {

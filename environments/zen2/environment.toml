@@ -1,0 +1,29 @@
+route   = "opencode-zen-2"
+profile = "mimo-v2.6-flash-free"
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "finish"
+
+# The model metadata states a 200,000-token context and a 32,000-token output limit; the latter
+# is the headroom. Summarize late enough for multi-file work but well below the input wall
+# (168,000), and keep a long recent tail. Operational values, not a capacity claim.
+[context]
+window_tokens = 200000
+output_headroom_tokens = 32000
+summarize_at_tokens = 120000
+keep_recent_tokens = 40000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000

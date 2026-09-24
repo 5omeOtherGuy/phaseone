@@ -172,6 +172,34 @@ fn kimi_request(request: &ProviderRequest) -> serde_json::Value {
     shipped_request_body("kimi", request)
 }
 
+/// The three free OpenCode Zen environments, each on its own account route. The Zen gateway is a
+/// NEW endpoint for the chat adapter, so all three run the shared suite; the two Go-1/Go-3
+/// accounts are the same data as Go-2 (whose environment is not in the suite either) and are
+/// pinned field by field in `the_new_opencode_account_routes_are_distinct`.
+fn shipped_zen(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped("zen"), transport)
+}
+
+fn zen_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body("zen", request)
+}
+
+fn shipped_zen2(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped("zen2"), transport)
+}
+
+fn zen2_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body("zen2", request)
+}
+
+fn shipped_zen3(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped("zen3"), transport)
+}
+
+fn zen3_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body("zen3", request)
+}
+
 fn fixtures() -> RouteFixtures {
     RouteFixtures {
         text_turn: chat_fixtures::TEXT_TURN,
@@ -207,12 +235,27 @@ struct ShippedRoute {
     follow_up_request: fn(&ProviderRequest) -> serde_json::Value,
 }
 
-fn shipped_routes() -> [ShippedRoute; 3] {
+fn shipped_routes() -> [ShippedRoute; 6] {
     [
         ShippedRoute {
             name: "opencode-go-subscription",
             build: shipped_deepseek,
             follow_up_request: deepseek_request,
+        },
+        ShippedRoute {
+            name: "opencode-zen-1",
+            build: shipped_zen,
+            follow_up_request: zen_request,
+        },
+        ShippedRoute {
+            name: "opencode-zen-2",
+            build: shipped_zen2,
+            follow_up_request: zen2_request,
+        },
+        ShippedRoute {
+            name: "opencode-zen-3",
+            build: shipped_zen3,
+            follow_up_request: zen3_request,
         },
         ShippedRoute {
             name: "glm-subscription",
@@ -499,9 +542,17 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
             "glm-subscription",
             "kimi-coding-subscription",
             "openai-codex-subscription",
-            // The owner's second OpenCode Go account: data only, no Rust change.
+            // The owner's three OpenCode Go accounts and the free Zen accounts: data only, no
+            // Rust change. Each account is its own route (its own id, origin and store entry),
+            // `opencode-go-subscription` and `opencode-zen-free` are compatibility aliases.
+            "opencode-go-1-subscription",
             "opencode-go-2-subscription",
-            "opencode-go-subscription"
+            "opencode-go-3-subscription",
+            "opencode-go-subscription",
+            "opencode-zen-1",
+            "opencode-zen-2",
+            "opencode-zen-3",
+            "opencode-zen-free"
         ]
     );
     assert!(
@@ -601,6 +652,118 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
     assert_eq!(resolved.profile.max_output_tokens, Some(131_072));
     assert_eq!(resolved.profile.context_tokens, None);
     assert_eq!(resolved.wire_model, "k3");
+}
+
+/// The OpenCode accounts added on 2026-09-24 (three Go, three free Zen, plus the Zen alias):
+/// each account is its own route with its own id, origin and credential REFERENCE, and the only
+/// things they share are the adapter, the dialect and the session header. `opencode-go-subscription`
+/// and `opencode-zen-free` are compatibility aliases — same data as a primary account, its own
+/// store entry — so environments and briefs that already name them keep working.
+#[test]
+fn the_new_opencode_account_routes_are_distinct() {
+    let dirs = shipped_environment_dirs();
+    const GO_ENDPOINT: &str = "https://opencode.ai/zen/go/v1/chat/completions";
+    const ZEN_ENDPOINT: &str = "https://opencode.ai/zen/v1/chat/completions";
+    const GO_MODELS: [&str; 1] = ["deepseek-v4.1-flash"];
+    const ZEN_MODELS: [&str; 3] = [
+        "mimo-v2.6-flash-free",
+        "muse-spark-1.3-contributor-free",
+        "space-bunny-free",
+    ];
+    // (route id, endpoint, the variable it names, the profiles it binds)
+    let expected: [(&str, &str, &str, &[&str]); 8] = [
+        (
+            "opencode-go-1-subscription",
+            GO_ENDPOINT,
+            "OPENCODE_GO_1_API_KEY",
+            &GO_MODELS[..],
+        ),
+        (
+            "opencode-go-2-subscription",
+            GO_ENDPOINT,
+            "OPENCODE_GO_2_API_KEY",
+            &GO_MODELS[..],
+        ),
+        (
+            "opencode-go-3-subscription",
+            GO_ENDPOINT,
+            "OPENCODE_GO_3_API_KEY",
+            &GO_MODELS[..],
+        ),
+        // The compatibility alias keeps its original id and variable; only a comment changed.
+        (
+            "opencode-go-subscription",
+            GO_ENDPOINT,
+            "OPENCODE_API_KEY",
+            &GO_MODELS[..],
+        ),
+        (
+            "opencode-zen-1",
+            ZEN_ENDPOINT,
+            "OPENCODE_ZEN_1_API_KEY",
+            &ZEN_MODELS[..],
+        ),
+        (
+            "opencode-zen-2",
+            ZEN_ENDPOINT,
+            "OPENCODE_ZEN_2_API_KEY",
+            &ZEN_MODELS[..],
+        ),
+        (
+            "opencode-zen-3",
+            ZEN_ENDPOINT,
+            "OPENCODE_ZEN_3_API_KEY",
+            &ZEN_MODELS[..],
+        ),
+        // The alias must NOT reuse OPENCODE_API_KEY: that is the Go alias's variable, and reusing
+        // it would make two accounts share one key.
+        (
+            "opencode-zen-free",
+            ZEN_ENDPOINT,
+            "OPENCODE_ZEN_API_KEY",
+            &ZEN_MODELS[..],
+        ),
+    ];
+    let settings = AdapterSettings::OpenAiChat(ChatAdapterSettings {
+        dialect: ChatDialect::ThinkingWithReasoningAlias,
+        session_header: Some("x-opencode-session".into()),
+    });
+    for (id, endpoint, env, models) in expected {
+        let route = load_route_by_id(&dirs, id).expect("the shipped route file");
+        assert_eq!(route.id, id);
+        assert_eq!(route.origin_route, format!("openai-chat/{id}"), "{id}");
+        assert_eq!(route.adapter, "openai-chat", "{id}");
+        assert_eq!(route.endpoint, endpoint, "{id}");
+        assert_eq!(route.credential.kind, CredentialKind::ApiKey, "{id}");
+        assert_eq!(route.credential.env.as_deref(), Some(env), "{id}");
+        assert!(route.credential.store_only, "{id} is store-only (ADR-0061)");
+        assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
+        assert_eq!(
+            route.settings().expect("the adapter parses its settings"),
+            settings.clone(),
+            "{id}"
+        );
+        assert!(route.headers.is_empty(), "{id}: user-agent stays compiled");
+        let bound: Vec<&str> = route.models.keys().map(String::as_str).collect();
+        assert_eq!(
+            bound.as_slice(),
+            models,
+            "{id} binds exactly these profiles"
+        );
+        for (profile, binding) in &route.models {
+            assert_eq!(
+                binding.wire_model.as_str(),
+                profile.as_str(),
+                "{id}: wire id is the profile id"
+            );
+        }
+    }
+    // No two accounts share a credential variable: p1's store is keyed by route id, and the
+    // documented variables are the other half of the chain.
+    let mut envs: Vec<&str> = expected.iter().map(|(_, _, env, _)| *env).collect();
+    envs.sort_unstable();
+    envs.dedup();
+    assert_eq!(envs.len(), expected.len(), "legal env vars differ: {envs:?}");
 }
 
 /// The endpoint, the session header and every model name of the two routes now live in

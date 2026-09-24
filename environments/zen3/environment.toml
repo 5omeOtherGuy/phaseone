@@ -1,0 +1,30 @@
+route   = "opencode-zen-3"
+profile = "muse-spark-1.3-contributor-free"
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "finish"
+
+# The model metadata states a 1,048,576-token context and a 131,072-token output limit; the latter
+# is the headroom. Summarizing starts below the remaining input wall (917,504). The chat
+# completions endpoint for this model is not verified yet (see the profile's comment), so these
+# values describe the metadata, not a measured run. Keep a long recent tail.
+[context]
+window_tokens = 1048576
+output_headroom_tokens = 131072
+summarize_at_tokens = 450000
+keep_recent_tokens = 60000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000
