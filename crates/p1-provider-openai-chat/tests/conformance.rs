@@ -308,3 +308,54 @@ async fn replay_is_structurally_preserved_in_the_actual_second_request() {
         assert_eq!(body["messages"][3]["tool_call_id"], "call_1");
     }
 }
+
+#[tokio::test]
+async fn retained_thinking_alias_replays_as_reasoning_content() {
+    use futures_util::StreamExt;
+    use p1_contracts::{Item, Outcome, StreamEvent, ToolResultItem, ToolStatus};
+    use p1_provider_http::testing::ScriptedResponse;
+    let transcript = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning\":\"exact reasoning 雪\"}},\"finish_reason\":null}}]}}\n\n{}",
+        fixtures::TOOL_CALL_TURN
+    );
+    let transport = ScriptedTransport::new(vec![
+        ScriptedResponse::ok_sse(&transcript),
+        ScriptedResponse::ok_sse(fixtures::NO_USAGE),
+    ]);
+    let p = provider(true, transport.clone());
+    let mut r = invalid();
+    r.options = ModelOptions::default();
+    r.history = vec![Item::User {
+        text: "synthetic question".into(),
+    }];
+    let mut stream = p
+        .stream(r.clone(), p1_contracts::CancellationToken::new())
+        .await
+        .unwrap();
+    let mut item = None;
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::Finished(Outcome::Completed(done)) = event {
+            item = Some(done.item);
+        }
+    }
+    let item = item.expect("completed aliased reasoning and tool call");
+    let call = item.tool_calls().next().unwrap().clone();
+    r.history.push(Item::Assistant(item));
+    r.history.push(Item::ToolResult(ToolResultItem {
+        call_id: call.call_id,
+        name: call.name,
+        status: ToolStatus::Ok,
+        content: "result".into(),
+    }));
+    let mut stream = p
+        .stream(r, p1_contracts::CancellationToken::new())
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+    let requests = transport.requests();
+    let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        body["messages"][2]["reasoning_content"],
+        "exact reasoning 雪"
+    );
+}
