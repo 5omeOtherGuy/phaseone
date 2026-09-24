@@ -1,3 +1,27 @@
+GLM                            —
+5h             0% · resets 3h24m
+██████████████████████████    0%
+!7d         100% · resets 5d 13h
+██████████████████████████  100%
+u9n2          42% · resets 8d 1h
+██████████████████████████   42%
+
+OPENCODE GO                    —
+rolling        0% · resets 1d 2h
+██████████████████████████    0%
+!7d          100% · resets 5d 1h
+██████████████████████████  100%
+30d         58% · resets 27d 19h
+██████████████████████████   58%
+
+OPENCODE GO-2                  —
+rolling       12% · resets 6h24m
+██████████████████████████   12%
+!7d          100% · resets 5d 1h
+██████████████████████████  100%
+30d          5% · resets 27d 19h
+██████████████████████████    5%
+
 CHATGPT PRO LITE         prolite
 7d           69% · resets 3d 13h
 ██████████████████████████   69%
@@ -11,8 +35,16 @@ CLAUDE MAX                   max
 ██████████████████████████    7%
 extra usage         0 / 5000 EUR
 
-FAILED                     error
-http
+KIMI CODING                    —
+5h    87/100 left · resets 1d 1h
+██████████████████████████   13%
+month        20% · resets 26d 1h
+██████████████████████████   20%
+month code    0% · resets 26d 1h
+██████████████████████████    0%
 
-OPENCODE GO-2            unknown
-no usage endpoint
+FAILED           error · no data
+error · HTTP 500
+
+KEY REFUSED      error · no data
+no access
