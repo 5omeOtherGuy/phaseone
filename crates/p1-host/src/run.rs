@@ -717,7 +717,14 @@ pub async fn run_with_front_end(
             let (agent, report) = Agent::resume(parts, &records).map_err(|e| e.to_string())?;
             #[cfg(feature = "delegation")]
             if let Some(service) = &service {
-                announce_lost_workers(deps, &agent, service, &child_counter, &records);
+                announce_lost_workers(
+                    deps,
+                    &agent,
+                    service,
+                    &child_counter,
+                    options.session.as_deref(),
+                    &records,
+                );
             }
             #[cfg(feature = "workflows")]
             if workflows.is_some() {
@@ -2075,19 +2082,27 @@ fn announce_lost_workers(
     agent: &Agent,
     service: &InProcessWorkers,
     child_counter: &AtomicUsize,
+    session_file: Option<&Path>,
     records: &[p1_contracts::JournalRecord],
 ) {
     let earlier = p1_tool_delegate::workers_started_in(records);
-    if earlier.is_empty() {
-        return;
-    }
+    // `workers_started_in` reads only the delegate tool's own results, so workers a
+    // WORKFLOW started are missing from it. Their journals are still on disk beside
+    // the session, one `<session>.w<N>.jsonl` per worker, and the next worker reuses
+    // the first free `N` — which would have to create a file that already exists
+    // (issue #98). The sibling journals therefore bound the reservation too, and the
+    // bound is taken BEFORE the message below can return early.
     let used = earlier
         .iter()
         .filter_map(|id| id.strip_prefix('w')?.parse::<usize>().ok())
         .max()
-        .unwrap_or(earlier.len());
+        .unwrap_or(earlier.len())
+        .max(session_file.map(session::highest_worker_id).unwrap_or(0));
     service.reserve_ids(used);
     child_counter.store(used, Ordering::SeqCst);
+    if earlier.is_empty() {
+        return;
+    }
     let names = earlier.join(", ");
     write_stderr(
         deps,

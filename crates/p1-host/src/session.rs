@@ -4,6 +4,7 @@
 //! (refusing to overwrite). `--resume` takes the file over under its writer lock:
 //! load, cut off a truncated tail, continue appending.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -72,6 +73,43 @@ pub fn worker_path(session: &Path, id: usize) -> PathBuf {
     let mut path = session.as_os_str().to_os_string();
     path.push(format!(".w{id}.jsonl"));
     PathBuf::from(path)
+}
+
+/// The highest `<N>` among the worker journals already beside `session`, `0` when
+/// there are none. A workflow step is a worker too, so its `FILE.w<N>.jsonl` exists
+/// on disk without any delegation-tool record naming it: on resume this is what keeps
+/// a new worker from being handed an id whose journal file is already there (issue
+/// #98). Only an exact sibling name counts — anything else is ignored.
+pub fn highest_worker_id(session: &Path) -> usize {
+    let directory = session
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let Some(name) = session.file_name().and_then(|name| name.to_str()) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| worker_id_in(name, &entry.file_name()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The `<N>` of a sibling named exactly `<session file name>.w<N>.jsonl`, `None` for
+/// every other name. `<N>` is one or more ASCII digits and nothing else.
+fn worker_id_in(session_name: &str, sibling: &OsStr) -> Option<usize> {
+    let digits = sibling
+        .to_str()?
+        .strip_prefix(session_name)?
+        .strip_prefix(".w")?
+        .strip_suffix(".jsonl")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Create the NEW JSONL journal for worker `<id>` next to its parent session.
