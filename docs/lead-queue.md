@@ -12,7 +12,7 @@ Keep `STATUS.md` current and post board state when it changes.
 
 1. Deliver `docs/worker-observability.md`; earlier analysis is under `~/projects/phaseone-briefs/worker-observability/`.
 2. Keep the free routes working: #107 shipped Go-1/3, Zen-1/2/3 and Cline Pass-1/2; MiMo/Muse wait for the Zen client-identity fix; OpenRouter free tier and account rotation follow the free-quota plan (#117, #118).
-Use `p1 login opencode-zen-free` through its designated stdin login flow when authorized credentials are available; never expose values to agent context.
+Keys enter a p1 store only as `p1 login <route> < ~/.config/keys/<name>.key` (keys-sync does this; check with `keys-sync --check`); never expose values to agent context.
 Validate actual tool use, identity, usage/errors and route receipt before moving workflow roles to p1.
 Coordinate route writers and research evidence; do not duplicate bootstrap work.
 3. Finish sanitized provider-error classification: plan refusals (#101) and quota 429s (#105) have landed; a Kimi 403 “quota exhausted” must still not appear as a rejected key; include reset hints.

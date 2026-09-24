@@ -17,7 +17,7 @@ Change only owned paths; do not reformat, rename or tidy another task's files.
 Keep shared-file edits minimal: `AGENTS.md`, `DECISIONS.md`, `Cargo.toml`, `Cargo.lock`, `scripts/`, `.github/`.
 Merge current main immediately before touching shared files.
 Keep `DECISIONS.md` append-only.
-Never `git add -A` or force-push main.
+Stage and commit only explicit owned paths; never `git add -A`; never force-push main.
 Commit often on the task branch; keep branches short-lived (no long-lived branches; main has no branch protection).
 Follow the global commit/PR/review/repair/merge order and merge as soon as review and the gate are green; do not bypass review with a local direct-to-main merge.
 A small diff is a mergeable diff; resolve conflicts without breaking either accepted behavior, then rerun the relevant gate.
@@ -26,7 +26,7 @@ Remove a finished worktree with `git worktree remove <path>` only after authoriz
 ## Workers
 
 Use `scripts/fanout.py <jobs.json>` under the global routing policy; it starts jobs up to a machine-wide pool bound and prints one JSON summary when the batch ends.
-A p1 job has full access by default; `"sandbox":true` confines its shell.
+A job with `"runner": "p1"` runs through p1 itself, with full access by default; `"sandbox":true` confines its shell.
 Inspect the run directory's journal, stdout/stderr and `report.json` from `scripts/run-report.py`.
 Verify independently and record accepted dogfood runs in `docs/dogfood/runs.jsonl`.
 Follow model-cards for briefing, nonblocking supervision, repairs and evidence.
@@ -47,13 +47,14 @@ Reconcile obsolete SSD-target instructions in ADR-0060 with the owner order thro
 ## Project safety
 
 Use no sudo or package installs; raise the need in an issue.
+Never read, print, log, commit or put into fixtures any credential, token, Authorization header, private prompt or raw authenticated traffic.
 Use no live network in unit/conformance tests.
 Use tempfile/scratch data, never real user data directories.
 Use fake time or explicit synchronization, not sleep-based timing assertions.
 Treat `/home/phaseonebig/projects/iris-agent` and `/home/phaseonebig/projects/iris-agent-clean` as read-only donors.
 Copy and adapt donor code into p1; name its donor path in the commit message.
 Never delete, weaken or skip frozen acceptance tests or fixtures; leave a spec-conflicting test failing and explain.
-Ask before adding a crate absent from the workspace.
+Keep dependencies few; ask before adding a crate absent from the workspace.
 
 ## Build
 
