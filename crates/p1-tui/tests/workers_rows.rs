@@ -32,7 +32,11 @@ fn long_model_is_whole_and_its_metrics_survive_at_both_widths() {
         let row = &text[3];
         assert!(row.contains("deepseek-v4.1-flash"), "{row}");
         assert!(!row.contains("openrouter-free"), "{row}");
-        assert!(row.contains("48.2k/128k"), "{row}");
+        if compact {
+            assert!(text[4].contains("48.2k/128k"), "{}", text[4]);
+        } else {
+            assert!(row.contains("48.2k/128k"), "{row}");
+        }
     }
 }
 
