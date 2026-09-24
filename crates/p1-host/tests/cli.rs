@@ -337,8 +337,10 @@ fn models_lists_every_shipped_model() {
         "{stdout}"
     );
 
+    // `kimi` alone also matches the ClinePass environments' `kimi-k3-clinepass` profile; the
+    // environment prefix selects the Kimi coding plan's one model.
     let output = isolated(home.path())
-        .args(["models", "kimi"])
+        .args(["models", "kimi/"])
         .output()
         .unwrap();
     assert!(output.status.success());
