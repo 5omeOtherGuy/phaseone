@@ -77,6 +77,8 @@ jobs:
             gate.log
           if-no-files-found: warn
 
+      # The job summary, and the same lines in the step log so they can be read
+      # back without the web UI.
       - name: Summary
         if: always()
         run: |
@@ -95,4 +97,4 @@ jobs:
             echo "Artifact \`p1-build\`: dist/p1, dist/p1.sha256, gate.log."
             echo
             echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
