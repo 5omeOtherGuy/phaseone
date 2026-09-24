@@ -1,0 +1,27 @@
+# What the model is, independent of the route that reaches it (ADR-0039).
+# OpenCode model metadata (provider `opencode`, model `muse-spark-1.3-contributor-free`, verified
+# by the lead from ~/.cache/opencode/models.json): name "Muse Spark 1.3 Free", family
+# "muse-free", reasoning true, reasoning_options effort [minimal, low, medium, high, xhigh],
+# interleaved null, limit.context 1048576, limit.output 131072, tool_call true, temperature true,
+# cost 0, provider npm `@ai-sdk/openai`.
+id        = "muse-spark-1.3-contributor-free"
+revision  = 1
+model_id  = "muse-spark-1.3-contributor-free"
+family    = "muse-free"
+thinking  = "enabled"
+
+# The metadata lists minimal/low/medium/high/xhigh. The compiled chat adapter encodes only
+# low/high/max (crates/p1-provider-openai-chat/src/lib.rs, validate_composition), and the
+# metadata's own scale does not spell `max`, so only low and high are selectable; every other
+# metadata level stays unstated rather than silently remapped.
+efforts        = ["low", "high"]
+default_effort = "high"
+
+context_tokens    = 1048576
+max_output_tokens = 131072
+
+# ENDPOINT NOT YET VERIFIED: the metadata's provider hint is npm `@ai-sdk/openai`, which serves
+# this model through the OpenAI *chat completions* shape; that shape is what our route speaks, but
+# no request has been made against it for this model yet (the live probe is pending by the
+# lead/XO). Until then this profile is data, not a claim that the Zen chat-completions endpoint
+# answers for it.

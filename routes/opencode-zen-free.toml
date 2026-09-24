@@ -1,0 +1,37 @@
+# How the OpenCode Zen free surface is reached: the COMPATIBILITY ALIAS for `opencode-zen-1`
+# (ADR-0039 step 3, spec §1.2 of docs/design/routes-and-profiles.md). It exists so environments
+# and briefs that already name `opencode-zen-free` (the owner's trial overlay used that name) keep
+# working; p1 has no alias mechanism in code, an alias is simply another route file. Same endpoint
+# and same models as `opencode-zen-1`, but its OWN store entry under `OPENCODE_ZEN_API_KEY` — the
+# account being reached may be a different key entry, so it must not borrow `OPENCODE_API_KEY`
+# (the Go alias's variable) or another Zen account's variable. Every model bound below is a
+# `-free` wire id whose opencode metadata cost is 0 per token, so this route cannot fall back to
+# a paid variant. `user-agent` stays compiled in `p1_host::catalog`; no `[headers]` table.
+id           = "opencode-zen-free"
+origin_route = "openai-chat/opencode-zen-free"
+adapter      = "openai-chat"
+endpoint     = "https://opencode.ai/zen/v1/chat/completions"
+
+[credential]
+# A reference, never a value. `store_only` (ADR-0061): the documented variable below and p1's own
+# store, and no CLI login file is ever read.
+kind       = "api-key"
+env        = "OPENCODE_ZEN_API_KEY"
+borrow     = []
+store_only = true
+
+[adapter_settings]
+dialect        = "thinking-with-reasoning-alias"
+session_header = "x-opencode-session"
+# Same Zen free-tier client identity as the account routes (owner decision 2026-09-24).
+client_identity = "opencode"
+
+# Only profiles the host ships a policy for; any other profile is refused — only -free ids appear.
+[models."mimo-v2.6-flash-free"]
+wire_model = "mimo-v2.6-flash-free"
+
+[models."muse-spark-1.3-contributor-free"]
+wire_model = "muse-spark-1.3-contributor-free"
+
+[models."space-bunny-free"]
+wire_model = "space-bunny-free"

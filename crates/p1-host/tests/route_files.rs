@@ -499,9 +499,15 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
             "glm-subscription",
             "kimi-coding-subscription",
             "openai-codex-subscription",
-            // The owner's second OpenCode Go account: data only, no Rust change.
+            // The owner's second OpenCode Go account and the free Zen accounts: data only,
+            // no Rust change. Each account is its own route; `opencode-zen-free` is a
+            // compatibility alias.
             "opencode-go-2-subscription",
-            "opencode-go-subscription"
+            "opencode-go-subscription",
+            "opencode-zen-1",
+            "opencode-zen-2",
+            "opencode-zen-3",
+            "opencode-zen-free"
         ]
     );
     assert!(
@@ -531,6 +537,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         AdapterSettings::OpenAiChat(ChatAdapterSettings {
             dialect: ChatDialect::ThinkingWithReasoningAlias,
             session_header: Some("x-opencode-session".into()),
+            client_identity: None,
         })
     );
     let deepseek = &go.models["deepseek-v4.1-flash"];
@@ -557,6 +564,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         AdapterSettings::OpenAiChat(ChatAdapterSettings {
             dialect: ChatDialect::RetainedThinking,
             session_header: None,
+            client_identity: None,
         })
     );
     assert_eq!(glm.models["glm-5.3"].wire_model, "glm-5.3");
@@ -581,6 +589,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         AdapterSettings::OpenAiChat(ChatAdapterSettings {
             dialect: ChatDialect::RetainedThinking,
             session_header: None,
+            client_identity: None,
         })
     );
     assert_eq!(kimi.models.len(), 1);
@@ -601,6 +610,72 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
     assert_eq!(resolved.profile.max_output_tokens, Some(131_072));
     assert_eq!(resolved.profile.context_tokens, None);
     assert_eq!(resolved.wire_model, "k3");
+}
+
+/// The Zen free routes present OpenCode's own client identity (owner decision 2026-09-24):
+/// the setting is route data, it is on exactly these four files, and the routes are otherwise
+/// ordinary chat routes on the Zen free endpoint. Evidence: `docs/design/zen-client-identity-evidence.md`.
+#[test]
+fn the_zen_free_routes_present_the_opencode_client_identity() {
+    let dirs = shipped_environment_dirs();
+    const ZEN_ENDPOINT: &str = "https://opencode.ai/zen/v1/chat/completions";
+    const ZEN_MODELS: [&str; 3] = [
+        "mimo-v2.6-flash-free",
+        "muse-spark-1.3-contributor-free",
+        "space-bunny-free",
+    ];
+    for (id, env) in [
+        ("opencode-zen-1", "OPENCODE_ZEN_1_API_KEY"),
+        ("opencode-zen-2", "OPENCODE_ZEN_2_API_KEY"),
+        ("opencode-zen-3", "OPENCODE_ZEN_3_API_KEY"),
+        ("opencode-zen-free", "OPENCODE_ZEN_API_KEY"),
+    ] {
+        let route = load_route_by_id(&dirs, id).expect("the shipped route file");
+        assert_eq!(route.origin_route, format!("openai-chat/{id}"), "{id}");
+        assert_eq!(route.endpoint, ZEN_ENDPOINT, "{id}");
+        assert_eq!(route.credential.env.as_deref(), Some(env), "{id}");
+        assert!(route.credential.store_only, "{id} is store-only (ADR-0061)");
+        assert_eq!(
+            route.settings().expect("the adapter parses its settings"),
+            AdapterSettings::OpenAiChat(ChatAdapterSettings {
+                dialect: ChatDialect::ThinkingWithReasoningAlias,
+                session_header: Some("x-opencode-session".into()),
+                client_identity: Some(p1_provider_openai_chat::ClientIdentity::Opencode),
+            }),
+            "{id}"
+        );
+        let mut bound: Vec<&str> = route.models.keys().map(String::as_str).collect();
+        bound.sort_unstable();
+        assert_eq!(
+            bound.as_slice(),
+            ZEN_MODELS,
+            "{id} binds exactly these profiles"
+        );
+        assert!(route.headers.is_empty(), "{id}: user-agent stays compiled");
+    }
+    // The setting is NOT anywhere else: exactly the four Zen free routes carry it. A
+    // route that impersonates a foreign client must be an explicit, reviewed choice.
+    let mut with_identity: Vec<String> = load_all_routes(&dirs)
+        .expect("the shipped route files load")
+        .into_iter()
+        .filter(|route| {
+            matches!(
+                route.settings(),
+                Ok(AdapterSettings::OpenAiChat(settings)) if settings.client_identity.is_some()
+            )
+        })
+        .map(|route| route.id)
+        .collect();
+    with_identity.sort();
+    assert_eq!(
+        with_identity,
+        [
+            "opencode-zen-1",
+            "opencode-zen-2",
+            "opencode-zen-3",
+            "opencode-zen-free"
+        ]
+    );
 }
 
 /// The endpoint, the session header and every model name of the two routes now live in
