@@ -17,7 +17,8 @@ Headers: `content-type: application/json`, `accept: text/event-stream`,
 `anthropic-version: 2023-06-01`, `user-agent`, `Authorization: Bearer <oauth access token>`,
 `anthropic-dangerous-direct-browser-access: true`, `x-app: cli`,
 `anthropic-beta: oauth-2025-04-20,claude-code-20250219` (+ `interleaved-thinking-2025-05-14`
-only for manual-budget thinking; + `extended-cache-ttl-2025-04-11` only if a 1h TTL is used).
+only for manual-budget thinking; + `extended-cache-ttl-2025-04-11` only if a 1h TTL is used; + `context-1m-2025-08-07`
+only when the route file sets `long_context = true`, ADR-0063).
 Never `x-api-key` on this route. (API-key route: `x-api-key`, no Bearer, no identity block.)
 
 **Hard constraint** [donor]: `system` is a block array whose FIRST block is exactly

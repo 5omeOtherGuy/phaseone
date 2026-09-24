@@ -184,6 +184,7 @@ fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::AnthropicMessages(MessagesAdapterSettings {
             account: MessagesAccount::ClaudeCodeSubscription,
+            long_context: true,
         })
     );
     assert!(route.headers.is_empty(), "no static headers on this route");
@@ -667,4 +668,18 @@ fn the_shipped_route_is_configured_as_the_wire_model_not_the_echo() {
     let provider = provider_of(&composed("claude"), ScriptedTransport::new(vec![]));
     assert_eq!(provider.describe().origin.model, "claude-sonnet-5");
     assert_eq!(provider.describe().origin.route, TODAYS_ORIGIN_ROUTE);
+}
+
+/// ADR-0063: the shipped Claude environment uses the 1M window its route requests,
+/// summarizing at 500k (owner hotfix 2026-09-25).
+#[test]
+fn the_shipped_claude_environment_uses_the_1m_window() {
+    let dirs = environment_dirs();
+    let loaded = load_environment("claude", &dirs).expect("the shipped environment loads");
+    let context = loaded
+        .context
+        .expect("the claude environment has a [context] table");
+    assert_eq!(context.window_tokens, 1_000_000);
+    assert_eq!(context.summarize_at_tokens, 500_000);
+    assert_eq!(context.keep_recent_tokens, 60_000);
 }

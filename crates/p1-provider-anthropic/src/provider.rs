@@ -22,7 +22,7 @@ use p1_provider_http::{
 
 use crate::MessagesRoute;
 use crate::parser::AnthropicParser;
-use crate::request::{build_headers, build_messages, build_request, lower};
+use crate::request::{build_headers, build_messages, build_request, lower, with_long_context};
 
 /// `native` keys in this namespace are route-specific. None are known in this
 /// slice, so any key here is rejected.
@@ -205,11 +205,19 @@ impl Provider for AnthropicProvider {
 
             let url = format!("{}/v1/messages", self.route.endpoint);
             let account = self.route.account;
+            let long_context = self.route.long_context;
             let origin_route = self.route.origin_route.clone();
             let model = self.wire_model.clone();
             let build = Box::new(move |credential: &Credential| HttpRequest {
                 url: url.clone(),
-                headers: build_headers(account, credential, &body),
+                headers: {
+                    let headers = build_headers(account, credential, &body);
+                    if long_context {
+                        with_long_context(headers)
+                    } else {
+                        headers
+                    }
+                },
                 body: encoded.clone(),
             });
             let new_parser = Box::new(move || {
@@ -242,6 +250,7 @@ mod tests {
             origin_route: crate::ROUTE.to_string(),
             endpoint: "https://api.anthropic.com".to_string(),
             account: crate::MessagesAccount::ClaudeCodeSubscription,
+            long_context: false,
         }
     }
 

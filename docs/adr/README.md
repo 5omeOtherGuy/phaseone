@@ -76,6 +76,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0060 | [One shared cargo target per repository across worktrees; rustc-serial ignores slots whose holder is stopped](0060-one-shared-cargo-target-per-repository-across-worktrees-rustc-serial-ignores-slots-whose-holder-is-stopped.md) | proposed | 2026-09-23 | owner+lead |
 | ADR-0061 | [A route may be self-contained: store-only credentials never read another tool's login](0061-a-route-may-be-self-contained-store-only-credentials-never-read-another-tool-s-login.md) | accepted | 2026-09-24 | owner |
 | ADR-0062 | [A plan refusal is its own provider error kind; it is never refreshed or retried](0062-a-plan-refusal-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md) | accepted | 2026-09-24 | lead |
+| ADR-0063 | [Claude requests its native 1M context window through a named long_context route setting](0063-claude-requests-its-native-1m-context-window-through-a-named-long-context-route-setting.md) | proposed | 2026-09-24 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

@@ -45,6 +45,7 @@ fn route() -> MessagesRoute {
         origin_route: p1_provider_anthropic::ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
         account: MessagesAccount::ClaudeCodeSubscription,
+        long_context: false,
     }
 }
 
