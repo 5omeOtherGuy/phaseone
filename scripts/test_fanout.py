@@ -11,6 +11,7 @@ are produced by the same code path a real run uses.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -287,6 +288,8 @@ class FanoutTest(unittest.TestCase):
         self.assertEqual(entry["cache_read_share"], 0.75)
         self.assertEqual(entry["input_total_with_workers"], 400)
         self.assertEqual(entry["usage"]["output"], 40)
+        with open(self.bin, "rb") as handle:
+            self.assertEqual(report["binary_sha256"], hashlib.file_digest(handle, "sha256").hexdigest())
 
     def test_outcome_mapping(self) -> None:
         expected = {0: "done", 3: "blocked", 4: "stalled", 130: "cancelled", 1: "failed"}

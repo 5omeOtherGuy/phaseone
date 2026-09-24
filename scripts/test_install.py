@@ -27,6 +27,7 @@ import unittest
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 INSTALL = os.path.join(SCRIPTS, "install.sh")
 UPDATE = os.path.join(SCRIPTS, "update.sh")
+RELEASE_WORKFLOW = os.path.join(os.path.dirname(SCRIPTS), ".github", "workflows", "release.yml")
 
 # The interpreter by absolute path, so a test PATH controls only what install.sh sees.
 BASH = shutil.which("bash") or "/bin/bash"
@@ -37,7 +38,7 @@ SYSTEM_PATH = "/usr/bin:/bin"
 # install.sh's external commands, symlinked into a farm of its own: a PATH built from
 # the farm carries no `gh`, which is how the curl fallback is reached deterministically.
 FARM_TOOLS = ("mktemp", "sha256sum", "cut", "awk", "tar", "gzip", "cp", "mv", "mkdir",
-              "rm", "chmod", "basename", "dirname", "env", "cat")
+              "rm", "chmod", "basename", "dirname", "env", "cat", "python3")
 
 VERSION_LINE = "p1 0.0.1 (deadbeef0000 2026-09-24)"
 
@@ -51,6 +52,7 @@ esac
 
 GH_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$P1_GH_LOG"
+if [ "${P1_GH_FAIL:-}" = download ]; then exit 7; fi
 dir=""
 pattern=""
 while [ $# -gt 0 ]; do
@@ -263,6 +265,16 @@ class InstallTest(unittest.TestCase):
         for line in self.log(self.gh_log).splitlines():
             self.assertIn("v9.9.9", line)
 
+    def test_gh_failure_falls_back_to_curl(self) -> None:
+        done = self.run_install("--prefix", self.prefix, P1_GH_FAIL="download")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assert_installed(self.prefix)
+        self.assertEqual(len(self.log(self.gh_log).splitlines()), 4)
+        curl = self.log(self.curl_log)
+        for asset in ASSETS:
+            self.assertIn("https://example.invalid/test/repo/releases/latest/download/" + asset,
+                          curl)
+
     def test_from_release_tag_reaches_curl(self) -> None:
         done = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix,
                                 **self.no_gh())
@@ -284,6 +296,17 @@ class InstallTest(unittest.TestCase):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("unknown argument", done.stderr)
         self.assert_nothing_installed(self.prefix)
+
+    # --- release workflow ---------------------------------------------------
+
+    def test_release_workflow_repairs_partial_publications_and_uses_matching_cache_prefix(self) -> None:
+        workflow = self.read(RELEASE_WORKFLOW)
+        self.assertIn("key: release-cargo-${{ runner.os }}-", workflow)
+        self.assertIn("release-cargo-${{ runner.os }}-", workflow.split("restore-keys:", 1)[1])
+        self.assertIn("required=(p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256)", workflow)
+        self.assertIn("gh release upload", workflow)
+        self.assertIn("--clobber", workflow)
+        self.assertIn("--verify-tag", workflow)
 
     # --- checksums and refusals --------------------------------------------
 
@@ -316,6 +339,32 @@ class InstallTest(unittest.TestCase):
         self.assertIn("p1-share.tar.gz: sha256 mismatch", done.stderr)
         self.assert_nothing_installed(self.prefix)
 
+    def test_archive_traversal_absolute_path_link_and_escape_are_refused(self) -> None:
+        cases = {
+            "traversal": ("environments/../escaped", tarfile.REGTYPE),
+            "absolute": ("/tmp/p1-install-escaped", tarfile.REGTYPE),
+            "symlink": ("environments/escape", tarfile.SYMTYPE),
+            "hardlink": ("environments/escape", tarfile.LNKTYPE),
+            "outside": ("elsewhere/escape", tarfile.REGTYPE),
+        }
+        outside = os.path.join(self.dir, "escaped")
+        for name, (member_name, kind) in cases.items():
+            with self.subTest(name=name):
+                path = os.path.join(self.release, "p1-share.tar.gz")
+                with tarfile.open(path, "w:gz") as archive:
+                    data = b"escaped\n"
+                    info = tarfile.TarInfo(member_name)
+                    info.type = kind
+                    info.linkname = "../../outside" if kind == tarfile.LNKTYPE else "/tmp/target"
+                    info.size = len(data) if kind == tarfile.REGTYPE else 0
+                    archive.addfile(info, io.BytesIO(data) if info.size else None)
+                self.write_sum("p1-share.tar.gz")
+                done = self.run_install("--prefix", self.prefix)
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertIn("unsafe or invalid", done.stderr)
+                self.assertFalse(os.path.exists(outside))
+                self.assert_nothing_installed(self.prefix)
+
     def test_a_share_tarball_without_the_shipped_dirs_is_refused(self) -> None:
         path = os.path.join(self.release, "p1-share.tar.gz")
         with tarfile.open(path, "w:gz") as archive:
@@ -326,10 +375,38 @@ class InstallTest(unittest.TestCase):
         self.write_sum("p1-share.tar.gz")
         done = self.run_install("--prefix", self.prefix)
         self.assertNotEqual(done.returncode, 0)
-        self.assertIn("has no environments/", done.stderr)
+        self.assertIn("unsafe or invalid", done.stderr)
         self.assert_nothing_installed(self.prefix)
 
     # --- the user's own p1 config -----------------------------------------
+
+    def test_prefix_equal_to_or_below_the_p1_config_tree_is_refused(self) -> None:
+        auth_dir = os.path.join(self.config, "p1")
+        os.makedirs(auth_dir)
+        sentinel = os.path.join(auth_dir, "sentinel")
+        with open(sentinel, "w", encoding="utf-8") as handle:
+            handle.write("untouched\n")
+        for prefix in (auth_dir, os.path.join(auth_dir, "tools")):
+            with self.subTest(prefix=prefix):
+                done = self.run_install("--prefix", prefix)
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertIn("refusing a prefix", done.stderr)
+                self.assertEqual(self.read(sentinel), "untouched\n")
+                self.assertEqual(os.listdir(auth_dir), ["sentinel"])
+
+    def test_root_prefix_is_preserved(self) -> None:
+        guard_log = os.path.join(self.dir, "python3.log")
+        guard_dir = self.mkdir("root-guard")
+        self.stub("python3", f"""#!/bin/sh
+printf '%s\\n' "$*" >> '{guard_log}'
+exit 99
+""", directory=guard_dir)
+        done = self.run_install("--prefix", "/", PATH=guard_dir + ":" + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0)
+        # The guard receives the rooted /bin and /share; trimming "/" to "" would produce
+        # "bin" and "share" instead.
+        self.assertEqual(self.log(guard_log).splitlines(),
+                         [f"- {self.config}/p1 //bin //share"])
 
     def test_the_users_p1_config_is_byte_identical_afterwards(self) -> None:
         auth_dir = os.path.join(self.config, "p1")
@@ -351,20 +428,103 @@ class InstallTest(unittest.TestCase):
 
     # --- updates -----------------------------------------------------------
 
+    def test_commit_failure_rolls_back_binary_share_and_updater(self) -> None:
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        paths = {
+            "binary": os.path.join(self.prefix, "bin", "p1"),
+            "updater": os.path.join(self.prefix, "bin", "p1-update"),
+            "share": os.path.join(self.prefix, "share", "p1", "environments", "marker.txt"),
+        }
+        before = {name: self.read(path) for name, path in paths.items()}
+        self.publish(marker="two", binary=FAKE_P1.replace("fake p1", "new p1"))
+
+        fail_dir = self.mkdir("fail-commit")
+        real_mv = shutil.which("mv")
+        self.stub("mv", f"""#!/bin/sh
+case \" $* \" in
+  *".p1.new."*"/share/p1 "*) exit 71 ;;
+esac
+exec '{real_mv}' \"$@\"
+""", directory=fail_dir)
+        done = self.run_install("--prefix", self.prefix,
+                                PATH=fail_dir + ":" + self.stub_dir + ":" + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("could not commit", done.stderr)
+        for name, path in paths.items():
+            self.assertEqual(self.read(path), before[name], name)
+        self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "bin"))
+                          if name.startswith(".p1")], [])
+        self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "share"))
+                          if name.startswith(".p1")], [])
+
+    def test_staged_updater_failure_leaves_previous_install_intact(self) -> None:
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        binary = self.read(os.path.join(self.prefix, "bin", "p1"))
+        marker = self.read(os.path.join(self.prefix, "share", "p1",
+                                        "environments", "marker.txt"))
+        self.publish(marker="two", binary=FAKE_P1.replace("fake p1", "new p1"))
+
+        fail_dir = self.mkdir("fail-updater")
+        real_chmod = shutil.which("chmod")
+        self.stub("chmod", f"""#!/bin/sh
+case \"$1\" in
+  0755) case \"$2\" in */.p1-update.new.*) exit 72 ;; esac ;;
+esac
+exec '{real_chmod}' \"$@\"
+""", directory=fail_dir)
+        done = self.run_install("--prefix", self.prefix,
+                                PATH=fail_dir + ":" + self.stub_dir + ":" + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.read(os.path.join(self.prefix, "bin", "p1")), binary)
+        self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1",
+                                                "environments", "marker.txt")), marker)
+
     def test_the_update_wrapper_reinstalls_without_a_checkout(self) -> None:
         first = self.run_install("--prefix", self.prefix)
         self.assertEqual(first.returncode, 0, first.stderr)
         # Publish a new release; the wrapper must pick it up through the installed copy.
-        self.publish(marker="two", binary=FAKE_P1.replace("fake p1", "fake p1 v2"))
+        self.publish(marker="two", binary=FAKE_P1.replace("fake p1", "fake p1 v2")
+                     .replace("deadbeef0000", "cafebabe0000"))
         done = subprocess.run([os.path.join(self.prefix, "bin", "p1-update")],
                               env=self.env(), capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn(VERSION_LINE, done.stdout)
+        self.assertIn("p1 0.0.1 (cafebabe0000 2026-09-24)", done.stdout)
         self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1",
                                                 "environments", "marker.txt")),
                          "environments two\n")
         self.assertIn("fake p1 v2", self.read(os.path.join(self.prefix, "bin", "p1")))
         self.assertEqual(len(self.log(self.gh_log).splitlines()), 8)
+
+    def test_same_release_is_a_noop_and_force_reinstalls(self) -> None:
+        first = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        gh_count = len(self.log(self.gh_log).splitlines())
+        mtime = os.stat(os.path.join(self.prefix, "bin", "p1")).st_mtime_ns
+
+        same = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertIn("already installed", same.stdout)
+        self.assertEqual(len(self.log(self.gh_log).splitlines()), gh_count)
+        self.assertEqual(os.stat(os.path.join(self.prefix, "bin", "p1")).st_mtime_ns, mtime)
+
+        with open(os.path.join(self.prefix, "share", "p1", "environments", "marker.txt"),
+                  "w", encoding="utf-8") as handle:
+            handle.write("changed before forced reinstall\n")
+        forced = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix, "--force")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertEqual(len(self.log(self.gh_log).splitlines()), gh_count + 4)
+        self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1",
+                                                "environments", "marker.txt")),
+                         "environments one\n")
+
+    def test_explicit_release_allows_a_downgrade(self) -> None:
+        self.run_install("--from-release", "v2.0.0", "--prefix", self.prefix)
+        done = self.run_install("--from-release", "v1.0.0", "--prefix", self.prefix)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1", ".p1-release")),
+                         "v1.0.0\n")
 
     def test_the_installed_installer_is_the_one_the_wrapper_runs(self) -> None:
         self.run_install("--prefix", self.prefix)

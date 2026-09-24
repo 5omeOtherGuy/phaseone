@@ -40,17 +40,19 @@ p1 is installed from a published release, and the binary says which commit it is
   the GitHub Release tagged `main-<12-char short sha>` with four assets — `p1-linux-x86_64`,
   `p1-linux-x86_64.sha256`, `p1-share.tar.gz` (top-level `environments/`, `routes/`,
   `profiles/`), `p1-share.tar.gz.sha256` — marked latest. The tag is the commit, so a
-  re-run for the same commit skips instead of failing.
+  re-run verifies the tag and complete asset set; a missing asset is uploaded with
+  replacement, and a tag without a release is completed rather than treated as published.
 - `scripts/install.sh [--latest | --from-release TAG | --local] [--prefix DIR]` installs
   `<prefix>/bin/p1` (0755), the share data at `<prefix>/share/p1/{environments,routes,profiles}`
   — exactly what `main.rs` looks for — plus `<prefix>/share/p1/install.sh` and
   `<prefix>/bin/p1-update` (which runs the installed installer with
   `--latest --prefix <prefix>`, so updating needs no checkout). Both checksums are verified
-  before the prefix is touched. The binary lands through a temp file in `<prefix>/bin` and
-  a rename; the share data are unpacked beside `<prefix>/share/p1`, checked for the three
-  top-level directories, and swapped in by renaming the previous directory to
-  `<prefix>/share/p1.prev` first — which is removed once the swap succeeded, so a failed
-  install leaves the previous one working and a successful one leaves no rollback copy.
+  before the prefix is touched. The binary, updater and share are staged first, validated
+  (the share contains only regular files and directories under the three shipped roots),
+  and then committed by same-filesystem renames with recoverable rollback across all three;
+  a failed install therefore leaves the previous binary, updater and share intact.
+  Installing the same release is a no-op unless `--force` is given. Explicit
+  `--from-release` permits downgrades; the updater follows the release marked latest.
 - `p1 --version` prints `p1 <CARGO_PKG_VERSION> (<sha> <date>)`. `crates/p1-host/build.rs`
   takes the sha from `P1_GIT_SHA`, else `git rev-parse --short=12 HEAD`, else `unknown`, and
   the date from `P1_BUILD_DATE`, else `SOURCE_DATE_EPOCH`, else `unknown` — never the wall
@@ -59,7 +61,8 @@ p1 is installed from a published release, and the binary says which commit it is
   into `$CARGO_TARGET_DIR`, else `/mnt/build/cargo-target/p1-release` when `/mnt/build`
   exists, else it refuses: the repository's own `target/` is never used.
 - The installer never reads, writes or deletes anything under
-  `${XDG_CONFIG_HOME:-$HOME/.config}/p1`.
+  `${XDG_CONFIG_HOME:-$HOME/.config}/p1`; it refuses a prefix whose prospective `bin` or
+  `share` path resolves into that tree.
 - `scripts/fanout.py` finds the binary as `P1_BIN`, else `p1` on `PATH` (the installed
   one), else the current `../phaseone-target/debug/p1` fallback of a development checkout.
 
@@ -71,8 +74,9 @@ p1 is installed from a published release, and the binary says which commit it is
   and nothing else edits shell profiles.
 - One tag per green push to `main` accumulates (`main-<sha>`), and every release is marked
   latest, so "latest" tracks `main`, not a stable version. Nothing prunes old releases.
-- Publishing is idempotent per commit: a red gate publishes nothing and a re-run for the
-  same commit leaves the existing release alone.
+- Publishing is idempotent per commit: a red gate publishes nothing; a re-run checks the
+  tag's commit and all four assets, repairing an incomplete release or leaving a complete
+  one alone.
 - The sha256 assets catch a truncated or corrupted download, not a compromised release;
   the release is trusted because it was built by CI from a commit the gate accepted.
 - The data dir and the binary can drift apart if a user copies files by hand; updating by
@@ -101,11 +105,13 @@ p1 is installed from a published release, and the binary says which commit it is
 - Files: `.github/workflows/release.yml`, `scripts/install.sh`, `scripts/update.sh`,
   `crates/p1-host/build.rs`, `crates/p1-host/src/cli.rs` (`version`),
   `scripts/test_install.py`, `scripts/test_fanout.py`, `README.md`, `AGENTS.md`.
-- `python3 scripts/test_install.py -v` (19 tests, no network): a fixture release with stub
-  `gh`, `curl` and `cargo` on `PATH` covers the successful install and its modes, the
-  `p1-update` wrapper, `--from-release` routed to the stub, both sha256 refusals (nothing
-  installed, the previous install intact), a pre-existing `$XDG_CONFIG_HOME/p1/auth.json`
-  byte-identical afterwards, and the `--local` refusal and target-dir probe.
+- `python3 scripts/test_install.py -v` (28 tests, no network): a fixture release with stub
+  `gh`, `curl` and `cargo` on `PATH` covers the successful install and its modes, gh
+  fallback, checksum refusals (nothing installed, the previous install intact), unsafe
+  archive members, protected config prefixes, same-release no-op/force and downgrade
+  behavior, failure-atomic binary/share/updater rollback, the `p1-update` wrapper,
+  `--from-release` routing, release-workflow repair/cache assertions, and the `--local`
+  target-dir probe.
 - `python3 scripts/test_fanout.py -v`: `$P1_BIN` over `p1` on `PATH` over the debug
   fallback, and a job that runs the `p1` found on `PATH` without `P1_BIN`.
 - `bash -n scripts/install.sh scripts/update.sh`; `shellcheck scripts/install.sh scripts/update.sh`.

@@ -24,17 +24,24 @@ curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/phaseone/main/scripts/
 bash p1-install.sh                 # --latest into ~/.local
 bash p1-install.sh --prefix /opt/p1
 bash p1-install.sh --from-release main-1a2b3c4d5e6f   # a specific published commit
+bash p1-install.sh --from-release main-1a2b3c4d5e6f --force  # reinstall the same release
 bash p1-install.sh --local         # build this checkout (needs CARGO_TARGET_DIR or /mnt/build)
 ```
 
 The installer
 
-- verifies both sha256 files before touching anything, and installs nothing on a mismatch;
+- stages the binary, updater and share together and swaps them only after validation, so a
+  failed install leaves the previous binary and data together;
 - writes `<prefix>/bin/p1` (0755) and the data at `<prefix>/share/p1/{environments,routes,profiles}`;
 - copies itself to `<prefix>/share/p1/install.sh` and installs `<prefix>/bin/p1-update`, so
   updates need no checkout;
-- never reads, writes or deletes anything under `~/.config/p1` — your logins and local
-  overrides stay yours.
+- never reads, writes or deletes anything under `${XDG_CONFIG_HOME:-$HOME/.config}/p1` —
+  your logins and local overrides stay yours, and a prefix whose `bin` or `share` resolves
+  into that tree is refused.
+
+Installing the release already present is a no-op; pass `--force` to reinstall it. An
+explicit `--from-release TAG` may install any published tag, including an older one, so
+a downgrade is allowed. `p1-update` follows the release marked latest.
 
 Update later with:
 

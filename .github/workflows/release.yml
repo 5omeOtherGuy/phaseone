@@ -42,7 +42,7 @@ jobs:
             target
           key: release-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            release-cargo-${{ runner.os }}-
 
       - name: Identify the commit
         id: tag
@@ -75,21 +75,49 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
-          # Idempotent: the tag is the commit, so a second run for the same commit — or a
-          # retry after a partial failure — must not fail the workflow.
-          git fetch --tags --force >/dev/null 2>&1 || true
-          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null ||
-             gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $tag already exists — nothing to publish"
+          target="${{ github.event.workflow_run.head_sha }}"
+          required=(p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256)
+
+          tag_sha="$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" \
+            | awk '$2 ~ /\^\{\}$/ { peeled=$1 } $2 !~ /\^\{\}$/ { direct=$1 } END { print peeled ? peeled : direct }')"
+          if [ -n "$tag_sha" ] && [ "$tag_sha" != "$target" ]; then
+            echo "tag $tag points to $tag_sha, expected $target" >&2
+            exit 1
+          fi
+
+          release_exists=0
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=1
+          fi
+
+          if [ "$release_exists" -eq 1 ]; then
+            assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            complete=1
+            for asset in "${required[@]}"; do
+              grep -Fxq "$asset" <<<"$assets" || complete=0
+            done
+            if [ "$complete" -eq 1 ]; then
+              echo "release $tag is complete — nothing to publish"
+              exit 0
+            fi
+            # Repair a partial publication. --clobber also repairs an asset left from an
+            # interrupted upload under the expected name.
+            gh release upload "$tag" "${required[@]/#/dist/}" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            echo "completed release $tag"
             exit 0
           fi
+
+          # A tag without a release is incomplete, not a reason to skip publication.
+          # --verify-tag also refuses to let a same-named tag point at another commit.
           gh release create "$tag" \
             dist/p1-linux-x86_64 \
             dist/p1-linux-x86_64.sha256 \
             dist/p1-share.tar.gz \
             dist/p1-share.tar.gz.sha256 \
             --repo "$GITHUB_REPOSITORY" \
-            --target "${{ github.event.workflow_run.head_sha }}" \
+            --target "$target" \
+            --verify-tag \
             --title "p1 $tag" \
             --latest \
-            --notes "Built from commit ${{ github.event.workflow_run.head_sha }} after a green gate on main. Assets: p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz (environments/, routes/, profiles/), p1-share.tar.gz.sha256. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"
+            --notes "Built from commit $target after a green gate on main. Assets: p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz (environments/, routes/, profiles/), p1-share.tar.gz.sha256. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"
