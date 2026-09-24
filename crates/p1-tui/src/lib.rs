@@ -17,5 +17,6 @@ pub mod palette;
 pub mod render;
 pub mod runtime;
 pub mod state;
+mod text;
 pub mod transcript;
 pub mod wrap;
