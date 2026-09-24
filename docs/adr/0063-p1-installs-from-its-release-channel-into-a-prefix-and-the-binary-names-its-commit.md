@@ -39,9 +39,12 @@ p1 is installed from a published release, and the binary says which commit it is
   profile on a GitHub runner (the only permitted release build, `AGENTS.md`) and publishes
   the GitHub Release tagged `main-<12-char short sha>` with four assets — `p1-linux-x86_64`,
   `p1-linux-x86_64.sha256`, `p1-share.tar.gz` (top-level `environments/`, `routes/`,
-  `profiles/`), `p1-share.tar.gz.sha256` — marked latest. The tag is the commit, so a
-  re-run verifies the tag and complete asset set; a missing asset is uploaded with
-  replacement, and a tag without a release is completed rather than treated as published.
+  `profiles/`), `p1-share.tar.gz.sha256` — marked latest. The tag is the commit: the
+  workflow resolves the tag's commit (`git ls-remote`) and refuses a mismatch, **creates**
+  the tag at the commit the gate ran on through `gh release create --target`, so
+  publication never depends on the tag already existing; a re-run checks the complete asset
+  set, a missing asset is uploaded with replacement, and a tag without a release is
+  completed rather than treated as published.
 - `scripts/install.sh [--latest | --from-release TAG | --local] [--prefix DIR]` installs
   `<prefix>/bin/p1` (0755), the share data at `<prefix>/share/p1/{environments,routes,profiles}`
   — exactly what `main.rs` looks for — plus `<prefix>/share/p1/install.sh` and
@@ -50,9 +53,20 @@ p1 is installed from a published release, and the binary says which commit it is
   before the prefix is touched. The binary, updater and share are staged first, validated
   (the share contains only regular files and directories under the three shipped roots),
   and then committed by same-filesystem renames with recoverable rollback across all three;
-  a failed install therefore leaves the previous binary, updater and share intact.
-  Installing the same release is a no-op unless `--force` is given. Explicit
-  `--from-release` permits downgrades; the updater follows the release marked latest.
+  a failed install therefore leaves the previous binary, updater and share intact, and a
+  signal during the commit rolls back and ends the script instead of resuming a half-swapped
+  install. The rollback copies use one fixed slot per prefix, named in the failure message
+  when a restore fails. Installing the release already present is a no-op unless `--force`
+  is given — `main-<sha>` is recognized from the `p1 --version` line, and the latest release
+  is resolved with one tag lookup, not a download. Explicit `--from-release` permits
+  downgrades; the updater follows the release marked latest.
+- The installer needs bash, `curl` (or `gh`, which is an optimization: a `gh` that fails or
+  is unauthenticated falls back to the public release URL), `sha256sum`, and **python3**:
+  the share tarball is validated and extracted with `tarfile` and the PEP 706 `filter=`
+  kwarg, and the prospective prefix is checked in Python. The interpreter is python3 3.12,
+  or 3.8.17 / 3.9.17 / 3.10.12 / 3.11.4+ with the security backports; it is probed once
+  before any install work, and a missing or older one is refused naming itself rather than
+  as a statement about the archive or the prefix.
 - `p1 --version` prints `p1 <CARGO_PKG_VERSION> (<sha> <date>)`. `crates/p1-host/build.rs`
   takes the sha from `P1_GIT_SHA`, else `git rev-parse --short=12 HEAD`, else `unknown`, and
   the date from `P1_BUILD_DATE`, else `SOURCE_DATE_EPOCH`, else `unknown` — never the wall
@@ -81,6 +95,11 @@ p1 is installed from a published release, and the binary says which commit it is
   the release is trusted because it was built by CI from a commit the gate accepted.
 - The data dir and the binary can drift apart if a user copies files by hand; updating by
   hand is not a supported path.
+- Open: the host's installed-layout lookup (`crates/p1-host/src/main.rs`'s
+  `$P1_CONFIG_DIR` / `$P1_ENVIRONMENTS_DIR` / exe-relative search, `routes.rs`, `models.rs`)
+  is still verified only by hand — it needs a cargo build, which this worktree could not
+  run. `scripts/test_install.py` covers the installer's output layout, not the host's
+  search order over it. Tracked as the open item of the round-1 install review.
 - `AGENTS.md`'s rule for workstations is untouched: release builds happen on GitHub
   runners, never locally.
 
@@ -105,13 +124,16 @@ p1 is installed from a published release, and the binary says which commit it is
 - Files: `.github/workflows/release.yml`, `scripts/install.sh`, `scripts/update.sh`,
   `crates/p1-host/build.rs`, `crates/p1-host/src/cli.rs` (`version`),
   `scripts/test_install.py`, `scripts/test_fanout.py`, `README.md`, `AGENTS.md`.
-- `python3 scripts/test_install.py -v` (28 tests, no network): a fixture release with stub
+- `python3 scripts/test_install.py -v` (36 tests, no network): a fixture release with stub
   `gh`, `curl` and `cargo` on `PATH` covers the successful install and its modes, gh
-  fallback, checksum refusals (nothing installed, the previous install intact), unsafe
-  archive members, protected config prefixes, same-release no-op/force and downgrade
-  behavior, failure-atomic binary/share/updater rollback, the `p1-update` wrapper,
-  `--from-release` routing, release-workflow repair/cache assertions, and the `--local`
-  target-dir probe.
+  fallback (including a `gh` that fails after writing a truncated asset), checksum refusals
+  (nothing installed, the previous install intact), unsafe archive members, protected
+  config prefixes, same-release no-op/force and downgrade behavior for `--latest`,
+  `--from-release main-<sha>` and the `p1-update` wrapper, a missing or older python3
+  refused by name, failure-atomic binary/share/updater rollback with a rolled-back
+  SIGTERM during the commit, a failed restore reported with its fixed-slot leftovers,
+  `--from-release` routing, release-workflow repair/cache/tag-creation assertions, and the
+  `--local` target-dir probe.
 - `python3 scripts/test_fanout.py -v`: `$P1_BIN` over `p1` on `PATH` over the debug
   fallback, and a job that runs the `p1` found on `PATH` without `P1_BIN`.
 - `bash -n scripts/install.sh scripts/update.sh`; `shellcheck scripts/install.sh scripts/update.sh`.

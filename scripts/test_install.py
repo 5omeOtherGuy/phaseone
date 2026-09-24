@@ -17,7 +17,10 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import re
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import tarfile
@@ -50,9 +53,17 @@ case "$1" in
 esac
 """.replace("@VERSION@", VERSION_LINE)
 
+# A second published release, naming a different commit: `p1 --version` tells the two
+# apart, which is how the installer recognizes the release it already has.
+NEW_RELEASE = FAKE_P1.replace("fake p1", "new p1").replace("deadbeef0000", "cafebabe0000")
+
 GH_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$P1_GH_LOG"
-if [ "${P1_GH_FAIL:-}" = download ]; then exit 7; fi
+if [ "$1" = "release" ] && [ "$2" = "view" ]; then
+  # `gh release view --json tagName --jq .tagName`: the tag "latest" carries.
+  cat "$P1_FIXTURE_RELEASE/latest-tag"
+  exit 0
+fi
 dir=""
 pattern=""
 while [ $# -gt 0 ]; do
@@ -64,6 +75,13 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+case "${P1_GH_FAIL:-}" in
+  download) exit 7 ;;
+  download-partial)
+    # A gh that fails may still leave a truncated asset behind.
+    printf 'truncated\\n' > "$dir/$pattern"
+    exit 7 ;;
+esac
 cp "$P1_FIXTURE_RELEASE/$pattern" "$dir/$pattern"
 """
 
@@ -78,7 +96,13 @@ while [ $# -gt 0 ]; do
     *) url="$1"; shift ;;
   esac
 done
-cp "$P1_FIXTURE_RELEASE/$(basename "$url")" "$out"
+case "$url" in
+  */releases/latest)
+    # The redirect target of releases/latest: what `-w '%{url_effective}'` prints.
+    printf '%s\\n' "https://example.invalid/releases/tag/$(cat "$P1_FIXTURE_RELEASE/latest-tag")" ;;
+  *)
+    cp "$P1_FIXTURE_RELEASE/$(basename "$url")" "$out" ;;
+esac
 """
 
 CARGO_STUB = """#!/bin/sh
@@ -169,6 +193,11 @@ class InstallTest(unittest.TestCase):
         for asset in ASSETS:
             if not asset.endswith(".sha256"):
                 self.write_sum(asset)
+        # The tag the channel marks latest names the commit the published binary prints,
+        # so a re-published fixture is a *different* latest release.
+        sha = re.search(r"\(([0-9a-f]+) ", binary).group(1)
+        with open(os.path.join(self.release, "latest-tag"), "w", encoding="utf-8") as h:
+            h.write(f"main-{sha}\n")
 
     def env(self, **overrides) -> dict:
         env = {
@@ -199,6 +228,14 @@ class InstallTest(unittest.TestCase):
             return ""
         with open(path, encoding="utf-8") as handle:
             return handle.read()
+
+    def gh_downloads(self) -> list:
+        """The `gh release download` calls, without a `gh release view` tag lookup."""
+        return [line for line in self.log(self.gh_log).splitlines() if " download " in line]
+
+    def curl_downloads(self) -> list:
+        """The asset downloads, without a `releases/latest` redirect probe."""
+        return [line for line in self.log(self.curl_log).splitlines() if "/download/" in line]
 
     def read(self, path: str) -> str:
         with open(path, encoding="utf-8") as handle:
@@ -234,7 +271,7 @@ class InstallTest(unittest.TestCase):
         self.assertIn(VERSION_LINE, done.stdout)
         self.assertIn("plain  api_key", done.stdout)
         self.assertIn("is not on PATH", done.stderr)
-        gh = self.log(self.gh_log).splitlines()
+        gh = self.gh_downloads()
         self.assertEqual(len(gh), 4, gh)
         for asset in ASSETS:
             self.assertTrue(any(asset in line for line in gh), (asset, gh))
@@ -269,11 +306,25 @@ class InstallTest(unittest.TestCase):
         done = self.run_install("--prefix", self.prefix, P1_GH_FAIL="download")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assert_installed(self.prefix)
-        self.assertEqual(len(self.log(self.gh_log).splitlines()), 4)
+        self.assertEqual(len(self.gh_downloads()), 4)
         curl = self.log(self.curl_log)
         for asset in ASSETS:
             self.assertIn("https://example.invalid/test/repo/releases/latest/download/" + asset,
                           curl)
+
+    def test_a_gh_that_left_a_truncated_asset_falls_back_to_curl(self) -> None:
+        # gh failing *after* writing part of an asset: the partial file must be discarded
+        # rather than handed to the checksum check, so the install still succeeds.
+        done = self.run_install("--prefix", self.prefix, P1_GH_FAIL="download-partial")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assert_installed(self.prefix)
+        self.assertEqual(len(self.gh_downloads()), 4)
+        curl = self.log(self.curl_log)
+        for asset in ASSETS:
+            self.assertIn("https://example.invalid/test/repo/releases/latest/download/" + asset,
+                          curl)
+        # The verified asset is the real one, not the truncated stub output.
+        self.assertEqual(self.read(os.path.join(self.prefix, "bin", "p1")), FAKE_P1)
 
     def test_from_release_tag_reaches_curl(self) -> None:
         done = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix,
@@ -306,7 +357,15 @@ class InstallTest(unittest.TestCase):
         self.assertIn("required=(p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256)", workflow)
         self.assertIn("gh release upload", workflow)
         self.assertIn("--clobber", workflow)
-        self.assertIn("--verify-tag", workflow)
+        self.assertIn("git ls-remote", workflow)
+        # Nothing else creates the tag, so the create call must not require it to exist:
+        # the flag that aborts on a tag that does not exist yet could never publish a
+        # first release. The create call makes the tag itself, at the commit the
+        # ls-remote block above verified.
+        create = workflow.split("gh release create", 1)[1].split("--title", 1)[0]
+        options = {line.strip().rstrip("\\").strip() for line in create.splitlines()}
+        self.assertIn('--target "$target"', options)
+        self.assertNotIn("--verify-tag", options)
 
     # --- checksums and refusals --------------------------------------------
 
@@ -317,10 +376,11 @@ class InstallTest(unittest.TestCase):
         before = self.read(binary)
 
         # A changed binary whose published checksum was not updated: the download must be
-        # refused before anything in the prefix is touched.
+        # refused before anything in the prefix is touched. --force skips the "already
+        # installed" answer, which would otherwise never fetch the tampered asset.
         with open(os.path.join(self.release, "p1-linux-x86_64"), "w", encoding="utf-8") as h:
             h.write(FAKE_P1.replace("fake p1", "tampered p1"))
-        done = self.run_install("--prefix", self.prefix)
+        done = self.run_install("--prefix", self.prefix, "--force")
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("sha256 mismatch", done.stderr)
         self.assertIn("nothing installed", done.stderr)
@@ -378,6 +438,30 @@ class InstallTest(unittest.TestCase):
         self.assertIn("unsafe or invalid", done.stderr)
         self.assert_nothing_installed(self.prefix)
 
+    # --- the interpreter the archive checks need ---------------------------
+
+    def test_a_python3_without_the_tarfile_data_filter_is_refused_by_name(self) -> None:
+        old_dir = self.mkdir("old-python3")
+        interpreter = self.stub("python3", "#!/bin/sh\nexit 2\n", directory=old_dir)
+        done = self.run_install("--prefix", self.prefix, PATH=old_dir + ":" + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("python3", done.stderr)
+        self.assertIn("required", done.stderr)
+        self.assertIn(interpreter, done.stderr)
+        # Not a statement about the archive or the prefix, which were never reached.
+        self.assertNotIn("unsafe or invalid", done.stderr)
+        self.assertNotIn("refusing a prefix", done.stderr)
+        self.assert_nothing_installed(self.prefix)
+
+    def test_a_missing_python3_is_refused_by_name(self) -> None:
+        os.remove(os.path.join(self.farm_dir, "python3"))
+        done = self.run_install("--prefix", self.prefix, **self.no_gh())
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("no python3 on PATH", done.stderr)
+        self.assertNotIn("unsafe or invalid", done.stderr)
+        self.assertNotIn("refusing a prefix", done.stderr)
+        self.assert_nothing_installed(self.prefix)
+
     # --- the user's own p1 config -----------------------------------------
 
     def test_prefix_equal_to_or_below_the_p1_config_tree_is_refused(self) -> None:
@@ -395,18 +479,21 @@ class InstallTest(unittest.TestCase):
                 self.assertEqual(os.listdir(auth_dir), ["sentinel"])
 
     def test_root_prefix_is_preserved(self) -> None:
-        guard_log = os.path.join(self.dir, "python3.log")
+        calls_log = os.path.join(self.dir, "python3.log")
         guard_dir = self.mkdir("root-guard")
         self.stub("python3", f"""#!/bin/sh
-printf '%s\\n' "$*" >> '{guard_log}'
+printf '%s\\n' "$*" >> '{calls_log}'
+case "$*" in
+  "-") exit 0 ;;
+esac
 exit 99
 """, directory=guard_dir)
         done = self.run_install("--prefix", "/", PATH=guard_dir + ":" + SYSTEM_PATH)
         self.assertNotEqual(done.returncode, 0)
-        # The guard receives the rooted /bin and /share; trimming "/" to "" would produce
-        # "bin" and "share" instead.
-        self.assertEqual(self.log(guard_log).splitlines(),
-                         [f"- {self.config}/p1 //bin //share"])
+        # The capability probe runs first (argv just `-`); the guard call then receives the
+        # rooted /bin and /share. Trimming "/" to "" would produce "bin" and "share".
+        self.assertEqual(self.log(calls_log).splitlines()[-1],
+                         f"- {self.config}/p1 //bin //share")
 
     def test_the_users_p1_config_is_byte_identical_afterwards(self) -> None:
         auth_dir = os.path.join(self.config, "p1")
@@ -437,7 +524,7 @@ exit 99
             "share": os.path.join(self.prefix, "share", "p1", "environments", "marker.txt"),
         }
         before = {name: self.read(path) for name, path in paths.items()}
-        self.publish(marker="two", binary=FAKE_P1.replace("fake p1", "new p1"))
+        self.publish(marker="two", binary=NEW_RELEASE)
 
         fail_dir = self.mkdir("fail-commit")
         real_mv = shutil.which("mv")
@@ -464,7 +551,7 @@ exec '{real_mv}' \"$@\"
         binary = self.read(os.path.join(self.prefix, "bin", "p1"))
         marker = self.read(os.path.join(self.prefix, "share", "p1",
                                         "environments", "marker.txt"))
-        self.publish(marker="two", binary=FAKE_P1.replace("fake p1", "new p1"))
+        self.publish(marker="two", binary=NEW_RELEASE)
 
         fail_dir = self.mkdir("fail-updater")
         real_chmod = shutil.which("chmod")
@@ -481,6 +568,124 @@ exec '{real_chmod}' \"$@\"
         self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1",
                                                 "environments", "marker.txt")), marker)
 
+    def test_a_signal_during_the_commit_rolls_back_and_ends_the_script(self) -> None:
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        paths = {
+            "binary": os.path.join(self.prefix, "bin", "p1"),
+            "updater": os.path.join(self.prefix, "bin", "p1-update"),
+            "share": os.path.join(self.prefix, "share", "p1", "environments", "marker.txt"),
+        }
+        before = {name: self.read(path) for name, path in paths.items()}
+        self.publish(marker="two", binary=NEW_RELEASE)
+
+        # The commit is parked inside this `mv` — no sleeping: it announces itself on one
+        # FIFO and waits for a line on the other, which the test writes only after
+        # signalling. The test's own writer on the second FIFO is what makes the stub's
+        # read return instead of hitting end-of-file.
+        ready = os.path.join(self.dir, "ready.fifo")
+        gate = os.path.join(self.dir, "gate.fifo")
+        blocked = os.path.join(self.dir, "blocked.once")
+        os.mkfifo(ready)
+        os.mkfifo(gate)
+        fail_dir = self.mkdir("signal-mv")
+        real_mv = shutil.which("mv")
+        self.stub("mv", f"""#!/bin/sh
+if [ ! -e "{blocked}" ]; then
+  case "$2" in
+    *.previous)
+      : > "{blocked}"
+      printf 'blocked\\n' > "{ready}"
+      read -r go < "{gate}" || true ;;
+  esac
+fi
+exec '{real_mv}' "$@"
+""", directory=fail_dir)
+
+        ready_fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, ready_fd)
+        # Held open for the whole test: it is the stub's writer, so `read` never sees EOF.
+        gate_fd = os.open(gate, os.O_RDWR)
+        self.addCleanup(os.close, gate_fd)
+        env = self.env(PATH=fail_dir + ":" + self.stub_dir + ":" + SYSTEM_PATH)
+        proc = subprocess.Popen([BASH, INSTALL, "--prefix", self.prefix], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            readable, _, _ = select.select([ready_fd], [], [], 60)
+            self.assertTrue(readable, "the install never reached the commit")
+            self.assertEqual(os.read(ready_fd, 64), b"blocked\n")
+            os.kill(proc.pid, signal.SIGTERM)
+            os.write(gate_fd, b"go\n")
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        # The interrupt ends the script after the rollback instead of letting it resume
+        # the half-swapped transaction.
+        self.assertEqual(proc.returncode, 130, (out, err))
+        for name, path in paths.items():
+            self.assertEqual(self.read(path), before[name], name)
+        self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "bin"))
+                          if name.startswith(".p1")], [])
+        self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "share"))
+                          if name.startswith(".p1")], [])
+
+    def test_a_failed_rollback_is_reported_and_reuses_one_backup_slot(self) -> None:
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        fail_dir = self.mkdir("fail-revert")
+        real_mv = shutil.which("mv")
+        self.stub("mv", f"""#!/bin/sh
+case "$2" in
+  *.previous) exec '{real_mv}' "$@" ;;
+esac
+case "$1" in
+  *.previous) exit 74 ;;
+esac
+case " $* " in
+  *"/share/p1 "*) exit 71 ;;
+  *"/bin/p1 "*) exit 71 ;;
+esac
+exec '{real_mv}' "$@"
+""", directory=fail_dir)
+        env = {"PATH": fail_dir + ":" + self.stub_dir + ":" + SYSTEM_PATH}
+        leftovers = {
+            "bin": [".p1-update.previous", ".p1.previous"],
+            "share": [".p1.previous"],
+        }
+
+        def hidden(where: str) -> list:
+            return sorted(name for name in os.listdir(os.path.join(self.prefix, where))
+                          if name.startswith(".p1"))
+
+        for attempt in ("first", "second"):
+            self.publish(marker="two", binary=NEW_RELEASE)
+            done = self.run_install("--prefix", self.prefix, **env)
+            self.assertNotEqual(done.returncode, 0, done.stdout)
+            self.assertIn("could not commit the new share data and binary", done.stderr)
+            # A restore that fails is reported with the paths it could not put back.
+            self.assertIn("could not be restored", done.stderr)
+            for where, names in leftovers.items():
+                for name in names:
+                    path = os.path.join(self.prefix, where, name)
+                    self.assertIn(path, done.stderr, attempt)
+                    self.assertTrue(os.path.exists(path), (attempt, path))
+                # One fixed slot per prefix: a second failure does not accumulate copies.
+                self.assertEqual(hidden(where), names, attempt)
+            self.assertFalse(os.path.exists(os.path.join(self.prefix, "bin", "p1")), attempt)
+            self.assertFalse(os.path.exists(os.path.join(self.prefix, "share", "p1")), attempt)
+
+            # The stale slot is replaced by the next install, which succeeds from scratch.
+            self.publish()
+            healthy = self.run_install("--prefix", self.prefix)
+            self.assertEqual(healthy.returncode, 0, healthy.stderr)
+            self.assert_installed(self.prefix)
+            self.assertEqual(hidden("bin"), [], attempt)
+            self.assertEqual(hidden("share"), [], attempt)
+
     def test_the_update_wrapper_reinstalls_without_a_checkout(self) -> None:
         first = self.run_install("--prefix", self.prefix)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -495,18 +700,18 @@ exec '{real_chmod}' \"$@\"
                                                 "environments", "marker.txt")),
                          "environments two\n")
         self.assertIn("fake p1 v2", self.read(os.path.join(self.prefix, "bin", "p1")))
-        self.assertEqual(len(self.log(self.gh_log).splitlines()), 8)
+        self.assertEqual(len(self.gh_downloads()), 8)
 
     def test_same_release_is_a_noop_and_force_reinstalls(self) -> None:
         first = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
         self.assertEqual(first.returncode, 0, first.stderr)
-        gh_count = len(self.log(self.gh_log).splitlines())
+        gh_count = len(self.gh_downloads())
         mtime = os.stat(os.path.join(self.prefix, "bin", "p1")).st_mtime_ns
 
         same = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
         self.assertEqual(same.returncode, 0, same.stderr)
         self.assertIn("already installed", same.stdout)
-        self.assertEqual(len(self.log(self.gh_log).splitlines()), gh_count)
+        self.assertEqual(len(self.gh_downloads()), gh_count)
         self.assertEqual(os.stat(os.path.join(self.prefix, "bin", "p1")).st_mtime_ns, mtime)
 
         with open(os.path.join(self.prefix, "share", "p1", "environments", "marker.txt"),
@@ -514,10 +719,59 @@ exec '{real_chmod}' \"$@\"
             handle.write("changed before forced reinstall\n")
         forced = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix, "--force")
         self.assertEqual(forced.returncode, 0, forced.stderr)
-        self.assertEqual(len(self.log(self.gh_log).splitlines()), gh_count + 4)
+        self.assertEqual(len(self.gh_downloads()), gh_count + 4)
         self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1",
                                                 "environments", "marker.txt")),
                          "environments one\n")
+
+    def test_latest_of_the_installed_commit_is_a_noop_and_force_reinstalls(self) -> None:
+        # `p1 --version` prints `p1 <version> (<sha> <date>)`: the installed commit must be
+        # recognized from that line, so a second --latest downloads nothing at all.
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(self.gh_downloads()), 4, self.log(self.gh_log))
+        binary = os.path.join(self.prefix, "bin", "p1")
+        mtime = os.stat(binary).st_mtime_ns
+
+        same = self.run_install("--prefix", self.prefix)
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertIn("already installed", same.stdout)
+        self.assertEqual(len(self.gh_downloads()), 4, self.log(self.gh_log))
+        self.assertEqual(os.stat(binary).st_mtime_ns, mtime)
+        self.assertEqual(self.read(binary), FAKE_P1)
+
+        forced = self.run_install("--prefix", self.prefix, "--force")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertEqual(len(self.gh_downloads()), 8)
+        self.assert_installed(self.prefix)
+
+    def test_latest_noop_without_gh_uses_the_releases_redirect(self) -> None:
+        first = self.run_install("--prefix", self.prefix, **self.no_gh())
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(self.curl_downloads()), 4, self.log(self.curl_log))
+        mtime = os.stat(os.path.join(self.prefix, "bin", "p1")).st_mtime_ns
+
+        same = self.run_install("--prefix", self.prefix, **self.no_gh())
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertIn("already installed", same.stdout)
+        # One releases/latest probe, and no asset fetched.
+        self.assertEqual(len(self.curl_downloads()), 4, self.log(self.curl_log))
+        self.assertIn("/releases/latest", self.log(self.curl_log))
+        self.assertEqual(os.stat(os.path.join(self.prefix, "bin", "p1")).st_mtime_ns, mtime)
+
+    def test_from_release_of_the_installed_commit_is_a_noop(self) -> None:
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        calls = len(self.log(self.gh_log).splitlines())
+        binary = os.path.join(self.prefix, "bin", "p1")
+        mtime = os.stat(binary).st_mtime_ns
+
+        # main-<sha> names the commit the installed binary prints; no lookup, no download.
+        same = self.run_install("--from-release", "main-deadbeef0000", "--prefix", self.prefix)
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertIn("already installed", same.stdout)
+        self.assertEqual(len(self.log(self.gh_log).splitlines()), calls)
+        self.assertEqual(os.stat(binary).st_mtime_ns, mtime)
 
     def test_explicit_release_allows_a_downgrade(self) -> None:
         self.run_install("--from-release", "v2.0.0", "--prefix", self.prefix)

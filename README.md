@@ -17,7 +17,10 @@ weak: `docs/SLICE-REPORT.md`.
 p1 is published as a GitHub Release for every commit whose gate is green on `main`: the
 binary `p1-linux-x86_64`, the shipped data `p1-share.tar.gz` (`environments/`, `routes/`,
 `profiles/`), and a sha256 file for each. Installing needs no Rust toolchain and no
-compile on your machine (ADR-0063).
+compile on your machine (ADR-0063). It needs `curl` (or `gh`), `sha256sum`, and python3 —
+3.12, or 3.8.17 / 3.9.17 / 3.10.12 / 3.11.4 with the security backports — whose `tarfile`
+data filter validates and extracts the share archive; a missing or older interpreter is
+refused by name, before anything is installed.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/phaseone/main/scripts/install.sh -o p1-install.sh

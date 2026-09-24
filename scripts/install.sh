@@ -19,6 +19,9 @@
 # Nothing under ${XDG_CONFIG_HOME:-$HOME/.config}/p1 — p1's credential store and the
 # user's own overrides — is read, written or deleted by this script.
 #
+# Needs bash, `curl` or `gh`, and python3 for the archive and prefix checks: python3 3.12,
+# or 3.8.17 / 3.9.17 / 3.10.12 / 3.11.4+ with the tarfile `filter=` security backports.
+#
 # Environment:
 #   P1_REPO              the GitHub repository (default 5omeOtherGuy/phaseone)
 #   P1_RELEASE_BASE_URL  base for the curl fallback (default the repo's releases page)
@@ -111,6 +114,26 @@ if [ "$prefix" != "/" ]; then
   prefix="${prefix%/}"
 fi
 
+# Python validates and extracts the share archive with the PEP 706 `filter=` kwarg and
+# runs the prefix guard below, so probe it once before any install work: a missing or
+# older interpreter must fail naming itself, not as a false statement about the archive
+# or the prefix.
+PYTHON3_NEEDED="python3 3.12, or 3.8.17 / 3.9.17 / 3.10.12 / 3.11.4+ (needs the tarfile filter= backport)"
+command -v python3 >/dev/null 2>&1 ||
+  die "$PYTHON3_NEEDED is required, but there is no python3 on PATH"
+python3 - <<'PY' || die "$PYTHON3_NEEDED is required, but $(command -v python3) ($(python3 -V 2>&1)) rejected tarfile's data filter"
+import io
+import tarfile
+
+# The exact call the installer makes (an empty in-memory archive: no filesystem writes).
+buffer = io.BytesIO()
+with tarfile.open(fileobj=buffer, mode="w"):
+    pass
+buffer.seek(0)
+with tarfile.open(fileobj=buffer, mode="r") as archive:
+    archive.extractall(path=".", members=[], filter="data")
+PY
+
 # Check the prospective bin/share paths, following existing symlinks, before any prefix
 # write. A custom prefix must never be allowed to target the user's private p1 tree.
 config_root="${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}"
@@ -129,9 +152,12 @@ stage="$(mktemp -d "${TMPDIR:-/tmp}/p1-install.XXXXXX")"
 bin_new=""
 update_new=""
 share_new=""
-bin_prev="$prefix/bin/.p1.previous.$$"
-update_prev="$prefix/bin/.p1-update.previous.$$"
-share_prev="$prefix/share/.p1.previous.$$"
+# One fixed backup slot per prefix, so a failed install leaves at most one rollback copy
+# behind (replaced by the next install, and named in the failure message) instead of one
+# per attempt.
+bin_prev="$prefix/bin/.p1.previous"
+update_prev="$prefix/bin/.p1-update.previous"
+share_prev="$prefix/share/.p1.previous"
 transaction=0
 new_started=0
 
@@ -162,7 +188,19 @@ cleanup() {
   [ -z "$update_new" ] || rm -f "$update_new"
   [ -z "$share_new" ] || rm -rf "$share_new"
 }
-trap cleanup EXIT INT TERM
+# A signal must end the script after the rollback, not let it resume a half-swapped
+# install: the INT/TERM handler runs cleanup and then exits.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
+
+# Keep the previous binary, updater and share together; a restore that fails is never
+# swallowed, so name what is left and let the caller die.
+restore_previous_install() {
+  if ! rollback_install; then
+    printf 'p1 install: the previous install could not be restored — leftovers: %s %s %s\n' \
+      "$bin_prev" "$update_prev" "$share_prev" >&2
+  fi
+}
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -200,18 +238,21 @@ download_with_curl() {
 }
 
 download_asset() {
-  local asset="$1"
+  local asset="$1" fetched=0
   if command -v gh >/dev/null 2>&1; then
     printf 'p1 install: gh release download %s\n' "$asset"
+    set -- --repo "$repo" --dir "$stage" --pattern "$asset" --clobber
     if [ -n "$tag" ]; then
-      gh release download "$tag" --repo "$repo" --dir "$stage" --pattern "$asset" --clobber || true
-    else
-      gh release download --repo "$repo" --dir "$stage" --pattern "$asset" --clobber || true
+      set -- "$tag" "$@"
+    fi
+    if gh release download "$@"; then
+      fetched=1
     fi
   fi
-  if [ ! -f "$stage/$asset" ]; then
-    # gh is an optimization, not an authentication requirement. Discard a partial
-    # download before using the public, credential-free release URL.
+  if [ "$fetched" -eq 0 ]; then
+    # gh is an optimization, not an authentication requirement: a failure falls back to
+    # the public, credential-free release URL, and whatever a failed gh left behind (a
+    # truncated asset, most likely) is discarded first.
     rm -f "$stage/$asset"
     download_with_curl "$asset"
   fi
@@ -340,31 +381,35 @@ commit_install() {
   [ ! -e "$prefix/bin/p1" ] || had_binary=1
   [ ! -e "$prefix/bin/p1-update" ] || had_updater=1
   [ ! -e "$prefix/share/p1" ] || had_share=1
+  # The fixed backup slots are ours to reuse: anything there is a stale copy from a
+  # failed rollback that named itself, and the next install replaces it.
+  rm -f "$bin_prev" "$update_prev"
+  rm -rf "$share_prev"
   transaction=1
 
   if [ "$had_binary" -eq 1 ] && ! mv "$prefix/bin/p1" "$bin_prev"; then
-    rollback_install || true
+    restore_previous_install
     die "could not retain the previous binary"
   fi
   if [ "$had_updater" -eq 1 ] && ! mv "$prefix/bin/p1-update" "$update_prev"; then
-    rollback_install || true
+    restore_previous_install
     die "could not retain the previous updater"
   fi
   if [ "$had_share" -eq 1 ] && ! mv "$prefix/share/p1" "$share_prev"; then
-    rollback_install || true
+    restore_previous_install
     die "could not retain the previous share data"
   fi
 
   new_started=1
   if ! mv "$share_new" "$prefix/share/p1" || ! mv "$bin_new" "$prefix/bin/p1"; then
-    rollback_install || true
+    restore_previous_install
     die "could not commit the new share data and binary"
   fi
   share_new=""
   bin_new=""
   if [ -n "$update_new" ]; then
     if ! mv "$update_new" "$prefix/bin/p1-update"; then
-      rollback_install || true
+      restore_previous_install
       die "could not commit the new updater"
     fi
     update_new=""
@@ -389,26 +434,50 @@ fi
 
 # Release tags name the commit (main-<sha>), so an already installed main-<sha> is the
 # same release. Arbitrary tags are tracked in the share by the installer itself.
+# `p1 --version` prints `p1 <version> (<short sha> <date>)`, so the sha is the
+# parenthesised hex token — `unknown` (a build without git) is not hex and yields nothing.
 release_sha() {
   local binary="$1" version
-  version="$($binary --version 2>/dev/null)" || return 1
-  printf '%s\n' "$version" | awk '{ if ($1 == "p1" && $3 ~ /^\([0-9a-f]+\)$/) print substr($3, 2, length($3)-2) }'
+  version="$("$binary" --version 2>/dev/null)" || return 1
+  printf '%s\n' "$version" |
+    awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\([0-9a-f]+$/) { print substr($i, 2); exit } }'
+}
+
+# The tag the "latest" release carries. Resolving it needs one cheap request, not four
+# downloads, so an up-to-date install can say so without fetching and discarding the
+# assets: gh answers from the API, and the public releases/latest redirect (no
+# credential, just curl) carries the tag in its final URL.
+latest_tag() {
+  local effective
+  if command -v gh >/dev/null 2>&1; then
+    gh release view --repo "$repo" --json tagName --jq .tagName 2>/dev/null && return 0
+  fi
+  effective="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$base/latest" 2>/dev/null)" || return 1
+  case "$effective" in
+    */tag/*) printf '%s\n' "${effective##*/tag/}" ;;
+    *) return 1 ;;
+  esac
 }
 
 already_installed() {
-  local want_sha installed_sha
-  [ "$mode" = release ] || return 1
+  local want_tag want_sha installed_sha
   [ -z "$force" ] || return 1
+  [ -x "$prefix/bin/p1" ] || return 1
+  if [ "$mode" = release ]; then
+    want_tag="$tag"
+  else
+    want_tag="$(latest_tag)" || return 1
+    [ -n "$want_tag" ] || return 1
+  fi
   if [ -f "$prefix/share/p1/.p1-release" ] &&
-     [ "$(cat "$prefix/share/p1/.p1-release")" = "$tag" ]; then
+     [ "$(cat "$prefix/share/p1/.p1-release")" = "$want_tag" ]; then
     return 0
   fi
-  case "$tag" in
+  case "$want_tag" in
     main-?*) ;;
     *) return 1 ;;
   esac
-  want_sha="${tag#main-}"
-  [ -x "$prefix/bin/p1" ] || return 1
+  want_sha="${want_tag#main-}"
   installed_sha="$(release_sha "$prefix/bin/p1")" || return 1
   [ "$installed_sha" = "$want_sha" ]
 }
@@ -419,10 +488,12 @@ case "$mode" in
   latest | release)
     if already_installed; then
       printf 'p1 install: release %s is already installed at %s (use --force to reinstall)\n' \
-        "$tag" "$prefix"
+        "${tag:-latest}" "$prefix"
       exit 0
     fi
     install_release
+    # When the tag could not be resolved up front, the downloaded binary itself answers
+    # whether this release is the installed one; the prefix is still untouched here.
     if [ "$mode" = latest ] && [ -z "$force" ] && [ -x "$prefix/bin/p1" ]; then
       installed_release_sha="$(release_sha "$prefix/bin/p1" || true)"
       downloaded_release_sha="$(release_sha "$release_bin" || true)"

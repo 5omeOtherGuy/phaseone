@@ -109,7 +109,9 @@ jobs:
           fi
 
           # A tag without a release is incomplete, not a reason to skip publication.
-          # --verify-tag also refuses to let a same-named tag point at another commit.
+          # Nothing else creates the tag: `gh release create --target` creates it at the
+          # commit verified above, so no --verify-tag (which would abort on a tag that
+          # does not exist yet and could never publish a first release).
           gh release create "$tag" \
             dist/p1-linux-x86_64 \
             dist/p1-linux-x86_64.sha256 \
@@ -117,7 +119,6 @@ jobs:
             dist/p1-share.tar.gz.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --target "$target" \
-            --verify-tag \
             --title "p1 $tag" \
             --latest \
             --notes "Built from commit $target after a green gate on main. Assets: p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz (environments/, routes/, profiles/), p1-share.tar.gz.sha256. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"
