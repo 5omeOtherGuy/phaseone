@@ -128,14 +128,29 @@ impl State {
 
     /// A transient failure: retry inside the shared budget, or fail. Grants no
     /// retry once visible output has been forwarded.
-    fn transient_or_fail(mut self, error: ProviderError, hint: Option<Duration>) -> Self {
+    fn transient_or_fail(
+        mut self,
+        error: ProviderError,
+        hint: Option<Duration>,
+        status: Option<u16>,
+    ) -> Self {
         if self.transient_retries >= self.request.retry.max_retries {
             return self.finish(Outcome::Failed(error));
         }
         self.transient_retries += 1;
         let delay = self.request.retry.delay(self.transient_retries, hint);
-        // Rule 4: a back-off yields Activity so the consumer sees life before the
-        // first content event of the next attempt.
+        let failure = match status {
+            Some(status) => format!("provider returned HTTP {status}"),
+            None => "provider request failed".to_string(),
+        };
+        self.pending.push_back(StreamEvent::Notice {
+            text: format!(
+                "{failure}; retry {}/{} in {}",
+                self.transient_retries,
+                self.request.retry.max_retries,
+                format_delay(delay)
+            ),
+        });
         self.pending.push_back(StreamEvent::Activity);
         self.phase = Phase::Wait { delay };
         self
@@ -199,7 +214,7 @@ async fn post_once(mut state: State) -> State {
                 ProviderErrorKind::Transport,
                 format!("request failed: {}", error.0),
             );
-            return state.transient_or_fail(error, None);
+            return state.transient_or_fail(error, None, None);
         }
         Raced::Done(Ok(response)) => response,
     };
@@ -230,7 +245,10 @@ async fn post_once(mut state: State) -> State {
                 Raced::Done(bytes) => bytes,
             };
             let error = parser.on_http_error(status, &headers, &body);
-            state.transient_or_fail(error, retry_after(&headers))
+            if error.kind == ProviderErrorKind::UsageLimitExhausted {
+                return state.finish(Outcome::Failed(error));
+            }
+            state.transient_or_fail(error, retry_after(&headers), Some(status))
         }
         HttpClass::Reauth => {
             let body = match drain_body(&cancel, response.body).await {
@@ -238,10 +256,14 @@ async fn post_once(mut state: State) -> State {
                 Raced::Done(bytes) => bytes,
             };
             let error = parser.on_http_error(status, &headers, &body);
-            if error.kind == ProviderErrorKind::InsufficientBalance {
-                // ADR-0046: an exhausted account is not a rejected key. Refreshing
-                // could only fail, and masking the adapter's diagnosis with a
-                // refresh error is the bug this kind exists to end.
+            if matches!(
+                error.kind,
+                ProviderErrorKind::InsufficientBalance | ProviderErrorKind::NotEntitled
+            ) {
+                // ADR-0046 / ADR-0062: an exhausted account or a plan that does
+                // not allow this model is not a rejected key. Refreshing could
+                // only fail, and masking the adapter's diagnosis with a refresh
+                // error is the bug these kinds exist to end.
                 return state.finish(Outcome::Failed(error));
             }
             if state.reauth_used {
@@ -299,7 +321,7 @@ async fn read_body(
                 // Rule 3: never retry once the consumer has seen output.
                 state.finish(Outcome::Failed(failure))
             } else {
-                state.transient_or_fail(failure, None)
+                state.transient_or_fail(failure, None, None)
             }
         }
         Raced::Done(None) => {
@@ -311,7 +333,9 @@ async fn read_body(
             }
             let outcome = parser.on_end();
             match outcome {
-                Outcome::Failed(error) if !state.visible => state.transient_or_fail(error, None),
+                Outcome::Failed(error) if !state.visible => {
+                    state.transient_or_fail(error, None, None)
+                }
                 other => state.finish(other),
             }
         }
@@ -372,6 +396,14 @@ async fn drain_body(cancel: &CancellationToken, mut body: ByteStream) -> Raced<V
             // policy; classify what arrived.
             Raced::Done(Some(Err(_))) => return Raced::Done(collected),
         }
+    }
+}
+
+fn format_delay(delay: Duration) -> String {
+    if delay.subsec_millis() == 0 {
+        format!("{} s", delay.as_secs())
+    } else {
+        format!("{:.1} s", delay.as_secs_f64())
     }
 }
 
@@ -501,6 +533,18 @@ mod tests {
                     "the account has no balance",
                 );
             }
+            if body == b"not-entitled" {
+                return ProviderError::new(
+                    ProviderErrorKind::NotEntitled,
+                    "the account's plan does not allow this model on this route",
+                );
+            }
+            if body == b"usage-limit-exhausted" {
+                return ProviderError::new(
+                    ProviderErrorKind::UsageLimitExhausted,
+                    "the account's usage allowance is used up",
+                );
+            }
             let kind = match status {
                 401 | 403 => ProviderErrorKind::Authentication,
                 408 | 425 | 429 | 500..=599 => ProviderErrorKind::Transport,
@@ -627,6 +671,22 @@ mod tests {
         response
     }
 
+    /// A 403 whose body says the plan does not allow this model, the way the chat
+    /// adapter reports one (ADR-0062).
+    fn not_entitled_response() -> ScriptedResponse {
+        let mut response = status_response(403);
+        response.chunks.push(b"not-entitled".to_vec());
+        response
+    }
+
+    /// A 429 whose body says the account's usage allowance is used up. It is a
+    /// terminal account diagnosis, not a short rate-limit window.
+    fn usage_limit_response() -> ScriptedResponse {
+        let mut response = status_response(429);
+        response.chunks.push(b"usage-limit-exhausted".to_vec());
+        response
+    }
+
     fn text_turn() -> &'static str {
         "data: delta\n\ndata: done\n\n"
     }
@@ -673,6 +733,11 @@ mod tests {
             .iter()
             .position(|event| matches!(event, StreamEvent::Activity))
             .expect("back-off activity");
+        let first_notice = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::Notice { .. }))
+            .expect("back-off notice");
+        assert!(first_notice < first_activity, "notice precedes activity");
         assert!(
             first_activity < first_content,
             "activity must precede the first content event: {events:?}"
@@ -747,6 +812,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn not_entitled_finishes_without_refresh_or_retry() {
+        // ADR-0062: a 403 whose body says the plan does not allow this model is
+        // NOT a rejected key. It must not refresh or retry, like no-balance.
+        // A second response is scripted so a stray request is reported as a plain
+        // count mismatch rather than a transport panic.
+        let harness = Harness::new(vec![not_entitled_response(), ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        let refresh_calls = harness.credentials.refresh_calls.lock().unwrap();
+        assert!(refresh_calls.is_empty(), "{refresh_calls:?}");
+        assert_eq!(harness.credentials.access_calls.load(Ordering::SeqCst), 1);
+        match terminal(&events) {
+            Outcome::Failed(error) => {
+                assert_eq!(error.kind, ProviderErrorKind::NotEntitled);
+                assert_eq!(
+                    error.message,
+                    "the account's plan does not allow this model on this route"
+                );
+            }
+            other => panic!("expected a not-entitled failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn insufficient_balance_after_a_refresh_keeps_the_diagnosis() {
         let harness = Harness::new(vec![status_response(401), exhausted_response()]);
         let events = collect(harness.start()).await;
@@ -773,6 +863,55 @@ mod tests {
         assert_eq!(harness.transport.requests().len(), 3);
         assert_eq!(harness.credentials.refresh_calls.lock().unwrap().len(), 1);
         assert!(matches!(terminal(&events), Outcome::Completed(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn usage_limit_exhausted_finishes_without_refresh_or_retry() {
+        let harness = Harness::new(vec![usage_limit_response(), ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        assert!(harness.credentials.refresh_calls.lock().unwrap().is_empty());
+        assert_eq!(harness.credentials.access_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Notice { .. }))
+        );
+        match terminal(&events) {
+            Outcome::Failed(error) => {
+                assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
+                assert_eq!(error.message, "the account's usage allowance is used up");
+            }
+            other => panic!("expected a usage-limit failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plain_429_emits_the_computed_retry_notice_before_the_wait() {
+        let policy = RetryPolicy {
+            jitter: Duration::ZERO,
+            ..RetryPolicy::default()
+        };
+        let mut throttled = status_response(429);
+        throttled.headers.push(("Retry-After".into(), "8".into()));
+        let harness = Harness::custom(vec![throttled, ok(text_turn())], policy, "OLD", "NEW");
+        let mut stream = harness.start();
+
+        assert_eq!(
+            stream.next().await,
+            Some(StreamEvent::Notice {
+                text: "provider returned HTTP 429; retry 1/3 in 8 s".into()
+            })
+        );
+        assert_eq!(harness.transport.requests().len(), 1);
+        assert_eq!(stream.next().await, Some(StreamEvent::Activity));
+        let rest = collect(stream).await;
+        assert!(
+            rest.iter()
+                .any(|event| matches!(event, StreamEvent::TextDelta { .. }))
+        );
+        assert_eq!(harness.transport.requests().len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -890,7 +1029,7 @@ mod tests {
         let mut stream = harness.start();
 
         let first = stream.next().await.expect("an event");
-        assert_eq!(first, StreamEvent::Activity);
+        assert!(matches!(first, StreamEvent::Notice { .. }), "{first:?}");
         harness.cancel.cancel();
 
         let events = collect(stream).await;

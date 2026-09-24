@@ -36,9 +36,26 @@ pub fn classify_status(status: u16) -> HttpClass {
 /// Read an integer-seconds `Retry-After` header. The HTTP-date form is uncommon
 /// for these routes and is ignored (as in the donor).
 pub fn retry_after(headers: &[(String, String)]) -> Option<Duration> {
+    header_seconds(headers, "retry-after")
+}
+
+/// Read an integer-seconds rate-limit reset hint, preferring `Retry-After`.
+pub fn reset_after(headers: &[(String, String)]) -> Option<Duration> {
+    retry_after(headers).or_else(|| {
+        [
+            "x-ratelimit-reset",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset-tokens",
+        ]
+        .into_iter()
+        .find_map(|name| header_seconds(headers, name))
+    })
+}
+
+fn header_seconds(headers: &[(String, String)], expected: &str) -> Option<Duration> {
     headers
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .find(|(name, _)| name.eq_ignore_ascii_case(expected))
         .and_then(|(_, value)| value.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
 }
@@ -158,6 +175,25 @@ mod tests {
             "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
         )];
         assert_eq!(retry_after(&http_date), None);
+    }
+
+    #[test]
+    fn reset_hint_prefers_retry_after_then_accepts_rate_limit_reset() {
+        assert_eq!(
+            reset_after(&[
+                ("x-ratelimit-reset".into(), "20".into()),
+                ("retry-after".into(), "10".into()),
+            ]),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            reset_after(&[("X-RateLimit-Reset-Requests".into(), "42".into())]),
+            Some(Duration::from_secs(42))
+        );
+        assert_eq!(
+            reset_after(&[("x-ratelimit-reset".into(), "later".into())]),
+            None
+        );
     }
 
     #[test]

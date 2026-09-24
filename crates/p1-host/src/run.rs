@@ -1923,8 +1923,8 @@ const RATE_LIMITED_RETRY_WAITS: [Duration; 3] = [
 /// The transient kind of a turn end, if it is one (completion.md §3b, amended by
 /// §3c): a dropped transport, a rate limit, or a malformed response are worth
 /// waiting out — the model's or the route's one-off. Everything else
-/// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`) ends the run as it
-/// always did.
+/// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`,
+/// `UsageLimitExhausted`) ends the run as it always did.
 fn transient_kind(end: &TurnEnd) -> Option<ProviderErrorKind> {
     match end {
         TurnEnd::ProviderFailed { error } => match error.kind {
@@ -2742,6 +2742,17 @@ mod tests {
         fn emit(&self, event: AgentEvent) {
             self.0.lock().unwrap().push(event);
         }
+    }
+
+    #[test]
+    fn an_exhausted_usage_limit_is_not_a_transient_host_failure() {
+        let end = TurnEnd::ProviderFailed {
+            error: p1_contracts::ProviderError::new(
+                ProviderErrorKind::UsageLimitExhausted,
+                "the account's usage allowance is used up",
+            ),
+        };
+        assert_eq!(transient_kind(&end), None);
     }
 
     #[test]

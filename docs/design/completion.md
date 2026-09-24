@@ -200,10 +200,10 @@ rebuilt log is never fingerprinted — so only a later command or a `write` re-a
 
 ## 3b. Provider failures in a headless run (issue #11)
 
-A turn that ends `ProviderFailed` with kind `Transport` or `RateLimited` is a TRANSIENT end: the
-adapter's own retries (seconds, before the stream starts) are already spent, or the stream broke
-after it began. Dogfooding lost two long jobs to exactly this in one afternoon. Every other kind
-(`InvalidRequest`, `Authentication`, `ContextWindowExceeded`, `Protocol`) ends the run as before.
+A turn that ends `ProviderFailed` with kind `Transport`, `RateLimited`, or `Protocol` is a TRANSIENT
+end: the adapter's own retries (seconds, before the stream starts) are already spent, or the stream
+broke after it began. A `UsageLimitExhausted` account allowance is not waited out. Dogfooding lost
+two long jobs to exactly this in one afternoon. Every other kind ends the run as before.
 
 Policy, headless only (an interactive user is present and decides):
 - The host WAITS, then continues with one fixed user-role message (`PROVIDER_RETRY_MESSAGE`:

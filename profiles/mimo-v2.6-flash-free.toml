@@ -1,0 +1,20 @@
+# What the model is, independent of the route that reaches it (ADR-0039).
+# Values verified from opencode's model metadata (provider `opencode`, model
+# `mimo-v2.6-flash-free`): family "mimo", reasoning true, interleaved reasoning_content,
+# limit.context 200000, limit.output 32000.
+id        = "mimo-v2.6-flash-free"
+revision  = 1
+model_id  = "mimo-v2.6-flash-free"
+family    = "mimo"
+thinking  = "enabled"
+
+# The metadata declares reasoning_options [] — the model takes no effort or budget knob, so no
+# level is verifiable from it. The chat adapter nevertheless requires a default_effort at
+# construction and encodes only low/high/max (crates/p1-provider-openai-chat/src/lib.rs,
+# validate_composition), so this profile states exactly one level: the one every request uses.
+# Unknown levels stay unstated.
+efforts        = ["high"]
+default_effort = "high"
+
+context_tokens    = 200000
+max_output_tokens = 32000

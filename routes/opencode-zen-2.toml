@@ -1,0 +1,31 @@
+# How the OpenCode Zen free surface is reached on the owner's SECOND Zen account
+# (ADR-0039 step 3, spec §1.2 of docs/design/routes-and-profiles.md). Same endpoint, dialect and
+# session header as `opencode-zen-1`; a different ACCOUNT, therefore a different route id and
+# origin: p1's store keeps one credential per route id (ADR-0061), so each account has its own key.
+# `user-agent` stays compiled in `p1_host::catalog`; no `[headers]` table.
+id           = "opencode-zen-2"
+origin_route = "openai-chat/opencode-zen-2"
+adapter      = "openai-chat"
+endpoint     = "https://opencode.ai/zen/v1/chat/completions"
+
+[credential]
+# A reference, never a value. `store_only` (ADR-0061): the documented variable below and p1's own
+# store, and no CLI login file is ever read. This account's key is its own store entry.
+kind       = "api-key"
+env        = "OPENCODE_ZEN_2_API_KEY"
+borrow     = []
+store_only = true
+
+[adapter_settings]
+dialect        = "thinking-with-reasoning-alias"
+session_header = "x-opencode-session"
+
+# Only profiles the host ships a policy for; any other profile is refused — only -free ids appear.
+[models."mimo-v2.6-flash-free"]
+wire_model = "mimo-v2.6-flash-free"
+
+[models."muse-spark-1.3-contributor-free"]
+wire_model = "muse-spark-1.3-contributor-free"
+
+[models."space-bunny-free"]
+wire_model = "space-bunny-free"

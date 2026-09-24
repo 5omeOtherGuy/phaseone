@@ -1,0 +1,29 @@
+route   = "cline-pass-1"
+profile = "deepseek-v4.1-flash"
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "finish"
+
+# Copied from environments/deepseek, not measured on this route: the runs behind these values
+# (split4a and its successors, docs/dogfood/runs.jsonl) ran on OpenCode Go, not on api.cline.bot,
+# and ClinePass documents no window. Summarize late, keep a long tail.
+[context]
+window_tokens = 1000000
+output_headroom_tokens = 32000
+summarize_at_tokens = 300000
+keep_recent_tokens = 60000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000
