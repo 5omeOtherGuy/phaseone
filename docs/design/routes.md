@@ -179,7 +179,11 @@ subscription endpoint; there is no fallback to Zen pay-as-you-go or another prov
 [OpenCode Go documentation](https://opencode.ai/docs/go/) lists the endpoint and asks
 coding clients to identify themselves and supply a stable conversation header. p1 sends
 its own `user-agent: p1/<version>` and uses the host's cache key as `x-opencode-session`.
-No foreign client identity is impersonated.
+No foreign client identity is impersonated. (Exception, owner decision 2026-09-24: the Zen
+FREE routes `opencode-zen-1/2/3` and `opencode-zen-free` are gated on OpenCode's own client,
+so they set `[adapter_settings] client_identity = "opencode"`; the Go subscription above is
+not gated and keeps p1's identity. ADR-0062, evidence in
+`docs/design/zen-client-identity-evidence.md`.)
 
 Credential precedence: `OPENCODE_API_KEY`; then the `opencode-go` API entry in
 `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`);

@@ -75,6 +75,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0059 | [A tool describes its results and its destructiveness; the host describer keeps no tool-name table](0059-a-tool-describes-its-results-and-its-destructiveness-the-host-describer-keeps-no-tool-name-table.md) | accepted | 2026-09-23 | lead |
 | ADR-0060 | [One shared cargo target per repository across worktrees; rustc-serial ignores slots whose holder is stopped](0060-one-shared-cargo-target-per-repository-across-worktrees-rustc-serial-ignores-slots-whose-holder-is-stopped.md) | proposed | 2026-09-23 | owner+lead |
 | ADR-0061 | [A route may be self-contained: store-only credentials never read another tool's login](0061-a-route-may-be-self-contained-store-only-credentials-never-read-another-tool-s-login.md) | accepted | 2026-09-24 | owner |
+| ADR-0062 | [Zen free routes present the OpenCode client identity](0062-zen-free-routes-present-the-opencode-client-identity.md) | proposed | 2026-09-24 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
