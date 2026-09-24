@@ -270,8 +270,11 @@ impl FrontEnd for TuiFrontEnd {
                 worker_rows,
                 branch,
                 tools: self.tools.lock().unwrap().clone(),
-                context_window: self.context.lock().unwrap().0,
-                context_warn_at: self.context.lock().unwrap().1,
+                // Read once above: two `lock()` temporaries in this literal both
+                // live to the end of the statement, and the second deadlocked
+                // every TUI start on its own guard.
+                context_window: window,
+                context_warn_at: summarize_at,
                 pending_worker_starts: HashMap::new(),
                 worker_details,
                 // ADR-0049 stage 3: `deps.model_switch` is set (in `run.rs`, this
