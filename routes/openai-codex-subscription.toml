@@ -11,8 +11,11 @@ adapter      = "openai-responses"
 endpoint     = "https://chatgpt.com/backend-api"
 
 [credential]
-# A reference, never a value: the compiled Codex CLI login source.
-kind = "codex-oauth"
+# A reference, never a value. `store_only` (ADR-0061) keeps this route
+# self-contained: the chain is p1's own store alone, and the Codex CLI auth file is
+# never read. Drop the field to restore the legacy borrow-the-CLI chain.
+kind       = "codex-oauth"
+store_only = true
 
 [adapter_settings]
 account = "codex-subscription"

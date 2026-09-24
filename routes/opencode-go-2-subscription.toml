@@ -10,11 +10,12 @@ adapter      = "openai-chat"
 endpoint     = "https://opencode.ai/zen/go/v1/chat/completions"
 
 [credential]
-# A reference, never a value: the environment variable first, then the two CLI logins
-# that hold this subscription's key.
-kind   = "api-key"
-env    = "OPENCODE_GO_2_API_KEY"
-borrow = []
+# A reference, never a value. `store_only` (ADR-0061): the documented variable
+# below and p1's own store, and no CLI login file is ever read.
+kind       = "api-key"
+env        = "OPENCODE_GO_2_API_KEY"
+borrow     = []
+store_only = true
 
 [adapter_settings]
 dialect        = "thinking-with-reasoning-alias"

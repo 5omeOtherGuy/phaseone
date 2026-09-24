@@ -725,6 +725,7 @@ mod tests {
                 kind,
                 env: None,
                 borrow: vec![],
+                store_only: false,
             },
         }
     }

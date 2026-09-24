@@ -8,9 +8,10 @@
 //!
 //! The key is read from STDIN, never from an argument: arguments land in shell
 //! history and in `ps`. It never reaches stdout, stderr, an error or a `Debug`; the
-//! store file is the only place it is written. Browser and OAuth logins stay borrowed
-//! from the official CLIs, so a route of any other kind is a usage error that says
-//! where its login comes from.
+//! store file is the only place it is written. An OAuth route is a usage error:
+//! a legacy one says which CLI login it borrows, and a `store_only` one says that
+//! its credential belongs in p1's store, that `p1 login` cannot write an OAuth entry
+//! yet, and that the CLI login is not read (ADR-0061). No OAuth flow is pretended.
 
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
@@ -189,6 +190,18 @@ fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a Rout
     };
     match route.credential.kind {
         CredentialKind::ApiKey => Ok(route),
+        // A self-contained OAuth route reads p1's own store only (ADR-0061). Sending
+        // the operator to that CLI's login would be wrong: this route does not read
+        // it. p1 has no OAuth flow yet, so the error says exactly that and never
+        // pretends one exists.
+        kind if route.credential.store_only => Err(format!(
+            "route `{route_id}` is a {} route with `store_only`: its credential is read from \
+             p1's own store, and `p1 login` cannot write an OAuth entry yet. p1 has no \
+             independent OAuth flow, so the grant has to come from elsewhere; the {} login is \
+             NOT read by this route",
+            kind.name(),
+            login_owner(kind)
+        )),
         kind => Err(format!(
             "route `{route_id}` is a {} route; its login comes from {}, not from p1's store",
             kind.name(),

@@ -95,6 +95,13 @@ pub struct CredentialSpec {
     /// Borrowed store entries, tried in this order after the store.
     #[serde(default)]
     pub borrow: Vec<BorrowSource>,
+    /// Self-contained credential policy (ADR-0061): the chain is the documented
+    /// environment variable and p1's own store ONLY. No other tool's login file is
+    /// opened, so a Claude/Codex route cannot silently fall back to the CLI that
+    /// happens to be installed. Absent (the default) keeps the legacy chain, where
+    /// the two OAuth kinds add the CLI's own login after p1's store.
+    #[serde(default)]
+    pub store_only: bool,
 }
 
 impl CredentialSpec {
@@ -113,6 +120,13 @@ impl CredentialSpec {
             return Err(
                 "`[credential]` kind \"api-key\" names no environment variable; write \
                  `env = \"…\"` with the documented variable for this route"
+                    .into(),
+            );
+        }
+        if self.store_only && !self.borrow.is_empty() {
+            return Err(
+                "`[credential]` sets `store_only` and also lists `borrow` entries; a \
+                 store-only route reads only its environment variable and p1's store"
                     .into(),
             );
         }

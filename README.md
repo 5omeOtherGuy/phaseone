@@ -26,8 +26,15 @@ p1 logout opencode-go-2-subscription    # removes that route's entry
 The key is written to `~/.config/p1/auth.json` (0600 in a 0700 directory); a store
 anyone but the owner can read is refused. Piped input works as well:
 `p1 login <route> < keyfile`. A documented environment variable still wins over the
-store, and `login` says so when it does. Browser logins stay borrowed from the Claude
-Code and Codex CLIs (`docs/design/credentials.md` §6).
+store, and `login` says so when it does.
+
+Every shipped route is self-contained (`store_only`, ADR-0061): p1 reads its own store
+and the route's documented environment variable, and never another tool's login file —
+no Pi, OpenCode, Claude Code or Codex credentials at runtime. `p1 login --list` marks
+such a route `[p1 store only]`. The two OAuth routes need an independent grant in p1's
+store; copying a live CLI refresh token is unsafe because it rotates, and p1 does not
+ship an OAuth browser flow yet, so `p1 login <oauth-route>` says so instead of pointing
+at the CLI (`docs/design/credentials.md` §8).
 
 ## What makes it different
 
