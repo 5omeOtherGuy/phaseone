@@ -234,6 +234,9 @@ pub fn usage() -> String {
     out.push_str(
         "  --max-idle-summaries N\n                    most consecutive context summaries without a workspace change\n                    before an unattended run stalls (default: 6; 0 disables)\n",
     );
+    out.push_str(
+        "  --                end option and subcommand parsing; every later token is\n                    the prompt verbatim (e.g. `p1 -- envs` sends \"envs\")\n",
+    );
     out
 }
 
@@ -282,6 +285,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut tui = false;
     let mut yes = false;
     let mut prompt_words: Vec<String> = Vec::new();
+    // `--` ends option and subcommand parsing: every later token is a prompt word,
+    // verbatim, even one that looks like a typo of a subcommand (issue #83).
+    let mut literal_prompt = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -315,6 +321,16 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             "--ask" => ask = true,
             "--yes" => yes = true,
             "--tui" => tui = true,
+            // `--` ends option/subcommand parsing; the rest is the prompt.
+            "--" => {
+                literal_prompt = true;
+                index += 1;
+                while index < args.len() {
+                    prompt_words.push(args[index].clone());
+                    index += 1;
+                }
+                break;
+            }
             // Validated by `parse_sandbox`/`parse_env_pass`/`parse_max_continuations`
             // /`parse_provider_retries` after the loop; the values are consumed here
             // so they are not mistaken for prompt words.
@@ -335,6 +351,21 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             other => prompt_words.push(other.to_string()),
         }
         index += 1;
+    }
+
+    // A single positional token shaped like a subcommand and near one is a typo,
+    // not a prompt: error before any provider is contacted (issue #83). `--`
+    // suppresses this, because it says the token IS the prompt.
+    if !literal_prompt
+        && prompt_words.len() == 1
+        && let Some(suggestion) = unknown_command_suggestion(&prompt_words[0])
+    {
+        let word = &prompt_words[0];
+        return Err(CliError {
+            message: format!(
+                "unknown command '{word}' — did you mean '{suggestion}'? (to send it as a prompt: p1 -- {word})"
+            ),
+        });
     }
 
     if resume && session.is_none() {
@@ -416,6 +447,63 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         provider_retries,
         max_idle_summaries,
     })
+}
+
+/// The subcommands a first positional token can name. Kept in one place so a
+/// near miss suggests from the same list the parser dispatches on.
+const SUBCOMMANDS: [&str; 6] = ["models", "env", "workflow", "usage", "login", "logout"];
+
+/// The subcommand a lone positional `token` most likely meant, or `None` when it
+/// is not a typo (issue #83). A typo is shaped like a command (`^[a-z][a-z-]*$`),
+/// is not itself a subcommand, and is either an exact plural/singular of one or
+/// within edit distance 2 of one.
+fn unknown_command_suggestion(token: &str) -> Option<&'static str> {
+    if !is_command_shaped(token) {
+        return None;
+    }
+    let mut best: Option<(usize, &'static str)> = None;
+    for name in SUBCOMMANDS {
+        // An exact subcommand is never a typo, even after flags (e.g. `--ask models`).
+        if token == name {
+            return None;
+        }
+        let singular = name.strip_suffix('s').unwrap_or(name);
+        let distance = if token == singular || token == format!("{name}s") {
+            0
+        } else {
+            edit_distance(token, name)
+        };
+        if distance <= 2 && best.is_none_or(|(best, _)| distance < best) {
+            best = Some((distance, name));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+/// `^[a-z][a-z-]*$`: a lowercase word that starts with a letter and holds only
+/// letters and hyphens. A prompt with capitals, digits, spaces or punctuation is
+/// left alone.
+fn is_command_shaped(token: &str) -> bool {
+    let mut chars = token.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c == '-')
+}
+
+/// The Levenshtein distance between `a` and `b`, one row at a time.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, left) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left != right);
+            current[j + 1] = (previous[j + 1] + 1).min(current[j] + 1).min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
 }
 
 fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
@@ -1316,5 +1404,78 @@ mod tests {
         assert!(parse(&args(&["models", "--bogus"])).is_err());
         assert!(parse(&args(&["models", "--models"])).is_err());
         assert!(usage().contains("p1 models [SEARCH]"));
+    }
+
+    /// A lone word that is a near miss for a subcommand is a usage error naming the
+    /// command meant, never a prompt (issue #83).
+    #[test]
+    fn a_lone_near_miss_for_a_subcommand_is_a_usage_error() {
+        for (typo, meant) in [
+            ("envs", "env"),
+            ("model", "models"),
+            ("usge", "usage"),
+            ("workfow", "workflow"),
+            ("logi", "login"),
+            ("loguot", "logout"),
+        ] {
+            let error = parse(&args(&[typo])).unwrap_err();
+            assert!(
+                error.message.contains(&format!("unknown command '{typo}'")),
+                "{typo}: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains(&format!("did you mean '{meant}'?")),
+                "{typo}: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains(&format!("p1 -- {typo}")),
+                "{typo}: {}",
+                error.message
+            );
+        }
+    }
+
+    /// Several words, a far-off single word, a capitalized word and `--` are all
+    /// prompts: only a lone near miss is an error.
+    #[test]
+    fn a_prompt_that_is_not_a_near_miss_is_kept() {
+        let prompt = |options: Options| match options.command {
+            Command::Run { prompt } => prompt,
+            other => panic!("expected a run, got {other:?}"),
+        };
+
+        assert_eq!(
+            prompt(parse(&args(&["fix", "the", "bug"])).unwrap()),
+            Some("fix the bug".to_string())
+        );
+        assert_eq!(
+            prompt(parse(&args(&["refactor"])).unwrap()),
+            Some("refactor".to_string())
+        );
+        // The shape guard: capitals, digits and punctuation are never a command.
+        assert_eq!(
+            prompt(parse(&args(&["Envs"])).unwrap()),
+            Some("Envs".to_string())
+        );
+        // `--` ends parsing: the token is the prompt, typo or not.
+        assert_eq!(
+            prompt(parse(&args(&["--", "envs"])).unwrap()),
+            Some("envs".to_string())
+        );
+        // An exact subcommand after a flag is a prompt, not a typo.
+        assert_eq!(
+            prompt(parse(&args(&["--ask", "models"])).unwrap()),
+            Some("models".to_string())
+        );
+    }
+
+    /// The help text documents `--`.
+    #[test]
+    fn help_documents_the_double_dash() {
+        let usage = usage();
+        assert!(usage.contains("  --  "), "{usage}");
+        assert!(usage.contains("p1 -- envs"), "{usage}");
     }
 }

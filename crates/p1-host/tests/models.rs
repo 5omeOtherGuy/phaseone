@@ -1098,6 +1098,9 @@ async fn resume_onto_another_model_continues_the_session() {
             workspace.path().to_str().unwrap(),
             "--session",
             session.to_str().unwrap(),
+            // `--` because `one` is a lone word within edit distance 2 of `env`,
+            // which the parser now rejects as a subcommand typo (issue #83).
+            "--",
             "one",
         ],
     )
