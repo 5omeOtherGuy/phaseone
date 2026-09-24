@@ -1,0 +1,31 @@
+route   = "opencode-go-3-subscription"
+profile = "deepseek-v4.1-flash"
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "finish"
+
+# Copied from environments/deepseek, not measured on this route: the runs behind these values
+# (split4a and its successors, docs/dogfood/runs.jsonl) ran on an earlier OpenCode Go account. The
+# 1M window is what the model's vendor states for its own API; OpenCode Go documents no window for
+# this endpoint (research #27). This is the account that serves work now. Summarize late, keep a
+# long tail — a task that must hold several large files at once thrashes below ~100k.
+[context]
+window_tokens = 1000000
+output_headroom_tokens = 32000
+summarize_at_tokens = 300000
+keep_recent_tokens = 60000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000

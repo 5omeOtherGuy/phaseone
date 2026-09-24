@@ -1,7 +1,7 @@
 ---
 adr: 62
 title: A plan refusal is its own provider error kind; it is never refreshed or retried
-status: proposed
+status: accepted
 date: 2026-09-24
 deciders: lead
 supersedes: []

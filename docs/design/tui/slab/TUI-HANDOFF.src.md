@@ -463,6 +463,7 @@ Input deltas are display-only: nothing is kept after `ToolStarted`.
 | ProviderFailed Authentication | `✗ authentication failed · <route>` | | journal | `p1 login <route>` |
 | ProviderFailed InsufficientBalance | `✗ account exhausted · <route> · not retried` | | journal | `/model` another route |
 | ProviderFailed NotEntitled | `✗ not included in the plan · <message> · not retried` | | journal | `/model` another route |
+| ProviderFailed UsageLimitExhausted | `✗ usage limit reached · <message> · not retried` | | journal | wait for the reset, or `/model` |
 | ProviderFailed RateLimited | `✗ rate limited · <route>` | | journal | `wait, or /model` |
 | ProviderFailed Transport | `✗ connection failed · <message>` | lost streamed text size | journal | `⏎ resend` |
 | ProviderFailed Protocol / InvalidRequest | `✗ provider error · <kind> · <message>` | | journal | |

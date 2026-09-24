@@ -1,0 +1,29 @@
+# ClinePass subscription #1 (owner's "Cline Pass" subscriptions; keys-worker 2026-09-24).
+# Official route outside Cline: docs.cline.bot/getting-started/clinepass.md — OpenAI-compatible
+# Chat Completions at api.cline.bot with a per-account API key (app.cline.bot > Account > API Keys),
+# model slugs "cline-pass/<model>". Usage is metered against the subscription's 5-hour, weekly
+# and monthly limits, not against Cline credits (dashboard "Credits Used 0.0000" for these slugs).
+# Only "cline-pass/" wire ids appear below: a bare id (e.g. "z-ai/glm-5.3") is Cline's
+# pay-as-you-go catalogue and would bill Cline credits.
+id           = "cline-pass-1"
+origin_route = "openai-chat/cline-pass-1"
+adapter      = "openai-chat"
+endpoint     = "https://api.cline.bot/api/v1/chat/completions"
+
+[credential]
+# A reference, never a value. Key file: ~/.config/keys/cline-pass-1.key, loaded with `p1 login cline-pass-1`.
+kind       = "api-key"
+store_only = true
+env        = "CLINE_PASS_1_API_KEY"
+borrow     = []
+
+[adapter_settings]
+# The stream carries reasoning as the OpenRouter-style "reasoning" delta (the alias this
+# dialect accepts; retained-thinking rejects it: "reasoning alias is not supported").
+dialect = "thinking-with-reasoning-alias"
+
+# Owner decision 2026-09-24 21:55: DeepSeek V4.1 Flash and/or GLM-5.3 Flash ONLY on ClinePass.
+# GLM-5.3 Flash (`cline-pass/glm-5.3-flash`) joins once p1 accepts its stream's repeated finish
+# chunk (#115); until then only DeepSeek V4.1 Flash is bound.
+[models."deepseek-v4.1-flash"]
+wire_model = "cline-pass/deepseek-v4.1-flash"
