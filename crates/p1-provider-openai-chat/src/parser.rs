@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 
 pub(crate) struct ChatParser {
     origin: Origin,
-    dialect: ChatDialect,
     blocks: Vec<AssistantBlock>,
     calls: BTreeMap<u64, usize>,
     text: Option<usize>,
@@ -19,10 +18,9 @@ pub(crate) struct ChatParser {
     ended: bool,
 }
 impl ChatParser {
-    pub(crate) fn new(origin: Origin, dialect: ChatDialect) -> Self {
+    pub(crate) fn new(origin: Origin, _dialect: ChatDialect) -> Self {
         Self {
             origin,
-            dialect,
             blocks: Vec::new(),
             calls: BTreeMap::new(),
             text: None,
@@ -176,12 +174,8 @@ impl ResponseParser for ChatParser {
             {
                 return self.fail("invalid tool delta list");
             }
-            if self.dialect != ChatDialect::ThinkingWithReasoningAlias
-                && delta.get("reasoning").is_some_and(|value| !value.is_null())
-            {
-                return self.fail("reasoning alias is not supported by this chat dialect");
-            }
-            // This dialect declares the alias equivalent to the replayable reasoning field.
+            // Both dialects declare the alias equivalent to the replayable reasoning field.
+            // When both arrive in one delta, reasoning_content wins and the alias is ignored.
             if let Some(part) = delta
                 .get("reasoning_content")
                 .and_then(Value::as_str)
@@ -394,6 +388,7 @@ fn map_usage(value: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChatDialect;
     use serde_json::json;
     fn parser() -> ChatParser {
         ChatParser::new(
@@ -628,11 +623,76 @@ mod tests {
         assert_eq!(replay.origin.model, "configured");
         assert_eq!(replay.payload, json!("preserve 雪\n"));
     }
+
+    #[test]
+    fn retained_thinking_accepts_reasoning_alias_as_reasoning_delta() {
+        let mut p = ChatParser::new(
+            crate::test_config::route(true).origin("configured"),
+            ChatDialect::RetainedThinking,
+        );
+        let events = send(
+            &mut p,
+            choice(json!({"reasoning":"preserve 雪\n"}), json!(null)),
+        );
+        assert_eq!(
+            events,
+            vec![StreamEvent::ReasoningDelta {
+                block: 0,
+                text: "preserve 雪\n".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reasoning_content_takes_precedence_over_reasoning_alias_in_both_dialects() {
+        for dialect in [
+            ChatDialect::ThinkingWithReasoningAlias,
+            ChatDialect::RetainedThinking,
+        ] {
+            let mut p = ChatParser::new(
+                crate::test_config::route(matches!(dialect, ChatDialect::RetainedThinking))
+                    .origin("configured"),
+                dialect,
+            );
+            let events = send(
+                &mut p,
+                choice(
+                    json!({"reasoning_content":"canonical", "reasoning":"alias"}),
+                    json!(null),
+                ),
+            );
+            assert_eq!(
+                events,
+                vec![StreamEvent::ReasoningDelta {
+                    block: 0,
+                    text: "canonical".into(),
+                }],
+                "{dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_string_reasoning_alias_keeps_the_existing_type_error() {
+        let mut p = ChatParser::new(
+            crate::test_config::route(true).origin("configured"),
+            ChatDialect::RetainedThinking,
+        );
+        let events = send(&mut p, choice(json!({"reasoning": 17}), json!(null)));
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Finished(Outcome::Failed(ProviderError {
+                kind: ProviderErrorKind::Protocol,
+                message,
+            }))] if message == "invalid chat text delta type"
+        ));
+    }
 }
 
 #[cfg(test)]
 mod block_order_tests {
     use super::*;
+    use crate::ChatDialect;
     use serde_json::json;
     #[test]
     fn text_and_reasoning_blocks_keep_their_sequence() {
@@ -660,6 +720,7 @@ mod block_order_tests {
 #[cfg(test)]
 mod malformed_tests {
     use super::*;
+    use crate::ChatDialect;
     use serde_json::json;
     #[test]
     fn malformed_deltas_fail_instead_of_becoming_empty_success() {
