@@ -27,6 +27,8 @@ const NO_BALANCE_WORDS: [&str; 5] = [
     "quota_exceeded",
     "billing_error",
 ];
+const NOT_ENTITLED_MESSAGE: &str = "the account's plan does not allow this model on this route";
+const NOT_ENTITLED_WORDS: [&str; 3] = ["freetiererror", "not_entitled", "plan_not_allowed"];
 /// The four fixed positions a no-balance word may occupy, as JSON pointers.
 const POSITIONS: [&str; 4] = ["error/type", "error/code", "type", "code"];
 
@@ -181,6 +183,55 @@ async fn each_allow_listed_word_in_any_of_the_four_positions_is_insufficient_bal
             );
         }
     }
+}
+
+#[tokio::test]
+async fn each_plan_refusal_word_in_any_position_is_not_entitled() {
+    for word in NOT_ENTITLED_WORDS {
+        for position in POSITIONS {
+            let body = error_body(position, word);
+            let (provider, transport, credentials) = provider(vec![error_response(403, &body)]);
+            let error = failed(finish(&provider).await);
+
+            assert_eq!(
+                error.kind,
+                ProviderErrorKind::NotEntitled,
+                "{position} {word}"
+            );
+            assert_eq!(error.message, NOT_ENTITLED_MESSAGE, "{position} {word}");
+            assert_eq!(
+                transport.requests().len(),
+                1,
+                "{position} {word}: no refresh and no re-send"
+            );
+            assert_eq!(
+                credentials.refreshes.load(Ordering::SeqCst),
+                0,
+                "{position} {word}: the credential is not refreshed"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_free_tier_error_shape_is_not_entitled_and_hides_the_server_text() {
+    // The observed live shape: HTTP 403 for a model gated to OpenCode's client,
+    // with a valid key. Case-insensitive, and the free text is never copied.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": {"type": "fReEtIeReRrOr", "message": SENTINEL},
+    }))
+    .unwrap();
+    let (provider, transport, credentials) = provider(vec![error_response(403, &body)]);
+    let error = failed(finish(&provider).await);
+
+    assert_eq!(error.kind, ProviderErrorKind::NotEntitled);
+    assert_eq!(error.message, NOT_ENTITLED_MESSAGE);
+    assert!(
+        !format!("{error} {error:?}").contains(SENTINEL),
+        "the body text leaked into {error:?}"
+    );
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(credentials.refreshes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
