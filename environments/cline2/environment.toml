@@ -1,0 +1,29 @@
+route   = "cline-pass-2"
+profile = "glm-5.3-clinepass"
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "finish"
+
+# Proven on this route: requests of 203k input tokens worked (run split3c-glm); the catalog
+# claims more, unverified. Summarize well below the proven size, keep a long tail — a tight
+# threshold makes a multi-file task thrash (run split4a-deepseek, docs/dogfood/runs.jsonl).
+[context]
+window_tokens = 260000
+output_headroom_tokens = 32000
+summarize_at_tokens = 150000
+keep_recent_tokens = 50000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000

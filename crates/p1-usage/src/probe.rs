@@ -50,7 +50,14 @@ impl Shape {
             // known endpoint stays unsupported: guessing one from its name would probe
             // somebody else's service with the owner's credential.
             CredentialKind::ApiKey => match route.route_id.as_str() {
-                "opencode-go-subscription" | "opencode-go-2-subscription" => Some(Self::OpenCodeGo),
+                // Every OpenCode Go account route speaks the same `/zen/go/v1` surface. The Zen
+                // FREE routes (`opencode-zen-*`) deliberately do NOT map here: no Zen usage
+                // endpoint is established anywhere (docs/design/usage.md), so they stay
+                // `Unsupported` rather than probing a guessed URL with the owner's credential.
+                "opencode-go-subscription"
+                | "opencode-go-1-subscription"
+                | "opencode-go-2-subscription"
+                | "opencode-go-3-subscription" => Some(Self::OpenCodeGo),
                 "kimi-coding-subscription" => Some(Self::Kimi),
                 "glm-subscription" => Some(Self::Glm),
                 _ => None,
@@ -797,7 +804,15 @@ mod tests {
             Some("https://opencode.ai/zen/go/v1/usage")
         );
         assert_eq!(
+            url("opencode-go-1-subscription"),
+            Some("https://opencode.ai/zen/go/v1/usage")
+        );
+        assert_eq!(
             url("opencode-go-2-subscription"),
+            Some("https://opencode.ai/zen/go/v1/usage")
+        );
+        assert_eq!(
+            url("opencode-go-3-subscription"),
             Some("https://opencode.ai/zen/go/v1/usage")
         );
         assert_eq!(
@@ -809,6 +824,13 @@ mod tests {
             Some("https://api.z.ai/api/monitor/usage/quota/limit")
         );
         assert_eq!(url("some-other-key-route"), None);
+        // The Zen FREE accounts have NO established usage endpoint (`https://opencode.ai/zen/v1`
+        // documents none), so they must stay unsupported: probing a guessed URL would send the
+        // owner's credential to a path nobody verified.
+        assert_eq!(url("opencode-zen-1"), None);
+        assert_eq!(url("opencode-zen-2"), None);
+        assert_eq!(url("opencode-zen-3"), None);
+        assert_eq!(url("opencode-zen-free"), None);
         let oauth =
             |kind| Shape::of(&fixture_route_of("anthropic-subscription", kind)).map(Shape::url);
         assert_eq!(

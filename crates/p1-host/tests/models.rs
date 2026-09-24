@@ -230,8 +230,16 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "claude/claude-opus-5-5",
             "claude/claude-sonnet-4-6",
             "claude/claude-sonnet-5",
+            // The two ClinePass accounts bind the ClinePass variants of glm-5.3 and kimi-k3
+            // (thinking "enabled": the gateway streams the `reasoning` alias, #100).
+            "cline/glm-5.3-clinepass",
+            "cline/kimi-k3-clinepass",
+            "cline2/glm-5.3-clinepass",
+            "cline2/kimi-k3-clinepass",
             "deepseek/deepseek-v4.1-flash",
+            "deepseek1/deepseek-v4.1-flash",
             "deepseek2/deepseek-v4.1-flash",
+            "deepseek3/deepseek-v4.1-flash",
             "glm/glm-5.3",
             "gpt/gpt-5.5",
             "gpt/gpt-5.6-luna",
@@ -241,6 +249,17 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "gpt/gpt-6-luna",
             "gpt/gpt-6-sol",
             "kimi/kimi-k3",
+            // The three free Zen accounts: every account route binds all three free models, so
+            // each environment lists them and `<env>/<profile>` selects the account × model pair.
+            "zen/mimo-v2.6-flash-free",
+            "zen/muse-spark-1.3-contributor-free",
+            "zen/space-bunny-free",
+            "zen2/mimo-v2.6-flash-free",
+            "zen2/muse-spark-1.3-contributor-free",
+            "zen2/space-bunny-free",
+            "zen3/mimo-v2.6-flash-free",
+            "zen3/muse-spark-1.3-contributor-free",
+            "zen3/space-bunny-free",
         ],
         "sorted by environment then profile"
     );
@@ -266,6 +285,60 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         .expect("the second account serves the same profile");
     assert_eq!(deepseek.efforts_line(), "high,max");
     assert_eq!(deepseek.route, "opencode-go-2-subscription");
+    // The first and third Go accounts are their own routes too: same profile, same efforts,
+    // different account (and therefore a different stored session, ADR-0033).
+    for (id, route) in [
+        (
+            "deepseek1/deepseek-v4.1-flash",
+            "opencode-go-1-subscription",
+        ),
+        (
+            "deepseek3/deepseek-v4.1-flash",
+            "opencode-go-3-subscription",
+        ),
+    ] {
+        let model = models
+            .iter()
+            .find(|model| model.id() == id)
+            .unwrap_or_else(|| panic!("the shipped {id} model"));
+        assert_eq!(model.route, route, "{id}");
+        assert_eq!(model.efforts_line(), "high,max", "{id}");
+    }
+    // Every Zen account serves every free model, and each free profile keeps its own efforts.
+    for environment in ["zen", "zen2", "zen3"] {
+        let served: Vec<&str> = models
+            .iter()
+            .filter(|model| model.environment == environment)
+            .map(|model| model.profile.as_str())
+            .collect();
+        assert_eq!(
+            served,
+            [
+                "mimo-v2.6-flash-free",
+                "muse-spark-1.3-contributor-free",
+                "space-bunny-free"
+            ],
+            "{environment}: every account binds the same free models"
+        );
+    }
+    let muse = models
+        .iter()
+        .find(|model| model.id() == "zen3/muse-spark-1.3-contributor-free")
+        .expect("the shipped Muse Spark profile");
+    assert_eq!(muse.route, "opencode-zen-3");
+    assert_eq!(muse.efforts_line(), "low,high");
+    let bunny = models
+        .iter()
+        .find(|model| model.id() == "zen/space-bunny-free")
+        .expect("the shipped Space Bunny profile");
+    assert_eq!(bunny.route, "opencode-zen-1");
+    assert_eq!(bunny.efforts_line(), "low,high,max");
+    let mimo = models
+        .iter()
+        .find(|model| model.id() == "zen2/mimo-v2.6-flash-free")
+        .expect("the shipped Mimo profile");
+    assert_eq!(mimo.route, "opencode-zen-2");
+    assert_eq!(mimo.efforts_line(), "high");
     let kimi = models
         .iter()
         .find(|model| model.id() == "kimi/kimi-k3")

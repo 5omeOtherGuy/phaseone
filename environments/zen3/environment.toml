@@ -1,0 +1,30 @@
+route   = "opencode-zen-3"
+profile = "space-bunny-free"
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "finish"
+
+# The model metadata states a 1,048,576-token context and a 524,288-token output limit. The
+# second value is what leaves room for the next response, so it is the headroom; summarizing
+# then starts below the remaining input wall (524,288). Keep a long recent tail for multi-file
+# work. Operational values for this route, not a capacity claim.
+[context]
+window_tokens = 1048576
+output_headroom_tokens = 524288
+summarize_at_tokens = 450000
+keep_recent_tokens = 60000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000

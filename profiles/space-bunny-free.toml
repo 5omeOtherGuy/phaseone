@@ -1,0 +1,18 @@
+# What the model is, independent of the route that reaches it (ADR-0039).
+# Values verified from opencode's model metadata (provider `opencode`, model `space-bunny-free`):
+# reasoning true, interleaved reasoning_content, limit.context 1048576, limit.output 524288. The
+# metadata has no separate family field; the family label follows the canonical model id.
+id        = "space-bunny-free"
+revision  = 1
+model_id  = "space-bunny-free"
+family    = "space-bunny"
+thinking  = "enabled"
+
+# Metadata lists low, medium, high, xhigh and max effort. The compiled chat adapter can encode
+# low, high and max (crates/p1-provider-openai-chat/src/lib.rs), so only those are selectable
+# here; the levels it cannot encode stay unstated rather than silently remapped.
+efforts        = ["low", "high", "max"]
+default_effort = "high"
+
+context_tokens    = 1048576
+max_output_tokens = 524288

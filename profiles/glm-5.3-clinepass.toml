@@ -1,0 +1,13 @@
+# ClinePass variant of glm-5.3 (keys-worker 2026-09-24). Same model as glm-5.3.toml, but thinking = "enabled":
+# api.cline.bot streams reasoning as the "reasoning" alias, which the retained-thinking dialect that
+# "preserved" needs rejects. Follow-up for the p1 lead: let retained-thinking accept the alias, then drop this file.
+id        = "glm-5.3-clinepass"
+revision  = 1
+model_id  = "glm-5.3"
+family    = "glm"
+thinking  = "enabled"
+
+efforts        = ["low", "high", "max"]
+default_effort = "high"
+
+max_output_tokens = 131072

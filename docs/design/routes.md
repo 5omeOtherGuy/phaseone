@@ -189,6 +189,47 @@ use a `key` member. Only the selected entry is used. These are read by the crede
 source, never printed or included in the environment manifest. p1 does not execute
 Pi command-backed key configuration; use the environment variable in that case.
 
+**Three accounts (2026-09-24, data only).** The owner has three Go subscriptions. Each is its own
+route — `opencode-go-1-subscription` (`OPENCODE_GO_1_API_KEY`; allowance used up until 2026-10-07, HTTP 402 until then),
+`opencode-go-2-subscription` (`OPENCODE_GO_2_API_KEY`) and `opencode-go-3-subscription`
+(`OPENCODE_GO_3_API_KEY`, the current primary) — because a stored session resumes only on the route
+that recorded it (ADR-0033). `opencode-go-subscription` keeps its id and `OPENCODE_API_KEY` and is a
+compatibility alias for the Go-3 account. Environments `deepseek1` and `deepseek3` name the first
+and third accounts; `deepseek` and `deepseek2` are unchanged.
+
+## C2. Free models on OpenCode Zen (`openai-chat/opencode-zen-1`, `-2`, `-3`, alias `-free`)
+
+**[docs + live, 2026-09-24]** `POST https://opencode.ai/zen/v1/chat/completions` — the Zen gateway
+itself, one `/v1` up from the Go subscription surface, reached with the same openai-chat adapter,
+`thinking-with-reasoning-alias` dialect and `x-opencode-session` header. Each of the owner's three
+Zen accounts is its own store-only route with its own variable (`OPENCODE_ZEN_1_API_KEY`,
+`_2_`, `_3_`); `opencode-zen-free` keeps its original name and `OPENCODE_ZEN_API_KEY` as the
+compatibility alias for Zen-1. Every route binds the same three free wire ids — `space-bunny-free`,
+`mimo-v2.6-flash-free` and `muse-spark-1.3-contributor-free` (metadata cost 0 per token, so no paid
+fallback exists) — and environments `zen`, `zen2`, `zen3` all default to `space-bunny-free`, so a
+workflow can spread work across accounts. **[live, 2026-09-24]** Space Bunny answers every account
+key from p1; MiMo and Muse answer HTTP 403 `FreeTierError` ("free tier can only be used from within
+OpenCode") to a non-OpenCode client, with or without a real Zen key — bound, but not usable from p1. No Zen usage endpoint is established, so these routes probe as
+unsupported (`docs/design/usage.md`). The Muse Spark model's metadata hint (`@ai-sdk/openai`) is
+not yet confirmed by a live request on this endpoint.
+
+
+## C3. ClinePass subscriptions (`openai-chat/cline-pass-1`, `-2`)
+
+**[docs + live, 2026-09-24]** `POST https://api.cline.bot/api/v1/chat/completions` — the documented
+way to use a ClinePass subscription outside Cline (docs.cline.bot/getting-started/clinepass.md): an
+OpenAI-compatible Chat Completions API, a per-account API key (app.cline.bot → Account → API Keys),
+wire ids `cline-pass/<model>`. Each of the owner's two subscriptions is its own store-only route
+(`CLINE_PASS_1_API_KEY`, `CLINE_PASS_2_API_KEY`); environments `cline` and `cline2`. Only
+`cline-pass/` ids are bound: a bare id (`z-ai/glm-5.3`) is Cline's pay-as-you-go catalogue and bills
+Cline credits instead of the subscription (the dashboard showed 0.0000 credits used for the
+`cline-pass/` test calls). The stream carries reasoning as the OpenRouter-style `reasoning` delta, so
+the routes use `thinking-with-reasoning-alias` and bind the `glm-5.3-clinepass` / `kimi-k3-clinepass`
+profiles (thinking `enabled`); once #100 lets `retained-thinking` accept the alias they move to the
+preserved-thinking `glm-5.3` / `kimi-k3` profiles and the two stopgap profiles go. Usage is metered
+per subscription in a rolling 5-hour, a weekly and a monthly window; no usage endpoint is
+established, so the routes probe as unsupported.
+
 ## D. GLM on its Z.ai coding subscription (`openai-chat/glm-subscription`)
 
 **[docs + live, 2026-09-20]** `POST https://api.z.ai/api/coding/paas/v4/chat/completions`.
