@@ -68,6 +68,9 @@ else `~/.claude/.credentials.json`. Refresh: `POST https://platform.claude.com/v
 header `anthropic-beta: oauth-2025-04-20`, JSON `{grant_type:"refresh_token", refresh_token,
 client_id, scope}`; the refresh token ROTATES and must be written back to the same file
 atomically (another tool — Claude Code itself — shares it). 401/403 → one forced refresh, once.
+Self-contained since ADR-0061: the shipped route sets `store_only`, so it reads the documented
+token and p1's own store and never this file; the borrowed source above survives only for a route
+that omits the field (`docs/design/credentials.md` §8).
 
 ## B. ChatGPT/Codex subscription — OpenAI Responses  (`openai-codex-responses`)
 
@@ -121,6 +124,9 @@ Refresh: `POST https://auth.openai.com/oauth/token`, form `grant_type=refresh_to
 refresh_token, client_id`; the refresh token ROTATES → atomic write-back under a file lock,
 because the Codex CLI shares the file. **[todo-live]** field layout of that file is read from
 the Codex CLI's own source/docs, never by dumping the owner's file.
+Self-contained since ADR-0061: the shipped route sets `store_only` and reads p1's own store
+instead, so this CLI file is not read at runtime; minting p1's own grant is the remaining work
+(`docs/design/credentials.md` §8).
 
 ## C. What the two routes force into the contracts
 
@@ -207,9 +213,10 @@ Following ADR-0039 migration step 2, `p1-provider-openai-chat` takes an injected
 The closed subscription-route enum is gone. `ChatRoute` carries origin, endpoint,
 non-secret headers, optional session header, wire dialect and route output ceiling.
 `ChatDialect` names implemented encodings (`ThinkingWithReasoningAlias` or
-`RetainedThinking`), never vendors; only the former permits the `reasoning` replay alias.
-The constructor rejects incompatible continuation requirements, unsupported efforts,
-credential-bearing URLs/known credential headers and invalid route settings.
+`RetainedThinking`), never vendors. Both dialects accept `reasoning` as a streaming alias for
+replayable `reasoning_content`; the retained dialect additionally supports preserved thinking
+and streaming function inputs. The constructor rejects incompatible continuation requirements,
+unsupported efforts, credential-bearing URLs/known credential headers and invalid route settings.
 
 The additive `p1-model-profile` crate depends only on contracts. It holds the currently
 consumed model policy: identity, enabled/preserved thinking, supported/default efforts and
@@ -235,8 +242,8 @@ Unknown options in the adapter namespace are errors. Go enables thinking without
 `clear_thinking` field. Both request streamed usage with `stream_options.include_usage`. GLM also sets
 `tool_stream: true` when tools are present to stream argument fragments.
 
-**Stream:** `choices[0].delta.content`, `reasoning_content` (Go's `reasoning` alias also
-accepted), and indexed function-call fragments. Calls retain first-appearance order;
+**Stream:** `choices[0].delta.content`, `reasoning_content` (the `reasoning` alias is also
+accepted in both dialects), and indexed function-call fragments. Calls retain first-appearance order;
 arguments are concatenated byte-exact and never parsed/repaired. `finish_reason` maps
 stop/tool_calls/length/content_filter to end-turn/tool-use/output-limit/refusal. Completion
 requires `[DONE]` after a finish reason, retaining usage in a later empty-choices chunk.

@@ -238,10 +238,14 @@ async fn post_once(mut state: State) -> State {
                 Raced::Done(bytes) => bytes,
             };
             let error = parser.on_http_error(status, &headers, &body);
-            if error.kind == ProviderErrorKind::InsufficientBalance {
-                // ADR-0046: an exhausted account is not a rejected key. Refreshing
-                // could only fail, and masking the adapter's diagnosis with a
-                // refresh error is the bug this kind exists to end.
+            if matches!(
+                error.kind,
+                ProviderErrorKind::InsufficientBalance | ProviderErrorKind::NotEntitled
+            ) {
+                // ADR-0046 / ADR-0062: an exhausted account or a plan that does
+                // not allow this model is not a rejected key. Refreshing could
+                // only fail, and masking the adapter's diagnosis with a refresh
+                // error is the bug these kinds exist to end.
                 return state.finish(Outcome::Failed(error));
             }
             if state.reauth_used {
@@ -501,6 +505,12 @@ mod tests {
                     "the account has no balance",
                 );
             }
+            if body == b"not-entitled" {
+                return ProviderError::new(
+                    ProviderErrorKind::NotEntitled,
+                    "the account's plan does not allow this model on this route",
+                );
+            }
             let kind = match status {
                 401 | 403 => ProviderErrorKind::Authentication,
                 408 | 425 | 429 | 500..=599 => ProviderErrorKind::Transport,
@@ -627,6 +637,14 @@ mod tests {
         response
     }
 
+    /// A 403 whose body says the plan does not allow this model, the way the chat
+    /// adapter reports one (ADR-0062).
+    fn not_entitled_response() -> ScriptedResponse {
+        let mut response = status_response(403);
+        response.chunks.push(b"not-entitled".to_vec());
+        response
+    }
+
     fn text_turn() -> &'static str {
         "data: delta\n\ndata: done\n\n"
     }
@@ -743,6 +761,31 @@ mod tests {
                 assert_eq!(error.message, "the account has no balance");
             }
             other => panic!("expected an exhausted-account failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn not_entitled_finishes_without_refresh_or_retry() {
+        // ADR-0062: a 403 whose body says the plan does not allow this model is
+        // NOT a rejected key. It must not refresh or retry, like no-balance.
+        // A second response is scripted so a stray request is reported as a plain
+        // count mismatch rather than a transport panic.
+        let harness = Harness::new(vec![not_entitled_response(), ok(text_turn())]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        let refresh_calls = harness.credentials.refresh_calls.lock().unwrap();
+        assert!(refresh_calls.is_empty(), "{refresh_calls:?}");
+        assert_eq!(harness.credentials.access_calls.load(Ordering::SeqCst), 1);
+        match terminal(&events) {
+            Outcome::Failed(error) => {
+                assert_eq!(error.kind, ProviderErrorKind::NotEntitled);
+                assert_eq!(
+                    error.message,
+                    "the account's plan does not allow this model on this route"
+                );
+            }
+            other => panic!("expected a not-entitled failure, got {other:?}"),
         }
     }
 

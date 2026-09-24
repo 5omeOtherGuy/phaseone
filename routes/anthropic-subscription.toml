@@ -10,8 +10,12 @@ adapter      = "anthropic-messages"
 endpoint     = "https://api.anthropic.com"
 
 [credential]
-# A reference, never a value: the compiled Claude Code login source.
-kind = "claude-code-oauth"
+# A reference, never a value. `store_only` (ADR-0061) keeps this route
+# self-contained: the chain is the documented token below (when one is set) and p1's
+# own store, and the Claude Code login file is never read. Drop the field to restore
+# the legacy borrow-the-CLI chain.
+kind       = "claude-code-oauth"
+store_only = true
 
 [adapter_settings]
 account = "claude-code-subscription"

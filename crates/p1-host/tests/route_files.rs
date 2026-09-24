@@ -13,7 +13,7 @@ use std::time::Duration;
 use common::Harness;
 use futures_util::StreamExt;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
-use p1_auth::{BorrowSource, BorrowStore, CredentialKind};
+use p1_auth::CredentialKind;
 use p1_contracts::{
     BoxFuture, CancellationToken, Effort, Item, JournalRecord, ModelOptions, Origin, Outcome,
     Provider, ProviderError, ProviderRequest, StreamEvent, TurnEnd,
@@ -518,18 +518,13 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
     );
     assert_eq!(go.credential.kind, CredentialKind::ApiKey);
     assert_eq!(go.credential.env.as_deref(), Some("OPENCODE_API_KEY"));
-    assert_eq!(
-        go.credential.borrow,
-        vec![
-            BorrowSource {
-                store: BorrowStore::Opencode,
-                key: "opencode-go".into(),
-            },
-            BorrowSource {
-                store: BorrowStore::Pi,
-                key: "opencode-go".into(),
-            },
-        ]
+    // Self-contained since ADR-0061: no other CLI's login is in the chain. The
+    // legacy borrow list still parses and validates (p1-auth's `credential_table`
+    // test), but no shipped route uses one.
+    assert!(go.credential.store_only, "the shipped route is store-only");
+    assert!(
+        go.credential.borrow.is_empty(),
+        "a store-only route lists no borrow source"
     );
     assert_eq!(
         go.settings().expect("the adapter parses its settings"),
@@ -555,13 +550,8 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
     );
     assert_eq!(glm.credential.kind, CredentialKind::ApiKey);
     assert_eq!(glm.credential.env.as_deref(), Some("ZAI_API_KEY"));
-    assert_eq!(
-        glm.credential.borrow,
-        vec![BorrowSource {
-            store: BorrowStore::Pi,
-            key: "zai".into(),
-        }]
-    );
+    assert!(glm.credential.store_only, "the shipped route is store-only");
+    assert!(glm.credential.borrow.is_empty());
     assert_eq!(
         glm.settings().expect("the adapter parses its settings"),
         AdapterSettings::OpenAiChat(ChatAdapterSettings {
@@ -581,19 +571,11 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
     );
     assert_eq!(kimi.credential.kind, CredentialKind::ApiKey);
     assert_eq!(kimi.credential.env.as_deref(), Some("KIMI_API_KEY"));
-    assert_eq!(
-        kimi.credential.borrow,
-        vec![
-            BorrowSource {
-                store: BorrowStore::Pi,
-                key: "kimi-coding".into(),
-            },
-            BorrowSource {
-                store: BorrowStore::Opencode,
-                key: "kimi-code-plan-global".into(),
-            },
-        ]
+    assert!(
+        kimi.credential.store_only,
+        "the shipped route is store-only"
     );
+    assert!(kimi.credential.borrow.is_empty());
     assert_eq!(
         kimi.settings().expect("the adapter parses its settings"),
         AdapterSettings::OpenAiChat(ChatAdapterSettings {

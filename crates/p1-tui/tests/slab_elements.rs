@@ -507,6 +507,41 @@ fn a_transport_failure_names_what_broke_and_what_to_do() {
     assert_row(&lines[2], 76, "el-endings@76", 21);
 }
 
+#[test]
+fn a_plan_refusal_names_the_plan_and_offers_another_route() {
+    let mut t = Transcript::new();
+    stamp(
+        &mut t,
+        0,
+        AgentEvent::TurnFinished {
+            end: TurnEnd::ProviderFailed {
+                error: ProviderError::new(
+                    ProviderErrorKind::NotEntitled,
+                    "the account's plan does not allow this model on this route",
+                ),
+            },
+        },
+    );
+    let rendered: String = rows(&t, 76, None, 0)
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The headline starts a fresh row, so this substring is not split by wrapping.
+    assert!(
+        rendered.contains("not included in the plan"),
+        "the plan refusal gets its own headline: {rendered}"
+    );
+    assert!(
+        !rendered.contains("authentication failed"),
+        "a plan refusal must not read as a key failure: {rendered}"
+    );
+    assert!(
+        rendered.contains("/model"),
+        "the offered next step is another route: {rendered}"
+    );
+}
+
 // ---------- WorkerReport (§6.8) ----------
 
 fn reports() -> Vec<WorkerReport> {

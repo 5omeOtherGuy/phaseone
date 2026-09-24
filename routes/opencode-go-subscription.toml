@@ -10,11 +10,14 @@ adapter      = "openai-chat"
 endpoint     = "https://opencode.ai/zen/go/v1/chat/completions"
 
 [credential]
-# A reference, never a value: the environment variable first, then the two CLI logins
-# that hold this subscription's key.
-kind   = "api-key"
-env    = "OPENCODE_API_KEY"
-borrow = ["opencode:opencode-go", "pi:opencode-go"]
+# A reference, never a value. `store_only` (ADR-0061) keeps this route
+# self-contained: the documented variable below and p1's own store, never the
+# OpenCode or Pi CLI login files. Drop the field to restore the legacy
+# borrow-the-CLI chain.
+kind       = "api-key"
+env        = "OPENCODE_API_KEY"
+borrow     = []
+store_only = true
 
 [adapter_settings]
 dialect        = "thinking-with-reasoning-alias"

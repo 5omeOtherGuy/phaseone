@@ -1044,6 +1044,7 @@ RUNS
 | Cancelled (^C) | `· cancelled at 12.4s` | requests + in/out of the turn | settled calls; the running call settled `cancelled`; `dropped 1 queued` | |
 | ProviderFailed Authentication | `✗ authentication failed · <route>` | | journal | `p1 login <route>` |
 | ProviderFailed InsufficientBalance | `✗ account exhausted · <route> · not retried` | | journal | `/model` another route |
+| ProviderFailed NotEntitled | `✗ not included in the plan · <message> · not retried` | | journal | `/model` another route |
 | ProviderFailed RateLimited | `✗ rate limited · <route>` | | journal | `wait, or /model` |
 | ProviderFailed Transport | `✗ connection failed · <message>` | lost streamed text size | journal | `⏎ resend` |
 | ProviderFailed Protocol / InvalidRequest | `✗ provider error · <kind> · <message>` | | journal | |

@@ -112,6 +112,23 @@ A 401/403 whose body says the account has no balance is NOT an authentication fa
   HTTP request in total. The host's turn-level retry (completion.md §3b) does not cover it.
 - The host prints the message as it prints any provider error; exit code as for any failed run.
 
+## A plan that does not allow the model (ADR-0062)
+
+A 401/403 whose body says the account's plan does not allow this model on this route is NOT an
+authentication failure: the key is valid, so a credential refresh cannot help either. Observed
+live on the OpenCode Zen chat endpoint, which answers a model gated to OpenCode's own client with
+HTTP 403 and a `FreeTierError`-shaped body while the key is fine.
+- `ProviderErrorKind::NotEntitled`, message exactly
+  `the account's plan does not allow this model on this route` (a constant — the server's text is
+  never copied, sliced or formatted into it).
+- The chat adapter's `on_http_error` reads the same four positions and lookups as the no-balance
+  check, with a second fixed allow-list: `freetiererror`, `not_entitled`, `plan_not_allowed`.
+  A hit → the new kind. No hit, no JSON, empty body → exactly today's behaviour (a 401/403 stays
+  `Authentication`).
+- The shared driver finishes immediately on this kind, exactly as on `InsufficientBalance`: no
+  credential refresh, no retry, ONE HTTP request in total.
+- The TUI renders `✗ not included in the plan · <message> · not retried` and offers `/model`.
+
 ## The ONE conformance suite — `p1-provider-conformance`
 
 ```rust
