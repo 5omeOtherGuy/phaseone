@@ -226,9 +226,12 @@ wire ids `cline-pass/<model>`. Each of the owner's two subscriptions is its own 
 `cline-pass/` ids are bound: a bare id (`z-ai/glm-5.3`) is Cline's pay-as-you-go catalogue and bills
 Cline credits instead of the subscription (the dashboard showed 0.0000 credits used for the
 `cline-pass/` test calls). The stream carries reasoning as the OpenRouter-style `reasoning` delta, so
-the routes use `thinking-with-reasoning-alias` and bind the `glm-5.3-clinepass` / `kimi-k3-clinepass`
-profiles (thinking `enabled`); once #100 lets `retained-thinking` accept the alias they move to the
-preserved-thinking `glm-5.3` / `kimi-k3` profiles and the two stopgap profiles go. Usage is metered
+the routes use `thinking-with-reasoning-alias`. **Owner decision 2026-09-24 21:55:** ClinePass runs
+DeepSeek V4.1 Flash and GLM-5.3 Flash only — the routes bind `deepseek-v4.1-flash`
+(`cline-pass/deepseek-v4.1-flash`, the environments' default) and `glm-5.3-flash-clinepass`
+(`cline-pass/glm-5.3-flash`, thinking `enabled`, effort `high` only because the vendor turns any
+other value into `max`); Kimi K3 and the larger GLM/Qwen/MiMo models are not bound. Live 2026-09-24:
+both ids answer 200; `cline-pass/deepseek-v4-flash` (listed in the docs) answers 404. Usage is metered
 per subscription in a rolling 5-hour, a weekly and a monthly window; no usage endpoint is
 established, so the routes probe as unsupported.
 

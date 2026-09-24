@@ -230,12 +230,12 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "claude/claude-opus-5-5",
             "claude/claude-sonnet-4-6",
             "claude/claude-sonnet-5",
-            // The two ClinePass accounts bind the ClinePass variants of glm-5.3 and kimi-k3
-            // (thinking "enabled": the gateway streams the `reasoning` alias, #100).
-            "cline/glm-5.3-clinepass",
-            "cline/kimi-k3-clinepass",
-            "cline2/glm-5.3-clinepass",
-            "cline2/kimi-k3-clinepass",
+            // The two ClinePass accounts serve DeepSeek V4.1 Flash and GLM-5.3 Flash only (owner,
+            // 2026-09-24); GLM's ClinePass variant has thinking "enabled" (`reasoning` alias, #100).
+            "cline/deepseek-v4.1-flash",
+            "cline/glm-5.3-flash-clinepass",
+            "cline2/deepseek-v4.1-flash",
+            "cline2/glm-5.3-flash-clinepass",
             "deepseek/deepseek-v4.1-flash",
             "deepseek1/deepseek-v4.1-flash",
             "deepseek2/deepseek-v4.1-flash",

@@ -1,0 +1,17 @@
+# GLM-5.3-Flash as ClinePass serves it (`cline-pass/glm-5.3-flash`, live 2026-09-24).
+# Owner decision 2026-09-24 21:55: the ClinePass subscriptions run DeepSeek V4.1 Flash and GLM-5.3
+# Flash ONLY — no Kimi K3 or other larger ClinePass models as workers.
+# thinking = "enabled", not "preserved": api.cline.bot streams reasoning as the `reasoning` alias,
+# which only `thinking-with-reasoning-alias` accepts (#100). Model card: 1M context / 131k output;
+# the vendor's effort knob accepts low/high/max but a missing or unknown value silently becomes
+# `max`, so this profile allows `high` only.
+id        = "glm-5.3-flash-clinepass"
+revision  = 1
+model_id  = "glm-5.3-flash"
+family    = "glm"
+thinking  = "enabled"
+
+efforts        = ["high"]
+default_effort = "high"
+
+max_output_tokens = 131072
