@@ -1,9 +1,11 @@
-# Credentials — crate `p1-auth` (ADR-0040, step 5 of ADR-0039)
+# Credentials — crate `p1-auth` (ADR-0040, step 5 of ADR-0039; self-contained routes, ADR-0061)
 
 Status: spec. Credentials belong to the ROUTE. After the provider split the lookup code still
 sits in three places (`p1-provider-anthropic/src/credentials.rs`, `p1-provider-openai/src/credentials.rs`,
 `p1-host/src/auth.rs`); this step moves it into one crate and adds the precedence chain and the
 "which source" report. Borrowing stays the default; §6 adds `p1 login` for pasted API keys (ADR-0044).
+§8 adds the opt-in `store_only` policy (ADR-0061): every SHIPPED route is now self-contained and
+reads no other tool's login at runtime, and minting an independent OAuth grant is the remaining work.
 
 ## 1. Crate and dependencies
 
@@ -22,6 +24,10 @@ The route file's `[credential]` table deserializes into `p1_auth::CredentialSpec
 | `api-key` | `env` (required name), `borrow` (ordered list of `opencode:<key>` / `pi:<key>`) | env var → p1 store entry for the route → each borrowed login |
 | `claude-code-oauth` | `env` optional | env var (a bearer token, no refresh) → p1 store → Claude Code's login file |
 | `codex-oauth` | `env` optional | env var → p1 store → Codex CLI's login file |
+
+`store_only` (boolean, default `false`) is the one policy field on the table, for every kind
+(ADR-0061, §8). Written, the chain stops after p1's own store: the documented variable and the
+store entry, and no other tool's login. Absent, the rows above are unchanged.
 
 `p1_auth::resolve(route_id, &spec, transport, &Locations) -> Arc<dyn CredentialSource>`.
 `Locations` carries every directory the chain may touch (home, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
@@ -48,15 +54,21 @@ the real home or the real environment; `Locations::from_process()` is the produc
 - `refresh(rejected)`: unchanged semantics — a different current credential is returned, the
   same one is an authentication error whose message names the SOURCE (never the value) and
   what to do.
+- A `store_only` route never CONSTRUCTS a borrowed source (§8): the CLI's login is not in the
+  chain, so it is not opened even when the store is absent, unusable or has just been rejected.
+  Absent means an error that names p1's store; the CLI login is not a fall-through.
 
 ## 4. Which source — visible, never the value
 
 `CredentialSource` gains nothing. `p1_auth::describe(route_id, &spec, &Locations) -> SourceReport`
-is a separate, non-secret probe: `{ chosen: Option<SourceName>, tried: Vec<(SourceName, Presence)> }`
+is a separate, non-secret probe:
+`{ chosen: Option<SourceName>, tried: Vec<(SourceName, Presence)>, policy: CredentialPolicy }`
 with `SourceName` rendering as `env OPENCODE_API_KEY`, `p1 store`, `opencode login`, `pi login`,
 `Claude Code login`, `Codex login`, and `Presence` = `present | absent | unusable(<reason>)`.
-`p1 env show` prints one line `credential  <chosen>` (or `credential  none — <what to do>`), and
-the TUI's `/status` can use the same report. The report reads files to see whether an entry
+`policy` is `Chain` (the default) or `StoreOnly`. `SourceReport::line()` returns the chosen source
+(or `none — <what to do>`), then ` [p1 store only]` when the policy is `StoreOnly`, so the setting
+is visible in `p1 env show`, `p1 login --list` and `p1 models` without reading any credential.
+`p1 env show` prints it as `credential  <line>`. The report reads files to see whether an entry
 EXISTS; it never returns, logs or formats a credential value, and its `Debug` is redacted by
 construction (there is no field that could hold one).
 
@@ -75,6 +87,10 @@ e. `describe` never contains a value (seed every source with a sentinel and asse
 f. No test touches the real home or the real process environment.
 g. Behaviour on the wire is unchanged: every adapter's characterization and conformance test
    passes with its expectations untouched.
+h. `store_only` (§8): the borrowed source is not in `tried`, the line carries the marker, and a
+   store-only chain with an absent or rejected p1 entry fails naming p1's store without opening
+   the CLI's login path at all; the same chain WITHOUT the field still reads and names it.
+i. Every shipped `routes/*.toml` sets `store_only = true` and lists no nonempty `borrow`.
 
 ## 6. `p1 login` — pasted keys into p1's own store (ADR-0044)
 
@@ -88,7 +104,10 @@ p1 logout <route>         remove the route's entry from p1's store
 ```
 
 - `<route>` must be a loaded route file whose credential kind is `api-key`; any other kind is a
-  usage error that says where that login comes from (`claude` / `codex` CLI). Unknown route →
+  usage error. A LEGACY OAuth route says where its login comes from (`claude` / `codex` CLI). A
+  `store_only` OAuth route says instead that its credential is read from p1's own store, that
+  `p1 login` cannot write an OAuth entry yet, that p1 has no independent OAuth flow, and that the
+  CLI login is NOT read (ADR-0061, §8) — it never pretends a browser flow exists. Unknown route →
   error listing the routes.
 - The key is read from STDIN, never from an argument (arguments land in shell history and in
   `ps`). On a TTY the prompt `key for <route> (input hidden): ` is shown and echo is switched
@@ -121,5 +140,59 @@ same file) both land.
 
 ## 7. Not decided yet
 
-Browser/OAuth login inside p1, macOS paths and Keychain, an OS keyring, key files outside the
-known stores, encrypting the store.
+Browser/OAuth login inside p1 (§8.4), macOS paths and Keychain, an OS keyring, key files outside
+the known stores, encrypting the store.
+
+## 8. Self-contained routes — `store_only` (ADR-0061)
+
+Owner order, 2026-09-24: every active p1 model route must be self-contained within p1, and p1
+must not silently read Pi, OpenCode, Claude Code or Codex login files at runtime.
+
+### 8.1 The field
+
+`[credential] store_only = true` cuts the chain to the documented environment variable (when the
+route names one) and p1's own store. Nothing else is constructed, so no other tool's login file
+is opened — absent store entry, unusable store entry and rejected store entry alike. It is a
+policy, not a kind: on `api-key` it is the same statement as `borrow = []`, and setting it with a
+non-empty `borrow` is a load error (`spec.rs::validate`).
+
+Without the field nothing changes: the legacy chain, the same report and the same guidance, which
+the tests pin under "explicit legacy configuration".
+
+### 8.2 The shipped set
+
+Every shipped `routes/*.toml` is store-only: `anthropic-subscription` and
+`openai-codex-subscription` (the two OAuth kinds) and `glm-subscription`,
+`kimi-coding-subscription`, `opencode-go-subscription`, `opencode-go-2-subscription` (API keys,
+`borrow = []`). No shipped route reads another tool's login at runtime.
+
+### 8.3 Migration
+
+- Nothing in the route FILES changes for a route that opts in beyond the field. To restore the
+  old chain for a route, delete the line; the field is the only switch.
+- A store-only route's credential must be in p1's store (`$XDG_CONFIG_HOME/p1/auth.json`,
+  `~/.config/p1/auth.json`, 0600 in a 0700 directory) or in its documented environment variable.
+  `p1 login <route>` writes `api_key` entries; an OAuth entry is written by the acquisition step
+  below or imported as `{"type":"oauth","access":…,"refresh":…,"expires":…,"account_id":…}`.
+- The operator (XO) moved the API keys into p1's store; every route now resolves from there or
+  from its variable. `p1 env show <env>` / `p1 login --list` print ` [p1 store only]` so the
+  policy is visible per route.
+
+### 8.4 Remaining work — an independent OAuth grant (limitation)
+
+p1's store refreshes an `oauth` entry it holds, but p1 ships no flow that MINTS one, so the two
+OAuth routes need a grant placed in the store by another step. Requirements for that step:
+
+- **Mint p1's own grant, do not copy one.** A refresh token rotates; importing a live refresh
+  token from Claude Code or Codex would invalidate it in the source file and break that CLI on its
+  next refresh. Copying an active token is explicitly rejected as the long-term mechanism.
+- **Use primary sources only.** The authorization endpoint, client id, redirect URI and grant type
+  per provider must come from the provider's or the client's own source; none are available in this
+  checkout, so nothing was invented. The token endpoints and client ids p1 already refreshes with
+  (`claude_code.rs`, `codex.rs`, `store.rs`) are the only provider facts p1 owns today.
+- **Human at the end is fine.** A browser/device authorization may need one operator action; the
+  flow should then store the resulting `oauth` entry in p1's store (0600, atomic, under the lock)
+  and never in another tool's file.
+- **Status.** The Codex grant from the retired Pi store was transferred by the XO and passed a live
+  p1 request. The Claude independent grant is pending an owner login. No credential value appears
+  in this repository.

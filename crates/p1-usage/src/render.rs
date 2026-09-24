@@ -242,7 +242,12 @@ fn render_parts(snapshot: &Snapshot, grid: usize, density: Density) -> Rendered 
                         },
                         grid,
                     ));
-                    lines.push(bar(window, grid));
+                    // The bar is the used fraction, so it is drawn only when that fraction is
+                    // known: an empty bar beside the unknown marker would read as `0 % used`
+                    // and contradict it.
+                    if window.used_percent.is_some_and(f64::is_finite) {
+                        lines.push(bar(window, grid));
+                    }
                 }
                 if let Some(credits) = &route.credits {
                     let currency = credits.currency.as_deref().unwrap_or("");
@@ -495,7 +500,13 @@ mod tests {
             "kimi coding",
             Probe::Supported,
             vec![
-                window(Some(0.0), false),
+                // The live 5h row: the vendor reports the request count left (`15/100`), and
+                // the bar is the used share that count implies (85 %).
+                Window {
+                    used_percent: Some(85.0),
+                    detail: Some("15/100 left".into()),
+                    ..window(None, false)
+                },
                 window(Some(28.0), false),
                 window(Some(0.0), false),
             ],
@@ -996,5 +1007,101 @@ mod tests {
             assert_eq!(lines[line].0[0].text.chars().count(), count);
         }
         assert!(lines.iter().all(|l| width(&l.text()) <= 32));
+    }
+
+    /// An unknown used share shows the `—` marker and no bar: an empty bar beside it would
+    /// read as `0 % used` and contradict the marker. A known sibling window keeps its bar.
+    #[test]
+    fn unknown_usage_draws_the_marker_and_no_bar() {
+        let snapshot = Snapshot {
+            taken_at: "2026-09-22T22:36:00Z".into(),
+            routes: vec![route(
+                "edge",
+                Probe::Supported,
+                vec![window(None, false), window(Some(42.0), false)],
+            )],
+        };
+        let lines = render(&snapshot, 32);
+        let texts: Vec<String> = lines.iter().map(Line::text).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("5h") && t.contains("— · resets")),
+            "{texts:#?}"
+        );
+        let bars: Vec<&Line> = lines
+            .iter()
+            .filter(|line| line.0.iter().any(|span| span.tone == Tone::Rule))
+            .collect();
+        assert_eq!(
+            bars.len(),
+            1,
+            "only the known window draws a bar: {texts:#?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("0%")),
+            "no 0 % bar for the unknown window: {texts:#?}"
+        );
+    }
+
+    /// A used-based window is unchanged: its label states the used percentage and its bar is
+    /// that same fraction.
+    #[test]
+    fn used_based_row_bar_and_percent_agree() {
+        let snapshot = Snapshot {
+            taken_at: "2026-09-22T22:36:00Z".into(),
+            routes: vec![route(
+                "used",
+                Probe::Supported,
+                vec![window(Some(42.0), false)],
+            )],
+        };
+        let grid = 32;
+        let lines = render(&snapshot, grid);
+        let texts: Vec<String> = lines.iter().map(Line::text).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("5h") && t.contains("42% · resets")),
+            "{texts:#?}"
+        );
+        let bar = lines
+            .iter()
+            .find(|line| line.0.iter().any(|span| span.tone == Tone::Rule))
+            .expect("a bar");
+        let cells = grid - 6;
+        assert_eq!(
+            bar.0[0].text.chars().count(),
+            (0.42 * cells as f64).round() as usize
+        );
+        assert!(bar.text().trim_end().ends_with("42%"), "{}", bar.text());
+    }
+
+    /// The owner's live Kimi row: `15/100 left` beside a bar at the 85 % used the count
+    /// implies, at the pane's 48-column grid and 42-row height. The bar used to sit at 0 %
+    /// while the text said 15 of 100 were left.
+    #[test]
+    fn seven_providers_kimi_row_bar_agrees_with_the_left_text() {
+        let snapshot = seven_providers();
+        let grid = 48;
+        let lines = render(&snapshot, grid);
+        let texts: Vec<String> = lines.iter().map(Line::text).collect();
+        let row = texts
+            .iter()
+            .find(|t| t.starts_with("5h") && t.contains("15/100 left"))
+            .unwrap_or_else(|| panic!("no kimi 5h row: {texts:#?}"));
+        assert!(!row.contains("0%"), "contradictory row: {row}");
+        let bar = lines
+            .iter()
+            .find(|line| line.text().contains("85%"))
+            .expect("the 85 % bar");
+        let cells = grid - 6;
+        assert_eq!(
+            bar.0[0].text.chars().count(),
+            (0.85 * cells as f64).round() as usize
+        );
+        assert!(bar.0[0].text.chars().all(|c| c == '█'));
+        // It still fits the owner's 56x42 pane with the status row reserved.
+        assert!(render_fitted(&snapshot, grid, 41).len() <= 41);
     }
 }

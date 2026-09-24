@@ -1,17 +1,19 @@
 # Kimi coding-plan subscription on the OpenAI-compatible Chat Completions surface.
-# Like glm-subscription, this endpoint returns reasoning_content alongside content;
-# like opencode-go-subscription, it borrows an existing CLI login. The opencode
-# kimi-for-coding entry is stale (401), so it must not be borrowed.
+# Like glm-subscription, this endpoint returns reasoning_content alongside content.
+# `store_only` (ADR-0061) keeps the key in the documented environment variable and
+# p1's own store: the Pi and OpenCode login files are never read. (The opencode
+# kimi-for-coding entry was also stale with a 401, so it must not be borrowed.)
 id           = "kimi-coding-subscription"
 origin_route = "openai-chat/kimi-coding-subscription"
 adapter      = "openai-chat"
 endpoint     = "https://api.kimi.ai/coding/v1/chat/completions"
 
 [credential]
-# References only: environment first, then the Pi and OpenCode logins in order.
-kind   = "api-key"
-env    = "KIMI_API_KEY"
-borrow = ["pi:kimi-coding", "opencode:kimi-code-plan-global"]
+# References only: the environment variable and p1's own store.
+kind       = "api-key"
+env        = "KIMI_API_KEY"
+borrow     = []
+store_only = true
 
 [adapter_settings]
 # RetainedThinking replays reasoning_content across turns and supports preserved

@@ -19,9 +19,10 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChatDialect {
-    /// Enabled thinking, replayable reasoning_content plus the equivalent reasoning alias.
+    /// Enabled thinking with replayable reasoning_content and its equivalent reasoning alias.
     ThinkingWithReasoningAlias,
-    /// Enabled/preserved thinking, reasoning_content replay, and streaming function inputs.
+    /// Enabled/preserved thinking, replayable reasoning_content and its equivalent reasoning
+    /// alias, and streaming function inputs.
     RetainedThinking,
 }
 

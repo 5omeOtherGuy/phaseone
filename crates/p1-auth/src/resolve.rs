@@ -49,6 +49,43 @@ impl std::fmt::Display for SourceName {
     }
 }
 
+/// The credential policy a route's `[credential]` table declares (spec §2, ADR-0061).
+/// A route that does not write the field keeps the legacy chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialPolicy {
+    /// Every source the kind has: the documented environment variable, p1's store,
+    /// then another tool's login where the kind has one.
+    Chain,
+    /// The documented environment variable and p1's OWN store only. No other tool's
+    /// login file is opened, whatever the outcome — absent, unusable or rejected.
+    StoreOnly,
+}
+
+impl CredentialPolicy {
+    /// The marker appended to the source line, so `p1 env show` and `p1 login --list`
+    /// make the policy visible. Empty for the legacy chain, which is the default.
+    pub fn marker(self) -> &'static str {
+        match self {
+            CredentialPolicy::Chain => "",
+            CredentialPolicy::StoreOnly => " [p1 store only]",
+        }
+    }
+
+    /// The policy name on its own, without the display spacing.
+    pub fn name(self) -> &'static str {
+        match self {
+            CredentialPolicy::Chain => "chain",
+            CredentialPolicy::StoreOnly => "store-only",
+        }
+    }
+}
+
+impl std::fmt::Display for CredentialPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// What a source looks like from the outside: an entry, no entry, or an entry that
 /// cannot be used. The reason names no value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,13 +114,17 @@ pub struct SourceReport {
     pub chosen: Option<SourceName>,
     /// Every source of the chain, in the order it is tried.
     pub tried: Vec<(SourceName, Presence)>,
+    /// The policy the route declared. `StoreOnly` means no other tool's login is in
+    /// the chain at all, so `tried` can never name one (spec §4, ADR-0061).
+    pub policy: CredentialPolicy,
 }
 
 impl SourceReport {
     /// The one line `p1 env show` prints (spec §4): the chosen source, or what to
-    /// do when no source has an entry.
+    /// do when no source has an entry. A store-only route appends the policy marker
+    /// so the operator sees that no other tool's login is tried.
     pub fn line(&self) -> String {
-        match &self.chosen {
+        let base = match &self.chosen {
             Some(name) => name.to_string(),
             None => match self.tried.iter().find_map(|(_, presence)| match presence {
                 Presence::Unusable(reason) => Some(reason.clone()),
@@ -92,7 +133,8 @@ impl SourceReport {
                 Some(reason) => format!("none — {reason}"),
                 None => format!("none — {}", guidance(&self.tried)),
             },
-        }
+        };
+        format!("{base}{}", self.policy.marker())
     }
 }
 
@@ -163,10 +205,25 @@ pub fn describe(route_id: &str, spec: &CredentialSpec, locations: &Locations) ->
         }
         tried.push((name, presence));
     }
-    SourceReport { chosen, tried }
+    SourceReport {
+        chosen,
+        tried,
+        policy: policy(spec),
+    }
 }
 
-/// The sources one route's credential is tried from, in order (spec §2).
+/// The policy a route's `[credential]` table declares (spec §2, ADR-0061).
+fn policy(spec: &CredentialSpec) -> CredentialPolicy {
+    if spec.store_only {
+        CredentialPolicy::StoreOnly
+    } else {
+        CredentialPolicy::Chain
+    }
+}
+
+/// The sources one route's credential is tried from, in order (spec §2). A store-only
+/// route stops after its own store: the borrowed login is not merely skipped when
+/// absent, it is never constructed, so no other tool's file is opened at all.
 fn sources(spec: &CredentialSpec) -> Vec<Source> {
     let mut sources = Vec::new();
     if let Some(env) = &spec.env {
@@ -175,20 +232,26 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
     match spec.kind {
         CredentialKind::ApiKey => {
             sources.push(Source::P1StoreApiKey);
-            for borrow in &spec.borrow {
-                sources.push(Source::Login {
-                    store: borrow.store,
-                    key: borrow.key.clone(),
-                });
+            if !spec.store_only {
+                for borrow in &spec.borrow {
+                    sources.push(Source::Login {
+                        store: borrow.store,
+                        key: borrow.key.clone(),
+                    });
+                }
             }
         }
         CredentialKind::ClaudeCodeOauth => {
             sources.push(Source::P1StoreOauth(OauthDialect::ClaudeCode));
-            sources.push(Source::ClaudeCodeLogin);
+            if !spec.store_only {
+                sources.push(Source::ClaudeCodeLogin);
+            }
         }
         CredentialKind::CodexOauth => {
             sources.push(Source::P1StoreOauth(OauthDialect::Codex));
-            sources.push(Source::CodexLogin);
+            if !spec.store_only {
+                sources.push(Source::CodexLogin);
+            }
         }
     }
     sources

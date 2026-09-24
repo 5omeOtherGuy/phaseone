@@ -35,6 +35,50 @@ fn isolated(home: &Path) -> Command {
     command
 }
 
+fn shipped(relative: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative)
+}
+
+/// A scratch environments root whose one route explicitly opts into the LEGACY
+/// borrowed-login chain. Every shipped route is self-contained since ADR-0061, so a
+/// route WITHOUT `store_only` is the only way left to exercise the borrowed-source
+/// reporting end to end.
+fn legacy_borrow_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("profiles")).unwrap();
+    std::fs::copy(
+        shipped("profiles/glm-5.3.toml"),
+        root.path().join("profiles/glm-5.3.toml"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("routes")).unwrap();
+    std::fs::write(
+        root.path().join("routes/legacy-borrow.toml"),
+        "id           = \"legacy-borrow\"\n\
+         origin_route = \"openai-chat/legacy-borrow\"\n\
+         adapter      = \"openai-chat\"\n\
+         endpoint     = \"https://example.invalid/v1/chat/completions\"\n\
+         \n[credential]\n\
+         kind   = \"api-key\"\n\
+         env    = \"FAKE_LEGACY_KEY\"\n\
+         borrow = [\"opencode:opencode-go\"]\n\
+         \n[adapter_settings]\ndialect = \"retained-thinking\"\n\
+         \n[models.\"glm-5.3\"]\nwire_model = \"glm-5.3\"\n",
+    )
+    .unwrap();
+    let environment = root.path().join("environments/legacy-borrow");
+    std::fs::create_dir_all(&environment).unwrap();
+    std::fs::write(
+        environment.join("environment.toml"),
+        "route = \"legacy-borrow\"\nprofile = \"glm-5.3\"\n",
+    )
+    .unwrap();
+    std::fs::write(environment.join("prompt.md"), "prompt").unwrap();
+    root
+}
+
 #[test]
 fn help_version_and_unknown_flag() {
     let output = p1().arg("--help").output().unwrap();
@@ -138,9 +182,12 @@ fn env_show_runs_without_credentials_or_network() {
 }
 
 /// The same line with a borrowed login present: the report names WHICH login, and
-/// never the value it holds.
+/// never the value it holds. The shipped routes are self-contained now (ADR-0061),
+/// so this runs against an explicit legacy route — the one configuration that still
+/// borrows another CLI's login.
 #[test]
 fn env_show_names_the_borrowed_login_it_would_use() {
+    let root = legacy_borrow_root();
     let home = tempfile::tempdir().unwrap();
     let data = home.path().join(".local/share/opencode");
     std::fs::create_dir_all(&data).unwrap();
@@ -151,18 +198,20 @@ fn env_show_names_the_borrowed_login_it_would_use() {
     .unwrap();
 
     let output = isolated(home.path())
-        .args(["env", "show", "deepseek"])
+        .env("P1_ENVIRONMENTS_DIR", root.path().join("environments"))
+        .args(["env", "show", "legacy-borrow"])
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "env show deepseek failed: {}",
+        "env show legacy-borrow failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout.lines().next().unwrap_or_default(),
-        "credential  opencode login"
+        "credential  opencode login",
+        "a route without `store_only` still borrows: {stdout}"
     );
     assert!(
         !stdout.contains("FAKE-ENV-SHOW-KEY"),

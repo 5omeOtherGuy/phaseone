@@ -53,6 +53,7 @@ endpoint = "https://…/v1"
 kind   = "api-key"
 env    = "OPENCODE_API_KEY"
 borrow = ["opencode:opencode-go", "pi:opencode-go"]   # tried in this order, after env
+# store_only = true                    # ADR-0061: env + p1's store only; no CLI login is read
 
 [headers]                              # non-secret, static
 # name = "value"
@@ -68,7 +69,12 @@ output_limit  = 32000                  # optional; same rule
 ```
 
 - `credential.kind` is a closed enum: `api-key` (above), `claude-code-oauth`, `codex-oauth`.
-  The two OAuth kinds take no further keys; their sources stay the compiled ones.
+  `store_only` (default `false`, ADR-0061) is the one policy field: written, the chain is the
+  documented variable and p1's own store, and no other tool's login file is read for ANY kind
+  (for `claude-code-oauth` / `codex-oauth` that is what removes the unconditional CLI fallback;
+  for `api-key` it is the same statement as `borrow = []`, and combining it with a non-empty
+  `borrow` is a load error). EVERY shipped route sets it, so p1 is self-contained at runtime
+  (`docs/design/credentials.md` §8).
   A header whose name is `authorization`, `x-api-key`, `cookie` or starts with `x-auth` is
   rejected in `[headers]`: a route file must not be able to hold a secret by accident.
 - `[adapter_settings]` is deserialized by the adapter's own typed struct with

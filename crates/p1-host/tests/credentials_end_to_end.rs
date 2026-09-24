@@ -7,6 +7,12 @@
 //! `p1-auth`, which no adapter may depend on, and only the host composes. No real
 //! credential file is ever read — every path is a scratch directory and every value
 //! is obviously fake.
+//!
+//! The SHIPPED Claude/Codex routes now opt out of borrowing (`store_only = true`,
+//! ADR-0061), so each test loads the same shipped route file with that one field
+//! removed. That keeps this file's subject — the BORROWED sources reaching the wire —
+//! and doubles as the legacy-behaviour guard: a route without the field still
+//! borrows the CLI login, exactly as before.
 
 // The adapter's own fixtures; only the text turn is used here.
 #[allow(dead_code)]
@@ -24,7 +30,7 @@ use p1_contracts::{
 };
 use p1_host::auth::credential_source_at;
 use p1_host::catalog::route_provider;
-use p1_host::routes::{RouteFile, load_route_by_id};
+use p1_host::routes::RouteFile;
 use p1_model_profile::ModelProfile;
 use p1_provider_http::Transport;
 use p1_provider_http::testing::{
@@ -45,15 +51,23 @@ fn repo(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-fn environment_dirs() -> Vec<PathBuf> {
-    vec![repo("environments")]
-}
-
 /// The shipped profile `id`, read from `profiles/<id>.toml`.
 fn profile(id: &str) -> Arc<ModelProfile> {
     let text = std::fs::read_to_string(repo(&format!("profiles/{id}.toml")))
         .unwrap_or_else(|error| panic!("profiles/{id}.toml: {error}"));
     Arc::new(ModelProfile::from_toml(id, &text).unwrap_or_else(|error| panic!("{id}: {error}")))
+}
+
+/// The shipped route with its `store_only` field removed (ADR-0061). Removing the
+/// line is deliberate: these tests are about the borrowed CLI logins, and the shipped
+/// routes no longer use them.
+fn borrowing_route(route_id: &str) -> RouteFile {
+    let shipped = std::fs::read_to_string(repo(&format!("routes/{route_id}.toml")))
+        .unwrap_or_else(|error| panic!("routes/{route_id}.toml: {error}"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("{route_id}.toml"));
+    std::fs::write(&path, shipped.replace("store_only = true", "")).unwrap();
+    p1_host::routes::load_route(&path).expect("the route file")
 }
 
 /// The provider the host's own catalog factory builds for this route: the shipped
@@ -70,7 +84,7 @@ fn provider(
     home: &Path,
     transport: Arc<dyn Transport>,
 ) -> Arc<dyn Provider> {
-    let route: RouteFile = load_route_by_id(&environment_dirs(), route_id).expect("the route file");
+    let route: RouteFile = borrowing_route(route_id);
     let binding = route
         .binding(profile_id)
         .expect("the route serves it")
