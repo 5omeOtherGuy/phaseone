@@ -1,7 +1,7 @@
 ---
 adr: 61
 title: A route may be self-contained: store-only credentials never read another tool's login
-status: proposed
+status: accepted
 date: 2026-09-24
 deciders: owner
 supersedes: []
