@@ -29,6 +29,7 @@ fn route() -> MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
         account: MessagesAccount::ClaudeCodeSubscription,
+        long_context: false,
     }
 }
 
@@ -831,5 +832,48 @@ async fn a_fake_file_shaped_source_drives_a_request_end_to_end() {
             .iter()
             .any(|(name, value)| name == "authorization" && value == "Bearer FILE-TOKEN"),
         "the source's token must be used verbatim"
+    );
+}
+
+/// The `anthropic-beta` header of the one request a turn sent.
+fn sent_beta(transport: &ScriptedTransport) -> String {
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    requests[0]
+        .headers
+        .iter()
+        .find(|(name, _)| name == "anthropic-beta")
+        .map(|(_, value)| value.clone())
+        .expect("every Messages request carries anthropic-beta")
+}
+
+#[tokio::test]
+async fn a_long_context_route_sends_the_1m_context_beta_and_a_default_route_does_not() {
+    let plain = harness("claude-opus-5-5", vec![ok(fixtures::text_turn)]);
+    run(&plain, request(vec![user("hi")])).await;
+    assert_eq!(
+        sent_beta(&plain.transport),
+        "oauth-2025-04-20,claude-code-20250219"
+    );
+
+    let transport = ScriptedTransport::new(vec![ok(fixtures::text_turn)]);
+    let long = Harness {
+        provider: AnthropicProvider::new(
+            MessagesRoute {
+                long_context: true,
+                ..route()
+            },
+            "claude-opus-5-5",
+            Arc::new(profile("claude-opus-5-5")),
+            Arc::new(transport.clone()),
+            FakeCredentials::new("SENTINEL-ACCESS"),
+        )
+        .expect("the profile is expressible on the Messages wire"),
+        transport,
+    };
+    run(&long, request(vec![user("hi")])).await;
+    assert_eq!(
+        sent_beta(&long.transport),
+        "oauth-2025-04-20,claude-code-20250219,context-1m-2025-08-07"
     );
 }

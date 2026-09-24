@@ -25,7 +25,7 @@ mod provider;
 mod request;
 
 pub use provider::AnthropicProvider;
-pub use request::{build_headers, build_request};
+pub use request::{build_headers, build_request, with_long_context};
 
 /// The `origin_route` of the shipped `routes/anthropic-subscription.toml`, byte for
 /// byte what this adapter wrote into every [`p1_contracts::Origin`] before route data
@@ -53,6 +53,10 @@ pub enum MessagesAccount {
 #[serde(deny_unknown_fields)]
 pub struct MessagesAdapterSettings {
     pub account: MessagesAccount,
+    /// Request the 1M-token context window (the `context-1m` beta). Off unless the
+    /// route file says so.
+    #[serde(default)]
+    pub long_context: bool,
 }
 
 /// How one Messages account and endpoint are reached: the data a route file
@@ -66,6 +70,8 @@ pub struct MessagesRoute {
     /// The API base URL. The adapter appends `/v1/messages`.
     pub endpoint: String,
     pub account: MessagesAccount,
+    /// Send the 1M-context beta on every request of this route.
+    pub long_context: bool,
 }
 
 impl MessagesRoute {
