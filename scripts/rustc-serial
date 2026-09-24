@@ -1,17 +1,181 @@
 #!/usr/bin/env bash
 # cargo `rustc-wrapper`: a machine-wide semaphore around every real compilation.
 # 7 GB RAM: however many agents and worktrees build at once, at most P1_RUSTC_SLOTS
-# (default 2) rustc processes run. The lock is held through `exec`, i.e. until rustc exits.
+# (default 2) rustc processes run. Each slot is one stable kernel `flock` on
+# "$P1_BUILD_LOCK_DIR/slotN"; the lock is held through `exec`, i.e. until rustc exits.
 # Probes (`rustc -vV`, `--print …`) are not compilations and pass straight through.
-case " $* " in *" --crate-name "*) ;; *) exec "$@" ;; esac
-dir="${P1_BUILD_LOCK_DIR:-/tmp/p1-build-locks-$(id -u)}"
-mkdir -p "$dir"
-slots="${P1_RUSTC_SLOTS:-2}"
-for ((s = 0; s < slots; s++)); do
-  exec {fd}>"$dir/slot$s"
-  if flock -n "$fd"; then exec "$@"; fi
-  exec {fd}>&-
+#
+# A waiter scans every slot non-blockingly and reads each slot's holder record
+# (slotN.holder) so it can SAY why it waits. Classification (running / stopped /
+# stale / unknown) never grants a slot: admission is a successful `flock -n`
+# alone, so counting on a record can never raise the live-compilation bound.
+set -u
+
+# --- compilation or probe? ---------------------------------------------------
+# A probe is an argv without `--crate-name`; pass it through byte for byte.
+crate=""
+compile=0
+prev=""
+for arg in "$@"; do
+  case "$arg" in
+    --crate-name=*) crate="${arg#--crate-name=}"; compile=1; break ;;
+  esac
+  if [ "$prev" = "--crate-name" ]; then crate="$arg"; compile=1; break; fi
+  prev="$arg"
 done
-exec {fd}>"$dir/slot$((RANDOM % slots))"
-flock "$fd"
-exec "$@"
+if [ "$compile" -eq 0 ]; then exec "$@"; fi
+
+# --- configuration -----------------------------------------------------------
+slots="${P1_RUSTC_SLOTS:-2}"
+case "$slots" in
+  ''|*[!0-9]*)
+    printf 'rustc-serial: P1_RUSTC_SLOTS must be a positive integer, got %q\n' "$slots" >&2
+    exit 2 ;;
+esac
+if [ "$slots" -lt 1 ]; then
+  printf 'rustc-serial: P1_RUSTC_SLOTS must be a positive integer, got %q\n' "$slots" >&2
+  exit 2
+fi
+
+dir="${P1_BUILD_LOCK_DIR:-/tmp/p1-build-locks-$(id -u)}"
+if [ -L "$dir" ]; then
+  printf 'rustc-serial: lock directory %s is a symlink\n' "$dir" >&2
+  exit 2
+fi
+if [ ! -d "$dir" ]; then
+  if ! mkdir -p -m 0700 -- "$dir"; then
+    printf 'rustc-serial: cannot create lock directory %s\n' "$dir" >&2
+    exit 2
+  fi
+fi
+if [ -L "$dir" ]; then
+  printf 'rustc-serial: lock directory %s is a symlink\n' "$dir" >&2
+  exit 2
+fi
+# Owner-only, also for a directory that already existed from an earlier run.
+chmod 0700 -- "$dir" 2>/dev/null || :
+
+boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || :)"
+
+for ((s = 0; s < slots; s++)); do
+  if [ -L "$dir/slot$s" ]; then
+    printf 'rustc-serial: slot %s is a symlink\n' "$dir/slot$s" >&2
+    exit 2
+  fi
+done
+
+# --- holder record -----------------------------------------------------------
+# Written only by a process that already holds the slot's flock, atomically via a
+# temp file in the same directory plus `mv`. The record carries pid ($$ — `exec`
+# keeps it), boot id, /proc start ticks, slot and the crate name only.
+publish_holder() {                      # $1 = slot
+  local s="$1" stat rest tmp my_start
+  local -a flds=()
+  stat="$(cat "/proc/$$/stat" 2>/dev/null || :)"
+  rest="${stat##*)}"
+  read -r -a flds <<< "$rest"
+  my_start="${flds[19]:-}"
+  tmp="$dir/slot$s.holder.$$.tmp"
+  {
+    printf 'pid=%s\n' "$$"
+    printf 'boot_id=%s\n' "$boot_id"
+    printf 'start_ticks=%s\n' "$my_start"
+    printf 'slot=%s\n' "$s"
+    printf 'crate=%s\n' "$crate"
+  } > "$tmp" 2>/dev/null || :
+  mv -f -- "$tmp" "$dir/slot$s.holder" 2>/dev/null || :
+}
+
+# --- classification ----------------------------------------------------------
+# Sets h_state (running|stopped|stale|unknown), h_pid, h_boot, h_start, h_crate.
+# `running` per the design: pid alive, boot id and start time match, state not T/t.
+h_pid=""; h_boot=""; h_start=""; h_crate=""; h_state=unknown
+classify_slot() {                       # $1 = slot
+  local s="$1" f="$dir/slot$s.holder" k v st rest pstate pstart
+  local -a flds=()
+  h_pid=""; h_boot=""; h_start=""; h_crate=""; h_state=unknown
+  if [ ! -f "$f" ]; then return; fi
+  while IFS='=' read -r k v; do
+    case "$k" in
+      pid) h_pid="$v" ;;
+      boot_id) h_boot="$v" ;;
+      start_ticks) h_start="$v" ;;
+      crate) h_crate="$v" ;;
+    esac
+  done < "$f"
+  case "$h_pid" in ''|*[!0-9]*) return ;; esac
+  case "$h_start" in ''|*[!0-9]*) return ;; esac
+  [ -n "$h_boot" ] || return
+  if [ ! -e "/proc/$h_pid" ]; then h_state=stale; return; fi
+  st="$(cat "/proc/$h_pid/stat" 2>/dev/null || :)"
+  if [ -z "$st" ]; then
+    if [ -e "/proc/$h_pid" ]; then return; else h_state=stale; return; fi
+  fi
+  rest="${st##*)}"
+  read -r -a flds <<< "$rest"
+  pstate="${flds[0]:-}"
+  pstart="${flds[19]:-}"
+  [ -n "$pstart" ] || return
+  if [ "$h_boot" != "$boot_id" ]; then h_state=stale; return; fi
+  if [ "$pstart" != "$h_start" ]; then h_state=stale; return; fi
+  case "$pstate" in
+    T|t) h_state=stopped ;;
+    *) h_state=running ;;
+  esac
+}
+
+# --- wait, then take the first slot a real `flock -n` grants -----------------
+t0=$SECONDS
+report_after="${P1_RUSTC_SERIAL_REPORT_AFTER_S:-600}"
+case "$report_after" in ''|*[!0-9]*) report_after=600 ;; esac
+backoff_ms=50
+declare -A seen=()
+report_done=0
+
+while :; do
+  for ((s = 0; s < slots; s++)); do
+    if [ -L "$dir/slot$s" ]; then
+      printf 'rustc-serial: slot %s is a symlink\n' "$dir/slot$s" >&2
+      exit 2
+    fi
+    exec {lockfd}>>"$dir/slot$s"
+    if flock -n "$lockfd"; then
+      publish_holder "$s"
+      exec "$@"
+    fi
+    exec {lockfd}>&-
+  done
+
+  for ((s = 0; s < slots; s++)); do
+    classify_slot "$s"
+    key="$s:${h_pid}:${h_start}"
+    case "$h_state" in
+      stopped)
+        if [ -z "${seen[$key]:-}" ]; then
+          seen[$key]=1
+          printf 'rustc-serial: slot %s held by stopped pid %s (crate %s); waiting for another slot\n' \
+            "$s" "$h_pid" "${h_crate:-}" >&2
+        fi ;;
+      stale)
+        if [ -z "${seen[$key]:-}" ]; then
+          seen[$key]=1
+          printf 'rustc-serial: slot %s holder record stale (pid %s gone); waiting on the lock\n' \
+            "$s" "$h_pid" >&2
+        fi ;;
+    esac
+  done
+
+  elapsed=$((SECONDS - t0))
+  if [ "$report_done" -eq 0 ] && [ "$elapsed" -ge "$report_after" ]; then
+    report_done=1
+    for ((s = 0; s < slots; s++)); do
+      classify_slot "$s"
+      printf 'rustc-serial: waited %ss; slot %s holder pid %s state %s crate %s\n' \
+        "$elapsed" "$s" "${h_pid:-?}" "$h_state" "${h_crate:-?}" >&2
+    done
+  fi
+
+  sleep "$(printf '%d.%03d' "$((backoff_ms / 1000))" "$((backoff_ms % 1000))")"
+  backoff_ms=$((backoff_ms * 2))
+  if [ "$backoff_ms" -gt 1000 ]; then backoff_ms=1000; fi
+done
