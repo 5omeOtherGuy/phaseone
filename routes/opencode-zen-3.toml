@@ -1,7 +1,7 @@
 # How the OpenCode Zen free surface is reached on the owner's THIRD Zen account
 # (ADR-0039 step 3, spec §1.2 of docs/design/routes-and-profiles.md). Same endpoint, dialect and
-# session header as `opencode-zen-1`; a different ACCOUNT, therefore a different route id, origin
-# (a session resumes only on the route that recorded it, ADR-0033) and its own key in p1's store.
+# session header as `opencode-zen-1`; a different ACCOUNT, therefore a different route id and
+# origin: p1's store keeps one credential per route id (ADR-0061), so each account has its own key.
 # `user-agent` stays compiled in `p1_host::catalog`; no `[headers]` table.
 id           = "opencode-zen-3"
 origin_route = "openai-chat/opencode-zen-3"

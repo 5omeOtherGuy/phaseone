@@ -284,7 +284,7 @@ fn every_environment_and_every_bound_profile_is_a_model() {
     assert_eq!(deepseek.efforts_line(), "high,max");
     assert_eq!(deepseek.route, "opencode-go-2-subscription");
     // The first and third Go accounts are their own routes too: same profile, same efforts,
-    // different account (and therefore a different stored session, ADR-0033).
+    // different account (and therefore its own store entry, ADR-0061).
     for (id, route) in [
         (
             "deepseek1/deepseek-v4.1-flash",
@@ -337,6 +337,18 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         .expect("the shipped Mimo profile");
     assert_eq!(mimo.route, "opencode-zen-2");
     assert_eq!(mimo.efforts_line(), "high");
+    // Each ClinePass environment spends its own account's key.
+    for (id, route) in [
+        ("cline/deepseek-v4.1-flash", "cline-pass-1"),
+        ("cline2/deepseek-v4.1-flash", "cline-pass-2"),
+    ] {
+        let model = models
+            .iter()
+            .find(|model| model.id() == id)
+            .unwrap_or_else(|| panic!("the shipped {id} model"));
+        assert_eq!(model.route, route, "{id}");
+        assert_eq!(model.efforts_line(), "high,max", "{id}");
+    }
     let kimi = models
         .iter()
         .find(|model| model.id() == "kimi/kimi-k3")

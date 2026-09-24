@@ -24,6 +24,8 @@ fn label(id: &str) -> String {
         "opencode-zen-2" => "opencode zen-2".into(),
         "opencode-zen-3" => "opencode zen-3".into(),
         "opencode-zen-free" => "opencode zen free".into(),
+        "cline-pass-1" => "clinepass 1".into(),
+        "cline-pass-2" => "clinepass 2".into(),
         "glm-subscription" => "glm".into(),
         _ => id
             .strip_suffix("-subscription")

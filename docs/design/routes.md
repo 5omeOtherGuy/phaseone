@@ -181,19 +181,15 @@ coding clients to identify themselves and supply a stable conversation header. p
 its own `user-agent: p1/<version>` and uses the host's cache key as `x-opencode-session`.
 No foreign client identity is impersonated.
 
-Credential precedence: `OPENCODE_API_KEY`; then the `opencode-go` API entry in
-`$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`);
-then the `opencode-go` API-key entry in `$PI_CODING_AGENT_DIR/auth.json` (default
-`~/.pi/agent/auth.json`). OpenCode uses `type: api`; Pi uses `type: api_key`; both
-use a `key` member. Only the selected entry is used. These are read by the credential
-source, never printed or included in the environment manifest. p1 does not execute
-Pi command-backed key configuration; use the environment variable in that case.
+Credential precedence (store-only, ADR-0061): `OPENCODE_API_KEY`, then p1's own store entry for
+the route id (`p1 login opencode-go-subscription`); no other tool's login file is read. The key is
+read by the credential source, never printed or included in the environment manifest.
 
 **Three accounts (2026-09-24, data only).** The owner has three Go subscriptions. Each is its own
 route — `opencode-go-1-subscription` (`OPENCODE_GO_1_API_KEY`; allowance used up until 2026-10-07, HTTP 402 until then),
 `opencode-go-2-subscription` (`OPENCODE_GO_2_API_KEY`) and `opencode-go-3-subscription`
-(`OPENCODE_GO_3_API_KEY`, the current primary) — because a stored session resumes only on the route
-that recorded it (ADR-0033). `opencode-go-subscription` keeps its id and `OPENCODE_API_KEY` and is a
+(`OPENCODE_GO_3_API_KEY`, the current primary) — because p1's store keeps one credential per route
+id (ADR-0061), and a separate origin keeps a recorded session's account meaningful. `opencode-go-subscription` keeps its id and `OPENCODE_API_KEY` and is a
 compatibility alias for the Go-3 account. Environments `deepseek1` and `deepseek3` name the first
 and third accounts; `deepseek` and `deepseek2` are unchanged.
 
@@ -242,8 +238,8 @@ established, so the routes probe as unsupported.
 **[docs + live, 2026-09-20]** `POST https://api.z.ai/api/coding/paas/v4/chat/completions`.
 Environment `glm` selects `glm-5.3`, high effort, matching the owner's `glm53` profile
 identified by the lead in issue #9. No fallback to the general paid API or Go.
-Credentials: `ZAI_API_KEY`, otherwise the `zai` API-key entry in Pi's auth file at the
-location above. Construction reads no credential. Access re-reads it; rejection re-reads
+Credentials (store-only, ADR-0061): `ZAI_API_KEY`, otherwise p1's own store entry for
+`glm-subscription`; no other tool's login file is read. Construction reads no credential. Access re-reads it; rejection re-reads
 once and only retries with a changed key. Static keys have no OAuth refresh; an unchanged
 rejected key produces an authentication error. Neither credential source writes files.
 

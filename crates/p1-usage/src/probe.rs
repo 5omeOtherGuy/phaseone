@@ -831,6 +831,9 @@ mod tests {
         assert_eq!(url("opencode-zen-2"), None);
         assert_eq!(url("opencode-zen-3"), None);
         assert_eq!(url("opencode-zen-free"), None);
+        // ClinePass shows usage only on its dashboard; no usage API is documented.
+        assert_eq!(url("cline-pass-1"), None);
+        assert_eq!(url("cline-pass-2"), None);
         let oauth =
             |kind| Shape::of(&fixture_route_of("anthropic-subscription", kind)).map(Shape::url);
         assert_eq!(

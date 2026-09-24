@@ -17,10 +17,9 @@ module = "shell"
 [[tools]]
 module = "finish"
 
-# The route serves a 1M-token window. The first values here (170k window, summarize at 90k) were
-# taken from one run's peak and were far too tight: run split4a (docs/dogfood/runs.jsonl) read
-# 698 files in 855 requests, was summarized 40 times and never reached its first edit — a task
-# that must hold several large files at once thrashes below ~100k. Summarize late, keep a long tail.
+# Copied from environments/deepseek, not measured on this route: the runs behind these values
+# (split4a and its successors, docs/dogfood/runs.jsonl) ran on OpenCode Go, not on api.cline.bot,
+# and ClinePass documents no window. Summarize late, keep a long tail.
 [context]
 window_tokens = 1000000
 output_headroom_tokens = 32000
