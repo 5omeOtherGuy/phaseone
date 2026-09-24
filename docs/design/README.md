@@ -31,4 +31,5 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 | `model-selection.md` | Choosing, scoping and switching models: `--model`, `p1 models`, `settings.toml`, `/model` (ADR-0049) |
 | `workflows.md` | Optional workflows: a sandboxed script orchestrates workers under roles and caps (ADR-0053) |
 | `hooks.md` | Optional detached brain shadow hook for user inputs and worker briefs (ADR-0058) |
+| `unified-dashboard.md` | Proposed pure dashboard shell, shipped-view inventory and incremental composition plan (#89, ADR-0064) |
 | `iris-tui-reuse-plan.md` | Proposed donor inventory, modularity gates and staged p1-workflow migration of Iris TUI mechanisms (#91) |

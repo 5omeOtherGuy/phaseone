@@ -76,6 +76,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0060 | [One shared cargo target per repository across worktrees; rustc-serial ignores slots whose holder is stopped](0060-one-shared-cargo-target-per-repository-across-worktrees-rustc-serial-ignores-slots-whose-holder-is-stopped.md) | proposed | 2026-09-23 | owner+lead |
 | ADR-0061 | [A route may be self-contained: store-only credentials never read another tool's login](0061-a-route-may-be-self-contained-store-only-credentials-never-read-another-tool-s-login.md) | accepted | 2026-09-24 | owner |
 | ADR-0062 | [A plan refusal is its own provider error kind; it is never refreshed or retried](0062-a-plan-refusal-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md) | proposed | 2026-09-24 | lead |
+| ADR-0064 | [Unified dashboard uses a pure shell and explicit view composition](0064-unified-dashboard-uses-a-pure-shell-and-explicit-view-composition.md) | proposed | 2026-09-24 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
