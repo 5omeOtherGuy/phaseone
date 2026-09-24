@@ -184,6 +184,7 @@ fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::AnthropicMessages(MessagesAdapterSettings {
             account: MessagesAccount::ClaudeCodeSubscription,
+            long_context: true,
         })
     );
     assert!(route.headers.is_empty(), "no static headers on this route");

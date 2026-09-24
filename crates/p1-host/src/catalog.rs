@@ -420,6 +420,7 @@ fn messages_route_from(
         origin_route: route.origin_route.clone(),
         endpoint: route.endpoint.clone(),
         account: settings.account,
+        long_context: settings.long_context,
     }
 }
 
