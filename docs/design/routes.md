@@ -213,9 +213,10 @@ Following ADR-0039 migration step 2, `p1-provider-openai-chat` takes an injected
 The closed subscription-route enum is gone. `ChatRoute` carries origin, endpoint,
 non-secret headers, optional session header, wire dialect and route output ceiling.
 `ChatDialect` names implemented encodings (`ThinkingWithReasoningAlias` or
-`RetainedThinking`), never vendors; only the former permits the `reasoning` replay alias.
-The constructor rejects incompatible continuation requirements, unsupported efforts,
-credential-bearing URLs/known credential headers and invalid route settings.
+`RetainedThinking`), never vendors. Both dialects accept `reasoning` as a streaming alias for
+replayable `reasoning_content`; the retained dialect additionally supports preserved thinking
+and streaming function inputs. The constructor rejects incompatible continuation requirements,
+unsupported efforts, credential-bearing URLs/known credential headers and invalid route settings.
 
 The additive `p1-model-profile` crate depends only on contracts. It holds the currently
 consumed model policy: identity, enabled/preserved thinking, supported/default efforts and
@@ -241,8 +242,8 @@ Unknown options in the adapter namespace are errors. Go enables thinking without
 `clear_thinking` field. Both request streamed usage with `stream_options.include_usage`. GLM also sets
 `tool_stream: true` when tools are present to stream argument fragments.
 
-**Stream:** `choices[0].delta.content`, `reasoning_content` (Go's `reasoning` alias also
-accepted), and indexed function-call fragments. Calls retain first-appearance order;
+**Stream:** `choices[0].delta.content`, `reasoning_content` (the `reasoning` alias is also
+accepted in both dialects), and indexed function-call fragments. Calls retain first-appearance order;
 arguments are concatenated byte-exact and never parsed/repaired. `finish_reason` maps
 stop/tool_calls/length/content_filter to end-turn/tool-use/output-limit/refusal. Completion
 requires `[DONE]` after a finish reason, retaining usage in a later empty-choices chunk.
