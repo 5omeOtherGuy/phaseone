@@ -286,9 +286,20 @@ impl ResponseParser for ChatParser {
     ) -> ProviderError {
         // A 401/403 whose body says the account has no balance is not a rejected
         // key (ADR-0046): refreshing the credential cannot help, so the operator
-        // must read the balance, not a key error.
-        if matches!(status, 401 | 403) && names_no_balance(body) {
-            return ProviderError::new(ProviderErrorKind::InsufficientBalance, NO_BALANCE_MESSAGE);
+        // must read the balance, not a key error. A plan / free-tier refusal is
+        // the same shape with a different diagnosis (ADR-0062): the key is valid,
+        // the route is just not entitled to this model, so a refresh cannot help
+        // either.
+        if matches!(status, 401 | 403) {
+            if names_no_balance(body) {
+                return ProviderError::new(
+                    ProviderErrorKind::InsufficientBalance,
+                    NO_BALANCE_MESSAGE,
+                );
+            }
+            if names_plan_refusal(body) {
+                return ProviderError::new(ProviderErrorKind::NotEntitled, NOT_ENTITLED_MESSAGE);
+            }
         }
         let context = serde_json::from_slice::<Value>(body).ok().is_some_and(|v| {
             v.pointer("/error/code").and_then(Value::as_str) == Some("context_length_exceeded")
@@ -323,17 +334,39 @@ const NO_BALANCE_WORDS: [&str; 5] = [
     "billing_error",
 ];
 
+/// The whole text of a plan / free-tier refusal (ADR-0062): like the no-balance
+/// message it is a constant, never the server's free text.
+const NOT_ENTITLED_MESSAGE: &str = "the account's plan does not allow this model on this route";
+
+/// The fixed allow-list of error words that mean "the plan does not allow this".
+/// `freetiererror` is the observed OpenCode Zen shape (a valid key, a model gated
+/// to OpenCode's own client); the rest are the same fixed-guess kind the no-balance
+/// list is, an unknown shape falling back to the status-based classification.
+const NOT_ENTITLED_WORDS: [&str; 3] = ["freetiererror", "not_entitled", "plan_not_allowed"];
+
 /// Whether an error body names a no-balance word in one of the four fixed
 /// positions. The body is classification input: a non-JSON, empty or differently
 /// shaped body is simply not a hit.
 fn names_no_balance(body: &[u8]) -> bool {
+    names_any_position(body, &NO_BALANCE_WORDS)
+}
+
+/// Whether an error body names a plan-refusal word in one of the same four fixed
+/// positions `names_no_balance` reads (ADR-0062).
+fn names_plan_refusal(body: &[u8]) -> bool {
+    names_any_position(body, &NOT_ENTITLED_WORDS)
+}
+
+/// Read `/error/type`, `/error/code`, top-level `/type` and `/code` (strings
+/// only), lower-case them and look each up in `words`.
+fn names_any_position(body: &[u8], words: &[&str]) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
     ["/error/type", "/error/code", "/type", "/code"]
         .iter()
         .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-        .any(|word| NO_BALANCE_WORDS.contains(&word.to_ascii_lowercase().as_str()))
+        .any(|word| words.contains(&word.to_ascii_lowercase().as_str()))
 }
 
 fn map_usage(value: &Value) -> Usage {
@@ -374,6 +407,34 @@ mod tests {
         let error = parser().on_http_error(400, &[], br#"{"error":{"code":"has spaces"}}"#);
         assert_eq!(error.message, "chat HTTP status 400");
         assert!(!error.message.contains("has spaces"));
+    }
+
+    #[test]
+    fn a_free_tier_refusal_is_not_entitled_not_authentication() {
+        // The live OpenCode Zen shape: a valid key, but the model is gated to
+        // OpenCode's own client (ADR-0062).
+        let error = parser().on_http_error(
+            403,
+            &[],
+            br#"{"error":{"type":"FreeTierError","message":"this model is only available in the OpenCode client"}}"#,
+        );
+        assert_eq!(error.kind, ProviderErrorKind::NotEntitled);
+        assert_eq!(error.message, NOT_ENTITLED_MESSAGE);
+        // The server's free text is never copied into the message.
+        assert!(
+            !error
+                .message
+                .contains("only available in the OpenCode client")
+        );
+
+        // An unknown 403 body keeps today's status-based classification.
+        let unknown = parser().on_http_error(403, &[], br#"{"error":{"type":"invalid_api_key"}}"#);
+        assert_eq!(unknown.kind, ProviderErrorKind::Authentication);
+
+        // The no-balance classification is unchanged.
+        let balance = parser().on_http_error(401, &[], br#"{"error":{"type":"creditserror"}}"#);
+        assert_eq!(balance.kind, ProviderErrorKind::InsufficientBalance);
+        assert_eq!(balance.message, NO_BALANCE_MESSAGE);
     }
 
     fn send(p: &mut ChatParser, value: Value) -> Vec<StreamEvent> {
