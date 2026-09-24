@@ -1406,7 +1406,7 @@ approval), done `✓` ok (and `done · not verified` when it finished without a 
 (`not restored on resume`, ADR-0034). Selection: `^F` focuses the pane, `↑ ↓` move an amber focus
 row (row 1 of a block), `a` attach, `x` stop (asks `y stop  n keep` — the one amber event), `esc`
 back. Rows changed by owner request (#111, 2026-09-24); the WORKERS mocks were re-derived from the
-renderer because the design source is not in the repo.
+renderer because the WorkersPane mock component is not in the repo; the state in lib/p1-screens.js carries the new fields.
 **el-workers-pane @ 56** — WorkersPane — wide (56) with every state; compact (38)
 
 TEXT 56×38

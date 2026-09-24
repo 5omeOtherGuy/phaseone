@@ -1,7 +1,8 @@
 //! Pane mocks (handoff §9): LEDGER, OUTPUT and WORKERS (wide and compact), built from the
 //! `lib/p1-screens.js` inputs and checked cell for cell against `grids.json` through the
-//! `common/slab` oracle. Plus unit coverage for mode availability/cycling and the LEDGER drop
-//! order (§9.2), which have no standalone mock (they are behaviour, not a screen).
+//! `common/slab` oracle. The WORKERS mocks were re-derived from the renderer for #111. Plus unit
+//! coverage for mode availability/cycling and the LEDGER drop order (§9.2), which have no
+//! standalone mock (they are behaviour, not a screen).
 
 mod common;
 

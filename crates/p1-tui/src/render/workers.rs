@@ -126,7 +126,7 @@ pub struct WorkersPane {
 
 /// Render the WORKERS pane: header, then one block per worker in state
 /// order, separated by one blank BLOCK row, then the selection footer
-/// (§9.4). `compact` selects the 2-row form (grid 30) over the wide 4-row
+/// (§9.4). `compact` selects the 3-row form (grid 30) over the wide 2–4-row
 /// form (grid 48); the footer drops `x stop` in the compact form (mock-
 /// verified: `el-workers-pane-38`).
 pub fn render(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'static>> {
@@ -249,15 +249,23 @@ fn cost_text(cost_micro_usd: Option<u64>) -> String {
         .unwrap_or_else(|| super::UNKNOWN.into())
 }
 
+const LEAD_INDENT: &str = "  ";
+
 fn lead(worker: &WorkerBlock, right_cells: usize, width: usize) -> Vec<Seg> {
     let Some(model) = &worker.model else {
-        return vec![Seg::new(palette::DIM, format!("  {}", worker.route))];
+        return vec![Seg::new(
+            palette::DIM,
+            format!("{LEAD_INDENT}{}", worker.route),
+        )];
     };
-    let mut segments = vec![Seg::new(palette::INK, format!("  {model}"))];
+    let mut segments = vec![Seg::new(palette::INK, format!("{LEAD_INDENT}{model}"))];
     let room = width.saturating_sub(8).saturating_sub(right_cells + 2);
     let suffix = format!(" · {}", worker.route);
     if worker.route != *model
-        && crate::wrap::cell_width(model) + crate::wrap::cell_width(&suffix) <= room
+        && crate::wrap::cell_width(LEAD_INDENT)
+            + crate::wrap::cell_width(model)
+            + crate::wrap::cell_width(&suffix)
+            <= room
     {
         segments.push(Seg::new(palette::DIM, suffix));
     }

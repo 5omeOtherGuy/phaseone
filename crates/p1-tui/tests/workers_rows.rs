@@ -52,6 +52,62 @@ fn overlong_model_is_cut_and_never_partially_shows_the_route() {
 }
 
 #[test]
+fn boundary_fits_never_show_a_partial_route() {
+    let mut wide = worker();
+    wide.model = Some("gpt-5.6-luna".into());
+    wide.route = "gpt/gpt-5.6-luna".into();
+    wide.tokens = None;
+    wide.context_window = None;
+    wide.elapsed = Some("4m12s".into());
+    // Wide: inner = 56 − 8 = 48; right cells = 15; room = 48 − 15 − 2 = 31.
+    // 2 indent + 12 model + 19 suffix = 33, so the whole route is omitted.
+    let row = render(&pane(wide), 56, false)[3].to_string();
+    assert!(row.contains("gpt-5.6-luna"), "{row}");
+    assert!(!row.contains('…'), "{row}");
+    assert!(!row.contains("gpt/gpt-5.6-luna"), "{row}");
+
+    let mut compact = worker();
+    compact.model = Some("glm-5.3".into());
+    compact.route = "glm/5.3-prod".into();
+    compact.tokens = None;
+    compact.context_window = None;
+    compact.elapsed = Some("4m12s".into());
+    // Compact: inner = 38 − 8 = 30; right cells = 5; room = 30 − 5 − 2 = 23.
+    // 2 indent + 7 model + 15 suffix = 24, so the whole route is omitted.
+    let row = render(&pane(compact), 38, true)[3].to_string();
+    assert!(row.contains("glm-5.3"), "{row}");
+    assert!(!row.contains('…'), "{row}");
+    assert!(!row.contains("glm/5.3-prod"), "{row}");
+}
+
+#[test]
+fn exact_fit_keeps_the_whole_suffix() {
+    let mut wide = worker();
+    wide.model = Some("gpt-5.6-luna".into());
+    wide.route = "gpt/5.6-luna-x".into();
+    wide.tokens = None;
+    wide.context_window = None;
+    wide.elapsed = Some("4m12s".into());
+    // Wide: inner = 56 − 8 = 48; right cells = 15; room = 31.
+    // 2 indent + 12 model + 17 suffix = 31 exactly.
+    let row = render(&pane(wide), 56, false)[3].to_string();
+    assert!(row.contains(" · gpt/5.6-luna-x"), "{row}");
+    assert!(!row.contains('…'), "{row}");
+
+    let mut compact = worker();
+    compact.model = Some("glm-5.3".into());
+    compact.route = "glm/5.3-pro".into();
+    compact.tokens = None;
+    compact.context_window = None;
+    compact.elapsed = Some("4m12s".into());
+    // Compact: inner = 38 − 8 = 30; right cells = 5; room = 23.
+    // 2 indent + 7 model + 14 suffix = 23 exactly.
+    let row = render(&pane(compact), 38, true)[3].to_string();
+    assert!(row.contains(" · glm/5.3-pro"), "{row}");
+    assert!(!row.contains('…'), "{row}");
+}
+
+#[test]
 fn a_short_model_gets_a_dim_route_suffix_when_it_fits() {
     let mut worker = worker();
     worker.model = Some("glm-5.3".into());
