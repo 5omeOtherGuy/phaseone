@@ -1,7 +1,7 @@
 //! Version metadata for `p1 --version`.
 //!
 //! The release job hands the built commit's short sha and date in through the
-//! environment (`P1_GIT_SHA`, `P1_BUILD_DATE`, ADR-0063); a local build falls back to
+//! environment (`P1_GIT_SHA`, `P1_BUILD_DATE`, ADR-0065); a local build falls back to
 //! `git rev-parse` for the sha and `SOURCE_DATE_EPOCH` for the date. There is no
 //! wall-clock fallback: two builds of one commit must print the same string, and
 //! `unknown` is the honest answer when neither source exists. A git-sourced sha is

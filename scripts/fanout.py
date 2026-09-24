@@ -179,7 +179,7 @@ def default_p1_binary():
 def p1_binary():
     """The p1 to run: `$P1_BIN`, else `p1` on PATH, else the sibling debug build.
 
-    An installed p1 (`<prefix>/bin/p1`, ADR-0063) is found through PATH, so a machine
+    An installed p1 (`<prefix>/bin/p1`, ADR-0065) is found through PATH, so a machine
     that installed the release needs no checkout and no `P1_BIN`.
     """
     override = os.environ.get("P1_BIN")

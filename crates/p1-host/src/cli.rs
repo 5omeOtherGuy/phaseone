@@ -238,7 +238,7 @@ pub fn usage() -> String {
 }
 
 /// `p1 <version>`: the package version, the built commit's short sha and the build
-/// date (ADR-0063). All three come from `build.rs`, so an installed binary says which
+/// date (ADR-0065). All three come from `build.rs`, so an installed binary says which
 /// commit it is — `p1-linux-x86_64` is published under a moving tag, not a version.
 pub fn version() -> String {
     format!(

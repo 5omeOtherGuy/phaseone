@@ -1,5 +1,5 @@
 ---
-adr: 63
+adr: 65
 title: p1 installs from its release channel into a prefix and the binary names its commit
 status: proposed
 date: 2026-09-24
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: []
 ---
-# ADR-0063: p1 installs from its release channel into a prefix and the binary names its commit
+# ADR-0065: p1 installs from its release channel into a prefix and the binary names its commit
 
 ## Context
 

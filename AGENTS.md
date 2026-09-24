@@ -67,7 +67,7 @@ Verify `scripts/local-cargo-config.sh` and the worktree helper honor the current
 `scripts/local-cargo-config.sh` writes an untracked `.cargo/config.toml`; never commit it.
 Use `cargo check -p <crate>` or `cargo test -p <crate> <filter>` while iterating, then the full gate at the integration boundary.
 Use no release build, cargo install, extra toolchain or target unless the task authorizes it.
-The one release build is CI's: `.github/workflows/release.yml` builds `p1` in release profile on a GitHub runner after a green `gate` on main and publishes `main-<shortsha>`, so a user installs without a toolchain (ADR-0063).
+The one release build is CI's: `.github/workflows/release.yml` builds `p1` in release profile on a GitHub runner after a green `gate` on main and publishes `main-<shortsha>`, so a user installs without a toolchain (ADR-0065).
 Do not move or remove a running build's target.
 
 ## Architecture

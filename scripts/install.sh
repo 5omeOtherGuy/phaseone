@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install or update p1 from its public release channel (ADR-0063).
+# Install or update p1 from its public release channel (ADR-0065).
 #
 #   scripts/install.sh [--latest | --from-release TAG | --local] [--prefix DIR] [--force]
 #
@@ -162,17 +162,16 @@ transaction=0
 new_started=0
 
 rollback_install() {
-  local restore_error=0 pair
+  local restore_error=0 restore_from restore_to index
   [ "$transaction" -eq 1 ] || return 0
   if [ "$new_started" -eq 1 ]; then
     rm -rf "$prefix/bin/p1" "$prefix/bin/p1-update" "$prefix/share/p1"
   fi
-  for pair in \
-    "$bin_prev:$prefix/bin/p1" \
-    "$update_prev:$prefix/bin/p1-update" \
-    "$share_prev:$prefix/share/p1"; do
-    if [ -e "${pair%%:*}" ] || [ -L "${pair%%:*}" ]; then
-      mv "${pair%%:*}" "${pair#*:}" || restore_error=1
+  restore_from=("$bin_prev" "$update_prev" "$share_prev")
+  restore_to=("$prefix/bin/p1" "$prefix/bin/p1-update" "$prefix/share/p1")
+  for index in "${!restore_from[@]}"; do
+    if [ -e "${restore_from[$index]}" ] || [ -L "${restore_from[$index]}" ]; then
+      mv "${restore_from[$index]}" "${restore_to[$index]}" || restore_error=1
     fi
   done
   transaction=0
@@ -321,7 +320,7 @@ stage_self_and_updater() {
   wrapper="$prefix/bin/.p1-update.new.$$"
   cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
-# Written by p1's install.sh (ADR-0063): update p1 to the latest release.
+# Written by p1's install.sh (ADR-0065): update p1 to the latest release.
 set -euo pipefail
 exec "$prefix/share/p1/install.sh" --latest --prefix "$prefix" "\$@"
 EOF
@@ -381,23 +380,46 @@ commit_install() {
   [ ! -e "$prefix/bin/p1" ] || had_binary=1
   [ ! -e "$prefix/bin/p1-update" ] || had_updater=1
   [ ! -e "$prefix/share/p1" ] || had_share=1
-  # The fixed backup slots are ours to reuse: anything there is a stale copy from a
-  # failed rollback that named itself, and the next install replaces it.
-  rm -f "$bin_prev" "$update_prev"
-  rm -rf "$share_prev"
   transaction=1
 
-  if [ "$had_binary" -eq 1 ] && ! mv "$prefix/bin/p1" "$bin_prev"; then
-    restore_previous_install
-    die "could not retain the previous binary"
+  # A stale fixed slot may be the only manual-recovery copy after a failed rollback. Move
+  # it aside rather than deleting it, and discard both it and this install's retained
+  # previous files only after every new-file rename has succeeded.
+  if [ "$had_binary" -eq 1 ]; then
+    if [ -e "$bin_prev" ] || [ -L "$bin_prev" ]; then
+      mv "$bin_prev" "$bin_prev.stale" || {
+        restore_previous_install
+        die "could not preserve the previous binary backup"
+      }
+    fi
+    if ! mv "$prefix/bin/p1" "$bin_prev"; then
+      restore_previous_install
+      die "could not retain the previous binary"
+    fi
   fi
-  if [ "$had_updater" -eq 1 ] && ! mv "$prefix/bin/p1-update" "$update_prev"; then
-    restore_previous_install
-    die "could not retain the previous updater"
+  if [ "$had_updater" -eq 1 ]; then
+    if [ -e "$update_prev" ] || [ -L "$update_prev" ]; then
+      mv "$update_prev" "$update_prev.stale" || {
+        restore_previous_install
+        die "could not preserve the previous updater backup"
+      }
+    fi
+    if ! mv "$prefix/bin/p1-update" "$update_prev"; then
+      restore_previous_install
+      die "could not retain the previous updater"
+    fi
   fi
-  if [ "$had_share" -eq 1 ] && ! mv "$prefix/share/p1" "$share_prev"; then
-    restore_previous_install
-    die "could not retain the previous share data"
+  if [ "$had_share" -eq 1 ]; then
+    if [ -e "$share_prev" ] || [ -L "$share_prev" ]; then
+      mv "$share_prev" "$share_prev.stale" || {
+        restore_previous_install
+        die "could not preserve the previous share data backup"
+      }
+    fi
+    if ! mv "$prefix/share/p1" "$share_prev"; then
+      restore_previous_install
+      die "could not retain the previous share data"
+    fi
   fi
 
   new_started=1
@@ -417,6 +439,8 @@ commit_install() {
 
   rm -f "$bin_prev" "$update_prev"
   rm -rf "$share_prev"
+  rm -f "$bin_prev.stale" "$update_prev.stale"
+  rm -rf "$share_prev.stale"
   transaction=0
 }
 
