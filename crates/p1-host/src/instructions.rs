@@ -38,6 +38,7 @@ pub fn prompt_section(instructions: &[PathBuf], skill_roots: &[PathBuf]) -> Resu
     for root in skill_roots {
         skills.extend(skills_under(root)?);
     }
+    skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
     if !skills.is_empty() {
         out.push_str(
             "\n\n# Skills (listed by p1 from --skills)\n\
@@ -64,7 +65,7 @@ struct Skill {
     path: PathBuf,
 }
 
-/// Every `<root>/<dir>/SKILL.md`, sorted by directory name. A missing root is an error;
+/// Every `<root>/<dir>/SKILL.md` (the caller sorts by name). A missing root is an error;
 /// a directory without SKILL.md is not a skill and is skipped.
 fn skills_under(root: &Path) -> Result<Vec<Skill>, String> {
     let entries = std::fs::read_dir(root)
@@ -94,7 +95,8 @@ fn skills_under(root: &Path) -> Result<Vec<Skill>, String> {
 }
 
 /// `name:` and `description:` from a leading `---` front-matter block. Values are single
-/// lines; surrounding quotes are removed.
+/// lines; surrounding quotes are removed. A block without its closing `---` is not front
+/// matter: reading on would take body lines for metadata.
 fn front_matter(text: &str) -> (Option<String>, Option<String>) {
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
@@ -102,8 +104,10 @@ fn front_matter(text: &str) -> (Option<String>, Option<String>) {
     }
     let mut name = None;
     let mut description = None;
+    let mut closed = false;
     for line in lines {
         if line.trim() == "---" {
+            closed = true;
             break;
         }
         if let Some((key, value)) = line.split_once(':') {
@@ -118,6 +122,9 @@ fn front_matter(text: &str) -> (Option<String>, Option<String>) {
                 _ => {}
             }
         }
+    }
+    if !closed {
+        return (None, None);
     }
     (name, description)
 }
@@ -172,7 +179,7 @@ mod tests {
     fn a_missing_instruction_file_is_an_error_naming_it() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.md");
-        let error = prompt_section(&[missing.clone()], &[]).unwrap_err();
+        let error = prompt_section(std::slice::from_ref(&missing), &[]).unwrap_err();
         assert!(error.contains(&missing.display().to_string()), "{error}");
     }
 
@@ -201,7 +208,7 @@ mod tests {
         );
         write(&root, "no-front-matter/SKILL.md", "# just a body\n");
         write(&root, "not-a-skill/README.md", "ignored");
-        let section = prompt_section(&[], &[root.clone()]).unwrap();
+        let section = prompt_section(&[], std::slice::from_ref(&root)).unwrap();
         let alpha = section.find("- alpha — Use for A. — ").unwrap();
         let fallback = section
             .find("- no-front-matter — (no description) — ")
@@ -214,6 +221,42 @@ mod tests {
             !section.contains("# body"),
             "bodies load on demand, not in the prompt"
         );
+    }
+
+    #[test]
+    fn skills_sort_by_front_matter_name_across_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("one");
+        let second = dir.path().join("two");
+        write(
+            &first,
+            "a/SKILL.md",
+            "---\nname: zeta\ndescription: Z.\n---\n",
+        );
+        write(
+            &second,
+            "z/SKILL.md",
+            "---\nname: alpha\ndescription: A.\n---\n",
+        );
+        let section = prompt_section(&[], &[first, second]).unwrap();
+        assert!(section.find("- alpha").unwrap() < section.find("- zeta").unwrap());
+    }
+
+    #[test]
+    fn unterminated_front_matter_is_not_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+        write(
+            &root,
+            "open/SKILL.md",
+            "---\nname: open\nbody line\ndescription: BODY TEXT\n",
+        );
+        let section = prompt_section(&[], std::slice::from_ref(&root)).unwrap();
+        assert!(
+            section.contains("- open — (no description) — "),
+            "{section}"
+        );
+        assert!(!section.contains("BODY TEXT"));
     }
 
     #[test]
