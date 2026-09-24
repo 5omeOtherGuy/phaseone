@@ -3,7 +3,7 @@ use p1_contracts::{
     AssistantBlock, AssistantItem, CompletedResponse, Origin, Outcome, ProviderError,
     ProviderErrorKind, ReplayData, StopReason, StreamEvent, ToolCall, ToolInput, Usage,
 };
-use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status};
+use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status, reset_after};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -275,9 +275,21 @@ impl ResponseParser for ChatParser {
     fn on_http_error(
         &self,
         status: u16,
-        _headers: &[(String, String)],
+        headers: &[(String, String)],
         body: &[u8],
     ) -> ProviderError {
+        // A usage-limit error is an exhausted allowance, not a short rate-limit
+        // window. Retrying it across the provider's reset only hides the failure.
+        if matches!(status, 402 | 429) && names_usage_limit(body) {
+            let message = match reset_after(headers) {
+                Some(delay) => format!(
+                    "{USAGE_LIMIT_MESSAGE} (resets in {})",
+                    human_duration(delay)
+                ),
+                None => USAGE_LIMIT_MESSAGE.to_string(),
+            };
+            return ProviderError::new(ProviderErrorKind::UsageLimitExhausted, message);
+        }
         // A 401/403 whose body says the account has no balance is not a rejected
         // key (ADR-0046): refreshing the credential cannot help, so the operator
         // must read the balance, not a key error. A plan / free-tier refusal is
@@ -310,6 +322,48 @@ impl ResponseParser for ChatParser {
             Some(code) => ProviderError::new(kind, format!("chat HTTP status {status} ({code})")),
             None => ProviderError::new(kind, format!("chat HTTP status {status}")),
         }
+    }
+}
+
+/// The whole text of an exhausted usage allowance: only the provider's reset
+/// hint is formatted into it, never the server's free text.
+const USAGE_LIMIT_MESSAGE: &str = "the account's usage allowance is used up";
+
+/// Fixed usage-limit/quota words, read in the same four JSON positions as the
+/// no-balance and plan-refusal classifications.
+const USAGE_LIMIT_WORDS: [&str; 3] = [
+    "gousagelimiterror",
+    "insufficient_quota",
+    "usage_limit_exceeded",
+];
+
+fn names_usage_limit(body: &[u8]) -> bool {
+    names_any_position(body, &USAGE_LIMIT_WORDS)
+}
+
+fn human_duration(duration: std::time::Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let parts = [
+        (total_seconds / 86_400, "d"),
+        ((total_seconds % 86_400) / 3_600, "h"),
+        ((total_seconds % 3_600) / 60, "min"),
+        (total_seconds % 60, "s"),
+    ];
+    let mut out = String::new();
+    for (amount, unit) in parts {
+        if amount > 0 {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&amount.to_string());
+            out.push(' ');
+            out.push_str(unit);
+        }
+    }
+    if out.is_empty() {
+        "0 s".to_string()
+    } else {
+        out
     }
 }
 
@@ -405,6 +459,13 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecognised_429_body_stays_rate_limited() {
+        let error =
+            parser().on_http_error(429, &[], br#"{"error":{"type":"temporary_burst_limit"}}"#);
+        assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+    }
+
+    #[test]
     fn a_free_tier_refusal_is_not_entitled_not_authentication() {
         // The live OpenCode Zen shape: a valid key, but the model is gated to
         // OpenCode's own client (ADR-0062).
@@ -454,6 +515,24 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+
+    #[test]
+    fn a_usage_limit_is_terminal_and_its_reset_hint_is_sanitised() {
+        for (header, value) in [("Retry-After", "187200"), ("X-RateLimit-Reset", "187200")] {
+            let error = parser().on_http_error(
+                429,
+                &[(header.into(), value.into())],
+                br#"{"error":{"type":"GoUsageLimitError","message":"wire text"}}"#,
+            );
+            assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
+            assert_eq!(
+                error.message,
+                "the account's usage allowance is used up (resets in 2 d 4 h)"
+            );
+            assert!(!error.message.contains("wire text"));
+        }
+    }
+
     #[test]
     fn a_null_or_empty_tool_type_on_a_continuation_chunk_is_not_a_protocol_error() {
         for filler in [json!(null), json!("")] {

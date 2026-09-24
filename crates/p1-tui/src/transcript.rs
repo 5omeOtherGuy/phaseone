@@ -1013,6 +1013,13 @@ fn turn_notice(
                         (Next, "/model to continue on another route".into()),
                     ],
                 ),
+                ProviderErrorKind::UsageLimitExhausted => failed(
+                    format!(
+                        "{} · not retried",
+                        with_detail("usage limit reached", message)
+                    ),
+                    vec![journal(), (Next, "wait for the reset, or /model".into())],
+                ),
                 ProviderErrorKind::RateLimited => failed(
                     with_detail("rate limited", message),
                     cost(true, false)
