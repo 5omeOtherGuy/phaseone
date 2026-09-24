@@ -207,3 +207,65 @@ fn an_empty_summarize_md_names_that_file() {
         other => panic!("expected InvalidContext, got {other:?}"),
     }
 }
+
+/// Every SHIPPED environment's `[context]` table loads and validates. The per-route windows
+/// came from public sources (docs/design/context-windows.md) and are hand-written data: a
+/// typo would otherwise only surface when an agent is built. The sweep runs over the
+/// directory, so a new environment cannot slip past the check by not being named here.
+#[test]
+fn every_shipped_environment_has_a_valid_context_table() {
+    let root = shipped_environments();
+    let mut checked: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&root).expect("the shipped environments directory is readable") {
+        let path = entry.expect("a readable entry").path();
+        if !path.join("environment.toml").is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("a directory name")
+            .to_string_lossy()
+            .into_owned();
+        let environment = load_environment(&name, &[root.clone()])
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let context = environment
+            .context
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} ships without a [context] table"));
+        context
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        // The two rules the table exists for, spelled out: both numbers stay under the wall,
+        // and the threshold is a round 10k (the rounding rule of the #125 retune).
+        let wall = context.window_tokens - context.output_headroom_tokens;
+        assert!(
+            context.summarize_at_tokens < wall,
+            "{name}: summarize_at_tokens ({}) is not below the wall ({wall})",
+            context.summarize_at_tokens
+        );
+        assert!(
+            context.summary_output_tokens < wall,
+            "{name}: summary_output_tokens ({}) is not below the wall ({wall})",
+            context.summary_output_tokens
+        );
+        assert_eq!(
+            context.summarize_at_tokens % 10_000,
+            0,
+            "{name}: summarize_at_tokens ({}) is not rounded to 10k",
+            context.summarize_at_tokens
+        );
+        checked.push(name);
+    }
+    checked.sort();
+    assert_eq!(
+        checked.len(),
+        13,
+        "every shipped environment was checked: {checked:?}"
+    );
+    for required in ["claude", "gpt", "deepseek3", "zen", "kimi"] {
+        assert!(
+            checked.iter().any(|name| name == required),
+            "`{required}` was not checked: {checked:?}"
+        );
+    }
+}
