@@ -28,7 +28,7 @@ pub use file_lock::{LOCK_PATIENCE, lock_exclusive};
 pub use http::{
     ByteStream, HttpRequest, HttpResponse, ReqwestTransport, Transport, TransportError,
 };
-pub use retry::{HttpClass, RetryPolicy, classify_status, retry_after};
+pub use retry::{HttpClass, RetryPolicy, classify_status, reset_after, retry_after};
 pub use sse::{SseDecoder, SseEvent};
 
 /// Test doubles for the transport seam. Enabled by the `testing` feature, and
