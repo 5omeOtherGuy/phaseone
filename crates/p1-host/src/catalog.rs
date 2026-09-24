@@ -2,7 +2,7 @@
 //! provider and tool crates. An environment file can only select keys registered
 //! here, so configuration can never load a module that was not compiled in.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use p1_assembly::{Catalog, ProviderSpec, ToolServices, ToolSpec};
@@ -469,41 +469,70 @@ fn register_standard_tools(
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) {
+    // Issue #84: a sandbox write grant is also a writable root for the FILE tools,
+    // not only the shell sandbox, so the two agree on where the agent may write.
+    // Only the job's own grants qualify — the toolchain grants fanout adds for the
+    // shell to build stay shell-only (`file_tool_roots`).
+    let file_roots = file_tool_roots(sandbox_write, deps.home.as_deref());
+    let read_roots = file_roots.clone();
     catalog.tool(
         "read",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
+        Box::new(move |spec: &ToolSpec, services: &ToolServices| {
             Ok(apply_face!(
-                p1_tool_read::ReadTool::new(services.workspace.clone(), services.observed.clone()),
-                spec
-            ))
-        }),
-    );
-    catalog.tool(
-        "edit",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_edit::EditTool::new(services.workspace.clone(), services.observed.clone()),
-                spec
-            ))
-        }),
-    );
-    catalog.tool(
-        "write",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_write::WriteTool::new(
-                    services.workspace.clone(),
+                p1_tool_read::ReadTool::new(
+                    services
+                        .workspace
+                        .clone()
+                        .with_writable_roots(read_roots.clone()),
                     services.observed.clone()
                 ),
                 spec
             ))
         }),
     );
+    let edit_roots = file_roots.clone();
+    catalog.tool(
+        "edit",
+        Box::new(move |spec: &ToolSpec, services: &ToolServices| {
+            Ok(apply_face!(
+                p1_tool_edit::EditTool::new(
+                    services
+                        .workspace
+                        .clone()
+                        .with_writable_roots(edit_roots.clone()),
+                    services.observed.clone()
+                ),
+                spec
+            ))
+        }),
+    );
+    let write_roots = file_roots.clone();
+    catalog.tool(
+        "write",
+        Box::new(move |spec: &ToolSpec, services: &ToolServices| {
+            Ok(apply_face!(
+                p1_tool_write::WriteTool::new(
+                    services
+                        .workspace
+                        .clone()
+                        .with_writable_roots(write_roots.clone()),
+                    services.observed.clone()
+                ),
+                spec
+            ))
+        }),
+    );
+    let grep_roots = file_roots.clone();
     catalog.tool(
         "grep",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
+        Box::new(move |spec: &ToolSpec, services: &ToolServices| {
             Ok(apply_face!(
-                p1_tool_search::GrepTool::new(services.workspace.clone()),
+                p1_tool_search::GrepTool::new(
+                    services
+                        .workspace
+                        .clone()
+                        .with_writable_roots(grep_roots.clone())
+                ),
                 spec
             ))
         }),
@@ -547,10 +576,13 @@ fn register_standard_tools(
     );
     catalog.tool(
         "apply_patch",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
+        Box::new(move |spec: &ToolSpec, services: &ToolServices| {
             Ok(apply_face!(
                 p1_tool_patch::PatchTool::new(
-                    services.workspace.clone(),
+                    services
+                        .workspace
+                        .clone()
+                        .with_writable_roots(file_roots.clone()),
                     services.observed.clone()
                 ),
                 spec
@@ -574,6 +606,38 @@ fn register_standard_tools(
             Ok(tool)
         }),
     );
+}
+
+/// The `--sandbox-write` grants the FILE tools accept as extra writable roots:
+/// the job's own grants only.
+///
+/// `scripts/fanout.py:236-238` also passes the toolchain directories
+/// (`~/.cargo/registry`, `~/.cargo/git`, the rustc build-lock directory) so the
+/// SHELL can compile. Those are shared build state, not the job's output, so a
+/// file tool must not write there (issue #84 decision). They are matched by
+/// path shape because fanout passes them through the same `--sandbox-write`
+/// flag as the job's own grants.
+fn file_tool_roots(grants: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
+    let home = home.and_then(|home| home.canonicalize().ok());
+    grants
+        .iter()
+        .filter(|grant| !is_toolchain_grant(grant, home.as_deref()))
+        .cloned()
+        .collect()
+}
+
+/// Whether `grant` is one of the toolchain directories `scripts/fanout.py:236-238`
+/// adds for the shell to build.
+fn is_toolchain_grant(grant: &Path, home: Option<&Path>) -> bool {
+    if let Some(home) = home {
+        let cargo = home.join(".cargo");
+        if grant == cargo.join("registry") || grant == cargo.join("git") {
+            return true;
+        }
+    }
+    grant
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("p1-build-locks-"))
 }
 
 #[cfg(feature = "delegation")]
@@ -709,4 +773,42 @@ pub(crate) fn register_workflow_tools(
             ))
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{file_tool_roots, is_toolchain_grant};
+    use std::path::{Path, PathBuf};
+
+    /// Issue #84 decision: the toolchain grants fanout adds for the shell to
+    /// build (`~/.cargo/registry`, `~/.cargo/git`, the rustc build-lock dir) do
+    /// NOT become file-tool writable roots; the job's own grant does.
+    #[test]
+    fn toolchain_grants_are_shell_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let cargo = home.join(".cargo");
+        std::fs::create_dir_all(cargo.join("registry")).unwrap();
+        std::fs::create_dir_all(cargo.join("git")).unwrap();
+        let out = home.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let grants = vec![
+            cargo.join("registry"),
+            cargo.join("git"),
+            PathBuf::from("/tmp/p1-build-locks-1000"),
+            out.clone(),
+        ];
+
+        assert_eq!(file_tool_roots(&grants, Some(home.as_path())), vec![out]);
+    }
+
+    #[test]
+    fn the_build_lock_dir_is_a_toolchain_grant_by_name() {
+        assert!(is_toolchain_grant(
+            Path::new("/tmp/p1-build-locks-1000"),
+            None
+        ));
+        assert!(!is_toolchain_grant(Path::new("/tmp/out"), None));
+    }
 }

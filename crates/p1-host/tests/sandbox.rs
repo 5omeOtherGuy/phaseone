@@ -11,7 +11,7 @@ mod common;
 use std::process::Command;
 
 use common::{Harness, provider_hook, run_args, shipped_environments, write_environment};
-use p1_contracts::Item;
+use p1_contracts::{Item, ToolCall, ToolInput};
 use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
 use tempfile::tempdir;
 
@@ -183,6 +183,229 @@ async fn sandbox_write_keeps_a_path_writable_end_to_end() {
             .trim(),
         "w"
     );
+}
+
+/// Issue #84: `--sandbox-write DIR` is also a writable root for the FILE tools,
+/// so the two agree on where the agent may write. A `write` call with an
+/// absolute path under the granted root succeeds; it needs no shell, so this
+/// runs even where `bwrap` does not.
+#[tokio::test]
+async fn sandbox_write_makes_the_file_tools_accept_a_granted_root() {
+    let home = tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let out = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["write"],
+        "test",
+    );
+    let target = out.path().join("result.txt");
+    let write_call = serde_json::json!({
+        "file_path": target.to_str().unwrap(),
+        "content": "verdict"
+    })
+    .to_string();
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "write", &write_call)]),
+        text_response("done"),
+    ]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.home = Some(home.path().to_path_buf());
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--sandbox",
+            "workspace",
+            "--sandbox-write",
+            out.path().to_str().unwrap(),
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verdict");
+}
+
+/// Without a grant the file tools are unchanged: an absolute path outside the
+/// workspace is still refused and nothing is written.
+#[tokio::test]
+async fn without_a_grant_the_file_tools_still_refuse_an_outside_path() {
+    let home = tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let out = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["write"],
+        "test",
+    );
+    let target = out.path().join("result.txt");
+    let write_call = serde_json::json!({
+        "file_path": target.to_str().unwrap(),
+        "content": "verdict"
+    })
+    .to_string();
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "write", &write_call)]),
+        text_response("done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.home = Some(home.path().to_path_buf());
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--sandbox",
+            "workspace",
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert!(!target.exists(), "the outside path must not be written");
+    let final_request = handle.requests();
+    let results = tool_results(&final_request.last().unwrap().history);
+    assert!(
+        results
+            .iter()
+            .any(|content| content.contains("escapes workspace")),
+        "the refusal must name the workspace boundary: {results:?}"
+    );
+}
+
+/// Issue #84: inside a granted root the ordinary file-tool rules hold — `read`
+/// observes the file and a following `edit` succeeds, with no shell involved.
+#[tokio::test]
+async fn sandbox_write_makes_read_and_edit_work_inside_a_granted_root() {
+    let home = tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let out = tempdir().unwrap();
+    let target = out.path().join("result.txt");
+    std::fs::write(&target, "before").unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["read", "edit"],
+        "test",
+    );
+    let read_call = serde_json::json!({ "file_path": target.to_str().unwrap() }).to_string();
+    let edit_call = serde_json::json!({
+        "file_path": target.to_str().unwrap(),
+        "old_string": "before",
+        "new_string": "after"
+    })
+    .to_string();
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "read", &read_call)]),
+        tool_call_response(vec![json_call("c2", "edit", &edit_call)]),
+        text_response("done"),
+    ]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.home = Some(home.path().to_path_buf());
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--sandbox",
+            "workspace",
+            "--sandbox-write",
+            out.path().to_str().unwrap(),
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "after");
+}
+
+/// Issue #84 / the reported gpt job: `apply_patch`, the gpt environment's file
+/// tool, also accepts an absolute path under a granted root, so a job can write
+/// the result file it was asked for.
+#[tokio::test]
+async fn sandbox_write_makes_apply_patch_accept_a_granted_root() {
+    let home = tempdir().unwrap();
+    let workspace = home.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let out = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["apply_patch"],
+        "test",
+    );
+    let target = out.path().join("result.txt");
+    let call = ToolCall {
+        call_id: "c1".into(),
+        name: "apply_patch".into(),
+        input: ToolInput::Text(format!(
+            "*** Begin Patch\n*** Add File: {}\n+verdict\n*** End Patch\n",
+            target.display()
+        )),
+    };
+    let provider =
+        ScriptedProvider::new(vec![tool_call_response(vec![call]), text_response("done")]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.home = Some(home.path().to_path_buf());
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--sandbox",
+            "workspace",
+            "--sandbox-write",
+            out.path().to_str().unwrap(),
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verdict\n");
 }
 
 /// `--sandbox-read PATH` keeps an extra path visible READ-ONLY end to end: the

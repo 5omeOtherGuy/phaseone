@@ -5,6 +5,11 @@
 //! variable: every path a file tool touches must resolve inside the workspace
 //! root *after* symlink resolution (see [`Workspace::resolve`]). This is an
 //! invariant of the tools, not a policy the host may relax.
+//!
+//! The host may open ADDITIONAL writable roots from a sandbox write grant
+//! ([`Workspace::with_writable_roots`]): a path is then confined to the
+//! workspace root OR one of those roots, with the same `..`/symlink checks. A
+//! workspace with no granted roots behaves exactly as before.
 
 mod gate;
 mod observe;
@@ -24,10 +29,12 @@ pub enum WorkspaceError {
     /// The configured root is not a directory.
     #[error("workspace root is not a directory: {}", .0.display())]
     NotADirectory(PathBuf),
-    /// The requested path resolves outside the workspace root, directly, by
-    /// `..`, or through a symlink.
-    #[error("path escapes workspace: {requested}")]
-    OutsideWorkspace { requested: String },
+    /// The requested path resolves outside every root the file tools may use,
+    /// directly, by `..`, or through a symlink. `granted` names the extra
+    /// writable roots a sandbox write grant opened, so the model knows where it
+    /// may write; it is empty when no grant was given.
+    #[error("path escapes workspace: {requested}{granted}")]
+    OutsideWorkspace { requested: String, granted: String },
     /// A filesystem operation failed while resolving the path.
     #[error("failed to resolve {}: {source}", path.display())]
     Io {
@@ -42,6 +49,9 @@ pub enum WorkspaceError {
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    /// Extra writable roots a sandbox write grant opened, each canonical like
+    /// `root`. Empty when the host granted nothing.
+    writable_roots: Vec<PathBuf>,
     writes: WriteGate,
 }
 
@@ -59,12 +69,43 @@ impl Workspace {
         }
         Ok(Self {
             root: canonical,
+            writable_roots: Vec::new(),
             writes: WriteGate::new(),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Open additional writable roots — the host's `--sandbox-write` grants. Each
+    /// existing directory is canonicalized exactly like the workspace root, so
+    /// the `starts_with` confinement checks stay sound. A grant that does not
+    /// exist, or is not a directory, is not bound — the same way the shell
+    /// sandbox ignores a missing writable path. Duplicates and the workspace
+    /// root itself are dropped.
+    pub fn with_writable_roots<I, P>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        for root in roots {
+            let Ok(canonical) = root.as_ref().canonicalize() else {
+                continue;
+            };
+            if canonical.is_dir()
+                && canonical != self.root
+                && !self.writable_roots.contains(&canonical)
+            {
+                self.writable_roots.push(canonical);
+            }
+        }
+        self
+    }
+
+    /// The extra writable roots, canonical. Empty unless a grant opened some.
+    pub fn writable_roots(&self) -> &[PathBuf] {
+        &self.writable_roots
     }
 
     /// Serialize this workspace's mutations with everyone else holding `gate` —
@@ -86,19 +127,17 @@ impl Workspace {
     }
 
     /// Resolve a model-supplied path (workspace-relative, or absolute) to a
-    /// path inside the root.
+    /// path inside the root, or inside one of the granted writable roots.
     ///
     /// `..` is normalized lexically first, so it can never climb out. An
     /// existing path is returned canonical, which rejects a symlink that points
     /// outside. For a path that does not exist yet, the deepest existing
-    /// ancestor is canonicalized and must be inside the root — that ancestor is
+    /// ancestor is canonicalized and must be inside a root — that ancestor is
     /// the one the eventual read/write would resolve through.
     pub fn resolve(&self, requested: &str) -> Result<PathBuf, WorkspaceError> {
         let candidate = path::lexical_normalize(&path::join_request(&self.root, requested));
-        if !candidate.starts_with(&self.root) {
-            return Err(WorkspaceError::OutsideWorkspace {
-                requested: requested.to_string(),
-            });
+        if !self.is_within_a_root(&candidate) {
+            return Err(self.outside(requested));
         }
 
         let mut ancestor = candidate.as_path();
@@ -110,20 +149,14 @@ impl Workspace {
                         path: candidate.clone(),
                         source,
                     })?;
-                if !canonical.starts_with(&self.root) {
-                    return Err(WorkspaceError::OutsideWorkspace {
-                        requested: requested.to_string(),
-                    });
+                if !self.is_within_a_root(&canonical) {
+                    return Err(self.outside(requested));
                 }
                 break;
             }
             match ancestor.parent() {
                 Some(parent) => ancestor = parent,
-                None => {
-                    return Err(WorkspaceError::OutsideWorkspace {
-                        requested: requested.to_string(),
-                    });
-                }
+                None => return Err(self.outside(requested)),
             }
         }
 
@@ -136,6 +169,37 @@ impl Workspace {
                 });
         }
         Ok(candidate)
+    }
+
+    /// Whether `path` lies inside the workspace root or a granted writable root.
+    /// Both are canonical, so a plain `starts_with` is sound.
+    fn is_within_a_root(&self, path: &Path) -> bool {
+        path.starts_with(&self.root)
+            || self
+                .writable_roots
+                .iter()
+                .any(|root| path.starts_with(root))
+    }
+
+    /// The refusal for `requested`, naming the granted roots when there are any.
+    fn outside(&self, requested: &str) -> WorkspaceError {
+        WorkspaceError::OutsideWorkspace {
+            requested: requested.to_string(),
+            granted: self.granted_hint(),
+        }
+    }
+
+    fn granted_hint(&self) -> String {
+        if self.writable_roots.is_empty() {
+            return String::new();
+        }
+        let roots = self
+            .writable_roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" (granted writable roots: {roots})")
     }
 
     /// Render `path` relative to the root with `/` separators, for model-facing
@@ -278,5 +342,130 @@ mod tests {
         let face = ToolFace::new("read", "Read a file.");
         assert_eq!(face.name, "read");
         assert_eq!(face.description, "Read a file.");
+    }
+
+    #[test]
+    fn with_writable_roots_ignores_missing_file_and_root_grants() {
+        let container = tempfile::tempdir().unwrap();
+        let ws = container.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let file = container.path().join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let workspace = Workspace::new(&ws).unwrap().with_writable_roots([
+            container.path().join("missing"),
+            file,
+            ws.clone(),
+        ]);
+
+        // Only real directories that are not the workspace root are bound.
+        assert!(workspace.writable_roots().is_empty());
+    }
+
+    /// Issue #84: a path inside a granted writable root is accepted, for an
+    /// existing leaf and for one that does not exist yet.
+    #[test]
+    fn resolve_allows_a_path_inside_a_granted_root() {
+        let container = tempfile::tempdir().unwrap();
+        let ws = container.path().join("ws");
+        let grant = container.path().join("out");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&grant).unwrap();
+        let grant = grant.canonicalize().unwrap();
+        let workspace = Workspace::new(&ws).unwrap().with_writable_roots([&grant]);
+
+        assert_eq!(
+            workspace
+                .resolve(grant.join("result.json").to_str().unwrap())
+                .unwrap(),
+            grant.join("result.json")
+        );
+        // A not-yet-existing leaf under the grant is accepted too.
+        assert_eq!(
+            workspace
+                .resolve(grant.join("a/b.txt").to_str().unwrap())
+                .unwrap(),
+            grant.join("a/b.txt")
+        );
+        // The workspace itself still resolves, relative and absolute.
+        assert_eq!(
+            workspace.resolve("x.txt").unwrap(),
+            workspace.root().join("x.txt")
+        );
+    }
+
+    /// Issue #84: the same `..`/symlink/absolute escapes are refused from a
+    /// granted root as from the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_refuses_dotdot_and_symlink_escapes_from_a_granted_root() {
+        use std::os::unix::fs::symlink;
+
+        let container = tempfile::tempdir().unwrap();
+        let ws = container.path().join("ws");
+        let grant = container.path().join("out");
+        let outside = container.path().join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&grant).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        symlink(&outside, grant.join("link")).unwrap();
+        let grant = grant.canonicalize().unwrap();
+        let workspace = Workspace::new(&ws).unwrap().with_writable_roots([&grant]);
+
+        // `..` from the granted root climbs into the container, outside every root.
+        assert!(matches!(
+            workspace.resolve(grant.join("../outside/secret.txt").to_str().unwrap()),
+            Err(WorkspaceError::OutsideWorkspace { .. })
+        ));
+        // A symlink inside the grant that points outside is refused, for an
+        // existing leaf...
+        assert!(matches!(
+            workspace.resolve(grant.join("link/secret.txt").to_str().unwrap()),
+            Err(WorkspaceError::OutsideWorkspace { .. })
+        ));
+        // ...and for a not-yet-existing leaf through it.
+        assert!(matches!(
+            workspace.resolve(grant.join("link/new.txt").to_str().unwrap()),
+            Err(WorkspaceError::OutsideWorkspace { .. })
+        ));
+        // An absolute path outside every root is still refused.
+        assert!(matches!(
+            workspace.resolve(outside.join("secret.txt").to_str().unwrap()),
+            Err(WorkspaceError::OutsideWorkspace { .. })
+        ));
+    }
+
+    /// Issue #84 (4): the refusal names the granted roots, and says nothing
+    /// extra when there are none.
+    #[test]
+    fn the_refusal_names_the_granted_roots() {
+        let container = tempfile::tempdir().unwrap();
+        let ws = container.path().join("ws");
+        let grant = container.path().join("out");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&grant).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let requested = outside.path().join("x");
+
+        let plain = Workspace::new(&ws).unwrap();
+        assert_eq!(
+            plain
+                .resolve(requested.to_str().unwrap())
+                .unwrap_err()
+                .to_string(),
+            format!("path escapes workspace: {}", requested.display())
+        );
+
+        let granted = Workspace::new(&ws).unwrap().with_writable_roots([&grant]);
+        let message = granted
+            .resolve(requested.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("granted writable roots"), "{message}");
+        assert!(
+            message.contains(&grant.canonicalize().unwrap().display().to_string()),
+            "{message}"
+        );
     }
 }
