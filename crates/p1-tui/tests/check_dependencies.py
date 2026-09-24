@@ -1,7 +1,7 @@
 """Resolved-graph regression check for the Iris presentation-only migration.
 
 Run with: python3 crates/p1-tui/tests/check_dependencies.py
-Uses locked/offline Cargo metadata, not compilation or live network.
+Uses locked/offline host-platform Cargo metadata, not compilation or live network.
 """
 
 import json
@@ -13,9 +13,26 @@ import unittest
 class PresentationDependencies(unittest.TestCase):
     def test_resolved_normal_dependencies_stay_presentation_only(self):
         root = Path(__file__).resolve().parents[3]
+        # Offline metadata for every platform needs packages a host build never
+        # downloads (CI failed on `bumpalo`), so resolve for the host only: the
+        # graph that is actually compiled here.
+        host = next(
+            line.split()[1]
+            for line in subprocess.check_output(["cargo", "-vV"], text=True).splitlines()
+            if line.startswith("host: ")
+        )
         metadata = json.loads(
             subprocess.check_output(
-                ["cargo", "metadata", "--locked", "--offline", "--format-version", "1"],
+                [
+                    "cargo",
+                    "metadata",
+                    "--locked",
+                    "--offline",
+                    "--filter-platform",
+                    host,
+                    "--format-version",
+                    "1",
+                ],
                 cwd=root,
                 text=True,
             )
