@@ -130,6 +130,14 @@ pub struct WorkersPane {
 /// form (grid 48); the footer drops `x stop` in the compact form (mock-
 /// verified: `el-workers-pane-38`).
 pub fn render(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'static>> {
+    let mut out = render_body(pane, width, compact);
+    out.push(blank_row(width));
+    out.push(footer_line(width, compact));
+    out
+}
+
+/// Shared body without the live selection/action footer.
+pub(crate) fn render_body(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'static>> {
     let mut sorted: Vec<&WorkerBlock> = pane.workers.iter().collect();
     sorted.sort_by_key(|w| w.state.rank());
     let mut out = vec![header_line(&pane.header, width)];
@@ -142,8 +150,6 @@ pub fn render(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'stat
             out.extend(wide_block(worker, width, focused));
         }
     }
-    out.push(blank_row(width));
-    out.push(footer_line(width, compact));
     out
 }
 
