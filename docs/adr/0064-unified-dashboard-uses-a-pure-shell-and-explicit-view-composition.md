@@ -1,7 +1,7 @@
 ---
 adr: 64
 title: Unified dashboard uses a pure shell and explicit view composition
-status: proposed
+status: accepted
 date: 2026-09-24
 deciders: owner+lead
 supersedes: []
