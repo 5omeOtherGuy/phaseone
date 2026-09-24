@@ -545,6 +545,37 @@ exec '{real_mv}' \"$@\"
         self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "share"))
                           if name.startswith(".p1")], [])
 
+    def test_a_prefix_containing_colon_fully_rolls_back_a_commit_failure(self) -> None:
+        prefix = os.path.join(self.dir, "prefix:with:colon")
+        first = self.run_install("--prefix", prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        paths = {
+            "binary": os.path.join(prefix, "bin", "p1"),
+            "updater": os.path.join(prefix, "bin", "p1-update"),
+            "share": os.path.join(prefix, "share", "p1", "environments", "marker.txt"),
+        }
+        before = {name: self.read(path) for name, path in paths.items()}
+        self.publish(marker="two", binary=NEW_RELEASE)
+
+        fail_dir = self.mkdir("fail-colon-commit")
+        real_mv = shutil.which("mv")
+        self.stub("mv", f"""#!/bin/sh
+case \" $* \" in
+  *".p1.new."*"/share/p1 "*) exit 71 ;;
+esac
+exec '{real_mv}' \"$@\"
+""", directory=fail_dir)
+        done = self.run_install("--prefix", prefix,
+                                PATH=fail_dir + ":" + self.stub_dir + ":" + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("could not commit", done.stderr)
+        for name, path in paths.items():
+            self.assertEqual(self.read(path), before[name], name)
+        self.assertEqual([name for name in os.listdir(os.path.join(prefix, "bin"))
+                          if name.startswith(".p1")], [])
+        self.assertEqual([name for name in os.listdir(os.path.join(prefix, "share"))
+                          if name.startswith(".p1")], [])
+
     def test_staged_updater_failure_leaves_previous_install_intact(self) -> None:
         first = self.run_install("--prefix", self.prefix)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -685,6 +716,40 @@ exec '{real_mv}' "$@"
             self.assert_installed(self.prefix)
             self.assertEqual(hidden("bin"), [], attempt)
             self.assertEqual(hidden("share"), [], attempt)
+
+    def test_a_failed_rollback_backup_survives_another_failed_install_until_success(self) -> None:
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        backup = os.path.join(self.prefix, "bin", ".p1.previous")
+
+        fail_dir = self.mkdir("preserve-backup")
+        real_mv = shutil.which("mv")
+        self.stub("mv", f"""#!/bin/sh
+case \"$1\" in
+  *.previous) exit 74 ;;
+esac
+case \" $* \" in
+  *"/share/p1 "*) exit 71 ;;
+esac
+exec '{real_mv}' \"$@\"
+""", directory=fail_dir)
+        self.publish(marker="two", binary=NEW_RELEASE)
+        env = {"PATH": fail_dir + ":" + self.stub_dir + ":" + SYSTEM_PATH}
+        failed = self.run_install("--prefix", self.prefix, **env)
+        self.assertNotEqual(failed.returncode, 0, failed.stdout)
+        self.assertIn("could not be restored", failed.stderr)
+        self.assertTrue(os.path.isfile(backup))
+        backup_bytes = self.read(backup)
+
+        # A second failed commit must not delete that only manual-recovery copy before it
+        # starts. The final successful install, by contrast, may discard it.
+        failed_again = self.run_install("--prefix", self.prefix, **env)
+        self.assertNotEqual(failed_again.returncode, 0, failed_again.stdout)
+        self.assertEqual(self.read(backup), backup_bytes)
+        self.publish()
+        healthy = self.run_install("--prefix", self.prefix)
+        self.assertEqual(healthy.returncode, 0, healthy.stderr)
+        self.assertFalse(os.path.exists(backup))
 
     def test_the_update_wrapper_reinstalls_without_a_checkout(self) -> None:
         first = self.run_install("--prefix", self.prefix)
