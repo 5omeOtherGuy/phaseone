@@ -374,11 +374,16 @@ fn parse_opencode_go(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
 /// window by the reset instant in its detail. That tie is accepted only when it is
 /// unambiguous across every window and entry (see [`unambiguous_detail`]), and only the 5h
 /// window receives the text: its request-count meaning is the one the saved body proves.
+///
+/// The 5h window's `detail` is a remaining count, not a used one: `15/100 left` is 85 % used.
+/// That count is a direct measurement, so it — and never a disagreeing or absent `used_ratio`
+/// — decides the bar; the two must agree or the row contradicts itself.
 fn parse_kimi(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
     let usages = data.get("usages").and_then(Value::as_object).ok_or(())?;
     // Each `limits` entry's `detail` is a request count; `remaining` is what is left, so the
-    // text says `left` rather than implying the count was used.
-    let mut details: Vec<(OffsetDateTime, String)> = Vec::new();
+    // text says `left` rather than implying the count was used, and the used share it implies
+    // is what the bar must show.
+    let mut details: Vec<Detail> = Vec::new();
     if let Some(limits) = data.get("limits").and_then(Value::as_array) {
         for limit in limits {
             let Some(detail) = limit.get("detail") else {
@@ -397,7 +402,11 @@ fn parse_kimi(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
             else {
                 continue;
             };
-            details.push((at, format!("{remaining}/{limit_count} left")));
+            details.push(Detail {
+                at,
+                text: format!("{remaining}/{limit_count} left"),
+                used_percent: used_percent_of_counts(&remaining, &limit_count),
+            });
         }
     }
     let kinds = [
@@ -427,10 +436,17 @@ fn parse_kimi(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
         let Some(entry) = usages.get(key).and_then(Value::as_object) else {
             continue;
         };
-        let used_percent = entry
+        let used_ratio = entry
             .get("used_ratio")
             .and_then(Value::as_f64)
             .map(|ratio| ratio * 100.0);
+        // Only the 5h window receives the count, so only it can override `used_ratio`.
+        let detail = if key == "limit_5h" {
+            five_hour_detail
+        } else {
+            None
+        };
+        let used_percent = detail.and_then(|detail| detail.used_percent).or(used_ratio);
         out.windows.push(Window {
             kind,
             scope: None,
@@ -440,11 +456,7 @@ fn parse_kimi(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             limit_reached: exhausted(used_percent),
-            detail: if key == "limit_5h" {
-                five_hour_detail.clone()
-            } else {
-                None
-            },
+            detail: detail.map(|detail| detail.text.clone()),
         });
     }
     Ok(())
@@ -496,6 +508,18 @@ fn text(value: Option<&Value>) -> Option<String> {
     }
 }
 
+/// The used share a `remaining`/`limit` count pair implies. `remaining` is what is left, so
+/// the used share is `(limit - remaining) / limit`. `None` when either is not a finite number
+/// or the limit is not positive — an unreadable count decides nothing, and no bar is drawn.
+fn used_percent_of_counts(remaining: &str, limit: &str) -> Option<f64> {
+    let remaining: f64 = remaining.trim().parse().ok()?;
+    let limit: f64 = limit.trim().parse().ok()?;
+    if !remaining.is_finite() || !limit.is_finite() || limit <= 0.0 {
+        return None;
+    }
+    Some(((limit - remaining) / limit * 100.0).clamp(0.0, 100.0))
+}
+
 /// Epoch milliseconds, UTC, as the GLM quota endpoint reports reset times.
 fn epoch_millis(value: Option<&Value>) -> Option<OffsetDateTime> {
     let millis = match value? {
@@ -506,40 +530,48 @@ fn epoch_millis(value: Option<&Value>) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000).ok()
 }
 
+/// A `limits` entry's request-count detail: the reset instant it names, the `N/M left` text,
+/// and the used share the count implies.
+struct Detail {
+    at: OffsetDateTime,
+    text: String,
+    used_percent: Option<f64>,
+}
+
 /// Whether a `limits` entry's reset instant names this window, i.e. the two are within
 /// [`DETAIL_MATCH_SECONDS`].
 fn within(at: &OffsetDateTime, window: &Option<OffsetDateTime>) -> bool {
     window.is_some_and(|window| (*at - window).whole_seconds().abs() <= DETAIL_MATCH_SECONDS)
 }
 
-/// The 5h request text, only when the mapping is unambiguous: exactly one `limits` entry
+/// The 5h request detail, only when the mapping is unambiguous: exactly one `limits` entry
 /// names the 5h window, and that entry names no other window. Month windows can share a
 /// reset instant and a 5h reset can coincide with a month's, so an ambiguous entry is
 /// dropped rather than guessed at.
-fn unambiguous_detail(
+fn unambiguous_detail<'a>(
     windows: &[Option<OffsetDateTime>],
     five_hour: Option<OffsetDateTime>,
-    details: &[(OffsetDateTime, String)],
-) -> Option<String> {
+    details: &'a [Detail],
+) -> Option<&'a Detail> {
     let five_hour = five_hour?;
-    let naming_5h: Vec<&(OffsetDateTime, String)> = details
+    let naming_5h: Vec<&Detail> = details
         .iter()
-        .filter(|entry| within(&entry.0, &Some(five_hour)))
+        .filter(|entry| within(&entry.at, &Some(five_hour)))
         .collect();
     if naming_5h.len() != 1 {
         return None;
     }
-    let (at, text) = naming_5h[0];
+    let entry = naming_5h[0];
     let mut named = 0usize;
     for window in windows {
-        if within(at, window) {
+        if within(&entry.at, window) {
             named += 1;
         }
     }
     if named != 1 {
         return None;
     }
-    Some(text.clone())
+    Some(entry)
 }
 
 /// A window is spent once the vendor reports at least the full quota used. An unknown
@@ -852,6 +884,118 @@ mod tests {
         assert_eq!(kimi.windows[1].detail, None);
         assert!(matches!(&kimi.windows[2].kind, WindowKind::Other(name) if name == "month code"));
         assert_eq!(kimi.windows[2].used_percent, Some(0.0));
+    }
+
+    /// The Kimi 5h window's value is a remaining request count: `15/100 left` is 85 % used, so
+    /// no bar may sit at 0 %. The count is a direct measurement and decides the used share even
+    /// when `used_ratio` is absent or disagrees (the live row showed `15/100 left` beside 0 %).
+    #[test]
+    fn kimi_remaining_count_decides_the_used_percent() {
+        let cases: &[(&[u8], f64, &str)] = &[
+            (
+                br#"{"usages":{"limit_5h":{"used_ratio":0.0,"reset_time":"2026-09-24T00:05:01Z"}},"limits":[{"detail":{"limit":"100","remaining":"15","resetTime":"2026-09-24T00:05:02Z"}}]}"#,
+                85.0,
+                "15/100 left",
+            ),
+            (
+                br#"{"usages":{"limit_5h":{"reset_time":"2026-09-24T00:05:01Z"}},"limits":[{"detail":{"limit":"100","remaining":"15","resetTime":"2026-09-24T00:05:02Z"}}]}"#,
+                85.0,
+                "15/100 left",
+            ),
+            (
+                br#"{"usages":{"limit_5h":{"reset_time":"2026-09-24T00:05:01Z"}},"limits":[{"detail":{"limit":"100","remaining":"100","resetTime":"2026-09-24T00:05:02Z"}}]}"#,
+                0.0,
+                "100/100 left",
+            ),
+            (
+                br#"{"usages":{"limit_5h":{"reset_time":"2026-09-24T00:05:01Z"}},"limits":[{"detail":{"limit":"100","remaining":"0","resetTime":"2026-09-24T00:05:02Z"}}]}"#,
+                100.0,
+                "0/100 left",
+            ),
+        ];
+        for (body, expected, text) in cases {
+            let kimi = parsed(Shape::Kimi, "kimi-coding-subscription", body);
+            assert_eq!(
+                kimi.windows[0].used_percent,
+                Some(*expected),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+            assert_eq!(kimi.windows[0].detail.as_deref(), Some(*text));
+        }
+    }
+
+    /// End to end, no network: a fabricated Kimi body with `15/100 left` renders that text
+    /// and a bar at the used fraction it implies (85 %), never at 0 %.
+    #[test]
+    fn kimi_remaining_row_renders_text_and_bar_consistently() {
+        let body = br#"{"usages":{"limit_5h":{"used_ratio":0.0,"reset_time":"2026-09-24T00:05:01Z"}},"limits":[{"detail":{"limit":"100","remaining":"15","resetTime":"2026-09-24T00:05:02Z"}}]}"#;
+        let kimi = parsed(Shape::Kimi, "kimi-coding-subscription", body);
+        let snapshot = Snapshot {
+            taken_at: "2026-09-24T00:06:00Z".into(),
+            routes: vec![kimi],
+        };
+        let grid = 32;
+        let lines = crate::render::render(&snapshot, grid);
+        let texts: Vec<String> = lines.iter().map(|line| line.text()).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("5h") && t.contains("15/100 left")),
+            "{texts:#?}"
+        );
+        let bars: Vec<&crate::render::Line> = lines
+            .iter()
+            .filter(|line| {
+                line.0
+                    .iter()
+                    .any(|span| span.tone == crate::render::Tone::Rule)
+            })
+            .collect();
+        assert_eq!(bars.len(), 1, "{texts:#?}");
+        let cells = grid - 6;
+        assert_eq!(
+            bars[0].0[0].text.chars().count(),
+            (0.85 * cells as f64).round() as usize
+        );
+        assert!(
+            bars[0].text().trim_end().ends_with("85%"),
+            "{}",
+            bars[0].text()
+        );
+    }
+
+    /// A Kimi window with neither a `used_ratio` nor a count is unknown: the row shows the
+    /// marker and draws no bar at all (an empty bar would read as `0 % used`).
+    #[test]
+    fn kimi_unknown_window_shows_no_value_and_no_bar() {
+        let kimi = parsed(
+            Shape::Kimi,
+            "kimi-coding-subscription",
+            br#"{"usages":{"limit_5h":{"reset_time":"2026-09-24T00:05:01Z"}}}"#,
+        );
+        assert_eq!(kimi.windows[0].used_percent, None);
+        assert_eq!(kimi.windows[0].detail, None);
+        let snapshot = Snapshot {
+            taken_at: "2026-09-24T00:06:00Z".into(),
+            routes: vec![kimi],
+        };
+        let lines = crate::render::render(&snapshot, 32);
+        let texts: Vec<String> = lines.iter().map(|line| line.text()).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("5h") && t.contains("— · resets")),
+            "{texts:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| {
+                line.0
+                    .iter()
+                    .any(|span| span.tone == crate::render::Tone::Rule)
+            }),
+            "{texts:#?}"
+        );
     }
 
     /// A `limits` entry names its window by the reset instant in its detail, never by array
