@@ -30,6 +30,9 @@ and an evidence record (scripts/run-report.py) in a run directory:
 Every job also accepts "after": ["label", ...] — start only when those jobs finished
 successfully (exit 0 / outcome done).
 
+A `p1` job's binary is `$P1_BIN`, else `p1` on `PATH` (an installed p1), else the debug
+build of a sibling checkout (`../phaseone-target/debug/p1`).
+
 The script blocks until all jobs have exited, then prints one JSON summary (runner,
 exit, outcome, run dir, cost and counters per job). Run it as ONE background task: its
 exit is the completion signal for the whole batch. No time limits, no retries, no
@@ -167,15 +170,32 @@ def outcome_for_exit(code):
 
 
 def default_p1_binary():
+    """The debug binary of a sibling checkout — the last resort, not the first choice."""
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     repo_parent = os.path.dirname(os.path.dirname(scripts_dir))
     return os.path.join(repo_parent, "phaseone-target", "debug", "p1")
 
 
 def p1_binary():
-    path = os.environ.get("P1_BIN") or default_p1_binary()
+    """The p1 to run: `$P1_BIN`, else `p1` on PATH, else the sibling debug build.
+
+    An installed p1 (`<prefix>/bin/p1`, ADR-0062) is found through PATH, so a machine
+    that installed the release needs no checkout and no `P1_BIN`.
+    """
+    override = os.environ.get("P1_BIN")
+    if override:
+        if not (os.path.isfile(override) and os.access(override, os.X_OK)):
+            raise JobError(f"fanout: no p1 binary at {override} — run: cargo build -p p1-host")
+        return override
+    on_path = shutil.which("p1")
+    if on_path:
+        return on_path
+    path = default_p1_binary()
     if not (os.path.isfile(path) and os.access(path, os.X_OK)):
-        raise JobError(f"fanout: no p1 binary at {path} — run: cargo build -p p1-host")
+        raise JobError(
+            f"fanout: no p1 binary at {path} — run: cargo build -p p1-host, "
+            "or install p1 with scripts/install.sh"
+        )
     return path
 
 

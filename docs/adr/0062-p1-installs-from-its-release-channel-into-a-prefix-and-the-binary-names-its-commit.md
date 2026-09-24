@@ -1,0 +1,128 @@
+---
+adr: 62
+title: p1 installs from its release channel into a prefix and the binary names its commit
+status: proposed
+date: 2026-09-24
+deciders: lead
+supersedes: []
+superseded_by: []
+sources: []
+---
+# ADR-0062: p1 installs from its release channel into a prefix and the binary names its commit
+
+## Context
+
+Until now the only way to run p1 was to clone the repository and `cargo build` it: there
+was no install, no update path, and nothing that said which commit a binary came from.
+That is fine for the agents working in this repo and wrong for anyone else — the machine
+rules in `AGENTS.md` even forbid a release build on a workstation (7 GB-class machine,
+one shared target dir), so a user cannot be asked to produce a shipping binary.
+
+The repository is public (`github.com/5omeOtherGuy/phaseone`), the gate already runs on
+every push to `main` and is the single definition of green (ADR-0011), and p1 has no
+version numbering beyond `0.0.1` — the commit is the only real identity it has. D7
+recorded "there are no other workflows": the release workflow added here is not a check,
+it runs only after the gate succeeded and can make no commit green or red, so ADR-0011
+stands unchanged.
+
+Two directories exist at runtime and they must not be confused: the user's
+`$HOME/.config/p1` (auth store and local overrides; ADR-0040, ADR-0044, ADR-0061) and the
+shipped data. `crates/p1-host/src/main.rs` already resolves the shipped data as
+`<exe dir>/../share/p1/environments` with `routes/` and `profiles/` as siblings, so an
+installed layout is implied by the code but was never produced.
+
+## Decision
+
+p1 is installed from a published release, and the binary says which commit it is.
+
+- After a **successful `gate` run on `main`**, the release workflow builds `p1` in release
+  profile on a GitHub runner (the only permitted release build, `AGENTS.md`) and publishes
+  the GitHub Release tagged `main-<12-char short sha>` with four assets — `p1-linux-x86_64`,
+  `p1-linux-x86_64.sha256`, `p1-share.tar.gz` (top-level `environments/`, `routes/`,
+  `profiles/`), `p1-share.tar.gz.sha256` — marked latest. The tag is the commit, so a
+  re-run for the same commit skips instead of failing.
+- `scripts/install.sh [--latest | --from-release TAG | --local] [--prefix DIR]` installs
+  `<prefix>/bin/p1` (0755), the share data at `<prefix>/share/p1/{environments,routes,profiles}`
+  — exactly what `main.rs` looks for — plus `<prefix>/share/p1/install.sh` and
+  `<prefix>/bin/p1-update` (which runs the installed installer with
+  `--latest --prefix <prefix>`, so updating needs no checkout). Both checksums are verified
+  before the prefix is touched. The binary lands through a temp file in `<prefix>/bin` and
+  a rename; the share data are unpacked beside `<prefix>/share/p1`, checked for the three
+  top-level directories, and swapped in by renaming the previous directory to
+  `<prefix>/share/p1.prev` first — which is removed once the swap succeeded, so a failed
+  install leaves the previous one working and a successful one leaves no rollback copy.
+- `p1 --version` prints `p1 <CARGO_PKG_VERSION> (<sha> <date>)`. `crates/p1-host/build.rs`
+  takes the sha from `P1_GIT_SHA`, else `git rev-parse --short=12 HEAD`, else `unknown`, and
+  the date from `P1_BUILD_DATE`, else `SOURCE_DATE_EPOCH`, else `unknown` — never the wall
+  clock, so two builds of one commit print the same string.
+- `--local` builds the current checkout with `cargo build --release --locked -p p1-host`
+  into `$CARGO_TARGET_DIR`, else `/mnt/build/cargo-target/p1-release` when `/mnt/build`
+  exists, else it refuses: the repository's own `target/` is never used.
+- The installer never reads, writes or deletes anything under
+  `${XDG_CONFIG_HOME:-$HOME/.config}/p1`.
+- `scripts/fanout.py` finds the binary as `P1_BIN`, else `p1` on `PATH` (the installed
+  one), else the current `../phaseone-target/debug/p1` fallback of a development checkout.
+
+## Consequences
+
+- Installing or updating needs no Rust toolchain, no repository and no compile on the
+  user's machine; `p1-update` is the whole update path.
+- A user's shell must have `<prefix>/bin` on `PATH`; the installer warns when it does not,
+  and nothing else edits shell profiles.
+- One tag per green push to `main` accumulates (`main-<sha>`), and every release is marked
+  latest, so "latest" tracks `main`, not a stable version. Nothing prunes old releases.
+- Publishing is idempotent per commit: a red gate publishes nothing and a re-run for the
+  same commit leaves the existing release alone.
+- The sha256 assets catch a truncated or corrupted download, not a compromised release;
+  the release is trusted because it was built by CI from a commit the gate accepted.
+- The data dir and the binary can drift apart if a user copies files by hand; updating by
+  hand is not a supported path.
+- `AGENTS.md`'s rule for workstations is untouched: release builds happen on GitHub
+  runners, never locally.
+
+## Alternatives considered
+
+- **`cargo install` / crates.io.** Needs a published crate, a toolchain and a compile on
+  the user's machine, and the share data would still need a home — more moving parts than
+  a four-asset release, and it contradicts the local build rules.
+- **A binary asset only, with the share data expected from a checkout.** A user would have
+  to clone the repository for `environments/`, which is exactly what this decision removes.
+- **`v<crate version>` tags.** Every commit is still `0.0.1`, so the tag would not name a
+  build; the commit is the identity p1 actually has.
+- **A date or a CI run number as the version.** Says nothing about which code is in the
+  binary, and cannot be re-derived from a checkout.
+- **Wall-clock build date.** Breaks reproducible builds; `SOURCE_DATE_EPOCH` and the
+  commit's own date answer the same question.
+- **Committing the release binary to the repository.** A binary in git, plus the same
+  release build on a workstation that `AGENTS.md` forbids.
+
+## Evidence
+
+- Files: `.github/workflows/release.yml`, `scripts/install.sh`, `scripts/update.sh`,
+  `crates/p1-host/build.rs`, `crates/p1-host/src/cli.rs` (`version`),
+  `scripts/test_install.py`, `scripts/test_fanout.py`, `README.md`, `AGENTS.md`.
+- `python3 scripts/test_install.py -v` (19 tests, no network): a fixture release with stub
+  `gh`, `curl` and `cargo` on `PATH` covers the successful install and its modes, the
+  `p1-update` wrapper, `--from-release` routed to the stub, both sha256 refusals (nothing
+  installed, the previous install intact), a pre-existing `$XDG_CONFIG_HOME/p1/auth.json`
+  byte-identical afterwards, and the `--local` refusal and target-dir probe.
+- `python3 scripts/test_fanout.py -v`: `$P1_BIN` over `p1` on `PATH` over the debug
+  fallback, and a job that runs the `p1` found on `PATH` without `P1_BIN`.
+- `bash -n scripts/install.sh scripts/update.sh`; `shellcheck scripts/install.sh scripts/update.sh`.
+- The release assets were produced with the workflow's own commands in a temp directory
+  (`install -m 0755` a stand-in binary, `tar -czf … environments routes profiles`,
+  `sha256sum`), then installed with `scripts/install.sh --from-release` against a stub `gh`
+  serving them: both checksums verified, the binary and the real share data landed in the
+  documented layout, and `<prefix>/bin/p1-update` ran the installed installer.
+- `crates/p1-host/build.rs` compiled on its own with
+  `CARGO_MANIFEST_DIR=<crate> rustc --edition 2024 -o /tmp/buildrs crates/p1-host/build.rs`
+  and run: with no environment it emitted the checkout's 12-char sha and `unknown`; with
+  `P1_GIT_SHA` and `P1_BUILD_DATE` it emitted those; with `SOURCE_DATE_EPOCH=1758681600` it
+  emitted `2025-09-24`; with a blank sha and a non-numeric epoch it fell back to git and
+  `unknown`. The `--version` assertions were exercised standalone against
+  `p1 0.0.1 (1a2b3c4d5e6f 2026-09-24)` (accepted), `p1 0.0.1 (unknown unknown)` (accepted) and
+  the old `p1 0.0.1` form (rejected).
+- The Rust side of this change was **not** run through cargo in this worktree: the root
+  filesystem held less free space than the 12 GiB build threshold, so no cargo command was
+  allowed. Re-check with `cargo test --locked -p p1-host --test cli` and
+  `cargo test --locked -p p1-host --test host help_and_version` on a machine with room.

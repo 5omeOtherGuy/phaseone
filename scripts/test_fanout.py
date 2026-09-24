@@ -71,6 +71,16 @@ class FanoutTest(unittest.TestCase):
             handle.write(text)
         return path
 
+    def write_executable(self, subdir: str, name: str, text: str) -> str:
+        """An executable inside `<self.dir>/<subdir>` — used as a PATH directory."""
+        directory = os.path.join(self.dir, subdir)
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(path, 0o755)
+        return path
+
     def read(self, path: str) -> str:
         with open(path, encoding="utf-8") as handle:
             return handle.read()
@@ -86,6 +96,20 @@ class FanoutTest(unittest.TestCase):
             os.environ.pop(name, None)
         else:
             os.environ[name] = old
+
+    def unset_env(self, name: str) -> None:
+        old = os.environ.pop(name, None)
+        self.addCleanup(self.restore_env, name, old)
+
+    @staticmethod
+    def path_without_p1() -> str:
+        """The machine's PATH minus every directory that holds a `p1`."""
+        return ":".join(
+            directory
+            for directory in os.environ.get("PATH", "").split(":")
+            if not os.path.exists(os.path.join(directory, "p1"))
+        )
+
     def set_attr(self, name: str, value) -> None:
         old = getattr(fanout, name)
         setattr(fanout, name, value)
@@ -304,6 +328,46 @@ class FanoutTest(unittest.TestCase):
         code, _, err = self.run_jobs([self.p1_job()])
         self.assertEqual(code, 1)
         self.assertIn("cargo build -p p1-host", err)
+
+    # --- which p1 is run (ADR-0062) ---------------------------------------
+
+    def test_p1_bin_wins_over_p1_on_path(self) -> None:
+        on_path = self.write_executable("onpath", "p1", FAKE_P1)
+        self.set_env("PATH", os.path.dirname(on_path))
+        self.assertEqual(fanout.p1_binary(), self.bin)
+
+    def test_p1_on_path_is_found_without_an_override(self) -> None:
+        on_path = self.write_executable("onpath", "p1", FAKE_P1)
+        self.unset_env("P1_BIN")
+        self.set_env("PATH", os.path.dirname(on_path))
+        self.assertEqual(fanout.p1_binary(), on_path)
+
+    def test_a_job_with_no_override_runs_the_p1_on_path(self) -> None:
+        on_path = self.write_executable("onpath", "p1", FAKE_P1)
+        self.unset_env("P1_BIN")
+        # The machine's own PATH (git, the interpreter) with every p1 removed, then the
+        # stub in front: the only p1 this PATH names is the stub.
+        self.set_env("PATH", os.path.dirname(on_path) + ":" + self.path_without_p1())
+        argv, entry = self.p1_argv()
+        self.assertEqual(argv[0], on_path)
+        self.assertEqual(entry["outcome"], "done")
+
+    def test_debug_fallback_is_used_when_nothing_else_exists(self) -> None:
+        self.unset_env("P1_BIN")
+        self.set_env("PATH", self.path_without_p1())
+        debug = self.write_executable("sibling", "p1", FAKE_P1)
+        self.set_attr("default_p1_binary", lambda: debug)
+        self.assertEqual(fanout.p1_binary(), debug)
+
+    def test_no_p1_anywhere_is_a_job_error_naming_the_fallback(self) -> None:
+        self.unset_env("P1_BIN")
+        self.set_env("PATH", self.path_without_p1())
+        missing = os.path.join(self.dir, "no-p1")
+        self.set_attr("default_p1_binary", lambda: missing)
+        with self.assertRaises(fanout.JobError) as caught:
+            fanout.p1_binary()
+        self.assertIn(missing, str(caught.exception))
+        self.assertIn("cargo build -p p1-host", str(caught.exception))
 
     def test_duplicate_labels(self) -> None:
         self.assert_rejected([self.p1_job(), self.p1_job()], "duplicate job labels")
