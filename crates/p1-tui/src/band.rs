@@ -36,11 +36,11 @@ impl Band {
         let right = sanitize_segments(&self.right);
         let right_len: usize = right.iter().map(|s| cell_width(&s.text)).sum();
         let left_len: usize = left.iter().map(|s| cell_width(&s.text)).sum();
-        // A side can keep segments whose text sanitized away (e.g. a lone incomplete CSI) or
-        // survives only as zero-cell marks, and those draw nothing: reserving the separator for
-        // them would truncate the left for free. So the separator is keyed on cells, not text.
+        // The SLAB row rule (TUI-HANDOFF.src.md §5, lib/p1-cells.js `R.length`) keys
+        // the separator on the right segment list, not on what it draws, and is ported 1:1;
+        // sanitizing keeps every segment, so a right side that sanitizes to nothing keeps it.
         let mut over =
-            (left_len + right_len + if right_len > 0 { 2 } else { 0 }) as isize - inner as isize;
+            (left_len + right_len + if right.is_empty() { 0 } else { 2 }) as isize - inner as isize;
         for seg in left.iter_mut().rev() {
             if over <= 0 {
                 break;
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(line.spans[1].style.bg, Some(palette::INK));
     }
     #[test]
-    fn a_right_side_that_sanitizes_to_nothing_reserves_no_separator() {
+    fn a_right_side_that_sanitizes_to_nothing_keeps_the_slab_separator() {
         let band = |right: &str, width| Band {
             bg: palette::BLOCK,
             left: vec![Seg::new(palette::INK, "abcdef")],
@@ -178,13 +178,17 @@ mod tests {
             width,
             pad: 0,
         };
-        for right in ["\u{1b}[31", "\u{301}", "\u{1b}[31m\u{301}"] {
+        // Same row as an empty-text right segment: the separator follows the segment list.
+        for right in ["", "\u{1b}[31", "\u{301}", "\u{1b}[31m\u{301}"] {
             assert!(
-                band(right, 2).render().to_string().starts_with("a\u{2026}"),
+                band(right, 2).render().to_string().starts_with("  "),
                 "{right:?}"
             );
             assert!(
-                band(right, 6).render().to_string().starts_with("abcdef"),
+                band(right, 6)
+                    .render()
+                    .to_string()
+                    .starts_with("abc\u{2026}  "),
                 "{right:?}"
             );
         }
