@@ -9,9 +9,12 @@ fn worker(id: &str, state: BlockState) -> WorkerBlock {
         id: id.into(),
         task: "task".into(),
         route: "route".into(),
+        model: None,
         state,
         elapsed: None,
         cost_micro_usd: None,
+        tokens: None,
+        context_window: None,
         grants: String::new(),
         activity: String::new(),
     }
