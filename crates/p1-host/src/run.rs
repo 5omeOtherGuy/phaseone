@@ -525,38 +525,16 @@ pub async fn run_with_front_end(
     // The delegation service must exist before the catalog so the `worker_*`
     // tools can be registered; the child factory reaches the catalog lazily,
     // breaking the cycle (children never assemble delegation tools).
+    // The child service and the direct factory share one initial reservation. This
+    // must happen before workflows are composed, since a step worker is built by the
+    // same service and receives the same id namespace.
+    #[cfg(feature = "delegation")]
+    let (completion_hub, catalog_slot, child_builder, service, child_counter) =
+        compose_children(deps, &workspace, front_end.clone(), options, 2)?;
+    #[cfg(feature = "delegation")]
+    let service = Some(service);
+    #[cfg(not(feature = "delegation"))]
     let completion_hub = Arc::new(CompletionHub::new());
-    #[cfg(feature = "delegation")]
-    let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
-    #[cfg(feature = "delegation")]
-    let child_counter = Arc::new(AtomicUsize::new(0));
-    #[cfg(feature = "delegation")]
-    let agent_ordinals = Arc::new(AtomicUsize::new(1));
-    // The child factory's §3c guard stops a child's turn through the service, which
-    // does not exist yet — the factory is its argument. Same slot pattern.
-    #[cfg(feature = "delegation")]
-    let service_slot: Arc<OnceLock<Arc<InProcessWorkers>>> = Arc::new(OnceLock::new());
-    #[cfg(feature = "delegation")]
-    let child_builder = Arc::new(ChildBuilder::new(
-        deps,
-        &workspace,
-        front_end.clone(),
-        catalog_slot.clone(),
-        child_counter.clone(),
-        agent_ordinals,
-        completion_hub.clone(),
-        options.session.clone(),
-        options.max_idle_summaries,
-        service_slot.clone(),
-    ));
-    #[cfg(feature = "delegation")]
-    let service: Option<Arc<InProcessWorkers>> = {
-        let factory = make_child_factory(child_builder.clone());
-        let service = InProcessWorkers::new(factory, 2);
-        let _ = service_slot.set(service.clone());
-        deps.worker_service = Some(service.clone());
-        Some(service)
-    };
     // Steps are workers of the SAME service built by the SAME builder, so the service
     // and the slots must exist first; the catalog below then registers the tools.
     #[cfg(feature = "workflows")]
@@ -724,7 +702,7 @@ pub async fn run_with_front_end(
                     &child_counter,
                     options.session.as_deref(),
                     &records,
-                );
+                )?;
             }
             #[cfg(feature = "workflows")]
             if workflows.is_some() {
@@ -803,6 +781,69 @@ pub async fn run_with_front_end(
     Ok(code)
 }
 
+/// Compose the child factory and worker service from one initial id reservation.
+/// Both direct workers and workflow steps consume this same service, so neither
+/// path may begin with an unexamined `w1` journal.
+#[cfg(feature = "delegation")]
+fn compose_children(
+    deps: &mut HostDeps,
+    workspace: &Path,
+    front_end: Arc<dyn FrontEnd>,
+    options: &Options,
+    max_workers: usize,
+) -> Result<
+    (
+        Arc<CompletionHub>,
+        Arc<OnceLock<Arc<Catalog>>>,
+        Arc<ChildBuilder>,
+        Arc<InProcessWorkers>,
+        Arc<AtomicUsize>,
+    ),
+    String,
+> {
+    let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
+    let service_slot: Arc<OnceLock<Arc<InProcessWorkers>>> = Arc::new(OnceLock::new());
+    let reserved = options
+        .session
+        .as_deref()
+        .map(session::highest_worker_id)
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "cannot reserve worker ids beside {}: {error}",
+                options.session.as_deref().unwrap().display()
+            )
+        })?
+        .unwrap_or(0);
+    if reserved >= usize::MAX - 1 {
+        return Err("worker id namespace is exhausted: no id can be allocated".into());
+    }
+    let child_counter = Arc::new(AtomicUsize::new(reserved));
+    let child_completion_hub = Arc::new(CompletionHub::new());
+    let child_builder = Arc::new(ChildBuilder::new(
+        deps,
+        workspace,
+        front_end,
+        catalog_slot.clone(),
+        child_counter.clone(),
+        Arc::new(AtomicUsize::new(1)),
+        child_completion_hub.clone(),
+        options.session.clone(),
+        options.max_idle_summaries,
+        service_slot.clone(),
+    ));
+    let service = InProcessWorkers::new(make_child_factory(child_builder.clone()), max_workers);
+    service.reserve_ids(reserved);
+    let _ = service_slot.set(service.clone());
+    deps.worker_service = Some(service.clone());
+    Ok((
+        child_completion_hub,
+        catalog_slot,
+        child_builder,
+        service,
+        child_counter,
+    ))
+}
 /// `p1 workflow run` (ADR-0053): the composition of a run — catalog, worker service,
 /// workflow service, line front end — with NO parent agent. The run's lines go to
 /// stderr as they come; its report, rendered as `workflow_result` renders it, goes to
@@ -825,29 +866,15 @@ async fn workflow_run(
     let cancel = CancellationToken::new();
     let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone()));
 
-    // The same slots and builder `run_with_front_end` composes: a step worker is built
-    // exactly as a direct worker is.
-    let completion_hub = Arc::new(CompletionHub::new());
-    let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
-    let service_slot: Arc<OnceLock<Arc<InProcessWorkers>>> = Arc::new(OnceLock::new());
-    let child_builder = Arc::new(ChildBuilder::new(
+    // The same child composition as an interactive run, including the sibling
+    // reservation. A standalone workflow can be invoked repeatedly with one session.
+    let (completion_hub, catalog_slot, child_builder, service, _child_counter) = compose_children(
         deps,
         &workspace,
         front_end.clone(),
-        catalog_slot.clone(),
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicUsize::new(1)),
-        completion_hub.clone(),
-        options.session.clone(),
-        options.max_idle_summaries,
-        service_slot.clone(),
-    ));
-    let service = InProcessWorkers::new(
-        make_child_factory(child_builder.clone()),
+        options,
         workflow.max_workers,
-    );
-    let _ = service_slot.set(service.clone());
-    deps.worker_service = Some(service.clone());
+    )?;
     let run_root = match &workflow.out {
         Some(out) => out.clone(),
         None => crate::workflow::run_root(deps, options.session.as_deref()),
@@ -2084,7 +2111,7 @@ fn announce_lost_workers(
     child_counter: &AtomicUsize,
     session_file: Option<&Path>,
     records: &[p1_contracts::JournalRecord],
-) {
+) -> Result<(), String> {
     let earlier = p1_tool_delegate::workers_started_in(records);
     // `workers_started_in` reads only the delegate tool's own results, so workers a
     // WORKFLOW started are missing from it. Their journals are still on disk beside
@@ -2092,16 +2119,29 @@ fn announce_lost_workers(
     // the first free `N` — which would have to create a file that already exists
     // (issue #98). The sibling journals therefore bound the reservation too, and the
     // bound is taken BEFORE the message below can return early.
+    let sibling_max = session_file
+        .map(session::highest_worker_id)
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "cannot reserve worker ids beside {}: {error}",
+                session_file.unwrap().display()
+            )
+        })?
+        .unwrap_or(0);
     let used = earlier
         .iter()
         .filter_map(|id| id.strip_prefix('w')?.parse::<usize>().ok())
         .max()
         .unwrap_or(earlier.len())
-        .max(session_file.map(session::highest_worker_id).unwrap_or(0));
+        .max(sibling_max);
+    if used >= usize::MAX - 1 {
+        return Err("worker id namespace is exhausted: no id can be allocated".into());
+    }
     service.reserve_ids(used);
     child_counter.store(used, Ordering::SeqCst);
     if earlier.is_empty() {
-        return;
+        return Ok(());
     }
     let names = earlier.join(", ");
     write_stderr(
@@ -2119,6 +2159,7 @@ fn announce_lost_workers(
              behind before relying on it, and start a new worker if the work is still needed."
         ),
     );
+    Ok(())
 }
 
 /// Workflow runs, like workers, live in the process that started them: the new
@@ -2629,7 +2670,11 @@ impl ChildBuilder {
         };
         // Both ways of starting a worker advance the counter on success, so the
         // direct factory's predicted id stays the service's next id.
-        self.counter.fetch_add(1, Ordering::SeqCst);
+        self.counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| "worker id namespace is exhausted: no id can be allocated")?;
         front_end.child_started(&worker_id);
         // The service snapshots this when a child's turn ends; it reads the SAME cell
         // the tap just filled and the front end was told about.
@@ -2661,7 +2706,14 @@ fn make_child_factory(builder: Arc<ChildBuilder>) -> AgentFactory {
         // out. The counter is only advanced after a successful build: a start that
         // fails (bad environment, an existing worker session file, a failed build)
         // must not desynchronise it from the service's own numbering.
-        let worker_id = format!("w{}", builder.counter.load(Ordering::SeqCst) + 1);
+        let next = builder
+            .counter
+            .load(Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| {
+                "worker id namespace is exhausted: no id can be allocated".to_string()
+            })?;
+        let worker_id = format!("w{next}");
         builder
             .build_child(
                 &spec.environment,

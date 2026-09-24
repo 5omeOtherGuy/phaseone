@@ -70,7 +70,10 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
   every id the session has already used — the journalled ones and the ids of the
   `FILE.w<N>.jsonl` worker journals on disk, which is all a workflow's step workers leave
   behind — so an old id answers `No worker <id>.` and is never given to a new worker, whose
-  own journal would then collide with a file that exists (ADR-0034, issue #98).
+  own journal would then collide with a file that exists (ADR-0034, issue #98). The same
+  initial reservation is made by standalone `p1 workflow run`, before any step starts; a
+  directory enumeration failure or an exhausted id namespace fails startup rather than
+  guessing that no ids are reserved.
 
 ### Prepared start (ADR-0053)
 

@@ -5,6 +5,7 @@
 //! load, cut off a truncated tail, continue appending.
 
 use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -80,36 +81,70 @@ pub fn worker_path(session: &Path, id: usize) -> PathBuf {
 /// on disk without any delegation-tool record naming it: on resume this is what keeps
 /// a new worker from being handed an id whose journal file is already there (issue
 /// #98). Only an exact sibling name counts — anything else is ignored.
-pub fn highest_worker_id(session: &Path) -> usize {
+///
+/// Failing to enumerate the directory is a safety failure, not evidence that no ids
+/// are reserved. `usize::MAX` is rejected because the service would have no next id
+/// to allocate. Both conditions must stop startup rather than weaken the guarantee.
+pub fn highest_worker_id(session: &Path) -> io::Result<usize> {
     let directory = session
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let Some(name) = session.file_name().and_then(|name| name.to_str()) else {
-        return 0;
+    let Some(name) = session.file_name() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session path has no file name",
+        ));
     };
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| worker_id_in(name, &entry.file_name()))
-        .max()
-        .unwrap_or(0)
+    let mut highest = 0;
+    for entry in std::fs::read_dir(directory)? {
+        let Some(id) = worker_id_in(name, &entry?.file_name())? else {
+            continue;
+        };
+        if id >= usize::MAX - 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker journal leaves no generatable worker id; cannot continue",
+            ));
+        }
+        highest = highest.max(id);
+    }
+    Ok(highest)
 }
 
 /// The `<N>` of a sibling named exactly `<session file name>.w<N>.jsonl`, `None` for
-/// every other name. `<N>` is one or more ASCII digits and nothing else.
-fn worker_id_in(session_name: &str, sibling: &OsStr) -> Option<usize> {
-    let digits = sibling
-        .to_str()?
-        .strip_prefix(session_name)?
-        .strip_prefix(".w")?
-        .strip_suffix(".jsonl")?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+/// every other name. `<N>` is one or more ASCII digits and nothing else. Values
+/// larger than `usize` cannot collide with a generatable id and are ignored.
+fn worker_id_in(session_name: &OsStr, sibling: &OsStr) -> io::Result<Option<usize>> {
+    #[cfg(unix)]
+    fn parse_id(session_name: &OsStr, sibling: &OsStr) -> Option<usize> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let sibling = sibling.as_bytes();
+        let suffix = sibling
+            .strip_prefix(session_name.as_bytes())?
+            .strip_prefix(b".w")?
+            .strip_suffix(b".jsonl")?;
+        if suffix.is_empty() || !suffix.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(suffix).ok()?.parse().ok()
     }
-    digits.parse().ok()
+
+    #[cfg(not(unix))]
+    fn parse_id(session_name: &OsStr, sibling: &OsStr) -> Option<usize> {
+        let digits = sibling
+            .to_str()?
+            .strip_prefix(session_name.to_str()?)?
+            .strip_prefix(".w")?
+            .strip_suffix(".jsonl")?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    }
+
+    Ok(parse_id(session_name, sibling))
 }
 
 /// Create the NEW JSONL journal for worker `<id>` next to its parent session.
@@ -122,4 +157,43 @@ pub fn worker(session: &Path, id: usize) -> Result<Arc<dyn CommitSink>, SessionE
         SyncPolicy::EveryRecord,
     )?);
     Ok(sink(&store))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::highest_worker_id;
+    use std::ffi::OsString;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn a_scan_failure_is_not_treated_as_no_reserved_ids() {
+        let error = highest_worker_id(std::path::Path::new("/dev/null/session.jsonl"))
+            .expect_err("a file cannot be enumerated as a session directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+    }
+
+    #[test]
+    fn a_usize_max_journal_is_a_clear_exhaustion_error() {
+        let directory = tempdir().unwrap();
+        let session = directory.path().join("session.jsonl");
+        fs::write(format!("{}w{}.jsonl", session.display(), usize::MAX), "").unwrap();
+        let error = highest_worker_id(&session).expect_err("the namespace is exhausted");
+        assert!(error.to_string().contains("no generatable worker id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_session_basename_is_still_discovered() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempdir().unwrap();
+        let mut name = OsString::from("session");
+        name.push(OsString::from_vec(vec![0xff]));
+        let session = directory.path().join(name);
+        let mut sibling = session.as_os_str().to_os_string();
+        sibling.push(".w4.jsonl");
+        fs::write(directory.path().join(sibling), "").unwrap();
+        assert_eq!(highest_worker_id(&session).unwrap(), 4);
+    }
 }

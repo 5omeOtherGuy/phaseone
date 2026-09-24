@@ -11,6 +11,11 @@
 #![cfg(feature = "delegation")]
 
 mod common;
+#[cfg(feature = "workflows")]
+mod workflow_common;
+
+#[cfg(feature = "workflows")]
+use workflow_common::{Fakes, Scratch, done};
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +25,44 @@ use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response}
 use tempfile::tempdir;
 
 const START: &str = r#"{"environment":"b","task":"work","tools":["read"]}"#;
+
+#[cfg(feature = "workflows")]
+#[tokio::test]
+async fn repeated_standalone_workflows_reserve_step_worker_ids() {
+    let scratch = Scratch::new();
+    let script = scratch.script("one.rhai", r#"agent("one step")"#);
+    let session = scratch.session();
+    let args = [
+        "workflow",
+        "run",
+        script.to_str().unwrap(),
+        "--workspace",
+        scratch.workspace.path().to_str().unwrap(),
+        "--session",
+        session.to_str().unwrap(),
+        "--yes",
+    ];
+    let mut first = scratch.harness();
+    first.deps.catalog_hook = Some(Fakes::new(Vec::new(), done("first"), Vec::new()).hook());
+    assert_eq!(
+        run_args(&mut first, &args).await,
+        0,
+        "{}",
+        first.stderr.text()
+    );
+    assert!(p1_host::session::worker_path(&session, 1).exists());
+
+    let mut second = scratch.harness();
+    second.deps.catalog_hook = Some(Fakes::new(Vec::new(), done("second"), Vec::new()).hook());
+    assert_eq!(
+        run_args(&mut second, &args).await,
+        0,
+        "{}",
+        second.stderr.text()
+    );
+    assert!(p1_host::session::worker_path(&session, 2).exists());
+    assert!(!second.stderr.text().contains("journal file already exists"));
+}
 
 fn start_call(call_id: &str) -> p1_contracts::ToolCall {
     json_call(call_id, "worker_start", START)
@@ -59,23 +102,19 @@ async fn a_resumed_session_reserves_the_ids_of_worker_journals_a_workflow_left()
     let session_arg = session.to_str().unwrap();
     let workspace_arg = workspace.path().to_str().unwrap();
 
-    // Six workers the DELEGATE tool started, one at a time: the service runs at most
-    // two children at once, and starting the next only after the previous completion
-    // notification makes the request order — and so the worker ids — deterministic.
-    // Requests: [c1] [text] [c2] [text] … [c6] [text] [text], where every inner
-    // `[text]` answers a completion notification; the trailing spares cover the last
-    // notification and any extra turn.
-    let mut steps = Vec::new();
-    for id in 1..=6 {
-        steps.push(tool_call_response(vec![start_call(&format!("c{id}"))]));
-        steps.push(text_response("waiting"));
-    }
-    steps.push(text_response("spare"));
-    steps.push(text_response("spare"));
+    // One delegate-tool worker gives the first process a real journal. Completion
+    // notifications and provider scheduling are deliberately not used to serialize
+    // more workers: the remaining journals below model workflow children, whose ids
+    // must be discovered from the filesystem.
     let (code, harness) = run(
         environments.path(),
-        ScriptedProvider::new(steps),
-        ScriptedProvider::new(vec![text_response("done"); 6]),
+        ScriptedProvider::new(vec![
+            tool_call_response(vec![start_call("c1")]),
+            text_response("done"),
+            text_response("spare"),
+            text_response("spare"),
+        ]),
+        ScriptedProvider::new(vec![text_response("child done")]),
         &[
             "--yes",
             "--env",
@@ -89,13 +128,11 @@ async fn a_resumed_session_reserves_the_ids_of_worker_journals_a_workflow_left()
     )
     .await;
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
-    for id in 1..=6 {
-        assert!(
-            worker_journal(&session, id).exists(),
-            "w{id} must be journalled: {}",
-            harness.stderr.text()
-        );
-    }
+    assert!(
+        worker_journal(&session, 1).exists(),
+        "w1 must be journalled: {}",
+        harness.stderr.text()
+    );
 
     // Four more worker journals, exactly the files a workflow's step workers leave:
     // on disk beside the session, and in no record the delegation tool wrote. w10 is
@@ -133,10 +170,10 @@ async fn a_resumed_session_reserves_the_ids_of_worker_journals_a_workflow_left()
 
     // The delegate-tool message is unchanged: it names only what the journal records.
     assert!(
-        harness.stderr.text().contains(
-            "resume: worker(s) w1, w2, w3, w4, w5, w6 belonged to the earlier process and are not \
-             restored"
-        ),
+        harness
+            .stderr
+            .text()
+            .contains("resume: worker(s) w1 belonged to the earlier process and are not restored"),
         "stderr: {}",
         harness.stderr.text()
     );
