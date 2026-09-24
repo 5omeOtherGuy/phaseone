@@ -19,6 +19,9 @@ store_only = true
 
 [adapter_settings]
 account = "claude-code-subscription"
+# Owner hotfix 2026-09-25: request the native 1M-token window (the context-1m beta) on this
+# subscription; the owner confirmed the account serves it.
+long_context = true
 
 # Only profiles the host ships a policy for; any other profile is refused. A dated
 # snapshot is a binding (`wire_model`), not a profile.

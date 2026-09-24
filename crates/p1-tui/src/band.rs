@@ -1,6 +1,7 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::text::sanitize_segments;
 use crate::wrap::{cell_width, fit_cells};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,11 +32,15 @@ pub struct Band {
 impl Band {
     pub fn render(&self) -> Line<'static> {
         let inner = self.width.saturating_sub(2 * self.pad);
-        let mut left = self.left.clone();
-        let right_len: usize = self.right.iter().map(|s| cell_width(&s.text)).sum();
+        let mut left = sanitize_segments(&self.left);
+        let right = sanitize_segments(&self.right);
+        let right_len: usize = right.iter().map(|s| cell_width(&s.text)).sum();
         let left_len: usize = left.iter().map(|s| cell_width(&s.text)).sum();
-        let mut over = (left_len + right_len + if self.right.is_empty() { 0 } else { 2 }) as isize
-            - inner as isize;
+        // The SLAB row rule (TUI-HANDOFF.src.md §5, lib/p1-cells.js `R.length`) keys
+        // the separator on the right segment list, not on what it draws, and is ported 1:1;
+        // sanitizing keeps every segment, so a right side that sanitizes to nothing keeps it.
+        let mut over =
+            (left_len + right_len + if right.is_empty() { 0 } else { 2 }) as isize - inner as isize;
         for seg in left.iter_mut().rev() {
             if over <= 0 {
                 break;
@@ -67,7 +72,7 @@ impl Band {
             }
         }
         space(gap, &mut spans);
-        for seg in &self.right {
+        for seg in &right {
             if !seg.text.is_empty() {
                 spans.push(Span::styled(
                     seg.text.clone(),
@@ -163,6 +168,43 @@ mod tests {
         .render();
         assert_eq!(crate::wrap::cell_width(&line.to_string()), 10);
         assert_eq!(line.spans[1].style.bg, Some(palette::INK));
+    }
+    #[test]
+    fn a_right_side_that_sanitizes_to_nothing_keeps_the_slab_separator() {
+        let band = |right: &str, width| Band {
+            bg: palette::BLOCK,
+            left: vec![Seg::new(palette::INK, "abcdef")],
+            right: vec![Seg::new(palette::OK, right)],
+            width,
+            pad: 0,
+        };
+        // Same row as an empty-text right segment: the separator follows the segment list.
+        for right in ["", "\u{1b}[31", "\u{301}", "\u{1b}[31m\u{301}"] {
+            assert!(
+                band(right, 2).render().to_string().starts_with("  "),
+                "{right:?}"
+            );
+            assert!(
+                band(right, 6)
+                    .render()
+                    .to_string()
+                    .starts_with("abc\u{2026}  "),
+                "{right:?}"
+            );
+        }
+        // Visible text after a malformed chip still earns its separator.
+        let line = Band {
+            bg: palette::BLOCK,
+            left: vec![Seg::new(palette::INK, "abcdef")],
+            right: vec![
+                Seg::new(palette::DIM, "\u{1b}[31m"),
+                Seg::new(palette::OK, "OK"),
+            ],
+            width: 8,
+            pad: 0,
+        }
+        .render();
+        assert_eq!(line.to_string(), "abc\u{2026}  OK");
     }
     #[test]
     fn path_cut_keeps_basename_and_wide_cut_is_safe() {

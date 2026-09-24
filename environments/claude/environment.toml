@@ -18,16 +18,15 @@ module = "shell"
 [[tools]]
 module = "finish"
 
-# Operational values, not a capacity claim: no vendor documents a context window for this
-# subscription endpoint (research #27), and no p1 run has proven a request size on it yet.
-# 200k is deliberately conservative — a too-small window only summarizes earlier, a too-large one
-# fails the request. Summarize late enough for multi-file work (a tight threshold thrashes: run
-# split4a-deepseek, docs/dogfood/runs.jsonl), keep a long tail. Raise only on evidence from
-# several runs, never from one run's peak.
+# Owner hotfix 2026-09-25: Opus 5.5 gets its native 1M-token window (the route sends the
+# context-1m beta; the owner confirmed the subscription serves it). Summarize at 500k: the owner
+# asked for at least 500k of working context, and a later summary keeps each request's cache
+# read bounded. The earlier 200k/120k values summarized a lead every ~40 requests (usage audit of
+# the two lead journals, #125). The per-model follow-up retunes every environment.
 [context]
-window_tokens = 200000
+window_tokens = 1000000
 output_headroom_tokens = 32000
-summarize_at_tokens = 120000
-keep_recent_tokens = 40000
+summarize_at_tokens = 500000
+keep_recent_tokens = 60000
 user_verbatim_tokens = 8000
 summary_output_tokens = 12000

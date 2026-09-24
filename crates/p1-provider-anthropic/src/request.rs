@@ -26,6 +26,11 @@ pub(crate) const BASE_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 /// Beta required only when the body carries a manual-budget `thinking` block.
 pub(crate) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
+/// Beta that lifts the Messages context window from 200k to 1M tokens. Sent only
+/// on a route whose settings enable `long_context`: the window is an account and
+/// model fact, so the route file decides it, not the request.
+pub(crate) const LONG_CONTEXT_BETA: &str = "context-1m-2025-08-07";
+
 /// `max_tokens` when the caller expresses no preference.
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
@@ -439,5 +444,18 @@ pub fn build_headers(
     }
     headers.push(("anthropic-beta".to_string(), beta));
 
+    headers
+}
+
+/// Add the 1M-context beta to headers [`build_headers`] produced, for a route whose
+/// settings enable `long_context`.
+pub fn with_long_context(mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    if let Some((_, beta)) = headers
+        .iter_mut()
+        .find(|(name, _)| name == "anthropic-beta")
+    {
+        beta.push(',');
+        beta.push_str(LONG_CONTEXT_BETA);
+    }
     headers
 }
