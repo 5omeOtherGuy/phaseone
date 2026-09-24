@@ -253,6 +253,7 @@ Both wf6 low findings were accepted as real and fixed, std-only, no API change:
    new sequence (`text.rs` test `a_new_introducer_aborts_an_unfinished_csi`).
 2. The Band separator is no longer reserved for a right side that draws nothing
    (`band.rs` test `a_right_side_that_sanitizes_to_nothing_reserves_no_separator`).
+   Reversed by the PR #102 review decision below (SLAB row rule).
 
 wf1 ran two parallel read/edit-only authors, then a per-file review → verify pipeline
 (read/grep only): 6/6 done, 0 blocked/failed/fallback, every step on
@@ -265,6 +266,24 @@ test with U+0301, a styled U+0301 and a malformed chip followed by visible `OK`.
 Mutation check: restoring the text key fails that test at `band.rs:182`.
 Per-step telemetry (turns, tokens, tool calls) is in the operator log
 `unified-dashboard-trial/iris-astra-operator-log.md`.
+
+### PR #102 review wf3 — separator decision reversed — 2026-09-24 22:00
+
+wf3 (three read-only DeepSeek reviewers, one verifier per finding; all steps done on
+`openai-chat/opencode-go-subscription/deepseek-v4.1-flash`, not verified) found the
+sanitizer (D1), Band trace (D2) and conformance/docs (D3–D5) clean, and one confirmed
+info finding: the separator key of item 2 above diverges from the SLAB row rule, which
+must be ported 1:1 (`docs/design/tui/slab/TUI-HANDOFF.src.md` §5 l.223 "right non-empty",
+reference renderer `docs/design/tui/slab/lib/p1-cells.js` `R.length`, ADR-0056 build
+contract). The lead checked both sources and decided for the contract: wf6 item 2 and the
+wf1 residual are reversed, not fixed. `Band::render` keys the separator on the sanitized
+right segment list again (sanitizing keeps every segment, so this equals the base
+behaviour); changing the rule is a SLAB design decision for the owner, not this slice.
+Test `a_right_side_that_sanitizes_to_nothing_keeps_the_slab_separator` pins it for an
+empty-text, incomplete-CSI, U+0301 and styled U+0301 right side at widths 2 and 6, plus the
+malformed chip followed by visible `OK`. Mutation check: the cells key fails it at
+`band.rs:183`. Focused `cargo test -p p1-tui --locked --offline`: all suites passed
+(117 unit, 15 sanitizer acceptance).
 
 ### Lead checks — 2026-09-24 (guarded, target `/mnt/build/cargo-target/iris-tui-migration`)
 
