@@ -17,8 +17,23 @@
 #      `gh` call, no run for that commit, no completed run within CI_BUILD_TIMEOUT
 #      seconds, or a failed download: nothing can be concluded about the commit
 #
-# Environment: CI_BUILD_TIMEOUT (seconds to wait for the run, default 1800),
-# CI_BUILD_INTERVAL (seconds between polls, default 20).
+# The same script serves a repository whose workflow runs on a branch push (p1)
+# and one whose workflow is only dispatched (brain-tools):
+#
+#   CI_TRIGGER=push      (default) the repository runs build.yml on a branch push:
+#                        push the branch, then find the push run for exactly that
+#                        headSha.
+#   CI_TRIGGER=dispatch  nothing runs on push: push the branch, then reuse a
+#                        build.yml run for exactly that headSha that is queued,
+#                        running or green, otherwise start one with
+#                        `gh workflow run build.yml --ref <branch>` and wait for
+#                        that workflow_dispatch run.
+#
+# Any other CI_TRIGGER value is a tooling error (exit 2).
+#
+# Environment: CI_TRIGGER (push|dispatch, default push), CI_BUILD_TIMEOUT (seconds
+# to wait for the run, default 1800), CI_BUILD_INTERVAL (seconds between polls,
+# default 20).
 #
 # It never force-pushes and pushes only <branch>.
 set -euo pipefail
@@ -32,12 +47,19 @@ usage: scripts/ci-build.sh [<branch>] [--no-download] [--wait-only]
   <branch>        branch to push and wait for (default: the current branch)
   --no-download   print the run summary only; do not download the artifact
   --wait-only     do not push; wait for the run of the branch's existing commit
+env: CI_TRIGGER=push|dispatch (default push; dispatch reuses or starts a build.yml run)
 exit: 0 success, 1 run failed or cancelled, 2 usage or tooling error
 EOF
 }
 
 command -v git >/dev/null 2>&1 || { echo "ci-build: git is not on PATH" >&2; exit 2; }
 command -v gh >/dev/null 2>&1 || { echo "ci-build: gh is not on PATH" >&2; exit 2; }
+
+trigger=${CI_TRIGGER:-push}
+case "$trigger" in
+  push|dispatch) ;;
+  *) echo "ci-build: CI_TRIGGER must be push or dispatch, not '$trigger'" >&2; exit 2 ;;
+esac
 
 branch=""
 download=1
@@ -88,6 +110,30 @@ for value in "$timeout_s" "$interval_s"; do
   esac
 done
 
+# The run to wait for, one TSV line "status<TAB>conclusion<TAB>id" per candidate,
+# newest first. Once a run is picked, `pinned` keeps the loop on that run.
+list_run() {
+  local fields="status,conclusion,headSha,event,databaseId"
+  local filter
+  if [ -n "$pinned" ]; then
+    filter=".[] | select(.databaseId==$pinned) | [.status, .conclusion, .databaseId] | @tsv"
+  elif [ "$trigger" = push ]; then
+    # Exactly this commit's run, as scripts/push-main.sh does for main.
+    filter=".[] | select(.headSha==\"$sha\") | [.status, .conclusion, .databaseId] | @tsv"
+  elif [ "$dispatched" = 1 ]; then
+    # The dispatch we just started, not an older run of the same commit.
+    filter=".[] | select(.headSha==\"$sha\" and .event==\"workflow_dispatch\") | [.status, .conclusion, .databaseId] | @tsv"
+  else
+    # Reuse a run of this commit that is still queued or running, or already green.
+    filter=".[] | select(.headSha==\"$sha\") | select((.status != \"completed\") or (.conclusion == \"success\")) | [.status, .conclusion, .databaseId] | @tsv"
+  fi
+  if [ "$trigger" = push ]; then
+    gh run list --branch "$branch" --limit 20 --json "$fields" -q "$filter"
+  else
+    gh run list --workflow build.yml --limit 30 --json "$fields" -q "$filter"
+  fi
+}
+
 if [ "$push" = 1 ]; then
   if ! git push --quiet origin "refs/heads/$branch:refs/heads/$branch"; then
     echo "ci-build: git push origin $branch failed" >&2
@@ -98,12 +144,25 @@ else
   echo "wait-only: not pushing; waiting for the run of $branch ${sha:0:7}…"
 fi
 
+pinned=""
+dispatched=0
+if [ "$trigger" = dispatch ]; then
+  existing=$(list_run) || { echo "ci-build: gh run list failed" >&2; exit 2; }
+  if [ -n "$existing" ]; then
+    echo "dispatch: reusing the build.yml run already queued, running or green for ${sha:0:7}"
+  else
+    if ! gh workflow run build.yml --ref "$branch"; then
+      echo "ci-build: gh workflow run build.yml --ref $branch failed" >&2
+      exit 2
+    fi
+    dispatched=1
+    echo "dispatch: started build.yml on $branch for ${sha:0:7}"
+  fi
+fi
+
 deadline=$(( $(date +%s) + timeout_s ))
 while :; do
-  # Exactly this commit's run, as scripts/push-main.sh does for main.
-  runs=$(gh run list --branch "$branch" --limit 20 \
-           --json status,conclusion,headSha,databaseId \
-           -q ".[] | select(.headSha==\"$sha\") | [.status, .conclusion, .databaseId] | @tsv") ||
+  runs=$(list_run) ||
     { echo "ci-build: gh run list failed" >&2; exit 2; }
   run_line=${runs%%$'\n'*}
   status=""
@@ -111,6 +170,9 @@ while :; do
   run_id=""
   if [ -n "$run_line" ]; then
     IFS=$'\t' read -r status conclusion run_id <<<"$run_line" || true
+  fi
+  if [ -n "$run_id" ]; then
+    pinned=$run_id
   fi
   if [ "$status" = completed ]; then
     break

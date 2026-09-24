@@ -94,18 +94,43 @@ GH_STUB = textwrap.dedent(
             fail("could not talk to the GitHub API", code)
         # Emulates -q '.[] | select(.headSha=="<sha>") | [.status,.conclusion,.databaseId] | @tsv'
         query = args[args.index("-q") + 1] if "-q" in args else ""
-        wanted = re.search(r'select\\(\\.headSha=="([0-9a-f]+)"\\)', query)
-        if wanted is None:
-            fail("run list was not filtered by headSha", 2)
-        if wanted.group(1) != env("STUB_RUN_SHA", env("STUB_SHA")):
+        if "select(" not in query:
+            fail("run list was not filtered", 2)
+        # A workflow_dispatch run only exists once the script started one.
+        dispatched = (state / "dispatched").exists()
+        if 'event=="workflow_dispatch"' in query and not dispatched:
+            sys.exit(0)
+        wanted = re.search(r'\\.headSha=="([0-9a-f]+)"', query)
+        if wanted and wanted.group(1) != env("STUB_RUN_SHA", env("STUB_SHA")):
             sys.exit(0)  # a run for a different commit does not match
-        polls = state / "polls"
+        pinned = re.search(r'\\.databaseId==(\\d+)', query)
+        if pinned:
+            last = state / "last_id"
+            if not last.exists() or pinned.group(1) != last.read_text().strip():
+                sys.exit(0)  # pinned to a run this stub never reported
+        polls = state / ("polls_dispatch" if dispatched else "polls")
         count = int(polls.read_text()) if polls.exists() else 0
         polls.write_text(str(count + 1))
-        answers = env("STUB_LIST_OUT", "completed\\tsuccess\\t4242").split("|")
+        default = "in_progress\\t\\t7|completed\\tsuccess\\t7" if dispatched else "completed\\tsuccess\\t4242"
+        answers = env("STUB_DISPATCH_OUT" if dispatched else "STUB_LIST_OUT", default).split("|")
         line = answers[min(count, len(answers) - 1)]
         if line:
+            fields = line.split("\\t")
+            # The reuse query keeps only runs that are still queued or running, or
+            # already green: a red run for the commit is not reused.
+            if '(.conclusion == "success")' in query and len(fields) > 1 and \\
+                    fields[0] == "completed" and fields[1] != "success":
+                sys.exit(0)
+            if len(fields) > 2:
+                (state / "last_id").write_text(fields[2])
             print(line)
+        sys.exit(0)
+
+    if args[:2] == ["workflow", "run"]:
+        code = int(env("STUB_DISPATCH_EXIT", "0"))
+        if code:
+            fail("workflow has no workflow_dispatch trigger", code)
+        (state / "dispatched").write_text("yes")
         sys.exit(0)
 
     if args[:2] == ["run", "view"] and "--json" in args:
@@ -363,6 +388,95 @@ class CiBuildTests(unittest.TestCase):
         result = h.run()
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("could not download", result.stderr)
+
+    def test_push_is_the_default_trigger(self) -> None:
+        h = self.harness(**{"CI_TRIGGER": "push"})
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lists = [call for call in h.calls("gh") if "run list" in call]
+        self.assertTrue(lists, h.calls("gh"))
+        self.assertIn("--branch " + BRANCH, lists[0])
+        self.assertNotIn("--workflow", lists[0], "push mode looks the run up by branch")
+        self.assertFalse(any("workflow run" in call for call in h.calls("gh")))
+
+    def test_invalid_trigger_is_a_tooling_error(self) -> None:
+        h = self.harness(**{"CI_TRIGGER": "webhook"})
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("CI_TRIGGER must be push or dispatch, not 'webhook'", result.stderr)
+        self.assertEqual(h.calls(), [], "an invalid trigger must not touch git or gh")
+
+    def test_dispatch_starts_a_run_and_waits_for_it(self) -> None:
+        h = self.harness(**{"CI_TRIGGER": "dispatch", "STUB_LIST_OUT": ""})
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"gh workflow run build.yml --ref {BRANCH}", h.calls("gh"))
+        self.assertIn("dispatch: started build.yml", result.stdout)
+        lists = [call for call in h.calls("gh") if "run list" in call]
+        self.assertTrue(any("--workflow build.yml" in call for call in lists), lists)
+        self.assertTrue(any('event=="workflow_dispatch"' in call for call in lists), lists)
+        self.assertEqual(len(lists), 3, lists)  # before dispatch, then two polls
+        self.assertEqual((h.artifact() / "p1").read_bytes(), P1_BYTES)
+        self.assertIn(P1_SHA, result.stdout)
+
+    def test_dispatch_reuses_a_running_run(self) -> None:
+        h = self.harness(
+            **{
+                "CI_TRIGGER": "dispatch",
+                "STUB_LIST_OUT": "in_progress\t\t7|in_progress\t\t7|completed\tsuccess\t7",
+            }
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dispatch: reusing", result.stdout)
+        self.assertFalse(any("workflow run" in call for call in h.calls("gh")), "must not start a second run")
+        self.assertEqual((h.artifact() / "p1").read_bytes(), P1_BYTES)
+
+    def test_dispatch_reuses_a_green_run(self) -> None:
+        h = self.harness(**{"CI_TRIGGER": "dispatch", "STUB_LIST_OUT": "completed\tsuccess\t7"})
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dispatch: reusing", result.stdout)
+        self.assertFalse(any("workflow run" in call for call in h.calls("gh")))
+        self.assertIn("verified against p1.sha256", result.stdout)
+
+    def test_dispatch_ignores_a_failed_run_for_the_same_commit(self) -> None:
+        # The reuse query only matches queued/running/green runs, so a red run is
+        # replaced by a fresh dispatch.
+        h = self.harness(**{"CI_TRIGGER": "dispatch", "STUB_LIST_OUT": "completed\tfailure\t7"})
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"gh workflow run build.yml --ref {BRANCH}", h.calls("gh"))
+
+    def test_dispatch_red_run_exits_one(self) -> None:
+        h = self.harness(
+            **{
+                "CI_TRIGGER": "dispatch",
+                "STUB_LIST_OUT": "",
+                "STUB_DISPATCH_OUT": "completed\tfailure\t9",
+                "STUB_LOG_FAILED": "error: the dispatch gate failed",
+            }
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("concluded 'failure'", result.stderr)
+        self.assertIn("error: the dispatch gate failed", result.stderr)
+
+    def test_dispatch_that_cannot_start_is_a_tooling_error(self) -> None:
+        # p1's build.yml has no workflow_dispatch trigger: dispatch mode must fail
+        # loudly instead of waiting for a run that can never exist.
+        h = self.harness(**{"CI_TRIGGER": "dispatch", "STUB_LIST_OUT": "", "STUB_DISPATCH_EXIT": "1"})
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("gh workflow run build.yml --ref " + BRANCH + " failed", result.stderr)
+        self.assertFalse(any("run download" in call for call in h.calls("gh")))
+
+    def test_dispatch_wait_only_does_not_push(self) -> None:
+        h = self.harness(**{"CI_TRIGGER": "dispatch", "STUB_LIST_OUT": "completed\tsuccess\t7"})
+        result = h.run("--wait-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("push" in call for call in h.calls("git")), "wait-only must not push")
+        self.assertIn("dispatch: reusing", result.stdout)
 
 
 if __name__ == "__main__":
