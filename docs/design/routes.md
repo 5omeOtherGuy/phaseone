@@ -68,6 +68,9 @@ else `~/.claude/.credentials.json`. Refresh: `POST https://platform.claude.com/v
 header `anthropic-beta: oauth-2025-04-20`, JSON `{grant_type:"refresh_token", refresh_token,
 client_id, scope}`; the refresh token ROTATES and must be written back to the same file
 atomically (another tool — Claude Code itself — shares it). 401/403 → one forced refresh, once.
+Self-contained since ADR-0061: the shipped route sets `store_only`, so it reads the documented
+token and p1's own store and never this file; the borrowed source above survives only for a route
+that omits the field (`docs/design/credentials.md` §8).
 
 ## B. ChatGPT/Codex subscription — OpenAI Responses  (`openai-codex-responses`)
 
@@ -121,6 +124,9 @@ Refresh: `POST https://auth.openai.com/oauth/token`, form `grant_type=refresh_to
 refresh_token, client_id`; the refresh token ROTATES → atomic write-back under a file lock,
 because the Codex CLI shares the file. **[todo-live]** field layout of that file is read from
 the Codex CLI's own source/docs, never by dumping the owner's file.
+Self-contained since ADR-0061: the shipped route sets `store_only` and reads p1's own store
+instead, so this CLI file is not read at runtime; minting p1's own grant is the remaining work
+(`docs/design/credentials.md` §8).
 
 ## C. What the two routes force into the contracts
 

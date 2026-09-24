@@ -14,6 +14,11 @@
 //! an error naming it, never a silent fall-through. A refresh is written back to
 //! the source the credential came from, never to another one.
 //!
+//! A route may opt out of every borrowed source with `store_only = true`
+//! (ADR-0061): its chain is then the documented environment variable and p1's own
+//! store, and no other tool's login file is opened. A route without the field keeps
+//! the chain above unchanged.
+//!
 //! Linux-only today: the store's permission check uses
 //! `std::os::unix::fs::PermissionsExt`, and there is no cfg scaffolding for other
 //! systems (spec §3).
@@ -33,7 +38,7 @@ pub use api_key::SubscriptionCredentials;
 pub use claude_code::ClaudeCodeCredentials;
 pub use codex::{Clock, CodexCliCredentials};
 pub use locations::Locations;
-pub use resolve::{Presence, SourceName, SourceReport, describe, resolve};
+pub use resolve::{CredentialPolicy, Presence, SourceName, SourceReport, describe, resolve};
 pub use spec::{BorrowSource, BorrowStore, CredentialKind, CredentialSpec};
 
 use p1_contracts::{ProviderError, ProviderErrorKind};
