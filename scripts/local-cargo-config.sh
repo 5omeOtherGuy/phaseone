@@ -133,6 +133,11 @@ fi
 if [[ -e $config && ! -f $config ]]; then
   die "Cargo config path is not a regular file: $config"
 fi
+if [[ -e $config ]]; then
+  # Writing through the name would rewrite every file linked to the same inode.
+  config_links="$(stat -c %h -- "$config")" || die "cannot inspect Cargo config link count: $config"
+  [[ $config_links == 1 ]] || die "Cargo config has multiple hard links: $config"
+fi
 config_resolved="$(realpath -m -- "$config")" || die "cannot resolve Cargo config path"
 expected_config="$checkout/.cargo/config.toml"
 [[ $config_resolved == "$expected_config" ]] || \

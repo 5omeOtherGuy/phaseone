@@ -220,6 +220,8 @@ class LocalCargoConfigTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cargo config must not be a symlink", result.stderr)
+        # Dry-run never writes, so unchanged-victim checks are defensive; the
+        # exit status and error message are the real rejection checks.
         with open(victim, "rb") as handle:
             self.assertEqual(handle.read(), victim_contents)
 
@@ -253,6 +255,29 @@ class LocalCargoConfigTest(unittest.TestCase):
         self.assertIn("Cargo config must not be a symlink", result.stderr)
         self.assertEqual(os.readlink(config), "missing.toml")
         self.assertFalse(os.path.exists(missing_target))
+
+    def test_dry_run_rejects_hard_linked_config(self) -> None:
+        config_dir = os.path.join(self.checkout, ".cargo")
+        manifest = os.path.join(self.checkout, "Cargo.toml")
+        config = os.path.join(config_dir, "config.toml")
+        os.mkdir(config_dir)
+        with open(manifest, "wb") as handle:
+            handle.write(b"known Cargo manifest contents\n")
+        os.link(manifest, config)
+
+        result = self.run_script("--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cargo config has multiple hard links", result.stderr)
+
+    def test_dry_run_rejects_dangling_config_parent_symlink(self) -> None:
+        config_dir = os.path.join(self.checkout, ".cargo")
+        os.symlink("nowhere", config_dir)
+
+        result = self.run_script("--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cargo config parent must not be a symlink", result.stderr)
 
     def test_regular_config_is_accepted_and_dry_runs_are_identical(self) -> None:
         config_dir = os.path.join(self.checkout, ".cargo")
