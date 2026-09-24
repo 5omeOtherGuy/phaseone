@@ -823,9 +823,12 @@ mod tests {
             id: id.into(),
             task: "task".into(),
             route: "deepseek/v4.1-flash".into(),
+            model: None,
             state,
             elapsed: None,
             cost_micro_usd: None,
+            tokens: None,
+            context_window: None,
             grants: "read finish".into(),
             activity: String::new(),
         }
