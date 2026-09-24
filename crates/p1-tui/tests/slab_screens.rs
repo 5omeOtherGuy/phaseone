@@ -409,6 +409,21 @@ fn worker(
         state,
         elapsed: elapsed.map(str::to_string),
         cost_micro_usd: None,
+        model: match id {
+            "w3" | "w2" => Some("deepseek-v4.1-flash".into()),
+            "w4" => Some("glm-5.3".into()),
+            _ => None,
+        },
+        tokens: match id {
+            "w3" => Some(12_400),
+            "w2" => Some(48_213),
+            "w4" => Some(3_100),
+            _ => None,
+        },
+        context_window: match id {
+            "w2" => Some(128_000),
+            _ => None,
+        },
         grants: grants.into(),
         activity: activity.into(),
     }
