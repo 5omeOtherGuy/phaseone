@@ -341,7 +341,7 @@ The judge accepted these slices:
   paragraph breaks, the first-nonblank steering tag, all-blank fallback, widths 12–40,
   the narrow and boundary tag columns, and rendered-row agreement.
 - **S12** — commit `ea5d940` (`quantize colours with grey ramp`). Tests cover unchanged
-  SLAB token indices, primary and grayscale anchors, exhaustive cube-distance bounds,
+  SLAB token indices, primary and grayscale anchors, cube-distance bounds over a step-5 RGB grid,
   the grey-ramp preference, and the SLAB background mapping.
 
 Owner decision 2026-09-25 07:30 approved both slices. Lead check after merging `main`: `cargo test -p p1-tui`
