@@ -6,6 +6,15 @@ at a named commit, with file and line), **implementation**, **behaviour tests**,
 done** (measurable), **state after**. The epic issue #72 tracks this list; `STATUS.md` "Next"
 stays the lead's short-form pointer.
 
+## Direction change (owner, 2026-09-25): WebAssembly modules
+
+p1 migrates to WebAssembly modules (ADR-0071, issue #187): `p1-core`, the host, the journal,
+the worker service and the terminal front ends stay native; every tool, provider and policy
+becomes a module the host loads by name. No browser GUI for now. Builds for this migration run
+on a dedicated AWS EC2 machine. The migration plan comes from Astra (brief and plan under
+`../phaseone-briefs/astra/wasm-migration/`); its phases become issues under a new epic and take
+precedence over the list below where they overlap.
+
 ## Usable today (main `b7f16b6`, CI green)
 
 - Interactive TUI (SLAB, ADR-0056) with model picker, call descriptions and edit previews

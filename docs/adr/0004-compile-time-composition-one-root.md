@@ -1,11 +1,11 @@
 ---
 adr: 4
 title: Compile-time composition with one composition root
-status: accepted
+status: superseded
 date: 2026-09-19
 deciders: lead
 supersedes: []
-superseded_by: []
+superseded_by: [71]
 sources: [docs/design/design-summary.md, docs/design/seams.md, AGENTS.md]
 ---
 # ADR-0004: Compile-time composition with one composition root

@@ -13,7 +13,7 @@ step is a worker, never granted the worker or workflow tools.
 |---|---|---|
 | `p1-workflow` | The rhai script engine, the script API, roles/caps resolution, the step envelope, the run journal with prefix replay, cancellation, and the service seams (`WorkflowService`, `StepRunner`, `ModelResolver`, `WorkflowObserver`, `WorkflowSettings`). | No provider, no tool, no worker implementation: it depends only on `p1-contracts` — never `p1-core`, `p1-workers` or a tool crate. |
 | `p1-tool-workflow` | The four model-facing tools (`workflow_start`, `workflow_status`, `workflow_result`, `workflow_cancel`) over the `WorkflowService` trait. | The engine's internals: it never constructs `InProcessWorkflows` and holds no run state. |
-| the host | Composition: implements `StepRunner` over `p1-workers`' prepared start, `ModelResolver` over its environments and routes, parses `[workflows]`, chooses the run root, renders lines, calls `shutdown()`. | No workflow logic of its own — ordinary constructors, no registry. |
+| the host | Composition: implements `StepRunner` over `p1-workers`' prepared start, `ModelResolver` over its environments and routes, parses `[workflows]`, chooses the run root, renders lines, calls `shutdown()`. | No workflow logic of its own — explicit composition in the native host, no registry. |
 
 `api.rs` in `p1-workflow` is the frozen public surface: additions are allowed, renames and
 removals are not.

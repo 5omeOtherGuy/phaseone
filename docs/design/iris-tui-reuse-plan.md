@@ -62,9 +62,9 @@ not a substitute for the per-file audit.
    leak across these seams.
 4. Tools/providers never import terminal types. Tool presentation stays neutral;
    renderers do not execute tools or recover semantics by matching tool names.
-5. Use ordinary constructors and narrow typed interfaces. No global registry,
-   plugin loader, hidden singleton settings, service locator or shared mutable
-   cross-module state. Pass capability/theme data explicitly.
+5. Use ordinary constructors and narrow typed interfaces inside the native TUI (the TUI
+   stays native under ADR-0071). No global registry, hidden singleton settings, service
+   locator or shared mutable cross-module state. Pass capability/theme data explicitly.
 6. Reuse implementation, not Iris's Nexus/Wayland/Mimir dependency graph. Keep
    private helpers as modules; create a crate only for a real independently
    selectable boundary/consumer, not one crate per donor file.

@@ -18,8 +18,10 @@ Detail and reasoning: `seams.md` (v1). Product direction: `pillars.md` (rev 2).
 ```
 
 1. **Module** = an independently selectable implementation behind an explicit Rust
-   interface, normally its own crate. Composed with ordinary constructors at one
-   composition root. No plugin loader, no service locator, no global registry.
+   interface, normally its own crate. Since 2026-09-25 (owner, ADR-0071) a module is a
+   WebAssembly artifact the native host loads by name when an environment assembles it;
+   the host stays the one composition root. No service locator, no global registry, no
+   auto-registration.
    Every tool is its own module; tools may share small helper libraries.
 2. **Agent core** knows only contracts: it runs one agent's loop, handles
    cancellation and steering, emits events. It never names a provider, tool, file
@@ -62,9 +64,10 @@ Detail and reasoning: `seams.md` (v1). Product direction: `pillars.md` (rev 2).
 
 ## Tradeoffs we are choosing (say if you disagree)
 
-- **Compile-time modules over runtime plugins** — far cheaper and leaner; cost: adding
-  a module means rebuilding. WASM/out-of-process tools (Iris #18) stay possible later
-  because tool input/output is plain data.
+- **WebAssembly modules over compile-time linking** (owner 2026-09-25, ADR-0071; reverses
+  the earlier choice) — add or remove a tool, provider or policy without rebuilding the
+  host, sandboxed by construction; cost: a boundary layer beside the Rust contracts, host
+  functions for what WASI lacks, one build per module.
 - **Configuration chooses tools per model** over tools auto-registering themselves —
   one inspectable place per model family; cost: a new tool must be named in config.
 - **Journal as the single truth** over Pi-style mirror — better resume/replay for long
