@@ -193,7 +193,7 @@ async fn a_step_that_ran_and_failed_does_not_fall_back() {
         );
         let lines = step_lines(&stderr, "wf1");
         assert!(
-            lines[0].contains("(worker → fake/main; w1) failed — ended without finish"),
+            lines[0].contains("(worker → fake/main; w1) failed — attempts 2; ended without finish"),
             "{lines:?}"
         );
         let result = result_of(&scratch);
