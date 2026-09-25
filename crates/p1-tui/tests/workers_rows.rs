@@ -4,7 +4,7 @@ fn worker() -> WorkerBlock {
     WorkerBlock {
         id: "w1".into(),
         task: "task".into(),
-        route: "openrouter-free/deepseek/deepseek-v4.1-flash:free".into(),
+        route: "cline-pass-1/cline-pass/deepseek-v4.1-flash".into(),
         model: Some("deepseek-v4.1-flash".into()),
         state: BlockState::Done,
         elapsed: Some("4m12s".into()),
@@ -32,7 +32,7 @@ fn long_model_is_whole_and_its_metrics_survive_at_both_widths() {
         let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
         let row = &text[3];
         assert!(row.contains("deepseek-v4.1-flash"), "{row}");
-        assert!(!row.contains("openrouter-free"), "{row}");
+        assert!(!row.contains("cline-pass-1"), "{row}");
         if compact {
             assert!(text[4].contains("48.2k/128k"), "{}", text[4]);
         } else {
@@ -49,7 +49,7 @@ fn overlong_model_is_cut_and_never_partially_shows_the_route() {
     let row = lines[3].to_string();
     assert!(row.contains("gpt-6-astra-reasonin"), "{row}");
     assert!(row.contains('…'));
-    assert!(!row.contains("openrouter-free"));
+    assert!(!row.contains("cline-pass-1"));
 }
 
 #[test]

@@ -317,6 +317,9 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
         // references go to `p1-usage`; no catalog, no provider.
         Command::Usage(usage) => crate::usage::usage(deps, &usage).await,
         Command::Login { route } => crate::login::login(deps, &route).await,
+        Command::LoginFromClaudeCode { route, dir } => {
+            crate::login::from_claude_code(deps, &route, dir.as_deref()).await
+        }
         Command::LoginList => crate::login::list(deps),
         Command::Logout { route } => crate::login::logout(deps, &route).await,
         Command::Run { .. } => {

@@ -54,6 +54,7 @@ kind   = "api-key"
 env    = "OPENCODE_API_KEY"
 borrow = ["opencode:opencode-go", "pi:opencode-go"]   # tried in this order, after env
 # store_only = true                    # ADR-0061: env + p1's store only; no CLI login is read
+# login_dir = "~/.claude-2"            # ADR-0074: claude-code-oauth only — the Claude Code dir to borrow
 
 [headers]                              # non-secret, static
 # name = "value"
@@ -78,8 +79,12 @@ output_limit  = 32000                  # optional; same rule
   documented variable and p1's own store, and no other tool's login file is read for ANY kind
   (for `claude-code-oauth` / `codex-oauth` that is what removes the unconditional CLI fallback;
   for `api-key` it is the same statement as `borrow = []`, and combining it with a non-empty
-  `borrow` is a load error). EVERY shipped route sets it, so p1 is self-contained at runtime
-  (`docs/design/credentials.md` §8).
+  `borrow` is a load error). Every shipped route sets it, so p1 is self-contained at runtime
+  (`docs/design/credentials.md` §8) — except `anthropic-subscription-2` (below).
+  `login_dir` (ADR-0074) is allowed ONLY on `claude-code-oauth`: the Claude Code config directory
+  whose login the route borrows (absolute, or `~/…` expanded against the home directory; absent →
+  `$CLAUDE_CONFIG_DIR`, else `~/.claude`). On any other kind it is a load error
+  (`docs/design/credentials.md` §10).
   A header whose name is `authorization`, `x-api-key`, `cookie` or starts with `x-auth` is
   rejected in `[headers]`: a route file must not be able to hold a secret by accident.
 - `[adapter_settings]` is deserialized by the adapter's own typed struct with
@@ -268,6 +273,20 @@ behaviour, compiled, never free-form headers. Responses likewise: `account = "co
 (`store:false`, no output-cap field, account-id header, session/conversation headers).
 The two OAuth credential kinds become constructible from a route file (3b rejected them with
 "not yet data-driven"); their sources stay the compiled ones, unchanged.
+
+**The second Claude subscription (ADR-0074, issue #199).** `routes/anthropic-subscription-2.toml`
+is `anthropic-subscription` on the owner's second account: the same adapter, endpoint,
+`account`, `long_context` and `[models]` table, its own `id` and `origin_route`
+(`anthropic-messages/claude-subscription-2` — a different account is a new id, §1.2), and the
+credential `kind = "claude-code-oauth"`, `login_dir = "~/.claude-2"` with no `store_only`: p1's
+store entry for the route wins when present (`p1 login anthropic-subscription-2
+--from-claude-code`), else the second account's Claude Code login is borrowed in place. The
+environment `claude2` is `claude` with `route = "anthropic-subscription-2"`, so `claude2/<profile>
+[:effort]` works wherever `claude/…` does — `--model`, `settings.toml`, workflow roles and their
+`fallback` chains, the TUI's `/model`. A role `claude/…` with `fallback = ["claude2/…"]` moves a
+step to the second account when the first one's quota is exhausted (ADR-0054: an exhausted
+account is a route failure). A bare profile name is now bound in both environments, so from any
+third environment it needs the `environment/profile` form.
 
 ### 7.3 Constructors and lowering
 

@@ -230,6 +230,14 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "claude/claude-opus-5-5",
             "claude/claude-sonnet-4-6",
             "claude/claude-sonnet-5",
+            // The second Claude subscription (ADR-0074) serves the same profiles on its own
+            // account, so a role can fall back from `claude/…` to `claude2/…`.
+            "claude2/claude-fable-5",
+            "claude2/claude-opus-4-6",
+            "claude2/claude-opus-5",
+            "claude2/claude-opus-5-5",
+            "claude2/claude-sonnet-4-6",
+            "claude2/claude-sonnet-5",
             // Each ClinePass account serves DeepSeek V4.1 Flash and GLM-5.3 Flash.
             "cline/deepseek-v4.1-flash",
             "cline/glm-5.3-flash-clinepass",
@@ -263,14 +271,19 @@ fn every_environment_and_every_bound_profile_is_a_model() {
     );
     // Every main agent carries the worker tools (ADR-0050), so delegation is not an
     // environment property: a model is listed once per environment, not once per
-    // delegating twin.
-    let opus: Vec<&Model> = models
+    // delegating twin. The two Claude accounts are two environments (ADR-0074).
+    let opus: Vec<(&str, &str)> = models
         .iter()
         .filter(|model| model.profile == "claude-opus-5")
+        .map(|model| (model.environment.as_str(), model.route.as_str()))
         .collect();
-    assert_eq!(opus.len(), 1);
-    assert_eq!(opus[0].environment, "claude");
-    assert_eq!(opus[0].route, "anthropic-subscription");
+    assert_eq!(
+        opus,
+        [
+            ("claude", "anthropic-subscription"),
+            ("claude2", "anthropic-subscription-2")
+        ]
+    );
     // The efforts are the profile's own, in its own order.
     let older = models
         .iter()
@@ -388,6 +401,27 @@ fn a_pair_reference_resolves_to_that_pair() {
 }
 
 #[test]
+fn a_bare_claude_profile_takes_the_current_claude_account_and_is_ambiguous_elsewhere() {
+    // ADR-0074: both Claude subscriptions bind every Claude profile, so a bare
+    // `claude-opus-5` takes the current environment's binding when that is one of the two
+    // Claude accounts, and is an error (never a guess) from any other environment.
+    let models = shipped_models();
+    for environment in ["claude", "claude2"] {
+        let resolved = models::resolve("claude-opus-5:high", environment, &models).unwrap();
+        assert_eq!(resolved.environment, environment);
+        assert_eq!(resolved.profile, "claude-opus-5");
+        assert_eq!(resolved.effort, Some(Effort::High));
+    }
+    let error = models::resolve("claude-opus-5", "gpt", &models).unwrap_err();
+    assert!(error.contains("more than one environment"), "{error}");
+    assert!(
+        error.contains("claude/claude-opus-5") && error.contains("claude2/claude-opus-5"),
+        "{error}"
+    );
+    assert!(error.contains("environment/profile"), "{error}");
+}
+
+#[test]
 fn a_bare_profile_prefers_the_current_environment() {
     let models = shipped_models();
     // `deepseek` and `deepseek2` both bind `deepseek-v4.1-flash`; the current
@@ -472,7 +506,7 @@ fn a_pattern_without_a_slash_matches_the_profile_part() {
         .filter(|model| models::in_scope(&patterns, model))
         .map(Model::id)
         .collect::<Vec<_>>();
-    assert_eq!(opus, ["claude/claude-opus-5"]);
+    assert_eq!(opus, ["claude/claude-opus-5", "claude2/claude-opus-5"]);
 
     let patterns = models::check_scope("claude/*", &models).unwrap();
     let claude = models

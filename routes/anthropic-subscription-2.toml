@@ -1,0 +1,42 @@
+# The owner's SECOND Claude Code subscription (ADR-0074): the same adapter, endpoint,
+# long-context setting, models and client identity as `anthropic-subscription`, on
+# another account, so a workflow role can fall back from `claude/…` to `claude2/…` when
+# the first account's quota is exhausted (ADR-0054). Only the id, the origin and the
+# credential differ. The identity block, the OAuth beta/version header set and the
+# `/v1/messages` path stay compiled: they are the account behaviour `account` selects.
+id           = "anthropic-subscription-2"
+origin_route = "anthropic-messages/claude-subscription-2"
+adapter      = "anthropic-messages"
+endpoint     = "https://api.anthropic.com"
+
+[credential]
+# A reference, never a value. p1's own store comes first (`p1 login
+# anthropic-subscription-2 --from-claude-code` fills it, e.g. on a machine without
+# Claude Code); without a store entry the route borrows the Claude Code login in
+# `login_dir` — the second account's config directory, logged in with
+# `CLAUDE_CONFIG_DIR=~/.claude-2 claude`. The login is read in place (same lock,
+# re-read and refresh path as the default directory), never copied.
+kind      = "claude-code-oauth"
+login_dir = "~/.claude-2"
+
+[adapter_settings]
+account = "claude-code-subscription"
+# Owner hotfix 2026-09-25: request the native 1M-token window (the context-1m beta) on this
+# subscription; the owner confirmed the account serves it. The second account keeps the
+# same setting (owner order, issue #199).
+long_context = true
+
+# Only profiles the host ships a policy for; any other profile is refused. A dated
+# snapshot is a binding (`wire_model`), not a profile.
+[models."claude-fable-5"]
+wire_model = "claude-fable-5"
+[models."claude-opus-4-6"]
+wire_model = "claude-opus-4-6"
+[models."claude-opus-5"]
+wire_model = "claude-opus-5"
+[models."claude-opus-5-5"]
+wire_model = "claude-opus-5-5"
+[models."claude-sonnet-4-6"]
+wire_model = "claude-sonnet-4-6"
+[models."claude-sonnet-5"]
+wire_model = "claude-sonnet-5"

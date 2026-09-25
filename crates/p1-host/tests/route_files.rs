@@ -573,6 +573,8 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         ids,
         [
             "anthropic-subscription",
+            // The owner's second Claude subscription (ADR-0074): data plus `login_dir`.
+            "anthropic-subscription-2",
             // The owner's two ClinePass subscriptions (OpenAI-compatible api.cline.bot): data only.
             "cline-pass-1",
             "cline-pass-2",

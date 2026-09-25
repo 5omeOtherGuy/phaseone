@@ -1,0 +1,34 @@
+route   = "anthropic-subscription-2"
+profile = "claude-sonnet-5"
+
+[options]
+reasoning_effort = "medium"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+
+[[tools]]
+module = "finish"
+
+# Owner hotfix 2026-09-25: Opus 5.5 gets its native 1M-token window (the route sends the
+# context-1m beta; the owner confirmed the subscription serves it). Summarize at 500k: the owner
+# asked for at least 500k of working context, and a later summary keeps each request's cache
+# read bounded. The earlier 200k/120k values summarized a lead every ~40 requests (usage audit of
+# the two lead journals, #125). 1M is also what Anthropic documents for this model family
+# ("1M tokens for Claude Sonnet 5 and Claude Sonnet 4.6", docs.anthropic.com context-windows,
+# fetched 2026-09-24). Do not lower it. Details: docs/design/context-windows.md.
+[context]
+window_tokens = 1000000
+output_headroom_tokens = 32000
+summarize_at_tokens = 500000
+keep_recent_tokens = 60000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000
