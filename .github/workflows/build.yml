@@ -1,0 +1,122 @@
+name: build
+
+# p1's build farm (owner order 2026-09-24 ~23:00): a push to any task branch runs
+# the same gate as local (scripts/gate.sh), builds the deployed debug binary and
+# uploads it with its sha256 and the gate log. Workers and the lead use
+# scripts/ci-build.sh, which waits for exactly the pushed commit's run here.
+#
+# Trigger is `push` to `task/**` only: a PR already runs ci.yml (the gate), so
+# this workflow never doubles a PR's run, and ci.yml keeps the main/PR behaviour
+# scripts/push-main.sh expects.
+on:
+  push:
+    branches: ['task/**']
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+# No secrets are needed: the runner only reads the repository and writes the run's
+# artifacts.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # A cold gate plus the binary build; a hung step must end the run red.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo (this branch)
+        id: rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # One shared key without a branch name: GitHub keeps each saved cache in
+          # the scope of the branch that saved it, so this branch's own next push
+          # restores it (a second push on the same branch is warm). build.yml
+          # deliberately does not run on main — a second gate run per main commit
+          # would race scripts/push-main.sh, which waits on headSha — so the
+          # cross-branch fallback is the restore step below, not a rust-cache main
+          # entry. The action also retries without the lockfile hash, so a
+          # Cargo.lock change still hits this branch's previous cache.
+          shared-key: p1-build
+          # Branch pushes save (a tag or other ref would write a cache nothing can
+          # restore).
+          save-if: ${{ github.ref_type == 'branch' }}
+
+      # The real main-branch fallback, for a branch that has nothing of its own:
+      # ci.yml saves the whole gate target (deps and workspace crates) under
+      # cargo-<os>-<Cargo.lock hash> on the default branch, and a workflow run may
+      # read the default branch's caches. Restore only: a task branch must not write
+      # another multi-GB copy (the repository store is near its 10 GiB limit). A
+      # branch whose own rust-cache hit exactly already has its target, so it skips
+      # this multi-GB restore; a fresh branch (no exact hit) gets it.
+      - name: Restore the main gate cache
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Gate
+        id: gate
+        run: |
+          echo "gate_start=$(date +%s)" >> "$GITHUB_ENV"
+          set -o pipefail
+          scripts/gate.sh 2>&1 | tee gate.log
+
+      - name: Build p1 (debug, as deployed)
+        id: build
+        run: |
+          echo "build_start=$(date +%s)" >> "$GITHUB_ENV"
+          cargo build -p p1-host --locked
+
+      - name: Stage binary and sha256
+        run: |
+          mkdir -p dist
+          cp target/debug/p1 dist/p1
+          ( cd dist && sha256sum p1 > p1.sha256 )
+          cat dist/p1.sha256
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p1-build
+          path: |
+            dist/p1
+            dist/p1.sha256
+            gate.log
+          if-no-files-found: warn
+
+      # The job summary, and the same lines in the step log so they can be read
+      # back without the web UI.
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          now=$(date +%s)
+          gate_start=${gate_start:-$now}
+          build_start=${build_start:-$now}
+          {
+            echo "### p1 build ${GITHUB_SHA:0:7} on ${GITHUB_REF_NAME}"
+            echo
+            echo "| step | outcome | seconds |"
+            echo "|---|---|---|"
+            echo "| scripts/gate.sh | ${{ steps.gate.outcome }} | $((build_start - gate_start)) |"
+            echo "| cargo build -p p1-host | ${{ steps.build.outcome }} | $((now - build_start)) |"
+            echo
+            echo "Artifact \`p1-build\`: dist/p1, dist/p1.sha256, gate.log."
+            echo
+            echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

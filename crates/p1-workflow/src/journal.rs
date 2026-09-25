@@ -39,8 +39,13 @@ impl JournalWriter {
 
 /// Reads a journal back. A final line without its newline is a write a crash interrupted
 /// and is ignored; any other unreadable line is an error, because silently skipping a
-/// `Dispatch` would under-charge the caps of the resuming run.
-pub(crate) fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, String> {
+/// `Dispatch` would under-charge the caps of the resuming run — and, for the host's
+/// resume-time worker-id reservation (issue #98), a skipped line could hide the only
+/// record of a worker id whose journal file is gone.
+///
+/// Public because the host reads run journals to reserve worker ids on resume; the
+/// crash-tolerance rule lives here once, not in every reader.
+pub fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, String> {
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let complete = text.ends_with('\n');

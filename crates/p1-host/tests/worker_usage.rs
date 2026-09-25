@@ -2,9 +2,10 @@
 //!
 //! With `--session FILE`, worker `w<N>` journals to its OWN new JSONL file
 //! `FILE.w<N>.jsonl`: the parent file never contains the child's records, an
-//! existing worker file is an error instead of being overwritten, and the host
-//! prints a `workers total (<n>)` line after the parent's own `total` line.
-//! Without `--session` the child stays in memory and no file appears.
+//! existing worker file is SKIPPED — its id is reserved and the file is never
+//! overwritten (issue #98) — and the host prints a `workers total (<n>)` line
+//! after the parent's own `total` line. Without `--session` the child stays in
+//! memory and no file appears.
 #![cfg(feature = "delegation")]
 
 mod common;
@@ -272,8 +273,12 @@ async fn without_a_session_the_worker_stays_in_memory_but_is_still_counted() {
     );
 }
 
+/// An existing `session.jsonl.w1.jsonl` is SKIPPED, never reused and never
+/// overwritten (issue #98): the reservation sees the file before the first
+/// `worker_start`, so the parent's first worker is `w2`, and the file that was
+/// already there keeps every byte it had.
 #[tokio::test]
-async fn an_existing_worker_file_is_an_error_and_is_never_overwritten() {
+async fn an_existing_worker_file_is_skipped_and_never_overwritten() {
     let workspace = tempdir().unwrap();
     let environments = tempdir().unwrap();
     declared_environments(environments.path());
@@ -286,7 +291,7 @@ async fn an_existing_worker_file_is_an_error_and_is_never_overwritten() {
     let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
     harness.deps.catalog_hook = Some(provider_hook(vec![
         ("fake-a", one_worker_parent()),
-        ("fake-b", child),
+        ("fake-b", child.clone()),
     ]));
 
     let session = workspace.path().join("session.jsonl");
@@ -312,21 +317,24 @@ async fn an_existing_worker_file_is_an_error_and_is_never_overwritten() {
         "an existing worker file must not be touched"
     );
 
-    let stdout = harness.stdout.text();
+    // The id the existing file occupies is reserved, so the worker runs as `w2`
+    // and journals there instead of colliding with `w1`.
+    let second = workspace.path().join("session.jsonl.w2.jsonl");
+    let text = fs::read_to_string(&second)
+        .unwrap_or_else(|error| panic!("{} missing: {error}", second.display()));
+    assert_eq!(text.lines().next(), Some("{\"p1_journal\":1}"), "{text}");
+    assert!(text.contains("child done"), "worker file: {text}");
+
+    // The worker past the existing file really ran, and its usage reached the
+    // parent's aggregate.
     assert!(
-        stdout.contains("session.jsonl.w1.jsonl"),
-        "the error must name the file: {stdout}"
+        !child.requests().is_empty(),
+        "the worker started as w2 was asked to run"
     );
+    let stderr = harness.stderr.text();
+    let expected = "workers total (1) · in 125 (cached 20) · out 7 · cost $0.0123";
     assert!(
-        stdout.contains("journal file already exists"),
-        "the error must say the file exists: {stdout}"
+        stderr.contains(expected),
+        "stderr missing `{expected}`: {stderr}"
     );
-    // No worker started, so there is no aggregate to print.
-    assert!(
-        !harness.stderr.text().contains("workers total"),
-        "no worker ran: {}",
-        harness.stderr.text()
-    );
-    // The child provider was never asked anything.
-    assert_eq!(harness.stdout.text().matches("child done").count(), 0);
 }

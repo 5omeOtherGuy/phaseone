@@ -14,6 +14,7 @@ pub(crate) struct ChatParser {
     text: Option<usize>,
     reasoning: Option<usize>,
     stop: Option<StopReason>,
+    finish_reason: Option<String>,
     usage: Option<Usage>,
     ended: bool,
 }
@@ -26,6 +27,7 @@ impl ChatParser {
             text: None,
             reasoning: None,
             stop: None,
+            finish_reason: None,
             usage: None,
             ended: false,
         }
@@ -72,6 +74,33 @@ impl ChatParser {
                 text: text.into(),
             }
         }
+    }
+    /// After a finish, accept only an empty repeat of that same finish. OpenRouter-style
+    /// gateways such as ClinePass repeat the finish choice in the usage chunk; any
+    /// non-empty unknown delta field remains a protocol error.
+    fn is_repeated_empty_finish(&self, choice: &Value) -> bool {
+        let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) else {
+            return false;
+        };
+        if self.finish_reason.as_deref() != Some(reason) {
+            return false;
+        }
+        let Some(delta) = choice.get("delta").filter(|value| value.is_object()) else {
+            return false;
+        };
+        let empty = |value: &Value| {
+            value.is_null()
+                || value.as_str() == Some("")
+                || value.as_array().is_some_and(Vec::is_empty)
+        };
+        delta.as_object().is_some_and(|fields| {
+            fields.iter().all(|(field, value)| match field.as_str() {
+                "role" => true,
+                "content" | "reasoning_content" | "reasoning" => empty(value),
+                "tool_calls" => value.is_null() || value.as_array().is_some_and(Vec::is_empty),
+                _ => value.is_null(),
+            })
+        })
     }
     fn fail(&mut self, message: &str) -> Vec<StreamEvent> {
         self.ended = true;
@@ -155,14 +184,13 @@ impl ResponseParser for ChatParser {
                 return self.fail("unexpected chat choice index");
             }
             if self.stop.is_some() {
-                // OpenCode Zen's free tier repeats the terminal `finish_reason` choice
-                // beside the usage block (instead of `choices: []`). It carries no model
-                // output, so it is tolerated; a choice with content after the stop is
-                // still a protocol error.
-                if is_empty_terminator(choice) {
-                    continue;
+                // OpenRouter-proxied gateways such as ClinePass, and OpenCode Zen's free
+                // tier, repeat the finish choice in the usage chunk, so accept only that
+                // empty repeat.
+                if !self.is_repeated_empty_finish(choice) {
+                    return self.fail("choice after finish reason");
                 }
-                return self.fail("choice after finish reason");
+                continue;
             }
             let Some(delta) = choice.get("delta").filter(|v| v.is_object()) else {
                 return self.fail("chat choice missing delta");
@@ -261,6 +289,7 @@ impl ResponseParser for ChatParser {
                 }
             }
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.finish_reason = Some(reason.to_owned());
                 self.stop = Some(match reason {
                     "stop" => StopReason::EndTurn,
                     "tool_calls" => StopReason::ToolUse,
@@ -330,31 +359,6 @@ impl ResponseParser for ChatParser {
             None => ProviderError::new(kind, format!("chat HTTP status {status}")),
         }
     }
-}
-
-/// Whether a post-stop choice is an empty terminator: a repeated `finish_reason`
-/// with no content, reasoning or tool fragment in its delta. Some gateways send
-/// one together with the usage block; it must not become model output or an
-/// error.
-fn is_empty_terminator(choice: &Value) -> bool {
-    if choice
-        .get("finish_reason")
-        .and_then(Value::as_str)
-        .is_none()
-    {
-        return false;
-    }
-    let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
-        return false;
-    };
-    ["content", "reasoning_content", "reasoning", "tool_calls"]
-        .iter()
-        .all(|field| match delta.get(*field) {
-            None | Some(Value::Null) => true,
-            Some(Value::String(text)) => text.is_empty(),
-            Some(Value::Array(items)) => items.is_empty(),
-            Some(_) => false,
-        })
 }
 
 /// The whole text of an exhausted usage allowance: only the provider's reset
