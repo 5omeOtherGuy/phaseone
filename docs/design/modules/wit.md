@@ -25,9 +25,10 @@ major 1. The files are split by topic:
 
 No world imports a `wasi:` interface. WASI is not part of the approved dependency set and the
 host does not link `wasmtime-wasi`, so every capability a module can have is one of p1's own
-interfaces below. Whether a guest built for `wasm32-wasip2` avoids every `wasi:` import is
-checked on the built component (the fixture module and `scripts/check-module-boundaries.sh`),
-not here; the worlds give such a guest nothing to import from WASI.
+interfaces below. The guest target is `wasm32-unknown-unknown`, componentized with no WASI
+adapter (decision D-XO-4 on S0-Q9), so a built component has no `wasi:` import to begin with;
+the build and the loader refuse one anyway, and `scripts/check-module-boundaries.sh` checks the
+built component.
 
 ## Two rules for every world
 

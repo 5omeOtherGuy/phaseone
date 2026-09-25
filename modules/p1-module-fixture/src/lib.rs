@@ -26,9 +26,10 @@
 //! Every other mode describes from its input alone.
 //!
 //! The module imports no `wasi:` interface of its own: it never prints, never reads the
-//! environment and never touches a file. The `wasi:` imports in the built component come from
-//! Rust std, which the `wasm32-wasip2` target links (open question S0-Q9; the build writes the
-//! component's full import list to `<package>.imports`).
+//! environment and never touches a file. The guest target is `wasm32-unknown-unknown`
+//! componentized with no WASI adapter (decision D-XO-4 on S0-Q9), so the built component imports
+//! only `p1:module` interfaces; the build writes its full import list to `<package>.imports`, and
+//! the build and the loader refuse any `wasi:` import.
 #![forbid(unsafe_code)]
 
 mod wire;
