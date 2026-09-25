@@ -298,3 +298,17 @@ malformed chip followed by visible `OK`. Mutation check: the cells key fails it 
 
 Open: P0 per-symbol/external-reach closure and P2–P6 (scope freeze for the owner's
 ~50-worker workflow). No programme-completion claim.
+
+## Massive run
+
+The judge accepted these slices:
+
+- **S2** — commits `9c8cc32` (`sanitize transcript text before wrapping`) and
+  `707acee` (`preserve transcript lines before wrapping`). Tests cover prose and OSC
+  sanitization before measurement/wrapping, row-count agreement, stored-text
+  immutability, operator paragraph breaks, and exact sanitized measurement.
+- **S10** — commit `fcd927b` (`clamp stale transcript scroll`). Tests cover stale
+  scroll-anchor movement, scroll marks, rendered-bound invariants, and refollowing
+  when the transcript fits.
+
+This records the accepted slice evidence only. The lead has not yet verified it.
