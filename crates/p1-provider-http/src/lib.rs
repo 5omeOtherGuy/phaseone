@@ -6,8 +6,9 @@
 //! an adapter supplies a request builder and a [`ResponseParser`], and this crate
 //! owns the policy that is identical across routes — one credential refresh per
 //! request, one shared transient-retry budget, bounded backoff that races
-//! cancellation, and the rule that a stream is never retried after any output has
-//! been forwarded.
+//! cancellation, the first-byte and stream-idle read bounds ([`FIRST_BYTE_TIMEOUT`]
+//! 120 s, [`STREAM_IDLE_TIMEOUT`] 300 s) that end a provider which never answers,
+//! and the rule that a stream is never retried after any output has been forwarded.
 //!
 //! The authoritative spec is `docs/design/providers.md`. The five stream rules
 //! the returned stream obeys are at the top of `p1-contracts/src/provider.rs`.
@@ -26,7 +27,8 @@ pub use drive::{DriveRequest, ResponseParser, drive};
 pub use error_code::{http_error_code, kind_for_status, safe_code};
 pub use file_lock::{LOCK_PATIENCE, lock_exclusive};
 pub use http::{
-    ByteStream, HttpRequest, HttpResponse, ReqwestTransport, Transport, TransportError,
+    ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, HttpResponse, ReqwestTransport,
+    STREAM_IDLE_TIMEOUT, Transport, TransportError,
 };
 pub use retry::{HttpClass, RetryPolicy, classify_status, reset_after, retry_after};
 pub use sse::{SseDecoder, SseEvent};

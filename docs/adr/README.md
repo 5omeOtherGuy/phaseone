@@ -82,6 +82,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0066 | [p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary](0066-p1-builds-and-verifies-on-github-actions-local-cargo-only-for-check-and-the-lead-s-deployed-binary.md) | accepted | 2026-09-24 | lead |
 | ADR-0067 | [Zen free routes present the OpenCode client identity](0067-zen-free-routes-present-the-opencode-client-identity.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0068 | [Tool output is masked for credential shapes before history, journal and summaries](0068-tool-output-is-masked-for-credential-shapes-before-history-journal-and-summaries.md) | accepted | 2026-09-25 | lead |
+| ADR-0069 | [Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s](0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md) | proposed | 2026-09-25 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

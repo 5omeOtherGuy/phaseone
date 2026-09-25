@@ -103,6 +103,35 @@ pub struct ReqwestTransport {
 /// keeps an unreachable host from hanging a first attempt forever.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a request may wait for the provider to START answering: the response
+/// headers for HTTP, the first frame for a WebSocket. A provider that never gets
+/// this far is unreachable or stuck in a queue, not slow.
+///
+/// 120 s is generous — a connect is already bounded at 30 s, and a server that has
+/// accepted the request answers in well under this — yet far shorter than the
+/// 300 s the operator observed hanging silently (issue #164).
+pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long an OPEN stream may stay silent between two chunks or frames. Any
+/// received bytes reset the clock, so an SSE comment or a WebSocket ping counts
+/// as life even when it carries no event.
+///
+/// 300 s is deliberately larger than [`FIRST_BYTE_TIMEOUT`]: a reasoning model may
+/// think for minutes before its next output, but its stream still carries
+/// reasoning deltas or keep-alive pings well inside this window.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The message an expired [`FIRST_BYTE_TIMEOUT`] becomes. It names the bound, and
+/// both the SSE driver and the WebSocket connection use the same wording.
+pub(crate) fn first_byte_timeout_message() -> String {
+    format!("no response within {} s", FIRST_BYTE_TIMEOUT.as_secs())
+}
+
+/// The message an expired [`STREAM_IDLE_TIMEOUT`] becomes.
+pub(crate) fn stream_idle_timeout_message() -> String {
+    format!("stream idle for {} s", STREAM_IDLE_TIMEOUT.as_secs())
+}
+
 impl ReqwestTransport {
     /// Build the shared client. Panics only if the TLS backend cannot start,
     /// which is a programming/environment error, not a request failure.
