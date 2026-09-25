@@ -6,7 +6,7 @@
 //! direction, carried over from the iris TUI) folds passive chrome away so
 //! the transcript owns the screen; the first edit reveals the composer again.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use p1_contracts::{AgentEvent, Usage};
 
@@ -333,6 +333,9 @@ pub struct Screen {
     /// A worker the operator attached to (`a`, handoff §9.5): its transcript replaces the
     /// parent's in the transcript area.
     pub attached: Option<AttachedWorker>,
+    /// Each worker's transcript while it is detached; attach takes the buffer out and detach
+    /// puts it back, so worker output survives every view change.
+    pub worker_transcripts: HashMap<String, Transcript>,
     /// Steering/follow-up text queued for the next boundary, shown above the
     /// composer hints so the operator sees what will land.
     pub queued: VecDeque<Queued>,
@@ -396,6 +399,7 @@ impl Screen {
     pub fn new(reduced_motion: bool) -> Self {
         Self {
             reduced_motion,
+            worker_transcripts: HashMap::new(),
             ..Self::default()
         }
     }
@@ -489,6 +493,53 @@ impl Screen {
                 self.working = None;
             }
             _ => {}
+        }
+    }
+
+    /// Observe one worker event without moving any parent state (handoff §9.5).
+    pub fn apply_worker(&mut self, id: &str, event: &AgentEvent, at_ms: u64) {
+        if let Some(worker) = &mut self.attached
+            && worker.id == id
+        {
+            worker.transcript.apply(event, Some(at_ms));
+        } else {
+            self.worker_transcripts
+                .entry(id.to_string())
+                .or_insert_with(Transcript::new)
+                .apply(event, Some(at_ms));
+        }
+    }
+
+    /// Attach the focused WORKERS row, taking over its buffered transcript (handoff §9.5).
+    pub fn attach_selected(&mut self) {
+        if self.pane_mode != PaneMode::Workers {
+            return;
+        }
+        let Some(id) = self.workers.focused.clone() else {
+            return;
+        };
+        let Some(row) = self.workers.workers.iter().find(|worker| worker.id == id) else {
+            return;
+        };
+        if self.attached.as_ref().is_some_and(|worker| worker.id == id) {
+            return;
+        }
+        let route = row.route.clone();
+        let state = row.state;
+        self.detach_worker();
+        let transcript = self.worker_transcripts.remove(&id).unwrap_or_default();
+        self.attached = Some(AttachedWorker {
+            id,
+            route,
+            state,
+            transcript,
+        });
+    }
+
+    /// Return to the parent transcript without changing pane focus or selection.
+    pub fn detach_worker(&mut self) {
+        if let Some(worker) = self.attached.take() {
+            self.worker_transcripts.insert(worker.id, worker.transcript);
         }
     }
 
@@ -648,6 +699,8 @@ impl Screen {
                 }
             }
             V::TogglePaneFocus => self.toggle_pane_focus(),
+            V::AttachWorker => self.attach_selected(),
+            V::DetachWorker => self.detach_worker(),
             V::EditGoal => self.edit_goal(),
             V::KeepComposer => self.composer.keep(),
             V::ToggleReview => self.toggle_review(),
@@ -699,6 +752,12 @@ impl Screen {
             self.workers.focused = None;
         }
         self.workers.workers = rows;
+        if let Some(worker) = &mut self.attached {
+            let id = &worker.id;
+            if let Some(row) = self.workers.workers.iter().find(|row| &row.id == id) {
+                worker.state = row.state;
+            }
+        }
         // A parked approval is the operator's turn: SELF-pin, no `^P` needed,
         // so nothing later demotes it out from under them. Only NEW attention
         // moves the mode; a refresh of the same row cannot undo ^Tab.

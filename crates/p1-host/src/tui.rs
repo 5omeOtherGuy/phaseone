@@ -772,6 +772,7 @@ impl Driver {
                         };
                         self.screen.transcript.note(&format!("↳ {id} {state}"));
                     }
+                    self.screen.apply_worker(id, &stamped.event, stamped.at_ms);
                     return;
                 }
                 // A delivered inbox message clears the queued steering display.
@@ -939,6 +940,7 @@ impl Driver {
             &self.workspace,
             &self.sandbox,
         ));
+        self.screen.detach_worker();
         // An approval self-pins (SPEC §5): nothing may swap it away.
         if !self.screen.pinned {
             self.screen.pinned = true;
