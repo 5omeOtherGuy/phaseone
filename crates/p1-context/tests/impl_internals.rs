@@ -504,9 +504,9 @@ async fn the_summary_request_carries_the_lowered_effort_whatever_the_agents_effo
     }
 }
 
-// Without the setting the request keeps the effort its options carry. The host never takes this
-// path — it always passes a floor (the profile's lowest level, else `Low`) — but the module has
-// no effort scale of its own, so an unset effort must leave the options alone.
+// Without the setting (never calling `with_summary_effort`) the request keeps the effort its
+// options carry: the module has no effort scale of its own. Passing `None` explicitly is a
+// different path — it clears the effort (the host's path for a profile with no effort levels).
 #[tokio::test(start_paused = true)]
 async fn an_unset_summary_effort_keeps_the_effort_the_options_carry() {
     let history = effort_history();

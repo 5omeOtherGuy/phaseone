@@ -153,9 +153,10 @@ impl SummarizingContext {
     /// of the summary-output cap on reasoning before a single summary token, and the
     /// transcript handed to the summarizer is already condensed. The host passes the
     /// LOWEST effort the model profile supports, and `Low` when the environment names
-    /// no profile at all, so every summary carries a floor; the one cap-doubling retry
-    /// is untouched. `None` leaves the effort the options carried — a path the host
-    /// does not take, kept because the module cannot invent a route's effort scale.
+    /// no profile at all; the one cap-doubling retry is untouched. Passing `None` CLEARS
+    /// the effort, so the summary request carries no explicit effort and the route's
+    /// default applies — the host passes it for a profile that lists no effort levels.
+    /// Not calling this at all keeps the effort the options carry.
     pub fn with_summary_effort(mut self, effort: Option<Effort>) -> Self {
         self.options.reasoning_effort = effort;
         self
