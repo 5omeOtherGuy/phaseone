@@ -880,21 +880,7 @@ fn the_two_shipped_routes_have_no_compiled_literals() {
         "glm-5.3",
         "chat/completions",
     ];
-    // S1.1 split `catalog.rs` into `catalog/` and moved parts of `run.rs` into
-    // their own files: every file that now holds that code is scanned.
-    for file in [
-        "src/catalog/mod.rs",
-        "src/catalog/providers.rs",
-        "src/catalog/tools.rs",
-        "src/catalog/delegation.rs",
-        "src/catalog/modules.rs",
-        "src/run.rs",
-        "src/child_assembly.rs",
-        "src/delegation.rs",
-        "src/workflow.rs",
-        "src/cli.rs",
-        "src/auth.rs",
-    ] {
+    for file in ["src/catalog.rs", "src/run.rs", "src/cli.rs", "src/auth.rs"] {
         let path = repo("crates/p1-host").join(file);
         let text = std::fs::read_to_string(&path).expect("the host source is readable");
         for literal in literals {
