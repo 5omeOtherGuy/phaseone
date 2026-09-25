@@ -44,6 +44,26 @@ pub(crate) fn sanitize_segments(segments: &[Seg]) -> Vec<Seg> {
     clean
 }
 
+/// Sanitize one plain transcript string without changing its storage.
+///
+/// Adapted from `iris-donor/src/ui/tui/text.rs`'s `strip_ansi_for_text` use
+/// before wrapping, commit `5b04a1ad3412ad0bb663b6355f77a024aec0ddfa`, MIT License.
+pub(crate) fn sanitize_text(input: &str) -> String {
+    let mut clean = String::with_capacity(input.len());
+    for (line, text) in input.split('\n').enumerate() {
+        if line > 0 {
+            clean.push('\n');
+        }
+        clean.push_str(
+            &sanitize_segments(&[Seg::new(crate::palette::INK, text)])
+                .pop()
+                .expect("one input segment produces one sanitized segment")
+                .text,
+        );
+    }
+    clean
+}
+
 fn transform(input: &str, output: &mut String, state: &mut State) {
     for ch in input.chars() {
         match *state {

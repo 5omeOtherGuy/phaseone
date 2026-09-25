@@ -63,14 +63,14 @@ alter stored/canonical text, activate links, interpret ANSI styles or add depend
 | `terminal_env.rs` | TerminalEnv, ControlModeProbe, tmux_probe | MIT | std environment/subprocess | Blocked; host capabilities |
 | `terminal_surface.rs` | TerminalSurface, RenderState/Stats/Line | MIT | ratatui, unicode-width; hyperlink, terminal I/O | Blocked; audit restore helpers, no second renderer |
 | `text.rs` | TextUi, paste/approval/input helpers | MIT | anyhow, unicode-segmentation; approval, nexus, tool_display | Blocked; preserve existing line frontend |
-| `textengine.rs` | parser, width, ZWJ, wrap/truncate families | MIT | unicode-segmentation, unicode-width; zwj_probe reference | **Adapted** bounded-progress, cell-width wrapping with oversized clusters rendered as ellipses; sanitizer adapted above; named width/ZWJ families and remainder Blocked; `crates/p1-tui/src/wrap.rs::{cell_width,wrap,wrap_len,wrap_paragraphs,wrap_styled}`, consumed by transcript measurement/render and ledger goals; #94 accepted |
+| `textengine.rs` | parser, width, ZWJ, wrap/truncate families | MIT | unicode-segmentation, unicode-width; zwj_probe reference | **Adapted** bounded-progress, cell-width wrapping with oversized clusters rendered as ellipses, and the sanitizer applied before transcript measurement/wrapping; named width/ZWJ families and remainder Blocked; `crates/p1-tui/src/wrap.rs::{cell_width,wrap,wrap_len,wrap_paragraphs,wrap_styled}`, consumed by transcript measurement/render and ledger goals; p1-tui pure `text` sanitizer, consumed by `render::transcript`; #94 and #135 accepted |
 | `theme.rs` | Theme, available, resolve, active global | MIT | ratatui; palette | Blocked; no donor theme framework port |
 | `tui.rs` | TuiUi, composition, input/render driver | MIT | anyhow, ratatui; git, metrics, mimir, nexus, signals, telemetry | Blocked; split pure helpers from host lifetime |
 | `tui/activity.rs` | WorkPhase | MIT | nexus::ToolCall, tool_display, UiEvent | Blocked; activity from p1 events/injected time |
 | `tui/component.rs` | Component, Container, cursor markers | MIT | ratatui; terminal_surface, wrap | Blocked; no component registry |
 | `tui/frame_stats.rs` | FrameStats, timing summaries | MIT | std timing | Blocked; deterministic work counters if needed |
 | `tui/overlay.rs` | FocusTarget, overlay_menu | MIT | ratatui; palette, selector, slash, component | Blocked; existing picker/focus |
-| `tui/pager.rs` | PagerSurface, frame/search/follow/lifecycle | MIT | ratatui; nexus, signals, terminal_surface, textengine | Blocked; pure scroll mechanism vs host lifecycle |
+| `tui/pager.rs` | PagerSurface, frame/search/follow/lifecycle | MIT | ratatui; nexus, signals, terminal_surface, textengine | **Adapted**: clamp a stale transcript scroll anchor to current rendered bounds; remainder Blocked; p1-tui `Screen::scroll_mark`/`scroll_by`, consumed by transcript scroll/page input; #140 accepted |
 | `tui/pane.rs` | assistant/user markdown rows | MIT | ratatui; markdown, symbols, panel, rows, wrap | Blocked; transcript consumers |
 | `tui/panel.rs` | PanelState, header/footer/body/diff layout | MIT | ratatui, similar; tool_display, highlight, textengine | Blocked; generic tool-neutral blocks |
 | `tui/rows.rs` | TranscriptRow, ChromeRow, overflow/rules | MIT | ratatui; component, panel, wrap | Blocked; transcript geometry/cache audit |
@@ -87,7 +87,7 @@ alter stored/canonical text, activate links, interpret ANSI styles or add depend
 | `tui/streaming/escapement.rs` | Escapement | MIT | std timing | Blocked; injected-time policy if consumer needs it |
 | `tui/streaming/mod.rs` | module exports | MIT | streaming child modules; provenance documentation | Blocked; audit wiring |
 | `tui/streaming/table_holdback.rs` | safe_commit_end, fence/list parsing | Apache | std | Blocked; Markdown boundary tests needed |
-| `tui/text.rs` | ansi_spans, strip_ansi_for_text, ansi_spans_shaped | MIT | ansi-to-tui, ratatui; textengine | Blocked; no ANSI style parser dependency in #93 |
+| `tui/text.rs` | ansi_spans, strip_ansi_for_text, ansi_spans_shaped | MIT | ansi-to-tui, ratatui; textengine | **Adapted** strip-before-wrap behavior for transcript strings while preserving stored line breaks; ansi span rendering remainder Blocked; p1-tui pure `text::sanitize_text`, consumed by transcript measurement/wrapping; #135 accepted |
 | `tui/tool_render.rs` | ToolRenderer, contexts/outcomes | MIT | ratatui; nexus, tool_display/summary, delegation_dashboard | Blocked; reuse layout, reject tool-name dispatch |
 | `tui/transcript.rs` | Transcript, TranscriptRender, caches | MIT | ratatui; metrics, nexus, UiEvent, streaming/render modules | Blocked; p1 event identity/retention preserved |
 | `tui/wrap.rs` | styled wrap/truncate, clamps | MIT | ratatui, unicode-segmentation; hyperlink, textengine | **Adapted** bounded-progress styled wrapping and measurement without the donor runtime; other helpers Blocked; `crates/p1-tui/src/wrap.rs::{wrap_styled,wrap_len,wrap_paragraphs_len}`, consumed by transcript rendering/measurement; #94 accepted |

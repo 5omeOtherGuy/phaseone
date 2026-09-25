@@ -314,4 +314,20 @@ The judge accepted these slices:
 
 Lead check after merging `main`: `cargo test -p p1-tui` (316 passed), clippy
 `-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI
-runs the full gate. Accepted follow-ups are listed on the pull request.
+runs the full gate. Accepted follow-ups are listed on PR #161.
+
+## Massive run: part A (S2, S10)
+
+The judge accepted these slices:
+
+- **S2** — commits `9c8cc32` (`sanitize transcript text before wrapping`) and
+  `707acee` (`preserve transcript lines before wrapping`). Tests cover prose and OSC
+  sanitization before measurement/wrapping, row-count agreement, stored-text
+  immutability, operator paragraph breaks, and exact sanitized measurement.
+- **S10** — commit `fcd927b` (`clamp stale transcript scroll`). Tests cover stale
+  scroll-anchor movement, scroll marks, rendered-bound invariants, and refollowing
+  when the transcript fits.
+
+Lead check after merging `main` (with S1 and S3): `cargo test -p p1-tui` (326 passed), clippy
+`-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI
+runs the full gate. Accepted follow-ups are listed on PR #162.
