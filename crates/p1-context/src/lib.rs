@@ -375,18 +375,20 @@ enum Ask {
     Cancelled,
 }
 
-/// The usage of two requests of one summarization, summed per part. A part either
-/// request reported is summed — the one the other omitted counts as zero, as the
-/// missing cache parts do everywhere else — and usage stays unknown only when
-/// neither request reported any.
+/// The usage of two requests of one summarization, summed per part. A part is
+/// summed only when BOTH requests reported it: when either one left it unknown the
+/// sum is unknown too, because a sum over an unknown part would state a number the
+/// route never reported (context.md, "unknown is not zero" — the same rule the
+/// estimator's `remaining` follows). Whole usage stays unknown when neither
+/// request reported any.
 fn sum_usage(first: Option<Usage>, second: Option<Usage>) -> Option<Usage> {
     if first.is_none() && second.is_none() {
         return None;
     }
     let (a, b) = (first.unwrap_or_default(), second.unwrap_or_default());
     let part = |x: Option<u64>, y: Option<u64>| match (x, y) {
-        (None, None) => None,
-        (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+        (Some(x), Some(y)) => Some(x + y),
+        _ => None,
     };
     Some(Usage {
         input_uncached: part(a.input_uncached, b.input_uncached),
