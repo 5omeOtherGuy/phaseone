@@ -1089,3 +1089,56 @@ fn only_output_mode_takes_the_bare_arrows() {
         "OUTPUT mode scrolls it"
     );
 }
+
+#[test]
+fn ctrl_f_off_detaches_and_returns_keys_to_the_composer() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Down), None);
+    d.on_key(key(KeyCode::Enter), None);
+    assert_eq!(
+        d.screen.attached.as_ref().map(|worker| worker.id.as_str()),
+        Some("w2")
+    );
+
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(d.screen.attached.is_none());
+    d.on_key(key(KeyCode::Char('h')), None);
+    d.on_key(key(KeyCode::Char('i')), None);
+    assert_eq!(d.screen.composer.text, "hi");
+    d.on_key(key(KeyCode::Enter), None);
+    assert!(d.screen.attached.is_none());
+}
+
+#[test]
+fn ctrl_n_detaches_an_attached_worker() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Enter), None);
+    assert!(d.screen.attached.is_some());
+
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(d.screen.attached.is_none());
+}

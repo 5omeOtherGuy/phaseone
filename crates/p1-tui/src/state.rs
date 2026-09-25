@@ -431,6 +431,9 @@ impl Screen {
             Some(at) => available[(at + 1) % available.len()],
             None => available.first().copied().unwrap_or(self.pane_mode),
         };
+        if self.pane_mode != PaneMode::Workers {
+            self.detach_worker();
+        }
         self.worker_mode_auto = false;
         // A deliberate choice is not a pin, but it outlives a transient peek.
         if matches!(self.promotion, Promotion::Peek { .. }) {
@@ -533,6 +536,8 @@ impl Screen {
             state,
             transcript,
         });
+        // An attachment owns WORKERS, so settlement must not demote the focused view.
+        self.worker_mode_auto = false;
     }
 
     /// Return to the parent transcript without changing pane focus or selection.
@@ -802,6 +807,7 @@ impl Screen {
     pub fn open_output(&mut self, view: crate::render::output::OutputView) {
         self.output = Some(view);
         self.pane_mode = PaneMode::Output;
+        self.detach_worker();
         self.worker_mode_auto = false;
         self.promotion_saved_width = None;
         if matches!(self.pane_width, PaneWidth::Off) {
@@ -813,6 +819,7 @@ impl Screen {
         self.pane_focused = !self.pane_focused;
         if !self.pane_focused {
             self.workers.focused = None;
+            self.detach_worker();
             return;
         }
         if self.pane_mode != PaneMode::Workers {
