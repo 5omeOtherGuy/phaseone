@@ -226,6 +226,60 @@ impl Composer {
         self.revealed = true;
     }
 
+    // Line editing behavior is adapted from `iris-donor/src/ui/tui_loop.rs`
+    // (`pi_editor_key_aliases_work` and `apply_editor_key`) at
+    // 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT). Composer's char cursor
+    // makes the byte conversions explicit instead of relying on a text area.
+    pub fn delete_to_line_start(&mut self) {
+        self.history_cursor = None;
+        let cursor = self.byte_index();
+        let start = self.text[..cursor]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        self.text.replace_range(start..cursor, "");
+        self.cursor = self.text[..start].chars().count();
+        self.revealed = !self.text.is_empty();
+    }
+
+    pub fn delete_to_line_end(&mut self) {
+        self.history_cursor = None;
+        let start = self.byte_index();
+        let end = self.text[start..]
+            .find('\n')
+            .map_or(self.text.len(), |newline| start + newline);
+        self.text.replace_range(start..end, "");
+        self.cursor = self.text[..start].chars().count();
+        self.revealed = !self.text.is_empty();
+    }
+
+    pub fn line_start(&mut self) {
+        self.history_cursor = None;
+        let cursor = self.byte_index();
+        self.cursor = self.text[..cursor]
+            .rfind('\n')
+            .map_or(0, |newline| self.text[..=newline].chars().count());
+    }
+
+    pub fn line_end(&mut self) {
+        self.history_cursor = None;
+        let start = self.byte_index();
+        let end = self.text[start..]
+            .find('\n')
+            .map_or(self.text.len(), |newline| start + newline);
+        self.cursor = self.text[..end].chars().count();
+    }
+
+    pub fn delete_forward(&mut self) {
+        self.history_cursor = None;
+        let start = self.byte_index();
+        let Some(ch) = self.text[start..].chars().next() else {
+            self.revealed = !self.text.is_empty();
+            return;
+        };
+        self.text.replace_range(start..start + ch.len_utf8(), "");
+        self.revealed = !self.text.is_empty();
+    }
+
     pub fn backspace(&mut self) {
         self.history_cursor = None;
         if self.cursor == 0 {
@@ -799,6 +853,11 @@ impl Screen {
             V::DetachWorker => self.detach_worker(),
             V::EditGoal => self.edit_goal(),
             V::KeepComposer => self.composer.keep(),
+            V::DeleteToLineStart => self.composer.delete_to_line_start(),
+            V::DeleteToLineEnd => self.composer.delete_to_line_end(),
+            V::LineStart => self.composer.line_start(),
+            V::LineEnd => self.composer.line_end(),
+            V::DeleteForward => self.composer.delete_forward(),
             V::HistoryPrev => {
                 if self.working.is_none() {
                     self.composer.history_prev();
@@ -1146,6 +1205,115 @@ mod tests {
         assert_eq!(s.folds.len(), 1, "only the folded output has a handle");
         assert_eq!((s.folds[0].kind.as_str(), s.folds[0].lines), ("shell", 60));
         assert_eq!(s.ledger().folds, s.folds);
+    }
+
+    #[test]
+    fn line_editing_uses_char_cursors_and_line_bounds() {
+        let mut composer = Composer {
+            text: "abc\ndef".into(),
+            cursor: 7,
+            ..Composer::default()
+        };
+        composer.delete_to_line_start();
+        assert_eq!((composer.text.as_str(), composer.cursor), ("abc\n", 4));
+        composer.cursor = 4;
+        composer.delete_to_line_start();
+        assert_eq!((composer.text.as_str(), composer.cursor), ("abc\n", 4));
+
+        composer.text = "abc\ndef".into();
+        composer.cursor = 5;
+        composer.delete_to_line_end();
+        assert_eq!((composer.text.as_str(), composer.cursor), ("abc\nd", 5));
+        composer.text = "abc\ndef".into();
+        composer.cursor = 7;
+        composer.delete_to_line_end();
+        assert_eq!((composer.text.as_str(), composer.cursor), ("abc\ndef", 7));
+
+        composer.text = "abc\ndef".into();
+        composer.cursor = 6;
+        composer.line_start();
+        assert_eq!(composer.cursor, 4);
+        composer.line_end();
+        assert_eq!(composer.cursor, 7);
+
+        composer.text = "abc".into();
+        composer.cursor = 1;
+        composer.delete_forward();
+        assert_eq!((composer.text.as_str(), composer.cursor), ("ac", 1));
+        composer.text = "abc".into();
+        composer.cursor = 3;
+        composer.delete_forward();
+        assert_eq!((composer.text.as_str(), composer.cursor), ("abc", 3));
+
+        composer.text = "日本語".into();
+        composer.cursor = 1;
+        composer.delete_forward();
+        assert_eq!((composer.text.as_str(), composer.cursor), ("日語", 1));
+    }
+
+    #[test]
+    fn line_editing_updates_disclosure_and_ends_history_browsing() {
+        let mut composer = Composer {
+            text: "one".into(),
+            ..Composer::default()
+        };
+        composer.take();
+        assert!(composer.history_prev());
+        composer.delete_to_line_start();
+        assert!(!composer.browsing_history());
+        assert_eq!(
+            (composer.text.as_str(), composer.cursor, composer.revealed),
+            ("", 0, false)
+        );
+
+        composer.text = "abc".into();
+        composer.cursor = 1;
+        composer.revealed = false;
+        composer.delete_to_line_end();
+        assert_eq!(
+            (composer.text.as_str(), composer.cursor, composer.revealed),
+            ("a", 1, true)
+        );
+        composer.text.clear();
+        composer.cursor = 0;
+        composer.delete_forward();
+        assert!(!composer.revealed);
+    }
+
+    #[test]
+    fn screen_applies_the_new_composer_view_commands() {
+        use crate::input::ViewCommand as V;
+        let mut screen = Screen::new(false);
+        screen.composer.text = "abc\ndef".into();
+        screen.composer.cursor = 7;
+        screen.apply_view(V::DeleteToLineStart);
+        assert_eq!(
+            (screen.composer.text.as_str(), screen.composer.cursor),
+            ("abc\n", 4)
+        );
+
+        screen.composer.text = "abc\ndef".into();
+        screen.composer.cursor = 5;
+        screen.apply_view(V::DeleteToLineEnd);
+        assert_eq!(
+            (screen.composer.text.as_str(), screen.composer.cursor),
+            ("abc\nd", 5)
+        );
+
+        screen.composer.text = "abc\ndef".into();
+        screen.composer.cursor = 6;
+        screen.apply_view(V::LineStart);
+        assert_eq!(screen.composer.cursor, 4);
+        screen.apply_view(V::LineEnd);
+        assert_eq!(screen.composer.cursor, 7);
+
+        screen.composer.text = "abc".into();
+        screen.composer.cursor = 1;
+        screen.apply_view(V::DeleteForward);
+        assert_eq!(
+            (screen.composer.text.as_str(), screen.composer.cursor),
+            ("ac", 1)
+        );
     }
 
     #[test]
