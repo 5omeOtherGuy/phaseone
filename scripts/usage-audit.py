@@ -12,7 +12,7 @@ incomparable denominators. This script is the one command every later usage clai
 Cohort. Each argument is either a runs directory — searched recursively for `session.jsonl`
 and `session.jsonl.wN.jsonl`, one journal per agent, parent and workers alike — or a journal
 file. Every other file is ignored; a file that is read but whose first line is not
-`{"p1_journal":1}` is reported under `skipped` with the reason, and the rest of the run is
+`{"p1_journal":1}` or `{"p1_journal":2}` is reported under `skipped` with the reason, and the rest of the run is
 still reported. `--since` keeps journals whose run directory is named `…-YYYYMMDD-HHMMSS`
 with a date on or after the given day (a journal carries no timestamps, so a file outside
 such a directory falls back to its modification date); `--label` keeps journals whose path
@@ -60,8 +60,8 @@ from datetime import date, datetime
 USAGE_FIELDS = ("input_uncached", "cache_read", "cache_write", "output", "reasoning_output")
 # The fields the cache-share denominator adds.
 CACHE_FIELDS = ("input_uncached", "cache_read", "cache_write")
-# The header of a p1 journal (docs/design/journal.md).
-JOURNAL_HEADER = {"p1_journal": 1}
+# The headers of a p1 journal, versions 1 and 2 (docs/design/journal.md).
+JOURNAL_HEADERS = ({"p1_journal": 1}, {"p1_journal": 2})
 # A journal file: the parent's `session.jsonl` or a worker's `session.jsonl.wN.jsonl`.
 JOURNAL_NAME = re.compile(r"^session\.jsonl(\.w\d+\.jsonl)?$")
 WORKER_FILE = re.compile(r"\.w(\d+)\.jsonl$")
@@ -172,14 +172,17 @@ def analyze_journal(path):
     interrupted = malformed = records = 0
     with open(path, encoding="utf-8") as handle:
         first = handle.readline()
-        if parse_line(first) != JOURNAL_HEADER:
-            raise NotAJournal('first line is not {"p1_journal":1}')
+        if parse_line(first) not in JOURNAL_HEADERS:
+            raise NotAJournal('first line is not {"p1_journal":1} or {"p1_journal":2}')
         for line in handle:
             if not line.strip():
                 continue
             record = parse_line(line)
             if not isinstance(record, dict):
                 malformed += 1
+                continue
+            # A version-2 assembly identity line is not a record.
+            if "assembly" in record:
                 continue
             records += 1
             kind = record.get("record")

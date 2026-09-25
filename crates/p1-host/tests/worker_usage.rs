@@ -122,7 +122,7 @@ async fn a_session_worker_journals_to_its_own_file_and_the_host_reports_it() {
         .expect("worker session file exists");
     assert_eq!(
         worker_text.lines().next(),
-        Some("{\"p1_journal\":1}"),
+        Some("{\"p1_journal\":2}"),
         "worker file header: {worker_text}"
     );
     assert!(worker_text.contains("\"record\":\"environment\""));
@@ -214,7 +214,7 @@ async fn a_second_worker_gets_the_next_session_file() {
         let text = fs::read_to_string(workspace.path().join(name)).unwrap_or_else(|error| {
             panic!("{name} missing: {error}");
         });
-        assert_eq!(text.lines().next(), Some("{\"p1_journal\":1}"), "{name}");
+        assert_eq!(text.lines().next(), Some("{\"p1_journal\":2}"), "{name}");
         assert_eq!(
             text.matches("\"record\":\"assistant_completed\"").count(),
             1,
@@ -322,7 +322,7 @@ async fn an_existing_worker_file_is_skipped_and_never_overwritten() {
     let second = workspace.path().join("session.jsonl.w2.jsonl");
     let text = fs::read_to_string(&second)
         .unwrap_or_else(|error| panic!("{} missing: {error}", second.display()));
-    assert_eq!(text.lines().next(), Some("{\"p1_journal\":1}"), "{text}");
+    assert_eq!(text.lines().next(), Some("{\"p1_journal\":2}"), "{text}");
     assert!(text.contains("child done"), "worker file: {text}");
 
     // The worker past the existing file really ran, and its usage reached the
