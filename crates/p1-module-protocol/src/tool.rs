@@ -6,7 +6,7 @@ use p1_contracts::{CallDescription, EditPreview, ToolOutcome};
 use serde::{Deserialize, Serialize};
 
 use crate::history::WireToolStatus;
-use crate::{ConversionError, call_verb, to_u64, to_usize};
+use crate::{ConversionError, call_verb, refuse_null, to_u64, to_usize};
 
 /// The result of one execution; `content` is exactly what the model will see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,10 +78,18 @@ pub struct WireCallDescription {
     /// One of [`crate::CALL_VERBS`]; anything else is shown as `call`.
     pub verb: String,
     /// What the call is about, trimmed for display.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub target: Option<String>,
     /// The edit the call would make, when it is one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub edit: Option<WireEditPreview>,
     /// Whether the call destroys data; always stated, because a missing flag must not be
     /// read as "safe" by a peer that forgot it.
@@ -126,10 +134,18 @@ pub enum WireResultDetail {
     /// A process run.
     Command {
         /// Absent when the process did not exit normally.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "refuse_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         exit_code: Option<i32>,
         /// Absent when not measured.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "refuse_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         elapsed_ms: Option<u64>,
         /// Last output lines.
         tail: Vec<String>,
@@ -224,7 +240,11 @@ pub struct WireResultDescription {
     /// One-line summary.
     pub summary: String,
     /// Structured detail, when the tool has one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub detail: Option<WireResultDetail>,
 }
 

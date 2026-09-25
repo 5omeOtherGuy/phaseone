@@ -149,7 +149,11 @@ pub enum WireAssistantBlock {
         /// Shown reasoning; may be empty.
         text: String,
         /// Absent when the route returned nothing to replay.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::refuse_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         replay: Option<WireReplayData>,
     },
     /// A complete tool call.

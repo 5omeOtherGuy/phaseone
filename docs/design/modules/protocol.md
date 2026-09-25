@@ -26,7 +26,9 @@ interpreted under it, and every schema `$id` carries the major:
 Closed objects reject unknown fields, both in the schemas (`additionalProperties: false`)
 and in serde (`deny_unknown_fields`). A module sending a field the host does not know is
 speaking another version; dropping the field silently would hide that. Optional values
-are omitted when absent, never sent as `null` or zero, so unknown usage stays unknown.
+are omitted when absent, never sent as `null` or zero, so unknown usage stays unknown, and
+a field the schema types as a value is never `null`: an explicit `null` is refused by serde
+exactly as the schema refuses it, so the host cannot read one as an absent value.
 
 ## Value families (freeze item 2)
 
@@ -64,8 +66,9 @@ Notes on the shapes:
 
 The crate's tests hold one fixture per variant of every family, round-trip each through
 the wire type and the contract type back to identical JSON, validate each against its
-schema, and check that a rejected fixture per family (an unknown field, tag or kind) is
-refused by both serde and the schema.
+schema, and check that a rejected fixture per family (an unknown field, tag or kind, or an
+explicit `null` where an optional field is typed as a value) is refused by both serde and
+the schema.
 
 ## Error mapping (freeze item 5)
 

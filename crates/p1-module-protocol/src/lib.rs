@@ -72,6 +72,21 @@ pub(crate) fn to_usize(field: &'static str, value: u64) -> Result<usize, Convers
 }
 
 pub(crate) fn to_u64(value: usize) -> u64 {
-    // usize is at most 64 bits on every target Rust supports, so this cannot saturate.
-    u64::try_from(value).unwrap_or(u64::MAX)
+    // usize is at most 64 bits on every target Rust supports, so this cannot fail; a loud
+    // panic names the broken invariant where a saturation would silently lose the value
+    // the module sent.
+    u64::try_from(value).expect("usize is at most 64 bits on every target Rust supports")
+}
+
+/// Deserialize an optional wire field that is absent or present, but never `null`.
+///
+/// A bare `Option<T>` reads an explicit `null` as absent, while every schema types these
+/// fields as a value and none admits `null`; the two peers must agree on the same shape, so
+/// a module that sends `"usage": null` is refused here exactly as the schema refuses it.
+pub(crate) fn refuse_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <T as serde::Deserialize<'de>>::deserialize(deserializer).map(Some)
 }

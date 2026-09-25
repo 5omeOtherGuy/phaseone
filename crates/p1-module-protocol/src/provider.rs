@@ -10,7 +10,7 @@ use p1_contracts::{
 use serde::{Deserialize, Serialize};
 
 use crate::history::{WireAssistantItem, WireOrigin};
-use crate::{ConversionError, to_u64, to_usize};
+use crate::{ConversionError, refuse_null, to_u64, to_usize};
 
 /// Requested reasoning effort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,13 +58,25 @@ impl From<WireEffort> for Effort {
 #[serde(deny_unknown_fields)]
 pub struct WireModelOptions {
     /// Absent: the route's default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reasoning_effort: Option<WireEffort>,
     /// Absent: the route's default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_output_tokens: Option<u32>,
     /// Stable key for provider-side prompt caching, where the route has one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cache_key: Option<String>,
     /// Route-native options namespaced by route id; values are the adapter's to interpret.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -130,7 +142,11 @@ pub struct WireRouteDescription {
     /// Whether freeform tool declarations can be carried.
     pub supports_freeform_tools: bool,
     /// Text the route forces in front of the prompt, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mandatory_prompt_prefix: Option<String>,
     /// Whether the route bills per request.
     pub reports_cost: bool,
@@ -168,22 +184,46 @@ impl From<WireRouteDescription> for RouteDescription {
 #[serde(deny_unknown_fields)]
 pub struct WireUsage {
     /// Input tokens not served from cache.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub input_uncached: Option<u64>,
     /// Input tokens read from cache.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cache_read: Option<u64>,
     /// Input tokens written to cache.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cache_write: Option<u64>,
     /// Output tokens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub output: Option<u64>,
     /// Part of `output` spent on reasoning.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reasoning_output: Option<u64>,
     /// Cost in micro-US-dollars, only where the route reports or prices it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "refuse_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cost_micro_usd: Option<u64>,
 }
 
@@ -374,7 +414,11 @@ pub enum WireOutcome {
         /// Why it stopped.
         stop: WireStopReason,
         /// Absent when the route reported none.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "refuse_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         usage: Option<WireUsage>,
     },
     /// The response failed.

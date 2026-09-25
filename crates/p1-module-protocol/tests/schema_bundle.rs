@@ -387,6 +387,18 @@ fn fixtures_cover_every_variant() {
         sorted(&["completed", "failed", "cancelled"])
     );
     assert_eq!(
+        tags("stream-event", "/outcome/stop"),
+        sorted(&[
+            "end_turn",
+            "tool_use",
+            "max_output_tokens",
+            "context_window_exceeded",
+            "refusal",
+            "paused",
+            "other"
+        ])
+    );
+    assert_eq!(
         tags("provider-error", "/kind"),
         sorted(&[
             "invalid_request",
