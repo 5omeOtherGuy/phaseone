@@ -42,6 +42,7 @@ fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Op
         return None;
     }
     screen.last_width = area.width;
+    screen.hits = Default::default();
     fill(area, buf, palette::GROUND);
     let (w, h) = (area.width, area.height);
     // §8.5: explicit `/focus` wins; otherwise the driver's `focus`, and always at 12 rows or
@@ -68,6 +69,12 @@ fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Op
             screen.review.body_rows = review::body_rows(&decision, rows);
             let lines = review::lines(&files, &screen.review, &decision, full.width as usize, rows);
             draw_lines(&lines, offset(area, full), buf);
+            screen.hits = crate::state::Hits {
+                transcript: unobstructed.transcript,
+                pane_mode: PaneMode::Ledger,
+                review: true,
+                ..Default::default()
+            };
             return None;
         }
     }
@@ -94,6 +101,7 @@ fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Op
     let composer_rows = frame.as_ref().map_or(0, |f| f.lines.len() as u16);
     let geometry = crate::geometry::layout(w, h, screen.pane_width, focus, composer_rows);
 
+    screen.hits.transcript = offset(area, geometry.transcript);
     draw_statusline(screen, area, geometry.statusline, buf);
     draw_transcript_area(
         screen,
@@ -113,7 +121,9 @@ fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Op
     }
 
     if geometry.pane.width > 0 {
-        draw_pane(screen, offset(area, geometry.pane), buf, now_ms);
+        let pane = offset(area, geometry.pane);
+        screen.hits.pane = pane;
+        screen.hits.pane_mode = draw_pane(screen, pane, buf, now_ms);
     } else if screen.ledger_overlay && !focus {
         // §9.6: under 100 columns `^L` draws the pane over the transcript's right side, from
         // the first row to the composer's last; nothing under it reflows.
@@ -125,7 +135,9 @@ fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Op
             geometry.transcript.bottom()
         };
         let overlay = Rect::new(w - 2 - cols, top, cols, bottom.saturating_sub(top));
-        draw_pane(screen, offset(area, overlay), buf, now_ms);
+        let overlay = offset(area, overlay);
+        screen.hits.pane = overlay;
+        screen.hits.pane_mode = draw_pane(screen, overlay, buf, now_ms);
     }
     cursor
 }
@@ -419,10 +431,10 @@ fn approval_rows(screen: &Screen, width: usize, now_ms: u64) -> Vec<Line<'static
 
 /// The pane (§9.1): BLOCK, a padding row, the current mode's rows, the mode strip as the last
 /// row, and a peek over the top rows.
-fn draw_pane(screen: &Screen, rect: Rect, buf: &mut Buffer, now_ms: u64) {
+fn draw_pane(screen: &Screen, rect: Rect, buf: &mut Buffer, now_ms: u64) -> PaneMode {
     fill(rect, buf, palette::BLOCK);
     if rect.height < 2 {
-        return;
+        return PaneMode::Ledger;
     }
     let width = rect.width as usize;
     let inner = rect.height as usize - 2;
@@ -475,6 +487,7 @@ fn draw_pane(screen: &Screen, rect: Rect, buf: &mut Buffer, now_ms: u64) {
             buf,
         );
     }
+    mode
 }
 
 /// OUTPUT's header, source, range and blank rows above the numbered body (§9.3).

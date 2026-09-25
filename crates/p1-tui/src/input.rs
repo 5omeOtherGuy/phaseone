@@ -3,7 +3,7 @@
 //! the effects. Single-character decisions (`y`/`a`/`p`/`n`) stay single
 //! characters — never a button row.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::state::{Approval, PaneMode, PaneWidth, Screen};
 
@@ -115,6 +115,10 @@ pub enum ViewCommand {
     ReviewFile(isize),
     /// `PgUp` (+1) / `PgDn` (−1) in the full review.
     ReviewPage(isize),
+    WheelTranscript(isize),
+    WheelPane(isize),
+    WheelReview(isize),
+    ToggleMouse,
 }
 
 /// What a key means: work for the driver, or a view change the screen makes itself.
@@ -158,6 +162,10 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
     use Action::{Command as C, View as V};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    if ctrl && key.code == KeyCode::Char('t') {
+        return Some(V(ViewCommand::ToggleMouse));
+    }
 
     if let Some(approval) = &screen.approval {
         let diff = matches!(approval, Approval::Diff(_));
@@ -315,6 +323,44 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
         (KeyCode::Right, false, false) => Some(C(Command::Right)),
         _ => None,
     }
+}
+
+// Mouse routing is adapted from `iris-donor/src/ui/tui_loop.rs`
+// (`pager_wheel`) at 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT).
+/// Decide a wheel event against the regions recorded by the last frame.
+pub fn decide_mouse(screen: &Screen, event: MouseEvent) -> Option<Action> {
+    if screen.mouse_off {
+        return None;
+    }
+    let ticks = match event.kind {
+        MouseEventKind::ScrollUp => 1,
+        MouseEventKind::ScrollDown => -1,
+        _ => return None,
+    };
+    let command = if screen.hits.review {
+        ViewCommand::WheelReview(ticks)
+    } else if screen
+        .hits
+        .pane
+        .contains(ratatui::layout::Position::new(event.column, event.row))
+    {
+        match screen.hits.pane_mode {
+            PaneMode::Output => ViewCommand::WheelPane(ticks),
+            PaneMode::Workers
+                if screen.pane_focused
+                    && screen.approval.is_none()
+                    && screen.picker.is_none()
+                    && screen.status.is_none()
+                    && screen.stop_pending.is_none() =>
+            {
+                ViewCommand::WheelPane(ticks)
+            }
+            PaneMode::Workers | PaneMode::Diff | PaneMode::Ledger => return None,
+        }
+    } else {
+        ViewCommand::WheelTranscript(ticks)
+    };
+    Some(Action::View(command))
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use futures_util::StreamExt;
 use p1_contracts::{
     AuthorizationPolicy, CallDescription, CancellationToken, Decision, Effect, EventSink,
@@ -307,24 +308,14 @@ impl FrontEnd for TuiFrontEnd {
                 route_label: self.route_label.clone(),
                 pending_switch: None,
                 _workers: workers,
+                mouse_capture: p1_tui::runtime::set_mouse_capture,
+                applied_mouse_capture: true,
             };
 
-            let keys = Box::pin(crossterm::event::EventStream::new().filter_map(
-                |event| async move {
-                    match event {
-                        Ok(crossterm::event::Event::Key(key))
-                            if key.kind == crossterm::event::KeyEventKind::Press =>
-                        {
-                            Some(Input::Key(key))
-                        }
-                        // A resize is a frame input too: the frame on screen is
-                        // stale at the new size (`Terminal::draw` resizes its
-                        // own buffer, issue #141).
-                        Ok(crossterm::event::Event::Resize(..)) => Some(Input::Resize),
-                        _ => None,
-                    }
-                },
-            ));
+            let keys = Box::pin(
+                crossterm::event::EventStream::new()
+                    .filter_map(|event| async move { terminal_input(event.ok()?) }),
+            );
             drive_loop(
                 &mut terminal,
                 &mut driver,
@@ -428,6 +419,8 @@ pub(crate) struct Driver {
     /// until then.
     pending_switch: Option<PendingSwitch>,
     _workers: Option<Arc<dyn WorkerService>>,
+    mouse_capture: fn(bool) -> std::io::Result<()>,
+    applied_mouse_capture: bool,
 }
 
 /// A `/model`/`/effort` switch queued while a turn was running.
@@ -450,8 +443,16 @@ impl Driver {
             && key.modifiers.is_empty()
         {
             match key.code {
-                KeyCode::Up => return self.dispatch(Command::PaneUp, None),
-                KeyCode::Down => return self.dispatch(Command::PaneDown, None),
+                KeyCode::Up => {
+                    self.dispatch(Command::PaneUp, None);
+                    self.apply_mouse_capture();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.dispatch(Command::PaneDown, None);
+                    self.apply_mouse_capture();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -482,6 +483,54 @@ impl Driver {
             // (it dropped them; that is the wiring gap this task closes).
             input::Action::View(other) => self.screen.apply_view(other),
         }
+        self.apply_mouse_capture();
+    }
+
+    fn apply_mouse_capture(&mut self) {
+        let wanted = !self.screen.mouse_off;
+        if wanted != self.applied_mouse_capture {
+            let _ = (self.mouse_capture)(wanted);
+            self.applied_mouse_capture = wanted;
+        }
+    }
+
+    fn on_mouse(&mut self, event: MouseEvent) -> bool {
+        let before = self.view_fingerprint();
+        if let Some(input::Action::View(command)) = input::decide_mouse(&self.screen, event) {
+            self.screen.apply_view(command);
+        }
+        self.apply_mouse_capture();
+        before != self.view_fingerprint()
+    }
+
+    fn view_fingerprint(
+        &self,
+    ) -> (
+        Option<usize>,
+        usize,
+        Option<String>,
+        bool,
+        PaneMode,
+        Option<String>,
+        usize,
+        bool,
+    ) {
+        (
+            self.screen.scroll_top,
+            self.screen
+                .output
+                .as_ref()
+                .map_or(0, |output| output.scroll),
+            self.screen.workers.focused.clone(),
+            self.screen.pane_focused,
+            self.screen.pane_mode,
+            self.screen
+                .attached
+                .as_ref()
+                .map(|worker| worker.id.clone()),
+            self.screen.review.scroll,
+            self.screen.mouse_off,
+        )
     }
 
     /// `agent` is `Some` only when no turn is running (the loop's idle key
@@ -636,12 +685,19 @@ impl Driver {
                 self.screen.transcript.command_output(output);
             }
             "help" => self.screen.transcript.command_output(help_command_output()),
+            "mouse" => match arg {
+                "on" => self.screen.set_mouse(true),
+                "off" => self.screen.set_mouse(false),
+                "" => self.screen.set_mouse(self.screen.mouse_off),
+                _ => self.screen.transcript.note("· /mouse takes on or off"),
+            },
             other => {
                 self.screen
                     .transcript
                     .note(&format!("· /{other} is not a command · /help"));
             }
         }
+        self.apply_mouse_capture();
     }
 
     /// `/model` bare lists every model (the same listing `/models` shows);
@@ -1122,12 +1178,34 @@ const IDLE_HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(100
 /// whole need and anything faster is frames nobody can see.
 const SPINNER_HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Convert terminal events into the small set that can wake the UI loop.
+fn terminal_input(event: crossterm::event::Event) -> Option<Input> {
+    match event {
+        crossterm::event::Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+            Some(Input::Key(key))
+        }
+        crossterm::event::Event::Resize(..) => Some(Input::Resize),
+        crossterm::event::Event::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::Down(MouseButton::Left)
+            ) =>
+        {
+            Some(Input::Mouse(mouse))
+        }
+        _ => None,
+    }
+}
+
 /// One terminal input the loop acts on. A resize carries nothing: it only says
 /// the frame on screen is stale (`Terminal::draw` resizes its own buffer).
 #[derive(Debug, Clone, Copy)]
 enum Input {
-    Key(crossterm::event::KeyEvent),
+    Key(KeyEvent),
     Resize,
+    Mouse(MouseEvent),
 }
 
 /// The frames one loop drew. Production ignores it; the idle-CPU tests (issue
@@ -1495,13 +1573,19 @@ where
             _ = cancel.cancelled() => return 130,
             input = keys.next() => {
                 let Some(input) = input else { return 0 };
-                redraws.dirty = true;
                 match input {
-                    // The frame on screen is stale at the new size; the next
-                    // iteration draws it.
-                    Input::Resize => {}
-                    Input::Key(key) if is_cancel(&key) => driver.exit = Some(0),
+                    Input::Resize => redraws.dirty = true,
+                    Input::Mouse(event) => {
+                        if driver.on_mouse(event) {
+                            redraws.dirty = true;
+                        }
+                    }
+                    Input::Key(key) if is_cancel(&key) => {
+                        redraws.dirty = true;
+                        driver.exit = Some(0);
+                    }
                     Input::Key(key) => {
+                        redraws.dirty = true;
                         driver.on_key(key, Some(agent));
                         if let Some(text) = driver.submit_pending.take() {
                             prompt = Some(text);
@@ -1624,16 +1708,23 @@ where
             end = &mut turn => return Ok(end),
             input = keys.next(), if !keys_done => {
                 let Some(input) = input else { keys_done = true; continue };
-                redraws.dirty = true;
                 match input {
-                    Input::Resize => {}
+                    Input::Resize => redraws.dirty = true,
+                    Input::Mouse(event) => {
+                        if driver.on_mouse(event) {
+                            redraws.dirty = true;
+                        }
+                    }
                     Input::Key(key) if is_cancel(&key) => {
-                        // ^C during a turn cancels the TURN; quitting is idle-only.
+                        redraws.dirty = true;
                         turn_cancel.cancel();
                     }
                     // A turn's future owns `agent`; a `/model`/`/effort`
                     // mid-turn queues instead (§11).
-                    Input::Key(key) => driver.on_key(key, None),
+                    Input::Key(key) => {
+                        redraws.dirty = true;
+                        driver.on_key(key, None);
+                    }
                 }
             }
             ui = events.recv() => {
@@ -1971,6 +2062,7 @@ fn help_command_output() -> p1_tui::transcript::CommandOutput {
             "set or clear the session objective · ^G edits",
         ),
         ("/focus [on|off]", "transcript only"),
+        ("/mouse [on|off]", "wheel and clicks · ^T toggles"),
         ("/status", "session facts"),
         ("/access", "access and sandbox · fixed per process"),
         ("/models [SEARCH]", "every model p1 can run"),

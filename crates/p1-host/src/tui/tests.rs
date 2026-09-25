@@ -89,6 +89,8 @@ fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             route_label: Arc::new(Mutex::new(String::new())),
             pending_switch: None,
             _workers: None,
+            mouse_capture: |_| Ok(()),
+            applied_mouse_capture: true,
         },
         auth,
     )

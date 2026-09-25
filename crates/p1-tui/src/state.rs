@@ -9,6 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use p1_contracts::{AgentEvent, Usage};
+use ratatui::layout::Rect;
 
 use crate::render::home::HomePrelude;
 use crate::render::ledger::{
@@ -476,6 +477,20 @@ pub struct Screen {
     pub pane_focused: bool,
     /// The full diff review's view state (handoff §7.5).
     pub review: FullReview,
+    /// Terminal mouse reporting is enabled unless the operator turns it off.
+    pub mouse_off: bool,
+    /// Regions occupied by the last rendered frame, for pointer hit testing.
+    #[doc(hidden)]
+    pub hits: Hits,
+}
+
+/// The regions and mode used by the last composed frame.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Hits {
+    pub transcript: Rect,
+    pub pane: Rect,
+    pub pane_mode: PaneMode,
+    pub review: bool,
 }
 
 /// The full diff review: shown over a diff approval while `open`. Paging files and scrolling
@@ -833,6 +848,58 @@ impl Screen {
             .min(last);
     }
 
+    // Mouse-wheel routing is adapted from `iris-donor/src/ui/tui_loop.rs`
+    // (`pager_wheel`) and `iris-donor/src/ui/tui/screen.rs` (`scroll_speed`) at
+    // 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT).
+    /// Scroll the transcript three rows per wheel tick. A wheel up moves back
+    /// in history, matching the terminal's native scroll direction.
+    pub fn wheel_transcript(&mut self, ticks: isize) {
+        self.scroll_by(3 * ticks);
+    }
+
+    /// Scroll the pane under the pointer. OUTPUT follows its content bounds;
+    /// WORKERS moves the selection only when the pane owns focus.
+    pub fn wheel_pane(&mut self, ticks: isize) {
+        match self.hits.pane_mode {
+            PaneMode::Output => {
+                if let Some(output) = &mut self.output {
+                    output.scroll = output.scroll.saturating_add_signed(-3 * ticks);
+                    let last = output.lines.len().saturating_sub(1);
+                    output.scroll = output.scroll.min(last);
+                }
+            }
+            PaneMode::Workers
+                if self.pane_focused
+                    && self.approval.is_none()
+                    && self.picker.is_none()
+                    && self.status.is_none()
+                    && self.stop_pending.is_none() =>
+            {
+                self.pane_step(-ticks);
+            }
+            PaneMode::Workers | PaneMode::Diff | PaneMode::Ledger => {}
+        }
+    }
+
+    /// Scroll a full diff review by rows, clamped to the body it can show.
+    pub fn review_scroll(&mut self, rows: isize) {
+        let Some(Approval::Diff(view)) = &self.approval else {
+            return;
+        };
+        let last = view.rows.len().saturating_sub(self.review.body_rows);
+        self.review.scroll = self.review.scroll.saturating_add_signed(-rows).min(last);
+    }
+
+    /// Set the terminal capture intent and leave one operator-facing note.
+    pub fn set_mouse(&mut self, on: bool) {
+        self.mouse_off = !on;
+        self.transcript.note(if on {
+            "· mouse on · wheel scrolls the pane under the pointer · ^T toggles"
+        } else {
+            "· mouse off · the terminal selects and copies · ^T turns it back on"
+        });
+    }
+
     /// Perform a view-only key decision (`input::decide`): nothing here reaches the agent.
     pub fn apply_view(&mut self, command: crate::input::ViewCommand) {
         use crate::input::ViewCommand as V;
@@ -874,6 +941,10 @@ impl Screen {
             V::ToggleReview => self.toggle_review(),
             V::ReviewFile(delta) => self.review_file(delta),
             V::ReviewPage(pages) => self.review_page(pages),
+            V::WheelTranscript(ticks) => self.wheel_transcript(ticks),
+            V::WheelPane(ticks) => self.wheel_pane(ticks),
+            V::WheelReview(ticks) => self.review_scroll(3 * ticks),
+            V::ToggleMouse => self.set_mouse(self.mouse_off),
         }
     }
 

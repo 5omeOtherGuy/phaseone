@@ -10,8 +10,8 @@
 //! wiring: it owns the terminal, the agent task, and the render tick.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once};
 
 use p1_contracts::{
     AgentEvent, AuthorizationPolicy, AuthorizationRequest, BoxFuture, CancellationToken, Decision,
@@ -242,10 +242,48 @@ impl AuthorizationPolicy for TuiPolicy {
     }
 }
 
+// Adapted from `iris-donor/src/ui/tui/pager.rs` (`emergency_restore` and
+// `set_mouse_capture`) at 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT).
 /// The terminal guard: raw mode + alternate screen, restored on drop. The
 /// whole TUI lives inside one of these; a panic still hands back a sane
 /// terminal.
 pub struct TerminalGuard;
+
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PANIC_HOOK: Once = Once::new();
+
+/// Mouse reporting uses only press/release/wheel tracking. Motion and drag
+/// reports are deliberately omitted because this TUI has no use for them.
+pub fn write_mouse_capture<W: std::io::Write>(out: &mut W, on: bool) -> std::io::Result<()> {
+    if on {
+        out.write_all(b"\x1b[?1000h\x1b[?1006h")?;
+    } else {
+        crossterm::queue!(out, crossterm::event::DisableMouseCapture)?;
+    }
+    out.flush()
+}
+
+pub fn set_mouse_capture(on: bool) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout();
+    write_mouse_capture(&mut stdout, on)
+}
+
+pub fn write_restore<W: std::io::Write>(out: &mut W) -> std::io::Result<()> {
+    crossterm::queue!(
+        out,
+        crossterm::event::DisableMouseCapture,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+    out.flush()
+}
+
+fn restore_terminal() {
+    if TERMINAL_ACTIVE.swap(false, Ordering::AcqRel) {
+        let _ = write_restore(&mut std::io::stdout());
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
 
 impl TerminalGuard {
     pub fn enter() -> std::io::Result<Self> {
@@ -257,14 +295,22 @@ impl TerminalGuard {
                 crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
             return Err(error);
         }
+        let _ = set_mouse_capture(true);
+        TERMINAL_ACTIVE.store(true, Ordering::Release);
+        PANIC_HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                restore_terminal();
+                previous(info);
+            }));
+        });
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-        let _ = crossterm::terminal::disable_raw_mode();
+        restore_terminal();
     }
 }
 
