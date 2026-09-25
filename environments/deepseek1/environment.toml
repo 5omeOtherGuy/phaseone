@@ -17,15 +17,17 @@ module = "shell"
 [[tools]]
 module = "finish"
 
-# Copied from environments/deepseek, not measured on this route: the runs behind these values
-# (split4a and its successors, docs/dogfood/runs.jsonl) ran on another OpenCode Go account. The 1M
-# window is what the model's vendor states for its own API; OpenCode Go documents no window for
-# this endpoint (research #27). The account's allowance is used up until 2026-10-07 (HTTP 402 until
-# then); the values match the other Go accounts so it serves the same way when it resumes.
-# Summarize late, keep a long tail.
+# Same endpoint and model as environments/deepseek, another OpenCode Go account. Sources
+# (2026-09-24): gateway metadata (models.dev/api.json, provider `opencode-go`,
+# `deepseek-v4.1-flash`: context 1000000, output 384000) and the vendor api-docs.deepseek.com
+# ("CONTEXT LENGTH 1M"); 300k and the 96,000 reserve stay for the reasons recorded in
+# environments/deepseek (the reserve is lead policy, not a per-response measurement: no such
+# measurement exists for this model). The account's allowance is used up until 2026-10-07 (HTTP
+# 402 until then); the values match the other Go accounts so it serves the same way when it
+# resumes. Summarize late, keep a long tail.
 [context]
 window_tokens = 1000000
-output_headroom_tokens = 32000
+output_headroom_tokens = 96000
 summarize_at_tokens = 300000
 keep_recent_tokens = 60000
 user_verbatim_tokens = 8000

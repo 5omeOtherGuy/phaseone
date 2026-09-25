@@ -8,6 +8,7 @@
 mod common;
 
 use common::{Harness, provider_hook, run_args, write_environment};
+use p1_contracts::Effort;
 use p1_testkit::{ScriptedProvider, text_response};
 use tempfile::tempdir;
 
@@ -241,4 +242,68 @@ async fn env_show_prints_the_context_table() {
     assert!(stdout.contains("\"context\""), "{stdout}");
     assert!(stdout.contains("\"summarize_at_tokens\": 580"), "{stdout}");
     assert!(stdout.contains("\"window_tokens\": 100000"), "{stdout}");
+}
+
+// (f) #125 review: with no profile at all (the whole-provider form) the summarization request
+// still runs at the LOWEST level — never at the agent's. The agent's own requests keep the effort
+// the environment configured, so only the summary is lowered.
+#[tokio::test]
+async fn a_whole_provider_environment_summarizes_at_low_whatever_the_agent_runs_at() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    let dir = environments.path().join("maxed");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("environment.toml"),
+        format!(
+            "family = \"maxed\"\nprovider = \"fake\"\nmodel = \"fake-model\"\n\n\
+             [options]\nreasoning_effort = \"max\"\n\n{CONTEXT_TABLE}"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("prompt.md"), "test").unwrap();
+
+    let provider = ScriptedProvider::new(vec![
+        text_response(&"a".repeat(2_000)),
+        text_response(&"b".repeat(50)),
+        text_response("SUMMARY"),
+        text_response("done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(
+        vec![environments.path().to_path_buf()],
+        &["one", "two", "three", "/exit"],
+    );
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--env",
+            "maxed",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let requests = handle.requests();
+    let summary = requests
+        .iter()
+        .position(is_summary_request)
+        .expect("the opted-in environment summarizes");
+    assert_eq!(
+        requests[summary].options.reasoning_effort,
+        Some(Effort::Low),
+        "an agent at max must still summarize at low"
+    );
+    assert!(
+        requests
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != summary)
+            .all(|(_, request)| request.options.reasoning_effort == Some(Effort::Max)),
+        "only the summary is lowered; the agent's own requests carry the configured effort"
+    );
 }

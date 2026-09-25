@@ -145,12 +145,18 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
 
     if let Some(approval) = &screen.approval {
         let diff = matches!(approval, Approval::Diff(_));
+        let grantable = match approval {
+            Approval::Diff(view) => view.grantable,
+            Approval::Permission(view) => view.grantable,
+        };
         let full = diff && screen.review.open;
-        // `y a p n` decide only here; everywhere else they type.
+        // Adapted from `iris-donor/src/ui/tui_loop.rs` `approval_key` at
+        // 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT): unavailable grants
+        // must not become commands while the approval remains modal.
         return match (key.code, ctrl) {
             (KeyCode::Char('y'), false) => Some(C(Command::ApproveOnce)),
-            (KeyCode::Char('a'), false) => Some(C(Command::ApproveSession)),
-            (KeyCode::Char('p'), false) => Some(C(Command::ApproveProject)),
+            (KeyCode::Char('a'), false) if grantable => Some(C(Command::ApproveSession)),
+            (KeyCode::Char('p'), false) if grantable => Some(C(Command::ApproveProject)),
             (KeyCode::Char('n'), false) => Some(C(Command::Deny)),
             (KeyCode::Char('d'), true) if diff => Some(V(ViewCommand::ToggleReview)),
             (KeyCode::Char('c'), true) => Some(C(Command::CancelOrQuit)),
@@ -317,7 +323,7 @@ mod tests {
         Some(Approval::Permission(PermissionView {
             command: "rm -rf /".into(),
             rows: vec![],
-            grantable: false,
+            grantable: true,
         }))
     }
 
@@ -421,6 +427,54 @@ mod tests {
         assert_eq!(
             decide(&s, key(KeyCode::Backspace)),
             view(ViewCommand::MenuBackspace)
+        );
+    }
+
+    #[test]
+    fn non_grantable_permission_ignores_session_and_project_grants() {
+        let mut s = Screen {
+            approval: permission_approval(),
+            ..Default::default()
+        };
+        let Some(Approval::Permission(permission_view)) = &mut s.approval else {
+            unreachable!()
+        };
+        permission_view.grantable = false;
+        s.composer.text = "draft".into();
+
+        assert_eq!(decide(&s, key(KeyCode::Char('a'))), None);
+        assert_eq!(decide(&s, key(KeyCode::Char('p'))), None);
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('y'))),
+            command(Command::ApproveOnce)
+        );
+        assert_eq!(decide(&s, key(KeyCode::Char('n'))), command(Command::Deny));
+
+        // An ignored decision stays modal and cannot leak into the composer.
+        let before = s.composer.text.clone();
+        assert_eq!(handle(&s, key(KeyCode::Char('a'))), None);
+        assert_eq!(handle(&s, key(KeyCode::Char('p'))), None);
+        assert_eq!(s.composer.text, before);
+    }
+
+    #[test]
+    fn non_grantable_diff_ignores_grants_but_keeps_review_keys() {
+        let mut s = Screen {
+            approval: diff_approval(),
+            ..Default::default()
+        };
+        let Some(Approval::Diff(diff_view)) = &mut s.approval else {
+            unreachable!()
+        };
+        diff_view.grantable = false;
+
+        assert_eq!(decide(&s, key(KeyCode::Char('a'))), None);
+        assert_eq!(decide(&s, key(KeyCode::Char('p'))), None);
+        assert_eq!(decide(&s, ctrl('d')), view(ViewCommand::ToggleReview));
+        s.review.open = true;
+        assert_eq!(
+            decide(&s, key(KeyCode::Tab)),
+            view(ViewCommand::ReviewFile(1))
         );
     }
 

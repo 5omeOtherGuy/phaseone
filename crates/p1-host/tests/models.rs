@@ -230,10 +230,11 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "claude/claude-opus-5-5",
             "claude/claude-sonnet-4-6",
             "claude/claude-sonnet-5",
-            // The two ClinePass accounts serve DeepSeek V4.1 Flash only for now (owner, 2026-09-24:
-            // DeepSeek V4.1 Flash and/or GLM-5.3 Flash; GLM waits for #115).
+            // Each ClinePass account serves DeepSeek V4.1 Flash and GLM-5.3 Flash.
             "cline/deepseek-v4.1-flash",
+            "cline/glm-5.3-flash-clinepass",
             "cline2/deepseek-v4.1-flash",
+            "cline2/glm-5.3-flash-clinepass",
             "deepseek/deepseek-v4.1-flash",
             "deepseek1/deepseek-v4.1-flash",
             "deepseek2/deepseek-v4.1-flash",
@@ -335,16 +336,18 @@ fn every_environment_and_every_bound_profile_is_a_model() {
     assert_eq!(mimo.route, "opencode-zen-2");
     assert_eq!(mimo.efforts_line(), "high");
     // Each ClinePass environment spends its own account's key.
-    for (id, route) in [
-        ("cline/deepseek-v4.1-flash", "cline-pass-1"),
-        ("cline2/deepseek-v4.1-flash", "cline-pass-2"),
+    for (id, route, efforts) in [
+        ("cline/deepseek-v4.1-flash", "cline-pass-1", "high,max"),
+        ("cline/glm-5.3-flash-clinepass", "cline-pass-1", "high"),
+        ("cline2/deepseek-v4.1-flash", "cline-pass-2", "high,max"),
+        ("cline2/glm-5.3-flash-clinepass", "cline-pass-2", "high"),
     ] {
         let model = models
             .iter()
             .find(|model| model.id() == id)
             .unwrap_or_else(|| panic!("the shipped {id} model"));
         assert_eq!(model.route, route, "{id}");
-        assert_eq!(model.efforts_line(), "high,max", "{id}");
+        assert_eq!(model.efforts_line(), efforts, "{id}");
     }
     let kimi = models
         .iter()

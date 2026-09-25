@@ -244,7 +244,10 @@ fn empty_tool_list_assembles() {
 
 #[test]
 fn resolved_environment_never_contains_a_captured_secret() {
-    const SENTINEL: &str = "sk-sentinel-do-not-leak";
+    // Deliberately NOT `sk-`-shaped: the gate's `scripts/secret-scan.sh` would flag a
+    // key-shaped literal in the tree (issue #142). The value is still an opaque
+    // sentinel the resolved environment must never carry.
+    const SENTINEL: &str = "sentinel-do-not-leak";
 
     let mut catalog = Catalog::new();
     catalog.provider(
