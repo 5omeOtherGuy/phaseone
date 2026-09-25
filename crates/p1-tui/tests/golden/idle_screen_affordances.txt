@@ -1,0 +1,40 @@
+
+    p1 0.1.0   ~/dev/phaseone   main
+
+      no journal in this directory.
+
+      /resume     reopen a previous session
+      /env        claude · sonnet-4.5
+      /access     full · --ask to confirm
+      /goal       set the session objective
+
+
+                                                    ●
+                                                    ·
+                                                ●···●
+                                                    ·
+                    ●···●···●···●                   ●
+                    ·                               ·
+                    ●               ●               ●
+                    ·               ·               ·
+                    ●               ●               ●
+                    ·               ·               ·
+                    ●               ●               ●
+                    ·                               ·
+                    ●···●···●···●               ●···●···●
+                    ·
+                    ●
+                    ·
+                    ●
+
+                                   phaseone
+
+                                 We love pie
+
+
+
+    ›
+    ⏎ send   ⇧⏎ newline                                    /help   ^C quit
+
+    p1    effort —
+

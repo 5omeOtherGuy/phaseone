@@ -60,6 +60,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0044 | [p1 login stores pasted API keys in p1's own store](0044-p1-login-stores-pasted-api-keys-in-p1-s-own-store.md) | accepted | 2026-09-20 | owner |
 | ADR-0045 | [Research items are issues that end used or discarded; a curator organises research, the lead alone develops](0045-research-items-are-issues-that-end-used-or-discarded-a-curator-organises-research-the-lead-alone-develops.md) | accepted | 2026-09-20 | owner+lead |
 | ADR-0046 | [An exhausted account is its own provider error kind; it is never refreshed or retried](0046-an-exhausted-account-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md) | accepted | 2026-09-21 | lead |
+| ADR-0047 | [Inbox withdraw: a cancel takes queued steering back](0047-inbox-withdraw-a-cancel-takes-queued-steering-back.md) | proposed | 2026-09-22 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

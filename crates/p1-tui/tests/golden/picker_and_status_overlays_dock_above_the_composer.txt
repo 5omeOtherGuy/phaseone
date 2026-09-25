@@ -1,0 +1,40 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ANTHROPIC ROUTE
+      claude · sonnet-4.5                                    300k · $3/$15
+      claude · opus-4.8                                     300k · $15/$75
+      glm · 5.3                                            quota exhausted
+
+    ›
+    ↑↓ select   ⏎ open   type to filter                          esc close
+
+    p1    effort —
+

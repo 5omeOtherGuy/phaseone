@@ -40,6 +40,53 @@ pub fn styled_row(
     ])
 }
 
+/// A label/description row (pickers, the palette, /help, /status). When
+/// both fit it is the grid row; when they do not, the label — the key or the
+/// command the operator types — stays whole (up to half the grid) and the
+/// description is cut with `…`, two spaces apart so they never read as one.
+pub fn described_row(
+    width: usize,
+    label: &str,
+    label_fg: Color,
+    value: &str,
+    value_fg: Color,
+) -> Line<'static> {
+    if cell_width(label) + 2 + cell_width(value) <= width {
+        return styled_row(width, label, label_fg, value, value_fg);
+    }
+    // A value up to two thirds of the grid (an output's `h-2ede · 60 lines`)
+    // is kept whole beside a long label; a longer one (a description) yields
+    // to the label past half the grid.
+    let keep = if cell_width(value) * 3 <= width * 2 {
+        cell_width(label).min(width.saturating_sub(cell_width(value) + 2))
+    } else {
+        cell_width(label).min(width.saturating_sub(cell_width(value) + 2).max(width / 2))
+    };
+    let label = if cell_width(label) <= keep {
+        label.to_string()
+    } else {
+        let mut cut = fit_cells(label, keep.saturating_sub(1));
+        cut.push('…');
+        cut
+    };
+    let room = width.saturating_sub(cell_width(&label) + 2);
+    let value = if cell_width(value) <= room {
+        value.to_string()
+    } else if room >= 2 {
+        let mut cut = fit_cells(value, room - 1);
+        cut.push('…');
+        cut
+    } else {
+        String::new()
+    };
+    let pad = width.saturating_sub(cell_width(&label) + cell_width(&value));
+    Line::from(vec![
+        Span::styled(label, Style::new().fg(label_fg)),
+        Span::styled(" ".repeat(pad), Style::new().fg(label_fg)),
+        Span::styled(value, Style::new().fg(value_fg)),
+    ])
+}
+
 /// A three-column row: label left, a count right-aligned to the fixed inner
 /// `stop`, the value right-aligned to the grid width (SPEC §5: 20 in the
 /// ledger). Rows with and without a count therefore share one value column.
@@ -106,6 +153,29 @@ mod tests {
     #[test]
     fn the_label_truncates_never_the_value() {
         assert_eq!(text(row(8, "averylonglabel", "1.2k")), "av… 1.2k");
+    }
+
+    #[test]
+    fn a_description_row_keeps_the_key_and_cuts_the_description() {
+        let row = |w, l, v| text(described_row(w, l, palette::DIM, v, palette::INK));
+        // Fits: the ordinary grid row.
+        assert_eq!(row(20, "  /help", "keys"), "  /help         keys");
+        // Too narrow: the command stays, the description is cut.
+        assert_eq!(
+            row(30, "  /outputs", "pick a retained output to open"),
+            "  /outputs  pick a retained o…"
+        );
+        // A label longer than half the grid is cut too, never to nothing.
+        let narrow = row(20, "  ^W · ^Tab or F6 · ^P", "pane width · pane mode");
+        assert_eq!(narrow, "  ^W · ^T…  pane wi…");
+        // A short value is kept whole beside a long label.
+        let output = row(
+            40,
+            "  shell  python3 -c 'for i in range(60): print(i)'",
+            "h-2ede · 60 lines",
+        );
+        assert!(output.ends_with("h-2ede · 60 lines"), "{output}");
+        assert!(narrow.contains("  "));
     }
 
     #[test]

@@ -1,0 +1,4 @@
+  ▸ read      src/main.rs                                 ✓ 3 lines · 37 B  
+    1  fn main() {                                                          
+    2      println!("hello");                                               
+    3  }                                                                    

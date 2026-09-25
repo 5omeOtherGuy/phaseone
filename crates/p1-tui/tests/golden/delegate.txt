@@ -1,0 +1,8 @@
+  ▸ delegate  2 workers                                   ceiling 40 calls  
+  ▪ renderer   deepseek · v4.1-flash                             1m12s · —  
+    owns  crates/p1-tui/**                                                  
+    ↳ running width sweep                                                   
+                                                                            
+  ✓ input      kimi · k3                                         2m10s · —  
+    owns  crates/p1-host/src/tui.rs                                         
+    ↳ paste handling complete                                               

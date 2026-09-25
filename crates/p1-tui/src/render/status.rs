@@ -42,9 +42,9 @@ pub fn lines(groups: &[StatusGroup], width: usize) -> Vec<Line<'static>> {
         for row in &group.rows {
             let label = format!("  {}", row.label);
             out.push(if row.available {
-                grid::row(grid, &label, &row.value)
+                grid::described_row(grid, &label, palette::DIM, &row.value, palette::INK)
             } else {
-                grid::styled_row(grid, &label, palette::FAINT, &row.value, palette::FAINT)
+                grid::described_row(grid, &label, palette::FAINT, &row.value, palette::FAINT)
             });
         }
     }

@@ -43,14 +43,21 @@ pub struct Picker {
 
 impl Picker {
     /// Rows surviving the filter. The match is a case-insensitive substring
-    /// on the label — the ONE matching rule, used by the model and the view.
+    /// of the label or the value (an output's handle) — the ONE matching
+    /// rule, used by the model and the view.
     pub fn visible(&self) -> Vec<&PickerRow> {
-        let needle = self.filter.to_lowercase();
         self.groups
             .iter()
             .flat_map(|g| &g.rows)
-            .filter(|r| needle.is_empty() || r.label.to_lowercase().contains(&needle))
+            .filter(|r| self.keeps(r))
             .collect()
+    }
+
+    fn keeps(&self, row: &PickerRow) -> bool {
+        let needle = self.filter.to_lowercase();
+        needle.is_empty()
+            || row.label.to_lowercase().contains(&needle)
+            || row.value.to_lowercase().contains(&needle)
     }
 
     /// Move the selection by `delta` over AVAILABLE visible rows.
@@ -79,6 +86,43 @@ impl Picker {
     }
 }
 
+/// The picker docked in `rows` entry rows (at most [`MAX_ROWS`]): one window
+/// that follows the selection, and one footer counting the ENTRIES hidden on
+/// either side, with the keys that move through them.
+pub fn lines_window(picker: &Picker, width: usize, rows: usize) -> Vec<Line<'static>> {
+    let visible = picker.visible();
+    let total = visible.len();
+    let rows = rows.clamp(1, MAX_ROWS);
+    let first = picker
+        .selected
+        .saturating_sub(rows - 1)
+        .min(total.saturating_sub(rows));
+    let shown = rows.min(total - first.min(total));
+    let mut out = window_lines(picker, &visible, first, shown, width);
+    let below = total.saturating_sub(first + shown);
+    if first > 0 || below > 0 {
+        let mut more = vec![];
+        if first > 0 {
+            more.push(format!("↑ {first}"));
+        }
+        if below > 0 {
+            more.push(format!("↓ {below}"));
+        }
+        let more = more.join(" ");
+        // Shorter wordings first, so the counts and `esc` are never cut.
+        let footer = [
+            format!("  {more} more   ↑↓ select   esc"),
+            format!("  {more} more   esc"),
+            format!("  {more}"),
+        ]
+        .into_iter()
+        .find(|f| crate::wrap::cell_width(f) <= width + 2)
+        .unwrap_or_else(|| format!("  {more}"));
+        out.push(Line::styled(footer, Style::new().fg(palette::FAINT)));
+    }
+    out
+}
+
 /// Render the picker on a `width`-column grid. The 8-row window follows the
 /// selection (SPEC §4.6: there is always exactly one inverted row), group
 /// headers attach only to visible rows, and `· N more` counts the rows below
@@ -91,15 +135,35 @@ pub fn lines(picker: &Picker, width: usize) -> Vec<Line<'static>> {
         .saturating_sub(MAX_ROWS - 1)
         .min(total.saturating_sub(MAX_ROWS));
     let window: &[&PickerRow] = &visible[first..(first + MAX_ROWS).min(total)];
+    let mut out = window_lines(picker, &visible, first, window.len(), width);
+    let below = total.saturating_sub(first + window.len());
+    if below > 0 {
+        out.push(Line::styled(
+            format!("  {} {below} more", crate::glyphs::PENDING),
+            Style::new().fg(palette::FAINT),
+        ));
+    }
+    out
+}
+
+/// Group headers and rows for `count` visible rows from `first`, the
+/// selection inverted.
+fn window_lines(
+    picker: &Picker,
+    visible: &[&PickerRow],
+    first: usize,
+    count: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let window: &[&PickerRow] = &visible[first..first + count];
     let mut out = Vec::new();
     // Group headers above their first visible row. A row's group is found by
     // walking the groups' surviving rows in order.
     let mut by_ptr: std::collections::HashMap<*const PickerRow, &str> =
         std::collections::HashMap::new();
-    let needle = picker.filter.to_lowercase();
     for group in &picker.groups {
         for row in &group.rows {
-            if needle.is_empty() || row.label.to_lowercase().contains(&needle) {
+            if picker.keeps(row) {
                 by_ptr.insert(row as *const _, group.header.as_str());
             }
         }
@@ -117,9 +181,15 @@ pub fn lines(picker: &Picker, width: usize) -> Vec<Line<'static>> {
             last_header = header;
         }
         let mut line = if row.available {
-            crate::grid::row(width, &format!("  {}", row.label), &row.value)
+            crate::grid::described_row(
+                width,
+                &format!("  {}", row.label),
+                palette::DIM,
+                &row.value,
+                palette::INK,
+            )
         } else {
-            crate::grid::styled_row(
+            crate::grid::described_row(
                 width,
                 &format!("  {}", row.label),
                 palette::FAINT,
@@ -136,13 +206,6 @@ pub fn lines(picker: &Picker, width: usize) -> Vec<Line<'static>> {
             }
         }
         out.push(line);
-    }
-    let below = total.saturating_sub(first + window.len());
-    if below > 0 {
-        out.push(Line::styled(
-            format!("  {} {below} more", crate::glyphs::PENDING),
-            Style::new().fg(palette::FAINT),
-        ));
     }
     out
 }

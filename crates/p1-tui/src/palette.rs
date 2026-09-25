@@ -29,3 +29,80 @@ pub const DIFF_DEL_FG: Color = Color::Rgb(0xe8, 0xd0, 0xd0);
 /// The one highlight: selection and focus invert ink and ground.
 pub const SELECTION_BG: Color = INK;
 pub const SELECTION_FG: Color = GROUND;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColorMode {
+    #[default]
+    TrueColor,
+    Indexed,
+    Plain,
+}
+
+impl ColorMode {
+    pub fn from_env() -> Self {
+        // The NO_COLOR convention: set to a non-empty value.
+        if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+            return Self::Plain;
+        }
+        let color = std::env::var("COLORTERM").unwrap_or_default();
+        let term = std::env::var("TERM").unwrap_or_default();
+        if color.contains("truecolor") || color.contains("24bit") {
+            Self::TrueColor
+        } else if term.contains("256color") {
+            Self::Indexed
+        } else {
+            Self::Plain
+        }
+    }
+    pub fn apply(self, buffer: &mut ratatui::buffer::Buffer) {
+        fn index(color: Color) -> Color {
+            // Keep both reserved diff hues distinct on the small xterm cube.
+            if color == DIFF_ADD_BG {
+                return Color::Indexed(22);
+            }
+            if color == DIFF_DEL_BG {
+                return Color::Indexed(52);
+            }
+            let Color::Rgb(r, g, b) = color else {
+                return color;
+            };
+            if r == g && g == b {
+                return Color::Indexed(if r < 8 {
+                    16
+                } else if r > 248 {
+                    231
+                } else {
+                    232 + (r - 8) / 10
+                });
+            }
+            let cube = |v: u8| ((u16::from(v) * 5 + 127) / 255) as u8;
+            Color::Indexed(16 + 36 * cube(r) + 6 * cube(g) + cube(b))
+        }
+        for cell in &mut buffer.content {
+            match self {
+                Self::TrueColor => {}
+                Self::Indexed => {
+                    cell.fg = index(cell.fg);
+                    cell.bg = index(cell.bg);
+                }
+                Self::Plain => {
+                    // Without colour, an inverted cell (decision keys, the
+                    // selection, the route chip) stays inverted as reverse
+                    // video, and an underline stays: every state reads (§10.1).
+                    use ratatui::style::Modifier;
+                    let inverted = cell.bg == INK && cell.fg == GROUND;
+                    let underlined = cell.modifier.contains(Modifier::UNDERLINED);
+                    cell.fg = Color::Reset;
+                    cell.bg = Color::Reset;
+                    cell.modifier = Modifier::empty();
+                    if inverted {
+                        cell.modifier.insert(Modifier::REVERSED);
+                    }
+                    if underlined {
+                        cell.modifier.insert(Modifier::UNDERLINED);
+                    }
+                }
+            }
+        }
+    }
+}

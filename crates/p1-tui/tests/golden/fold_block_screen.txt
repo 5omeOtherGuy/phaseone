@@ -1,0 +1,40 @@
+
+    ▸ shell     cargo test -p p1-context boundary                  ✗ 11.4s
+    test line 70
+    test line 71
+    test line 72
+    test line 73
+    test line 74
+    test line 75
+    test line 76
+    test line 77
+    test line 78
+    test line 79
+    test line 80
+    test line 81
+    test line 82
+    test line 83
+    test line 84
+    test line 85
+    test line 86
+    test line 87
+    test line 88
+    test line 89
+    test line 90
+    test line 91
+    test line 92
+    test line 93
+    · 70 more lines folded → [h-dfd9]                      ^O open in pane
+
+    ▪▪▪ waiting for the model
+
+
+
+
+
+
+    ›
+    ⏎ steer   ⇧⏎ newline   ⌥⏎ follow-up                          ^C cancel
+
+    p1    effort —
+

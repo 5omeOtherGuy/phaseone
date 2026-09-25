@@ -117,12 +117,14 @@ mod tests {
             text: "abcd".into(),
             cursor: 2,
             revealed: false,
+            ..Default::default()
         };
         assert_eq!(cursor_cell(&c, 0, 10), (4, 0));
         c = Composer {
             text: "ab\ncd".into(),
             cursor: 4, // before the 'd'
             revealed: false,
+            ..Default::default()
         };
         assert_eq!(cursor_cell(&c, 0, 10), (3, 1));
         // Wrapping: width 6 -> body 4; "abcdef" wraps after 4.
@@ -130,6 +132,7 @@ mod tests {
             text: "abcdef".into(),
             cursor: 6,
             revealed: false,
+            ..Default::default()
         };
         assert_eq!(cursor_cell(&c, 0, 6), (4, 1));
     }

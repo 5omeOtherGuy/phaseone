@@ -50,7 +50,13 @@ fn welcome_does_not_replace_history_or_focus_mode() {
         lines: vec!["welcome metadata".into()],
     });
     let greeting = render(&mut screen, 80, 24, 0);
-    assert!(text(&greeting).starts_with("welcome metadata"));
+    assert!(
+        text(&greeting)
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("    welcome metadata")
+    );
     assert!(has_dots(&greeting));
     screen.transcript.operator("start work");
     assert!(!has_dots(&render(&mut screen, 80, 24, 0)));

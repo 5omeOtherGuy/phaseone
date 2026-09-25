@@ -223,6 +223,26 @@ async fn inbox_only_turn_commits_environment_before_inbox() {
     assert!(!agent.has_pending_inbox());
 }
 
+// A cancel takes back queued steering (ADR-0047): only undelivered messages of
+// the named kind leave the inbox, in send order; notifications stay.
+#[tokio::test(start_paused = true)]
+async fn withdraw_takes_back_only_undelivered_messages_of_one_kind() {
+    let (mut agent, _fixture) = agent_with(vec![text_response("ok")]);
+    let inbox = agent.inbox();
+    assert!(inbox.send(InboxKind::Steering, "first"));
+    assert!(inbox.send(InboxKind::Notification, "worker done"));
+    assert!(inbox.send(InboxKind::Steering, "second"));
+    assert_eq!(
+        inbox.withdraw(InboxKind::Steering),
+        vec!["first".to_string(), "second".to_string()]
+    );
+    assert!(inbox.withdraw(InboxKind::Steering).is_empty());
+    assert!(agent.has_pending_inbox(), "the notification stays queued");
+    run_inbox(&mut agent, CancellationToken::new()).await;
+    assert!(!agent.has_pending_inbox());
+    assert!(inbox.withdraw(InboxKind::Notification).is_empty());
+}
+
 // A pre-cancelled inbox turn races cancellation before the provider is ever
 // asked and records the interruption without touching history.
 #[tokio::test(start_paused = true)]

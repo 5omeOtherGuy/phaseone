@@ -1,0 +1,4 @@
+  ▸ ask       Which layout?                                       pick one  
+  · Compact               More transcript space                             
+  ▸ Expanded              Full tool evidence                                
+                                    space toggle   ⏎ confirm   esc dismiss  

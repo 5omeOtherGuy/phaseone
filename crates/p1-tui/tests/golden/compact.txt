@@ -1,0 +1,3 @@
+  ▸ compact   session scope only                         ✓ 420ms · 2 lines  
+  kept     Design decisions · open tasks                                    
+  dropped  Completed sidequests                                             

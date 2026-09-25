@@ -13,6 +13,8 @@ use super::fill;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionView {
+    /// The tool asking (`shell`, `worker_start`…): the header names it.
+    pub tool: String,
     /// The exact command being asked about, echoed as it will run.
     pub command: String,
     /// Label/value rows in display order.
@@ -92,6 +94,7 @@ mod tests {
     #[test]
     fn the_prompt_echoes_the_command_on_block_plus() {
         let view = PermissionView {
+            tool: "shell".into(),
             command: "rm -rf target/".into(),
             rows: vec![
                 ("cwd".into(), "~/dev/phaseone".into()),

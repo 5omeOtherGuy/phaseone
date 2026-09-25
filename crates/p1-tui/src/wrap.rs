@@ -32,44 +32,85 @@ pub fn fit_cells(s: &str, cells: usize) -> String {
 /// empty line so a block always occupies its row. Leading indentation is
 /// preserved and hangs: continuation lines keep the same indent.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let indent = cell_width(&text[..text.len() - text.trim_start_matches(' ').len()]);
+    wrap_hanging(text, width, indent)
+}
+
+/// Wrap at spaces, keeping runs of spaces inside a row exactly as written (only
+/// the spaces a row breaks at are dropped). Continuation rows start `hang`
+/// cells in; a word too long for a row breaks hard at the cell edge.
+pub fn wrap_hanging(text: &str, width: usize, hang: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
     }
-    let indent: String = text.chars().take_while(|c| *c == ' ').collect();
-    let text = &text[indent.len()..];
-    let body_width = width.saturating_sub(indent.len()).max(1);
+    let hang = hang.min(width.saturating_sub(1));
     let mut lines = Vec::new();
     let mut current = String::new();
-    for word in text.split(' ') {
-        if word.is_empty() {
-            continue;
-        }
-        let word_len = cell_width(word);
-        let current_len = cell_width(&current);
-        if current_len > 0 && current_len + 1 + word_len > body_width {
-            lines.push(std::mem::take(&mut current));
-        } else if current_len > 0 {
-            current.push(' ');
-        }
-        if word_len > body_width {
-            // A word that cannot fit alone breaks hard at the cell edge.
-            let mut rest = word;
-            while cell_width(rest) > body_width {
-                let cut = fit_cells(rest, body_width);
-                current.push_str(&cut);
+    let mut used = 0;
+    // Cells a row holds before its first word (the leading indent or the hang).
+    let mut floor = 0;
+    let mut rest = text;
+    let mut first = true;
+    while !rest.is_empty() {
+        let spaces_len = rest.len() - rest.trim_start_matches(' ').len();
+        let (spaces, after) = rest.split_at(spaces_len);
+        let word_len = after.find(' ').unwrap_or(after.len());
+        let (word, after) = after.split_at(word_len);
+        rest = after;
+        if first && current.is_empty() {
+            // Leading indentation belongs to the first row.
+            let indent = fit_cells(spaces, width.saturating_sub(1));
+            used = cell_width(&indent);
+            floor = used;
+            current.push_str(&indent);
+            first = false;
+        } else if !spaces.is_empty() && used > floor {
+            let gap = cell_width(spaces);
+            if used + gap + cell_width(word).min(1) <= width
+                && (word.is_empty() || used + gap + cell_width(word) <= width)
+            {
+                current.push_str(spaces);
+                used += gap;
+            } else if !word.is_empty() {
                 lines.push(std::mem::take(&mut current));
-                rest = &rest[cut.len()..];
+                current.push_str(&" ".repeat(hang));
+                used = hang;
+                floor = hang;
             }
-            current.push_str(rest);
-        } else {
-            current.push_str(word);
         }
+        let mut word = word;
+        while cell_width(word) > width - used {
+            let cut = fit_cells(word, width - used);
+            if cut.is_empty() {
+                if used > floor {
+                    lines.push(std::mem::take(&mut current));
+                    current.push_str(&" ".repeat(hang));
+                    used = hang;
+                    floor = hang;
+                    continue;
+                }
+                // Not even one glyph fits this row: mark the cut and move on.
+                let ch = word.chars().next().unwrap();
+                current.push('›');
+                lines.push(std::mem::take(&mut current));
+                current.push_str(&" ".repeat(hang));
+                used = hang;
+                floor = hang;
+                word = &word[ch.len_utf8()..];
+                continue;
+            }
+            current.push_str(&cut);
+            lines.push(std::mem::take(&mut current));
+            current.push_str(&" ".repeat(hang));
+            used = hang;
+            floor = hang;
+            word = &word[cut.len()..];
+        }
+        current.push_str(word);
+        used += cell_width(word);
     }
     lines.push(current);
     lines
-        .into_iter()
-        .map(|line| format!("{indent}{line}"))
-        .collect()
 }
 
 #[cfg(test)]
@@ -93,6 +134,23 @@ mod tests {
             assert!(cell_width(&line) <= 5, "{line:?}");
         }
         assert!(wrap("你好你好", 5).iter().all(|l| cell_width(l) <= 5));
+    }
+
+    #[test]
+    fn interior_spacing_survives_and_breaks_drop_only_the_break_spaces() {
+        assert_eq!(wrap("let x    = 1;", 40), vec!["let x    = 1;"]);
+        assert_eq!(wrap("aa   bb cc", 5), vec!["aa", "bb cc"]);
+        for line in wrap("a  b    c d      e", 4) {
+            assert!(cell_width(&line) <= 4, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn continuation_rows_hang_under_the_item_text() {
+        assert_eq!(
+            wrap_hanging("- one two three", 8, 2),
+            vec!["- one", "  two", "  three"]
+        );
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub struct Ledger {
     /// The session goal, shown as a quotation (SPEC §4.7).
     pub goal: Option<String>,
     pub context: Option<Context>,
+    /// The context window when known but nothing is measured yet: the section
+    /// then reads `— / 128k` instead of vanishing.
+    pub window: Option<u64>,
     pub task: Option<Task>,
     pub spend: SpendView,
 }
@@ -75,29 +78,42 @@ pub struct SpendView {
 /// Render the ledger on its 32-column grid. Sections are separated by one
 /// blank line; absent sections leave no gap.
 pub fn lines(ledger: &Ledger) -> Vec<Line<'static>> {
+    lines_at(ledger, LEDGER_GRID)
+}
+
+/// The ledger laid out on a `grid` narrower than the pane's 32 (the `^L`
+/// overlay on a small terminal): every row keeps its value.
+pub fn lines_at(ledger: &Ledger, grid: usize) -> Vec<Line<'static>> {
+    let grid = grid.min(LEDGER_GRID);
     let mut sections: Vec<Vec<Line<'static>>> = Vec::new();
     if let Some(goal) = &ledger.goal {
         let mut section = vec![header("GOAL")];
-        for part in crate::wrap::wrap(goal, LEDGER_GRID) {
+        for part in crate::wrap::wrap(goal, grid) {
             section.push(Line::styled(part, Style::new().fg(palette::INK)));
         }
         sections.push(section);
     }
     if let Some(context) = &ledger.context {
         let mut section = Vec::new();
-        context_lines(context, &mut section);
+        context_lines(context, grid, &mut section);
         sections.push(section);
+    } else if let Some(window) = ledger.window {
+        sections.push(vec![grid::row(
+            grid,
+            "CONTEXT",
+            &format!("{UNKNOWN} / {}", tokens(window)),
+        )]);
     }
     if let Some(task) = &ledger.task {
         let mut section = Vec::new();
-        task_lines(task, &mut section);
+        task_lines(task, grid, &mut section);
         sections.push(section);
     }
     // Before the first response there is no spend to report: the section is
     // absent, not a column of `—` (absence is not unknownness).
     if ledger.spend.responses > 0 {
         let mut spend = Vec::new();
-        spend_lines(&ledger.spend, &mut spend);
+        spend_lines(&ledger.spend, grid, &mut spend);
         sections.push(spend);
     }
     let mut out = Vec::new();
@@ -115,13 +131,15 @@ fn header(text: &str) -> Line<'static> {
     Line::styled(text.to_string(), Style::new().fg(palette::DIM))
 }
 
-fn context_lines(context: &Context, out: &mut Vec<Line<'static>>) {
+fn context_lines(context: &Context, grid: usize, out: &mut Vec<Line<'static>>) {
     let total = format!("{} / {}", tokens(context.used), tokens(context.window));
-    out.push(grid::row(LEDGER_GRID, "CONTEXT", &total));
+    out.push(grid::row(grid, "CONTEXT", &total));
     let fraction = context.used as f64 / context.window.max(1) as f64;
     let percent = format!("{}%", (fraction * 100.0).round() as u64);
-    let mut bar = grid::bar(BAR_CELLS, fraction);
-    let pad = LEDGER_GRID.saturating_sub(BAR_CELLS + percent.len());
+    // A narrow grid shortens the bar, never the percentage beside it.
+    let cells = BAR_CELLS.min(grid.saturating_sub(percent.len() + 1));
+    let mut bar = grid::bar(cells, fraction);
+    let pad = grid.saturating_sub(cells + percent.len());
     bar.push(Span::raw(" ".repeat(pad)));
     bar.push(Span::styled(percent, Style::new().fg(palette::INK)));
     out.push(Line::from(bar));
@@ -129,70 +147,66 @@ fn context_lines(context: &Context, out: &mut Vec<Line<'static>>) {
         let label = format!("  {}", part.label);
         let row = match &part.count {
             Some(count) => grid::counted_row(
-                LEDGER_GRID,
+                grid,
                 COUNT_STOP,
                 &label,
                 &count.to_string(),
                 &tokens(part.tokens),
             ),
-            None => grid::row(LEDGER_GRID, &label, &tokens(part.tokens)),
+            None => grid::row(grid, &label, &tokens(part.tokens)),
         };
         out.push(row);
     }
-    let warn_pct = context.warn_at * 100 / context.window.max(1);
-    out.push(grid::row(
-        LEDGER_GRID,
-        &format!("  warn at {warn_pct}%"),
-        &tokens(context.warn_at),
-    ));
+    // A warn point only when a context policy states one.
+    if context.warn_at > 0 {
+        let warn_pct = context.warn_at * 100 / context.window.max(1);
+        out.push(grid::row(
+            grid,
+            &format!("  warn at {warn_pct}%"),
+            &tokens(context.warn_at),
+        ));
+    }
 }
 
-fn task_lines(task: &Task, out: &mut Vec<Line<'static>>) {
+fn task_lines(task: &Task, grid: usize, out: &mut Vec<Line<'static>>) {
     match (&task.id, task.files) {
-        (Some(id), _) => out.push(grid::row(LEDGER_GRID, "TASK", id)),
-        (None, Some(files)) => out.push(grid::row(LEDGER_GRID, "TASK", &files.to_string())),
+        (Some(id), _) => out.push(grid::row(grid, "TASK", id)),
+        // Without a task id the row counts files, and says so.
+        (None, Some(files)) => out.push(grid::row(
+            grid,
+            "TASK",
+            &super::block::plural(files as usize, "file"),
+        )),
         (None, None) => out.push(header("TASK")),
     }
     if task.id.is_some()
         && let Some(files) = task.files
     {
-        out.push(grid::row(LEDGER_GRID, "  files", &files.to_string()));
+        out.push(grid::row(grid, "  files", &files.to_string()));
     }
     if let Some((added, removed)) = task.diff {
-        out.push(grid::row(
-            LEDGER_GRID,
-            "  diff",
-            &format!("+{added} −{removed}"),
-        ));
+        out.push(grid::row(grid, "  diff", &format!("+{added} −{removed}")));
     }
     if let Some(journal) = &task.journal {
-        out.push(grid::row(LEDGER_GRID, "  journal", journal));
+        out.push(grid::row(grid, "  journal", journal));
     }
 }
 
-fn spend_lines(spend: &SpendView, out: &mut Vec<Line<'static>>) {
+fn spend_lines(spend: &SpendView, grid: usize, out: &mut Vec<Line<'static>>) {
     // Called only once at least one response landed (the section is omitted
     // before); a None part is a KNOWN-unknown — render `—`.
     out.push(header("SPEND"));
     let or_unknown =
         |value: Option<u64>, format: fn(u64) -> String| value.map(format).unwrap_or(UNKNOWN.into());
+    out.push(grid::row(grid, "  in", &or_unknown(spend.input, tokens)));
+    out.push(grid::row(grid, "  out", &or_unknown(spend.output, tokens)));
     out.push(grid::row(
-        LEDGER_GRID,
-        "  in",
-        &or_unknown(spend.input, tokens),
-    ));
-    out.push(grid::row(
-        LEDGER_GRID,
-        "  out",
-        &or_unknown(spend.output, tokens),
-    ));
-    out.push(grid::row(
-        LEDGER_GRID,
+        grid,
         "  cache hit",
         &or_unknown(spend.cache_hit_percent, |p| format!("{p}%")),
     ));
     out.push(grid::row(
-        LEDGER_GRID,
+        grid,
         "  cost",
         &or_unknown(spend.cost_micro_usd, |micro| {
             format!("${}.{:04}", micro / 1_000_000, (micro % 1_000_000) / 100)
@@ -211,6 +225,7 @@ mod tests {
 
     fn spec_ledger() -> Ledger {
         Ledger {
+            window: None,
             goal: Some("fix compaction boundary stall".into()),
             context: Some(Context {
                 used: 12_400,

@@ -1,0 +1,40 @@
+
+    ✗ provider failed: Transport: connection dropped
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ›
+    ⏎ send   ⇧⏎ newline                                    /help   ^C quit
+
+    p1    effort —
+

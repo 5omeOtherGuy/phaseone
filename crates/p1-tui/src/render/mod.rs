@@ -3,8 +3,10 @@
 //! placement) is the caller's one mechanical step. Keeping renderers line-
 //! shaped makes every screen snapshot-testable against `TestBackend`.
 
+pub mod block;
 pub mod composer;
 pub mod diff;
+pub mod editor;
 mod home;
 pub mod ledger;
 pub mod output;
@@ -12,6 +14,7 @@ pub mod permission;
 pub mod picker;
 pub mod screen;
 pub mod status;
+pub mod statusline;
 pub mod transcript;
 pub mod workers;
 
@@ -55,10 +58,12 @@ pub fn elapsed(ms: u64) -> String {
 pub fn tokens(count: u64) -> String {
     if count < 1_000 {
         count.to_string()
-    } else if count < 100_000 {
+    } else if count < 99_950 {
         format!("{:.1}k", count as f64 / 1_000.0)
+    } else if count < 999_500 {
+        format!("{}k", (count + 500) / 1_000)
     } else {
-        format!("{}k", count / 1_000)
+        format!("{:.1}M", count as f64 / 1_000_000.0)
     }
 }
 
@@ -82,5 +87,11 @@ mod tests {
         assert_eq!(tokens(12_400), "12.4k");
         assert_eq!(tokens(120_000), "120k");
         assert_eq!(tokens(200_000), "200k");
+        // Rounded, never floored: the two branches meet at 100k.
+        assert_eq!(tokens(99_949), "99.9k");
+        assert_eq!(tokens(99_960), "100k");
+        assert_eq!(tokens(137_760), "138k");
+        assert_eq!(tokens(999_500), "1.0M");
+        assert_eq!(tokens(3_000_000), "3.0M");
     }
 }

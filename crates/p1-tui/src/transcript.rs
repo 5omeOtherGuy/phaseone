@@ -41,15 +41,24 @@ pub enum Block {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolRow {
     pub name: String,
+    /// Original tool input, retained for rendering successful edits and writes.
+    pub input: String,
     /// The one-line argument summary (newlines as `␤`, bounded).
     pub summary: String,
     pub status: RowStatus,
     /// Full output exactly as the model saw it, when a result arrived. The
     /// fold decision is renderable from this plus the status.
     pub output: Option<String>,
+    pub output_id: Option<FoldId>,
     pub elapsed_ms: Option<u64>,
     /// Delegation indents ONCE and never more (SPEC §3).
     pub depth: u8,
+    /// The tool actually ran (a `ToolStarted`); a denied or never-started call
+    /// shows only its reason, no run facts.
+    pub started: bool,
+    /// The change as reviewed before it ran (edit/write/patch), with real line
+    /// numbers and context: the settled block shows the same rows.
+    pub diff: Option<Vec<crate::render::diff::DiffRow>>,
 }
 
 /// The lifecycle of a call row: running, then settled with the tool's status.
@@ -79,6 +88,9 @@ impl ToolRow {
 #[derive(Debug, Default)]
 pub struct Transcript {
     pub blocks: Vec<Block>,
+    /// Per-block disclosure override: absent retains the compact preview.
+    pub disclosures: HashMap<usize, bool>,
+    pub(crate) render_cache: std::cell::RefCell<crate::render::block::Cache>,
     outputs: HashMap<FoldId, String>,
     /// The most recently registered fold — what `^O` opens.
     pub latest_fold: Option<FoldId>,
@@ -88,6 +100,16 @@ pub struct Transcript {
     /// Call rows not yet settled, by provider call id, so a result settles the
     /// row its call started.
     running: HashMap<String, usize>,
+    /// Every call row by call id: a late result (a reconciled call after resume)
+    /// updates its row instead of adding a second one.
+    rows_by_id: HashMap<String, usize>,
+    /// Calls the host announced before they started (a parked approval), so a
+    /// denied or never-started call still shows what it would have done.
+    announced: HashMap<String, ToolCall>,
+    /// When the open reasoning stream began, for its `· reasoning 4.2s` row.
+    reasoning_started_ms: Option<u64>,
+    /// Pre-execution diffs by call id, waiting for their row.
+    diffs: HashMap<String, Vec<crate::render::diff::DiffRow>>,
 }
 
 impl Transcript {
@@ -100,6 +122,27 @@ impl Transcript {
         self.outputs.get(id).map(String::as_str)
     }
 
+    /// Styled blocks laid out so far (layout is lazy: tests assert that a
+    /// resize re-renders what shows, not the history).
+    pub fn rendered_events(&self) -> usize {
+        self.render_cache.borrow().rendered_events
+    }
+
+    pub(crate) fn running_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.running.values().copied()
+    }
+
+    pub fn output_handles(&self) -> Vec<(FoldId, usize)> {
+        let mut handles: Vec<_> = self
+            .outputs
+            .iter()
+            .filter(|(id, _)| id.0.len() == 6)
+            .map(|(id, body)| (id.clone(), body.lines().count()))
+            .collect();
+        handles.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        handles
+    }
+
     /// The operator sent a prompt: the marked turn (SPEC §2 `›`).
     pub fn operator(&mut self, text: impl Into<String>) {
         self.close_streams();
@@ -110,6 +153,38 @@ impl Transcript {
     /// events open and close them. `ToolInputDelta` is display-only freeform
     /// preview and intentionally ignored: a row appears at `ToolStarted`.
     pub fn apply(&mut self, event: &AgentEvent, elapsed_ms: Option<u64>) {
+        self.apply_at(event, elapsed_ms, None);
+    }
+
+    /// [`Transcript::apply`] with the event's stamp, which times reasoning.
+    pub fn apply_at(&mut self, event: &AgentEvent, elapsed_ms: Option<u64>, now_ms: Option<u64>) {
+        if let (Some(now), Some(index)) = (now_ms, self.open_reasoning) {
+            match event {
+                AgentEvent::ReasoningDelta { .. } => {
+                    self.reasoning_started_ms.get_or_insert(now);
+                }
+                // Anything else that follows reasoning ends it.
+                _ => {
+                    if let Some(started) = self.reasoning_started_ms.take()
+                        && let Block::Reasoning { elapsed_ms, .. } = &mut self.blocks[index]
+                    {
+                        *elapsed_ms = Some(now.saturating_sub(started));
+                        self.render_cache.borrow_mut().invalidate(index);
+                    }
+                }
+            }
+        } else if let (Some(now), AgentEvent::ReasoningDelta { .. }) = (now_ms, event) {
+            self.reasoning_started_ms = Some(now);
+        }
+        let dirty = match event {
+            AgentEvent::ToolFinished { result } => self.running.get(&result.call_id).copied(),
+            AgentEvent::TextDelta { .. } => self.open_text,
+            AgentEvent::ReasoningDelta { .. } => self.open_reasoning,
+            _ => None,
+        };
+        if let Some(index) = dirty {
+            self.render_cache.borrow_mut().invalidate(index);
+        }
         match event {
             AgentEvent::TurnStarted | AgentEvent::RequestStarted { .. } => {}
             AgentEvent::TextDelta { text } => self.text_delta(text),
@@ -171,21 +246,78 @@ impl Transcript {
         }
     }
 
+    /// The host saw a call before it started (it parked for approval): keep its
+    /// input so the row can show it whatever the decision.
+    pub fn announce(&mut self, call: &ToolCall) {
+        self.announced.insert(call.call_id.clone(), call.clone());
+    }
+
+    /// The change a call will make, computed by the host before it runs (it can
+    /// still read the old file): the settled block shows these rows.
+    pub fn attach_diff(&mut self, call_id: &str, rows: Vec<crate::render::diff::DiffRow>) {
+        match self.rows_by_id.get(call_id).copied() {
+            Some(index) => {
+                if let Some(Block::Call(row)) = self.blocks.get_mut(index) {
+                    row.diff = Some(rows);
+                    self.render_cache.borrow_mut().invalidate(index);
+                }
+            }
+            None => {
+                self.diffs.insert(call_id.to_owned(), rows);
+            }
+        }
+    }
+
     fn tool_started(&mut self, call: &ToolCall) {
+        self.add_call(call, true);
+    }
+
+    /// A call row: `started` when the tool ran (a live `ToolStarted`), not when
+    /// it is only listed in a response being replayed.
+    fn add_call(&mut self, call: &ToolCall, started: bool) {
         self.close_streams();
+        self.announced.remove(&call.call_id);
+        if let Some(&index) = self.rows_by_id.get(&call.call_id)
+            && let Some(Block::Call(row)) = self.blocks.get_mut(index)
+        {
+            row.started |= started;
+            self.running.insert(call.call_id.clone(), index);
+            self.render_cache.borrow_mut().invalidate(index);
+            return;
+        }
+        self.rows_by_id
+            .insert(call.call_id.clone(), self.blocks.len());
         self.blocks.push(Block::Call(ToolRow {
             name: call.name.clone(),
+            input: call.input.raw().to_owned(),
             summary: summarize_call(&call.name, call.input.raw()),
             status: RowStatus::Running,
             output: None,
+            output_id: None,
             elapsed_ms: None,
             depth: 0,
+            started,
+            diff: self.diffs.remove(&call.call_id),
         }));
         self.running
             .insert(call.call_id.clone(), self.blocks.len() - 1);
     }
 
     fn tool_finished(&mut self, result: &ToolResultItem, elapsed_ms: Option<u64>) {
+        if !self.running.contains_key(&result.call_id)
+            && !self.rows_by_id.contains_key(&result.call_id)
+            && !self.announced.contains_key(&result.call_id)
+        {
+            // Unannounced and unstarted: name the row after the result.
+            self.announced.insert(
+                result.call_id.clone(),
+                ToolCall {
+                    call_id: result.call_id.clone(),
+                    name: result.name.clone(),
+                    input: p1_contracts::ToolInput::Json(String::new()),
+                },
+            );
+        }
         self.settle(
             &result.call_id,
             RowStatus::Settled(result.status),
@@ -197,30 +329,147 @@ impl Transcript {
     /// Settle the row a call started, wherever the outcome came from (live
     /// event or journal replay).
     fn settle(&mut self, call_id: &str, status: RowStatus, content: &str, elapsed_ms: Option<u64>) {
-        let Some(index) = self.running.remove(call_id) else {
-            return;
+        let index = match self.running.remove(call_id) {
+            Some(index) => index,
+            // A result for a call that never started (denied, unavailable,
+            // cancelled before execution) or one reconciled after a resume: it
+            // still gets its row — nothing the model asked for is invisible.
+            None => match self.rows_by_id.get(call_id) {
+                Some(&index) => {
+                    self.render_cache.borrow_mut().invalidate(index);
+                    index
+                }
+                None => {
+                    self.close_streams();
+                    let call = self.announced.remove(call_id);
+                    let (name, input) = match &call {
+                        Some(call) => (call.name.clone(), call.input.raw().to_owned()),
+                        None => (String::new(), String::new()),
+                    };
+                    self.rows_by_id
+                        .insert(call_id.to_owned(), self.blocks.len());
+                    self.blocks.push(Block::Call(ToolRow {
+                        summary: summarize_call(&name, &input),
+                        name,
+                        input,
+                        status: RowStatus::Running,
+                        output: None,
+                        output_id: None,
+                        elapsed_ms: None,
+                        depth: 0,
+                        started: false,
+                        diff: None,
+                    }));
+                    self.blocks.len() - 1
+                }
+            },
         };
+        self.render_cache.borrow_mut().invalidate(index);
         let Block::Call(row) = &mut self.blocks[index] else {
             return;
         };
         row.status = status;
-        row.elapsed_ms = elapsed_ms;
+        if elapsed_ms.is_some() {
+            row.elapsed_ms = elapsed_ms;
+        }
+        // A denial's reason, or a tool that was never there, is not output:
+        // nothing to open, copy or list.
+        // Nor is the note of a call cancelled before it started.
+        if matches!(
+            status,
+            RowStatus::Settled(ToolStatus::Denied | ToolStatus::Unavailable)
+        ) || (status == RowStatus::Settled(ToolStatus::Cancelled) && !row.started)
+        {
+            row.output = (!content.is_empty()).then(|| content.to_string());
+            return;
+        }
         if !content.is_empty() {
-            if let Fold::Folded { id, .. } = Fold::present(content) {
-                self.latest_fold = Some(id.clone());
-                self.outputs.insert(id, content.to_string());
-            }
+            // The call id is journal-stable, so replay regenerates the same
+            // short handle. Probe for collisions rather than silently losing output.
+            let legacy = FoldId::of(content);
+            let mut slot = call_id.bytes().fold(0x811c9dc5u32, |h, b| {
+                (h ^ u32::from(b)).wrapping_mul(0x01000193)
+            }) as usize
+                & 0xffff;
+            let id = match row.output_id.clone() {
+                // A late result for a settled row keeps its handle.
+                Some(id) => id,
+                None => loop {
+                    let id = FoldId(format!("h-{slot:04x}"));
+                    if !self.outputs.contains_key(&id) {
+                        break id;
+                    }
+                    slot += 1;
+                },
+            };
+            let input: serde_json::Value = serde_json::from_str(&row.input).unwrap_or_default();
+            let full = if matches!(status, RowStatus::Settled(ToolStatus::Ok))
+                && row.name == "write"
+            {
+                input
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(content)
+                    .to_owned()
+            } else if matches!(status, RowStatus::Settled(ToolStatus::Ok)) && row.name == "edit" {
+                match (
+                    input.get("old_string").and_then(|v| v.as_str()),
+                    input.get("new_string").and_then(|v| v.as_str()),
+                ) {
+                    (Some(old), Some(new)) => old
+                        .lines()
+                        .map(|s| format!("- {s}"))
+                        .chain(new.lines().map(|s| format!("+ {s}")))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => content.to_owned(),
+                }
+            } else {
+                content.to_owned()
+            };
+            self.outputs.insert(legacy, content.to_owned());
+            self.outputs.insert(id.clone(), full);
+            row.output_id = Some(id.clone());
             row.output = Some(content.to_string());
+            // `^O` and the pane's `newer` note mean an output the transcript
+            // folds — one shown whole inline has nothing more to open.
+            if crate::render::block::foldable(row) {
+                self.latest_fold = Some(id);
+            }
         }
     }
 
     /// `^R`: toggle the most recent reasoning block (SPEC §4.2).
     pub fn toggle_reasoning(&mut self) {
-        for block in self.blocks.iter_mut().rev() {
+        for (index, block) in self.blocks.iter_mut().enumerate().rev() {
             if let Block::Reasoning { expanded, .. } = block {
                 *expanded = !*expanded;
+                self.render_cache.borrow_mut().invalidate(index);
                 return;
             }
+        }
+    }
+
+    /// Append ` · suffix` to the newest block when it is a note starting with
+    /// `prefix` (one line per event). False when there is no such note.
+    pub fn extend_note(&mut self, prefix: &str, suffix: &str) -> bool {
+        let index = self.blocks.len().saturating_sub(1);
+        match self.blocks.last_mut() {
+            Some(Block::Meta { text }) if text.starts_with(prefix) => {
+                text.push_str(" · ");
+                text.push_str(suffix);
+                self.render_cache.borrow_mut().invalidate(index);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Toggle one reasoning block (a click on its row).
+    pub fn toggle_reasoning_at(&mut self, index: usize) {
+        if let Some(Block::Reasoning { expanded, .. }) = self.blocks.get_mut(index) {
+            *expanded = !*expanded;
+            self.render_cache.borrow_mut().invalidate(index);
         }
     }
 
@@ -268,10 +517,152 @@ impl Transcript {
                 ),
             }
         }
+        self.close_streams();
+        self.settle_dangling(ToolStatus::Unknown, DANGLING);
+    }
+
+    /// Settle every row still running: a turn that ended (or a session that was
+    /// left) cannot leave a working indicator behind.
+    fn settle_dangling(&mut self, status: ToolStatus, content: &str) {
+        let mut ids: Vec<(String, usize)> = self.running.drain().collect();
+        ids.sort_by_key(|(_, index)| *index);
+        for (id, index) in ids {
+            self.running.insert(id.clone(), index);
+            self.settle(&id, RowStatus::Settled(status), content, None);
+        }
+    }
+
+    /// Paint a resumed session from its journal: what the operator saw, not
+    /// the model-visible projection — partial replies with their cancel mark,
+    /// provider failures, steering as operator input, history from before a
+    /// compaction. Returns the usage records for the spend totals.
+    pub fn replay(
+        &mut self,
+        records: &[p1_contracts::JournalRecord],
+    ) -> Vec<Option<p1_contracts::Usage>> {
+        use p1_contracts::{AssistantBlock, InboxKind, InterruptionReason, RecordBody};
+        let mut usage = vec![];
+        // A turn cancelled during a tool call or an approval leaves no record of
+        // its own: a cancelled result that no response follows marks it.
+        let mut cut = false;
+        for record in records {
+            let starts_turn = matches!(
+                record.body,
+                RecordBody::UserInput { .. } | RecordBody::Inbox { .. }
+            );
+            if cut && starts_turn {
+                self.note("· cancelled");
+            }
+            if starts_turn || matches!(record.body, RecordBody::AssistantCompleted { .. }) {
+                cut = false;
+            }
+            match &record.body {
+                RecordBody::Environment { .. } => {}
+                RecordBody::ToolStarted { call_id, .. } => {
+                    if let Some(&index) = self.rows_by_id.get(call_id)
+                        && let Some(Block::Call(row)) = self.blocks.get_mut(index)
+                    {
+                        row.started = true;
+                    }
+                }
+                RecordBody::UserInput { text } => self.operator(text.clone()),
+                RecordBody::Inbox { kind, text } => match kind {
+                    InboxKind::Steering => self.operator(text.clone()),
+                    InboxKind::Notification => self.note(&format!(
+                        "· notification: {}",
+                        text.lines().next().unwrap_or("")
+                    )),
+                },
+                RecordBody::AssistantCompleted { item, usage: u, .. } => {
+                    usage.push(*u);
+                    for block in &item.blocks {
+                        match block {
+                            AssistantBlock::Text { text } => {
+                                self.close_streams();
+                                self.blocks.push(Block::Prose {
+                                    lines: text.lines().map(str::to_string).collect(),
+                                });
+                            }
+                            AssistantBlock::Reasoning { text, .. } => {
+                                self.close_streams();
+                                self.blocks.push(Block::Reasoning {
+                                    lines: text.lines().map(str::to_string).collect(),
+                                    expanded: false,
+                                    elapsed_ms: None,
+                                });
+                            }
+                            AssistantBlock::ToolCall(call) => self.add_call(call, false),
+                        }
+                    }
+                }
+                RecordBody::AssistantInterrupted {
+                    reason,
+                    partial_text,
+                    error,
+                } => {
+                    // A cut response was billed but reported no usage: unknown.
+                    if !partial_text.is_empty() {
+                        usage.push(None);
+                    }
+                    if !partial_text.trim().is_empty() {
+                        self.close_streams();
+                        self.blocks.push(Block::Prose {
+                            lines: partial_text.lines().map(str::to_string).collect(),
+                        });
+                    }
+                    match (reason, error) {
+                        (InterruptionReason::ProviderFailed, Some(error)) => {
+                            self.blocks.push(Block::Notice {
+                                lines: vec![format!("provider failed: {error}")],
+                            })
+                        }
+                        (InterruptionReason::ProviderFailed, None) => {
+                            self.blocks.push(Block::Notice {
+                                lines: vec!["provider failed".into()],
+                            })
+                        }
+                        (InterruptionReason::Cancelled, _) => self.note("· cancelled"),
+                    }
+                    self.settle_dangling(ToolStatus::Cancelled, "[cancelled]");
+                }
+                RecordBody::ToolFinished { result } => {
+                    cut = result.status == ToolStatus::Cancelled
+                        || (result.status == ToolStatus::Denied
+                            && result.content == crate::runtime::CANCEL_DENY);
+                    self.settle(
+                        &result.call_id,
+                        RowStatus::Settled(result.status),
+                        &result.content,
+                        None,
+                    )
+                }
+                RecordBody::ContextReplaced { items, usage: u } => {
+                    usage.push(*u);
+                    self.note(&format!(
+                        "· context summarized — the model now sees {} items",
+                        items.len()
+                    ));
+                }
+            }
+        }
+        if cut {
+            self.note("· cancelled");
+        }
+        self.close_streams();
+        self.settle_dangling(ToolStatus::Unknown, DANGLING);
+        usage
     }
 
     fn turn_finished(&mut self, end: &TurnEnd) {
         self.close_streams();
+        self.settle_dangling(
+            if matches!(end, TurnEnd::Cancelled) {
+                ToolStatus::Cancelled
+            } else {
+                ToolStatus::Unknown
+            },
+            "[cancelled]",
+        );
         let lines = match end {
             TurnEnd::Completed { .. } | TurnEnd::Cancelled => None,
             TurnEnd::ProviderFailed { error } => Some(vec![format!("provider failed: {error}")]),
@@ -286,8 +677,17 @@ impl Transcript {
     fn close_streams(&mut self) {
         self.open_text = None;
         self.open_reasoning = None;
+        self.reasoning_started_ms = None;
+    }
+
+    /// Whether a text or reasoning stream is open (a cancel then cut a reply).
+    pub fn streaming(&self) -> bool {
+        self.open_text.is_some() || self.open_reasoning.is_some()
     }
 }
+
+/// What a resumed call shows when the session ended before its result.
+const DANGLING: &str = "No result was recorded before the session ended.";
 
 /// Append streamed text to a line buffer, splitting on newlines.
 fn append_text(lines: &mut Vec<String>, text: &str) {

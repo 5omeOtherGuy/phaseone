@@ -1,0 +1,4 @@
+  ▸ send      worker-1                                   ✓ 420ms · 3 lines  
+  Verify the narrow layout                                                  
+  Check all four insets                                                     
+  Keep the outcome visible                                                  

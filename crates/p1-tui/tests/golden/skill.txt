@@ -1,0 +1,3 @@
+  ▸ skill     model-cards                                         ✓ loaded  
+  3 cards · deepseek · kimi · glm                                           
+  evidence.jsonl 41 rows                                                    

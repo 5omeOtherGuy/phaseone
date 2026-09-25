@@ -1,0 +1,40 @@
+
+    ! shell     rm -rf target/                                                                     approval required
+    command  rm -rf target/
+    cwd      ~/dev/phaseone
+    sandbox  bubblewrap · writes: workspace
+    network  off
+     y  allow once    n  deny
+     a  session   not grantable — destructive floor
+     p  project   not grantable — destructive floor
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ›
+    ⏎ send   ⇧⏎ newline                                                                              /help   ^C quit
+
+    p1    effort —                                                                         ctx —   spend —   0h00   —
+

@@ -1,0 +1,6 @@
+  ▸ shell     cargo test -p p1-tui                      ✗ 420ms · exit 101  
+  running 3 tests                                                           
+  test composer ... ok                                                      
+  test output ... FAILED                                                    
+  assertion failed: expected 24 rows                                        
+  exit 101 · 4 lines · cwd ~/phaseone                                       

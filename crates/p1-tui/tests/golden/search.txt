@@ -1,0 +1,3 @@
+  ▸ search    render                                              ✓ 2 hits  
+  screen.rs — compose visible cells                                         
+  block.rs — render tool output                                             

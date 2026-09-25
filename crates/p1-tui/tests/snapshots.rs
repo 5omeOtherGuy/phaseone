@@ -163,20 +163,7 @@ fn streaming_at_120x40() {
     let mut s = streaming_screen();
     let text = left(&render(&mut s, 120, 40, 11_400), 80);
     assert_palette_law(&mut s, 120, 40);
-    assert_eq!(text[0], "› why does compaction stall at the turn edge?");
-    assert!(text[1].starts_with("· reasoning"));
-    assert!(text[1].ends_with("^R expand"));
-    assert!(text[2].starts_with("The hard-pressure wait"));
-    assert!(text[4].starts_with("✓ read      p1-context/src/edge.rs"));
-    assert!(text[4].ends_with("412 lines"));
-    assert_eq!(text[5], "▸ shell     cargo test -p p1-context boundary");
-    assert!(text[6].starts_with("▪▪▪ shell"));
-    // The pane is up by default: LEDGER on the right, composer at the bottom.
-    assert!(text[38].starts_with('›'));
-    assert_eq!(
-        text[39],
-        "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel"
-    );
+    assert_frame("streaming_at_120x40", &text);
 }
 
 #[test]
@@ -184,15 +171,7 @@ fn streaming_at_80x24_collapses_the_pane() {
     let mut s = streaming_screen();
     let text = render(&mut s, 80, 24, 11_400);
     assert_palette_law(&mut s, 80, 24);
-    // Newest rows stay visible; the pane is gone and the floor line appears.
-    assert!(text[21].starts_with('›'));
-    assert_eq!(
-        text[22],
-        "⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel"
-    );
-    let floor = &text[23];
-    assert!(floor.ends_with("^L ledger   ^C cancel"));
-    assert!(floor.starts_with("ask · claude · —"));
+    assert_frame("streaming_at_80x24_collapses_the_pane", &text);
 }
 
 #[test]
@@ -212,10 +191,7 @@ fn idle_screen_affordances() {
     });
     let text = left(&render(&mut s, 120, 40, 0), 80);
     assert_palette_law(&mut s, 120, 40);
-    assert_eq!(text[0], "p1 0.1.0   ~/dev/phaseone   main");
-    assert_eq!(text[2], "  no journal in this directory.");
-    assert_eq!(text[4], "  /resume     reopen a previous session");
-    assert_eq!(text[39], "⏎ send   ⌥⏎ newline   ^C quit");
+    assert_frame("idle_screen_affordances", &text);
 }
 
 #[test]
@@ -236,13 +212,9 @@ fn fold_block_screen() {
     );
     let full = render(&mut s, 120, 40, 12_000);
     assert_palette_law(&mut s, 120, 40);
-    // The failure promoted a PEEK banner over the ledger (SPEC §5).
-    assert!(full[0].contains("shell failed"));
-    let text = left(&full, 80);
-    assert!(text[0].starts_with("✗ shell"));
-    assert_eq!(text[1], "  test line 0");
-    // The fold handle is stable, addressable, FAINT metadata.
-    assert!(text[9].contains("more lines folded → [h-"));
+    assert!(full[1].contains("shell failed"));
+    let text = left(&full, 76);
+    assert_frame("fold_block_screen", &text);
 }
 
 #[test]
@@ -268,22 +240,19 @@ fn diff_review_blocks_full_width() {
             },
         ],
         grantable: true,
+        files: vec![],
+        note: None,
     }));
     let text = render(&mut s, 120, 40, 0);
     assert_palette_law(&mut s, 120, 40);
-    assert!(text[0].starts_with("! edit      p1-context/src/edge.rs"));
-    assert!(text[0].ends_with("1 of 3 files"));
-    assert!(text[3].starts_with(" 410"));
-    assert!(text[4].contains('−'));
-    assert!(text[5].contains('+'));
-    assert!(text[38].contains("y  allow once"));
-    assert!(text[39].contains("^D next file   ^A all files"));
+    assert_frame("diff_review_blocks_full_width", &text);
 }
 
 #[test]
 fn permission_prompt_with_destructive_floor() {
     let mut s = Screen::new(true);
     s.approval = Some(Approval::Permission(PermissionView {
+        tool: "shell".into(),
         command: "rm -rf target/".into(),
         rows: vec![
             ("cwd".into(), "~/dev/phaseone".into()),
@@ -294,11 +263,7 @@ fn permission_prompt_with_destructive_floor() {
     }));
     let text = render(&mut s, 120, 40, 0);
     assert_palette_law(&mut s, 120, 40);
-    assert_eq!(text[0], "  rm -rf target/");
-    // Decision keys pinned at the bottom; grant rows greyed above them.
-    assert!(text[37].contains("y  allow once"));
-    assert!(text[38].contains("not grantable — destructive floor"));
-    assert!(text[39].contains("not grantable — destructive floor"));
+    assert_frame("permission_prompt_with_destructive_floor", &text);
 }
 
 #[test]
@@ -330,9 +295,7 @@ fn picker_and_status_overlays_dock_above_the_composer() {
     });
     let text = left(&render(&mut s, 120, 40, 0), 80);
     assert_palette_law(&mut s, 120, 40);
-    assert_eq!(text[1], "ANTHROPIC ROUTE");
-    assert!(text[2].contains("claude · sonnet-4.5"));
-    assert!(text[4].contains("quota exhausted"));
+    assert_frame("picker_and_status_overlays_dock_above_the_composer", &text);
 }
 
 #[test]
@@ -350,7 +313,7 @@ fn a_failure_states_what_broke_without_a_banner() {
         0,
     );
     let text = left(&render(&mut s, 120, 40, 0), 80);
-    assert_eq!(text[0], "provider failed: Transport: connection dropped");
+    assert_frame("a_failure_states_what_broke_without_a_banner", &text);
 }
 
 #[test]
@@ -359,15 +322,29 @@ fn every_state_reads_with_colour_stripped() {
     // which is exactly what the text snapshots above are — the glyphs must
     // still carry the state. This test pins the glyph per state.
     let mut s = streaming_screen();
-    let text = render(&mut s, 120, 40, 0);
-    assert!(text.iter().any(|l| l.starts_with('›')), "operator turn");
-    assert!(text.iter().any(|l| l.starts_with('✓')), "settled call");
-    assert!(text.iter().any(|l| l.starts_with('▸')), "running call");
-    assert!(
-        text.iter().any(|l| l.starts_with("▪▪▪")),
-        "working indicator"
+    s.color_mode = p1_tui::palette::ColorMode::Plain;
+    let lines = p1_tui::render::block::lines(
+        &s.transcript,
+        120,
+        s.working.as_ref().map(|w| w.label.as_str()),
+        0,
+        true,
     );
-    assert!(text.iter().any(|l| l.starts_with('·')), "folded reasoning");
+    let text = lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for marker in ["› why", "✓ 412 lines", "▸ shell", "▪▪▪", "· reasoning"] {
+        assert!(text.contains(marker), "missing {marker}");
+    }
+    let frame = render(&mut s, 120, 40, 0);
+    assert!(frame.iter().any(|l| l.contains("▪▪▪")));
 }
 
 #[test]
@@ -390,6 +367,8 @@ fn every_screen_renders_at_the_80x24_floor_without_overflow() {
                     })
                     .collect(),
                 grantable: true,
+                files: vec![],
+                note: None,
             }));
             s
         },
@@ -397,6 +376,7 @@ fn every_screen_renders_at_the_80x24_floor_without_overflow() {
             let mut s = Screen::new(true);
             s.approval = Some(Approval::Permission(
                 p1_tui::render::permission::PermissionView {
+                    tool: "shell".into(),
                     command: "rm -rf target/".into(),
                     rows: vec![("cwd".into(), "~/dev".into())],
                     grantable: false,
@@ -410,7 +390,7 @@ fn every_screen_renders_at_the_80x24_floor_without_overflow() {
         assert_eq!(text.len(), 24);
         // A diff review's decision keys are ALWAYS on screen at the floor.
         if s.approval.is_some() {
-            let tail = text[20..].join("\n");
+            let tail = text[1..22].join("\n");
             assert!(tail.contains("allow once"), "decision keys visible: {tail}");
         }
     }
@@ -429,12 +409,12 @@ fn output_pane_opens_the_fold_handle() {
     let text = render(&mut s, 120, 40, 0);
     assert_palette_law(&mut s, 120, 40);
     // The pane header names the handle; the body starts at the top.
-    assert!(text[0].contains(&format!("OUTPUT [{}]", id)));
-    assert!(text[1].contains("output line 0"));
+    assert!(text[1].contains(&format!("OUTPUT [{}]", id)));
+    assert!(text[2].contains("output line 0"));
     // Up/Down scroll the pane.
     s.scroll_output_by(10);
     let text = render(&mut s, 120, 40, 0);
-    assert!(text[1].contains("output line 10"));
+    assert!(text[2].contains("output line 10"));
 }
 
 #[test]
@@ -443,13 +423,26 @@ fn pane_width_cycling_changes_the_layout() {
     s.goal = Some("fix compaction boundary stall".into());
     let wide = render(&mut s, 120, 40, 0);
     // Default 40ch pane: the ledger sits at the right.
-    assert!(wide[0].contains("GOAL"));
+    assert!(wide[1].contains("GOAL"));
     s.cycle_width(); // 56
     let wider = render(&mut s, 120, 40, 0);
-    assert!(wider[0].contains("GOAL"));
+    assert!(wider[1].contains("GOAL"));
     s.cycle_width(); // split
     s.cycle_width(); // off
     let off = render(&mut s, 120, 40, 0);
-    assert!(!off[0].contains("GOAL"));
+    assert!(!off[1].contains("GOAL"));
     assert_eq!(s.pane_width, PaneWidth::Off);
+}
+
+/// BLOCK supersedes the old fixed positions: retain whole frames as evidence.
+fn assert_frame(name: &str, rows: &[String]) {
+    let path = format!("{}/tests/golden/{name}.txt", env!("CARGO_MANIFEST_DIR"));
+    let actual = rows.join("\n") + "\n";
+    if std::env::var_os("P1_UPDATE_GOLDENS").is_some() {
+        std::fs::write(&path, &actual).unwrap();
+    }
+    assert_eq!(
+        actual,
+        std::fs::read_to_string(path).expect("reviewed frame golden")
+    );
 }

@@ -10,8 +10,8 @@
 //! wiring: it owns the terminal, the agent task, and the render tick.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use p1_contracts::{
@@ -37,6 +37,12 @@ pub struct Stamped {
 pub enum UiEvent {
     Agent(Stamped),
     WorkerStarted(String),
+    /// A front end's own background work reporting back (e.g. a clipboard
+    /// copy finished): shown as a transient notice.
+    Notice(String),
+    /// Bytes background work needs written to the terminal (an OSC 52 copy):
+    /// the driver writes them between frames, never inside one.
+    Terminal(Vec<u8>),
 }
 
 /// The `EventSink` for a TUI agent. Created before the agent; the receiving
@@ -44,7 +50,9 @@ pub enum UiEvent {
 pub struct TuiSink {
     epoch: Instant,
     /// Compensates for clock granularity collisions so ordering survives.
-    tick: AtomicU64,
+    /// Shared with every child sink: one clock, one claim order, so an
+    /// interleaved parent/child stream keeps a single monotonic sequence.
+    tick: Arc<AtomicU64>,
     worker: Option<String>,
     tx: mpsc::UnboundedSender<UiEvent>,
 }
@@ -55,7 +63,7 @@ impl TuiSink {
         (
             Self {
                 epoch: Instant::now(),
-                tick: AtomicU64::new(0),
+                tick: Arc::new(AtomicU64::new(0)),
                 worker: None,
                 tx,
             },
@@ -67,7 +75,9 @@ impl TuiSink {
     pub fn child(&self, worker_id: &str) -> Self {
         Self {
             epoch: self.epoch,
-            tick: AtomicU64::new(0),
+            // The parent's tick, not a fresh one: a child's events share the
+            // parent's arrival-order sequence (the epoch already is shared).
+            tick: self.tick.clone(),
             worker: Some(worker_id.to_string()),
             tx: self.tx.clone(),
         }
@@ -77,6 +87,11 @@ impl TuiSink {
     /// a successful build, so a failed start never shows).
     pub fn worker_started(&self, worker_id: &str) {
         let _ = self.tx.send(UiEvent::WorkerStarted(worker_id.to_string()));
+    }
+
+    /// A sender into the same channel, for the front end's own background work.
+    pub fn sender(&self) -> mpsc::UnboundedSender<UiEvent> {
+        self.tx.clone()
     }
 
     /// Milliseconds since this sink's epoch — the ONE clock the screen runs on
@@ -89,10 +104,19 @@ impl TuiSink {
 impl EventSink for TuiSink {
     fn emit(&self, event: AgentEvent) {
         let now = self.epoch.elapsed().as_millis() as u64;
-        // Monotonic even for concurrent emits (a sink is Send+Sync): the stamp
-        // is max(now, previous+1), via fetch_max — no add-then-store window.
-        let prev = self.tick.fetch_max(now + 1, Ordering::Relaxed);
-        let at_ms = now.max(prev + 1);
+        // Monotonic even for concurrent emits (a sink is Send+Sync): claim a
+        // stamp strictly greater than every earlier claim. `fetch_update`
+        // retries its compare-exchange until it publishes `max(now, prev+1)`,
+        // so no two events — parent or child — ever share a stamp.
+        let at_ms = match self
+            .tick
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(now.max(prev + 1))
+            }) {
+            Ok(previous) => now.max(previous + 1),
+            // Unreachable: the closure above always returns `Some`.
+            Err(_) => now,
+        };
         // Unbounded: observation must never block the agent loop (contract).
         let _ = self.tx.send(UiEvent::Agent(Stamped {
             at_ms,
@@ -223,28 +247,98 @@ impl AuthorizationPolicy for TuiPolicy {
 }
 
 /// The terminal guard: raw mode + alternate screen, restored on drop. The
-/// whole TUI lives inside one of these; a panic still hands back a sane
-/// terminal.
-pub struct TerminalGuard;
+/// whole TUI lives inside one of these. A panic restores it too — through a
+/// panic hook, because the release profile aborts and never runs `Drop` — so
+/// the message lands readable on the normal screen (Iris pager emergency_restore).
+pub struct TerminalGuard {
+    pub keyboard_enhanced: bool,
+}
 
-impl TerminalGuard {
-    pub fn enter() -> std::io::Result<Self> {
-        // Alt screen first: if raw mode then fails, the terminal is still
-        // restored (raw-first would strand the terminal on alt-screen failure).
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
-        if let Err(error) = crossterm::terminal::enable_raw_mode() {
-            let _ =
-                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-            return Err(error);
-        }
-        Ok(Self)
+/// Whether a guard holds the terminal; one flag arbitrates Drop and the hook,
+/// so the restore sequence is written exactly once.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+static ENHANCED: AtomicBool = AtomicBool::new(false);
+static HOOK: std::sync::Once = std::sync::Once::new();
+/// A panic while the alternate screen is up (an unwinding build): its message
+/// is printed once the normal screen is back, where it can be read.
+static PANIC_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn restore_terminal(out: &mut impl std::io::Write) {
+    if !ACTIVE.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    if ENHANCED.swap(false, Ordering::SeqCst) {
+        let _ = crossterm::execute!(out, crossterm::event::PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(
+        out,
+        crossterm::terminal::EndSynchronizedUpdate,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture,
+        crossterm::cursor::Show,
+        crossterm::terminal::LeaveAlternateScreen
+    );
+    let _ = crossterm::terminal::disable_raw_mode();
+    if let Some(message) = PANIC_MESSAGE.lock().ok().and_then(|mut m| m.take()) {
+        eprintln!("{message}");
     }
 }
 
+impl TerminalGuard {
+    pub fn enter() -> std::io::Result<Self> {
+        // Under `panic = "abort"` Drop never runs: the hook restores. Under
+        // unwinding the guard's Drop does (a panic a task survives must not
+        // break a live TUI), and the message waits for the normal screen —
+        // printed on the alternate one, it would vanish with it.
+        HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if cfg!(panic = "abort") {
+                    restore_terminal(&mut std::io::stdout());
+                    previous(info);
+                } else if ACTIVE.load(Ordering::SeqCst) {
+                    let thread = std::thread::current();
+                    let message =
+                        format!("thread '{}' {info}", thread.name().unwrap_or("<unnamed>"));
+                    if let Ok(mut slot) = PANIC_MESSAGE.lock() {
+                        slot.get_or_insert(message);
+                    }
+                } else {
+                    previous(info);
+                }
+            }));
+        });
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        ACTIVE.store(true, Ordering::SeqCst);
+        // Construct the guard before fallible setup: every error restores the terminal.
+        let mut guard = Self {
+            keyboard_enhanced: false,
+        };
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableMouseCapture
+        )?;
+        guard.keyboard_enhanced =
+            crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        if guard.keyboard_enhanced {
+            crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                )
+            )?;
+            ENHANCED.store(true, Ordering::SeqCst);
+        }
+        Ok(guard)
+    }
+}
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-        let _ = crossterm::terminal::disable_raw_mode();
+        restore_terminal(&mut std::io::stdout());
     }
 }
 
@@ -340,5 +434,53 @@ mod tests {
             .await;
         assert_eq!(decision, Decision::Permit);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_restore_sequence_is_written_once_and_leaves_every_mode() {
+        ACTIVE.store(true, Ordering::SeqCst);
+        ENHANCED.store(true, Ordering::SeqCst);
+        let mut out: Vec<u8> = vec![];
+        restore_terminal(&mut out);
+        let text = String::from_utf8_lossy(&out);
+        for seq in [
+            "\x1b[<1u",
+            "\x1b[?2004l",
+            "\x1b[?1000l",
+            "\x1b[?25h",
+            "\x1b[?1049l",
+        ] {
+            assert!(text.contains(seq), "{seq:?} missing from {text:?}");
+        }
+        // A second restore (Drop after the panic hook) writes nothing.
+        let mut again: Vec<u8> = vec![];
+        restore_terminal(&mut again);
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn parent_and_child_sinks_share_one_strictly_increasing_clock() {
+        let (parent, mut rx) = TuiSink::new();
+        let child = parent.child("w1");
+        // Interleave the two sinks; one shared claim clock must keep the
+        // combined emission order and the stamp order identical.
+        for _ in 0..16 {
+            parent.emit(AgentEvent::TurnStarted);
+            child.emit(AgentEvent::TurnStarted);
+        }
+        let mut last: Option<u64> = None;
+        let mut seen = 0;
+        while let Ok(UiEvent::Agent(stamped)) = rx.try_recv() {
+            if let Some(previous) = last {
+                assert!(
+                    stamped.at_ms > previous,
+                    "stamp {} did not increase past {previous}",
+                    stamped.at_ms
+                );
+            }
+            last = Some(stamped.at_ms);
+            seen += 1;
+        }
+        assert_eq!(seen, 32, "every emit reached the channel");
     }
 }

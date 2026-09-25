@@ -168,6 +168,8 @@ fn diff() -> Screen {
             },
         ],
         grantable: true,
+        files: vec![],
+        note: None,
     }));
     s
 }
@@ -175,6 +177,7 @@ fn diff() -> Screen {
 fn permission() -> Screen {
     let mut s = Screen::new(true);
     s.approval = Some(Approval::Permission(PermissionView {
+        tool: "shell".into(),
         command: "rm -rf target/".into(),
         rows: vec![
             ("cwd".into(), "~/dev/phaseone".into()),

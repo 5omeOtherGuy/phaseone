@@ -1,0 +1,4 @@
+  ▸ write     src/new.rs                                 ✓ 3 lines written  
+    1  + pub fn answer() -> u8 {                                            
+    2  +     42                                                             
+    3  + }                                                                  

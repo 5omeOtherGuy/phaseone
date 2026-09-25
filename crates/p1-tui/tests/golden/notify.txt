@@ -1,0 +1,4 @@
+  ▸ notify    renderer returned                          ✓ 420ms · 3 lines  
+  verdict  Width sweep passed at 80–200 columns                             
+  files    3 written, all inside owned paths                                
+  ↳ review staged worktree before merge                                     

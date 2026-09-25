@@ -1,0 +1,40 @@
+
+    ! edit      p1-context/src/edge.rs                                                          +1 −1 · 1 of 3 files
+    410    let ready = worker.take_summary();
+    412  -     block_until_ready(&worker);
+    412  +     if let Some(summary) = ready {
+     y  allow once    a  session    p  project    n  deny                                      p: no trust store yet
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ›
+    ⏎ send   ⇧⏎ newline                                                                              /help   ^C quit
+
+    p1    effort —                                                                         ctx —   spend —   0h00   —
+

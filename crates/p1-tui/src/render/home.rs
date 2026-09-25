@@ -48,12 +48,12 @@ pub(super) fn draw(area: Rect, buf: &mut Buffer) {
                     buf[(px, py)].set_char('●').set_fg(palette::INK);
                     if row.as_bytes().get(x + 1) == Some(&b'1') {
                         for dx in 1..step_x {
-                            buf[(px + dx, py)].set_char('─').set_fg(palette::DIM);
+                            buf[(px + dx, py)].set_char('·').set_fg(palette::DIM);
                         }
                     }
                     if rows.get(y + 1).is_some_and(|r| r.as_bytes()[x] == b'1') {
                         for dy in 1..step_y {
-                            buf[(px, py + dy)].set_char('│').set_fg(palette::DIM);
+                            buf[(px, py + dy)].set_char('·').set_fg(palette::DIM);
                         }
                     }
                 }

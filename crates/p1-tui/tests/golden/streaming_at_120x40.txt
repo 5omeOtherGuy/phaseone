@@ -1,0 +1,40 @@
+
+    · reasoning 4.2s   ^R expand
+
+    The hard-pressure wait in `p1-context` blocks the turn boundary
+    instead of applying the summary.
+
+    ▸ read      p1-context/src/edge.rs                 ✓ 412 lines · 824 B
+      1  x
+      2  x
+      3  x
+      4  x
+      5  x
+      6  x
+      7  x
+      8  x
+      9  x
+     10  x
+     11  x
+     12  x
+     13  x
+     14  x
+     15  x
+     16  x
+     17  x
+     18  x
+     19  x
+     20  x
+     21  x
+     22  x
+     23  x
+     24  x
+    · 388 more lines folded → [h-dfd9]                     ^O open in pane
+
+    ▸ shell     cargo test -p p1-context boundary                      ▪▪▪
+
+    ›
+    ⏎ steer   ⇧⏎ newline   ⌥⏎ follow-up                          ^C cancel
+
+    claude    effort —
+

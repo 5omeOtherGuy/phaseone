@@ -1,0 +1,2 @@
+  ▸ stop      worker-1                                    ✓ 420ms · 1 line  
+  local agent · 6 calls spent · worktree kept                               

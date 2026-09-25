@@ -69,6 +69,27 @@ impl Inbox {
         shared.notify.notify_one();
         true
     }
+
+    /// Take back every message of `kind` that has not been delivered yet, in
+    /// the order it was sent; other kinds stay queued. A host calls this when
+    /// the operator cancels: queued steering belongs to the cancelled work and
+    /// must not start a new turn (ADR-0047).
+    pub fn withdraw(&self, kind: InboxKind) -> Vec<String> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let mut queue = shared.queue.lock().unwrap();
+        let mut taken = Vec::new();
+        queue.retain(|(k, text)| {
+            if *k == kind {
+                taken.push(text.clone());
+                false
+            } else {
+                true
+            }
+        });
+        taken
+    }
 }
 
 /// One agent. Single owner of its state: `run_turn` takes `&mut self`.
