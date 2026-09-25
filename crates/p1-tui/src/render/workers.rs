@@ -130,18 +130,33 @@ pub struct WorkersPane {
 /// form (grid 48); the footer drops `x stop` in the compact form (mock-
 /// verified: `el-workers-pane-38`).
 pub fn render(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'static>> {
+    render_with(pane, width, compact, None)
+}
+
+/// Render WORKERS with an optional pending stop confirmation in the footer.
+pub fn render_with(
+    pane: &WorkersPane,
+    width: usize,
+    compact: bool,
+    stop_pending: Option<&str>,
+) -> Vec<Line<'static>> {
     let mut out = render_body(pane, width, compact);
     out.push(blank_row(width));
-    out.push(footer_line(width, compact));
+    out.push(footer_line(width, compact, stop_pending));
     out
+}
+
+/// WORKERS rows in their stable display order (handoff §9.4).
+pub fn display_order(pane: &WorkersPane) -> Vec<&WorkerBlock> {
+    let mut sorted: Vec<&WorkerBlock> = pane.workers.iter().collect();
+    sorted.sort_by_key(|worker| worker.state.rank());
+    sorted
 }
 
 /// Shared body without the live selection/action footer.
 pub(crate) fn render_body(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'static>> {
-    let mut sorted: Vec<&WorkerBlock> = pane.workers.iter().collect();
-    sorted.sort_by_key(|w| w.state.rank());
     let mut out = vec![header_line(&pane.header, width)];
-    for worker in sorted {
+    for worker in display_order(pane) {
         out.push(blank_row(width));
         let focused = pane.focused.as_deref() == Some(worker.id.as_str());
         if compact {
@@ -387,7 +402,20 @@ fn compact_block(worker: &WorkerBlock, width: usize, focused: bool) -> Vec<Line<
     ]
 }
 
-fn footer_line(width: usize, compact: bool) -> Line<'static> {
+fn footer_line(width: usize, compact: bool, stop_pending: Option<&str>) -> Line<'static> {
+    if let Some(id) = stop_pending {
+        return Band {
+            bg: palette::AMBER_FILL,
+            left: vec![Seg::new(
+                palette::ON_FILL,
+                format!("stop {id}?   y stop   n keep"),
+            )],
+            right: vec![],
+            width,
+            pad: 4,
+        }
+        .render();
+    }
     let text = if compact {
         "^F select   a attach"
     } else {

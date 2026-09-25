@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{Approval, PaneWidth, Screen};
+use crate::state::{Approval, PaneMode, PaneWidth, Screen};
 
 /// What a keypress asks the driver to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,8 @@ pub enum Command {
     /// `Up` / `Down` with pane focus: scroll the pane.
     PaneUp,
     PaneDown,
+    /// `y` on a pending worker stop: cancel that worker through the host service.
+    StopWorker(String),
 }
 
 /// A key decision that only changes what the screen shows. The TUI performs these itself
@@ -79,6 +81,14 @@ pub enum ViewCommand {
     Effort(isize),
     /// `^F`, and `esc` while the pane has focus.
     TogglePaneFocus,
+    /// `⏎` / `a` on the focused WORKERS row (handoff §9.5).
+    AttachWorker,
+    /// `x` on the focused WORKERS row: ask before stopping it.
+    AskStopWorker,
+    /// `n` / `esc` on the pending worker stop: keep it running.
+    KeepWorker,
+    /// `esc` while a worker transcript is attached.
+    DetachWorker,
     /// `^G`: the goal, prefilled, in the composer.
     EditGoal,
     /// `esc` during a goal edit: the previous composer text comes back.
@@ -172,9 +182,33 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
             _ => None,
         };
     }
+    if let Some(id) = &screen.stop_pending {
+        return match (key.code, ctrl) {
+            (KeyCode::Char('y'), false) => Some(C(Command::StopWorker(id.clone()))),
+            (KeyCode::Char('n'), false) | (KeyCode::Esc, false) => Some(V(ViewCommand::KeepWorker)),
+            (KeyCode::Char('c'), true) => Some(C(Command::CancelOrQuit)),
+            _ => None,
+        };
+    }
     let pane_shown =
         !screen.focus && (screen.pane_width != PaneWidth::Off || screen.ledger_overlay);
     match (key.code, ctrl, alt) {
+        (KeyCode::Enter, false, false) | (KeyCode::Char('a'), false, false)
+            if key.modifiers.is_empty()
+                && screen.pane_focused
+                && screen.pane_mode == PaneMode::Workers
+                && screen.workers.focused.is_some() =>
+        {
+            Some(V(ViewCommand::AttachWorker))
+        }
+        (KeyCode::Char('x'), false, false)
+            if key.modifiers.is_empty()
+                && screen.pane_focused
+                && screen.pane_mode == PaneMode::Workers
+                && (screen.attached.is_some() || screen.workers.focused.is_some()) =>
+        {
+            Some(V(ViewCommand::AskStopWorker))
+        }
         (KeyCode::Enter, false, false) => {
             let text = screen.composer.text.clone();
             if text.trim().is_empty() {
@@ -209,12 +243,14 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
         (KeyCode::PageUp, false, false) => Some(V(ViewCommand::PageUp)),
         (KeyCode::PageDown, false, false) => Some(V(ViewCommand::PageDown)),
         // esc order (menus and overlays were handled above): goal edit → ledger overlay →
-        // pane focus → scrolled view.
+        // attached worker → pane focus → scrolled view.
         (KeyCode::Esc, false, false) => {
             if screen.composer.editing_goal() {
                 Some(V(ViewCommand::KeepComposer))
             } else if screen.ledger_overlay {
                 Some(C(Command::ToggleLedgerOverlay))
+            } else if screen.attached.is_some() {
+                Some(V(ViewCommand::DetachWorker))
             } else if screen.pane_focused {
                 Some(V(ViewCommand::TogglePaneFocus))
             } else if screen.scroll_top.is_some() {
@@ -545,5 +581,115 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(handle(&s, key(KeyCode::Down)), Some(Command::PaneDown));
+    }
+
+    #[test]
+    fn worker_focus_attaches_with_enter_or_a_but_unfocused_composer_keys_are_unchanged() {
+        let mut s = Screen {
+            pane_focused: true,
+            pane_mode: PaneMode::Workers,
+            ..Default::default()
+        };
+        s.workers.focused = Some("w2".into());
+
+        assert_eq!(
+            decide(&s, key(KeyCode::Enter)),
+            view(ViewCommand::AttachWorker)
+        );
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('a'))),
+            view(ViewCommand::AttachWorker)
+        );
+
+        s.pane_focused = false;
+        s.composer.text = "hi".into();
+        assert_eq!(
+            decide(&s, key(KeyCode::Enter)),
+            command(Command::Submit("hi".into()))
+        );
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('a'))),
+            command(Command::Insert('a'))
+        );
+    }
+
+    #[test]
+    fn worker_focus_asks_before_stopping_and_unfocused_x_types() {
+        let mut s = Screen {
+            pane_focused: true,
+            pane_mode: PaneMode::Workers,
+            ..Default::default()
+        };
+        s.workers.focused = Some("w2".into());
+
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('x'))),
+            view(ViewCommand::AskStopWorker)
+        );
+        s.pane_focused = false;
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('x'))),
+            command(Command::Insert('x'))
+        );
+    }
+
+    #[test]
+    fn the_pending_worker_stop_is_modal() {
+        let s = Screen {
+            stop_pending: Some("w2".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('y'))),
+            command(Command::StopWorker("w2".into()))
+        );
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            assert_eq!(decide(&s, key(code)), view(ViewCommand::KeepWorker));
+        }
+        assert_eq!(decide(&s, key(KeyCode::Char('a'))), None);
+        assert_eq!(decide(&s, ctrl('c')), command(Command::CancelOrQuit));
+    }
+
+    #[test]
+    fn an_approval_wins_over_a_pending_worker_stop() {
+        let s = Screen {
+            approval: permission_approval(),
+            stop_pending: Some("w2".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('y'))),
+            command(Command::ApproveOnce)
+        );
+    }
+
+    #[test]
+    fn esc_detaches_after_the_ledger_overlay_and_before_pane_focus() {
+        let mut s = Screen {
+            attached: Some(crate::state::AttachedWorker {
+                id: "w2".into(),
+                route: "route".into(),
+                state: crate::render::workers::BlockState::Running,
+                transcript: crate::transcript::Transcript::new(),
+            }),
+            ledger_overlay: true,
+            pane_focused: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            decide(&s, key(KeyCode::Esc)),
+            command(Command::ToggleLedgerOverlay)
+        );
+        s.ledger_overlay = false;
+        assert_eq!(
+            decide(&s, key(KeyCode::Esc)),
+            view(ViewCommand::DetachWorker)
+        );
+        s.attached = None;
+        assert_eq!(
+            decide(&s, key(KeyCode::Esc)),
+            view(ViewCommand::TogglePaneFocus)
+        );
     }
 }

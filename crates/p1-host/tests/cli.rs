@@ -114,6 +114,52 @@ fn help_version_and_unknown_flag() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown flag"));
 }
 
+/// A typo of a subcommand is a usage error: exit 2 with no provider request, no
+/// journal and no run state — the bug in issue #83 was that `p1 envs` started a
+/// headless agent instead (issue #83).
+#[test]
+fn a_subcommand_typo_exits_two_without_running() {
+    // `envs` (the reported typo) and the two the owner named, `modles` and `loginn`.
+    for (typo, meant) in [("envs", "env"), ("modles", "models"), ("loginn", "login")] {
+        let home = tempfile::tempdir().unwrap();
+        let output = isolated(home.path()).arg(typo).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{typo} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("unknown command '{typo}'")),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("did you mean '{meant}'?")),
+            "{stderr}"
+        );
+        assert!(stderr.contains(&format!("p1 -- {typo}")), "{stderr}");
+        assert!(
+            stderr.contains("usage:"),
+            "a usage error prints the usage: {stderr}"
+        );
+        // No agent ran: nothing was written under the scratch home.
+        let leftovers: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no state written for {typo}, found {leftovers:?}"
+        );
+    }
+
+    // `--help` documents `--`.
+    let output = p1().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("p1 -- envs"), "help must document --: {help}");
+}
+
 #[test]
 fn yes_with_ask_is_a_usage_error() {
     let output = p1().args(["--yes", "--ask", "go"]).output().unwrap();
