@@ -282,6 +282,36 @@ class ReleaseManifestTest(unittest.TestCase):
             },
         )
 
+    def test_schema_scan_stays_at_the_schema_directory_top_level(self) -> None:
+        # The format fixes the schema set as schema/*.json (one level) and only the WIT
+        # set as **/*.wit, so a nested schema is not part of the manifest S7.2 verifies.
+        write_file(
+            os.path.join(
+                self.root,
+                "crates",
+                "p1-module-protocol",
+                "schema",
+                "nested",
+                "extra.json",
+            ),
+            b'{"title": "nested"}\n',
+        )
+        self.write_wit("nested/p1.wit", b"(component)\n")
+
+        manifest = self.generate_ok()
+
+        self.assertEqual(
+            [entry["path"] for entry in manifest["schemas"]],
+            [
+                "crates/p1-module-protocol/schema/stream-event.json",
+                "crates/p1-module-protocol/schema/usage.json",
+            ],
+        )
+        self.assertEqual(
+            [entry["path"] for entry in manifest["wit"]],
+            ["modules/wit/nested/p1.wit"],
+        )
+
     def test_every_array_is_sorted_by_path(self) -> None:
         # Creation order is deliberately not sorted, so a pass means the generator sorts.
         self.write_package("zeta.wasm", b"z\n")

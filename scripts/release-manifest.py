@@ -148,21 +148,36 @@ def walk_packages(packages_dir: str) -> list[tuple[str, str, int]]:
     return found
 
 
-def digest_entries(root: str, directory: str, suffix: str, what: str) -> list[dict[str, str]]:
-    """Digest every regular file ending in `suffix` below `directory`, sorted by path."""
+def digest_entries(
+    root: str, directory: str, suffix: str, what: str, *, recursive: bool = True
+) -> list[dict[str, str]]:
+    """Digest every regular file ending in `suffix` below `directory`, sorted by path.
+
+    `recursive` is False for the schema set, which the format fixes at one level
+    (schema/*.json — only the WIT set is **/*.wit), so a future subdirectory under
+    schema/ contributes nothing the installer would have to expect. A missing directory
+    is the scaffold stage, where that set is still empty.
+    """
+    if not os.path.isdir(directory):
+        return []
+
+    found: list[tuple[str, str]] = []
+    if recursive:
+        for dirpath, dirnames, filenames in os.walk(directory):
+            dirnames.sort()
+            found.extend((dirpath, name) for name in sorted(filenames))
+    else:
+        found.extend((directory, name) for name in sorted(os.listdir(directory)))
+
     entries: list[dict[str, str]] = []
-    for dirpath, dirnames, filenames in os.walk(directory):
-        dirnames.sort()
-        for name in sorted(filenames):
-            if not name.endswith(suffix):
-                continue
-            full = os.path.join(dirpath, name)
-            if os.path.islink(full) or not os.path.isfile(full):
-                raise ManifestError(f"{full}: {what} is not a regular file")
-            rel = check_relpath(
-                os.path.relpath(full, root).replace(os.sep, "/"), what
-            )
-            entries.append({"path": rel, "sha256": sha256_file(full)})
+    for dirpath, name in found:
+        if not name.endswith(suffix):
+            continue
+        full = os.path.join(dirpath, name)
+        if os.path.islink(full) or not os.path.isfile(full):
+            raise ManifestError(f"{full}: {what} is not a regular file")
+        rel = check_relpath(os.path.relpath(full, root).replace(os.sep, "/"), what)
+        entries.append({"path": rel, "sha256": sha256_file(full)})
     entries.sort(key=lambda entry: str(entry["path"]))
     return entries
 
@@ -224,6 +239,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
             os.path.join(root, "crates", "p1-module-protocol", "schema"),
             ".json",
             "schema entry",
+            recursive=False,
         ),
         "packages": packages,
         # The entry shape is fixed by the freeze tag wasm-boundary-v1; before it, empty.
