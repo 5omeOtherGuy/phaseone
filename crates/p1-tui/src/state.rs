@@ -15,7 +15,7 @@ use crate::render::ledger::{
     ContextView, FoldRef, LedgerPane, LedgerSpend, SessionView, WorkersSummary, WorkspaceView,
 };
 use crate::render::picker::Picker;
-use crate::render::workers::{BlockState, WorkerBlock, WorkersPane};
+use crate::render::workers::{BlockState, WorkerBlock, WorkersPane, display_order};
 use crate::transcript::{Block, Transcript};
 
 /// A pending approval (handoff §7.5): inline as the transcript's running element, or the full
@@ -647,7 +647,7 @@ impl Screen {
                     menu.step_effort(delta);
                 }
             }
-            V::TogglePaneFocus => self.pane_focused = !self.pane_focused,
+            V::TogglePaneFocus => self.toggle_pane_focus(),
             V::EditGoal => self.edit_goal(),
             V::KeepComposer => self.composer.keep(),
             V::ToggleReview => self.toggle_review(),
@@ -732,6 +732,12 @@ impl Screen {
                 self.pane_width = saved;
             }
         }
+        if self.pane_focused
+            && self.pane_mode == PaneMode::Workers
+            && self.workers.focused.is_none()
+        {
+            self.select_first_worker();
+        }
     }
     /// Open a fold handle in the OUTPUT pane (`^O`): switches the pane to
     /// OUTPUT mode and widens it if it is hidden.
@@ -743,6 +749,57 @@ impl Screen {
         if matches!(self.pane_width, PaneWidth::Off) {
             self.pane_width = PaneWidth::Wide;
         }
+    }
+
+    fn toggle_pane_focus(&mut self) {
+        self.pane_focused = !self.pane_focused;
+        if !self.pane_focused {
+            self.workers.focused = None;
+            return;
+        }
+        if self.pane_mode != PaneMode::Workers {
+            return;
+        }
+        let order = display_order(&self.workers);
+        let selected_is_present = self
+            .workers
+            .focused
+            .as_deref()
+            .is_some_and(|id| order.iter().any(|worker| worker.id == id));
+        if !selected_is_present {
+            self.select_first_worker();
+        }
+    }
+
+    /// Move the focused WORKERS selection, or scroll OUTPUT when another pane mode owns arrows.
+    pub fn pane_step(&mut self, delta: isize) {
+        if self.pane_mode != PaneMode::Workers {
+            self.scroll_output_by(delta);
+            return;
+        }
+        let order = display_order(&self.workers);
+        let Some(last) = order.len().checked_sub(1) else {
+            return;
+        };
+        let current = self.workers.focused.as_deref().and_then(|id| {
+            order
+                .iter()
+                .position(|worker| worker.id == id)
+                .map(|index| index as isize)
+        });
+        let next = match current {
+            Some(current) => current.saturating_add(delta).clamp(0, last as isize) as usize,
+            None if delta > 0 => 0,
+            None if delta < 0 => last,
+            None => return,
+        };
+        self.workers.focused = Some(order[next].id.clone());
+    }
+
+    fn select_first_worker(&mut self) {
+        self.workers.focused = display_order(&self.workers)
+            .first()
+            .map(|worker| worker.id.clone());
     }
 
     /// Scroll the OUTPUT pane's content.
