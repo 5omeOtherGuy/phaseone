@@ -20,11 +20,12 @@ module = "finish"
 # Same endpoint and model as environments/deepseek, the owner's second OpenCode Go account. Sources
 # (2026-09-24): gateway metadata (models.dev/api.json, provider `opencode-go`,
 # `deepseek-v4.1-flash`: context 1000000, output 384000) and the vendor api-docs.deepseek.com
-# ("CONTEXT LENGTH 1M"); 300k stays for the reason recorded in environments/deepseek. Summarize
-# late, keep a long tail — a task that must hold several large files at once thrashes below ~100k.
+# ("CONTEXT LENGTH 1M"); 300k and the 96,000 reserve stay for the reasons recorded in
+# environments/deepseek (run split4a2-deepseek reported 71,337 reasoning tokens). Summarize late,
+# keep a long tail — a task that must hold several large files at once thrashes below ~100k.
 [context]
 window_tokens = 1000000
-output_headroom_tokens = 32000
+output_headroom_tokens = 96000
 summarize_at_tokens = 300000
 keep_recent_tokens = 60000
 user_verbatim_tokens = 8000
