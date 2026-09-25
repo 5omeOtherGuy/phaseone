@@ -7,12 +7,20 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-/// A driver with an `--ask`-off policy and no wiring behind it.
-fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
-    let (policy, auth) = TuiPolicy::new(false, CancellationToken::new());
-    // A minimal real agent, for its inbox handle.
-    let agent = Agent::new(p1_core::AgentParts {
-        provider: Arc::new(p1_testkit::ScriptedProvider::new(vec![])),
+/// A minimal real agent, for its inbox handle and (in the loop tests) for the
+/// `&mut Agent` the run loop drives. Its provider never answers, so a turn is
+/// never run through it: a test that runs one to its end builds its own agent
+/// with [`agent_with`] (and scripts a provider that does answer).
+fn test_agent() -> Agent {
+    agent_with(Arc::new(p1_testkit::ScriptedProvider::new(vec![])))
+}
+
+/// An agent over `provider`: no tools, no authorization prompt, in-memory
+/// journal. Its inbox handle is what the driver uses. The handle stays with the
+/// caller, so a test can see how many turns the fake was asked for.
+fn agent_with(provider: Arc<p1_testkit::ScriptedProvider>) -> Agent {
+    Agent::new(p1_core::AgentParts {
+        provider,
         tools: vec![],
         system_prompt: String::new(),
         options: p1_contracts::ModelOptions::default(),
@@ -27,7 +35,27 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
         journal: Arc::new(p1_journal::MemoryJournal::new()),
         events: Arc::new(p1_tui::runtime::TuiSink::new().0),
     })
-    .expect("agent builds");
+    .expect("agent builds")
+}
+
+/// One scripted turn that RESOLVES on its first poll: a stream that ends with no
+/// events is a transport failure (SPEC §3d), which ends the turn immediately —
+/// the provider is asked nothing further, so a later turn needs another step.
+fn resolving_turn() -> p1_testkit::Step {
+    p1_testkit::Step::Events(vec![])
+}
+
+/// A driver with an `--ask`-off policy and no wiring behind it.
+fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
+    driver_with(false)
+}
+
+/// A driver whose policy is `--ask` (`true`) or full access: the idle-loop tests
+/// park a real authorization on the ask one (handoff §7.5).
+fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
+    let (policy, auth) = TuiPolicy::new(ask, CancellationToken::new());
+    // A minimal real agent, for its inbox handle.
+    let agent = test_agent();
     (
         Driver {
             screen: Screen::new(true),
@@ -36,7 +64,7 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             model: "sonnet-4.5".into(),
             workspace: std::env::current_dir().unwrap(),
             sandbox: "off".into(),
-            ask: false,
+            ask,
             policy: Arc::new(policy),
             pending_auth: VecDeque::new(),
             pinned_by_approval: false,
@@ -440,23 +468,7 @@ fn response_completed_computes_ctx_from_the_configured_window() {
 /// A driver plus the agent whose inbox handle it holds.
 fn driver_with_agent() -> (Driver, Agent) {
     let (mut d, _auth) = driver();
-    let agent = Agent::new(p1_core::AgentParts {
-        provider: Arc::new(p1_testkit::ScriptedProvider::new(vec![])),
-        tools: vec![],
-        system_prompt: String::new(),
-        options: p1_contracts::ModelOptions::default(),
-        context: Arc::new(crate::run::DefaultContext),
-        authorization: Arc::new(crate::policy::HostPolicy::new(
-            false,
-            false,
-            Arc::new(crate::StdinLines::new()),
-            Arc::new(std::sync::Mutex::new(Box::new(std::io::sink()))),
-            CancellationToken::new(),
-        )),
-        journal: Arc::new(p1_journal::MemoryJournal::new()),
-        events: Arc::new(p1_tui::runtime::TuiSink::new().0),
-    })
-    .expect("agent builds");
+    let agent = test_agent();
     d.inbox = agent.inbox();
     (d, agent)
 }
@@ -788,6 +800,27 @@ fn a_renamed_edit_face_and_an_apply_patch_call_track_both_files() {
     );
 }
 
+// ------------------------------------------------------ the idle redraw policy
+
+/// One WORKERS row for the redraw tests: running, with a fixed elapsed string
+/// (the real refresher's own field) so nothing in the row moves on its own.
+fn worker_row() -> p1_tui::render::workers::WorkerBlock {
+    use p1_tui::render::workers::{BlockState, WorkerBlock};
+    WorkerBlock {
+        id: "w1".into(),
+        task: "inspect the parser".into(),
+        route: "deepseek/v4.1-flash".into(),
+        model: None,
+        state: BlockState::Running,
+        elapsed: Some("0m00s".into()),
+        cost_micro_usd: None,
+        tokens: None,
+        context_window: None,
+        grants: "read, edit".into(),
+        activity: String::new(),
+    }
+}
+
 fn worker_response(id: &str, model: &str, usage: Option<p1_contracts::Usage>) -> UiEvent {
     UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms: 0,
@@ -814,6 +847,765 @@ fn worker_test_row(id: &str) -> p1_tui::render::workers::WorkerBlock {
         grants: String::new(),
         activity: String::new(),
     }
+}
+
+/// A key stream over a channel, so a script can deliver an input at a chosen
+/// simulated instant — the shape `run` builds from crossterm's events.
+fn key_stream(
+    rx: mpsc::UnboundedReceiver<Input>,
+) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Input>>> {
+    Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|input| (input, rx))
+    }))
+}
+
+/// The handles a test script uses to poke the running loop.
+#[derive(Clone)]
+struct Wires {
+    keys: mpsc::UnboundedSender<Input>,
+    /// The loop's UI event channel (the tests stamp their own events).
+    events: mpsc::UnboundedSender<UiEvent>,
+    rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
+    /// The driver's policy: an `authorize` call on it parks a request on the
+    /// screen when the driver is under `--ask`.
+    policy: Arc<TuiPolicy>,
+    cancel: CancellationToken,
+    draws: DrawCounter,
+}
+
+/// The real idle loop (`drive_loop`) over a test backend: a test runs a script
+/// beside it under paused tokio time (`#[tokio::test(start_paused = true)]`), so
+/// every `sleep` in a script is the runtime's own frozen clock — no real time
+/// passes, and no assertion here is a timing measurement.
+struct IdleLoop<B: Backend> {
+    terminal: ratatui::Terminal<B>,
+    driver: Driver,
+    agent: Agent,
+    keys: mpsc::UnboundedReceiver<Input>,
+    events: mpsc::UnboundedReceiver<UiEvent>,
+    auth: mpsc::UnboundedReceiver<AuthRequest>,
+    sink: TuiSink,
+    cancel: CancellationToken,
+    redraws: Redraws,
+    wires: Wires,
+}
+
+impl IdleLoop<ratatui::backend::TestBackend> {
+    fn new() -> Self {
+        Self::with_ask(false)
+    }
+
+    /// With `--ask` (`true`), an authorization parks on the screen — a frame
+    /// input of its own.
+    fn with_ask(ask: bool) -> Self {
+        Self::with_backend(ratatui::backend::TestBackend::new(96, 24), ask)
+    }
+}
+
+impl<B: Backend> IdleLoop<B> {
+    fn with_backend(backend: B, ask: bool) -> Self {
+        Self::with_agent(backend, ask, test_agent())
+    }
+
+    /// A loop over a test's own agent. `test_agent`'s provider never answers, so
+    /// only a test that runs a turn to its end needs this.
+    fn with_agent(backend: B, ask: bool, agent: Agent) -> Self {
+        let (mut driver, auth) = driver_with(ask);
+        driver.inbox = agent.inbox();
+        // The sink is the loop's clock — the production wiring — while the
+        // events the tests inject go over their own channel, so a test stamps
+        // its own `at_ms` (`run` gets both from the one sink).
+        let (sink, _unused) = TuiSink::new();
+        let (events, event_rx) = mpsc::unbounded_channel();
+        let (keys, key_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let draws = DrawCounter::default();
+        let wires = Wires {
+            keys,
+            events,
+            rows: driver.worker_rows.clone(),
+            policy: driver.policy.clone(),
+            cancel: cancel.clone(),
+            draws: draws.clone(),
+        };
+        Self {
+            terminal: ratatui::Terminal::new(backend).expect("the test terminal builds"),
+            driver,
+            agent,
+            keys: key_rx,
+            events: event_rx,
+            auth,
+            sink,
+            cancel,
+            redraws: Redraws::new(draws),
+            wires,
+        }
+    }
+
+    /// Run the loop beside `script` until the script finishes (its own `cancel`
+    /// normally ends the loop first). What the loop drew is the test's to assert
+    /// on, through its clone of the counter.
+    async fn run<S: std::future::Future<Output = ()>>(self, script: S) {
+        tokio::select! {
+            _ = self.run_to_end() => {}
+            () = script => {}
+        }
+    }
+
+    /// Run the loop until it returns — its exit code.
+    async fn run_to_end(self) -> i32 {
+        self.run_to_end_with_driver().await.0
+    }
+
+    /// Run the loop until it returns, handing the driver back as well: a test
+    /// that needs to see the state the loop left behind (which prompts it
+    /// started, what it queued) reads it here.
+    async fn run_to_end_with_driver(self) -> (i32, Driver) {
+        let IdleLoop {
+            mut terminal,
+            mut driver,
+            mut agent,
+            keys,
+            events,
+            auth,
+            sink,
+            cancel,
+            redraws,
+            ..
+        } = self;
+        let keys = key_stream(keys);
+        let code = drive_loop(
+            &mut terminal,
+            &mut driver,
+            &mut agent,
+            keys,
+            events,
+            auth,
+            &cancel,
+            &sink,
+            ColorMode::TrueColor,
+            redraws,
+        )
+        .await;
+        (code, driver)
+    }
+}
+
+/// The operator's lines, in order: the prompts the loop actually started. The
+/// transcript is the loop's own record — a queued follow-up lands here when the
+/// turn boundary takes it, not when it is queued.
+fn operator_prompts(driver: &Driver) -> Vec<&str> {
+    driver
+        .screen
+        .transcript
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            p1_tui::transcript::Block::Operator { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Everything a drawn frame left on the terminal — the tests' way to read what
+/// actually reached the screen (the backend's own cell buffer).
+fn frame_text<B: ScreenText>(terminal: &ratatui::Terminal<B>) -> String {
+    terminal.backend().screen_text()
+}
+
+/// A test backend whose drawn frame a test can read back row by row.
+trait ScreenText: Backend {
+    fn screen_text(&self) -> String;
+}
+
+/// The cell grid of a `TestBackend`'s buffer, row by row.
+fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+    let area = buffer.area;
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl ScreenText for ratatui::backend::TestBackend {
+    fn screen_text(&self) -> String {
+        buffer_text(self.buffer())
+    }
+}
+
+/// A backend whose `draw` fails until its budget runs out, then hands over to
+/// the `TestBackend` underneath (issue #141 review: a refused frame must not be
+/// recorded as drawn). Every other call is the inner backend's, whose own
+/// error type is `Infallible`.
+struct FailingBackend {
+    inner: ratatui::backend::TestBackend,
+    /// How many more `draw` calls refuse the frame.
+    failures: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FailingBackend {
+    /// The next `failures` frames are refused; the one after them is drawn.
+    fn refusing(failures: usize) -> Self {
+        Self {
+            inner: ratatui::backend::TestBackend::new(96, 24),
+            failures: Arc::new(std::sync::atomic::AtomicUsize::new(failures)),
+        }
+    }
+
+    /// Take one refusal from the budget; `true` when this frame is refused.
+    fn refuse(&self) -> bool {
+        self.failures
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |left| (left > 0).then(|| left - 1),
+            )
+            .is_ok()
+    }
+}
+
+impl ScreenText for FailingBackend {
+    fn screen_text(&self) -> String {
+        buffer_text(self.inner.buffer())
+    }
+}
+
+/// The `TestBackend` never fails; its `Infallible` becomes the `io::Error` this
+/// wrapper must be able to raise from `draw`.
+fn infallible<T>(result: Result<T, std::convert::Infallible>) -> std::io::Result<T> {
+    result.map_err(|never| match never {})
+}
+
+/// The refusal the terminal reports in the failure tests.
+fn terminal_error() -> std::io::Error {
+    std::io::Error::other("the terminal went away")
+}
+
+impl Backend for FailingBackend {
+    type Error = std::io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        if self.refuse() {
+            return Err(terminal_error());
+        }
+        infallible(self.inner.draw(content))
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        infallible(self.inner.hide_cursor())
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        infallible(self.inner.show_cursor())
+    }
+
+    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+        infallible(self.inner.get_cursor_position())
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> std::io::Result<()> {
+        infallible(self.inner.set_cursor_position(position))
+    }
+
+    fn clear(&mut self) -> std::io::Result<()> {
+        infallible(self.inner.clear())
+    }
+
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+        infallible(self.inner.clear_region(clear_type))
+    }
+
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        infallible(self.inner.size())
+    }
+
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        infallible(self.inner.window_size())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        infallible(self.inner.flush())
+    }
+}
+
+/// Issue #141: an idle TUI with no events draws almost nothing. Ten simulated
+/// seconds draw the first frame and nothing else, where the old loop drew 20 a
+/// second; the requirement's bound is one a second.
+#[tokio::test(start_paused = true)]
+async fn an_idle_loop_draws_at_most_once_a_second() {
+    let harness = IdleLoop::new();
+    let wires = harness.wires.clone();
+    let draws = wires.draws.clone();
+    let script = async move {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        wires.cancel.cancel();
+    };
+    harness.run(script).await;
+    let frames = draws.count();
+    assert!(
+        frames >= 1,
+        "the first frame must be drawn before any input"
+    );
+    assert!(
+        frames <= 10,
+        "an idle TUI drew {frames} frames in ten simulated seconds"
+    );
+}
+
+/// Issue #141: worker rows are polled, but only a change draws a frame — and
+/// only one: the polls after it see the rows they already drew.
+#[tokio::test(start_paused = true)]
+async fn a_changed_worker_row_draws_exactly_once() {
+    let harness = IdleLoop::new();
+    let wires = harness.wires.clone();
+    let script = async move {
+        // Let the first frame and a couple of polls pass.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let before = wires.draws.count();
+        wires.rows.lock().unwrap().push(worker_row());
+        // Two polls later than the change needs: the first one drew, the second
+        // saw the same rows.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        wires.cancel.cancel();
+        assert_eq!(
+            wires.draws.count() - before,
+            1,
+            "a changed worker row draws exactly one frame"
+        );
+    };
+    harness.run(script).await;
+}
+
+/// Issue #141: a key is a frame input of its own — it draws at once, without
+/// waiting for the heartbeat (a simulated second away here).
+#[tokio::test(start_paused = true)]
+async fn a_key_draws_immediately() {
+    let harness = IdleLoop::new();
+    let wires = harness.wires.clone();
+    let script = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1550)).await;
+        let before = wires.draws.count();
+        wires
+            .keys
+            .send(Input::Key(key(KeyCode::Char('x'))))
+            .expect("the loop reads keys");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wires.cancel.cancel();
+        assert_eq!(
+            wires.draws.count() - before,
+            1,
+            "a key draws at once, not at the next heartbeat"
+        );
+    };
+    harness.run(script).await;
+}
+
+/// Issue #141: while a turn runs, the `▪▪▪` pulse is the one frame input with
+/// no text to compare, so the heartbeat draws it — at the spinner's 5 Hz, not
+/// the old 20 Hz, and it keeps drawing while the turn is live.
+#[tokio::test(start_paused = true)]
+async fn a_running_turns_pulse_draws_at_the_spinner_heartbeat() {
+    let (mut d, mut auth) = driver();
+    d.screen.reduced_motion = false;
+    d.screen.working = Some(p1_tui::state::Working {
+        label: "shell".into(),
+        started_ms: 0,
+    });
+    let (sink, mut events) = TuiSink::new();
+    let (keys_tx, keys) = mpsc::unbounded_channel();
+    let _keys_tx = keys_tx;
+    let mut keys = key_stream(keys);
+    let turn_cancel = CancellationToken::new();
+    let mut redraws = Redraws::new(DrawCounter::default());
+    let draws = redraws.draws.clone();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(96, 24)).unwrap();
+    let mut running = Box::pin(pump(
+        &mut terminal,
+        &mut d,
+        &mut keys,
+        &mut events,
+        &mut auth,
+        &sink,
+        &turn_cancel,
+        ColorMode::TrueColor,
+        &mut redraws,
+        Box::pin(std::future::pending::<TurnEnd>()),
+    ));
+    let script = async {
+        // Start after the first pulse frame, so the window is exactly one
+        // simulated second of a live turn.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let before = draws.count();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        draws.count() - before
+    };
+    let frames = tokio::select! {
+        _ = &mut running => panic!("the turn future never resolves"),
+        frames = script => frames,
+    };
+    assert!(frames > 0, "the pulse keeps drawing while the turn runs");
+    assert!(
+        frames <= 5,
+        "a running turn drew {frames} pulse frames in one simulated second"
+    );
+}
+
+/// A parent event that fails a tool call: `Screen::apply` raises the §5 PEEK —
+/// the three-second banner the loop must keep counting down (issue #141 review).
+fn failed_tool_event(at_ms: u64) -> UiEvent {
+    UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms,
+        worker: None,
+        event: p1_contracts::AgentEvent::ToolFinished {
+            result: p1_contracts::ToolResultItem {
+                call_id: "c1".into(),
+                name: "shell".into(),
+                status: p1_contracts::ToolStatus::Error,
+                content: "exit 1: no such file".into(),
+            },
+        },
+    })
+}
+
+/// Issue #141 review: a PEEK is a frame input that moves on its own — its
+/// countdown redraws at the 1 Hz heartbeat while the banner is visible, and
+/// exactly one frame erases it once `Screen::tick` expires it, then the loop is
+/// idle again. The simulated instants avoid the 1 s tick boundaries, so the
+/// counts are exact rather than timing races.
+#[tokio::test(start_paused = true)]
+async fn a_peek_countdown_draws_at_the_idle_heartbeat_and_expires() {
+    let harness = IdleLoop::new();
+    let wires = harness.wires.clone();
+    let draws = wires.draws.clone();
+    let script = async move {
+        // The failed call raises the peek at simulated t=0, which is also the
+        // loop's own clock (`at_ms` is stamped by the run's sink).
+        wires
+            .events
+            .send(failed_tool_event(0))
+            .expect("the loop reads events");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let peeked = draws.count();
+        assert_eq!(
+            peeked, 2,
+            "the first frame, then one for the peek: the event draws at once"
+        );
+
+        // t=1000 and t=2000: the countdown moves, so the heartbeat draws it —
+        // one frame a second, not twenty.
+        tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+        let counted = draws.count() - peeked;
+        assert_eq!(
+            counted, 2,
+            "the visible countdown drew {counted} frames in 2.2 simulated seconds"
+        );
+
+        // t=3000 expires it: exactly one frame erases the banner.
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        assert_eq!(
+            draws.count() - peeked - counted,
+            1,
+            "one frame after expiry takes the banner away"
+        );
+
+        // Back to idle: nothing moves, so nothing draws.
+        let expired = draws.count();
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert_eq!(
+            draws.count() - expired,
+            0,
+            "an idle screen draws nothing after the peek is gone"
+        );
+        wires.cancel.cancel();
+    };
+    harness.run(script).await;
+}
+
+/// Issue #141 review: a resize is a frame input of its own — the frame on screen
+/// is stale at the new size — so it draws at once, without waiting for the
+/// heartbeat a second away.
+#[tokio::test(start_paused = true)]
+async fn a_resize_draws_immediately() {
+    let harness = IdleLoop::new();
+    let wires = harness.wires.clone();
+    let script = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1_550)).await;
+        let before = wires.draws.count();
+        wires.keys.send(Input::Resize).expect("the loop reads keys");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wires.cancel.cancel();
+        assert_eq!(
+            wires.draws.count() - before,
+            1,
+            "a resize draws at once, not at the next heartbeat"
+        );
+    };
+    harness.run(script).await;
+}
+
+/// Issue #141 review: one parent agent event draws one frame, at once.
+#[tokio::test(start_paused = true)]
+async fn a_parent_event_draws_immediately() {
+    let harness = IdleLoop::new();
+    let wires = harness.wires.clone();
+    let script = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1_550)).await;
+        let before = wires.draws.count();
+        wires
+            .events
+            .send(UiEvent::Agent(p1_tui::runtime::Stamped {
+                at_ms: 1_550,
+                worker: None,
+                event: p1_contracts::AgentEvent::ProviderNotice {
+                    text: "transport: retrying over HTTP".into(),
+                },
+            }))
+            .expect("the loop reads events");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wires.cancel.cancel();
+        assert_eq!(
+            wires.draws.count() - before,
+            1,
+            "a parent event draws one frame, at once"
+        );
+    };
+    harness.run(script).await;
+}
+
+/// Issue #141 review: an attached worker's own event (#147) is a frame input
+/// too — its transcript is what the screen is showing.
+#[tokio::test(start_paused = true)]
+async fn an_attached_workers_event_draws_immediately() {
+    let mut harness = IdleLoop::new();
+    // Attach w1 before the loop starts. Its pane row comes from the snapshot the
+    // loop's own `sync_workers` reads, so the attach survives the refreshes.
+    harness
+        .driver
+        .worker_rows
+        .lock()
+        .unwrap()
+        .push(worker_row());
+    harness.driver.sync_workers();
+    harness.driver.screen.pane_mode = p1_tui::state::PaneMode::Workers;
+    harness.driver.screen.workers.focused = Some("w1".into());
+    harness.driver.screen.attach_selected();
+    assert_eq!(
+        harness
+            .driver
+            .screen
+            .attached
+            .as_ref()
+            .map(|row| row.id.as_str()),
+        Some("w1"),
+        "the loop starts attached to w1"
+    );
+    let wires = harness.wires.clone();
+    let script = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1_550)).await;
+        let before = wires.draws.count();
+        wires
+            .events
+            .send(UiEvent::Agent(p1_tui::runtime::Stamped {
+                at_ms: 1_550,
+                worker: Some("w1".into()),
+                event: p1_contracts::AgentEvent::TextDelta {
+                    text: "worker prose".into(),
+                },
+            }))
+            .expect("the loop reads events");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wires.cancel.cancel();
+        assert_eq!(
+            wires.draws.count() - before,
+            1,
+            "an attached worker's event draws one frame, at once"
+        );
+    };
+    harness.run(script).await;
+}
+
+/// Park one authorization on the screen (handoff §7.5): the task resolves when
+/// the operator answers, exactly as the running turn's own call would.
+fn park_authorization(policy: &Arc<TuiPolicy>) -> tokio::task::JoinHandle<Decision> {
+    let call = p1_contracts::ToolCall {
+        call_id: "c1".into(),
+        name: "shell".into(),
+        input: p1_contracts::ToolInput::Json("{\"command\":\"cargo check\"}".into()),
+    };
+    let identity = p1_contracts::ToolIdentity {
+        implementation: "shell".into(),
+        variant: String::new(),
+    };
+    let policy = policy.clone();
+    tokio::spawn(async move {
+        policy
+            .authorize(p1_contracts::AuthorizationRequest {
+                call: &call,
+                identity: &identity,
+                effect: p1_contracts::Effect::Executes,
+            })
+            .await
+    })
+}
+
+/// Issue #141 review: an authorization arriving at idle is a frame input — the
+/// operator must see what is being asked at once, not at the next heartbeat.
+#[tokio::test(start_paused = true)]
+async fn an_authorization_arrival_draws_immediately() {
+    let harness = IdleLoop::with_ask(true);
+    let wires = harness.wires.clone();
+    let script = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1_550)).await;
+        let before = wires.draws.count();
+        let parked = park_authorization(&wires.policy);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            wires.draws.count() - before,
+            1,
+            "an authorization draws one frame, at once"
+        );
+        // The loop's own key handling answers it (the driver tests' `n`); a
+        // simulated timeout turns a missing answer into a failure, not a hang.
+        wires
+            .keys
+            .send(Input::Key(key(KeyCode::Char('n'))))
+            .expect("the loop reads keys");
+        let decision = tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+            .await
+            .expect("the loop answers the parked request")
+            .expect("the parked task answers");
+        assert_eq!(
+            decision,
+            Decision::Deny {
+                reason: p1_tui::runtime::USER_DENY.into()
+            }
+        );
+        wires.cancel.cancel();
+    };
+    harness.run(script).await;
+}
+
+/// Issue #141 review: a frame the terminal refuses is not recorded as drawn, so
+/// the next wake retries it — and the frame that finally reaches the screen
+/// carries the state the input acted on.
+#[test]
+fn a_refused_frame_stays_due_and_the_retry_carries_the_state() {
+    let (mut d, _auth) = driver();
+    let draws = DrawCounter::default();
+    let mut redraws = Redraws::new(draws.clone());
+    let mut terminal =
+        ratatui::Terminal::new(FailingBackend::refusing(1)).expect("the test terminal builds");
+
+    // The operator types; the frame that must show it is refused.
+    for c in "qzj".chars() {
+        d.on_key(key(KeyCode::Char(c)), None);
+    }
+    redraws.dirty = true;
+    let error = frame_if_due(&mut redraws, &mut terminal, &mut d, 0, ColorMode::TrueColor)
+        .expect_err("the terminal refuses the first frame");
+    assert!(error.contains("the terminal went away"), "{error}");
+    assert_eq!(
+        draws.count(),
+        1,
+        "the refused frame still went through the draw path"
+    );
+    assert!(
+        !frame_text(&terminal).contains("qzj"),
+        "a refused frame never reached the screen"
+    );
+
+    // The next wake retries it, and this frame does reach the terminal.
+    let period = frame_if_due(&mut redraws, &mut terminal, &mut d, 0, ColorMode::TrueColor)
+        .expect("the retry reaches the terminal");
+    assert_eq!(draws.count(), 2);
+    assert!(
+        frame_text(&terminal).contains("qzj"),
+        "the retry carries the state the keys acted on"
+    );
+    assert_eq!(
+        period, IDLE_HEARTBEAT,
+        "the retry waits at the heartbeat the loop is already armed for"
+    );
+}
+
+/// Issue #141 review: a terminal that keeps refusing frames ends the loop the
+/// way `run` reports a terminal it cannot use — after three attempts, one per
+/// wake, never a spin.
+#[tokio::test(start_paused = true)]
+async fn a_persistent_draw_error_ends_the_loop_like_a_missing_terminal() {
+    let harness = IdleLoop::with_backend(FailingBackend::refusing(usize::MAX), false);
+    let draws = harness.wires.draws.clone();
+    let code = harness.run_to_end().await;
+    assert_eq!(code, 1, "the loop reports the terminal it cannot use");
+    assert_eq!(
+        draws.count(),
+        DRAW_FAILURES_BEFORE_EXIT as usize,
+        "one refused frame per attempt, then the loop gives up"
+    );
+}
+
+/// Issue #141 review round 2: the retry budget spans turns, not one `pump`. A
+/// backend that refuses every frame cannot outlast the loop by ending turns
+/// between refusals — the count lives in `Redraws` — so the idle frame, the
+/// prompt turn's first frame and the follow-up turn's first frame add up to the
+/// three-failure exit. The follow-up IS taken (the assertions below prove it);
+/// what it cannot show is a provider request, because the loop gives up on the
+/// second pump's first frame, before that pump's turn future is ever polled.
+#[tokio::test(start_paused = true)]
+async fn a_persistent_draw_error_ends_the_loop_across_turn_boundaries() {
+    // Two scripted turns; only the first is reached (a stream that ends with no
+    // events is a transport failure, SPEC §3d, so its turn resolves on the
+    // pump's first poll and the loop takes the follow-up at the boundary).
+    let provider = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        resolving_turn(),
+        resolving_turn(),
+    ]));
+    let agent = agent_with(provider.clone());
+    let mut harness = IdleLoop::with_agent(FailingBackend::refusing(usize::MAX), false, agent);
+    // The prompt the operator sent, and a follow-up queued behind it. One key,
+    // so the frame count below is: the idle first frame, then one frame per pump.
+    harness.driver.screen.composer.insert('g');
+    harness.driver.follow_ups.push_back("next".into());
+    harness
+        .wires
+        .keys
+        .clone()
+        .send(Input::Key(key(KeyCode::Enter)))
+        .expect("the loop reads keys");
+    let draws = harness.wires.draws.clone();
+
+    let (code, driver) = harness.run_to_end_with_driver().await;
+
+    assert_eq!(code, 1, "the loop reports the terminal it cannot use");
+    assert_eq!(
+        draws.count(),
+        DRAW_FAILURES_BEFORE_EXIT as usize,
+        "the idle frame and one refused frame per pump share one budget: a count \
+         reset per pump would let the loop spend this pump's budget, take the \
+         follow-up and only give up three frames later (five in all)"
+    );
+    assert_eq!(
+        operator_prompts(&driver),
+        ["g", "next"],
+        "the loop took the queued follow-up, so the third refusal came from the \
+         second pump's first frame"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the second pump refuses its first frame before it polls the turn future, \
+         so the follow-up's turn never reaches the provider"
+    );
 }
 
 #[test]
