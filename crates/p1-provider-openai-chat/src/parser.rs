@@ -184,8 +184,9 @@ impl ResponseParser for ChatParser {
                 return self.fail("unexpected chat choice index");
             }
             if self.stop.is_some() {
-                // OpenRouter-proxied gateways such as ClinePass repeat the finish
-                // choice in the usage chunk, so accept only that empty repeat.
+                // OpenRouter-proxied gateways such as ClinePass, and OpenCode Zen's free
+                // tier, repeat the finish choice in the usage chunk, so accept only that
+                // empty repeat.
                 if !self.is_repeated_empty_finish(choice) {
                     return self.fail("choice after finish reason");
                 }
@@ -651,6 +652,52 @@ mod tests {
             })
         ));
     }
+    #[test]
+    fn a_repeated_empty_terminator_with_usage_completes_instead_of_failing() {
+        // `mimo-v2.6-flash-free` on the OpenCode Zen free tier sends: a content
+        // chunk, the stop chunk, a SECOND stop chunk carrying the usage block,
+        // then [DONE]. The repeat is not model output and must not be an error.
+        let mut p = parser();
+        send(&mut p, choice(json!({"content":"OK"}), json!(null)));
+        send(
+            &mut p,
+            choice(
+                json!({"role":"assistant","content":"","reasoning":null}),
+                json!("stop"),
+            ),
+        );
+        let events = send(
+            &mut p,
+            json!({
+                "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":131,"completion_tokens":38,
+                         "prompt_tokens_details":{"cached_tokens":0},
+                         "completion_tokens_details":{"reasoning_tokens":35}}
+            }),
+        );
+        assert!(events.is_empty(), "{events:?}");
+        let response = done(&mut p);
+        assert_eq!(response.stop, StopReason::EndTurn);
+        assert_eq!(
+            response.item.blocks,
+            [AssistantBlock::Text { text: "OK".into() }]
+        );
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.output, Some(38));
+        assert_eq!(usage.reasoning_output, Some(35));
+        // A genuine content choice after the stop is still refused.
+        let mut p = parser();
+        send(&mut p, choice(json!({}), json!("stop")));
+        let failed = send(&mut p, choice(json!({"content":"stray"}), json!(null)));
+        assert!(
+            matches!(
+                failed.as_slice(),
+                [StreamEvent::Finished(Outcome::Failed(_))]
+            ),
+            "{failed:?}"
+        );
+    }
+
     #[test]
     fn interleaved_call_fragments_preserve_order_and_raw_arguments() {
         let mut p = parser();

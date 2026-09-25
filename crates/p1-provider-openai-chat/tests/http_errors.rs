@@ -84,6 +84,7 @@ fn provider(
         endpoint: "https://opencode.example.test/zen/go/v1/chat/completions".into(),
         headers: vec![],
         session_header: None,
+        client_identity: None,
         dialect: ChatDialect::ThinkingWithReasoningAlias,
         limits: ChatLimits::default(),
     };
