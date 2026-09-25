@@ -9,13 +9,19 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The native driver, `SummarizingContext` (ADR-0071). Without it only the I/O-free
+# policy engine builds, which the context-policy component compiles for the wasm target.
+default = ["native"]
+native = ["dep:p1-redact", "dep:futures-util", "dep:tokio"]
+
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 # The summarizer's own output goes through the same credential-shape matcher the
 # host wraps every tool in (issue #142).
-p1-redact = { path = "../p1-redact" }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", default-features = false, features = ["macros"] }
+p1-redact = { path = "../p1-redact", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+tokio = { version = "1", default-features = false, features = ["macros"], optional = true }
 
 [dev-dependencies]
 p1-core = { path = "../p1-core" }
