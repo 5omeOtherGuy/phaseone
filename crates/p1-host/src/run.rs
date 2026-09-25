@@ -2675,6 +2675,12 @@ impl ChildBuilder {
         // The front end builds the labelled child sink; under delegation it also
         // feeds the run's worker-usage aggregate.
         let renderer = front_end.child_event_sink(&worker_id, &route, &model);
+        let worker_window = assembled
+            .resolved
+            .context
+            .as_ref()
+            .map(|settings| config_for_route(settings, child_profile.as_deref()).window_tokens);
+        front_end.worker_context_configured(&worker_id, worker_window);
         // Every child gets its OWN activity log, whether or not its environment
         // assembles `finish`: the child's §3c guard reads that log for its
         // replacements and its progress, exactly as the parent's guard reads the
