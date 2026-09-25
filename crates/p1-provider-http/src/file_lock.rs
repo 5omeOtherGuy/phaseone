@@ -13,9 +13,11 @@ use std::time::Duration;
 
 const POLL: Duration = Duration::from_millis(50);
 
-/// How long [`lock_exclusive`] waits for another holder before giving up. A
-/// refresh is one short HTTPS request; a lock held this long is a stuck process.
-pub const LOCK_PATIENCE: Duration = Duration::from_secs(120);
+/// How long [`lock_exclusive`] waits for another holder before giving up. A holder's
+/// refresh is itself bounded (first byte within `FIRST_BYTE_TIMEOUT`, then at most
+/// `STREAM_IDLE_TIMEOUT` between body reads), so a queued peer outlives the longest
+/// bounded refresh and gets its turn; a lock held longer than this is a stuck process.
+pub const LOCK_PATIENCE: Duration = Duration::from_secs(360);
 
 /// Take the exclusive advisory lock on `file`, waiting up to `patience` for another
 /// holder without ever blocking the thread. The lock is released when the returned

@@ -65,8 +65,10 @@ the real home or the real environment; `Locations::from_process()` is the produc
   reads, from `p1-provider-http`, applied by one helper (`p1-auth/src/refresh_http.rs`) for the
   Claude Code login, the Codex login and p1's store `oauth` entries. Expiry is an
   `Authentication` error `token refresh got no response within <n> s` — never a body, token or
-  header; nothing is written, so the file stays byte-identical, and the lock is released, so a
-  peer waiting on it (up to `LOCK_PATIENCE`, 120 s) gets its turn and refreshes itself.
+  header; nothing is written, so the file stays byte-identical, and the lock is released. A
+  peer waits up to `LOCK_PATIENCE` (360 s), longer than the longest bounded refresh (first
+  byte 120 s, then up to 300 s of body idle), so a peer queued behind a holder that times
+  out gets its turn and refreshes itself.
 - A `store_only` route never CONSTRUCTS a borrowed source (§8): the CLI's login is not in the
   chain, so it is not opened even when the store is absent, unusable or has just been rejected.
   Absent means an error that names p1's store; the CLI login is not a fall-through.
