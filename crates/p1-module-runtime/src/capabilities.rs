@@ -64,10 +64,16 @@ pub trait ProcessService: Send + Sync {
 }
 
 /// A started command. Dropping it must end the process group if it still runs: the runtime
-/// drops it when the module drops the resource, when the call ends or when it is abandoned.
+/// drops it when the module drops the resource, when the call ends (however it ends) or when
+/// it is abandoned.
 pub trait RunningProcess: Send {
-    /// The next event: output, then one `Exited`, then `None`.
+    /// The next event: output, then one `Exited`, then `None`. The runtime drops this future
+    /// when the call is cancelled or abandoned while it waits, so it must lose no event then.
     fn next(&mut self) -> BoxFuture<'_, Option<ProcessEvent>>;
+
+    /// Kills the process group because the call was cancelled. `next` then returns the
+    /// output that remains and the exit; the runtime reports that exit as `cancelled`.
+    fn kill(&mut self) -> BoxFuture<'_, ()>;
 }
 
 /// The services a caller grants a module; each is linked only when the manifest grants the
@@ -78,11 +84,66 @@ pub struct Services {
     pub process: Option<Arc<dyn ProcessService>>,
 }
 
-/// A `process.running` as the host holds it.
+/// A `process.running` as the host holds it, and where it is in the stream `process.wit`
+/// defines: output, one `exited`, then `none`, then a trap.
 pub(crate) struct HostRunning {
     process: Box<dyn RunningProcess>,
-    /// `next` returned `none`; one more call traps (`process.wit`).
+    /// The host killed the process group for the cancellation.
+    killed: bool,
+    /// The `exited` event was returned.
+    exited: bool,
+    /// `next` returned `none`; one more call traps.
     finished: bool,
+}
+
+impl HostRunning {
+    fn new(process: Box<dyn RunningProcess>) -> Self {
+        Self {
+            process,
+            killed: false,
+            exited: false,
+            finished: false,
+        }
+    }
+
+    /// The next event of the stream. A cancellation, before or while this waits, kills the
+    /// process group; what the process still prints follows, then `exited(cancelled)`.
+    async fn next(&mut self, cancel: &CancellationToken) -> Option<ProcessEvent> {
+        if self.exited {
+            self.finished = true;
+            return None;
+        }
+        if !self.killed {
+            let event = tokio::select! {
+                biased;
+                () = cancel.cancelled() => None,
+                event = self.process.next() => Some(event),
+            };
+            match event {
+                Some(event) => return self.record(event),
+                None => {
+                    self.process.kill().await;
+                    self.killed = true;
+                }
+            }
+        }
+        match self.process.next().await {
+            Some(ProcessEvent::Output(bytes)) => Some(ProcessEvent::Output(bytes)),
+            Some(ProcessEvent::Exited(_)) | None => {
+                self.exited = true;
+                Some(ProcessEvent::Exited(ExitStatus::Cancelled))
+            }
+        }
+    }
+
+    fn record(&mut self, event: Option<ProcessEvent>) -> Option<ProcessEvent> {
+        match &event {
+            Some(ProcessEvent::Exited(_)) => self.exited = true,
+            Some(ProcessEvent::Output(_)) => {}
+            None => self.finished = true,
+        }
+        event
+    }
 }
 
 /// The state of one per-call Store: everything the linked capabilities read.
@@ -92,10 +153,8 @@ pub(crate) struct CallState {
     process: Option<Arc<dyn ProcessService>>,
     /// The origin of `clock.monotonic-now`, fixed per instance.
     origin: Instant,
-    /// Epoch ticks the call has run, for its deadline.
-    pub(crate) ticks: u64,
-    /// Epoch ticks the call has run since it was cancelled, for the grace it gets to return.
-    pub(crate) cancelled_ticks: u64,
+    /// The call was cancelled and its fuel cut to the grace it gets to return.
+    pub(crate) cancel_grace: bool,
 }
 
 impl CallState {
@@ -105,8 +164,7 @@ impl CallState {
             table: ResourceTable::new(),
             process: services.process.clone(),
             origin: Instant::now(),
-            ticks: 0,
-            cancelled_ticks: 0,
+            cancel_grace: false,
         }
     }
 }
@@ -247,12 +305,16 @@ fn link_process(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
                 bail!("process.spawn called without a process service");
             };
             let cancel = store.data().cancel.clone();
-            results[0] = match service.spawn(command, cancel).await {
+            // A cancelled call starts nothing; a cancellation while the service is starting
+            // the command ends the wait, and the half-started process is dropped, which ends it.
+            let spawned = tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err("the call was cancelled".to_owned()),
+                spawned = service.spawn(command, cancel.clone()) => spawned,
+            };
+            results[0] = match spawned {
                 Ok(process) => {
-                    let running = store.data_mut().table.push(HostRunning {
-                        process,
-                        finished: false,
-                    })?;
+                    let running = store.data_mut().table.push(HostRunning::new(process))?;
                     let handle = ResourceAny::try_from_resource(running, &mut store)?;
                     Val::Result(Ok(Some(Box::new(Val::Resource(handle)))))
                 }
@@ -266,15 +328,15 @@ fn link_process(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
             let Val::Resource(handle) = &params[0] else {
                 bail!("process.running.next called without its resource");
             };
+            // A handle the module dropped, or one the call no longer holds, fails here: a
+            // later use traps.
             let running: Resource<HostRunning> = handle.try_into_resource(&mut store)?;
+            let cancel = store.data().cancel.clone();
             let entry = store.data_mut().table.get_mut(&running)?;
             if entry.finished {
                 bail!("process.running.next called after the stream ended");
             }
-            let event = entry.process.next().await;
-            if event.is_none() {
-                entry.finished = true;
-            }
+            let event = entry.next(&cancel).await;
             results[0] = Val::Option(event.map(|event| Box::new(event_val(event))));
             Ok(())
         })
