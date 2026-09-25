@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use p1_hook_shadow::{Origin, ShadowEvent, ShadowHook, find_binary};
@@ -57,33 +58,42 @@ fn event(origin: Origin) -> ShadowEvent {
     }
 }
 
-fn fake_binary(root: &Path) -> (PathBuf, PathBuf) {
+fn fake_binary(root: &Path) -> (PathBuf, PathBuf, std::fs::File) {
     let binary = root.join("fake-shadow");
     let arguments = root.join("arguments");
+    let ready_path = root.join("arguments.ready");
+    let ready = Command::new("mkfifo")
+        .arg(&ready_path)
+        .status()
+        .map(|_| {
+            // Open the reader before observe so the fake child never has to win a race
+            // against the test's FIFO open. O_RDWR keeps this non-blocking; the read
+            // below is what waits for the child to write its completion marker.
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&ready_path)
+                .unwrap()
+        })
+        .expect("mkfifo should create the synchronization FIFO");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}.tmp'\nmv '{}.tmp' '{}'\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}.tmp'\nmv '{}.tmp' '{}'\nprintf ready > '{}'\n",
         arguments.display(),
         arguments.display(),
-        arguments.display()
+        arguments.display(),
+        ready_path.display()
     );
     fs::write(&binary, script).unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-    (binary, arguments)
+    (binary, arguments, ready)
 }
 
-fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if path.exists() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+fn synchronize(ready: &mut std::fs::File) {
+    // The fake binary writes this FIFO only after the argument file is complete.
+    // Reading it is explicit child/process synchronization, with no wall-clock
+    // budget or polling.
+    let mut byte = [0];
+    ready.read_exact(&mut byte).unwrap();
 }
 
 #[test]
@@ -92,7 +102,7 @@ fn kill_file_prevents_file_and_spawn() {
     let state = temp.0.join("state");
     fs::create_dir(&state).unwrap();
     fs::write(state.join("kill"), b"").unwrap();
-    let (binary, arguments) = fake_binary(&temp.0);
+    let (binary, arguments, _ready) = fake_binary(&temp.0);
     let hook = ShadowHook::new(
         binary,
         env_for(HashMap::from([(
@@ -112,7 +122,7 @@ fn every_recursion_guard_prevents_file_and_spawn() {
     for guard in GUARDS {
         let temp = TempDir::new(guard);
         let state = temp.0.join("state");
-        let (binary, arguments) = fake_binary(&temp.0);
+        let (binary, arguments, _ready) = fake_binary(&temp.0);
         let hook = ShadowHook::new(
             binary,
             env_for(HashMap::from([
@@ -133,7 +143,7 @@ fn zero_and_empty_recursion_values_do_not_guard() {
     for value in ["", "0"] {
         let temp = TempDir::new("unguarded");
         let state = temp.0.join("state");
-        let (binary, arguments) = fake_binary(&temp.0);
+        let (binary, _arguments, mut ready) = fake_binary(&temp.0);
         let hook = ShadowHook::new(
             binary,
             env_for(HashMap::from([
@@ -142,7 +152,7 @@ fn zero_and_empty_recursion_values_do_not_guard() {
             ])),
         );
         hook.observe(event(Origin::UserInput));
-        wait_for(&arguments);
+        synchronize(&mut ready);
     }
 }
 
@@ -150,7 +160,7 @@ fn zero_and_empty_recursion_values_do_not_guard() {
 fn normal_dispatch_writes_private_exact_task_and_exact_argv() {
     let temp = TempDir::new("normal");
     let state = temp.0.join("state");
-    let (binary, arguments) = fake_binary(&temp.0);
+    let (binary, arguments, mut ready) = fake_binary(&temp.0);
     let hook = ShadowHook::new(
         binary,
         env_for(HashMap::from([(
@@ -163,7 +173,7 @@ fn normal_dispatch_writes_private_exact_task_and_exact_argv() {
         family: "researcher".into(),
         provider: "p1".into(),
     }));
-    wait_for(&arguments);
+    synchronize(&mut ready);
 
     let entries: Vec<_> = fs::read_dir(state.join("inbox"))
         .unwrap()
@@ -214,7 +224,7 @@ fn normal_dispatch_writes_private_exact_task_and_exact_argv() {
 fn user_input_has_exact_argv_and_private_exact_bytes() {
     let temp = TempDir::new("user");
     let state = temp.0.join("state");
-    let (binary, arguments) = fake_binary(&temp.0);
+    let (binary, arguments, mut ready) = fake_binary(&temp.0);
     let hook = ShadowHook::new(
         binary,
         env_for(HashMap::from([(
@@ -225,7 +235,7 @@ fn user_input_has_exact_argv_and_private_exact_bytes() {
     let mut input = event(Origin::UserInput);
     input.source_ref = None;
     hook.observe(input);
-    wait_for(&arguments);
+    synchronize(&mut ready);
     let task = fs::read_dir(state.join("inbox"))
         .unwrap()
         .next()
@@ -268,7 +278,7 @@ fn user_input_has_exact_argv_and_private_exact_bytes() {
 fn explicit_episode_and_derived_session_are_used() {
     let temp = TempDir::new("ids");
     let state = temp.0.join("state");
-    let (binary, arguments) = fake_binary(&temp.0);
+    let (binary, arguments, mut ready) = fake_binary(&temp.0);
     let hook = ShadowHook::new(
         binary,
         env_for(HashMap::from([(
@@ -282,7 +292,7 @@ fn explicit_episode_and_derived_session_are_used() {
     observed.workspace = Some(PathBuf::from("relative"));
     observed.source_ref = None;
     hook.observe(observed);
-    wait_for(&arguments);
+    synchronize(&mut ready);
 
     let args = fs::read_to_string(arguments).unwrap();
     assert!(args.contains("--workspace\nunknown\n"));
@@ -339,7 +349,7 @@ fn home_fallback_and_find_binary_use_only_injected_environment() {
 fn twenty_calls_have_under_fifty_millisecond_p95() {
     let temp = TempDir::new("latency");
     let state = temp.0.join("state");
-    let (binary, _) = fake_binary(&temp.0);
+    let (binary, _, _ready) = fake_binary(&temp.0);
     let hook = ShadowHook::new(
         binary,
         env_for(HashMap::from([(
