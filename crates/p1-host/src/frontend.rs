@@ -95,6 +95,12 @@ pub trait FrontEnd: Send + Sync {
     /// front end that never shows `ctx` (the line renderer) need not override it.
     fn context_configured(&self, _window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {}
 
+    /// A child's effective context window, with its selected profile's capacity
+    /// folded in as for the parent; `None` when the child's environment has no
+    /// `[context]` section. The default does nothing: a front end that never shows
+    /// worker `ctx` (the line renderer) need not override it.
+    fn worker_context_configured(&self, _worker_id: &str, _window_tokens: Option<u64>) {}
+
     /// The route label the parent renderer names, when this front end has one: the
     /// host moves it after a successful model switch, so the per-response line names
     /// the route that produced the response (ADR-0049 stage 3). `None` — the default

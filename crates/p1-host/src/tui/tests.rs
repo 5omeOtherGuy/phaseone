@@ -45,6 +45,7 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             worker_rows: Arc::new(Mutex::new(Vec::new())),
             worker_stops: None,
             worker_usage: HashMap::new(),
+            worker_windows: Arc::new(Mutex::new(HashMap::new())),
             pending_calls: HashMap::new(),
             task_files: HashSet::new(),
             exit: None,
@@ -1198,4 +1199,52 @@ fn worker_stop_without_the_host_channel_reports_that_it_cannot_stop() {
         p1_tui::transcript::Block::Meta { text }
             if text == "↳ w2 cannot be stopped here"
     )));
+}
+
+#[test]
+fn worker_rows_show_only_their_configured_context_window_without_touching_the_parent() {
+    let (mut d, _auth) = driver();
+    let parent_context = d.screen.context.clone();
+    let parent_ctx = d.screen.statusbar.ctx.clone();
+    d.worker_windows
+        .lock()
+        .unwrap()
+        .insert("w1".into(), 1_048_576);
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+
+    d.sync_workers();
+
+    assert_eq!(d.screen.workers.workers[0].context_window, Some(1_048_576));
+    assert_eq!(d.screen.workers.workers[1].context_window, None);
+    assert_eq!(d.screen.context, parent_context);
+    assert_eq!(d.screen.statusbar.ctx, parent_ctx);
+}
+
+#[test]
+fn worker_context_window_sync_keeps_filling_usage_from_worker_responses() {
+    use p1_contracts::Usage;
+
+    let (mut d, _auth) = driver();
+    d.worker_windows
+        .lock()
+        .unwrap()
+        .insert("w1".into(), 1_048_576);
+    d.on_ui_event(worker_response(
+        "w1",
+        "deepseek-v4.1-flash",
+        Some(Usage {
+            input_uncached: Some(48_213),
+            cost_micro_usd: Some(5),
+            ..Usage::default()
+        }),
+    ));
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1")];
+
+    d.sync_workers();
+
+    let row = &d.screen.workers.workers[0];
+    assert_eq!(row.context_window, Some(1_048_576));
+    assert_eq!(row.model.as_deref(), Some("deepseek-v4.1-flash"));
+    assert_eq!(row.tokens, Some(48_213));
+    assert_eq!(row.cost_micro_usd, Some(5));
 }
