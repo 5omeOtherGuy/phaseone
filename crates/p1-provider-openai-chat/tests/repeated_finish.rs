@@ -166,6 +166,20 @@ async fn repeated_finish_carrying_a_tool_call_delta_is_a_protocol_error() {
 }
 
 #[tokio::test]
+async fn repeated_finish_carrying_a_legacy_function_call_is_a_protocol_error() {
+    assert_repeated_is_protocol_error(
+        json!({"function_call": {"name": "read", "arguments": "{}"}}),
+        Some("stop"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repeated_finish_carrying_an_unknown_non_empty_delta_is_a_protocol_error() {
+    assert_repeated_is_protocol_error(json!({"refusal": "no"}), Some("stop")).await;
+}
+
+#[tokio::test]
 async fn repeated_finish_with_a_different_reason_is_a_protocol_error() {
     assert_repeated_is_protocol_error(json!({"content": ""}), Some("length")).await;
 }

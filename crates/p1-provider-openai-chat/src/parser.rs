@@ -75,6 +75,9 @@ impl ChatParser {
             }
         }
     }
+    /// After a finish, accept only an empty repeat of that same finish. OpenRouter-style
+    /// gateways such as ClinePass repeat the finish choice in the usage chunk; any
+    /// non-empty unknown delta field remains a protocol error.
     fn is_repeated_empty_finish(&self, choice: &Value) -> bool {
         let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) else {
             return false;
@@ -85,16 +88,19 @@ impl ChatParser {
         let Some(delta) = choice.get("delta").filter(|value| value.is_object()) else {
             return false;
         };
-        ["content", "reasoning_content", "reasoning"]
-            .into_iter()
-            .all(|field| {
-                delta
-                    .get(field)
-                    .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
+        let empty = |value: &Value| {
+            value.is_null()
+                || value.as_str() == Some("")
+                || value.as_array().is_some_and(Vec::is_empty)
+        };
+        delta.as_object().is_some_and(|fields| {
+            fields.iter().all(|(field, value)| match field.as_str() {
+                "role" => true,
+                "content" | "reasoning_content" | "reasoning" => empty(value),
+                "tool_calls" => value.is_null() || value.as_array().is_some_and(Vec::is_empty),
+                _ => value.is_null(),
             })
-            && delta
-                .get("tool_calls")
-                .is_none_or(|value| value.is_null() || value.as_array().is_some_and(Vec::is_empty))
+        })
     }
     fn fail(&mut self, message: &str) -> Vec<StreamEvent> {
         self.ended = true;
