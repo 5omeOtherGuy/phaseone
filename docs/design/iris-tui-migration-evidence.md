@@ -298,3 +298,18 @@ malformed chip followed by visible `OK`. Mutation check: the cells key fails it 
 
 Open: P0 per-symbol/external-reach closure and P2–P6 (scope freeze for the owner's
 ~50-worker workflow). No programme-completion claim.
+
+## Massive run
+
+The judge accepted these slices:
+
+- **S1** — commits `e0c3ceb` (`bound wrap progress`) and `4a04f61` (`keep wrap
+  word units`). Tests cover watchdog-bounded wrapping, oversized wide glyphs,
+  zero-width and ZWJ text, capped indentation, styled wrapping, rendered-bound
+  invariants, and `wrap`/`wrap_len` agreement.
+- **S3** — commit `8d37370` (`gate approval grant keys`). Tests cover
+  non-grantable permission and diff approvals ignoring session/project grant keys
+  without leaking them into the composer, while once/deny and diff-review keys
+  remain available.
+
+This records the accepted slice evidence only. The lead has not yet verified it.
