@@ -8,7 +8,7 @@ stays the lead's short-form pointer.
 
 ## Direction change (owner, 2026-09-25): WebAssembly modules
 
-p1 migrates to WebAssembly modules (ADR-0070, issue #187): `p1-core`, the host, the journal,
+p1 migrates to WebAssembly modules (ADR-0071, issue #187): `p1-core`, the host, the journal,
 the worker service and the terminal front ends stay native; every tool, provider and policy
 becomes a module the host loads by name. No browser GUI for now. Builds for this migration run
 on a dedicated AWS EC2 machine. The migration plan comes from Astra (brief and plan under

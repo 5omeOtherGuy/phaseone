@@ -34,11 +34,25 @@ fn the_three_kinds_parse_by_their_route_file_spelling() {
     }
 }
 
+/// Issue #134: a fourth kind, `none`, on its own test so the three above stay the
+/// sentence they were (ADR-0029: a pre-existing acceptance test is not renamed).
+#[test]
+fn the_none_kind_parses_and_is_labelled_as_proxy_injected() {
+    let parsed = spec(r#"{"kind":"none"}"#).expect("the table parses");
+    assert_eq!(parsed.kind, CredentialKind::None);
+    assert_eq!(parsed.kind.name(), "none");
+    assert_eq!(parsed.kind.label(), "none (proxy-injected)");
+    assert!(parsed.borrow.is_empty());
+    assert!(parsed.env.is_none());
+    assert!(!parsed.store_only);
+    assert!(parsed.validate().is_ok());
+}
+
 #[test]
 fn an_unknown_kind_is_rejected_and_the_error_lists_the_known_ones() {
     let error = spec(r#"{"kind":"bearer-token"}"#).unwrap_err().to_string();
     assert!(error.contains("bearer-token"), "{error}");
-    for name in ["api-key", "claude-code-oauth", "codex-oauth"] {
+    for name in ["api-key", "claude-code-oauth", "codex-oauth", "none"] {
         assert!(error.contains(name), "{error}");
     }
 }

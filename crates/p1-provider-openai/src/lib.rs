@@ -30,7 +30,9 @@ mod request;
 mod websocket;
 
 pub use provider::{Clock, OpenAiCodexProvider, OpenAiCodexProviderBuilder};
-pub use request::{build_headers, build_request, resolve_base_url};
+pub use request::{
+    build_headers, build_headers_without_credential, build_request, resolve_base_url,
+};
 
 /// The `origin_route` of the shipped `routes/openai-codex-subscription.toml`, byte for
 /// byte what this adapter wrote into every [`p1_contracts::Origin`] before route data

@@ -53,7 +53,7 @@ can never mention a tool by placeholder that the agent does not have. No fragmen
 
 ## Catalog (composition root)
 
-ADR-0070 (owner 2026-09-25): the catalog's entries become WebAssembly modules the host loads by
+ADR-0071 (owner 2026-09-25): the catalog's entries become WebAssembly modules the host loads by
 name under the same keys; until that migration lands they are the compile-time constructors below.
 
 ```rust

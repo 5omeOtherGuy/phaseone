@@ -29,8 +29,8 @@ use p1_provider_http::{
 use crate::ResponsesRoute;
 use crate::parser::CodexResponseParser;
 use crate::request::{
-    build_headers, build_request, clamped_cache_key, lower, resolve_base_url,
-    validate as validate_options,
+    build_headers, build_headers_without_credential, build_request, clamped_cache_key, lower,
+    resolve_base_url, validate as validate_options,
 };
 use crate::websocket::{self, WebSocket};
 
@@ -143,6 +143,9 @@ impl OpenAiCodexProvider {
     ) -> Box<dyn Fn() -> ProviderStream + Send> {
         let transport = self.transport.clone();
         let credentials = self.credentials.clone();
+        // A route whose credential an egress proxy injects sends NO credential header
+        // (issue #134). The source behind the account-id guard answers for it.
+        let proxy_injected = credentials.proxy_injected();
         let model = self.wire_model.clone();
         let account = self.route.account;
         let origin_route = self.route.origin_route.clone();
@@ -160,9 +163,15 @@ impl OpenAiCodexProvider {
                 build: Box::new(move |credential: &Credential| {
                     // Unreachable by construction: `AccountIdGuard` turns a
                     // credential without an account id into an authentication
-                    // failure before the driver can build a request.
-                    let headers = build_headers(account, credential, cache_key.as_deref())
-                        .expect("the credential guard guarantees a ChatGPT account id");
+                    // failure before the driver can build a request — except on a
+                    // proxy-injected route, where there is no credential to guard and
+                    // no credential header to send.
+                    let headers = if proxy_injected {
+                        build_headers_without_credential(account, cache_key.as_deref())
+                    } else {
+                        build_headers(account, credential, cache_key.as_deref())
+                    }
+                    .expect("the credential guard guarantees a ChatGPT account id");
                     HttpRequest {
                         url: url.clone(),
                         headers,
@@ -387,6 +396,11 @@ struct AccountIdGuard {
 impl CredentialSource for AccountIdGuard {
     fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move {
+            if self.inner.proxy_injected() {
+                // A route whose credential an egress proxy injects (issue #134) has no
+                // account id p1 could send: the proxy supplies the whole credential.
+                return self.inner.access().await;
+            }
             let credential = self.inner.access().await?;
             require_account_id(credential)
         })
@@ -400,6 +414,10 @@ impl CredentialSource for AccountIdGuard {
             let credential = self.inner.refresh(rejected).await?;
             require_account_id(credential)
         })
+    }
+
+    fn proxy_injected(&self) -> bool {
+        self.inner.proxy_injected()
     }
 }
 

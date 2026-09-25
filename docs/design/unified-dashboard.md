@@ -29,7 +29,7 @@ live brain/board integration. The base has the verified startup deadlock fix.
    host-owned terminal lifecycle; preserve agent input, approvals and cancellation.
    Decide application navigation keys with the concrete composition, not here.
 3. Extract independently selectable framework/view crates when real composition
-   proves the boundary. Ordinary constructors inside the native TUI (ADR-0070 keeps the
+   proves the boundary. Ordinary constructors inside the native TUI (ADR-0071 keeps the
    front ends native); no global registry. No UI, storage or project ownership enters `p1-core`.
 4. Concrete Kimi visual design brief only after a renderable shell: at least two
    real-terminal capture → inspect → fix rounds, then lead inspection. Existing

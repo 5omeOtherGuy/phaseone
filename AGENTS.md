@@ -81,7 +81,7 @@ Keep providers limited to wire translation, with no tools.
 Keep provider wire formats and UI types out of tools.
 Expose only assembled prompts and tools to an agent; an unassembled tool cannot dispatch.
 Keep delegation optional, with no mandatory coordinating agent.
-Compose explicitly at one root: the host loads WebAssembly modules by name from the environment file (ADR-0070); add no service locator, global registry, auto-registration or DI framework.
+Compose explicitly at one root: the host loads WebAssembly modules by name from the environment file (ADR-0071); add no service locator, global registry, auto-registration or DI framework.
 Make public async interfaces Send-capable; give each agent's mutable state one owner.
 Represent unknown usage/cost as None, never zero.
 Use Rust 2024; forbid unsafe; use thiserror for library errors.

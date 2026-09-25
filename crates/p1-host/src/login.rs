@@ -123,7 +123,7 @@ pub fn list(deps: &HostDeps) -> i32 {
     let id_width = routes.iter().map(|route| route.id.len()).max().unwrap_or(0);
     let kind_width = routes
         .iter()
-        .map(|route| route.credential.kind.name().len())
+        .map(|route| route.credential.kind.label().len())
         .max()
         .unwrap_or(0);
     let mut text = String::new();
@@ -132,7 +132,7 @@ pub fn list(deps: &HostDeps) -> i32 {
         text.push_str(&format!(
             "{:<id_width$}  {:<kind_width$}  {}\n",
             route.id,
-            route.credential.kind.name(),
+            route.credential.kind.label(),
             report.line()
         ));
     }
@@ -190,6 +190,13 @@ fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a Rout
     };
     match route.credential.kind {
         CredentialKind::ApiKey => Ok(route),
+        // A route that sends no credential has nothing to log in to (issue #134):
+        // the egress proxy injects the provider's credential, and p1 stores none.
+        CredentialKind::None => Err(format!(
+            "route `{route_id}` declares `kind = \"none\"`: p1 sends no credential on this \
+             route, so there is nothing to log in to; the egress proxy injects the proxy \
+             credential"
+        )),
         // A self-contained OAuth route reads p1's own store only (ADR-0061). Sending
         // the operator to that CLI's login would be wrong: this route does not read
         // it. p1 has no OAuth flow yet, so the error says exactly that and never
@@ -216,6 +223,9 @@ fn login_owner(kind: CredentialKind) -> &'static str {
         CredentialKind::ApiKey => "the documented key environment variable",
         CredentialKind::ClaudeCodeOauth => "the Claude Code CLI (`claude`)",
         CredentialKind::CodexOauth => "the Codex CLI (`codex login`)",
+        // Unreachable through `api_key_route`, which answers for `none` first: the
+        // credential is the egress proxy's (issue #134), not a login p1 could store.
+        CredentialKind::None => "the egress proxy that injects it",
     }
 }
 

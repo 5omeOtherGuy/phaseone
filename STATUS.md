@@ -19,7 +19,7 @@ owner), #45 (owner), #6, #25; #46–#48, #53, #54, #60 closed. No worktree of th
 
 ## Next — READ FIRST
 
-OWNER DIRECTION 2026-09-25: p1 migrates to WebAssembly modules (ADR-0070, #187); `p1-core`,
+OWNER DIRECTION 2026-09-25: p1 migrates to WebAssembly modules (ADR-0071, #187); `p1-core`,
 host, journal, workers and TUI stay native; no browser GUI now; builds on a dedicated EC2 machine.
 Astra's migration plan: `../phaseone-briefs/astra/wasm-migration/PLAN.md` (Codex CLI, xhigh).
 

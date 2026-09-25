@@ -1,5 +1,5 @@
 ---
-adr: 70
+adr: 71
 title: p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name
 status: proposed
 date: 2026-09-25
@@ -8,7 +8,7 @@ supersedes: [4]
 superseded_by: []
 sources: [issue #187, owner words 2026-09-25, docs/design/pillars.md, docs/design/design-summary.md, ADR-0004]
 ---
-# ADR-0070: p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name
+# ADR-0071: p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name
 
 ## Context
 

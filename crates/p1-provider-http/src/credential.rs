@@ -34,6 +34,19 @@ pub trait CredentialSource: Send + Sync {
         &'a self,
         rejected: &'a Credential,
     ) -> BoxFuture<'a, Result<Credential, ProviderError>>;
+
+    /// Whether an egress proxy — not p1 — injects this route's credential after the
+    /// request leaves the process (`[credential] kind = "none"`, issue #134). An
+    /// adapter that would send `Authorization` (or any other credential header)
+    /// sends NONE when this is true: `access()` hands it a placeholder whose
+    /// `bearer` is EMPTY and whose value no adapter may send. The driver never
+    /// refreshes such a route; a 401/403 is the proxy's refusal, reported as an
+    /// [`ProviderErrorKind::Authentication`](p1_contracts::ProviderErrorKind)
+    /// failure naming the missing proxy credential. `false` by default, so every
+    /// source that resolves a credential of its own is unchanged.
+    fn proxy_injected(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

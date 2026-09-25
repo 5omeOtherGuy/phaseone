@@ -82,22 +82,30 @@ impl ResponsesAccount {
 /// `originator` and `User-Agent`. The SSE header set and the WebSocket handshake
 /// each append their own protocol headers to exactly this prefix, so the two
 /// cannot drift apart on what identifies the credential and the client.
+///
+/// `credential` is `None` on a route whose credential an egress proxy injects (issue
+/// #134): such a route sends NO credential header at all — no `Authorization` and no
+/// account id — because the proxy supplies the whole credential; the client identity
+/// both transports send is unchanged.
 fn identity_headers(
     account: ResponsesAccount,
-    credential: &Credential,
+    credential: Option<&Credential>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
-    let mut headers = vec![(
-        "Authorization".to_string(),
-        format!("Bearer {}", credential.bearer),
-    )];
-    if let Some(name) = account.account_id_header() {
-        let account_id = credential.account_id.as_deref().ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::Authentication,
-                "the Codex credential has no ChatGPT account id",
-            )
-        })?;
-        headers.push((name.to_string(), account_id.to_string()));
+    let mut headers = Vec::new();
+    if let Some(credential) = credential {
+        headers.push((
+            "Authorization".to_string(),
+            format!("Bearer {}", credential.bearer),
+        ));
+        if let Some(name) = account.account_id_header() {
+            let account_id = credential.account_id.as_deref().ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    "the Codex credential has no ChatGPT account id",
+                )
+            })?;
+            headers.push((name.to_string(), account_id.to_string()));
+        }
     }
     headers.extend([
         ("originator".to_string(), "p1".to_string()),
@@ -117,6 +125,25 @@ fn identity_headers(
 pub fn build_headers(
     account: ResponsesAccount,
     credential: &Credential,
+    cache_key: Option<&str>,
+) -> Result<Vec<(String, String)>, ProviderError> {
+    headers(account, Some(credential), cache_key)
+}
+
+/// The same header set for a route whose credential an egress proxy injects (issue
+/// #134): the request carries NO credential header, and everything else — the client
+/// identity, the protocol betas and the session headers — is byte for byte
+/// [`build_headers`]'s, because it is the same builder.
+pub fn build_headers_without_credential(
+    account: ResponsesAccount,
+    cache_key: Option<&str>,
+) -> Result<Vec<(String, String)>, ProviderError> {
+    headers(account, None, cache_key)
+}
+
+fn headers(
+    account: ResponsesAccount,
+    credential: Option<&Credential>,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
     let mut headers = identity_headers(account, credential)?;
@@ -143,6 +170,23 @@ pub fn build_headers(
 pub(crate) fn build_ws_headers(
     account: ResponsesAccount,
     credential: &Credential,
+    cache_key: Option<&str>,
+) -> Result<Vec<(String, String)>, ProviderError> {
+    ws_headers(account, Some(credential), cache_key)
+}
+
+/// The handshake header set of a route whose credential an egress proxy injects
+/// (issue #134): the same set as [`build_ws_headers`] minus every credential header.
+pub(crate) fn build_ws_headers_without_credential(
+    account: ResponsesAccount,
+    cache_key: Option<&str>,
+) -> Result<Vec<(String, String)>, ProviderError> {
+    ws_headers(account, None, cache_key)
+}
+
+fn ws_headers(
+    account: ResponsesAccount,
+    credential: Option<&Credential>,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
     let mut headers = identity_headers(account, credential)?;

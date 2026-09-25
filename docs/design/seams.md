@@ -11,7 +11,7 @@ explicit Rust interface. A public module boundary normally maps to a crate;
 private helper modules need not. A module can implement several closely related
 interfaces. Every tool remains an independently selectable module.
 
-Since ADR-0070 (owner 2026-09-25) modules are WebAssembly artifacts: the application
+Since ADR-0071 (owner 2026-09-25) modules are WebAssembly artifacts: the application
 composition root loads each one by name from the environment file and supplies its host
 functions explicitly. No service locator, hidden global registry, auto-registration or
 dependency-injection framework; an embeddable library caller can be that root too.
@@ -274,7 +274,7 @@ should normally wait until outstanding tool calls are settled.
 
 Leave behind #73's fragment frontmatter/slot machinery, override ordering and plugin
 policy; those were Iris proposals. #18's WASM loader idea is now p1's own direction
-(ADR-0070), designed afresh from p1's contracts rather than carried over from Iris. Tool
+(ADR-0071), designed afresh from p1's contracts rather than carried over from Iris. Tool
 input/output stays data; the boundary layer is fixed by the migration plan.
 
 ## 12. Remaining bounded technical work

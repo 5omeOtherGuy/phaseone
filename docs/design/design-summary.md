@@ -18,7 +18,7 @@ Detail and reasoning: `seams.md` (v1). Product direction: `pillars.md` (rev 2).
 ```
 
 1. **Module** = an independently selectable implementation behind an explicit Rust
-   interface, normally its own crate. Since 2026-09-25 (owner, ADR-0070) a module is a
+   interface, normally its own crate. Since 2026-09-25 (owner, ADR-0071) a module is a
    WebAssembly artifact the native host loads by name when an environment assembles it;
    the host stays the one composition root. No service locator, no global registry, no
    auto-registration.
@@ -64,7 +64,7 @@ Detail and reasoning: `seams.md` (v1). Product direction: `pillars.md` (rev 2).
 
 ## Tradeoffs we are choosing (say if you disagree)
 
-- **WebAssembly modules over compile-time linking** (owner 2026-09-25, ADR-0070; reverses
+- **WebAssembly modules over compile-time linking** (owner 2026-09-25, ADR-0071; reverses
   the earlier choice) — add or remove a tool, provider or policy without rebuilding the
   host, sandboxed by construction; cost: a boundary layer beside the Rust contracts, host
   functions for what WASI lacks, one build per module.

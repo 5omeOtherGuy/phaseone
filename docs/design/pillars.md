@@ -26,7 +26,7 @@ recommendation.
    and modes. Tools are always their own modules; providers only translate wire
    behaviour. Iris donates parts (Nexus as raw material with a reduced interface),
    not structure.
-   *Boundary (amended 2026-09-25 by the owner, ADR-0070):* modules are WebAssembly artifacts
+   *Boundary (amended 2026-09-25 by the owner, ADR-0071):* modules are WebAssembly artifacts
    the native host loads by name; the core, host and terminal front ends stay native. No
    marketplace, auto-registration or fixed crate list. Adding a model through existing contracts should not require
    changing the core; a genuinely new capability may.

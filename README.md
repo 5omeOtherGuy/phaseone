@@ -4,7 +4,7 @@ A lean, modular Rust coding harness that adapts itself to the model it runs.
 
 You type a prompt and the agent works. One small agent core (loop + API); everything
 else — providers, tools, sessions, frontends, delegation — is a module around it.
-Modules are migrating to WebAssembly artifacts the host loads by name (ADR-0070, 2026-09-25).
+Modules are migrating to WebAssembly artifacts the host loads by name (ADR-0071, 2026-09-25).
 
 **Status: pre-alpha, first usable slice done (2026-09-20).** `p1 --env claude|gpt "prompt"`
 runs a real coding task on the Claude and Codex subscription routes, each with its own

@@ -462,6 +462,46 @@ async fn login_list_names_every_route_its_kind_and_its_source() {
     assert!(line.ends_with("env P1_LOGIN_TEST_KEY"), "{listed}");
 }
 
+/// Issue #134: a route that sends no credential is listed as such, and there is
+/// nothing `p1 login` could store for it — the egress proxy injects the credential.
+#[tokio::test]
+async fn a_none_route_is_listed_as_proxy_injected_and_cannot_be_logged_in() {
+    let scratch = Scratch::new();
+    scratch.write_route(ROUTE, "kind = \"none\"\n");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut harness = scratch.harness(&[]);
+    harness.deps.lines = Arc::new(CountingLines {
+        reads: reads.clone(),
+    });
+    let echo = RecordingEcho::new();
+
+    assert_eq!(p1_host::login::list(&harness.deps), 0);
+    let listed = harness.stdout.text();
+    let line = listed
+        .lines()
+        .find(|line| line.starts_with(ROUTE))
+        .unwrap_or_else(|| panic!("no line for {ROUTE}: {listed}"));
+    assert!(line.contains("none (proxy-injected)"), "{listed}");
+    assert!(line.contains("egress proxy"), "{listed}");
+    assert!(
+        !line.contains("api-key") && !line.contains("oauth"),
+        "the kind is not one this route resolves: {listed}"
+    );
+
+    assert_eq!(
+        p1_host::login::login_with(&harness.deps, ROUTE, false, &echo).await,
+        2
+    );
+    let stderr = harness.stderr.text();
+    assert!(
+        stderr.contains("kind = \"none\"") && stderr.contains("egress proxy"),
+        "{stderr}"
+    );
+    assert_eq!(p1_host::login::logout(&harness.deps, ROUTE).await, 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "no key was ever read");
+    assert!(!scratch.store_path().exists());
+}
+
 // -------------------------------------------------------------------- logout
 
 #[tokio::test]

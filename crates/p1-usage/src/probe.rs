@@ -62,6 +62,9 @@ impl Shape {
                 "glm-subscription" => Some(Self::Glm),
                 _ => None,
             },
+            // A route that sends no credential (issue #134) cannot be probed: the
+            // egress proxy injects the credential, so p1 has none to present.
+            CredentialKind::None => None,
         }
     }
 
@@ -115,8 +118,16 @@ impl UsageProbe for HttpProbe {
         Box::pin(async move {
             let mut result = RouteUsage::empty(route);
             let Some(shape) = Shape::of(route) else {
+                // A route that sends no credential has no endpoint p1 could probe:
+                // the egress proxy injects the credential (issue #134).
+                let reason = if route.spec.kind == CredentialKind::None {
+                    "p1 sends no credential on this route (kind \"none\"), so it has none to \
+                     present to a usage endpoint"
+                } else {
+                    "no usage endpoint known for this route"
+                };
                 result.probe = Probe::Unsupported {
-                    reason: "no usage endpoint known for this route".into(),
+                    reason: reason.into(),
                 };
                 return result;
             };
@@ -844,6 +855,57 @@ mod tests {
             oauth(CredentialKind::CodexOauth),
             Some("https://chatgpt.com/backend-api/wham/usage")
         );
+    }
+
+    /// Issue #134: a route that sends no credential has no usage endpoint p1 could
+    /// probe — it has no credential to present — so it is never mapped to one.
+    #[test]
+    fn a_route_that_sends_no_credential_maps_to_no_endpoint() {
+        let route = fixture_route_of("proxy-route", CredentialKind::None);
+        assert!(Shape::of(&route).is_none());
+    }
+
+    /// A transport that fails the test if a probe ever reaches the network.
+    struct NoNetwork;
+
+    impl Transport for NoNetwork {
+        fn post<'a>(
+            &'a self,
+            _request: p1_provider_http::HttpRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            p1_provider_http::HttpResponse,
+                            p1_provider_http::TransportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                panic!("a route that sends no credential must not reach the network")
+            })
+        }
+    }
+
+    /// Issue #134: such a route is reported `Unsupported`, with a reason that says p1
+    /// has no credential to present — and not a single request is made.
+    #[tokio::test]
+    async fn a_route_that_sends_no_credential_is_unsupported() {
+        let route = fixture_route_of("proxy-route", CredentialKind::None);
+        let result = HttpProbe
+            .probe(&route, &Locations::none(), Arc::new(NoNetwork))
+            .await;
+        match result.probe {
+            Probe::Unsupported { reason } => {
+                for part in ["none", "no credential"] {
+                    assert!(reason.contains(part), "{reason}: {part}");
+                }
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(result.windows.is_empty());
     }
 
     #[test]

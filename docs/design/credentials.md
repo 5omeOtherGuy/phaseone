@@ -24,10 +24,15 @@ The route file's `[credential]` table deserializes into `p1_auth::CredentialSpec
 | `api-key` | `env` (required name), `borrow` (ordered list of `opencode:<key>` / `pi:<key>`) | env var → p1 store entry for the route → each borrowed login |
 | `claude-code-oauth` | `env` optional | env var (a bearer token, no refresh) → p1 store → Claude Code's login file |
 | `codex-oauth` | `env` optional | env var → p1 store → Codex CLI's login file |
+| `none` | none | NOTHING. An egress proxy injects the provider's credential after the request leaves the process, so no variable, store entry or login is read, and the adapter sends no authentication header (§9) |
 
 `store_only` (boolean, default `false`) is the one policy field on the table, for every kind
 (ADR-0061, §8). Written, the chain stops after p1's own store: the documented variable and the
 store entry, and no other tool's login. Absent, the rows above are unchanged.
+
+`kind = "none"` is not a policy but a KIND with no source at all (issue #134, §9). Naming a
+source beside it is a contradiction, so `env`, a nonempty `borrow` or `store_only = true` on a
+`none` route is a load error.
 
 `p1_auth::resolve(route_id, &spec, transport, &Locations) -> Arc<dyn CredentialSource>`.
 `Locations` carries every directory the chain may touch (home, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
@@ -60,14 +65,18 @@ the real home or the real environment; `Locations::from_process()` is the produc
 
 ## 4. Which source — visible, never the value
 
-`CredentialSource` gains nothing. `p1_auth::describe(route_id, &spec, &Locations) -> SourceReport`
-is a separate, non-secret probe:
+`CredentialSource` gains one defaulted method, `proxy_injected()` (§9): `false` for every source
+that resolves a credential of its own, `true` for `kind = "none"`. `p1_auth::describe(route_id,
+&spec, &Locations) -> SourceReport` is a separate, non-secret probe:
 `{ chosen: Option<SourceName>, tried: Vec<(SourceName, Presence)>, policy: CredentialPolicy }`
 with `SourceName` rendering as `env OPENCODE_API_KEY`, `p1 store`, `opencode login`, `pi login`,
 `Claude Code login`, `Codex login`, and `Presence` = `present | absent | unusable(<reason>)`.
-`policy` is `Chain` (the default) or `StoreOnly`. `SourceReport::line()` returns the chosen source
-(or `none — <what to do>`), then ` [p1 store only]` when the policy is `StoreOnly`, so the setting
-is visible in `p1 env show`, `p1 login --list` and `p1 models` without reading any credential.
+`policy` is `Chain` (the default), `StoreOnly` or `ProxyInjected` (`kind = "none"`, §9).
+`SourceReport::line()` returns the chosen source (or `none — <what to do>`), then ` [p1 store only]`
+when the policy is `StoreOnly`; a `ProxyInjected` route's line is `none (proxy-injected) — the
+egress proxy injects the credential`, and its `tried` list is empty. The setting is visible in
+`p1 env show`, `p1 login --list` and `p1 models` without reading any credential; `p1 login --list`
+also spells the KIND as `none (proxy-injected)` (`CredentialKind::label`).
 `p1 env show` prints it as `credential  <line>`. The report reads files to see whether an entry
 EXISTS; it never returns, logs or formats a credential value, and its `Debug` is redacted by
 construction (there is no field that could hold one).
@@ -203,3 +212,59 @@ OAuth routes need a grant placed in the store by another step. Requirements for 
 - **Status.** The Codex grant from the retired Pi store was transferred by the XO and passed a live
   p1 request. The Claude independent grant is pending an owner login. No credential value appears
   in this repository.
+
+## 9. A route that sends NO credential — `kind = "none"` (issue #134)
+
+Request from brain1 (2026-09-25): in a Claude Code cloud session an EGRESS PROXY adds the provider
+key per host after the request leaves the VM, so the session never sees it. A stored placeholder key
+only works if the proxy overrides an existing `Authorization` header, and it may not: p1 needs a
+route that sends no credential at all.
+
+### 9.1 The kind
+
+`[credential] kind = "none"` is written EXPLICITLY in the route file; it is never inferred from a
+missing key. It has no source: `p1_auth::resolve` returns a source that reads nothing — no
+environment variable, no store entry, no other tool's login — and an adapter sends no
+authentication header for it. `validate` refuses `env`, a nonempty `borrow` or `store_only = true`
+on such a route, because each would name a source the route must not read.
+
+### 9.2 What the adapters and the transports do
+
+- `CredentialSource::proxy_injected() -> bool` (default `false`, `true` for this kind) is the one
+  signal. Every adapter that would send `Authorization` (and the Responses account-id header) sends
+  NONE when it is true: `p1-provider-openai-chat`, `p1-provider-anthropic` and
+  `p1-provider-openai`, on both the SSE path and the WebSocket handshake. The placeholder
+  `access()` returns has an EMPTY bearer, and no adapter may send it.
+- Neither transport refreshes such a route: there is no credential to rotate and no write-back. A
+  401/403 that classifies as `Authentication` (not `InsufficientBalance`/`NotEntitled`, which keep
+  their own diagnosis) finishes immediately as an Authentication failure whose message names the
+  missing PROXY credential and the status — never a key p1 could hold. That holds for the SSE driver
+  AND for a WebSocket upgrade refused 401/403, which never enters its refresh phase; both report
+  through `p1_provider_http::proxy_refusal_message`, so the wording cannot drift. A direct
+  `refresh(rejected)` still refuses the same way, so a caller that asks anyway gets the refusal and
+  never a value.
+
+### 9.3 What is visible
+
+- `p1 login --list` prints the kind as `none (proxy-injected)` (`CredentialKind::label`) and the
+  source line as `none (proxy-injected) — the egress proxy injects the credential`
+  (`CredentialPolicy::ProxyInjected`). `p1 env show` prints the same line.
+- `p1 login <route>` and `p1 logout <route>` are usage errors: p1 stores nothing for this route, so
+  there is nothing to write and nothing to remove.
+- `p1 usage` reports such a route `Unsupported`: p1 has no credential to present to a usage
+  endpoint, and probing one with an empty bearer would be a lie.
+
+### 9.4 Must-pass
+
+a. The table parses `none`, `name()` is `none`, `label()` is `none (proxy-injected)`, and
+   `env`/`borrow`/`store_only` beside it are load errors. An unknown kind is still a route-file
+   error listing the known ones.
+b. A `kind = "none"` route composes and its request carries no `authorization` (nor `x-api-key`,
+   nor the Responses account id) for EVERY adapter — asserted from the transport's record, through
+   the host's own route loader and catalog factory.
+c. Nothing is read: with a store file whose mode makes any read fail, and a directory where each
+   CLI's login file belongs, the chain still yields the empty placeholder and a request still
+   reaches the transport. The files are byte-identical afterwards.
+d. A 401 on such a route is an Authentication failure naming the proxy credential and the status,
+   with exactly one request (or, on a WebSocket route, one handshake) and no refresh call.
+e. An api-key route with the very same route file and a readable store still sends `Bearer <key>`.

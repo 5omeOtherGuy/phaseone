@@ -69,7 +69,11 @@ context_limit = 128000                 # optional; lowers the profile's ceiling,
 output_limit  = 32000                  # optional; same rule
 ```
 
-- `credential.kind` is a closed enum: `api-key` (above), `claude-code-oauth`, `codex-oauth`.
+- `credential.kind` is a closed enum: `api-key` (above), `claude-code-oauth`, `codex-oauth`,
+  `none`. `none` (issue #134) is the route that sends NO credential: an egress proxy injects the
+  provider's credential after the request leaves the process, so nothing is read and the adapter
+  sends no authentication header (`docs/design/credentials.md` §9). It names no source, so `env`,
+  a nonempty `borrow` and `store_only` beside it are load errors.
   `store_only` (default `false`, ADR-0061) is the one policy field: written, the chain is the
   documented variable and p1's own store, and no other tool's login file is read for ANY kind
   (for `claude-code-oauth` / `codex-oauth` that is what removes the unconditional CLI fallback;
