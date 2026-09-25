@@ -66,21 +66,21 @@ fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Op
     // on `^D`, or by itself when the diff is taller than the transcript area. That region is
     // the transcript area of a screen with no pane and no composer, at full width.
     let unobstructed = crate::geometry::layout(w, h, PaneWidth::Off, true, 0);
-    if let Some(Approval::Diff(view)) = &screen.approval {
-        if review_covers(screen, w, h) {
-            draw_statusline(screen, area, unobstructed.statusline, buf);
-            let files = [review::ReviewFile::new(view.clone())];
-            let decision = review::Decision::for_call(view.grantable, files.len());
-            let rows = unobstructed.transcript.height as usize;
-            let full = Rect {
-                width: w.saturating_sub(4),
-                ..unobstructed.transcript
-            };
-            screen.review.body_rows = review::body_rows(&decision, rows);
-            let lines = review::lines(&files, &screen.review, &decision, full.width as usize, rows);
-            draw_lines(&lines, offset(area, full), buf);
-            return None;
-        }
+    if let Some(Approval::Diff(view)) = &screen.approval
+        && review_covers(screen, w, h)
+    {
+        draw_statusline(screen, area, unobstructed.statusline, buf);
+        let files = [review::ReviewFile::new(view.clone())];
+        let decision = review::Decision::for_call(view.grantable, files.len());
+        let rows = unobstructed.transcript.height as usize;
+        let full = Rect {
+            width: w.saturating_sub(4),
+            ..unobstructed.transcript
+        };
+        screen.review.body_rows = review::body_rows(&decision, rows);
+        let lines = review::lines(&files, &screen.review, &decision, full.width as usize, rows);
+        draw_lines(&lines, offset(area, full), buf);
+        return None;
     }
 
     // The composer first: its height moves the transcript's bottom edge (§8.1 — it grows
