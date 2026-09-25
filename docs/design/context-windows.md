@@ -14,7 +14,8 @@ OpenCode gateways' own model metadata (published as the public `models.dev` data
 `https://opencode.ai/zen/v1/models`), and OpenRouter's public `/api/v1/models`. No logins, no keys,
 no authenticated traffic. Everything below was fetched on 2026-09-24 (UTC). A number no public
 source states is recorded as **unknown** and the environment keeps the value it had; no window is
-invented.
+invented. A number that is neither sourced nor unknown but chosen by the owner is recorded as
+**policy** and never dressed up as a measurement.
 
 **Terms.** `window` is the capacity the route accepts (p1 `[context] window_tokens`).
 `threshold` is p1's useful point (`summarize_at_tokens`), where the summarizer runs before the
@@ -24,23 +25,28 @@ on every model we run.
 
 ## The table
 
-| env | route | wire model | window | reserve | threshold | source (URL / file, fetched 2026-09-24) | documented or measured |
-|---|---|---|---|---|---|---|---|
-| claude | anthropic-subscription | claude-sonnet-5 (route also binds opus-5-5, opus-5, fable-5, sonnet-4-6, opus-4-6) | 1,000,000 | 32,000 | 500,000 | Owner-confirmed 2026-09-25 (ADR-0063: `long_context = true` sends the `context-1m-2025-08-07` beta). Public: docs.anthropic.com/en/docs/build-with-claude/context-windows — "1M tokens for Claude Sonnet 5 and Claude Sonnet 4.6" (the same public API face lists a 128,000 completion ceiling; the 32,000 reserve is p1's next-response budget, kept with the owner's hotfix) | vendor-documented + owner-confirmed |
-| gpt | openai-codex-subscription | gpt-5.6-sol (route also binds gpt-5.6-luna, gpt-5.6-terra, gpt-5.5, gpt-6-sol, gpt-6-luna, gpt-6-astra) | 272,000 | 32,000 | 220,000 | github.com/openai/codex, `codex-rs/models-manager/models.json` at main `cf792c3a` ("Model metadata returned by the Codex backend `/models` endpoint"): gpt-5.6-sol `"context_window": 272000`, `"max_context_window": 872000`, `"auto_compact_token_limit": null`, `supports_experimental_context: false`; `codex-rs/protocol/src/openai_models.rs` `ModelInfo::auto_compact_token_limit()` derives 90 % of the window when the field is null → 244,800, and `usable_context_window()` = `effective_context_window_percent` (default 95) → 258,400. The public API face allows 128,000 completion tokens, so the reserve is 32,000 rather than Codex's 5 % | vendor-documented (Codex CLI source, ChatGPT auth) |
-| deepseek | opencode-go-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | models.dev/api.json provider `opencode-go`, model `deepseek-v4.1-flash`: `limit: {context: 1000000, output: 384000}`; api-docs.deepseek.com (pricing/model page): `CONTEXT LENGTH 1M`. Reserve from measured output: run `split4a2-deepseek` (`docs/dogfood/runs.jsonl`) reported 71,337 reasoning tokens / 141,126 output tokens | gateway metadata + vendor-documented + measured |
-| deepseek1 | opencode-go-1-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` (same endpoint, another account) | gateway metadata + vendor-documented + measured |
-| deepseek2 | opencode-go-2-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` | gateway metadata + vendor-documented + measured |
-| deepseek3 | opencode-go-3-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` | gateway metadata + vendor-documented + measured |
-| cline | cline-pass-1 | cline-pass/deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | **unknown on this route**: docs.cline.bot/getting-started/clinepass documents subscription limits and reference prices, no context window (it footnotes "DeepSeek API pricing" for the model). The window is carried from the same model's vendor/gateway numbers above; the reserve from the measured run | not documented on the route (carried) |
-| cline2 | cline-pass-2 | cline-pass/deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `cline` (same endpoint, another account) | not documented on the route (carried) |
-| zen | opencode-zen-1 | space-bunny-free (env default; route also binds mimo-v2.6-flash-free, muse-spark-1.3-contributor-free) | 1,048,576 | 524,288 | 500,000 | models.dev/api.json provider `opencode`, model `space-bunny-free`: `limit: {context: 1048576, input: 524288, output: 524288}` — the Zen/Go docs state no limit and `/zen/v1/models` returns only ids | gateway metadata |
-| zen2 | opencode-zen-2 | space-bunny-free | 1,048,576 | 524,288 | 500,000 | as `zen` | gateway metadata |
-| zen3 | opencode-zen-3 | space-bunny-free | 1,048,576 | 524,288 | 500,000 | as `zen` | gateway metadata |
-| zen (profile `mimo-v2.6-flash-free`) | opencode-zen-* | mimo-v2.6-flash-free | 200,000 | 32,000 | 120,000 | models.dev/api.json provider `opencode`, model `mimo-v2.6-flash-free`: `limit: {context: 200000, output: 32000}`. The paid/openrouter `xiaomi/mimo-v2.6-flash` (1,048,576) is a different binding. **Effective on this environment**: the host folds a selected profile's capacity in, so selecting this profile narrows the 1M table to these numbers (`crates/p1-host/src/run.rs` `config_for_route`) | gateway metadata, enforced by the host |
-| zen (profile `muse-spark-1.3-contributor-free`) | opencode-zen-* | muse-spark-1.3-contributor-free | 1,048,576 | 131,072 | 500,000 | models.dev/api.json provider `opencode`: `limit: {context: 1048576, output: 131072}`. The window is not narrowed; the profile's output ceiling lowers the reserve | gateway metadata, enforced by the host |
-| glm | glm-subscription | glm-5.3 | 260,000 | 32,000 | 150,000 | **unknown on the coding plan**: docs.z.ai/guides/llm/glm-5.3.md says the model has "a 1M-token context window and a maximum output length of 128K tokens" (no 32,000 reserve is derived from it — p1's next-response budget stands until the plan's window is known), but the plan pages conflict — docs.z.ai/devpack/tool/others.md tells clients "Adjust Context Window Size based on your model (glm-5.2 is 1000000; other models 200000)" while docs.z.ai/devpack/latest-model.md tells the same client to "Set Context Window Size to 1000000" and says 1M needs the `[1m]` model suffix. Keep the previous conservative value | model documented; plan window unknown |
-| kimi | kimi-coding-subscription | k3 | 262,144 | 32,000 | 150,000 | www.kimi.com/code/docs/en/kimi-code/models.html: `Context window 1048576 (for higher-tier members)`, `262144 only` for `k3-256k`, and "on a Moderato / Plus plan, k3 supports up to 256K context; up to 1M context is available on Allegretto / Pro or above". The owner's plan tier is unknown, so the floor is used | vendor-documented, tier-dependent |
+Every row states the window (sourced, or "unknown" with the carried value), the reserve and the
+threshold, and whether each number is **sourced** or **policy** (lead decision 2026-09-25). A
+reserve is never derived from a run total: `docs/dogfood/runs.jsonl` sums usage over every request
+of a run (`scripts/run-report.py`), so it cannot size one response.
+
+| env | route | wire model | window | reserve | summarize_at | source or policy |
+|---|---|---|---|---|---|---|
+| claude | anthropic-subscription | claude-sonnet-5 (route also binds opus-5-5, opus-5, fable-5, sonnet-4-6, opus-4-6) | 1,000,000 | 32,000 | 500,000 | window **sourced**: owner-confirmed 2026-09-25 (ADR-0063: `long_context = true` sends the `context-1m-2025-08-07` beta) + docs.anthropic.com/en/docs/build-with-claude/context-windows ("1M tokens for Claude Sonnet 5 and Claude Sonnet 4.6"). reserve 32,000 + threshold 500,000: **owner hotfix**, not to be lowered |
+| gpt | openai-codex-subscription | gpt-5.6-sol (route also binds gpt-5.6-luna, gpt-5.6-terra, gpt-5.5, gpt-6-sol, gpt-6-luna, gpt-6-astra) | 272,000 | 32,000 | 220,000 | window **sourced**: github.com/openai/codex, `codex-rs/models-manager/models.json` at main `cf792c3a` ("Model metadata returned by the Codex backend `/models` endpoint"): `"context_window": 272000`, `"max_context_window": 872000`, `"auto_compact_token_limit": null`, `supports_experimental_context: false`; `codex-rs/protocol/src/openai_models.rs` derives auto-compaction at 90 % (244,800) and usable input at 95 % (258,400). reserve 32,000 **policy** (the completion ceiling is 128,000; Codex's own 5 % = 13,600 is smaller than one reasoning-heavy xhigh turn, and no per-response measurement exists); threshold 220,000 keeps the wall at 240,000 and leaves 52,000 for one response — above that the window is hit: **accepted risk** |
+| deepseek | opencode-go-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | window **sourced**: models.dev/api.json provider `opencode-go` (`limit: {context: 1000000, output: 384000}`) + api-docs.deepseek.com ("CONTEXT LENGTH 1M"). reserve 96,000 **policy** (below the 384,000 per-response ceiling; no per-response measurement exists — `split4a2-deepseek`'s 71,337 reasoning / 141,126 output are sums over 235 requests, per `docs/dogfood/runs.jsonl` and `scripts/run-report.py`); wall 904,000, threshold 300,000 → 604,000 of room, so the reserve cannot bind first |
+| deepseek1 | opencode-go-1-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` (same endpoint, another account) |
+| deepseek2 | opencode-go-2-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` |
+| deepseek3 | opencode-go-3-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` |
+| cline | cline-pass-1 | cline-pass/deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | window **not documented on this route**: docs.cline.bot/getting-started/clinepass publishes no context window (its price table footnotes "DeepSeek API pricing"), so 1,000,000 is the MODEL's window (DeepSeek vendor + OpenCode Go gateway metadata above), carried — the runs behind these values ran on OpenCode Go, not api.cline.bot. reserve **policy** as `deepseek` |
+| cline2 | cline-pass-2 | cline-pass/deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `cline` (same endpoint, another account) |
+| zen | opencode-zen-1 | space-bunny-free (env default; route also binds mimo-v2.6-flash-free, muse-spark-1.3-contributor-free) | 1,048,576 | 524,288 | 500,000 | window **sourced**: models.dev/api.json provider `opencode`, `space-bunny-free`: `limit: {context: 1048576, input: 524288, output: 524288}` (the Zen/Go docs state no limit and `/zen/v1/models` returns only ids). reserve 524,288 = the model's documented output limit; threshold 500,000 = min(500k, 60 %) |
+| zen2 | opencode-zen-2 | space-bunny-free | 1,048,576 | 524,288 | 500,000 | as `zen` |
+| zen3 | opencode-zen-3 | space-bunny-free | 1,048,576 | 524,288 | 500,000 | as `zen` |
+| zen (profile `mimo-v2.6-flash-free`) | opencode-zen-* | mimo-v2.6-flash-free | 200,000 | 32,000 | 120,000 | **sourced, enforced by the host**: models.dev/api.json provider `opencode`, `mimo-v2.6-flash-free`: `limit: {context: 200000, output: 32000}` (the paid/openrouter `xiaomi/mimo-v2.6-flash`, 1,048,576, is a different binding). The host folds the selected profile in (`config_for_route`), so selecting this profile narrows the 1M table to these numbers |
+| zen (profile `muse-spark-1.3-contributor-free`) | opencode-zen-* | muse-spark-1.3-contributor-free | 1,048,576 | 131,072 | 500,000 | **sourced, enforced by the host**: models.dev/api.json provider `opencode`: `limit: {context: 1048576, output: 131072}`. The window is not narrowed; the profile's output ceiling lowers the reserve |
+| glm | glm-subscription | glm-5.3 | 260,000 | 32,000 | 150,000 | window **unknown on the coding plan** (kept conservative): docs.z.ai/guides/llm/glm-5.3.md documents the model with 1M context and 128K output, but the plan pages conflict — docs.z.ai/devpack/tool/others.md ("glm-5.2 is 1000000; other models 200000") vs docs.z.ai/devpack/latest-model.md ("Set Context Window Size to 1000000", 1M needs the `[1m]` suffix), and our route sends the unsuffixed model. Measured: one request reached ~203k real input tokens (run `split3c-glm`). reserve 32,000 **policy** (below the documented 128,000 output); wall 228,000, threshold 150,000 → 78,000 for one response: **accepted risk** |
+| kimi | kimi-coding-subscription | k3 | 262,144 | 32,000 | 150,000 | window **sourced, tier-dependent**: www.kimi.com/code/docs/en/kimi-code/models.html — "Context window 1048576 (for higher-tier members)", "on a Moderato / Plus plan, k3 supports up to 256K context; up to 1M context is available on Allegretto / Pro or above", `k3-256k` fixed at 262144; the owner's tier is unknown, so the floor is used. reserve 32,000 **policy** (below the documented 131,072 output); wall 230,144, threshold 150,000 → 80,144 for one response: **accepted risk** |
 
 ## GPT on the subscription (the special case)
 
@@ -57,15 +63,18 @@ Codex counts the window as follows (`codex-rs/protocol/src/openai_models.rs`):
 - `auto_compact_token_limit()` = the model's own field when present, else 90 % of the window
   (244,800); a present field is clamped to 90 %.
 
-`environments/gpt/environment.toml` follows that accounting, with two deliberate deviations
-(#125 review: reasoning counts as output):
+`environments/gpt/environment.toml` follows that accounting, with two deliberate deviations, both
+**lead policy** (2026-09-25) rather than a reading of the source:
 
-- `window_tokens = 272000` — the subscription's context window;
-- `output_headroom_tokens = 32000` — the next turn's response, not Codex's 5 % (13,600): Sol
-  reasons heavily at high/xhigh, and the public API face of the same model allows up to 128,000
-  completion tokens, so a 13,600 reserve can be overrun by a single turn. Wall: 240,000;
+- `window_tokens = 272000` — the subscription's context window (sourced, above);
+- `output_headroom_tokens = 32000` — the next turn's response. Codex's own 5 % is 13,600, but
+  reasoning counts as output and the public API face of the same model allows up to 128,000
+  completion tokens, so 13,600 is smaller than one reasoning-heavy xhigh turn can be; no
+  per-response measurement of this route exists, so 32,000 is policy. Wall: 240,000;
 - `summarize_at_tokens = 220000` — below that wall (240,000) and below Codex's derived
-  `auto_compact_token_limit` of 244,800;
+  `auto_compact_token_limit` of 244,800; it leaves 52,000 for one response, and a single xhigh
+  response above 52,000 would hit the window: **accepted risk**, to be revisited with per-response
+  telemetry (deferred follow-up below);
 - `max_context_window` (872,000) is not used: it is the ceiling for an experimental context the
   subscription models do not announce (`supports_experimental_context: false` for every model our
   route binds), and overstating a window fails the request.
@@ -77,17 +86,19 @@ Except where a route pins a number, `summarize_at_tokens = min(500_000, 60 % of 
 
 | window | 60 % | threshold | reserve |
 |---|---|---|---|
-| 1,000,000 (claude, deepseek*, cline*) | 600,000 → capped at 500,000 | claude 500,000 (owner hotfix); deepseek*/cline* 300,000 | claude 32,000; deepseek*/cline* 96,000 |
+| 1,000,000 (claude, deepseek*, cline*) | 600,000 → capped at 500,000 | claude 500,000 (owner hotfix); deepseek*/cline* 300,000 | claude 32,000 (owner hotfix); deepseek*/cline* 96,000 (policy) |
 | 1,048,576 (zen*, space bunny / muse spark) | 629,146 → capped at 500,000 | 500,000 | the model's output limit (524,288 space bunny, 131,072 muse spark) |
-| 272,000 (gpt, Codex subscription) | — (Codex's own rule) | 220,000, below both the 240,000 wall and Codex's 244,800 | 32,000 |
-| 262,144 (kimi) | 157,286 → rounded down | 150,000 | 32,000 |
-| 260,000 (glm, unconfirmed) | 156,000 → rounded down | 150,000 (unchanged) | 32,000 |
+| 272,000 (gpt, Codex subscription) | — (Codex's own rule) | 220,000, below both the 240,000 wall and Codex's 244,800 | 32,000 (policy) |
+| 262,144 (kimi) | 157,286 → rounded down | 150,000 | 32,000 (policy) |
+| 260,000 (glm, unconfirmed) | 156,000 → rounded down | 150,000 (unchanged) | 32,000 (policy) |
 
-A reserve must cover the next turn's OUTPUT, and reasoning is output. Two reserves are derived
-from measured output rather than from a round number: deepseek*/cline* at 96,000, because the
-accepted run `split4a2-deepseek` (`docs/dogfood/runs.jsonl`: 235 requests, 141,126 output tokens,
-71,337 reasoning tokens) already exceeded the previous 32,000; and gpt at 32,000 against the
-128,000 completion ceiling of the same model on the public API. Where a profile's own output
+A reserve must cover the next turn's OUTPUT, and reasoning is output. **Every reserve here is
+either the model's documented output limit (zen) or lead policy (all the others, 2026-09-25):**
+no per-response output measurement exists for any of these routes, and the totals in
+`docs/dogfood/runs.jsonl` (e.g. `split4a2-deepseek`'s 141,126 output / 71,337 reasoning over 235
+requests) are run aggregates that cannot size one response. A policy reserve is a number below the
+route's documented per-response output ceiling; where the room between the threshold and the wall
+is smaller than that ceiling, the risk is recorded in the row above. Where a profile's own output
 ceiling is smaller than the environment's reserve, the host lowers the reserve to the profile's
 (`config_for_route`).
 
@@ -96,7 +107,8 @@ metadata and the vendor both say the window is 1,000,000 (60 % would be 600,000,
 500,000), and the only measured evidence (run `split4a`, `docs/dogfood/runs.jsonl`) is that
 thresholds *below* ~100k make a multi-file task thrash — it does not measure the right point.
 Task rule: keep 300,000 unless a documented reason to change it exists; none was found, so the
-value stands. The reserve rose to 96,000; the wall (904,000) is still far above it.
+value stands. The reserve rose to 96,000 as lead policy; with the wall at 904,000 and the threshold
+at 300,000 there are 604,000 tokens of room, so the reserve cannot bind before summarization.
 
 **claude** keeps the owner's hotfix (1,000,000 / 500,000 / reserve 32,000): ADR-0063, do not
 lower.
@@ -109,22 +121,29 @@ selected profile's own capacity into the effective table (`config_for_route` in
 `crates/p1-host/src/run.rs`):
 
 - effective `window_tokens` = `min(env window, profile.context_tokens)`;
-- effective `output_headroom_tokens` = `min(env reserve, profile.max_output_tokens)` — a reserve
-  larger than the effective window would leave no room at all for the request;
+- effective `output_headroom_tokens` = `min(env reserve, profile.max_output_tokens)`, and always
+  strictly below the effective window (a reserve as large as the window would leave no room at all
+  for the request that carries the next response);
 - effective `summarize_at_tokens` = `min(env threshold, 60 % of the effective window)`, and always
-  below `window - reserve`.
+  below `window - reserve`;
+- the copied verbatim budgets (`keep_recent_tokens`, `user_verbatim_tokens`) are clamped below the
+  wall, because a kept tail larger than what a request can carry would keep the whole history
+  verbatim and leave the next request over the wall (a 40,000-token profile on `zen`).
 
 Examples on `zen*` (whose table describes its DEFAULT profile, `space-bunny-free`):
 
 - `space-bunny-free` (1,048,576 / 524,288) → unchanged: 1,048,576 / 524,288 / 500,000;
 - `mimo-v2.6-flash-free` (200,000 / 32,000) → 200,000 / 32,000 / 120,000: before this rule the
   environment kept Space Bunny's 1M window, so a MiMo request could fail before compaction;
-- `muse-spark-1.3-contributor-free` (1,048,576 / 131,072) → 1,048,576 / 131,072 / 500,000.
+- `muse-spark-1.3-contributor-free` (1,048,576 / 131,072) → 1,048,576 / 131,072 / 500,000;
+- a profile stating MORE than the environment (4,000,000 / 900,000) → the environment's table,
+  unchanged: the fold only ever narrows;
 - No other shipped profile states `context_tokens`, so no other environment is narrowed.
 
-`crates/p1-host/src/run.rs` unit tests pin these (MiMo on `zen`, Muse on `zen`, and an
-environment whose profile states nothing). The same effective numbers are what the front end's
-`ctx` display is told, so the denominator is the window the summarizer actually acts on.
+`crates/p1-host/src/run.rs` unit tests pin these (MiMo on `zen`, Muse on `zen`, a roomier synthetic
+profile, a 40,000-token profile whose copied budgets are clamped, and an environment whose profile
+states nothing). The same effective numbers are what the front end's `ctx` display is told, so the
+denominator is the window the summarizer actually acts on.
 
 ## How to re-check
 
@@ -146,11 +165,11 @@ curl -sS https://openrouter.ai/api/v1/models | python3 -c 'import json,sys; [pri
   name are outside this task's owned paths.
 - **kimi**: raise the window to 1,048,576 once the owner's plan tier (Allegretto/Pro vs
   Moderato/Plus) is known.
-- **claude, glm, kimi reserves**: all three keep 32,000, while the public face of their models
-  states a 128,000/131,072 output ceiling. Raising them was NOT decided by the lead and is not a
-  one-line change (on glm and kimi a 131,072 reserve would fall below the current 150,000
-  threshold and force an earlier compaction), so the numbers stand with the ceiling recorded here.
-- **cline\***: no ClinePass window is documented; the carried 1,000,000 is a model-level value.
+- **claude, glm, kimi reserves**: all three keep 32,000 (policy / owner hotfix), while the public
+  face of their models states a 128,000/131,072 output ceiling, and on glm and kimi the room
+  between the threshold and the wall (78,000 / 80,144) is smaller than that ceiling. The reserves
+  stand as lead policy with the risk recorded in the table; revisit with per-response telemetry.
+- **cline\***: no ClinePass window is published; the carried 1,000,000 is a model-level value.
 - **gpt**: the 872,000 `max_context_window` becomes usable only if the subscription enables
   experimental context (`supports_experimental_context`).
 - **First-attempt truncation telemetry** (deferred at the lead's decision): the summarizer knows
@@ -158,3 +177,6 @@ curl -sS https://openrouter.ai/api/v1/models | python3 -c 'import json,sys; [pri
   carry only summed `Usage`, so `scripts/run-report.py` and `scripts/usage-audit.py` cannot tell a
   one-shot replacement from a truncation retry. Reporting the first-attempt truncation rate needs
   a defaulted field through `p1-contracts`' journal, which this PR does not touch. Follow-up.
+- **deferred: call-site tests for agent_context (review 146 r2)** — the host tests drive
+  `agent_context` directly, not the parent / `/model` switch / worker-start / re-grant call sites;
+  the lead files that issue.

@@ -21,13 +21,14 @@ module = "finish"
 # auto-compaction point at 90% of the window (244,800) and counts only 95% of the window as usable
 # INPUT, "after reserving headroom for system prompts, tool overhead, and model output" (258,400).
 # This table follows that accounting: window = the subscription's context window, and the
-# auto-compaction point stays at or below Codex's 244,800. Two deliberate deviations, from the
-# #125 review: the reserve is 32,000, not Codex's 5% (13,600), because REASONING COUNTS AS OUTPUT
-# and Sol reasons a lot at high/xhigh (the public API face of the same model allows up to 128,000
-# completion tokens), so a 13,600 reserve can be overrun by a single turn; and the useful point is
-# 220,000, below the 240,000 wall that reserve leaves (and below Codex's 244,800). 872,000 is not
-# used: no model our route binds enables experimental context, and overstating a window fails the
-# request. Details: docs/design/context-windows.md.
+# auto-compaction point stays below Codex's 244,800. The reserve is 32,000: LEAD POLICY
+# (2026-09-25), because REASONING COUNTS AS OUTPUT and the same model's public API face allows up
+# to 128,000 completion tokens — Codex's own 5% (13,600) is smaller than one reasoning-heavy turn
+# can be, and no per-response measurement exists for this route. The reserve bounds the wall at
+# 240,000, so summarizing at 220,000 leaves 52,000 for one response; a single xhigh response above
+# 52,000 is possible and would hit the window — ACCEPTED RISK, to be revisited with per-response
+# telemetry (deferred follow-up, docs/design/context-windows.md). 872,000 is not used: no model
+# our route binds enables experimental context, and overstating a window fails the request.
 [context]
 window_tokens = 272000
 output_headroom_tokens = 32000

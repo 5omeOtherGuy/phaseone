@@ -29,6 +29,11 @@ module = "finish"
 # 200k cap unless the endpoint changed. Summarize at 150k, keep a long tail — a tight threshold
 # makes a multi-file task thrash (run split4a-deepseek, docs/dogfood/runs.jsonl). Confirm the
 # plan's window (and whether `glm-5.3[1m]` should be the route's wire model) before raising it.
+# The reserve is 32,000: LEAD POLICY (2026-09-25). The model is documented with up to 128,000
+# output tokens and no per-response measurement exists on this route, so 32,000 is a policy choice
+# below that ceiling; it bounds the wall at 228,000, and summarizing at 150,000 leaves 78,000 for
+# one response — a response above that is possible and would hit the window. ACCEPTED RISK, to be
+# revisited with per-response telemetry (deferred follow-up, docs/design/context-windows.md).
 [context]
 window_tokens = 260000
 output_headroom_tokens = 32000

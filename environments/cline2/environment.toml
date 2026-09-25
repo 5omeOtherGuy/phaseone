@@ -18,12 +18,11 @@ module = "shell"
 module = "finish"
 
 # Same as environments/cline (the owner's second ClinePass account): the 1M window is a MODEL-level
-# value, not measured on this route. ClinePass documents no context window
+# value, not measured on this route. ClinePass publishes no context window
 # (docs.cline.bot/getting-started/clinepass, fetched 2026-09-24) and the model's vendor states 1M
 # (api-docs.deepseek.com "CONTEXT LENGTH 1M"); the OpenCode Go gateway metadata agrees (context
-# 1000000, output 384000). Summarize at 300k and reserve 96,000 as in environments/deepseek
-# (reasoning counts as output; run split4a2-deepseek emitted 71,337 reasoning tokens). Keep a long
-# tail.
+# 1000000, output 384000). Summarize at 300k; the 96,000 reserve is lead policy (2026-09-25) as in
+# environments/deepseek, not a measurement on this route either.
 [context]
 window_tokens = 1000000
 output_headroom_tokens = 96000

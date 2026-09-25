@@ -24,11 +24,13 @@ module = "finish"
 # split4a (docs/dogfood/runs.jsonl) read 698 files in 855 requests, was summarized 40 times and
 # never reached its first edit — a task that must hold several large files at once thrashes below
 # ~100k. Summarize at 300k: no source argues for another point, and the 60% rule would cap at 500k
-# with no measured evidence for it (docs/design/context-windows.md). The reserve is 96,000, not
-# 32,000 (#125 review): reasoning counts as output, and the accepted run split4a2-deepseek
-# (docs/dogfood/runs.jsonl) reported 71,337 reasoning tokens and 141,126 output tokens — the old
-# reserve was already too small for one turn of this model, while the route's own output ceiling is
-# 384,000 (the gateway metadata above). Keep a long tail.
+# with no measured evidence for it (docs/design/context-windows.md). The reserve is 96,000: LEAD
+# POLICY (2026-09-25), not a measurement. The route allows up to 384,000 output per response
+# (gateway metadata above), and no per-response usage has been measured here — the reasoning and
+# output totals of run split4a2-deepseek (71,337 and 141,126, docs/dogfood/runs.jsonl) are sums
+# over that run's 235 requests, so they cannot size one response. The reserve is therefore a policy
+# choice below the 384,000 ceiling; with the wall at 904,000 and the threshold at 300,000 there are
+# 604,000 tokens of room, so it cannot bind before summarization. Keep a long tail.
 [context]
 window_tokens = 1000000
 output_headroom_tokens = 96000

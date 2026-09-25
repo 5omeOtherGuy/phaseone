@@ -18,15 +18,14 @@ module = "shell"
 module = "finish"
 
 # The 1M window is a MODEL-level value, carried from the same model elsewhere, not measured on
-# this route: ClinePass documents subscription limits and reference prices but no context window
-# (docs.cline.bot/getting-started/clinepass, fetched 2026-09-24 — its price table footnotes
-# "DeepSeek API pricing"), and the runs behind these values (split4a and its successors,
-# docs/dogfood/runs.jsonl) ran on OpenCode Go, not on api.cline.bot. The model's vendor states
-# 1M (api-docs.deepseek.com "CONTEXT LENGTH 1M") and the OpenCode Go gateway metadata agrees
-# (context 1000000, output 384000). Summarize at 300k; the reserve is 96,000 as in
-# environments/deepseek, because reasoning counts as output and the same model emitted 71,337
-# reasoning tokens in the accepted run split4a2-deepseek (docs/dogfood/runs.jsonl). Keep a long
-# tail. docs/design/context-windows.md records the window as not documented on this route.
+# this route: ClinePass publishes NO context window (docs.cline.bot/getting-started/clinepass,
+# fetched 2026-09-24 — its price table footnotes "DeepSeek API pricing"), so 1,000,000 is the
+# MODEL's window from the DeepSeek vendor (api-docs.deepseek.com "CONTEXT LENGTH 1M") and the
+# OpenCode Go gateway metadata (context 1000000, output 384000), which the runs behind these
+# values (split4a and its successors, docs/dogfood/runs.jsonl) also ran on — OpenCode Go, not
+# api.cline.bot. Summarize at 300k; the reserve is 96,000 as in environments/deepseek: LEAD POLICY
+# (2026-09-25), not a measurement on this route either. docs/design/context-windows.md records the
+# window as not documented on this route.
 [context]
 window_tokens = 1000000
 output_headroom_tokens = 96000
