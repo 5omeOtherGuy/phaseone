@@ -127,6 +127,9 @@ pub struct Options {
     pub workspace: Option<PathBuf>,
     pub session: Option<PathBuf>,
     pub resume: bool,
+    /// `--compact` (ADR-0076): with `--resume`, summarize the resumed history once
+    /// before the first turn, exactly as the TUI's `/compact` does.
+    pub compact: bool,
     /// Ask before permitting a call: the restrictive policy (ADR-0038). The
     /// default is full access; `--yes` is accepted and means the default.
     pub ask: bool,
@@ -192,7 +195,7 @@ pub fn usage() -> String {
     out.push_str("p1 — a lean, model-shaped coding harness\n\n");
     out.push_str("usage:\n");
     out.push_str(
-        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]\n     [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]\n",
+        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]\n     [--workspace DIR] [--session FILE] [--resume [--compact]] [--ask]\n     [PROMPT…]\n",
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str("  p1 env show NAME\n");
@@ -224,6 +227,9 @@ pub fn usage() -> String {
     out.push_str("  --instructions FILE  append FILE to the agent's system prompt (repeatable; e.g.\n                    the global and the repository AGENTS.md)\n");
     out.push_str("  --skills DIR      list DIR/*/SKILL.md by name and description in the system\n                    prompt; the agent reads one when a task calls for it (repeatable)\n");
     out.push_str("  --resume          continue an existing --session file\n");
+    out.push_str(
+        "  --compact         with --resume: summarize the resumed session once before the\n                    first turn (the TUI's /compact)\n",
+    );
     out.push_str(
         "  --ask             ask before permitting a tool call; headless permits only\n                    read-only calls (default: full access, no questions)\n",
     );
@@ -306,6 +312,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut workspace: Option<PathBuf> = None;
     let mut session: Option<PathBuf> = None;
     let mut resume = false;
+    let mut compact = false;
     let mut ask = false;
     let mut tui = false;
     let mut yes = false;
@@ -345,6 +352,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
                 session = Some(PathBuf::from(value));
             }
             "--resume" => resume = true,
+            "--compact" => compact = true,
             "--instructions" => {
                 instructions.push(PathBuf::from(take_value(args, &mut index, arg)?));
             }
@@ -404,6 +412,12 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     if resume && session.is_none() {
         return Err(CliError {
             message: "--resume requires --session".to_string(),
+        });
+    }
+    if compact && !resume {
+        return Err(CliError {
+            message: "--compact needs --resume (a fresh session has nothing to compact)"
+                .to_string(),
         });
     }
     // `--yes` is the default, so combining it with `--ask` names two policies at once.
@@ -470,6 +484,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         workspace,
         session,
         resume,
+        compact,
         ask,
         tui,
         sandbox,
@@ -583,6 +598,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         workspace: None,
         session: None,
         resume: false,
+        compact: false,
         ask: false,
         tui: false,
         sandbox,
@@ -1048,6 +1064,7 @@ fn defaults(command: Command) -> Options {
         workspace: None,
         session: None,
         resume: false,
+        compact: false,
         ask: false,
         tui: false,
         sandbox: SandboxMode::Off,
@@ -1162,6 +1179,26 @@ mod tests {
         assert!(usage().contains("p1 login <route>"));
         assert!(usage().contains("p1 login --list"));
         assert!(usage().contains("p1 logout <route>"));
+    }
+
+    #[test]
+    fn parses_compact_only_with_resume() {
+        let options = parse(&args(&["--session", "s.jsonl", "--resume", "--compact"])).unwrap();
+        assert!(options.resume);
+        assert!(options.compact);
+        assert!(
+            !parse(&args(&["--session", "s.jsonl", "--resume"]))
+                .unwrap()
+                .compact
+        );
+        let error = parse(&args(&["--session", "s.jsonl", "--compact"])).unwrap_err();
+        assert_eq!(
+            error.message,
+            "--compact needs --resume (a fresh session has nothing to compact)"
+        );
+        assert!(parse(&args(&["--compact"])).is_err());
+        assert!(usage().contains("--resume [--compact]"));
+        assert!(usage().contains("  --compact         with --resume"));
     }
 
     #[test]

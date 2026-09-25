@@ -89,6 +89,7 @@ fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             environment_dirs: Vec::new(),
             route_label: Arc::new(Mutex::new(String::new())),
             pending_switch: None,
+            pending_compact: false,
             _workers: None,
         },
         auth,
@@ -2056,6 +2057,7 @@ fn workflow_calls_build_the_tree_and_a_run_header_cancels_through_the_run_channe
             workspace: std::path::PathBuf::from("/workspace"),
             sandbox: "off".into(),
             effort: None,
+            compact: false,
         },
         CancellationToken::new(),
     );
@@ -2194,4 +2196,340 @@ async fn a_live_run_draws_on_the_heartbeat_only_while_its_tree_is_visible() {
         0,
         "an auto-opened review covers the pane"
     );
+}
+
+// ------------------------------------------------------ /compact (ADR-0076)
+
+/// A provider whose FIRST stream is held until `release`: a turn that keeps
+/// running until the test lets it end. `started` is notified on every stream.
+struct HeldProvider {
+    inner: Arc<p1_testkit::ScriptedProvider>,
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    held: std::sync::atomic::AtomicBool,
+}
+
+impl p1_contracts::Provider for HeldProvider {
+    fn describe(&self) -> p1_contracts::RouteDescription {
+        p1_contracts::Provider::describe(&*self.inner)
+    }
+
+    fn validate(
+        &self,
+        request: &p1_contracts::ProviderRequest,
+    ) -> Result<(), p1_contracts::ProviderError> {
+        p1_contracts::Provider::validate(&*self.inner, request)
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: p1_contracts::ProviderRequest,
+        cancel: CancellationToken,
+    ) -> p1_contracts::BoxFuture<
+        'a,
+        Result<p1_contracts::ProviderStream, p1_contracts::ProviderError>,
+    > {
+        Box::pin(async move {
+            let stream = p1_contracts::Provider::stream(&*self.inner, request, cancel).await;
+            self.started.notify_one();
+            if !self.held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.release.notified().await;
+            }
+            stream
+        })
+    }
+}
+
+/// The journal of three exchanges of ~100 tokens each.
+async fn long_session() -> Vec<p1_contracts::JournalRecord> {
+    let journal = Arc::new(p1_testkit::RecordingJournal::new());
+    let provider = Arc::new(p1_testkit::ScriptedProvider::new(
+        (0..3)
+            .map(|round| p1_testkit::text_response(&format!("{round}{}", "a".repeat(400))))
+            .collect(),
+    ));
+    let mut agent = Agent::new(p1_core::AgentParts {
+        provider,
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+        journal: journal.clone(),
+        events: Arc::new(p1_testkit::RecordingEvents::new()),
+    })
+    .expect("agent builds");
+    for input in ["one", "two", "three"] {
+        agent.run_turn(input.into(), CancellationToken::new()).await;
+    }
+    journal.records()
+}
+
+/// An agent resumed from `records` whose context is the real summarizer, with a
+/// threshold no test history reaches: only a `/compact` summarizes.
+fn compacting_agent(
+    provider: Arc<dyn p1_contracts::Provider>,
+    journal: Arc<p1_testkit::RecordingJournal>,
+    records: &[p1_contracts::JournalRecord],
+) -> Agent {
+    let context = p1_context::SummarizingContext::new(
+        provider.clone(),
+        p1_contracts::ModelOptions::default(),
+        p1_context::ContextConfig {
+            window_tokens: 20_000,
+            output_headroom_tokens: 1_000,
+            summarize_at_tokens: 10_000,
+            keep_recent_tokens: 120,
+            user_verbatim_tokens: 100,
+            tool_result_excerpt_chars: 2_000,
+        },
+        "summary prompt".into(),
+    )
+    .expect("the summarizer builds");
+    Agent::resume(
+        p1_core::AgentParts {
+            provider,
+            tools: vec![],
+            system_prompt: String::new(),
+            options: p1_contracts::ModelOptions::default(),
+            context: Arc::new(context),
+            authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+            journal,
+            events: Arc::new(p1_testkit::RecordingEvents::new()),
+        },
+        records,
+    )
+    .expect("the session resumes")
+    .0
+}
+
+/// Run the loop until it returns, with the harness's own key and event senders
+/// dropped first: the loop ends at idle once the test drops its clones.
+async fn run_with_own_wires<B: Backend, S: std::future::Future<Output = ()>>(
+    harness: IdleLoop<B>,
+    script: S,
+) -> (i32, Driver, Agent) {
+    let IdleLoop {
+        mut terminal,
+        mut driver,
+        mut agent,
+        keys,
+        events,
+        auth,
+        sink,
+        cancel,
+        redraws,
+        wires,
+    } = harness;
+    drop(wires);
+    let keys = key_stream(keys);
+    let (code, ()) = tokio::join!(
+        drive_loop(
+            &mut terminal,
+            &mut driver,
+            &mut agent,
+            keys,
+            events,
+            auth,
+            &cancel,
+            &sink,
+            ColorMode::TrueColor,
+            redraws,
+        ),
+        script
+    );
+    (code, driver, agent)
+}
+
+fn meta_rows(driver: &Driver) -> Vec<&str> {
+    driver
+        .screen
+        .transcript
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            p1_tui::transcript::Block::Meta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `· compacted: <before> → <after> tokens`, as numbers.
+fn compacted_counts(driver: &Driver) -> (u64, u64) {
+    let rows = meta_rows(driver);
+    let line = rows
+        .iter()
+        .find_map(|row| row.strip_prefix("· compacted: "))
+        .unwrap_or_else(|| panic!("no compacted line in {rows:?}"));
+    let (before, after) = line
+        .strip_suffix(" tokens")
+        .and_then(|counts| counts.split_once(" → "))
+        .unwrap_or_else(|| panic!("malformed line {line:?}"));
+    (before.parse().unwrap(), after.parse().unwrap())
+}
+
+fn is_summary(item: &p1_contracts::Item) -> bool {
+    matches!(item, p1_contracts::Item::User { text } if text.starts_with(p1_context::SUMMARY_MARKER))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_compact_typed_mid_turn_applies_at_the_turns_end() {
+    let records = long_session().await;
+    let scripted = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        p1_testkit::text_response("turn answer"),
+        p1_testkit::text_response("## Task\nsummed"),
+    ]));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(HeldProvider {
+        inner: scripted.clone(),
+        started: started.clone(),
+        release: release.clone(),
+        held: std::sync::atomic::AtomicBool::new(false),
+    });
+    let journal = Arc::new(p1_testkit::RecordingJournal::new());
+    let agent = compacting_agent(provider, journal.clone(), &records);
+    let mut harness =
+        IdleLoop::with_agent(ratatui::backend::TestBackend::new(96, 24), false, agent);
+    harness.driver.context_window = Some(20_000);
+    harness.driver.context_warn_at = Some(10_000);
+    harness.driver.screen.composer.insert('g');
+    let keys = harness.wires.keys.clone();
+    let events = harness.wires.events.clone();
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    let requests = scripted.clone();
+    let script = async move {
+        // The turn's request is in flight and held.
+        started.notified().await;
+        // The screen is working, as the agent's own `TurnStarted` makes it: the
+        // typed line would be steering if it were not a command.
+        events
+            .send(UiEvent::Agent(p1_tui::runtime::Stamped {
+                worker: None,
+                at_ms: 0,
+                event: p1_contracts::AgentEvent::TurnStarted,
+            }))
+            .unwrap();
+        for c in "/compact".chars() {
+            keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+        }
+        keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+        // Let the loop take every key (explicit scheduling, no clock).
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.requests().len(),
+            1,
+            "the summary waits for the running turn"
+        );
+        release.notify_one();
+        drop(keys);
+        drop(events);
+    };
+
+    let (code, driver, agent) = run_with_own_wires(harness, script).await;
+
+    assert_eq!(code, 0);
+    let rows = meta_rows(&driver);
+    assert!(
+        rows.contains(&"· compact queued · applies at the end of this turn"),
+        "{rows:?}"
+    );
+    assert!(
+        driver.screen.queued.is_empty(),
+        "the command is not steering"
+    );
+    let requests = scripted.requests();
+    assert_eq!(requests.len(), 2, "the turn, then one summary");
+    assert_eq!(requests[0].system_prompt, "");
+    assert_eq!(requests[1].system_prompt, "summary prompt");
+    // The journal: the turn's answer, then the SAME record a threshold summary writes.
+    let records = journal.records();
+    let answered = records
+        .iter()
+        .position(|record| {
+            matches!(&record.body, p1_contracts::RecordBody::AssistantCompleted { item, .. } if item.text() == "turn answer")
+        })
+        .expect("the turn's answer is journalled");
+    let replaced = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record.body,
+                p1_contracts::RecordBody::ContextReplaced { .. }
+            )
+        })
+        .expect("the compaction is journalled");
+    assert!(answered < replaced, "applied at the turn's end");
+    // The run continues on the summary, and `ctx` shows what it now carries.
+    assert!(is_summary(&agent.history()[0]));
+    let (before, after) = compacted_counts(&driver);
+    assert!(after < before);
+    assert_eq!(after, p1_context::estimate_tokens(agent.history()));
+    assert_eq!(
+        driver.screen.context.as_ref().and_then(|view| view.used),
+        Some(after)
+    );
+    assert!(driver.screen.statusbar.ctx.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_compact_at_idle_applies_at_once() {
+    let records = long_session().await;
+    let scripted = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        p1_testkit::text_response("## Task\nsummed"),
+    ]));
+    let journal = Arc::new(p1_testkit::RecordingJournal::new());
+    let agent = compacting_agent(scripted.clone(), journal.clone(), &records);
+    let harness = IdleLoop::with_agent(ratatui::backend::TestBackend::new(96, 24), false, agent);
+    let keys = harness.wires.keys.clone();
+    for c in "/compact".chars() {
+        keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+    }
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    drop(keys);
+
+    let (code, driver, agent) = run_with_own_wires(harness, async {}).await;
+
+    assert_eq!(code, 0);
+    let rows = meta_rows(&driver);
+    assert!(
+        !rows.iter().any(|row| row.contains("queued")),
+        "nothing is queued at idle: {rows:?}"
+    );
+    let requests = scripted.requests();
+    assert_eq!(requests.len(), 1, "one summary, no turn");
+    assert_eq!(requests[0].system_prompt, "summary prompt");
+    assert!(journal.records().iter().any(|record| matches!(
+        record.body,
+        p1_contracts::RecordBody::ContextReplaced { .. }
+    )));
+    assert!(is_summary(&agent.history()[0]));
+    let (before, after) = compacted_counts(&driver);
+    assert!(after < before);
+}
+
+#[test]
+fn a_short_history_reports_nothing_to_compact() {
+    let (mut d, _auth) = driver();
+    d.report_compaction(Ok(p1_contracts::Compaction::Unchanged { tokens: 42 }));
+    assert_eq!(meta_rows(&d), ["· nothing to compact: 42 tokens"]);
+}
+
+#[test]
+fn slash_compact_is_listed_in_help_and_is_a_command_while_working() {
+    let (mut d, _auth) = driver();
+    d.slash("help", None);
+    let p1_tui::transcript::Block::CommandOutput(output) = &d.screen.transcript.blocks[0] else {
+        panic!("expected the help output");
+    };
+    assert!(output.body.iter().any(|row| matches!(
+        row,
+        p1_tui::transcript::CommandRow::Entry { key, .. } if key == "/compact"
+    )));
+    assert!(is_slash_command("/compact"));
+    assert!(is_slash_command("/model gpt/x"));
+    assert!(!is_slash_command("/usr/bin is where it lives"));
+    assert!(!is_slash_command("compact"));
 }

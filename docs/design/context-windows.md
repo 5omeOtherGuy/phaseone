@@ -114,6 +114,15 @@ at 300,000 there are 604,000 tokens of room, so the reserve cannot bind before s
 **claude** keeps the owner's hotfix (1,000,000 / 500,000 / reserve 32,000): ADR-0063, do not
 lower.
 
+**Manual trigger (ADR-0076).** The threshold is not the only trigger: `/compact` in the TUI and
+`--compact` on `--resume` run the same summarizer on the current history now, through the same
+function and the same `ContextReplaced` record, whatever `summarize_at_tokens` says. Nothing in
+the table above changes; the summary uses the same reserve, summary output cap and effort. A
+history with no unit older than the `keep_recent_tokens` tail is left alone
+(`nothing to compact: <tokens> tokens`); otherwise the line is
+`compacted: <before> → <after> tokens` (estimates). In the TUI a `/compact` typed during a turn
+waits for the turn's end, like `/model`.
+
 ## Profile `context_tokens` per env
 
 `profiles/*.toml` states what a model serves, and the environment states the window of its

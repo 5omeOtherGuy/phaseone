@@ -170,7 +170,7 @@
     { label: "/model", desc: "switch model or effort", right: "claude/opus-5.5:high" }, { label: "/effort", desc: "set effort for this model", right: "high" },
     { label: "/goal", desc: "set the session objective" }, { label: "/focus", desc: "transcript only", right: "off" }, { label: "/status", desc: "session facts" },
     { label: "/resume", desc: "reopen a previous session" }, { label: "/access", desc: "access and sandbox", right: "full" }, { label: "/help", desc: "commands and keys" },
-    { label: "/models", desc: "every model p1 can run" }, { label: "/exit", desc: "quit p1" }];
+    { label: "/models", desc: "every model p1 can run" }, { label: "/exit", desc: "quit p1" }, { label: "/compact", desc: "summarize the session now" }];
   var MODELS = [
     { header: "CLAUDE", right: "anthropic-subscription", rows: [{ label: "claude/opus-5.5", desc: "low medium high max", right: "current" }, { label: "claude/sonnet-5", desc: "low medium high max", right: "oauth \u00b7 borrowed" }, { label: "claude/opus-5", desc: "low medium high", right: "oauth \u00b7 borrowed" }] },
     { header: "DEEPSEEK", right: "opencode-go-subscription", rows: [{ label: "deepseek/v4.1-flash", desc: "default", right: "api key" }] },
