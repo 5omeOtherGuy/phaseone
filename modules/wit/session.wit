@@ -1,0 +1,121 @@
+package p1:module@1.0.0;
+
+/// One summarization request through the agent's own provider. Owner: the native context
+/// adapter.
+///
+/// The host sends the environment's summarizer prompt as the system prompt and `transcript`
+/// as the one user item, with the agent's model options at the summary effort the host chose
+/// and `max-output-tokens` as the cap (lowered to the agent's own explicit cap when that is
+/// smaller). It streams the response to its end and masks credential-shaped text in the
+/// summary before the module sees it (issue #142).
+interface summary {
+    use types.{stop-reason, provider-error, usage};
+
+    record summary-request {
+        /// The rendered part of the history to summarize.
+        transcript: string,
+        /// The output cap; `none` sends no cap.
+        max-output-tokens: option<u32>,
+    }
+
+    record summary-response {
+        /// The text of the completed response, masked.
+        text: string,
+        stop: stop-reason,
+        /// Unknown usage is `none`, never zero.
+        usage: option<usage>,
+    }
+
+    variant summary-error {
+        /// The route refused the request before anything was sent (an option it cannot
+        /// carry, such as an output cap); a module may retry with a different request.
+        refused(provider-error),
+        /// The request was sent and failed.
+        failed(provider-error),
+        /// The call was cancelled while the request was in flight.
+        cancelled,
+    }
+
+    /// Blocks the module while the host streams the request.
+    summarize: func(request: summary-request) -> result<summary-response, summary-error>;
+}
+
+/// The session's completion state. Owner: the host completion hub (`CompletionHub` in
+/// `p1-host`, `docs/design/completion.md`).
+///
+/// What the `finish` tool reads to verify a completion and writes when it accepts one. The
+/// session record is the host's; a module reads it and never writes it.
+interface completion {
+    use types.{json};
+
+    /// Which completion rule applies to this agent (ADR-0051). The host chooses it.
+    enum completion-policy {
+        /// `done` needs a successful command run recorded after the last file change.
+        recorded-commands,
+        /// For an agent with no tool that runs commands: `done` may pass `["none"]` after a
+        /// file change, and the parent is told the result is unverified.
+        report-to-parent,
+    }
+
+    /// One finished `executes` call of this session.
+    record shell-run {
+        /// The command as the model passed it.
+        command: string,
+        /// The parsed exit code; `none` (a timeout, a cancellation) never counts as success.
+        exit-code: option<s32>,
+        /// Increasing order of the finished call within the session.
+        order: u64,
+    }
+
+    /// What an accepted `done` established (ADR-0051), from the session's own record.
+    variant evidence {
+        /// These commands all ran successfully after the last file change.
+        commands-passed(list<string>),
+        /// Nothing was established, and why.
+        not-run(string),
+    }
+
+    record done {
+        summary: string,
+        evidence: evidence,
+    }
+
+    record blocked {
+        summary: string,
+        needs: string,
+        tried: list<string>,
+    }
+
+    variant accepted {
+        done(done),
+        blocked(blocked),
+    }
+
+    /// Whether an accepted `done`'s structured result met the output contract.
+    variant schema-check {
+        not-requested,
+        passed,
+        failed(list<string>),
+    }
+
+    record structured-result {
+        /// The accepted result as JSON text; `none` only when no contract was requested.
+        value: option<json>,
+        schema: schema-check,
+    }
+
+    /// The order of the last finished `writes-files` call, if any.
+    last-file-change: func() -> option<u64>;
+
+    /// Every finished `executes` call so far, oldest first.
+    shell-runs: func() -> list<shell-run>;
+
+    policy: func() -> completion-policy;
+
+    /// The JSON Schema subset an accepted `done`'s result must meet (ADR-0053), if the host
+    /// set one for this agent.
+    output-contract: func() -> option<json>;
+
+    /// Record an accepted call; the last one wins. The host reads it when the turn ends.
+    accept: func(accepted: accepted, structured: option<structured-result>);
+}

@@ -44,6 +44,24 @@ macro_rules! apply_face {
     }};
 }
 
+// The delegation and workflow families and the child assembly live in their own files,
+// so a later slice can turn each into a WebAssembly module without touching `run.rs`.
+// They are declared after `apply_face!`: a `macro_rules!` macro is only visible to the
+// modules declared below its definition.
+#[cfg(feature = "delegation")]
+pub(crate) mod children;
+pub(crate) mod delegation;
+#[cfg(feature = "workflows")]
+pub mod workflow;
+#[cfg(feature = "workflows")]
+pub(crate) mod worktree;
+
+#[cfg(feature = "delegation")]
+use delegation::register_delegation_tools;
+// Re-exported so `crate::catalog::register_workflow_tools` stays the path its callers use.
+#[cfg(feature = "workflows")]
+pub(crate) use workflow::register_workflow_tools;
+
 /// Build the catalog from the injected dependencies.
 ///
 /// Provider keys: one key per route file found in `<environments dir>/../routes`
@@ -577,141 +595,6 @@ fn register_standard_tools(
                 .log
                 .set_finish_name(tool.declaration().name.clone());
             Ok(tool)
-        }),
-    );
-}
-
-#[cfg(feature = "delegation")]
-fn register_delegation_tools(
-    catalog: &mut Catalog,
-    deps: &HostDeps,
-    service: Option<Arc<dyn p1_workers::WorkerService>>,
-) -> Result<(), String> {
-    // Without a service the keys are not registered at all, so an environment naming
-    // one gets the ordinary `UnknownToolModule`.
-    let Some(service) = service else {
-        return Ok(());
-    };
-
-    // What a parent may grant is the host's own knowledge, never a compiled list in
-    // the tool crate: every tool module this catalog registers, minus `finish` (the
-    // factory adds it to every worker), the `worker_*` modules (a worker never
-    // delegates) and the `workflow_*` modules (a worker never orchestrates). The environments a worker may run are the host's environment dirs.
-    let grantable: Vec<String> = catalog
-        .tool_keys()
-        .into_iter()
-        .filter(|key| {
-            key != "finish" && !key.starts_with("worker_") && !key.starts_with("workflow_")
-        })
-        .collect();
-    let environments = crate::models::environment_names(&deps.environment_dirs)?;
-
-    let service_for = service.clone();
-    let grantable_for_start = grantable.clone();
-    catalog.tool(
-        "worker_start",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_delegate::WorkerStartTool::new(
-                    service_for.clone(),
-                    grantable_for_start.clone(),
-                    environments.clone(),
-                ),
-                spec
-            ))
-        }),
-    );
-
-    let service_for = service.clone();
-    catalog.tool(
-        "worker_result",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_delegate::WorkerResultTool::new(service_for.clone()),
-                spec
-            ))
-        }),
-    );
-
-    let service_for = service.clone();
-    catalog.tool(
-        "worker_continue",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_delegate::WorkerContinueTool::new(service_for.clone(), grantable.clone()),
-                spec
-            ))
-        }),
-    );
-
-    catalog.tool(
-        "worker_cancel",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_delegate::WorkerCancelTool::new(service.clone()),
-                spec
-            ))
-        }),
-    );
-    Ok(())
-}
-
-/// The four `workflow_*` tools over `service` (ADR-0053 item 7). Without a service the
-/// keys are not registered at all, so an environment naming one gets the ordinary
-/// `UnknownToolModule`.
-#[cfg(feature = "workflows")]
-pub(crate) fn register_workflow_tools(
-    catalog: &mut Catalog,
-    service: Option<Arc<dyn p1_workflow::WorkflowService>>,
-) {
-    let Some(service) = service else {
-        return;
-    };
-
-    let service_for = service.clone();
-    catalog.tool(
-        "workflow_start",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_workflow::WorkflowStartTool::new(service_for.clone()),
-                spec,
-                p1_tool_workflow::ToolFace
-            ))
-        }),
-    );
-
-    let service_for = service.clone();
-    catalog.tool(
-        "workflow_status",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_workflow::WorkflowStatusTool::new(service_for.clone()),
-                spec,
-                p1_tool_workflow::ToolFace
-            ))
-        }),
-    );
-
-    let service_for = service.clone();
-    catalog.tool(
-        "workflow_result",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_workflow::WorkflowResultTool::new(service_for.clone()),
-                spec,
-                p1_tool_workflow::ToolFace
-            ))
-        }),
-    );
-
-    catalog.tool(
-        "workflow_cancel",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_workflow::WorkflowCancelTool::new(service.clone()),
-                spec,
-                p1_tool_workflow::ToolFace
-            ))
         }),
     );
 }

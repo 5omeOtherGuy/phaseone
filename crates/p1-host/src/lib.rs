@@ -30,10 +30,12 @@ pub mod run;
 pub mod session;
 pub mod tui;
 pub mod usage;
+// Both files live under `catalog/` now; the re-exports keep `p1_host::workflow` and
+// `crate::worktree` the paths their users already name.
 #[cfg(feature = "workflows")]
-pub mod workflow;
+pub use catalog::workflow;
 #[cfg(feature = "workflows")]
-mod worktree;
+use catalog::worktree;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
