@@ -79,7 +79,7 @@ shell history and in `ps`:
 ```sh
 p1 login opencode-go-2-subscription     # reads one key, hidden on a terminal
 p1 login --list                         # every route, its credential kind and its source
-p1 logout opencode-go-2-subscription    # removes that route's entry
+p1 logout opencode-go-2-subscription    # removes that route's entry (an imported OAuth copy too)
 ```
 
 The key is written to `~/.config/p1/auth.json` (0600 in a 0700 directory); a store
@@ -94,6 +94,21 @@ such a route `[p1 store only]`. The two OAuth routes need an independent grant i
 store; copying a live CLI refresh token is unsafe because it rotates, and p1 does not
 ship an OAuth browser flow yet, so `p1 login <oauth-route>` says so instead of pointing
 at the CLI (`docs/design/credentials.md` §8).
+
+The second Claude subscription (`claude2/…`, route `anthropic-subscription-2`, ADR-0074)
+is the exception: it borrows the Claude Code login in `~/.claude-2` in place (log in there
+with `CLAUDE_CONFIG_DIR=~/.claude-2 claude`), after p1's own store. On a machine without
+Claude Code, copy a login into p1's store instead — no token is printed:
+
+```sh
+p1 login anthropic-subscription-2 --from-claude-code             # the route's login_dir
+p1 login anthropic-subscription --from-claude-code ~/.claude     # any Claude Code directory
+```
+
+An imported copy wins over the live Claude Code login until `p1 logout <route>` removes
+it (`p1 logout anthropic-subscription-2` makes the route borrow `~/.claude-2` again). The
+copied refresh token rotates: once p1 or Claude Code refreshes it, the other copy is
+stale, so import where only p1 uses that login (`docs/design/credentials.md` §10).
 
 ## What makes it different
 

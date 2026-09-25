@@ -335,10 +335,10 @@ impl Entry for ClaudeCodeCredentials {
     }
 }
 
-struct StoredCredentials {
-    access: String,
-    refresh: Option<String>,
-    expires_ms: Option<u64>,
+pub(crate) struct StoredCredentials {
+    pub(crate) access: String,
+    pub(crate) refresh: Option<String>,
+    pub(crate) expires_ms: Option<u64>,
     /// The raw `scopes` value, preserved so the refresh requests the same scopes.
     scopes: Option<Value>,
 }
@@ -369,7 +369,10 @@ fn auth_error(path: &Path, reason: &str) -> ProviderError {
 
 /// Both the nested (`{"claudeAiOauth":{…}}`) and the older flat shape are
 /// accepted. Errors are redacted: the raw JSON never appears in a message.
-fn parse_credentials(document: &Value, path: &Path) -> Result<StoredCredentials, ProviderError> {
+pub(crate) fn parse_credentials(
+    document: &Value,
+    path: &Path,
+) -> Result<StoredCredentials, ProviderError> {
     let oauth = document.get("claudeAiOauth").unwrap_or(document);
     let access = oauth
         .get("accessToken")

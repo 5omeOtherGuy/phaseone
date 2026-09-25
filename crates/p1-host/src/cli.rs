@@ -59,6 +59,13 @@ pub enum Command {
     Login {
         route: String,
     },
+    /// Copy a Claude Code login into p1's store for this `claude-code-oauth` route
+    /// (ADR-0074). `dir` is the Claude Code config directory; `None` means the one the
+    /// route borrows (its `login_dir`, else the default).
+    LoginFromClaudeCode {
+        route: String,
+        dir: Option<String>,
+    },
     /// Every route, its credential kind and which source its credential comes from.
     LoginList,
     /// Remove this route's entry from p1's store.
@@ -194,6 +201,9 @@ pub fn usage() -> String {
     );
     out.push_str("  p1 usage [--json] [--watch SECONDS] [--plain] [--grid N] [SEARCH]   route quota ledger\n");
     out.push_str("  p1 login <route>     read one API key from stdin and store it for ROUTE\n");
+    out.push_str(
+        "  p1 login <route> --from-claude-code [DIR]\n                       copy the Claude Code login in DIR (default: the route's\n                       login_dir, else ~/.claude) into p1's store for ROUTE\n",
+    );
     out.push_str("  p1 login --list      every route, its credential kind and its source\n");
     out.push_str("  p1 logout <route>    remove ROUTE's entry from p1's store\n");
     out.push_str("  p1 --help\n");
@@ -763,11 +773,13 @@ fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
     Ok(options)
 }
 
-/// `p1 login <route>` and `p1 login --list` (ADR-0044, spec §6). The key is never an
-/// argument: it is read from stdin, so arguments would only put it in shell history
+/// `p1 login <route>`, `p1 login <route> --from-claude-code [DIR]` and `p1 login --list`
+/// (ADR-0044, ADR-0074, spec §6). The key is never an argument: it is read from stdin
+/// or from a Claude Code login file, so arguments would only put it in shell history
 /// and in `ps`.
 fn parse_login(args: &[String]) -> Result<Options, CliError> {
-    const USAGE: &str = "usage: p1 login <route> | p1 login --list";
+    const USAGE: &str =
+        "usage: p1 login <route> | p1 login <route> --from-claude-code [DIR] | p1 login --list";
     match args.get(1).map(String::as_str) {
         None => Err(CliError {
             message: USAGE.to_string(),
@@ -783,16 +795,37 @@ fn parse_login(args: &[String]) -> Result<Options, CliError> {
         Some(other) if other.starts_with('-') => Err(CliError {
             message: format!("unknown flag `{other}`"),
         }),
-        Some(route) => {
-            if let Some(extra) = args.get(2) {
-                return Err(CliError {
-                    message: format!("unexpected argument `{extra}`"),
-                });
-            }
-            Ok(defaults(Command::Login {
+        Some(route) => match args.get(2).map(String::as_str) {
+            None => Ok(defaults(Command::Login {
                 route: route.to_string(),
-            }))
-        }
+            })),
+            Some("--from-claude-code") => {
+                let dir = match args.get(3).map(String::as_str) {
+                    None => None,
+                    Some(other) if other.starts_with('-') => {
+                        return Err(CliError {
+                            message: format!("unknown flag `{other}`"),
+                        });
+                    }
+                    Some(dir) => Some(dir.to_string()),
+                };
+                if let Some(extra) = args.get(4) {
+                    return Err(CliError {
+                        message: format!("unexpected argument `{extra}`"),
+                    });
+                }
+                Ok(defaults(Command::LoginFromClaudeCode {
+                    route: route.to_string(),
+                    dir,
+                }))
+            }
+            Some(other) if other.starts_with('-') => Err(CliError {
+                message: format!("unknown flag `{other}`"),
+            }),
+            Some(extra) => Err(CliError {
+                message: format!("unexpected argument `{extra}`"),
+            }),
+        },
     }
 }
 
@@ -1101,6 +1134,28 @@ mod tests {
         assert!(parse(&args(&["login", "-"])).is_err());
         assert!(parse(&args(&["login", "a", "b"])).is_err());
         assert!(parse(&args(&["login", "--list", "a"])).is_err());
+        assert_eq!(
+            parse(&args(&["login", "a-route", "--from-claude-code"]))
+                .unwrap()
+                .command,
+            Command::LoginFromClaudeCode {
+                route: "a-route".to_string(),
+                dir: None
+            }
+        );
+        assert_eq!(
+            parse(&args(&["login", "a-route", "--from-claude-code", "/tmp/x"]))
+                .unwrap()
+                .command,
+            Command::LoginFromClaudeCode {
+                route: "a-route".to_string(),
+                dir: Some("/tmp/x".to_string())
+            }
+        );
+        assert!(parse(&args(&["login", "a", "--from-claude-code", "d", "e"])).is_err());
+        assert!(parse(&args(&["login", "a", "--from-claude-code", "--bogus"])).is_err());
+        assert!(parse(&args(&["login", "a", "--bogus"])).is_err());
+        assert!(usage().contains("p1 login <route> --from-claude-code [DIR]"));
         assert!(parse(&args(&["logout", "--list"])).is_err());
         assert!(parse(&args(&["logout", "a", "b"])).is_err());
 

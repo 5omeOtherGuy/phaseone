@@ -776,6 +776,7 @@ mod tests {
                 env: None,
                 borrow: vec![],
                 store_only: false,
+                login_dir: None,
             },
         }
     }

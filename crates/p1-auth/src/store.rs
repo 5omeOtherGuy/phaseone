@@ -5,7 +5,9 @@
 //! `{"type":"oauth","access":…,"refresh":…,"expires":…,"account_id":…}` entries.
 //! It READS it, and it WRITES it for two callers: an `oauth` entry that had to be
 //! refreshed is written back to the store, and `p1 login`/`p1 logout` (spec §6,
-//! ADR-0044) put one pasted API key in and take one out. Every write goes under
+//! ADR-0044) put one pasted API key in and take one out; `p1 login <route>
+//! --from-claude-code` copies one Claude Code login in as an `oauth` entry
+//! (ADR-0074). Every write goes under
 //! the same non-blocking lock, through the same atomic 0600 writer.
 //!
 //! A store file or directory that is group/world-accessible is REFUSED (spec §3):
@@ -309,6 +311,101 @@ pub async fn put_api_key(route_id: &str, key: &str, locations: &Locations) -> Re
         object.insert(route_id.to_string(), json!({"type": "api_key", "key": key}));
     }
     write_atomic(&path, &encode(&document)).map_err(|error| error.message)
+}
+
+/// Why a Claude Code login was not imported. Every message names paths and routes
+/// only, never a token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportError {
+    /// The directory holds no Claude Code login: the fix is to log in there first.
+    NoLogin(String),
+    /// Anything else: an unusable login file, or a store that must not be written.
+    Failed(String),
+}
+
+impl std::fmt::Display for ImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImportError::NoLogin(message) | ImportError::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+/// Copy the Claude Code login in `dir` (its `.credentials.json`) into p1's store as
+/// this route's `oauth` entry (ADR-0074): `{"type":"oauth","access","refresh",
+/// "expires","account_id"}`, with `null` for a field the login does not record. The
+/// account id is Claude Code's `oauthAccount.accountUuid` from `dir/.claude.json`
+/// when that file has one.
+///
+/// Read-modify-write under the store lock through the same atomic 0600 writer as
+/// every other write; a store file or directory anyone but the owner can reach is
+/// refused exactly as [`put_api_key`] refuses it. The login file itself is only read.
+pub async fn import_claude_code_login(
+    route_id: &str,
+    dir: &Path,
+    locations: &Locations,
+) -> Result<(), ImportError> {
+    let path = dir.join(".credentials.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ImportError::NoLogin(format!(
+                "no Claude Code login at {}; log in with Claude Code for that directory \
+                 (`CLAUDE_CONFIG_DIR={} claude`, then `/login`) and run this again",
+                path.display(),
+                dir.display()
+            )));
+        }
+        Err(_) => {
+            return Err(ImportError::Failed(format!(
+                "the Claude Code login at {} could not be read",
+                path.display()
+            )));
+        }
+    };
+    let document: Value = serde_json::from_str(&raw).map_err(|_| {
+        ImportError::Failed(format!(
+            "the Claude Code login at {} is malformed",
+            path.display()
+        ))
+    })?;
+    let login = crate::claude_code::parse_credentials(&document, &path)
+        .map_err(|error| ImportError::Failed(error.message))?;
+    let account_id = std::fs::read_to_string(dir.join(".claude.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|config| {
+            config
+                .get("oauthAccount")
+                .and_then(|account| account.get("accountUuid"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        });
+
+    let store = store_path(locations).map_err(ImportError::Failed)?;
+    check_writable(locations).map_err(ImportError::Failed)?;
+    let _lock = lock(&store)
+        .await
+        .map_err(|error| ImportError::Failed(error.message))?;
+    let mut document = match load(locations).map_err(ImportError::Failed)? {
+        Some((_, document)) => document,
+        None => Value::Object(serde_json::Map::new()),
+    };
+    if let Some(object) = document.as_object_mut() {
+        object.insert(
+            route_id.to_string(),
+            json!({
+                "type": "oauth",
+                "access": login.access,
+                "refresh": login.refresh,
+                "expires": login.expires_ms,
+                "account_id": account_id,
+            }),
+        );
+    }
+    write_atomic(&store, &encode(&document)).map_err(|error| ImportError::Failed(error.message))
 }
 
 /// Remove one route's entry from p1's store (spec §6), leaving every other entry as

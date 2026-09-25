@@ -131,12 +131,37 @@ impl Locations {
             .map(|dir| dir.join("auth.json"))
     }
 
-    /// Claude Code's credential file: `$CLAUDE_CONFIG_DIR/.credentials.json`, else
+    /// Claude Code's credential file: `<login_dir>/.credentials.json` when the route
+    /// names a directory (ADR-0074), else `$CLAUDE_CONFIG_DIR/.credentials.json`, else
     /// `~/.claude/.credentials.json`.
-    pub(crate) fn claude_code_path(&self) -> Option<PathBuf> {
-        self.tool_dir("CLAUDE_CONFIG_DIR")
-            .or_else(|| self.home.as_ref().map(|home| home.join(".claude")))
+    pub(crate) fn claude_code_path(&self, login_dir: Option<&str>) -> Option<PathBuf> {
+        self.claude_code_dir(login_dir)
             .map(|dir| dir.join(".credentials.json"))
+    }
+
+    /// The Claude Code config directory a route borrows its login from: the route's
+    /// `login_dir` with a leading `~` expanded against the home directory, else
+    /// `$CLAUDE_CONFIG_DIR`, else `~/.claude`. `None` when the directory needs a home
+    /// and the host has none.
+    pub fn claude_code_dir(&self, login_dir: Option<&str>) -> Option<PathBuf> {
+        match login_dir {
+            Some(dir) => self.expand_home(dir),
+            None => self
+                .tool_dir("CLAUDE_CONFIG_DIR")
+                .or_else(|| self.home.as_ref().map(|home| home.join(".claude"))),
+        }
+    }
+
+    /// A path with a leading `~` (alone or `~/…`) expanded against the home directory.
+    /// Any other path is taken as written.
+    pub fn expand_home(&self, path: &str) -> Option<PathBuf> {
+        if path == "~" {
+            return self.home.clone();
+        }
+        match path.strip_prefix("~/") {
+            Some(rest) => self.home.as_ref().map(|home| home.join(rest)),
+            None => Some(PathBuf::from(path)),
+        }
     }
 
     /// The Codex CLI's auth file: `$CODEX_HOME/auth.json`, else

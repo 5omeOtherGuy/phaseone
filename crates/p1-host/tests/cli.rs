@@ -333,12 +333,12 @@ fn models_lists_every_shipped_model() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    // One row per model: every environment × every profile its route binds. The
-    // anthropic-subscription route binds 6 profiles; each of the three OpenCode Go accounts
+    // One row per model: every environment × every profile its route binds. Each of the two
+    // Claude subscription routes (anthropic-subscription, -2) binds 6 profiles; each of the three OpenCode Go accounts
     // binds the one DeepSeek profile, each of the three free Zen accounts binds the MiMo and
     // Space Bunny free profiles, and each of the two ClinePass accounts binds the DeepSeek and
     // GLM-5.3 Flash profiles; `claude-delegating` is gone (ADR-0050).
-    assert_eq!(lines.len(), 29, "one row per model: {stdout}");
+    assert_eq!(lines.len(), 35, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(

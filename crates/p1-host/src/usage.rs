@@ -13,6 +13,8 @@ use crate::cli::UsageOptions;
 fn label(id: &str) -> String {
     match id {
         "anthropic-subscription" => "claude max".into(),
+        // The second Claude subscription (ADR-0074): its own account, its own row.
+        "anthropic-subscription-2" => "claude max 2".into(),
         "openai-codex-subscription" => "chatgpt pro lite".into(),
         "opencode-go-subscription" => "opencode go".into(),
         "opencode-go-1-subscription" => "opencode go-1".into(),
@@ -263,6 +265,31 @@ fn draw(
     }
 }
 
+/// The rows `p1 usage` probes: every loaded route the search matches, each with its
+/// own label and its own credential reference, so every account is probed with that
+/// route's credential.
+fn usage_routes(
+    routes: Vec<crate::routes::RouteFile>,
+    search: Option<&str>,
+    locations: &Locations,
+) -> Vec<UsageRoute> {
+    let search = search.map(str::to_lowercase);
+    routes
+        .into_iter()
+        .filter(|r| {
+            search
+                .as_ref()
+                .is_none_or(|s| r.id.to_lowercase().contains(s) || label(&r.id).contains(s))
+        })
+        .map(|route| UsageRoute {
+            label: label(&route.id),
+            credential: p1_auth::describe(&route.id, &route.credential, locations).line(),
+            route_id: route.id,
+            spec: route.credential,
+        })
+        .collect()
+}
+
 pub async fn usage(deps: &HostDeps, options: &UsageOptions) -> i32 {
     let UsageOptions {
         json,
@@ -280,21 +307,7 @@ pub async fn usage(deps: &HostDeps, options: &UsageOptions) -> i32 {
             return 2;
         }
     };
-    let search = search.map(str::to_lowercase);
-    let routes: Vec<UsageRoute> = routes
-        .into_iter()
-        .filter(|r| {
-            search
-                .as_ref()
-                .is_none_or(|s| r.id.to_lowercase().contains(s) || label(&r.id).contains(s))
-        })
-        .map(|route| UsageRoute {
-            label: label(&route.id),
-            credential: p1_auth::describe(&route.id, &route.credential, &locations).line(),
-            route_id: route.id,
-            spec: route.credential,
-        })
-        .collect();
+    let routes = usage_routes(routes, search, &locations);
     let interrupt = deps.interrupt.recv();
     tokio::pin!(interrupt);
     #[cfg(unix)]
@@ -432,6 +445,38 @@ mod tests {
             Some("2026-09-24T05:00:00Z")
         );
         assert_eq!(second[0].stale.as_deref(), Some("no access"));
+    }
+
+    /// ADR-0074: both Claude subscriptions are their own rows, each probed with its
+    /// own route's credential reference. The locations are empty, so no real login is
+    /// read.
+    #[test]
+    fn usage_lists_both_claude_accounts() {
+        let dirs =
+            vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+        let routes = crate::routes::load_all_routes(&dirs).expect("the shipped routes load");
+        let rows = usage_routes(routes, Some("claude"), &Locations::none());
+        let rows: Vec<(&str, &str, Option<&str>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.route_id.as_str(),
+                    row.label.as_str(),
+                    row.spec.login_dir.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("anthropic-subscription", "claude max", None),
+                (
+                    "anthropic-subscription-2",
+                    "claude max 2",
+                    Some("~/.claude-2")
+                ),
+            ]
+        );
     }
 
     #[test]

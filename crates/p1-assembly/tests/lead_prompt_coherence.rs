@@ -293,6 +293,7 @@ fn every_shipped_prompt_renders_for_every_subset_of_its_tools() {
         checked,
         [
             "claude",
+            "claude2",
             "cline",
             "cline2",
             "deepseek",
