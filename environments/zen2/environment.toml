@@ -4,8 +4,13 @@ profile = "space-bunny-free"
 [options]
 reasoning_effort = "high"
 
+# The OpenCode Zen free-tier gate accepts a request only when it declares tools
+# named `bash` and `read`. The environment grants them (a provider owns no tool):
+# `shell` is presented as `bash`, `read` as `read`. Evidence:
+# docs/design/zen-client-identity-evidence.md.
 [[tools]]
 module = "read"
+name   = "read"
 [[tools]]
 module = "edit"
 [[tools]]
@@ -14,6 +19,7 @@ module = "write"
 module = "grep"
 [[tools]]
 module = "shell"
+name   = "bash"
 [[tools]]
 module = "finish"
 

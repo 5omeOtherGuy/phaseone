@@ -26,6 +26,7 @@ Read `~/projects/phaseone-briefs/usage-dashboard-tmux.md`; inspect any reusable 
 6. Reconcile ADR-0060 with the current build-storage order.
 7. Fix and issue-track fanout/p1 defects encountered throughout the programme.
 8. Context window by role (#113): leads 500k, workers 300k, capped by each route's capacity.
+9. Build p1 on the GitHub Actions farm: push a `task/**` branch and run `scripts/ci-build.sh` (green = the run of exactly that commit, artifact in `ci-artifacts/<sha>/`); local cargo is `cargo check -p <crate>` plus the lead's deployed-binary rebuild only.
 
 Keep interface, gate and rollback decisions in their project records.
 Use `docs/iris-workflow.md` for coordination with Iris and ownership of shared UI seams.

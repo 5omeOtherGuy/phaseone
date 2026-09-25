@@ -23,13 +23,12 @@ store_only = true
 [adapter_settings]
 dialect        = "thinking-with-reasoning-alias"
 session_header = "x-opencode-session"
+# Same Zen free-tier client identity as the account routes (owner decision 2026-09-24).
+client_identity = "opencode"
 
 # Only profiles the host ships a policy for; any other profile is refused — only -free ids appear.
 [models."mimo-v2.6-flash-free"]
 wire_model = "mimo-v2.6-flash-free"
-
-[models."muse-spark-1.3-contributor-free"]
-wire_model = "muse-spark-1.3-contributor-free"
 
 [models."space-bunny-free"]
 wire_model = "space-bunny-free"

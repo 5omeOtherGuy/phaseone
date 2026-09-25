@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fanout  # noqa: E402
@@ -322,6 +323,16 @@ class FanoutTest(unittest.TestCase):
         job["brief_file"] = os.path.join(self.dir, "nope.md")
         self.assert_rejected([job], "brief file missing")
 
+    def test_empty_brief_file(self) -> None:
+        job = self.p1_job()
+        job["brief_file"] = self.write("empty.md", "  \n")
+        self.assert_rejected([job], "prompt is empty")
+
+    def test_empty_resume_prompt_file(self) -> None:
+        session = self.write("session.jsonl", '{"p1_journal":1}\n')
+        job = self.p1_job(session=session, prompt_file=self.write("empty-prompt.md", ""))
+        self.assert_rejected([job], "prompt is empty")
+
     def test_missing_workspace(self) -> None:
         self.assert_rejected([self.p1_job(dir=os.path.join(self.dir, "gone"))],
                              "no such workspace")
@@ -331,6 +342,12 @@ class FanoutTest(unittest.TestCase):
         code, _, err = self.run_jobs([self.p1_job()])
         self.assertEqual(code, 1)
         self.assertIn("cargo build -p p1-host", err)
+
+    def test_p1_bin_with_another_name_is_refused(self) -> None:
+        os.environ["P1_BIN"] = self.write_executable("renamed", "worker", FAKE_P1)
+        code, _, err = self.run_jobs([self.p1_job()])
+        self.assertEqual(code, 1)
+        self.assertIn("P1_BIN must be named p1 or p1-*", err)
 
     # --- which p1 is run (ADR-0065) ---------------------------------------
 
@@ -390,6 +407,52 @@ class FanoutTest(unittest.TestCase):
                          ["pi-worker", "deepseek", "--dir", "/work", "--effort", "high",
                           "--session", "abc", "--prompt", "fix it"])
 
+    def test_mem_available_mb_returns_none_for_bad_proc_data(self) -> None:
+        for text in ("MemTotal: 100 kB\n", "MemAvailable: nope kB\n",
+                     "MemAvailable:\n"):
+            with self.subTest(text=text):
+                self.assertIsNone(fanout.mem_available_mb(lambda path: io.StringIO(text)))
+
+        def unreadable(path):
+            raise OSError("unreadable")
+
+        self.assertIsNone(fanout.mem_available_mb(unreadable))
+
+    def test_waiting_message_is_emitted_once_until_the_reason_changes(self) -> None:
+        jobs_path = self.write("waiting-jobs.json", json.dumps([self.p1_job()]))
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(fanout, "workers_alive", side_effect=[1, 1, 0]), \
+             mock.patch.object(fanout, "mem_available_mb", return_value=2000), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fanout.main([jobs_path, "--max-parallel", "1", "--min-free-mb", "1500"])
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue().count("fanout: waiting —"), 1)
+        self.assertIn("1 workers alive (1 max), MemAvailable 2000 MB", err.getvalue())
+
+    def test_waiting_message_does_not_enforce_memory_when_unknown(self) -> None:
+        jobs_path = self.write("unknown-memory-jobs.json", json.dumps([self.p1_job()]))
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(fanout, "workers_alive", side_effect=[1, 0]), \
+             mock.patch.object(fanout, "mem_available_mb", return_value=None), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fanout.main([jobs_path, "--max-parallel", "1", "--min-free-mb", "1500"])
+        self.assertEqual(code, 0)
+        self.assertIn("fanout: MemAvailable unknown — memory floor not enforced", err.getvalue())
+        self.assertIn("1 workers alive (1 max), MemAvailable unknown", err.getvalue())
+
+    def test_waiting_message_changes_with_the_blocking_reason(self) -> None:
+        jobs_path = self.write("reason-jobs.json", json.dumps([self.p1_job()]))
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(fanout, "workers_alive", side_effect=[2, 1, 0]), \
+             mock.patch.object(fanout, "mem_available_mb", side_effect=[2000, 100, 2000]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fanout.main([jobs_path, "--max-parallel", "2", "--min-free-mb", "1500"])
+        self.assertEqual(code, 0)
+        messages = [line for line in err.getvalue().splitlines() if "fanout: waiting —" in line]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("2 workers alive (2 max), MemAvailable 2000 MB", messages[0])
+        self.assertIn("1 workers alive (2 max), MemAvailable 100 MB", messages[1])
+
     def test_live_worker_count_ignores_wrapper_processes(self) -> None:
         real = [["python3", "/home/u/brain-tools/scripts/pi-worker", "glm", "--dir", "/w"],
                 ["python3", "/home/u/.local/bin/pi-worker", "sol6", "--dir", "/w"],
@@ -404,9 +467,32 @@ class FanoutTest(unittest.TestCase):
             self.assertTrue(fanout.is_pi_worker(argv), argv)
         for argv in wrappers:
             self.assertFalse(fanout.is_pi_worker(argv), argv)
-        self.assertTrue(fanout.is_p1_agent(["/x/phaseone-target/debug/p1", "--env", "deepseek2"]))
+        self.assertFalse(fanout.is_p1_agent(["/x/phaseone-target/debug/p1", "--env", "deepseek2"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "--tui", "--env", "claude"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "--env", "claude", "--workspace", "/w"]))
+        self.assertTrue(fanout.is_p1_agent([
+            "/x/phaseone-target/debug/p1", "--env", "plain", "--workspace", "/w",
+            "--session", "/tmp/session.jsonl", "--yes", BRIEF,
+        ]))
+        resume_argv = fanout.p1_command(
+            self.p1_job(session="/tmp/session.jsonl", prompt_file=self.brief, sandbox=True),
+            self.bin, "/tmp/session.jsonl", BRIEF, "/tmp/locks", ("/tmp/read",))
+        self.assertTrue(fanout.is_p1_agent(resume_argv))
+        self.assertFalse(fanout.is_p1_agent(["p1", "--brief-file", "/tmp/brief.md"]))
         self.assertFalse(fanout.is_p1_agent(["python3", "scripts/fanout.py", "--env"]))
         self.assertFalse(fanout.is_p1_agent(["p1", "models"]))
+        self.assertTrue(fanout.is_p1_agent(
+            ["/x/build-evidence/p1-hotfix2-81c6411e6f60", "--env", "zen", "--yes", BRIEF]))
+        self.assertFalse(fanout.is_p1_agent(["/usr/bin/p1x", "--env", "zen", BRIEF]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "--env", "zen", "--", "models"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "--env", "zen", "--"]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "workflow", "run", "/w/flow.rhai"]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "workflow", "run", "--yes", "/w/flow.rhai"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "workflow"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "workflow", "run"]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "--env", "zen", "--", "--tui"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "--env", "zen", "hello", "--tui"]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "--session", "--tui", "hello"]))
 
 
 if __name__ == "__main__":

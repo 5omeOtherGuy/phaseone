@@ -73,12 +73,14 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0057 | [A tool describes each call's target; the host and the UI stop matching tool names](0057-a-tool-describes-each-call-s-target-the-host-and-the-ui-stop-matching-tool-names.md) | accepted | 2026-09-23 | lead |
 | ADR-0058 | [p1 spawns the brain shadow hook, detached and fail-open, as an optional module](0058-p1-spawns-the-brain-shadow-hook-detached-and-fail-open-as-an-optional-module.md) | accepted | 2026-09-23 | owner+lead |
 | ADR-0059 | [A tool describes its results and its destructiveness; the host describer keeps no tool-name table](0059-a-tool-describes-its-results-and-its-destructiveness-the-host-describer-keeps-no-tool-name-table.md) | accepted | 2026-09-23 | lead |
-| ADR-0060 | [One shared cargo target per repository across worktrees; rustc-serial ignores slots whose holder is stopped](0060-one-shared-cargo-target-per-repository-across-worktrees-rustc-serial-ignores-slots-whose-holder-is-stopped.md) | proposed | 2026-09-23 | owner+lead |
+| ADR-0060 | [Per-task SSD Cargo targets and the machine-wide rustc limit](0060-one-shared-cargo-target-per-repository-across-worktrees-rustc-serial-ignores-slots-whose-holder-is-stopped.md) | proposed | 2026-09-23 | owner+lead |
 | ADR-0061 | [A route may be self-contained: store-only credentials never read another tool's login](0061-a-route-may-be-self-contained-store-only-credentials-never-read-another-tool-s-login.md) | accepted | 2026-09-24 | owner |
 | ADR-0062 | [A plan refusal is its own provider error kind; it is never refreshed or retried](0062-a-plan-refusal-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md) | accepted | 2026-09-24 | lead |
 | ADR-0063 | [Claude requests its native 1M context window through a named long_context route setting](0063-claude-requests-its-native-1m-context-window-through-a-named-long-context-route-setting.md) | proposed | 2026-09-24 | lead |
 | ADR-0064 | [Unified dashboard uses a pure shell and explicit view composition](0064-unified-dashboard-uses-a-pure-shell-and-explicit-view-composition.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0065 | [p1 installs from its release channel into a prefix and the binary names its commit](0065-p1-installs-from-its-release-channel-into-a-prefix-and-the-binary-names-its-commit.md) | proposed | 2026-09-24 | lead |
+| ADR-0066 | [p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary](0066-p1-builds-and-verifies-on-github-actions-local-cargo-only-for-check-and-the-lead-s-deployed-binary.md) | proposed | 2026-09-24 | lead |
+| ADR-0067 | [Zen free routes present the OpenCode client identity](0067-zen-free-routes-present-the-opencode-client-identity.md) | proposed | 2026-09-24 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

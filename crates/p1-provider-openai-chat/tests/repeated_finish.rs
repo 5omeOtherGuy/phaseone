@@ -37,6 +37,7 @@ fn provider(response: ScriptedResponse) -> Arc<dyn Provider> {
         session_header: None,
         dialect: ChatDialect::ThinkingWithReasoningAlias,
         limits: ChatLimits::default(),
+        client_identity: None,
     };
     let profile = ModelProfile {
         id: "test-model".into(),

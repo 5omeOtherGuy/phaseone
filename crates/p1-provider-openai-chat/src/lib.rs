@@ -16,20 +16,37 @@ use std::sync::Arc;
 
 /// Implemented encodings, not service names. Unknown extensions require an implementation.
 /// The names are the kebab-case spellings a route file's `[adapter_settings]` uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChatDialect {
     /// Enabled thinking with replayable reasoning_content and its equivalent reasoning alias.
+    #[default]
     ThinkingWithReasoningAlias,
     /// Enabled/preserved thinking, replayable reasoning_content and its equivalent reasoning
     /// alias, and streaming function inputs.
     RetainedThinking,
 }
 
+/// The non-secret client identity a route can present to a vendor gateway that gates its
+/// free tier on the caller looking like the vendor's own client (owner decision 2026-09-24).
+/// Unlike a dialect, it changes no message encoding and declares no tool: it only adds the
+/// identity's static headers and a generated session id. The tool names a gate wants are an
+/// environment's business, never the adapter's. The names are the kebab-case spellings a
+/// route file's `[adapter_settings]` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientIdentity {
+    /// Present the OpenCode CLI's identity to the OpenCode Zen gateway: its `user-agent`
+    /// and its `x-opencode-*` headers with a generated `ses_`/`msg_` id. The system prompt
+    /// and the declared tools are NOT changed; the `zen`/`zen2`/`zen3` environments grant
+    /// the `bash`/`read` names the gate wants.
+    Opencode,
+}
+
 /// The `[adapter_settings]` table of a route whose `adapter` is `openai-chat`: fields
 /// this adapter owns, parsed by this adapter (`docs/design/routes-and-profiles.md`
 /// §1.2). A key this struct does not name is rejected rather than ignored.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatAdapterSettings {
     pub dialect: ChatDialect,
@@ -37,6 +54,11 @@ pub struct ChatAdapterSettings {
     /// an explicit cache key is an error for this route.
     #[serde(default)]
     pub session_header: Option<String>,
+    /// A non-secret client identity the route presents instead of p1's own. `None`
+    /// (the default): p1 sends its own `user-agent` and the cache key as the session
+    /// header, and no foreign client is impersonated.
+    #[serde(default)]
+    pub client_identity: Option<ClientIdentity>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,7 +67,7 @@ pub struct ChatLimits {
     pub max_output_tokens: Option<u32>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct ChatRoute {
     pub origin_route: String,
     pub endpoint: String,
@@ -53,6 +75,7 @@ pub struct ChatRoute {
     pub headers: Vec<(String, String)>,
     pub session_header: Option<String>,
     pub dialect: ChatDialect,
+    pub client_identity: Option<ClientIdentity>,
     pub limits: ChatLimits,
 }
 impl std::fmt::Debug for ChatRoute {
@@ -104,6 +127,62 @@ impl ChatRoute {
         Ok(())
     }
 }
+/// The `user-agent` OpenCode's CLI sends to the Zen gateway (captured 2026-09-24,
+/// opencode 1.18.31; see `docs/design/zen-client-identity-evidence.md`).
+const OPENCODE_USER_AGENT: &str =
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+
+/// The headers a `client_identity` adds to a request. Static, non-secret values
+/// plus ids generated for this request from the route's cache key.
+fn client_identity_headers(
+    identity: ClientIdentity,
+    cache_key: Option<&str>,
+) -> Vec<(String, String)> {
+    match identity {
+        ClientIdentity::Opencode => {
+            let (session, request) = opencode_ids(cache_key);
+            vec![
+                ("user-agent".into(), OPENCODE_USER_AGENT.into()),
+                ("x-opencode-client".into(), "cli".into()),
+                ("x-opencode-project".into(), "global".into()),
+                ("x-opencode-session".into(), session),
+                ("x-opencode-request".into(), request),
+            ]
+        }
+    }
+}
+
+/// The `ses_`/`msg_` ids OpenCode shapes as `<prefix>_<12 lowercase hex><14 alnum>`
+/// (its `Identifier.ascending`): the gateway's free-tier gate accepts exactly that
+/// shape and rejects a short or non-hex-prefixed id with 403. p1 derives both ids
+/// from the route's cache key — a pure function, so a resumed session keeps them.
+/// Without a key, a per-request nonce does the same job.
+fn opencode_ids(cache_key: Option<&str>) -> (String, String) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match cache_key {
+        Some(key) => key.hash(&mut hasher),
+        None => {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos() as u64)
+                .unwrap_or(0)
+                .hash(&mut hasher);
+            NONCE.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+        }
+    }
+    let first = hasher.finish();
+    let mut second = std::collections::hash_map::DefaultHasher::new();
+    first.hash(&mut second);
+    let hex = format!("{first:016x}{:016x}", second.finish());
+    (
+        format!("ses_{}", &hex[..26]),
+        format!("msg_{}", &hex[6..32]),
+    )
+}
+
 fn header_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -253,11 +332,16 @@ impl Provider for ChatProvider {
             let origin = route.origin(&self.wire_model);
             let dialect = route.dialect;
             let cache_key = request.options.cache_key;
-            Ok(drive(DriveRequest {
-                transport: self.transport.clone(),
-                credentials: self.credentials.clone(),
-                build: Box::new(move |credential| {
+            let build_headers = {
+                let route = route.clone();
+                let identity = route.client_identity;
+                move |credential: &p1_provider_http::Credential| {
                     let mut headers = route.headers.clone();
+                    // The identity replaces p1's own user-agent; the identity's session
+                    // header replaces the generic cache-key session header.
+                    if identity.is_some() {
+                        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("user-agent"));
+                    }
                     headers.extend([
                         ("content-type".into(), "application/json".into()),
                         ("accept".into(), "text/event-stream".into()),
@@ -266,15 +350,27 @@ impl Provider for ChatProvider {
                             format!("Bearer {}", credential.bearer),
                         ),
                     ]);
-                    if let (Some(name), Some(value)) = (&route.session_header, &cache_key) {
-                        headers.push((name.clone(), value.clone()));
+                    match identity {
+                        None => {
+                            if let (Some(name), Some(value)) = (&route.session_header, &cache_key) {
+                                headers.push((name.clone(), value.clone()));
+                            }
+                        }
+                        Some(identity) => {
+                            headers.extend(client_identity_headers(identity, cache_key.as_deref()));
+                        }
                     }
                     HttpRequest {
                         url: route.endpoint.clone(),
                         headers,
                         body: body.clone(),
                     }
-                }),
+                }
+            };
+            Ok(drive(DriveRequest {
+                transport: self.transport.clone(),
+                credentials: self.credentials.clone(),
+                build: Box::new(build_headers),
                 new_parser: Box::new(move || {
                     Box::new(parser::ChatParser::new(origin.clone(), dialect))
                 }),
@@ -299,6 +395,7 @@ mod test_config {
             endpoint: "https://example.test/chat/completions".into(),
             headers: vec![],
             session_header: (!retained).then(|| "x-session".into()),
+            client_identity: None,
             dialect: if retained {
                 ChatDialect::RetainedThinking
             } else {
