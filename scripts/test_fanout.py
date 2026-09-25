@@ -323,6 +323,16 @@ class FanoutTest(unittest.TestCase):
         job["brief_file"] = os.path.join(self.dir, "nope.md")
         self.assert_rejected([job], "brief file missing")
 
+    def test_empty_brief_file(self) -> None:
+        job = self.p1_job()
+        job["brief_file"] = self.write("empty.md", "  \n")
+        self.assert_rejected([job], "prompt is empty")
+
+    def test_empty_resume_prompt_file(self) -> None:
+        session = self.write("session.jsonl", '{"p1_journal":1}\n')
+        job = self.p1_job(session=session, prompt_file=self.write("empty-prompt.md", ""))
+        self.assert_rejected([job], "prompt is empty")
+
     def test_missing_workspace(self) -> None:
         self.assert_rejected([self.p1_job(dir=os.path.join(self.dir, "gone"))],
                              "no such workspace")
@@ -465,6 +475,9 @@ class FanoutTest(unittest.TestCase):
         self.assertFalse(fanout.is_p1_agent(["p1", "--brief-file", "/tmp/brief.md"]))
         self.assertFalse(fanout.is_p1_agent(["python3", "scripts/fanout.py", "--env"]))
         self.assertFalse(fanout.is_p1_agent(["p1", "models"]))
+        self.assertTrue(fanout.is_p1_agent(
+            ["/x/build-evidence/p1-hotfix2-81c6411e6f60", "--env", "zen", "--yes", BRIEF]))
+        self.assertFalse(fanout.is_p1_agent(["/usr/bin/p1x", "--env", "zen", BRIEF]))
 
 
 if __name__ == "__main__":

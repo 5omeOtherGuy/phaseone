@@ -143,11 +143,13 @@ P1_BOOL_FLAGS = {"--resume", "--ask", "--yes"}
 
 def is_p1_agent(argv):
     """A HEADLESS p1 worker, decided from argv alone (/proc/<pid>/cmdline — environ is
-    never read): basename `p1`, no `--tui`, and a positional prompt. The accepted option
+    never read): basename `p1` or `p1-*`, no `--tui`, and a positional prompt. The accepted option
     shape is the same run grammar used by p1_command; unsupported prompt-file flags do not
     count because p1 rejects them. An interactive session (`p1`, `p1 --env claude`, or
     anything `--tui`) and meta subcommands (`p1 models`, `p1 login …`) never count."""
-    if not argv or os.path.basename(argv[0]) != "p1":
+    # A renamed build (P1_BIN=…/p1-hotfix2-<sha>) is still p1.
+    name = os.path.basename(argv[0]) if argv else ""
+    if name != "p1" and not name.startswith("p1-"):
         return False
     args = argv[1:]
     if not args or args[0] in P1_SUBCOMMANDS or "--tui" in args:
@@ -367,6 +369,12 @@ def validate_jobs(jobs):
                 raise JobError(f"fanout: job {label}: prompt file missing: {job['prompt_file']}")
         elif not os.path.isfile(job.get("brief_file") or ""):
             raise JobError(f"fanout: job {label}: brief file missing: {job.get('brief_file')}")
+        # An empty prompt would be an empty argv element, which /proc cmdline parsing drops, so
+        # the pool could not count the worker it started.
+        prompt_path = job["prompt_file"] if job.get("session") else job["brief_file"]
+        with open(prompt_path, encoding="utf-8", errors="replace") as handle:
+            if not handle.read().strip():
+                raise JobError(f"fanout: job {label}: prompt is empty: {prompt_path}")
         if not isinstance(job.get("sandbox", False), bool):
             raise JobError(f"fanout: job {label}: sandbox must be true or false")
         if job.get("sandbox_write") and not job.get("sandbox", False):
