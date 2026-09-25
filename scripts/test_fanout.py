@@ -487,7 +487,12 @@ class FanoutTest(unittest.TestCase):
         self.assertTrue(fanout.is_p1_agent(["p1", "--env", "zen", "--", "models"]))
         self.assertFalse(fanout.is_p1_agent(["p1", "--env", "zen", "--"]))
         self.assertTrue(fanout.is_p1_agent(["p1", "workflow", "run", "/w/flow.rhai"]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "workflow", "run", "--yes", "/w/flow.rhai"]))
         self.assertFalse(fanout.is_p1_agent(["p1", "workflow"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "workflow", "run"]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "--env", "zen", "--", "--tui"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "--env", "zen", "hello", "--tui"]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "--session", "--tui", "hello"]))
 
 
 if __name__ == "__main__":

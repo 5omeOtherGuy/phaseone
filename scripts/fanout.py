@@ -152,18 +152,24 @@ def is_p1_agent(argv):
     if name != "p1" and not name.startswith("p1-"):
         return False
     args = argv[1:]
-    # `p1 workflow run FILE` runs unattended (cli.rs `Options::is_headless`); its steps run
-    # in that one process, so the process counts once.
+    # `p1 workflow run FILE …` runs unattended (cli.rs `Options::is_headless`); its steps
+    # run in that one process, so the process counts once. Flags may precede FILE; a bare
+    # `p1 workflow run` is a usage error that never starts.
     if args[:2] == ["workflow", "run"]:
-        return True
-    if not args or args[0] in P1_SUBCOMMANDS or "--tui" in args:
+        return len(args) > 2
+    if not args or args[0] in P1_SUBCOMMANDS:
         return False
+    # Tokens are read in order, as cli.rs parses them: a value flag swallows its value,
+    # `--tui` before `--` makes the session interactive, and after `--` everything is prompt.
+    prompt = False
     index = 0
     while index < len(args):
         arg = args[index]
         if arg == "--":
-            # `--` ends option parsing; everything after it is the prompt (cli.rs).
-            return index + 1 < len(args)
+            prompt = prompt or index + 1 < len(args)
+            break
+        if arg == "--tui":
+            return False
         if arg in P1_VALUE_FLAGS:
             index += 2
             continue
@@ -172,8 +178,9 @@ def is_p1_agent(argv):
             continue
         if arg.startswith("-") and arg != "-":
             return False
-        return True  # a bare word: the positional prompt of a headless run
-    return False
+        prompt = True  # a bare word: the positional prompt of a headless run
+        index += 1
+    return prompt
 
 
 def processes():
