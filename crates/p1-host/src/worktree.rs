@@ -133,9 +133,10 @@ fn prepare(run_workspace: &Path, located: &Located, base: &str) -> Result<Worktr
     let branch_ref = format!("refs/heads/{branch}");
     let registered = entries.iter().find(|entry| same_path(&entry.path, path));
     match registered {
-        // A registration whose directory is gone (git lists it `prunable`): named, and
-        // left for the owner's `git worktree prune`.
-        Some(_) if path.symlink_metadata().is_err() => {
+        // A registration whose directory is gone — or replaced by a file or a dangling
+        // symlink, which git lists as `prunable` all the same: named, and left for the
+        // owner's `git worktree prune`.
+        Some(_) if !path.is_dir() => {
             return Err(format!(
                 "{} is registered but missing (git worktree prune)",
                 path.display()
@@ -510,6 +511,27 @@ mod tests {
             repo.git(&["worktree", "list", "--porcelain"])
                 .contains(&format!("worktree {}", info.path.display())),
             "p1 pruned nothing"
+        );
+    }
+
+    #[test]
+    fn a_registration_whose_path_is_a_plain_file_is_named_not_pruned() {
+        let repo = Repo::new();
+        let base = repo.git(&["rev-parse", "HEAD"]);
+        let info = ensure(&repo.main(), "filed", &base).unwrap();
+        std::fs::remove_dir_all(repo.tree("filed")).unwrap();
+        std::fs::write(repo.tree("filed"), b"not a worktree").unwrap();
+
+        let worktrees = Arc::new(Worktrees::default());
+        let Err(error) = worktrees.acquire(&repo.main(), "filed", &base) else {
+            panic!("a file sits where the worktree was");
+        };
+        assert_eq!(
+            error,
+            format!(
+                "worktree: filed: {} is registered but missing (git worktree prune)",
+                info.path.display()
+            )
         );
     }
 
