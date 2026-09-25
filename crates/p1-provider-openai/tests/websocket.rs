@@ -31,7 +31,9 @@ use p1_provider_http::testing::{
     ScriptedWsConnector,
 };
 use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsError, WsHandshake};
-use p1_provider_http::{Credential, CredentialSource, RetryPolicy};
+use p1_provider_http::{
+    Credential, CredentialSource, FIRST_BYTE_TIMEOUT, RetryPolicy, STREAM_IDLE_TIMEOUT,
+};
 use p1_provider_openai::{
     Clock, OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesAdapterSettings, ResponsesRoute,
     ResponsesTransport,
@@ -1325,6 +1327,83 @@ async fn a_read_error_before_any_output_retries_within_the_budget_then_falls_bac
     completed(&events);
     assert_eq!(connector.handshakes().len(), 4);
     assert_eq!(sse.requests().len(), 1, "the budget spent, SSE serves it");
+}
+
+/// Issue #164 for the WebSocket arm: a peer that opens the socket and never sends
+/// the FIRST frame is §5's transient row, each attempt bounded by
+/// [`FIRST_BYTE_TIMEOUT`], and the budget spent falls back to SSE.
+#[tokio::test(start_paused = true)]
+async fn a_read_that_never_answers_is_bounded_at_the_first_frame_and_falls_back() {
+    let peer = PendingPeer::stalling_read();
+    let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        sse.clone(),
+        Some(peer.clone()),
+    )
+    .expect("the route composes");
+
+    let start = tokio::time::Instant::now();
+    let events = turn(&provider).await;
+    completed(&events);
+
+    assert_eq!(
+        peer.handshakes(),
+        4,
+        "a first-frame timeout is the transient row: the first attempt and the three \
+         reconnects the default policy's max_retries allows"
+    );
+    assert_eq!(
+        sse.requests().len(),
+        1,
+        "the first-frame bound fell back to SSE"
+    );
+    let policy = RetryPolicy::default();
+    assert_eq!(
+        start.elapsed(),
+        4 * FIRST_BYTE_TIMEOUT
+            + policy.delay(1, None)
+            + policy.delay(2, None)
+            + policy.delay(3, None),
+        "four bounded attempts, the retry policy's backoff between them"
+    );
+}
+
+/// Issue #164 for the WebSocket arm after output: a stream that goes silent past
+/// [`STREAM_IDLE_TIMEOUT`] is this response's own `Transport` failure, naming the
+/// bound — no retry, no fallback.
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_stalls_after_output_fails_at_the_idle_bound() {
+    // One script per connect: a reconnect would panic the peer's script, so a
+    // single script asserts there is no reconnect. No SSE response is scripted, so
+    // a fallback would panic too.
+    let peer = StallAfterFrames::new(vec![vec![ScriptedFrame::text(DELTA)]]);
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        ScriptedTransport::new(Vec::new()),
+        Some(peer.clone()),
+    )
+    .expect("the route composes");
+
+    let start = tokio::time::Instant::now();
+    let events = turn(&provider).await;
+
+    assert_eq!(failed(&events).kind, ProviderErrorKind::Transport);
+    assert_eq!(
+        failed(&events).message,
+        format!("stream idle for {} s", STREAM_IDLE_TIMEOUT.as_secs())
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta { text, .. } if text == "Hello")),
+        "the visible output is preserved: {events:?}"
+    );
+    assert_eq!(
+        start.elapsed(),
+        STREAM_IDLE_TIMEOUT,
+        "the wait ends at the idle bound, exactly"
+    );
 }
 
 /// The same for a close before any output — and on a FRESH connection, where §5 has
