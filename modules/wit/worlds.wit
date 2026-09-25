@@ -28,7 +28,9 @@ world tool {
     import snapshot;
     import workspace-mutation;
     import process;
-    import workers;
+    import workers-start;
+    import workers-observe;
+    import workers-control;
     import workflows;
     import completion;
 
@@ -57,9 +59,10 @@ world tool {
     export execute: func(call: tool-call) -> tool-outcome;
 }
 
-/// A provider module (`p1_contracts::Provider`): it lowers requests and classifies what
-/// comes back. Retry, backoff, the one refresh after a 401 and every network wait stay in
-/// the native transport broker (freeze item 9).
+/// A provider module (`p1_contracts::Provider`): it lowers requests, decides how each goes
+/// out (HTTP, a full WebSocket frame or a continuation frame) and classifies what comes back.
+/// Retry, backoff, the one refresh after a 401, the WebSocket connection and every network
+/// wait stay in the native transport broker (freeze item 9; see `websocket`).
 world provider {
     import control;
     import clock;
@@ -72,7 +75,7 @@ world provider {
     use types.{json, provider-error, route-description, history-item, model-options};
     use types.{declaration as tool-declaration};
     use http.{http-request, response-head};
-    use websocket.{websocket-request};
+    use websocket.{connection-state, websocket-send};
 
     /// The instance a route file and a model profile assemble. The endpoint is given so a
     /// module can choose its path; the broker still prefixes it and owns the connection.
@@ -93,11 +96,11 @@ world provider {
         options: model-options,
     }
 
-    /// One request, lowered. `http` is always present because it is also the fallback of a
-    /// route that speaks WebSocket.
-    record lowered-request {
-        http: http-request,
-        websocket: option<websocket-request>,
+    /// One request, lowered: the component has chosen the transport. A route that speaks
+    /// WebSocket falls back by returning `http`.
+    variant lowered-request {
+        http(http-request),
+        websocket(websocket-send),
     }
 
     /// Called once on an instance, before any other export on it: the assembly instance and
@@ -114,7 +117,11 @@ world provider {
     export validate: func(request: provider-request) -> result<_, provider-error>;
 
     /// Lower `request` into what the broker sends; `err` means no request exists.
-    export lower: func(request: provider-request) -> result<lowered-request, provider-error>;
+    /// `connection` is the broker's report of this instance's WebSocket connection and of the
+    /// previous attempt of this request; from it the component decides between HTTP, a
+    /// handshake with a full frame, a full frame or a continuation frame. The broker calls
+    /// `lower` again for a retry after a WebSocket failure before any output.
+    export lower: func(request: provider-request, connection: connection-state) -> result<lowered-request, provider-error>;
 
     /// Classify a non-2xx response or a refused WebSocket upgrade into one of the closed
     /// kinds. `body` is classification input only and never enters the message.
@@ -170,18 +177,29 @@ world context-policy {
     export compact-now: func(history: list<history-item>, last-usage: option<usage>) -> result<compaction, context-error>;
 }
 
-/// An authorization policy (`p1_contracts::AuthorizationPolicy`). Asking the operator stays
-/// in the host's own policy: a module has no way to read input.
+/// An authorization policy (`p1_contracts::AuthorizationPolicy`). A module has no way to read
+/// input, so it may answer `ask` and the host resolves it.
 world authorization-policy {
     import control;
     import clock;
     import notices;
 
-    use types.{tool-call, tool-identity, effect as call-effect, decision};
+    use types.{tool-call, tool-identity, effect as call-effect};
+
+    /// A policy's answer. Wider than `types.decision` by `ask`: the native ask bridge resolves
+    /// `ask` through the front end (a headless host answers without waiting for input), so
+    /// only `permit` or `deny` reaches the core as a `p1_contracts::Decision`.
+    variant verdict {
+        permit,
+        /// Nothing is executed; the reason is shown to the model.
+        deny(string),
+        /// Leave it to the host, which resolves it.
+        ask,
+    }
 
     /// May `call` run? `identity` is the loader-built identity of the tool that would run it,
     /// `effect` that tool's own classification.
-    export authorize: func(call: tool-call, identity: tool-identity, effect: call-effect) -> decision;
+    export authorize: func(call: tool-call, identity: tool-identity, effect: call-effect) -> verdict;
 }
 
 /// An optional workflow implemented as a module rather than a script: it orchestrates
@@ -191,11 +209,31 @@ world workflow-implementation {
     import clock;
     import random;
     import notices;
-    import workers;
+    import workers-start;
+    import workers-observe;
+    import workers-control;
     import workflows;
 
     use types.{json};
 
     /// Run the workflow with `args` (a JSON object); its JSON value, or why it failed.
     export run: func(args: json) -> result<json, string>;
+}
+
+/// A workflow's decisions, with the workflow's state kept native: the decision component
+/// answers short calls, and the native substrate (`p1-workflow`) keeps all state and passes
+/// the snapshot in on every call. It needs no capability beyond cancellation and the clock.
+world workflow-decision {
+    import control;
+    import clock;
+
+    use types.{json};
+
+    /// The next step to run, given the run's `snapshot` and the `request` that asks for it;
+    /// or why none can be planned.
+    export plan-step: func(snapshot: json, request: json) -> result<json, string>;
+
+    /// Accept the `outcome` of a step the substrate ran, given the run's `snapshot`; what the
+    /// substrate records, or why the outcome is refused.
+    export accept-step: func(snapshot: json, outcome: json) -> result<json, string>;
 }
