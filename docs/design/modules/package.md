@@ -103,3 +103,28 @@ What a guest may import from WASI is the guest-target question S0-Q9, decided on
 actual imports: the build writes every imported interface of the built component to
 `<package>.imports`, which on the `wasm32-wasip2` target includes the `wasi:` interfaces Rust std
 links.
+
+## Shared guest logic (S0-R3)
+
+Decision S0-R3, asked by S3 and decided by the S0 lead: guest logic MAY be a target-independent
+library crate under `crates/` used by both the native adapter's tests (in `crates/p1-tool-<x>/`)
+and the component package (`modules/p1-module-<x>/`), so the frozen native tests — for example
+[`crates/p1-tool-shell/tests/output_filters.rs`](../../../crates/p1-tool-shell/tests/output_filters.rs),
+byte-for-byte — keep running over the same code the component ships. The decision adds a crate
+beside a package; it replaces no package and no world.
+
+Rules:
+
+- The crate lives in the root workspace under `crates/`, is a member of it, and never lives under
+  `modules/`. The stream that owns the tool owns the crate; the module package depends on it by
+  `path`.
+- It is pure computation per D-XO-8: no filesystem, network, process, thread, clock or
+  environment access, and no host-specific I/O. A guest that needs any of those goes through the
+  imported capability interfaces of [`wit.md`](wit.md), never this crate.
+- It depends only on std, `serde` (derive), `serde_json` and `regex`, at the versions the root
+  `Cargo.lock` pins. It does not depend on `p1-contracts`, `p1-module-protocol` or any other
+  host crate.
+- It inherits the root workspace's `unsafe_code = "forbid"` (`Cargo.toml`).
+- It compiles natively and for the guest target `wasm32-unknown-unknown`; the component build is
+  what proves it, since a crate built only for the host workspace would not.
+- `scripts/check-module-boundaries.sh` (slice S0.7) counts it as handwritten guest code.
