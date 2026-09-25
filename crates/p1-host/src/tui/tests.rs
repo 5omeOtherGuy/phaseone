@@ -49,6 +49,7 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             follow_ups: VecDeque::new(),
             submit_pending: None,
             worker_rows: Arc::new(Mutex::new(Vec::new())),
+            worker_stops: None,
             worker_usage: HashMap::new(),
             pending_calls: HashMap::new(),
             task_files: HashSet::new(),
@@ -1376,4 +1377,60 @@ fn ctrl_n_detaches_an_attached_worker() {
         None,
     );
     assert!(d.screen.attached.is_none());
+}
+
+#[test]
+fn worker_stop_confirmation_keeps_or_dispatches_through_the_stop_channel() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    d.worker_stops = Some(tx);
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Down), None);
+    d.on_key(key(KeyCode::Char('x')), None);
+    assert_eq!(d.screen.stop_pending.as_deref(), Some("w2"));
+
+    d.on_key(key(KeyCode::Char('n')), None);
+    assert_eq!(d.screen.stop_pending, None);
+    assert!(rx.try_recv().is_err());
+
+    d.on_key(key(KeyCode::Char('x')), None);
+    d.on_key(key(KeyCode::Char('y')), None);
+    assert_eq!(d.screen.stop_pending, None);
+    assert_eq!(rx.try_recv(), Ok("w2".to_string()));
+    assert!(d.screen.transcript.blocks.iter().any(|block| matches!(
+        block,
+        p1_tui::transcript::Block::Meta { text } if text == "↳ w2 stop requested"
+    )));
+}
+
+#[test]
+fn worker_stop_without_the_host_channel_reports_that_it_cannot_stop() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Down), None);
+    d.on_key(key(KeyCode::Char('x')), None);
+    d.on_key(key(KeyCode::Char('y')), None);
+
+    assert_eq!(d.screen.stop_pending, None);
+    assert!(d.screen.transcript.blocks.iter().any(|block| matches!(
+        block,
+        p1_tui::transcript::Block::Meta { text }
+            if text == "↳ w2 cannot be stopped here"
+    )));
 }
