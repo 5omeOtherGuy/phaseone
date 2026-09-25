@@ -438,7 +438,12 @@ fn draw_pane(screen: &Screen, rect: Rect, buf: &mut Buffer, now_ms: u64) {
             let body = inner.saturating_sub(OUTPUT_HEAD_ROWS);
             output::render(&view.pane(output_source(screen, view), body), width)
         }
-        (PaneMode::Workers, _) => workers::render(&screen.workers, width, rect.width < WIDE_PANE),
+        (PaneMode::Workers, _) => workers::render_with(
+            &screen.workers,
+            width,
+            rect.width < WIDE_PANE,
+            screen.stop_pending.as_deref(),
+        ),
         _ => ledger::render(&screen.ledger(), width, Some(inner)),
     };
     let content = Rect {
