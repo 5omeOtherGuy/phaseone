@@ -129,6 +129,71 @@ async fn the_review_shape_keeps_order_and_completes() {
     assert_eq!(harness.recorder.steps.lock().unwrap().len(), 9);
 }
 
+/// ADR-0075: a fan-out reports its size before any job runs — `parallel` its
+/// thunks, `pipeline` its items — so the TUI knows how many steps are queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fan_out_reports_its_job_count_when_it_starts() {
+    let harness = Harness::new();
+    let report = harness
+        .run(
+            r#"
+            agent("alone");
+            let pair = parallel([|| agent("a"), || agent("b")]);
+            pipeline([1, 2, 3], |x| agent("p" + x))
+            "#,
+        )
+        .await;
+    assert_eq!(report.outcome, RunOutcome::Completed, "{report:?}");
+    harness.recorder.run_ended.notified().await;
+    assert_eq!(*harness.recorder.jobs.lock().unwrap(), vec![2, 3]);
+}
+
+/// ADR-0075: two calls with the same id are two steps — each request and each step line
+/// carries its own ordinal, and a replayed step still has one.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_calls_with_one_id_carry_their_own_ordinals_replayed_too() {
+    let harness = Harness::new();
+    let script = r#"parallel([|| agent("vote"), || agent("vote")])"#;
+    let first = harness.run(script).await;
+    assert_eq!(first.outcome, RunOutcome::Completed, "{first:?}");
+    assert_eq!(first.steps[0].call, first.steps[1].call, "one call id");
+    let sorted = |mut ordinals: Vec<u32>| {
+        ordinals.sort_unstable();
+        ordinals
+    };
+    assert_eq!(
+        sorted(
+            harness
+                .runner
+                .requests()
+                .iter()
+                .map(|r| r.ordinal)
+                .collect()
+        ),
+        [1, 2]
+    );
+    assert_eq!(
+        sorted(first.steps.iter().map(|line| line.ordinal).collect()),
+        [1, 2]
+    );
+
+    let second = harness
+        .wait(
+            &harness
+                .start_request(StartRequest {
+                    resume_from: Some(first.id.clone()),
+                    ..request(script)
+                })
+                .await,
+        )
+        .await;
+    assert_eq!(second.counts.replayed, 2);
+    assert_eq!(
+        sorted(second.steps.iter().map(|line| line.ordinal).collect()),
+        [1, 2]
+    );
+}
+
 // (3)
 #[tokio::test(flavor = "multi_thread")]
 async fn nested_parallel_in_a_stage_is_bounded_and_never_deadlocks() {

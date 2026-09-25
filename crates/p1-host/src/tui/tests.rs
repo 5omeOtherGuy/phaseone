@@ -72,6 +72,7 @@ fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             submit_pending: None,
             worker_rows: Arc::new(Mutex::new(Vec::new())),
             worker_stops: None,
+            run_cancels: None,
             worker_usage: HashMap::new(),
             worker_windows: Arc::new(Mutex::new(HashMap::new())),
             pending_calls: HashMap::new(),
@@ -2039,4 +2040,158 @@ fn worker_context_window_sync_keeps_filling_usage_from_worker_responses() {
     assert_eq!(row.model.as_deref(), Some("deepseek-v4.1-flash"));
     assert_eq!(row.tokens, Some(48_213));
     assert_eq!(row.cost_micro_usd, Some(5));
+}
+
+/// ADR-0075: the front end's workflow calls reach the screen's tree through the sink's
+/// channel, and `x`/`y` on a run header sends the run to the host's canceller.
+#[cfg(feature = "workflows")]
+#[test]
+fn workflow_calls_build_the_tree_and_a_run_header_cancels_through_the_run_channel() {
+    use p1_tui::state::{PaneMode, PaneWidth};
+
+    let front_end = TuiFrontEnd::new(
+        TuiOptions {
+            env: "claude".into(),
+            ask: false,
+            workspace: std::path::PathBuf::from("/workspace"),
+            sandbox: "off".into(),
+            effort: None,
+        },
+        CancellationToken::new(),
+    );
+    let mut events = front_end.events.lock().unwrap().take().unwrap();
+    front_end.workflow_run_started(&crate::frontend::WorkflowRunStarted {
+        id: "wf1".into(),
+        resumed_from: None,
+    });
+    front_end.workflow_phase("wf1", "Review");
+    front_end.workflow_line("workflow wf1 phase: Review");
+
+    let (mut d, _auth) = driver();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    d.run_cancels = Some(tx);
+    let mut forwarded = 0;
+    while let Ok(event) = events.try_recv() {
+        assert!(matches!(event, UiEvent::Workflow { .. }), "{event:?}");
+        d.on_ui_event(event);
+        forwarded += 1;
+    }
+    assert_eq!(forwarded, 2, "the ledger line is not a tree event");
+    let run = d
+        .screen
+        .workers
+        .tree
+        .run("wf1")
+        .expect("the run is in the tree");
+    assert_eq!(
+        run.current_phase().map(|phase| phase.name.as_str()),
+        Some("Review")
+    );
+
+    d.screen.pane_width = PaneWidth::Wide;
+    d.screen.pane_mode = PaneMode::Workers;
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert_eq!(d.screen.workers.focused.as_deref(), Some("wf1"));
+    d.on_key(key(KeyCode::Char('x')), None);
+    assert_eq!(d.screen.stop_pending.as_deref(), Some("wf1"));
+    d.on_key(key(KeyCode::Char('y')), None);
+    assert_eq!(d.screen.stop_pending, None);
+    assert_eq!(rx.try_recv(), Ok("wf1".to_string()));
+    assert!(d.screen.transcript.blocks.iter().any(|block| matches!(
+        block,
+        p1_tui::transcript::Block::Meta { text } if text == "↳ wf1 cancel requested"
+    )));
+}
+
+/// ADR-0075 / #141's idle rule: a live run's tree redraws on the heartbeat only while the
+/// pane shows it — with the pane off, a running workflow draws no periodic frames.
+#[cfg(feature = "workflows")]
+#[tokio::test(start_paused = true)]
+async fn a_live_run_draws_on_the_heartbeat_only_while_its_tree_is_visible() {
+    use p1_tui::state::{PaneMode, PaneWidth};
+
+    async fn frames_in_five_seconds(pane_width: PaneWidth, setup: fn(&mut Screen)) -> usize {
+        let mut harness =
+            IdleLoop::with_backend(ratatui::backend::TestBackend::new(120, 40), false);
+        // Pinned, so the run's start does not promote (and open) the pane.
+        harness.driver.screen.pinned = true;
+        harness.driver.screen.pane_mode = PaneMode::Workers;
+        harness.driver.screen.pane_width = pane_width;
+        setup(&mut harness.driver.screen);
+        let wires = harness.wires.clone();
+        let script = async move {
+            wires
+                .events
+                .send(UiEvent::Workflow {
+                    at_ms: 0,
+                    event: p1_tui::workflow::WorkflowEvent::RunStarted(
+                        p1_tui::workflow::RunStarted {
+                            id: "wf1".into(),
+                            resumed_from: None,
+                        },
+                    ),
+                })
+                .expect("the loop reads events");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let before = wires.draws.count();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            wires.cancel.cancel();
+            wires.draws.count() - before
+        };
+        let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = frames.clone();
+        harness
+            .run(async move {
+                seen.store(script.await, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
+        frames.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    assert_eq!(
+        frames_in_five_seconds(PaneWidth::Off, |_| {}).await,
+        0,
+        "a hidden tree draws nothing on its own"
+    );
+    let shown = frames_in_five_seconds(PaneWidth::Wide, |_| {}).await;
+    assert!(
+        (3..=5).contains(&shown),
+        "a visible live tree redraws once a second: {shown}"
+    );
+    // A review flag left open by an earlier diff decision covers nothing once that
+    // decision is gone: the tree keeps its refresh.
+    let stale = frames_in_five_seconds(PaneWidth::Wide, |screen| {
+        screen.review.open = true;
+        screen.approval = None;
+    })
+    .await;
+    assert!(
+        (3..=5).contains(&stale),
+        "a stale review flag must not stop the tree: {stale}"
+    );
+    // A diff taller than the transcript opens the full review by itself (`review.open`
+    // stays false): it covers the pane, so the tree draws nothing on its own.
+    assert_eq!(
+        frames_in_five_seconds(PaneWidth::Wide, |screen| {
+            let old: String = (0..80).map(|n| format!("old {n}\n")).collect();
+            let new: String = (0..80).map(|n| format!("new {n}\n")).collect();
+            screen.approval = Some(p1_tui::state::Approval::Diff(
+                p1_tui::render::diff::DiffView::from_edit(
+                    "edit",
+                    "src/lib.rs",
+                    &old,
+                    &new,
+                    Some(&old),
+                    (1, 1),
+                ),
+            ));
+            assert!(!screen.review.open);
+        })
+        .await,
+        0,
+        "an auto-opened review covers the pane"
+    );
 }

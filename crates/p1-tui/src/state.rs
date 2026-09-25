@@ -15,7 +15,7 @@ use crate::render::ledger::{
     ContextView, FoldRef, LedgerPane, LedgerSpend, SessionView, WorkersSummary, WorkspaceView,
 };
 use crate::render::picker::Picker;
-use crate::render::workers::{BlockState, WorkerBlock, WorkersPane, display_order};
+use crate::render::workers::{BlockState, Selectable, WorkerBlock, WorkersPane, display_order};
 use crate::transcript::{Block, Transcript};
 
 /// A pending approval (handoff §7.5): inline as the transcript's running element, or the full
@@ -472,6 +472,10 @@ pub struct Screen {
     /// The terminal width of the last frame: `^W` resolves the `Auto` start state at it.
     #[doc(hidden)]
     pub last_width: u16,
+    /// The terminal height of the last frame: whether a diff review opens by itself
+    /// depends on it (`render::screen::review_covers`).
+    #[doc(hidden)]
+    pub last_height: u16,
     /// `^F`: the pane owns `↑ ↓` (WORKERS select, OUTPUT scroll) until `esc` or `^F`.
     pub pane_focused: bool,
     /// The full diff review's view state (handoff §7.5).
@@ -501,6 +505,18 @@ pub struct AttachedWorker {
     pub route: String,
     pub state: BlockState,
     pub transcript: Transcript,
+    /// Set when a workflow step was opened (`⏎` on a step, ADR-0075): its stats band and
+    /// its prompt head the transcript.
+    pub step: Option<OpenedStep>,
+}
+
+/// A workflow step opened over its worker's transcript (ADR-0075).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedStep {
+    /// The step's key in the tree (`wf1/3`).
+    pub key: String,
+    /// `p`: the whole prompt instead of its first three lines.
+    pub prompt_expanded: bool,
 }
 
 /// One queued operator input (SPEC §4.2 hints: steering vs follow-up).
@@ -615,6 +631,11 @@ impl Screen {
 
     /// Observe one worker event without moving any parent state (handoff §9.5).
     pub fn apply_worker(&mut self, id: &str, event: &AgentEvent, at_ms: u64) {
+        self.workers
+            .activity
+            .entry(id.to_string())
+            .or_default()
+            .observe(event);
         if let Some(worker) = &mut self.attached
             && worker.id == id
         {
@@ -627,22 +648,106 @@ impl Screen {
         }
     }
 
+    /// Fold one workflow event into the WORKERS tree (ADR-0075). A run makes WORKERS
+    /// available like a worker does.
+    ///
+    /// A run's start — or the first step of a run the tree had not seen start — is new live
+    /// attention exactly like a direct worker's start: an unpinned pane is promoted to
+    /// WORKERS. A run's end settles the pane like the last worker's end does.
+    pub fn apply_workflow(&mut self, event: crate::workflow::WorkflowEvent, at_ms: u64) {
+        use crate::workflow::WorkflowEvent as E;
+        self.workers_ever_started = true;
+        let starts = match &event {
+            E::RunStarted(started) => self.workers.tree.run(&started.id).is_none(),
+            E::StepStarted(step) => self
+                .workers
+                .tree
+                .run(&step.run)
+                .is_none_or(|run| run.steps().next().is_none()),
+            _ => false,
+        };
+        let ends = matches!(event, E::RunEnded(_));
+        self.workers.tree.apply(event, at_ms);
+        if starts && !self.pinned {
+            self.promote_workers(false);
+        }
+        if ends {
+            let count = |state| {
+                self.workers
+                    .workers
+                    .iter()
+                    .filter(|worker| worker.state == state)
+                    .count() as u64
+            };
+            let (needs_review, live) = (
+                count(BlockState::NeedsReview) > 0,
+                count(BlockState::Running),
+            );
+            self.demote_if_settled(needs_review, live);
+        }
+    }
+
     /// Attach the focused WORKERS row, taking over its buffered transcript (handoff §9.5).
+    /// On a workflow step, `a` attaches the step's worker; a step with no worker yet and a
+    /// run header attach nothing.
     pub fn attach_selected(&mut self) {
+        self.attach_focused(false);
+    }
+
+    /// `⏎` on the focused row: a workflow step opens (its stats band and prompt over its
+    /// worker's transcript, ADR-0075); any other row attaches as `a` does.
+    pub fn open_selected(&mut self) {
+        self.attach_focused(true);
+    }
+
+    fn attach_focused(&mut self, open: bool) {
         if self.pane_mode != PaneMode::Workers {
             return;
         }
-        let Some(id) = self.workers.focused.clone() else {
+        let Some(mut key) = self.workers.focused.clone() else {
             return;
         };
-        let Some(row) = self.workers.workers.iter().find(|worker| worker.id == id) else {
-            return;
+        if open && let Some(target) = self.workers.tree.open_target(&key) {
+            key = target.to_string();
+        }
+        let (id, step) = match self.workers.tree.step(&key) {
+            Some((_, step)) => {
+                let Some(worker) = step.worker_id.clone() else {
+                    return;
+                };
+                let opened = open.then(|| OpenedStep {
+                    key: key.clone(),
+                    prompt_expanded: false,
+                });
+                (worker, Some((opened, step.model.clone(), step.state)))
+            }
+            None => (key, None),
         };
-        if self.attached.as_ref().is_some_and(|worker| worker.id == id) {
+        let row = self.workers.workers.iter().find(|worker| worker.id == id);
+        let (route, state, opened) = match (row, step) {
+            (Some(row), step) => (row.route.clone(), row.state, step.and_then(|s| s.0)),
+            // A step's worker the refresher has not listed (yet, or any more): its own
+            // transcript is still here to read.
+            (None, Some((opened, model, state))) => (
+                model,
+                match state {
+                    crate::workflow::StepState::Running => BlockState::Running,
+                    crate::workflow::StepState::Done => BlockState::Done,
+                    crate::workflow::StepState::Failed => BlockState::Failed,
+                    crate::workflow::StepState::Blocked | crate::workflow::StepState::Cancelled => {
+                        BlockState::Cancelled
+                    }
+                },
+                opened,
+            ),
+            (None, None) => return,
+        };
+        if let Some(worker) = &mut self.attached
+            && worker.id == id
+        {
+            worker.step = opened;
             return;
         }
-        let route = row.route.clone();
-        let state = row.state;
         self.detach_worker();
         let transcript = self.worker_transcripts.remove(&id).unwrap_or_default();
         self.attached = Some(AttachedWorker {
@@ -650,9 +755,21 @@ impl Screen {
             route,
             state,
             transcript,
+            step: opened,
         });
         // An attachment owns WORKERS, so settlement must not demote the focused view.
         self.worker_mode_auto = false;
+    }
+
+    /// `p` on an opened step: its whole prompt, or back to the first three lines.
+    pub fn toggle_prompt(&mut self) {
+        if let Some(step) = self
+            .attached
+            .as_mut()
+            .and_then(|worker| worker.step.as_mut())
+        {
+            step.prompt_expanded = !step.prompt_expanded;
+        }
     }
 
     /// Return to the parent transcript without changing pane focus or selection.
@@ -662,16 +779,40 @@ impl Screen {
         }
     }
 
-    /// Ask before stopping the attached worker, or the selected one when detached.
+    /// Ask before stopping the attached worker, or the selected one when detached: on a
+    /// workflow step its worker, on a run header the run (ADR-0075).
+    ///
+    /// A focused run header or step is what `x` acts on even while a worker is attached
+    /// (ADR-0075): the attached worker is the target only when the focus is a worker row
+    /// or there is no selection.
     pub fn ask_stop(&mut self) {
-        let target = self
-            .attached
-            .as_ref()
-            .map(|worker| worker.id.clone())
-            .or(self.workers.focused.clone());
+        let focused_tree_row = self.workers.focused.clone().filter(|key| {
+            self.pane_focused
+                && (self.workers.tree.run(key).is_some() || self.workers.tree.step(key).is_some())
+        });
+        let target = focused_tree_row.or_else(|| {
+            self.attached
+                .as_ref()
+                .map(|worker| worker.id.clone())
+                .or(self.workers.focused.clone())
+        });
         let Some(target) = target else {
             return;
         };
+        if let Some(run) = self.workers.tree.run(&target) {
+            if run.running() {
+                self.stop_pending = Some(target);
+            }
+            return;
+        }
+        if let Some((_, step)) = self.workers.tree.step(&target) {
+            if step.running()
+                && let Some(worker) = step.worker_id.clone()
+            {
+                self.stop_pending = Some(worker);
+            }
+            return;
+        }
         if self.workers.workers.iter().any(|worker| {
             worker.id == target
                 && matches!(
@@ -851,6 +992,8 @@ impl Screen {
             }
             V::TogglePaneFocus => self.toggle_pane_focus(),
             V::AttachWorker => self.attach_selected(),
+            V::OpenStep => self.open_selected(),
+            V::TogglePrompt => self.toggle_prompt(),
             V::AskStopWorker => self.ask_stop(),
             V::KeepWorker => self.keep_worker(),
             V::DetachWorker => self.detach_worker(),
@@ -916,23 +1059,27 @@ impl Screen {
         let needs_review = count(BlockState::NeedsReview) > 0;
         self.workers.header.live = live;
         self.workers.header.queued = (queued > 0).then_some(queued);
-        // A focus on a worker that left the snapshot has nothing left to point at.
+        // A focus on a worker that left the snapshot has nothing left to point at; a run
+        // or a step stays in the tree.
         if let Some(focused) = &self.workers.focused
             && !rows.iter().any(|w| &w.id == focused)
+            && self.workers.tree.run(focused).is_none()
+            && self.workers.tree.step(focused).is_none()
         {
             self.workers.focused = None;
         }
         if self.stop_pending.as_ref().is_some_and(|id| {
-            !rows.iter().any(|worker| {
-                &worker.id == id
-                    && matches!(
-                        worker.state,
-                        BlockState::Running
-                            | BlockState::Queued
-                            | BlockState::NeedsReview
-                            | BlockState::Stalled
-                    )
-            })
+            self.workers.tree.run(id).is_none_or(|run| !run.running())
+                && !rows.iter().any(|worker| {
+                    &worker.id == id
+                        && matches!(
+                            worker.state,
+                            BlockState::Running
+                                | BlockState::Queued
+                                | BlockState::NeedsReview
+                                | BlockState::Stalled
+                        )
+                })
         }) {
             self.stop_pending = None;
         }
@@ -951,19 +1098,38 @@ impl Screen {
             self.pinned = true;
         }
         if new_review || (new_live && !pinned_before) {
-            if self.pane_mode != PaneMode::Workers {
-                self.pane_mode = PaneMode::Workers;
-                self.worker_mode_auto = true;
-            }
-            // The width force is a promotion and a pin from BEFORE this sync
-            // always wins it. Save what the operator had so the demotion can
-            // restore it.
-            if !pinned_before && matches!(self.pane_width, PaneWidth::Off) {
-                self.promotion_saved_width = Some(self.pane_width);
-                self.pane_width = PaneWidth::Wide;
-            }
+            self.promote_workers(pinned_before);
         }
-        if !needs_review && live == 0 && !self.pinned {
+        self.demote_if_settled(needs_review, live);
+        if self.pane_focused
+            && self.pane_mode == PaneMode::Workers
+            && self.workers.focused.is_none()
+        {
+            self.select_first_worker();
+        }
+    }
+    /// New attention in WORKERS (SPEC §5, handoff §9.1): a new live worker, new review
+    /// attention or a workflow run that starts (ADR-0075) moves the pane to WORKERS.
+    fn promote_workers(&mut self, pinned_before: bool) {
+        if self.pane_mode != PaneMode::Workers {
+            self.pane_mode = PaneMode::Workers;
+            self.worker_mode_auto = true;
+        }
+        // The width force is a promotion and a pin from BEFORE this sync
+        // always wins it. Save what the operator had so the demotion can
+        // restore it.
+        if !pinned_before && matches!(self.pane_width, PaneWidth::Off) {
+            self.promotion_saved_width = Some(self.pane_width);
+            self.pane_width = PaneWidth::Wide;
+        }
+    }
+
+    /// Settlement: with nothing live, nothing to review and no workflow running, an
+    /// automatically selected, unpinned WORKERS pane falls back to LEDGER.
+    fn demote_if_settled(&mut self, needs_review: bool, live: u64) {
+        // A running workflow keeps its tree up between steps.
+        let runs_live = self.workers.tree.any_running();
+        if !needs_review && live == 0 && !runs_live && !self.pinned {
             if self.worker_mode_auto && self.pane_mode == PaneMode::Workers {
                 self.pane_mode = PaneMode::Ledger;
             }
@@ -976,13 +1142,8 @@ impl Screen {
                 self.pane_width = saved;
             }
         }
-        if self.pane_focused
-            && self.pane_mode == PaneMode::Workers
-            && self.workers.focused.is_none()
-        {
-            self.select_first_worker();
-        }
     }
+
     /// Open a fold handle in the OUTPUT pane (`^O`): switches the pane to
     /// OUTPUT mode and widens it if it is hidden.
     pub fn open_output(&mut self, view: crate::render::output::OutputView) {
@@ -1011,7 +1172,7 @@ impl Screen {
             .workers
             .focused
             .as_deref()
-            .is_some_and(|id| order.iter().any(|worker| worker.id == id));
+            .is_some_and(|id| order.iter().any(|row| row.key() == id));
         if !selected_is_present {
             self.select_first_worker();
         }
@@ -1030,7 +1191,7 @@ impl Screen {
         let current = self.workers.focused.as_deref().and_then(|id| {
             order
                 .iter()
-                .position(|worker| worker.id == id)
+                .position(|row| row.key() == id)
                 .map(|index| index as isize)
         });
         let next = match current {
@@ -1039,13 +1200,13 @@ impl Screen {
             None if delta < 0 => last,
             None => return,
         };
-        self.workers.focused = Some(order[next].id.clone());
+        self.workers.focused = Some(order[next].key().to_string());
     }
 
     fn select_first_worker(&mut self) {
         self.workers.focused = display_order(&self.workers)
             .first()
-            .map(|worker| worker.id.clone());
+            .map(|row: &Selectable<'_>| row.key().to_string());
     }
 
     /// Scroll the OUTPUT pane's content.
@@ -1123,6 +1284,8 @@ impl Screen {
 
     /// Expire a peek whose time has passed. Driven by the render tick's clock.
     pub fn tick(&mut self, now_ms: u64) {
+        // The tree's live elapsed times read the frame's clock.
+        self.workers.now_ms = now_ms;
         if let Promotion::Peek { until_ms, .. } = self.promotion
             && now_ms >= until_ms
         {

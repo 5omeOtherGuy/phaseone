@@ -377,6 +377,8 @@ pub struct Recorder {
     /// Every `thunk_failed` error, and a notification per failure.
     pub thunk_errors: Mutex<Vec<String>>,
     pub thunk_failed: Notify,
+    /// Every `jobs_queued` count, in call order.
+    pub jobs: Mutex<Vec<usize>>,
 }
 
 impl WorkflowObserver for Recorder {
@@ -390,6 +392,9 @@ impl WorkflowObserver for Recorder {
     fn thunk_failed(&self, _id: &RunId, error: &str) {
         self.thunk_errors.lock().unwrap().push(error.to_string());
         self.thunk_failed.notify_one();
+    }
+    fn jobs_queued(&self, _id: &RunId, count: usize) {
+        self.jobs.lock().unwrap().push(count);
     }
     fn run_ended(&self, _id: &RunId, report: &RunReport) {
         self.ended.lock().unwrap().push(report.clone());

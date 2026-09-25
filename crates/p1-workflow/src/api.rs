@@ -178,6 +178,9 @@ pub struct StepRequest {
     /// `worktree`, the path of the worktree the runner prepared (ADR-0073).
     pub workspace: Option<PathBuf>,
     pub attempt: u32,
+    /// The step's ordinal in its run, from 1 in `agent()` call order: unlike `call`,
+    /// unique even for two calls with the same label, prompt and options (ADR-0075).
+    pub ordinal: u32,
     /// The slug of the git worktree the step asked for (`worktree: "<slug>"`, ADR-0073).
     pub worktree: Option<String>,
     /// The run's base commit: what a new step worktree branches from. `None` when the
@@ -468,6 +471,10 @@ pub struct Counts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepLine {
     pub call: CallId,
+    /// The step's ordinal in its run, as its `StepRequest` carried it (ADR-0075); `0` in
+    /// a report written before ordinals existed.
+    #[serde(default)]
+    pub ordinal: u32,
     pub label: Option<String>,
     pub role: String,
     pub model: String,
@@ -608,6 +615,9 @@ pub trait WorkflowObserver: Send + Sync {
     /// error included. Fires when that job ends, before `parallel`/`pipeline` has joined
     /// its siblings and failed the script; a job that panics or never starts reports nothing.
     fn thunk_failed(&self, _id: &RunId, _error: &str) {}
+    /// `parallel`/`pipeline` is starting `count` jobs (thunks or items), before any of
+    /// them runs: how many steps a fan-out will add, as early as the script states it.
+    fn jobs_queued(&self, _id: &RunId, _count: usize) {}
     fn run_ended(&self, _id: &RunId, _report: &RunReport) {}
 }
 
@@ -783,6 +793,7 @@ mod tests {
     #[test]
     fn a_line_names_the_chain_it_walked() {
         let line = |models: Vec<ModelTry>| StepLine {
+            ordinal: 1,
             call: CallId("abc".into()),
             label: None,
             role: "worker".into(),

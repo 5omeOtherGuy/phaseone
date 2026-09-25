@@ -1401,6 +1401,7 @@ fn w02_attached_worker() {
         route: "deepseek2/v4.1-flash".into(),
         state: BlockState::Running,
         transcript: t,
+        step: None,
     });
     let buf = render(&mut s, 120, 40, T0 + 300);
     assert_rows_except(&buf, "W02", &[38]);

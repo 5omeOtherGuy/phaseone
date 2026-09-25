@@ -22,6 +22,15 @@ pub const NESTED: char = '↳';
 /// `▪` — working (LED chase).
 pub const WORKING: char = '▪';
 
+/// The workflow tree's own marks (ADR-0075), kept with the vocabulary so no renderer
+/// hard-codes one: an open and a collapsed phase, a step that stopped short of done
+/// (blocked or cancelled), and a step answered from an earlier run's journal (also the
+/// resumed-run mark).
+pub const PHASE_OPEN: char = '▾';
+pub const PHASE_FOLDED: char = '▸';
+pub const STOPPED: char = '⊘';
+pub const REPLAYED: char = '↺';
+
 /// Working indicator (SPEC §2): three `▪` cells, 1.1 s cycle, 0.18 s stagger,
 /// opacity 0.18 → 1.0. Not a braille spinner.
 pub const WORKING_CELLS: usize = 3;

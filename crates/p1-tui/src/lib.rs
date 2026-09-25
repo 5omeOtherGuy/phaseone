@@ -20,4 +20,5 @@ pub mod runtime;
 pub mod state;
 mod text;
 pub mod transcript;
+pub mod workflow;
 pub mod wrap;

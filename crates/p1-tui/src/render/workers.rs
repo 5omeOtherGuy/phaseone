@@ -3,11 +3,18 @@
 //! (grid 48) takes 2–4 rows per worker, the compact form (grid 30) three. Unknown metrics render
 //! `—`. Plus the attach band (§9.5) that heads a worker's own transcript.
 
-use ratatui::text::Line;
+use std::collections::BTreeMap;
+
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 
 use crate::band::{Band, Seg};
 use crate::glyphs;
 use crate::palette;
+use crate::workflow::{
+    MovedLink, StepState, WorkerActivity, WorkflowPhase, WorkflowRun, WorkflowStep, WorkflowTree,
+    clock,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockState {
@@ -119,9 +126,35 @@ pub struct WorkerBlock {
 pub struct WorkersPane {
     pub header: WorkersHeader,
     pub workers: Vec<WorkerBlock>,
-    /// The `↑ ↓`-selected worker's id; its row 1 gets the amber focus fill
-    /// (§9.4, the Menu focused-row convention).
+    /// The `↑ ↓`-selected row's key — a worker's id, a run's id (`wf1`) or a step's
+    /// key (`wf1/3`); its first row gets the amber focus fill (§9.4, the Menu
+    /// focused-row convention).
     pub focused: Option<String>,
+    /// Workflow runs (ADR-0075): while one exists the pane is their live tree.
+    pub tree: WorkflowTree,
+    /// What each worker is doing and its tool calls, from its own event stream.
+    pub activity: BTreeMap<String, WorkerActivity>,
+    /// The TUI's clock at this frame, for live elapsed times.
+    pub now_ms: u64,
+}
+
+/// One selectable WORKERS row (phase rows are not selectable).
+#[derive(Debug, Clone, Copy)]
+pub enum Selectable<'a> {
+    Run(&'a WorkflowRun),
+    Step(&'a WorkflowStep),
+    Worker(&'a WorkerBlock),
+}
+
+impl Selectable<'_> {
+    /// The key `WorkersPane::focused` names this row by.
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Run(run) => &run.id,
+            Self::Step(step) => &step.key,
+            Self::Worker(worker) => &worker.id,
+        }
+    }
 }
 
 /// Render the WORKERS pane: header, then one block per worker in state
@@ -140,32 +173,108 @@ pub fn render_with(
     compact: bool,
     stop_pending: Option<&str>,
 ) -> Vec<Line<'static>> {
-    let mut out = render_body(pane, width, compact);
+    render_in(pane, width, compact, stop_pending, None)
+}
+
+/// Render WORKERS into `height` rows when known: a workflow tree taller than that
+/// collapses its ended phases (ADR-0075).
+pub fn render_in(
+    pane: &WorkersPane,
+    width: usize,
+    compact: bool,
+    stop_pending: Option<&str>,
+    height: Option<usize>,
+) -> Vec<Line<'static>> {
+    // The blank row and the footer below the body.
+    let body_rows = height.map(|height| height.saturating_sub(2));
+    let mut out = body(pane, width, compact, body_rows);
     out.push(blank_row(width));
-    out.push(footer_line(width, compact, stop_pending));
+    out.push(footer_line(pane, width, compact, stop_pending));
     out
 }
 
-/// WORKERS rows in their stable display order (handoff §9.4).
-pub fn display_order(pane: &WorkersPane) -> Vec<&WorkerBlock> {
-    let mut sorted: Vec<&WorkerBlock> = pane.workers.iter().collect();
+/// Every selectable WORKERS row in display order (handoff §9.4, ADR-0075): each run's
+/// header, its steps in phase order and a running step's worker, then the workers no
+/// step references, in state order.
+pub fn display_order(pane: &WorkersPane) -> Vec<Selectable<'_>> {
+    let mut order = Vec::new();
+    for run in &pane.tree.runs {
+        order.push(Selectable::Run(run));
+        for step in run.steps() {
+            order.push(Selectable::Step(step));
+            order.extend(
+                step.moved
+                    .iter()
+                    .filter_map(|link| block(pane, &link.worker_id))
+                    .map(Selectable::Worker),
+            );
+            if let Some(worker) = step_block(pane, step) {
+                order.push(Selectable::Worker(worker));
+            }
+        }
+    }
+    order.extend(flat_workers(pane).into_iter().map(Selectable::Worker));
+    order
+}
+
+/// Workers no step references, in state order.
+fn flat_workers(pane: &WorkersPane) -> Vec<&WorkerBlock> {
+    let mut sorted: Vec<&WorkerBlock> = pane
+        .workers
+        .iter()
+        .filter(|worker| !pane.tree.references(&worker.id))
+        .collect();
     sorted.sort_by_key(|worker| worker.state.rank());
     sorted
 }
 
+fn block<'a>(pane: &'a WorkersPane, id: &str) -> Option<&'a WorkerBlock> {
+    pane.workers.iter().find(|worker| worker.id == id)
+}
+
+/// The worker block shown under a step: only while the step runs.
+fn step_block<'a>(pane: &'a WorkersPane, step: &WorkflowStep) -> Option<&'a WorkerBlock> {
+    if !step.running() {
+        return None;
+    }
+    let id = step.worker_id.as_deref()?;
+    pane.workers.iter().find(|worker| worker.id == id)
+}
+
 /// Shared body without the live selection/action footer.
 pub(crate) fn render_body(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'static>> {
+    body(pane, width, compact, None)
+}
+
+fn body(
+    pane: &WorkersPane,
+    width: usize,
+    compact: bool,
+    rows: Option<usize>,
+) -> Vec<Line<'static>> {
+    if !pane.tree.is_empty() {
+        return tree_body(pane, width, compact, rows);
+    }
     let mut out = vec![header_line(&pane.header, width)];
-    for worker in display_order(pane) {
+    for worker in flat_workers(pane) {
         out.push(blank_row(width));
-        let focused = pane.focused.as_deref() == Some(worker.id.as_str());
-        if compact {
-            out.extend(compact_block(worker, width, focused));
-        } else {
-            out.extend(wide_block(worker, width, focused));
-        }
+        out.extend(worker_block(pane, worker, width, compact));
     }
     out
+}
+
+fn worker_block(
+    pane: &WorkersPane,
+    worker: &WorkerBlock,
+    width: usize,
+    compact: bool,
+) -> Vec<Line<'static>> {
+    let focused = pane.focused.as_deref() == Some(worker.id.as_str());
+    if compact {
+        compact_block(worker, width, focused)
+    } else {
+        wide_block(worker, width, focused)
+    }
 }
 
 fn blank_row(width: usize) -> Line<'static> {
@@ -218,6 +327,94 @@ pub fn attach_band(id: &str, route: &str, state: BlockState, width: usize) -> Li
         pad: 2,
     }
     .render()
+}
+
+/// Prompt lines an opened step shows folded (ADR-0075).
+const PROMPT_FOLDED: usize = 3;
+
+/// The rows an opened workflow step puts over its worker's transcript (ADR-0075): a stats
+/// band — status · model · phase · attempts · elapsed · tokens · tool calls — then the
+/// step's prompt, its first three lines folded (`p` expands it, wrapped). Empty when the
+/// step is not in the tree.
+pub fn step_band(
+    pane: &WorkersPane,
+    key: &str,
+    expanded: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let Some((_, step)) = pane.tree.step(key) else {
+        return Vec::new();
+    };
+    let phase = pane
+        .tree
+        .phase_of(key)
+        .filter(|phase| !phase.is_empty())
+        .unwrap_or(super::UNKNOWN);
+    let elapsed = step
+        .elapsed_ms(pane.now_ms)
+        .map(clock)
+        .unwrap_or_else(|| super::UNKNOWN.into());
+    let tokens = step_tokens(pane, step)
+        .flatten()
+        .map(super::tokens)
+        .unwrap_or_else(|| super::UNKNOWN.into());
+    let calls = step_calls(pane, step)
+        .map(|calls| calls.to_string())
+        .unwrap_or_else(|| super::UNKNOWN.into());
+    let status = if step.replayed {
+        format!("replayed · {}", step.state.word())
+    } else {
+        step.state.word().to_string()
+    };
+    let band = |left: Vec<Seg>, right: Vec<Seg>| {
+        Band {
+            bg: palette::BLOCK_PLUS,
+            left,
+            right,
+            width,
+            pad: 2,
+        }
+        .render()
+    };
+    let (glyph, fg) = step_glyph(step);
+    let mut out = vec![band(
+        vec![
+            Seg::new(fg, format!("{glyph} ")),
+            Seg::new(palette::INK, step.name().to_string()),
+            Seg::new(
+                palette::DIM,
+                format!(
+                    " · {status} · {} · {phase} · ×{} · {elapsed} · {tokens} tok · {calls} calls",
+                    step.model, step.attempts
+                ),
+            ),
+        ],
+        vec![],
+    )];
+    let room = width.saturating_sub(4).max(1);
+    let lines: Vec<String> = if expanded {
+        crate::wrap::wrap_paragraphs(&step.prompt, room)
+    } else {
+        step.prompt
+            .lines()
+            .take(PROMPT_FOLDED)
+            .map(str::to_string)
+            .collect()
+    };
+    for line in lines {
+        out.push(band(vec![Seg::new(palette::DIM, line)], vec![]));
+    }
+    let more = step.prompt.lines().count().saturating_sub(PROMPT_FOLDED);
+    let hint = match (expanded, more) {
+        (false, 0) => None,
+        (false, more) => Some(format!("… {more} more lines · p expands")),
+        (true, _) if more > 0 => Some("p folds".to_string()),
+        (true, _) => None,
+    };
+    if let Some(hint) = hint {
+        out.push(band(vec![Seg::new(palette::FAINT, hint)], vec![]));
+    }
+    out
 }
 
 /// Row 1 of a block: glyph + id + task, state right — or, focused, the Menu
@@ -402,24 +599,32 @@ fn compact_block(worker: &WorkerBlock, width: usize, focused: bool) -> Vec<Line<
     ]
 }
 
-fn footer_line(width: usize, compact: bool, stop_pending: Option<&str>) -> Line<'static> {
+fn footer_line(
+    pane: &WorkersPane,
+    width: usize,
+    compact: bool,
+    stop_pending: Option<&str>,
+) -> Line<'static> {
     if let Some(id) = stop_pending {
+        let text = if pane.tree.run(id).is_some() {
+            format!("cancel {id}?   y cancel   n keep")
+        } else {
+            format!("stop {id}?   y stop   n keep")
+        };
         return Band {
             bg: palette::AMBER_FILL,
-            left: vec![Seg::new(
-                palette::ON_FILL,
-                format!("stop {id}?   y stop   n keep"),
-            )],
+            left: vec![Seg::new(palette::ON_FILL, text)],
             right: vec![],
             width,
             pad: 4,
         }
         .render();
     }
-    let text = if compact {
-        "^F select   a attach"
-    } else {
-        "^F select   a attach   x stop"
+    let text = match (pane.tree.is_empty(), compact) {
+        (true, true) => "^F select   a attach",
+        (true, false) => "^F select   a attach   x stop",
+        (false, true) => "^F select   ⏎ open",
+        (false, false) => "^F select   ⏎ open   a attach   x stop",
     };
     Band {
         bg: palette::BLOCK,
@@ -429,6 +634,519 @@ fn footer_line(width: usize, compact: bool, stop_pending: Option<&str>) -> Line<
         pad: 4,
     }
     .render()
+}
+
+// ------------------------------------------------------------ workflow tree (ADR-0075)
+
+/// A width at and above which a step shows its second line (activity and metrics).
+const STEP_DETAIL_WIDTH: usize = 48;
+/// A width at and above which the tree spells counts out and shows cost.
+const TREE_WIDE: usize = 56;
+
+/// The tree: header, each run (header, notes, phases, steps, running workers), then the
+/// workers no step references under a `workers` group. `rows` is the body's height when
+/// known: ended phases collapse, oldest first, until the body fits — never the phase a
+/// running run is in, one with a running step, or the selected step's.
+fn tree_body(
+    pane: &WorkersPane,
+    width: usize,
+    compact: bool,
+    rows: Option<usize>,
+) -> Vec<Line<'static>> {
+    let mut collapsed: Vec<Vec<bool>> = pane
+        .tree
+        .runs
+        .iter()
+        .map(|run| vec![false; run.phases.len()])
+        .collect();
+    let mut out = tree_lines(pane, width, compact, &collapsed);
+    let Some(rows) = rows else {
+        return out;
+    };
+    let selected = pane.focused.as_deref();
+    for (r, run) in pane.tree.runs.iter().enumerate() {
+        for (p, phase) in run.phases.iter().enumerate() {
+            if out.len() <= rows {
+                return out;
+            }
+            let holds_selection = selected.is_some_and(|key| {
+                phase.steps.iter().any(|step| {
+                    step.key == key || step.worker_id.as_deref() == Some(key) && step.running()
+                })
+            });
+            if phase.name.is_empty()
+                || phase.steps.is_empty()
+                || !run.phase_ended(p)
+                || holds_selection
+            {
+                continue;
+            }
+            collapsed[r][p] = true;
+            out = tree_lines(pane, width, compact, &collapsed);
+        }
+    }
+    out
+}
+
+fn tree_lines(
+    pane: &WorkersPane,
+    width: usize,
+    compact: bool,
+    collapsed: &[Vec<bool>],
+) -> Vec<Line<'static>> {
+    let mut out = vec![header_line(&pane.header, width)];
+    for (run, folded) in pane.tree.runs.iter().zip(collapsed) {
+        out.push(blank_row(width));
+        out.extend(run_rows(pane, run, width, compact));
+        for (index, phase) in run.phases.iter().enumerate() {
+            if !phase.name.is_empty() {
+                out.push(phase_row(pane, run, index, folded[index], width, compact));
+            }
+            if folded[index] {
+                continue;
+            }
+            for step in &phase.steps {
+                out.extend(step_rows(pane, step, width));
+                out.extend(step.moved.iter().map(|link| moved_row(pane, link, width)));
+                if let Some(worker) = step_block(pane, step) {
+                    let inner = width.saturating_sub(TREE_INDENT);
+                    out.extend(
+                        worker_block(pane, worker, inner, compact)
+                            .into_iter()
+                            .map(indent),
+                    );
+                }
+            }
+        }
+    }
+    let flat = flat_workers(pane);
+    if !flat.is_empty() {
+        out.push(blank_row(width));
+        out.push(row(width, vec![Seg::new(palette::DIM, "workers")], vec![]));
+        for worker in flat {
+            out.push(blank_row(width));
+            out.extend(worker_block(pane, worker, width, compact));
+        }
+    }
+    out
+}
+
+/// How far a step's worker block sits in: one level.
+const TREE_INDENT: usize = 2;
+
+fn indent(line: Line<'static>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        " ".repeat(TREE_INDENT),
+        Style::new().bg(palette::BLOCK),
+    )];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+fn row(width: usize, left: Vec<Seg>, right: Vec<Seg>) -> Line<'static> {
+    Band {
+        bg: palette::BLOCK,
+        left,
+        right,
+        width,
+        pad: 4,
+    }
+    .render()
+}
+
+/// A selected row: the Menu convention (amber fill, ground text, glyph `▸`, §6.10/§9.4).
+fn focused_row(width: usize, left: Vec<String>, right: Vec<String>) -> Line<'static> {
+    Band {
+        bg: palette::AMBER_FILL,
+        left: left
+            .into_iter()
+            .map(|text| Seg::new(palette::ON_FILL, text))
+            .collect(),
+        right: right
+            .into_iter()
+            .map(|text| Seg::new(palette::ON_FILL, text))
+            .collect(),
+        width,
+        pad: 4,
+    }
+    .render()
+}
+
+/// A sum over steps whose parts may be unknown: the known part, `+?` when some part is
+/// unknown, `—` when nothing is known — never a 0 for an unknown.
+#[derive(Debug, Default, Clone, Copy)]
+struct Sum {
+    known: u64,
+    any_known: bool,
+    any_unknown: bool,
+}
+
+impl Sum {
+    fn add(&mut self, part: Option<u64>) {
+        match part {
+            Some(value) => {
+                self.known += value;
+                self.any_known = true;
+            }
+            None => self.any_unknown = true,
+        }
+    }
+
+    fn text(self, show: impl Fn(u64) -> String) -> String {
+        match (self.any_known, self.any_unknown) {
+            (false, _) => super::UNKNOWN.into(),
+            (true, false) => show(self.known),
+            (true, true) => format!("{}+?", show(self.known)),
+        }
+    }
+}
+
+fn step_worker<'a>(pane: &'a WorkersPane, step: &WorkflowStep) -> Option<&'a WorkerBlock> {
+    let id = step.worker_id.as_deref()?;
+    pane.workers.iter().find(|worker| worker.id == id)
+}
+
+/// A step's tokens: its worker's, unknown while the worker row does not have them.
+/// `None` for a step that ran no worker (replayed, refused): it is not a part.
+fn step_tokens(pane: &WorkersPane, step: &WorkflowStep) -> Option<Option<u64>> {
+    step.worker_id.as_ref()?;
+    Some(step_worker(pane, step).and_then(|worker| worker.tokens))
+}
+
+/// A step's tool calls: the TUI's own count on its worker's stream — unknown (`None`)
+/// until that stream has shown the TUI anything, and for a step that ran no worker.
+fn step_calls(pane: &WorkersPane, step: &WorkflowStep) -> Option<u64> {
+    let id = step.worker_id.as_deref()?;
+    pane.activity.get(id).map(|activity| activity.tool_calls)
+}
+
+fn sums<'a>(pane: &WorkersPane, steps: impl Iterator<Item = &'a WorkflowStep>) -> (Sum, Sum) {
+    let (mut tokens, mut calls) = (Sum::default(), Sum::default());
+    for step in steps {
+        if let Some(part) = step_tokens(pane, step) {
+            tokens.add(part);
+        }
+        if step.worker_id.is_some() {
+            calls.add(step_calls(pane, step));
+        }
+    }
+    (tokens, calls)
+}
+
+fn calls_text(calls: Sum) -> String {
+    format!("{} calls", calls.text(|n| n.to_string()))
+}
+
+fn run_rows(
+    pane: &WorkersPane,
+    run: &WorkflowRun,
+    width: usize,
+    compact: bool,
+) -> Vec<Line<'static>> {
+    let wide = !compact && width >= TREE_WIDE;
+    let phase = run
+        .current_phase()
+        .map(|phase| phase.name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| super::UNKNOWN.into());
+    let resumed = run
+        .resumed_from
+        .as_ref()
+        .map(|from| format!(" {} {from}", glyphs::REPLAYED))
+        .unwrap_or_default();
+    let elapsed = clock(run.elapsed_ms(pane.now_ms));
+    let total = run.total();
+    let right = if wide {
+        format!("{total} steps · {elapsed}")
+    } else {
+        elapsed
+    };
+    let mut out = Vec::new();
+    if pane.focused.as_deref() == Some(run.id.as_str()) {
+        out.push(focused_row(
+            width,
+            vec![
+                format!("{} {}", glyphs::TOOL, run.id),
+                format!(" · {phase}{resumed}"),
+            ],
+            vec![right],
+        ));
+    } else {
+        let (glyph, fg) = match run.ended.as_ref().map(|ended| ended.outcome.as_str()) {
+            None => (glyphs::WORKING, palette::LIVE),
+            Some("completed") => (glyphs::DONE, palette::OK),
+            Some("completed_with_issues") => (glyphs::DONE, palette::ATTN),
+            Some("cancelled") => (glyphs::STOPPED, palette::FAINT),
+            Some(_) => (glyphs::FAILED, palette::FAIL),
+        };
+        out.push(row(
+            width,
+            vec![
+                Seg::new(fg, glyph.to_string()),
+                Seg::new(palette::INK, format!(" {}", run.id)),
+                Seg::new(palette::DIM, " · "),
+                Seg::new(palette::INK, phase),
+                Seg::new(palette::DIM, resumed),
+            ],
+            vec![Seg::new(palette::DIM, right)],
+        ));
+    }
+    let (running, done, failed) = (
+        run.count(StepState::Running),
+        run.count(StepState::Done),
+        run.count(StepState::Failed),
+    );
+    let counts = if wide {
+        vec![
+            Seg::new(palette::INK, format!("  {running}")),
+            Seg::new(palette::DIM, " running · "),
+            Seg::new(palette::INK, done.to_string()),
+            Seg::new(palette::DIM, " done · "),
+            Seg::new(palette::INK, failed.to_string()),
+            Seg::new(palette::DIM, " failed · "),
+            Seg::new(palette::INK, run.queued.to_string()),
+            Seg::new(palette::DIM, " queued"),
+        ]
+    } else {
+        vec![
+            Seg::new(palette::DIM, format!("  {}", glyphs::WORKING)),
+            Seg::new(palette::INK, running.to_string()),
+            Seg::new(palette::DIM, format!(" {}", glyphs::DONE)),
+            Seg::new(palette::INK, done.to_string()),
+            Seg::new(palette::DIM, format!(" {}", glyphs::FAILED)),
+            Seg::new(palette::INK, failed.to_string()),
+            Seg::new(palette::DIM, format!(" {}", glyphs::PENDING)),
+            Seg::new(palette::INK, run.queued.to_string()),
+            Seg::new(palette::DIM, " of "),
+            Seg::new(palette::INK, total.to_string()),
+        ]
+    };
+    out.push(row(width, counts, vec![]));
+    let (tokens, calls) = sums(pane, run.steps());
+    out.push(row(
+        width,
+        vec![
+            Seg::new(palette::DIM, "  tokens "),
+            Seg::new(palette::INK, tokens.text(super::tokens)),
+        ],
+        vec![Seg::new(palette::DIM, calls_text(calls))],
+    ));
+    let mut note = |text: String| {
+        out.push(row(
+            width,
+            vec![Seg::new(palette::DIM, format!("  {text}"))],
+            vec![],
+        ));
+    };
+    if let Some(ended) = &run.ended {
+        match ended
+            .error
+            .as_deref()
+            .and_then(|error| error.lines().next())
+        {
+            Some(error) => note(format!("{} — {error}", ended.outcome)),
+            None => note(ended.outcome.clone()),
+        }
+        // Jobs a cancelled or failed run never started stay counted (ADR-0075 item 4).
+        if run.never_run > 0 {
+            note(format!("{} never run", run.never_run));
+        }
+    }
+    if let Some(error) = &run.note {
+        note(format!(
+            "{} {}",
+            glyphs::FAILED,
+            error.lines().next().unwrap_or_default()
+        ));
+    }
+    if let Some(log) = &run.last_log {
+        note(log.lines().next().unwrap_or_default().to_string());
+    }
+    out
+}
+
+fn phase_row(
+    pane: &WorkersPane,
+    run: &WorkflowRun,
+    index: usize,
+    folded: bool,
+    width: usize,
+    compact: bool,
+) -> Line<'static> {
+    let phase: &WorkflowPhase = &run.phases[index];
+    let current = run.running() && run.current == Some(index);
+    // The phase a running run is in also owns the jobs not started yet.
+    let known = phase.steps.len() + if current { run.queued } else { 0 };
+    let glyph = if folded {
+        glyphs::PHASE_FOLDED
+    } else {
+        glyphs::PHASE_OPEN
+    };
+    let (glyph_fg, name_fg) = if current {
+        (palette::LIVE, palette::INK)
+    } else {
+        (palette::DIM, palette::DIM)
+    };
+    let elapsed = clock(run.phase_elapsed_ms(index, pane.now_ms));
+    let right = if !compact && width >= TREE_WIDE {
+        let (tokens, calls) = sums(pane, phase.steps.iter());
+        vec![Seg::new(
+            palette::DIM,
+            format!(
+                "{} · {} · {elapsed}",
+                tokens.text(super::tokens),
+                calls_text(calls)
+            ),
+        )]
+    } else {
+        vec![Seg::new(palette::DIM, elapsed)]
+    };
+    row(
+        width,
+        vec![
+            Seg::new(glyph_fg, format!("  {glyph} ")),
+            Seg::new(name_fg, phase.name.clone()),
+            Seg::new(palette::INK, format!(" {}/{known}", phase.done())),
+        ],
+        right,
+    )
+}
+
+/// A link the step moved past: one dim row under the step, its worker's block folded —
+/// selectable and openable by its worker's id like any worker.
+fn moved_row(pane: &WorkersPane, link: &MovedLink, width: usize) -> Line<'static> {
+    let text = format!("moved on · {} · route_failed", link.model);
+    if pane.focused.as_deref() == Some(link.worker_id.as_str()) {
+        return focused_row(
+            width,
+            vec![format!("      {} {text}", glyphs::TOOL)],
+            vec![link.worker_id.clone()],
+        );
+    }
+    row(
+        width,
+        vec![Seg::new(
+            palette::DIM,
+            format!("      {} {text}", glyphs::NESTED),
+        )],
+        vec![Seg::new(palette::DIM, link.worker_id.clone())],
+    )
+}
+
+fn step_glyph(step: &WorkflowStep) -> (char, ratatui::style::Color) {
+    if step.replayed {
+        return (glyphs::REPLAYED, palette::DIM);
+    }
+    match step.state {
+        StepState::Running => (glyphs::WORKING, palette::LIVE),
+        StepState::Done => (glyphs::DONE, palette::OK),
+        StepState::Failed => (glyphs::FAILED, palette::FAIL),
+        StepState::Blocked | StepState::Cancelled => (glyphs::STOPPED, palette::FAINT),
+    }
+}
+
+/// What a step's worker is doing now, or how the step ended.
+fn step_activity(pane: &WorkersPane, step: &WorkflowStep) -> String {
+    if !step.running() {
+        return step.outcome();
+    }
+    step.worker_id
+        .as_deref()
+        .and_then(|id| pane.activity.get(id))
+        .map(|activity| activity.now.clone())
+        .filter(|now| !now.is_empty())
+        .unwrap_or_else(|| "thinking".into())
+}
+
+fn step_rows(pane: &WorkersPane, step: &WorkflowStep, width: usize) -> Vec<Line<'static>> {
+    let detail = width >= STEP_DETAIL_WIDTH;
+    let elapsed = step
+        .elapsed_ms(pane.now_ms)
+        .map(clock)
+        .unwrap_or_else(|| super::UNKNOWN.into());
+    let right = if step.attempts > 1 {
+        format!("×{} · {elapsed}", step.attempts)
+    } else {
+        elapsed
+    };
+    let activity = step_activity(pane, step);
+    // Below the detail width the activity is a trailing suffix of the one row.
+    let suffix = if detail {
+        format!(" · {}", step.model)
+    } else {
+        format!(" · {activity}")
+    };
+    let mut out = Vec::new();
+    if pane.focused.as_deref() == Some(step.key.as_str()) {
+        out.push(focused_row(
+            width,
+            vec![format!("    {} {}", glyphs::TOOL, step.name()), suffix],
+            vec![right],
+        ));
+    } else {
+        let (glyph, fg) = step_glyph(step);
+        out.push(row(
+            width,
+            vec![
+                Seg::new(fg, format!("    {glyph} ")),
+                Seg::new(
+                    if step.running() {
+                        palette::INK
+                    } else {
+                        palette::DIM
+                    },
+                    step.name().to_string(),
+                ),
+                Seg::new(palette::DIM, suffix),
+            ],
+            vec![Seg::new(palette::DIM, right)],
+        ));
+    }
+    if !detail {
+        return out;
+    }
+    let mut right = Vec::new();
+    if step.worker_id.is_some() {
+        let worker = step_worker(pane, step);
+        let tok = worker
+            .and_then(|worker| worker.tokens)
+            .map(super::tokens)
+            .unwrap_or_else(|| super::UNKNOWN.into());
+        let ctx = worker
+            .and_then(|worker| worker.context_window)
+            .map(super::tokens)
+            .unwrap_or_else(|| super::UNKNOWN.into());
+        let calls = step_calls(pane, step)
+            .map(|calls| calls.to_string())
+            .unwrap_or_else(|| super::UNKNOWN.into());
+        right.push(Seg::new(palette::INK, tok));
+        right.push(Seg::new(palette::DIM, "/"));
+        right.push(Seg::new(palette::INK, ctx));
+        right.push(Seg::new(palette::DIM, format!(" · {calls} calls")));
+        if width >= TREE_WIDE {
+            right.push(Seg::new(palette::DIM, " · "));
+            right.push(Seg::new(
+                palette::INK,
+                cost_text(worker.and_then(|worker| worker.cost_micro_usd)),
+            ));
+        }
+    }
+    out.push(row(
+        width,
+        vec![
+            Seg::new(palette::DIM, format!("      {} ", glyphs::NESTED)),
+            Seg::new(
+                if step.running() {
+                    palette::INK
+                } else {
+                    palette::DIM
+                },
+                activity,
+            ),
+        ],
+        right,
+    ));
+    out
 }
 
 #[cfg(test)]

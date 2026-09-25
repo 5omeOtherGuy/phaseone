@@ -37,11 +37,25 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     screen.cursor = compose(screen, area, buf, now_ms);
 }
 
+/// Whether the full diff review owns a `w`×`h` screen (§7.5), covering the transcript and
+/// the pane: only while a diff decision is on screen, and then on `^D` or by itself when
+/// the diff is taller than the transcript area. The one rule the renderer draws by, and
+/// what the host asks before it keeps a covered pane redrawing.
+pub fn review_covers(screen: &Screen, w: u16, h: u16) -> bool {
+    let Some(Approval::Diff(view)) = &screen.approval else {
+        return false;
+    };
+    let focus = screen.focus_explicit.unwrap_or(screen.focus || h <= 12);
+    let normal = crate::geometry::layout(w, h, screen.pane_width, focus, 2);
+    screen.review.open || review::opens_itself(view.rows.len(), normal.transcript.height as usize)
+}
+
 fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Option<(u16, u16)> {
     if area.width == 0 || area.height == 0 {
         return None;
     }
     screen.last_width = area.width;
+    screen.last_height = area.height;
     fill(area, buf, palette::GROUND);
     let (w, h) = (area.width, area.height);
     // §8.5: explicit `/focus` wins; otherwise the driver's `focus`, and always at 12 rows or
@@ -52,24 +66,21 @@ fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Op
     // on `^D`, or by itself when the diff is taller than the transcript area. That region is
     // the transcript area of a screen with no pane and no composer, at full width.
     let unobstructed = crate::geometry::layout(w, h, PaneWidth::Off, true, 0);
-    if let Some(Approval::Diff(view)) = &screen.approval {
-        let normal = crate::geometry::layout(w, h, screen.pane_width, focus, 2);
-        if screen.review.open
-            || review::opens_itself(view.rows.len(), normal.transcript.height as usize)
-        {
-            draw_statusline(screen, area, unobstructed.statusline, buf);
-            let files = [review::ReviewFile::new(view.clone())];
-            let decision = review::Decision::for_call(view.grantable, files.len());
-            let rows = unobstructed.transcript.height as usize;
-            let full = Rect {
-                width: w.saturating_sub(4),
-                ..unobstructed.transcript
-            };
-            screen.review.body_rows = review::body_rows(&decision, rows);
-            let lines = review::lines(&files, &screen.review, &decision, full.width as usize, rows);
-            draw_lines(&lines, offset(area, full), buf);
-            return None;
-        }
+    if let Some(Approval::Diff(view)) = &screen.approval
+        && review_covers(screen, w, h)
+    {
+        draw_statusline(screen, area, unobstructed.statusline, buf);
+        let files = [review::ReviewFile::new(view.clone())];
+        let decision = review::Decision::for_call(view.grantable, files.len());
+        let rows = unobstructed.transcript.height as usize;
+        let full = Rect {
+            width: w.saturating_sub(4),
+            ..unobstructed.transcript
+        };
+        screen.review.body_rows = review::body_rows(&decision, rows);
+        let lines = review::lines(&files, &screen.review, &decision, full.width as usize, rows);
+        draw_lines(&lines, offset(area, full), buf);
+        return None;
     }
 
     // The composer first: its height moves the transcript's bottom edge (§8.1 — it grows
@@ -155,11 +166,24 @@ fn draw_transcript_area(
 ) {
     let width = area.width as usize;
     let rows = area.height as usize;
-    let attach: Vec<Line<'static>> = screen
+    let mut attach: Vec<Line<'static>> = screen
         .attached
         .iter()
         .map(|worker| workers::attach_band(&worker.id, &worker.route, worker.state, width))
         .collect();
+    // An opened workflow step heads its worker's transcript with its stats and prompt.
+    if let Some(step) = screen
+        .attached
+        .as_ref()
+        .and_then(|worker| worker.step.as_ref())
+    {
+        attach.extend(workers::step_band(
+            &screen.workers,
+            &step.key,
+            step.prompt_expanded,
+            width,
+        ));
+    }
     let docked = screen
         .picker
         .as_ref()
@@ -438,11 +462,12 @@ fn draw_pane(screen: &Screen, rect: Rect, buf: &mut Buffer, now_ms: u64) {
             let body = inner.saturating_sub(OUTPUT_HEAD_ROWS);
             output::render(&view.pane(output_source(screen, view), body), width)
         }
-        (PaneMode::Workers, _) => workers::render_with(
+        (PaneMode::Workers, _) => workers::render_in(
             &screen.workers,
             width,
             rect.width < WIDE_PANE,
             screen.stop_pending.as_deref(),
+            Some(inner),
         ),
         _ => ledger::render(&screen.ledger(), width, Some(inner)),
     };
