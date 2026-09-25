@@ -267,7 +267,7 @@ class UsageAuditTest(unittest.TestCase):
             json.dumps(response(1, usage(input_uncached=10, cache_read=80, cache_write=10))),
         ])
         not_a_journal = self.write_journal("session.jsonl.w1.jsonl", [environment(0)],
-                                           header='{"p1_journal":2}')
+                                           header='{"p1_journal":3}')
         notes = self.write_text("notes.txt", "not a journal at all\n")
         code, out, err = self.run_cli("--json", self.dir, notes)
         self.assertEqual(code, 0, err)

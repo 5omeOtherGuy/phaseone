@@ -304,7 +304,7 @@ async fn jsonl_round_trips_every_record_body() {
     assert_eq!(loaded.records, records);
     // The file really is header + one line per record.
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.starts_with("{\"p1_journal\":1}\n"));
+    assert!(text.starts_with("{\"p1_journal\":2}\n"));
     assert_eq!(text.lines().count(), records.len() + 1);
 }
 
@@ -542,7 +542,7 @@ async fn created_session_files_are_mode_0600() {
 async fn unknown_version_is_refused() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("version.jsonl");
-    std::fs::write(&path, b"{\"p1_journal\":2}\n").unwrap();
+    std::fs::write(&path, b"{\"p1_journal\":3}\n").unwrap();
     assert_eq!(load(&path).unwrap_err(), JournalError::UnknownVersion);
     // A file with no p1_journal header at all is corrupt, not a version problem.
     std::fs::write(&path, b"{\"other\":1}\n").unwrap();

@@ -16,19 +16,40 @@ impl JsonlJournal {
     pub fn resume(path: &Path, sync: SyncPolicy) -> Result<(Self, Resumed), JournalError>;
     /// Lower-level: locks before reading; rejects a `next_seq` that does not match the file.
     pub fn open_for_append(path: &Path, sync: SyncPolicy, next_seq: u64) -> Result<Self, JournalError>;
+    /// Version 2 only: an assembly identity line, durable like a commit under `SyncPolicy`.
+    pub fn record_assembly(&self, identity: &AssemblyIdentity) -> Result<(), JournalError>;
 }
 pub enum SyncPolicy { EveryRecord, OsBuffered }
 pub fn load(path: &Path) -> Result<Loaded, JournalError>;
-pub struct Loaded { pub records: Vec<JournalRecord>, pub truncated_tail: Option<TruncatedTail> }
+pub struct Loaded { pub records: Vec<JournalRecord>, pub truncated_tail: Option<TruncatedTail>,
+                    pub version: u64, pub assemblies: Vec<AssemblyEntry> }
 pub struct TruncatedTail { pub byte_offset: u64, pub bytes: u64 }
-pub struct Resumed { pub records: Vec<JournalRecord>, pub repaired_tail: Option<TruncatedTail> }
+pub struct Resumed { pub records: Vec<JournalRecord>, pub repaired_tail: Option<TruncatedTail>,
+                     pub version: u64, pub assemblies: Vec<AssemblyEntry> }
+pub struct AssemblyEntry { pub from_seq: u64, pub identity: AssemblyIdentity }
 /// Cut the file back to `byte_offset`. Takes the lock (`Locked` if a writer owns the file) and
 /// refuses a tail that is no longer the file's tail (`StaleTail`).
 pub fn repair_truncated_tail(path: &Path, tail: &TruncatedTail) -> Result<(), JournalError>;
 ```
 
 **Format.** One record per line: `serde_json` of `JournalRecord`, `\n`-terminated. The first
-line of a file is a header `{"p1_journal":1}`; an unknown version is an error, never guessed.
+line of a file is a header naming the format version; a version other than 1 or 2 is
+`JournalError::UnknownVersion`, never guessed.
+- Version 1 (`{"p1_journal":1}`) holds records only. It is what the released binaries write
+  and the only version they accept. p1 still reads it and appends to it as version 1: the
+  header is never rewritten, and `record_assembly` on it is `AssemblyNeedsVersion2`.
+- Version 2 (`{"p1_journal":2}`) is what `create` writes. Old binaries refuse it, which is the
+  point: they cannot check what executed the session. Between records it permits an assembly
+  identity line `{"assembly":{"environment":…,"host":{"version":…,"commit":…},"modules":[…]}}`,
+  each module `{"name","kind","package","version","digest","abi"}` with `kind` one of `tool`,
+  `provider`, `context_policy`, `authorization_policy`, `digest` the sha256 hex of the
+  verified package bytes (`null` for a native module) and `abi` optional. The line carries no
+  `seq`, does not count in the dense-seq rule, and applies to the records that follow it;
+  `load` reports it as `AssemblyEntry{from_seq}` with the seq of the next record (the record
+  count when it is last). Unknown fields are refused (`deny_unknown_fields`): extending the
+  identity is a version bump. An assembly line in a version-1 file is
+  `JournalError::AssemblyInVersion1{line}`. A torn assembly line is a truncated tail, exactly
+  like a torn record. `MemoryJournal::record_assembly`/`assemblies()` mirror the file store.
 Both stores reject a record whose `seq` is not exactly the next one (`JournalError::OutOfOrder`)
 — gaps and repeats are bugs in the caller, caught at the store.
 

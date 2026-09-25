@@ -1,0 +1,26 @@
+[package]
+name = "p1-module-fixture"
+description = "The fixture tool module: one guest component whose raw input text picks one documented mode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-tool = { path = "../p1-bindings-tool" }
+
+# The frozen package manifest (docs/design/modules/package.md). `scripts/build-modules.sh`
+# reads these fields, checks them and copies them into the built module's manifest.
+[package.metadata.p1-module]
+name = "p1/fixture"
+kind = "tool"
+world = "p1:module/tool@1.0.0"
+protocol = "1.0"
+capabilities = ["control", "clock", "process"]
+variant = "default"

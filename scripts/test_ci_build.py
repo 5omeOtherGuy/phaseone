@@ -416,8 +416,14 @@ class CiBuildTests(unittest.TestCase):
         self.assertIn("--workflow build.yml", ts[0])
         self.assertIn(f'event=="push"', ts[0])
         self.assertTrue(query, "the script snapshots the matching run ids before pushing")
-        # The manifest is verified with sha256sum -c inside the artifact directory.
-        checks = [call for call in h.calls("sha256sum") if "-c" in call]
+        # The manifest is verified with sha256sum -c inside the artifact directory. Filter on the
+        # parsed argv, not the rendered line: the temp directory name in the "(in ...)" suffix can
+        # itself contain "-c", so a substring match sometimes picks the plain digest call.
+        checks = [
+            call
+            for call in h.calls("sha256sum")
+            if call.split(" (in ", 1)[0].split()[1:] == ["-c", "p1.sha256"]
+        ]
         self.assertTrue(checks, h.calls("sha256sum"))
         self.assertIn(f"sha256sum -c p1.sha256 (in {h.artifact()})", checks[0])
 
