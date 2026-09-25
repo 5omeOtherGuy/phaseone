@@ -343,6 +343,12 @@ class FanoutTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("cargo build -p p1-host", err)
 
+    def test_p1_bin_with_another_name_is_refused(self) -> None:
+        os.environ["P1_BIN"] = self.write_executable("renamed", "worker", FAKE_P1)
+        code, _, err = self.run_jobs([self.p1_job()])
+        self.assertEqual(code, 1)
+        self.assertIn("P1_BIN must be named p1 or p1-*", err)
+
     # --- which p1 is run (ADR-0065) ---------------------------------------
 
     def test_p1_bin_wins_over_p1_on_path(self) -> None:
@@ -478,6 +484,10 @@ class FanoutTest(unittest.TestCase):
         self.assertTrue(fanout.is_p1_agent(
             ["/x/build-evidence/p1-hotfix2-81c6411e6f60", "--env", "zen", "--yes", BRIEF]))
         self.assertFalse(fanout.is_p1_agent(["/usr/bin/p1x", "--env", "zen", BRIEF]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "--env", "zen", "--", "models"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "--env", "zen", "--"]))
+        self.assertTrue(fanout.is_p1_agent(["p1", "workflow", "run", "/w/flow.rhai"]))
+        self.assertFalse(fanout.is_p1_agent(["p1", "workflow"]))
 
 
 if __name__ == "__main__":

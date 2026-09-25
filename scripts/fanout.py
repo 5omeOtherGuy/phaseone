@@ -152,11 +152,18 @@ def is_p1_agent(argv):
     if name != "p1" and not name.startswith("p1-"):
         return False
     args = argv[1:]
+    # `p1 workflow run FILE` runs unattended (cli.rs `Options::is_headless`); its steps run
+    # in that one process, so the process counts once.
+    if args[:2] == ["workflow", "run"]:
+        return True
     if not args or args[0] in P1_SUBCOMMANDS or "--tui" in args:
         return False
     index = 0
     while index < len(args):
         arg = args[index]
+        if arg == "--":
+            # `--` ends option parsing; everything after it is the prompt (cli.rs).
+            return index + 1 < len(args)
         if arg in P1_VALUE_FLAGS:
             index += 2
             continue
@@ -238,6 +245,11 @@ def p1_binary():
     if override:
         if not (os.path.isfile(override) and os.access(override, os.X_OK)):
             raise JobError(f"fanout: no p1 binary at {override} — run: cargo build -p p1-host")
+        name = os.path.basename(override)
+        # The pool recognises its workers by argv[0] alone (is_p1_agent).
+        if name != "p1" and not name.startswith("p1-"):
+            raise JobError(f"fanout: P1_BIN must be named p1 or p1-* so the pool can count its "
+                           f"workers, not {name} — point it at a symlink with such a name")
         return override
     on_path = shutil.which("p1")
     if on_path:
