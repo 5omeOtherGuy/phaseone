@@ -268,6 +268,7 @@ impl FrontEnd for TuiFrontEnd {
                 exit: None,
                 inbox: agent.inbox(),
                 worker_rows,
+                worker_usage: HashMap::new(),
                 branch,
                 tools: self.tools.lock().unwrap().clone(),
                 // Read once above: two `lock()` temporaries in this literal both
@@ -320,6 +321,13 @@ impl FrontEnd for TuiFrontEnd {
     }
 }
 
+/// Usage assembled from one worker's own response events.
+struct WorkerUsage {
+    model: String,
+    tokens: Option<u64>,
+    cost_micro_usd: Option<u64>,
+}
+
 /// The UI state plus the wiring the loop needs. No terminal in here: keys and
 /// events enter through methods, so the whole driver is channel-testable.
 pub(crate) struct Driver {
@@ -355,6 +363,9 @@ pub(crate) struct Driver {
     submit_pending: Option<String>,
     /// The worker snapshot the refresher task maintains (delegation only).
     worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
+    /// Usage reported by each worker's own responses; never merged into the
+    /// parent's context or spend.
+    worker_usage: HashMap<String, WorkerUsage>,
     inbox: p1_core::Inbox,
     /// §10 `branch`: refreshed off the render loop (`spawn_branch_refresh`,
     /// called from the async loop, never from a `Driver` method a plain
@@ -711,8 +722,15 @@ impl Driver {
     /// Pull the refresher's snapshot into the screen (SPEC §5 promotion) and
     /// the statusline's §10 `▪ N workers` count.
     fn sync_workers(&mut self) {
-        let rows = self.worker_rows.lock().unwrap().clone();
+        let mut rows = self.worker_rows.lock().unwrap().clone();
         self.screen.statusbar.workers = status::running_workers(&rows);
+        for row in &mut rows {
+            if let Some(usage) = self.worker_usage.get(&row.id) {
+                row.model = Some(usage.model.clone());
+                row.tokens = usage.tokens;
+                row.cost_micro_usd = usage.cost_micro_usd;
+            }
+        }
         self.screen.sync_workers(rows);
     }
 
@@ -723,17 +741,32 @@ impl Driver {
                 self.screen.transcript.note(&format!("↳ {id} started"));
             }
             UiEvent::Agent(stamped) => {
-                if stamped.worker.is_some() {
-                    // Worker streams stay OUT of the parent's transcript (the
-                    // WORKERS pane is a later milestone); a finished worker is
-                    // worth one quiet line.
+                if let Some(id) = &stamped.worker {
+                    // Worker streams stay OUT of the parent's transcript and
+                    // usage; a finished worker is worth one quiet line.
+                    if let p1_contracts::AgentEvent::ResponseCompleted { model, usage, .. } =
+                        &stamped.event
+                    {
+                        let cost = usage.and_then(|usage| usage.cost_micro_usd);
+                        let worker_usage =
+                            self.worker_usage.entry(id.clone()).or_insert(WorkerUsage {
+                                model: model.clone(),
+                                tokens: None,
+                                cost_micro_usd: Some(0),
+                            });
+                        worker_usage.model = model.clone();
+                        worker_usage.tokens = status::usage_input_total(usage.as_ref());
+                        worker_usage.cost_micro_usd = match (worker_usage.cost_micro_usd, cost) {
+                            (Some(total), Some(cost)) => Some(total + cost),
+                            _ => None,
+                        };
+                    }
                     if let p1_contracts::AgentEvent::TurnFinished { end } = &stamped.event {
                         let state = match end {
                             TurnEnd::Completed { .. } => "finished",
                             TurnEnd::Cancelled => "cancelled",
                             _ => "failed",
                         };
-                        let id = stamped.worker.clone().unwrap_or_default();
                         self.screen.transcript.note(&format!("↳ {id} {state}"));
                     }
                     return;
@@ -1226,8 +1259,21 @@ where
     }
 }
 
+/// Format a worker's live or frozen elapsed time.
+fn elapsed_text(
+    now: std::time::Instant,
+    running_since: Option<std::time::Instant>,
+    frozen: Option<std::time::Duration>,
+) -> Option<String> {
+    frozen
+        .or_else(|| running_since.map(|since| now.saturating_duration_since(since)))
+        .map(|elapsed| {
+            let secs = elapsed.as_secs();
+            format!("{}m{:02}s", secs / 60, secs % 60)
+        })
+}
+
 /// Poll the worker service into the shared snapshot the driver draws from.
-/// Workers carry no usage tap yet, so cost renders `—` (issue #12).
 #[cfg(feature = "delegation")]
 fn spawn_worker_refresher(
     service: Arc<dyn WorkerService>,
@@ -1239,6 +1285,7 @@ fn spawn_worker_refresher(
     use p1_workers::ChildStatus;
     tokio::spawn(async move {
         let mut started: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut frozen: HashMap<String, std::time::Duration> = HashMap::new();
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1250,16 +1297,19 @@ fn spawn_worker_refresher(
             let mut next = Vec::with_capacity(list.len());
             for (id, status) in list {
                 let description = service.describe(&id).await.unwrap_or_default();
-                let elapsed = match &status {
-                    ChildStatus::Running => {
-                        let at = started
-                            .entry(id.0.clone())
-                            .or_insert_with(std::time::Instant::now);
-                        let secs = at.elapsed().as_secs();
-                        Some(format!("{}m{:02}s", secs / 60, secs % 60))
+                let now = std::time::Instant::now();
+                let running_since = match &status {
+                    ChildStatus::Running => Some(*started.entry(id.0.clone()).or_insert(now)),
+                    _ => {
+                        if let Some(since) = started.get(&id.0) {
+                            frozen
+                                .entry(id.0.clone())
+                                .or_insert_with(|| now.saturating_duration_since(*since));
+                        }
+                        None
                     }
-                    _ => None,
                 };
+                let elapsed = elapsed_text(now, running_since, frozen.get(&id.0).copied());
                 let (state, activity) = match &status {
                     ChildStatus::Running => (BlockState::Running, String::new()),
                     ChildStatus::Finished(_) => (BlockState::Done, String::new()),
@@ -1281,6 +1331,7 @@ fn spawn_worker_refresher(
                     elapsed,
                     cost_micro_usd: None,
                     tokens: None,
+                    // The child's configured window is not known to the host.
                     context_window: None,
                     grants,
                     activity,

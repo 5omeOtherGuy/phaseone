@@ -43,6 +43,7 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             follow_ups: VecDeque::new(),
             submit_pending: None,
             worker_rows: Arc::new(Mutex::new(Vec::new())),
+            worker_usage: HashMap::new(),
             pending_calls: HashMap::new(),
             task_files: HashSet::new(),
             exit: None,
@@ -783,4 +784,130 @@ fn a_renamed_edit_face_and_an_apply_patch_call_track_both_files() {
         Some(2),
         "the WORKSPACE section counts both files"
     );
+}
+
+fn worker_response(id: &str, model: &str, usage: Option<p1_contracts::Usage>) -> UiEvent {
+    UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 0,
+        worker: Some(id.into()),
+        event: p1_contracts::AgentEvent::ResponseCompleted {
+            model: model.into(),
+            stop: p1_contracts::StopReason::EndTurn,
+            usage,
+        },
+    })
+}
+
+fn worker_test_row(id: &str) -> p1_tui::render::workers::WorkerBlock {
+    p1_tui::render::workers::WorkerBlock {
+        id: id.into(),
+        task: String::new(),
+        route: "deepseek/v4.1-flash".into(),
+        model: None,
+        state: p1_tui::render::workers::BlockState::Running,
+        elapsed: None,
+        cost_micro_usd: None,
+        tokens: None,
+        context_window: None,
+        grants: String::new(),
+        activity: String::new(),
+    }
+}
+
+#[test]
+fn worker_rows_get_latest_context_and_accumulated_cost_without_touching_the_parent() {
+    use p1_contracts::Usage;
+
+    let (mut d, _auth) = driver();
+    let parent_context = d.screen.context.clone();
+    let parent_ctx = d.screen.statusbar.ctx.clone();
+    let parent_spend = d.screen.spend;
+
+    d.on_ui_event(worker_response(
+        "w1",
+        "deepseek-v4.1-flash",
+        Some(Usage {
+            input_uncached: Some(10_000),
+            cost_micro_usd: Some(10),
+            ..Usage::default()
+        }),
+    ));
+    d.on_ui_event(worker_response(
+        "w1",
+        "deepseek-v4.1-flash",
+        Some(Usage {
+            input_uncached: Some(48_213),
+            cost_micro_usd: Some(5),
+            ..Usage::default()
+        }),
+    ));
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1")];
+    d.sync_workers();
+
+    let row = &d.screen.workers.workers[0];
+    assert_eq!(row.model.as_deref(), Some("deepseek-v4.1-flash"));
+    assert_eq!(row.tokens, Some(48_213));
+    assert_eq!(row.cost_micro_usd, Some(15));
+    assert_eq!(row.context_window, None);
+    assert_eq!(d.screen.context, parent_context);
+    assert_eq!(d.screen.statusbar.ctx, parent_ctx);
+    assert_eq!(d.screen.spend, parent_spend);
+}
+
+#[test]
+fn missing_worker_usage_poisons_its_latest_tokens_and_accumulated_cost() {
+    use p1_contracts::Usage;
+
+    let (mut d, _auth) = driver();
+    d.on_ui_event(worker_response(
+        "w1",
+        "deepseek-v4.1-flash",
+        Some(Usage {
+            input_uncached: Some(48_213),
+            cost_micro_usd: Some(5),
+            ..Usage::default()
+        }),
+    ));
+    d.on_ui_event(worker_response("w1", "deepseek-v4.1-flash", None));
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1")];
+    d.sync_workers();
+
+    let usage = &d.worker_usage["w1"];
+    assert_eq!(usage.tokens, None);
+    assert_eq!(usage.cost_micro_usd, None);
+    let row = &d.screen.workers.workers[0];
+    assert_eq!(row.tokens, None);
+    assert_eq!(row.cost_micro_usd, None);
+}
+
+#[test]
+fn a_worker_row_without_response_events_keeps_its_metrics_unknown() {
+    let (mut d, _auth) = driver();
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w2")];
+    d.sync_workers();
+
+    let row = &d.screen.workers.workers[0];
+    assert_eq!(row.model, None);
+    assert_eq!(row.tokens, None);
+    assert_eq!(row.cost_micro_usd, None);
+}
+
+#[test]
+fn elapsed_text_formats_live_time_freezes_the_final_time_and_knows_never_running() {
+    let start = std::time::Instant::now();
+    let elapsed = std::time::Duration::from_secs(252);
+    assert_eq!(
+        elapsed_text(start + elapsed, Some(start), None).as_deref(),
+        Some("4m12s")
+    );
+    assert_eq!(
+        elapsed_text(
+            start + std::time::Duration::from_secs(9_999),
+            None,
+            Some(elapsed)
+        )
+        .as_deref(),
+        Some("4m12s")
+    );
+    assert_eq!(elapsed_text(start + elapsed, None, None), None);
 }
