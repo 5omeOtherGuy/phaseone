@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -65,8 +66,26 @@ fn fake_binary(root: &Path) -> (PathBuf, PathBuf) {
         arguments.display(),
         arguments.display()
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    // The executable must never be open for writing in this process: other tests in
+    // this binary spawn concurrently, and a fork on another thread inherits any open
+    // write descriptor, so a concurrent exec of this path fails with ETXTBSY (the
+    // known Linux fork/exec race, rust-lang/rust#114554). Let a waited-for `cp` child
+    // create the executable and a `chmod` child mark it executable, so no descriptor
+    // for the executable's inode exists here when any thread forks.
+    let source = root.join("fake-shadow.txt");
+    fs::write(&source, script).unwrap();
+    let copied = Command::new("cp")
+        .arg(&source)
+        .arg(&binary)
+        .status()
+        .expect("run cp");
+    assert!(copied.success(), "cp failed: {copied:?}");
+    let chmodded = Command::new("chmod")
+        .arg("700")
+        .arg(&binary)
+        .status()
+        .expect("run chmod");
+    assert!(chmodded.success(), "chmod failed: {chmodded:?}");
     (binary, arguments)
 }
 

@@ -9,6 +9,7 @@
 mod gate;
 mod observe;
 mod path;
+mod read;
 mod text;
 
 use std::path::{Path, PathBuf};
@@ -16,20 +17,25 @@ use std::path::{Path, PathBuf};
 pub use gate::{Mutation, WriteGate};
 pub use observe::{Observation, ObservedFiles, StreamingHash};
 pub use p1_contracts::tool::ToolFace;
+pub use read::{CheckedPath, DirEntry, FileKind, Snapshot, SnapshotMetadata, Stat};
 pub use text::{bound_output, write_atomic};
 
 /// Why a workspace path could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
-    /// The configured root is not a directory.
-    #[error("workspace root is not a directory: {}", .0.display())]
+    /// The workspace root, or a path a caller asked to list, is not a directory.
+    #[error("not a directory: {}", .0.display())]
     NotADirectory(PathBuf),
+    /// The requested path resolves inside the workspace but does not exist.
+    #[error("no such path in the workspace: {requested}")]
+    NotFound { requested: String },
     /// The requested path resolves outside the workspace root, directly, by
     /// `..`, or through a symlink.
     #[error("path escapes workspace: {requested}")]
     OutsideWorkspace { requested: String },
-    /// A filesystem operation failed while resolving the path.
-    #[error("failed to resolve {}: {source}", path.display())]
+    /// A filesystem operation on the path failed while resolving, reading or
+    /// listing it.
+    #[error("workspace I/O failed for {}: {source}", path.display())]
     Io {
         path: PathBuf,
         #[source]
