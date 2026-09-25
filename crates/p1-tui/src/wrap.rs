@@ -34,8 +34,8 @@ pub fn fit_cells(s: &str, cells: usize) -> String {
     s[..fit_cells_boundary(s, cells)].to_string()
 }
 
-/// The number of rows `wrap(text, width)` would produce, without building the
-/// strings. The transcript tail pass needs the full height cheaply.
+/// The number of rows `wrap(text, width)` would produce. It reuses `wrap` so
+/// measurement cannot drift from rendering.
 pub(crate) fn wrap_len(text: &str, width: usize) -> usize {
     wrap(text, width).len()
 }
@@ -83,27 +83,17 @@ fn wrap_units<S: Copy>(text: &str, width: usize, style: S) -> Vec<Vec<Unit<S>>> 
     let mut body_rows = Vec::new();
     let mut current: Vec<Unit<S>> = Vec::new();
     let mut current_width = 0usize;
-    let mut words: Vec<Vec<Unit<S>>> = Vec::new();
-    let mut word = Vec::new();
-    for ch in body.chars() {
-        if ch == ' ' {
-            if !word.is_empty() {
-                words.push(std::mem::take(&mut word));
-            }
-        } else {
-            word.extend(units_for_text(&ch.to_string(), style));
-        }
-    }
-    if !word.is_empty() {
-        words.push(word);
-    }
+    let words = body
+        .split(' ')
+        .filter(|word| !word.is_empty())
+        .map(|word| (cell_width(word), units_for_text(word, style)))
+        .collect::<Vec<_>>();
     let push_current = |rows: &mut Vec<UnitRow<S>>, current: &mut UnitRow<S>| {
         if !current.is_empty() {
             rows.push(std::mem::take(current));
         }
     };
-    for word in words {
-        let word_width: usize = word.iter().map(|unit| unit.width).sum();
+    for (word_width, word) in words {
         if !current.is_empty() && current_width + 1 + word_width > body_width {
             push_current(&mut body_rows, &mut current);
             current_width = 0;
@@ -276,6 +266,13 @@ mod tests {
     }
 
     #[test]
+    fn oversized_glyph_absorbs_following_zero_width_char() {
+        let (rows, len) = watchdog(|| (wrap("界\u{301}", 1), wrap_len("界\u{301}", 1)));
+        assert_eq!(rows, vec!["…"]);
+        assert_eq!(len, 1);
+    }
+
+    #[test]
     fn oversized_glyph_after_indent_is_one_ellipsis_and_returns() {
         let (rows, len) = watchdog(|| (wrap(" 界", 2), wrap_len(" 界", 2)));
         assert_eq!(rows, vec![" …"]);
@@ -309,6 +306,15 @@ mod tests {
             watchdog(|| (wrap("e\u{301}e\u{301}", 1), wrap_len("e\u{301}e\u{301}", 1)));
         assert_eq!(rows, vec!["e\u{301}", "e\u{301}"]);
         assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn a_fitting_zwj_word_is_not_split_by_character_widths() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let text = format!("x{family}");
+        let expected = text.clone();
+        let rows = watchdog(move || wrap(&text, 3));
+        assert_eq!(rows, vec![expected]);
     }
 
     #[test]
@@ -404,13 +410,8 @@ mod tests {
             "x  y   z",
             "你好a好你",
         ];
-        // CJK needs at least two cells per glyph, so start there; the widths
-        // below that are exercised with ASCII only (a glyph wider than the
-        // body is a pre-existing wrap edge, not this change's concern).
         for text in corpus {
-            let wide = text.chars().any(|c| cell_width(&c.to_string()) > 1);
-            let from = if wide { 2 } else { 0 };
-            for width in from..=14 {
+            for width in 0..=14 {
                 assert_eq!(
                     wrap_len(text, width),
                     wrap(text, width).len(),
