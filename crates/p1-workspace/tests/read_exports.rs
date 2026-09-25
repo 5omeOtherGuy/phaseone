@@ -369,6 +369,32 @@ fn read_refuses_paths_outside_the_workspace_and_a_missing_path() {
 }
 
 #[test]
+fn read_of_a_directory_is_the_typed_not_a_directory_error() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("subdir")).unwrap();
+    let workspace = workspace(dir.path());
+    let observed = ObservedFiles::new();
+
+    // A directory is not untyped I/O: the host import maps the wrong kind without
+    // parsing the io error, exactly as `list` of a file already does.
+    let not_a_directory = workspace.read("subdir", &observed).unwrap_err();
+    assert!(
+        matches!(not_a_directory, WorkspaceError::NotADirectory(_)),
+        "{not_a_directory:?}"
+    );
+    // The refused read recorded nothing.
+    let subdir = dir.path().join("subdir");
+    assert_eq!(
+        observed.check_unchanged(&subdir, b""),
+        Observation::NeverObserved
+    );
+
+    // The root reads as a directory too.
+    let root = workspace.read("", &observed).unwrap_err();
+    assert!(matches!(root, WorkspaceError::NotADirectory(_)), "{root:?}");
+}
+
+#[test]
 fn a_snapshot_is_clone_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Snapshot>();

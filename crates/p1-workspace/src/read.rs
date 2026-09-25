@@ -216,6 +216,14 @@ impl Workspace {
     ) -> Result<Snapshot, WorkspaceError> {
         let path = self.resolve(requested)?;
         let display = self.display(&path);
+        // Mirror `list`: decide the kind from metadata instead of leaving `read` of a
+        // directory to surface as an untyped `Io` ("Is a directory"). The host import
+        // needs the typed variant to map a wrong kind without parsing an io message.
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| missing_or_io(requested, &path, error))?;
+        if metadata.is_dir() {
+            return Err(WorkspaceError::NotADirectory(path));
+        }
         let bytes = std::fs::read(&path).map_err(|error| missing_or_io(requested, &path, error))?;
 
         // `record` stores `hash_of(contents)`: computing the same value here with
