@@ -331,3 +331,17 @@ The judge accepted these slices:
 Lead check after merging `main` (with S1 and S3): `cargo test -p p1-tui` (326 passed), clippy
 `-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI
 runs the full gate. Accepted follow-ups are listed on PR #162.
+
+## Massive run
+
+The judge accepted these slices:
+
+- **S7** — commits `313e5ec` (`mark first nonblank operator row`) and `280587c`
+  (`repair steering marker column`). Tests cover leading blank and whitespace rows,
+  paragraph breaks, the first-nonblank steering tag, all-blank fallback, widths 12–40,
+  the narrow and boundary tag columns, and rendered-row agreement.
+- **S12** — commit `ea5d940` (`quantize colours with grey ramp`). Tests cover unchanged
+  SLAB token indices, primary and grayscale anchors, exhaustive cube-distance bounds,
+  the grey-ramp preference, and the SLAB background mapping.
+
+The lead has not yet verified this Massive run.
