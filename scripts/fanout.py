@@ -41,7 +41,7 @@ judging — accepting a result stays the lead's job.
 Compiles are serialised machine-wide by cargo's lock on the shared target dir
 (scripts/local-cargo-config.sh). The pool is bounded twice: at most --max-parallel live
 workers (default 6) and no new worker starts while MemAvailable is below --min-free-mb
-(default 1500). Both bounds count EVERY pi-worker AND every running p1 agent on the
+(default 1500). Both bounds count EVERY pi-worker AND every headless p1 worker on the
 machine, not only this batch's; a job starts regardless only when no worker is running
 anywhere (so a batch can never wait forever on memory that nothing will free). The job
 list may be much longer than the pool — queue 20 jobs, run 6 at a time.
@@ -110,11 +110,51 @@ def is_pi_worker(argv):
     return head.startswith("python") and len(argv) > 1 and os.path.basename(argv[1]) == "pi-worker"
 
 
+# p1 subcommands (crates/p1-host/src/cli.rs): first-token words and flags that are never
+# an agent run — `p1 models`, `p1 login …`, `p1 --help` and the like.
+P1_SUBCOMMANDS = {"env", "models", "usage", "login", "logout", "workflow", "help",
+                  "--help", "-h", "--version", "-V"}
+
+# p1 run-mode flags that swallow the NEXT token as their value (cli.rs `take_value`);
+# everything else that does not start with `-` is a prompt word.
+P1_VALUE_FLAGS = {
+    "--env", "--model", "--effort", "--models", "--workspace", "--session",
+    "--instructions", "--skills", "--sandbox", "--sandbox-write", "--sandbox-read",
+    "--env-pass", "--max-continuations", "--provider-retries", "--max-idle-summaries",
+}
+
+# Prompt-by-file/in-line flags (pi-worker style; p1 itself takes the prompt positionally).
+P1_PROMPT_FLAGS = {"--prompt", "--prompt-file", "--brief-file"}
+
+
 def is_p1_agent(argv):
-    """A running p1 agent: argv[0] basename `p1` with `--env` in the args. A `python3
-    scripts/fanout.py` process or an editor is never counted, and neither is anything else
-    that merely mentions p1."""
-    return bool(argv) and os.path.basename(argv[0]) == "p1" and "--env" in argv[1:]
+    """A HEADLESS p1 worker, decided from argv alone (/proc/<pid>/cmdline — environ is
+    never read): basename `p1`, no `--tui`, and a prompt on the command line — positional
+    words (the shape fanout itself launches: `p1 --env … --session … --yes <brief>`) or a
+    `--prompt`/`--prompt-file`/`--brief-file`-style flag. An interactive session (`p1`,
+    `p1 --env claude`, anything `--tui`) and meta subcommands (`p1 models`, `p1 login …`)
+    never count toward the pool; a `python3 scripts/fanout.py` process or an editor never
+    did."""
+    if not argv or os.path.basename(argv[0]) != "p1":
+        return False
+    args = argv[1:]
+    if not args or args[0] in P1_SUBCOMMANDS or "--tui" in args:
+        return False
+    if any(arg in P1_PROMPT_FLAGS and index + 1 < len(args)
+           or arg.startswith(tuple(flag + "=" for flag in P1_PROMPT_FLAGS))
+           for index, arg in enumerate(args)):
+        return True
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in P1_VALUE_FLAGS:
+            index += 2
+            continue
+        if arg.startswith("-") and arg != "-":
+            index += 1
+            continue
+        return True  # a bare word: the positional prompt of a headless run
+    return False
 
 
 def processes():
@@ -136,7 +176,7 @@ def pi_workers_alive():
 
 
 def p1_agents_alive():
-    """Running p1 agents machine-wide."""
+    """Headless p1 workers machine-wide."""
     return sum(1 for argv in processes() if is_p1_agent(argv))
 
 
@@ -455,7 +495,10 @@ def main(argv=None):
     labels = [job["label"] for job in jobs]
     pending = {job["label"]: job for job in jobs}
     running, results = {}, {}
+    last_wait_reason = None
     while pending or running:
+        waiting_reason = None
+        waiting_snapshot = None
         for label, job in list(pending.items()):
             deps = job.get("after", [])
             failed = [d for d in deps if d in results and not record_ok(results[d])]
@@ -467,7 +510,11 @@ def main(argv=None):
             if not all(d in results for d in deps):
                 continue
             alive = workers_alive()
-            if alive != 0 and not (alive < a.max_parallel and mem_available_mb() >= a.min_free_mb):
+            available = mem_available_mb()
+            if alive != 0 and not (alive < a.max_parallel and available >= a.min_free_mb):
+                reason = "pool" if alive >= a.max_parallel else "memory"
+                waiting_reason = waiting_reason or reason
+                waiting_snapshot = waiting_snapshot or (alive, available)
                 continue
             state = launch(job, worker, binary, out_dir)
             running[label] = state
@@ -478,6 +525,11 @@ def main(argv=None):
             else:
                 print(f"fanout: started {label} ({job['profile']}) pid {state['proc'].pid}",
                       file=sys.stderr, flush=True)
+        if waiting_reason is not None and waiting_reason != last_wait_reason:
+            alive, available = waiting_snapshot
+            print(f"fanout: waiting — {alive} workers alive ({a.max_parallel} max), "
+                  f"MemAvailable {available} MB", file=sys.stderr, flush=True)
+        last_wait_reason = waiting_reason
         for label, state in list(running.items()):
             proc = state["proc"]
             if proc.poll() is None:
