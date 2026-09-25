@@ -1,0 +1,36 @@
+package p1:module@1.0.0;
+
+/// Exported by a provider module: turning what the broker receives into stream events.
+///
+/// The broker frames the response natively (its SSE decoder is shared by every route) and
+/// feeds the decoder one event at a time: an SSE event with its name, or one WebSocket text
+/// frame as data with no name. The decoder answers with stream events in the order they are
+/// forwarded; failures are `finished` events whose outcome carries a provider error of one of
+/// the closed kinds. The events obey the stream rules of `p1-contracts/src/provider.rs`.
+interface decoding {
+    use types.{stream-event};
+
+    record wire-event {
+        /// The SSE `event:` name; `none` for a WebSocket frame or an unnamed SSE event.
+        name: option<string>,
+        data: string,
+    }
+
+    /// One response attempt's decoder; the broker creates a fresh one per attempt and drops
+    /// it when the attempt ends.
+    resource decoder {
+        constructor();
+
+        /// Decode one event. A returned `finished` event ends the response: the broker calls
+        /// neither `feed` nor `finish` again, and a decoder may trap if it is.
+        feed: func(event: wire-event) -> list<stream-event>;
+
+        /// The body ended before a `finished` event: the terminal `finished` event, normally
+        /// a `transport` failure because the stream ended without its terminal event.
+        finish: func() -> stream-event;
+
+        /// The id of the response this decoder saw, if the wire named one: the id a
+        /// WebSocket continuation refers to.
+        response-id: func() -> option<string>;
+    }
+}

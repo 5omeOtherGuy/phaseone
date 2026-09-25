@@ -1,0 +1,195 @@
+/// The p1 module boundary (ADR-0071), published as `docs/design/modules/wit.md`.
+///
+/// One world per module class. A world imports the union of the capabilities its class may
+/// be granted (the per-class allocation); a module's manifest narrows that, and the host
+/// links only what the manifest grants. Every world also imports `types`, which carries types
+/// only and grants nothing.
+///
+/// Exports are synchronous: each is a plain function the host calls on the module's one
+/// executor. Host imports may block the module while the native host awaits (wasmtime's
+/// asynchronous host functions); that is how every wait and every I/O happens. No world uses
+/// WIT `future` or `stream` types, and none imports a WASI interface.
+///
+/// The restricted path: the host calls a tool's `effect` and `describe`, and a provider's
+/// `describe`, with no capability granted and a tight fuel budget. Any import called on that
+/// path traps, so a module's inspection code cannot reach a capability; those exports must
+/// work from their arguments alone.
+package p1:module@1.0.0;
+
+/// A tool module (`p1_contracts::Tool`). Its identity is built by the loader, not exported.
+world tool {
+    import control;
+    import clock;
+    import random;
+    import notices;
+    import workspace;
+    import snapshot;
+    import workspace-mutation;
+    import process;
+    import workers;
+    import workflows;
+    import completion;
+
+    use types.{tool-call, tool-outcome, call-description, result-description, history-item};
+    use types.{declaration as tool-declaration, effect as call-effect};
+
+    /// What the model is told about this tool. May read the completion policy and output
+    /// contract, which change the `finish` tool's declaration.
+    export declaration: func() -> tool-declaration;
+
+    /// Classify `call` for authorization. Restricted path; no side effect. Invalid input is
+    /// classified at the tool's worst case; `execute` reports the input error.
+    export effect: func(call: tool-call) -> call-effect;
+
+    /// Describe what `call` is about, for the host and the UI (ADR-0057). Restricted path; no
+    /// side effect. What needs a capability to know (whether a path escapes through a
+    /// symlink) is decided lexically here and enforced again by the capability at `execute`.
+    export describe: func(call: tool-call) -> call-description;
+
+    /// Describe the result of `call`; `tool-result` is a `tool_result` history item.
+    export describe-result: func(call: tool-call, tool-result: history-item) -> result-description;
+
+    /// Validate the input and run. Invalid input is an `error` outcome the model can act on.
+    /// On cancellation (`control.cancelled`, or a blocking import that returned because of
+    /// it) return promptly with the `cancelled` status.
+    export execute: func(call: tool-call) -> tool-outcome;
+}
+
+/// A provider module (`p1_contracts::Provider`): it lowers requests and classifies what
+/// comes back. Retry, backoff, the one refresh after a 401 and every network wait stay in
+/// the native transport broker (freeze item 9).
+world provider {
+    import control;
+    import clock;
+    import random;
+    import notices;
+    import http;
+    import websocket;
+    import credential-control;
+
+    use types.{json, provider-error, route-description, history-item, model-options};
+    use types.{declaration as tool-declaration};
+    use http.{http-request, response-head};
+    use websocket.{websocket-request};
+
+    /// The instance a route file and a model profile assemble. The endpoint is given so a
+    /// module can choose its path; the broker still prefixes it and owns the connection.
+    record provider-settings {
+        origin-route: string,
+        endpoint: string,
+        model: string,
+        wire-model: string,
+        /// The route file's `adapter_settings` table as a JSON object, the module's to read.
+        adapter-settings: json,
+    }
+
+    /// Mirrors `p1_contracts::ProviderRequest`.
+    record provider-request {
+        system-prompt: string,
+        history: list<history-item>,
+        tools: list<tool-declaration>,
+        options: model-options,
+    }
+
+    /// One request, lowered. `http` is always present because it is also the fallback of a
+    /// route that speaks WebSocket.
+    record lowered-request {
+        http: http-request,
+        websocket: option<websocket-request>,
+    }
+
+    /// Called once, before any other export. `err` refuses the assembly.
+    export configure: func(settings: provider-settings) -> result<_, provider-error>;
+
+    /// What this instance is. Restricted path.
+    export describe: func() -> route-description;
+
+    /// Refuse what this route cannot carry, before a run starts.
+    export validate: func(request: provider-request) -> result<_, provider-error>;
+
+    /// Lower `request` into what the broker sends; `err` means no request exists.
+    export lower: func(request: provider-request) -> result<lowered-request, provider-error>;
+
+    /// Classify a non-2xx response or a refused WebSocket upgrade into one of the closed
+    /// kinds. `body` is classification input only and never enters the message.
+    export classify: func(head: response-head, body: list<u8>) -> provider-error;
+
+    export decoding;
+}
+
+/// A context policy (`p1_contracts::ContextPolicy`).
+world context-policy {
+    import control;
+    import clock;
+    import notices;
+    import summary;
+    import completion;
+
+    use types.{json, history-item, usage};
+
+    /// A replacement history and what preparing it cost; unknown usage is `none`.
+    record prepared {
+        items: list<history-item>,
+        usage: option<usage>,
+    }
+
+    variant context-error {
+        cancelled,
+        failed(string),
+    }
+
+    record replacement {
+        prepared: prepared,
+        /// The policy's estimates of the history before and after.
+        tokens-before: u64,
+        tokens-after: u64,
+    }
+
+    /// What one manual compaction did (ADR-0076).
+    variant compaction {
+        replaced(replacement),
+        /// Nothing to summarize; the estimate of the unchanged history.
+        unchanged(u64),
+    }
+
+    /// Called once, before any other export, with the environment's settings for this policy
+    /// as a JSON object. `err` refuses the assembly.
+    export configure: func(settings: json) -> result<_, string>;
+
+    /// `none` sends the history unchanged; `some` replaces it from now on. `last-usage` is
+    /// the usage of this agent's last completed response, if it reported any.
+    export prepare: func(history: list<history-item>, last-usage: option<usage>) -> result<option<prepared>, context-error>;
+
+    /// Summarize now, whatever the threshold (ADR-0076).
+    export compact-now: func(history: list<history-item>, last-usage: option<usage>) -> result<compaction, context-error>;
+}
+
+/// An authorization policy (`p1_contracts::AuthorizationPolicy`). Asking the operator stays
+/// in the host's own policy: a module has no way to read input.
+world authorization-policy {
+    import control;
+    import clock;
+    import notices;
+
+    use types.{tool-call, tool-identity, effect as call-effect, decision};
+
+    /// May `call` run? `identity` is the loader-built identity of the tool that would run it,
+    /// `effect` that tool's own classification.
+    export authorize: func(call: tool-call, identity: tool-identity, effect: call-effect) -> decision;
+}
+
+/// An optional workflow implemented as a module rather than a script: it orchestrates
+/// workers and runs through its imports.
+world workflow-implementation {
+    import control;
+    import clock;
+    import random;
+    import notices;
+    import workers;
+    import workflows;
+
+    use types.{json};
+
+    /// Run the workflow with `args` (a JSON object); its JSON value, or why it failed.
+    export run: func(args: json) -> result<json, string>;
+}
