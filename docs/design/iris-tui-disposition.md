@@ -50,7 +50,7 @@ alter stored/canonical text, activate links, interpret ANSI styles or add depend
 | `markdown.rs` | render_markdown, MarkdownTheme, LineClass, HighlightFn | MIT | pulldown-cmark, ratatui, unicode-segmentation; highlight, hyperlink | Blocked; transcript, parser approval/equivalence needed |
 | `mod.rs` | Ui, UiEvent, UiBridge, TurnErrorKind | MIT | anyhow; nexus events and all UI wiring | Blocked; audit wiring, retain p1 contracts |
 | `modal.rs` | Modal, ModalKey/Action/Outcome | MIT | ratatui; mimir, nexus, selector, wayland skills/trust | Blocked; pure input/focus mechanisms only |
-| `palette.rs` | ColorDepth, depth detection/adaptation | MIT | ratatui; theme, environment | Blocked; retain SLAB palette; audit capability adaptation |
+| `palette.rs` | ColorDepth, depth detection/adaptation | MIT | ratatui; theme, environment | **Adapted** nearest xterm cube/grey-ramp quantization for ANSI-256 while preserving the SLAB token indices; theme/availability framework Blocked; `crates/p1-tui/src/palette.rs::{degrade,index}`, consumed by the p1-host TUI frame-color adapter; #170 accepted |
 | `picker.rs` | model_command, apply_action, resume/tasks/settings views | MIT | anyhow; cli/config/git/mimir/nexus/session/wayland | Blocked; existing p1 picker/host seams |
 | `screen_mode.rs` | ScreenMode, AltScreenConfig, Resolution, resolve_for_startup | MIT | config flags, terminal_env | Blocked; host single terminal lifecycle |
 | `selector.rs` | Selector, SelectorItem, fuzzy_match, scroll_offset | MIT | std; slash-policy references | Blocked; existing picker, substring contract must remain |
@@ -71,7 +71,7 @@ alter stored/canonical text, activate links, interpret ANSI styles or add depend
 | `tui/frame_stats.rs` | FrameStats, timing summaries | MIT | std timing | Blocked; deterministic work counters if needed |
 | `tui/overlay.rs` | FocusTarget, overlay_menu | MIT | ratatui; palette, selector, slash, component | Blocked; existing picker/focus |
 | `tui/pager.rs` | PagerSurface, frame/search/follow/lifecycle | MIT | ratatui; nexus, signals, terminal_surface, textengine | **Adapted**: clamp a stale transcript scroll anchor to current rendered bounds; remainder Blocked; p1-tui `Screen::scroll_mark`/`scroll_by`, consumed by transcript scroll/page input; #140 accepted |
-| `tui/pane.rs` | assistant/user markdown rows | MIT | ratatui; markdown, symbols, panel, rows, wrap | Blocked; transcript consumers |
+| `tui/pane.rs` | assistant/user markdown rows | MIT | ratatui; markdown, symbols, panel, rows, wrap | **Adapted** first-nonblank operator marker and steering-tag placement; remainder Blocked; `crates/p1-tui/src/render/transcript.rs::operator_lines`, consumed by transcript rendering; #169 accepted |
 | `tui/panel.rs` | PanelState, header/footer/body/diff layout | MIT | ratatui, similar; tool_display, highlight, textengine | Blocked; generic tool-neutral blocks |
 | `tui/rows.rs` | TranscriptRow, ChromeRow, overflow/rules | MIT | ratatui; component, panel, wrap | Blocked; transcript geometry/cache audit |
 | `tui/screen.rs` | Screen, SessionMeter, flow meter, editor | MIT | iris-subagent-runtime, ratatui, ratatui-textarea; config/git/goal/metrics/mimir/nexus | **Adapted** prompt submission and history state/navigation for S4; remainder Blocked; `crates/p1-tui/src/state.rs::Composer::{take,history_prev,history_next,browsing_history}`, consumed through `input::ViewCommand::{HistoryPrev,HistoryNext}` by `Screen::apply_view`; #136 accepted |
