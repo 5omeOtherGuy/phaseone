@@ -4,7 +4,7 @@ title: Execution manifests in journals
 status: proposed
 date: 2026-09-25
 deciders: lead
-supersedes: []
+supersedes: [21]
 superseded_by: []
 sources: [ADR-0021, ADR-0049, ADR-0071, migration plan finding F3, freeze item 7]
 ---
@@ -14,7 +14,10 @@ sources: [ADR-0021, ADR-0049, ADR-0071, migration plan finding F3, freeze item 7
 
 ADR-0021 makes the session journal the single truth: a JSONL file with a
 `{"p1_journal":1}` header, dense `seq` records, and an unknown version refused rather
-than guessed. ADR-0049 re-commits the `Environment` record whenever a session switches
+than guessed. ADR-0021 is accepted and names the version-1 header this decision
+changes, so the draft lists it in `supersedes`: nothing else in ADR-0021 changes, but
+its record must stop stating version 1 as the header of a journal `create` writes.
+ADR-0049 re-commits the `Environment` record whenever a session switches
 model. Until now the code that executed a tool call was fixed at compile time, so the
 binary's commit named it.
 
@@ -64,6 +67,14 @@ loader.
 - `p1-journal`'s `Loaded` and `Resumed` gain the assembly entries; their in-repo
   consumers adapt in the same PR (plan §6 mechanical adaptation).
 - The workflow run journal is a separate format and is unchanged.
+- ADR-0021's record is corrected at the land step, when this draft is numbered and
+  accepted: `scripts/adr.py` requires the reciprocal link (an ADR that `supersedes`
+  another fails `check` until that ADR lists it in `superseded_by`), so landing this
+  ADR with `supersedes: [21]` forces ADR-0021 to be marked `status: superseded`,
+  `superseded_by: [<this ADR number>]` and its `{"p1_journal":1}` header sentence
+  noted as superseded in part by this decision's version 2. The land step that
+  stamps the number must make those edits; until it does, `scripts/adr.py check`
+  fails rather than letting an accepted ADR contradict the written format.
 
 ## Alternatives considered
 
