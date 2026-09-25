@@ -33,18 +33,37 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo
+      - name: Cache cargo (this branch)
         uses: Swatinem/rust-cache@v2
         with:
-          # One shared key for every branch: GitHub keeps each saved cache in the
-          # scope of the branch that saved it, so a task branch restores its own
-          # earlier build and the default branch's entry remains the fallback for
-          # all branches. The action also retries without the lockfile hash, so a
-          # Cargo.lock change still hits the previous cache.
+          # One shared key without a branch name: GitHub keeps each saved cache in
+          # the scope of the branch that saved it, so this branch's own next push
+          # restores it (a second push on the same branch is warm). build.yml
+          # deliberately does not run on main — a second gate run per main commit
+          # would race scripts/push-main.sh, which waits on headSha — so the
+          # cross-branch fallback is the restore step below, not a rust-cache main
+          # entry. The action also retries without the lockfile hash, so a
+          # Cargo.lock change still hits this branch's previous cache.
           shared-key: p1-build
           # Branch pushes save (a tag or other ref would write a cache nothing can
           # restore).
           save-if: ${{ github.ref_type == 'branch' }}
+
+      # The real main-branch fallback: ci.yml saves the whole gate target (deps and
+      # workspace crates) under cargo-<os>-<Cargo.lock hash> on the default branch,
+      # and a workflow run can read the default branch's caches. Restore only: a
+      # task branch must not write another multi-GB copy (the repository store is
+      # near its 10 GiB limit). This step runs after rust-cache so the branch's own,
+      # newer cache wins where the two overlap.
+      - name: Restore the main gate cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
 
       - name: Gate
         id: gate

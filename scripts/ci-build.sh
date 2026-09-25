@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # p1's build farm entry point: push a task branch, wait for the GitHub Actions run
-# of exactly that commit (as scripts/push-main.sh does for main), print the run
-# summary and download the built binary.
+# of exactly that commit, print the run summary and download the built binary.
 #
 #   scripts/ci-build.sh [<branch>] [--no-download] [--wait-only]
 #
@@ -10,24 +9,29 @@
 #   --wait-only     do not push; wait for the run of the branch's existing commit
 #
 # Exit codes:
-#   0  the run concluded success and the downloaded p1 matches its uploaded sha256
-#   1  the run failed, was cancelled or timed out, or the artifact's sha256 does
-#      not match the uploaded one (the failed step's log tail is printed)
-#   2  usage or tooling error: bad arguments, `main`, a failed push, a failed
-#      `gh` call, no run for that commit, no completed run within CI_BUILD_TIMEOUT
-#      seconds, or a failed download: nothing can be concluded about the commit
+#   0  the run concluded success and the downloaded p1 passed `sha256sum -c`
+#   1  the run failed or was cancelled, or the downloaded p1 does not match the
+#      uploaded p1.sha256 (the failed step's log tail is printed)
+#   2  usage or tooling error: bad arguments, a detached HEAD, `main`, a failed
+#      push, a missing local tool, a failed `gh` call, no run for that commit, no
+#      completed run within CI_BUILD_TIMEOUT seconds, or a failed download:
+#      nothing can be concluded about the commit
 #
-# The same script serves a repository whose workflow runs on a branch push (p1)
-# and one whose workflow is only dispatched (brain-tools):
+# The push must come from the branch's checkout, so a detached HEAD is refused
+# whether or not a branch was named.
 #
-#   CI_TRIGGER=push      (default) the repository runs build.yml on a branch push:
-#                        push the branch, then find the push run for exactly that
-#                        headSha.
-#   CI_TRIGGER=dispatch  nothing runs on push: push the branch, then reuse a
-#                        build.yml run for exactly that headSha that is queued,
-#                        running or green, otherwise start one with
-#                        `gh workflow run build.yml --ref <branch>` and wait for
-#                        that workflow_dispatch run.
+# Run identity: only runs of `.github/workflows/build.yml` for the exact headSha
+# count, and only a run this invocation caused:
+#
+#   CI_TRIGGER=push      (default) event `push`. A push that moves the branch
+#                        accepts only a run that did not exist before it; a push
+#                        that moves nothing (the commit is already on the branch)
+#                        waits for that commit's own newest run, because such a
+#                        push creates no run at all.
+#   CI_TRIGGER=dispatch  nothing runs on push: reuse a build.yml run for the commit
+#                        that is queued, running or green, otherwise start one with
+#                        `gh workflow run build.yml --ref <branch>` and accept only
+#                        a run id that did not exist before the dispatch.
 #
 # Any other CI_TRIGGER value is a tooling error (exit 2).
 #
@@ -40,6 +44,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 artifact=p1-build
+workflow=build.yml
 
 usage() {
   cat >&2 <<'EOF'
@@ -52,8 +57,11 @@ exit: 0 success, 1 run failed or cancelled, 2 usage or tooling error
 EOF
 }
 
-command -v git >/dev/null 2>&1 || { echo "ci-build: git is not on PATH" >&2; exit 2; }
-command -v gh >/dev/null 2>&1 || { echo "ci-build: gh is not on PATH" >&2; exit 2; }
+# A missing tool must be a tooling error (2), not whatever `set -e` would report.
+for tool in git gh mktemp mkdir find mv sha256sum cut sleep; do
+  command -v "$tool" >/dev/null 2>&1 ||
+    { echo "ci-build: $tool is not on PATH" >&2; exit 2; }
+done
 
 trigger=${CI_TRIGGER:-push}
 case "$trigger" in
@@ -82,9 +90,14 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) ||
+  { echo "ci-build: not in a git checkout; name a task branch" >&2; exit 2; }
+if [ "$current" = HEAD ]; then
+  echo "ci-build: refusing a detached HEAD; the push must come from the branch's checkout" >&2
+  exit 2
+fi
 if [ -z "$branch" ]; then
-  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) ||
-    { echo "ci-build: not in a git checkout; name a task branch" >&2; exit 2; }
+  branch=$current
 fi
 case "$branch" in
   main|refs/heads/main|origin/main)
@@ -92,10 +105,6 @@ case "$branch" in
     exit 2
     ;;
 esac
-if [ "$branch" = HEAD ]; then
-  echo "ci-build: detached HEAD; name a task branch" >&2
-  exit 2
-fi
 sha=$(git rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null) ||
   { echo "ci-build: no local branch $branch" >&2; exit 2; }
 
@@ -110,60 +119,99 @@ for value in "$timeout_s" "$interval_s"; do
   esac
 done
 
+# Ids of the build.yml runs of this commit that already exist, space separated:
+# a run this invocation causes cannot be one of them.
+matching_ids() {
+  local ids
+  ids=$(gh run list --workflow "$workflow" --limit 50 --json databaseId,headSha \
+          -q ".[] | select(.headSha==\"$sha\") | .databaseId") || return 1
+  printf '%s' "${ids//$'\n'/ }"
+}
+
 # The run to wait for, one TSV line "status<TAB>conclusion<TAB>id" per candidate,
 # newest first. Once a run is picked, `pinned` keeps the loop on that run.
 list_run() {
   local fields="status,conclusion,headSha,event,databaseId"
-  local filter
+  local excl="" filter id
+  if [ "$require_new" = 1 ] && [ -n "$snapshot" ]; then
+    local -a ids
+    read -r -a ids <<<"$snapshot"
+    for id in "${ids[@]}"; do
+      if [ -n "$id" ]; then
+        excl="$excl and .databaseId != $id"
+      fi
+    done
+  fi
   if [ -n "$pinned" ]; then
     filter=".[] | select(.databaseId==$pinned) | [.status, .conclusion, .databaseId] | @tsv"
   elif [ "$trigger" = push ]; then
-    # Exactly this commit's run, as scripts/push-main.sh does for main.
-    filter=".[] | select(.headSha==\"$sha\") | [.status, .conclusion, .databaseId] | @tsv"
-  elif [ "$dispatched" = 1 ]; then
-    # The dispatch we just started, not an older run of the same commit.
-    filter=".[] | select(.headSha==\"$sha\" and .event==\"workflow_dispatch\") | [.status, .conclusion, .databaseId] | @tsv"
+    # Only build.yml's push run of this exact commit.
+    filter=".[] | select(.headSha==\"$sha\" and .event==\"push\"$excl) | [.status, .conclusion, .databaseId] | @tsv"
+  elif [ "$require_new" = 1 ]; then
+    # The dispatch this invocation started, not a run that already existed.
+    filter=".[] | select(.headSha==\"$sha\" and .event==\"workflow_dispatch\"$excl) | [.status, .conclusion, .databaseId] | @tsv"
   else
-    # Reuse a run of this commit that is still queued or running, or already green.
+    # A build.yml run of this commit that is still queued or running, or already green.
     filter=".[] | select(.headSha==\"$sha\") | select((.status != \"completed\") or (.conclusion == \"success\")) | [.status, .conclusion, .databaseId] | @tsv"
   fi
   if [ "$trigger" = push ]; then
-    gh run list --branch "$branch" --limit 20 --json "$fields" -q "$filter"
+    gh run list --branch "$branch" --workflow "$workflow" --limit 30 --json "$fields" -q "$filter"
   else
-    gh run list --workflow build.yml --limit 30 --json "$fields" -q "$filter"
+    gh run list --workflow "$workflow" --limit 30 --json "$fields" -q "$filter"
   fi
 }
 
+snapshot=""
+pinned=""
+push_moved=0
+require_new=0
 if [ "$push" = 1 ]; then
+  remote_line=$(git ls-remote --heads origin "refs/heads/$branch" 2>/dev/null) ||
+    { echo "ci-build: git ls-remote origin $branch failed" >&2; exit 2; }
+  remote_sha=""
+  if [ -n "$remote_line" ]; then
+    remote_sha=${remote_line%%$'\t'*}
+  fi
+  snapshot=$(matching_ids) || { echo "ci-build: gh run list failed" >&2; exit 2; }
   if ! git push --quiet origin "refs/heads/$branch:refs/heads/$branch"; then
     echo "ci-build: git push origin $branch failed" >&2
     exit 2
   fi
+  if [ "$remote_sha" != "$sha" ]; then
+    # The push moved the branch, so a run that already existed is not this one's.
+    push_moved=1
+  fi
   echo "pushed $branch ${sha:0:7}; waiting for its build run…"
 else
+  # --wait-only: wait for the run of the commit the branch already has.
+  snapshot=$(matching_ids) || { echo "ci-build: gh run list failed" >&2; exit 2; }
   echo "wait-only: not pushing; waiting for the run of $branch ${sha:0:7}…"
 fi
+if [ "$trigger" = push ]; then
+  require_new=$push_moved
+fi
 
-pinned=""
-dispatched=0
 if [ "$trigger" = dispatch ]; then
+  # Reuse a run that already exists (queued, running or green); --wait-only never
+  # starts one.
   existing=$(list_run) || { echo "ci-build: gh run list failed" >&2; exit 2; }
   if [ -n "$existing" ]; then
     echo "dispatch: reusing the build.yml run already queued, running or green for ${sha:0:7}"
-  else
-    if ! gh workflow run build.yml --ref "$branch"; then
-      echo "ci-build: gh workflow run build.yml --ref $branch failed" >&2
+  elif [ "$push" = 1 ]; then
+    if ! gh workflow run "$workflow" --ref "$branch"; then
+      echo "ci-build: gh workflow run $workflow --ref $branch failed" >&2
       exit 2
     fi
-    dispatched=1
-    echo "dispatch: started build.yml on $branch for ${sha:0:7}"
+    require_new=1
+    echo "dispatch: started $workflow on $branch for ${sha:0:7}"
+  else
+    echo "wait-only: no build.yml run for ${sha:0:7} yet; waiting…"
   fi
 fi
 
-deadline=$(( $(date +%s) + timeout_s ))
+SECONDS=0
 while :; do
-  runs=$(list_run) ||
-    { echo "ci-build: gh run list failed" >&2; exit 2; }
+  runs=$(list_run) || { echo "ci-build: gh run list failed" >&2; exit 2; }
   run_line=${runs%%$'\n'*}
   status=""
   conclusion=""
@@ -178,11 +226,14 @@ while :; do
     break
   fi
   echo "  ${status:-no run for ${sha:0:7} yet}"
-  if [ "$(date +%s)" -ge "$deadline" ]; then
+  if [ "$SECONDS" -ge "$timeout_s" ]; then
     echo "ci-build: no completed run for ${sha:0:7} on $branch within ${timeout_s}s (last status: ${status:-none})" >&2
     exit 2
   fi
-  sleep "$interval_s"
+  if ! sleep "$interval_s"; then
+    echo "ci-build: sleep failed" >&2
+    exit 2
+  fi
 done
 
 if ! summary=$(gh run view "$run_id" \
@@ -209,26 +260,43 @@ if [ "$download" = 0 ]; then
 fi
 
 dest="ci-artifacts/$sha"
-tmpdir=$(mktemp -d)
+if ! tmpdir=$(mktemp -d); then
+  echo "ci-build: mktemp -d failed" >&2
+  exit 2
+fi
 trap 'rm -rf -- "$tmpdir"' EXIT
 if ! gh run download "$run_id" --name "$artifact" --dir "$tmpdir"; then
   echo "ci-build: could not download the $artifact artifact of run $run_id" >&2
   exit 2
 fi
-mkdir -p "$dest"
-find "$tmpdir" -type f -exec mv -t "$dest" {} +
-if [ ! -f "$dest/p1" ] || [ ! -f "$dest/p1.sha256" ]; then
-  echo "ci-build: the $artifact artifact has no p1 and p1.sha256" >&2
+if ! mkdir -p "$dest"; then
+  echo "ci-build: cannot create $dest" >&2
   exit 2
 fi
-local_sha=$(sha256sum "$dest/p1")
+if ! find "$tmpdir" -type f -exec mv -t "$dest" {} +; then
+  echo "ci-build: cannot move the artifact files into $dest" >&2
+  exit 2
+fi
+for file in p1 p1.sha256 gate.log; do
+  if [ ! -f "$dest/$file" ]; then
+    echo "ci-build: the $artifact artifact has no $file" >&2
+    exit 2
+  fi
+done
+if ! local_sha=$(sha256sum "$dest/p1"); then
+  echo "ci-build: sha256sum failed on $dest/p1" >&2
+  exit 2
+fi
 local_sha=${local_sha%% *}
-uploaded_sha=$(cut -d' ' -f1 "$dest/p1.sha256")
+if ! uploaded_sha=$(cut -d' ' -f1 "$dest/p1.sha256"); then
+  echo "ci-build: cannot read $dest/p1.sha256" >&2
+  exit 2
+fi
 echo "sha256 (downloaded) $local_sha"
 echo "sha256 (uploaded)   $uploaded_sha"
-if [ "$local_sha" != "$uploaded_sha" ]; then
-  echo "ci-build: sha256 mismatch for $dest/p1" >&2
+if ! ( cd "$dest" && sha256sum -c p1.sha256 ); then
+  echo "ci-build: sha256 verification failed for $dest/p1" >&2
   exit 1
 fi
-echo "ci-build: $branch ${sha:0:7} green; $dest/p1 verified against p1.sha256"
+echo "ci-build: $branch ${sha:0:7} green; $dest/p1 verified with sha256sum -c"
 exit 0
