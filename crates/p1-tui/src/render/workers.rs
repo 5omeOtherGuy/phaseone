@@ -136,12 +136,17 @@ pub fn render(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'stat
     out
 }
 
+/// WORKERS rows in their stable display order (handoff §9.4).
+pub fn display_order(pane: &WorkersPane) -> Vec<&WorkerBlock> {
+    let mut sorted: Vec<&WorkerBlock> = pane.workers.iter().collect();
+    sorted.sort_by_key(|worker| worker.state.rank());
+    sorted
+}
+
 /// Shared body without the live selection/action footer.
 pub(crate) fn render_body(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'static>> {
-    let mut sorted: Vec<&WorkerBlock> = pane.workers.iter().collect();
-    sorted.sort_by_key(|w| w.state.rank());
     let mut out = vec![header_line(&pane.header, width)];
-    for worker in sorted {
+    for worker in display_order(pane) {
         out.push(blank_row(width));
         let focused = pane.focused.as_deref() == Some(worker.id.as_str());
         if compact {

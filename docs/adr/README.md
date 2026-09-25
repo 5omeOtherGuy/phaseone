@@ -78,6 +78,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0062 | [A plan refusal is its own provider error kind; it is never refreshed or retried](0062-a-plan-refusal-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md) | accepted | 2026-09-24 | lead |
 | ADR-0063 | [Claude requests its native 1M context window through a named long_context route setting](0063-claude-requests-its-native-1m-context-window-through-a-named-long-context-route-setting.md) | proposed | 2026-09-24 | lead |
 | ADR-0064 | [Unified dashboard uses a pure shell and explicit view composition](0064-unified-dashboard-uses-a-pure-shell-and-explicit-view-composition.md) | accepted | 2026-09-24 | owner+lead |
+| ADR-0065 | [p1 installs from its release channel into a prefix and the binary names its commit](0065-p1-installs-from-its-release-channel-into-a-prefix-and-the-binary-names-its-commit.md) | proposed | 2026-09-24 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

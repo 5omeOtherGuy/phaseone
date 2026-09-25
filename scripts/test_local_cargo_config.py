@@ -4,8 +4,9 @@
     python3 scripts/test_local_cargo_config.py
 
 Each test runs the Bash script with a synthetic PATH containing deterministic
-findmnt and git stubs.  Checkouts and stubs live only in temporary directories;
-no test creates, removes, or depends on state below /mnt/build.
+findmnt and git stubs. Checkouts, HOME, stubs, and targets live only in temporary
+directories; no test creates, removes, or depends on state below the real HOME or
+/mnt/build.
 """
 from __future__ import annotations
 
@@ -20,17 +21,17 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "local-cargo-config.sh")
-TARGET_ROOT = "/mnt/build/cargo-target"
 
-# The script deliberately requires the exact /mnt/build ext4 entry.  An autofs
-# entry by itself simulates storage that is not available yet.
 FINDMNT_STUB = r"""#!/bin/sh
 case "${FIXTURE:-ext4}" in
   ext4)
-    printf '%s\n' '/mnt/build autofs' '/mnt/build ext4'
+    printf '%s\n' '/ ext4'
+    ;;
+  ntfs)
+    printf '%s\n' '/media/usb ntfs3'
     ;;
   autofs)
-    printf '%s\n' '/mnt/build autofs'
+    printf '%s\n' '/home autofs'
     ;;
   nested)
     path=
@@ -45,10 +46,10 @@ case "${FIXTURE:-ext4}" in
           ;;
       esac
     done
-    if [ "$path" = '/mnt/build/.' ]; then
-      printf '%s\n' '/mnt/build ext4'
+    if [ "$path" = "${HOME:?}/.cache/cargo-target" ] || [ "$path" = "${HOME:?}" ]; then
+      printf '%s\n' '/ ext4'
     else
-      printf '%s\n' '/mnt/build/cargo-target foreignfs'
+      printf '%s\n' '/somewhere foreignfs'
     fi
     ;;
   *)
@@ -73,18 +74,17 @@ def write_executable(path: str, text: str) -> None:
     os.chmod(path, 0o755)
 
 
-def target_for(checkout: str) -> str:
+def target_for(checkout: str, home: str) -> str:
     """Return the target the script derives from a canonical checkout path.
 
     The script composes "<target-root>/<basename>-<hash>" and canonicalises the
     result with `realpath -m`, so canonicalise the target root here too rather
-    than trusting the literal constant.
+    than trusting a literal path.
     """
     canonical = os.path.realpath(checkout)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
-    return os.path.join(
-        os.path.realpath(TARGET_ROOT), f"{os.path.basename(canonical)}-{digest}"
-    )
+    target_root = os.path.realpath(os.path.join(home, ".cache", "cargo-target"))
+    return os.path.join(target_root, f"{os.path.basename(canonical)}-{digest}")
 
 
 @unittest.skipUnless(shutil.which("bash"), "bash is required")
@@ -96,6 +96,11 @@ class LocalCargoConfigTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.bin = os.path.join(self.root, "bin")
         os.mkdir(self.bin)
+        self.home = os.path.realpath(os.path.join(self.root, "home"))
+        os.mkdir(self.home)
+        self.target_root = os.path.realpath(
+            os.path.join(self.home, ".cache", "cargo-target")
+        )
         write_executable(os.path.join(self.bin, "findmnt"), FINDMNT_STUB)
         write_executable(os.path.join(self.bin, "git"), GIT_STUB)
         self.checkout, self.main_worktree = self.make_checkout("checkout")
@@ -130,8 +135,11 @@ class LocalCargoConfigTest(unittest.TestCase):
         self,
         main_worktree: str,
         fixture: str = "ext4",
+        *,
+        home: str | None = None,
+        unset_home: bool = False,
     ) -> dict[str, str]:
-        """Build an environment with only the synthetic findmnt/git commands first."""
+        """Build an environment with synthetic HOME, findmnt, and git commands."""
         env = os.environ.copy()
         for name in (
             "BASH_ENV",
@@ -142,6 +150,10 @@ class LocalCargoConfigTest(unittest.TestCase):
         ):
             env.pop(name, None)
         env["PATH"] = self.bin + os.pathsep + env.get("PATH", "")
+        if unset_home:
+            env.pop("HOME", None)
+        else:
+            env["HOME"] = home or self.home
         env["FIXTURE"] = fixture
         env["GIT_MAIN_WORKTREE"] = main_worktree
         return env
@@ -153,11 +165,18 @@ class LocalCargoConfigTest(unittest.TestCase):
         fixture: str = "ext4",
         target_override: str | None = None,
         main_worktree: str | None = None,
+        home: str | None = None,
+        unset_home: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Invoke the real script under test with bounded subprocess execution."""
         selected = checkout or self.checkout
         reported_main = main_worktree or self.main_worktree
-        env = self.environment(reported_main, fixture=fixture)
+        env = self.environment(
+            reported_main,
+            fixture=fixture,
+            home=home,
+            unset_home=unset_home,
+        )
         if target_override is not None:
             env["CARGO_TARGET_DIR"] = target_override
         return subprocess.run(
@@ -179,15 +198,27 @@ class LocalCargoConfigTest(unittest.TestCase):
             "the script unexpectedly wrote config.toml",
         )
 
+    def test_unset_home_is_rejected_without_writing_config(self) -> None:
+        result = self.run_script("--dry-run", unset_home=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HOME", result.stderr)
+        self.assert_config_absent(self.checkout)
+
+    def test_relative_home_is_rejected_without_writing_config(self) -> None:
+        result = self.run_script("--dry-run", home="home")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HOME", result.stderr)
+        self.assert_config_absent(self.checkout)
+
     def test_dry_run_default_is_valid_isolated_toml(self) -> None:
         result = self.run_script("--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         config = tomllib.loads(result.stdout)
-        expected_target = target_for(self.checkout)
+        expected_target = target_for(self.checkout, self.home)
         self.assertEqual(config["build"]["target-dir"], expected_target)
         self.assertRegex(
             expected_target,
-            rf"^{re.escape(os.path.realpath(TARGET_ROOT))}/"
+            rf"^{re.escape(self.target_root)}/"
             rf"{re.escape(os.path.basename(self.checkout))}-[0-9a-f]{{12}}$",
         )
         self.assertEqual(config["build"]["jobs"], 2)
@@ -306,14 +337,14 @@ class LocalCargoConfigTest(unittest.TestCase):
         self.assertEqual(second_result.returncode, 0, second_result.stderr)
         first_target = tomllib.loads(first_result.stdout)["build"]["target-dir"]
         second_target = tomllib.loads(second_result.stdout)["build"]["target-dir"]
-        self.assertEqual(first_target, target_for(first))
-        self.assertEqual(second_target, target_for(second))
+        self.assertEqual(first_target, target_for(first, self.home))
+        self.assertEqual(second_target, target_for(second, self.home))
         self.assertNotEqual(first_target, second_target)
         self.assert_config_absent(first)
         self.assert_config_absent(second)
 
-    def test_explicit_target_below_build_root_is_accepted(self) -> None:
-        target = f"{TARGET_ROOT}/explicit-build"
+    def test_explicit_target_below_target_root_is_accepted(self) -> None:
+        target = f"{self.target_root}/explicit-build"
         result = self.run_script(
             "--dry-run", target_override=target
         )
@@ -327,9 +358,14 @@ class LocalCargoConfigTest(unittest.TestCase):
             ("empty", "", "must not be empty"),
             ("relative", "relative-target", "must be absolute"),
             ("filesystem root", "/", "resolves outside"),
-            ("target root", TARGET_ROOT, "not /mnt/build/cargo-target itself"),
+            ("target root", self.target_root, f"not {self.target_root} itself"),
             ("parent escape", "../escape", "must be absolute"),
-            ("absolute escape", f"{TARGET_ROOT}/../escape", "resolves outside"),
+            ("absolute escape", f"{self.target_root}/../escape", "resolves outside"),
+            (
+                "old root",
+                "/mnt/build/cargo-target/x",
+                "resolves outside",
+            ),
             (
                 "outside root",
                 "/var/tmp/local-cargo-config-outside-root",
@@ -350,18 +386,25 @@ class LocalCargoConfigTest(unittest.TestCase):
     def test_autofs_without_ext4_is_rejected(self) -> None:
         result = self.run_script("--dry-run", fixture="autofs")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("required /mnt/build ext4", result.stderr)
+        self.assertIn("is not on an ext4 filesystem", result.stderr)
+        self.assert_config_absent(self.checkout)
+
+    def test_ntfs_is_rejected(self) -> None:
+        result = self.run_script("--dry-run", fixture="ntfs")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not on an ext4 filesystem", result.stderr)
+        self.assertIn("NTFS, USB and other filesystems are refused", result.stderr)
         self.assert_config_absent(self.checkout)
 
     def test_nested_foreign_mount_at_target_ancestor_is_rejected(self) -> None:
+        os.makedirs(target_for(self.checkout, self.home))
         result = self.run_script("--dry-run", fixture="nested")
         self.assertNotEqual(result.returncode, 0)
-        # The first probe (for /mnt/build/.) must succeed, so the rejection has to
-        # come from the ancestor probe rather than the build-root probe.
-        self.assertNotIn("/mnt/build/. is not on", result.stderr)
-        self.assertIn(
-            "is not on the required /mnt/build ext4 filesystem", result.stderr
-        )
+        # The first probe is for the target root's nearest existing ancestor;
+        # the target probe must still reject a nested foreign mount.
+        self.assertNotIn(f"{self.home} is not on", result.stderr)
+        self.assertNotIn(f"{self.target_root} is not on", result.stderr)
+        self.assertIn("is not on an ext4 filesystem", result.stderr)
         self.assert_config_absent(self.checkout)
 
     def test_quote_and_backslash_checkout_yields_exact_toml_paths(self) -> None:
@@ -369,7 +412,7 @@ class LocalCargoConfigTest(unittest.TestCase):
         result = self.run_script("--dry-run", checkout=checkout)
         self.assertEqual(result.returncode, 0, result.stderr)
         config = tomllib.loads(result.stdout)
-        self.assertEqual(config["build"]["target-dir"], target_for(checkout))
+        self.assertEqual(config["build"]["target-dir"], target_for(checkout, self.home))
         self.assertEqual(
             config["build"]["rustc-wrapper"],
             os.path.join(checkout, "scripts", "rustc-serial"),
@@ -424,15 +467,22 @@ class LocalCargoConfigTest(unittest.TestCase):
         self.assertIn("rustc-serial wrapper is not executable", result.stderr)
         self.assert_config_absent(checkout)
 
-    def test_actual_mode_safely_rejects_absent_build_storage(self) -> None:
-        # Actual mode is intentionally not allowed to proceed far enough to call
-        # mkdir.  On both mounted and unmounted test machines, the stubbed
-        # autofs-only result models an absent build root and fails validation
-        # before the real /mnt/build tree can be inspected or modified.
-        result = self.run_script(fixture="autofs")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("required /mnt/build ext4", result.stderr)
-        self.assert_config_absent(self.checkout)
+    def test_actual_mode_creates_target_and_writes_config(self) -> None:
+        result = self.run_script(fixture="ext4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected_target = target_for(self.checkout, self.home)
+        config_path = os.path.join(self.checkout, ".cargo", "config.toml")
+        with open(config_path, "rb") as handle:
+            config_bytes = handle.read()
+        config = tomllib.loads(config_bytes.decode("utf-8"))
+        self.assertEqual(config["build"]["target-dir"], expected_target)
+        self.assertTrue(os.path.isdir(expected_target), result.stderr)
+        self.assertIn(
+            b"# New targets live below ~/.cache/cargo-target on the SSD (ext4); "
+            b"build in CI where possible, and check 12 GiB free before a first "
+            b"local build (8 GiB floor).",
+            config_bytes,
+        )
 
 
 if __name__ == "__main__":

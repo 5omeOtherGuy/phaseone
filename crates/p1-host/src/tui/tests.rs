@@ -49,6 +49,7 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             follow_ups: VecDeque::new(),
             submit_pending: None,
             worker_rows: Arc::new(Mutex::new(Vec::new())),
+            worker_usage: HashMap::new(),
             pending_calls: HashMap::new(),
             task_files: HashSet::new(),
             exit: None,
@@ -796,6 +797,34 @@ fn worker_row() -> p1_tui::render::workers::WorkerBlock {
     }
 }
 
+fn worker_response(id: &str, model: &str, usage: Option<p1_contracts::Usage>) -> UiEvent {
+    UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 0,
+        worker: Some(id.into()),
+        event: p1_contracts::AgentEvent::ResponseCompleted {
+            model: model.into(),
+            stop: p1_contracts::StopReason::EndTurn,
+            usage,
+        },
+    })
+}
+
+fn worker_test_row(id: &str) -> p1_tui::render::workers::WorkerBlock {
+    p1_tui::render::workers::WorkerBlock {
+        id: id.into(),
+        task: String::new(),
+        route: "deepseek/v4.1-flash".into(),
+        model: None,
+        state: p1_tui::render::workers::BlockState::Running,
+        elapsed: None,
+        cost_micro_usd: None,
+        tokens: None,
+        context_window: None,
+        grants: String::new(),
+        activity: String::new(),
+    }
+}
+
 /// A key stream over a channel, so a script can deliver an input at a chosen
 /// simulated instant — the shape `run` builds from crossterm's events.
 fn key_stream(
@@ -1018,4 +1047,333 @@ async fn a_running_turns_pulse_draws_at_the_spinner_heartbeat() {
         frames <= 5,
         "a running turn drew {frames} pulse frames in one simulated second"
     );
+}
+
+#[test]
+fn worker_rows_get_latest_context_and_accumulated_cost_without_touching_the_parent() {
+    use p1_contracts::Usage;
+
+    let (mut d, _auth) = driver();
+    let parent_context = d.screen.context.clone();
+    let parent_ctx = d.screen.statusbar.ctx.clone();
+    let parent_spend = d.screen.spend;
+
+    d.on_ui_event(worker_response(
+        "w1",
+        "deepseek-v4.1-flash",
+        Some(Usage {
+            input_uncached: Some(10_000),
+            cost_micro_usd: Some(10),
+            ..Usage::default()
+        }),
+    ));
+    d.on_ui_event(worker_response(
+        "w1",
+        "deepseek-v4.1-flash",
+        Some(Usage {
+            input_uncached: Some(48_213),
+            cost_micro_usd: Some(5),
+            ..Usage::default()
+        }),
+    ));
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1")];
+    d.sync_workers();
+
+    let row = &d.screen.workers.workers[0];
+    assert_eq!(row.model.as_deref(), Some("deepseek-v4.1-flash"));
+    assert_eq!(row.tokens, Some(48_213));
+    assert_eq!(row.cost_micro_usd, Some(15));
+    assert_eq!(row.context_window, None);
+    assert_eq!(d.screen.context, parent_context);
+    assert_eq!(d.screen.statusbar.ctx, parent_ctx);
+    assert_eq!(d.screen.spend, parent_spend);
+}
+
+#[test]
+fn missing_worker_usage_poisons_its_latest_tokens_and_accumulated_cost() {
+    use p1_contracts::Usage;
+
+    let (mut d, _auth) = driver();
+    d.on_ui_event(worker_response(
+        "w1",
+        "deepseek-v4.1-flash",
+        Some(Usage {
+            input_uncached: Some(48_213),
+            cost_micro_usd: Some(5),
+            ..Usage::default()
+        }),
+    ));
+    d.on_ui_event(worker_response("w1", "deepseek-v4.1-flash", None));
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1")];
+    d.sync_workers();
+
+    let usage = &d.worker_usage["w1"];
+    assert_eq!(usage.tokens, None);
+    assert_eq!(usage.cost_micro_usd, None);
+    let row = &d.screen.workers.workers[0];
+    assert_eq!(row.tokens, None);
+    assert_eq!(row.cost_micro_usd, None);
+}
+
+#[test]
+fn a_worker_row_without_response_events_keeps_its_metrics_unknown() {
+    let (mut d, _auth) = driver();
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w2")];
+    d.sync_workers();
+
+    let row = &d.screen.workers.workers[0];
+    assert_eq!(row.model, None);
+    assert_eq!(row.tokens, None);
+    assert_eq!(row.cost_micro_usd, None);
+}
+
+#[test]
+fn worker_clocks_restart_after_continue_and_freeze_once_settled() {
+    let t = std::time::Instant::now();
+    let mut clocks = WorkerClocks::default();
+
+    assert_eq!(clocks.observe("w1", true, t).as_deref(), Some("0m00s"));
+    assert_eq!(
+        clocks
+            .observe("w1", true, t + std::time::Duration::from_secs(252))
+            .as_deref(),
+        Some("4m12s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", false, t + std::time::Duration::from_secs(300))
+            .as_deref(),
+        Some("5m00s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", false, t + std::time::Duration::from_secs(9_999))
+            .as_deref(),
+        Some("5m00s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", true, t + std::time::Duration::from_secs(10_000))
+            .as_deref(),
+        Some("0m00s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", true, t + std::time::Duration::from_secs(10_030))
+            .as_deref(),
+        Some("0m30s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", false, t + std::time::Duration::from_secs(10_060))
+            .as_deref(),
+        Some("1m00s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", false, t + std::time::Duration::from_secs(20_000))
+            .as_deref(),
+        Some("1m00s")
+    );
+    assert_eq!(
+        clocks.observe("w2", false, t + std::time::Duration::from_secs(5)),
+        None
+    );
+    assert_eq!(
+        clocks.observe("w2", false, t + std::time::Duration::from_secs(50)),
+        None
+    );
+}
+
+// ------------------------------------------------- attached worker detail (§9.5)
+
+/// A worker's own stream is buffered for the attach view, never drawn into the
+/// parent's transcript (handoff §9.5): attaching later shows detail the parent
+/// stream never carried.
+#[test]
+fn a_worker_stream_is_buffered_for_attach_and_stays_out_of_the_parent() {
+    let (mut d, _auth) = driver();
+    d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 7,
+        worker: Some("w1".into()),
+        event: p1_contracts::AgentEvent::TextDelta {
+            text: "worker prose".into(),
+        },
+    }));
+
+    assert!(
+        !d.screen
+            .transcript
+            .blocks
+            .iter()
+            .any(|b| matches!(b, p1_tui::transcript::Block::Prose { .. })),
+        "the parent never shows a worker's prose"
+    );
+    let buffered = d
+        .screen
+        .worker_transcripts
+        .get("w1")
+        .expect("w1's stream is buffered while it is detached");
+    assert_eq!(
+        buffered.blocks,
+        vec![p1_tui::transcript::Block::Prose {
+            lines: vec!["worker prose".into()],
+        }]
+    );
+}
+
+/// The approval owns the transcript area (handoff §7.5), so parking one while
+/// attached to a worker detaches it; the buffer is kept, not dropped.
+#[tokio::test]
+async fn an_approval_while_attached_detaches_the_worker() {
+    use p1_tui::state::PaneMode;
+
+    let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
+    let (mut d, _auth) = driver();
+    d.policy = Arc::new(policy);
+    d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 4,
+        worker: Some("w1".into()),
+        event: p1_contracts::AgentEvent::TextDelta {
+            text: "worker prose".into(),
+        },
+    }));
+    d.screen.pane_mode = PaneMode::Workers;
+    d.screen.workers.workers = vec![worker_test_row("w1")];
+    d.screen.workers.focused = Some("w1".into());
+    d.screen.attach_selected();
+    assert_eq!(
+        d.screen.attached.as_ref().map(|worker| worker.id.as_str()),
+        Some("w1")
+    );
+
+    let call = p1_contracts::ToolCall {
+        call_id: "c1".into(),
+        name: "shell".into(),
+        input: p1_contracts::ToolInput::Json("{\"command\":\"cargo test\"}".into()),
+    };
+    let identity = p1_contracts::ToolIdentity {
+        implementation: "shell".into(),
+        variant: String::new(),
+    };
+    let pending = tokio::spawn({
+        let policy = d.policy.clone();
+        let call = call.clone();
+        let identity = identity.clone();
+        async move {
+            policy
+                .authorize(p1_contracts::AuthorizationRequest {
+                    call: &call,
+                    identity: &identity,
+                    effect: p1_contracts::Effect::Executes,
+                })
+                .await
+        }
+    });
+    let request = auth_rx.recv().await.unwrap();
+    d.on_auth(request);
+
+    assert!(matches!(d.screen.approval, Some(Approval::Permission(_))));
+    assert!(
+        d.screen.attached.is_none(),
+        "the approval needs the transcript area"
+    );
+    d.on_key(key(KeyCode::Char('n')), None);
+    assert_eq!(
+        pending.await.unwrap(),
+        Decision::Deny {
+            reason: p1_tui::runtime::USER_DENY.into()
+        }
+    );
+    assert_eq!(
+        d.screen
+            .worker_transcripts
+            .get("w1")
+            .map(|transcript| transcript.blocks.len()),
+        Some(1),
+        "detaching keeps the worker's buffered transcript"
+    );
+}
+
+/// An open OUTPUT fold scrolls on the bare arrows only while OUTPUT is the
+/// pane's mode; another mode showing keeps them out of the hidden pane.
+#[test]
+fn only_output_mode_takes_the_bare_arrows() {
+    use p1_tui::render::output::OutputView;
+    use p1_tui::state::PaneMode;
+
+    let (mut d, _auth) = driver();
+    d.screen.output = Some(OutputView {
+        id: p1_tui::fold::FoldId::of("folded output"),
+        lines: vec!["a".into(), "b".into(), "c".into()],
+        scroll: 0,
+    });
+    d.screen.pane_mode = PaneMode::Ledger;
+    d.on_key(key(KeyCode::Down), None);
+    assert_eq!(
+        d.screen.output.as_ref().map(|output| output.scroll),
+        Some(0),
+        "LEDGER leaves the hidden OUTPUT pane alone"
+    );
+
+    d.screen.pane_mode = PaneMode::Output;
+    d.on_key(key(KeyCode::Down), None);
+    assert_eq!(
+        d.screen.output.as_ref().map(|output| output.scroll),
+        Some(1),
+        "OUTPUT mode scrolls it"
+    );
+}
+
+#[test]
+fn ctrl_f_off_detaches_and_returns_keys_to_the_composer() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Down), None);
+    d.on_key(key(KeyCode::Enter), None);
+    assert_eq!(
+        d.screen.attached.as_ref().map(|worker| worker.id.as_str()),
+        Some("w2")
+    );
+
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(d.screen.attached.is_none());
+    d.on_key(key(KeyCode::Char('h')), None);
+    d.on_key(key(KeyCode::Char('i')), None);
+    assert_eq!(d.screen.composer.text, "hi");
+    d.on_key(key(KeyCode::Enter), None);
+    assert!(d.screen.attached.is_none());
+}
+
+#[test]
+fn ctrl_n_detaches_an_attached_worker() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Enter), None);
+    assert!(d.screen.attached.is_some());
+
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(d.screen.attached.is_none());
 }

@@ -19,4 +19,7 @@ mod journal;
 mod service;
 
 pub use api::*;
+// The one piece of the journal module the host needs: it reads a run's journal to
+// reserve worker ids on resume (issue #98), with this crate's exact parse semantics.
+pub use journal::read_journal;
 pub use service::InProcessWorkflows;

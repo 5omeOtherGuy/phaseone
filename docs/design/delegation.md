@@ -67,8 +67,17 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
 
 - Workers do not survive the process. When the parent session is resumed, the host declares
   the journalled workers gone (stderr + an inbox notification to the model) and reserves
-  their ids, so an old id answers `No worker <id>.` and is never given to a new worker
-  (ADR-0034).
+  every id the session has already used, from every source that can hold one: the parent
+  journal's `worker_start` results, the `FILE.w<N>.jsonl` worker journals on disk (all a
+  workflow's step workers leave there), and the worker ids the run journals
+  `FILE.workflows/wf*/journal.jsonl` name — the only witness of a step worker whose own
+  file is gone — so an old id answers `No worker <id>.` and is never given to a new
+  worker, whose own journal would then collide with a file that exists (ADR-0034,
+  issue #98). The same initial reservation is made by standalone `p1 workflow run`, before
+  any step starts; an unreadable sibling directory, an unreadable or malformed run
+  journal, or an exhausted id namespace fails startup rather than guessing that no ids
+  are reserved. The service itself refuses a start past `w<usize::MAX>` with a stable
+  error instead of wrapping.
 
 ### Prepared start (ADR-0053)
 
