@@ -164,7 +164,7 @@ impl InProcessWorkflows {
         let handle = Handle::try_current()
             .map_err(|_| preflight("start must be called inside a tokio runtime".into()))?;
 
-        let engine = engine::sandboxed_engine();
+        let engine = engine::sandboxed_engine(self.settings.max_steps);
         let ast = engine::compile(&engine, &request.script)?;
         let roles = self.resolve_roles(&request.role_models)?;
         let args = match request.args {

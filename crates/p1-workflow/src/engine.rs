@@ -824,9 +824,42 @@ pub(crate) struct Script {
     ast: OnceLock<Arc<AST>>,
 }
 
-/// The raw engine with only the reviewed packages and the limits of ADR-0053. No module
+/// What ONE step envelope may carry, in each of the three sums rhai checks: strings,
+/// array items and map entries (§2 "Engine limits") — the per-envelope part of a run's
+/// data budget.
+const ENVELOPE_STRINGS: usize = 64 * 1024;
+const ENVELOPE_ARRAY_ITEMS: usize = 4096;
+const ENVELOPE_MAP_ENTRIES: usize = 4096;
+
+/// The data-size limits for a run that may make `max_steps` `agent()` calls: that many
+/// envelopes' worth, in each of rhai's three sums.
+///
+/// rhai checks its data limits against the SUM over the whole value a call returns
+/// (`eval/data_check.rs` `calc_array_sizes`/`calc_map_sizes`), and a native function's
+/// result is checked like any other, so rhai offers no way to exempt a host-provided value
+/// from the accounting: `parallel()`'s array of a dozen done envelopes, a map a script
+/// builds from several envelopes, and one verbose envelope are all ONE budget (issue #121).
+/// The envelopes are the host's data — one per `agent()` call the run's `max_steps` caps —
+/// so that cap, and not a single envelope, is the bound a completed fan-out needs. A
+/// script's OWN strings, arrays and maps stay bounded by the same per-value numbers, and
+/// the script can neither hold unlimited values (`max_variables`) nor build them cheaply
+/// (`max_operations`); the budget follows the operator's own cap the way the worker count
+/// does — a settings table that allows a million steps already allows a million workers.
+fn data_limits(max_steps: u32) -> (usize, usize, usize) {
+    // A run that may make no call still evaluates its script: one envelope's worth, never
+    // zero (a zero limit refuses every non-empty string).
+    let envelopes = usize::try_from(max_steps).unwrap_or(usize::MAX).max(1);
+    (
+        ENVELOPE_STRINGS.saturating_mul(envelopes),
+        ENVELOPE_ARRAY_ITEMS.saturating_mul(envelopes),
+        ENVELOPE_MAP_ENTRIES.saturating_mul(envelopes),
+    )
+}
+
+/// The raw engine with only the reviewed packages and the limits of ADR-0053. `max_steps`
+/// is the run's own step cap, which sizes the data limits ([`data_limits`]). No module
 /// resolver is set, so `import` finds nothing; `eval` is a disabled keyword (a parse error).
-pub(crate) fn sandboxed_engine() -> Engine {
+pub(crate) fn sandboxed_engine(max_steps: u32) -> Engine {
     let mut engine = Engine::new_raw();
     LanguageCorePackage::new().register_into_engine(&mut engine);
     ArithmeticPackage::new().register_into_engine(&mut engine);
@@ -840,9 +873,10 @@ pub(crate) fn sandboxed_engine() -> Engine {
     engine.set_max_operations(5_000_000);
     engine.set_max_call_levels(24);
     engine.set_max_expr_depths(32, 32);
-    engine.set_max_string_size(64 * 1024);
-    engine.set_max_array_size(4096);
-    engine.set_max_map_size(4096);
+    let (strings, arrays, maps) = data_limits(max_steps);
+    engine.set_max_string_size(strings);
+    engine.set_max_array_size(arrays);
+    engine.set_max_map_size(maps);
     engine.set_max_variables(256);
     // Closures count as functions: this also bounds the thunks of one script.
     engine.set_max_functions(256);

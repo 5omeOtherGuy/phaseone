@@ -64,8 +64,22 @@ process access (`timestamp`, `now`, `rand`, `read_file`, `http_get`, `connect`, 
 started.
 
 **Engine limits.** `max_operations` 5,000,000; `max_call_levels` 24; expression depths
-32/32; string 64 KiB; array 4096; map 4096; `max_variables` 256; `max_functions` 256
-(closures count, which also bounds the thunks of one script); `max_modules` 1.
+32/32; `max_variables` 256; `max_functions` 256 (closures count, which also bounds the
+thunks of one script); `max_modules` 1.
+
+The three DATA limits are sized to the RUN, not to one value. rhai checks `max_string_size`,
+`max_array_size` and `max_map_size` against the SUM of every string, array item and map
+entry inside the whole value a call returns (`eval/data_check.rs`
+`calc_array_sizes`/`calc_map_sizes`), and the result of a native function is checked like
+any other — rhai has no way to exempt a value. The envelope `agent()` returns is the
+HOST's data, one per call, so one `parallel()` of a dozen done envelopes, a map a script
+builds from several envelopes, and one verbose envelope are all ONE budget (issue #121).
+The engine therefore sizes each limit to the run's own step cap: `max_steps` envelopes'
+worth, one envelope being 64 KiB of strings, 4096 array items and 4096 map entries — with
+the default `max_steps = 200` that is 12.5 MiB of strings and 800k array items or map
+entries in one script value. A script's OWN strings, arrays and maps stay bounded by the
+same numbers (a `max_steps = 2` run can build a 128 KiB string, not more), and building
+them is still charged against `max_operations`.
 
 **The bounded thread rule.** rhai has no async VM: each run's script executes on its own
 OS thread (`p1-wf-script`), and `agent()` blocks that thread on the caller's tokio handle
@@ -434,7 +448,10 @@ refusals, every envelope shape, constant `args`, located script errors. `replay.
 proves the replay rules: an unchanged run replays everything, an edited middle call
 re-runs it and everything after, caps are rebuilt from every old dispatch, failed steps
 are not replayed, parallel calls match by content. `sandbox.rs` proves every escape
-vector fails and every engine limit holds; `prompt_example.rs` runs the prompts'
+vector fails and every engine limit holds; `size_limits.rs` proves a completed `parallel`
+of twelve large envelopes comes back whole, that one verbose envelope does too, and that
+a script's own string is refused past `max_steps` envelopes' worth; `prompt_example.rs`
+runs the prompts'
 example on the shipped settings; `fallback.rs` proves the chains (ADR-0054): a route
 failure on the head hands the step to the next link with
 `dispatch/fallback/dispatch` journalled and `fell_back` counted, a capped link is skipped
