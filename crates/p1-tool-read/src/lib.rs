@@ -5,7 +5,7 @@
 //! and the read-before-mutate observation.
 
 use std::io::{ErrorKind, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
@@ -34,6 +34,12 @@ pub struct ReadTool {
     observed: ObservedFiles,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
+    /// `HOME` (or an injected temp home, in tests). The credential files under it are
+    /// refused even with full access.
+    home: Option<PathBuf>,
+    /// Extra credential FILES from the XDG overrides p1-auth also honours, captured
+    /// from the process environment when the tool is built.
+    xdg_credentials: Vec<PathBuf>,
 }
 
 impl ReadTool {
@@ -44,6 +50,8 @@ impl ReadTool {
             observed,
             declaration: declaration(default_face()),
             identity: identity("claude"),
+            home: env_path("HOME"),
+            xdg_credentials: xdg_credentials(),
         }
     }
 
@@ -55,7 +63,80 @@ impl ReadTool {
             observed: self.observed,
             declaration: declaration(face),
             identity: identity(variant),
+            home: self.home,
+            xdg_credentials: self.xdg_credentials,
         }
+    }
+
+    /// Override the home directory whose credential files are refused. The host
+    /// passes its injected `HOME`; a test passes a temp home.
+    pub fn with_home(mut self, home: Option<PathBuf>) -> Self {
+        self.home = home;
+        self
+    }
+}
+
+/// Whether `candidate` is one of the credential files `read` always refuses: the p1
+/// auth store, anything under `~/.config/keys/`, and the other tools' auth files.
+/// Compared on the canonicalised form, so a symlink or a relative path cannot slip
+/// past. An empty `home` refuses only the XDG-named stores.
+fn refuses_credentials(candidate: &Path, home: Option<&Path>, xdg_credentials: &[PathBuf]) -> bool {
+    let candidate = canonical_best_effort(candidate);
+    if xdg_credentials
+        .iter()
+        .any(|path| canonical_best_effort(path) == candidate)
+    {
+        return true;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    let home = canonical_best_effort(home);
+    let keys = canonical_best_effort(&home.join(".config").join("keys"));
+    if candidate == keys || candidate.starts_with(&keys) {
+        return true;
+    }
+    [
+        home.join(".config/p1/auth.json"),
+        home.join(".codex/auth.json"),
+        home.join(".claude/.credentials.json"),
+        home.join(".local/share/opencode/auth.json"),
+        home.join(".pi/agent/auth.json"),
+    ]
+    .iter()
+    .any(|path| canonical_best_effort(path) == candidate)
+}
+
+/// A non-empty environment variable as a path, or `None`.
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The p1 and OpenCode stores move with their XDG override (p1-auth); a home-based
+/// path below covers the default. `None` when the variable is unset.
+fn xdg_credentials() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Some(config) = env_path("XDG_CONFIG_HOME") {
+        files.push(config.join("p1/auth.json"));
+    }
+    if let Some(data) = env_path("XDG_DATA_HOME") {
+        files.push(data.join("opencode/auth.json"));
+    }
+    files
+}
+
+/// The canonical form of `path`, or — when it does not exist yet — its canonical
+/// parent with the file name appended, so a refusal never falls back to a lexical
+/// comparison against the whole path.
+fn canonical_best_effort(path: &Path) -> PathBuf {
+    match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => match path.parent().and_then(|parent| parent.canonicalize().ok()) {
+            Some(parent) => parent.join(path.file_name().unwrap_or_default()),
+            None => path.to_path_buf(),
+        },
     }
 }
 
@@ -186,9 +267,21 @@ impl Tool for ReadTool {
             let workspace = self.workspace.clone();
             let observed = self.observed.clone();
             let tool = self.declaration.name.clone();
+            let home = self.home.clone();
+            let xdg_credentials = self.xdg_credentials.clone();
             // All filesystem work runs on a blocking thread; the async thread
             // is never used for synchronous I/O.
-            match tokio::task::spawn_blocking(move || run(&workspace, &observed, &input)).await {
+            match tokio::task::spawn_blocking(move || {
+                run(
+                    &workspace,
+                    &observed,
+                    &input,
+                    home.as_deref(),
+                    &xdg_credentials,
+                )
+            })
+            .await
+            {
                 // `run` bounds the window itself so the continuation trailer survives.
                 Ok(Ok(content)) => ToolOutcome::ok(content),
                 Ok(Err(message)) => ToolOutcome::error(message),
@@ -239,7 +332,23 @@ fn run(
     workspace: &Workspace,
     observed: &ObservedFiles,
     input: &ReadInput,
+    home: Option<&Path>,
+    xdg_credentials: &[PathBuf],
 ) -> Result<String, String> {
+    // Issue #142: a credential file is refused even with full access, BEFORE any
+    // confinement error, so the model is told why and never sees the file's bytes.
+    let candidate = if Path::new(&input.file_path).is_absolute() {
+        PathBuf::from(&input.file_path)
+    } else {
+        workspace.root().join(&input.file_path)
+    };
+    if refuses_credentials(&candidate, home, xdg_credentials) {
+        return Err(format!(
+            "read refuses credential files ({}); credentials never enter the model's context",
+            workspace.display(&candidate)
+        ));
+    }
+
     let resolved = workspace
         .resolve(&input.file_path)
         .map_err(|error| error.to_string())?;
@@ -1173,5 +1282,91 @@ mod tests {
             streamed.check_unchanged(&path, &contents),
             p1_workspace::Observation::Unchanged
         );
+    }
+
+    /// The credential files `read` refuses, relative to the home it was given.
+    const CREDENTIAL_PATHS: [&str; 7] = [
+        ".config/p1/auth.json",
+        ".config/keys/tool.key",
+        ".config/keys/nested/deeper.key",
+        ".codex/auth.json",
+        ".claude/.credentials.json",
+        ".local/share/opencode/auth.json",
+        ".pi/agent/auth.json",
+    ];
+
+    /// A temp home with every refused credential file, and the tool pointed at it.
+    /// The workspace IS the home, so a relative credential path is inside the
+    /// confinement and only the refusal can stop it.
+    fn home_with_credentials() -> (tempfile::TempDir, ReadTool) {
+        let home = tempfile::tempdir().unwrap();
+        for relative in CREDENTIAL_PATHS {
+            let path = home.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{}\n").unwrap();
+        }
+        let observed = ObservedFiles::new();
+        let tool = ReadTool::new(workspace(home.path()), observed)
+            .with_home(Some(home.path().to_path_buf()));
+        (home, tool)
+    }
+
+    #[tokio::test]
+    async fn refuses_every_credential_path_inside_the_workspace() {
+        let (_home, tool) = home_with_credentials();
+
+        for relative in CREDENTIAL_PATHS {
+            let outcome = execute(&tool, &format!("{{\"file_path\": \"{relative}\"}}")).await;
+            assert_eq!(outcome.status, ToolStatus::Error, "{relative}");
+            assert!(
+                outcome.content.contains("read refuses credential files"),
+                "{relative}: {}",
+                outcome.content
+            );
+            assert!(
+                outcome
+                    .content
+                    .contains("credentials never enter the model's context"),
+                "{relative}: {}",
+                outcome.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_a_credential_file_outside_the_workspace_before_confinement() {
+        let (home, _tool) = home_with_credentials();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let observed = ObservedFiles::new();
+        // The workspace does not contain the home at all, so the ordinary
+        // confinement would reject the path anyway; the refusal must come first and
+        // name the credential rule.
+        let tool = ReadTool::new(workspace(elsewhere.path()), observed)
+            .with_home(Some(home.path().to_path_buf()));
+        let absolute = home.path().join(".codex/auth.json");
+
+        let outcome = execute(
+            &tool,
+            &format!("{{\"file_path\": \"{}\"}}", absolute.display()),
+        )
+        .await;
+
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(
+            outcome.content.contains("read refuses credential files"),
+            "{}",
+            outcome.content
+        );
+    }
+
+    #[tokio::test]
+    async fn still_reads_an_ordinary_file_from_the_same_home() {
+        let (home, tool) = home_with_credentials();
+        std::fs::write(home.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
+
+        let outcome = execute(&tool, r#"{"file_path": "notes.txt"}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert_eq!(outcome.content, "     1\talpha\n     2\tbeta");
     }
 }

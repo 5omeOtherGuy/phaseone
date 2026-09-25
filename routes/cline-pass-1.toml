@@ -23,7 +23,10 @@ borrow     = []
 dialect = "thinking-with-reasoning-alias"
 
 # Owner decision 2026-09-24 21:55: DeepSeek V4.1 Flash and/or GLM-5.3 Flash ONLY on ClinePass.
-# GLM-5.3 Flash (`cline-pass/glm-5.3-flash`) joins once p1 accepts its stream's repeated finish
-# chunk (#115); until then only DeepSeek V4.1 Flash is bound.
+# GLM-5.3 Flash is bound beside DeepSeek V4.1 Flash because p1 accepts its repeated finish chunk
+# (#115, fixed in #126).
 [models."deepseek-v4.1-flash"]
 wire_model = "cline-pass/deepseek-v4.1-flash"
+
+[models."glm-5.3-flash-clinepass"]
+wire_model = "cline-pass/glm-5.3-flash"

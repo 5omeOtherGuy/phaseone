@@ -1,7 +1,7 @@
 ---
 adr: 66
 title: p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary
-status: proposed
+status: accepted
 date: 2026-09-24
 deciders: lead
 supersedes: []

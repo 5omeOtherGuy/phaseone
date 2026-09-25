@@ -11,8 +11,8 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use p1_contracts::{
     BoxFuture, CancellationToken, CompletedResponse, ContextError, ContextInput, ContextPolicy,
-    Item, ModelOptions, Outcome, Prepared, Provider, ProviderRequest, StopReason, StreamEvent,
-    Usage,
+    Effort, Item, ModelOptions, Outcome, Prepared, Provider, ProviderRequest, StopReason,
+    StreamEvent, Usage,
 };
 
 pub use estimate::estimate_tokens;
@@ -147,6 +147,19 @@ impl SummarizingContext {
         self.summary_output_tokens = tokens;
         Ok(self)
     }
+
+    /// Sets the reasoning effort the summarization request carries (#125). A summary
+    /// must NOT inherit the agent's effort: on a thinking model the route spends part
+    /// of the summary-output cap on reasoning before a single summary token, and the
+    /// transcript handed to the summarizer is already condensed. The host passes the
+    /// LOWEST effort the model profile supports, and `Low` when the environment names
+    /// no profile at all, so every summary carries a floor; the one cap-doubling retry
+    /// is untouched. `None` leaves the effort the options carried — a path the host
+    /// does not take, kept because the module cannot invent a route's effort scale.
+    pub fn with_summary_effort(mut self, effort: Option<Effort>) -> Self {
+        self.options.reasoning_effort = effort;
+        self
+    }
 }
 
 impl ContextPolicy for SummarizingContext {
@@ -226,7 +239,11 @@ impl ContextPolicy for SummarizingContext {
                     Err(Ask::Cancelled) => return Err(ContextError::Cancelled),
                     Err(Ask::Failed(reason)) => return failure(next_input, wall, reason),
                 };
-                usage = sum_usage(usage, response.usage);
+                usage = if attempts == 1 {
+                    response.usage
+                } else {
+                    sum_usage(usage, response.usage)
+                };
                 match response.stop {
                     StopReason::EndTurn => break response.item.text(),
                     // The cap actually sent, doubled: an agent's own lower limit
@@ -270,6 +287,11 @@ impl ContextPolicy for SummarizingContext {
                 );
             }
 
+            // Issue #142: the summarizer is a second model whose output becomes a
+            // history item, so it is masked with the same matcher the host wraps
+            // every tool in. A summary can never carry a credential shape into the
+            // history and every later request.
+            let answer = p1_redact::redact(&answer).text;
             let summary = Item::User {
                 text: format!("{SUMMARY_MARKER}\n{answer}"),
             };
@@ -362,18 +384,18 @@ enum Ask {
     Cancelled,
 }
 
-/// The usage of two requests of one summarization, summed per part. A part either
-/// request reported is summed — the one the other omitted counts as zero, as the
-/// missing cache parts do everywhere else — and usage stays unknown only when
-/// neither request reported any.
+/// The usage of the two requests of a retried summarization, summed per part. A part
+/// is summed only when BOTH requests reported it: when either one left it unknown the
+/// sum is unknown too, because a sum over an unknown part would state a number the
+/// route never reported (context.md, "unknown is not zero" — the same rule the
+/// estimator's `remaining` follows). Whole usage is unknown when either request
+/// reported none. A summarization that needed one request keeps that request's usage
+/// as it is (the caller sums only from the second attempt on).
 fn sum_usage(first: Option<Usage>, second: Option<Usage>) -> Option<Usage> {
-    if first.is_none() && second.is_none() {
-        return None;
-    }
-    let (a, b) = (first.unwrap_or_default(), second.unwrap_or_default());
+    let (a, b) = (first?, second?);
     let part = |x: Option<u64>, y: Option<u64>| match (x, y) {
-        (None, None) => None,
-        (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+        (Some(x), Some(y)) => Some(x + y),
+        _ => None,
     };
     Some(Usage {
         input_uncached: part(a.input_uncached, b.input_uncached),

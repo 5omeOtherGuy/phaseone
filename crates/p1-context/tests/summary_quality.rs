@@ -136,8 +136,9 @@ fn history() -> Vec<Item> {
     vec![assistant_text("x".repeat(500)), assistant_text("tail")]
 }
 
-// A truncated summary is retried once with the cap doubled, and both requests'
-// usage is reported (summed by the usual known-parts rule).
+// A truncated summary is retried once with the cap doubled. A usage part is reported only
+// when BOTH attempts reported it: `cache_read` and `reasoning_output` are missing on the
+// second attempt here, so the sum stays unknown for them — never zero.
 #[tokio::test(start_paused = true)]
 async fn a_truncated_summary_is_retried_once_with_the_cap_doubled() {
     let history = history();
@@ -196,13 +197,95 @@ async fn a_truncated_summary_is_retried_once_with_the_cap_doubled() {
         prepared.usage,
         Some(Usage {
             input_uncached: Some(30),
-            cache_read: Some(2),
+            cache_read: None,
             cache_write: Some(4),
             output: Some(DEFAULT_CAP as u64 + 8),
-            reasoning_output: Some(1),
+            reasoning_output: None,
             cost_micro_usd: Some(14),
         })
     );
+}
+
+// The parts both attempts reported are summed, and usage of a retry where NEITHER attempt
+// reported anything stays unknown.
+#[tokio::test(start_paused = true)]
+async fn the_retry_sums_the_parts_both_attempts_reported() {
+    let history = history();
+    let first = Usage {
+        input_uncached: Some(10),
+        cache_read: Some(2),
+        cache_write: Some(3),
+        output: Some(4),
+        reasoning_output: Some(1),
+        cost_micro_usd: Some(5),
+    };
+    let second = Usage {
+        input_uncached: Some(20),
+        cache_read: Some(7),
+        cache_write: Some(1),
+        output: Some(8),
+        reasoning_output: Some(9),
+        cost_micro_usd: Some(9),
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        truncated(Some(first)),
+        Step::Events(vec![
+            StreamEvent::TextDelta {
+                block: 0,
+                text: "whole".into(),
+            },
+            StreamEvent::Finished(completed(
+                vec![text_block("whole")],
+                StopReason::EndTurn,
+                Some(second),
+            )),
+        ]),
+    ]));
+    let prepared = prepare(
+        &policy(
+            provider.clone(),
+            force_config(&history),
+            ModelOptions::default(),
+        ),
+        &history,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .expect("the completed retry must be accepted");
+    assert_eq!(
+        prepared.usage,
+        Some(Usage {
+            input_uncached: Some(30),
+            cache_read: Some(9),
+            cache_write: Some(4),
+            output: Some(12),
+            reasoning_output: Some(10),
+            cost_micro_usd: Some(14),
+        }),
+        "every part both attempts reported is summed"
+    );
+
+    // Neither attempt reported usage: the replacement's cost is unknown, never zero.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        truncated(None),
+        text_response("whole"),
+    ]));
+    let prepared = prepare(
+        &policy(
+            provider.clone(),
+            force_config(&history),
+            ModelOptions::default(),
+        ),
+        &history,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .expect("the completed retry must be accepted");
+    assert_eq!(prepared.usage, None, "unknown usage is not zero usage");
 }
 
 // The setting, not the default, is what the request carries and what is doubled.

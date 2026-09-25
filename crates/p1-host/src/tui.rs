@@ -25,7 +25,7 @@ use p1_tui::render::home::HomePrelude;
 use p1_tui::render::ledger::{ContextView, SessionView};
 use p1_tui::render::permission::PermissionView;
 use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
-use p1_tui::state::{Approval, PaneMode, Screen};
+use p1_tui::state::{Approval, PaneMode, Promotion, Screen};
 use p1_tui::transcript::Transcript;
 use ratatui::backend::Backend;
 use tokio::sync::mpsc;
@@ -73,6 +73,9 @@ pub struct TuiFrontEnd {
     /// (§10 `ctx`'s denominator); `None` fields when the environment has no
     /// `[context]` section.
     context: Mutex<(Option<u64>, Option<u64>)>,
+    /// Effective context windows announced for workers by
+    /// `FrontEnd::worker_context_configured`.
+    worker_windows: Arc<Mutex<HashMap<String, u64>>>,
     /// The parent's route label (ADR-0049 stage 3): a `/model`/`/effort` switch
     /// moves it, the same seam `LineFrontEnd` already uses — the assembled
     /// route fills it in, `route_label()` shares it with `crate::run::ModelSwitch`.
@@ -94,6 +97,7 @@ impl TuiFrontEnd {
             auth: Mutex::new(Some(auth)),
             labels: Mutex::new(None),
             context: Mutex::new((None, None)),
+            worker_windows: Arc::new(Mutex::new(HashMap::new())),
             route_label: Arc::new(Mutex::new(String::new())),
             tools: Mutex::new(Arc::new(Vec::new())),
         }
@@ -141,6 +145,15 @@ impl FrontEnd for TuiFrontEnd {
 
     fn context_configured(&self, window_tokens: Option<u64>, summarize_at_tokens: Option<u64>) {
         *self.context.lock().unwrap() = (window_tokens, summarize_at_tokens);
+    }
+
+    fn worker_context_configured(&self, worker_id: &str, window_tokens: Option<u64>) {
+        let mut worker_windows = self.worker_windows.lock().unwrap();
+        if let Some(window_tokens) = window_tokens {
+            worker_windows.insert(worker_id.to_string(), window_tokens);
+        } else {
+            worker_windows.remove(worker_id);
+        }
     }
 
     /// ADR-0049 stage 3: shared with `crate::run::ModelSwitch`, so a
@@ -276,6 +289,7 @@ impl FrontEnd for TuiFrontEnd {
                 worker_rows,
                 worker_stops,
                 worker_usage: HashMap::new(),
+                worker_windows: self.worker_windows.clone(),
                 branch,
                 tools: self.tools.lock().unwrap().clone(),
                 // Read once above: two `lock()` temporaries in this literal both
@@ -301,8 +315,12 @@ impl FrontEnd for TuiFrontEnd {
                         Ok(crossterm::event::Event::Key(key))
                             if key.kind == crossterm::event::KeyEventKind::Press =>
                         {
-                            Some(key)
+                            Some(Input::Key(key))
                         }
+                        // A resize is a frame input too: the frame on screen is
+                        // stale at the new size (`Terminal::draw` resizes its
+                        // own buffer, issue #141).
+                        Ok(crossterm::event::Event::Resize(..)) => Some(Input::Resize),
                         _ => None,
                     }
                 },
@@ -317,6 +335,7 @@ impl FrontEnd for TuiFrontEnd {
                 cancel,
                 &self.sink,
                 color_mode,
+                Redraws::new(DrawCounter::default()),
             )
             .await
         })
@@ -375,6 +394,8 @@ pub(crate) struct Driver {
     /// Usage reported by each worker's own responses; never merged into the
     /// parent's context or spend.
     worker_usage: HashMap<String, WorkerUsage>,
+    /// Effective context windows announced for individual workers.
+    worker_windows: Arc<Mutex<HashMap<String, u64>>>,
     inbox: p1_core::Inbox,
     /// §10 `branch`: refreshed off the render loop (`spawn_branch_refresh`,
     /// called from the async loop, never from a `Driver` method a plain
@@ -750,7 +771,9 @@ impl Driver {
     fn sync_workers(&mut self) {
         let mut rows = self.worker_rows.lock().unwrap().clone();
         self.screen.statusbar.workers = status::running_workers(&rows);
+        let worker_windows = self.worker_windows.lock().unwrap();
         for row in &mut rows {
+            row.context_window = worker_windows.get(&row.id).copied();
             if let Some(usage) = self.worker_usage.get(&row.id) {
                 row.model = Some(usage.model.clone());
                 row.tokens = usage.tokens;
@@ -1077,8 +1100,275 @@ fn spawn_branch_refresh(workspace: std::path::PathBuf, branch: Arc<Mutex<Option<
     });
 }
 
+/// Worker rows are re-read at 4 Hz while idle (issue #141). The refresher task
+/// publishes them every 500 ms, and a frame follows only when they changed, so
+/// the poll itself costs a lock and a comparison — never a render.
+///
+/// The slower poll is a deliberate trade, kept after review: worker rows are
+/// display-only, so up to ~200 ms more latency on a row is worth cutting the
+/// idle wake-ups from 20 a second to 4 (issue #141's whole point), and no frame
+/// follows a poll that changed nothing.
+const WORKER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The idle heartbeat (issue #141): the fastest an idle TUI needs to look at
+/// the fields that move on their own — the §10 clock (minute granularity), the
+/// branch, the worker count. A frame still follows only when their text moved,
+/// so an idle screen draws at most once a minute.
+const IDLE_HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// While a turn runs the `▪▪▪` pulse (SPEC §2) is the one frame input with no
+/// text to compare: colour alone moves, so the heartbeat itself must draw it.
+/// Its cell cycle is 1.1 s with a 180 ms stagger, so 5 Hz is the spinner's
+/// whole need and anything faster is frames nobody can see.
+const SPINNER_HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// One terminal input the loop acts on. A resize carries nothing: it only says
+/// the frame on screen is stale (`Terminal::draw` resizes its own buffer).
+#[derive(Debug, Clone, Copy)]
+enum Input {
+    Key(crossterm::event::KeyEvent),
+    Resize,
+}
+
+/// The frames one loop drew. Production ignores it; the idle-CPU tests (issue
+/// #141) hold a clone and count frames under fake time — a number taken from
+/// the draw path itself, never a timing assertion.
+#[derive(Clone, Default)]
+pub(crate) struct DrawCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+impl DrawCounter {
+    /// Frames drawn so far — the tests' read side.
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn bump(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The loop's draw decision (issue #141). A frame follows a key, a UI/agent
+/// event, an authorization, a resize, worker rows that differ from the last
+/// drawn ones, a statusline whose text moved, or a promotion that came or went
+/// — and, besides those frame inputs, only the heartbeat while something
+/// time-driven is on screen (a `▪▪▪` pulse or a §5 PEEK countdown).
+struct Redraws {
+    /// A frame input changed; the next iteration draws.
+    dirty: bool,
+    /// The heartbeat ticked, so time-based fields may have moved.
+    beat: bool,
+    /// Nothing has been drawn yet: the first frame is unconditional.
+    first: bool,
+    /// The worker rows of the last drawn frame.
+    rows: Vec<p1_tui::render::workers::WorkerBlock>,
+    /// The statusline fields of the last drawn frame.
+    status: p1_tui::render::statusbar::StatusBar,
+    /// The promotion of the last drawn frame: a PEEK appears and — the one
+    /// frame that erases its banner — expires.
+    promotion: Promotion,
+    /// Frames in a row the terminal has refused, cleared by the next frame that
+    /// reaches it. It lives here, not in a loop's stack, because the budget
+    /// must survive a turn: a turn that resolves after its first refused frame
+    /// hands the count to the next pump (or back to idle) instead of starting
+    /// over (issue #141 review).
+    failed: u8,
+    /// Frames drawn, for the tests.
+    draws: DrawCounter,
+}
+
+impl Redraws {
+    fn new(draws: DrawCounter) -> Self {
+        Self {
+            dirty: false,
+            beat: false,
+            first: true,
+            rows: Vec::new(),
+            status: Default::default(),
+            promotion: Default::default(),
+            failed: 0,
+            draws,
+        }
+    }
+
+    /// Whether this iteration draws a frame. Every time-based field that is on
+    /// screen when this is asked changes its TEXT (the clock, an elapsed time, a
+    /// worker count, a peek countdown), so the comparisons below catch it; only
+    /// the `▪▪▪` pulse moves by colour alone and needs the `animated` flag.
+    fn due(&self, screen: &Screen, animated: bool) -> bool {
+        self.first
+            || self.dirty
+            || (self.beat && animated)
+            || self.rows != screen.workers.workers
+            || self.status != screen.statusbar
+            || self.promotion != screen.promotion
+    }
+
+    /// Remember what was just drawn. Only ever called for a frame that reached
+    /// the terminal: a refused frame stays due for the next wake, and the only
+    /// thing that clears the consecutive-failure count is a frame this far.
+    fn drawn(&mut self, screen: &Screen) {
+        self.dirty = false;
+        self.beat = false;
+        self.first = false;
+        self.rows = screen.workers.workers.clone();
+        self.status = screen.statusbar.clone();
+        self.promotion = screen.promotion.clone();
+        self.failed = 0;
+    }
+
+    /// The terminal refused too many frames in a row: there is nothing left to
+    /// draw to, so the loop ends the way `run` does for a terminal it cannot use.
+    /// The count spans turns, so any mix of idle and pump attempts reaches it.
+    fn refused(&self) -> bool {
+        self.failed >= DRAW_FAILURES_BEFORE_EXIT
+    }
+
+    /// The heartbeat to wait at until the next check: the spinner's while a
+    /// `▪▪▪` pulse is on screen (only its colour moves), the idle rate
+    /// otherwise, where the wake merely re-reads the clock's text and any
+    /// countdown. A PEEK moves once a second, so the idle rate covers it.
+    fn heartbeat(&self, spinning: bool) -> std::time::Duration {
+        if spinning {
+            SPINNER_HEARTBEAT
+        } else {
+            IDLE_HEARTBEAT
+        }
+    }
+}
+
+/// Whether a `▪▪▪` pulse is on screen this frame (SPEC §2): a running call row,
+/// or the turn working row that stands in for a live turn with nothing running.
+/// Reduced motion freezes the pulse and a parked approval replaces the working
+/// row — neither leaves anything to animate.
+fn pulsing(screen: &Screen, now_ms: u64) -> bool {
+    if screen.reduced_motion {
+        return false;
+    }
+    match &screen.attached {
+        // A worker's own transcript is on screen: its pulse, not the parent's.
+        Some(worker) => {
+            worker.transcript.call_running() || worker.transcript.turn_working(now_ms).is_some()
+        }
+        None => {
+            screen.transcript.call_running()
+                || (screen.working.is_some() && screen.approval.is_none())
+        }
+    }
+}
+
+/// Whether a §5 PEEK banner is on screen this frame. Its countdown moves once a
+/// second, so it needs the heartbeat to draw (like the pulse), and it cannot be
+/// compared as text: the renderer hides it the instant its `until_ms` passes.
+/// `Screen::tick` has already cleared an expired one, so a `Peek` still set is a
+/// banner the operator can see — `render::screen` hides it while the pane is
+/// pinned or a decision is on screen, and so does this.
+fn peek_visible(screen: &Screen) -> bool {
+    matches!(screen.promotion, Promotion::Peek { .. })
+        && !screen.pinned
+        && screen.approval.is_none()
+}
+
+/// How many frames in a row the terminal may refuse before the loop gives up
+/// (issue #141 review): one retry per wake, then the same exit `run` takes for a
+/// terminal it cannot use. The count lives in [`Redraws`], so a turn that ends
+/// between two refusals cannot reset the budget.
+const DRAW_FAILURES_BEFORE_EXIT: u8 = 3;
+
+/// A terminal that refused [`DRAW_FAILURES_BEFORE_EXIT`] frames in a row. This
+/// is how `run` reports a terminal it could not use — there is nothing left to
+/// draw to, so the loop ends the same way.
+fn terminal_gave_up(error: &str) -> i32 {
+    eprintln!("p1 --tui: {error}");
+    1
+}
+
+/// The loop's heartbeat timer. It wakes at the rate the last frame asked for,
+/// so a rate change restarts the wait instead of firing a catch-up tick.
+struct Heartbeat {
+    interval: tokio::time::Interval,
+    period: std::time::Duration,
+}
+
+impl Heartbeat {
+    fn new() -> Self {
+        Self {
+            interval: Self::every(IDLE_HEARTBEAT),
+            period: IDLE_HEARTBEAT,
+        }
+    }
+
+    /// One interval that first ticks a whole period from now — the heartbeat
+    /// never fires at the instant the rate changes.
+    fn every(period: std::time::Duration) -> tokio::time::Interval {
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval
+    }
+
+    /// Wait `period` for the next tick; a period change takes effect at once.
+    fn set(&mut self, period: std::time::Duration) {
+        if self.period != period {
+            self.period = period;
+            self.interval = Self::every(period);
+        }
+    }
+
+    async fn tick(&mut self) {
+        self.interval.tick().await;
+    }
+}
+
+/// One iteration's frame decision (issue #141): advance the screen's own time
+/// state (the §5 PEEK expiry), republish the fields that move without an event
+/// (worker rows, the §10 clock and branch), draw a frame only when a frame input
+/// changed, and say which heartbeat to wait at next.
+///
+/// `Err` is the terminal refusing the frame: nothing was recorded as drawn, so
+/// the frame stays due and the next wake (a heartbeat tick, a key, an event)
+/// retries it. The message is the terminal's own. Every refusal is counted here,
+/// where the only `draw` call is, so the caller can end the loop on a terminal
+/// that keeps refusing — whichever loop (idle or a turn) took the attempt.
+fn frame_if_due<B: Backend>(
+    redraws: &mut Redraws,
+    terminal: &mut ratatui::Terminal<B>,
+    driver: &mut Driver,
+    now_ms: u64,
+    color_mode: ColorMode,
+) -> Result<std::time::Duration, String> {
+    driver.sync_workers();
+    driver.sync_status(now_ms);
+    // The screen's own clock: a PEEK expires three seconds after it appeared
+    // (§5), so every wake advances it and the countdown needs no timer of its
+    // own.
+    driver.screen.tick(now_ms);
+    let spinning = pulsing(&driver.screen, now_ms);
+    let animated = spinning || peek_visible(&driver.screen);
+    if redraws.due(&driver.screen, animated) {
+        match draw(
+            terminal,
+            &mut driver.screen,
+            now_ms,
+            color_mode,
+            &redraws.draws,
+        ) {
+            Ok(()) => redraws.drawn(&driver.screen),
+            Err(error) => {
+                redraws.failed = redraws.failed.saturating_add(1);
+                return Err(error.to_string());
+            }
+        }
+    }
+    Ok(redraws.heartbeat(spinning))
+}
+
 /// The render/input loop over a borrowed agent. Turns are pinned futures
 /// inside this function: polled every wakeup, never dropped mid-flight.
+///
+/// Idle (issue #141): a frame follows a frame input — a key, a UI/agent event,
+/// an authorization, a resize, worker rows, statusline text or a promotion that
+/// changed — or the heartbeat while a `▪▪▪` pulse or a PEEK countdown is on
+/// screen. Nothing else draws, and the worker poll never does.
 #[allow(clippy::too_many_arguments)]
 async fn drive_loop<B, K>(
     terminal: &mut ratatui::Terminal<B>,
@@ -1090,13 +1380,16 @@ async fn drive_loop<B, K>(
     cancel: &CancellationToken,
     sink: &TuiSink,
     color_mode: ColorMode,
+    mut redraws: Redraws,
 ) -> i32
 where
     B: Backend,
-    K: futures_util::Stream<Item = crossterm::event::KeyEvent> + Unpin,
+    K: futures_util::Stream<Item = Input> + Unpin,
 {
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut workers =
+        tokio::time::interval_at(tokio::time::Instant::now() + WORKER_POLL, WORKER_POLL);
+    workers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = Heartbeat::new();
     let mut prompt: Option<String> = None;
     loop {
         if let Some(code) = driver.exit {
@@ -1109,13 +1402,16 @@ where
         // the last turn's end), then drain the inbox after it — the
         // interactive loop's drain rule, unchanged.
         if let Some(text) = prompt.take() {
+            // A new turn is a frame input of its own: the operator line, the
+            // working row. The pump's first iteration draws it.
+            redraws.dirty = true;
             let child = cancel.child_token();
             driver.policy.set_turn(Some(child.clone()));
             // Bind mutably: the drain loop below can run more than one
             // inbox sub-turn, and the end that decides whether to stop is
             // the LAST one. A `let` inside the loop would shadow this and
             // the check would read the first turn's end instead.
-            let mut end = pump(
+            let mut end = match pump(
                 terminal,
                 driver,
                 &mut keys,
@@ -1124,13 +1420,18 @@ where
                 sink,
                 &child,
                 color_mode,
+                &mut redraws,
                 Box::pin(agent.run_turn(text, child.clone())),
             )
-            .await;
+            .await
+            {
+                Ok(end) => end,
+                Err(error) => return terminal_gave_up(&error),
+            };
             driver.note_turn_end(&end);
             spawn_branch_refresh(driver.workspace.clone(), driver.branch.clone());
             while !child.is_cancelled() && agent.has_pending_inbox() {
-                end = pump(
+                end = match pump(
                     terminal,
                     driver,
                     &mut keys,
@@ -1139,6 +1440,7 @@ where
                     sink,
                     &child,
                     color_mode,
+                    &mut redraws,
                     Box::pin(async {
                         agent
                             .run_inbox_turn(child.clone())
@@ -1148,7 +1450,11 @@ where
                             })
                     }),
                 )
-                .await;
+                .await
+                {
+                    Ok(end) => end,
+                    Err(error) => return terminal_gave_up(&error),
+                };
                 driver.note_turn_end(&end);
                 spawn_branch_refresh(driver.workspace.clone(), driver.branch.clone());
             }
@@ -1158,6 +1464,9 @@ where
             if let Some(pending) = driver.pending_switch.take() {
                 driver.apply_switch(pending, agent);
             }
+            // The turn's end moved the screen too: the working row leaves, a
+            // cancelled turn drops its queue, a switch renames the chip.
+            redraws.dirty = true;
             if matches!(end, TurnEnd::Cancelled) {
                 continue;
             }
@@ -1168,42 +1477,64 @@ where
                 .or_else(|| driver.submit_pending.take());
             continue;
         }
-        // Idle: draw, then wait for anything.
-        driver.sync_status(sink.now_ms());
-        draw(terminal, &mut driver.screen, sink.now_ms(), color_mode);
+        // Idle: republish what moves by itself, draw only when a frame input
+        // changed, then wait for anything at all.
+        match frame_if_due(&mut redraws, terminal, driver, sink.now_ms(), color_mode) {
+            Ok(period) => heartbeat.set(period),
+            // The terminal refused the frame. Keep the frame due and wait at the
+            // rate already armed — one retry per wake, never a spin — until the
+            // consecutive refusals (idle and turn alike) run out.
+            Err(error) => {
+                if redraws.refused() {
+                    return terminal_gave_up(&error);
+                }
+            }
+        }
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return 130,
-            key = keys.next() => {
-                let Some(key) = key else { return 0 };
-                if is_cancel(&key) {
-                    driver.exit = Some(0);
-                    continue;
-                }
-                driver.on_key(key, Some(agent));
-                if let Some(text) = driver.submit_pending.take() {
-                    prompt = Some(text);
+            input = keys.next() => {
+                let Some(input) = input else { return 0 };
+                redraws.dirty = true;
+                match input {
+                    // The frame on screen is stale at the new size; the next
+                    // iteration draws it.
+                    Input::Resize => {}
+                    Input::Key(key) if is_cancel(&key) => driver.exit = Some(0),
+                    Input::Key(key) => {
+                        driver.on_key(key, Some(agent));
+                        if let Some(text) = driver.submit_pending.take() {
+                            prompt = Some(text);
+                        }
+                    }
                 }
             }
             ui = events.recv() => {
                 match ui {
-                    Some(ui) => driver.on_ui_event(ui),
+                    Some(ui) => {
+                        redraws.dirty = true;
+                        driver.on_ui_event(ui);
+                    }
                     None => return 0,
                 }
             }
             request = auth.recv() => {
                 if let Some(request) = request {
+                    redraws.dirty = true;
                     driver.on_auth(request);
                 }
             }
-            _ = tick.tick() => { driver.sync_workers(); }
+            // Paces re-reading the worker rows; the frame still follows only
+            // when `frame_if_due` above sees them differ.
+            _ = workers.tick() => {}
+            _ = heartbeat.tick() => redraws.beat = true,
             _ = agent.inbox_ready() => {
                 // A worker's completion arrived at idle: drain it through the
                 // inbox path — never as a phantom empty user turn.
                 let child = cancel.child_token();
                 driver.policy.set_turn(Some(child.clone()));
                 while agent.has_pending_inbox() {
-                    let end = pump(
+                    let end = match pump(
                         terminal,
                         driver,
                         &mut keys,
@@ -1212,6 +1543,7 @@ where
                         sink,
                         &child,
                         color_mode,
+                        &mut redraws,
                         Box::pin(async {
                             agent
                                 .run_inbox_turn(child.clone())
@@ -1221,7 +1553,11 @@ where
                                 })
                         }),
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(end) => end,
+                        Err(error) => return terminal_gave_up(&error),
+                    };
                     driver.note_turn_end(&end);
                     spawn_branch_refresh(driver.workspace.clone(), driver.branch.clone());
                 }
@@ -1229,6 +1565,7 @@ where
                 if let Some(pending) = driver.pending_switch.take() {
                     driver.apply_switch(pending, agent);
                 }
+                redraws.dirty = true;
             }
         }
     }
@@ -1237,6 +1574,16 @@ where
 /// Poll one turn-shaped future to completion while the UI stays live: keys,
 /// events and parked authorizations are handled on every wakeup, and the
 /// future is re-polled — never dropped — until it resolves.
+///
+/// Frames follow the idle rule (issue #141), except that a `▪▪▪` pulse is on
+/// screen while the turn runs: the heartbeat then draws it at the spinner's
+/// rate instead of once a second.
+///
+/// `Err` is the terminal refusing [`DRAW_FAILURES_BEFORE_EXIT`] frames in a row —
+/// counted in `redraws`, so refusals from an earlier turn or from idle count
+/// too: there is no screen left to keep live, so the caller ends the loop the
+/// way `run` does for a terminal it cannot use (the one case where this returns
+/// without the turn future finishing).
 #[allow(clippy::too_many_arguments)]
 async fn pump<B, K, F>(
     terminal: &mut ratatui::Terminal<B>,
@@ -1247,44 +1594,62 @@ async fn pump<B, K, F>(
     sink: &TuiSink,
     turn_cancel: &CancellationToken,
     color_mode: ColorMode,
+    redraws: &mut Redraws,
     mut turn: std::pin::Pin<Box<F>>,
-) -> TurnEnd
+) -> Result<TurnEnd, String>
 where
     B: Backend,
-    K: futures_util::Stream<Item = crossterm::event::KeyEvent> + Unpin,
+    K: futures_util::Stream<Item = Input> + Unpin,
     F: std::future::Future<Output = TurnEnd>,
 {
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut workers =
+        tokio::time::interval_at(tokio::time::Instant::now() + WORKER_POLL, WORKER_POLL);
+    workers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = Heartbeat::new();
     let mut keys_done = false;
     loop {
-        driver.sync_status(sink.now_ms());
-        draw(terminal, &mut driver.screen, sink.now_ms(), color_mode);
+        match frame_if_due(redraws, terminal, driver, sink.now_ms(), color_mode) {
+            Ok(period) => heartbeat.set(period),
+            // A refusal is counted across the whole loop, not per pump: a turn
+            // that resolves after its first refused frame leaves the count to
+            // the next pump (or to idle), so a persistent failure still ends it.
+            Err(error) => {
+                if redraws.refused() {
+                    return Err(error);
+                }
+            }
+        }
         tokio::select! {
             biased;
-            end = &mut turn => return end,
-            key = keys.next(), if !keys_done => {
-                let Some(key) = key else { keys_done = true; continue };
-                if is_cancel(&key) {
-                    // ^C during a turn cancels the TURN; quitting is idle-only.
-                    turn_cancel.cancel();
-                    continue;
+            end = &mut turn => return Ok(end),
+            input = keys.next(), if !keys_done => {
+                let Some(input) = input else { keys_done = true; continue };
+                redraws.dirty = true;
+                match input {
+                    Input::Resize => {}
+                    Input::Key(key) if is_cancel(&key) => {
+                        // ^C during a turn cancels the TURN; quitting is idle-only.
+                        turn_cancel.cancel();
+                    }
+                    // A turn's future owns `agent`; a `/model`/`/effort`
+                    // mid-turn queues instead (§11).
+                    Input::Key(key) => driver.on_key(key, None),
                 }
-                // A turn's future owns `agent`; a `/model`/`/effort` mid-turn
-                // queues instead (§11).
-                driver.on_key(key, None);
             }
             ui = events.recv() => {
                 if let Some(ui) = ui {
+                    redraws.dirty = true;
                     driver.on_ui_event(ui);
                 }
             }
             request = auth.recv() => {
                 if let Some(request) = request {
+                    redraws.dirty = true;
                     driver.on_auth(request);
                 }
             }
-            _ = tick.tick() => { driver.sync_workers(); }
+            _ = workers.tick() => {}
+            _ = heartbeat.tick() => redraws.beat = true,
         }
     }
 }
@@ -1367,7 +1732,8 @@ fn spawn_worker_refresher(
                     elapsed,
                     cost_micro_usd: None,
                     tokens: None,
-                    // The child's configured window is not known to the host.
+                    // The driver fills the effective window from
+                    // `FrontEnd::worker_context_configured`.
                     context_window: None,
                     grants,
                     activity,
@@ -1412,12 +1778,19 @@ fn is_cancel(key: &crossterm::event::KeyEvent) -> bool {
 /// Draw one frame, then degrade the whole buffer to the process's colour mode
 /// (§2): truecolor needs no pass (`palette::degrade`'s RGB→indexed path is
 /// for 256/no-colour only), so it is skipped rather than called as a no-op.
+///
+/// Every frame goes through here and bumps `draws` (issue #141), so the loop's
+/// tests count frames on the draw path itself rather than by timing. The
+/// terminal's own result comes back to the caller: a refused frame was never
+/// shown, so it must not be recorded as drawn.
 fn draw<B: Backend>(
     terminal: &mut ratatui::Terminal<B>,
     screen: &mut Screen,
     now_ms: u64,
     color_mode: ColorMode,
-) {
+    draws: &DrawCounter,
+) -> Result<(), B::Error> {
+    draws.bump();
     terminal
         .draw(|frame| {
             // Focus mode: explicit (/focus) wins; otherwise automatic at 12
@@ -1432,7 +1805,7 @@ fn draw<B: Backend>(
                 frame.set_cursor_position(cursor);
             }
         })
-        .ok();
+        .map(|_| ())
 }
 
 /// The file a successful call writes, from the tool that owns it (ADR-0057):
@@ -1642,6 +2015,36 @@ fn models_command_output(
 
 #[cfg(test)]
 mod tests;
+
+/// The TUI records a worker's effective context window, and removes the fact
+/// when the child reports that it has no configured context.
+#[cfg(test)]
+mod worker_context_window_tests {
+    use super::*;
+
+    #[test]
+    fn worker_context_windows_are_set_and_cleared_by_id() {
+        let front_end = TuiFrontEnd::new(
+            TuiOptions {
+                env: "claude".into(),
+                ask: false,
+                workspace: std::path::PathBuf::from("/workspace"),
+                sandbox: "off".into(),
+                effort: None,
+            },
+            CancellationToken::new(),
+        );
+
+        front_end.worker_context_configured("w1", Some(200_000));
+        assert_eq!(
+            front_end.worker_windows.lock().unwrap().get("w1"),
+            Some(&200_000)
+        );
+
+        front_end.worker_context_configured("w1", None);
+        assert!(!front_end.worker_windows.lock().unwrap().contains_key("w1"));
+    }
+}
 
 /// The worker-end wiring (ADR-0050 item 6): the sentence the line front end prints
 /// reaches the TUI as the note the driver already renders for a provider notice, so

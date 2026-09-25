@@ -12,16 +12,27 @@ module = "apply_patch"
 [[tools]]
 module = "finish"
 
-# Operational values, not a capacity claim: no vendor documents a context window for this
-# subscription endpoint (research #27), and no p1 run has proven a request size on it yet.
-# 200k is deliberately conservative — a too-small window only summarizes earlier, a too-large one
-# fails the request. Summarize late enough for multi-file work (a tight threshold thrashes: run
-# split4a-deepseek, docs/dogfood/runs.jsonl), keep a long tail. Raise only on evidence from
-# several runs, never from one run's peak.
+# GPT on the ChatGPT-login (Codex) subscription, not the API: the same model on api.openai.com is
+# 1,050,000 (OpenRouter public list), but the Codex CLI's own model metadata for this account says
+# otherwise. Source (2026-09-24): github.com/openai/codex, codex-rs/models-manager/models.json at
+# main cf792c3a — "Model metadata returned by the Codex backend /models endpoint" — gpt-5.6-sol:
+# "context_window": 272000, "max_context_window": 872000, "auto_compact_token_limit": null,
+# supports_experimental_context: false. codex-rs/protocol/src/openai_models.rs then derives the
+# auto-compaction point at 90% of the window (244,800) and counts only 95% of the window as usable
+# INPUT, "after reserving headroom for system prompts, tool overhead, and model output" (258,400).
+# This table follows that accounting: window = the subscription's context window, and the
+# auto-compaction point stays below Codex's 244,800. The reserve is 32,000: LEAD POLICY
+# (2026-09-25), because REASONING COUNTS AS OUTPUT and the same model's public API face allows up
+# to 128,000 completion tokens — Codex's own 5% (13,600) is smaller than one reasoning-heavy turn
+# can be, and no per-response measurement exists for this route. The reserve bounds the wall at
+# 240,000, so summarizing at 220,000 leaves 52,000 for one response; a single xhigh response above
+# 52,000 is possible and would hit the window — ACCEPTED RISK, to be revisited with per-response
+# telemetry (deferred follow-up, docs/design/context-windows.md). 872,000 is not used: no model
+# our route binds enables experimental context, and overstating a window fails the request.
 [context]
-window_tokens = 200000
+window_tokens = 272000
 output_headroom_tokens = 32000
-summarize_at_tokens = 120000
+summarize_at_tokens = 220000
 keep_recent_tokens = 40000
 user_verbatim_tokens = 8000
 summary_output_tokens = 12000

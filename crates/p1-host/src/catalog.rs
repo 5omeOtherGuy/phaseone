@@ -471,13 +471,16 @@ fn register_standard_tools(
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) {
+    let read_home = deps.home.clone();
     catalog.tool(
         "read",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_read::ReadTool::new(services.workspace.clone(), services.observed.clone()),
-                spec
-            ))
+        Box::new(move |spec: &ToolSpec, services: &ToolServices| {
+            // Issue #142: `read` refuses the credential files under the agent's home
+            // (the injected one in tests), whatever access it was granted.
+            let tool =
+                p1_tool_read::ReadTool::new(services.workspace.clone(), services.observed.clone())
+                    .with_home(read_home.clone());
+            Ok(apply_face!(tool, spec))
         }),
     );
     catalog.tool(

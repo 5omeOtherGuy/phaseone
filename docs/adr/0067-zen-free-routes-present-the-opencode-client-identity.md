@@ -1,7 +1,7 @@
 ---
 adr: 67
 title: Zen free routes present the OpenCode client identity
-status: proposed
+status: accepted
 date: 2026-09-24
 deciders: owner+lead
 supersedes: []

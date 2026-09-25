@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
+# The summarizer's own output goes through the same credential-shape matcher the
+# host wraps every tool in (issue #142).
+p1-redact = { path = "../p1-redact" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["macros"] }
 
