@@ -19,9 +19,9 @@ major 1. The files are split by topic:
 | [`process.wit`](../../../modules/wit/process.wit) | `process` |
 | [`transport.wit`](../../../modules/wit/transport.wit) | `credential-control`, `http`, `websocket` |
 | [`session.wit`](../../../modules/wit/session.wit) | `summary`, `completion` |
-| [`delegation.wit`](../../../modules/wit/delegation.wit) | `workers`, `workflows` |
+| [`delegation.wit`](../../../modules/wit/delegation.wit) | `worker-types`, `workers-start`, `workers-observe`, `workers-control`, `workflows` |
 | [`decoding.wit`](../../../modules/wit/decoding.wit) | `decoding`, the provider's exported decoder |
-| [`worlds.wit`](../../../modules/wit/worlds.wit) | the five worlds |
+| [`worlds.wit`](../../../modules/wit/worlds.wit) | the six worlds |
 
 No world imports a `wasi:` interface. WASI is not part of the approved dependency set and the
 host does not link `wasmtime-wasi`, so every capability a module can have is one of p1's own
@@ -45,13 +45,16 @@ string alias in `types` (`tool-call`, `tool-outcome`, `history-item`, `stream-ev
 has no alias of its own. Text that does not conform is the module's invalid output
 (`ModuleFailure::InvalidOutput`), never a value. Small closed values that the host reads
 without parsing JSON are WIT types: `effect` (`read-only`, `writes-files`, `executes`,
-`delegates`, mirroring `p1_contracts::Effect`), `decision` (`permit` or `deny(reason)`), the
-declaration and its `declaration-kind`, `tool-identity` and `stop-reason`.
+`delegates`, mirroring `p1_contracts::Effect`), `decision` (`permit` or `deny(reason)`, the
+mirror of `p1_contracts::Decision`), the declaration and its `declaration-kind`,
+`tool-identity` and `stop-reason`.
 
 The generic alias `json` marks JSON that is not a protocol family; each use says what it
 holds: a declaration's input JSON Schema, a module's own settings, a workflow's arguments and
-value, a finish tool's output contract and structured result, and a workflow run's status
-(`p1_workflow::RunStatus` in its serde form, whose schema `p1-workflow` owns).
+value, a finish tool's output contract and structured result, a workflow run's status
+(`p1_workflow::RunStatus` in its serde form, whose schema `p1-workflow` owns), and the
+snapshot, request, outcome and answers of `workflow-decision` (their schemas are
+`p1-workflow`'s too).
 
 ## Worlds (freeze item 1)
 
@@ -60,8 +63,9 @@ value, a finish tool's output contract and structured result, and a workflow run
 | `tool` | `declaration`, `effect`, `describe`, `describe-result`, `execute` | `p1_contracts::Tool` |
 | `provider` | `configure`, `describe`, `validate`, `lower`, `classify`, interface `decoding` | `p1_contracts::Provider` |
 | `context-policy` | `configure`, `prepare`, `compact-now` | `p1_contracts::ContextPolicy` |
-| `authorization-policy` | `authorize` | `p1_contracts::AuthorizationPolicy` |
+| `authorization-policy` | `authorize` | `p1_contracts::AuthorizationPolicy`, through the native ask bridge |
 | `workflow-implementation` (optional) | `run` | none yet |
+| `workflow-decision` | `plan-step`, `accept-step` | none; `p1-workflow` calls it |
 
 - **tool.** `declaration` returns what the model is told; `effect` and `describe` classify
   and describe one call; `describe-result` describes a `tool_result` history item; `execute`
@@ -71,10 +75,12 @@ value, a finish tool's output contract and structured result, and a workflow run
 - **provider.** A provider module lowers requests and classifies what comes back; the broker
   sends (freeze item 9, below). `describe` returns the route description, on the restricted
   path and so from the state `configure` stored on that instance; `validate` refuses
-  what the route cannot carry; `lower` turns a provider request into the HTTP request the
-  broker sends (method, path relative to the route's endpoint, headers without credentials,
-  the credential's placement, body) and, for a route that speaks WebSocket, the handshake and
-  request frame as well; `classify` maps a non-2xx response or a refused upgrade to a provider
+  what the route cannot carry; `lower` takes a provider request and the broker's
+  `connection-state` and returns either the HTTP request the broker sends (method, path
+  relative to the route's endpoint, headers without credentials, the credential's placement,
+  body) or, for a route that speaks WebSocket, a `websocket-send`: the handshake head when no
+  connection is open, and the one frame to send (see "WebSocket: who decides what" below);
+  `classify` maps a non-2xx response or a refused upgrade to a provider
   error; the exported `decoding` interface holds the `decoder` resource that turns the
   response's events into stream events (`feed`, and `finish` when the body ends without a
   terminal event).
@@ -82,12 +88,21 @@ value, a finish tool's output contract and structured result, and a workflow run
   `none` (unchanged), replacement items with the usage preparing them cost, or a context error
   (`cancelled` or `failed`). `compact-now` is the manual compaction of ADR-0076.
 - **authorization-policy.** `authorize` takes the call, the loader-built identity of the tool
-  that would run it and that tool's effect, and returns a decision. Asking the operator stays
-  in the host's own policy; this world has no way to read input.
+  that would run it and that tool's effect, and returns a `verdict`: `permit`, `deny(reason)`
+  or `ask`. The world has no way to read input, so the host resolves `ask`: the native ask
+  bridge asks through the front end (a headless host answers without waiting for input), and
+  only a `p1_contracts::Decision`, Permit or Deny, reaches the core. `verdict` is local to this
+  world; `types.decision` stays the mirror of `p1_contracts::Decision`, unchanged.
 - **workflow-implementation.** Optional: a workflow written as a module instead of a script.
   `run` takes the arguments and returns the workflow's JSON value or why it failed; it works
-  through `workers` and `workflows`. No stream needs it yet, and the host needs no adapter for
-  it until one does.
+  through `workers-start`, `workers-observe`, `workers-control` and `workflows`. No stream
+  needs it yet, and the host needs no adapter for it until one does.
+- **workflow-decision.** A workflow's decisions as a component, with its state native. The
+  decision component answers short calls; the native substrate (`p1-workflow`) keeps all
+  state and passes the snapshot in: `plan-step` takes the snapshot and a request and returns
+  the next step as JSON or why it cannot, and `accept-step` takes the snapshot and a step's
+  outcome and returns what to record or why it is refused. It imports `control` and `clock`
+  only.
 
 Additions beyond the slice brief's export list, each with its reason:
 
@@ -107,11 +122,10 @@ Additions beyond the slice brief's export list, each with its reason:
   shares (`p1-provider-http`'s SSE decoder), so the broker frames and the decoder receives an
   SSE event with its name, or one WebSocket text frame as data with no name, exactly as the
   native `ResponseParser` does.
-- `websocket-request.continuation` and `decoder.response-id`. The native Codex route continues
-  the previous response on a reused connection (`docs/design/websocket.md` §6). The connection
-  is the broker's, so the module offers a continuation frame naming the response it continues,
-  the decoder reports the id of the response it saw, and the broker sends the continuation only
-  on the connection whose last clean response has that id; otherwise the full frame goes out.
+- `connection-state` and `decoder.response-id`. The native Codex route continues the previous
+  response on a reused connection ([`websocket.md`](../websocket.md) §6). The decoder reports
+  the id of the response it saw, the broker reports it back as the last clean response of the
+  open connection, and the component decides from that whether a continuation frame fits.
 
 ## Capability interfaces (freeze item 3)
 
@@ -129,11 +143,14 @@ native crate. Each is sized to what today's native implementation needs.
 | `workspace-mutation` | `p1-workspace` | `begin` the write gate; the `mutation` resource's `write`, `create`, `remove`, `rename`, each an atomic native operation |
 | `process` | the process service extracted from `p1-tool-shell` | `spawn` a `bash -lc` command with a time limit; the `running` streaming resource |
 | `http` | `p1-provider-http` with the `p1-auth` broker | the lowered HTTP request and the response head |
-| `websocket` | `p1-provider-http` with the `p1-auth` broker | the lowered WebSocket handshake, frame and continuation |
+| `websocket` | `p1-provider-http` with the `p1-auth` broker | `connection-state` (the broker's facts) and `websocket-send` (the optional handshake head and the frame) |
 | `credential-control` | `p1-provider-http` with the `p1-auth` broker | `credential-use`: how the broker attaches the credential |
 | `summary` | the native context adapter | `summarize`: one summarization request through the agent's provider |
 | `completion` | the host completion hub | the session record the `finish` tool verifies against, and `accept` |
-| `workers` | `p1-workers` | `start`, `describe`, `status`, `wait`, `cancel`, `continue-child` |
+| `worker-types` | `p1-workers` | the records and variants the three worker interfaces share; no functions, grants nothing |
+| `workers-start` | `p1-workers` | `start` |
+| `workers-observe` | `p1-workers` | `describe`, `status`, `wait` |
+| `workers-control` | `p1-workers` | `cancel`, `continue-child` |
 | `workflows` | `p1-workflow` | `start`, `status`, `wait`, `cancel` |
 
 Notes on the boundary each one keeps:
@@ -150,16 +167,27 @@ Notes on the boundary each one keeps:
   carry no function that returns a value: a provider names where the credential goes
   (`credential-use`), and the broker refuses a lowered request whose own headers name
   `authorization`, `proxy-authorization`, `cookie`, `x-api-key` or `api-key`. Sending,
-  retry, backoff, the one refresh after a 401 or 403, the read bounds, the WebSocket
-  connection's lifetime and the fallback to HTTP all stay in the broker (freeze item 9).
+  retry, backoff, the one refresh after a 401 or 403, the read bounds and the WebSocket
+  connection's lifetime stay in the broker (freeze item 9); the continuation and the fallback
+  to HTTP are the component's decisions (below).
 - **Summaries are masked natively.** The host masks credential-shaped text in a summary before
   the module sees it, as the native policy does (issue #142).
+- **Worker ids are host-scoped.** A child is named by a string id, not a WIT resource. An id is
+  valid only in the scope that started it — the (generation, operation, parent) it was started
+  in — and any other id, including one started by another module or another parent, is
+  `unknown-child`.
+- **Worker capabilities are per member, and static.** The worker functions are split into
+  `workers-start`, `workers-observe` and `workers-control` so that what a module may do with
+  workers is visible in its imports, which the boundary check compares to its class
+  allocation; a grant per function would be invisible to that check. A tool such as
+  `worker_result` declares only `workers-observe` in its manifest and cannot link `start`.
 - **Worker and workflow waits block the import.** `wait` returns as soon as the child or run
   is no longer running, and returns the running status at once when the call is cancelled
   first, as `WorkerService::wait` and `WorkflowService::wait` do.
 
 `types` is imported by every world for its types only and grants nothing, so it is not part of
-any allocation.
+any allocation. `worker-types` is the same: a component importing any worker interface imports
+it for the shared types, and it grants nothing.
 
 ## Per-class capability allocation (freeze item 13)
 
@@ -167,25 +195,69 @@ Each world imports the union of the capabilities its class may be granted. A mod
 narrows it, the host links only what the manifest grants, and
 `scripts/check-module-boundaries.sh` compares a component's actual imports to this table.
 
-| Capability | tool | provider | context-policy | authorization-policy | workflow-implementation |
-|---|---|---|---|---|---|
-| `control` | yes | yes | yes | yes | yes |
-| `clock` | yes | yes | yes | yes | yes |
-| `random` | yes | yes | — | — | yes |
-| `notices` | yes | yes | yes | yes | yes |
-| `workspace` | yes | — | — | — | — |
-| `snapshot` | yes | — | — | — | — |
-| `workspace-mutation` | yes | — | — | — | — |
-| `process` | yes | — | — | — | — |
-| `workers` | yes | — | — | — | yes |
-| `workflows` | yes | — | — | — | yes |
-| `completion` | yes | — | yes | — | — |
-| `http` | — | yes | — | — | — |
-| `websocket` | — | yes | — | — | — |
-| `credential-control` | — | yes | — | — | — |
-| `summary` | — | — | yes | — | — |
+| Capability | tool | provider | context-policy | authorization-policy | workflow-implementation | workflow-decision |
+|---|---|---|---|---|---|---|
+| `control` | yes | yes | yes | yes | yes | yes |
+| `clock` | yes | yes | yes | yes | yes | yes |
+| `random` | yes | yes | — | — | yes | — |
+| `notices` | yes | yes | yes | yes | yes | — |
+| `workspace` | yes | — | — | — | — | — |
+| `snapshot` | yes | — | — | — | — | — |
+| `workspace-mutation` | yes | — | — | — | — | — |
+| `process` | yes | — | — | — | — | — |
+| `workers-start` | yes | — | — | — | yes | — |
+| `workers-observe` | yes | — | — | — | yes | — |
+| `workers-control` | yes | — | — | — | yes | — |
+| `workflows` | yes | — | — | — | yes | — |
+| `completion` | yes | — | yes | — | — | — |
+| `http` | — | yes | — | — | — | — |
+| `websocket` | — | yes | — | — | — | — |
+| `credential-control` | — | yes | — | — | — | — |
+| `summary` | — | — | yes | — | — | — |
 
-The allocation is the frozen one, unchanged.
+The allocation is the frozen one, amended by decisions S0-R1.1 (the `workflow-decision`
+column) and S0-R1.3 (the three worker rows replace `workers`).
+
+## WebSocket: who decides what
+
+The provider component owns the Responses framing, the continuation decision and the fallback
+to HTTP/SSE. The host service (the transport broker in `p1-provider-http`) keeps TLS, the
+handshake, ping/pong, bounded writes, raw-frame activity, retry and backoff, and the one
+credential refresh (freeze item 9). The broker decides nothing about continuation or fallback:
+on every `lower` it passes a `connection-state` holding facts only:
+
+- `open`: whether a WebSocket connection of this provider instance is open;
+- `last-clean-response`: the response id of the last response that connection completed
+  cleanly, as the decoder reported it;
+- `failed-before-output`: whether the previous attempt of this same request failed over
+  WebSocket before any output.
+
+From these the component returns `lowered-request.http`, the fallback, or
+`lowered-request.websocket` with a `websocket-send`: `handshake` (path, headers, credential
+placement) present only when no connection is open, and `frame`, the full request frame or the
+shorter continuation frame that the rules of [`websocket.md`](../websocket.md) §6 allow. The
+component may remember in its own instance state that it fell back, as the native adapter turns
+WebSocket off for the rest of the provider instance.
+
+The pre-output/post-output rule of
+[ADR-0047](../../adr/0047-the-codex-route-may-speak-websocket-an-adapter-local-transport-with-sse-as-the-fallback.md)
+holds unchanged: a WebSocket failure before any output of a request is reported back through
+`connection-state` on the next `lower` call of that request, after the broker's own backoff,
+and the component chooses the retry's form; a failure after output ends the response as a
+failure, with no retry and no fallback.
+
+## Decisions S0-R1 and S0-R2
+
+Boundary changes other streams asked for, routed by the programme lead and decided by the S0
+lead before the freeze. The package version stays `1.0.0`: nothing is frozen yet.
+
+| Decision | Asked by | What changed |
+|---|---|---|
+| S0-R1.1 | S6 | New world `workflow-decision` (`plan-step`, `accept-step`), importing `control` and `clock` only; the native substrate keeps all state and passes the snapshot in. `workflow-implementation` stays. |
+| S0-R1.2 | S6 | Worker handles stay host-scoped string ids, with no WIT resource for a child; an id outside the (generation, operation, parent) scope that started it is `unknown-child`. |
+| S0-R1.3 | S6 | `workers` is split into `worker-types`, `workers-start`, `workers-observe` and `workers-control`, so per-member worker capabilities stay a static fact of a component's imports. `workflows` stays one interface. |
+| S0-R2.1 | S5 | `authorize` returns the world-local `verdict` (`permit`, `deny`, `ask`); the host resolves `ask`, and `types.decision` is unchanged. |
+| S0-R2.2 | S5 | The continuation and the HTTP/SSE fallback move from the broker into the provider component, decided from the broker's `connection-state`; `lowered-request` becomes a variant and the `continuation` record goes away. |
 
 ## Cancellation and the restricted path (freeze item 4, the WIT part)
 
@@ -234,7 +306,7 @@ resources a module holds, because the broker owns sending (freeze item 9). The p
 ## Checks
 
 - `wasm-tools component wit modules/wit` resolves the package.
-- For each world, `wasm-tools component embed --dummy --world <world> modules/wit`, then
+- For each of the six worlds, `wasm-tools component embed --dummy --world <world> modules/wit`, then
   `wasm-tools component new` and `wasm-tools validate`, form a valid component whose
   extracted world imports no `wasi:` interface.
 - `scripts/module-toolchain.sh --check` records the digest of every `.wit` file.
