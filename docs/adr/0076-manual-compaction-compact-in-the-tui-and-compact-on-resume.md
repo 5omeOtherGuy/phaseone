@@ -53,7 +53,8 @@ settings unchanged.
 5. **TUI.** `/compact` queues exactly like `/model`: typed while a turn runs it says
    `compact queued · applies at the end of this turn` and waits for the turn's end;
    typed at idle it applies at once. The loop pumps the summary request like a turn
-   (the screen stays live, ^C cancels it) and leaves one line,
+   (the screen stays live, ^C cancels it) and leaves one line of its own (the
+   `ContextReplaced` event still renders its items row),
    `compacted: <before> → <after> tokens` or `nothing to compact: <tokens> tokens`
    (`compact failed: <reason>` on an error); `ctx` shows the new estimate. A known
    slash command typed while a turn runs is now a command, not steering text for the

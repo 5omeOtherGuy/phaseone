@@ -1576,6 +1576,9 @@ where
                 Err(error) => return terminal_gave_up(&error),
             };
             driver.report_compaction(result);
+            // The pump's last frame predates the line just written: a failed or
+            // no-op compaction touches nothing else the frame test compares.
+            redraws.dirty = true;
             if prompt.is_none() {
                 prompt = driver.submit_pending.take();
             }
