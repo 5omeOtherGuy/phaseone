@@ -953,6 +953,13 @@ impl<B: Backend> IdleLoop<B> {
 
     /// Run the loop until it returns — its exit code.
     async fn run_to_end(self) -> i32 {
+        self.run_to_end_with_driver().await.0
+    }
+
+    /// Run the loop until it returns, handing the driver back as well: a test
+    /// that needs to see the state the loop left behind (which prompts it
+    /// started, what it queued) reads it here.
+    async fn run_to_end_with_driver(self) -> (i32, Driver) {
         let IdleLoop {
             mut terminal,
             mut driver,
@@ -966,7 +973,7 @@ impl<B: Backend> IdleLoop<B> {
             ..
         } = self;
         let keys = key_stream(keys);
-        drive_loop(
+        let code = drive_loop(
             &mut terminal,
             &mut driver,
             &mut agent,
@@ -978,8 +985,25 @@ impl<B: Backend> IdleLoop<B> {
             ColorMode::TrueColor,
             redraws,
         )
-        .await
+        .await;
+        (code, driver)
     }
+}
+
+/// The operator's lines, in order: the prompts the loop actually started. The
+/// transcript is the loop's own record — a queued follow-up lands here when the
+/// turn boundary takes it, not when it is queued.
+fn operator_prompts(driver: &Driver) -> Vec<&str> {
+    driver
+        .screen
+        .transcript
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            p1_tui::transcript::Block::Operator { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Everything a drawn frame left on the terminal — the tests' way to read what
@@ -1529,25 +1553,26 @@ async fn a_persistent_draw_error_ends_the_loop_like_a_missing_terminal() {
     );
 }
 
-/// Issue #141 review round 2: the retry budget spans turns. A backend that
-/// refuses every frame cannot outlast the loop by finishing turns — the count
-/// lives in `Redraws` — so a turn that resolves right after the pump's first
-/// refused frame hands that refusal to the next pump, and a follow-up queued
-/// behind it adds the third attempt that ends the loop.
+/// Issue #141 review round 2: the retry budget spans turns, not one `pump`. A
+/// backend that refuses every frame cannot outlast the loop by ending turns
+/// between refusals — the count lives in `Redraws` — so the idle frame, the
+/// prompt turn's first frame and the follow-up turn's first frame add up to the
+/// three-failure exit. The follow-up IS taken (the assertions below prove it);
+/// what it cannot show is a provider request, because the loop gives up on the
+/// second pump's first frame, before that pump's turn future is ever polled.
 #[tokio::test(start_paused = true)]
 async fn a_persistent_draw_error_ends_the_loop_across_turn_boundaries() {
-    // Two turns: the prompt, then the follow-up. Each resolves on its first poll
-    // (an empty stream is a transport failure), so the pump returns after one
-    // refused frame and the loop moves on.
+    // Two scripted turns; only the first is reached (a stream that ends with no
+    // events is a transport failure, SPEC §3d, so its turn resolves on the
+    // pump's first poll and the loop takes the follow-up at the boundary).
     let provider = Arc::new(p1_testkit::ScriptedProvider::new(vec![
         resolving_turn(),
         resolving_turn(),
     ]));
     let agent = agent_with(provider.clone());
     let mut harness = IdleLoop::with_agent(FailingBackend::refusing(usize::MAX), false, agent);
-    // The prompt the operator sent, and a follow-up queued behind it: the loop
-    // takes the follow-up at the turn boundary, so the second pump starts
-    // without an idle frame in between.
+    // The prompt the operator sent, and a follow-up queued behind it. One key,
+    // so the frame count below is: the idle first frame, then one frame per pump.
     harness.driver.screen.composer.insert('g');
     harness.driver.follow_ups.push_back("next".into());
     harness
@@ -1558,19 +1583,27 @@ async fn a_persistent_draw_error_ends_the_loop_across_turn_boundaries() {
         .expect("the loop reads keys");
     let draws = harness.wires.draws.clone();
 
-    let code = harness.run_to_end().await;
+    let (code, driver) = harness.run_to_end_with_driver().await;
 
     assert_eq!(code, 1, "the loop reports the terminal it cannot use");
     assert_eq!(
-        provider.requests().len(),
-        2,
-        "both turns ran: the prompt's, then the queued follow-up's"
-    );
-    assert_eq!(
         draws.count(),
         DRAW_FAILURES_BEFORE_EXIT as usize,
-        "the idle frame and the two pumps' first frames share one budget: a turn \
-         that ended between them cannot reset it"
+        "the idle frame and one refused frame per pump share one budget: a count \
+         reset per pump would let the loop spend this pump's budget, take the \
+         follow-up and only give up three frames later (five in all)"
+    );
+    assert_eq!(
+        operator_prompts(&driver),
+        ["g", "next"],
+        "the loop took the queued follow-up, so the third refusal came from the \
+         second pump's first frame"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the second pump refuses its first frame before it polls the turn future, \
+         so the follow-up's turn never reaches the provider"
     );
 }
 
