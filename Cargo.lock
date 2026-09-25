@@ -1549,6 +1549,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-module-protocol"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "p1-provider-anthropic"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/call-description/1",
+  "title": "Call description",
+  "description": "A tool's description of one call for the host and the UI. The verb is drawn from the closed vocabulary; any other string is shown as call.",
+  "type": "object",
+  "properties": {
+    "verb": { "type": "string" },
+    "target": { "type": "string" },
+    "edit": { "$ref": "#/$defs/edit_preview" },
+    "destructive": { "type": "boolean" }
+  },
+  "required": ["verb", "destructive"],
+  "additionalProperties": false,
+  "$defs": {
+    "edit_preview": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "old": { "type": "string" },
+        "new": { "type": "string" }
+      },
+      "required": ["path", "old", "new"],
+      "additionalProperties": false
+    }
+  }
+}

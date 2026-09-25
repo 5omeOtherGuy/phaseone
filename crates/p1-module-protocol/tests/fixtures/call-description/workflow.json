@@ -1,0 +1,5 @@
+{
+  "verb": "workflow",
+  "target": "review",
+  "destructive": false
+}

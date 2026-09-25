@@ -1,0 +1,58 @@
+{
+  "event": "finished",
+  "outcome": {
+    "status": "completed",
+    "item": {
+      "origin": {
+        "route": "anthropic-messages/claude-subscription",
+        "model": "claude-test"
+      },
+      "blocks": [
+        {
+          "block": "reasoning",
+          "text": "",
+          "replay": {
+            "origin": {
+              "route": "anthropic-messages/claude-subscription",
+              "model": "claude-test"
+            },
+            "version": 2,
+            "payload": {
+              "signature": "c2lnbmF0dXJl",
+              "nested": [
+                1,
+                {
+                  "deep": [
+                    true,
+                    null,
+                    2.5,
+                    "x"
+                  ]
+                }
+              ],
+              "empty": {}
+            }
+          }
+        },
+        {
+          "block": "text",
+          "text": "done"
+        },
+        {
+          "block": "tool_call",
+          "call_id": "c",
+          "name": "run",
+          "input": {
+            "kind": "json",
+            "raw": "{}"
+          }
+        }
+      ]
+    },
+    "stop": "tool_use",
+    "usage": {
+      "input_uncached": 10,
+      "output": 5
+    }
+  }
+}

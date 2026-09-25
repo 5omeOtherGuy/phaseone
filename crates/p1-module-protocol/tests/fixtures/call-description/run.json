@@ -1,0 +1,5 @@
+{
+  "verb": "run",
+  "target": "cargo test",
+  "destructive": true
+}

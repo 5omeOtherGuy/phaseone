@@ -1,0 +1,6 @@
+{
+  "event": "tool_input_delta",
+  "call_id": "call_1",
+  "name": "read",
+  "text": "{\"pa"
+}

@@ -1,0 +1,8 @@
+{
+  "item": "assistant",
+  "origin": {
+    "route": "anthropic-messages/claude-subscription",
+    "model": "claude-test"
+  },
+  "blocks": []
+}

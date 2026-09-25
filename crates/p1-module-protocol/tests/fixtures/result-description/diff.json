@@ -1,0 +1,9 @@
+{
+  "summary": "+1 -1",
+  "detail": {
+    "kind": "diff",
+    "path": "a.rs",
+    "before": "old",
+    "after": "new"
+  }
+}
