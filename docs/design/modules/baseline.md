@@ -48,6 +48,10 @@ It asserts nothing about the time itself.
   figure of the pair.
 - The readings are about the fixture component built at that commit. Another module's numbers are
   another module's.
+- Two runs of the same commit on the same box do not repeat each other: the first compile in
+  particular moves by a large fraction, and the warm maximum follows whatever else the box was
+  doing. A record is a fact of its run, which is why it names the run's commit, and why the numbers
+  above are quoted as they were printed rather than smoothed.
 
 ## The recorded values
 
