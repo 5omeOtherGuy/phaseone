@@ -1,0 +1,18 @@
+[package]
+name = "p1-redact"
+description = "Mask credential-shaped strings in tool output before history, journal and summaries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+regex = "1"
+
+[dev-dependencies]
+p1-testkit = { path = "../p1-testkit" }
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

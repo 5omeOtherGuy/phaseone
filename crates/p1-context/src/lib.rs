@@ -287,6 +287,11 @@ impl ContextPolicy for SummarizingContext {
                 );
             }
 
+            // Issue #142: the summarizer is a second model whose output becomes a
+            // history item, so it is masked with the same matcher the host wraps
+            // every tool in. A summary can never carry a credential shape into the
+            // history and every later request.
+            let answer = p1_redact::redact(&answer).text;
             let summary = Item::User {
                 text: format!("{SUMMARY_MARKER}\n{answer}"),
             };

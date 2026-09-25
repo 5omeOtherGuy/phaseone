@@ -20,6 +20,8 @@ echo "== gate: test"
 timeout --foreground 3600 cargo test --workspace --locked
 echo "== gate: core isolation"
 scripts/check-core-isolation.sh
+echo "== gate: secret scan"
+scripts/secret-scan.sh
 echo "== gate: adr"
 scripts/adr.py check
 python3 scripts/test_adr.py -q
@@ -28,6 +30,7 @@ python3 scripts/test_install.py -q
 python3 scripts/test_local_cargo_config.py -q
 python3 scripts/test_run_report.py -q
 python3 scripts/test_rustc_serial.py -q
+python3 scripts/test_secret_scan.py -q
 python3 scripts/test_usage_audit.py -q
 target_dir="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 echo "== target dir: $(du -sh "$target_dir" 2>/dev/null | cut -f1) $target_dir (free: $(df -h --output=avail "$target_dir" | tail -1 | tr -d ' '))"
