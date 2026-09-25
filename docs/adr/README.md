@@ -93,6 +93,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0077 | [Builds on the stream boxes](0077-builds-on-the-stream-boxes.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0078 | [Connection resources and component replacement](0078-connection-resources-and-component-replacement.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0079 | [Verified module releases and installation](0079-verified-module-releases-and-installation.md) | proposed | 2026-09-25 | owner+lead |
+| ADR-0080 | [Execution manifests in journals](0080-execution-manifests-in-journals.md) | proposed | 2026-09-25 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
