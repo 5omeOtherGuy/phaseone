@@ -1,11 +1,20 @@
 package p1:module@1.0.0;
 
-/// Worker agents. Owner: `p1-workers` (the `WorkerService` the host implements).
+/// Worker agents: the values `workers-start`, `workers-observe` and `workers-control` share.
+/// Owner: `p1-workers` (the `WorkerService` the host implements). Like `types`, this
+/// interface carries types only and grants nothing.
 ///
 /// A worker is a child agent the host assembles from a named environment and runs in the
-/// background. Ids are `w1`, `w2`, … and never reused; a result stays retrievable by id for
-/// the service's lifetime.
-interface workers {
+/// background. A child is named by a host-scoped string id, not by a WIT resource: ids are
+/// `w1`, `w2`, … and never reused, and a result stays retrievable by id for the service's
+/// lifetime. An id is valid only in the scope that started it — the (generation, operation,
+/// parent) it was started in — and every other id, including one started by another module or
+/// another parent, is `unknown-child`.
+///
+/// The functions are split into three interfaces so that a module's capabilities stay a static
+/// fact of its imports, which the host compares to its class allocation: a tool that only
+/// reads results (`worker_result`) declares `workers-observe` and cannot link `start`.
+interface worker-types {
     use types.{stop-reason, provider-error, usage};
 
     record child-spec {
@@ -74,9 +83,19 @@ interface workers {
         cancelled,
         failed(string),
     }
+}
 
-    /// Start a child now; the id on success.
+/// Starting workers. Owner: `p1-workers`.
+interface workers-start {
+    use worker-types.{child-spec, worker-error};
+
+    /// Start a child now; the id on success, valid only in the calling scope.
     start: func(spec: child-spec) -> result<string, worker-error>;
+}
+
+/// Observing workers this scope started. Owner: `p1-workers`.
+interface workers-observe {
+    use worker-types.{child-status, worker-error};
 
     /// The route and model a child runs on, as the host shows it.
     describe: func(id: string) -> result<string, worker-error>;
@@ -87,6 +106,11 @@ interface workers {
     /// Blocks the module until the child is no longer running. When the call is cancelled
     /// first, returns `running` at once.
     wait: func(id: string) -> result<child-status, worker-error>;
+}
+
+/// Controlling workers this scope started. Owner: `p1-workers`.
+interface workers-control {
+    use worker-types.{worker-error};
 
     /// Cancel the child's running turn. A finished child is a no-op.
     cancel: func(id: string) -> result<_, worker-error>;
