@@ -25,7 +25,7 @@ use p1_tui::render::home::HomePrelude;
 use p1_tui::render::ledger::{ContextView, SessionView};
 use p1_tui::render::permission::PermissionView;
 use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
-use p1_tui::state::{Approval, Screen};
+use p1_tui::state::{Approval, PaneMode, Screen};
 use p1_tui::transcript::Transcript;
 use ratatui::backend::Backend;
 use tokio::sync::mpsc;
@@ -405,6 +405,7 @@ impl Driver {
         if self.screen.approval.is_none()
             && self.screen.picker.is_none()
             && self.screen.output.is_some()
+            && self.screen.pane_mode == PaneMode::Output
             && key.modifiers.is_empty()
         {
             match key.code {
@@ -527,8 +528,8 @@ impl Driver {
             }
             Command::ScrollUp => self.screen.scroll_by(10),
             Command::ScrollDown => self.screen.scroll_by(-10),
-            Command::PaneUp => self.screen.scroll_output_by(-1),
-            Command::PaneDown => self.screen.scroll_output_by(1),
+            Command::PaneUp => self.screen.pane_step(-1),
+            Command::PaneDown => self.screen.pane_step(1),
         }
     }
 
