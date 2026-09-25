@@ -2998,8 +2998,9 @@ mod tests {
         p1_context::ContextConfig::validate(&config).expect("the effective table validates");
     }
 
-    /// A profile that states no capacity at all (deepseek-v4.1-flash) leaves the environment's
-    /// table exactly as it is — and so does the whole-provider form, which names no profile.
+    /// A profile that states no capacity at all (the one the `deepseek` environment binds) leaves
+    /// the environment's table exactly as it is — and so does the whole-provider form, which names
+    /// no profile.
     #[test]
     fn a_profile_that_states_nothing_leaves_the_environment_table_alone() {
         let settings = shipped_settings("deepseek");
@@ -3012,7 +3013,13 @@ mod tests {
         assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
         assert_eq!(config.keep_recent_tokens, settings.keep_recent_tokens);
 
-        let deepseek = shipped_profile("deepseek-v4.1-flash");
+        // The environment's own binding, not a compiled model id: route data stays out of run.rs
+        // (`tests/route_files.rs`).
+        let deepseek = load_environment("deepseek", &[shipped_environments()])
+            .expect("the shipped environment loads")
+            .profile
+            .expect("the deepseek environment binds a profile");
+        let deepseek = deepseek.as_ref().clone();
         assert_eq!(
             deepseek.context_tokens, None,
             "the profile states no window"
