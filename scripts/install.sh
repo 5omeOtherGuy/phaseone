@@ -23,11 +23,10 @@
 # or 3.8.17 / 3.9.17 / 3.10.12 / 3.11.4+ with the tarfile `filter=` security backports.
 #
 # Environment:
-#   P1_REPO              the GitHub repository (default 5omeOtherGuy/phaseone)
-#   P1_RELEASE_BASE_URL  base for the curl fallback (default the repo's releases page)
-#   P1_LOCAL_BUILD_ROOT  the directory --local probes for a build tree (default /mnt/build)
-#   CARGO_TARGET_DIR     --local's target directory when set
-#   CARGO_BUILD_JOBS     --local's job count (default 2)
+#   P1_REPO             the GitHub repository (default 5omeOtherGuy/phaseone)
+#   P1_RELEASE_BASE_URL base for the curl fallback (default the repo's releases page)
+#   CARGO_TARGET_DIR    --local's absolute target directory when set
+#   CARGO_BUILD_JOBS    --local's requested job count (must not exceed 2)
 set -euo pipefail
 
 BINARY_ASSET="p1-linux-x86_64"
@@ -49,8 +48,7 @@ usage: install.sh [--latest | --from-release TAG | --local] [--prefix DIR] [--fo
   --prefix DIR          where to install (default $HOME/.local)
   --force               reinstall even when TAG is already installed
 
-Environment: P1_REPO, P1_RELEASE_BASE_URL, P1_LOCAL_BUILD_ROOT, CARGO_TARGET_DIR,
-CARGO_BUILD_JOBS.
+Environment: P1_REPO, P1_RELEASE_BASE_URL, CARGO_TARGET_DIR, CARGO_BUILD_JOBS.
 EOF
 }
 
@@ -328,28 +326,86 @@ EOF
   update_new="$wrapper"
 }
 
-# --local: build this checkout in release profile, never into the repo's target/ —
-# a 7 GB-class machine shares one build tree, and the repository's own target dir is
-# reserved for the gate.
+# --local: a cloud build is normal. This fallback uses one per-task target on the
+# ext4 SSD, with the configured free-space admission check; the repository's own
+# target/ is never used.
+local_refuse() {
+  printf 'p1 install: %s\n' "$*" >&2
+  exit 2
+}
+
 local_target_dir() {
   if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-    printf '%s\n' "$CARGO_TARGET_DIR"
-    return
+    case "$CARGO_TARGET_DIR" in
+      /*) printf '%s\n' "$CARGO_TARGET_DIR" ;;
+      *) local_refuse "--local CARGO_TARGET_DIR must be an absolute path: $CARGO_TARGET_DIR" ;;
+    esac
+  else
+    [ -n "${HOME:-}" ] || local_refuse "--local needs HOME to select ~/.cache/cargo-target/p1-release"
+    printf '%s/.cache/cargo-target/p1-release\n' "$HOME"
   fi
-  local root="${P1_LOCAL_BUILD_ROOT:-/mnt/build}"
-  if [ ! -d "$root" ]; then
-    die "--local needs a build directory: set CARGO_TARGET_DIR ($root does not exist here; the repo's target/ is not used)"
+}
+
+check_local_target() {
+  local target=$1 root target_root probe parent filesystem df_output free
+  root="$HOME/.cache/cargo-target"
+  target_root=$(realpath -m -- "$root") || local_refuse "--local cannot resolve $root"
+  target=$(realpath -m -- "$target") || local_refuse "--local cannot resolve target: $target"
+  case "$target" in
+    "$target_root"/*) ;;
+    *) local_refuse "--local target must resolve below $root: $target" ;;
+  esac
+  if [ -e "$target" ] && [ ! -d "$target" ]; then
+    local_refuse "--local target is not a directory: $target"
   fi
-  printf '%s\n' "$root/cargo-target/p1-release"
+
+  probe=$target
+  while [ ! -d "$probe" ]; do
+    if [ -e "$probe" ] || [ -L "$probe" ]; then
+      local_refuse "--local target ancestor is not a directory: $probe"
+    fi
+    parent=${probe%/*}
+    [ -n "$parent" ] || parent=/
+    [ "$parent" != "$probe" ] || local_refuse "--local cannot find an existing target ancestor"
+    probe=$parent
+  done
+
+  filesystem=$(findmnt -n -o FSTYPE --target "$probe" 2>/dev/null) ||
+    local_refuse "--local cannot inspect target filesystem: $target"
+  [ "$filesystem" = ext4 ] ||
+    local_refuse "--local target is not on an ext4 filesystem: $target (found ${filesystem:-unparseable})"
+
+  df_output=$(df -P --block-size=1 "$probe" 2>/dev/null) ||
+    local_refuse "--local cannot inspect target free space: $target"
+  if ! free=$(printf '%s\n' "$df_output" | awk 'NR == 2 && NF >= 4 && $4 ~ /^[0-9]+$/ { print $4 }' 2>/dev/null); then
+    local_refuse "--local cannot parse target free space: $target"
+  fi
+  case "$free" in
+    '' | *[!0-9]*) local_refuse "--local cannot read target free space: $target" ;;
+  esac
+  if [ "$free" -lt 12884901888 ]; then
+    local_refuse "--local target has $free bytes free, below the 12884901888-byte admission threshold: $target"
+  fi
+  printf '%s\n' "$target"
 }
 
 install_local() {
-  local target
+  local target jobs wrapper
   [ -f "$repo_root/crates/p1-host/Cargo.toml" ] ||
     die "--local needs a checkout: run scripts/install.sh from the repository"
+  jobs=${CARGO_BUILD_JOBS:-2}
+  case "$jobs" in
+    '' | *[!0-9]*) local_refuse "--local CARGO_BUILD_JOBS must be an integer no greater than 2: $jobs" ;;
+  esac
+  [ "$jobs" -le 2 ] ||
+    local_refuse "--local CARGO_BUILD_JOBS must not exceed 2: $jobs"
+  wrapper="$repo_root/scripts/rustc-serial"
+  [ -x "$wrapper" ] || local_refuse "--local rustc wrapper is not executable: $wrapper"
   target="$(local_target_dir)"
+  target="$(check_local_target "$target")"
   export CARGO_TARGET_DIR="$target"
-  export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+  export CARGO_BUILD_JOBS=2
+  export RUSTC_WRAPPER="$wrapper"
   printf 'p1 install: cargo build --release --locked -p p1-host (target %s, jobs %s)\n' \
     "$target" "$CARGO_BUILD_JOBS"
   (cd "$repo_root" && cargo build --release --locked -p p1-host)
