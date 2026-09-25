@@ -34,6 +34,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo (this branch)
+        id: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
           # One shared key without a branch name: GitHub keeps each saved cache in
@@ -49,13 +50,15 @@ jobs:
           # restore).
           save-if: ${{ github.ref_type == 'branch' }}
 
-      # The real main-branch fallback: ci.yml saves the whole gate target (deps and
-      # workspace crates) under cargo-<os>-<Cargo.lock hash> on the default branch,
-      # and a workflow run can read the default branch's caches. Restore only: a
-      # task branch must not write another multi-GB copy (the repository store is
-      # near its 10 GiB limit). This step runs after rust-cache so the branch's own,
-      # newer cache wins where the two overlap.
+      # The real main-branch fallback, for a branch that has nothing of its own:
+      # ci.yml saves the whole gate target (deps and workspace crates) under
+      # cargo-<os>-<Cargo.lock hash> on the default branch, and a workflow run may
+      # read the default branch's caches. Restore only: a task branch must not write
+      # another multi-GB copy (the repository store is near its 10 GiB limit). A
+      # branch whose own rust-cache hit exactly already has its target, so it skips
+      # this multi-GB restore; a fresh branch (no exact hit) gets it.
       - name: Restore the main gate cache
+        if: steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
