@@ -245,9 +245,16 @@ pub fn usage() -> String {
     out
 }
 
-/// `p1 <version>`.
+/// `p1 <version>`: the package version, the built commit's short sha and the build
+/// date (ADR-0065). All three come from `build.rs`, so an installed binary says which
+/// commit it is — `p1-linux-x86_64` is published under a moving tag, not a version.
 pub fn version() -> String {
-    format!("p1 {}", env!("CARGO_PKG_VERSION"))
+    format!(
+        "p1 {} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("P1_GIT_SHA"),
+        env!("P1_BUILD_DATE")
+    )
 }
 
 /// Parse the arguments after the program name.
