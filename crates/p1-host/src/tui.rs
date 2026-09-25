@@ -25,7 +25,7 @@ use p1_tui::render::home::HomePrelude;
 use p1_tui::render::ledger::{ContextView, SessionView};
 use p1_tui::render::permission::PermissionView;
 use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
-use p1_tui::state::{Approval, PaneMode, Screen};
+use p1_tui::state::{Approval, PaneMode, Promotion, Screen};
 use p1_tui::transcript::Transcript;
 use ratatui::backend::Backend;
 use tokio::sync::mpsc;
@@ -1085,6 +1085,11 @@ fn spawn_branch_refresh(workspace: std::path::PathBuf, branch: Arc<Mutex<Option<
 /// Worker rows are re-read at 4 Hz while idle (issue #141). The refresher task
 /// publishes them every 500 ms, and a frame follows only when they changed, so
 /// the poll itself costs a lock and a comparison — never a render.
+///
+/// The slower poll is a deliberate trade, kept after review: worker rows are
+/// display-only, so up to ~200 ms more latency on a row is worth cutting the
+/// idle wake-ups from 20 a second to 4 (issue #141's whole point), and no frame
+/// follows a poll that changed nothing.
 const WORKER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The idle heartbeat (issue #141): the fastest an idle TUI needs to look at
@@ -1127,19 +1132,23 @@ impl DrawCounter {
 
 /// The loop's draw decision (issue #141). A frame follows a key, a UI/agent
 /// event, an authorization, a resize, worker rows that differ from the last
-/// drawn ones, or a statusline whose text moved — and, besides those frame
-/// inputs, only the heartbeat while a `▪▪▪` pulse is on screen.
+/// drawn ones, a statusline whose text moved, or a promotion that came or went
+/// — and, besides those frame inputs, only the heartbeat while something
+/// time-driven is on screen (a `▪▪▪` pulse or a §5 PEEK countdown).
 struct Redraws {
     /// A frame input changed; the next iteration draws.
     dirty: bool,
-    /// The heartbeat ticked while a `▪▪▪` pulse was on screen.
-    pulse: bool,
+    /// The heartbeat ticked, so time-based fields may have moved.
+    beat: bool,
     /// Nothing has been drawn yet: the first frame is unconditional.
     first: bool,
     /// The worker rows of the last drawn frame.
     rows: Vec<p1_tui::render::workers::WorkerBlock>,
     /// The statusline fields of the last drawn frame.
     status: p1_tui::render::statusbar::StatusBar,
+    /// The promotion of the last drawn frame: a PEEK appears and — the one
+    /// frame that erases its banner — expires.
+    promotion: Promotion,
     /// Frames drawn, for the tests.
     draws: DrawCounter,
 }
@@ -1148,40 +1157,45 @@ impl Redraws {
     fn new(draws: DrawCounter) -> Self {
         Self {
             dirty: false,
-            pulse: false,
+            beat: false,
             first: true,
             rows: Vec::new(),
             status: Default::default(),
+            promotion: Default::default(),
             draws,
         }
     }
 
-    /// Whether this iteration draws a frame. Every time-based field except the
-    /// pulse changes its TEXT (the clock, an elapsed time, the worker count), so
-    /// the two comparisons below catch it and the heartbeat needs no rate check
-    /// of its own.
-    fn due(&self, screen: &Screen, pulsing: bool) -> bool {
+    /// Whether this iteration draws a frame. Every time-based field that is on
+    /// screen when this is asked changes its TEXT (the clock, an elapsed time, a
+    /// worker count, a peek countdown), so the comparisons below catch it; only
+    /// the `▪▪▪` pulse moves by colour alone and needs the `animated` flag.
+    fn due(&self, screen: &Screen, animated: bool) -> bool {
         self.first
             || self.dirty
-            || (self.pulse && pulsing)
+            || (self.beat && animated)
             || self.rows != screen.workers.workers
             || self.status != screen.statusbar
+            || self.promotion != screen.promotion
     }
 
-    /// Remember what was just drawn.
+    /// Remember what was just drawn. Only ever called for a frame that reached
+    /// the terminal: a refused frame stays due for the next wake.
     fn drawn(&mut self, screen: &Screen) {
         self.dirty = false;
-        self.pulse = false;
+        self.beat = false;
         self.first = false;
         self.rows = screen.workers.workers.clone();
         self.status = screen.statusbar.clone();
+        self.promotion = screen.promotion.clone();
     }
 
     /// The heartbeat to wait at until the next check: the spinner's while a
     /// `▪▪▪` pulse is on screen (only its colour moves), the idle rate
-    /// otherwise, where the wake merely re-reads the clock's text.
-    fn heartbeat(&self, pulsing: bool) -> std::time::Duration {
-        if pulsing {
+    /// otherwise, where the wake merely re-reads the clock's text and any
+    /// countdown. A PEEK moves once a second, so the idle rate covers it.
+    fn heartbeat(&self, spinning: bool) -> std::time::Duration {
+        if spinning {
             SPINNER_HEARTBEAT
         } else {
             IDLE_HEARTBEAT
@@ -1207,6 +1221,31 @@ fn pulsing(screen: &Screen, now_ms: u64) -> bool {
                 || (screen.working.is_some() && screen.approval.is_none())
         }
     }
+}
+
+/// Whether a §5 PEEK banner is on screen this frame. Its countdown moves once a
+/// second, so it needs the heartbeat to draw (like the pulse), and it cannot be
+/// compared as text: the renderer hides it the instant its `until_ms` passes.
+/// `Screen::tick` has already cleared an expired one, so a `Peek` still set is a
+/// banner the operator can see — `render::screen` hides it while the pane is
+/// pinned or a decision is on screen, and so does this.
+fn peek_visible(screen: &Screen) -> bool {
+    matches!(screen.promotion, Promotion::Peek { .. })
+        && !screen.pinned
+        && screen.approval.is_none()
+}
+
+/// How many frames in a row the terminal may refuse before the loop gives up
+/// (issue #141 review): one retry per wake, then the same exit `run` takes for a
+/// terminal it cannot use.
+const DRAW_FAILURES_BEFORE_EXIT: u8 = 3;
+
+/// A terminal that refused [`DRAW_FAILURES_BEFORE_EXIT`] frames in a row. This
+/// is how `run` reports a terminal it could not use — there is nothing left to
+/// draw to, so the loop ends the same way.
+fn terminal_gave_up(error: &str) -> i32 {
+    eprintln!("p1 --tui: {error}");
+    1
 }
 
 /// The loop's heartbeat timer. It wakes at the rate the last frame asked for,
@@ -1245,38 +1284,50 @@ impl Heartbeat {
     }
 }
 
-/// One iteration's frame decision (issue #141): republish the fields that move
-/// without an event (worker rows, the §10 clock and branch), draw a frame only
-/// when a frame input changed, and say which heartbeat to wait at next.
+/// One iteration's frame decision (issue #141): advance the screen's own time
+/// state (the §5 PEEK expiry), republish the fields that move without an event
+/// (worker rows, the §10 clock and branch), draw a frame only when a frame input
+/// changed, and say which heartbeat to wait at next.
+///
+/// `Err` is the terminal refusing the frame: nothing was recorded as drawn, so
+/// the frame stays due and the next wake (a heartbeat tick, a key, an event)
+/// retries it. The message is the terminal's own.
 fn frame_if_due<B: Backend>(
     redraws: &mut Redraws,
     terminal: &mut ratatui::Terminal<B>,
     driver: &mut Driver,
     now_ms: u64,
     color_mode: ColorMode,
-) -> std::time::Duration {
+) -> Result<std::time::Duration, String> {
     driver.sync_workers();
     driver.sync_status(now_ms);
-    let pulsing = pulsing(&driver.screen, now_ms);
-    if redraws.due(&driver.screen, pulsing) {
+    // The screen's own clock: a PEEK expires three seconds after it appeared
+    // (§5), so every wake advances it and the countdown needs no timer of its
+    // own.
+    driver.screen.tick(now_ms);
+    let spinning = pulsing(&driver.screen, now_ms);
+    let animated = spinning || peek_visible(&driver.screen);
+    if redraws.due(&driver.screen, animated) {
         draw(
             terminal,
             &mut driver.screen,
             now_ms,
             color_mode,
             &redraws.draws,
-        );
+        )
+        .map_err(|error| error.to_string())?;
         redraws.drawn(&driver.screen);
     }
-    redraws.heartbeat(pulsing)
+    Ok(redraws.heartbeat(spinning))
 }
 
 /// The render/input loop over a borrowed agent. Turns are pinned futures
 /// inside this function: polled every wakeup, never dropped mid-flight.
 ///
 /// Idle (issue #141): a frame follows a frame input — a key, a UI/agent event,
-/// an authorization, a resize, worker rows or statusline text that changed — or
-/// the heartbeat's pulse. Nothing else draws, and the worker poll never does.
+/// an authorization, a resize, worker rows, statusline text or a promotion that
+/// changed — or the heartbeat while a `▪▪▪` pulse or a PEEK countdown is on
+/// screen. Nothing else draws, and the worker poll never does.
 #[allow(clippy::too_many_arguments)]
 async fn drive_loop<B, K>(
     terminal: &mut ratatui::Terminal<B>,
@@ -1298,6 +1349,7 @@ where
         tokio::time::interval_at(tokio::time::Instant::now() + WORKER_POLL, WORKER_POLL);
     workers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = Heartbeat::new();
+    let mut failed_draws = 0u8;
     let mut prompt: Option<String> = None;
     loop {
         if let Some(code) = driver.exit {
@@ -1319,7 +1371,7 @@ where
             // inbox sub-turn, and the end that decides whether to stop is
             // the LAST one. A `let` inside the loop would shadow this and
             // the check would read the first turn's end instead.
-            let mut end = pump(
+            let mut end = match pump(
                 terminal,
                 driver,
                 &mut keys,
@@ -1331,11 +1383,15 @@ where
                 &mut redraws,
                 Box::pin(agent.run_turn(text, child.clone())),
             )
-            .await;
+            .await
+            {
+                Ok(end) => end,
+                Err(error) => return terminal_gave_up(&error),
+            };
             driver.note_turn_end(&end);
             spawn_branch_refresh(driver.workspace.clone(), driver.branch.clone());
             while !child.is_cancelled() && agent.has_pending_inbox() {
-                end = pump(
+                end = match pump(
                     terminal,
                     driver,
                     &mut keys,
@@ -1354,7 +1410,11 @@ where
                             })
                     }),
                 )
-                .await;
+                .await
+                {
+                    Ok(end) => end,
+                    Err(error) => return terminal_gave_up(&error),
+                };
                 driver.note_turn_end(&end);
                 spawn_branch_refresh(driver.workspace.clone(), driver.branch.clone());
             }
@@ -1379,13 +1439,20 @@ where
         }
         // Idle: republish what moves by itself, draw only when a frame input
         // changed, then wait for anything at all.
-        heartbeat.set(frame_if_due(
-            &mut redraws,
-            terminal,
-            driver,
-            sink.now_ms(),
-            color_mode,
-        ));
+        match frame_if_due(&mut redraws, terminal, driver, sink.now_ms(), color_mode) {
+            Ok(period) => {
+                failed_draws = 0;
+                heartbeat.set(period);
+            }
+            // The terminal refused the frame. Keep the frame due and wait at the
+            // rate already armed — one retry per wake, never a spin.
+            Err(error) => {
+                failed_draws += 1;
+                if failed_draws >= DRAW_FAILURES_BEFORE_EXIT {
+                    return terminal_gave_up(&error);
+                }
+            }
+        }
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return 130,
@@ -1423,14 +1490,14 @@ where
             // Paces re-reading the worker rows; the frame still follows only
             // when `frame_if_due` above sees them differ.
             _ = workers.tick() => {}
-            _ = heartbeat.tick() => redraws.pulse = true,
+            _ = heartbeat.tick() => redraws.beat = true,
             _ = agent.inbox_ready() => {
                 // A worker's completion arrived at idle: drain it through the
                 // inbox path — never as a phantom empty user turn.
                 let child = cancel.child_token();
                 driver.policy.set_turn(Some(child.clone()));
                 while agent.has_pending_inbox() {
-                    let end = pump(
+                    let end = match pump(
                         terminal,
                         driver,
                         &mut keys,
@@ -1449,7 +1516,11 @@ where
                                 })
                         }),
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(end) => end,
+                        Err(error) => return terminal_gave_up(&error),
+                    };
                     driver.note_turn_end(&end);
                     spawn_branch_refresh(driver.workspace.clone(), driver.branch.clone());
                 }
@@ -1470,6 +1541,11 @@ where
 /// Frames follow the idle rule (issue #141), except that a `▪▪▪` pulse is on
 /// screen while the turn runs: the heartbeat then draws it at the spinner's
 /// rate instead of once a second.
+///
+/// `Err` is the terminal refusing [`DRAW_FAILURES_BEFORE_EXIT`] frames in a row:
+/// there is no screen left to keep live, so the caller ends the loop the way
+/// `run` does for a terminal it cannot use (the one case where this returns
+/// without the turn future finishing).
 #[allow(clippy::too_many_arguments)]
 async fn pump<B, K, F>(
     terminal: &mut ratatui::Terminal<B>,
@@ -1482,7 +1558,7 @@ async fn pump<B, K, F>(
     color_mode: ColorMode,
     redraws: &mut Redraws,
     mut turn: std::pin::Pin<Box<F>>,
-) -> TurnEnd
+) -> Result<TurnEnd, String>
 where
     B: Backend,
     K: futures_util::Stream<Item = Input> + Unpin,
@@ -1493,17 +1569,23 @@ where
     workers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = Heartbeat::new();
     let mut keys_done = false;
+    let mut failed_draws = 0u8;
     loop {
-        heartbeat.set(frame_if_due(
-            redraws,
-            terminal,
-            driver,
-            sink.now_ms(),
-            color_mode,
-        ));
+        match frame_if_due(redraws, terminal, driver, sink.now_ms(), color_mode) {
+            Ok(period) => {
+                failed_draws = 0;
+                heartbeat.set(period);
+            }
+            Err(error) => {
+                failed_draws += 1;
+                if failed_draws >= DRAW_FAILURES_BEFORE_EXIT {
+                    return Err(error);
+                }
+            }
+        }
         tokio::select! {
             biased;
-            end = &mut turn => return end,
+            end = &mut turn => return Ok(end),
             input = keys.next(), if !keys_done => {
                 let Some(input) = input else { keys_done = true; continue };
                 redraws.dirty = true;
@@ -1531,7 +1613,7 @@ where
                 }
             }
             _ = workers.tick() => {}
-            _ = heartbeat.tick() => redraws.pulse = true,
+            _ = heartbeat.tick() => redraws.beat = true,
         }
     }
 }
@@ -1661,14 +1743,16 @@ fn is_cancel(key: &crossterm::event::KeyEvent) -> bool {
 /// for 256/no-colour only), so it is skipped rather than called as a no-op.
 ///
 /// Every frame goes through here and bumps `draws` (issue #141), so the loop's
-/// tests count frames on the draw path itself rather than by timing.
+/// tests count frames on the draw path itself rather than by timing. The
+/// terminal's own result comes back to the caller: a refused frame was never
+/// shown, so it must not be recorded as drawn.
 fn draw<B: Backend>(
     terminal: &mut ratatui::Terminal<B>,
     screen: &mut Screen,
     now_ms: u64,
     color_mode: ColorMode,
     draws: &DrawCounter,
-) {
+) -> Result<(), B::Error> {
     draws.bump();
     terminal
         .draw(|frame| {
@@ -1684,7 +1768,7 @@ fn draw<B: Backend>(
                 frame.set_cursor_position(cursor);
             }
         })
-        .ok();
+        .map(|_| ())
 }
 
 /// The file a successful call writes, from the tool that owns it (ADR-0057):
