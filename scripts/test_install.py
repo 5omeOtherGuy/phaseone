@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import re
 import select
@@ -120,6 +121,9 @@ chmod 0755 "$CARGO_TARGET_DIR/release/p1"
 ASSETS = ("p1-linux-x86_64", "p1-linux-x86_64.sha256",
           "p1-share.tar.gz", "p1-share.tar.gz.sha256")
 
+# A manifest commit is the released source commit: 40 lowercase hex characters.
+MANIFEST_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
 
 class InstallTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -188,8 +192,8 @@ class InstallTest(unittest.TestCase):
         with open(path + ".sha256", "w", encoding="utf-8") as handle:
             handle.write(f"{self.digest(path)}  {asset}\n")
 
-    def make_share_tarball(self, marker: str) -> None:
-        """Top-level environments/, routes/ and profiles/, each with a marker file."""
+    def make_share_tarball(self, marker: str, modules: dict | None = None) -> None:
+        """Top-level environments/, routes/ and profiles/, plus an optional modules/ tree."""
         path = os.path.join(self.release, "p1-share.tar.gz")
         with tarfile.open(path, "w:gz") as archive:
             for top in ("environments", "routes", "profiles"):
@@ -197,12 +201,87 @@ class InstallTest(unittest.TestCase):
                 info = tarfile.TarInfo(f"{top}/marker.txt")
                 info.size = len(data)
                 archive.addfile(info, io.BytesIO(data))
+            if modules is not None:
+                self.add_modules(archive, modules)
 
-    def publish(self, marker: str = "one", binary: str = FAKE_P1) -> None:
+    def add_modules(self, archive: tarfile.TarFile, spec: dict) -> None:
+        """Write a modules/ tree: manifest.json, packages/<files>, and raw extras."""
+        manifest = spec.get("manifest")
+        if manifest is not None:
+            if isinstance(manifest, (dict, list)):
+                text = json.dumps(manifest, sort_keys=True, indent=2).encode()
+            elif isinstance(manifest, str):
+                text = manifest.encode()
+            else:
+                text = manifest
+            info = tarfile.TarInfo("modules/manifest.json")
+            info.size = len(text)
+            archive.addfile(info, io.BytesIO(text))
+        for name, data in spec.get("files", {}).items():
+            info = tarfile.TarInfo("modules/packages/" + name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        for info, fileobj in spec.get("members", []):
+            archive.addfile(info, fileobj)
+
+    @staticmethod
+    def tar_member(name: str, data: bytes = b"", kind: bytes = tarfile.REGTYPE,
+                   linkname: str = "") -> tuple:
+        info = tarfile.TarInfo(name)
+        info.type = kind
+        info.linkname = linkname
+        info.size = len(data) if kind in (tarfile.REGTYPE, tarfile.AREGTYPE) else 0
+        return info, (io.BytesIO(data) if info.size else None)
+
+    def manifest(self, packages: list, *, binary_sha: str | None = None, **overrides) -> dict:
+        """A valid p1-release-manifest/1 whose native pin names the published binary."""
+        if binary_sha is None:
+            binary_sha = self.digest(os.path.join(self.release, "p1-linux-x86_64"))
+        manifest = {
+            "format": "p1-release-manifest/1",
+            "commit": MANIFEST_COMMIT,
+            "tag": None,
+            "native": {"asset": "p1-linux-x86_64", "sha256": binary_sha},
+            "toolchain": {"rustc": None, "cargo": None, "wasm_target": None,
+                          "wasm_tools": None, "wit_bindgen": None},
+            "runtime": {"wasmtime": None, "wasmtime_features": None},
+            "wit": [],
+            "schemas": [],
+            "packages": packages,
+            "components": [],
+            "environment_locks": [],
+        }
+        for key, value in overrides.items():
+            if value is None:
+                manifest.pop(key, None)
+            else:
+                manifest[key] = value
+        return manifest
+
+    @staticmethod
+    def package_entry(name: str, data: bytes, **overrides) -> dict:
+        """A manifest packages[] entry for data, relative to the archive's modules/."""
+        entry = {"path": "packages/" + name,
+                 "sha256": hashlib.sha256(data).hexdigest(),
+                 "size": len(data)}
+        entry.update(overrides)
+        return entry
+
+    def module_spec(self, packages: list, files: dict, **manifest_overrides) -> callable:
+        """A publish() modules= callable whose manifest pins the published binary."""
+        def build(binary_sha: str) -> dict:
+            return {"manifest": self.manifest(packages, binary_sha=binary_sha,
+                                              **manifest_overrides),
+                    "files": files}
+        return build
+
+    def publish(self, marker: str = "one", binary: str = FAKE_P1, modules=None) -> None:
         """(Re)write the whole fixture release, checksums included."""
         with open(os.path.join(self.release, "p1-linux-x86_64"), "w", encoding="utf-8") as h:
             h.write(binary)
-        self.make_share_tarball(marker)
+        binary_sha = self.digest(os.path.join(self.release, "p1-linux-x86_64"))
+        spec = modules(binary_sha) if callable(modules) else modules
+        self.make_share_tarball(marker, spec)
         for asset in ASSETS:
             if not asset.endswith(".sha256"):
                 self.write_sum(asset)
@@ -274,6 +353,37 @@ class InstallTest(unittest.TestCase):
         if os.path.isdir(share):
             self.assertEqual([name for name in os.listdir(share) if name.startswith(".p1")],
                              [], os.listdir(share))
+
+    def snapshot(self, path: str) -> dict:
+        """Every entry below path, so a refusal can be shown to leave the prefix untouched."""
+        if not os.path.exists(path):
+            return {}
+        entries = {}
+        for root, dirs, files in os.walk(path):
+            for name in sorted(dirs) + sorted(files):
+                full = os.path.join(root, name)
+                key = os.path.relpath(full, path)
+                if os.path.islink(full):
+                    entries[key] = ("symlink", os.readlink(full))
+                elif os.path.isdir(full):
+                    entries[key] = ("dir", stat.S_IMODE(os.stat(full).st_mode))
+                else:
+                    with open(full, "rb") as handle:
+                        entries[key] = ("file", stat.S_IMODE(os.stat(full).st_mode),
+                                        handle.read())
+        return entries
+
+    def assert_refused_untouched(self, done: subprocess.CompletedProcess, message: str,
+                                 before: dict | None = None) -> None:
+        """A verification failure names the problem, ends with the promise and changes nothing."""
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn(message, done.stderr)
+        self.assertIn("nothing installed", done.stderr)
+        if before is None:
+            # The prefix did not exist before the refusal, so the refusal must not create it.
+            self.assertFalse(os.path.exists(self.prefix), f"a refusal created {self.prefix}")
+        else:
+            self.assertEqual(self.snapshot(self.prefix), before)
 
     # --- the release channel ----------------------------------------------
 
@@ -450,6 +560,263 @@ class InstallTest(unittest.TestCase):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("unsafe or invalid", done.stderr)
         self.assert_nothing_installed(self.prefix)
+
+    # --- the fourth root: modules/ -----------------------------------------
+
+    def refusing_releases(self) -> dict:
+        """Every refusal the module checks raise: name -> (modules spec, message fragment)."""
+        binary_sha = self.digest(os.path.join(self.release, "p1-linux-x86_64"))
+        content = b"content\n"
+        return {
+            "a missing package file": (
+                {"manifest": self.manifest(
+                    [self.package_entry("only.wasm", b"present\n"),
+                     self.package_entry("gone.wasm", b"absent\n")], binary_sha=binary_sha),
+                 "files": {"only.wasm": b"present\n"}},
+                "missing from the archive: packages/gone.wasm"),
+            "an extra package file not in the manifest": (
+                {"manifest": self.manifest([self.package_entry("a.wasm", b"a\n")],
+                                           binary_sha=binary_sha),
+                 "files": {"a.wasm": b"a\n", "extra.wasm": b"extra\n"}},
+                "not listed in the manifest: packages/extra.wasm"),
+            "a corrupted package": (
+                {"manifest": self.manifest([self.package_entry("a.wasm", b"original")],
+                                           binary_sha=binary_sha),
+                 "files": {"a.wasm": b"tampered"}},
+                "packages/a.wasm: sha256 is"),
+            "a package size mismatch": (
+                {"manifest": self.manifest(
+                    [self.package_entry("a.wasm", content, size=len(content) + 4)],
+                    binary_sha=binary_sha),
+                 "files": {"a.wasm": content}},
+                "size is 8 bytes, the manifest says 12"),
+            "a duplicate manifest entry": (
+                {"manifest": self.manifest(
+                    [self.package_entry("a.wasm", b"a\n"),
+                     self.package_entry("a.wasm", b"a\n")], binary_sha=binary_sha),
+                 "files": {"a.wasm": b"a\n"}},
+                "duplicates packages[0]"),
+            "a traversing manifest path": (
+                {"manifest": self.manifest(
+                    [{"path": "packages/../escaped.wasm", "sha256": "0" * 64, "size": 1}],
+                    binary_sha=binary_sha),
+                 "files": {}},
+                "has an empty, '.' or '..' component"),
+            "a symlink under modules": (
+                {"manifest": None, "files": {},
+                 "members": [self.tar_member("modules/link", kind=tarfile.SYMTYPE,
+                                             linkname="/tmp/target")]},
+                "unsafe archive member: 'modules/link'"),
+            "an extra entry directly under modules": (
+                {"manifest": None, "files": {},
+                 "members": [self.tar_member("modules/toolchain.pins", b"RUST_MIN=1.82.0\n")]},
+                "only manifest.json and packages/ are allowed"),
+            "modules without a manifest": (
+                {"manifest": None, "files": {"a.wasm": b"a\n"}},
+                "modules/ has no regular manifest.json"),
+            "a wrong format string": (
+                {"manifest": self.manifest([], binary_sha=binary_sha,
+                                           format="p1-release-manifest/2"), "files": {}},
+                "format is 'p1-release-manifest/2'"),
+            "a native digest mismatch": (
+                {"manifest": self.manifest(
+                    [], binary_sha=binary_sha,
+                    native={"asset": "p1-linux-x86_64", "sha256": "f" * 64}), "files": {}},
+                "does not match the verified binary"),
+            "a cwasm package": (
+                {"manifest": self.manifest([self.package_entry("cache.cwasm", b"blob\n")],
+                                           binary_sha=binary_sha),
+                 "files": {"cache.cwasm": b"blob\n"}},
+                ".cwasm is never shipped"),
+            "an unexpected top-level key": (
+                {"manifest": self.manifest([], binary_sha=binary_sha, extra=True), "files": {}},
+                "unexpected extra"),
+            "a value of the wrong JSON type": (
+                {"manifest": self.manifest([], binary_sha=binary_sha, components={}),
+                 "files": {}},
+                "components is object, not array"),
+            "a manifest that is not valid JSON": (
+                {"manifest": b"{not json", "files": {}},
+                "is not valid UTF-8 JSON"),
+        }
+
+    def test_a_release_with_a_manifest_and_packages_installs_them_under_share_p1_modules(self) -> None:
+        files = {"tool.wasm": b"tool bytes\n", "providers/route.wasm": b"route bytes\n"}
+        packages = [self.package_entry(name, data) for name, data in sorted(files.items())]
+        self.publish(modules=self.module_spec(packages, files))
+        done = self.run_install("--prefix", self.prefix)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assert_installed(self.prefix)
+        modules_root = os.path.join(self.prefix, "share", "p1", "modules")
+        self.assertEqual(json.loads(self.read(os.path.join(modules_root, "manifest.json")))
+                         ["packages"], packages)
+        for name, data in files.items():
+            with open(os.path.join(modules_root, "packages", name), "rb") as handle:
+                self.assertEqual(handle.read(), data, name)
+
+    def test_a_missing_package_file_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a missing package file"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_an_extra_package_file_not_in_the_manifest_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["an extra package file not in the manifest"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_corrupted_package_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a corrupted package"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_package_size_mismatch_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a package size mismatch"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_duplicate_manifest_entry_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a duplicate manifest entry"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_traversing_manifest_path_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a traversing manifest path"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_symlink_under_modules_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a symlink under modules"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_an_extra_entry_directly_under_modules_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["an extra entry directly under modules"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_modules_without_a_manifest_json_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["modules without a manifest"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_wrong_format_string_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a wrong format string"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_native_digest_mismatch_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a native digest mismatch"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_cwasm_package_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a cwasm package"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_manifest_with_an_unexpected_key_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["an unexpected top-level key"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_manifest_with_a_value_of_the_wrong_json_type_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a value of the wrong JSON type"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_a_manifest_that_is_not_valid_json_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a manifest that is not valid JSON"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_every_module_refusal_leaves_an_existing_prefix_byte_identical(self) -> None:
+        # A refusal may come after an install already exists; then not one byte may move.
+        files = {"tool.wasm": b"tool v1\n"}
+        packages = [self.package_entry("tool.wasm", files["tool.wasm"])]
+        self.publish(marker="one", modules=self.module_spec(packages, files))
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = self.snapshot(self.prefix)
+        for name, (spec, fragment) in self.refusing_releases().items():
+            with self.subTest(name=name):
+                self.publish(marker="one", modules=spec)
+                done = self.run_install("--prefix", self.prefix, "--force")
+                self.assert_refused_untouched(done, fragment, before)
+
+    def test_a_manifest_tag_that_disagrees_with_from_release_is_refused(self) -> None:
+        def modules(binary_sha: str) -> dict:
+            return {"manifest": self.manifest([], binary_sha=binary_sha,
+                                              tag="main-cafebabe0000"),
+                    "files": {}}
+        self.publish(modules=modules)
+        done = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
+        self.assert_refused_untouched(done, "does not match the requested release 'v9.9.9'")
+
+    def test_a_manifest_tag_matching_from_release_installs(self) -> None:
+        def modules(binary_sha: str) -> dict:
+            return {"manifest": self.manifest([], binary_sha=binary_sha, tag="v9.9.9"),
+                    "files": {}}
+        self.publish(modules=modules)
+        done = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(os.path.isdir(os.path.join(self.prefix, "share", "p1", "modules")))
+
+    def test_an_interrupted_commit_restores_the_previous_release_including_its_modules(self) -> None:
+        files = {"tools/tool.wasm": b"tool v1\n"}
+        packages = [self.package_entry("tools/tool.wasm", files["tools/tool.wasm"])]
+        self.publish(marker="one", modules=self.module_spec(packages, files))
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        paths = {
+            "binary": os.path.join(self.prefix, "bin", "p1"),
+            "updater": os.path.join(self.prefix, "bin", "p1-update"),
+            "share": os.path.join(self.prefix, "share", "p1", "environments", "marker.txt"),
+            "module": os.path.join(self.prefix, "share", "p1", "modules", "packages",
+                                   "tools", "tool.wasm"),
+            "manifest": os.path.join(self.prefix, "share", "p1", "modules", "manifest.json"),
+        }
+        before = {name: self.read(path) for name, path in paths.items()}
+        new_files = {"tools/tool.wasm": b"tool v2\n"}
+        new_packages = [self.package_entry("tools/tool.wasm", new_files["tools/tool.wasm"])]
+        self.publish(marker="two", binary=NEW_RELEASE,
+                     modules=self.module_spec(new_packages, new_files))
+
+        fail_dir = self.mkdir("fail-commit-modules")
+        real_mv = shutil.which("mv")
+        self.stub("mv", f"""#!/bin/sh
+case \" $* \" in
+  *".p1.new."*"/share/p1 "*) exit 71 ;;
+esac
+exec '{real_mv}' \"$@\"
+""", directory=fail_dir)
+        done = self.run_install("--prefix", self.prefix,
+                                PATH=fail_dir + ":" + self.stub_dir + ":" + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("could not commit", done.stderr)
+        for name, path in paths.items():
+            self.assertEqual(self.read(path), before[name], name)
+        self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "bin"))
+                          if name.startswith(".p1")], [])
+        self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "share"))
+                          if name.startswith(".p1")], [])
+
+    def test_an_old_release_without_modules_downgrades_over_one_with_modules(self) -> None:
+        files = {"tool.wasm": b"tool v2\n"}
+        packages = [self.package_entry("tool.wasm", files["tool.wasm"])]
+        self.publish(marker="two", binary=NEW_RELEASE, modules=self.module_spec(packages, files))
+        newer = self.run_install("--from-release", "v2.0.0", "--prefix", self.prefix)
+        self.assertEqual(newer.returncode, 0, newer.stderr)
+        self.assertTrue(os.path.isdir(os.path.join(self.prefix, "share", "p1", "modules")))
+
+        # An older release has no modules/, so the whole share tree — modules included — is
+        # replaced by the previous data and the downgrade succeeds.
+        self.publish(marker="one", binary=FAKE_P1)
+        older = self.run_install("--from-release", "v1.0.0", "--prefix", self.prefix)
+        self.assertEqual(older.returncode, 0, older.stderr)
+        self.assertEqual(self.read(os.path.join(self.prefix, "bin", "p1")), FAKE_P1)
+        self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1", ".p1-release")),
+                         "v1.0.0\n")
+        self.assertFalse(os.path.exists(os.path.join(self.prefix, "share", "p1", "modules")))
 
     # --- the interpreter the archive checks need ---------------------------
 
