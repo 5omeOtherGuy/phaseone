@@ -742,7 +742,9 @@ fn the_new_opencode_account_routes_are_distinct() {
         assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
         // The free Zen routes present the OpenCode client identity (owner decision 2026-09-24,
         // ADR-0066); the Go and ClinePass routes keep p1's own identity.
-        let identity = id.starts_with("opencode-zen").then_some(ClientIdentity::Opencode);
+        let identity = id
+            .starts_with("opencode-zen")
+            .then_some(ClientIdentity::Opencode);
         let settings = AdapterSettings::OpenAiChat(ChatAdapterSettings {
             dialect: ChatDialect::ThinkingWithReasoningAlias,
             session_header: Some("x-opencode-session".into()),
