@@ -14,9 +14,9 @@ sources: []
 
 Until now the only way to run p1 was to clone the repository and `cargo build` it: there
 was no install, no update path, and nothing that said which commit a binary came from.
-That is fine for the agents working in this repo and wrong for anyone else — the machine
-rules in `AGENTS.md` even forbid a release build on a workstation (7 GB-class machine,
-one shared target dir), so a user cannot be asked to produce a shipping binary.
+That is fine for the agents working in this repo and wrong for anyone else — the 7 GB-class
+machine rules in `AGENTS.md` forbid a release build on a workstation, so a user cannot be
+asked to produce a shipping binary.
 
 The repository is public (`github.com/5omeOtherGuy/phaseone`), the gate already runs on
 every push to `main` and is the single definition of green (ADR-0011), and p1 has no
@@ -71,9 +71,10 @@ p1 is installed from a published release, and the binary says which commit it is
   takes the sha from `P1_GIT_SHA`, else `git rev-parse --short=12 HEAD`, else `unknown`, and
   the date from `P1_BUILD_DATE`, else `SOURCE_DATE_EPOCH`, else `unknown` — never the wall
   clock, so two builds of one commit print the same string.
-- `--local` builds the current checkout with `cargo build --release --locked -p p1-host`
-  into `$CARGO_TARGET_DIR`, else `/mnt/build/cargo-target/p1-release` when `/mnt/build`
-  exists, else it refuses: the repository's own `target/` is never used.
+- `--local` is the fallback for a build that cannot run in the cloud. It builds the current
+  checkout with `cargo build --release --locked -p p1-host` into the caller's explicitly set
+  `$CARGO_TARGET_DIR`; that directory must be a distinct per-task target below
+  `~/.cache/cargo-target` on the SSD. The retired internal HDD is not a build tree.
 - The installer never reads, writes or deletes anything under
   `${XDG_CONFIG_HOME:-$HOME/.config}/p1`; it refuses a prefix whose prospective `bin` or
   `share` path resolves into that tree.
