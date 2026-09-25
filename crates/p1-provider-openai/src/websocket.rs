@@ -36,7 +36,9 @@ use futures_util::stream::unfold;
 use p1_contracts::{
     CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream, StreamEvent,
 };
-use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsHandshake, WsNext};
+use p1_provider_http::ws::{
+    WsBound, WsConnectError, WsConnection, WsConnector, WsHandshake, WsNext,
+};
 use p1_provider_http::{Credential, CredentialSource, ResponseParser, RetryPolicy, SseEvent};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -713,7 +715,7 @@ async fn read(mut state: State) -> State {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         Raced::Done(Ok(WsNext::Timeout(bound))) => {
             let error = ProviderError::new(ProviderErrorKind::Transport, bound.message());
-            state.on_read_timeout(error)
+            state.on_read_timeout(bound, error)
         }
         Raced::Done(Ok(WsNext::Text(text))) => state.on_frame(&text),
         Raced::Done(Ok(WsNext::Closed)) | Raced::Done(Err(_)) => state.on_close(),
@@ -772,10 +774,21 @@ impl State {
     }
 
     /// A read whose bound expired (the connection reports it as
-    /// [`WsNext::Timeout`]). Before any output it is §5's transient row — the
-    /// reconnect budget, then the SSE fallback. After output it is this response's
-    /// own `Transport` failure, whose message names the bound that expired.
-    fn on_read_timeout(self, error: ProviderError) -> State {
+    /// [`WsNext::Timeout`]). A FIRST-FRAME expiry on a REUSED connection is §5's
+    /// third "once" row — the same dead-slot case `on_close` handles for a reused
+    /// socket that closes before its first frame: the connection was already stale
+    /// when this request picked it up, so reconnect once instead of spending a retry
+    /// byte, waiting the backoff, and risking the SSE fallback on a healthy turn.
+    ///
+    /// Otherwise, before any output it is §5's transient row — the reconnect budget,
+    /// then the SSE fallback. After output it is this response's own `Transport`
+    /// failure, whose message names the bound that expired.
+    fn on_read_timeout(mut self, bound: WsBound, error: ProviderError) -> State {
+        if bound == WsBound::FirstFrame && reused(&self) && !self.visible && !self.once.reused_close
+        {
+            self.once.reused_close = true;
+            return self.reconnect();
+        }
         if self.visible {
             self.terminal(Outcome::Failed(error))
         } else {

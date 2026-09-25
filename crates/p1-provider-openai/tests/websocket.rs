@@ -1375,6 +1375,59 @@ async fn a_read_that_never_answers_is_bounded_at_the_first_frame_and_falls_back(
     );
 }
 
+/// Review round 2: a first-frame bound expiry on a REUSED connection is §5's third
+/// "once" row — the dead-slot case `on_close` already handles for a reused socket
+/// that closes before its first frame — so it reconnects ONCE, with no retry backoff
+/// and no `Activity`, instead of spending a retry byte and risking the SSE fallback
+/// on a healthy turn.
+#[tokio::test(start_paused = true)]
+async fn a_first_frame_timeout_on_a_reused_connection_reconnects_once() {
+    // One connection serves turn 1 and is returned to the slot; turn 2 takes it out
+    // of the slot (reused) and its first frame never arrives. The reconnect is the
+    // second scripted connection, which serves turn 2.
+    let connector = ScriptedWsConnector::new(vec![
+        ScriptedConnection::accept(
+            turn_frames(1)
+                .into_iter()
+                .chain([ScriptedFrame::wait(Duration::from_secs(3600))])
+                .collect(),
+        ),
+        ScriptedConnection::accept(turn_frames(1)),
+    ]);
+    let sse = ScriptedTransport::new(Vec::new());
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        sse.clone(),
+        Some(Arc::new(connector.clone())),
+    )
+    .expect("the route composes");
+
+    completed(&turn(&provider).await);
+    let start = tokio::time::Instant::now();
+    let events = tokio::time::timeout(Duration::from_secs(200), turn(&provider))
+        .await
+        .expect("the first-frame bound must end the wait, not hang CI");
+    completed(&events);
+
+    assert_eq!(
+        connector.handshakes().len(),
+        2,
+        "one reconnect for the reused socket's first-frame timeout"
+    );
+    assert_eq!(sse.requests().len(), 0, "no SSE fallback");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Activity)),
+        "the once row has no retry backoff: {events:?}"
+    );
+    assert_eq!(
+        start.elapsed(),
+        FIRST_BYTE_TIMEOUT,
+        "exactly the bound: not the transient row's bound + backoff"
+    );
+}
+
 /// Issue #164: a WebSocket peer that stays alive with CONTROL pings is not idle —
 /// every frame, a ping included, resets the idle clock — so 20 minutes of pings
 /// then a text frame completes instead of being failed as silent.
