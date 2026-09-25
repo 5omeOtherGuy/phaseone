@@ -318,9 +318,9 @@ fn operator_lines(text: &str, steering: bool, width: usize, out: &mut Vec<Line<'
             } else {
                 Vec::new()
             };
-            if steering && operator_measure(width, steering) == 0 {
-                // The tag consumes the whole measured body at very narrow widths;
-                // put the marker beside it so the visual anchor is not truncated.
+            if steering && measure(width) < HANG + cell_width(STEERING) + 2 {
+                // The marker and tag need the hang and a separator beside each other;
+                // move the marker right only when that whole tag has no measured body.
                 out.push(ground(
                     Vec::new(),
                     vec![
@@ -912,6 +912,18 @@ mod tests {
         assert!(!text[0].contains(STEERING));
         assert!(text[1].starts_with("  › now"));
         assert!(text[1].trim_end().ends_with(STEERING));
+    }
+
+    #[test]
+    fn steering_marker_stays_at_the_text_column_when_its_tag_just_fits() {
+        let mut t = Transcript::new();
+        t.blocks.push(Block::Operator {
+            text: "now".into(),
+            steering: true,
+        });
+        let rows = lines(&t, 16, usize::MAX, false, 0, true);
+        assert_eq!(plain(&rows)[0].trim_end(), "  ›   steering");
+        assert_eq!(count_rows(&t, 16), rows.len());
     }
 
     #[test]
