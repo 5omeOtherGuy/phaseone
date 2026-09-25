@@ -150,7 +150,7 @@ fn assert_opencode_id(id: &str, prefix: &str) {
 }
 
 #[tokio::test]
-async fn opencode_identity_sets_the_headers_and_the_gate_tools() {
+async fn opencode_identity_sets_the_headers_and_injects_no_tools() {
     let request = sent(Some(ClientIdentity::Opencode), vec![], Some("p1-abc")).await;
     let user_agent = header(&request, "user-agent").expect("user-agent");
     assert!(
@@ -167,21 +167,18 @@ async fn opencode_identity_sets_the_headers_and_the_gate_tools() {
         header(&request, "x-opencode-request").expect("request id"),
         "msg_",
     );
-    // The gate requires these two declarations; empty schemas suffice.
+    // The adapter declares no tool of its own. The Zen free-tier gate wants `bash` and
+    // `read` among the declared tools, but that is an environment's business
+    // (`[[tools]] name = "bash"` / `"read"`); a tool-less request therefore carries no
+    // `tools` and no `tool_choice`.
     let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-    let names: Vec<&str> = body["tools"]
-        .as_array()
-        .expect("tools")
-        .iter()
-        .map(|tool| tool["function"]["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(names, ["bash", "read"], "{names:?}");
-    assert_eq!(body["tool_choice"], "auto");
+    assert!(body.get("tools").is_none(), "{body}");
+    assert!(body.get("tool_choice").is_none(), "{body}");
     assert_eq!(body["stream"], true);
 }
 
 #[tokio::test]
-async fn the_identity_keeps_p1_tools_and_never_duplicates_a_name() {
+async fn the_identity_leaves_p1_tools_untouched() {
     let request = sent(
         Some(ClientIdentity::Opencode),
         vec![declaration("read"), declaration("shell")],
@@ -195,8 +192,8 @@ async fn the_identity_keeps_p1_tools_and_never_duplicates_a_name() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect();
-    // p1's own declarations first, then only the missing gate name.
-    assert_eq!(names, ["read", "shell", "bash"], "{names:?}");
+    // The identity changes only headers: it neither adds nor renames a declaration.
+    assert_eq!(names, ["read", "shell"], "{names:?}");
 }
 
 #[tokio::test]

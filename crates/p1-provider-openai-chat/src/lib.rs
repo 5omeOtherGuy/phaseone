@@ -16,10 +16,11 @@ use std::sync::Arc;
 
 /// Implemented encodings, not service names. Unknown extensions require an implementation.
 /// The names are the kebab-case spellings a route file's `[adapter_settings]` uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChatDialect {
     /// Enabled thinking with replayable reasoning_content and its equivalent reasoning alias.
+    #[default]
     ThinkingWithReasoningAlias,
     /// Enabled/preserved thinking, replayable reasoning_content and its equivalent reasoning
     /// alias, and streaming function inputs.
@@ -28,22 +29,24 @@ pub enum ChatDialect {
 
 /// The non-secret client identity a route can present to a vendor gateway that gates its
 /// free tier on the caller looking like the vendor's own client (owner decision 2026-09-24).
-/// Unlike a dialect, it changes no message encoding: it adds static headers, a generated
-/// session id, and the tool declarations the gateway's gate requires. The names are the
-/// kebab-case spellings a route file's `[adapter_settings]` uses.
+/// Unlike a dialect, it changes no message encoding and declares no tool: it only adds the
+/// identity's static headers and a generated session id. The tool names a gate wants are an
+/// environment's business, never the adapter's. The names are the kebab-case spellings a
+/// route file's `[adapter_settings]` uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClientIdentity {
-    /// Present the OpenCode CLI's identity to the OpenCode Zen gateway: its `user-agent`,
-    /// its `x-opencode-*` headers with a generated `ses_`/`msg_` id, and the two tool
-    /// declarations the gate requires (`bash`, `read`). The system prompt is NOT changed.
+    /// Present the OpenCode CLI's identity to the OpenCode Zen gateway: its `user-agent`
+    /// and its `x-opencode-*` headers with a generated `ses_`/`msg_` id. The system prompt
+    /// and the declared tools are NOT changed; the `zen`/`zen2`/`zen3` environments grant
+    /// the `bash`/`read` names the gate wants.
     Opencode,
 }
 
 /// The `[adapter_settings]` table of a route whose `adapter` is `openai-chat`: fields
 /// this adapter owns, parsed by this adapter (`docs/design/routes-and-profiles.md`
 /// §1.2). A key this struct does not name is rejected rather than ignored.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatAdapterSettings {
     pub dialect: ChatDialect,
@@ -64,7 +67,7 @@ pub struct ChatLimits {
     pub max_output_tokens: Option<u32>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct ChatRoute {
     pub origin_route: String,
     pub endpoint: String,

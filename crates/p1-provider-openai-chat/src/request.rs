@@ -1,4 +1,4 @@
-use crate::{ChatDialect, ChatRoute, ClientIdentity};
+use crate::{ChatDialect, ChatRoute};
 use p1_contracts::{
     AssistantBlock, AssistantItem, DeclarationKind, Effort, Item, Origin, ProviderError,
     ProviderErrorKind, ProviderRequest, ToolInput,
@@ -216,7 +216,7 @@ pub fn build_request(
     if let Some(cap) = request.options.max_output_tokens {
         body["max_tokens"] = json!(cap);
     }
-    let mut tools: Vec<Value> = request
+    let tools: Vec<Value> = request
         .tools
         .iter()
         .map(|tool| match &tool.kind {
@@ -224,59 +224,17 @@ pub fn build_request(
             _ => unreachable!("validated"),
         })
         .collect();
-    let identity = route.client_identity == Some(ClientIdentity::Opencode);
-    if identity {
-        add_opencode_tool_declarations(&mut tools, request);
-    }
+    // This adapter declares no tool of its own. The Zen free tier's gate wants
+    // `bash` and `read` among the declared tools, but that is an environment's
+    // business (`[[tools]] name = "bash"` / `"read"`), never the provider's: the
+    // provider only translates the request's own tools to the wire.
     if !tools.is_empty() {
         if route.dialect == ChatDialect::RetainedThinking {
             body["tool_stream"] = json!(true);
         }
         body["tools"] = json!(tools);
-        if identity {
-            // OpenCode's own request carries this; the gate does not require it, but
-            // sending the same shape keeps the identity faithful.
-            body["tool_choice"] = json!("auto");
-        }
     }
     Ok(body)
-}
-
-/// The OpenCode client identity's tool declarations. The Zen free-tier gate accepts
-/// a request only when `bash` and `read` are both declared — empty schemas suffice,
-/// and every other tool is free — so p1 keeps its own tools and adds a declaration
-/// only for a name it does not already carry. A `bash` declaration states the tool
-/// is not dispatchable here: `p1-core` answers a foreign call with `Unavailable`,
-/// and `p1-tool-shell` is the real caller-facing tool.
-fn add_opencode_tool_declarations(tools: &mut Vec<Value>, request: &ProviderRequest) {
-    let present: std::collections::BTreeSet<&str> = request
-        .tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect();
-    for (name, description) in [
-        (
-            "bash",
-            "Compatibility declaration for the OpenCode Zen free tier; not available on this \
-             route. Use the `shell` tool to run commands.",
-        ),
-        (
-            "read",
-            "Compatibility declaration for the OpenCode Zen free tier; not available when this \
-             environment does not grant the `read` tool.",
-        ),
-    ] {
-        if !present.contains(name) {
-            tools.push(json!({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": {"type": "object", "properties": {}},
-                }
-            }));
-        }
-    }
 }
 
 #[cfg(test)]
