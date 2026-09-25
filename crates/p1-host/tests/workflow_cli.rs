@@ -187,9 +187,14 @@ async fn failing_script_body() {
     assert_eq!(code, 1, "failed: {}", harness.stderr.text());
     assert!(harness.stdout.text().starts_with("Workflow wf1: failed"));
 
-    // A step that ends without `finish` is an issue, not a failure of the run.
+    // A step that ends without `finish` — also after its one nudge (ADR-0073) — is an
+    // issue, not a failure of the run.
     let issues = scratch.script("issues.rhai", r#"agent("talk only").status"#);
-    let fakes = Fakes::new(Vec::new(), vec![text_response("no finish")], Vec::new());
+    let fakes = Fakes::new(
+        Vec::new(),
+        vec![text_response("no finish"), text_response("still no finish")],
+        Vec::new(),
+    );
     let mut harness = scratch.harness();
     harness.deps.catalog_hook = Some(fakes.hook());
     let args = base_args(&scratch, issues.to_str().unwrap(), out.to_str().unwrap());

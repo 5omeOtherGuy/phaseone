@@ -291,6 +291,135 @@ async fn a_capped_repair_keeps_the_invalid_value() {
     assert!(harness.runner.repair_messages().is_empty());
 }
 
+const FINISH_NUDGE: &str = "You ended your turn without calling finish. Call finish now: \
+    status \"done\" with your result (and the evidence), or \"blocked\" with what you need.";
+
+// ADR-0073
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_that_ends_without_finish_is_nudged_once_in_the_same_worker() {
+    let harness = Harness::new();
+    harness.runner.queue(
+        "answer",
+        StepEnd::EndedWithoutFinish {
+            text: "the answer is 4".into(),
+        },
+    );
+    harness
+        .runner
+        .queue_repair("answer", support::done("the answer is 4"));
+    let report = harness.run(r#"agent("answer")"#).await;
+    assert_eq!(report.value["status"], "done", "{report:?}");
+    assert_eq!(report.value["attempts"], 2);
+    assert_eq!(report.value["value"], "the answer is 4");
+    assert_eq!(report.value["error"], Value::Null);
+    let messages = harness.runner.repair_messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].1, FINISH_NUDGE);
+    assert!(
+        messages[0].0.id.starts_with("w1|"),
+        "the nudge goes to the worker that ran: {messages:?}"
+    );
+    assert_eq!(
+        harness.runner.requests().len(),
+        1,
+        "a nudge is never a new worker"
+    );
+    let attempts: Vec<u32> = dispatches(&harness.journal(&report.id))
+        .into_iter()
+        .map(|(_, attempt)| attempt)
+        .collect();
+    assert_eq!(attempts, [1, 2]);
+    assert_eq!(report.outcome, RunOutcome::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_never_finishes_gets_exactly_one_nudge() {
+    let harness = Harness::new();
+    harness.runner.queue(
+        "chatty",
+        StepEnd::EndedWithoutFinish {
+            text: "first words".into(),
+        },
+    );
+    harness.runner.queue_repair(
+        "chatty",
+        StepEnd::EndedWithoutFinish {
+            text: "last words".into(),
+        },
+    );
+    let report = harness.run(r#"agent("chatty")"#).await;
+    assert_eq!(report.value["status"], "failed");
+    assert_eq!(report.value["error"], "ended without finish");
+    assert_eq!(report.value["value"], "last words");
+    assert_eq!(report.value["attempts"], 2);
+    let messages = harness.runner.repair_messages();
+    assert_eq!(messages.len(), 1, "exactly one nudge: {messages:?}");
+    assert_eq!(messages[0].1, FINISH_NUDGE);
+    assert_eq!(harness.runner.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_nudge_is_the_refused_repair_envelope() {
+    let harness = Harness::with(p1_workflow::WorkflowSettings {
+        caps: BTreeMap::from([("claude-fable-5".to_string(), 1)]),
+        ..settings()
+    });
+    harness.runner.queue(
+        "judge it",
+        StepEnd::EndedWithoutFinish {
+            text: "looks fine".into(),
+        },
+    );
+    let report = harness
+        .run(r#"agent("judge it", #{ role: "judge" })"#)
+        .await;
+    assert_eq!(report.value["status"], "failed");
+    assert_eq!(
+        report.value["error"],
+        "quota_exceeded: claude-fable-5 used=1 limit=1 (repair)"
+    );
+    assert_eq!(report.value["value"], "looks fine");
+    assert_eq!(report.value["attempts"], 1);
+    assert!(harness.runner.repair_messages().is_empty());
+    assert_eq!(report.counts.capped, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_repair_that_ends_without_finish_is_not_nudged_again() {
+    let harness = Harness::new();
+    harness.runner.queue(
+        "extract",
+        done_with(
+            json!({"n": "x"}),
+            SchemaCheck::Failed(vec!["/n: expected integer".into()]),
+        ),
+    );
+    harness.runner.queue_repair(
+        "extract",
+        StepEnd::EndedWithoutFinish {
+            text: "gave up".into(),
+        },
+    );
+    // Were a second nudge sent, it would find this and end the step `done`.
+    harness
+        .runner
+        .queue_repair("extract", done_with(json!({"n": 1}), SchemaCheck::Passed));
+    let report = harness
+        .run(r#"agent("extract", #{ schema: #{ type: "object" } })"#)
+        .await;
+    assert_eq!(report.value["status"], "failed");
+    assert_eq!(report.value["error"], "ended without finish");
+    assert_eq!(report.value["value"], "gave up");
+    assert_eq!(report.value["attempts"], 2);
+    let messages = harness.runner.repair_messages();
+    assert_eq!(
+        messages.len(),
+        1,
+        "at most one repair turn per step: {messages:?}"
+    );
+    assert!(messages[0].1.starts_with("Your result did not match"));
+}
+
 // (6)
 #[tokio::test(flavor = "multi_thread")]
 async fn every_dispatch_is_journalled_before_the_runner_sees_it() {
@@ -584,6 +713,12 @@ async fn every_step_end_has_its_envelope_shape() {
             text: "I stopped".into(),
         },
     );
+    harness.runner.queue_repair(
+        "silent",
+        StepEnd::EndedWithoutFinish {
+            text: "I stopped again".into(),
+        },
+    );
     harness.runner.queue(
         "unverified",
         StepEnd::Done {
@@ -640,8 +775,8 @@ async fn every_step_end_has_its_envelope_shape() {
     );
     assert_eq!(
         without_step(3),
-        json!({"label": null, "status": "failed", "value": "I stopped",
-               "schema": "not_requested", "evidence": null, "attempts": 1,
+        json!({"label": null, "status": "failed", "value": "I stopped again",
+               "schema": "not_requested", "evidence": null, "attempts": 2,
                "worker": worker(4, "silent"), "needs": null, "error": "ended without finish",
                "models": walked})
     );
