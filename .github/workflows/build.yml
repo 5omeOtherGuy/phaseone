@@ -83,21 +83,26 @@ jobs:
           cargo build -p p1-host --locked
 
       - name: Stage binary and sha256
+        # Always runs: the gate log is staged first so a red patch still uploads it,
+        # and the binary with its sha256 is staged only on a successful build. The
+        # artifact root is dist/ (see Upload artifact), exactly what ci-build.sh
+        # stages into ci-artifacts/<sha>/.
+        if: always()
         run: |
           mkdir -p dist
-          cp target/debug/p1 dist/p1
-          ( cd dist && sha256sum p1 > p1.sha256 )
-          cat dist/p1.sha256
+          cp gate.log dist/gate.log
+          if [ "${{ steps.build.outcome }}" = success ]; then
+            cp target/debug/p1 dist/p1
+            ( cd dist && sha256sum p1 > p1.sha256 )
+            cat dist/p1.sha256
+          fi
 
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: p1-build
-          path: |
-            dist/p1
-            dist/p1.sha256
-            gate.log
+          path: dist/
           if-no-files-found: warn
 
       # The job summary, and the same lines in the step log so they can be read
