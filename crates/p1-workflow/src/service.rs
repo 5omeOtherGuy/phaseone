@@ -196,7 +196,7 @@ impl InProcessWorkflows {
                 )
             }
         };
-        // A resumed run keeps the base its steps' worktrees were made from (ADR-0072).
+        // A resumed run keeps the base its steps' worktrees were made from (ADR-0073).
         let base = recorded_base.or(request.base);
 
         // From here on a run exists. The lock is held through the spawn so a concurrent

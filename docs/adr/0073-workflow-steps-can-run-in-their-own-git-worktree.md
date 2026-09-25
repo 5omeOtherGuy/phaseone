@@ -1,5 +1,5 @@
 ---
-adr: 72
+adr: 73
 title: Workflow steps can run in their own git worktree
 status: proposed
 date: 2026-09-25
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [issue #189, docs/adr/0053-workflows-are-an-optional-module-a-sandboxed-script-orchestrates-workers-under-roles-and-caps.md, docs/design/workflows.md, scripts/new-worktree.sh, AGENTS.md]
 ---
-# ADR-0072: Workflow steps can run in their own git worktree
+# ADR-0073: Workflow steps can run in their own git worktree
 
 ## Context
 

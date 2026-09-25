@@ -45,7 +45,7 @@ three bindings:
 | `schema` | map | none | The output contract the worker's `finish` gets (§5). |
 | `tools` | non-empty array of strings | the role's grant | Replaces the role's grant for this one step. |
 | `workspace` | string path | the run's workspace | Where the worker runs (§8). |
-| `worktree` | slug string | none | The step runs in its own git worktree (ADR-0072): `<parent of the main worktree>/<main worktree name>-<slug>` on branch `task/<slug>`, made from the run's base commit when missing, reused untouched when there. The slug is lowercase ASCII letters, digits and `-`, starting and ending with a letter or digit, at most 64 characters; anything else, or `worktree` together with `workspace`, is a script error. A later step is pointed at the same tree with `workspace: r.worktree.path`. |
+| `worktree` | slug string | none | The step runs in its own git worktree (ADR-0073): `<parent of the main worktree>/<main worktree name>-<slug>` on branch `task/<slug>`, made from the run's base commit when missing, reused untouched when there. The slug is lowercase ASCII letters, digits and `-`, starting and ending with a letter or digit, at most 64 characters; anything else, or `worktree` together with `workspace`, is a script error. A later step is pointed at the same tree with `workspace: r.worktree.path`. |
 
 **Idioms a writer needs.** Maps are `#{ key: value }`. Work given to `parallel` must be
 deferred as a closure — `|| agent(..)` — because `parallel` takes functions: passing
@@ -240,7 +240,7 @@ re-run step starts from the head again.
 | `needs` | A blocked step's need, or `()`. |
 | `error` | A typed failure, or `()`. |
 | `models` | The chain the step walked (§3 "Fallback"), head first: `[{model, moved_on}]`, `moved_on` `route_failed`/`capped` where the step moved on. `[]` only when the step was refused before it reached a model (an unknown role, `max_steps`). |
-| `worktree` | Only on a step that asked for a worktree and got it (ADR-0072): `{path, branch, head}` — `head` is the tree's `HEAD` after the step ended. Absent otherwise (a replayed step returns its recorded envelope unchanged). |
+| `worktree` | Only on a step that asked for a worktree and got it (ADR-0073): `{path, branch, head}` — `head` is the tree's `HEAD` after the step ended. Absent otherwise (a replayed step returns its recorded envelope unchanged). |
 
 The `schema` states mirror the `finish` tool's own check (§5).
 
@@ -259,9 +259,9 @@ and every step refused before dispatch: `()`.
 | `max_steps: <n> reached` | The run's `agent()` budget is spent. |
 | `unknown_role: <name>` | The role is not in the effective table. |
 | `route: <error>` | No model of the role's chain could run the step — the last link's route failure. |
-| `ended without finish` | The worker's turn completed with no accepted `finish` call. |
-| `worktree: <slug>: <reason>` | The step's worktree could not be made or reused, before dispatch (ADR-0072): the run has no base commit (its workspace is not a git repository), the path exists and is not that branch's worktree, or git's own error. |
-| `worktree_busy: <slug>` | A running step of this host holds that worktree; refused at once, before dispatch (ADR-0072). |
+| `ended without finish` | The worker's turn completed with no accepted `finish` call, after one repair turn (§5, ADR-0072). |
+| `worktree: <slug>: <reason>` | The step's worktree could not be made or reused, before dispatch (ADR-0073): the run has no base commit (its workspace is not a git repository), the path exists and is not that branch's worktree, or git's own error. |
+| `worktree_busy: <slug>` | A running step of this host holds that worktree; refused at once, before dispatch (ADR-0073). |
 | anything else | The host's `StepRunner` reason (its `Err` string, e.g. an unknown environment), or `journal: …` when the `Dispatch` line could not be written. |
 
 ## 5. Structured output
@@ -288,6 +288,18 @@ tool's rules, texts and error wording are completion.md §2 "Structured result" 
    `error: invalid_output: <errors joined by "; ">`, the last rejected value kept,
    `attempts: 2`; any other end (blocked, ended without finish) is that end, `attempts: 2`.
 
+**A turn that ends without `finish` (ADR-0072)** gets the same one round: when a step's
+FIRST turn ends without an accepted `finish` call,
+1. the cap is checked AGAIN (a capped nudge is the §3 refused-repair envelope, the
+   worker's message kept as the value);
+2. ONE repair turn runs in the SAME worker with the message
+   `You ended your turn without calling finish. Call finish now: status "done" with your result (and the evidence), or "blocked" with what you need.`;
+3. its end is the step's end, `attempts: 2`; a second end without `finish` stays
+   `ended without finish` with the worker's last message as the value.
+
+A step gets at most ONE repair turn: a schema repair turn that ends without `finish` is
+that end and is not nudged again.
+
 ## 6. Journal and replay
 
 Each record is one JSON line in the run's `journal.jsonl`, append-only, written with one
@@ -298,7 +310,7 @@ silently skipping a `Dispatch` would under-charge the caps.
 
 | Kind | Fields | When |
 |---|---|---|
-| `started` | run, script_hash, args, resumed_from, base (only when the run has one, ADR-0072) | The first line. |
+| `started` | run, script_hash, args, resumed_from, base (only when the run has one, ADR-0073) | The first line. |
 | `phase` | name | Every `phase()`. |
 | `dispatch` | call, label, role, model, wire_model, attempt, prompt, opts | **Before the worker starts** — one per model a chain turns to. |
 | `capped` | call, wire_model, used, limit | A dispatch refused by a cap, before anything ran. |
@@ -444,7 +456,7 @@ whatever the script returns.
   caller gave `StartRequest`) or in a path the script itself names with the call's
   `workspace` opt; the opt wins for that step. The engine passes it through and confines
   nothing; the host's workspace rules (ADR-0025) apply as for any worker.
-- **Worktree rule** (ADR-0072): a step with `worktree: "<slug>"` runs in its own git
+- **Worktree rule** (ADR-0073): a step with `worktree: "<slug>"` runs in its own git
   worktree. The host resolves the run's base commit (`git rev-parse HEAD` of the run's
   workspace) when it starts the run; a resumed run keeps its predecessor's. The host holds
   a step's worktree for the whole step — its fallback links and its repair turn — and

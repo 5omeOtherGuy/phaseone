@@ -185,7 +185,7 @@ let b = agent("second task", #{ label: "two", worktree: "e2e-b" });
 [a.worktree.path, a.worktree.branch, a.worktree.head, b.worktree.path, b.worktree.branch, b.worktree.head]
 "#;
 
-// ADR-0072: two steps, each in its own worktree next to the parent's checkout — one
+// ADR-0073: two steps, each in its own worktree next to the parent's checkout — one
 // made from the run's base, one attached to its existing branch.
 #[tokio::test]
 async fn two_steps_run_in_two_worktrees() {

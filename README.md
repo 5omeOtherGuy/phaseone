@@ -141,7 +141,7 @@ workstation (AGENTS.md).
 ## Working here
 
 The repo is built for parallel agents: one git worktree per task, one small issue per
-task, short-lived branches, trunk-based merges. No review gate, no branch protection.
+task, short-lived branches, trunk-based merges through pull requests; main requires the `gate` CI check.
 See `AGENTS.md` and open an issue to claim work.
 
 ## Licence

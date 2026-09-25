@@ -9,9 +9,9 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 const RECURSION_GUARDS: [&str; 5] = [
@@ -42,6 +42,31 @@ pub struct ShadowEvent {
     pub source_ref: Option<String>,
 }
 
+/// What one [`ShadowHook::observe_outcome`] call decided.
+#[derive(Debug)]
+pub enum Outcome {
+    /// A recursion guard variable was set: no task file, no process.
+    Guarded,
+    /// No state directory could be derived: no task file, no process.
+    NoState,
+    /// `STATE/kill` exists: no task file, no process.
+    Killed,
+    /// The task file was written and the process started, detached.
+    Spawned(Spawned),
+    /// A filesystem or spawn error; any task file this call created was removed.
+    Failed(io::Error),
+}
+
+/// A started shadow process.
+#[derive(Debug)]
+pub struct Spawned {
+    /// The task file handed to the process.
+    pub task_file: PathBuf,
+    /// Receives the child's wait result from the reaper thread once it exits;
+    /// disconnects without a value if no reaper could be started.
+    pub exit: mpsc::Receiver<io::Result<ExitStatus>>,
+}
+
 /// A configured, fail-open shadow hook.
 #[allow(clippy::type_complexity)]
 pub struct ShadowHook {
@@ -63,22 +88,34 @@ impl ShadowHook {
 
     /// Observes an event. All filesystem and process errors are intentionally ignored.
     pub fn observe(&self, event: ShadowEvent) {
-        let _ = self.observe_inner(event);
+        let _ = self.observe_outcome(event);
     }
 
-    fn observe_inner(&self, event: ShadowEvent) -> io::Result<()> {
+    /// Observes an event like [`ShadowHook::observe`] and reports what the hook decided.
+    ///
+    /// The call itself never waits for the child. Dropping the outcome keeps the
+    /// fire-and-forget behaviour; holding a [`Spawned`] lets a caller (the tests)
+    /// synchronise on the child's exit instead of on wall-clock time.
+    pub fn observe_outcome(&self, event: ShadowEvent) -> Outcome {
+        match self.observe_inner(event) {
+            Ok(outcome) => outcome,
+            Err(error) => Outcome::Failed(error),
+        }
+    }
+
+    fn observe_inner(&self, event: ShadowEvent) -> io::Result<Outcome> {
         if RECURSION_GUARDS
             .iter()
             .any(|name| guarded((self.env)(name)))
         {
-            return Ok(());
+            return Ok(Outcome::Guarded);
         }
 
         let Some(state) = state_dir(&*self.env) else {
-            return Ok(());
+            return Ok(Outcome::NoState);
         };
         if state.join("kill").exists() {
-            return Ok(());
+            return Ok(Outcome::Killed);
         }
 
         let inbox = state.join("inbox");
@@ -136,13 +173,19 @@ impl ShadowHook {
         match command.spawn() {
             Ok(mut child) => {
                 // Builder::spawn is fallible, unlike thread::spawn. If the reaper
-                // cannot be created, dropping Child still does not delay this path.
+                // cannot be created, dropping Child still does not delay this path;
+                // the dropped closure drops the sender, so `exit` disconnects.
+                let (sender, exit) = mpsc::channel();
                 let _ = thread::Builder::new()
                     .name("p1-shadow-reaper".into())
                     .spawn(move || {
-                        let _ = child.wait();
+                        // Nobody listens when the caller dropped the outcome.
+                        let _ = sender.send(child.wait());
                     });
-                Ok(())
+                Ok(Outcome::Spawned(Spawned {
+                    task_file: task_path,
+                    exit,
+                }))
             }
             Err(error) => {
                 let _ = fs::remove_file(task_path);

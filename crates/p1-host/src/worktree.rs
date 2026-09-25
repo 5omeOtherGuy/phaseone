@@ -1,4 +1,4 @@
-//! A workflow step's own git worktree (ADR-0072). The engine carries only strings — a
+//! A workflow step's own git worktree (ADR-0073). The engine carries only strings — a
 //! slug and the run's base commit; the git work is here, through the `git` CLI.
 //!
 //! A step's worktree is `<parent of the main worktree>/<main worktree name>-<slug>` on the
@@ -37,7 +37,7 @@ pub(crate) fn head(dir: &Path) -> Result<String, String> {
     git(dir, &["rev-parse", "HEAD"])
 }
 
-/// The base commit of a run in `workspace` (ADR-0072 item 2): its `HEAD`, or `None` when
+/// The base commit of a run in `workspace` (ADR-0073 item 2): its `HEAD`, or `None` when
 /// it is not a git repository (or has no commit). Blocking: call it off the executor.
 pub(crate) fn run_base(workspace: &Path) -> Option<String> {
     head(workspace).ok()
@@ -107,7 +107,7 @@ fn locate(run_workspace: &Path, slug: &str) -> Result<Located, String> {
     })
 }
 
-/// Makes or reuses the worktree `located` names (ADR-0072 item 3).
+/// Makes or reuses the worktree `located` names (ADR-0073 item 3).
 fn prepare(run_workspace: &Path, located: &Located, base: &str) -> Result<WorktreeInfo, String> {
     let Located {
         path,
@@ -174,13 +174,13 @@ fn same_path(listed: &Path, wanted: &Path) -> bool {
 }
 
 /// The step worktree for `slug` in the repository of `run_workspace`, made from `base`
-/// when missing (ADR-0072 item 3). Blocking. Errors carry git's own words.
+/// when missing (ADR-0073 item 3). Blocking. Errors carry git's own words.
 pub(crate) fn ensure(run_workspace: &Path, slug: &str, base: &str) -> Result<WorktreeInfo, String> {
     let located = locate(run_workspace, slug)?;
     prepare(run_workspace, &located, base)
 }
 
-/// The worktree paths held by running steps (ADR-0072 item 4). Its one lock also
+/// The worktree paths held by running steps (ADR-0073 item 4). Its one lock also
 /// serialises `git worktree add`, so two steps never race to make the same tree.
 #[derive(Default)]
 pub(crate) struct Worktrees {

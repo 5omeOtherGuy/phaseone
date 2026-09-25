@@ -18,7 +18,8 @@ Keep shared-file edits minimal: `AGENTS.md`, `DECISIONS.md`, `Cargo.toml`, `Carg
 Merge current main immediately before touching shared files.
 Keep `DECISIONS.md` append-only.
 Stage and commit only explicit owned paths; never `git add -A`; never force-push main.
-Commit often on the task branch; keep branches short-lived (no long-lived branches; main has no branch protection).
+Commit often on the task branch; keep branches short-lived (no long-lived branches).
+main requires the `gate` check (branch protection, admins included, owner 2026-09-25): a change reaches main only through a PR whose gate is green, so `gh pr merge --auto` waits for green.
 Land every slice as the owner's landing order requires (`~/.agents/OWNER-ORDERS.md`, 2026-09-24 21:00): `gh pr create --fill`, an independent cheap review, repair until it approves, then `gh pr merge --auto --squash --delete-branch` on green PR CI; do not bypass review with a local direct-to-main merge.
 A small diff is a mergeable diff; resolve conflicts without breaking either accepted behavior, then rerun the relevant gate.
 Remove a finished worktree with `git worktree remove <path>` only when its work is merged or pushed and its board claim is released by its owner or the lead.
@@ -36,7 +37,7 @@ Follow model-cards for briefing, nonblocking supervision, repairs and evidence.
 Run `scripts/gate.sh` before merge: fmt check, clippy with `-D warnings`, all tests and core isolation.
 Before a merge, the PR's CI (which runs exactly this script) and an independent review must both be green.
 Intermediate commits need not run the full gate.
-After merging main, use `scripts/push-main.sh` and verify the CI run for exactly that commit.
+After a PR merges, verify main's own `gate` run for exactly the merge commit; direct pushes to main (`scripts/push-main.sh`) are refused.
 Do not equate a green workstation gate with green CI; CI lacks bubblewrap and can start more slowly.
 Create an ADR for changed interfaces, dependency/workflow rules or reversed decisions using `scripts/adr.py new "Title"`.
 Keep it proposed until merged, then accepted or rejected.

@@ -82,7 +82,7 @@ pub struct HostStepRunner {
     /// What a blocked step asked for, by worker id: the step line carries no `needs`,
     /// and the observer words the line.
     needs: Arc<Mutex<HashMap<String, String>>>,
-    /// The worktrees running steps hold (ADR-0072 item 4).
+    /// The worktrees running steps hold (ADR-0073 item 4).
     worktrees: Arc<crate::worktree::Worktrees>,
 }
 
@@ -363,7 +363,7 @@ impl StepRunner for HostStepRunner {
 }
 
 /// The service the `workflow_*` tools start runs through: the tool names no workspace,
-/// so the run's base commit (ADR-0072 item 2) is `HEAD` of the workspace its steps fall
+/// so the run's base commit (ADR-0073 item 2) is `HEAD` of the workspace its steps fall
 /// back to, resolved here, in the host — the engine never runs git.
 struct BasedWorkflows {
     inner: Arc<InProcessWorkflows>,

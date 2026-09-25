@@ -167,22 +167,33 @@ async fn route_failure_body() {
 }
 
 /// The mapping is for the ROUTE alone: a worker whose turn completed without a `finish`
-/// executed and failed, so the chain is not walked.
+/// executed and failed, so the chain is not walked — its one nudge (ADR-0072) is another
+/// turn of the SAME worker on the same route.
 #[tokio::test]
 async fn a_step_that_ran_and_failed_does_not_fall_back() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let (fakes, scratch, code, stderr) = run(
             ROLES_WITH_FALLBACK,
             ONE_STEP,
-            vec![text_response("nothing done")],
+            vec![
+                text_response("nothing done"),
+                text_response("still nothing"),
+            ],
         )
         .await;
         assert_eq!(code, 2, "completed with issues: {stderr}");
         assert_eq!(fakes.builds(), 1, "no second worker: {stderr}");
         assert!(fakes.other.requests().is_empty());
+        let nudged = fakes.main.requests();
+        assert_eq!(nudged.len(), 2, "one nudge turn: {stderr}");
+        assert!(
+            format!("{:?}", nudged[1].history)
+                .contains("You ended your turn without calling finish."),
+            "the nudge is the worker's next message"
+        );
         let lines = step_lines(&stderr, "wf1");
         assert!(
-            lines[0].contains("(worker → fake/main; w1) failed — ended without finish"),
+            lines[0].contains("(worker → fake/main; w1) failed — attempts 2; ended without finish"),
             "{lines:?}"
         );
         let result = result_of(&scratch);

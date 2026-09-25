@@ -1,4 +1,4 @@
-//! A step's own git worktree (ADR-0072): the `worktree` option, the run's base commit
+//! A step's own git worktree (ADR-0073): the `worktree` option, the run's base commit
 //! carried into every step request and kept on resume, the hold across the step, and the
 //! `worktree` field of the envelope. The git work is the host's; here the scripted
 //! runner hands out fake worktrees.

@@ -1034,7 +1034,7 @@ async fn workflow_run(
     )?);
     let _ = catalog_slot.set(catalog);
 
-    // The run's base commit (ADR-0072): what its steps' new worktrees branch from.
+    // The run's base commit (ADR-0073): what its steps' new worktrees branch from.
     let base = crate::worktree::run_base_async(workspace.clone()).await;
     let request = p1_workflow::StartRequest {
         script,

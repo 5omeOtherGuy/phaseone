@@ -5,10 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use p1_hook_shadow::{Origin, ShadowEvent, ShadowHook, find_binary};
+use p1_hook_shadow::{Origin, Outcome, ShadowEvent, ShadowHook, find_binary};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const GUARDS: [&str; 5] = [
@@ -71,19 +70,24 @@ fn fake_binary(root: &Path) -> (PathBuf, PathBuf) {
     (binary, arguments)
 }
 
-fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if path.exists() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+/// Guards only against a hung test: the fake child is a three-line shell script, so a
+/// correct run never comes near this. The result is decided by the hook's outcome and
+/// the child's exit status, never by the clock.
+const HUNG_TEST_BOUND: Duration = Duration::from_secs(300);
+
+/// Asserts that the hook spawned, waits for the fake child to exit (the reaper
+/// reports its exit status), and returns the task file handed to it.
+fn wait_for_spawned_exit(outcome: Outcome) -> PathBuf {
+    let Outcome::Spawned(spawned) = outcome else {
+        panic!("expected a spawn, got {outcome:?}");
+    };
+    let status = spawned
+        .exit
+        .recv_timeout(HUNG_TEST_BOUND)
+        .expect("the reaper reports the fake child's exit")
+        .expect("waiting on the fake child succeeds");
+    assert!(status.success(), "fake child failed: {status:?}");
+    spawned.task_file
 }
 
 #[test]
@@ -101,7 +105,9 @@ fn kill_file_prevents_file_and_spawn() {
         )])),
     );
 
-    hook.observe(event(Origin::UserInput));
+    // The hook's own decision, returned synchronously: nothing is left to wait for.
+    let outcome = hook.observe_outcome(event(Origin::UserInput));
+    assert!(matches!(outcome, Outcome::Killed), "{outcome:?}");
 
     assert!(!arguments.exists());
     assert!(!temp.0.join("state/inbox").exists());
@@ -121,7 +127,11 @@ fn every_recursion_guard_prevents_file_and_spawn() {
             ])),
         );
 
-        hook.observe(event(Origin::UserInput));
+        let outcome = hook.observe_outcome(event(Origin::UserInput));
+        assert!(
+            matches!(outcome, Outcome::Guarded),
+            "guard {guard}: {outcome:?}"
+        );
 
         assert!(!arguments.exists(), "spawned with guard {guard}");
         assert!(!state.join("inbox").exists(), "wrote with guard {guard}");
@@ -141,8 +151,8 @@ fn zero_and_empty_recursion_values_do_not_guard() {
                 ("BRAIN_HOME".into(), OsString::from(value)),
             ])),
         );
-        hook.observe(event(Origin::UserInput));
-        wait_for(&arguments);
+        wait_for_spawned_exit(hook.observe_outcome(event(Origin::UserInput)));
+        assert!(arguments.exists(), "no spawn with BRAIN_HOME={value:?}");
     }
 }
 
@@ -159,11 +169,10 @@ fn normal_dispatch_writes_private_exact_task_and_exact_argv() {
         )])),
     );
 
-    hook.observe(event(Origin::Dispatch {
+    let spawned_task = wait_for_spawned_exit(hook.observe_outcome(event(Origin::Dispatch {
         family: "researcher".into(),
         provider: "p1".into(),
-    }));
-    wait_for(&arguments);
+    })));
 
     let entries: Vec<_> = fs::read_dir(state.join("inbox"))
         .unwrap()
@@ -171,6 +180,7 @@ fn normal_dispatch_writes_private_exact_task_and_exact_argv() {
         .collect();
     assert_eq!(entries.len(), 1);
     let task = &entries[0];
+    assert_eq!(task, &spawned_task);
     assert_eq!(fs::read(task).unwrap(), b"  retain this exact task\n");
     assert_eq!(
         fs::metadata(task).unwrap().permissions().mode() & 0o777,
@@ -224,14 +234,14 @@ fn user_input_has_exact_argv_and_private_exact_bytes() {
     );
     let mut input = event(Origin::UserInput);
     input.source_ref = None;
-    hook.observe(input);
-    wait_for(&arguments);
+    let spawned_task = wait_for_spawned_exit(hook.observe_outcome(input));
     let task = fs::read_dir(state.join("inbox"))
         .unwrap()
         .next()
         .unwrap()
         .unwrap()
         .path();
+    assert_eq!(task, spawned_task);
     assert_eq!(fs::read(&task).unwrap(), b"  retain this exact task\n");
     assert_eq!(
         fs::metadata(&task).unwrap().permissions().mode() & 0o777,
@@ -281,8 +291,7 @@ fn explicit_episode_and_derived_session_are_used() {
     observed.cache_key = None;
     observed.workspace = Some(PathBuf::from("relative"));
     observed.source_ref = None;
-    hook.observe(observed);
-    wait_for(&arguments);
+    wait_for_spawned_exit(hook.observe_outcome(observed));
 
     let args = fs::read_to_string(arguments).unwrap();
     assert!(args.contains("--workspace\nunknown\n"));
@@ -306,7 +315,8 @@ fn nonexistent_binary_removes_only_new_task_file() {
         )])),
     );
 
-    hook.observe(event(Origin::UserInput));
+    let outcome = hook.observe_outcome(event(Origin::UserInput));
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
 
     let names: Vec<_> = fs::read_dir(state.join("inbox"))
         .unwrap()
