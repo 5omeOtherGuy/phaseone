@@ -57,6 +57,8 @@ pub enum Command {
     /// `Up` / `Down` with pane focus: scroll the pane.
     PaneUp,
     PaneDown,
+    /// `y` on a pending worker stop: cancel that worker through the host service.
+    StopWorker(String),
 }
 
 /// A key decision that only changes what the screen shows. The TUI performs these itself
@@ -81,6 +83,10 @@ pub enum ViewCommand {
     TogglePaneFocus,
     /// `⏎` / `a` on the focused WORKERS row (handoff §9.5).
     AttachWorker,
+    /// `x` on the focused WORKERS row: ask before stopping it.
+    AskStopWorker,
+    /// `n` / `esc` on the pending worker stop: keep it running.
+    KeepWorker,
     /// `esc` while a worker transcript is attached.
     DetachWorker,
     /// `^G`: the goal, prefilled, in the composer.
@@ -176,6 +182,14 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
             _ => None,
         };
     }
+    if let Some(id) = &screen.stop_pending {
+        return match (key.code, ctrl) {
+            (KeyCode::Char('y'), false) => Some(C(Command::StopWorker(id.clone()))),
+            (KeyCode::Char('n'), false) | (KeyCode::Esc, false) => Some(V(ViewCommand::KeepWorker)),
+            (KeyCode::Char('c'), true) => Some(C(Command::CancelOrQuit)),
+            _ => None,
+        };
+    }
     let pane_shown =
         !screen.focus && (screen.pane_width != PaneWidth::Off || screen.ledger_overlay);
     match (key.code, ctrl, alt) {
@@ -186,6 +200,14 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
                 && screen.workers.focused.is_some() =>
         {
             Some(V(ViewCommand::AttachWorker))
+        }
+        (KeyCode::Char('x'), false, false)
+            if key.modifiers.is_empty()
+                && screen.pane_focused
+                && screen.pane_mode == PaneMode::Workers
+                && (screen.attached.is_some() || screen.workers.focused.is_some()) =>
+        {
+            Some(V(ViewCommand::AskStopWorker))
         }
         (KeyCode::Enter, false, false) => {
             let text = screen.composer.text.clone();
@@ -588,6 +610,56 @@ mod tests {
         assert_eq!(
             decide(&s, key(KeyCode::Char('a'))),
             command(Command::Insert('a'))
+        );
+    }
+
+    #[test]
+    fn worker_focus_asks_before_stopping_and_unfocused_x_types() {
+        let mut s = Screen {
+            pane_focused: true,
+            pane_mode: PaneMode::Workers,
+            ..Default::default()
+        };
+        s.workers.focused = Some("w2".into());
+
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('x'))),
+            view(ViewCommand::AskStopWorker)
+        );
+        s.pane_focused = false;
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('x'))),
+            command(Command::Insert('x'))
+        );
+    }
+
+    #[test]
+    fn the_pending_worker_stop_is_modal() {
+        let s = Screen {
+            stop_pending: Some("w2".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('y'))),
+            command(Command::StopWorker("w2".into()))
+        );
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            assert_eq!(decide(&s, key(code)), view(ViewCommand::KeepWorker));
+        }
+        assert_eq!(decide(&s, key(KeyCode::Char('a'))), None);
+        assert_eq!(decide(&s, ctrl('c')), command(Command::CancelOrQuit));
+    }
+
+    #[test]
+    fn an_approval_wins_over_a_pending_worker_stop() {
+        let s = Screen {
+            approval: permission_approval(),
+            stop_pending: Some("w2".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('y'))),
+            command(Command::ApproveOnce)
         );
     }
 

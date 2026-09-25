@@ -216,14 +216,23 @@ pub fn build_request(
     if let Some(cap) = request.options.max_output_tokens {
         body["max_tokens"] = json!(cap);
     }
-    if !request.tools.is_empty() {
+    let tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|tool| match &tool.kind {
+            DeclarationKind::Function { input_schema } => json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":input_schema}}),
+            _ => unreachable!("validated"),
+        })
+        .collect();
+    // This adapter declares no tool of its own. The Zen free tier's gate wants
+    // `bash` and `read` among the declared tools, but that is an environment's
+    // business (`[[tools]] name = "bash"` / `"read"`), never the provider's: the
+    // provider only translates the request's own tools to the wire.
+    if !tools.is_empty() {
         if route.dialect == ChatDialect::RetainedThinking {
             body["tool_stream"] = json!(true);
         }
-        body["tools"] = request.tools.iter().map(|tool| match &tool.kind {
-            DeclarationKind::Function { input_schema } => json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":input_schema}}),
-            _ => unreachable!("validated"),
-        }).collect();
+        body["tools"] = json!(tools);
     }
     Ok(body)
 }

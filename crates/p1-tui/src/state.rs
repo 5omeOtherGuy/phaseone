@@ -333,6 +333,8 @@ pub struct Screen {
     /// A worker the operator attached to (`a`, handoff §9.5): its transcript replaces the
     /// parent's in the transcript area.
     pub attached: Option<AttachedWorker>,
+    /// A running worker awaiting the `y stop   n keep` confirmation.
+    pub stop_pending: Option<String>,
     /// Each worker's transcript while it is detached; attach takes the buffer out and detach
     /// puts it back, so worker output survives every view change.
     pub worker_transcripts: HashMap<String, Transcript>,
@@ -547,6 +549,35 @@ impl Screen {
         }
     }
 
+    /// Ask before stopping the attached worker, or the selected one when detached.
+    pub fn ask_stop(&mut self) {
+        let target = self
+            .attached
+            .as_ref()
+            .map(|worker| worker.id.clone())
+            .or(self.workers.focused.clone());
+        let Some(target) = target else {
+            return;
+        };
+        if self.workers.workers.iter().any(|worker| {
+            worker.id == target
+                && matches!(
+                    worker.state,
+                    BlockState::Running
+                        | BlockState::Queued
+                        | BlockState::NeedsReview
+                        | BlockState::Stalled
+                )
+        }) {
+            self.stop_pending = Some(target);
+        }
+    }
+
+    /// Dismiss a pending worker stop without changing the worker.
+    pub fn keep_worker(&mut self) {
+        self.stop_pending = None;
+    }
+
     /// Queue operator input for the next boundary (SPEC §4.2).
     pub fn queue(&mut self, follow_up: bool, text: String) {
         self.queued.push_back(Queued { follow_up, text });
@@ -707,6 +738,8 @@ impl Screen {
             }
             V::TogglePaneFocus => self.toggle_pane_focus(),
             V::AttachWorker => self.attach_selected(),
+            V::AskStopWorker => self.ask_stop(),
+            V::KeepWorker => self.keep_worker(),
             V::DetachWorker => self.detach_worker(),
             V::EditGoal => self.edit_goal(),
             V::KeepComposer => self.composer.keep(),
@@ -760,6 +793,20 @@ impl Screen {
             && !rows.iter().any(|w| &w.id == focused)
         {
             self.workers.focused = None;
+        }
+        if self.stop_pending.as_ref().is_some_and(|id| {
+            !rows.iter().any(|worker| {
+                &worker.id == id
+                    && matches!(
+                        worker.state,
+                        BlockState::Running
+                            | BlockState::Queued
+                            | BlockState::NeedsReview
+                            | BlockState::Stalled
+                    )
+            })
+        }) {
+            self.stop_pending = None;
         }
         self.workers.workers = rows;
         if let Some(worker) = &mut self.attached {

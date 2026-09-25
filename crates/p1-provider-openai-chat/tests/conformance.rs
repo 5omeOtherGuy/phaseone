@@ -49,6 +49,7 @@ fn config(retained: bool) -> (ChatRoute, Arc<ModelProfile>) {
             .into(),
             headers: vec![("user-agent".into(), "p1/test".into())],
             session_header: (!retained).then(|| "x-opencode-session".into()),
+            client_identity: None,
             dialect: if retained {
                 ChatDialect::RetainedThinking
             } else {
