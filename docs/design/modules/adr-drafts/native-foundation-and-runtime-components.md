@@ -16,9 +16,9 @@ does not move, and what a guest is allowed to be.
 Some parts of p1 cannot become modules at all. WASI gives a module no process spawn and no
 sockets, and a module must never hold a credential; the bubblewrap boundary, the workspace and
 the journal are native services whose whole point is that the guest cannot reach past them. Read
-carelessly, "everything migrates to wasm" (DECISIONS.md D22) would either pull a capability into
-the guest — where it could be bypassed — or pull the wasmtime runtime into `p1-core`, which
-ADR-0002 forbids and `scripts/check-core-isolation.sh` fails.
+carelessly, D22's decision that p1 migrates completely to WebAssembly modules would either pull a
+capability into the guest — where it could be bypassed — or pull the wasmtime runtime into
+`p1-core`, which ADR-0002 forbids and `scripts/check-core-isolation.sh` fails.
 
 The guest side needs its own line. The owner's programme answered two questions that fix it
 (XO with owner authority, 2026-09-25): the guest target is `wasm32-unknown-unknown` componentized
@@ -50,10 +50,10 @@ constructed at the host's one composition root, exactly as ADR-0002 and ADR-0004
 changed is one layer below the composition root, where the module is no longer linked in.
 
 A guest has no WASI surface and no std I/O by design. The guest target is
-`wasm32-unknown-unknown` (`modules/toolchain.pins`), componentized by the build with
-`wasm-tools component new`; a component with any `wasi:` import is refused, not allow-listed
-(D-XO-4). A guest panic is the wasm `unreachable` trap, which the host maps through
-`ModuleFailure` into the existing closed shapes — `ToolOutcome` for a tool call and
+`wasm32-unknown-unknown` (`modules/toolchain.pins`; the pin takes effect with S0.5, PR #252),
+componentized by the build with `wasm-tools component new`; a component with any `wasi:` import is
+refused, not allow-listed (D-XO-4). A guest panic is the wasm `unreachable` trap, which the host
+maps through `ModuleFailure` into the existing closed shapes — `ToolOutcome` for a tool call and
 `ProviderErrorKind` for a provider outcome — and adds no kind ([`protocol.md`](../protocol.md)).
 
 A guest crate may use only serde, serde_json and regex (D-XO-8); any other crate is a
@@ -109,9 +109,10 @@ by the migration; this records the compile-time consequence of reading it beside
   commit `a64d9e76`), with [`package.md`](../package.md).
 - The WIT worlds give a guest no `wasi:` interface to import: PR #226 (merge commit `2f9c2223`)
   and PR #245 (merge commit `36ec6e16`), with [`wit.md`](../wit.md).
-- The loader and executor that put the runtime in the host, the `wasm32-unknown-unknown` target
-  of D-XO-4 and the S0-R3 reading of guest crates land with S0.5 (PR #252, open at drafting) and
-  are recorded here when they merge.
+- The loader and executor that put the runtime in the host and the `wasm32-unknown-unknown` target
+  of D-XO-4 land with S0.5 (PR #252, open at drafting) and are recorded here when they merge.
+- The S0-R3 reading of guest crates is recorded by this PR's section of
+  [`package.md`](../package.md); the first shared guest crate lands with S3's slices.
 - The remaining evidence — the S0.5–S0.8 PRs and their definition-of-done rows — is added before
   the `wasm-boundary-v1` tag. The recorded DoD runs are the evidence bundle
   `.wasm/up/evidence/` on box `wasm-s0`.

@@ -50,7 +50,9 @@ rebuilt after any trap, and a failed inspection degrades safely (a failed `effec
 a failed `describe` is the empty `call` description). This is how PR #252 implements it: the
 restricted Store links nothing asynchronous, so the same engine serves both paths and the call
 uses wasmtime's synchronous entry point with no fiber, no future and no poll loop. It lands with
-S0.5, whose cancellation and streaming cases (S0.6) extend the same path.
+S0.5 (PR #252). The cancellation and streaming cases are S0.6's and exercise the executor's
+execute path — epoch and fuel limits, cooperative `control.cancelled()` and the `process.running`
+streaming resource — not this restricted inspection path.
 
 **Rich values cross as JSON text under the protocol version rule.** Each value family has a
 string alias in the WIT `types` and must conform to its schema, `p1:protocol/<family>/1`, where
