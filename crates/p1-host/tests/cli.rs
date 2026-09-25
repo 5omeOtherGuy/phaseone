@@ -95,7 +95,19 @@ fn help_version_and_unknown_flag() {
 
     let output = p1().arg("--version").output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("p1 0.0.1"));
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let prefix = format!("p1 {} (", env!("CARGO_PKG_VERSION"));
+    assert!(version.starts_with(&prefix), "{version:?}");
+    assert!(version.ends_with(')'), "{version:?}");
+    // The sha and the build date, in that order and each non-empty; `unknown` (no git,
+    // no date source) is a valid field.
+    let fields: Vec<&str> = version
+        .trim_start_matches(prefix.as_str())
+        .trim_end_matches(')')
+        .split(' ')
+        .collect();
+    assert_eq!(fields.len(), 2, "{version:?}");
+    assert!(fields.iter().all(|field| !field.is_empty()), "{version:?}");
 
     let output = p1().arg("--bogus").output().unwrap();
     assert_eq!(output.status.code(), Some(2));

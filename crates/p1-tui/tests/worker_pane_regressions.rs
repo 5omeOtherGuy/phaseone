@@ -13,9 +13,12 @@ fn worker(state: BlockState) -> WorkerBlock {
         id: "fixture-worker".into(),
         task: "synthetic task".into(),
         route: "synthetic/model".into(),
+        model: None,
         state,
         elapsed: None,
         cost_micro_usd: None,
+        tokens: None,
+        context_window: None,
         grants: String::new(),
         activity: "synthetic activity".into(),
     }

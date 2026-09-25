@@ -171,6 +171,10 @@ pub enum WorkerError {
     LimitReached { max: usize },
     #[error("invalid child environment: {0}")]
     InvalidEnvironment(String),
+    /// The service's id namespace holds no unallocated id: the last one handed out was
+    /// `w<usize::MAX>`. Stable, so a caller can report it without panicking or wrapping.
+    #[error("the worker id namespace is exhausted: no id can be allocated")]
+    IdsExhausted,
     #[error("the worker's tools were not changed: {0}")]
     Regrant(String),
     #[error("the worker service has shut down")]
@@ -430,8 +434,14 @@ impl InProcessWorkers {
             self.shared.reserve_running_slot(&state)?;
             // The id the build is handed is the id this call returns, and it is claimed
             // only once the child exists: the counter moves after a successful build, so
-            // the next start is offered this same id.
-            let id = format!("w{}", state.next_id + 1);
+            // the next start is offered this same id. `next_id` is the last id handed
+            // out, so the next is ONE more — and past `usize::MAX` there is none: a
+            // checked addition refuses the start (a stable error), never wraps.
+            let next = state
+                .next_id
+                .checked_add(1)
+                .ok_or(WorkerError::IdsExhausted)?;
+            let id = format!("w{next}");
             // Build failure is an invalid environment, not a service fault.
             let ChildAgent {
                 agent,
@@ -439,7 +449,7 @@ impl InProcessWorkers {
                 report,
                 regrant,
             } = build(&ChildId(id.clone())).map_err(WorkerError::InvalidEnvironment)?;
-            state.next_id += 1;
+            state.next_id = next;
 
             let (status, _) = watch::channel(ChildStatus::Running);
             let (commands, command_rx) = mpsc::unbounded_channel();
@@ -1588,6 +1598,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, ChildId("w1".into()), "the id was not consumed");
+    }
+
+    /// The exact boundary of the id namespace (issue #98): `w<usize::MAX>` is still
+    /// allocated and the counter reaches `usize::MAX`, and the NEXT start — direct or
+    /// prepared — is a stable `IdsExhausted` error, never a wrapped id or a panic. A
+    /// build that fails at the boundary consumes nothing, so the boundary id is still
+    /// on offer to the next successful build.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_worker_id_is_allocated_and_exhaustion_is_an_error() {
+        let (factory, _, _) = factory(1, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(Arc::clone(&factory), 2);
+        workers.reserve_ids(usize::MAX - 1);
+
+        // A failed build at the boundary consumes no id: the boundary one is offered again.
+        assert_eq!(
+            workers
+                .start_prepared(prepared(), |_| Err("no such environment".to_string()))
+                .await,
+            Err(WorkerError::InvalidEnvironment(
+                "no such environment".into()
+            ))
+        );
+
+        // `w<usize::MAX>` is the last allocatable id, and the build sees it.
+        let id = workers
+            .start_prepared(prepared(), |child_id| {
+                assert_eq!(child_id.0, format!("w{}", usize::MAX));
+                factory(&spec())
+            })
+            .await
+            .expect("the last id is still allocated");
+        assert_eq!(id, ChildId(format!("w{}", usize::MAX)));
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        // The namespace is exhausted: a stable error for every way of starting.
+        assert_eq!(workers.start(spec()).await, Err(WorkerError::IdsExhausted));
+        assert_eq!(
+            workers
+                .start_prepared(prepared(), |_| factory(&spec()))
+                .await,
+            Err(WorkerError::IdsExhausted)
+        );
     }
 
     /// At the bound the slot check runs BEFORE the build: `LimitReached`, and the build

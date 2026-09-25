@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# One worktree per task, so parallel agents never share a checkout. All worktrees share
-# ONE cargo target dir (small SSD, 7 GB RAM) — see scripts/local-cargo-config.sh.
+# One worktree per task, so parallel agents never share a checkout. Each gets a cold target
+# under ~/.cache/cargo-target on the SSD (ext4); jobs=2 and scripts/rustc-serial; see AGENTS.md.
 #
 #   scripts/new-worktree.sh 12-jsonl-journal        # -> ../phaseone-12-jsonl-journal
 #

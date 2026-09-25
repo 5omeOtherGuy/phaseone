@@ -40,9 +40,9 @@
   function strip(current, modes) { return c("PaneStrip", { modes: modes || ["ledger", "output", "workers"], current: current || "ledger" }); }
 
   var WORKERS = [
-    { id: "w3", task: "audit sandbox read paths", route: "deepseek2/v4.1-flash", state: "review", elapsed: "0m48s", grants: "read grep shell finish", activity: "shell rm -rf target/ \u00b7 awaiting approval" },
-    { id: "w2", task: "split provider-http helpers", route: "deepseek2/v4.1-flash", state: "running", elapsed: "0m52s", grants: "read edit shell finish", activity: "edit crates/p1-provider-http/src/retry.rs" },
-    { id: "w4", task: "measure summarize threshold", route: "glm/5.3", state: "failed", elapsed: "1m03s", grants: "read shell finish", activity: "RateLimited: HTTP 429" },
+    { id: "w3", task: "audit sandbox read paths", route: "deepseek2/v4.1-flash", model: "deepseek-v4.1-flash", tokens: 12400, state: "review", elapsed: "0m48s", grants: "read grep shell finish", activity: "shell rm -rf target/ \u00b7 awaiting approval" },
+    { id: "w2", task: "split provider-http helpers", route: "deepseek2/v4.1-flash", model: "deepseek-v4.1-flash", tokens: 48213, ctx: 128000, state: "running", elapsed: "0m52s", grants: "read edit shell finish", activity: "edit crates/p1-provider-http/src/retry.rs" },
+    { id: "w4", task: "measure summarize threshold", route: "glm/5.3", model: "glm-5.3", tokens: 3100, state: "failed", elapsed: "1m03s", grants: "read shell finish", activity: "RateLimited: HTTP 429" },
     { id: "w6", task: "rename ToolFace", route: "deepseek/v4.1-flash", state: "stalled", elapsed: "6m40s", grants: "read edit finish", activity: "6 summaries without a workspace change" },
     { id: "w5", task: "doc note for ADR-0050", route: "claude/sonnet-5", state: "queued", grants: "read write finish", activity: "waiting for a pool slot" },
     { id: "w1", task: "reject cred-dir ancestors", route: "gpt/gpt-5.6-luna", state: "unverified", elapsed: "2m10s", grants: "read edit finish", activity: "not verified \u2014 parent verification required" },

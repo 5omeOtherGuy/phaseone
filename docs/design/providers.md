@@ -15,6 +15,12 @@ no tools and chooses neither prompt nor tool set.
 
 Adapters depend on `p1-contracts` and `p1-provider-http`; never on the core, a tool or each other.
 
+For the OpenAI Chat Completions stream, the finish choice is terminal except for one
+OpenRouter-proxied gateway shape: ClinePass may repeat the same empty finish choice
+(the delta has no content, reasoning, or tool calls) in the final usage chunk. The
+repeat may carry usage, which is recorded as the latest usage report, but it does not
+emit a second finish; every other choice after a finish remains a protocol error.
+
 ## `p1-provider-http`
 
 ```rust
