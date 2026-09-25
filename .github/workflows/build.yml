@@ -32,6 +32,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-wasip2
 
       - name: Cache cargo (this branch)
         id: rust-cache

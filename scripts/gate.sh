@@ -18,6 +18,9 @@ echo "== gate: test"
 # futex for 37 minutes with nobody watching (2026-09-23). An hour covers a cold build under
 # the rustc semaphore plus every test; a green gate never comes near it.
 timeout --foreground 3600 cargo test --workspace --locked
+echo "== gate: modules"
+scripts/module-toolchain.sh --check
+scripts/build-modules.sh --all
 echo "== gate: core isolation"
 scripts/check-core-isolation.sh
 echo "== gate: secret scan"
