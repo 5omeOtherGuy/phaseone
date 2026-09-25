@@ -74,12 +74,22 @@ entry inside the whole value a call returns (`eval/data_check.rs`
 any other — rhai has no way to exempt a value. The envelope `agent()` returns is the
 HOST's data, one per call, so one `parallel()` of a dozen done envelopes, a map a script
 builds from several envelopes, and one verbose envelope are all ONE budget (issue #121).
-The engine therefore sizes each limit to the run's own step cap: `max_steps` envelopes'
-worth, one envelope being 64 KiB of strings, 4096 array items and 4096 map entries — with
-the default `max_steps = 200` that is 12.5 MiB of strings and 800k array items or map
-entries in one script value. A script's OWN strings, arrays and maps stay bounded by the
-same numbers (a `max_steps = 2` run can build a 128 KiB string, not more), and building
-them is still charged against `max_operations`.
+The engine therefore sizes each limit to the run's own step cap — `min(max_steps, 64)`
+envelopes' worth, one envelope being 64 KiB of strings, 4096 array items and 4096 map
+entries — with the cap a constant (`engine.rs` `DATA_BUDGET_ENVELOPES`). At the default
+`max_steps = 200` the limits ARE the cap: 4 MiB of strings, 262,144 array items, 262,144
+map entries in one script value, which a run of any step cap cannot exceed. rhai gives
+each VALUE its own three sums, so the sandbox's ceiling is that cap times the concurrency:
+64 thunks × 4 MiB of strings = 256 MiB, and near 1.5 GiB for a script that fills a string,
+an array and a map in every thunk at once — the cap is what keeps the ceiling independent
+of the operator's own step cap.
+
+A script's OWN strings, arrays and maps stay bounded by the same numbers (a `max_steps = 2`
+run can build a 128 KiB string, not more), and building them is still charged against
+`max_operations`. Because the budget is per VALUE and capped, a fan-out whose envelopes sum
+past 4 MiB of strings — more than 64 full-size (64 KiB) envelopes, about 136 at the 30 KB
+the issue's steps returned — must be SPLIT into several `parallel()` calls; `max_steps`
+200 still allows several such batches.
 
 **The bounded thread rule.** rhai has no async VM: each run's script executes on its own
 OS thread (`p1-wf-script`), and `agent()` blocks that thread on the caller's tokio handle
@@ -449,9 +459,9 @@ proves the replay rules: an unchanged run replays everything, an edited middle c
 re-runs it and everything after, caps are rebuilt from every old dispatch, failed steps
 are not replayed, parallel calls match by content. `sandbox.rs` proves every escape
 vector fails and every engine limit holds; `size_limits.rs` proves a completed `parallel`
-of twelve large envelopes comes back whole, that one verbose envelope does too, and that
-a script's own string is refused past `max_steps` envelopes' worth; `prompt_example.rs`
-runs the prompts'
+of twelve large envelopes comes back whole, that one verbose envelope does too, that a
+script's own string is refused past its run's budget, and that a 200-step run is still
+capped at 64 envelopes' worth; `prompt_example.rs` runs the prompts'
 example on the shipped settings; `fallback.rs` proves the chains (ADR-0054): a route
 failure on the head hands the step to the next link with
 `dispatch/fallback/dispatch` journalled and `fell_back` counted, a capped link is skipped

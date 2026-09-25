@@ -117,3 +117,51 @@ async fn a_script_built_string_is_bounded_by_the_runs_step_cap() {
     let error = refused.error.expect("a failure names its error");
     assert!(error.contains("Length of string too large"), "{error}");
 }
+
+/// The budget does NOT follow `max_steps` past the cap: at the default 200 steps the limits
+/// are the 64 envelopes `DATA_BUDGET_ENVELOPES` allows — 4 MiB of strings, 262,144 array
+/// items — and not 200 × 64 KiB and 200 × 4096, so the sandbox's ceiling stays independent
+/// of the operator's step cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_200_step_run_is_still_capped_at_sixty_four_envelopes() {
+    let harness = Harness::new(); // max_steps = 200
+    let allowed = harness
+        .run(
+            r#"
+            let s = "x";
+            while s.len() < 4 * 1024 * 1024 { s += s; }
+            s.len()
+            "#,
+        )
+        .await;
+    assert_eq!(allowed.outcome, RunOutcome::Completed, "{allowed:?}");
+    assert_eq!(allowed.value, json!(4 * 1024 * 1024));
+
+    let refused = harness
+        .run(
+            r#"
+            let s = "x";
+            while s.len() < 8 * 1024 * 1024 { s += s; }
+            s.len()
+            "#,
+        )
+        .await;
+    assert_eq!(refused.outcome, RunOutcome::Failed, "{refused:?}");
+    let error = refused.error.expect("a failure names its error");
+    assert!(
+        error.contains("Length of string too large"),
+        "8 MiB is past the 4 MiB cap: {error}"
+    );
+
+    // The array limit is capped the same way (the map limit shares the factor): doubling is
+    // the one way to build a large array that does not re-walk it on every push.
+    let array = harness
+        .run("let a = [0]; while a.len() < 300000 { a += a; } a.len()")
+        .await;
+    assert_eq!(array.outcome, RunOutcome::Failed, "{array:?}");
+    let error = array.error.expect("a failure names its error");
+    assert!(
+        error.contains("Size of array"),
+        "300k items is past the 262,144 cap: {error}"
+    );
+}

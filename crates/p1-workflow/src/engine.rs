@@ -831,8 +831,30 @@ const ENVELOPE_STRINGS: usize = 64 * 1024;
 const ENVELOPE_ARRAY_ITEMS: usize = 4096;
 const ENVELOPE_MAP_ENTRIES: usize = 4096;
 
-/// The data-size limits for a run that may make `max_steps` `agent()` calls: that many
-/// envelopes' worth, in each of rhai's three sums.
+/// The most envelopes' worth of data one run is budgeted for, whatever its `max_steps` is.
+///
+/// A budget that grew with the whole step cap (`max_steps` defaults to 200, a settings
+/// table may set thousands) is not a machine-safe ceiling: rhai gives every value its own
+/// three sums, so one run can hold this much per VALUE, and `max_threads` (64) thunks may
+/// be in flight at once. The ceiling is therefore this cap times that concurrency, not the
+/// step count.
+///
+/// The arithmetic, worst case: 64 thunks × 4 MiB of strings = 256 MiB; a thunk that also
+/// fills an array and a map holds 64 × 262,144 entries — about 6 MiB of array items and
+/// 13 MiB of map entries at roughly 24 and 50 bytes each, so a script holding a full-size
+/// value of each kind in every thunk peaks near 1.5 GiB, about a third of what an uncapped
+/// 200-step budget allowed (the review of PR #174 measured 4.5–5.5 GiB there). Filling
+/// those containers is not cheap either: the map path re-checks the WHOLE map on every
+/// insert, and that walk is not operation-counted, so filling one to the cap is 262,144²/2
+/// entry walks — tens of minutes of one thread's CPU.
+///
+/// So a fan-out whose envelopes sum past one capped value — more than 64 full-size (64 KiB)
+/// envelopes, or about 136 at the 30 KB the issue's steps returned — must be split into
+/// several `parallel()` calls, which `max_steps` 200 still allows.
+const DATA_BUDGET_ENVELOPES: u32 = 64;
+
+/// The data-size limits for a run that may make `max_steps` `agent()` calls: the smaller of
+/// that cap and [`DATA_BUDGET_ENVELOPES`] envelopes' worth, in each of rhai's three sums.
 ///
 /// rhai checks its data limits against the SUM over the whole value a call returns
 /// (`eval/data_check.rs` `calc_array_sizes`/`calc_map_sizes`), and a native function's
@@ -840,15 +862,15 @@ const ENVELOPE_MAP_ENTRIES: usize = 4096;
 /// from the accounting: `parallel()`'s array of a dozen done envelopes, a map a script
 /// builds from several envelopes, and one verbose envelope are all ONE budget (issue #121).
 /// The envelopes are the host's data — one per `agent()` call the run's `max_steps` caps —
-/// so that cap, and not a single envelope, is the bound a completed fan-out needs. A
-/// script's OWN strings, arrays and maps stay bounded by the same per-value numbers, and
-/// the script can neither hold unlimited values (`max_variables`) nor build them cheaply
-/// (`max_operations`); the budget follows the operator's own cap the way the worker count
-/// does — a settings table that allows a million steps already allows a million workers.
+/// so many envelopes' worth, and not one, is the bound a completed fan-out needs. A
+/// script's OWN strings, arrays and maps stay bounded by the same per-value numbers, which
+/// `max_variables` and `max_operations` keep it from multiplying without limit.
 fn data_limits(max_steps: u32) -> (usize, usize, usize) {
     // A run that may make no call still evaluates its script: one envelope's worth, never
     // zero (a zero limit refuses every non-empty string).
-    let envelopes = usize::try_from(max_steps).unwrap_or(usize::MAX).max(1);
+    let envelopes = usize::try_from(max_steps.min(DATA_BUDGET_ENVELOPES))
+        .unwrap_or(usize::MAX)
+        .max(1);
     (
         ENVELOPE_STRINGS.saturating_mul(envelopes),
         ENVELOPE_ARRAY_ITEMS.saturating_mul(envelopes),
