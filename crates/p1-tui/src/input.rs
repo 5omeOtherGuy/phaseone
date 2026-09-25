@@ -591,6 +591,7 @@ mod tests {
         s.composer.take();
         s.composer.text = "draft".into();
         assert_eq!(decide(&s, key(KeyCode::Up)), None);
+        s.composer.text.clear();
         s.working = working();
         assert_eq!(decide(&s, key(KeyCode::Up)), None);
         assert_eq!(decide(&s, key(KeyCode::Down)), None);
