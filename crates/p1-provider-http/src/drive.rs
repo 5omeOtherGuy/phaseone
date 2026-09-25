@@ -25,7 +25,7 @@ use p1_contracts::{
 use crate::credential::{Credential, CredentialSource};
 use crate::http::{
     ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, HttpResponse, STREAM_IDLE_TIMEOUT, Transport,
-    TransportError, first_byte_timeout_message,
+    TransportError, first_byte_timeout_message, stream_idle_timeout_message,
 };
 use crate::retry::{HttpClass, RetryPolicy, classify_status, retry_after};
 use crate::sse::{SseDecoder, SseEvent};
@@ -255,15 +255,16 @@ async fn await_post(
 ) -> State {
     let cancel = state.request.cancel.clone();
     let now = tokio::time::Instant::now();
-    if now >= deadline {
-        return first_byte_timeout(state);
-    }
     // The note fires once, after the grace delay; after that only the bound remains.
     let wake = if notified {
         deadline
     } else {
         (now + WAITING_NOTE_AFTER).min(deadline)
     };
+    // No pre-check on the deadline before the wait: the timed wait polls the post
+    // first, so a response that already arrived wins even when this call resumes
+    // after the grace yield and the bound has passed (the deadline only surfaces in
+    // the `Err(_elapsed)` arm below, where nothing arrived).
     let outcome = race(cancel, tokio::time::timeout(wake - now, post.as_mut())).await;
     match outcome {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
@@ -396,10 +397,8 @@ async fn read_body(
         // No bytes for the idle bound: the stream is silent, not slow. Any chunk —
         // including an SSE comment or ping — would have reset this clock.
         Raced::Done(Err(_elapsed)) => {
-            let failure = ProviderError::new(
-                ProviderErrorKind::Transport,
-                format!("stream idle for {} s", STREAM_IDLE_TIMEOUT.as_secs()),
-            );
+            let failure =
+                ProviderError::new(ProviderErrorKind::Transport, stream_idle_timeout_message());
             if state.visible {
                 // Rule 3: never retry once the consumer has seen output.
                 state.finish(Outcome::Failed(failure))
@@ -900,10 +899,13 @@ mod tests {
         }
     }
 
-    /// A transport whose headers arrive only after `after`. On the paused clock the
-    /// delay is virtual, so no test ever sleeps.
+    /// A transport whose headers arrive only after `after`, counting the attempts so
+    /// a test can prove a late poll reuses the single in-flight request. On the paused
+    /// clock the delay is virtual, so no test ever sleeps.
+    #[derive(Clone, Default)]
     struct SlowServer {
         after: Duration,
+        posts: Arc<AtomicUsize>,
     }
 
     impl Transport for SlowServer {
@@ -911,6 +913,7 @@ mod tests {
             &'a self,
             _request: HttpRequest,
         ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+            self.posts.fetch_add(1, Ordering::SeqCst);
             let after = self.after;
             Box::pin(async move {
                 tokio::time::sleep(after).await;
@@ -1520,6 +1523,7 @@ mod tests {
         let stream = drive_with(
             Arc::new(SlowServer {
                 after: Duration::from_secs(60),
+                ..SlowServer::default()
             }),
             RetryPolicy::default(),
         );
@@ -1557,6 +1561,44 @@ mod tests {
             start.elapsed(),
             Duration::from_secs(60),
             "the response at 60 s"
+        );
+    }
+
+    /// Review round 2: the deadline is not pre-checked before the in-flight post is
+    /// polled, so a response that arrived inside the bound still wins when the consumer
+    /// only resumes polling after it — no retry, no duplicate request. (A pre-check
+    /// would have failed the attempt and re-sent.)
+    #[tokio::test(start_paused = true)]
+    async fn a_response_that_arrived_inside_the_bound_wins_when_the_poll_resumes_late() {
+        let server = SlowServer {
+            after: Duration::from_secs(60),
+            ..SlowServer::default()
+        };
+        let mut stream = drive_with(Arc::new(server.clone()), RetryPolicy::default());
+        let start = tokio::time::Instant::now();
+
+        // The 30 s note is the consumer's only event while the post stays in flight.
+        let note = tokio::time::timeout(WAITING_NOTE_AFTER + Duration::from_secs(1), stream.next())
+            .await
+            .expect("the waiting note is due at 30 s")
+            .expect("an event");
+        assert!(matches!(note, StreamEvent::Notice { .. }), "{note:?}");
+        assert_eq!(start.elapsed(), WAITING_NOTE_AFTER);
+
+        // Away past the bound; the provider answered at 60 s.
+        tokio::time::advance(FIRST_BYTE_TIMEOUT).await;
+
+        let events = tokio::time::timeout(Duration::from_secs(1), collect(stream))
+            .await
+            .expect("the ready response must be used, not the bound");
+        assert!(
+            matches!(terminal(&events), Outcome::Completed(_)),
+            "{events:?}"
+        );
+        assert_eq!(
+            server.posts.load(Ordering::SeqCst),
+            1,
+            "the arrived response is used: no retry, no second request"
         );
     }
 

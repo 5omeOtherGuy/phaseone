@@ -35,6 +35,13 @@ use crate::http::{
     stream_idle_timeout_message,
 };
 
+/// The write of the pong that answers a peer's ping is bounded like a caller's own
+/// send (10 s, `docs/design/websocket.md` §4), because a peer that stops reading its
+/// socket while the write buffer fills would otherwise block the read loop forever —
+/// the very unbounded provider wait issue #164 removes. Cancellation is no longer
+/// the only thing that ends it.
+const PONG_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// One handshake: the URL to open and the headers to send with it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WsHandshake {
@@ -81,9 +88,12 @@ pub trait WsConnection: Send {
     /// that expires is [`WsNext::Timeout`], distinct from a close, so a caller can
     /// name it.
     ///
-    /// The default forwards [`next_text`](WsConnection::next_text) with no bound,
-    /// which is all a simple test double needs; [`TungsteniteConnector`] and
-    /// [`crate::testing::ScriptedWsConnector`] override it.
+    /// The default forwards [`next_text`](WsConnection::next_text) with no bound, so
+    /// an existing implementor keeps compiling — it is all a simple test double
+    /// needs. A real connection, or ANY decorator that wraps one, MUST override it:
+    /// the default can never report [`WsNext::Timeout`], so an implementor that just
+    /// delegates would silently drop the bound and see an expiry as a close.
+    /// [`TungsteniteConnector`] and [`crate::testing::ScriptedWsConnector`] override it.
     fn next_bounded<'a>(&'a mut self) -> BoxFuture<'a, Result<WsNext, WsError>> {
         Box::pin(async move {
             Ok(match self.next_text().await? {
@@ -301,8 +311,20 @@ pub(crate) async fn read_bounded(
                     .map_err(|_| WsError("WebSocket binary frame is not UTF-8".to_string()));
             }
             // Answered here, inside the read loop, so a peer sees the pong without
-            // the caller having to send anything.
-            RawMessage::Ping(payload) => channel.pong(payload).await?,
+            // the caller having to send anything. The write is bounded like a caller's
+            // own send (see `PONG_WRITE_TIMEOUT`); an expiry or a write error is the
+            // read failure it already is, which the caller takes as its close path.
+            RawMessage::Ping(payload) => {
+                match tokio::time::timeout(PONG_WRITE_TIMEOUT, channel.pong(payload)).await {
+                    Ok(result) => result?,
+                    Err(_elapsed) => {
+                        return Err(WsError(format!(
+                            "WebSocket pong write timed out after {} s",
+                            PONG_WRITE_TIMEOUT.as_secs()
+                        )));
+                    }
+                }
+            }
             RawMessage::Pong => {}
             RawMessage::Close => return Ok(WsNext::Closed),
         }
@@ -437,12 +459,23 @@ mod tests {
     /// the crate's REAL `read_bounded`, so a test exercises the production clock.
     struct Scripted {
         steps: std::collections::VecDeque<Step>,
+        /// A pong write that never completes, the way a peer that stopped reading its
+        /// socket fills the write buffer (see `PONG_WRITE_TIMEOUT`).
+        stalling_pong: bool,
     }
 
     impl Scripted {
         fn new(steps: Vec<Step>) -> Self {
             Self {
                 steps: steps.into(),
+                stalling_pong: false,
+            }
+        }
+
+        fn with_stalling_pong(steps: Vec<Step>) -> Self {
+            Self {
+                steps: steps.into(),
+                stalling_pong: true,
             }
         }
     }
@@ -461,7 +494,13 @@ mod tests {
         }
 
         fn pong(&mut self, _payload: Vec<u8>) -> BoxFuture<'_, Result<(), WsError>> {
-            Box::pin(async move { Ok(()) })
+            let stalling = self.stalling_pong;
+            Box::pin(async move {
+                if stalling {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+                Ok(())
+            })
         }
     }
 
@@ -488,6 +527,50 @@ mod tests {
         .expect("control pings must keep the stream alive, not hang CI");
         assert_eq!(next.unwrap(), WsNext::Text("done".to_string()));
         assert_eq!(start.elapsed(), Duration::from_secs(1200));
+    }
+
+    /// A pong-only keep-alive resets the idle clock exactly like a ping.
+    #[tokio::test(start_paused = true)]
+    async fn a_pong_only_keep_alive_resets_the_idle_clock() {
+        let mut steps = Vec::new();
+        for _ in 0..6 {
+            steps.push(Step::Message(RawMessage::Pong));
+            steps.push(Step::Wait(Duration::from_secs(200)));
+        }
+        steps.push(Step::Message(RawMessage::Text("done".to_string())));
+        let mut channel = Scripted::new(steps);
+        let mut awaiting_first_frame = true;
+
+        let start = tokio::time::Instant::now();
+        let next = tokio::time::timeout(
+            Duration::from_secs(1201),
+            read_bounded(&mut channel, &mut awaiting_first_frame),
+        )
+        .await
+        .expect("pongs must keep the stream alive, not hang CI");
+        assert_eq!(next.unwrap(), WsNext::Text("done".to_string()));
+        assert_eq!(start.elapsed(), Duration::from_secs(1200));
+    }
+
+    /// Review round 2: the pong the read loop owes a ping is bounded like a caller's
+    /// send, so a peer that stopped reading cannot block the read forever — a stalled
+    /// write is the read error the caller already takes as its close path.
+    #[tokio::test(start_paused = true)]
+    async fn a_pong_write_that_stalls_fails_the_read_instead_of_hanging() {
+        let mut channel =
+            Scripted::with_stalling_pong(vec![Step::Message(RawMessage::Ping(Vec::new()))]);
+        let mut awaiting_first_frame = false;
+
+        let start = tokio::time::Instant::now();
+        let next = tokio::time::timeout(
+            PONG_WRITE_TIMEOUT + Duration::from_secs(1),
+            read_bounded(&mut channel, &mut awaiting_first_frame),
+        )
+        .await
+        .expect("a stalled pong write must not hang the read");
+        let error = next.expect_err("a stalled pong write is a read failure");
+        assert!(error.0.contains("pong"), "{error:?}");
+        assert_eq!(start.elapsed(), PONG_WRITE_TIMEOUT);
     }
 
     #[tokio::test(start_paused = true)]

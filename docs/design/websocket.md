@@ -35,9 +35,23 @@ pub struct WsHandshake { pub url: String, pub headers: Vec<(String, String)> }
 pub trait WsConnection: Send {
     fn send_text<'a>(&'a mut self, text: String) -> BoxFuture<'a, Result<(), WsError>>;
     /// The next TEXT payload. Binary frames are decoded as UTF-8; ping is answered and pong
-    /// ignored inside the implementation; a close frame or end of stream is `Ok(None)`.
+    /// ignored inside the implementation; a close frame or end of stream is `Ok(None)`. A bound
+    /// expiry is folded into `Ok(None)` as well, so a legacy caller cannot tell it from a close —
+    /// a caller that must NAME the bound reads `next_bounded` instead.
     fn next_text<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<String>, WsError>>;
+    /// The next frame under the read bounds of §4: the first frame after a send waits
+    /// `WsBound::FirstFrame` (120 s) and every later one `WsBound::Idle` (300 s), and any message
+    /// resets the idle clock. A bound that expires is `WsNext::Timeout(bound)`, distinct from a
+    /// close, so the caller can name it (`bound.message()`).
+    ///
+    /// The PROVIDED default forwards `next_text` with NO bound — all a simple test double needs. A
+    /// real connection, or any decorator that wraps one, MUST override it: the default can never
+    /// report `Timeout`, so an implementor that just delegates would make the read unbounded and
+    /// see an expiry as a close.
+    fn next_bounded<'a>(&'a mut self) -> BoxFuture<'a, Result<WsNext, WsError>>;
 }
+pub enum WsNext { Text(String), Closed, Timeout(WsBound) }
+pub enum WsBound { FirstFrame, Idle } // limit() 120 s / 300 s; message() is the Transport wording
 pub enum WsConnectError { Status { status: u16, body: Vec<u8> }, Failed(String) }
 pub struct WsError(pub String);
 ```
@@ -45,6 +59,9 @@ pub struct WsError(pub String);
 - The real connector (`TungsteniteConnector`) is the ONLY code that names `tokio-tungstenite`
   (`default-features = false`, features `connect`, `rustls-tls-webpki-roots`). A rejected upgrade
   surfaces its HTTP status and body as `WsConnectError::Status`.
+- The connection answers a peer's ping with a pong bounded by 10 s, like a caller's own send: a
+  peer that stops reading its socket cannot block the read loop forever. An expiry or a write
+  error is the same read failure it already is (the adapter's close path).
 - Behind the existing `testing` feature: `ScriptedWsConnector` — scripted connections (refuse
   with a status, or accept and then yield scripted text frames / errors / a close), recording
   every handshake (url, header NAMES and values) and every sent text frame. No network.
@@ -71,12 +88,12 @@ pub struct WsError(pub String);
   arrives (concurrent `stream` calls), that request uses SSE — never a second socket, never a wait.
 - Reuse only while `age < 55 min` and `idle < 5 min` [donor; vendor: connections last 60 min];
   otherwise drop it and connect anew. Time comes from an injected clock, as elsewhere in the crate.
-- Connect and send are bounded by 10 s each. A read is bounded inside the connection
-  (`p1-provider-http`): the first frame after a send waits `FIRST_BYTE_TIMEOUT` = 120 s and every
-  later frame waits `STREAM_IDLE_TIMEOUT` = 300 s, and ANY frame — a control ping or pong included
-  — resets the idle clock, so a keep-alive peer is never called idle. An expiry is a
-  `ProviderErrorKind::Transport` failure naming the bound. Every wait races the request's
-  `CancellationToken`.
+- Connect, send, and the pong the read loop sends to answer a ping are each bounded by 10 s.
+- A read is bounded inside the connection (`p1-provider-http`): the first frame after a send waits
+  `FIRST_BYTE_TIMEOUT` = 120 s and every later frame waits `STREAM_IDLE_TIMEOUT` = 300 s, and ANY
+  frame — a control ping or pong included — resets the idle clock, so a keep-alive peer is never
+  called idle. An expiry is a `ProviderErrorKind::Transport` failure naming the bound. Every wait
+  races the request's `CancellationToken`.
 - A cancelled or failed response DROPS the connection (a half-read socket is never reused) and
   clears the continuation of §6. Dropping the returned stream counts as cancellation.
 - A connection returns to the slot only after a response completed cleanly.
@@ -91,9 +108,9 @@ Before any model-visible output of this request:
 | Upgrade refused, any other status (the endpoint says no) | fall back to SSE at once |
 | Error event `previous_response_not_found` | reconnect, send FULL input, once |
 | Error event `websocket_connection_limit_reached` | reconnect, send FULL input, once |
-| A reused socket closes before its first frame | reconnect, send FULL input, once |
+| A reused socket closes, or expires on its first-frame bound (120 s), before its first frame | reconnect, send FULL input, once |
 | Any other error event | what the existing parser makes of it (same kinds as SSE) |
-| Connect error or timeout; read/send error or close before visible output | reconnect with the FULL body, with the adapter's retry policy's backoff, up to its `max_retries` (default 3) — then fall back to SSE |
+| Connect error or timeout; read/send error or close before visible output; a first-frame (120 s) or idle (300 s) bound expiry on a FRESH socket | reconnect with the FULL body, with the adapter's retry policy's backoff, up to its `max_retries` (default 3) — then fall back to SSE |
 
 "Fall back to SSE" = run today's `drive()` path for THIS request and turn WebSocket off for this
 provider instance (until the process ends). The adapter emits ONE `StreamEvent::Notice` when it falls back
