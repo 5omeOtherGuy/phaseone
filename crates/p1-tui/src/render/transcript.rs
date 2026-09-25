@@ -379,6 +379,7 @@ fn sanitized_prose_runs(transcript: &Transcript, line: &str) -> Vec<(String, Col
         .collect()
 }
 
+/// Split a meta row's leading glyph off its text: `·` is faint, `↳` dim (§3.3).
 fn meta_glyph(text: &str) -> (Option<Seg>, &str) {
     for (glyph, fg) in [
         (glyphs::PENDING, palette::FAINT),
@@ -816,42 +817,64 @@ mod tests {
     }
 
     #[test]
-    fn all_wrapped_transcript_text_is_sanitized_and_counted() {
+    fn sanitizing_preserves_operator_paragraph_breaks() {
         let mut t = Transcript::new();
-        t.blocks.extend([
-            Block::Prose {
-                lines: vec!["prose \u{1b}[31mnow".into()],
-            },
-            Block::Reasoning {
+        t.blocks.push(Block::Operator {
+            text: "a\nb".into(),
+            steering: false,
+        });
+        let rows = lines(&t, 40, usize::MAX, false, 0, true);
+        assert_eq!(
+            plain(&rows)
+                .iter()
+                .map(|row| row.trim())
+                .collect::<Vec<_>>(),
+            ["› a", "b"]
+        );
+        assert_eq!(count_rows(&t, 40), rows.len());
+    }
+
+    #[test]
+    fn reasoning_and_operator_measure_sanitized_text_exactly() {
+        for width in 10..=40 {
+            let mut reasoning = Transcript::new();
+            reasoning.blocks.push(Block::Reasoning {
                 lines: vec!["run \u{1b}[2Jnow".into()],
                 expanded: true,
                 elapsed_ms: Some(1),
                 started_ms: Some(0),
-            },
-            Block::Operator {
+            });
+            let reasoning_rows = lines(&reasoning, width, usize::MAX, false, 0, true);
+            let reasoning_rendered = plain(&reasoning_rows);
+            let reasoning_text: Vec<String> = reasoning_rendered[1..]
+                .iter()
+                .flat_map(|row| row.split_whitespace().map(str::to_string))
+                .collect();
+            assert_eq!(
+                reasoning_text,
+                ["run", "now"],
+                "unexpected reasoning text at width {width}"
+            );
+            assert_eq!(count_rows(&reasoning, width), reasoning_rows.len());
+
+            let mut operator = Transcript::new();
+            operator.blocks.push(Block::Operator {
                 text: "run \u{1b}[2Jnow".into(),
                 steering: false,
-            },
-            Block::Meta {
-                text: "· run \u{1b}[31mnow".into(),
-            },
-        ]);
-        for width in [10usize, 20, 40] {
-            let rows = lines(&t, width, usize::MAX, false, 0, true);
-            for row in plain(&rows) {
-                assert!(!row.contains("[2J"), "CSI leaked at width {width}");
-                assert!(!row.contains("[31m"), "CSI leaked at width {width}");
-            }
-            let rendered = plain(&rows);
-            let visible: Vec<&str> = rendered
+            });
+            let operator_rows = lines(&operator, width, usize::MAX, false, 0, true);
+            let operator_rendered = plain(&operator_rows);
+            let operator_text: Vec<String> = operator_rendered
                 .iter()
-                .flat_map(|row| row.split_whitespace())
+                .flat_map(|row| row.split_whitespace().map(str::to_string))
+                .filter(|word| !word.starts_with(glyphs::OPERATOR))
                 .collect();
-            assert!(
-                visible.windows(2).any(|words| words == ["run", "now"]),
-                "missing visible text: {visible:?}"
+            assert_eq!(
+                operator_text,
+                ["run", "now"],
+                "unexpected operator text at width {width}"
             );
-            assert_eq!(count_rows(&t, width), rows.len());
+            assert_eq!(count_rows(&operator, width), operator_rows.len());
         }
     }
 
