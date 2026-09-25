@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use p1_contracts::{BoxFuture, CancellationToken, InboxKind};
+use p1_assembly::{Catalog, ToolServices, ToolSpec};
+use p1_contracts::{BoxFuture, CancellationToken, InboxKind, Tool};
 use p1_core::Inbox;
 use p1_tool_finish::{FinishOutcome, OutputContract};
 use p1_workers::{
@@ -25,6 +26,15 @@ use crate::frontend::{
     FrontEnd, WorkflowRunEnded, WorkflowRunStarted, WorkflowStepEnded, WorkflowStepStarted,
 };
 use crate::run::{ChildBuilder, TurnEndCell};
+
+/// The four workflow tools, appended after the worker tools.
+#[cfg(feature = "workflows")]
+pub(crate) const WORKFLOW_MODULES: [&str; 4] = [
+    "workflow_start",
+    "workflow_status",
+    "workflow_result",
+    "workflow_cancel",
+];
 
 /// The evidence of a `done` whose outcome established none (ADR-0051 item 3).
 const NOT_VERIFIED: &str = "not verified; parent verification required";
@@ -713,6 +723,66 @@ pub(crate) fn running_workflows(deps: &HostDeps) -> usize {
     deps.workflow_observer
         .as_ref()
         .map_or(0, |observer| observer.running())
+}
+
+/// The four `workflow_*` tools over `service` (ADR-0053 item 7). Without a service the
+/// keys are not registered at all, so an environment naming one gets the ordinary
+/// `UnknownToolModule`.
+#[cfg(feature = "workflows")]
+pub(crate) fn register_workflow_tools(
+    catalog: &mut Catalog,
+    service: Option<Arc<dyn p1_workflow::WorkflowService>>,
+) {
+    let Some(service) = service else {
+        return;
+    };
+
+    let service_for = service.clone();
+    catalog.tool(
+        "workflow_start",
+        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
+            Ok(apply_face!(
+                p1_tool_workflow::WorkflowStartTool::new(service_for.clone()),
+                spec,
+                p1_tool_workflow::ToolFace
+            ))
+        }),
+    );
+
+    let service_for = service.clone();
+    catalog.tool(
+        "workflow_status",
+        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
+            Ok(apply_face!(
+                p1_tool_workflow::WorkflowStatusTool::new(service_for.clone()),
+                spec,
+                p1_tool_workflow::ToolFace
+            ))
+        }),
+    );
+
+    let service_for = service.clone();
+    catalog.tool(
+        "workflow_result",
+        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
+            Ok(apply_face!(
+                p1_tool_workflow::WorkflowResultTool::new(service_for.clone()),
+                spec,
+                p1_tool_workflow::ToolFace
+            ))
+        }),
+    );
+
+    catalog.tool(
+        "workflow_cancel",
+        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
+            Ok(apply_face!(
+                p1_tool_workflow::WorkflowCancelTool::new(service.clone()),
+                spec,
+                p1_tool_workflow::ToolFace
+            ))
+        }),
+    );
 }
 
 /// The observer projects every run event into the structured `FrontEnd` calls the TUI's
