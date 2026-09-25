@@ -46,7 +46,9 @@ const PATTERNS: &str = concat!(
     r"|\bsk-[A-Za-z0-9_-]{20,})",
     r"|(?P<bearer>(?i:Bearer)[ \t]+(?P<btoken>[A-Za-z0-9._~+/=-]{16,}))",
     r"|(?P<authz>(?i:Authorization):[ \t]*(?P<atoken>[A-Za-z0-9._~+/=-]{16,}))",
-    r#"(?:(?P<jkey>api_key|access|refresh|token|key)"[ \t]*:[ \t]*"(?P<jtoken>[^"]{16,})")"#,
+    // The opening quote anchors the key name (`"monkey"` is not `"key"`); a value that
+    // starts with `<` is an existing marker, which keeps masking idempotent.
+    r#"|(?:"(?P<jkey>api_key|access|refresh|token|key)"[ \t]*:[ \t]*"(?P<jtoken>[^"<][^"]{15,})")"#,
 );
 
 /// The modifier families whose `sk-<modifier>-` prefix is kept in the marker.
@@ -85,7 +87,9 @@ pub fn redact(text: &str) -> Redaction {
 fn marker(captures: &Captures) -> String {
     if let Some(found) = captures.name("sk") {
         let token = found.as_str();
-        return format!("<redacted:{}:{} chars>", sk_family(token), token.len());
+        let family = sk_family(token);
+        // The length of the secret part only, like the other families' token lengths.
+        return format!("<redacted:{family}:{} chars>", token.len() - family.len());
     }
     if let Some(found) = captures.name("btoken") {
         return format!("<redacted:Bearer:{} chars>", found.as_str().len());
@@ -97,7 +101,8 @@ fn marker(captures: &Captures) -> String {
     let length = captures
         .name("jtoken")
         .map_or(0, |found| found.as_str().len());
-    format!("<redacted:{key}:{length} chars>")
+    // The match spans the whole `"key": "value"` pair, so the key is written back.
+    format!("\"{key}\": \"<redacted:{key}:{length} chars>\"")
 }
 
 /// The family prefix of an `sk-` token: `sk-` alone, or `sk-<modifier>-`. A pure
@@ -254,6 +259,12 @@ mod tests {
                 format!("{{\"{json_key}\": \"<redacted:{json_key}:18 chars>\"}}")
             );
         }
+    }
+
+    #[test]
+    fn a_key_name_that_only_ends_in_a_family_word_is_left_alone() {
+        let text = format!("{{\"monkey\": \"{}\"}}", key("", 18));
+        assert_eq!(redact(&text).masked, 0, "{text}");
     }
 
     #[test]
