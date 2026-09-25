@@ -415,6 +415,7 @@ fn workflow_result_line(worker: &str) -> String {
         needs: None,
         error: None,
         models: Vec::new(),
+        worktree: None,
     };
     let record = JournalRecord::Result {
         call: CallId("call".into()),

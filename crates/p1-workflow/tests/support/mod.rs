@@ -11,7 +11,7 @@ use p1_contracts::{BoxFuture, CancellationToken};
 use p1_workflow::{
     InProcessWorkflows, JournalRecord, ModelResolver, ResolvedModel, RoleSpec, RunId, RunReport,
     RunStatus, SchemaCheck, StartRequest, StepEnd, StepLine, StepOutcome, StepRequest, StepRunner,
-    WorkerRef, WorkflowObserver, WorkflowService, WorkflowSettings,
+    WorkerRef, WorkflowObserver, WorkflowService, WorkflowSettings, WorktreeHold, WorktreeInfo,
 };
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -77,6 +77,8 @@ struct Script {
     requests: Vec<StepRequest>,
     repair_messages: Vec<(WorkerRef, String)>,
     workers: usize,
+    /// Every `worktree` request, in order.
+    worktree_requests: Vec<StepRequest>,
 }
 
 /// Maps a prompt to queued outcomes; a prompt with nothing queued ends `done` with the
@@ -87,6 +89,37 @@ pub struct ScriptedRunner {
     /// Steps in flight on engine thunk threads, and the most seen at once.
     live_thunks: AtomicUsize,
     pub max_live_thunks: AtomicUsize,
+    /// Worktree slugs held right now: a fake hold removes its slug when dropped.
+    pub held_worktrees: Arc<Mutex<Vec<String>>>,
+}
+
+/// The fake worktree a `ScriptedRunner` hands out: `/fake-worktrees/<slug>` on
+/// `task/<slug>`, head `prepared-<slug>` until the step ends, `ended-<slug>` after.
+struct FakeHold {
+    info: WorktreeInfo,
+    held: Arc<Mutex<Vec<String>>>,
+    slug: String,
+}
+
+impl WorktreeHold for FakeHold {
+    fn info(&self) -> &WorktreeInfo {
+        &self.info
+    }
+
+    fn settle<'a>(&'a self) -> BoxFuture<'a, Result<WorktreeInfo, String>> {
+        Box::pin(async move {
+            Ok(WorktreeInfo {
+                head: format!("ended-{}", self.slug),
+                ..self.info.clone()
+            })
+        })
+    }
+}
+
+impl Drop for FakeHold {
+    fn drop(&mut self) {
+        self.held.lock().unwrap().retain(|slug| *slug != self.slug);
+    }
 }
 
 pub fn done(summary: &str) -> StepEnd {
@@ -168,6 +201,10 @@ impl ScriptedRunner {
     pub fn repair_messages(&self) -> Vec<(WorkerRef, String)> {
         self.script.lock().unwrap().repair_messages.clone()
     }
+
+    pub fn worktree_requests(&self) -> Vec<StepRequest> {
+        self.script.lock().unwrap().worktree_requests.clone()
+    }
 }
 
 /// Worker ids carry the prompt so a repair finds its queue: `w<n>|<prompt>`.
@@ -243,6 +280,34 @@ impl StepRunner for ScriptedRunner {
                 .get_mut(&prompt_of(worker))
                 .and_then(VecDeque::pop_front)
                 .unwrap_or_else(|| Err("no repair queued".to_string()))
+        })
+    }
+
+    fn worktree<'a>(
+        &'a self,
+        request: &'a StepRequest,
+    ) -> BoxFuture<'a, Result<Box<dyn WorktreeHold>, String>> {
+        Box::pin(async move {
+            self.script
+                .lock()
+                .unwrap()
+                .worktree_requests
+                .push(request.clone());
+            let slug = request.worktree.clone().unwrap_or_default();
+            let mut held = self.held_worktrees.lock().unwrap();
+            if held.contains(&slug) {
+                return Err(format!("worktree_busy: {slug}"));
+            }
+            held.push(slug.clone());
+            Ok(Box::new(FakeHold {
+                info: WorktreeInfo {
+                    path: PathBuf::from(format!("/fake-worktrees/{slug}")),
+                    branch: format!("task/{slug}"),
+                    head: format!("prepared-{slug}"),
+                },
+                held: self.held_worktrees.clone(),
+                slug,
+            }) as Box<dyn WorktreeHold>)
         })
     }
 }
@@ -410,6 +475,7 @@ pub fn request(script: &str) -> StartRequest {
         resume_from: None,
         role_models: BTreeMap::new(),
         workspace: None,
+        base: None,
     }
 }
 

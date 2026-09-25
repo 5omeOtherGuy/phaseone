@@ -16,8 +16,8 @@ use p1_workers::{
 };
 use p1_workflow::{
     InProcessWorkflows, ModelResolver, ResolvedModel, RunId, RunReport, RunStatus, SchemaCheck,
-    StepEnd, StepLine, StepOutcome, StepRequest, StepRunner, WorkerRef, WorkflowObserver,
-    WorkflowService,
+    StartRequest, StepEnd, StepLine, StepOutcome, StepRequest, StepRunner, WorkerRef,
+    WorkflowError, WorkflowObserver, WorkflowService, WorktreeHold,
 };
 
 use crate::HostDeps;
@@ -82,6 +82,8 @@ pub struct HostStepRunner {
     /// What a blocked step asked for, by worker id: the step line carries no `needs`,
     /// and the observer words the line.
     needs: Arc<Mutex<HashMap<String, String>>>,
+    /// The worktrees running steps hold (ADR-0072 item 4).
+    worktrees: Arc<crate::worktree::Worktrees>,
 }
 
 /// One step worker, as its runner keeps it.
@@ -333,6 +335,77 @@ impl StepRunner for HostStepRunner {
             self.turn(&id, cancel).await
         })
     }
+
+    fn worktree<'a>(
+        &'a self,
+        request: &'a StepRequest,
+    ) -> BoxFuture<'a, Result<Box<dyn WorktreeHold>, String>> {
+        Box::pin(async move {
+            let slug = request.worktree.clone().unwrap_or_default();
+            let Some(base) = request.base.clone() else {
+                return Err(format!("worktree: {slug}: the run has no base commit"));
+            };
+            // The run's workspace, as a step without a worktree would resolve it.
+            let run_workspace = request
+                .workspace
+                .clone()
+                .unwrap_or_else(|| self.builder.parent_workspace.clone());
+            let worktrees = self.worktrees.clone();
+            // git runs off the executor; the hold's lock serialises `git worktree add`.
+            let guard = tokio::task::spawn_blocking(move || {
+                worktrees.acquire(&run_workspace, &slug, &base)
+            })
+            .await
+            .map_err(|error| format!("worktree: {error}"))??;
+            Ok(Box::new(guard) as Box<dyn WorktreeHold>)
+        })
+    }
+}
+
+/// The service the `workflow_*` tools start runs through: the tool names no workspace,
+/// so the run's base commit (ADR-0072 item 2) is `HEAD` of the workspace its steps fall
+/// back to, resolved here, in the host — the engine never runs git.
+struct BasedWorkflows {
+    inner: Arc<InProcessWorkflows>,
+    workspace: PathBuf,
+}
+
+impl WorkflowService for BasedWorkflows {
+    fn start<'a>(
+        &'a self,
+        mut request: StartRequest,
+    ) -> BoxFuture<'a, Result<RunId, WorkflowError>> {
+        Box::pin(async move {
+            if request.base.is_none() {
+                let workspace = request
+                    .workspace
+                    .clone()
+                    .unwrap_or_else(|| self.workspace.clone());
+                request.base = crate::worktree::run_base_async(workspace).await;
+            }
+            self.inner.start(request).await
+        })
+    }
+
+    fn status<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        self.inner.status(id)
+    }
+
+    fn wait<'a>(
+        &'a self,
+        id: &'a RunId,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        self.inner.wait(id, cancel)
+    }
+
+    fn cancel<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<(), WorkflowError>> {
+        self.inner.cancel(id)
+    }
+
+    fn list<'a>(&'a self) -> BoxFuture<'a, Vec<(RunId, RunStatus)>> {
+        self.inner.list()
+    }
 }
 
 // ------------------------------------------------------------------ lines (item 7)
@@ -474,14 +547,19 @@ pub(crate) fn compose(
     let resolver = Arc::new(HostModelResolver {
         environment_dirs: deps.environment_dirs.clone(),
     });
+    let parent_workspace = builder.parent_workspace.clone();
     let runner = Arc::new(HostStepRunner {
         builder,
         service: workers,
         workers: Mutex::new(HashMap::new()),
         needs,
+        worktrees: Arc::default(),
     });
     let service = InProcessWorkflows::new(runner, resolver, observer.clone(), settings, run_root);
-    deps.workflow_service = Some(service.clone() as Arc<dyn WorkflowService>);
+    deps.workflow_service = Some(Arc::new(BasedWorkflows {
+        inner: service.clone(),
+        workspace: parent_workspace,
+    }) as Arc<dyn WorkflowService>);
     deps.workflow_observer = Some(observer.clone());
     Ok(Workflows { service, observer })
 }
