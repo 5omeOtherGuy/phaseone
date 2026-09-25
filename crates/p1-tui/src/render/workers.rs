@@ -1,6 +1,6 @@
 //! The WORKERS pane (handoff §9.4): one block per worker, ordered by what needs the operator —
 //! needs review, running, failed and stalled, queued, done, cancelled, lost. The wide form
-//! (grid 48) takes four rows per worker, the compact form (grid 30) two. Unknown cost renders
+//! (grid 48) takes 2–4 rows per worker, the compact form (grid 30) three. Unknown metrics render
 //! `—`. Plus the attach band (§9.5) that heads a worker's own transcript.
 
 use ratatui::text::Line;
@@ -100,10 +100,16 @@ pub struct WorkerBlock {
     pub task: String,
     /// `env/profile`.
     pub route: String,
+    /// The model actually answering; `None` means it is not known yet.
+    pub model: Option<String>,
     pub state: BlockState,
     pub elapsed: Option<String>,
     /// `None` until workers carry a usage tap (§9.4); renders `—`.
     pub cost_micro_usd: Option<u64>,
+    /// Tokens used so far; `None` means unknown, never zero.
+    pub tokens: Option<u64>,
+    /// The worker's context window; `None` means unknown.
+    pub context_window: Option<u64>,
     pub grants: String,
     /// The `↳` line: current activity (running) or the end line (settled).
     pub activity: String,
@@ -120,7 +126,7 @@ pub struct WorkersPane {
 
 /// Render the WORKERS pane: header, then one block per worker in state
 /// order, separated by one blank BLOCK row, then the selection footer
-/// (§9.4). `compact` selects the 2-row form (grid 30) over the wide 4-row
+/// (§9.4). `compact` selects the 3-row form (grid 30) over the wide 2–4-row
 /// form (grid 48); the footer drops `x stop` in the compact form (mock-
 /// verified: `el-workers-pane-38`).
 pub fn render(pane: &WorkersPane, width: usize, compact: bool) -> Vec<Line<'static>> {
@@ -243,55 +249,101 @@ fn cost_text(cost_micro_usd: Option<u64>) -> String {
         .unwrap_or_else(|| super::UNKNOWN.into())
 }
 
+const LEAD_INDENT: &str = "  ";
+
+fn lead(worker: &WorkerBlock, right_cells: usize, width: usize) -> Vec<Seg> {
+    let Some(model) = &worker.model else {
+        return vec![Seg::new(
+            palette::DIM,
+            format!("{LEAD_INDENT}{}", worker.route),
+        )];
+    };
+    let mut segments = vec![Seg::new(palette::INK, format!("{LEAD_INDENT}{model}"))];
+    let room = width.saturating_sub(8).saturating_sub(right_cells + 2);
+    let suffix = format!(" · {}", worker.route);
+    if worker.route != *model
+        && crate::wrap::cell_width(LEAD_INDENT)
+            + crate::wrap::cell_width(model)
+            + crate::wrap::cell_width(&suffix)
+            <= room
+    {
+        segments.push(Seg::new(palette::DIM, suffix));
+    }
+    segments
+}
+
 fn wide_block(worker: &WorkerBlock, width: usize, focused: bool) -> Vec<Line<'static>> {
     let elapsed = worker
         .elapsed
         .clone()
         .unwrap_or_else(|| super::UNKNOWN.into());
-    vec![
+    let tok = worker
+        .tokens
+        .map(super::tokens)
+        .unwrap_or_else(|| super::UNKNOWN.into());
+    let ctx = worker
+        .context_window
+        .map(super::tokens)
+        .unwrap_or_else(|| super::UNKNOWN.into());
+    let right = vec![
+        Seg::new(palette::INK, tok),
+        Seg::new(palette::DIM, "/"),
+        Seg::new(palette::INK, ctx),
+        Seg::new(palette::DIM, " · "),
+        Seg::new(palette::INK, elapsed),
+        Seg::new(palette::DIM, " · "),
+        Seg::new(palette::INK, cost_text(worker.cost_micro_usd)),
+    ];
+    let right_cells: usize = right.iter().map(|s| crate::wrap::cell_width(&s.text)).sum();
+    let mut out = vec![
         block_head(worker, width, focused),
         Band {
             bg: palette::BLOCK,
-            left: vec![Seg::new(palette::DIM, format!("  {}", worker.route))],
-            right: vec![
-                Seg::new(palette::INK, elapsed),
-                Seg::new(palette::DIM, " · ".to_string()),
-                Seg::new(palette::INK, cost_text(worker.cost_micro_usd)),
-            ],
+            left: lead(worker, right_cells, width),
+            right,
             width,
             pad: 4,
         }
         .render(),
-        Band {
-            bg: palette::BLOCK,
-            left: vec![
-                Seg::new(palette::DIM, "  grants  ".to_string()),
-                Seg::new(palette::INK, worker.grants.clone()),
-            ],
-            right: vec![],
-            width,
-            pad: 4,
-        }
-        .render(),
-        Band {
-            bg: palette::BLOCK,
-            left: vec![
-                Seg::new(palette::DIM, "  ↳ ".to_string()),
-                Seg::new(
-                    if worker.state.muted() {
-                        palette::DIM
-                    } else {
-                        palette::INK
-                    },
-                    worker.activity.clone(),
-                ),
-            ],
-            right: vec![],
-            width,
-            pad: 4,
-        }
-        .render(),
-    ]
+    ];
+    if !worker.grants.is_empty() {
+        out.push(
+            Band {
+                bg: palette::BLOCK,
+                left: vec![
+                    Seg::new(palette::DIM, "  grants  "),
+                    Seg::new(palette::INK, worker.grants.clone()),
+                ],
+                right: vec![],
+                width,
+                pad: 4,
+            }
+            .render(),
+        );
+    }
+    if !worker.activity.is_empty() {
+        out.push(
+            Band {
+                bg: palette::BLOCK,
+                left: vec![
+                    Seg::new(palette::DIM, "  ↳ "),
+                    Seg::new(
+                        if worker.state.muted() {
+                            palette::DIM
+                        } else {
+                            palette::INK
+                        },
+                        worker.activity.clone(),
+                    ),
+                ],
+                right: vec![],
+                width,
+                pad: 4,
+            }
+            .render(),
+        );
+    }
+    out
 }
 
 fn compact_block(worker: &WorkerBlock, width: usize, focused: bool) -> Vec<Line<'static>> {
@@ -299,12 +351,35 @@ fn compact_block(worker: &WorkerBlock, width: usize, focused: bool) -> Vec<Line<
         .elapsed
         .clone()
         .unwrap_or_else(|| super::UNKNOWN.into());
+    let cost = cost_text(worker.cost_micro_usd);
+    let right_cells = crate::wrap::cell_width(&elapsed);
+    let tok = worker
+        .tokens
+        .map(super::tokens)
+        .unwrap_or_else(|| super::UNKNOWN.into());
+    let ctx = worker
+        .context_window
+        .map(super::tokens)
+        .unwrap_or_else(|| super::UNKNOWN.into());
     vec![
         block_head(worker, width, focused),
         Band {
             bg: palette::BLOCK,
-            left: vec![Seg::new(palette::DIM, format!("  {}", worker.route))],
+            left: lead(worker, right_cells, width),
             right: vec![Seg::new(palette::INK, elapsed)],
+            width,
+            pad: 4,
+        }
+        .render(),
+        Band {
+            bg: palette::BLOCK,
+            left: vec![
+                Seg::new(palette::DIM, "  tokens "),
+                Seg::new(palette::INK, tok),
+                Seg::new(palette::DIM, "/"),
+                Seg::new(palette::INK, ctx),
+            ],
+            right: vec![Seg::new(palette::INK, cost)],
             width,
             pad: 4,
         }

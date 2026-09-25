@@ -20,6 +20,7 @@ pub mod catalog;
 pub mod cli;
 pub mod fingerprint;
 pub mod frontend;
+pub mod instructions;
 pub mod login;
 pub mod models;
 pub mod policy;

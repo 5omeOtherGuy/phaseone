@@ -202,9 +202,12 @@ mod tests {
             id: "w1".into(),
             task: String::new(),
             route: String::new(),
+            model: None,
             state,
             elapsed: None,
             cost_micro_usd: None,
+            tokens: None,
+            context_window: None,
             grants: String::new(),
             activity: String::new(),
         };

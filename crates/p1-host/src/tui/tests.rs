@@ -700,9 +700,12 @@ fn a_live_worker_promotes_the_pane_and_a_finished_one_releases_it() {
         id: "w1".into(),
         task: String::new(),
         route: "deepseek/v4.1-flash".into(),
+        model: None,
         state,
         elapsed: None,
         cost_micro_usd: None,
+        tokens: None,
+        context_window: None,
         grants: String::new(),
         activity: String::new(),
     };

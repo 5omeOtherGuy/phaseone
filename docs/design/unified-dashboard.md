@@ -69,9 +69,9 @@ The shell deliberately clips from the top left; view-specific scrolling and live
 navigation bindings are not implemented in this slice. Existing live worker-pane
 rendering and controls remain unchanged.
 
-Lead verification: 233 tests in all 14 freshly built p1-tui test binaries passed,
-including five new dashboard tests (eight after the wf8 repairs below); both
-preview dimensions/content passed.
+Lead verification (local, before the PR merged current main): 233 tests in all
+14 freshly built p1-tui test binaries passed, including five new dashboard tests
+(eight after the wf8 repairs below); both preview dimensions/content passed.
 After disk recovery, the full locked workspace gate **passed** offline with
 jobs=2 on 2026-09-24 (148.027 seconds, exit 0). Minimum sampled free space was
 15,404,658,688 bytes, above the 8 GiB stop floor. This supersedes the earlier
@@ -84,8 +84,9 @@ subscription route) completed with no source-review blocker or fallback. Lead
 inspection confirms the composition boundary and preservation of the live worker
 footer/focus behavior. The review ran source/ADR checks only, not Rust tests;
 its workflow verification flag does not establish runtime or merge acceptance.
-Independent review of PR #112 (DeepSeek V4.1 Flash via ClinePass, 2026-09-24)
-approved with no blocker or major findings.
+PR #112 also received a separate review (DeepSeek V4.1 Flash via ClinePass,
+2026-09-24); both review rounds approved, with no blocker or major findings. PR
+#112 merged as 93271b6.
 
 Implementation workflow wf8 resolved the three non-blocking wf7 findings:
 

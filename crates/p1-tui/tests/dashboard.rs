@@ -252,9 +252,12 @@ fn worker(id: &str, state: BlockState) -> WorkerBlock {
         id: id.into(),
         task: "synthetic work".into(),
         route: "synthetic/model".into(),
+        model: None,
         state,
         elapsed: Some("0m12s".into()),
         cost_micro_usd: None,
+        tokens: None,
+        context_window: None,
         grants: "read shell finish".into(),
         activity: "synthetic worker activity".into(),
     }
@@ -283,10 +286,11 @@ fn workers_adapter_handles_compact_threshold_and_tiny_viewports_read_only() {
 
     for width in [38, 55] {
         let lines = WorkersView::new(pane()).lines(width, 6);
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         assert!(lines.iter().all(|line| line.width() <= width));
         assert!(lines[2].to_string().contains("w-run"));
         assert!(lines[3].to_string().contains("synthetic/model"));
+        assert!(lines[4].to_string().contains("tokens"));
         assert!(!lines.iter().any(|line| line.to_string().contains("grants")));
         let output = lines
             .iter()

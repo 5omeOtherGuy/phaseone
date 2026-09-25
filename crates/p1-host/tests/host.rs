@@ -1212,6 +1212,8 @@ async fn usage_errors_exit_2() {
         max_continuations: 3,
         provider_retries: 3,
         max_idle_summaries: 6,
+        instructions: Vec::new(),
+        skills: Vec::new(),
     };
     let code = p1_host::run::run(&mut harness.deps, options).await;
 
