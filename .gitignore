@@ -4,3 +4,4 @@ target/
 .worker-scratch/
 .cargo/config.toml
 __pycache__/
+ci-artifacts/
