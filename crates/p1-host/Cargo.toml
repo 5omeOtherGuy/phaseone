@@ -40,6 +40,8 @@ p1-tool-search = { path = "../p1-tool-search" }
 p1-tool-shell = { path = "../p1-tool-shell" }
 p1-tool-patch = { path = "../p1-tool-patch" }
 p1-tool-finish = { path = "../p1-tool-finish" }
+# Issue #142: credential-shape masking for every assembled tool and its per-turn count.
+p1-redact = { path = "../p1-redact" }
 p1-hook-shadow = { path = "../p1-hook-shadow", optional = true }
 p1-provider-anthropic = { path = "../p1-provider-anthropic" }
 p1-provider-openai = { path = "../p1-provider-openai" }

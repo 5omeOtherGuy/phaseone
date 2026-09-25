@@ -1435,6 +1435,7 @@ dependencies = [
  "p1-contracts",
  "p1-core",
  "p1-journal",
+ "p1-redact",
  "p1-testkit",
  "tempfile",
  "tokio",
@@ -1486,6 +1487,7 @@ dependencies = [
  "p1-provider-http",
  "p1-provider-openai",
  "p1-provider-openai-chat",
+ "p1-redact",
  "p1-testkit",
  "p1-tool-delegate",
  "p1-tool-edit",
@@ -1610,6 +1612,16 @@ dependencies = [
  "p1-provider-http",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "p1-redact"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-testkit",
+ "regex",
  "tokio",
 ]
 

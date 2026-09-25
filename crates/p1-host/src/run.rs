@@ -30,6 +30,7 @@ use p1_contracts::{
 use p1_core::{Agent, AgentParts, Reconfiguration, ResumeReport};
 #[cfg(feature = "delegation")]
 use p1_journal::MemoryJournal;
+use p1_redact::{MaskCounter, redacted};
 
 #[cfg(feature = "delegation")]
 use crate::activity::WorkerReportTap;
@@ -580,12 +581,16 @@ pub async fn run_with_front_end(
         .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
     let substitutions = substitutions(deps, &workspace);
+    // Issue #142: one counter per agent, shared by the tools assembled below and by
+    // the notice sink the turn boundary reports through.
+    let mask = Arc::new(MaskCounter::new());
     let assembled = assemble_with_cache_key(
         &catalog,
         &environment,
         &workspace,
         &substitutions,
         PARENT_ORDINAL,
+        &mask,
     )?;
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
@@ -682,6 +687,9 @@ pub async fn run_with_front_end(
     } else {
         events
     };
+    // Issue #142: report the count of masked credential-shaped values once per turn,
+    // through the same display-only notice path a provider notice uses; never a value.
+    let events: Arc<dyn EventSink> = Arc::new(MaskNoticeSink::new(events, mask.clone()));
 
     let parts = AgentParts {
         provider: assembled.provider,
@@ -750,6 +758,7 @@ pub async fn run_with_front_end(
         scope: options.models.clone(),
         route_label: front_end.route_label(),
         instructions,
+        mask: mask.clone(),
         session: Mutex::new(SessionModel {
             environment: session_environment,
             profile: choice.profile.clone(),
@@ -1476,6 +1485,7 @@ fn apply_completion_policy(
     assembled: &mut Assembled,
     completion: &Completion,
     contract: Option<p1_tool_finish::OutputContract>,
+    mask: &Arc<MaskCounter>,
 ) {
     let Some(index) = finish_index(assembled) else {
         return;
@@ -1487,6 +1497,7 @@ fn apply_completion_policy(
         completion.outcome.clone(),
         policy,
         contract,
+        mask,
     );
     // `resolved` is what the host journals and prints: keep the declaration in step
     // with the tool the model is actually given.
@@ -1507,6 +1518,7 @@ fn finish_under_policy(
     outcome: p1_tool_finish::FinishOutcome,
     policy: CompletionPolicy,
     contract: Option<p1_tool_finish::OutputContract>,
+    mask: &Arc<MaskCounter>,
 ) -> Arc<dyn Tool> {
     let name = finish.declaration().name.clone();
     let variant = finish.identity().variant.clone();
@@ -1515,7 +1527,12 @@ fn finish_under_policy(
         tool = tool.with_output_contract(contract);
     }
     let face = p1_tool_finish::ToolFace::new(name, tool.declaration().description.clone());
-    Arc::new(tool.with_face(face, &variant))
+    // Issue #142: this `finish` is assembled after the general wrapping pass, so it
+    // is wrapped here too; the marker keeps the face and identity above.
+    redacted(
+        Arc::new(tool.with_face(face, &variant)) as Arc<dyn Tool>,
+        mask,
+    )
 }
 
 /// The session's model (ADR-0049 stage 3): what a `/model` or `/effort` line
@@ -1556,6 +1573,9 @@ pub(crate) struct ModelSwitch {
     /// The top-level agent's standing instructions and skill index (issue #129),
     /// re-appended to every switched assembly.
     instructions: String,
+    /// Issue #142: the top-level agent's mask counter. A switched assembly's tools
+    /// feed the SAME counter the parent's notice sink reads.
+    mask: Arc<MaskCounter>,
     session: Mutex<SessionModel>,
 }
 
@@ -1618,6 +1638,7 @@ pub(crate) fn switch_model(
         &switch.workspace,
         &switch.substitutions,
         PARENT_ORDINAL,
+        &switch.mask,
     )?;
     // The catalog's `finish` factory issued this assembly its own completion. Take
     // it, so the hub cannot hand a stale one to a later worker assembly, and so it
@@ -1882,6 +1903,39 @@ impl EventSink for InteractiveStallWatcher {
             // the single warning meta row; it is never exposed to the model.
             self.inner.emit(AgentEvent::ProviderNotice {
                 text: format!("\0p1-idle-summary-count:{count}"),
+            });
+        }
+    }
+}
+
+/// Issue #142: report how many credential-shaped values were masked during one
+/// turn, once per turn boundary, through the host's EXISTING display-only notice
+/// path (`AgentEvent::ProviderNotice`, the channel a provider notice and a
+/// worker-end note already use). Only the count is ever emitted; the values live
+/// only in [`p1_redact`]'s replacement and never reach an event, a journal record or
+/// a request.
+struct MaskNoticeSink {
+    inner: Arc<dyn EventSink>,
+    counter: Arc<MaskCounter>,
+}
+
+impl MaskNoticeSink {
+    fn new(inner: Arc<dyn EventSink>, counter: Arc<MaskCounter>) -> Self {
+        Self { inner, counter }
+    }
+}
+
+impl EventSink for MaskNoticeSink {
+    fn emit(&self, event: AgentEvent) {
+        let turn_finished = matches!(event, AgentEvent::TurnFinished { .. });
+        self.inner.emit(event);
+        if !turn_finished {
+            return;
+        }
+        let masked = self.counter.take();
+        if masked > 0 {
+            self.inner.emit(AgentEvent::ProviderNotice {
+                text: format!("masked {masked} credential-shaped value(s) in tool output"),
             });
         }
     }
@@ -2296,6 +2350,7 @@ fn assemble_child(
     workspace: &Path,
     substitutions: &Substitutions,
     ordinal: u64,
+    mask: &Arc<MaskCounter>,
 ) -> Result<Assembled, String> {
     let mut environment =
         load_environment(environment_name, environment_dirs).map_err(|error| error.to_string())?;
@@ -2306,7 +2361,14 @@ fn assemble_child(
         crate::models::apply(&mut environment, choice, environment_dirs)?;
     }
     crate::catalog::resolve_environment(&mut environment, environment_dirs)?;
-    assemble_with_cache_key(catalog, &environment, workspace, substitutions, ordinal)
+    assemble_with_cache_key(
+        catalog,
+        &environment,
+        workspace,
+        substitutions,
+        ordinal,
+        mask,
+    )
 }
 
 /// The tool list of a child: the granted modules in the parent's order, each with the
@@ -2459,6 +2521,9 @@ impl ChildBuilder {
         // This child's own cache-key ordinal, kept for its whole life: a re-grant
         // assembles at the SAME ordinal, never a new one.
         let ordinal = next_agent_ordinal(&self.agent_ordinals);
+        // Issue #142: the child's own mask counter, shared by its assembled tools and
+        // by its notice sink below (a child is its own agent).
+        let mask = Arc::new(MaskCounter::new());
         let mut assembled = assemble_child(
             environment_dirs,
             &catalog,
@@ -2468,6 +2533,7 @@ impl ChildBuilder {
             &workspace,
             &substitutions,
             ordinal,
+            &mask,
         )?;
         // The session file is numbered like the id the service hands out.
         let id: usize = worker_id
@@ -2486,7 +2552,7 @@ impl ChildBuilder {
         // ADR-0052 item 1: the policy follows the assembled tools' identities, so it
         // is applied here, after assembly, to the `finish` tool the catalog built.
         if let Some(completion) = &child_completion {
-            apply_completion_policy(&mut assembled, completion, contract.clone());
+            apply_completion_policy(&mut assembled, completion, contract.clone(), &mask);
         }
         let context = agent_context(&assembled)?;
         let route = assembled.resolved.route.origin.route.clone();
@@ -2524,6 +2590,9 @@ impl ChildBuilder {
         } else {
             events
         };
+        // Issue #142: a worker's masked values are reported once per turn through the
+        // same display-only notice path, tagged with its own id by its renderer.
+        let events: Arc<dyn EventSink> = Arc::new(MaskNoticeSink::new(events, mask.clone()));
         // The worker's report (ADR-0050 item 6): the tap is the OUTERMOST sink, so it
         // sees the whole turn — the child's own rendering and the stall guard have
         // had their say before the operator is told the worker's end. The service
@@ -2577,6 +2646,7 @@ impl ChildBuilder {
             let tee = tee.clone();
             let log = log.clone();
             let outcome = outcome.clone();
+            let mask = mask.clone();
             // The worker's OWN `finish` tool survives every re-grant: its activity
             // log is the worker's whole history, which `finish` reads to verify a
             // claim, and a freshly assembled one would see an empty session.
@@ -2591,6 +2661,7 @@ impl ChildBuilder {
                     &workspace,
                     &substitutions,
                     ordinal,
+                    &mask,
                 )?;
                 // The catalog's `finish` factory issued THIS assembly its own
                 // completion: take it, so the hub cannot hand a stale one to a later
@@ -2610,6 +2681,7 @@ impl ChildBuilder {
                         outcome.clone(),
                         policy,
                         contract.clone(),
+                        &mask,
                     );
                 }
                 // The report's `tools` becomes the new assembly's names, its `finish`
@@ -2763,10 +2835,11 @@ fn assemble_with_cache_key(
     workspace: &std::path::Path,
     substitutions: &Substitutions,
     agent_ordinal: u64,
+    mask: &Arc<MaskCounter>,
 ) -> Result<p1_assembly::Assembled, String> {
     let name = environment.name.clone();
     let configured = environment.options.clone();
-    p1_assembly::assemble_with_route_options(
+    let mut assembled = p1_assembly::assemble_with_route_options(
         catalog,
         environment,
         workspace,
@@ -2779,7 +2852,16 @@ fn assemble_with_cache_key(
             options
         },
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    // Issue #142: every ASSEMBLED tool is wrapped here, at the one host assembly
+    // path, so a tool's result text is masked before p1-core turns it into a
+    // `ToolResultItem` — history, journal and every later request only ever see the
+    // masked form. Declaration and identity are forwarded unchanged, so dispatch and
+    // the journalled identity do not move.
+    for tool in &mut assembled.tools {
+        *tool = redacted(tool.clone(), mask);
+    }
+    Ok(assembled)
 }
 
 /// A STABLE provider-side prompt-cache key for one agent: a pure function of the
