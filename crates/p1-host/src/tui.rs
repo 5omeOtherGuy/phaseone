@@ -250,6 +250,12 @@ impl FrontEnd for TuiFrontEnd {
                     cancel.child_token(),
                 );
             }
+            #[cfg(feature = "delegation")]
+            let worker_stops = workers
+                .as_ref()
+                .map(|service| spawn_worker_stopper(service.clone(), cancel.child_token()));
+            #[cfg(not(feature = "delegation"))]
+            let worker_stops: Option<mpsc::UnboundedSender<String>> = None;
             let mut driver = Driver {
                 screen,
                 env: self.options.env.clone(),
@@ -268,6 +274,7 @@ impl FrontEnd for TuiFrontEnd {
                 exit: None,
                 inbox: agent.inbox(),
                 worker_rows,
+                worker_stops,
                 worker_usage: HashMap::new(),
                 branch,
                 tools: self.tools.lock().unwrap().clone(),
@@ -363,6 +370,8 @@ pub(crate) struct Driver {
     submit_pending: Option<String>,
     /// The worker snapshot the refresher task maintains (delegation only).
     worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
+    /// Confirmed worker stops; the task owns the service calls off the UI loop.
+    worker_stops: Option<mpsc::UnboundedSender<String>>,
     /// Usage reported by each worker's own responses; never merged into the
     /// parent's context or spend.
     worker_usage: HashMap<String, WorkerUsage>,
@@ -539,6 +548,22 @@ impl Driver {
             }
             Command::ScrollUp => self.screen.scroll_by(10),
             Command::ScrollDown => self.screen.scroll_by(-10),
+            Command::StopWorker(id) => {
+                self.screen.stop_pending = None;
+                if self
+                    .worker_stops
+                    .as_ref()
+                    .is_some_and(|tx| tx.send(id.clone()).is_ok())
+                {
+                    self.screen
+                        .transcript
+                        .note(&format!("↳ {id} stop requested"));
+                } else {
+                    self.screen
+                        .transcript
+                        .note(&format!("↳ {id} cannot be stopped here"));
+                }
+            }
             Command::PaneUp => self.screen.pane_step(-1),
             Command::PaneDown => self.screen.pane_step(1),
         }
@@ -772,6 +797,7 @@ impl Driver {
                         };
                         self.screen.transcript.note(&format!("↳ {id} {state}"));
                     }
+                    self.screen.apply_worker(id, &stamped.event, stamped.at_ms);
                     return;
                 }
                 // A delivered inbox message clears the queued steering display.
@@ -939,6 +965,7 @@ impl Driver {
             &self.workspace,
             &self.sandbox,
         ));
+        self.screen.detach_worker();
         // An approval self-pins (SPEC §5): nothing may swap it away.
         if !self.screen.pinned {
             self.screen.pinned = true;
@@ -1349,6 +1376,29 @@ fn spawn_worker_refresher(
             *rows.lock().unwrap() = next;
         }
     });
+}
+
+/// Apply confirmed worker stops outside the UI loop; the refresher publishes the new state.
+#[cfg(feature = "delegation")]
+fn spawn_worker_stopper(
+    service: Arc<dyn WorkerService>,
+    cancel: CancellationToken,
+) -> mpsc::UnboundedSender<String> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                received = rx.recv() => match received {
+                    Some(id) => {
+                        let _ = service.cancel(&p1_workers::ChildId(id)).await;
+                    }
+                    None => return,
+                },
+            }
+        }
+    });
+    tx
 }
 
 /// `^C`: cancel during a turn, quit at idle.

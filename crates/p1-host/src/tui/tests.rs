@@ -43,6 +43,7 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             follow_ups: VecDeque::new(),
             submit_pending: None,
             worker_rows: Arc::new(Mutex::new(Vec::new())),
+            worker_stops: None,
             worker_usage: HashMap::new(),
             pending_calls: HashMap::new(),
             task_files: HashSet::new(),
@@ -948,4 +949,253 @@ fn worker_clocks_restart_after_continue_and_freeze_once_settled() {
         clocks.observe("w2", false, t + std::time::Duration::from_secs(50)),
         None
     );
+}
+
+// ------------------------------------------------- attached worker detail (§9.5)
+
+/// A worker's own stream is buffered for the attach view, never drawn into the
+/// parent's transcript (handoff §9.5): attaching later shows detail the parent
+/// stream never carried.
+#[test]
+fn a_worker_stream_is_buffered_for_attach_and_stays_out_of_the_parent() {
+    let (mut d, _auth) = driver();
+    d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 7,
+        worker: Some("w1".into()),
+        event: p1_contracts::AgentEvent::TextDelta {
+            text: "worker prose".into(),
+        },
+    }));
+
+    assert!(
+        !d.screen
+            .transcript
+            .blocks
+            .iter()
+            .any(|b| matches!(b, p1_tui::transcript::Block::Prose { .. })),
+        "the parent never shows a worker's prose"
+    );
+    let buffered = d
+        .screen
+        .worker_transcripts
+        .get("w1")
+        .expect("w1's stream is buffered while it is detached");
+    assert_eq!(
+        buffered.blocks,
+        vec![p1_tui::transcript::Block::Prose {
+            lines: vec!["worker prose".into()],
+        }]
+    );
+}
+
+/// The approval owns the transcript area (handoff §7.5), so parking one while
+/// attached to a worker detaches it; the buffer is kept, not dropped.
+#[tokio::test]
+async fn an_approval_while_attached_detaches_the_worker() {
+    use p1_tui::state::PaneMode;
+
+    let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
+    let (mut d, _auth) = driver();
+    d.policy = Arc::new(policy);
+    d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
+        at_ms: 4,
+        worker: Some("w1".into()),
+        event: p1_contracts::AgentEvent::TextDelta {
+            text: "worker prose".into(),
+        },
+    }));
+    d.screen.pane_mode = PaneMode::Workers;
+    d.screen.workers.workers = vec![worker_test_row("w1")];
+    d.screen.workers.focused = Some("w1".into());
+    d.screen.attach_selected();
+    assert_eq!(
+        d.screen.attached.as_ref().map(|worker| worker.id.as_str()),
+        Some("w1")
+    );
+
+    let call = p1_contracts::ToolCall {
+        call_id: "c1".into(),
+        name: "shell".into(),
+        input: p1_contracts::ToolInput::Json("{\"command\":\"cargo test\"}".into()),
+    };
+    let identity = p1_contracts::ToolIdentity {
+        implementation: "shell".into(),
+        variant: String::new(),
+    };
+    let pending = tokio::spawn({
+        let policy = d.policy.clone();
+        let call = call.clone();
+        let identity = identity.clone();
+        async move {
+            policy
+                .authorize(p1_contracts::AuthorizationRequest {
+                    call: &call,
+                    identity: &identity,
+                    effect: p1_contracts::Effect::Executes,
+                })
+                .await
+        }
+    });
+    let request = auth_rx.recv().await.unwrap();
+    d.on_auth(request);
+
+    assert!(matches!(d.screen.approval, Some(Approval::Permission(_))));
+    assert!(
+        d.screen.attached.is_none(),
+        "the approval needs the transcript area"
+    );
+    d.on_key(key(KeyCode::Char('n')), None);
+    assert_eq!(
+        pending.await.unwrap(),
+        Decision::Deny {
+            reason: p1_tui::runtime::USER_DENY.into()
+        }
+    );
+    assert_eq!(
+        d.screen
+            .worker_transcripts
+            .get("w1")
+            .map(|transcript| transcript.blocks.len()),
+        Some(1),
+        "detaching keeps the worker's buffered transcript"
+    );
+}
+
+/// An open OUTPUT fold scrolls on the bare arrows only while OUTPUT is the
+/// pane's mode; another mode showing keeps them out of the hidden pane.
+#[test]
+fn only_output_mode_takes_the_bare_arrows() {
+    use p1_tui::render::output::OutputView;
+    use p1_tui::state::PaneMode;
+
+    let (mut d, _auth) = driver();
+    d.screen.output = Some(OutputView {
+        id: p1_tui::fold::FoldId::of("folded output"),
+        lines: vec!["a".into(), "b".into(), "c".into()],
+        scroll: 0,
+    });
+    d.screen.pane_mode = PaneMode::Ledger;
+    d.on_key(key(KeyCode::Down), None);
+    assert_eq!(
+        d.screen.output.as_ref().map(|output| output.scroll),
+        Some(0),
+        "LEDGER leaves the hidden OUTPUT pane alone"
+    );
+
+    d.screen.pane_mode = PaneMode::Output;
+    d.on_key(key(KeyCode::Down), None);
+    assert_eq!(
+        d.screen.output.as_ref().map(|output| output.scroll),
+        Some(1),
+        "OUTPUT mode scrolls it"
+    );
+}
+
+#[test]
+fn ctrl_f_off_detaches_and_returns_keys_to_the_composer() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Down), None);
+    d.on_key(key(KeyCode::Enter), None);
+    assert_eq!(
+        d.screen.attached.as_ref().map(|worker| worker.id.as_str()),
+        Some("w2")
+    );
+
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(d.screen.attached.is_none());
+    d.on_key(key(KeyCode::Char('h')), None);
+    d.on_key(key(KeyCode::Char('i')), None);
+    assert_eq!(d.screen.composer.text, "hi");
+    d.on_key(key(KeyCode::Enter), None);
+    assert!(d.screen.attached.is_none());
+}
+
+#[test]
+fn ctrl_n_detaches_an_attached_worker() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Enter), None);
+    assert!(d.screen.attached.is_some());
+
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(d.screen.attached.is_none());
+}
+
+#[test]
+fn worker_stop_confirmation_keeps_or_dispatches_through_the_stop_channel() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    d.worker_stops = Some(tx);
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Down), None);
+    d.on_key(key(KeyCode::Char('x')), None);
+    assert_eq!(d.screen.stop_pending.as_deref(), Some("w2"));
+
+    d.on_key(key(KeyCode::Char('n')), None);
+    assert_eq!(d.screen.stop_pending, None);
+    assert!(rx.try_recv().is_err());
+
+    d.on_key(key(KeyCode::Char('x')), None);
+    d.on_key(key(KeyCode::Char('y')), None);
+    assert_eq!(d.screen.stop_pending, None);
+    assert_eq!(rx.try_recv(), Ok("w2".to_string()));
+    assert!(d.screen.transcript.blocks.iter().any(|block| matches!(
+        block,
+        p1_tui::transcript::Block::Meta { text } if text == "↳ w2 stop requested"
+    )));
+}
+
+#[test]
+fn worker_stop_without_the_host_channel_reports_that_it_cannot_stop() {
+    use p1_tui::state::PaneWidth;
+
+    let (mut d, _auth) = driver();
+    d.screen.pane_width = PaneWidth::Wide;
+    *d.worker_rows.lock().unwrap() = vec![worker_test_row("w1"), worker_test_row("w2")];
+    d.sync_workers();
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    d.on_key(key(KeyCode::Down), None);
+    d.on_key(key(KeyCode::Char('x')), None);
+    d.on_key(key(KeyCode::Char('y')), None);
+
+    assert_eq!(d.screen.stop_pending, None);
+    assert!(d.screen.transcript.blocks.iter().any(|block| matches!(
+        block,
+        p1_tui::transcript::Block::Meta { text }
+            if text == "↳ w2 cannot be stopped here"
+    )));
 }
