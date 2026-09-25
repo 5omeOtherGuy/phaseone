@@ -174,9 +174,36 @@ pub struct StepRequest {
     pub prompt: String,
     /// The output contract the worker's `finish` gets, when the call passed `schema`.
     pub schema: Option<Value>,
-    /// The workspace the worker runs in: the run's own when `None`.
+    /// The workspace the worker runs in: the run's own when `None`. For a step with a
+    /// `worktree`, the path of the worktree the runner prepared (ADR-0073).
     pub workspace: Option<PathBuf>,
     pub attempt: u32,
+    /// The slug of the git worktree the step asked for (`worktree: "<slug>"`, ADR-0073).
+    pub worktree: Option<String>,
+    /// The run's base commit: what a new step worktree branches from. `None` when the
+    /// run's workspace is not a git repository.
+    pub base: Option<String>,
+}
+
+/// A step's own git worktree (ADR-0073), as the host prepared it and the step left it.
+/// The script reads `r.worktree.path`, `.branch` and `.head`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    /// `task/<slug>`.
+    pub branch: String,
+    /// The worktree's `HEAD` commit after the step ended.
+    pub head: String,
+}
+
+/// A step's worktree, held for the whole step (ADR-0073 item 4): across its fallback
+/// links and its repair turn. Dropping it releases the worktree for the next step.
+pub trait WorktreeHold: Send + Sync {
+    /// The worktree as prepared, before the step ran.
+    fn info(&self) -> &WorktreeInfo;
+
+    /// The worktree as the step left it: its `head` read again.
+    fn settle<'a>(&'a self) -> BoxFuture<'a, Result<WorktreeInfo, String>>;
 }
 
 /// The worker a step ran in: its id in the host's worker service and the route/model
@@ -261,6 +288,22 @@ pub trait StepRunner: Send + Sync {
         message: String,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StepEnd, String>>;
+
+    /// Prepare and hold the git worktree `request.worktree` names (ADR-0073), once per
+    /// step, before its first link is dispatched. `request.workspace` is the run's
+    /// workspace here. `Err` fails the step before dispatch with the reason
+    /// (`worktree: …`, `worktree_busy: …`). The default makes none.
+    fn worktree<'a>(
+        &'a self,
+        request: &'a StepRequest,
+    ) -> BoxFuture<'a, Result<Box<dyn WorktreeHold>, String>> {
+        Box::pin(async move {
+            Err(format!(
+                "worktree: {}: this host does not make worktrees",
+                request.worktree.as_deref().unwrap_or_default()
+            ))
+        })
+    }
 }
 
 // ------------------------------------------------------------------ envelope (item 3)
@@ -321,6 +364,9 @@ pub struct StepEnvelope {
     /// model the step turned to, including the link a cap skipped. Empty when the step
     /// was refused before it reached any model.
     pub models: Vec<ModelTry>,
+    /// The step's own git worktree (ADR-0073), when it asked for one and got it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeInfo>,
 }
 
 // ------------------------------------------------------------------ journal (item 6)
@@ -337,6 +383,9 @@ pub enum JournalRecord {
         script_hash: String,
         args: Value,
         resumed_from: Option<RunId>,
+        /// The run's base commit (ADR-0073): a resumed run keeps its predecessor's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
     },
     Phase {
         name: String,
@@ -496,6 +545,9 @@ pub struct StartRequest {
     pub role_models: BTreeMap<String, String>,
     /// The run's workspace, when the caller has one to name.
     pub workspace: Option<PathBuf>,
+    /// The run's base commit, `HEAD` of its workspace when the host started it
+    /// (ADR-0073). On `resume_from`, the resumed run's recorded base wins.
+    pub base: Option<String>,
 }
 
 /// Every way a workflow service call can fail.
@@ -691,6 +743,37 @@ mod tests {
         let json = serde_json::to_string(&hop).unwrap();
         assert!(json.starts_with(r#"{"kind":"fallback""#), "{json}");
         assert_eq!(serde_json::from_str::<JournalRecord>(&json).unwrap(), hop);
+    }
+
+    #[test]
+    fn journals_written_before_worktrees_still_read() {
+        let started: JournalRecord = serde_json::from_str(
+            r#"{"kind":"started","run":"wf1","script_hash":"00","args":{},"resumed_from":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(started, JournalRecord::Started { base: None, .. }));
+        let result: JournalRecord = serde_json::from_str(
+            r#"{"kind":"result","call":"c","envelope":{"step":"c","label":null,"status":"done","value":null,"schema":"not_requested","evidence":null,"attempts":1,"worker":null,"needs":null,"error":null,"models":[]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            JournalRecord::Result {
+                envelope: StepEnvelope { worktree: None, .. },
+                ..
+            }
+        ));
+
+        let with = JournalRecord::Started {
+            run: RunId("wf2".into()),
+            script_hash: "00".into(),
+            args: Value::Null,
+            resumed_from: None,
+            base: Some("abc".into()),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""base":"abc""#), "{json}");
+        assert_eq!(serde_json::from_str::<JournalRecord>(&json).unwrap(), with);
     }
 
     #[test]

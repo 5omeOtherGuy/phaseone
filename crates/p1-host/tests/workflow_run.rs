@@ -143,3 +143,118 @@ async fn parent_run_body() {
         serde_json::json!(["first summary", "second summary"])
     );
 }
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn commit(repo: &std::path::Path, name: &str) -> String {
+    std::fs::write(repo.join(name), name).unwrap();
+    git(repo, &["add", name]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            name,
+        ],
+    );
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+const TWO_TREES: &str = r#"
+let a = agent("first task", #{ label: "one", worktree: "e2e-a" });
+let b = agent("second task", #{ label: "two", worktree: "e2e-b" });
+[a.worktree.path, a.worktree.branch, a.worktree.head, b.worktree.path, b.worktree.branch, b.worktree.head]
+"#;
+
+// ADR-0073: two steps, each in its own worktree next to the parent's checkout — one
+// made from the run's base, one attached to its existing branch.
+#[tokio::test]
+async fn two_steps_run_in_two_worktrees() {
+    tokio::time::timeout(Duration::from_secs(60), two_trees_body())
+        .await
+        .expect("worktree workflow run hung");
+}
+
+async fn two_trees_body() {
+    let scratch = Scratch::new();
+    let checkout = tempfile::tempdir().unwrap();
+    let repo = checkout.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let older = commit(&repo, "older");
+    git(&repo, &["branch", "task/e2e-b"]);
+    let base = commit(&repo, "newer");
+
+    let fakes = Fakes::new(
+        parent_that_runs(TWO_TREES, ""),
+        [done("first summary"), done("second summary")].concat(),
+        Vec::new(),
+    );
+    let mut harness = scratch.harness();
+    harness.deps.catalog_hook = Some(fakes.hook());
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "parent",
+            "--session",
+            scratch.session().to_str().unwrap(),
+            "--workspace",
+            repo.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+    let stderr = harness.stderr.text();
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let result = read_json(&scratch.run_dir("wf1").join("result.json"));
+    assert_eq!(result["outcome"], "completed", "{result}");
+    let value = result["value"].as_array().unwrap().clone();
+    let tree_a = std::path::PathBuf::from(value[0].as_str().unwrap());
+    let tree_b = std::path::PathBuf::from(value[3].as_str().unwrap());
+    let real = |path: &std::path::Path| path.canonicalize().unwrap();
+    assert_eq!(real(&tree_a), real(&checkout.path().join("repo-e2e-a")));
+    assert_eq!(real(&tree_b), real(&checkout.path().join("repo-e2e-b")));
+    assert_eq!(value[1], "task/e2e-a");
+    assert_eq!(value[4], "task/e2e-b");
+    assert_eq!(value[2], base.as_str(), "a new tree branches from the base");
+    assert_eq!(
+        value[5],
+        older.as_str(),
+        "an existing branch keeps its commit"
+    );
+    assert_eq!(
+        git(&tree_a, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "task/e2e-a"
+    );
+    assert_eq!(
+        git(&tree_b, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "task/e2e-b"
+    );
+    assert_eq!(
+        git(&repo, &["rev-parse", "HEAD"]),
+        base,
+        "the checkout untouched"
+    );
+}

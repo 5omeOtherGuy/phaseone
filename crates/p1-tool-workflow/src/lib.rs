@@ -169,6 +169,8 @@ impl Tool for WorkflowStartTool {
                 resume_from: resume_from.clone(),
                 role_models: Default::default(),
                 workspace: None,
+                // The host fills in the base of the workspace the steps fall back to.
+                base: None,
             };
             match self.service.start(request).await {
                 Ok(id) => {

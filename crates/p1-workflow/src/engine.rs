@@ -27,7 +27,7 @@ use tokio::sync::watch;
 use crate::api::{
     CallId, Counts, JournalRecord, ModelTry, MovedOn, ResolvedModel, RunId, RunOutcome,
     RunProgress, RunReport, SchemaCheck, StepEnd, StepEnvelope, StepLine, StepRequest, StepRunner,
-    StepStatus, WorkerRef, WorkflowError, WorkflowObserver,
+    StepStatus, WorkerRef, WorkflowError, WorkflowObserver, WorktreeHold,
 };
 use crate::caps::CapCounter;
 use crate::error::{parse_error, runtime_message};
@@ -78,6 +78,8 @@ pub(crate) struct RunState {
     pub(crate) caps: CapCounter,
     pub(crate) max_steps: u32,
     pub(crate) workspace: Option<PathBuf>,
+    /// The run's base commit (ADR-0073): what a step's new worktree branches from.
+    pub(crate) base: Option<String>,
     pub(crate) token: CancellationToken,
     /// The caller's runtime: `agent()` blocks a script thread on it; the crate owns none.
     pub(crate) handle: Handle,
@@ -204,6 +206,7 @@ impl RunState {
             needs: None,
             error: Some(error),
             models: Vec::new(),
+            worktree: None,
         };
 
         let number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -230,6 +233,62 @@ impl RunState {
             .phase
             .clone()
             .or_else(|| lock(&self.record).phase.clone());
+        let request_for = |model: &ResolvedModel, workspace: Option<PathBuf>| StepRequest {
+            run: self.id.clone(),
+            call: call.clone(),
+            label: opts.label.clone(),
+            phase: phase.clone(),
+            role: opts.role.clone(),
+            model: model.clone(),
+            tools: tools.clone(),
+            prompt: prompt.to_string(),
+            schema: opts.schema.clone(),
+            workspace,
+            attempt: 1,
+            worktree: opts.worktree.clone(),
+            base: self.base.clone(),
+        };
+
+        // The step's own worktree (ADR-0073), held until the step ends: across every
+        // link of its chain and its repair turn. Refused before anything is dispatched.
+        let hold: Option<Box<dyn WorktreeHold>> = match (&opts.worktree, role.chain.first()) {
+            (Some(slug), Some(head)) => {
+                if self.base.is_none() {
+                    let envelope = refused(format!(
+                        "worktree: {slug}: the run has no base commit (its workspace is not a git repository)"
+                    ));
+                    return Ok(self.conclude(call, &line, envelope, false, &StepCost::default()));
+                }
+                let probe = request_for(head, self.workspace.clone());
+                match self.cancellable(self.runner.worktree(&probe)) {
+                    None => {
+                        let envelope = StepEnvelope {
+                            status: StepStatus::Cancelled,
+                            error: None,
+                            ..refused(String::new())
+                        };
+                        self.conclude(call, &line, envelope, false, &StepCost::default());
+                        return Err(cancelled_error());
+                    }
+                    Some(Err(error)) => {
+                        let envelope = refused(error);
+                        return Ok(self.conclude(
+                            call,
+                            &line,
+                            envelope,
+                            false,
+                            &StepCost::default(),
+                        ));
+                    }
+                    Some(Ok(hold)) => Some(hold),
+                }
+            }
+            _ => None,
+        };
+        let workspace = match &hold {
+            Some(hold) => Some(hold.info().path.clone()),
+            None => opts.workspace.clone().or_else(|| self.workspace.clone()),
+        };
 
         // The chain, head first (ADR-0054 item 2). A link is left only for a route
         // failure or a cap; every other end stops the step (ADR-0054 item 3).
@@ -251,19 +310,7 @@ impl RunState {
                 });
                 cost.fell_back += 1;
             }
-            let request = StepRequest {
-                run: self.id.clone(),
-                call: call.clone(),
-                label: opts.label.clone(),
-                phase: phase.clone(),
-                role: opts.role.clone(),
-                model: model.clone(),
-                tools: tools.clone(),
-                prompt: prompt.to_string(),
-                schema: opts.schema.clone(),
-                workspace: opts.workspace.clone().or_else(|| self.workspace.clone()),
-                attempt: 1,
-            };
+            let request = request_for(model, workspace.clone());
             match self.link(&request, &opts.json, &mut cost) {
                 Link::Ended(end) => {
                     walked.push(ModelTry {
@@ -309,6 +356,19 @@ impl RunState {
             ..refused(String::new())
         });
         envelope.models = walked;
+        if let Some(hold) = hold {
+            // The head as the step left it; the hold is released right after, before the
+            // step concludes, so the script's next step finds the worktree free.
+            let settled = self.handle.block_on(hold.settle());
+            envelope.worktree = Some(match settled {
+                Ok(info) => info,
+                Err(error) => {
+                    self.log_line(&format!("worktree: {error}"));
+                    hold.info().clone()
+                }
+            });
+            drop(hold);
+        }
         if envelope.status == StepStatus::Cancelled {
             self.conclude(call, &line, envelope, false, &cost);
             return Err(cancelled_error());
@@ -331,6 +391,7 @@ impl RunState {
             needs: None,
             error: None,
             models: Vec::new(),
+            worktree: None,
         };
         match self.spend(request, opts, 1, cost) {
             // A cap is the one refusal a step walks past (ADR-0054 item 4).
@@ -757,6 +818,8 @@ struct StepOptions {
     schema: Option<Value>,
     tools: Option<Vec<String>>,
     workspace: Option<PathBuf>,
+    /// The step's own git worktree, by slug (ADR-0073).
+    worktree: Option<String>,
 }
 
 impl StepOptions {
@@ -779,6 +842,7 @@ impl StepOptions {
             schema: None,
             tools: None,
             workspace: None,
+            worktree: None,
         };
         let text = |key: &str, value: &Value| {
             value
@@ -792,15 +856,43 @@ impl StepOptions {
                 "label" => parsed.label = Some(text(key, value)?),
                 "phase" => parsed.phase = Some(text(key, value)?),
                 "workspace" => parsed.workspace = Some(PathBuf::from(text(key, value)?)),
+                "worktree" => parsed.worktree = Some(parse_slug(&text(key, value)?)?),
                 "schema" if value.is_object() => parsed.schema = Some(value.clone()),
                 "schema" => return Err(script_error("agent: option \"schema\" must be a map")),
                 "tools" => parsed.tools = Some(parse_tools(value)?),
                 other => return Err(script_error(format!("agent: unknown option \"{other}\""))),
             }
         }
+        if parsed.worktree.is_some() && parsed.workspace.is_some() {
+            return Err(script_error(
+                "agent: options \"worktree\" and \"workspace\" cannot be given together",
+            ));
+        }
         parsed.json = json;
         Ok(parsed)
     }
+}
+
+/// The longest worktree slug a script may name (ADR-0073).
+const MAX_SLUG: usize = 64;
+
+/// A worktree slug: lowercase ASCII letters, digits and `-`, starting and ending with a
+/// letter or digit, at most [`MAX_SLUG`] characters — it becomes a directory name and
+/// the branch `task/<slug>`, so nothing else is let through.
+fn parse_slug(slug: &str) -> Result<String, Box<EvalAltResult>> {
+    let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let bytes = slug.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= MAX_SLUG
+        && bytes.iter().all(|&byte| edge(byte) || byte == b'-')
+        && edge(bytes[0])
+        && edge(bytes[bytes.len() - 1]);
+    if !valid {
+        return Err(script_error(format!(
+            "agent: option \"worktree\" must be a slug of lowercase letters, digits and '-', starting and ending with a letter or digit, at most {MAX_SLUG} characters, not \"{slug}\""
+        )));
+    }
+    Ok(slug.to_string())
 }
 
 fn parse_tools(value: &Value) -> Result<Vec<String>, Box<EvalAltResult>> {

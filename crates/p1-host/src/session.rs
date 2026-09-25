@@ -264,6 +264,7 @@ mod tests {
                 needs: None,
                 error: None,
                 models: Vec::new(),
+                worktree: None,
             };
             let record = JournalRecord::Result {
                 call: CallId("call".into()),

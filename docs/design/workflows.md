@@ -45,6 +45,7 @@ three bindings:
 | `schema` | map | none | The output contract the worker's `finish` gets (§5). |
 | `tools` | non-empty array of strings | the role's grant | Replaces the role's grant for this one step. |
 | `workspace` | string path | the run's workspace | Where the worker runs (§8). |
+| `worktree` | slug string | none | The step runs in its own git worktree (ADR-0073): `<parent of the main worktree>/<main worktree name>-<slug>` on branch `task/<slug>`, made from the run's base commit when missing, reused untouched when there. The slug is lowercase ASCII letters, digits and `-`, starting and ending with a letter or digit, at most 64 characters; anything else, or `worktree` together with `workspace`, is a script error. A later step is pointed at the same tree with `workspace: r.worktree.path`. |
 
 **Idioms a writer needs.** Maps are `#{ key: value }`. Work given to `parallel` must be
 deferred as a closure — `|| agent(..)` — because `parallel` takes functions: passing
@@ -239,6 +240,7 @@ re-run step starts from the head again.
 | `needs` | A blocked step's need, or `()`. |
 | `error` | A typed failure, or `()`. |
 | `models` | The chain the step walked (§3 "Fallback"), head first: `[{model, moved_on}]`, `moved_on` `route_failed`/`capped` where the step moved on. `[]` only when the step was refused before it reached a model (an unknown role, `max_steps`). |
+| `worktree` | Only on a step that asked for a worktree and got it (ADR-0073): `{path, branch, head}` — `head` is the tree's `HEAD` after the step ended. Absent otherwise (a replayed step returns its recorded envelope unchanged). |
 
 The `schema` states mirror the `finish` tool's own check (§5).
 
@@ -258,6 +260,8 @@ and every step refused before dispatch: `()`.
 | `unknown_role: <name>` | The role is not in the effective table. |
 | `route: <error>` | No model of the role's chain could run the step — the last link's route failure. |
 | `ended without finish` | The worker's turn completed with no accepted `finish` call, after one repair turn (§5, ADR-0072). |
+| `worktree: <slug>: <reason>` | The step's worktree could not be made or reused, before dispatch (ADR-0073): the run has no base commit (its workspace is not a git repository), the path exists and is not that branch's worktree, or git's own error. |
+| `worktree_busy: <slug>` | A running step of this host holds that worktree; refused at once, before dispatch (ADR-0073). |
 | anything else | The host's `StepRunner` reason (its `Err` string, e.g. an unknown environment), or `journal: …` when the `Dispatch` line could not be written. |
 
 ## 5. Structured output
@@ -306,7 +310,7 @@ silently skipping a `Dispatch` would under-charge the caps.
 
 | Kind | Fields | When |
 |---|---|---|
-| `started` | run, script_hash, args, resumed_from | The first line. |
+| `started` | run, script_hash, args, resumed_from, base (only when the run has one, ADR-0073) | The first line. |
 | `phase` | name | Every `phase()`. |
 | `dispatch` | call, label, role, model, wire_model, attempt, prompt, opts | **Before the worker starts** — one per model a chain turns to. |
 | `capped` | call, wire_model, used, limit | A dispatch refused by a cap, before anything ran. |
@@ -452,6 +456,13 @@ whatever the script returns.
   caller gave `StartRequest`) or in a path the script itself names with the call's
   `workspace` opt; the opt wins for that step. The engine passes it through and confines
   nothing; the host's workspace rules (ADR-0025) apply as for any worker.
+- **Worktree rule** (ADR-0073): a step with `worktree: "<slug>"` runs in its own git
+  worktree. The host resolves the run's base commit (`git rev-parse HEAD` of the run's
+  workspace) when it starts the run; a resumed run keeps its predecessor's. The host holds
+  a step's worktree for the whole step — its fallback links and its repair turn — and
+  refuses a second step on it with `worktree_busy:`. Nothing is ever deleted, reset,
+  cleaned or forced: a finished tree is removed with `git worktree remove`, by the rule
+  for every worktree.
 - **Thread cost**: one OS thread per in-flight thunk, bounded by `max_threads`
   (default 64, inline fallback), plus one thread per running script.
 - **Runs do not survive the process, journals do.** A run lives in its service; its

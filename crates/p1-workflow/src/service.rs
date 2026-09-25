@@ -174,8 +174,8 @@ impl InProcessWorkflows {
         };
         let args_dynamic =
             rhai::serde::to_dynamic(&args).map_err(|error| preflight(format!("args: {error}")))?;
-        let (replay, charged) = match &request.resume_from {
-            None => (Replay::none(), BTreeMap::new()),
+        let (replay, charged, recorded_base) = match &request.resume_from {
+            None => (Replay::none(), BTreeMap::new(), None),
             Some(from) => {
                 let path = self.run_root.join(&from.0).join("journal.jsonl");
                 if from.0.contains(['/', '\\']) || from.0.starts_with('.') || !path.is_file() {
@@ -185,12 +185,19 @@ impl InProcessWorkflows {
                     )));
                 }
                 let records = read_journal(&path).map_err(preflight)?;
+                let recorded_base = records.iter().find_map(|record| match record {
+                    JournalRecord::Started { base, .. } => base.clone(),
+                    _ => None,
+                });
                 (
                     Replay::from_records(from.clone(), &records),
                     dispatch_charges(&records),
+                    recorded_base,
                 )
             }
         };
+        // A resumed run keeps the base its steps' worktrees were made from (ADR-0073).
+        let base = recorded_base.or(request.base);
 
         // From here on a run exists. The lock is held through the spawn so a concurrent
         // `shutdown` either refuses this start or sees and cancels the run.
@@ -212,6 +219,7 @@ impl InProcessWorkflows {
                 script_hash: script_hash(&request.script),
                 args,
                 resumed_from: request.resume_from.clone(),
+                base: base.clone(),
             })
             .map_err(io)?;
 
@@ -226,6 +234,7 @@ impl InProcessWorkflows {
             caps: CapCounter::new(self.settings.caps.clone(), charged),
             max_steps: self.settings.max_steps,
             workspace: request.workspace,
+            base,
             token: CancellationToken::new(),
             handle,
             journal,

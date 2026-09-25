@@ -32,6 +32,8 @@ pub mod tui;
 pub mod usage;
 #[cfg(feature = "workflows")]
 pub mod workflow;
+#[cfg(feature = "workflows")]
+mod worktree;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
