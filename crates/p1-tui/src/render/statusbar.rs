@@ -12,7 +12,10 @@ use crate::wrap::cell_width;
 
 /// Everything the statusline shows. `None` is unknown and renders as `—` (or is omitted where
 /// §10 says so); it is never shown as a zero.
-#[derive(Debug, Clone, Default)]
+///
+/// `PartialEq` is the redraw test (issue #141): the driver keeps the fields of the last drawn
+/// frame and draws the next one only when this differs — a statusline whose visible text moved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatusBar {
     /// The model reference `env/profile`.
     pub model: Option<String>,

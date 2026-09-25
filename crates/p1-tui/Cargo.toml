@@ -13,7 +13,9 @@ workspace = true
 p1-contracts = { path = "../p1-contracts" }
 crossterm = "0.29"
 ratatui = "0.30"
-tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+# `time`: the sink's epoch is a tokio `Instant` (runtime.rs), so the TUI's one
+# clock follows the runtime clock — a paused-time test drives every screen clock.
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "time"] }
 # Display-cell width for layout math (chars are not cells: CJK/emoji are wide).
 # Already in the tree as ratatui's own dependency — no new vendoring.
 unicode-width = "0.2"

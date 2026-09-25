@@ -12,13 +12,18 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use p1_contracts::{
     AgentEvent, AuthorizationPolicy, AuthorizationRequest, BoxFuture, CancellationToken, Decision,
     Effect, EventSink, ToolCall, ToolIdentity,
 };
 use tokio::sync::{mpsc, oneshot};
+// The sink's epoch is the RUNTIME's clock, not `std`'s: outside a paused
+// runtime the two are the same clock, but under `tokio::time::pause` every
+// screen clock (event stamps and `now_ms`) then moves with simulated time, so a
+// paused-time test drives the whole screen — the §5 PEEK countdown's expiry is
+// compared against `now_ms` (issue #141).
+use tokio::time::Instant;
 
 /// One agent event stamped with milliseconds since the frontend's epoch, so
 /// the screen's fake-time discipline holds in production too: the clock is
@@ -84,7 +89,9 @@ impl TuiSink {
     }
 
     /// Milliseconds since this sink's epoch — the ONE clock the screen runs on
-    /// (events arrive stamped on it; the render tick reads it directly).
+    /// (events arrive stamped on it; the render tick reads it directly). The
+    /// epoch is the runtime's `Instant`, so this is real time in production and
+    /// simulated time under a paused test runtime.
     pub fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
     }
