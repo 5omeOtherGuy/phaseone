@@ -64,7 +64,24 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           install -m 0755 target/release/p1 dist/p1-linux-x86_64
-          tar -czf dist/p1-share.tar.gz environments routes profiles
+          # Stage the share tree, then write the release manifest into it. modules/ here
+          # is the staged archive tree, never the repository's own modules/ sources: the
+          # archive carries manifest.json and packages/ only.
+          rm -rf dist/share
+          mkdir -p dist/share/modules/packages
+          cp -a environments routes profiles dist/share/
+          python3 scripts/release-manifest.py \
+            --root . \
+            --commit "${{ github.event.workflow_run.head_sha }}" \
+            --tag "${{ steps.tag.outputs.tag }}" \
+            --native dist/p1-linux-x86_64 \
+            --modules-dir dist/share/modules
+          # No compiled-cache blob is ever published; a package build must ship .wasm.
+          if [ -n "$(find dist/share/modules -name '*.cwasm' -print -quit)" ]; then
+            echo "refusing to publish a compiled-cache blob under dist/share/modules" >&2
+            exit 1
+          fi
+          tar -czf dist/p1-share.tar.gz -C dist/share environments routes profiles modules
           ( cd dist && sha256sum p1-linux-x86_64 > p1-linux-x86_64.sha256 )
           ( cd dist && sha256sum p1-share.tar.gz > p1-share.tar.gz.sha256 )
           ls -l dist
@@ -121,4 +138,4 @@ jobs:
             --target "$target" \
             --title "p1 $tag" \
             --latest \
-            --notes "Built from commit $target after a green gate on main. Assets: p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz (environments/, routes/, profiles/), p1-share.tar.gz.sha256. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"
+            --notes "Built from commit $target after a green gate on main. Assets: p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz (environments/, routes/, profiles/, modules/ with manifest.json and packages/), p1-share.tar.gz.sha256. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"
