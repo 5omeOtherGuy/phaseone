@@ -1460,9 +1460,11 @@ mod tests {
     fn a_lone_near_miss_for_a_subcommand_is_a_usage_error() {
         for (typo, meant) in [
             ("envs", "env"),
+            ("modles", "models"),
             ("model", "models"),
             ("usge", "usage"),
             ("workfow", "workflow"),
+            ("loginn", "login"),
             ("logi", "login"),
             ("loguot", "logout"),
         ] {

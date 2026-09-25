@@ -119,31 +119,40 @@ fn help_version_and_unknown_flag() {
 /// headless agent instead (issue #83).
 #[test]
 fn a_subcommand_typo_exits_two_without_running() {
-    let home = tempfile::tempdir().unwrap();
-    let output = isolated(home.path()).arg("envs").output().unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown command 'envs'"), "{stderr}");
-    assert!(stderr.contains("did you mean 'env'?"), "{stderr}");
-    assert!(stderr.contains("p1 -- envs"), "{stderr}");
-    assert!(
-        stderr.contains("usage:"),
-        "a usage error prints the usage: {stderr}"
-    );
-    // No agent ran: nothing was written under the scratch home.
-    let leftovers: Vec<_> = std::fs::read_dir(home.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-    assert!(
-        leftovers.is_empty(),
-        "no state written, found {leftovers:?}"
-    );
+    // `envs` (the reported typo) and the two the owner named, `modles` and `loginn`.
+    for (typo, meant) in [("envs", "env"), ("modles", "models"), ("loginn", "login")] {
+        let home = tempfile::tempdir().unwrap();
+        let output = isolated(home.path()).arg(typo).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{typo} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("unknown command '{typo}'")),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("did you mean '{meant}'?")),
+            "{stderr}"
+        );
+        assert!(stderr.contains(&format!("p1 -- {typo}")), "{stderr}");
+        assert!(
+            stderr.contains("usage:"),
+            "a usage error prints the usage: {stderr}"
+        );
+        // No agent ran: nothing was written under the scratch home.
+        let leftovers: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no state written for {typo}, found {leftovers:?}"
+        );
+    }
 
     // `--help` documents `--`.
     let output = p1().arg("--help").output().unwrap();
