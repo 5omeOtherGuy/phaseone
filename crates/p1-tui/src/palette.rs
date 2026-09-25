@@ -94,6 +94,45 @@ pub fn degrade(buffer: &mut ratatui::buffer::Buffer, mode: ColorMode) {
     }
 }
 
+// Adapted from iris-donor/src/ui/palette.rs at pin
+// 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT).
+fn nearest_cube_component(value: u8) -> (u8, u8) {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    LEVELS
+        .iter()
+        .copied()
+        .enumerate()
+        .min_by_key(|(_, level)| value.abs_diff(*level))
+        .map(|(index, level)| (index as u8, level))
+        .unwrap_or((0, 0))
+}
+
+fn distance_sq(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
+    let dr = i32::from(a.0) - i32::from(b.0);
+    let dg = i32::from(a.1) - i32::from(b.1);
+    let db = i32::from(a.2) - i32::from(b.2);
+    (dr * dr + dg * dg + db * db) as u32
+}
+
+fn rgb_to_xterm(r: u8, g: u8, b: u8) -> u8 {
+    let (ri, rv) = nearest_cube_component(r);
+    let (gi, gv) = nearest_cube_component(g);
+    let (bi, bv) = nearest_cube_component(b);
+    let cube_index = 16 + 36 * ri + 6 * gi + bi;
+    let cube_distance = distance_sq((r, g, b), (rv, gv, bv));
+
+    let mean = (u16::from(r) + u16::from(g) + u16::from(b)) / 3;
+    let gray_slot = mean.saturating_sub(8).saturating_add(5) / 10;
+    let gray_slot = gray_slot.min(23) as u8;
+    let gray = 8 + 10 * gray_slot;
+    let gray_distance = distance_sq((r, g, b), (gray, gray, gray));
+    if gray_distance < cube_distance {
+        232 + gray_slot
+    } else {
+        cube_index
+    }
+}
+
 fn index(r: u8, g: u8, b: u8) -> u8 {
     match (r, g, b) {
         (10, 10, 10) => 232,
@@ -113,19 +152,7 @@ fn index(r: u8, g: u8, b: u8) -> u8 {
         (0xd8, 0xe8, 0xd0) => 194,
         (0x4a, 0x35, 0x35) => 52,
         (0xe8, 0xd0, 0xd0) => 224,
-        _ => {
-            let cv = |v: u8| {
-                if v < 48 {
-                    0
-                } else if v < 115 {
-                    1
-                } else {
-                    ((v as usize - 35) / 40).min(5)
-                }
-            };
-            let (r, g, b) = (cv(r), cv(g), cv(b));
-            (16 + 36 * r + 6 * g + b) as u8
-        }
+        _ => rgb_to_xterm(r, g, b),
     }
 }
 
@@ -134,6 +161,122 @@ mod tests {
     use super::*;
     use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
     use std::collections::HashMap;
+
+    const SLAB_TOKEN_INDICES: [(Color, u8); 17] = [
+        (GROUND, 232),
+        (BLOCK, 233),
+        (BLOCK_PLUS, 234),
+        (RULE, 235),
+        (DIM, 247),
+        (FAINT, 242),
+        (INK, 254),
+        (ATTN, 179),
+        (FAIL, 167),
+        (OK, 107),
+        (LIVE, 73),
+        (REF, 110),
+        (SYNTAX, 176),
+        (DIFF_ADD_BG, 22),
+        (DIFF_ADD_FG, 194),
+        (DIFF_DEL_BG, 52),
+        (DIFF_DEL_FG, 224),
+    ];
+
+    fn main_cube_index(r: u8, g: u8, b: u8) -> u8 {
+        let cv = |value: u8| {
+            if value < 48 {
+                0
+            } else if value < 115 {
+                1
+            } else {
+                ((value as usize - 35) / 40).min(5)
+            }
+        };
+        (16 + 36 * cv(r) + 6 * cv(g) + cv(b)) as u8
+    }
+
+    fn indexed_rgb(index: u8) -> (u8, u8, u8) {
+        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        if (16..232).contains(&index) {
+            let offset = usize::from(index - 16);
+            (
+                LEVELS[offset / 36],
+                LEVELS[offset / 6 % 6],
+                LEVELS[offset % 6],
+            )
+        } else {
+            let grey = 8 + 10 * (index - 232);
+            (grey, grey, grey)
+        }
+    }
+
+    fn squared_distance(rgb: (u8, u8, u8), other: (u8, u8, u8)) -> u32 {
+        let channel_distance = |a: u8, b: u8| {
+            let difference = i32::from(a) - i32::from(b);
+            (difference * difference) as u32
+        };
+        channel_distance(rgb.0, other.0)
+            + channel_distance(rgb.1, other.1)
+            + channel_distance(rgb.2, other.2)
+    }
+
+    #[test]
+    fn slab_token_indices_are_unchanged() {
+        for (color, expected) in SLAB_TOKEN_INDICES {
+            let Color::Rgb(r, g, b) = color else {
+                unreachable!()
+            };
+            assert_eq!(index(r, g, b), expected, "{color:?}");
+        }
+    }
+
+    // Adapted from iris-donor/src/ui/palette.rs at pin
+    // 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT).
+    #[test]
+    fn xterm_quantizer_keeps_primary_and_grayscale_anchors() {
+        assert_eq!(index(255, 0, 0), 196);
+        assert_eq!(index(128, 128, 128), 244);
+        assert_eq!(index(0x30, 0x30, 0x30), 236);
+        assert_eq!(index(0x00, 0x87, 0xff), 33);
+    }
+
+    #[test]
+    fn quantizer_is_never_farther_than_the_cube() {
+        let values = || (0..=250).step_by(5).chain(std::iter::once(255));
+        for r in values() {
+            for g in values() {
+                for b in values() {
+                    let rgb = (r, g, b);
+                    if SLAB_TOKEN_INDICES
+                        .iter()
+                        .any(|(color, _)| *color == Color::Rgb(r, g, b))
+                    {
+                        continue;
+                    }
+                    let cube_distance =
+                        squared_distance(rgb, indexed_rgb(main_cube_index(r, g, b)));
+                    let quantized_distance = squared_distance(rgb, indexed_rgb(index(r, g, b)));
+                    assert!(
+                        quantized_distance <= cube_distance,
+                        "{rgb:?}: {quantized_distance} > {cube_distance}"
+                    );
+                }
+            }
+        }
+        let grey = (128, 128, 128);
+        assert!(
+            squared_distance(grey, indexed_rgb(index(128, 128, 128)))
+                < squared_distance(grey, indexed_rgb(main_cube_index(128, 128, 128)))
+        );
+    }
+
+    #[test]
+    fn ansi256_uses_the_grey_ramp_for_slab_background() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buffer[(0, 0)].set_bg(Color::Rgb(0x30, 0x30, 0x30));
+        degrade(&mut buffer, ColorMode::Ansi256);
+        assert_eq!(buffer[(0, 0)].bg, Color::Indexed(236));
+    }
 
     #[test]
     fn truecolor_leaves_the_frame_untouched() {

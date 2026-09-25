@@ -3,8 +3,8 @@
 
 mod support;
 
-use p1_workflow::{RunOutcome, WorkflowError, WorkflowService};
-use support::{Harness, request};
+use p1_workflow::{RunOutcome, WorkflowError, WorkflowService, WorkflowSettings};
+use support::{Harness, request, settings};
 
 // (13)
 #[tokio::test(flavor = "multi_thread")]
@@ -69,7 +69,13 @@ async fn eval_is_a_parse_error() {
 // (14)
 #[tokio::test(flavor = "multi_thread")]
 async fn every_engine_limit_holds() {
-    let harness = Harness::new();
+    // `max_steps = 1` sizes the data limits to ONE envelope's worth (engine.rs
+    // `data_limits`): 64 KiB of strings, 4096 array items, 4096 map entries. The caps the
+    // cases below exceed are the per-run numbers §2 documents, not fixed constants.
+    let harness = Harness::with(WorkflowSettings {
+        max_steps: 1,
+        ..settings()
+    });
     let cases: &[(&str, &str)] = &[
         ("operations", "let x = 0; loop { x += 1; }"),
         ("recursion", "fn down(n) { down(n + 1) } down(0)"),

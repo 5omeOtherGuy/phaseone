@@ -118,6 +118,15 @@ impl ChatRoute {
             {
                 return Err(request::invalid("invalid or duplicate static chat header"));
             }
+            if self.client_identity.is_some()
+                && OPENCODE_IDENTITY_OWNED_HEADERS
+                    .iter()
+                    .any(|owned| name.eq_ignore_ascii_case(owned))
+            {
+                return Err(request::invalid(&format!(
+                    "static chat header `{name}` is owned by the client identity"
+                )));
+            }
         }
         if let Some(name) = &self.session_header
             && (!header_name(name) || names.contains(&name.to_ascii_lowercase()))
@@ -131,6 +140,15 @@ impl ChatRoute {
 /// opencode 1.18.31; see `docs/design/zen-client-identity-evidence.md`).
 const OPENCODE_USER_AGENT: &str =
     "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+
+/// The static header names owned by the OpenCode identity. These must be reserved
+/// so a route cannot send a second value for a header the identity also sets.
+const OPENCODE_IDENTITY_OWNED_HEADERS: [&str; 4] = [
+    "x-opencode-client",
+    "x-opencode-project",
+    "x-opencode-session",
+    "x-opencode-request",
+];
 
 /// The headers a `client_identity` adds to a request. Static, non-secret values
 /// plus ids generated for this request from the route's cache key.
