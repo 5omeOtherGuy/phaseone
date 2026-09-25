@@ -286,11 +286,10 @@ fn config_for_route(
 /// must still not leak into the summary: the whole-provider form summarizes at `Low`, the
 /// lowest level every route's effort scale starts at.
 fn summary_effort(profile: Option<&ModelProfile>) -> Option<Effort> {
-    Some(
-        profile
-            .and_then(|profile| profile.efforts.iter().copied().min())
-            .unwrap_or(Effort::Low),
-    )
+    match profile {
+        Some(profile) => profile.efforts.iter().copied().min(),
+        None => Some(Effort::Low),
+    }
 }
 
 /// A session store plus the records to resume from (when resuming).
@@ -3416,19 +3415,25 @@ mod tests {
 
     // ---------------------------- #125 review: the summary's own effort
 
-    /// The floor the host passes: the profile's lowest level, and `Low` when there is no profile
-    /// to read one from (the whole-provider form).
+    /// The floor the host passes: the profile's lowest level when it states one, no override for
+    /// a present profile with an empty effort list, and `Low` when there is no profile to read
+    /// one from (the whole-provider form).
     #[test]
     fn the_summary_effort_is_the_profiles_lowest_level_or_low_without_a_profile() {
+        let mut profile = synthetic_profile(None, None);
+        profile.efforts = vec![Effort::Low, Effort::High];
         assert_eq!(
-            summary_effort(Some(&shipped_profile("mimo-v2.6-flash-free"))),
-            Some(Effort::High),
-            "MiMo states exactly one level"
-        );
-        assert_eq!(
-            summary_effort(Some(&shipped_profile("space-bunny-free"))),
+            summary_effort(Some(&profile)),
             Some(Effort::Low),
-            "Space Bunny allows low"
+            "a present profile uses its lowest listed level"
+        );
+
+        let mut empty = synthetic_profile(None, None);
+        empty.efforts.clear();
+        assert_eq!(
+            summary_effort(Some(&empty)),
+            None,
+            "a present profile with no effort list carries no override"
         );
         assert_eq!(
             summary_effort(None),
