@@ -11,15 +11,15 @@
 //! injected snapshot by [`ENV_ALLOW`], [`ENV_ALLOW_PREFIXES`] and the names added
 //! with [`ShellTool::with_env_pass`], sandboxed or not.
 //!
-//! The crate is split in two. [`ProcessService`] (`process`) is the native part:
-//! sandbox, spawn, environment policy, bounded capture, timeout and group kill,
-//! all fixed at assembly so a request carries only a command and a timeout.
-//! [`ShellTool`] is the tool logic on top of it — input parsing, declaration and
-//! identity, destructiveness, output filters and result formatting — and holds no
-//! process capability beyond the service it owns.
+//! The tool is split along the WebAssembly boundary (ADR-0071). [`ProcessService`]
+//! (`process`) is the native part and stays native: sandbox, spawn, environment
+//! policy, bounded capture, timeout and group kill, all fixed at assembly so a
+//! request carries only a command and a timeout. The guest behaviour — input
+//! parsing, declaration, destructiveness, output filters and result formatting —
+//! is `p1-shell-guest`, which the `p1/shell` component also runs. [`ShellTool`] is
+//! the native adapter over the two: the same code the component ships, driven by
+//! the native `Tool` contract, so the frozen tests of this crate prove it.
 
-mod destructive;
-mod filter;
 mod process;
 
 use std::ffi::OsString;
@@ -30,24 +30,14 @@ use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
+use p1_shell_guest::{End, Outcome, RawInput, ShellInput, Status};
 use p1_workspace::{ToolFace, Workspace};
-use serde::Deserialize;
 
 pub use process::{
     CREDENTIAL_DIRECTORIES, DEFAULT_HOME_VISIBLE, ENV_ALLOW, ENV_ALLOW_PREFIXES, ProcessEnd,
-    ProcessFailure, ProcessOutcome, ProcessRequest, ProcessService, Sandbox, SandboxError,
-    bwrap_args,
+    ProcessFailure, ProcessOutcome, ProcessRequest, ProcessService, SANDBOX_PARAGRAPH,
+    SANDBOX_VARIANT_SUFFIX, Sandbox, SandboxError, bwrap_args,
 };
-
-const NAME: &str = "shell";
-const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test) is summarised unless `raw: true` is passed.";
-const DEFAULT_TIMEOUT_SECONDS: i64 = 120;
-const MIN_TIMEOUT_SECONDS: i64 = 1;
-const MAX_TIMEOUT_SECONDS: i64 = 3_600;
-const MAX_OUTPUT_BYTES: usize = 50_000;
-/// The paragraph the model sees when the host turned the sandbox on. Appended to
-/// whatever face the environment gave the tool, so a `with_face` override keeps it.
-const SANDBOX_PARAGRAPH: &str = "Commands run in a sandbox: only the workspace and /tmp are writable, the rest of the filesystem is read-only, and most of the home directory is not visible. Do not try to install software outside the workspace.";
 
 /// The `shell` tool. Holds one agent's workspace and the process service that
 /// runs its commands, sandboxed when the host chose it.
@@ -133,7 +123,7 @@ impl ShellTool {
             self.face.description.clone()
         };
         let variant = if sandboxed {
-            format!("{}+sandbox", self.variant)
+            format!("{}{SANDBOX_VARIANT_SUFFIX}", self.variant)
         } else {
             self.variant.clone()
         };
@@ -144,7 +134,7 @@ impl ShellTool {
 }
 
 fn default_face() -> ToolFace {
-    ToolFace::new(NAME, DESCRIPTION)
+    ToolFace::new(p1_shell_guest::NAME, p1_shell_guest::DESCRIPTION)
 }
 
 fn declaration(face: ToolFace) -> ToolDeclaration {
@@ -152,7 +142,7 @@ fn declaration(face: ToolFace) -> ToolDeclaration {
         name: face.name,
         description: face.description,
         kind: DeclarationKind::Function {
-            input_schema: input_schema(),
+            input_schema: p1_shell_guest::input_schema(),
         },
     }
 }
@@ -162,43 +152,6 @@ fn identity(variant: &str) -> ToolIdentity {
         implementation: env!("CARGO_PKG_NAME").to_string(),
         variant: variant.to_string(),
     }
-}
-
-fn input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "Command line, run with `bash -lc` from the workspace root."
-            },
-            "timeout_seconds": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 3600,
-                "default": 120,
-                "description": "Seconds before the command and its process group are killed."
-            },
-            "raw": {
-                "type": "boolean",
-                "default": false,
-                "description": "Return the full, unfiltered output instead of the summary."
-            }
-        },
-        "required": ["command"],
-        "additionalProperties": false
-    })
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ShellInput {
-    command: String,
-    #[serde(default)]
-    timeout_seconds: Option<i64>,
-    /// Skip the structured output filter: the model asked for the full log.
-    #[serde(default)]
-    raw: bool,
 }
 
 impl Tool for ShellTool {
@@ -217,60 +170,24 @@ impl Tool for ShellTool {
     /// ADR-0057: the command's first line, trimmed to 80 characters, from the
     /// tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
-        let input = parse_input(&self.declaration.name, call).ok();
+        let summary = p1_shell_guest::describe(raw_input(call), Some(self.workspace.root()));
         CallDescription {
-            verb: "run",
-            target: input.as_ref().map(|input| {
-                let first = input.command.lines().next().unwrap_or_default().trim();
-                first.chars().take(80).collect()
-            }),
+            verb: summary.verb,
+            target: summary.target,
             edit: None,
-            // Invalid input is classified at the tool's worst case, as required
-            // by the Tool contract. Execution will still return the input error.
-            destructive: input.as_ref().is_none_or(|input| {
-                destructive::is_destructive(&input.command, self.workspace.root())
-            }),
+            destructive: summary.destructive,
         }
     }
 
     fn describe_result(&self, _call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
-        let mut lines: Vec<&str> = result.content.lines().collect();
-        let exit_code = lines.last().and_then(|line| {
-            line.strip_prefix("[exit code: ")
-                .and_then(|code| code.strip_suffix(']'))
-                .and_then(|code| code.parse().ok())
-        });
-        // Shell terminal lines are framing, not command output. Only an exit
-        // footer carries an exit code, but timeout/cancellation/signal footers
-        // must not leak into the command tail either.
-        if lines.last().is_some_and(|line| {
-            exit_code.is_some()
-                || matches!(*line, "[cancelled]" | "[terminated by an unknown signal]")
-                || line.starts_with("[timed out after ")
-                || line.starts_with("[terminated by signal ")
-        }) {
-            lines.pop();
-        }
-        let line_count = lines.len();
-        let summary = if result.status == ToolStatus::Ok {
-            match exit_code {
-                Some(code) => format!("exit {code} · {line_count} lines"),
-                None => format!("{line_count} lines"),
-            }
-        } else {
-            result
-                .content
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .to_string()
-        };
+        let summary =
+            p1_shell_guest::describe_result(&result.content, result.status == ToolStatus::Ok);
         ResultDescription {
-            summary,
+            summary: summary.summary,
             detail: Some(ResultDetail::Command {
-                exit_code,
+                exit_code: summary.exit_code,
                 elapsed_ms: None,
-                tail: lines.into_iter().map(str::to_string).collect(),
+                tail: summary.tail,
             }),
         }
     }
@@ -283,21 +200,13 @@ impl Tool for ShellTool {
         Box::pin(async move {
             // Cancellation before any work: no process is started.
             if context.cancel.is_cancelled() {
-                return ToolOutcome {
-                    status: ToolStatus::Cancelled,
-                    content: String::new(),
-                };
+                return tool_outcome(Outcome::cancelled_before_start());
             }
             let input = match parse_input(&self.declaration.name, call) {
                 Ok(input) => input,
                 Err(message) => return ToolOutcome::error(message),
             };
-            let timeout = Duration::from_secs(
-                input
-                    .timeout_seconds
-                    .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
-                    .unsigned_abs(),
-            );
+            let timeout = Duration::from_secs(input.timeout_seconds());
             let request = ProcessRequest {
                 command: &input.command,
                 timeout,
@@ -308,172 +217,46 @@ impl Tool for ShellTool {
     }
 }
 
+fn raw_input(call: &ToolCall) -> RawInput<'_> {
+    match &call.input {
+        ToolInput::Json(raw) => RawInput::Json(raw),
+        ToolInput::Text(raw) => RawInput::Text(raw),
+    }
+}
+
 fn parse_input(tool: &str, call: &ToolCall) -> Result<ShellInput, String> {
-    let raw = match &call.input {
-        ToolInput::Json(raw) => raw,
-        ToolInput::Text(_) => {
-            return Err(invalid(
-                tool,
-                "expected a JSON object input, got freeform text",
-            ));
-        }
-    };
-    let input: ShellInput =
-        serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
-    if matches!(
-        input.timeout_seconds,
-        Some(seconds) if !(MIN_TIMEOUT_SECONDS..=MAX_TIMEOUT_SECONDS).contains(&seconds)
-    ) {
-        return Err(invalid(
-            tool,
-            "`timeout_seconds` must be between 1 and 3600",
-        ));
-    }
-    Ok(input)
+    p1_shell_guest::parse_input(tool, raw_input(call))
 }
 
-fn invalid(tool: &str, reason: &str) -> String {
-    format!("Invalid input for {tool}: {reason}")
-}
-
-/// A completed command whose output may be summarised: what ran, whether the
-/// model asked for the full log, and whether it exited 0. Absent for an
-/// incomplete run (cancellation, timeout, a signal) — there is no complete
-/// output to summarise then.
-#[derive(Clone, Copy)]
-struct Filter<'a> {
-    command: &'a str,
-    raw: bool,
-    exit_ok: bool,
-}
-
-impl Filter<'_> {
-    /// The model-visible body: the summary plus its marker line when a filter
-    /// applied, the raw body when none did (unrecognised command, decline,
-    /// panic, no reduction) or `raw: true` was passed.
-    fn apply<'a>(&self, body: &'a str) -> std::borrow::Cow<'a, str> {
-        if self.raw {
-            return std::borrow::Cow::Borrowed(body);
-        }
-        match filter::filter_output(self.command, body, self.exit_ok) {
-            Some(summary) => std::borrow::Cow::Owned(format!("{summary}\n{FILTERED_MARKER}")),
-            None => std::borrow::Cow::Borrowed(body),
-        }
-    }
-}
-
-/// The model-visible result of a run: the captured output plus the footer for
-/// how it ended. `timeout` is only what a timed-out footer reports.
+/// The model-visible result of a run. `timeout` is only what a timed-out footer reports.
 fn outcome(run: ProcessOutcome, command: &str, timeout: Duration, raw: bool) -> ToolOutcome {
     let ProcessOutcome { output, end } = run;
-    match end {
-        ProcessEnd::Exited(code) => {
-            // The seam: the filter only ever sees a COMPLETED command, and
-            // `exit_ok` is true only for exit code 0.
-            let filter = Filter {
-                command,
-                raw,
-                exit_ok: code == 0,
-            };
-            render(
-                &output,
-                &format!("[exit code: {code}]"),
-                ToolStatus::Ok,
-                Some(filter),
-            )
-        }
-        // A cancelled or timed-out command is an incomplete run with no exit
-        // status, and a signalled one was killed before it could exit: their
-        // output is never summarised.
-        ProcessEnd::Cancelled => render(&output, "[cancelled]", ToolStatus::Cancelled, None),
-        ProcessEnd::TimedOut => render(
-            &output,
-            &format!("[timed out after {} s]", timeout.as_secs()),
-            ToolStatus::Error,
-            None,
-        ),
-        ProcessEnd::TerminatedBySignal(signal) => render(
-            &output,
-            &format!("[terminated by signal {signal}]"),
-            ToolStatus::Error,
-            None,
-        ),
-        ProcessEnd::TerminatedByUnknownSignal => render(
-            &output,
-            "[terminated by an unknown signal]",
-            ToolStatus::Error,
-            None,
-        ),
-        ProcessEnd::Failed(failure) => ToolOutcome::error(match failure {
-            ProcessFailure::Start { program, error } => {
-                format!("failed to start {program}: {error}")
-            }
-            ProcessFailure::Capture { program, stream } => {
-                format!("failed to capture {program} {stream}")
-            }
-            ProcessFailure::Wait { program, error } => {
-                format!("failed to wait for {program}: {error}")
-            }
-        }),
-    }
-}
-
-/// Render captured output plus a footer as the model-visible content.
-fn render(
-    bytes: &[u8],
-    footer: &str,
-    status: ToolStatus,
-    filter: Option<Filter<'_>>,
-) -> ToolOutcome {
-    let text = String::from_utf8_lossy(bytes);
-    // The footer goes on its own line without an extra blank line after the
-    // command's usual trailing newline.
-    let body = text.trim_end_matches('\n');
-    // The structured filter runs BEFORE the byte bound: a summary is the
-    // smaller, more useful body to squeeze when it is still too long.
-    let body = match filter {
-        Some(filter) => filter.apply(body),
-        None => std::borrow::Cow::Borrowed(body),
+    let end = match end {
+        ProcessEnd::Exited(code) => End::Exited(code),
+        ProcessEnd::Cancelled => End::Cancelled,
+        ProcessEnd::TimedOut => End::TimedOut,
+        ProcessEnd::TerminatedBySignal(signal) => End::TerminatedBySignal(signal),
+        ProcessEnd::TerminatedByUnknownSignal => End::TerminatedByUnknownSignal,
+        ProcessEnd::Failed(failure) => return ToolOutcome::error(failure.to_string()),
     };
-    // Lossy decoding can TRIPLE the size of binary output (each bad byte becomes
-    // U+FFFD), pushing already-capped bytes past the content bound. Squeeze the body
-    // — head and tail kept, like the collector — and never bound the footer: the exit
-    // code must survive however noisy the output was.
-    let body = squeeze(&body, MAX_OUTPUT_BYTES - FOOTER_RESERVE);
-    let content = if body.is_empty() {
-        footer.to_string()
-    } else {
-        format!("{body}\n{footer}")
-    };
-    ToolOutcome { status, content }
-}
-
-const FOOTER_RESERVE: usize = 2_000;
-
-/// Last line of a summarised result, before the exit-code footer. The raw log
-/// stays one call away, which is what makes summarising safe.
-const FILTERED_MARKER: &str = "[output filtered; pass raw:true for the full log]";
-
-/// Keep the first and last halves of `text` (cut on char boundaries) when it exceeds `max`.
-fn squeeze(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
-    if text.len() <= max {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let half = max / 2;
-    let mut head_end = half;
-    while !text.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
-    let mut tail_start = text.len() - half;
-    while !text.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
-    std::borrow::Cow::Owned(format!(
-        "{}\n[… {} bytes omitted …]\n{}",
-        &text[..head_end],
-        tail_start - head_end,
-        &text[tail_start..]
+    tool_outcome(p1_shell_guest::finished(
+        &output,
+        end,
+        command,
+        timeout.as_secs(),
+        raw,
     ))
+}
+
+fn tool_outcome(outcome: Outcome) -> ToolOutcome {
+    ToolOutcome {
+        status: match outcome.status {
+            Status::Ok => ToolStatus::Ok,
+            Status::Error => ToolStatus::Error,
+            Status::Cancelled => ToolStatus::Cancelled,
+        },
+        content: outcome.content,
+    }
 }
 
 #[cfg(test)]

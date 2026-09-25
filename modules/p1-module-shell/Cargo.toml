@@ -1,0 +1,31 @@
+[package]
+name = "p1-module-shell"
+description = "The p1 `shell` tool as a component: the guest behaviour of p1-shell-guest over the host's process capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-tool = { path = "../p1-bindings-tool" }
+# The guest behaviour lives with the native adapter it is tested through (S0-R3 pending;
+# default layout of the S3.2 brief), so both hosts run the same source.
+p1-shell-guest = { path = "../../crates/p1-tool-shell/guest" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The frozen package manifest (docs/design/modules/package.md). The shell is granted the
+# process service and monotonic elapsed time and nothing else (PLAN.md §4).
+[package.metadata.p1-module]
+name = "p1/shell"
+kind = "tool"
+world = "p1:module/tool@1.0.0"
+protocol = "1.0"
+capabilities = ["clock", "process"]
+variant = "claude"

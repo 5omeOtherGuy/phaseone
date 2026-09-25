@@ -8,6 +8,16 @@
 
 mod sandbox;
 
+/// The paragraph the model reads when the host turned the sandbox on (ADR-0035: the
+/// description says what the boundary is). It belongs to the side that assembled the
+/// sandbox: a tool running over this service cannot know whether it is sandboxed, so
+/// whoever presents the tool appends this to the face's description.
+pub const SANDBOX_PARAGRAPH: &str = "Commands run in a sandbox: only the workspace and /tmp are writable, the rest of the filesystem is read-only, and most of the home directory is not visible. Do not try to install software outside the workspace.";
+
+/// Appended to a tool's identity variant when its commands run in the sandbox, for the
+/// same reason as [`SANDBOX_PARAGRAPH`].
+pub const SANDBOX_VARIANT_SUFFIX: &str = "+sandbox";
+
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::ExitStatusExt;
@@ -145,16 +155,21 @@ pub enum ProcessEnd {
 
 /// Why no complete run could be observed. `program` is the name the failure
 /// message has always named: `bwrap` or `bash` for a start, `bash` otherwise.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The message is the model-visible error text, so it is the service's to word:
+/// the shell's guest behaviour passes it through unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProcessFailure {
+    #[error("failed to start {program}: {error}")]
     Start {
         program: &'static str,
         error: String,
     },
+    #[error("failed to capture {program} {stream}")]
     Capture {
         program: &'static str,
         stream: &'static str,
     },
+    #[error("failed to wait for {program}: {error}")]
     Wait {
         program: &'static str,
         error: String,
