@@ -328,6 +328,6 @@ The judge accepted these slices:
   scroll-anchor movement, scroll marks, rendered-bound invariants, and refollowing
   when the transcript fits.
 
-Lead check after merging `main`: `cargo test -p p1-tui` (314 passed), clippy
+Lead check after merging `main` (with S1 and S3): `cargo test -p p1-tui` (326 passed), clippy
 `-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI
 runs the full gate. Accepted follow-ups are listed on PR #162.
