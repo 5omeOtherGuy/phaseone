@@ -125,8 +125,10 @@ selected profile's own capacity into the effective table (`config_for_route` in
 - effective `output_headroom_tokens` = `min(env reserve, profile.max_output_tokens)`, and always
   strictly below the effective window (a reserve as large as the window would leave no room at all
   for the request that carries the next response);
-- effective `summarize_at_tokens` = `min(env threshold, 60 % of the effective window)`, and always
-  below `window - reserve`;
+- effective `summarize_at_tokens` = `min(env threshold, 60 % of the effective window)` only when
+  the selected profile narrows the environment window; otherwise the environment's own threshold
+  is retained (GPT keeps 220,000 of 272,000). The resulting threshold is always below
+  `window - reserve`;
 - the copied verbatim budgets (`keep_recent_tokens`, `user_verbatim_tokens`) are clamped below the
   wall, because a kept tail larger than what a request can carry would keep the whole history
   verbatim and leave the next request over the wall (a 40,000-token profile on `zen`);

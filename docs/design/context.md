@@ -195,7 +195,9 @@ every worker from its own environment. The host also folds the SELECTED model pr
 table it hands the policy (#125 review): effective `window_tokens = min(env window,
 profile.context_tokens)`, effective reserve = `min(env reserve, profile.max_output_tokens)` (always
 strictly below the effective window), and effective `summarize_at_tokens = min(env threshold, 60 %
-of the effective window)`, always below `window - reserve`. The copied verbatim budgets
+of the effective window)` only when the selected profile narrows the environment window; otherwise
+the environment's own threshold is retained (for example, GPT keeps 220,000 of 272,000). The
+resulting threshold is always below `window - reserve`. The copied verbatim budgets
 (`keep_recent_tokens`, `user_verbatim_tokens`) are clamped below the wall too: they are budgets of
 the effective window, and a tail larger than a request can carry would keep the whole history
 verbatim. The summary-output cap (`[context] summary_output_tokens`, 12_000 in the shipped
