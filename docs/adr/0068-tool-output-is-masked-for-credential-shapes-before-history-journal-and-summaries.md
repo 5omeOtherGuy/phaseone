@@ -52,7 +52,7 @@ tool call can return a credential-shaped string that was never typed into a file
      character of the secret itself;
    - a `RedactingTool` decorator implementing `p1_contracts::Tool` that wraps any other
      tool and passes its `ToolOutcome.content` through `redact` before returning it.
-2. **The host wraps every assembled tool.** `crates/p1-host/src/run.rs`,
+2. **The host wraps every assembled tool.** `crates/p1-host/src/child_assembly.rs`,
    `assemble_with_cache_key`, wraps each tool the catalog assembles in `RedactingTool`
    before it is handed to p1-core. p1-core therefore always builds its `ToolResultItem`
    from already-masked content: history, the on-disk journal, and anything later derived
@@ -137,7 +137,7 @@ tool call can return a credential-shaped string that was never typed into a file
   / `Bearer ` tokens, and 16+ character JSON values under `key`/`access`/`refresh`/
   `api_key`/`token`), the `<redacted:family:N chars>` mask, and the `RedactingTool`
   decorator.
-- `crates/p1-host/src/run.rs`, `assemble_with_cache_key`, wraps every assembled tool in
+- `crates/p1-host/src/child_assembly.rs`, `assemble_with_cache_key`, wraps every assembled tool in
   `RedactingTool` so `ToolOutcome.content` reaching p1-core is already masked.
 - `crates/p1-context/src/lib.rs` passes the summarizer's output through the same
   `p1_redact::redact` function before it becomes a history item.
