@@ -61,6 +61,7 @@ borrow = ["opencode:opencode-go", "pi:opencode-go"]   # tried in this order, aft
 [adapter_settings]                     # typed by the adapter named above
 dialect        = "thinking-with-reasoning-alias"   # a ChatDialect variant
 session_header = "x-opencode-session"
+client_identity = "opencode"           # optional; a non-secret client identity (see below)
 
 [models."deepseek-v4.1-flash"]         # key = profile id
 wire_model    = "deepseek-v4.1-flash"
@@ -79,6 +80,14 @@ output_limit  = 32000                  # optional; same rule
   rejected in `[headers]`: a route file must not be able to hold a secret by accident.
 - `[adapter_settings]` is deserialized by the adapter's own typed struct with
   `deny_unknown_fields`; the host passes it through as a `toml::Value` and never interprets it.
+- `[adapter_settings] client_identity` (optional, `openai-chat` only) makes a route present
+  a vendor's own client identity to a gateway that gates a free tier on it. The only value is
+  `opencode`: the request carries OpenCode's `user-agent` and `x-opencode-*` headers and a
+  `ses_`/`msg_` id derived from the route's cache key. It declares no tool of its own; the
+  gate's `bash` and `read` names are an environment's business (`[[tools]] name = "bash"` /
+  `"read"`), so the system prompt and p1's own tools are unchanged. Only the shipped Zen free
+  routes set it (owner decision 2026-09-24, ADR-0067; evidence and the minimal accepted shape
+  in `docs/design/zen-client-identity-evidence.md`).
 - A profile that has no `[models.<profile id>]` entry is NOT served by that route. There is no
   pass-through of unknown model names: an aggregator serving 200 models gets entries for the
   ones we have profiles for.
