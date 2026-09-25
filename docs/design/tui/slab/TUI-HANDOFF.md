@@ -2552,7 +2552,7 @@ TEXT 120×40
 29     · /resume     reopen a previous session                                                                             
 30     · /access     access and sandbox                                    full                                            
 31     · /help       commands and keys                                                                                     
-32     · 2 more                                                                                                            
+32     · 3 more                                                                                                            
 33                                         ↑↓ move   tab complete   ⏎ run   esc                                            
 34                                                                                                                         
 35     › /                                                                                                                 

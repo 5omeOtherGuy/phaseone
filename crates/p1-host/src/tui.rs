@@ -59,6 +59,9 @@ pub struct TuiOptions {
     /// assembled environment, which is not known this early (`run_agent`
     /// builds this before `assemble`).
     pub effort: Option<String>,
+    /// `--compact` on `--resume` (ADR-0076): a `/compact` queued before the
+    /// first turn, so its line lands in the transcript.
+    pub compact: bool,
 }
 
 /// The TUI front end. Created before the agent so its sink and policy install
@@ -371,6 +374,9 @@ impl FrontEnd for TuiFrontEnd {
                 environment_dirs: deps.environment_dirs.clone(),
                 route_label: self.route_label.clone(),
                 pending_switch: None,
+                // ADR-0076: `--compact --resume` is a `/compact` queued before
+                // the first turn; the loop applies it before anything else.
+                pending_compact: self.options.compact,
                 _workers: workers,
             };
 
@@ -494,6 +500,10 @@ pub(crate) struct Driver {
     /// boundary"), since `agent` is exclusively borrowed by the turn future
     /// until then.
     pending_switch: Option<PendingSwitch>,
+    /// A `/compact` (ADR-0076), queued exactly like a switch: while a turn runs
+    /// it waits for the turn's end; at idle the loop applies it at once. Its own
+    /// flag, so a `/model` and a `/compact` typed in one turn both apply.
+    pending_compact: bool,
     _workers: Option<Arc<dyn WorkerService>>,
 }
 
@@ -558,6 +568,13 @@ impl Driver {
     fn dispatch(&mut self, command: Command, agent: Option<&mut Agent>) {
         match command {
             Command::Submit(text) => {
+                self.screen.composer.take();
+                self.submit(text, agent);
+            }
+            Command::QueueSteering(text) if is_slash_command(&text) => {
+                // §11: a command typed while a turn runs is a command, never
+                // steering for the model; the ones that need `agent` queue for
+                // the turn's end (`agent` is `None` here).
                 self.screen.composer.take();
                 self.submit(text, agent);
             }
@@ -710,6 +727,7 @@ impl Driver {
             "model" | "env" => self.slash_model(arg, agent),
             "effort" => self.slash_effort(arg, agent),
             "models" => self.slash_models((!arg.is_empty()).then_some(arg)),
+            "compact" => self.request_compact(agent.is_some()),
             "status" => {
                 let output = status_command_output(self);
                 self.screen.transcript.command_output(output);
@@ -765,6 +783,52 @@ impl Driver {
             return;
         };
         self.apply_switch(request, agent);
+    }
+
+    /// ADR-0076: `/compact` queues like a switch (§11). The summary is a provider
+    /// request, so the LOOP applies it where `agent` is free — at once when idle
+    /// (`idle`), at the turn's end otherwise.
+    fn request_compact(&mut self, idle: bool) {
+        if !idle {
+            self.screen
+                .transcript
+                .note("· compact queued · applies at the end of this turn");
+        }
+        self.pending_compact = true;
+    }
+
+    /// The ONE line a `/compact` leaves (ADR-0076), and the `ctx` it moved: the
+    /// estimate of the history the next request carries.
+    fn report_compaction(
+        &mut self,
+        result: Result<p1_contracts::Compaction, p1_contracts::ContextError>,
+    ) {
+        if let Ok(compaction) = &result {
+            let tokens = match compaction {
+                p1_contracts::Compaction::Replaced { tokens_after, .. } => tokens_after,
+                p1_contracts::Compaction::Unchanged { tokens } => tokens,
+            };
+            self.set_context_used(Some(*tokens));
+        }
+        let line = crate::run::compaction_line(&result);
+        self.screen.transcript.note(&format!("· {line}"));
+    }
+
+    /// §10 `ctx`: the used tokens against the configured window and threshold;
+    /// unknown (no `[context]` section) stays `None`, never a guessed `0`.
+    fn set_context_used(&mut self, used: Option<u64>) {
+        self.screen.context =
+            self.context_window
+                .zip(self.context_warn_at)
+                .map(|(window, summarize_at)| ContextView {
+                    used,
+                    window,
+                    summarize_at,
+                    parts: vec![],
+                });
+        let (ctx, warn) = status::ctx_status(used, self.context_window, self.context_warn_at);
+        self.screen.statusbar.ctx = ctx;
+        self.screen.statusbar.ctx_warn = warn;
     }
 
     fn apply_switch(&mut self, request: PendingSwitch, agent: &mut Agent) {
@@ -942,19 +1006,7 @@ impl Driver {
                     // §10 `ctx`: `FrontEnd::context_configured` carries the
                     // assembled `[context]` window and threshold; unknown (no
                     // `[context]` section) stays `None`, never a guessed `0`.
-                    let used = status::usage_input_total(usage.as_ref());
-                    self.screen.context = self.context_window.zip(self.context_warn_at).map(
-                        |(window, summarize_at)| ContextView {
-                            used,
-                            window,
-                            summarize_at,
-                            parts: vec![],
-                        },
-                    );
-                    let (ctx, warn) =
-                        status::ctx_status(used, self.context_window, self.context_warn_at);
-                    self.screen.statusbar.ctx = ctx;
-                    self.screen.statusbar.ctx_warn = warn;
+                    self.set_context_used(status::usage_input_total(usage.as_ref()));
                 }
                 self.track_task(&stamped.event);
                 self.screen.apply(&stamped.event, stamped.at_ms);
@@ -1498,6 +1550,37 @@ where
         if cancel.is_cancelled() {
             return 130;
         }
+        // ADR-0076: a `/compact` applies here, where `agent` is free: at once
+        // when it was typed at idle, and at the end of the turn it was typed in
+        // (a follow-up that boundary took waits until the summary is in). The
+        // summary request is pumped like a turn, so the screen stays live and
+        // ^C cancels it.
+        if std::mem::take(&mut driver.pending_compact) {
+            redraws.dirty = true;
+            let child = cancel.child_token();
+            let result = match pump(
+                terminal,
+                driver,
+                &mut keys,
+                &mut events,
+                &mut auth,
+                sink,
+                &child,
+                color_mode,
+                &mut redraws,
+                Box::pin(agent.compact_now(&child)),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => return terminal_gave_up(&error),
+            };
+            driver.report_compaction(result);
+            if prompt.is_none() {
+                prompt = driver.submit_pending.take();
+            }
+            continue;
+        }
         // Start the next turn (submitted prompt, or a queued follow-up from
         // the last turn's end), then drain the inbox after it — the
         // interactive loop's drain rule, unchanged.
@@ -1685,7 +1768,7 @@ where
 /// way `run` does for a terminal it cannot use (the one case where this returns
 /// without the turn future finishing).
 #[allow(clippy::too_many_arguments)]
-async fn pump<B, K, F>(
+async fn pump<B, K, F, T>(
     terminal: &mut ratatui::Terminal<B>,
     driver: &mut Driver,
     keys: &mut K,
@@ -1696,11 +1779,11 @@ async fn pump<B, K, F>(
     color_mode: ColorMode,
     redraws: &mut Redraws,
     mut turn: std::pin::Pin<Box<F>>,
-) -> Result<TurnEnd, String>
+) -> Result<T, String>
 where
     B: Backend,
     K: futures_util::Stream<Item = Input> + Unpin,
-    F: std::future::Future<Output = TurnEnd>,
+    F: std::future::Future<Output = T>,
 {
     let mut workers =
         tokio::time::interval_at(tokio::time::Instant::now() + WORKER_POLL, WORKER_POLL);
@@ -2082,6 +2165,20 @@ fn access_command_output(driver: &Driver) -> p1_tui::transcript::CommandOutput {
     }
 }
 
+/// The names `Driver::slash` runs. A line that starts with one of them is a
+/// command even while a turn runs; any other text — `/usr/bin` included — stays
+/// steering for the model.
+const SLASH_COMMANDS: &[&str] = &[
+    "exit", "quit", "focus", "goal", "model", "env", "effort", "models", "compact", "status",
+    "access", "help",
+];
+
+fn is_slash_command(text: &str) -> bool {
+    text.strip_prefix('/')
+        .map(|rest| rest.split_once(' ').map_or(rest, |(name, _)| name))
+        .is_some_and(|name| SLASH_COMMANDS.contains(&name))
+}
+
 /// §11: `/help` — the command list with descriptions. `/resume` is left off:
 /// the TUI does not implement it yet (a listed-but-inert command would be
 /// worse than an incomplete list).
@@ -2089,6 +2186,7 @@ fn help_command_output() -> p1_tui::transcript::CommandOutput {
     use p1_tui::transcript::{CommandOutput, CommandRow};
     const COMMANDS: &[(&str, &str)] = &[
         ("/model [REF]", "switch model or effort · alias /env"),
+        ("/compact", "summarize the session now"),
         ("/effort LEVEL", "low medium high max"),
         (
             "/goal [TEXT]",
@@ -2155,6 +2253,7 @@ mod worker_context_window_tests {
                 workspace: std::path::PathBuf::from("/workspace"),
                 sandbox: "off".into(),
                 effort: None,
+                compact: false,
             },
             CancellationToken::new(),
         );
@@ -2187,6 +2286,7 @@ mod worker_end_tests {
                 workspace: std::path::PathBuf::from("/workspace"),
                 sandbox: "off".into(),
                 effort: None,
+                compact: false,
             },
             CancellationToken::new(),
         );
