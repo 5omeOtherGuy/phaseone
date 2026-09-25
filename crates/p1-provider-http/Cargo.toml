@@ -10,21 +10,33 @@ publish.workspace = true
 workspace = true
 
 [features]
+# The native transport and drive policy (ADR-0071). Without it only the portable
+# protocol helpers build, so a provider WebAssembly component reaches no socket,
+# runtime or credential code.
+default = ["native"]
+native = [
+    "dep:futures-core",
+    "dep:futures-util",
+    "dep:reqwest",
+    "dep:thiserror",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+]
 # Exposes `ScriptedTransport` and `ScriptedWsConnector` to other crates (the
 # conformance suite and the provider adapters). This crate's own tests always see
 # them via `cfg(test)`.
-testing = []
+testing = ["native"]
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
-futures-core = "0.3"
-futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-thiserror = "2"
-tokio = { version = "1", default-features = false, features = ["sync", "time", "net"] }
+futures-core = { version = "0.3", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
+thiserror = { version = "2", optional = true }
+tokio = { version = "1", default-features = false, features = ["sync", "time", "net"], optional = true }
 # The WebSocket seam (`ws`) is the only user. rustls + webpki roots, no default
 # features; `connect` also supplies the handshake and the tokio/net socket.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
