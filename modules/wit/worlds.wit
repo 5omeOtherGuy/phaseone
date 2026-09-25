@@ -61,7 +61,7 @@ world tool {
 
 /// A provider module (`p1_contracts::Provider`): it lowers requests, decides how each goes
 /// out (HTTP, a full WebSocket frame or a continuation frame) and classifies what comes back.
-/// Retry, backoff, the one refresh after a 401, the WebSocket connection and every network
+/// Retry, backoff, the one refresh after a 401 or 403, the WebSocket connection and every network
 /// wait stay in the native transport broker (freeze item 9; see `websocket`).
 world provider {
     import control;
