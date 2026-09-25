@@ -66,7 +66,9 @@ config surface, and the tests use fake time and the crate's existing test transp
 ## Consequences
 
 - A provider that never answers now ends as a named `Transport` failure instead of hanging. A
-  first-byte expiry happens before any output, so it takes §5's transient row: with the default
+  first-byte expiry on a FRESH connection happens before any output, so it takes §5's transient
+  row (a first-frame expiry on a REUSED WebSocket takes the once row and reconnects, like a reused
+  socket that closes before its first frame; websocket.rs `on_read_timeout`): with the default
   `RetryPolicy` (1 + `max_retries` = 4 attempts, 2/4/8 s backoff) the operator sees the named error
   after at most 4 × 120 s + 14 s ≈ 8 min 14 s of post-connect silence (≈ 10 min 14 s if each
   attempt also burns the 30 s connect timeout). An idle expiry AFTER model-visible output is
@@ -114,7 +116,7 @@ config surface, and the tests use fake time and the crate's existing test transp
   (`STREAM_IDLE_TIMEOUT`), `:126`/`:131` (the one wording per bound).
 - `crates/p1-provider-http/src/drive.rs` — the SSE first-byte bound and its expiry
   (`first_byte_timeout`, :303; the deadline is armed per attempt), the idle bound on the body read
-  (`stream_idle_timeout_message()`, :402), and the once-per-wait note (`WAITING_NOTE_AFTER`, :529;
+  (`stream_idle_timeout_message()`, :401), and the once-per-wait note (`WAITING_NOTE_AFTER`, :527;
   `await_post`, :249). Tests: `a_request_that_never_answers_fails_at_the_first_byte_bound`,
   `a_first_byte_timeout_retries_within_the_budget_then_fails_transport`,
   `a_stream_that_stalls_after_an_event_fails_at_the_idle_bound`,
