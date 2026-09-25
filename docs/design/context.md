@@ -107,7 +107,15 @@ re-summarized together with the newer material next time (rolling).
 `Item::User` holding the rendered transcript; `tools` = empty; `options` = the agent's options
 with `max_output_tokens = Some(min(existing, 4_000))` where the route validates it (if
 `provider.validate` rejects the request because of `max_output_tokens`, retry validation once
-without it — the Codex route refuses the field). Rendering, one block per item, in order:
+without it — the Codex route refuses the field), and `reasoning_effort` = the LOWEST effort the
+model profile supports (#125). The summary must not inherit the agent's effort: on a thinking
+model the route spends part of the cap on reasoning before a single summary token, and no adapter
+of ours can switch thinking off entirely (`None` means the route's default, which is the
+profile's own `default_effort`). The host supplies the floor
+(`SummarizingContext::with_summary_effort`, `crates/p1-host/src/run.rs`) because a
+`ModelProfile` is configuration the module does not see; an environment with no profile at all
+(the whole-provider form) summarizes at `Low`, the level every effort scale starts at, never at
+the agent's own. Rendering, one block per item, in order:
 `## Previous summary` (the old summary text), `## User` / `## Notification` / `## Steering`,
 `## Assistant` (text blocks; reasoning TEXT is omitted; each call as
 `→ <tool>(<input, first 500 chars>)`), `## Result of <tool> [<status>]` with the content cut
@@ -125,7 +133,8 @@ The answer is the concatenated text blocks of the completed response; an empty a
 - A summary that did not END is never accepted: a completed response whose `stop` is
   `MaxOutputTokens` is retried ONCE with the cap doubled (only where a cap is being sent); a
   second truncation, or any stop other than `EndTurn`, is a failure like an empty answer. Both
-  requests' usage is reported (summed by the usual known-parts rule).
+  requests' usage is reported, summed per part — and a part stays `None` when EITHER request left
+  it unknown, because a sum over an unknown part would state a number no route reported.
 - The default prompt gains one section, between "State of the work" and "Verified facts":
   `## Files` — for every file that was read or changed and still matters: its path and, in a few
   words each, the symbols and line ranges that matter in it, so that the work can continue with
@@ -182,10 +191,26 @@ plus an optional `summarize.md` next to `prompt.md` (whole-file override of the 
 model-family seam). `ResolvedEnvironment` shows the table and the effective prompt.
 `AssemblyError::InvalidContext{message}` when `validate` fails. `p1-assembly` parses and
 resolves; the HOST constructs `SummarizingContext` (composition root) for the parent and for
-every worker from its own environment. The renderer prints
+every worker from its own environment. The host also folds the SELECTED model profile into the
+table it hands the policy (#125 review): effective `window_tokens = min(env window,
+profile.context_tokens)`, effective reserve = `min(env reserve, profile.max_output_tokens)` (always
+strictly below the effective window), and effective `summarize_at_tokens = min(env threshold, 60 %
+of the effective window)`, always below `window - reserve`. The copied verbatim budgets
+(`keep_recent_tokens`, `user_verbatim_tokens`) are clamped below the wall too: they are budgets of
+the effective window, and a tail larger than a request can carry would keep the whole history
+verbatim. The summary-output cap (`[context] summary_output_tokens`, 12_000 in the shipped
+environments) is composed the same way: it is clamped to half the effective wall, because the
+summarization request carries the rendered transcript as well as its own answer; a table that
+cannot host `MIN_SUMMARY_OUTPUT_TOKENS` (1_000) fails the agent's construction with an error naming
+the profile and the window it serves, rather than a request failing later. That is what makes
+selecting a narrower profile (MiMo's 200k on `zen`) compact
+at the model's real size instead of failing a request against the environment's wider table; the
+same effective numbers are what `FrontEnd::context_configured` reports. The summarizer runs at the
+lowest effort the profile supports (`Low` without a profile). The renderer prints
 `context: summarized <before> → <after> items · <usage line>` on `ContextReplaced`.
-The shipped environments get measured values only after dogfooding; until then they ship
-WITHOUT `[context]`.
+The shipped environments carry researched per-route values in `docs/design/context-windows.md`,
+each marked sourced or policy; a route whose window no public source states keeps its previous
+conservative value and says so in the env comment.
 
 ## 4. Must-pass behaviour (deterministic, scripted provider)
 

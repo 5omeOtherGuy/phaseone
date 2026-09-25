@@ -17,9 +17,23 @@ module = "shell"
 [[tools]]
 module = "finish"
 
-# Proven on this route: requests of 203k input tokens worked (run split3c-glm); the catalog
-# claims more, unverified. Summarize well below the proven size, keep a long tail — a tight
-# threshold makes a multi-file task thrash (run split4a-deepseek, docs/dogfood/runs.jsonl).
+# UNKNOWN on this plan, so the previous conservative window is kept (never invent one). Sources
+# (2026-09-24, docs/design/context-windows.md): the model itself is documented with a 1M-token
+# context and a 128K output (docs.z.ai/guides/llm/glm-5.3.md), but the CODING PLAN pages conflict —
+# docs.z.ai/devpack/tool/others.md: "Adjust Context Window Size based on your model (glm-5.2 is
+# 1000000; other models 200000)", while docs.z.ai/devpack/latest-model.md: "Set Context Window Size
+# to 1000000" and "To enable GLM 1M context, add the [1m] suffix to the model name". Our route
+# sends the unsuffixed `glm-5.3`, so the plan's real window is unresolved either way.
+# Measured: requests reached ~203k real input tokens on this route (run split3c-glm,
+# docs/dogfood/runs.jsonl: cache_read + input_uncached of one request), which rules out a hard
+# 200k cap unless the endpoint changed. Summarize at 150k, keep a long tail — a tight threshold
+# makes a multi-file task thrash (run split4a-deepseek, docs/dogfood/runs.jsonl). Confirm the
+# plan's window (and whether `glm-5.3[1m]` should be the route's wire model) before raising it.
+# The reserve is 32,000: LEAD POLICY (2026-09-25). The model is documented with up to 128,000
+# output tokens and no per-response measurement exists on this route, so 32,000 is a policy choice
+# below that ceiling; it bounds the wall at 228,000, and summarizing at 150,000 leaves 78,000 for
+# one response — a response above that is possible and would hit the window. ACCEPTED RISK, to be
+# revisited with per-response telemetry (deferred follow-up, docs/design/context-windows.md).
 [context]
 window_tokens = 260000
 output_headroom_tokens = 32000

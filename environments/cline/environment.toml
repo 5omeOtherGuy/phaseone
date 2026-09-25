@@ -17,12 +17,18 @@ module = "shell"
 [[tools]]
 module = "finish"
 
-# Copied from environments/deepseek, not measured on this route: the runs behind these values
-# (split4a and its successors, docs/dogfood/runs.jsonl) ran on OpenCode Go, not on api.cline.bot,
-# and ClinePass documents no window. Summarize late, keep a long tail.
+# The 1M window is a MODEL-level value, carried from the same model elsewhere, not measured on
+# this route: ClinePass publishes NO context window (docs.cline.bot/getting-started/clinepass,
+# fetched 2026-09-24 — its price table footnotes "DeepSeek API pricing"), so 1,000,000 is the
+# MODEL's window from the DeepSeek vendor (api-docs.deepseek.com "CONTEXT LENGTH 1M") and the
+# OpenCode Go gateway metadata (context 1000000, output 384000), which the runs behind these
+# values (split4a and its successors, docs/dogfood/runs.jsonl) also ran on — OpenCode Go, not
+# api.cline.bot. Summarize at 300k; the reserve is 96,000 as in environments/deepseek: LEAD POLICY
+# (2026-09-25), not a measurement on this route either. docs/design/context-windows.md records the
+# window as not documented on this route.
 [context]
 window_tokens = 1000000
-output_headroom_tokens = 32000
+output_headroom_tokens = 96000
 summarize_at_tokens = 300000
 keep_recent_tokens = 60000
 user_verbatim_tokens = 8000

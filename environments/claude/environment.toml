@@ -22,7 +22,9 @@ module = "finish"
 # context-1m beta; the owner confirmed the subscription serves it). Summarize at 500k: the owner
 # asked for at least 500k of working context, and a later summary keeps each request's cache
 # read bounded. The earlier 200k/120k values summarized a lead every ~40 requests (usage audit of
-# the two lead journals, #125). The per-model follow-up retunes every environment.
+# the two lead journals, #125). 1M is also what Anthropic documents for this model family
+# ("1M tokens for Claude Sonnet 5 and Claude Sonnet 4.6", docs.anthropic.com context-windows,
+# fetched 2026-09-24). Do not lower it. Details: docs/design/context-windows.md.
 [context]
 window_tokens = 1000000
 output_headroom_tokens = 32000
