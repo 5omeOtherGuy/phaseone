@@ -179,15 +179,7 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
     let pane_shown =
         !screen.focus && (screen.pane_width != PaneWidth::Off || screen.ledger_overlay);
     match (key.code, ctrl, alt) {
-        (KeyCode::Enter, false, false)
-            if key.modifiers.is_empty()
-                && screen.pane_focused
-                && screen.pane_mode == PaneMode::Workers
-                && screen.workers.focused.is_some() =>
-        {
-            Some(V(ViewCommand::AttachWorker))
-        }
-        (KeyCode::Char('a'), false, false)
+        (KeyCode::Enter, false, false) | (KeyCode::Char('a'), false, false)
             if key.modifiers.is_empty()
                 && screen.pane_focused
                 && screen.pane_mode == PaneMode::Workers

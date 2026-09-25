@@ -399,7 +399,6 @@ impl Screen {
     pub fn new(reduced_motion: bool) -> Self {
         Self {
             reduced_motion,
-            worker_transcripts: HashMap::new(),
             ..Self::default()
         }
     }
@@ -505,7 +504,7 @@ impl Screen {
         } else {
             self.worker_transcripts
                 .entry(id.to_string())
-                .or_insert_with(Transcript::new)
+                .or_default()
                 .apply(event, Some(at_ms));
         }
     }
