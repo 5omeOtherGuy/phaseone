@@ -270,7 +270,13 @@ fn session_lines(session: &SessionView, width: usize) -> Vec<Line<'static>> {
     vec![
         header_row(width, "SESSION"),
         value_row(width, "  model", palette::INK, &session.model),
-        value_row(width, "  effort", palette::INK, &session.effort),
+        // `extra_high` is `xhigh` to the operator (§9.2/§10, owner 2026-09-24).
+        value_row(
+            width,
+            "  effort",
+            palette::INK,
+            super::effort_label(&session.effort),
+        ),
         value_row(width, "  access", palette::INK, &session.access),
         value_row(width, "  sandbox", palette::INK, &session.sandbox),
     ]

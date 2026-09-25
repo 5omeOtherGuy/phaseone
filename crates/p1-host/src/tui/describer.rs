@@ -7,7 +7,6 @@ use std::sync::Arc;
 use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{Tool, ToolCall, ToolResultItem, ToolStatus};
 use p1_tui::face::{CallFace, FaceBody, GenericDescriber, ResultFace, TargetKind, ToolDescriber};
-use p1_tui::render::diff::DiffRow;
 use p1_tui::wrap::{cell_width, fit_cells};
 
 const FACT_CELLS: usize = 40;
@@ -110,29 +109,11 @@ fn render_result(
         outcome: Some(description.summary),
         ..empty_face()
     };
+    // An ok call renders ONE row (handoff §7.3, owner 2026-09-24), so its body
+    // would never be drawn and is not built here. Only the facts that ride in
+    // band A survive: the shell's elapsed and sandbox posture, and the
+    // result-time target (`worker_start`'s `w1 · env/profile`).
     match description.detail {
-        Some(ResultDetail::Diff {
-            path,
-            before,
-            after,
-        }) => {
-            // The returned diff describes the replacement; the current file is
-            // used only to anchor its surrounding context, never to infer the edit.
-            if !before.is_empty() {
-                face.body = FaceBody::Diff(diff_rows(workspace, &path, &before, &after));
-            }
-        }
-        Some(ResultDetail::Files { paths }) => {
-            face.body = FaceBody::Files(
-                paths
-                    .into_iter()
-                    .map(|line| {
-                        let (path, facts) = line.split_once('\t').unwrap_or((&line, ""));
-                        (path.to_owned(), facts.to_owned())
-                    })
-                    .collect(),
-            );
-        }
         Some(ResultDetail::Command {
             elapsed_ms: tool_elapsed,
             ..
@@ -149,72 +130,19 @@ fn render_result(
             }
         }
         Some(ResultDetail::Text(text)) if !text.is_empty() => {
-            // Only explicitly marked presentation lines become an inline body;
-            // raw read/workflow text stays available to callers of the contract.
-            let mut lines = text.lines();
-            if let Some(first) = lines.next() {
-                if let Some(target) = first.strip_prefix("target\t") {
-                    face.target = Some(target.to_owned());
-                    face.body = FaceBody::Lines(lines.map(str::to_owned).collect());
-                } else if let Some(line) = first.strip_prefix("lines\t") {
-                    face.body = FaceBody::Lines(
-                        std::iter::once(line.to_owned())
-                            .chain(lines.map(str::to_owned))
-                            .collect(),
-                    );
-                }
+            // Only the explicitly marked target line is presentation; raw read
+            // and workflow text stays available to callers of the contract.
+            if let Some(target) = text
+                .lines()
+                .next()
+                .and_then(|first| first.strip_prefix("target\t"))
+            {
+                face.target = Some(target.to_owned());
             }
         }
         _ => {}
     }
     face
-}
-
-fn diff_rows(workspace: &Path, path: &str, before: &str, after: &str) -> Vec<DiffRow> {
-    let old_lines: Vec<&str> = before.lines().collect();
-    let new_lines: Vec<&str> = after.lines().collect();
-    let current = std::fs::read_to_string(workspace.join(path)).ok();
-    let current_lines: Vec<&str> = current
-        .as_deref()
-        .map(str::lines)
-        .map(Iterator::collect)
-        .unwrap_or_default();
-    let anchor = new_lines.first().and_then(|first| {
-        current_lines
-            .iter()
-            .position(|line| line.trim_end() == first.trim_end())
-    });
-    let mut rows = Vec::new();
-    if let Some(a) = anchor
-        && a > 0
-    {
-        rows.push(DiffRow::Context {
-            line: a as u32,
-            text: current_lines[a - 1].to_string(),
-        });
-    }
-    let first_line = anchor.map(|a| a as u32 + 1).unwrap_or(0);
-    for (n, line) in old_lines.iter().enumerate() {
-        rows.push(DiffRow::Del {
-            line: first_line + n as u32,
-            text: (*line).to_string(),
-        });
-    }
-    for (n, line) in new_lines.iter().enumerate() {
-        rows.push(DiffRow::Add {
-            line: first_line + n as u32,
-            text: (*line).to_string(),
-        });
-    }
-    if let Some(a) = anchor
-        && let Some(line) = current_lines.get(a + new_lines.len())
-    {
-        rows.push(DiffRow::Context {
-            line: (a + new_lines.len()) as u32 + 1,
-            text: (*line).to_string(),
-        });
-    }
-    rows
 }
 
 #[cfg(test)]

@@ -27,12 +27,14 @@ use crate::cli::DEFAULT_ENV;
 pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "extra_high", "max"];
 
 /// Parse one effort level. An unknown spelling is an error naming every level.
+/// `xhigh` is the interface's name for `extra_high` (handoff §10, owner
+/// 2026-09-24): the operator may write either, the profile keeps `extra_high`.
 pub fn parse_effort(text: &str) -> Result<Effort, String> {
     match text {
         "low" => Ok(Effort::Low),
         "medium" => Ok(Effort::Medium),
         "high" => Ok(Effort::High),
-        "extra_high" => Ok(Effort::ExtraHigh),
+        "extra_high" | "xhigh" => Ok(Effort::ExtraHigh),
         "max" => Ok(Effort::Max),
         other => Err(format!(
             "unknown effort `{other}`; the levels are {}",

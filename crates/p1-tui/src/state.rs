@@ -97,6 +97,21 @@ pub enum Promotion {
     // displaces it (checked there).
 }
 
+/// What an idle `^C` decided (handoff §12, owner 2026-09-24). The host asks the
+/// screen, because the quit arm and its 2000 ms window are screen state; the
+/// host only performs the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// A turn is live: cancel it (the host owns the turn's token).
+    Cancel,
+    /// A menu or the pane overlay was open: it closed first, nothing else.
+    Dismissed,
+    /// Quit is armed: the hint reads `^C again to quit`.
+    Armed,
+    /// The second `^C` inside the window: the host exits.
+    Quit,
+}
+
 /// Running totals for the LEDGER spend section. Each part starts at a known
 /// zero; the first unreported part makes THAT part unknown, forever — unknown
 /// is never summed into a fake zero and never recovers mid-session.
@@ -353,6 +368,10 @@ pub struct Screen {
     pub pane_focused: bool,
     /// The full diff review's view state (handoff §7.5).
     pub review: FullReview,
+    /// When the first idle `^C` armed quit, on the screen's own clock (§12,
+    /// owner 2026-09-24). A second `^C` within [`QUIT_WINDOW_MS`] quits; any
+    /// other key, or the window passing, disarms.
+    pub quit_armed_at: Option<u64>,
 }
 
 /// The full diff review: shown over a diff approval while `open`. Paging files and scrolling
@@ -532,8 +551,11 @@ impl Screen {
             .effort
             .clone()
             .unwrap_or_else(|| "default".into());
-        menu.set_value("/model", format!("{model}:{effort}"));
-        menu.set_value("/effort", effort);
+        // The completion's right-hand values are read by the operator: the
+        // effort cell spells `extra_high` the way §10 does (owner 2026-09-24).
+        let shown = crate::render::effort_label(&effort).to_string();
+        menu.set_value("/model", format!("{model}:{shown}"));
+        menu.set_value("/effort", shown);
         menu.set_value("/focus", if self.focus { "on" } else { "off" });
         menu.filter = self.composer.text.clone();
         menu.select_first();
@@ -800,11 +822,60 @@ impl Screen {
         {
             self.promotion = Promotion::None;
         }
+        // The quit window passing disarms (§12, owner 2026-09-24): the arm never
+        // outlives its two seconds, however many frames go by.
+        if self
+            .quit_armed_at
+            .is_some_and(|armed_at| !Self::inside_window(now_ms, armed_at))
+        {
+            self.quit_armed_at = None;
+        }
+    }
+
+    fn inside_window(now_ms: u64, armed_at: u64) -> bool {
+        now_ms.saturating_sub(armed_at) <= QUIT_WINDOW_MS
+    }
+
+    /// Whether quit is armed at `now_ms`: the hint reads `^C again to quit` and
+    /// the second `^C` quits, both from this one answer.
+    pub fn quit_armed(&self, now_ms: u64) -> bool {
+        self.quit_armed_at
+            .is_some_and(|armed_at| Self::inside_window(now_ms, armed_at))
+    }
+
+    /// Any key other than `^C` disarms quit (§12, owner 2026-09-24).
+    pub fn disarm_quit(&mut self) {
+        self.quit_armed_at = None;
+    }
+
+    /// `^C` (handoff §12): a live turn is the host's to cancel; at idle the first
+    /// press arms quit and a second one inside [`QUIT_WINDOW_MS`] quits. A menu or
+    /// the pane overlay closes first — the operator's turn is there, not here.
+    pub fn cancel_or_quit(&mut self, at_ms: u64) -> CancelOutcome {
+        if self.working.is_some() {
+            return CancelOutcome::Cancel;
+        }
+        if self.picker.is_some() || self.ledger_overlay {
+            self.picker = None;
+            self.ledger_overlay = false;
+            self.disarm_quit();
+            return CancelOutcome::Dismissed;
+        }
+        if self.quit_armed(at_ms) {
+            self.quit_armed_at = None;
+            return CancelOutcome::Quit;
+        }
+        self.quit_armed_at = Some(at_ms);
+        CancelOutcome::Armed
     }
 }
 
 /// The peek banner's lifetime (SPEC §5: 3 s).
 pub const PEEK_MS: u64 = 3_000;
+
+/// How long an idle `^C` stays armed before it disarms itself (handoff §12,
+/// owner 2026-09-24: a second `^C` within 2000 ms quits).
+pub const QUIT_WINDOW_MS: u64 = 2_000;
 
 /// LEDGER FOLDS lists this many handles (§9.2).
 const FOLDS_SHOWN: usize = 3;

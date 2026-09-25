@@ -63,7 +63,8 @@ impl StatusBar {
     /// 4 repo, 5 diff, 6 the `spend` label (its value stays).
     fn segments(&self, step: usize) -> (Vec<Seg>, Vec<Seg>) {
         let model = self.model.as_deref().unwrap_or("—");
-        let effort = self.effort.as_deref().unwrap_or("default");
+        // `extra_high` is `xhigh` to the operator (§10, owner 2026-09-24).
+        let effort = super::effort_label(self.effort.as_deref().unwrap_or("default"));
         let folded = step >= 1;
         let chip = if folded {
             format!(" {model}:{effort} ")

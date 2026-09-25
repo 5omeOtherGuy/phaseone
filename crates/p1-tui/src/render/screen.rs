@@ -83,6 +83,9 @@ fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Op
         Mode::Attached(&worker.id)
     } else if screen.working.is_some() {
         Mode::Working
+    } else if screen.quit_armed(now_ms) {
+        // §12 (owner 2026-09-24): the first idle `^C` arms quit and the hint says so.
+        Mode::QuitArmed
     } else {
         Mode::Idle
     };

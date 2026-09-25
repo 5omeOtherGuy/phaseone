@@ -265,8 +265,10 @@ pub fn lines(picker: &Picker, width: usize) -> Vec<Line<'static>> {
         let row = &group.rows[r];
         let label = field(&row.label, label_column);
         if first + offset == picker.selected && row.available {
+            // The effort cell shows the level as the operator reads it: a
+            // profile's `extra_high` is `xhigh` (§6.10/§10, owner 2026-09-24).
             let description = match row.efforts.get(row.effort) {
-                Some(effort) => format!("effort ← {effort} →"),
+                Some(effort) => format!("effort ← {} →", super::effort_label(effort)),
                 None => row.description.clone(),
             };
             let on_fill = |text: String| Seg::new(palette::ON_FILL, text);

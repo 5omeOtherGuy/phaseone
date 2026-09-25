@@ -20,7 +20,7 @@ fn result(call: &ToolCall, status: ToolStatus, content: &str) -> ToolResultItem 
 }
 
 #[test]
-fn edit_hunk_comes_from_the_tool_result_description() {
+fn an_ok_edit_states_its_outcome_and_builds_no_body() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f.rs"), "one\ntwo\nTHREE\nfour\n").unwrap();
     let tool: Arc<dyn Tool> = Arc::new(p1_tool_edit::EditTool::new(
@@ -37,28 +37,10 @@ fn edit_hunk_comes_from_the_tool_result_description() {
         &result(&call, ToolStatus::Ok, "Edited f.rs (1 replacement)."),
         None,
     );
+    // §7.3, owner 2026-09-24: an ok call is ONE row, so the hunk the tool
+    // describes is not turned into a body nobody would render.
     assert_eq!(face.outcome.as_deref(), Some("+1 −1"));
-    assert_eq!(
-        face.body,
-        FaceBody::Diff(vec![
-            DiffRow::Context {
-                line: 2,
-                text: "two".into()
-            },
-            DiffRow::Del {
-                line: 3,
-                text: "old".into()
-            },
-            DiffRow::Add {
-                line: 3,
-                text: "THREE".into()
-            },
-            DiffRow::Context {
-                line: 4,
-                text: "four".into()
-            },
-        ])
-    );
+    assert_eq!(face.body, FaceBody::None);
 }
 
 #[test]
@@ -80,13 +62,8 @@ fn patch_files_and_shell_command_facts_are_rendered_generically() {
         None,
     );
     assert_eq!(face.outcome.as_deref(), Some("+2 · 2 files"));
-    assert_eq!(
-        face.body,
-        FaceBody::Files(vec![
-            ("new.txt".into(), "+2 −0".into()),
-            ("old.txt".into(), "D".into())
-        ])
-    );
+    // The file list is an ok body: dropped, not built (§7.3, owner 2026-09-24).
+    assert_eq!(face.body, FaceBody::None);
     let shell = call("shell", ToolInput::Json(r#"{"command":"echo hi"}"#.into()));
     let face = d.result(
         &shell,
@@ -94,10 +71,12 @@ fn patch_files_and_shell_command_facts_are_rendered_generically() {
         Some(412),
     );
     assert_eq!(face.outcome.as_deref(), Some("412ms · exit 0 · 1 lines"));
+    // The sandbox facts survive: an ok row carries them in band A.
     assert_eq!(
         face.meta.as_deref(),
         Some(format!("cwd {} · bubblewrap", dir.path().display()).as_str())
     );
+    assert_eq!(face.body, FaceBody::None);
 }
 
 #[test]

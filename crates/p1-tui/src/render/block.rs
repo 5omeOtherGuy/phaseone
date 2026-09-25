@@ -112,7 +112,7 @@ pub fn lines_with_approval(
                     (glyphs::PENDING, palette::FAINT)
                 }
             };
-            let fact = row
+            let mut fact = row
                 .result_face
                 .as_ref()
                 .and_then(|f| f.outcome.clone())
@@ -123,6 +123,17 @@ pub fn lines_with_approval(
                     p1_contracts::ToolStatus::Unavailable => "unavailable · not assembled".into(),
                     _ => String::new(),
                 });
+            // A successful call is exactly one row (§7.3, owner 2026-09-24), so the
+            // facts its face would have put on band C ride in band A instead.
+            if matches!(status, p1_contracts::ToolStatus::Ok)
+                && let Some(meta) = row.result_face.as_ref().and_then(|f| f.meta.as_ref())
+            {
+                fact = if fact.is_empty() {
+                    meta.clone()
+                } else {
+                    format!("{fact} · {meta}")
+                };
+            }
             (
                 glyphs::TOOL,
                 palette::DIM,
@@ -233,6 +244,14 @@ pub fn lines_with_approval(
         .render(),
     );
 
+    // §7.3 (owner 2026-09-24): one row per ok call. A successful call's Block is
+    // its band A — no body and no fold band, whatever the tool. Its full output
+    // stays reachable through `^O` (the transcript registers the handle when it
+    // settles); nothing here draws it inline.
+    if matches!(row.status, RowStatus::Settled(p1_contracts::ToolStatus::Ok)) {
+        return out;
+    }
+
     let body = row.result_face.as_ref().map(|f| &f.body);
     if let Some(approval) = approval {
         for (label, value, reference) in &approval.permission_rows {
@@ -261,14 +280,13 @@ pub fn lines_with_approval(
             Some(FaceBody::Lines(_)) => Vec::new(),
             Some(FaceBody::Diff(_)) => Vec::new(),
             Some(FaceBody::Files(_)) => Vec::new(),
-            _ if !matches!(row.status, RowStatus::Settled(p1_contracts::ToolStatus::Ok)) => row
+            _ => row
                 .output
                 .as_deref()
                 .unwrap_or("")
                 .lines()
                 .map(|l| (l.to_string(), palette::DIM))
                 .collect(),
-            _ => Vec::new(),
         }
     };
     let mut diff_fold_meta = None;
@@ -319,11 +337,7 @@ pub fn lines_with_approval(
     }
     if let Some(FaceBody::Lines(lines)) = body {
         for text in lines {
-            out.push(render_face_line(
-                text,
-                matches!(row.status, RowStatus::Settled(p1_contracts::ToolStatus::Ok)),
-                width,
-            ));
+            out.push(render_face_line(text, width));
         }
     }
     if let Some(preview) = &row.input_preview {
@@ -339,8 +353,7 @@ pub fn lines_with_approval(
     }
     let mut fold_meta = None;
     let limit = if short { 4 } else { 8 };
-    // Only a shown body folds: an ok call's long output is registered for `^O` but draws no
-    // band (§7.1 "ok → no body").
+    // Only a shown body folds: a not-ok call's evidence band (§7.1).
     let body_shown =
         !body_lines.is_empty() || matches!(body, Some(FaceBody::Lines(lines)) if !lines.is_empty());
     if body_shown
@@ -427,48 +440,23 @@ pub fn lines_with_approval(
     out
 }
 
-fn render_face_line(text: &str, success: bool, width: usize) -> Line<'static> {
+/// One `FaceBody::Lines` body row. Only a NOT-ok call has one (§7.3: an ok call
+/// is one row), so the body is dim evidence, never the success styling.
+fn render_face_line(text: &str, width: usize) -> Line<'static> {
     let room = width.saturating_sub(6);
     let shown = if cell_width(text) >= room {
         format!("{}…", fit_cells(text, room.saturating_sub(1)))
     } else {
         text.to_string()
     };
-    let text = shown.as_str();
-    let mut segments = vec![Span::raw("    ")];
-    if let Some(rest) = text.strip_prefix("✓ ") {
-        segments.push(Span::styled("✓ ", Style::new().fg(palette::OK)));
-        if let Some((command, facts)) = rest.split_once("  ") {
-            segments.push(Span::styled(
-                command.to_string(),
-                Style::new().fg(palette::INK),
-            ));
-            segments.push(Span::styled(
-                format!("  {facts}"),
-                Style::new().fg(palette::DIM),
-            ));
-        } else {
-            segments.push(Span::styled(
-                rest.to_string(),
-                Style::new().fg(palette::INK),
-            ));
-        }
-    } else if success && let Some((label, value)) = text.split_once("    ") {
-        segments.push(Span::styled(
-            format!("{label:<10}"),
-            Style::new().fg(palette::DIM),
-        ));
-        segments.push(Span::styled(
-            value.to_string(),
-            Style::new().fg(palette::INK),
-        ));
-    } else {
-        segments.push(Span::styled(
-            text.to_string(),
-            Style::new().fg(if success { palette::INK } else { palette::DIM }),
-        ));
-    }
-    full(Line::from(segments), width, palette::BLOCK)
+    full(
+        Line::from(vec![
+            Span::raw("    "),
+            Span::styled(shown, Style::new().fg(palette::DIM)),
+        ]),
+        width,
+        palette::BLOCK,
+    )
 }
 
 fn render_diff_body_row(row: &crate::render::diff::DiffRow, width: usize) -> Line<'static> {
@@ -563,8 +551,10 @@ mod tests {
         fold::FoldId,
     };
 
+    /// §7.3, owner 2026-09-24: an ok call draws its band A and nothing else — no
+    /// body rows, no fold band, whatever the tool put in the face.
     #[test]
-    fn apply_patch_files_body_keeps_eight_rows_and_folds_the_rest() {
+    fn an_ok_call_is_one_row_whatever_its_body() {
         let files = (0..11)
             .map(|n| (format!("src/file{n}.rs"), format!("+{n} −0")))
             .collect();
@@ -585,19 +575,18 @@ mod tests {
             result_face: Some(ResultFace {
                 outcome: Some("+11 −0 · 11 files".into()),
                 body: FaceBody::Files(files),
-                meta: None,
+                // The face's meta is a band C fact on a not-ok call; on an ok one
+                // it rides in band A, because there is no band C to draw.
+                meta: Some("cwd ~/dev/phaseone · bubblewrap".into()),
                 target: None,
             }),
             input_preview: None,
         };
         let rendered = lines(&row, 76, false, 0, true);
-        let text: Vec<String> = rendered.iter().map(ToString::to_string).collect();
-        assert_eq!(rendered.len(), 10, "header, eight files, fold row");
-        for index in 0..8 {
-            assert!(text[index + 1].contains(&format!("src/file{index}.rs")));
-        }
-        assert!(!text.iter().any(|line| line.contains("src/file8.rs")));
-        assert!(text[9].contains("· 3 more files → [h-12345678]"));
-        assert!(text[9].contains("^O open in pane"));
+        assert_eq!(rendered.len(), 1, "band A only: {}", rendered[0]);
+        let text = rendered[0].to_string();
+        assert!(text.contains("apply_patch"));
+        assert!(text.contains("✓ +11 −0 · 11 files · cwd ~/dev/phaseone · bubblewrap"));
+        assert!(!text.contains("src/file0.rs"));
     }
 }

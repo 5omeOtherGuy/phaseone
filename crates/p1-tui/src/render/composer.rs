@@ -19,6 +19,8 @@ const PROMPT: usize = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode<'a> {
     Idle,
+    /// Idle with quit armed (§12, owner 2026-09-24): the hint reads `^C again to quit`.
+    QuitArmed,
     /// A turn is live: `⏎` queues steering.
     Working,
     /// An approval is on screen: one amber event per view, so the prompt goes dim.
@@ -59,7 +61,7 @@ pub fn render(composer: &Composer, mode: Mode<'_>, width: usize, max_rows: usize
     let disabled = match mode {
         Mode::Decision => Some("decide above".to_string()),
         Mode::Attached(id) => Some(format!("attached to {id} — read only")),
-        Mode::Idle | Mode::Working => None,
+        Mode::Idle | Mode::QuitArmed | Mode::Working => None,
     };
     let placeholder = match (&disabled, mode) {
         (Some(text), _) => Some(text.clone()),
@@ -183,6 +185,7 @@ fn hints(composer: &Composer, mode: Mode<'_>) -> (&'static str, &'static str) {
         _ if composer.editing_goal() => ("⏎ set goal   empty ⏎ clears", "esc keep"),
         _ if composer.text.starts_with('/') => ("tab complete   ⏎ run", "esc dismiss"),
         Mode::Working => ("⏎ queue steering   ⌥⏎ queue follow-up", "^C cancel"),
+        Mode::QuitArmed => ("⏎ send   ⌥⏎ newline", "^C again to quit"),
         Mode::Idle => ("⏎ send   ⌥⏎ newline", "^C quit"),
     }
 }
@@ -216,6 +219,12 @@ mod tests {
                 "  › message, / for commands",
                 "  ⏎ send   ⌥⏎ newline",
                 "^C quit",
+            ),
+            (
+                Mode::QuitArmed,
+                "  › message, / for commands",
+                "  ⏎ send   ⌥⏎ newline",
+                "^C again to quit",
             ),
             (
                 Mode::Working,

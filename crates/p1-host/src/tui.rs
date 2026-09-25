@@ -25,7 +25,7 @@ use p1_tui::render::home::HomePrelude;
 use p1_tui::render::ledger::{ContextView, SessionView};
 use p1_tui::render::permission::PermissionView;
 use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
-use p1_tui::state::{Approval, Screen};
+use p1_tui::state::{Approval, CancelOutcome, Screen};
 use p1_tui::transcript::Transcript;
 use ratatui::backend::Backend;
 use tokio::sync::mpsc;
@@ -393,8 +393,18 @@ enum PendingSwitch {
 }
 
 impl Driver {
-    fn on_key(&mut self, key: crossterm::event::KeyEvent, agent: Option<&mut Agent>) {
+    fn on_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        agent: Option<&mut Agent>,
+        now_ms: u64,
+    ) {
         use crossterm::event::KeyCode;
+        // §12 (owner 2026-09-24): the arm belongs to the state machine, and any
+        // key other than `^C` disarms it — before that key does anything else.
+        if !is_cancel(&key) {
+            self.screen.disarm_quit();
+        }
         // `input::handle`'s own pre-check, replicated: until `^F` is applied
         // through `apply_view`, an open OUTPUT pane with no modal on screen
         // keeps scrolling on the bare arrows (this driver now calls `decide`
@@ -414,6 +424,14 @@ impl Driver {
             return;
         };
         match action {
+            // `^C` at idle is the screen's decision (arm, dismiss, or quit); the
+            // driver only exits when it says so. A live turn never reaches here
+            // — `pump` cancels it first, exactly as before.
+            input::Action::Command(Command::CancelOrQuit) => {
+                if self.screen.cancel_or_quit(now_ms) == CancelOutcome::Quit {
+                    self.exit = Some(0);
+                }
+            }
             input::Action::Command(command) => self.dispatch(command, agent),
             // These keep `input::handle`'s exact historical mapping: opening
             // the command-completion picker isn't wired to submit on `Enter`
@@ -473,7 +491,8 @@ impl Driver {
             Command::Backspace => self.screen.composer.backspace(),
             Command::Left => self.screen.composer.left(),
             Command::Right => self.screen.composer.right(),
-            // ^C is handled by the loop: cancel the turn, quit at idle.
+            // ^C never reaches here: `on_key` answers it through the screen's own
+            // quit arm before dispatch (§12, owner 2026-09-24).
             Command::CancelOrQuit => {}
             Command::ApproveOnce => self.answer(Decision::Permit, false),
             Command::ApproveSession | Command::ApproveProject | Command::AllFiles => {
@@ -597,7 +616,7 @@ impl Driver {
         if level.is_empty() {
             self.screen
                 .transcript
-                .note("· /effort needs a level · low medium high max");
+                .note("· /effort needs a level · low medium high xhigh max");
             return;
         }
         self.request_switch(PendingSwitch::Effort(level.to_string()), agent);
@@ -931,6 +950,9 @@ impl Driver {
     /// carries) and the branch (a background task keeps `self.branch`
     /// current; this just republishes its latest value).
     fn sync_status(&mut self, now_ms: u64) {
+        // The screen's own clock input: the peek banner and the `^C` quit window
+        // both expire here, so no frame shows either past its time (§12).
+        self.screen.tick(now_ms);
         self.screen.statusbar.clock = Some(status::clock(now_ms));
         self.screen.statusbar.branch = self.branch.lock().unwrap().clone();
     }
@@ -1110,11 +1132,9 @@ where
             _ = cancel.cancelled() => return 130,
             key = keys.next() => {
                 let Some(key) = key else { return 0 };
-                if is_cancel(&key) {
-                    driver.exit = Some(0);
-                    continue;
-                }
-                driver.on_key(key, Some(agent));
+                // §12 (owner 2026-09-24): `^C` at idle is the screen's decision —
+                // arm quit, dismiss a menu, or exit; the driver only acts on it.
+                driver.on_key(key, Some(agent), sink.now_ms());
                 if let Some(text) = driver.submit_pending.take() {
                     prompt = Some(text);
                 }
@@ -1206,7 +1226,7 @@ where
                 }
                 // A turn's future owns `agent`; a `/model`/`/effort` mid-turn
                 // queues instead (§11).
-                driver.on_key(key, None);
+                driver.on_key(key, None, sink.now_ms());
             }
             ui = events.recv() => {
                 if let Some(ui) = ui {
@@ -1476,7 +1496,7 @@ fn help_command_output() -> p1_tui::transcript::CommandOutput {
     use p1_tui::transcript::{CommandOutput, CommandRow};
     const COMMANDS: &[(&str, &str)] = &[
         ("/model [REF]", "switch model or effort · alias /env"),
-        ("/effort LEVEL", "low medium high max"),
+        ("/effort LEVEL", "low medium high xhigh max"),
         (
             "/goal [TEXT]",
             "set or clear the session objective · ^G edits",

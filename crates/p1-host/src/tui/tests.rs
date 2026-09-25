@@ -67,9 +67,9 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
 fn typing_and_enter_submits_a_prompt() {
     let (mut d, _auth) = driver();
     for c in "fix it".chars() {
-        d.on_key(key(KeyCode::Char(c)), None);
+        d.on_key(key(KeyCode::Char(c)), None, 0);
     }
-    d.on_key(key(KeyCode::Enter), None);
+    d.on_key(key(KeyCode::Enter), None, 0);
     assert_eq!(d.submit_pending.as_deref(), Some("fix it"));
     assert_eq!(d.screen.composer.text, "");
     // The operator line is in the transcript.
@@ -169,15 +169,15 @@ fn home_prelude_is_attached_to_the_driver_screen_with_workspace_and_current_mode
 fn slash_exit_quits_and_focus_toggles() {
     let (mut d, _auth) = driver();
     for c in "/focus".chars() {
-        d.on_key(key(KeyCode::Char(c)), None);
+        d.on_key(key(KeyCode::Char(c)), None, 0);
     }
-    d.on_key(key(KeyCode::Enter), None);
+    d.on_key(key(KeyCode::Enter), None, 0);
     assert_eq!(d.screen.focus_explicit, Some(true));
     assert_eq!(d.submit_pending, None);
     for c in "/exit".chars() {
-        d.on_key(key(KeyCode::Char(c)), None);
+        d.on_key(key(KeyCode::Char(c)), None, 0);
     }
-    d.on_key(key(KeyCode::Enter), None);
+    d.on_key(key(KeyCode::Enter), None, 0);
     assert_eq!(d.exit, Some(0));
 }
 
@@ -189,9 +189,9 @@ fn enter_while_working_queues_steering_to_the_inbox() {
         started_ms: 0,
     });
     for c in "use vecdeque".chars() {
-        d.on_key(key(KeyCode::Char(c)), None);
+        d.on_key(key(KeyCode::Char(c)), None, 0);
     }
-    d.on_key(key(KeyCode::Enter), None);
+    d.on_key(key(KeyCode::Enter), None, 0);
     assert_eq!(d.submit_pending, None, "steering never starts a turn");
     assert_eq!(d.screen.queued.len(), 1);
     assert_eq!(d.screen.queued[0].text, "use vecdeque");
@@ -549,7 +549,7 @@ async fn an_auth_request_becomes_the_approval_view_and_answers() {
     assert_eq!(d.screen.approval_tool, "shell");
     assert_eq!(d.screen.approvals_waiting, 0);
     assert!(d.screen.pinned);
-    d.on_key(key(KeyCode::Char('y')), None);
+    d.on_key(key(KeyCode::Char('y')), None, 0);
     assert_eq!(pending.await.unwrap(), Decision::Permit);
     assert!(d.screen.approval.is_none());
     assert!(!d.screen.pinned);

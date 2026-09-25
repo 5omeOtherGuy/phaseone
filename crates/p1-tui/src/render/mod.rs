@@ -71,6 +71,18 @@ pub fn tokens(count: u64) -> String {
 /// `—` for an unknown quantity (SPEC §5: unknown cost renders `—`, never 0).
 pub const UNKNOWN: &str = "—";
 
+/// An effort level as the operator reads it (handoff §10, owner 2026-09-24):
+/// `p1_contracts::Effort::ExtraHigh` is `xhigh` in the interface, and a profile
+/// still spells it `extra_high` in its own file. The levels arrive as strings
+/// (the profile's list, `/effort`'s argument, the statusline's value), so the
+/// display name is one mapping and never a second list of levels.
+pub fn effort_label(level: &str) -> &str {
+    match level {
+        "extra_high" => "xhigh",
+        other => other,
+    }
+}
+
 /// Append one decision key and its spelled-out label to a footer line
 /// (SPEC §4.4/§4.5): ` y  allow once     `. An unavailable key (the
 /// destructive floor) is FAINT for the key and the label; a live key is INK
@@ -133,5 +145,14 @@ mod tests {
         assert_eq!(cost_string(0), "$0.0000");
         assert_eq!(cost_string(12_300), "$0.0123");
         assert_eq!(cost_string(1_234_567), "$1.2345");
+    }
+
+    #[test]
+    fn extra_high_reads_as_xhigh() {
+        assert_eq!(effort_label("extra_high"), "xhigh");
+        // Every other level is its own name; `default` is not a level at all.
+        for level in ["low", "medium", "high", "max", "default"] {
+            assert_eq!(effort_label(level), level);
+        }
     }
 }
