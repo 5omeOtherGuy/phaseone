@@ -1518,6 +1518,7 @@ dependencies = [
  "p1-contracts",
  "p1-core",
  "p1-testkit",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
