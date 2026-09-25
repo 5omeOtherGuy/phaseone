@@ -4,8 +4,10 @@
 //!
 //! This crate names no concrete provider or tool. Everything it can build comes
 //! from a [`Catalog`] of closures supplied by the composition root (`p1-host`);
-//! an environment file can therefore never select a module that was not compiled
-//! into the binary. `assemble` never runs a model and never touches the network.
+//! an environment file can therefore never select a module the host did not register
+//! (compiled into the binary, or an official package the host resolved through
+//! [`ModulesLock`] and loaded). `assemble` never runs a model and never touches the
+//! network.
 //!
 //! # Prompt substitution
 //!
@@ -62,6 +64,12 @@ use p1_contracts::{
 use p1_model_profile::ModelProfile;
 use p1_workspace::{ObservedFiles, Workspace, WriteGate};
 use serde::{Deserialize, Serialize};
+
+mod modules_lock;
+pub use modules_lock::{
+    LockedModule, LockedProtocol, MODULES_LOCK_FORMAT, ModulesLock, ModulesLockError,
+    load_modules_lock,
+};
 
 /// File name of an environment definition inside `<dir>/<name>/`.
 const ENVIRONMENT_FILE: &str = "environment.toml";
