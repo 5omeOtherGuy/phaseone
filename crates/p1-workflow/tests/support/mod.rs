@@ -353,6 +353,9 @@ pub struct Recorder {
     pub logged: Notify,
     /// Fires on `run_ended`, which comes AFTER the status a `wait` returns is stored.
     pub run_ended: Notify,
+    /// Every `thunk_failed` error, and a notification per failure.
+    pub thunk_errors: Mutex<Vec<String>>,
+    pub thunk_failed: Notify,
 }
 
 impl WorkflowObserver for Recorder {
@@ -362,6 +365,10 @@ impl WorkflowObserver for Recorder {
     }
     fn step_ended(&self, _id: &RunId, line: &StepLine) {
         self.steps.lock().unwrap().push(line.clone());
+    }
+    fn thunk_failed(&self, _id: &RunId, error: &str) {
+        self.thunk_errors.lock().unwrap().push(error.to_string());
+        self.thunk_failed.notify_one();
     }
     fn run_ended(&self, _id: &RunId, report: &RunReport) {
         self.ended.lock().unwrap().push(report.clone());

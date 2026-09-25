@@ -1192,6 +1192,16 @@ impl Script {
     fn fan_out(self: &Arc<Self>, jobs: Vec<Job>) -> Result<Array, Box<EvalAltResult>> {
         let mut pending = Vec::with_capacity(jobs.len());
         for job in jobs {
+            let job: Job = Box::new(move |script: &Script| {
+                let result = job(script);
+                if let Err(error) = &result {
+                    script
+                        .run
+                        .observer
+                        .thunk_failed(&script.run.id, &error.to_string());
+                }
+                result
+            });
             match self.take_slot() {
                 Some(slot) => {
                     let script = self.clone();

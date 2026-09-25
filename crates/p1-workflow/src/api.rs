@@ -604,6 +604,9 @@ pub trait WorkflowObserver: Send + Sync {
     fn log(&self, _id: &RunId, _text: &str) {}
     fn step_started(&self, _id: &RunId, _request: &StepRequest, _worker: &WorkerRef) {}
     fn step_ended(&self, _id: &RunId, _line: &StepLine) {}
+    /// A `parallel` thunk or a `pipeline` item ended with an error. Fires when that job
+    /// ends, before `parallel`/`pipeline` has joined its siblings and failed the script.
+    fn thunk_failed(&self, _id: &RunId, _error: &str) {}
     fn run_ended(&self, _id: &RunId, _report: &RunReport) {}
 }
 

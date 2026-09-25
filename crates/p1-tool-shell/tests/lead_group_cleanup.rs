@@ -3,7 +3,7 @@
 //! whether the run ends by cancellation or by timeout.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use p1_contracts::{CancellationToken, Tool, ToolCall, ToolContext, ToolInput, ToolStatus};
 use p1_tool_shell::ShellTool;
@@ -52,7 +52,14 @@ async fn cooperative_descendants_end_without_waiting_out_the_grace_period() {
     let dir = tempfile::tempdir().unwrap();
     let tool = ShellTool::new(Workspace::new(dir.path()).unwrap());
     let cancel = CancellationToken::new();
-    let call = call("sleep 300 & echo $! > pid; wait", None);
+    // The leader records how its descendant ended: on the group's SIGTERM its trap waits
+    // for the descendant and writes that exit status, then the leader exits too. A SIGKILL
+    // anywhere in the group (the grace run out) leaves no status or a 137.
+    let call = call(
+        "trap 'wait \"$child\"; echo $? > status; exit 143' TERM; \
+         sleep 300 & child=$!; echo $child > pid; wait",
+        None,
+    );
     let run = tool.execute(
         &call,
         ToolContext {
@@ -62,17 +69,21 @@ async fn cooperative_descendants_end_without_waiting_out_the_grace_period() {
     let stopper = async {
         let pid = wait_for_pid(dir.path(), "pid").await;
         cancel.cancel();
-        (pid, Instant::now())
+        pid
     };
-    let (outcome, (pid, cancelled_at)) = tokio::join!(run, stopper);
+    let (outcome, pid) = tokio::join!(run, stopper);
 
     assert_eq!(outcome.status, ToolStatus::Cancelled);
     assert!(!alive(pid), "descendant {pid} survived");
-    // SIGTERM is enough here; the 2 s grace period must not be slept through.
-    assert!(
-        cancelled_at.elapsed() < Duration::from_millis(1500),
-        "took {:?}",
-        cancelled_at.elapsed()
+    // SIGTERM is enough here; the group must not be left for the SIGKILL after the 2 s
+    // grace period. 143 = 128 + SIGTERM: the descendant died of the TERM, and the leader
+    // lived to report it, so nothing in the group was killed.
+    let status = std::fs::read_to_string(dir.path().join("status"))
+        .unwrap_or_else(|error| panic!("the leader did not survive to report: {error}"));
+    assert_eq!(
+        status.trim(),
+        "143",
+        "the descendant must end by SIGTERM (143), not SIGKILL (137)"
     );
 }
 
