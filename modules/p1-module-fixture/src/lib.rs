@@ -67,7 +67,7 @@ impl Guest for Fixture {
 
     fn effect(call: ToolCall) -> CallEffect {
         // The worst case of this fixture is a call that runs a script, and only a script mode
-        // asks for one; everything else, unknown input included, is read-only.
+        // asks for one; else read-only, unknown input included — worlds.wit's worst case is moot, since execute rejects it first.
         if executes(head(&call).as_deref()) {
             CallEffect::Executes
         } else {
