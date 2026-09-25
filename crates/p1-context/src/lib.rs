@@ -239,7 +239,11 @@ impl ContextPolicy for SummarizingContext {
                     Err(Ask::Cancelled) => return Err(ContextError::Cancelled),
                     Err(Ask::Failed(reason)) => return failure(next_input, wall, reason),
                 };
-                usage = sum_usage(usage, response.usage);
+                usage = if attempts == 1 {
+                    response.usage
+                } else {
+                    sum_usage(usage, response.usage)
+                };
                 match response.stop {
                     StopReason::EndTurn => break response.item.text(),
                     // The cap actually sent, doubled: an agent's own lower limit
@@ -375,17 +379,15 @@ enum Ask {
     Cancelled,
 }
 
-/// The usage of two requests of one summarization, summed per part. A part is
-/// summed only when BOTH requests reported it: when either one left it unknown the
+/// The usage of the two requests of a retried summarization, summed per part. A part
+/// is summed only when BOTH requests reported it: when either one left it unknown the
 /// sum is unknown too, because a sum over an unknown part would state a number the
 /// route never reported (context.md, "unknown is not zero" — the same rule the
-/// estimator's `remaining` follows). Whole usage stays unknown when neither
-/// request reported any.
+/// estimator's `remaining` follows). Whole usage is unknown when either request
+/// reported none. A summarization that needed one request keeps that request's usage
+/// as it is (the caller sums only from the second attempt on).
 fn sum_usage(first: Option<Usage>, second: Option<Usage>) -> Option<Usage> {
-    if first.is_none() && second.is_none() {
-        return None;
-    }
-    let (a, b) = (first.unwrap_or_default(), second.unwrap_or_default());
+    let (a, b) = (first?, second?);
     let part = |x: Option<u64>, y: Option<u64>| match (x, y) {
         (Some(x), Some(y)) => Some(x + y),
         _ => None,
