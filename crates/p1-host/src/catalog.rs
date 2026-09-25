@@ -390,6 +390,7 @@ fn chat_route_from(
         headers,
         session_header: settings.session_header,
         dialect: settings.dialect,
+        client_identity: settings.client_identity,
         limits: ChatLimits {
             max_output_tokens: lower_ceiling(profile.max_output_tokens, binding.output_limit),
         },

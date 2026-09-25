@@ -32,7 +32,7 @@ use p1_provider_conformance::{
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 use p1_provider_openai::{ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport};
-use p1_provider_openai_chat::{ChatAdapterSettings, ChatDialect, build_request};
+use p1_provider_openai_chat::{ChatAdapterSettings, ChatDialect, ClientIdentity, build_request};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
 
@@ -585,6 +585,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         AdapterSettings::OpenAiChat(ChatAdapterSettings {
             dialect: ChatDialect::ThinkingWithReasoningAlias,
             session_header: Some("x-opencode-session".into()),
+            client_identity: None,
         })
     );
     let deepseek = &go.models["deepseek-v4.1-flash"];
@@ -611,6 +612,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         AdapterSettings::OpenAiChat(ChatAdapterSettings {
             dialect: ChatDialect::RetainedThinking,
             session_header: None,
+            client_identity: None,
         })
     );
     assert_eq!(glm.models["glm-5.3"].wire_model, "glm-5.3");
@@ -635,6 +637,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         AdapterSettings::OpenAiChat(ChatAdapterSettings {
             dialect: ChatDialect::RetainedThinking,
             session_header: None,
+            client_identity: None,
         })
     );
     assert_eq!(kimi.models.len(), 1);
@@ -668,11 +671,7 @@ fn the_new_opencode_account_routes_are_distinct() {
     const GO_ENDPOINT: &str = "https://opencode.ai/zen/go/v1/chat/completions";
     const ZEN_ENDPOINT: &str = "https://opencode.ai/zen/v1/chat/completions";
     const GO_MODELS: [&str; 1] = ["deepseek-v4.1-flash"];
-    const ZEN_MODELS: [&str; 3] = [
-        "mimo-v2.6-flash-free",
-        "muse-spark-1.3-contributor-free",
-        "space-bunny-free",
-    ];
+    const ZEN_MODELS: [&str; 2] = ["mimo-v2.6-flash-free", "space-bunny-free"];
     // (route id, endpoint, the variable it names, the profiles it binds)
     let expected: [(&str, &str, &str, &[&str]); 8] = [
         (
@@ -727,10 +726,6 @@ fn the_new_opencode_account_routes_are_distinct() {
             &ZEN_MODELS[..],
         ),
     ];
-    let settings = AdapterSettings::OpenAiChat(ChatAdapterSettings {
-        dialect: ChatDialect::ThinkingWithReasoningAlias,
-        session_header: Some("x-opencode-session".into()),
-    });
     for (id, endpoint, env, models) in expected {
         let route = load_route_by_id(&dirs, id).expect("the shipped route file");
         assert_eq!(route.id, id);
@@ -741,9 +736,19 @@ fn the_new_opencode_account_routes_are_distinct() {
         assert_eq!(route.credential.env.as_deref(), Some(env), "{id}");
         assert!(route.credential.store_only, "{id} is store-only (ADR-0061)");
         assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
+        // The free Zen routes present the OpenCode client identity (owner decision 2026-09-24,
+        // ADR-0067); the Go and ClinePass routes keep p1's own identity.
+        let identity = id
+            .starts_with("opencode-zen")
+            .then_some(ClientIdentity::Opencode);
+        let settings = AdapterSettings::OpenAiChat(ChatAdapterSettings {
+            dialect: ChatDialect::ThinkingWithReasoningAlias,
+            session_header: Some("x-opencode-session".into()),
+            client_identity: identity,
+        });
         assert_eq!(
             route.settings().expect("the adapter parses its settings"),
-            settings.clone(),
+            settings,
             "{id}"
         );
         assert!(route.headers.is_empty(), "{id}: user-agent stays compiled");
@@ -799,6 +804,7 @@ fn the_clinepass_routes_bind_only_subscription_wire_ids() {
             AdapterSettings::OpenAiChat(ChatAdapterSettings {
                 dialect: ChatDialect::ThinkingWithReasoningAlias,
                 session_header: None,
+                client_identity: None,
             }),
             "{id}"
         );
