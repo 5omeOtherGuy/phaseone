@@ -4,7 +4,7 @@ title: A second Claude subscription route: claude-code-oauth borrows a named log
 status: proposed
 date: 2026-09-25
 deciders: owner
-supersedes: []
+supersedes: [61]
 superseded_by: []
 sources: [docs/design/credentials.md, docs/design/routes-and-profiles.md, crates/p1-auth/src/spec.rs, crates/p1-auth/src/locations.rs, crates/p1-auth/src/resolve.rs, crates/p1-auth/src/store.rs, crates/p1-host/src/login.rs, crates/p1-host/src/cli.rs, crates/p1-host/src/usage.rs, routes/anthropic-subscription-2.toml, environments/claude2/environment.toml]
 ---
@@ -35,10 +35,11 @@ Two facts shape the decision:
 ## Decision
 
 1. **`login_dir` in `[credential]`.** A `claude-code-oauth` route may name the Claude Code
-   config directory whose login it borrows: an absolute path, or one starting with `~/`
-   that is expanded against the home directory when it is used. Absent keeps the default
-   (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). Any other kind with `login_dir`, or a relative
-   directory, is a route-file load error. This amends ADR-0061's login-file rule only by
+   config directory whose login it borrows: an absolute path, or a directory below the
+   home (`~/<dir>`) that is expanded against the home directory when it is used. Absent
+   keeps the default (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). Any other kind with
+   `login_dir`, a relative directory, or the home itself (`~`, `~/`) is a route-file load
+   error. This amends ADR-0061's login-file rule only by
    naming the directory: the named login is read in place with the same lock, re-read and
    refresh write-back as the default one, and `store_only` still means it is never read.
 2. **`p1 login <route> --from-claude-code [DIR]`.** For a `claude-code-oauth` route it
@@ -49,7 +50,11 @@ Two facts shape the decision:
    through the store's own writer (0600 file, a wider store or directory refused, lock,
    atomic replace). A non-`claude-code-oauth` route, or a directory without a login, is a
    usage error naming the fix. The token is never an argument, and no output, log or error
-   carries it.
+   carries it. Importing again replaces the entry. Because p1's store precedes the borrowed
+   login, an imported copy wins over the live login until `p1 logout <route>` removes it:
+   `p1 logout` now removes a `claude-code-oauth` or `codex-oauth` route's store entry like an
+   API key's (a missing entry on such a route is a usage error), and both the import and the
+   plain-`p1 login` refusal say so.
 3. **A second shipped route and environment.** `routes/anthropic-subscription-2.toml` is
    `anthropic-subscription` with its own id, its own origin
    (`anthropic-messages/claude-subscription-2`) and the credential
@@ -58,6 +63,23 @@ Two facts shape the decision:
    `environments/claude2` is `environments/claude` with `route = "anthropic-subscription-2"`,
    so `claude2/<profile>[:effort]` works wherever `claude/…` does. `p1 usage` labels the
    route `claude max 2` and probes it with its own credential.
+4. **This supersedes ADR-0061, in three of its decisions** (`scripts/adr.py` records a
+   reversal only as a whole-ADR supersession; the rest of ADR-0061 still stands):
+   - ADR-0061 decision 4 ("every shipped route is store-only … no shipped route reads Pi,
+     OpenCode, Claude Code or Codex at runtime") is replaced by: every shipped route is
+     store-only EXCEPT `anthropic-subscription-2`, which reads the second account's Claude
+     Code login in its `login_dir` at runtime.
+   - ADR-0061 decision 5 ("`p1 login` cannot write an OAuth entry yet") is replaced by: a
+     `claude-code-oauth` route's entry is written by `p1 login <route> --from-claude-code`,
+     and `p1 logout <route>` removes an OAuth route's entry; `p1 login <route>` alone still
+     reads no OAuth grant from stdin and still never pretends a browser flow exists.
+   - ADR-0061 decision 6 ("importing a live refresh token from another CLI is explicitly
+     rejected as the long-term mechanism") is replaced by: importing a Claude Code login is a
+     supported, explicit operator action with the rotation risk stated (Consequences); minting
+     an independent grant remains the open work of `docs/design/credentials.md` §8.4.
+   - ADR-0061 decisions 1–3 STILL STAND unchanged: the `store_only` field and its meaning
+     (env + p1's store only, the borrowed source never constructed), `store_only` as a policy
+     that conflicts with a nonempty `borrow`, and the visible ` [p1 store only]` marker.
 
 ## Consequences
 

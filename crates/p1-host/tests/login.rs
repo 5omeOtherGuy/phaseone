@@ -534,7 +534,9 @@ async fn from_claude_code_imports_the_routes_login_dir_into_a_private_store() {
     assert_eq!(
         harness.stdout.text(),
         format!(
-            "imported the Claude Code login in {} for claude-route-2 · source now: p1 store\n",
+            "imported the Claude Code login in {} for claude-route-2 · source now: p1 store\n\
+             this p1 store entry wins over any Claude Code login the route borrows until \
+             `p1 logout claude-route-2` removes it\n",
             dir.display()
         )
     );
@@ -628,6 +630,146 @@ async fn from_claude_code_refuses_a_non_oauth_route_and_a_missing_login() {
         "{}",
         harness.stderr.text()
     );
+}
+
+/// ADR-0074 review: an imported copy shadows the live login, so there must be a way back.
+/// `p1 logout` removes an OAuth route's entry exactly like an API key's, every other entry
+/// stays byte for byte, and the route borrows its Claude Code login again.
+#[tokio::test]
+async fn logout_removes_an_imported_oauth_entry_and_the_live_login_answers_again() {
+    let scratch = Scratch::new();
+    scratch.write_route(
+        "claude-route-2",
+        "kind      = \"claude-code-oauth\"\nlogin_dir = \"~/.claude-2\"\n",
+    );
+    scratch.write_route("codex-route", "kind = \"codex-oauth\"\n");
+    write_claude_login(&scratch, ".claude-2");
+    let others = serde_json::json!({
+        "codex-route": {"type": "oauth", "access": "FAKE-CODEX", "refresh": null,
+                        "expires": null, "account_id": "fake-acct", "extra": [1, 2]},
+        "other-route": {"type": "api_key", "key": "FAKE-OTHER"},
+    });
+    let pretty = |value: &Value| format!("{}\n", serde_json::to_string_pretty(value).unwrap());
+    scratch.write_store(&pretty(&others), 0o600);
+    let harness = scratch.harness(&[]);
+
+    assert_eq!(
+        p1_host::login::from_claude_code(&harness.deps, "claude-route-2", None).await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    let route = p1_host::routes::load_route_by_id(&harness.deps.environment_dirs, "claude-route-2")
+        .unwrap();
+    let locations = p1_auth::Locations::none().with_home(Some(scratch.home()));
+    assert_eq!(
+        p1_auth::describe("claude-route-2", &route.credential, &locations).chosen,
+        Some(p1_auth::SourceName::P1Store),
+        "the imported copy wins over the live login"
+    );
+
+    assert_eq!(
+        p1_host::login::logout(&harness.deps, "claude-route-2").await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    assert!(
+        harness
+            .stdout
+            .text()
+            .ends_with("removed claude-route-2 from p1's store\n"),
+        "{}",
+        harness.stdout.text()
+    );
+    assert_eq!(
+        scratch.store(),
+        pretty(&others),
+        "every other entry is byte-identical"
+    );
+    assert_eq!(mode(&scratch.store_path()), 0o600);
+    assert_eq!(
+        p1_auth::describe("claude-route-2", &route.credential, &locations).chosen,
+        Some(p1_auth::SourceName::ClaudeCodeLogin),
+        "the borrowed login answers again"
+    );
+
+    // A codex-oauth route's entry is removable too.
+    assert_eq!(
+        p1_host::login::logout(&harness.deps, "codex-route").await,
+        0
+    );
+    assert_eq!(
+        scratch.store(),
+        pretty(&serde_json::json!({"other-route": {"type": "api_key", "key": "FAKE-OTHER"}}))
+    );
+}
+
+/// An OAuth route with no p1 store entry: nothing to remove, and its login is the CLI's,
+/// which `p1 logout` must not pretend to touch — a usage error.
+#[tokio::test]
+async fn logout_of_an_oauth_route_with_no_entry_is_a_usage_error() {
+    let scratch = Scratch::new();
+    scratch.write_route("claude-route", "kind = \"claude-code-oauth\"\n");
+    scratch.write_store(
+        "{\"other-route\":{\"type\":\"api_key\",\"key\":\"K\"}}",
+        0o600,
+    );
+    let harness = scratch.harness(&[]);
+
+    assert_eq!(
+        p1_host::login::logout(&harness.deps, "claude-route").await,
+        2
+    );
+    let stderr = harness.stderr.text();
+    assert!(
+        stderr.contains("no claude-route entry in p1's store")
+            && stderr.contains("Claude Code CLI (`claude`)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        scratch.store(),
+        "{\"other-route\":{\"type\":\"api_key\",\"key\":\"K\"}}",
+        "the store is left alone"
+    );
+}
+
+/// Importing twice replaces the route's entry; it never adds a second one.
+#[tokio::test]
+async fn from_claude_code_twice_replaces_the_entry() {
+    let scratch = Scratch::new();
+    scratch.write_route("claude-route", "kind = \"claude-code-oauth\"\n");
+    write_claude_login(&scratch, "first");
+    let second = scratch.home().join("second");
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(
+        second.join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"FAKE-SECOND","refreshToken":"FAKE-SECOND-R"}}"#,
+    )
+    .unwrap();
+    let harness = scratch.harness(&[]);
+
+    for dir in ["~/first", "~/second"] {
+        assert_eq!(
+            p1_host::login::from_claude_code(&harness.deps, "claude-route", Some(dir)).await,
+            0,
+            "{}",
+            harness.stderr.text()
+        );
+    }
+    let store: Value = serde_json::from_str(&scratch.store()).unwrap();
+    assert_eq!(
+        store,
+        serde_json::json!({ "claude-route": {
+            "type": "oauth",
+            "access": "FAKE-SECOND",
+            "refresh": "FAKE-SECOND-R",
+            "expires": null,
+            "account_id": null,
+        } }),
+        "one entry, the second login's"
+    );
+    assert_eq!(scratch.store().matches("claude-route").count(), 1);
 }
 
 // -------------------------------------------------------------------- logout

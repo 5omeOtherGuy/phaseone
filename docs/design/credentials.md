@@ -37,7 +37,8 @@ source beside it is a contradiction, so `env`, a nonempty `borrow` or `store_onl
 `none` route is a load error.
 
 `login_dir` (ADR-0074, §10) is allowed ONLY on `claude-code-oauth`: the same field on any other
-kind is a load error, and so is a directory that is neither absolute nor starts with `~/`.
+kind is a load error, and so is a directory that is neither absolute nor below the home
+(`~/<dir>`; the home itself, `~` or `~/`, is refused).
 
 `p1_auth::resolve(route_id, &spec, transport, &Locations) -> Arc<dyn CredentialSource>`.
 `Locations` carries every directory the chain may touch (home, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
@@ -154,7 +155,9 @@ p1 logout <route>         remove the route's entry from p1's store
   variable still overrides the store, the line says so, because that is the surprise ADR-0040
   warned about.
 - `logout` removes only that route's entry; a missing entry is reported, not an error; an empty
-  object stays a valid file.
+  object stays a valid file. Since ADR-0074 `logout` also removes a `claude-code-oauth` or
+  `codex-oauth` route's store entry (an imported copy, §10); for those routes a missing entry is a
+  usage error, because their login lives with the CLI and `logout` cannot touch it.
 - The key never appears in output, errors, the journal or `Debug`; tests seed a sentinel and
   assert its absence everywhere except the store file.
 
@@ -190,7 +193,9 @@ the tests pin under "explicit legacy configuration".
 
 ### 8.2 The shipped set
 
-Every shipped `routes/*.toml` is store-only: `anthropic-subscription` and
+Every shipped `routes/*.toml` is store-only except ONE, `anthropic-subscription-2` (the second
+Claude subscription, ADR-0074, §10.3), which borrows its account's Claude Code login in its
+`login_dir` by owner order. The store-only set: `anthropic-subscription` and
 `openai-codex-subscription` (the two OAuth kinds) and `glm-subscription`,
 `kimi-coding-subscription`, `opencode-go-subscription`, `opencode-go-1-subscription`,
 `opencode-go-2-subscription`, `opencode-go-3-subscription`, `opencode-zen-1`, `opencode-zen-2`,
@@ -199,8 +204,8 @@ own route with its own variable and its own store entry; `opencode-go-subscripti
 account) and `opencode-zen-free` (the Zen-1 account) are compatibility aliases: each reaches the
 same account as its numbered route by owner convention, not a code feature. Each alias has its own
 store entry (or variable: `OPENCODE_API_KEY`, `OPENCODE_ZEN_API_KEY`) that must hold that account's
-key; nothing in p1 keeps the two entries equal — the operator's keys-sync writes both. No shipped route
-reads another tool's login at runtime.
+key; nothing in p1 keeps the two entries equal — the operator's keys-sync writes both. Apart from
+`anthropic-subscription-2`, no shipped route reads another tool's login at runtime.
 
 ### 8.3 Migration
 
@@ -233,6 +238,9 @@ OAuth routes need a grant placed in the store by another step. Requirements for 
 - **Status.** The Codex grant from the retired Pi store was transferred by the XO and passed a live
   p1 request. The Claude independent grant is pending an owner login. No credential value appears
   in this repository.
+- **Since ADR-0074** a Claude Code login CAN be copied into p1's store
+  (`p1 login <route> --from-claude-code`, §10.2), with the rotation risk above stated there, and
+  the second Claude route borrows its login in place instead of holding a grant (§10.3).
 
 ## 9. A route that sends NO credential — `kind = "none"` (issue #134)
 
@@ -299,9 +307,9 @@ kept in its own config directory (`CLAUDE_CONFIG_DIR=~/.claude-2 claude`).
 ### 10.1 `login_dir`
 
 `[credential] login_dir = "<dir>"` names the Claude Code config directory a `claude-code-oauth`
-route borrows: `<dir>/.credentials.json` replaces the default file in the chain of §2. A leading
-`~` (`~` alone or `~/…`) is expanded against the home directory of the `Locations` at use time;
-any other value must be absolute. Absent keeps the default directory (`$CLAUDE_CONFIG_DIR`, else
+route borrows: `<dir>/.credentials.json` replaces the default file in the chain of §2. A
+`~/<dir>` value is expanded against the home directory of the `Locations` at use time; any other
+value must be absolute, and the home itself (`~`, `~/`) is refused at load. Absent keeps the default directory (`$CLAUDE_CONFIG_DIR`, else
 `~/.claude`); a route that names one never falls back to the default. The named login is handled
 exactly like the default one — read fresh on every `access`, refreshed under its own `.lock`,
 re-read under the lock, written back to the same file — and nothing is copied. `store_only`
@@ -324,8 +332,15 @@ directory of the import below. Any other kind with `login_dir` is a load error (
 - The write is the store's own (`p1_auth::store::import_claude_code_login`): lock, read-modify-
   write, atomic 0600 file, 0700 directory when created, a wider existing file or directory
   refused with the chmod message, every other entry preserved.
-- The output is `imported the Claude Code login in <DIR> for <route> · source now: <§4 line>`.
-  No token is ever an argument or appears in output, an error or a log.
+- The output is `imported the Claude Code login in <DIR> for <route> · source now: <§4 line>`,
+  then a line saying that this p1 store entry wins over any Claude Code login the route borrows
+  until `p1 logout <route>` removes it. No token is ever an argument or appears in output, an
+  error or a log.
+- **An imported copy wins over the live login until `p1 logout <route>`.** p1's store precedes
+  the borrowed login in the chain (§2), so on a route that also borrows (`anthropic-subscription-2`)
+  the copy shadows the live `~/.claude-2` login — also after Claude Code rotated it. `p1 logout
+  <route>` removes the entry (every other entry left as it was), and the route borrows the live
+  login again. Importing again replaces the entry; there is never a second one.
 - An imported refresh token is a COPY (the rotation risk of §8.4): the first refresh on either
   side invalidates the other. The import is for a machine where only p1 uses the login (an EC2
   box: the route then reads p1's store), or to be repeated after Claude Code rotated it.
@@ -343,5 +358,8 @@ its own credential.
 `login_dir` parsed, expanded and used (a scratch directory with a fake `.credentials.json`;
 absent → the default directory); `login_dir` on another kind is a load error; the import writes
 exactly the store's `oauth` shape, 0600, refuses a non-`claude-code-oauth` route and a missing
-login as usage errors, and no output or error carries a token
+login as usage errors, and no output or error carries a token; an import twice replaces the
+entry; `p1 logout` removes an OAuth entry with every other entry byte-identical and is a usage
+error for an OAuth route without one; a refresh through a `login_dir` writes back to
+`<login_dir>/.credentials.json` (0600, atomic) and never touches `~/.claude`
 (`crates/p1-auth/tests/login_dir.rs`, `crates/p1-host/tests/login.rs`).

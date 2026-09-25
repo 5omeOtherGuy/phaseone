@@ -167,7 +167,9 @@ pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>
     out(
         deps,
         &format!(
-            "imported the Claude Code login in {} for {route_id} · source now: {}\n",
+            "imported the Claude Code login in {} for {route_id} · source now: {}\n\
+             this p1 store entry wins over any Claude Code login the route borrows until \
+             `p1 logout {route_id}` removes it\n",
             source.display(),
             report.line()
         ),
@@ -206,8 +208,11 @@ pub fn list(deps: &HostDeps) -> i32 {
     EXIT_OK
 }
 
-/// `p1 logout <route>`: remove that route's entry from p1's store. A missing entry
-/// is reported, not an error.
+/// `p1 logout <route>`: remove that route's entry from p1's store. An `api-key` route
+/// and an OAuth route (`claude-code-oauth`, `codex-oauth`) alike: an imported OAuth copy
+/// wins over the live login until it is removed here (ADR-0074). A missing entry of an
+/// `api-key` route is reported, not an error; a missing entry of an OAuth route is a
+/// usage error, because its login lives with the CLI and this command cannot touch it.
 pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
     let routes = match load_all_routes(&deps.environment_dirs) {
         Ok(routes) => routes,
@@ -216,19 +221,35 @@ pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
             return EXIT_FAILURE;
         }
     };
-    if let Err(message) = api_key_route(&routes, route_id) {
-        return usage_error(deps, &message);
-    }
+    let kind = match find_route(&routes, route_id) {
+        Ok(route) => match route.credential.kind {
+            CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth => route.credential.kind,
+            _ => match api_key_route(&routes, route_id) {
+                Ok(route) => route.credential.kind,
+                Err(message) => return usage_error(deps, &message),
+            },
+        },
+        Err(message) => return usage_error(deps, &message),
+    };
     let locations = crate::auth::locations(deps);
     match p1_auth::store::remove(route_id, &locations).await {
         Ok(true) => {
             out(deps, &format!("removed {route_id} from p1's store\n"));
             EXIT_OK
         }
-        Ok(false) => {
+        Ok(false) if kind == CredentialKind::ApiKey => {
             out(deps, &format!("no {route_id} entry in p1's store\n"));
             EXIT_OK
         }
+        Ok(false) => usage_error(
+            deps,
+            &format!(
+                "no {route_id} entry in p1's store; route `{route_id}` is a {} route whose \
+                 login comes from {}, which `p1 logout` does not touch",
+                kind.name(),
+                login_owner(kind)
+            ),
+        ),
         Err(message) => {
             err(deps, &format!("error: {message}\n"));
             EXIT_FAILURE
@@ -264,7 +285,9 @@ fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a Rout
             import_hint(kind, route_id)
         )),
         kind => Err(format!(
-            "route `{route_id}` is a {} route; its login comes from {}, not from p1's store{}",
+            "route `{route_id}` is a {} route; its login comes from {}, not from p1's store — \
+             unless p1's store holds an entry for the route: that entry wins over the login \
+             until `p1 logout {route_id}` removes it{}",
             kind.name(),
             login_owner(kind),
             import_hint(kind, route_id)

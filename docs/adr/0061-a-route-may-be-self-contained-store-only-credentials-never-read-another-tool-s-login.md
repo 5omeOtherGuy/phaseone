@@ -1,11 +1,11 @@
 ---
 adr: 61
 title: A route may be self-contained: store-only credentials never read another tool's login
-status: accepted
+status: superseded
 date: 2026-09-24
 deciders: owner
 supersedes: []
-superseded_by: []
+superseded_by: [74]
 sources: [docs/design/credentials.md, docs/design/routes-and-profiles.md, crates/p1-auth/src/spec.rs, crates/p1-auth/src/resolve.rs, crates/p1-host/src/login.rs, routes/anthropic-subscription.toml, routes/openai-codex-subscription.toml]
 ---
 # ADR-0061: A route may be self-contained: store-only credentials never read another tool's login

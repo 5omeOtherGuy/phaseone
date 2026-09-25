@@ -401,6 +401,27 @@ fn a_pair_reference_resolves_to_that_pair() {
 }
 
 #[test]
+fn a_bare_claude_profile_takes_the_current_claude_account_and_is_ambiguous_elsewhere() {
+    // ADR-0074: both Claude subscriptions bind every Claude profile, so a bare
+    // `claude-opus-5` takes the current environment's binding when that is one of the two
+    // Claude accounts, and is an error (never a guess) from any other environment.
+    let models = shipped_models();
+    for environment in ["claude", "claude2"] {
+        let resolved = models::resolve("claude-opus-5:high", environment, &models).unwrap();
+        assert_eq!(resolved.environment, environment);
+        assert_eq!(resolved.profile, "claude-opus-5");
+        assert_eq!(resolved.effort, Some(Effort::High));
+    }
+    let error = models::resolve("claude-opus-5", "gpt", &models).unwrap_err();
+    assert!(error.contains("more than one environment"), "{error}");
+    assert!(
+        error.contains("claude/claude-opus-5") && error.contains("claude2/claude-opus-5"),
+        "{error}"
+    );
+    assert!(error.contains("environment/profile"), "{error}");
+}
+
+#[test]
 fn a_bare_profile_prefers_the_current_environment() {
     let models = shipped_models();
     // `deepseek` and `deepseek2` both bind `deepseek-v4.1-flash`; the current

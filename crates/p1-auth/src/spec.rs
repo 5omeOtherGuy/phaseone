@@ -117,8 +117,8 @@ pub struct CredentialSpec {
     #[serde(default)]
     pub store_only: bool,
     /// The Claude Code config directory whose login this route borrows (ADR-0074),
-    /// as the file writes it: an absolute path or one that starts with `~/`, which is
-    /// expanded against the home directory when it is used. Only a
+    /// as the file writes it: an absolute path or a directory below the home (`~/<dir>`,
+    /// never `~` itself), expanded against the home directory when it is used. Only a
     /// `claude-code-oauth` route may name one. Absent keeps the default directory
     /// (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). It is also the directory
     /// `p1 login <route> --from-claude-code` imports from when no directory is given.
@@ -178,10 +178,12 @@ impl CredentialSpec {
                     self.kind.name()
                 ));
             }
-            if !(dir == "~" || dir.starts_with("~/") || dir.starts_with('/')) {
+            // The home directory itself (`~`, `~/`) is not a Claude Code config directory.
+            let below_home = dir.strip_prefix("~/").is_some_and(|rest| !rest.is_empty());
+            if !(below_home || dir.starts_with('/')) {
                 return Err(format!(
-                    "`[credential]` login_dir \"{dir}\" is neither an absolute path nor one that \
-                     starts with `~/`"
+                    "`[credential]` login_dir \"{dir}\" is neither an absolute path nor a \
+                     directory below the home (`~/<dir>`)"
                 ));
             }
         }

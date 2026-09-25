@@ -19,6 +19,16 @@ The candidates are exactly: every environment E, every profile P bound in E's ro
 environment property: a model is listed once per environment, and `claude/claude-opus-5` is one
 model, not two. Nothing else is selectable; there is no free-text model id.
 
+The two Claude subscriptions are two environments (ADR-0074): `claude` (route
+`anthropic-subscription`) and `claude2` (route `anthropic-subscription-2`) bind the same profiles,
+so `claude/claude-opus-5` and `claude2/claude-opus-5` are two models — the same profile on two
+accounts. A bare `--model claude-opus-5` takes the CURRENT environment's binding (the `--env`
+given, else the default `claude`); from any environment that binds it in neither Claude account
+(e.g. `--env gpt --model claude-opus-5`) it is an error listing both pairs, and the `E/P` form
+selects one. Rule 2 below is that behaviour, pinned by
+`a_bare_claude_profile_takes_the_current_claude_account_and_is_ambiguous_elsewhere`
+(`crates/p1-host/tests/models.rs`).
+
 **Reference resolution** (`--model`, `/model`, `default_model`), in order:
 1. `E/P` — that pair; unknown pair → error listing the pairs whose P or E matches.
 2. bare `P` — the pairs whose profile is P. If the CURRENT environment (the `--env` given, else

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use p1_auth::store::{ImportError, import_claude_code_login};
 use p1_auth::{CredentialSpec, SourceName, describe, resolve};
-use p1_provider_http::testing::ScriptedTransport;
-use support::{NEVER_EXPIRES_MS, Scratch, claude_login};
+use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
+use support::{LONG_EXPIRED_MS, NEVER_EXPIRES_MS, Scratch, claude_login};
 
 const ROUTE: &str = "test-route-2";
 const SENTINEL_ACCESS: &str = "FAKE-SENTINEL-ACCESS";
@@ -91,10 +91,16 @@ fn a_login_dir_on_any_other_kind_or_a_relative_one_is_a_load_error() {
             "{json}: {error}"
         );
     }
-    let error = spec(r#"{"kind":"claude-code-oauth","login_dir":"claude-2"}"#)
+    // A relative directory, and the home directory itself (`~`, `~/`), are refused: a
+    // Claude Code login directory is absolute or a directory BELOW the home.
+    for dir in ["claude-2", "~", "~/"] {
+        let error = spec(&format!(
+            r#"{{"kind":"claude-code-oauth","login_dir":"{dir}"}}"#
+        ))
         .validate()
         .unwrap_err();
-    assert!(error.contains("absolute"), "{error}");
+        assert!(error.contains("absolute"), "{dir}: {error}");
+    }
 }
 
 #[tokio::test]
@@ -200,5 +206,84 @@ async fn an_import_writes_exactly_the_store_oauth_shape_private_and_never_says_a
     assert!(
         !seen.contains(SENTINEL_ACCESS) && !seen.contains(SENTINEL_REFRESH),
         "a token leaked: {seen}"
+    );
+}
+
+/// Review item 8: a REFRESH through a named `login_dir`. The expired token in
+/// `<login_dir>/.credentials.json` is rotated against the scripted token endpoint, and the
+/// rotation is written back to THAT file (0600, replaced atomically — no temp file left
+/// beside it), never to the default `~/.claude`.
+#[tokio::test]
+async fn a_refresh_through_a_login_dir_writes_back_to_that_directory_only() {
+    let scratch = Scratch::new();
+    let default_login = claude_login(
+        "FAKE-DEFAULT-ACCESS",
+        "FAKE-DEFAULT-REFRESH",
+        NEVER_EXPIRES_MS,
+    );
+    scratch.write(".claude/.credentials.json", &default_login);
+    scratch.write(
+        ".claude-2/.credentials.json",
+        &claude_login("FAKE-OLD-ACCESS", "FAKE-OLD-REFRESH", LONG_EXPIRED_MS),
+    );
+    let transport = ScriptedTransport::new(vec![ScriptedResponse {
+        status: 200,
+        headers: Vec::new(),
+        chunks: vec![
+            serde_json::json!({
+                "access_token": "FAKE-NEW-ACCESS",
+                "refresh_token": "FAKE-NEW-REFRESH",
+                "expires_in": 3600,
+            })
+            .to_string()
+            .into_bytes(),
+        ],
+        end: BodyEnd::Eof,
+    }]);
+    let second = spec(r#"{"kind":"claude-code-oauth","login_dir":"~/.claude-2"}"#);
+
+    let credential = resolve(
+        ROUTE,
+        &second,
+        Arc::new(transport.clone()),
+        &scratch.locations(),
+    )
+    .access()
+    .await
+    .unwrap();
+
+    assert_eq!(credential.bearer, "FAKE-NEW-ACCESS");
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1, "exactly one rotation");
+    let body = String::from_utf8(requests[0].body.clone()).unwrap();
+    assert!(
+        body.contains("FAKE-OLD-REFRESH"),
+        "the named login's refresh token is used"
+    );
+
+    let written: serde_json::Value =
+        serde_json::from_str(&scratch.read(".claude-2/.credentials.json")).unwrap();
+    assert_eq!(written["claudeAiOauth"]["accessToken"], "FAKE-NEW-ACCESS");
+    assert_eq!(written["claudeAiOauth"]["refreshToken"], "FAKE-NEW-REFRESH");
+    let mode = std::fs::metadata(scratch.path(".claude-2/.credentials.json"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+    let leftovers: Vec<String> = std::fs::read_dir(scratch.path(".claude-2"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".credentials.json" && name != ".credentials.json.lock")
+        .collect();
+    assert!(leftovers.is_empty(), "no temp file is left: {leftovers:?}");
+    assert_eq!(
+        scratch.read(".claude/.credentials.json"),
+        default_login,
+        "the default login is never touched"
+    );
+    assert!(
+        !scratch.path(".claude/.credentials.json.lock").exists(),
+        "not even locked"
     );
 }
