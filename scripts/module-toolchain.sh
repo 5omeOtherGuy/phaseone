@@ -158,17 +158,36 @@ else
   echo "wasmtime: not pinned yet (S0.2)"
 fi
 
-# Features are a record, not a lockfile fact: Cargo.lock does not carry them.
+# Cargo.lock does not carry features, so they are checked against the one manifest that
+# declares wasmtime. Compared as sorted sets: the order in either file carries no meaning.
+runtime_manifest=crates/p1-module-runtime/Cargo.toml
+feature_set() { tr -d ' "' <<<"$1" | tr ',' '\n' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd, -; }
 if [ -n "${pin[WASMTIME_FEATURES]:-}" ]; then
-  echo "wasmtime_features: ${pin[WASMTIME_FEATURES]}"
+  want="$(feature_set "${pin[WASMTIME_FEATURES]}")"
+  declared=""
+  if [ -f "$runtime_manifest" ]; then
+    declared="$(sed -n 's/^wasmtime *= *{.*features *= *\[\([^]]*\)\].*/\1/p' "$runtime_manifest")"
+  fi
+  if [ -z "$declared" ]; then
+    echo "wasmtime_features: ${pin[WASMTIME_FEATURES]} (FAIL: no wasmtime features in $runtime_manifest)"
+    fail "WASMTIME_FEATURES pinned but $runtime_manifest declares no wasmtime features"
+  elif [ "$(feature_set "$declared")" = "$want" ]; then
+    echo "wasmtime_features: ${pin[WASMTIME_FEATURES]} (matches $runtime_manifest)"
+  else
+    echo "wasmtime_features: ${pin[WASMTIME_FEATURES]} (FAIL: $runtime_manifest has $(feature_set "$declared"))"
+    fail "WASMTIME_FEATURES pinned $want but $runtime_manifest has $(feature_set "$declared")"
+  fi
 else
   echo "wasmtime_features: not pinned yet (S0.2)"
 fi
 
+# wit-bindgen is a guest-side crate: only the module workspace locks it.
 if [ -n "${pin[WIT_BINDGEN]:-}" ]; then
-  lockfiles=(Cargo.lock)
-  [ -f modules/Cargo.lock ] && lockfiles+=(modules/Cargo.lock)
-  check_locked wit-bindgen "${pin[WIT_BINDGEN]}" "${lockfiles[@]}"
+  if [ -f modules/Cargo.lock ]; then
+    check_locked wit-bindgen "${pin[WIT_BINDGEN]}" modules/Cargo.lock
+  else
+    echo "wit-bindgen: ${pin[WIT_BINDGEN]} pinned (no module workspace yet)"
+  fi
 else
   echo "wit-bindgen: not pinned yet (S0.2)"
 fi
