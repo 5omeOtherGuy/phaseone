@@ -300,26 +300,45 @@ fn band(bg: Color, left: Vec<Seg>, right: Vec<Seg>, width: usize) -> Line<'stati
 }
 
 /// §6.2: `›` attn, the prompt in ink hanging 2; a steering message carries a faint tag.
+// Adapted from `iris-donor/src/ui/tui/pane.rs` `push_user_rows`, pinned at
+// `5b04a1ad3412ad0bb663b6355f77a024aec0ddfa`, MIT License.
 fn operator_lines(text: &str, steering: bool, width: usize, out: &mut Vec<Line<'static>>) {
     let clean = sanitize_text(text);
-    for (n, part) in wrap_paragraphs(&clean, operator_measure(width, steering))
-        .into_iter()
-        .enumerate()
-    {
-        if n == 0 {
+    let parts = wrap_paragraphs(&clean, operator_measure(width, steering));
+    // The marker identifies the turn, so blank rows before the first prompt text
+    // must not consume the only visual anchor.
+    let marked = parts
+        .iter()
+        .position(|part| !part.trim().is_empty())
+        .unwrap_or(0);
+    for (n, part) in parts.into_iter().enumerate() {
+        if n == marked {
             let tag = if steering {
                 vec![Seg::new(palette::FAINT, STEERING)]
             } else {
                 Vec::new()
             };
-            out.push(ground(
-                vec![
-                    Seg::new(palette::ATTN, format!("{} ", glyphs::OPERATOR)),
-                    Seg::new(palette::INK, part),
-                ],
-                tag,
-                width,
-            ));
+            if steering && operator_measure(width, steering) == 0 {
+                // The tag consumes the whole measured body at very narrow widths;
+                // put the marker beside it so the visual anchor is not truncated.
+                out.push(ground(
+                    Vec::new(),
+                    vec![
+                        Seg::new(palette::ATTN, format!("{} ", glyphs::OPERATOR)),
+                        Seg::new(palette::FAINT, STEERING),
+                    ],
+                    width,
+                ));
+            } else {
+                out.push(ground(
+                    vec![
+                        Seg::new(palette::ATTN, format!("{} ", glyphs::OPERATOR)),
+                        Seg::new(palette::INK, part),
+                    ],
+                    tag,
+                    width,
+                ));
+            }
         } else {
             out.push(ground(
                 vec![Seg::new(palette::INK, format!("{:HANG$}{part}", ""))],
@@ -832,6 +851,141 @@ mod tests {
             ["› a", "b"]
         );
         assert_eq!(count_rows(&t, 40), rows.len());
+    }
+
+    #[test]
+    fn operator_marker_skips_leading_blank_rows() {
+        let mut t = Transcript::new();
+        t.blocks.push(Block::Operator {
+            text: "\n\nhello".into(),
+            steering: false,
+        });
+        let rows = lines(&t, 40, usize::MAX, false, 0, true);
+        let text: Vec<String> = plain(&rows)
+            .iter()
+            .map(|row| row.trim_end().to_string())
+            .collect();
+        assert_eq!(text, ["", "", "  › hello"]);
+        assert_eq!(count_rows(&t, 40), rows.len());
+    }
+
+    #[test]
+    fn operator_marker_skips_leading_whitespace_row() {
+        let mut t = Transcript::new();
+        t.blocks.push(Block::Operator {
+            text: "  \nhi\nthere".into(),
+            steering: false,
+        });
+        let rows = lines(&t, 40, usize::MAX, false, 0, true);
+        let text: Vec<String> = plain(&rows)
+            .iter()
+            .map(|row| row.trim_end().to_string())
+            .collect();
+        assert_eq!(text, ["", "  › hi", "    there"]);
+    }
+
+    #[test]
+    fn operator_marker_keeps_paragraph_breaks_after_the_first_line() {
+        let mut t = Transcript::new();
+        t.blocks.push(Block::Operator {
+            text: "hello\n\nworld".into(),
+            steering: false,
+        });
+        let rows = lines(&t, 40, usize::MAX, false, 0, true);
+        let text: Vec<String> = plain(&rows)
+            .iter()
+            .map(|row| row.trim_end().to_string())
+            .collect();
+        assert_eq!(text, ["  › hello", "", "    world"]);
+    }
+
+    #[test]
+    fn steering_tag_uses_the_first_nonblank_operator_row() {
+        let mut t = Transcript::new();
+        t.blocks.push(Block::Operator {
+            text: "\nnow".into(),
+            steering: true,
+        });
+        let rows = lines(&t, 40, usize::MAX, false, 0, true);
+        let text = plain(&rows);
+        assert!(text[0].trim().is_empty());
+        assert!(!text[0].contains(STEERING));
+        assert!(text[1].starts_with("  › now"));
+        assert!(text[1].trim_end().ends_with(STEERING));
+    }
+
+    #[test]
+    fn all_blank_operator_input_keeps_the_marker_on_row_zero() {
+        for text in ["", "\n"] {
+            let mut t = Transcript::new();
+            t.blocks.push(Block::Operator {
+                text: text.into(),
+                steering: true,
+            });
+            let rows = lines(&t, 40, usize::MAX, false, 0, true);
+            let rendered = plain(&rows);
+            assert!(rendered[0].contains(glyphs::OPERATOR));
+            assert!(rendered[0].trim_end().ends_with(STEERING));
+        }
+    }
+
+    #[test]
+    fn operator_marker_invariants_hold_across_widths_and_steering() {
+        for text in [
+            "\n\nhello",
+            "  \nhi\nthere",
+            "hello\n\nworld",
+            "\nalpha beta gamma delta epsilon zeta",
+            "a\nb",
+            "why does compaction stall?",
+            " \n \nx",
+        ] {
+            for width in 12..=40 {
+                for steering in [false, true] {
+                    let mut t = Transcript::new();
+                    t.blocks.push(Block::Operator {
+                        text: text.into(),
+                        steering,
+                    });
+                    let rows = lines(&t, width, usize::MAX, false, 0, true);
+                    let expected =
+                        wrap_paragraphs(&sanitize_text(text), operator_measure(width, steering))
+                            .iter()
+                            .position(|part| !part.trim().is_empty())
+                            .unwrap_or(0);
+                    let marked: Vec<usize> = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| {
+                            row.spans.iter().any(|span| {
+                                span.style.fg == Some(palette::ATTN)
+                                    && span.content.starts_with(glyphs::OPERATOR)
+                            })
+                        })
+                        .map(|(n, _)| n)
+                        .collect();
+                    assert_eq!(
+                        marked,
+                        [expected],
+                        "text {text:?}, width {width}, steering {steering}"
+                    );
+                    let steering_rows = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| {
+                            row.spans.iter().any(|span| span.content.contains(STEERING))
+                        })
+                        .map(|(n, _)| n)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        steering_rows,
+                        if steering { vec![expected] } else { vec![] },
+                        "text {text:?}, width {width}"
+                    );
+                    assert_eq!(count_rows(&t, width), rows.len());
+                }
+            }
+        }
     }
 
     #[test]
