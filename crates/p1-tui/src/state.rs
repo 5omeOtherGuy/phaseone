@@ -1216,6 +1216,7 @@ mod tests {
         };
         composer.delete_to_line_start();
         assert_eq!((composer.text.as_str(), composer.cursor), ("abc\n", 4));
+        assert!(composer.revealed);
         composer.cursor = 4;
         composer.delete_to_line_start();
         assert_eq!((composer.text.as_str(), composer.cursor), ("abc\n", 4));
