@@ -332,7 +332,7 @@ Lead check after merging `main` (with S1 and S3): `cargo test -p p1-tui` (326 pa
 `-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI
 runs the full gate. Accepted follow-ups are listed on PR #162.
 
-## Massive run
+## Massive run: part C (S7, S12)
 
 The judge accepted these slices:
 
@@ -344,4 +344,6 @@ The judge accepted these slices:
   SLAB token indices, primary and grayscale anchors, exhaustive cube-distance bounds,
   the grey-ramp preference, and the SLAB background mapping.
 
-The lead has not yet verified this Massive run.
+Owner decision 2026-09-25 07:30 approved both slices. Lead check after merging `main`: `cargo test -p p1-tui`
+(337 passed), clippy `-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI runs the
+full gate. Accepted follow-ups are listed on the pull request.
