@@ -77,7 +77,9 @@ rule; it does not fix those mechanisms.
   core still depends only on contracts; the runtime lives in the host.
 - `docs/design/pillars.md` pillar 3 boundary, `design-summary.md` item 1 and its
   "compile-time modules over runtime plugins" trade-off, `seams.md` sections 1 and 11,
-  `assembly.md` and `AGENTS.md` Architecture are amended in the same change.
+  `assembly.md`, `AGENTS.md` Architecture, and the dated notes that restated the old rule
+  (`iris-tui-reuse-plan.md`, `unified-dashboard.md`, `workflows.md`,
+  `notes/2026-09-20-provider-split.md`) are amended in the same change.
 
 ## Alternatives considered
 
@@ -91,7 +93,7 @@ rule; it does not fix those mechanisms.
 
 ## Evidence
 
-Owner words 2026-09-25 quoted above (DECISIONS.md D21). dsh survey of the same day: browser
+Owner words 2026-09-25 quoted above (DECISIONS.md D22). dsh survey of the same day: browser
 client about 135k lines, host API about 25k, agent core about 15k, whole repository about
 1M lines with tests (brain note 2026-09-25; two dsh docs copied beside the Astra brief). The
 lead's partition and obstacle analysis: issue #187. The migration plan is pending from
