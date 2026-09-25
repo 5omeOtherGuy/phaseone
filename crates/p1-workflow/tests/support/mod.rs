@@ -91,6 +91,9 @@ pub struct ScriptedRunner {
     pub max_live_thunks: AtomicUsize,
     /// Worktree slugs held right now: a fake hold removes its slug when dropped.
     pub held_worktrees: Arc<Mutex<Vec<String>>>,
+    /// Fires (`notify_waiters`) after every `worktree` call has been answered.
+    pub worktree_answered: Notify,
+    answered_worktrees: AtomicUsize,
 }
 
 /// The fake worktree a `ScriptedRunner` hands out: `/fake-worktrees/<slug>` on
@@ -205,6 +208,18 @@ impl ScriptedRunner {
     pub fn worktree_requests(&self) -> Vec<StepRequest> {
         self.script.lock().unwrap().worktree_requests.clone()
     }
+
+    /// Returns once `count` `worktree` calls have been answered.
+    pub async fn worktrees_answered(&self, count: usize) {
+        loop {
+            // Created before the check: a `notify_waiters` after it is not missed.
+            let answered = self.worktree_answered.notified();
+            if self.answered_worktrees.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            answered.await;
+        }
+    }
 }
 
 /// Worker ids carry the prompt so a repair finds its queue: `w<n>|<prompt>`.
@@ -294,20 +309,26 @@ impl StepRunner for ScriptedRunner {
                 .worktree_requests
                 .push(request.clone());
             let slug = request.worktree.clone().unwrap_or_default();
-            let mut held = self.held_worktrees.lock().unwrap();
-            if held.contains(&slug) {
-                return Err(format!("worktree_busy: {slug}"));
-            }
-            held.push(slug.clone());
-            Ok(Box::new(FakeHold {
-                info: WorktreeInfo {
-                    path: PathBuf::from(format!("/fake-worktrees/{slug}")),
-                    branch: format!("task/{slug}"),
-                    head: format!("prepared-{slug}"),
-                },
-                held: self.held_worktrees.clone(),
-                slug,
-            }) as Box<dyn WorktreeHold>)
+            let answer = {
+                let mut held = self.held_worktrees.lock().unwrap();
+                if held.contains(&slug) {
+                    Err(format!("worktree_busy: {slug}"))
+                } else {
+                    held.push(slug.clone());
+                    Ok(Box::new(FakeHold {
+                        info: WorktreeInfo {
+                            path: PathBuf::from(format!("/fake-worktrees/{slug}")),
+                            branch: format!("task/{slug}"),
+                            head: format!("prepared-{slug}"),
+                        },
+                        held: self.held_worktrees.clone(),
+                        slug,
+                    }) as Box<dyn WorktreeHold>)
+                }
+            };
+            self.answered_worktrees.fetch_add(1, Ordering::SeqCst);
+            self.worktree_answered.notify_waiters();
+            answer
         })
     }
 }

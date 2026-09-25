@@ -260,8 +260,8 @@ and every step refused before dispatch: `()`.
 | `unknown_role: <name>` | The role is not in the effective table. |
 | `route: <error>` | No model of the role's chain could run the step — the last link's route failure. |
 | `ended without finish` | The worker's turn completed with no accepted `finish` call, after one repair turn (§5, ADR-0072). |
-| `worktree: <slug>: <reason>` | The step's worktree could not be made or reused, before dispatch (ADR-0073): the run has no base commit (its workspace is not a git repository), the path exists and is not that branch's worktree, or git's own error. |
-| `worktree_busy: <slug>` | A running step of this host holds that worktree; refused at once, before dispatch (ADR-0073). |
+| `worktree: <slug>: <reason>` | The step's worktree could not be made or reused, before dispatch (ADR-0073): the run has no base commit (its workspace is not a git repository), the path exists and is not that branch's worktree, `worktree: <slug>: <path> is registered but missing (git worktree prune)` when git still lists a worktree whose directory is gone (p1 prunes nothing), or git's own error. |
+| `worktree_busy: <slug>` | A running step of this p1 process holds that worktree; refused at once, before dispatch (ADR-0073). Another p1 process is not refused. |
 | anything else | The host's `StepRunner` reason (its `Err` string, e.g. an unknown environment), or `journal: …` when the `Dispatch` line could not be written. |
 
 ## 5. Structured output
@@ -458,11 +458,18 @@ whatever the script returns.
   nothing; the host's workspace rules (ADR-0025) apply as for any worker.
 - **Worktree rule** (ADR-0073): a step with `worktree: "<slug>"` runs in its own git
   worktree. The host resolves the run's base commit (`git rev-parse HEAD` of the run's
-  workspace) when it starts the run; a resumed run keeps its predecessor's. The host holds
+  workspace) when it starts the run; a resumed run keeps its predecessor's. A missing
+  tree is made on `task/<slug>`: a local branch of that name is attached; else
+  `origin/task/<slug>`, when it exists, is attached with tracking (a resumed run on a
+  fresh clone continues its own work); else a new branch from the base. The host holds
   a step's worktree for the whole step — its fallback links and its repair turn — and
-  refuses a second step on it with `worktree_busy:`. Nothing is ever deleted, reset,
-  cleaned or forced: a finished tree is removed with `git worktree remove`, by the rule
-  for every worktree.
+  refuses a second step on it with `worktree_busy:`. The busy set is per p1 process: a
+  second p1 process is NOT refused and would share the tree, so across parallel
+  workflows on one machine a slug names one tree — one slug per tree, never two runs
+  on it. Nothing is ever deleted, reset, cleaned, pruned or forced: a finished tree is
+  removed with `git worktree remove`, by the rule for every worktree, and a registered
+  tree whose directory is gone is named for `git worktree prune`. git runs without an
+  inherited `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` or `GIT_COMMON_DIR`.
 - **Thread cost**: one OS thread per in-flight thunk, bounded by `max_threads`
   (default 64, inline fallback), plus one thread per running script.
 - **Runs do not survive the process, journals do.** A run lives in its service; its
@@ -491,7 +498,11 @@ failure on the head hands the step to the next link with
 and counted (a chain can never pass a capped model past its cap), a whole chain failing
 ends `failed — route: …`, a step that ran and failed does not fall back, a schema repair
 stays in its worker, and resume replays the recorded chain while a re-run starts at the
-head. `crates/p1-tool-workflow/tests/tools.rs` proves
+head. `crates/p1-workflow/tests/worktree.rs` proves the `worktree` option (ADR-0073): the slug rule, the run's
+base in every step request and the journal, kept on resume, the hold across a step, a
+refused tree failing its step before dispatch, and two parallel steps on one slug in one
+run — exactly one runs, the other ends `worktree_busy: <slug>`.
+`crates/p1-tool-workflow/tests/tools.rs` proves
 the four declarations and faces, every Ok and error text, the wait semantics and the two
 rendering bounds; `crates/p1-tool-finish/tests/result.rs` proves the `OutputContract`
 subset and its path-worded errors; `p1-workers`' in-crate tests prove the prepared
@@ -499,4 +510,10 @@ start; `api.rs`'s unit tests pin the shipped defaults (DeepSeek worker with its 
 the override rule and the journal round-trip. The host's own suites prove the seams:
 `crates/p1-host/tests/workflow_fallback.rs` runs `p1 workflow run` over scripted providers
 and shows a provider failure becoming a hop (and a `finish`-less turn staying a plain
-failure), `workflow_settings.rs` the table over the shipped defaults.
+failure), `workflow_settings.rs` the table over the shipped defaults, and
+`workflow_run.rs::two_steps_run_in_two_worktrees` two steps of one run in two real git
+worktrees. `crates/p1-host/src/worktree.rs`'s unit tests prove the git side on temp
+repositories: a new tree from the base, reuse untouched, a foreign path refused, a local
+branch attached, an origin-only branch attached with tracking (local wins, neither is the
+base), a registered-but-missing tree named, the `GIT_*` variables removed, and the
+per-process hold.

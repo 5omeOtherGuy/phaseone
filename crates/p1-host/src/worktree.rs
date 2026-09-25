@@ -14,14 +14,29 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use p1_contracts::BoxFuture;
 use p1_workflow::{WorktreeHold, WorktreeInfo};
 
-/// Runs `git -C <dir> <args>` with stdin closed. `Ok` is its trimmed stdout; `Err` names
-/// the command and carries git's trimmed stderr.
+/// The variables that would point git at another repository, index or tree than `dir`'s
+/// (a p1 started from a git hook inherits them); the child never sees them.
+const GIT_ENV_REMOVED: [&str; 4] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// `git -C <dir> <args>` with stdin closed and [`GIT_ENV_REMOVED`] removed.
+fn command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args).stdin(Stdio::null());
+    for name in GIT_ENV_REMOVED {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// Runs [`command`]. `Ok` is its trimmed stdout; `Err` names the command and carries
+/// git's trimmed stderr.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(Stdio::null())
+    let output = command(dir, args)
         .output()
         .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
     if output.status.success() {
@@ -118,6 +133,14 @@ fn prepare(run_workspace: &Path, located: &Located, base: &str) -> Result<Worktr
     let branch_ref = format!("refs/heads/{branch}");
     let registered = entries.iter().find(|entry| same_path(&entry.path, path));
     match registered {
+        // A registration whose directory is gone (git lists it `prunable`): named, and
+        // left for the owner's `git worktree prune`.
+        Some(_) if path.symlink_metadata().is_err() => {
+            return Err(format!(
+                "{} is registered but missing (git worktree prune)",
+                path.display()
+            ));
+        }
         // (a) The step's own worktree: reused untouched — a resumed or repaired step.
         Some(entry) if entry.branch.as_deref() == Some(branch_ref.as_str()) => {}
         Some(entry) => {
@@ -139,14 +162,27 @@ fn prepare(run_workspace: &Path, located: &Located, base: &str) -> Result<Worktr
             ));
         }
         None => {
-            let exists = git(
-                run_workspace,
-                &["rev-parse", "--verify", "--quiet", &branch_ref],
-            )
-            .is_ok();
-            if exists {
+            let exists = |reference: &str| {
+                git(
+                    run_workspace,
+                    &["rev-parse", "--verify", "--quiet", reference],
+                )
+                .is_ok()
+            };
+            // The full ref: `origin/<branch>` alone could resolve to a local ref first.
+            let remote = format!("refs/remotes/origin/{branch}");
+            if exists(&branch_ref) {
                 // (c) The branch without its worktree: attach it.
                 git(run_workspace, &["worktree", "add", &path_text, branch])?;
+            } else if exists(&remote) {
+                // (d) No local branch, but origin has it (a resumed run on a fresh
+                // clone): origin's work, tracked.
+                git(
+                    run_workspace,
+                    &[
+                        "worktree", "add", "--track", "-b", branch, &path_text, &remote,
+                    ],
+                )?;
             } else {
                 // (d) Neither: a new branch from the run's base.
                 git(
@@ -400,6 +436,102 @@ mod tests {
         );
         assert_eq!(info.head, base);
         assert_eq!(repo.git(&["rev-parse", "task/attach"]), branch_head);
+    }
+
+    #[test]
+    fn an_origin_only_branch_is_attached_with_tracking_a_local_one_wins_and_neither_is_the_base() {
+        let repo = Repo::new();
+        let base = repo.git(&["rev-parse", "HEAD"]);
+        let origin = repo.dir.path().join("origin.git");
+        repo.git(&["init", "-q", "--bare", origin.to_str().unwrap()]);
+        repo.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+        repo.git(&["branch", "task/both"]);
+        let ahead = repo.commit("ahead");
+        repo.git(&[
+            "push",
+            "-q",
+            "origin",
+            "HEAD:refs/heads/task/remote-only",
+            "HEAD:refs/heads/task/both",
+        ]);
+        repo.git(&["fetch", "-q", "origin"]);
+        assert_ne!(base, ahead);
+
+        // Only origin has it: attached at origin's head, tracking origin's branch.
+        let info = ensure(&repo.main(), "remote-only", &base).unwrap();
+        assert_eq!(info.branch, "task/remote-only");
+        assert_eq!(info.head, ahead, "origin's work, not the base");
+        assert_eq!(
+            repo.git(&["rev-parse", "refs/heads/task/remote-only"]),
+            ahead
+        );
+        assert_eq!(
+            git(
+                &info.path,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ]
+            )
+            .unwrap(),
+            "origin/task/remote-only"
+        );
+
+        // A local branch wins over origin's.
+        let info = ensure(&repo.main(), "both", &base).unwrap();
+        assert_eq!(info.head, base, "the local branch, not origin's");
+
+        // Neither: the base, with origin configured.
+        let info = ensure(&repo.main(), "neither", &base).unwrap();
+        assert_eq!(info.head, base);
+    }
+
+    #[test]
+    fn a_registered_worktree_whose_directory_is_gone_is_named_not_pruned() {
+        let repo = Repo::new();
+        let base = repo.git(&["rev-parse", "HEAD"]);
+        let info = ensure(&repo.main(), "gone", &base).unwrap();
+        std::fs::remove_dir_all(repo.tree("gone")).unwrap();
+
+        let worktrees = Arc::new(Worktrees::default());
+        let Err(error) = worktrees.acquire(&repo.main(), "gone", &base) else {
+            panic!("the directory is gone");
+        };
+        assert_eq!(
+            error,
+            format!(
+                "worktree: gone: {} is registered but missing (git worktree prune)",
+                info.path.display()
+            )
+        );
+        assert!(
+            repo.git(&["worktree", "list", "--porcelain"])
+                .contains(&format!("worktree {}", info.path.display())),
+            "p1 pruned nothing"
+        );
+    }
+
+    #[test]
+    fn git_runs_without_the_inherited_repository_variables() {
+        let built = command(Path::new("/nowhere"), &["status"]);
+        let removed: Vec<_> = built
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            assert!(
+                removed.iter().any(|removed| removed == name),
+                "{name}: {removed:?}"
+            );
+        }
     }
 
     #[test]

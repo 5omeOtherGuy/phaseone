@@ -166,6 +166,51 @@ async fn a_refused_worktree_fails_its_step_before_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn two_parallel_steps_on_one_slug_run_one_and_refuse_the_other() {
+    let harness = Harness::new();
+    let first = harness.runner.hold("first");
+    let second = harness.runner.hold("second");
+    let script = r#"
+        let both = parallel([
+            || agent("first", #{ worktree: "same" }),
+            || agent("second", #{ worktree: "same" }),
+        ]);
+        both.map(|r| [r.status, if r.error == () { "" } else { r.error }, r.attempts])
+    "#;
+    let id = harness.start_request(based(script, Some("base1"))).await;
+
+    // Both asked for the tree; the one that got it is held inside the runner.
+    harness.runner.worktrees_answered(2).await;
+    let winner = tokio::select! {
+        _ = first.reached.notified() => 0,
+        _ = second.reached.notified() => 1,
+    };
+    [&first, &second][winner].release.notify_one();
+
+    let report = harness.wait(&id).await;
+    assert_eq!(
+        report.outcome,
+        RunOutcome::CompletedWithIssues,
+        "{report:?}"
+    );
+    let ran = json!(["done", "", 1]);
+    let refused = json!(["failed", "worktree_busy: same", 0]);
+    let expected = if winner == 0 {
+        json!([ran, refused])
+    } else {
+        json!([refused, ran])
+    };
+    assert_eq!(report.value, expected);
+    assert_eq!(
+        harness.runner.prompts(),
+        [["first", "second"][winner]],
+        "exactly one step ran"
+    );
+    assert_eq!(harness.runner.worktree_requests().len(), 2);
+    assert!(harness.runner.held_worktrees.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn without_a_base_a_worktree_step_fails_and_the_others_run() {
     let harness = Harness::new();
     let script = r#"
