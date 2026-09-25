@@ -1,0 +1,57 @@
+package p1:module@1.0.0;
+
+/// Running commands. Owner: the process service extracted from `p1-tool-shell`.
+///
+/// The execution boundary stays native (ADR-0035): the host decides whether a command runs
+/// inside bubblewrap, rebuilds its environment from the allow-list (the command never
+/// inherits p1's environment), starts it in its own process group in the workspace root with
+/// no terminal and no input, and kills the whole group on timeout, cancellation or drop. A
+/// module chooses only the command text and its time limit.
+interface process {
+    record command {
+        /// Run as `bash -lc <script>`.
+        script: string,
+        /// Wall-clock limit in milliseconds; the host kills the process group when it expires.
+        timeout-ms: u64,
+    }
+
+    /// How a command ended.
+    variant exit-status {
+        /// The shell exited with this code.
+        code(s32),
+        /// The shell was ended by this signal.
+        signal(s32),
+        /// Ended by a signal the host could not name.
+        unknown-signal,
+        /// The host killed it at `timeout-ms`.
+        timed-out,
+        /// The host killed it because the call was cancelled.
+        cancelled,
+    }
+
+    variant process-event {
+        /// Output bytes, standard output and standard error merged in arrival order.
+        output(list<u8>),
+        /// The terminal event: no output follows.
+        exited(exit-status),
+    }
+
+    /// A running command: a streaming resource.
+    ///
+    /// `next` blocks the module while the host waits for output. It returns `output` events,
+    /// then exactly one `exited`, then `none`; calling `next` again after `none` traps. When
+    /// the call is cancelled while `next` is blocked, the host kills the process group and
+    /// `next` returns the remaining output, then `exited(cancelled)`. Dropping the resource
+    /// kills the process group if it still runs. When the host abandons the call while `next`
+    /// is blocked (an epoch deadline, or the caller dropping the call), it drops the resource
+    /// itself with the same effect, and it does so too when the call returns with the
+    /// resource still held (a later use traps), so no command outlives the call that started
+    /// it. A trap never undoes what the command already did.
+    resource running {
+        next: func() -> option<process-event>;
+    }
+
+    /// Start `command`. `err` names why it could not start (the shell or the sandbox is
+    /// missing); nothing runs then.
+    spawn: func(command: command) -> result<running, string>;
+}

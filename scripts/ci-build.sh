@@ -21,6 +21,13 @@
 # The push must come from the branch's checkout, so a detached HEAD is refused
 # whether or not a branch was named.
 #
+# Download: the artifact tree is validated and staged with its relative paths into
+# ci-artifacts/<sha>/ (p1, p1.sha256 and gate.log must sit at its root). Only
+# regular files and directories are accepted, so a symlink, FIFO, socket or device
+# is a tooling error; a fresh staging directory beside the destination is renamed
+# into place, so a failure never leaves a half-written destination and an earlier
+# download of the same commit is replaced cleanly.
+#
 # Run identity: a run is the answer when it is a run of `.github/workflows/build.yml`
 # for this exact headSha, it is not one this invocation has already seen (the
 # pre-action snapshot of run ids), and its event matches the action taken:
@@ -56,7 +63,7 @@ set -euo pipefail
 # This runs before the first external command (dirname, below) and must list every
 # external command the script runs: git and gh, the artifact and log tooling, and
 # the tool the exit trap uses.
-for tool in git gh dirname cat mktemp mkdir find mv cut sha256sum tail rm sleep; do
+for tool in git gh dirname cat mktemp mkdir find cp mv cut sha256sum tail rm sleep; do
   command -v "$tool" >/dev/null 2>&1 ||
     { echo "ci-build: $tool is not on PATH" >&2; exit 2; }
 done
@@ -291,30 +298,98 @@ if [ "$download" = 0 ]; then
   exit 0
 fi
 
-dest="ci-artifacts/$sha"
+artifacts=ci-artifacts
+dest="$artifacts/$sha"
+# Beside the destination and on its filesystem, so the final mv is a rename.
+staging="$artifacts/.$sha.staging.$$"
 if ! tmpdir=$(mktemp -d); then
   echo "ci-build: mktemp -d failed" >&2
   exit 2
 fi
-trap 'rm -rf -- "$tmpdir" || echo "ci-build: could not remove $tmpdir" >&2' EXIT
+# A failure must leave neither a half-written ci-artifacts/<sha> (only the rename at
+# the end writes it) nor the scratch directories behind.
+trap 'rm -rf -- "$tmpdir" "$staging" || echo "ci-build: could not remove the temporary directories" >&2' EXIT
 if ! gh run download "$run_id" --name "$artifact" --dir "$tmpdir"; then
   echo "ci-build: could not download the $artifact artifact of run $run_id" >&2
   exit 2
 fi
-if ! mkdir -p "$dest"; then
-  echo "ci-build: cannot create $dest" >&2
+
+# Validate the downloaded tree before anything is written to ci-artifacts/<sha>: the
+# artifact carries module packages, so its relative layout is kept (two files with one
+# basename in different directories must both survive) and only regular files and
+# directories are accepted — a symlink, FIFO, socket or device is refused.
+if ! special=$(find "$tmpdir" -mindepth 1 ! -type f ! -type d); then
+  echo "ci-build: cannot inspect the downloaded $artifact tree" >&2
   exit 2
 fi
-if ! find "$tmpdir" -type f -exec mv -t "$dest" {} +; then
-  echo "ci-build: cannot move the artifact files into $dest" >&2
+if [ -n "$special" ]; then
+  echo "ci-build: the downloaded $artifact holds an entry that is neither a regular file nor a directory:" >&2
+  printf '%s\n' "$special" >&2
   exit 2
+fi
+if ! top=$(find "$tmpdir" -mindepth 1 -maxdepth 1); then
+  echo "ci-build: cannot list the downloaded $artifact tree" >&2
+  exit 2
+fi
+
+# Locate the artifact root deterministically: `gh run download --name X --dir D`
+# extracts the artifact's contents directly into D, so D is the root; a D that holds
+# nothing but a single directory named after the artifact is accepted as well, and
+# anything else (that directory beside other entries) cannot be located.
+count=0
+named=0
+while IFS= read -r entry; do
+  [ -n "$entry" ] || continue
+  count=$((count + 1))
+  if [ "$entry" = "$tmpdir/$artifact" ] && [ -d "$entry" ]; then
+    named=1
+  fi
+done <<<"$top"
+if [ "$named" = 1 ] && [ "$count" -ne 1 ]; then
+  echo "ci-build: the downloaded $artifact artifact is a $artifact directory beside other entries in $tmpdir" >&2
+  exit 2
+fi
+if [ "$named" = 1 ]; then
+  root=$tmpdir/$artifact
+else
+  root=$tmpdir
 fi
 for file in p1 p1.sha256 gate.log; do
-  if [ ! -f "$dest/$file" ]; then
+  if [ ! -f "$root/$file" ]; then
     echo "ci-build: the $artifact artifact has no $file" >&2
     exit 2
   fi
 done
+
+if ! mkdir -p "$artifacts"; then
+  echo "ci-build: cannot create $artifacts" >&2
+  exit 2
+fi
+if ! rm -rf -- "$staging"; then
+  echo "ci-build: cannot clear $staging" >&2
+  exit 2
+fi
+if ! mkdir -p -- "$staging"; then
+  echo "ci-build: cannot create $staging" >&2
+  exit 2
+fi
+if ! cp -a "$root/." "$staging/"; then
+  echo "ci-build: cannot stage the $artifact artifact into $staging" >&2
+  exit 2
+fi
+# The rename is the only write to ci-artifacts/<sha>: an earlier download of the same
+# commit is replaced cleanly, or nothing is written at all. -T renames the staging
+# directory onto $dest itself, so a concurrent invocation for the same commit
+# (ADR-0066) that recreated $dest between the rm and this mv fails loudly (exit 2)
+# instead of silently nesting the staging directory inside a fresh destination.
+if ! rm -rf -- "$dest"; then
+  echo "ci-build: cannot replace $dest" >&2
+  exit 2
+fi
+if ! mv -T -- "$staging" "$dest"; then
+  echo "ci-build: cannot move the staged artifact to $dest" >&2
+  exit 2
+fi
 if ! local_sha=$(sha256sum "$dest/p1"); then
   echo "ci-build: sha256sum failed on $dest/p1" >&2
   exit 2
