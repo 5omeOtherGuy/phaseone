@@ -17,13 +17,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::{
-    ByteStream, Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, Transport, lock_exclusive,
+    Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, Transport, lock_exclusive,
 };
 use serde_json::{Value, json};
 
+use crate::refresh_http::{self, RefreshIoError};
 use crate::resolve::{Entry, Presence, SourceName};
 
 pub(crate) const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -153,12 +153,15 @@ impl ClaudeCodeCredentials {
             body,
         };
 
-        let response = self.transport.post(request).await.map_err(|_| {
-            ProviderError::new(
-                ProviderErrorKind::Authentication,
-                "the Claude Code token refresh request failed",
-            )
-        })?;
+        let response = refresh_http::post(self.transport.as_ref(), request)
+            .await
+            .map_err(|error| match error {
+                RefreshIoError::TimedOut(error) => error,
+                RefreshIoError::Transport(_) => ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    "the Claude Code token refresh request failed",
+                ),
+            })?;
         if !(200..300).contains(&response.status) {
             return Err(ProviderError::new(
                 ProviderErrorKind::Authentication,
@@ -169,7 +172,15 @@ impl ClaudeCodeCredentials {
             ));
         }
 
-        let bytes = read_all(response.body).await?;
+        let bytes = refresh_http::drain(response.body)
+            .await
+            .map_err(|error| match error {
+                RefreshIoError::TimedOut(error) => error,
+                RefreshIoError::Transport(_) => ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    "the Claude Code token refresh response could not be read",
+                ),
+            })?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
             ProviderError::new(
                 ProviderErrorKind::Authentication,
@@ -488,22 +499,6 @@ fn merge_document(
         .map_err(|_| auth_error(path, "Claude Code credentials could not be encoded"))?;
     encoded.push('\n');
     Ok(encoded)
-}
-
-async fn read_all(mut body: ByteStream) -> Result<Vec<u8>, ProviderError> {
-    let mut bytes = Vec::new();
-    while let Some(chunk) = body.next().await {
-        match chunk {
-            Ok(chunk) => bytes.extend_from_slice(&chunk),
-            Err(_) => {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::Authentication,
-                    "the Claude Code token refresh response could not be read",
-                ));
-            }
-        }
-    }
-    Ok(bytes)
 }
 
 fn unique_tmp_path(path: &Path) -> PathBuf {

@@ -18,14 +18,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use p1_contracts::{BoxFuture, ProviderError};
-use p1_provider_http::{
-    ByteStream, Credential, HttpRequest, LOCK_PATIENCE, Transport, lock_exclusive,
-};
+use p1_provider_http::{Credential, HttpRequest, LOCK_PATIENCE, Transport, lock_exclusive};
 use serde_json::{Value, json};
 
 use crate::claude_code::{DEFAULT_SCOPES, OAUTH_BETA};
 use crate::codex::percent_encode;
 use crate::locations::Locations;
+use crate::refresh_http::{self, RefreshIoError};
 use crate::resolve::{Entry, Presence, SourceName};
 use crate::{CredentialKind, auth};
 
@@ -557,18 +556,29 @@ impl StoreOauth {
     }
 
     async fn post_refresh(&self, refresh_token: &str) -> Result<Refreshed, ProviderError> {
-        let response = self
-            .transport
-            .post(self.dialect.request(refresh_token))
-            .await
-            .map_err(|_| auth("the p1 store token refresh request failed"))?;
+        let response =
+            refresh_http::post(self.transport.as_ref(), self.dialect.request(refresh_token))
+                .await
+                .map_err(|error| match error {
+                    RefreshIoError::TimedOut(error) => error,
+                    RefreshIoError::Transport(_) => {
+                        auth("the p1 store token refresh request failed")
+                    }
+                })?;
         if !(200..300).contains(&response.status) {
             return Err(auth(format!(
                 "the p1 store token refresh failed with status {}",
                 response.status
             )));
         }
-        let bytes = read_all(response.body).await?;
+        let bytes = refresh_http::drain(response.body)
+            .await
+            .map_err(|error| match error {
+                RefreshIoError::TimedOut(error) => error,
+                RefreshIoError::Transport(_) => {
+                    auth("the p1 store token refresh response could not be read")
+                }
+            })?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| auth("the p1 store token refresh response is malformed"))?;
         self.dialect.parse(&value)
@@ -702,22 +712,6 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
         std::process::id(),
         now_ms()
     ))
-}
-
-async fn read_all(mut body: ByteStream) -> Result<Vec<u8>, ProviderError> {
-    use futures_util::StreamExt;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = body.next().await {
-        match chunk {
-            Ok(chunk) => bytes.extend_from_slice(&chunk),
-            Err(_) => {
-                return Err(auth(
-                    "the p1 store token refresh response could not be read",
-                ));
-            }
-        }
-    }
-    Ok(bytes)
 }
 
 fn now_ms() -> u64 {
