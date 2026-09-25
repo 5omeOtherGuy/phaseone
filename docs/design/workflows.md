@@ -406,8 +406,9 @@ non-JSON return), `Cancelled`.
 no-op by default): `run_started`, `phase`, `log`, `step_started`, `step_ended`,
 `thunk_failed`, `run_ended`. `step_started` fires only when the step's worker is known — the runner
 returns the `WorkerRef` at the end — so it is not a start signal. `thunk_failed` fires
-when one `parallel`/`pipeline` job ends with an error, before its siblings are joined
-(tests synchronise on it; the host ignores it). `run_ended` fires
+when one `parallel`/`pipeline` job returns an error — a cancelled step's error included —
+before its siblings are joined; a job that panics or never starts reports nothing (tests
+synchronise on it; the host ignores it). `run_ended` fires
 after `result.json` is written, the `Ended` line journalled and the report stored, and
 is the ONE place the host wakes the parent from: one notification at the run's end,
 never one per step.
