@@ -315,3 +315,19 @@ The judge accepted these slices:
 Lead check after merging `main`: `cargo test -p p1-tui` (316 passed), clippy
 `-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI
 runs the full gate. Accepted follow-ups are listed on the pull request.
+
+## Massive run
+
+The judge accepted these slices:
+
+- **S4** — commits `e1ba735` (`adapt composer history`) and `6487853`
+  (`isolate working gate history test`). Tests cover idle-only history recall,
+  picker/pane/approval precedence, duplicate and blank submissions, navigation
+  to both ends, multiline cursor placement, focus-mode disclosure, and edits
+  ending history browsing.
+- **S5** — commits `43ced90` (`add composer line editing`) and `1262e7d`
+  (`assert composer disclosure after ^U`). Tests cover `^U`, `^K`, Home, End and
+  Delete while idle and working; modal precedence; char-safe multiline bounds;
+  history-browsing cancellation; and composer disclosure after line edits.
+
+The lead has not yet verified this merged massive-run implementation.
