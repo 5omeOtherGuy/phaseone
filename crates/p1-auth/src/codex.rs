@@ -16,11 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::{
-    ByteStream, Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, Transport,
-    TransportError, lock_exclusive,
+    Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, Transport, lock_exclusive,
 };
 use serde_json::Value;
 
+use crate::refresh_http::{self, RefreshIoError};
 use crate::resolve::{Entry, Presence, SourceName};
 
 pub(crate) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -144,19 +144,25 @@ impl CodexCliCredentials {
             ],
             body: body.into_bytes(),
         };
-        let response = self.transport.post(request).await.map_err(|error| {
-            ProviderError::new(
-                ProviderErrorKind::Authentication,
-                format!("token refresh request failed: {}", error.0),
-            )
-        })?;
+        let response = refresh_http::post(self.transport.as_ref(), request)
+            .await
+            .map_err(|error| match error {
+                RefreshIoError::TimedOut(error) => error,
+                RefreshIoError::Transport(error) => ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    format!("token refresh request failed: {}", error.0),
+                ),
+            })?;
         let status = response.status;
-        let body = drain_body(response.body).await.map_err(|error| {
-            ProviderError::new(
-                ProviderErrorKind::Authentication,
-                format!("token refresh body failed: {}", error.0),
-            )
-        })?;
+        let body = refresh_http::drain(response.body)
+            .await
+            .map_err(|error| match error {
+                RefreshIoError::TimedOut(error) => error,
+                RefreshIoError::Transport(error) => ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    format!("token refresh body failed: {}", error.0),
+                ),
+            })?;
         if !(200..=299).contains(&status) {
             return Err(ProviderError::new(
                 ProviderErrorKind::Authentication,
@@ -402,17 +408,6 @@ fn lock_error() -> ProviderError {
         ProviderErrorKind::Authentication,
         "failed to lock the Codex auth file for refresh",
     )
-}
-
-async fn drain_body(mut body: ByteStream) -> Result<Vec<u8>, TransportError> {
-    let mut bytes = Vec::new();
-    loop {
-        match std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-            Some(Ok(chunk)) => bytes.extend_from_slice(&chunk),
-            Some(Err(error)) => return Err(error),
-            None => return Ok(bytes),
-        }
-    }
 }
 
 /// Percent-encode a form value by hand: unreserved characters pass through, a
@@ -823,6 +818,7 @@ mod tests {
     /// `#[tokio::test]` through the driver instead.
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap()
             .block_on(future)

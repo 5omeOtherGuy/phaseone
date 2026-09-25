@@ -37,6 +37,7 @@ mod api_key;
 mod claude_code;
 mod codex;
 mod locations;
+mod refresh_http;
 mod resolve;
 mod spec;
 pub mod store;

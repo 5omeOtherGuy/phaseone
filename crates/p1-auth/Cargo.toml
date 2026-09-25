@@ -17,6 +17,9 @@ serde_json = "1"
 # Draining the streaming body of an OAuth token-refresh response needs `StreamExt`;
 # the crate is already in the workspace tree.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# The OAuth token refresh is bounded like a provider read (issue #164, ADR-0069's
+# constants); the crate is already in the workspace tree.
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
