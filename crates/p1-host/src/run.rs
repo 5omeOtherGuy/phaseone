@@ -172,7 +172,7 @@ fn agent_context(
     let Some(settings) = &assembled.resolved.context else {
         return Ok(Arc::new(DefaultContext));
     };
-    let config = config_for_route(settings, profile);
+    let (config, summary_output_tokens) = effective_context(settings, profile)?;
     let prompt = assembled
         .resolved
         .summarize_prompt
@@ -184,9 +184,44 @@ fn agent_context(
         config,
         prompt,
     )?
-    .with_summary_output_tokens(settings.summary_output_tokens)?
+    .with_summary_output_tokens(summary_output_tokens)?
     .with_summary_effort(summary_effort(profile));
     Ok(Arc::new(policy))
+}
+
+/// The smallest summary-output cap worth sending: a cap below this cannot produce a summary
+/// that says anything, so a table that leaves no such cap is a configuration error rather
+/// than an agent that fails on its first long turn.
+const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 1_000;
+
+/// The effective table PLUS the summary-output cap that belongs to it (#125 review round 3):
+/// the cap is a budget of the SAME window as the table, so it is clamped against the effective
+/// wall and not the environment's — a profile that narrows the window must narrow the cap with
+/// it, or a valid narrow profile makes the agent unstartable. Half the wall is the ceiling: the
+/// summarization request carries the rendered transcript as well as its own answer, so a cap
+/// that claimed more than half of what can be sent would leave the transcript no room. A table
+/// that cannot host even [`MIN_SUMMARY_OUTPUT_TOKENS`] fails here, naming the profile and the
+/// window it serves, instead of failing later with a number no operator wrote.
+fn effective_context(
+    settings: &p1_assembly::ContextSettings,
+    profile: Option<&ModelProfile>,
+) -> Result<(p1_context::ContextConfig, u64), String> {
+    let config = config_for_route(settings, profile);
+    let wall = config.window_tokens - config.output_headroom_tokens;
+    let cap = settings.summary_output_tokens.min(wall / 2);
+    if cap < MIN_SUMMARY_OUTPUT_TOKENS {
+        let who = match profile {
+            Some(profile) => format!("profile `{}`", profile.id),
+            None => "this environment".to_string(),
+        };
+        return Err(format!(
+            "the declared summary-output cap ({}) does not fit the context table of {who}: its window \
+             is {} tokens with {} reserved, leaving {wall} to send, and a summary request needs at \
+             least {MIN_SUMMARY_OUTPUT_TOKENS} of them for its own answer",
+            settings.summary_output_tokens, config.window_tokens, config.output_headroom_tokens
+        ));
+    }
+    Ok((config, cap))
 }
 
 /// The `ContextConfig` one assembled agent actually gets, with the selected profile's own
@@ -3143,7 +3178,9 @@ mod tests {
         p1_context::ContextConfig::validate(&config).expect("the effective table validates");
 
         // A profile whose own output ceiling exceeds its own window: the reserve is clamped
-        // below the window, so the table still describes a sendable request.
+        // below the window, so the table still describes a sendable request. What is left is too
+        // little to send a summary under, and that is a configuration error that NAMES the profile
+        // and the window it serves — not a bare number check the operator never wrote.
         let odd = synthetic_profile(Some(20_000), Some(32_000));
         let config = config_for_route(&settings, Some(&odd));
         assert_eq!(config.window_tokens, 20_000);
@@ -3155,6 +3192,57 @@ mod tests {
         );
         assert!(config.keep_recent_tokens < wall_of(&config));
         p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+
+        let (assembled, _) = assembled_for_test(Some(settings.clone()), Effort::High);
+        let error = match agent_context(&assembled, Some(&odd)) {
+            Ok(_) => panic!("a table with no room for a summary must not build an agent"),
+            Err(error) => error,
+        };
+        assert!(error.contains("synthetic"), "{error}");
+        assert!(error.contains("20000"), "{error}");
+        assert!(
+            error.contains("summary-output cap"),
+            "the error names the budget that does not fit: {error}"
+        );
+    }
+
+    /// #125 review round 3: the summary-output cap is a budget of the SAME effective window, so a
+    /// profile that narrows the window narrows the cap with it. Under a 40,000-token profile on the
+    /// `zen` table (wall 8,000) the environment's 12,000 cap cannot be sent; the agent must still
+    /// start, with the cap clamped below the wall, and the request it sends must carry that cap.
+    #[tokio::test(start_paused = true)]
+    async fn a_narrow_profile_clamps_the_summary_output_cap_and_the_agent_still_starts() {
+        // The zen table's own window, reserve and summary cap, with a threshold a two-item
+        // history crosses.
+        let settings = p1_assembly::ContextSettings {
+            window_tokens: 1_048_576,
+            output_headroom_tokens: 524_288,
+            summarize_at_tokens: 100,
+            summary_output_tokens: 12_000,
+            ..summarizer_table()
+        };
+        let narrow = synthetic_profile(Some(40_000), Some(32_000));
+        let (assembled, provider) = assembled_for_test(Some(settings), Effort::High);
+        let policy = agent_context(&assembled, Some(&narrow))
+            .expect("a valid narrow profile must not make the agent unstartable");
+        let history = summarizer_history();
+        let cancel = CancellationToken::new();
+        let prepared = policy
+            .prepare(ContextInput {
+                history: &history,
+                last_usage: None,
+                cancel: &cancel,
+            })
+            .await
+            .expect("preparing a summary succeeds")
+            .expect("the history crosses the threshold");
+        assert_eq!(
+            provider.requests()[0].options.max_output_tokens,
+            Some(4_000),
+            "the cap is clamped to half of the effective wall (8,000), not sent at the \
+             environment's 12,000"
+        );
+        assert_eq!(prepared.usage, None);
     }
 
     /// The other two zen bindings: Space Bunny is the environment's own table, Muse's output
