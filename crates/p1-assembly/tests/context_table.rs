@@ -226,7 +226,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
             .expect("a directory name")
             .to_string_lossy()
             .into_owned();
-        let environment = load_environment(&name, &[root.clone()])
+        let environment = load_environment(&name, std::slice::from_ref(&root))
             .unwrap_or_else(|error| panic!("{name}: {error}"));
         let context = environment
             .context
@@ -264,7 +264,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
     );
     for required in ["claude", "gpt", "deepseek3", "zen", "kimi"] {
         assert!(
-            checked.iter().any(|name| name == required),
+            checked.iter().any(|name| name.as_str() == required),
             "`{required}` was not checked: {checked:?}"
         );
     }
