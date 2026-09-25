@@ -9,12 +9,25 @@
 #
 #   <prefix>/bin/p1                                 the binary (0755)
 #   <prefix>/share/p1/{environments,routes,profiles}  the shipped data
+#   <prefix>/share/p1/modules                       the released module set (optional)
 #   <prefix>/share/p1/install.sh                    this script, so updates need no checkout
 #   <prefix>/bin/p1-update                          runs install.sh --latest --prefix <prefix>
 #
-# Nothing is written to the prefix before both checksums pass. The binary, updater and
-# share are staged first, then committed with all previous files retained until every
-# rename succeeds; an error rolls the previous installation back into place.
+# The share archive has four roots: environments/, routes/ and profiles/, plus the optional
+# modules/ set (manifest.json and packages/). modules/ is optional, so releases that predate
+# the WebAssembly migration still install.
+#
+# Nothing is written to the prefix before the archive is known good. The member listing and
+# the tarfile data filter, the three required roots and the module package set with its
+# manifest are all checked inside a temporary stage; only then are bin/ and share/ created,
+# the .new copies written and the existing rename transaction run. The binary, updater and
+# share are committed together with all previous files retained until every rename succeeds;
+# an error rolls the previous installation back into place. The module set lives inside the
+# share directory, so it is replaced by the same rollback transaction as the shipped data.
+#
+# `--local` builds the share archive from this checkout's environments, routes and profiles
+# only: the local module build arrives with a later slice, so a local install ships no
+# share/p1/modules and is checked exactly like a release that has no modules/.
 #
 # Nothing under ${XDG_CONFIG_HOME:-$HOME/.config}/p1 — p1's credential store and the
 # user's own overrides — is read, written or deleted by this script.
@@ -147,9 +160,17 @@ for candidate in sys.argv[2:]:
 PY
 
 stage="$(mktemp -d "${TMPDIR:-/tmp}/p1-install.XXXXXX")"
+# The verified share tree, binary and updater wait in the stage; the prefix paths below are
+# set only by publish_staged, once nothing can still refuse the archive.
+staged_share=""
+staged_bin=""
+staged_update=""
 bin_new=""
 update_new=""
 share_new=""
+# The sha256 of the verified binary asset, for the manifest's native.sha256 check. Empty for
+# --local, which has no release manifest.
+binary_sha=""
 # One fixed backup slot per prefix, so a failed install leaves at most one rollback copy
 # behind (replaced by the next install, and named in the failure message) instead of one
 # per attempt.
@@ -255,32 +276,213 @@ download_asset() {
   fi
 }
 
-# Every install artifact is prepared in its destination directory before the transaction
-# starts, so the final commit consists only of same-filesystem renames.
-stage_binary() {
-  local src="$1"
-  mkdir -p "$prefix/bin"
-  bin_new="$prefix/bin/.p1.new.$$"
-  cp -f "$src" "$bin_new"
-  chmod 0755 "$bin_new"
+# The optional fourth root: modules/manifest.json beside the modules/packages/ tree. Every
+# check runs against the extracted stage — layout, normalised and unique package paths, each
+# file's digest and size, no compiled-cache blob — plus, for a release install, the manifest
+# pinned to the verified binary and, for --from-release TAG, to TAG. A refusal names the
+# archive entry and leaves the prefix untouched.
+verify_modules() {
+  local root="$1" tarball="$2"
+  python3 - "$root" "${binary_sha:-}" "$tag" <<'PY' || die "$(basename "$tarball") has an invalid module package set — nothing installed"
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+binary_sha, tag = sys.argv[2], sys.argv[3]
+
+FORMAT = "p1-release-manifest/1"
+TOP_LEVEL = {"format", "commit", "tag", "native", "toolchain", "runtime", "wit",
+             "schemas", "packages", "components", "environment_locks"}
+TOOLCHAIN_KEYS = {"rustc", "cargo", "wasm_target", "wasm_tools", "wit_bindgen"}
+RUNTIME_KEYS = {"wasmtime", "wasmtime_features"}
+PACKAGE_KEYS = {"path", "sha256", "size"}
+
+
+def type_name(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+JSON_NAMES = {str: "string", dict: "object", list: "array", int: "number",
+              bool: "boolean", type(None): "null"}
+
+
+def bad_path(rel):
+    """Why rel is not a normalised, relative POSIX path under packages/, else ''."""
+    if "\\" in rel:
+        return "a backslash"
+    if not rel.startswith("packages/"):
+        return "no packages/ prefix"
+    for part in rel.split("/"):
+        if part in ("", ".", ".."):
+            return "an empty, '.' or '..' component"
+    return ""
+
+
+modules = root / "modules"
+if not (modules.exists() or modules.is_symlink()):
+    sys.exit(0)
+
+if modules.is_symlink() or not modules.is_dir():
+    raise SystemExit("modules/ is not a directory")
+for entry in sorted(modules.iterdir()):
+    if entry.name == "manifest.json":
+        if entry.is_symlink() or not entry.is_file():
+            raise SystemExit("modules/manifest.json is not a regular file")
+    elif entry.name == "packages":
+        if entry.is_symlink() or not entry.is_dir():
+            raise SystemExit("modules/packages is not a directory")
+    else:
+        raise SystemExit(f"modules/{entry.name}: only manifest.json and packages/ are allowed")
+
+manifest_path = modules / "manifest.json"
+if manifest_path.is_symlink() or not manifest_path.is_file():
+    raise SystemExit("modules/ has no regular manifest.json")
+
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"modules/manifest.json is not valid UTF-8 JSON: {error}")
+
+if not isinstance(manifest, dict):
+    raise SystemExit(f"modules/manifest.json is not a JSON object but {type_name(manifest)}")
+keys = set(manifest)
+if keys != TOP_LEVEL:
+    detail = []
+    if TOP_LEVEL - keys:
+        detail.append("missing " + ", ".join(sorted(TOP_LEVEL - keys)))
+    if keys - TOP_LEVEL:
+        detail.append("unexpected " + ", ".join(sorted(keys - TOP_LEVEL)))
+    raise SystemExit("modules/manifest.json has the wrong top-level keys: " + "; ".join(detail))
+
+wanted = {
+    "format": (str,), "commit": (str,), "tag": (str, type(None)),
+    "native": (dict,), "toolchain": (dict,), "runtime": (dict,),
+    "wit": (list,), "schemas": (list,), "packages": (list,),
+    "components": (list,), "environment_locks": (list,),
+}
+for key, kinds in wanted.items():
+    value = manifest[key]
+    if isinstance(value, bool) or not isinstance(value, kinds):
+        names = " or ".join(JSON_NAMES.get(kind, kind.__name__) for kind in kinds)
+        raise SystemExit(f"modules/manifest.json: {key} is {type_name(value)}, not {names}")
+
+if manifest["format"] != FORMAT:
+    raise SystemExit(f"modules/manifest.json: format is {manifest['format']!r}, not {FORMAT!r}")
+
+commit = manifest["commit"]
+if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+    raise SystemExit(f"modules/manifest.json: commit {commit!r} is not a 40-character lowercase hex commit")
+
+native = manifest["native"]
+if set(native) != {"asset", "sha256"}:
+    raise SystemExit("modules/manifest.json: native must have exactly asset and sha256")
+if not isinstance(native["asset"], str) or not isinstance(native["sha256"], str):
+    raise SystemExit("modules/manifest.json: native.asset and native.sha256 must be strings")
+
+for section, section_keys in (("toolchain", TOOLCHAIN_KEYS), ("runtime", RUNTIME_KEYS)):
+    value = manifest[section]
+    if set(value) != section_keys:
+        raise SystemExit(f"modules/manifest.json: {section} must have exactly {', '.join(sorted(section_keys))}")
+    for name in sorted(section_keys):
+        if value[name] is not None and not isinstance(value[name], str):
+            raise SystemExit(f"modules/manifest.json: {section}.{name} is {type_name(value[name])}, not string or null")
+
+listed = {}
+for index, entry in enumerate(manifest["packages"]):
+    where = f"packages[{index}]"
+    if not isinstance(entry, dict) or isinstance(entry, bool):
+        raise SystemExit(f"modules/manifest.json: {where} is {type_name(entry)}, not an object")
+    if set(entry) != PACKAGE_KEYS:
+        raise SystemExit(f"modules/manifest.json: {where} must have exactly path, sha256 and size")
+    rel = entry["path"]
+    if not isinstance(rel, str):
+        raise SystemExit(f"modules/manifest.json: {where}.path is {type_name(rel)}, not a string")
+    complaint = bad_path(rel)
+    if complaint:
+        raise SystemExit(f"modules/manifest.json: {where}.path {rel!r} has {complaint}")
+    if rel.endswith(".cwasm"):
+        raise SystemExit(f"modules/manifest.json: {where}.path {rel!r} is a compiled-cache blob (.cwasm is never shipped)")
+    if rel in listed:
+        raise SystemExit(f"modules/manifest.json: {where}.path {rel!r} duplicates packages[{listed[rel]}]")
+    listed[rel] = index
+    if not isinstance(entry["sha256"], str):
+        raise SystemExit(f"modules/manifest.json: {where}.sha256 is {type_name(entry['sha256'])}, not a string")
+    size = entry["size"]
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise SystemExit(f"modules/manifest.json: {where}.size is not a byte count")
+
+packages_dir = modules / "packages"
+packaged = {}
+if packages_dir.exists() or packages_dir.is_symlink():
+    if packages_dir.is_symlink() or not packages_dir.is_dir():
+        raise SystemExit("modules/packages is not a directory")
+    for path in packages_dir.rglob("*"):
+        rel = path.relative_to(modules).as_posix()
+        if path.is_symlink():
+            raise SystemExit(f"modules/{rel}: a symlink is not allowed under modules/")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise SystemExit(f"modules/{rel}: a special file is not allowed under modules/")
+        if rel.endswith(".cwasm"):
+            raise SystemExit(f"modules/{rel}: a compiled-cache blob (.cwasm) is never shipped")
+        packaged[rel] = path
+
+if set(packaged) != set(listed):
+    detail = []
+    missing = sorted(set(listed) - set(packaged))
+    extra = sorted(set(packaged) - set(listed))
+    if missing:
+        detail.append("missing from the archive: " + ", ".join(missing))
+    if extra:
+        detail.append("not listed in the manifest: " + ", ".join(extra))
+    raise SystemExit("modules/manifest.json does not match the packaged files: " + "; ".join(detail))
+
+for entry in manifest["packages"]:
+    data = packaged[entry["path"]].read_bytes()
+    if len(data) != entry["size"]:
+        raise SystemExit(f"modules/{entry['path']}: size is {len(data)} bytes, the manifest says {entry['size']}")
+    got = hashlib.sha256(data).hexdigest()
+    if got != entry["sha256"]:
+        raise SystemExit(f"modules/{entry['path']}: sha256 is {got}, the manifest says {entry['sha256']}")
+
+if binary_sha and native["sha256"] != binary_sha:
+    raise SystemExit(f"modules/manifest.json: native.sha256 {native['sha256']!r} does not match the verified binary {binary_sha}")
+if tag and manifest["tag"] is not None and manifest["tag"] != tag:
+    raise SystemExit(f"modules/manifest.json: tag {manifest['tag']!r} does not match the requested release {tag!r}")
+PY
 }
 
 # Listing validation and Python's data extraction filter both reject traversal, links and
-# special members. Only regular files and directories beneath the three shipped roots are
-# accepted, and the resulting layout is checked again after extraction.
+# special members. Only regular files and directories beneath the four shipped roots are
+# accepted, and the result is checked again after extraction. Everything lands in the
+# temporary stage, so a rejected archive never reaches the prefix.
 stage_share() {
   local tarball="$1"
-  mkdir -p "$prefix/share"
-  share_new="$prefix/share/.p1.new.$$"
-  rm -rf "$share_new"
-  mkdir -p "$share_new"
-  python3 - "$tarball" "$share_new" <<'PY' || die "unsafe or invalid $(basename "$tarball") — nothing installed"
+  staged_share="$stage/share"
+  rm -rf "$staged_share"
+  mkdir -p "$staged_share"
+  python3 - "$tarball" "$staged_share" <<'PY' || die "unsafe or invalid $(basename "$tarball") — nothing installed"
 import pathlib
 import sys
 import tarfile
 
 archive_path, destination = sys.argv[1:]
-allowed = {"environments", "routes", "profiles"}
+allowed = {"environments", "routes", "profiles", "modules"}
 with tarfile.open(archive_path, "r:gz") as archive:
     members = archive.getmembers()
     for member in members:
@@ -292,11 +494,11 @@ with tarfile.open(archive_path, "r:gz") as archive:
     archive.extractall(destination, members=members, filter="data")
 PY
   for dir in environments routes profiles; do
-    if [ ! -d "$share_new/$dir" ] || [ -L "$share_new/$dir" ]; then
+    if [ ! -d "$staged_share/$dir" ] || [ -L "$staged_share/$dir" ]; then
       die "$(basename "$tarball") has no regular $dir/ directory — nothing installed"
     fi
   done
-  python3 - "$share_new" <<'PY' || die "archive produced an unexpected filesystem entry — nothing installed"
+  python3 - "$staged_share" <<'PY' || die "archive produced an unexpected filesystem entry — nothing installed"
 import os
 import pathlib
 import sys
@@ -306,24 +508,51 @@ for path in root.rglob("*"):
     if path.is_symlink() or not (path.is_dir() or path.is_file()):
         raise SystemExit(f"unexpected archive entry: {path}")
 PY
+  verify_modules "$staged_share" "$tarball"
+}
+
+# The verified binary waits in the stage too; publish_staged copies it into the prefix only
+# once the whole archive has passed.
+stage_binary() {
+  local src="$1"
+  staged_bin="$stage/p1"
+  cp -f "$src" "$staged_bin"
+  chmod 0755 "$staged_bin"
 }
 
 # The updater is written into the staged share, rather than after its directory is
 # committed, so a copy or chmod failure cannot leave a binary without a working updater.
 stage_self_and_updater() {
-  local wrapper
   [ -n "$stage_script" ] || return 0
-  cp -f "$stage_script" "$share_new/install.sh"
-  chmod 0755 "$share_new/install.sh"
-  wrapper="$prefix/bin/.p1-update.new.$$"
-  cat >"$wrapper" <<EOF
+  cp -f "$stage_script" "$staged_share/install.sh"
+  chmod 0755 "$staged_share/install.sh"
+  staged_update="$stage/p1-update"
+  cat >"$staged_update" <<EOF
 #!/usr/bin/env bash
 # Written by p1's install.sh (ADR-0065): update p1 to the latest release.
 set -euo pipefail
 exec "$prefix/share/p1/install.sh" --latest --prefix "$prefix" "\$@"
 EOF
-  chmod 0755 "$wrapper"
-  update_new="$wrapper"
+  chmod 0755 "$staged_update"
+}
+
+# Only now, with the archive and the binary verified, is the prefix created and filled with
+# .new copies in their destination directories, so the commit stays a set of same-filesystem
+# renames and every earlier refusal leaves the prefix exactly as it was.
+publish_staged() {
+  mkdir -p "$prefix/bin" "$prefix/share"
+  share_new="$prefix/share/.p1.new.$$"
+  rm -rf "$share_new"
+  mkdir -p "$share_new"
+  cp -a "$staged_share/." "$share_new/"
+  bin_new="$prefix/bin/.p1.new.$$"
+  cp -f "$staged_bin" "$bin_new"
+  chmod 0755 "$bin_new"
+  if [ -n "$staged_update" ]; then
+    update_new="$prefix/bin/.p1-update.new.$$"
+    cp -f "$staged_update" "$update_new"
+    chmod 0755 "$update_new"
+  fi
 }
 
 # --local: a cloud build is normal. This fallback uses one per-task target on the
@@ -411,7 +640,8 @@ install_local() {
   (cd "$repo_root" && cargo build --release --locked -p p1-host)
   local_bin="$target/release/p1"
   [ -x "$local_bin" ] || die "cargo did not produce $local_bin"
-  # The share data come from this checkout, so a local build ships this checkout's routes.
+  # The share data come from this checkout: environments, routes and profiles only. The
+  # local module build arrives with a later slice, so a --local install ships no modules/.
   tar -czf "$stage/$SHARE_ASSET" -C "$repo_root" environments routes profiles
   printf 'p1 install: %s -> %s\n' "$local_bin" "$prefix"
 }
@@ -429,6 +659,8 @@ install_release() {
   verify_asset "$stage/$BINARY_ASSET" "$stage/$BINARY_ASSET.sha256"
   verify_asset "$stage/$SHARE_ASSET" "$stage/$SHARE_ASSET.sha256"
   release_bin="$stage/$BINARY_ASSET"
+  # The manifest's native.sha256 pins the released binary; compute it from the verified file.
+  binary_sha="$(sha256_of "$release_bin")"
 }
 
 commit_install() {
@@ -585,19 +817,20 @@ case "$mode" in
       fi
     fi
     stage_share "$stage/$SHARE_ASSET"
-    printf '%s\n' "${tag:-latest}" >"$share_new/.p1-release"
+    printf '%s\n' "${tag:-latest}" >"$staged_share/.p1-release"
     stage_binary "$release_bin"
     stage_self_and_updater
     ;;
   local)
     install_local
     stage_share "$stage/$SHARE_ASSET"
-    printf 'local\n' >"$share_new/.p1-release"
+    printf 'local\n' >"$staged_share/.p1-release"
     stage_binary "$local_bin"
     stage_self_and_updater
     ;;
 esac
 
+publish_staged
 commit_install
 
 printf 'p1 install: installed %s\n' "$prefix/bin/p1"

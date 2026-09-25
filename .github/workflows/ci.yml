@@ -22,6 +22,14 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-wasip2
 
+      - name: Read the wasm-tools pin
+        run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"
+
+      - name: Install wasm-tools (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
+
       - uses: actions/cache@v4
         with:
           path: |
