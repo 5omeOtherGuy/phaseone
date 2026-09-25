@@ -31,7 +31,9 @@ use p1_provider_http::testing::{
     ScriptedWsConnector,
 };
 use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsError, WsHandshake};
-use p1_provider_http::{Credential, CredentialSource, RetryPolicy};
+use p1_provider_http::{
+    Credential, CredentialSource, FIRST_BYTE_TIMEOUT, RetryPolicy, STREAM_IDLE_TIMEOUT,
+};
 use p1_provider_openai::{
     Clock, OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesAdapterSettings, ResponsesRoute,
     ResponsesTransport,
@@ -540,8 +542,9 @@ impl WsConnection for StalledConnection {
         match self.frames.pop_front() {
             Some(ScriptedFrame::Text(text)) => Box::pin(async move { Ok(Some(text)) }),
             Some(ScriptedFrame::Error(message)) => Box::pin(async move { Err(WsError(message)) }),
-            // Past its script this connection never answers again.
-            Some(ScriptedFrame::Close) | None => Box::pin(std::future::pending()),
+            // Past its script — and for any control or pause this stall double does
+            // not model — the connection never answers again.
+            _ => Box::pin(std::future::pending()),
         }
     }
 }
@@ -1325,6 +1328,184 @@ async fn a_read_error_before_any_output_retries_within_the_budget_then_falls_bac
     completed(&events);
     assert_eq!(connector.handshakes().len(), 4);
     assert_eq!(sse.requests().len(), 1, "the budget spent, SSE serves it");
+}
+
+/// Issue #164 for the WebSocket arm: a peer that opens the socket and never sends
+/// the FIRST frame is §5's transient row, each attempt bounded at the first-frame
+/// bound, and the budget spent falls back to SSE. The script waits past the bound
+/// and never delivers a frame, so the connection's own read loop expires.
+#[tokio::test(start_paused = true)]
+async fn a_read_that_never_answers_is_bounded_at_the_first_frame_and_falls_back() {
+    let silence =
+        || ScriptedConnection::accept(vec![ScriptedFrame::wait(Duration::from_secs(3600))]);
+    let connector = ScriptedWsConnector::new(vec![silence(), silence(), silence(), silence()]);
+    let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        sse.clone(),
+        Some(Arc::new(connector.clone())),
+    )
+    .expect("the route composes");
+
+    let start = tokio::time::Instant::now();
+    let events = tokio::time::timeout(Duration::from_secs(600), turn(&provider))
+        .await
+        .expect("the first-frame bound must end the wait, not hang CI");
+    completed(&events);
+
+    assert_eq!(
+        connector.handshakes().len(),
+        4,
+        "a first-frame timeout is the transient row: the first attempt and the three \
+         reconnects the default policy's max_retries allows"
+    );
+    assert_eq!(
+        sse.requests().len(),
+        1,
+        "the first-frame bound fell back to SSE"
+    );
+    let policy = RetryPolicy::default();
+    assert_eq!(
+        start.elapsed(),
+        4 * FIRST_BYTE_TIMEOUT
+            + policy.delay(1, None)
+            + policy.delay(2, None)
+            + policy.delay(3, None),
+        "four bounded attempts, the retry policy's backoff between them"
+    );
+}
+
+/// Review round 2: a first-frame bound expiry on a REUSED connection is §5's third
+/// "once" row — the dead-slot case `on_close` already handles for a reused socket
+/// that closes before its first frame — so it reconnects ONCE, with no retry backoff
+/// and no `Activity`, instead of spending a retry byte and risking the SSE fallback
+/// on a healthy turn.
+#[tokio::test(start_paused = true)]
+async fn a_first_frame_timeout_on_a_reused_connection_reconnects_once() {
+    // One connection serves turn 1 and is returned to the slot; turn 2 takes it out
+    // of the slot (reused) and its first frame never arrives. The reconnect is the
+    // second scripted connection, which serves turn 2.
+    let connector = ScriptedWsConnector::new(vec![
+        ScriptedConnection::accept(
+            turn_frames(1)
+                .into_iter()
+                .chain([ScriptedFrame::wait(Duration::from_secs(3600))])
+                .collect(),
+        ),
+        ScriptedConnection::accept(turn_frames(1)),
+    ]);
+    let sse = ScriptedTransport::new(Vec::new());
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        sse.clone(),
+        Some(Arc::new(connector.clone())),
+    )
+    .expect("the route composes");
+
+    completed(&turn(&provider).await);
+    let start = tokio::time::Instant::now();
+    let events = tokio::time::timeout(Duration::from_secs(200), turn(&provider))
+        .await
+        .expect("the first-frame bound must end the wait, not hang CI");
+    completed(&events);
+
+    assert_eq!(
+        connector.handshakes().len(),
+        2,
+        "one reconnect for the reused socket's first-frame timeout"
+    );
+    assert_eq!(sse.requests().len(), 0, "no SSE fallback");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Activity)),
+        "the once row has no retry backoff: {events:?}"
+    );
+    assert_eq!(
+        start.elapsed(),
+        FIRST_BYTE_TIMEOUT,
+        "exactly the bound: not the transient row's bound + backoff"
+    );
+}
+
+/// Issue #164: a WebSocket peer that stays alive with CONTROL pings is not idle —
+/// every frame, a ping included, resets the idle clock — so 20 minutes of pings
+/// then a text frame completes instead of being failed as silent.
+#[tokio::test(start_paused = true)]
+async fn keep_alive_pings_reset_the_idle_bound() {
+    let mut frames = Vec::new();
+    for _ in 0..6 {
+        frames.push(ScriptedFrame::ping());
+        frames.push(ScriptedFrame::wait(Duration::from_secs(200)));
+    }
+    frames.push(ScriptedFrame::ping());
+    frames.extend(turn_frames(1));
+    let connector = ScriptedWsConnector::new(vec![ScriptedConnection::accept(frames)]);
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        ScriptedTransport::new(Vec::new()),
+        Some(Arc::new(connector.clone())),
+    )
+    .expect("the route composes");
+
+    let start = tokio::time::Instant::now();
+    let events = tokio::time::timeout(Duration::from_secs(1300), turn(&provider))
+        .await
+        .expect("keep-alive pings must keep the stream alive, not hang CI");
+    completed(&events);
+
+    assert_eq!(
+        connector.handshakes().len(),
+        1,
+        "one connection, kept alive"
+    );
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_secs(1200),
+        "six pings 200 s apart: 20 minutes, none of them past the idle bound"
+    );
+}
+
+/// Issue #164 for the WebSocket arm after output: a stream that goes silent past
+/// the idle bound is this response's own `Transport` failure, naming the bound —
+/// no retry, no fallback.
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_stalls_after_output_fails_at_the_idle_bound() {
+    // One script per connect (a reconnect would panic it), no SSE response (a
+    // fallback would panic): the delta is visible, then the peer goes silent.
+    let connector = ScriptedWsConnector::new(vec![ScriptedConnection::accept(vec![
+        ScriptedFrame::text(DELTA),
+        ScriptedFrame::wait(Duration::from_secs(3600)),
+    ])]);
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        ScriptedTransport::new(Vec::new()),
+        Some(Arc::new(connector.clone())),
+    )
+    .expect("the route composes");
+
+    let start = tokio::time::Instant::now();
+    let events = tokio::time::timeout(Duration::from_secs(400), turn(&provider))
+        .await
+        .expect("the idle bound must end the wait, not hang CI");
+
+    assert_eq!(failed(&events).kind, ProviderErrorKind::Transport);
+    assert_eq!(
+        failed(&events).message,
+        format!("stream idle for {} s", STREAM_IDLE_TIMEOUT.as_secs())
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta { text, .. } if text == "Hello")),
+        "the visible output is preserved: {events:?}"
+    );
+    assert_eq!(connector.handshakes().len(), 1, "no reconnect after output");
+    assert_eq!(
+        start.elapsed(),
+        STREAM_IDLE_TIMEOUT,
+        "the wait ends at the idle bound, exactly"
+    );
 }
 
 /// The same for a close before any output — and on a FRESH connection, where §5 has

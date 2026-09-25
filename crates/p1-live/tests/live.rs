@@ -282,9 +282,21 @@ impl p1_provider_http::ws::WsConnection for CountingConnection {
         &'a mut self,
     ) -> futures_util::future::BoxFuture<'a, Result<Option<String>, p1_provider_http::ws::WsError>>
     {
+        self.inner.next_text()
+    }
+
+    fn next_bounded<'a>(
+        &'a mut self,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<p1_provider_http::ws::WsNext, p1_provider_http::ws::WsError>,
+    > {
+        // The adapter reads through `next_bounded`, so this decorator MUST forward it:
+        // delegating to the provided default would drop the read bound issue #164 adds
+        // and report an expiry as a close. The frame count moves here with it.
         Box::pin(async move {
-            let next = self.inner.next_text().await;
-            if matches!(next, Ok(Some(_))) {
+            let next = self.inner.next_bounded().await;
+            if matches!(next, Ok(p1_provider_http::ws::WsNext::Text(_))) {
                 self.frames
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }

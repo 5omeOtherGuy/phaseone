@@ -36,7 +36,9 @@ use futures_util::stream::unfold;
 use p1_contracts::{
     CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream, StreamEvent,
 };
-use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsHandshake};
+use p1_provider_http::ws::{
+    WsBound, WsConnectError, WsConnection, WsConnector, WsHandshake, WsNext,
+};
 use p1_provider_http::{Credential, CredentialSource, ResponseParser, RetryPolicy, SseEvent};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -607,7 +609,7 @@ async fn connect(mut state: State) -> State {
     };
     let connector = state.request.ws.connector.clone();
     let cancel = state.request.cancel.clone();
-    match race_bounded(&cancel, connector.connect(handshake)).await {
+    match race_bounded(&cancel, BOUND, connector.connect(handshake)).await {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         // §5: a connect error or a timeout is the transient row, whatever the
         // failure class: the socket never came up, so nothing was sent.
@@ -677,7 +679,7 @@ async fn send(mut state: State) -> State {
             .live
             .as_mut()
             .expect("a connection is open before a frame is sent");
-        race_bounded(&cancel, live.connection.send_text(frame)).await
+        race_bounded(&cancel, BOUND, live.connection.send_text(frame)).await
     };
     match sent {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
@@ -699,19 +701,24 @@ async fn send(mut state: State) -> State {
 
 async fn read(mut state: State) -> State {
     let cancel = state.request.cancel.clone();
+    // §4: the read is bounded INSIDE the connection, where the message loop sees
+    // every frame — so ANY message, a control ping included, resets the idle clock
+    // (issue #164). Here we only race cancellation and classify the outcome.
     let received = {
         let live = state
             .live
             .as_mut()
             .expect("a connection is open while reading");
-        // §4: a read is bounded by the adapter's existing idle timeout — this
-        // adapter has none for a streaming body, so only cancellation ends the wait.
-        race(&cancel, live.connection.next_text()).await
+        race(&cancel, live.connection.next_bounded()).await
     };
     match received {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
-        Raced::Done(Ok(Some(text))) => state.on_frame(&text),
-        Raced::Done(Ok(None)) | Raced::Done(Err(_)) => state.on_close(),
+        Raced::Done(Ok(WsNext::Timeout(bound))) => {
+            let error = ProviderError::new(ProviderErrorKind::Transport, bound.message());
+            state.on_read_timeout(bound, error)
+        }
+        Raced::Done(Ok(WsNext::Text(text))) => state.on_frame(&text),
+        Raced::Done(Ok(WsNext::Closed)) | Raced::Done(Err(_)) => state.on_close(),
     }
 }
 
@@ -762,6 +769,29 @@ impl State {
         } else {
             // §5's last row: a read error or a close before any output is the
             // transient row — reconnect inside the retry budget, then fall back.
+            self.transient()
+        }
+    }
+
+    /// A read whose bound expired (the connection reports it as
+    /// [`WsNext::Timeout`]). A FIRST-FRAME expiry on a REUSED connection is §5's
+    /// third "once" row — the same dead-slot case `on_close` handles for a reused
+    /// socket that closes before its first frame: the connection was already stale
+    /// when this request picked it up, so reconnect once instead of spending a retry
+    /// byte, waiting the backoff, and risking the SSE fallback on a healthy turn.
+    ///
+    /// Otherwise, before any output it is §5's transient row — the reconnect budget,
+    /// then the SSE fallback. After output it is this response's own `Transport`
+    /// failure, whose message names the bound that expired.
+    fn on_read_timeout(mut self, bound: WsBound, error: ProviderError) -> State {
+        if bound == WsBound::FirstFrame && reused(&self) && !self.visible && !self.once.reused_close
+        {
+            self.once.reused_close = true;
+            return self.reconnect();
+        }
+        if self.visible {
+            self.terminal(Outcome::Failed(error))
+        } else {
             self.transient()
         }
     }
@@ -991,13 +1021,14 @@ async fn race<T>(cancel: &CancellationToken, future: impl Future<Output = T>) ->
     }
 }
 
-/// Await `future` under [`BOUND`] and under cancellation (§4). The timeout is the
+/// Await `future` under `bound` and under cancellation (§4). The timeout is the
 /// only thing that can give up on a peer that never answers.
 async fn race_bounded<T>(
     cancel: &CancellationToken,
+    bound: Duration,
     future: impl Future<Output = T>,
 ) -> Raced<Result<T, tokio::time::error::Elapsed>> {
-    race(cancel, tokio::time::timeout(BOUND, future)).await
+    race(cancel, tokio::time::timeout(bound, future)).await
 }
 
 #[cfg(test)]

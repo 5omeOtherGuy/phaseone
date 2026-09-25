@@ -5,13 +5,17 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::stream;
 use p1_contracts::BoxFuture;
 
 use crate::http::{ByteStream, HttpRequest, HttpResponse, Transport, TransportError};
-use crate::ws::{WsConnectError, WsConnection, WsConnector, WsError, WsHandshake};
+use crate::ws::{
+    MessageChannel, RawMessage, WsConnectError, WsConnection, WsConnector, WsError, WsHandshake,
+    WsNext, read_bounded,
+};
 
 /// A queue of canned responses plus a record of every request received.
 ///
@@ -241,7 +245,10 @@ impl WsConnector for ScriptedWsConnector {
                 }
                 ScriptedConnection::Fail(message) => Err(WsConnectError::Failed(message)),
                 ScriptedConnection::Accept(frames) => Ok(Box::new(ScriptedWsConnection {
-                    frames: frames.into(),
+                    channel: ScriptedChannel {
+                        frames: frames.into(),
+                    },
+                    awaiting_first_frame: false,
                     inner,
                     connection: connection.expect("an accepted connection is recorded"),
                 })
@@ -336,9 +343,16 @@ impl ScriptedConnection {
 }
 
 /// One scripted incoming message.
+///
+/// `Ping`/`Pong` are the WebSocket CONTROL frames a real peer sends to keep the
+/// socket alive; `Wait` is a pause before the next frame is delivered, which the
+/// fake clock advances instead of sleeping (issue #164's bound tests).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScriptedFrame {
     Text(String),
+    Ping,
+    Pong,
+    Wait(Duration),
     Error(String),
     Close,
 }
@@ -346,6 +360,19 @@ pub enum ScriptedFrame {
 impl ScriptedFrame {
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text(text.into())
+    }
+
+    pub fn ping() -> Self {
+        Self::Ping
+    }
+
+    pub fn pong() -> Self {
+        Self::Pong
+    }
+
+    /// Pause for `delay` before the next frame is delivered.
+    pub fn wait(delay: Duration) -> Self {
+        Self::Wait(delay)
     }
 
     pub fn error(message: impl Into<String>) -> Self {
@@ -358,7 +385,10 @@ impl ScriptedFrame {
 }
 
 struct ScriptedWsConnection {
-    frames: VecDeque<ScriptedFrame>,
+    channel: ScriptedChannel,
+    /// Whether no frame has arrived since this connection's last `send_text`; the
+    /// bounded read uses it exactly as the real connection does.
+    awaiting_first_frame: bool,
     inner: Arc<Mutex<ScriptedWsState>>,
     connection: usize,
 }
@@ -371,19 +401,53 @@ impl WsConnection for ScriptedWsConnection {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.sent_texts[self.connection].push(text);
+            drop(state);
+            self.awaiting_first_frame = true;
             Ok(())
         })
     }
 
     fn next_text<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<String>, WsError>> {
         Box::pin(async move {
-            match self.frames.pop_front() {
-                Some(ScriptedFrame::Text(text)) => Ok(Some(text)),
-                Some(ScriptedFrame::Error(message)) => Err(WsError(message)),
-                // A close frame, and an exhausted script, both end the stream.
-                Some(ScriptedFrame::Close) | None => Ok(None),
+            Ok(match self.next_bounded().await? {
+                WsNext::Text(text) => Some(text),
+                WsNext::Closed | WsNext::Timeout(_) => None,
+            })
+        })
+    }
+
+    fn next_bounded<'a>(&'a mut self) -> BoxFuture<'a, Result<WsNext, WsError>> {
+        Box::pin(
+            async move { read_bounded(&mut self.channel, &mut self.awaiting_first_frame).await },
+        )
+    }
+}
+
+/// The scripted raw message source: it replays [`ScriptedFrame`]s and drives the
+/// crate's real bounded read, so a test exercises the production idle clock.
+struct ScriptedChannel {
+    frames: VecDeque<ScriptedFrame>,
+}
+
+impl MessageChannel for ScriptedChannel {
+    fn next_message(&mut self) -> BoxFuture<'_, Result<Option<RawMessage>, WsError>> {
+        Box::pin(async move {
+            loop {
+                match self.frames.pop_front() {
+                    Some(ScriptedFrame::Text(text)) => return Ok(Some(RawMessage::Text(text))),
+                    Some(ScriptedFrame::Ping) => return Ok(Some(RawMessage::Ping(Vec::new()))),
+                    Some(ScriptedFrame::Pong) => return Ok(Some(RawMessage::Pong)),
+                    Some(ScriptedFrame::Wait(delay)) => tokio::time::sleep(delay).await,
+                    Some(ScriptedFrame::Error(message)) => return Err(WsError(message)),
+                    // A close frame, and an exhausted script, both end the stream.
+                    Some(ScriptedFrame::Close) | None => return Ok(None),
+                }
             }
         })
+    }
+
+    fn pong(&mut self, _payload: Vec<u8>) -> BoxFuture<'_, Result<(), WsError>> {
+        Box::pin(async move { Ok(()) })
     }
 }
 
