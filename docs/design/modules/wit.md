@@ -69,7 +69,8 @@ value, a finish tool's output contract and structured result, and a workflow run
   from the package identity and is not exported, so a module cannot claim another
   implementation's identity or grants.
 - **provider.** A provider module lowers requests and classifies what comes back; the broker
-  sends (freeze item 9, below). `describe` returns the route description; `validate` refuses
+  sends (freeze item 9, below). `describe` returns the route description, on the restricted
+  path and so from the state `configure` stored on that instance; `validate` refuses
   what the route cannot carry; `lower` turns a provider request into the HTTP request the
   broker sends (method, path relative to the route's endpoint, headers without credentials,
   the credential's placement, body) and, for a route that speaks WebSocket, the handshake and
@@ -93,9 +94,11 @@ Additions beyond the slice brief's export list, each with its reason:
 - `configure` (provider, context-policy). A native provider is constructed for one route and
   model, and a native context policy with its thresholds; none of the listed exports receives
   them, and a route description cannot be produced without them. The host calls `configure`
-  once, before any other export, and an `err` refuses the assembly. Tools and authorization
-  policies need none: their native constructors take only host services, which are imports
-  here, and an environment's tool face is applied by the host.
+  once per instance, before any other export on it — on the assembly instance and on the
+  restricted instance that provider `describe` runs on — and an `err` on the assembly refuses
+  the assembly. Tools and authorization policies need none: their native constructors take
+  only host services, which are imports here, and an environment's tool face is applied by the
+  host.
 - `classify` (provider). The native `ResponseParser::on_http_error` classifies a non-2xx
   response by route knowledge (a context-window error type in the body); the broker cannot.
 - `compact-now` (context-policy). `ContextPolicy` has it and the native summarizing policy
@@ -194,9 +197,14 @@ waits. A trap never undoes a native effect: what a command, a write or a worker 
 stays done.
 
 The host calls a tool's `effect` and `describe`, and a provider's `describe`, on a restricted
-path: no capability is granted and the fuel budget is tight, so any import called there traps
-and a module's inspection code cannot reach a capability. These exports work from their
-arguments alone. What only a capability can know, such as whether a path escapes the
+path: a second instance of the module with no capability linked and a tight fuel budget, so any
+import called there traps and a module's inspection code cannot reach a capability. These
+exports work from their arguments alone and from state the restricted instance itself holds.
+The instance and ordering rule is explicit: the host calls `configure` first on the restricted
+instance, with the same settings as the assembly instance, and only then a restricted export;
+the restricted instance's `configure` has no capability either, so it must not depend on one. A
+provider's `describe` therefore takes no argument of its own and still reads what its own
+`configure` stored. What only a capability can know, such as whether a path escapes the
 workspace through a symlink, is judged lexically there and enforced again by the capability
 when the call executes.
 

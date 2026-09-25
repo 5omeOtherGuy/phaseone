@@ -11,9 +11,11 @@
 /// WIT `future` or `stream` types, and none imports a WASI interface.
 ///
 /// The restricted path: the host calls a tool's `effect` and `describe`, and a provider's
-/// `describe`, with no capability granted and a tight fuel budget. Any import called on that
-/// path traps, so a module's inspection code cannot reach a capability; those exports must
-/// work from their arguments alone.
+/// `describe`, on a second instance of the module, with no capability granted and a tight fuel
+/// budget. Any import called on that path traps, so a module's inspection code cannot reach a
+/// capability; those exports work from their arguments alone and from what that instance's own
+/// `configure` stored. The instance and ordering rule is: configure, then describe, on both
+/// the assembly instance and the restricted instance, with the same settings.
 package p1:module@1.0.0;
 
 /// A tool module (`p1_contracts::Tool`). Its identity is built by the loader, not exported.
@@ -98,10 +100,14 @@ world provider {
         websocket: option<websocket-request>,
     }
 
-    /// Called once, before any other export. `err` refuses the assembly.
+    /// Called once on an instance, before any other export on it: the assembly instance and
+    /// the restricted instance `describe` runs on each get it, with the same settings, and an
+    /// `err` refuses the assembly. On the restricted instance it has no capability either, so
+    /// it must not depend on one.
     export configure: func(settings: provider-settings) -> result<_, provider-error>;
 
-    /// What this instance is. Restricted path.
+    /// What this instance is. Restricted path: reads what this instance's `configure` stored,
+    /// takes no argument of its own and calls no import.
     export describe: func() -> route-description;
 
     /// Refuse what this route cannot carry, before a run starts.
