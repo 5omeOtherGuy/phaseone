@@ -671,11 +671,7 @@ fn the_new_opencode_account_routes_are_distinct() {
     const GO_ENDPOINT: &str = "https://opencode.ai/zen/go/v1/chat/completions";
     const ZEN_ENDPOINT: &str = "https://opencode.ai/zen/v1/chat/completions";
     const GO_MODELS: [&str; 1] = ["deepseek-v4.1-flash"];
-    const ZEN_MODELS: [&str; 3] = [
-        "mimo-v2.6-flash-free",
-        "muse-spark-1.3-contributor-free",
-        "space-bunny-free",
-    ];
+    const ZEN_MODELS: [&str; 2] = ["mimo-v2.6-flash-free", "space-bunny-free"];
     // (route id, endpoint, the variable it names, the profiles it binds)
     let expected: [(&str, &str, &str, &[&str]); 8] = [
         (
@@ -741,7 +737,7 @@ fn the_new_opencode_account_routes_are_distinct() {
         assert!(route.credential.store_only, "{id} is store-only (ADR-0061)");
         assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
         // The free Zen routes present the OpenCode client identity (owner decision 2026-09-24,
-        // ADR-0066); the Go and ClinePass routes keep p1's own identity.
+        // ADR-0067); the Go and ClinePass routes keep p1's own identity.
         let identity = id
             .starts_with("opencode-zen")
             .then_some(ClientIdentity::Opencode);

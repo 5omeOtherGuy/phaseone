@@ -20,9 +20,8 @@ default_effort = "high"
 context_tokens    = 1048576
 max_output_tokens = 131072
 
-# ENDPOINT: the metadata's provider hint is npm `@ai-sdk/openai`, and Zen serves this model on
-# `/zen/v1/responses` — a real opencode `build` request gets 200 there. The chat-completions
-# endpoint our route speaks passes the free-tier gate once the OpenCode client identity is
-# presented, then answers 503 `Upstream request failed: Endpoint is unavailable.` (no muse
-# upstream). This profile is data: it is served on a Responses route, and on the shipped chat
-# route the live receipt is that 503. Evidence: docs/design/zen-client-identity-evidence.md.
+# ENDPOINT NOT YET VERIFIED: the metadata's provider hint is npm `@ai-sdk/openai`, and the Zen docs
+# list this model on `/zen/v1/responses`; our route speaks chat completions. Live 2026-09-24 the
+# chat-completions endpoint answers HTTP 403 `FreeTierError` (free tier only from within OpenCode)
+# before any model check, so whether it would serve this model past the gate is unknown. This
+# profile is data, not a claim that the Zen chat-completions endpoint answers for it.

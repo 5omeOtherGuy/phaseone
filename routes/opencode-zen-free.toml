@@ -30,8 +30,5 @@ client_identity = "opencode"
 [models."mimo-v2.6-flash-free"]
 wire_model = "mimo-v2.6-flash-free"
 
-[models."muse-spark-1.3-contributor-free"]
-wire_model = "muse-spark-1.3-contributor-free"
-
 [models."space-bunny-free"]
 wire_model = "space-bunny-free"

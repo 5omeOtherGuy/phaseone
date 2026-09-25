@@ -27,7 +27,7 @@ store_only = true
 # docs/design/routes.md §"x-opencode-session" describes for the gateway.
 dialect        = "thinking-with-reasoning-alias"
 session_header = "x-opencode-session"
-# Owner decision 2026-09-24: the Zen free tier gates MiMo and Muse on the request looking like
+# Owner decision 2026-09-24: the Zen free tier gates MiMo on the request looking like
 # OpenCode's own client (403 FreeTierError otherwise). This route presents that client identity;
 # Space Bunny is ungated and is unaffected. Evidence: docs/design/zen-client-identity-evidence.md.
 client_identity = "opencode"
@@ -36,9 +36,6 @@ client_identity = "opencode"
 # pass-through of unknown model names — only -free ids appear here.
 [models."mimo-v2.6-flash-free"]
 wire_model = "mimo-v2.6-flash-free"
-
-[models."muse-spark-1.3-contributor-free"]
-wire_model = "muse-spark-1.3-contributor-free"
 
 [models."space-bunny-free"]
 wire_model = "space-bunny-free"

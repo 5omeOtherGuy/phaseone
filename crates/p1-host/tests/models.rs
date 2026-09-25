@@ -247,16 +247,15 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "gpt/gpt-6-luna",
             "gpt/gpt-6-sol",
             "kimi/kimi-k3",
-            // The three free Zen accounts: every account route binds all three free models, so
-            // each environment lists them and `<env>/<profile>` selects the account × model pair.
+            // The three free Zen accounts: each account route binds the MiMo and Space Bunny
+            // free profiles, so each environment lists them and `<env>/<profile>` selects the
+            // account × model pair. (Muse is not shipped on these routes: its chat endpoint
+            // answers 503, so the owner keeps Muse on opencode.)
             "zen/mimo-v2.6-flash-free",
-            "zen/muse-spark-1.3-contributor-free",
             "zen/space-bunny-free",
             "zen2/mimo-v2.6-flash-free",
-            "zen2/muse-spark-1.3-contributor-free",
             "zen2/space-bunny-free",
             "zen3/mimo-v2.6-flash-free",
-            "zen3/muse-spark-1.3-contributor-free",
             "zen3/space-bunny-free",
         ],
         "sorted by environment then profile"
@@ -302,7 +301,9 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         assert_eq!(model.route, route, "{id}");
         assert_eq!(model.efforts_line(), "high,max", "{id}");
     }
-    // Every Zen account serves every free model, and each free profile keeps its own efforts.
+    // Every Zen account serves the same free models, and each free profile keeps its own
+    // efforts. Muse is deliberately NOT among them: its chat-completions endpoint returns
+    // 503, so the owner keeps Muse on opencode (owner exception 2026-09-25).
     for environment in ["zen", "zen2", "zen3"] {
         let served: Vec<&str> = models
             .iter()
@@ -311,20 +312,16 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             .collect();
         assert_eq!(
             served,
-            [
-                "mimo-v2.6-flash-free",
-                "muse-spark-1.3-contributor-free",
-                "space-bunny-free"
-            ],
+            ["mimo-v2.6-flash-free", "space-bunny-free"],
             "{environment}: every account binds the same free models"
         );
     }
-    let muse = models
-        .iter()
-        .find(|model| model.id() == "zen3/muse-spark-1.3-contributor-free")
-        .expect("the shipped Muse Spark profile");
-    assert_eq!(muse.route, "opencode-zen-3");
-    assert_eq!(muse.efforts_line(), "low,high");
+    assert!(
+        !models
+            .iter()
+            .any(|model| model.profile == "muse-spark-1.3-contributor-free"),
+        "no shipped route serves Muse (its chat endpoint returns 503)"
+    );
     let bunny = models
         .iter()
         .find(|model| model.id() == "zen/space-bunny-free")
