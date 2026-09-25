@@ -1,9 +1,11 @@
 # Zen free-tier client identity — probes and receipts
 
 Owner decision 2026-09-24 (~21:10): p1 presents the OpenCode client identity to the Zen
-free endpoint so `mimo-v2.6-flash-free` and `muse-spark-1.3-contributor-free` answer from
-p1 natively. This file records what the gate actually accepts, the implementation's shape
-(`ADR-0066`), and the live receipts. Probes were run 2026-09-24 against key 1
+free endpoint so `mimo-v2.6-flash-free` answers from p1 natively.
+(`muse-spark-1.3-contributor-free` is gated the same way, but its chat endpoint answers
+503, so it is not shipped on these routes — Muse stays on opencode.) This file records what
+the gate actually accepts, the implementation's shape (`ADR-0067`), and the live receipts.
+Probes were run 2026-09-24 against key 1
 (`~/.config/keys/opencode-zen-1.key`); no key, token or header value with a credential is
 recorded here. Requests were sent from a header file (`curl -H @file`) or a script that
 reads the key file into memory, never on a command line.
@@ -84,9 +86,10 @@ All rows use opencode UA + a valid `ses_…`.
 | neutral | `bash` renamed `Bash` | 403 FreeTierError |
 
 The gate requires the request to declare BOTH a tool named `bash` and one named `read`;
-the system prompt is free, the schemas are free, and extra tools are free. p1 keeps its
-own tools and injects only the missing gate name (`bash`; `read` only when the environment
-does not grant it) as an empty-schema function stub.
+the system prompt is free, the schemas are free, and extra tools are free. The provider
+adapter declares no tool of its own: the shipped `zen`, `zen2` and `zen3` environments give
+the `shell` tool the face name `bash` and the `read` tool its own name `read`, so the
+request carries both as ordinary, dispatchable declarations.
 
 ### Minimal accepted shape (chat)
 
@@ -120,13 +123,14 @@ The Responses endpoint's gate is the same shape. Probes (key 1):
 | `ses_`+`A`×26 | `bash` + `read` | 403 FreeTierError |
 | no opencode UA | `bash` + `read` | 403 Cloudflare HTML |
 
-**Consequence.** p1's `openai-chat` adapter cannot reach muse, so the muse binding on
-the chat Zen routes returns 503. Reaching muse natively needs a second route using the
-`openai-responses` adapter pointed at `/zen/v1/responses`, an account behaviour that
-sends the Zen key without the ChatGPT account id, the same `client_identity` mechanism,
-and a profile with `thinking = "effort-level"` (the Responses adapter encodes only that
-policy). That is deliberately NOT done in this slice: it changes the Codex adapter and is
-a separate review. The chat identity above is what this slice lands.
+**Consequence.** p1's `openai-chat` adapter cannot reach muse, so the muse binding was
+removed from the chat Zen routes (owner exception 2026-09-25: Muse stays on opencode).
+Reaching muse natively needs a second route using the `openai-responses` adapter pointed
+at `/zen/v1/responses`, an account behaviour that sends the Zen key without the ChatGPT
+account id, the same `client_identity` mechanism, and a profile with
+`thinking = "effort-level"` (the Responses adapter encodes only that policy). That is
+deliberately NOT done in this slice: it changes the Codex adapter and is a separate review.
+The chat identity above is what this slice lands.
 
 ## Live p1 receipts
 

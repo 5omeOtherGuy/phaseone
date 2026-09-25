@@ -183,7 +183,7 @@ its own `user-agent: p1/<version>` and uses the host's cache key as `x-opencode-
 No foreign client identity is impersonated. (Exception, owner decision 2026-09-24: the Zen
 FREE routes `opencode-zen-1/2/3` and `opencode-zen-free` are gated on OpenCode's own client,
 so they set `[adapter_settings] client_identity = "opencode"`; the Go subscription above is
-not gated and keeps p1's identity. ADR-0066, evidence in
+not gated and keeps p1's identity. ADR-0067, evidence in
 `docs/design/zen-client-identity-evidence.md`.)
 
 Credential precedence (store-only, ADR-0061): `OPENCODE_API_KEY`, then p1's own store entry for
@@ -205,16 +205,20 @@ itself, one `/v1` up from the Go subscription surface, reached with the same ope
 `thinking-with-reasoning-alias` dialect and `x-opencode-session` header. Each of the owner's three
 Zen accounts is its own store-only route with its own variable (`OPENCODE_ZEN_1_API_KEY`,
 `_2_`, `_3_`); `opencode-zen-free` keeps its original name and `OPENCODE_ZEN_API_KEY` as the
-compatibility alias for Zen-1. Every route binds the same three free wire ids — `space-bunny-free`,
-`mimo-v2.6-flash-free` and `muse-spark-1.3-contributor-free` (metadata cost 0 per token, so no paid
-fallback exists) — and environments `zen`, `zen2`, `zen3` all default to `space-bunny-free`, so a
-workflow can spread work across accounts. **[live, 2026-09-24]** Space Bunny answers every account
-key from p1; MiMo and Muse answer HTTP 403 `FreeTierError` ("free tier can only be used from within
-OpenCode") on this chat endpoint to a non-OpenCode client, with or without a real Zen key — bound,
-but not usable from p1. (The Zen docs list Muse on `/zen/v1/responses`; which endpoint serves it
-past the gate is unverified — see its profile.) No Zen usage endpoint is established, so these routes probe as
-unsupported (`docs/design/usage.md`). The Muse Spark model's metadata hint (`@ai-sdk/openai`) is
-not yet confirmed by a live request on this endpoint.
+compatibility alias for Zen-1. Every route binds the same two free wire ids — `space-bunny-free`
+and `mimo-v2.6-flash-free` (metadata cost 0 per token, so no paid fallback exists) — and
+environments `zen`, `zen2`, `zen3` all default to `space-bunny-free`, so a workflow can spread
+work across accounts. **[live, 2026-09-24]** Space Bunny answers every account key from p1. MiMo
+answers HTTP 403 `FreeTierError` ("free tier can only be used from within OpenCode") to a
+non-OpenCode client, with or without a real Zen key; the routes set
+`[adapter_settings] client_identity = "opencode"` (ADR-0067) and the `zen`/`zen2`/`zen3`
+environments name the `shell` tool `bash` and the `read` tool `read`, which together satisfy the
+gate, so MiMo answers from p1 natively (live receipt in
+`docs/design/zen-client-identity-evidence.md`). `muse-spark-1.3-contributor-free` is gated the
+same way, but the chat endpoint has no upstream for it (503 past the gate), so it is NOT bound
+here — Muse stays on opencode (owner exception 2026-09-25; the Zen docs list it on
+`/zen/v1/responses`, an unimplemented route). No Zen usage endpoint is established, so these
+routes probe as unsupported (`docs/design/usage.md`).
 
 
 ## C3. ClinePass subscriptions (`openai-chat/cline-pass-1`, `-2`)
