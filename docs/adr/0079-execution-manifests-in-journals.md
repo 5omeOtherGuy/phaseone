@@ -1,5 +1,5 @@
 ---
-adr: {{number}}
+adr: 79
 title: Execution manifests in journals
 status: proposed
 date: 2026-09-25
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [ADR-0021, ADR-0049, ADR-0071, migration plan finding F3, freeze item 7]
 ---
-# ADR-{{number_padded}}: Execution manifests in journals
+# ADR-0079: Execution manifests in journals
 
 ## Context
 
