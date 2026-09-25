@@ -15,8 +15,9 @@ sources: []
 Until now the only way to run p1 was to clone the repository and `cargo build` it: there
 was no install, no update path, and nothing that said which commit a binary came from.
 That is fine for the agents working in this repo and wrong for anyone else — the 7 GB-class
-machine rules in `AGENTS.md` forbid a release build on a workstation, so a user cannot be
-asked to produce a shipping binary.
+machine normally forbids a release build on a workstation, so a user cannot be asked to
+produce the shipping binary. The single local exception is the guarded `--local` fallback
+defined below.
 
 The repository is public (`github.com/5omeOtherGuy/phaseone`), the gate already runs on
 every push to `main` and is the single definition of green (ADR-0011), and p1 has no
@@ -36,7 +37,7 @@ installed layout is implied by the code but was never produced.
 p1 is installed from a published release, and the binary says which commit it is.
 
 - After a **successful `gate` run on `main`**, the release workflow builds `p1` in release
-  profile on a GitHub runner (the only permitted release build, `AGENTS.md`) and publishes
+  profile on a GitHub runner (the normal release build path) and publishes
   the GitHub Release tagged `main-<12-char short sha>` with four assets — `p1-linux-x86_64`,
   `p1-linux-x86_64.sha256`, `p1-share.tar.gz` (top-level `environments/`, `routes/`,
   `profiles/`), `p1-share.tar.gz.sha256` — marked latest. The tag is the commit: the
@@ -71,12 +72,13 @@ p1 is installed from a published release, and the binary says which commit it is
   takes the sha from `P1_GIT_SHA`, else `git rev-parse --short=12 HEAD`, else `unknown`, and
   the date from `P1_BUILD_DATE`, else `SOURCE_DATE_EPOCH`, else `unknown` — never the wall
   clock, so two builds of one commit print the same string.
-- `--local` is the fallback for a build that cannot run in the cloud. It builds the current
-  checkout with `cargo build --release --locked -p p1-host` into `$CARGO_TARGET_DIR`, or
-  `$HOME/.cache/cargo-target/p1-release` when that variable is unset. The target must be
-  absolute, below `$HOME/.cache/cargo-target`, on an ext4 filesystem, and have at least
-  12 GiB free; `P1_INSTALL_MIN_FREE_BYTES` can lower that admission threshold for hermetic
-  tests. The repository's own `target/` and the retired internal HDD are never used.
+- `--local` is the one admitted local fallback for a build that cannot run in the cloud. It
+  builds the current checkout with `cargo build --release --locked -p p1-host` into an
+  absolute `$CARGO_TARGET_DIR`, or `$HOME/.cache/cargo-target/p1-release` when that variable
+  is unset. The resolved target must be below `$HOME/.cache/cargo-target`, on an ext4
+  filesystem, and have at least 12 GiB free. Cargo always receives two jobs and this
+  checkout's `scripts/rustc-serial` wrapper. The repository's own `target/` and the retired
+  internal HDD are never used.
 - The installer never reads, writes or deletes anything under
   `${XDG_CONFIG_HOME:-$HOME/.config}/p1`; it refuses a prefix whose prospective `bin` or
   `share` path resolves into that tree.
@@ -103,8 +105,9 @@ p1 is installed from a published release, and the binary says which commit it is
   is still verified only by hand — it needs a cargo build, which this worktree could not
   run. `scripts/test_install.py` covers the installer's output layout, not the host's
   search order over it. Tracked as the open item of the round-1 install review.
-- `AGENTS.md`'s rule for workstations is untouched: release builds happen on GitHub
-  runners, never locally.
+- Normal release builds happen on GitHub runners. The only admitted workstation release build
+  is `scripts/install.sh --local`, guarded by the absolute per-task SSD target, ext4, 12 GiB
+  free, two-job, and `rustc-serial` rules above.
 
 ## Alternatives considered
 
@@ -127,7 +130,7 @@ p1 is installed from a published release, and the binary says which commit it is
 - Files: `.github/workflows/release.yml`, `scripts/install.sh`, `scripts/update.sh`,
   `crates/p1-host/build.rs`, `crates/p1-host/src/cli.rs` (`version`),
   `scripts/test_install.py`, `scripts/test_fanout.py`, `README.md`, `AGENTS.md`.
-- `python3 scripts/test_install.py -v` (38 tests, no network): a fixture release with stub
+- `python3 scripts/test_install.py -v` (49 tests, no network): a fixture release with stub
   `gh`, `curl` and `cargo` on `PATH` covers the successful install and its modes, gh
   fallback (including a `gh` that fails after writing a truncated asset), checksum refusals
   (nothing installed, the previous install intact), unsafe archive members, protected
@@ -136,7 +139,9 @@ p1 is installed from a published release, and the binary says which commit it is
   refused by name, failure-atomic binary/share/updater rollback (including a colon-containing
   prefix) with a rolled-back SIGTERM during the commit, a failed restore reported with its
   fixed-slot leftovers and retained across another failure, release-workflow repair/cache/tag-
-  creation assertions, and the `--local` target-dir probe.
+  creation assertions, and `--local` default/absolute override, relative/outside-root refusal,
+  two-job and rustc-wrapper enforcement, fixed 12-GiB boundary, exact ext4 admission,
+  non-ext4 refusal, and failed or malformed filesystem/free-space probe refusal.
 - `python3 scripts/test_fanout.py -v`: `$P1_BIN` over `p1` on `PATH` over the debug
   fallback, and a job that runs the `p1` found on `PATH` without `P1_BIN`.
 - `bash -n scripts/install.sh scripts/update.sh`; `shellcheck scripts/install.sh scripts/update.sh`.

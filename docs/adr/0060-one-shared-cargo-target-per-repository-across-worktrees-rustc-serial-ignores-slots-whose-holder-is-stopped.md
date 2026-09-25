@@ -111,6 +111,7 @@ not stand.
   only after acquiring a slot, reports stopped or stale holders, and never admits a slot from
   holder metadata alone.
 - `scripts/install.sh` makes `--latest` the default release mode. Its `--local` mode selects
-  `$CARGO_TARGET_DIR` or `$HOME/.cache/cargo-target/p1-release`, refuses a non-ext4 target or
-  one with less than 12 GiB free, and runs Cargo with two jobs. README.md records the normal
-  release and SSD fallback workflows.
+  an absolute `$CARGO_TARGET_DIR` or `$HOME/.cache/cargo-target/p1-release`, resolves it below
+  the cache root, refuses any filesystem other than ext4 or less than 12 GiB free, forces two
+  Cargo jobs, and sets the checkout's `scripts/rustc-serial` as `RUSTC_WRAPPER`.
+  README.md records the normal release and SSD fallback workflows.
