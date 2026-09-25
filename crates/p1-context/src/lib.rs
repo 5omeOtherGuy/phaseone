@@ -1,11 +1,12 @@
-//! Context control — a summarizing [`ContextPolicy`]. Specification:
+//! Context control — a summarizing [`ContextPolicy`](p1_contracts::ContextPolicy). Specification:
 //! `docs/design/context.md` §2. The module keeps no state across calls and
 //! summarizes through the ordinary provider interface.
 //!
 //! The policy's decisions are the [`engine`], which does no I/O and builds without the
 //! `native` feature, so the context-policy component (`modules/p1-module-context/`)
-//! runs the same code. The `native` feature (on by default) adds [`SummarizingContext`],
-//! the driver that sends the engine's summary requests through a provider.
+//! runs the same code. The `native` feature (on by default) adds `SummarizingContext`,
+//! the driver that sends the engine's summary requests through `ProviderSummary`, the
+//! native summary operation the component's `summary` import is answered with.
 
 pub mod engine;
 mod estimate;
@@ -13,10 +14,14 @@ mod estimate;
 mod native;
 mod plan;
 mod render;
+#[cfg(feature = "native")]
+mod summary;
 
 pub use estimate::estimate_tokens;
 #[cfg(feature = "native")]
 pub use native::SummarizingContext;
+#[cfg(feature = "native")]
+pub use summary::{ProviderSummary, SummaryAnswer, SummaryFailure};
 
 /// First line of every summary item (context.md "Replacement").
 pub const SUMMARY_MARKER: &str = "[p1 context summary v1 — written by the harness from the earlier part of this session. The user's own messages follow verbatim.]";
