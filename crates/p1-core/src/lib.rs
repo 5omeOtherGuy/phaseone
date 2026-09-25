@@ -10,10 +10,11 @@ use std::sync::{Arc, Mutex, Weak};
 use futures_util::StreamExt;
 use p1_contracts::{
     AgentEvent, AuthorizationPolicy, AuthorizationRequest, CancellationToken, CommitError,
-    CommitSink, CompletedResponse, ContextError, ContextInput, ContextPolicy, Decision, EventSink,
-    InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Prepared, Provider,
-    ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody, StopReason,
-    StreamEvent, Tool, ToolCall, ToolContext, ToolResultItem, ToolStatus, TurnEnd, Usage,
+    CommitSink, Compaction, CompletedResponse, ContextError, ContextInput, ContextPolicy, Decision,
+    EventSink, InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Prepared,
+    Provider, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody,
+    StopReason, StreamEvent, Tool, ToolCall, ToolContext, ToolResultItem, ToolStatus, TurnEnd,
+    Usage,
 };
 use tokio::sync::Notify;
 
@@ -332,26 +333,10 @@ impl Agent {
                 return Flow::End(end);
             }
             Some(Ok(None)) => {}
-            Some(Ok(Some(Prepared { items, usage }))) => {
-                // A policy bug must not become a provider 400 three requests later.
-                if let Err(message) = validate_replacement(&items) {
-                    return Flow::End(TurnEnd::ContextFailed { message });
+            Some(Ok(Some(prepared))) => {
+                if let Err(end) = self.install_replacement(prepared, items_before).await {
+                    return Flow::End(end);
                 }
-                let items_after = items.len();
-                let body = RecordBody::ContextReplaced {
-                    items: items.clone(),
-                    usage,
-                };
-                if let Err(error) = self.commit(body).await {
-                    return Flow::End(TurnEnd::CommitFailed { message: error.0 });
-                }
-                self.history = items;
-                // R6: the event announces the committed record, so it comes after.
-                self.parts.events.emit(AgentEvent::ContextReplaced {
-                    items_before,
-                    items_after,
-                    usage,
-                });
             }
             // The policy itself gave up, with or without the turn's token firing.
             Some(Err(ContextError::Cancelled)) => {
@@ -461,6 +446,98 @@ impl Agent {
             return Flow::End(TurnEnd::Cancelled);
         }
         Flow::Continue
+    }
+
+    /// §3b: install a policy's replacement — validated, journalled as
+    /// `ContextReplaced`, then the history, then the event (R6). The ONE install,
+    /// shared by the threshold path and [`Agent::compact_now`] (ADR-0076), so both
+    /// write the same record.
+    async fn install_replacement(
+        &mut self,
+        prepared: Prepared,
+        items_before: usize,
+    ) -> Result<(), TurnEnd> {
+        let Prepared { items, usage } = prepared;
+        // A policy bug must not become a provider 400 three requests later.
+        if let Err(message) = validate_replacement(&items) {
+            return Err(TurnEnd::ContextFailed { message });
+        }
+        let items_after = items.len();
+        let body = RecordBody::ContextReplaced {
+            items: items.clone(),
+            usage,
+        };
+        if let Err(error) = self.commit(body).await {
+            return Err(TurnEnd::CommitFailed { message: error.0 });
+        }
+        self.history = items;
+        // R6: the event announces the committed record, so it comes after.
+        self.parts.events.emit(AgentEvent::ContextReplaced {
+            items_before,
+            items_after,
+            usage,
+        });
+        Ok(())
+    }
+
+    /// Manual compaction (ADR-0076): ask the context policy for one summary of the
+    /// current history NOW ([`ContextPolicy::compact_now`]) and install it exactly
+    /// as a threshold replacement is installed — the same `ContextReplaced` record
+    /// and event. Callable only between turns (`&mut self`), like
+    /// [`Agent::reconfigure`]. A pending `Environment` is committed first, as a
+    /// turn would before its own records.
+    ///
+    /// On a replacement the last usage is forgotten: it measured the history that
+    /// was just replaced, so the next preparation estimates the new one instead of
+    /// adding to a number that no longer applies. `Unchanged` changes nothing. On
+    /// an error nothing is installed; the error names why.
+    pub async fn compact_now(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Compaction, ContextError> {
+        let context = self.parts.context.clone();
+        let input = ContextInput {
+            history: &self.history,
+            last_usage: self.last_usage.as_ref(),
+            cancel,
+        };
+        let compaction = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ContextError::Cancelled),
+            result = context.compact_now(input) => result?,
+        };
+        let Compaction::Replaced {
+            prepared,
+            tokens_before,
+            tokens_after,
+        } = compaction
+        else {
+            return Ok(compaction);
+        };
+        self.commit_environment_if_needed()
+            .await
+            .map_err(ContextError::Failed)?;
+        let kept = Prepared {
+            items: prepared.items.clone(),
+            usage: prepared.usage,
+        };
+        let items_before = self.history.len();
+        self.install_replacement(prepared, items_before)
+            .await
+            .map_err(|end| {
+                ContextError::Failed(match end {
+                    TurnEnd::ContextFailed { message } | TurnEnd::CommitFailed { message } => {
+                        message
+                    }
+                    other => format!("{other:?}"),
+                })
+            })?;
+        self.last_usage = None;
+        Ok(Compaction::Replaced {
+            prepared: kept,
+            tokens_before,
+            tokens_after,
+        })
     }
 
     /// §3d: consume one provider stream, racing every wait on `cancel`.

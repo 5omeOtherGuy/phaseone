@@ -1,5 +1,5 @@
 ---
-adr: 76
+adr: 77
 title: Builds on the stream boxes
 status: proposed
 date: 2026-09-25
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [DECISIONS.md, docs/adr/0066-p1-builds-and-verifies-on-github-actions-local-cargo-only-for-check-and-the-lead-s-deployed-binary.md, docs/adr/0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md, scripts/gate.sh, scripts/rustc-serial, scripts/local-cargo-config.sh, scripts/module-toolchain.sh, scripts/build-modules.sh, .github/workflows/ci.yml, .github/workflows/build.yml]
 ---
-# ADR-0076: Builds on the stream boxes
+# ADR-0077: Builds on the stream boxes
 
 ## Context
 

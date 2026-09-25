@@ -23,9 +23,9 @@ use p1_assembly::Catalog;
 use p1_assembly::ToolSpec;
 use p1_assembly::{Assembled, EnvironmentFile, Substitutions, assemble, load_environment};
 use p1_contracts::{
-    AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
-    ContextInput, ContextPolicy, Effort, EventSink, JournalRecord, Prepared, ProviderErrorKind,
-    Tool, TurnEnd,
+    AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, Compaction,
+    ContextError, ContextInput, ContextPolicy, Effort, EventSink, JournalRecord, Prepared,
+    ProviderErrorKind, Tool, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, Reconfiguration, ResumeReport};
 #[cfg(feature = "delegation")]
@@ -603,6 +603,7 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
                 effort: options
                     .effort
                     .map(|effort| crate::models::effort_name(effort).to_string()),
+                compact: options.compact,
             },
             cancel.clone(),
         ))
@@ -837,6 +838,19 @@ pub async fn run_with_front_end(
     };
     if let Some(report) = &report {
         print_resume_report(deps, report);
+    }
+    // ADR-0076: `--compact` (only with `--resume`, `cli::parse` refuses it
+    // otherwise) summarizes the resumed history once, before the first turn and
+    // its first provider request. The TUI queues it as a `/compact` instead, so
+    // its line lands in the transcript; every other front end does it here.
+    if options.compact && !options.tui {
+        let result = agent.compact_now(&cancel).await;
+        write_stderr(deps, &format!("{}\n", compaction_line(&result)));
+        // The run was asked to start compacted; running on the old history
+        // would hide that it did not.
+        if let Err(error) = result {
+            return Err(format!("--compact: {error}").into());
+        }
     }
 
     #[cfg(feature = "delegation")]
@@ -2367,6 +2381,20 @@ fn announce_lost_runs(deps: &HostDeps, options: &Options) {
             root.display()
         ),
     );
+}
+
+/// The ONE line a manual compaction reports (ADR-0076): the TUI's `/compact`
+/// and `--compact` on resume print the same text.
+pub(crate) fn compaction_line(result: &Result<Compaction, ContextError>) -> String {
+    match result {
+        Ok(Compaction::Replaced {
+            tokens_before,
+            tokens_after,
+            ..
+        }) => format!("compacted: {tokens_before} → {tokens_after} tokens"),
+        Ok(Compaction::Unchanged { tokens }) => format!("nothing to compact: {tokens} tokens"),
+        Err(error) => format!("compact failed: {error}"),
+    }
 }
 
 fn print_resume_report(deps: &HostDeps, report: &ResumeReport) {

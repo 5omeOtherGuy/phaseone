@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use p1_contracts::{
-    BoxFuture, CancellationToken, CompletedResponse, ContextError, ContextInput, ContextPolicy,
-    Effort, Item, ModelOptions, Outcome, Prepared, Provider, ProviderRequest, StopReason,
-    StreamEvent, Usage,
+    BoxFuture, CancellationToken, Compaction, CompletedResponse, ContextError, ContextInput,
+    ContextPolicy, Effort, Item, ModelOptions, Outcome, Prepared, Provider, ProviderRequest,
+    StopReason, StreamEvent, Usage,
 };
 
 pub use estimate::estimate_tokens;
@@ -178,161 +178,221 @@ impl ContextPolicy for SummarizingContext {
             if next_input < self.config.summarize_at_tokens {
                 return Ok(None);
             }
+            match self.summarize(history, input.cancel).await? {
+                Summarized::Replacement(prepared) => Ok(Some(prepared)),
+                Summarized::NothingToSummarize => nothing_to_summarize(next_input, wall),
+                Summarized::Failed(reason) => failure(next_input, wall, reason),
+            }
+        })
+    }
 
-            // What is summarized is everything outside the verbatim tail.
+    /// Manual compaction (ADR-0076): ONE summary of the current history, made by
+    /// [`SummarizingContext::summarize`] — the very function the threshold path
+    /// calls — whatever `summarize_at_tokens` says.
+    ///
+    /// The no-op rule ("too short"): when no unit lies older than the verbatim
+    /// tail `keep_recent_tokens` keeps, no request is made and the result is
+    /// `Unchanged` with the history's estimate. What precedes such a tail is only
+    /// the prelude — the task message, which the replacement keeps verbatim
+    /// anyway, and an earlier summary — so a summary could only add to the
+    /// history. An empty history is the same no-op, and so is the threshold
+    /// path's own "nothing to summarize". A failed summary is an error here, not
+    /// the threshold path's soft retry: the operator asked for it.
+    fn compact_now<'a>(
+        &'a self,
+        input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Compaction, ContextError>> {
+        Box::pin(async move {
+            let history = input.history;
+            let tokens = estimate_tokens(history);
             let segments = plan::segments(history);
             let tail_start = plan::tail_start(history, &segments, self.config.keep_recent_tokens);
-
-            // "Nothing to summarize": when everything outside the kept tail units
-            // is a previous summary, a request could only buy the same summary back
-            // (context.md "Nothing to summarize"). Unit-less histories (a lone user
-            // message) still count as material.
-            let has_material = history.iter().enumerate().any(|(index, item)| {
-                !plan::in_tail_unit(index, tail_start, &segments) && !plan::is_summary_item(item)
-            });
-            if !has_material {
-                return nothing_to_summarize(next_input, wall);
+            if tail_start <= segments.prelude_end {
+                return Ok(Compaction::Unchanged { tokens });
             }
-
-            // The cap is this request's output limit and the room the transcript is
-            // measured against (context.md "Revision 2026-09-20"). The wire field is
-            // a `u32`, so a cap beyond it is clamped.
-            let cap = self.summary_output_tokens;
-            let limit = u32::try_from(cap).unwrap_or(u32::MAX);
-            let render_budget = wall.saturating_sub(cap);
-            let rendered = render::transcript(
-                &history[..tail_start],
-                self.config.tool_result_excerpt_chars,
-                render_budget,
-            );
-
-            let mut options = self.options.clone();
-            options.max_output_tokens = Some(options.max_output_tokens.unwrap_or(limit).min(limit));
-            let mut request = ProviderRequest {
-                system_prompt: self.prompt.clone(),
-                history: vec![Item::User { text: rendered }],
-                tools: Vec::new(),
-                options,
-            };
-            // Whether this request still carries a cap: the route below may refuse it.
-            let mut capped = true;
-            if let Err(first) = self.provider.validate(&request) {
-                if request.options.max_output_tokens.is_none() {
-                    return failure(next_input, wall, first.to_string());
+            match self.summarize(history, input.cancel).await? {
+                Summarized::Replacement(prepared) => {
+                    let tokens_after = estimate_tokens(&prepared.items);
+                    Ok(Compaction::Replaced {
+                        prepared,
+                        tokens_before: tokens,
+                        tokens_after,
+                    })
                 }
-                // The Codex route refuses `max_output_tokens`: retry once without it.
-                request.options.max_output_tokens = None;
-                capped = false;
-                if let Err(second) = self.provider.validate(&request) {
-                    return failure(next_input, wall, second.to_string());
+                Summarized::NothingToSummarize => Ok(Compaction::Unchanged { tokens }),
+                Summarized::Failed(reason) => Err(ContextError::Failed(format!(
+                    "summarizing failed: {reason}"
+                ))),
+            }
+        })
+    }
+}
+
+/// What one summarization of a history produced.
+enum Summarized {
+    /// The summary plus the verbatim tail: the replacement history.
+    Replacement(Prepared),
+    /// Everything outside the kept tail is already a summary (or there is nothing
+    /// outside it): a request could only buy the same summary back.
+    NothingToSummarize,
+    /// The summary could not be made; the reason names why.
+    Failed(String),
+}
+
+impl SummarizingContext {
+    /// The ONE summarization, shared by the threshold path ([`ContextPolicy::prepare`])
+    /// and the manual one ([`ContextPolicy::compact_now`]): what the caller does
+    /// with a failure (soft below the wall, fatal at it, or an error for a manual
+    /// request) is the caller's; `Err` is only a cancellation.
+    async fn summarize(
+        &self,
+        history: &[Item],
+        cancel: &CancellationToken,
+    ) -> Result<Summarized, ContextError> {
+        let wall = self.config.wall();
+        // What is summarized is everything outside the verbatim tail.
+        let segments = plan::segments(history);
+        let tail_start = plan::tail_start(history, &segments, self.config.keep_recent_tokens);
+
+        // "Nothing to summarize": when everything outside the kept tail units
+        // is a previous summary, a request could only buy the same summary back
+        // (context.md "Nothing to summarize"). Unit-less histories (a lone user
+        // message) still count as material.
+        let has_material = history.iter().enumerate().any(|(index, item)| {
+            !plan::in_tail_unit(index, tail_start, &segments) && !plan::is_summary_item(item)
+        });
+        if !has_material {
+            return Ok(Summarized::NothingToSummarize);
+        }
+
+        // The cap is this request's output limit and the room the transcript is
+        // measured against (context.md "Revision 2026-09-20"). The wire field is
+        // a `u32`, so a cap beyond it is clamped.
+        let cap = self.summary_output_tokens;
+        let limit = u32::try_from(cap).unwrap_or(u32::MAX);
+        let render_budget = wall.saturating_sub(cap);
+        let rendered = render::transcript(
+            &history[..tail_start],
+            self.config.tool_result_excerpt_chars,
+            render_budget,
+        );
+
+        let mut options = self.options.clone();
+        options.max_output_tokens = Some(options.max_output_tokens.unwrap_or(limit).min(limit));
+        let mut request = ProviderRequest {
+            system_prompt: self.prompt.clone(),
+            history: vec![Item::User { text: rendered }],
+            tools: Vec::new(),
+            options,
+        };
+        // Whether this request still carries a cap: the route below may refuse it.
+        let mut capped = true;
+        if let Err(first) = self.provider.validate(&request) {
+            if request.options.max_output_tokens.is_none() {
+                return Ok(Summarized::Failed(first.to_string()));
+            }
+            // The Codex route refuses `max_output_tokens`: retry once without it.
+            request.options.max_output_tokens = None;
+            capped = false;
+            if let Err(second) = self.provider.validate(&request) {
+                return Ok(Summarized::Failed(second.to_string()));
+            }
+        }
+
+        // A summary whose stop is not `EndTurn` is never accepted. A truncated
+        // one (`MaxOutputTokens`) gets one retry with the cap doubled, and the
+        // usage of both requests is reported.
+        let mut usage: Option<Usage> = None;
+        let mut attempts = 0u32;
+        let answer = loop {
+            attempts += 1;
+            let response = match self.ask(&request, cancel).await {
+                Ok(response) => response,
+                Err(Ask::Cancelled) => return Err(ContextError::Cancelled),
+                Err(Ask::Failed(reason)) => return Ok(Summarized::Failed(reason)),
+            };
+            usage = if attempts == 1 {
+                response.usage
+            } else {
+                sum_usage(usage, response.usage)
+            };
+            match response.stop {
+                StopReason::EndTurn => break response.item.text(),
+                // The cap actually sent, doubled: an agent's own lower limit
+                // would otherwise be sent again unchanged.
+                StopReason::MaxOutputTokens if attempts == 1 && capped => {
+                    let sent = request.options.max_output_tokens.unwrap_or(limit);
+                    request.options.max_output_tokens = Some(sent.saturating_mul(2));
+                    if let Err(error) = self.provider.validate(&request) {
+                        return Ok(Summarized::Failed(error.to_string()));
+                    }
+                }
+                StopReason::MaxOutputTokens if !capped => {
+                    return Ok(Summarized::Failed(
+                        "the summary was truncated and the route carries no cap to double"
+                            .to_string(),
+                    ));
+                }
+                StopReason::MaxOutputTokens => {
+                    return Ok(Summarized::Failed(
+                        "the summary was truncated twice".to_string(),
+                    ));
+                }
+                stop => {
+                    return Ok(Summarized::Failed(format!(
+                        "the summary stopped before the end ({stop:?})"
+                    )));
                 }
             }
+        };
+        if answer.is_empty() {
+            return Ok(Summarized::Failed(
+                "the summarization produced an empty answer".to_string(),
+            ));
+        }
 
-            // A summary whose stop is not `EndTurn` is never accepted. A truncated
-            // one (`MaxOutputTokens`) gets one retry with the cap doubled, and the
-            // usage of both requests is reported.
-            let mut usage: Option<Usage> = None;
-            let mut attempts = 0u32;
-            let answer = loop {
-                attempts += 1;
-                let response = match self.ask(&request, input.cancel).await {
-                    Ok(response) => response,
-                    Err(Ask::Cancelled) => return Err(ContextError::Cancelled),
-                    Err(Ask::Failed(reason)) => return failure(next_input, wall, reason),
-                };
-                usage = if attempts == 1 {
-                    response.usage
-                } else {
-                    sum_usage(usage, response.usage)
-                };
-                match response.stop {
-                    StopReason::EndTurn => break response.item.text(),
-                    // The cap actually sent, doubled: an agent's own lower limit
-                    // would otherwise be sent again unchanged.
-                    StopReason::MaxOutputTokens if attempts == 1 && capped => {
-                        let sent = request.options.max_output_tokens.unwrap_or(limit);
-                        request.options.max_output_tokens = Some(sent.saturating_mul(2));
-                        if let Err(error) = self.provider.validate(&request) {
-                            return failure(next_input, wall, error.to_string());
-                        }
-                    }
-                    StopReason::MaxOutputTokens if !capped => {
-                        return failure(
-                            next_input,
-                            wall,
-                            "the summary was truncated and the route carries no cap to double"
-                                .to_string(),
-                        );
-                    }
-                    StopReason::MaxOutputTokens => {
-                        return failure(
-                            next_input,
-                            wall,
-                            "the summary was truncated twice".to_string(),
-                        );
-                    }
-                    stop => {
-                        return failure(
-                            next_input,
-                            wall,
-                            format!("the summary stopped before the end ({stop:?})"),
-                        );
-                    }
-                }
-            };
-            if answer.is_empty() {
-                return failure(
-                    next_input,
-                    wall,
-                    "the summarization produced an empty answer".to_string(),
-                );
-            }
-
-            // Issue #142: the summarizer is a second model whose output becomes a
-            // history item, so it is masked with the same matcher the host wraps
-            // every tool in. A summary can never carry a credential shape into the
-            // history and every later request.
-            let answer = p1_redact::redact(&answer).text;
-            let summary = Item::User {
-                text: format!("{SUMMARY_MARKER}\n{answer}"),
-            };
-            // The tail is the new history's floor and the spec halves
-            // `keep_recent_tokens` no lower than one unit. A one-unit tail cannot
-            // shrink, so the replacement is returned as it is instead of looping.
-            let mut keep = self.config.keep_recent_tokens;
-            let mut tail_start = plan::tail_start(history, &segments, keep);
-            let mut items = plan::build_replacement(
+        // Issue #142: the summarizer is a second model whose output becomes a
+        // history item, so it is masked with the same matcher the host wraps
+        // every tool in. A summary can never carry a credential shape into the
+        // history and every later request.
+        let answer = p1_redact::redact(&answer).text;
+        let summary = Item::User {
+            text: format!("{SUMMARY_MARKER}\n{answer}"),
+        };
+        // The tail is the new history's floor and the spec halves
+        // `keep_recent_tokens` no lower than one unit. A one-unit tail cannot
+        // shrink, so the replacement is returned as it is instead of looping.
+        let mut keep = self.config.keep_recent_tokens;
+        let mut tail_start = plan::tail_start(history, &segments, keep);
+        let mut items = plan::build_replacement(
+            history,
+            tail_start,
+            self.config.user_verbatim_tokens,
+            summary.clone(),
+        );
+        let mut halvings = 0;
+        while estimate_tokens(&items) >= self.config.summarize_at_tokens
+            && halvings < 3
+            && plan::tail_units(&segments, tail_start) > 1
+        {
+            keep /= 2;
+            tail_start = plan::tail_start(history, &segments, keep);
+            items = plan::build_replacement(
                 history,
                 tail_start,
                 self.config.user_verbatim_tokens,
                 summary.clone(),
             );
-            let mut halvings = 0;
-            while estimate_tokens(&items) >= self.config.summarize_at_tokens
-                && halvings < 3
-                && plan::tail_units(&segments, tail_start) > 1
-            {
-                keep /= 2;
-                tail_start = plan::tail_start(history, &segments, keep);
-                items = plan::build_replacement(
-                    history,
-                    tail_start,
-                    self.config.user_verbatim_tokens,
-                    summary.clone(),
-                );
-                halvings += 1;
-            }
-            if estimate_tokens(&items) >= self.config.summarize_at_tokens
-                && plan::tail_units(&segments, tail_start) > 1
-            {
-                return failure(
-                    next_input,
-                    wall,
-                    "the replacement did not fit below summarize_at_tokens".to_string(),
-                );
-            }
-            Ok(Some(Prepared { items, usage }))
-        })
+            halvings += 1;
+        }
+        if estimate_tokens(&items) >= self.config.summarize_at_tokens
+            && plan::tail_units(&segments, tail_start) > 1
+        {
+            return Ok(Summarized::Failed(
+                "the replacement did not fit below summarize_at_tokens".to_string(),
+            ));
+        }
+        Ok(Summarized::Replacement(Prepared { items, usage }))
     }
 }
 

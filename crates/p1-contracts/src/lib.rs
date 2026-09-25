@@ -19,7 +19,7 @@ pub use history::{
 };
 pub use journal::{CommitError, CommitSink, InterruptionReason, JournalRecord, RecordBody};
 pub use policy::{
-    AgentEvent, AuthorizationPolicy, AuthorizationRequest, ContextError, ContextInput,
+    AgentEvent, AuthorizationPolicy, AuthorizationRequest, Compaction, ContextError, ContextInput,
     ContextPolicy, Decision, EventSink, Prepared, TurnEnd,
 };
 pub use provider::{
