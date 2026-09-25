@@ -380,42 +380,51 @@ impl RunState {
             ..blank(cost.attempts)
         };
 
-        match outcome.end {
-            StepEnd::RouteFailed { model, error } => Link::MovedOn(Moved {
-                reason: MovedOn::RouteFailed,
-                // The host names the model it could not run; the engine's own answer
-                // stands when a runner names none.
-                model: if model.is_empty() {
-                    request.model.reference.clone()
-                } else {
-                    model
-                },
-                error,
-                worker: Some(worker_line),
-            }),
+        // A failed contract and a turn that ended without `finish` both get the ONE
+        // repair turn of the same worker (item 5, ADR-0072); every other end is the step's.
+        let (message, rejected) = match outcome.end {
+            StepEnd::RouteFailed { model, error } => {
+                return Link::MovedOn(Moved {
+                    reason: MovedOn::RouteFailed,
+                    // The host names the model it could not run; the engine's own answer
+                    // stands when a runner names none.
+                    model: if model.is_empty() {
+                        request.model.reference.clone()
+                    } else {
+                        model
+                    },
+                    error,
+                    worker: Some(worker_line),
+                });
+            }
             StepEnd::Done {
                 evidence,
                 result,
                 schema: SchemaCheck::Failed(errors),
                 ..
-            } => {
-                let rejected = StepEnvelope {
+            } => (
+                repair_message(&errors),
+                StepEnvelope {
                     value: result.unwrap_or(Value::Null),
-                    schema: SchemaCheck::Failed(errors.clone()),
+                    schema: SchemaCheck::Failed(errors),
                     evidence: Some(evidence),
                     error: None,
                     ..base.clone()
-                };
-                match self.repair(request, opts, &worker, &errors, rejected, cost) {
-                    Some(envelope) => Link::Ended(envelope),
-                    None => Link::Cancelled(StepEnvelope {
-                        status: StepStatus::Cancelled,
-                        attempts: cost.attempts,
-                        ..base
-                    }),
-                }
-            }
-            end => Link::Ended(envelope_from_end(end, cost.attempts, base)),
+                },
+            ),
+            end @ StepEnd::EndedWithoutFinish { .. } => (
+                FINISH_NUDGE.to_string(),
+                envelope_from_end(end, cost.attempts, base.clone()),
+            ),
+            end => return Link::Ended(envelope_from_end(end, cost.attempts, base)),
+        };
+        match self.repair(request, opts, &worker, message, rejected, cost) {
+            Some(envelope) => Link::Ended(envelope),
+            None => Link::Cancelled(StepEnvelope {
+                status: StepStatus::Cancelled,
+                attempts: cost.attempts,
+                ..base
+            }),
         }
     }
 
@@ -460,31 +469,28 @@ impl RunState {
         None
     }
 
-    /// The one schema repair turn (item 5): another turn in the SAME worker that produced
-    /// the invalid result, never a new model (ADR-0054 item 3). `rejected` is the envelope
-    /// if the repair cannot run. `None` when the run is cancelled meanwhile.
+    /// The one repair turn (item 5): another turn in the SAME worker that produced the
+    /// invalid result — or ended its turn without `finish` (ADR-0072) — never a new model
+    /// (ADR-0054 item 3). `rejected` is the envelope if the repair cannot run. `None` when
+    /// the run is cancelled meanwhile.
     fn repair(
         &self,
         request: &StepRequest,
         opts: &Value,
         worker: &WorkerRef,
-        errors: &[String],
+        message: String,
         rejected: StepEnvelope,
         cost: &mut StepCost,
     ) -> Option<StepEnvelope> {
         if let Some(refused) = self.spend(request, opts, 2, cost) {
-            // A capped repair and an unwritable journal both keep the invalid value.
+            // A capped repair and an unwritable journal both keep the rejected value.
             return Some(StepEnvelope {
                 error: Some(refused.error()),
                 ..rejected
             });
         }
         cost.attempts += 1;
-        let end = self.cancellable(self.runner.repair(
-            worker,
-            repair_message(errors),
-            self.token.clone(),
-        ))?;
+        let end = self.cancellable(self.runner.repair(worker, message, self.token.clone()))?;
         Some(match end {
             Err(reason) => StepEnvelope {
                 attempts: cost.attempts,
@@ -723,6 +729,9 @@ fn envelope_from_end(end: StepEnd, attempts: u32, base: StepEnvelope) -> StepEnv
         },
     }
 }
+
+/// The repair turn's message to a worker whose turn ended without `finish` (ADR-0072).
+const FINISH_NUDGE: &str = "You ended your turn without calling finish. Call finish now: status \"done\" with your result (and the evidence), or \"blocked\" with what you need.";
 
 fn repair_message(errors: &[String]) -> String {
     let mut message = String::from("Your result did not match the required schema:\n");
