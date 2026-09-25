@@ -381,7 +381,7 @@ impl RunState {
         };
 
         // A failed contract and a turn that ended without `finish` both get the ONE
-        // repair turn of the same worker (item 5, ADR-0073); every other end is the step's.
+        // repair turn of the same worker (item 5, ADR-0072); every other end is the step's.
         let (message, rejected) = match outcome.end {
             StepEnd::RouteFailed { model, error } => {
                 return Link::MovedOn(Moved {
@@ -470,7 +470,7 @@ impl RunState {
     }
 
     /// The one repair turn (item 5): another turn in the SAME worker that produced the
-    /// invalid result — or ended its turn without `finish` (ADR-0073) — never a new model
+    /// invalid result — or ended its turn without `finish` (ADR-0072) — never a new model
     /// (ADR-0054 item 3). `rejected` is the envelope if the repair cannot run. `None` when
     /// the run is cancelled meanwhile.
     fn repair(
@@ -730,7 +730,7 @@ fn envelope_from_end(end: StepEnd, attempts: u32, base: StepEnvelope) -> StepEnv
     }
 }
 
-/// The repair turn's message to a worker whose turn ended without `finish` (ADR-0073).
+/// The repair turn's message to a worker whose turn ended without `finish` (ADR-0072).
 const FINISH_NUDGE: &str = "You ended your turn without calling finish. Call finish now: status \"done\" with your result (and the evidence), or \"blocked\" with what you need.";
 
 fn repair_message(errors: &[String]) -> String {

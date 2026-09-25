@@ -1,5 +1,5 @@
 ---
-adr: 73
+adr: 72
 title: A workflow step that ends without finish gets one repair turn
 status: proposed
 date: 2026-09-25
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [docs/adr/0053-workflows-are-an-optional-module-a-sandboxed-script-orchestrates-workers-under-roles-and-caps.md, docs/adr/0054-workflow-roles-have-a-fallback-chain-for-route-failures-deepseek-is-the-shipped-worker.md, crates/p1-workflow/src/engine.rs, docs/design/workflows.md]
 ---
-# ADR-0073: A workflow step that ends without finish gets one repair turn
+# ADR-0072: A workflow step that ends without finish gets one repair turn
 
 ## Context
 

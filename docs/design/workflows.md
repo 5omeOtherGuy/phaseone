@@ -257,7 +257,7 @@ and every step refused before dispatch: `()`.
 | `max_steps: <n> reached` | The run's `agent()` budget is spent. |
 | `unknown_role: <name>` | The role is not in the effective table. |
 | `route: <error>` | No model of the role's chain could run the step — the last link's route failure. |
-| `ended without finish` | The worker's turn completed with no accepted `finish` call, after one repair turn (§5, ADR-0073). |
+| `ended without finish` | The worker's turn completed with no accepted `finish` call, after one repair turn (§5, ADR-0072). |
 | anything else | The host's `StepRunner` reason (its `Err` string, e.g. an unknown environment), or `journal: …` when the `Dispatch` line could not be written. |
 
 ## 5. Structured output
@@ -284,7 +284,7 @@ tool's rules, texts and error wording are completion.md §2 "Structured result" 
    `error: invalid_output: <errors joined by "; ">`, the last rejected value kept,
    `attempts: 2`; any other end (blocked, ended without finish) is that end, `attempts: 2`.
 
-**A turn that ends without `finish` (ADR-0073)** gets the same one round: when a step's
+**A turn that ends without `finish` (ADR-0072)** gets the same one round: when a step's
 FIRST turn ends without an accepted `finish` call,
 1. the cap is checked AGAIN (a capped nudge is the §3 refused-repair envelope, the
    worker's message kept as the value);

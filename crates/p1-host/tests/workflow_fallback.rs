@@ -167,7 +167,7 @@ async fn route_failure_body() {
 }
 
 /// The mapping is for the ROUTE alone: a worker whose turn completed without a `finish`
-/// executed and failed, so the chain is not walked — its one nudge (ADR-0073) is another
+/// executed and failed, so the chain is not walked — its one nudge (ADR-0072) is another
 /// turn of the SAME worker on the same route.
 #[tokio::test]
 async fn a_step_that_ran_and_failed_does_not_fall_back() {

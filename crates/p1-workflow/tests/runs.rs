@@ -294,7 +294,7 @@ async fn a_capped_repair_keeps_the_invalid_value() {
 const FINISH_NUDGE: &str = "You ended your turn without calling finish. Call finish now: \
     status \"done\" with your result (and the evidence), or \"blocked\" with what you need.";
 
-// ADR-0073
+// ADR-0072
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_that_ends_without_finish_is_nudged_once_in_the_same_worker() {
     let harness = Harness::new();
