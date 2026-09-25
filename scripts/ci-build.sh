@@ -13,25 +13,35 @@
 #   1  the run failed or was cancelled, or the downloaded p1 does not match the
 #      uploaded p1.sha256 (the failed step's log tail is printed)
 #   2  usage or tooling error: bad arguments, a detached HEAD, `main`, a failed
-#      push, a missing local tool, a failed `gh` call, no run for that commit, no
-#      completed run within CI_BUILD_TIMEOUT seconds, or a failed download:
-#      nothing can be concluded about the commit
+#      push or a push whose status line cannot be read, a missing or failing local
+#      tool, a failed `gh` call, no run for that commit, no completed run within
+#      CI_BUILD_TIMEOUT seconds, or a failed download: nothing can be concluded
+#      about the commit
 #
 # The push must come from the branch's checkout, so a detached HEAD is refused
 # whether or not a branch was named.
 #
-# Run identity: only runs of `.github/workflows/build.yml` for the exact headSha
-# count, and only a run this invocation caused:
+# Run identity: a run is the answer when it is a run of `.github/workflows/build.yml`
+# for this exact headSha, it is not one this invocation has already seen (the
+# pre-action snapshot of run ids), and its event matches the action taken:
 #
-#   CI_TRIGGER=push      (default) event `push`. A push that moves the branch
-#                        accepts only a run that did not exist before it; a push
-#                        that moves nothing (the commit is already on the branch)
-#                        waits for that commit's own newest run, because such a
-#                        push creates no run at all.
-#   CI_TRIGGER=dispatch  nothing runs on push: reuse a build.yml run for the commit
-#                        that is queued, running or green, otherwise start one with
-#                        `gh workflow run build.yml --ref <branch>` and accept only
-#                        a run id that did not exist before the dispatch.
+#   CI_TRIGGER=push      (default) event `push`. When this invocation's own push
+#                        moved the branch (its porcelain status line is ` `, `+` or
+#                        `*`), only a run that appeared after the snapshot is
+#                        accepted. When the push changed nothing (`=` up to date:
+#                        another caller already pushed this commit, so GitHub
+#                        creates no run for us), that commit's newest push run is
+#                        the answer, because the snapshot would exclude the only
+#                        run there is.
+#   CI_TRIGGER=dispatch  event `workflow_dispatch`. Reuse a build.yml run of the
+#                        commit that is queued, running or green; otherwise start
+#                        one with `gh workflow run build.yml --ref <branch>` and
+#                        accept any run for the commit that appeared after the
+#                        snapshot.
+#
+# Identity is the commit plus the workflow file, not the caller: a run a concurrent
+# invocation started for the same commit and workflow is the same build, so it is
+# accepted and there is no caller-correlation token.
 #
 # Any other CI_TRIGGER value is a tooling error (exit 2).
 #
@@ -41,6 +51,16 @@
 #
 # It never force-pushes and pushes only <branch>.
 set -euo pipefail
+
+# A missing tool must be a tooling error (2), not whatever `set -e` would report.
+# This runs before the first external command (dirname, below) and must list every
+# external command the script runs: git and gh, the artifact and log tooling, and
+# the tool the exit trap uses.
+for tool in git gh dirname cat mktemp mkdir find mv cut sha256sum tail rm sleep; do
+  command -v "$tool" >/dev/null 2>&1 ||
+    { echo "ci-build: $tool is not on PATH" >&2; exit 2; }
+done
+
 cd "$(dirname "$0")/.."
 
 artifact=p1-build
@@ -56,12 +76,6 @@ env: CI_TRIGGER=push|dispatch (default push; dispatch reuses or starts a build.y
 exit: 0 success, 1 run failed or cancelled, 2 usage or tooling error
 EOF
 }
-
-# A missing tool must be a tooling error (2), not whatever `set -e` would report.
-for tool in git gh mktemp mkdir find mv sha256sum cut sleep; do
-  command -v "$tool" >/dev/null 2>&1 ||
-    { echo "ci-build: $tool is not on PATH" >&2; exit 2; }
-done
 
 trigger=${CI_TRIGGER:-push}
 case "$trigger" in
@@ -148,7 +162,8 @@ list_run() {
     # Only build.yml's push run of this exact commit.
     filter=".[] | select(.headSha==\"$sha\" and .event==\"push\"$excl) | [.status, .conclusion, .databaseId] | @tsv"
   elif [ "$require_new" = 1 ]; then
-    # The dispatch this invocation started, not a run that already existed.
+    # Any build.yml dispatch run of this commit that appeared after the snapshot,
+    # this invocation's or a concurrent caller's (same commit, same workflow).
     filter=".[] | select(.headSha==\"$sha\" and .event==\"workflow_dispatch\"$excl) | [.status, .conclusion, .databaseId] | @tsv"
   else
     # A build.yml run of this commit that is still queued or running, or already green.
@@ -166,21 +181,34 @@ pinned=""
 push_moved=0
 require_new=0
 if [ "$push" = 1 ]; then
-  remote_line=$(git ls-remote --heads origin "refs/heads/$branch" 2>/dev/null) ||
-    { echo "ci-build: git ls-remote origin $branch failed" >&2; exit 2; }
-  remote_sha=""
-  if [ -n "$remote_line" ]; then
-    remote_sha=${remote_line%%$'\t'*}
-  fi
   snapshot=$(matching_ids) || { echo "ci-build: gh run list failed" >&2; exit 2; }
-  if ! git push --quiet origin "refs/heads/$branch:refs/heads/$branch"; then
-    echo "ci-build: git push origin $branch failed" >&2
-    exit 2
-  fi
-  if [ "$remote_sha" != "$sha" ]; then
-    # The push moved the branch, so a run that already existed is not this one's.
-    push_moved=1
-  fi
+  refspec="refs/heads/$branch:refs/heads/$branch"
+  # Whether THIS push moved the branch comes from the push's own machine-readable
+  # status, not from a value read before it: a concurrent caller pushing the same
+  # commit would otherwise make our no-op push look like the one that moved it.
+  push_out=$(git push --porcelain origin "$refspec") ||
+    { echo "ci-build: git push origin $branch failed" >&2; exit 2; }
+  push_flag=""
+  while IFS=$'\t' read -r line_flag line_refspec _; do
+    if [ "$line_refspec" = "$refspec" ]; then
+      push_flag=$line_flag
+      break
+    fi
+  done <<<"$push_out"
+  case "$push_flag" in
+    ' ') push_moved=1 ;;   # fast-forward update
+    '+') push_moved=1 ;;   # forced update
+    '*') push_moved=1 ;;   # new branch
+    '=') push_moved=0 ;;   # up to date: this push changed nothing
+    '')
+      echo "ci-build: git push printed no status line for $refspec; cannot tell whether it moved the branch" >&2
+      exit 2
+      ;;
+    *)
+      echo "ci-build: git push reported '$push_flag' for $refspec; nothing can be concluded" >&2
+      exit 2
+      ;;
+  esac
   echo "pushed $branch ${sha:0:7}; waiting for its build run…"
 else
   # --wait-only: wait for the run of the commit the branch already has.
@@ -188,6 +216,7 @@ else
   echo "wait-only: not pushing; waiting for the run of $branch ${sha:0:7}…"
 fi
 if [ "$trigger" = push ]; then
+  # Only a run caused by this push's move; an up-to-date push created none.
   require_new=$push_moved
 fi
 
@@ -247,7 +276,10 @@ echo "run $run_id: $summary"
 if [ "$conclusion" != success ]; then
   echo "ci-build: run $run_id concluded '${conclusion:-unknown}' for ${sha:0:7} on $branch; failed step log tail:" >&2
   if failed_log=$(gh run view "$run_id" --log-failed 2>/dev/null); then
-    printf '%s\n' "$failed_log" | tail -n 40 >&2
+    if ! printf '%s\n' "$failed_log" | tail -n 40 >&2; then
+      echo "ci-build: cannot print the failed-step log tail" >&2
+      exit 2
+    fi
   else
     echo "ci-build: no failed-step log for run $run_id" >&2
   fi
@@ -264,7 +296,7 @@ if ! tmpdir=$(mktemp -d); then
   echo "ci-build: mktemp -d failed" >&2
   exit 2
 fi
-trap 'rm -rf -- "$tmpdir"' EXIT
+trap 'rm -rf -- "$tmpdir" || echo "ci-build: could not remove $tmpdir" >&2' EXIT
 if ! gh run download "$run_id" --name "$artifact" --dir "$tmpdir"; then
   echo "ci-build: could not download the $artifact artifact of run $run_id" >&2
   exit 2

@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """Unit tests for scripts/ci-build.sh — no network and no real git/gh/rust.
 
-Every test copies the script into a temporary "repo" and puts stub `git`, `gh`,
-`sleep` and `sha256sum` executables first on PATH. The stubs answer from
-environment variables and log every call, so argument handling, the refusals, the
-run identity and correlation, the artifact checks and the exit-code mapping can
-all be checked without touching GitHub. Polling is driven by canned answer
-sequences and call counters, never by elapsed time.
+Every test copies the script into a temporary "repo" and puts stub executables
+first on PATH. The stubs answer from environment variables and log every call, so
+argument handling, the refusals, the run identity, the artifact checks and the
+exit-code mapping can all be checked without touching GitHub. Polling is driven by
+canned answer sequences and call counters, never by elapsed time.
 
-    python3 scripts/test_ci_build.py
+TOOL_INVENTORY mirrors the script's own preflight list, and
+`test_script_runs_on_the_declared_tool_path` runs the real script end to end on a
+PATH that holds nothing but those tools plus bash, so an external command missing
+from the inventory fails that test.
 """
 from __future__ import annotations
 
 import hashlib
 import os
 import pathlib
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -29,6 +33,14 @@ OTHER_SHA = "2" * 40
 BRANCH = "task/cloud-builds"
 P1_BYTES = b"p1 debug binary\n"
 P1_SHA = hashlib.sha256(P1_BYTES).hexdigest()
+
+# The script's preflight inventory: every external command it runs.
+TOOL_INVENTORY = ("git", "gh", "dirname", "cat", "mktemp", "mkdir", "find",
+                  "mv", "cut", "sha256sum", "tail", "rm", "sleep")
+# The tools whose real binary the logging stub delegates to.
+PASSTHROUGH_TOOLS = ("dirname", "cat", "mktemp", "mkdir", "find", "mv", "cut",
+                     "tail", "rm")
+REAL_TOOLS = {name: shutil.which(name) or f"/usr/bin/{name}" for name in PASSTHROUGH_TOOLS}
 REAL_SHA256SUM = shutil.which("sha256sum") or "/usr/bin/sha256sum"
 
 GIT_STUB = textwrap.dedent(
@@ -38,13 +50,23 @@ GIT_STUB = textwrap.dedent(
     echo "git $*" >> "$STUB_LOG"
     args="$*"
     if [ "${1:-}" = push ]; then
-      exit "${STUB_PUSH_EXIT:-0}"
-    fi
-    if [ "${1:-}" = ls-remote ]; then
-      if [ -n "${STUB_REMOTE_SHA:-}" ]; then
-        printf '%s\\t%s\\n' "$STUB_REMOTE_SHA" "${4:-refs/heads/unknown}"
+      # Porcelain status, as real git prints it:
+      #   <flag>\\t<from>:<to>\\t<summary>
+      code=${STUB_PUSH_EXIT:-0}
+      refspec=${4:-refs/heads/unknown}
+      if [ -n "${STUB_PUSH_OTHER_REFSPEC:-}" ]; then
+        refspec=$STUB_PUSH_OTHER_REFSPEC
       fi
-      exit "${STUB_LS_REMOTE_EXIT:-0}"
+      flag=${STUB_PUSH_FLAG- }
+      printf 'To https://example.invalid/repo.git\\n'
+      case "$flag" in
+        '=') printf '=\\t%s\\t[up to date]\\n' "$refspec" ;;
+        ' '|'+'|'*') printf '%s\\t%s\\t0000000..1111111\\n' "$flag" "$refspec" ;;
+        '') printf '\\t%s\\t[up to date]\\n' "$refspec" ;;
+        *) printf '%s\\t%s\\t[rejected]\\n' "$flag" "$refspec" ;;
+      esac
+      printf 'Done\\n'
+      exit "$code"
     fi
     if [ "$args" = "rev-parse --abbrev-ref HEAD" ]; then
       printf '%s\\n' "${STUB_CURRENT_BRANCH:-task/cloud-builds}"
@@ -70,6 +92,16 @@ SLEEP_STUB = textwrap.dedent(
     """
 )
 
+# Logs the invocation and delegates to the real tool, so the script's own external
+# commands run for real while the tests can still see them.
+PASSTHROUGH_STUB = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    echo "{name} $*" >> "$STUB_LOG"
+    exec "{real}" "$@"
+    """
+)
+
 # Logs the invocation and delegates, so a test can prove the script ran
 # `sha256sum -c` on the downloaded manifest, in the artifact directory.
 SHA256SUM_STUB = textwrap.dedent(
@@ -80,7 +112,6 @@ SHA256SUM_STUB = textwrap.dedent(
     """
     % REAL_SHA256SUM
 )
-
 # A tool that exists but fails, for the tooling-error exit-code tests.
 FAILING_STUB = textwrap.dedent(
     """\
@@ -245,14 +276,18 @@ class Harness:
         self.state = root / "state"
         self.state.mkdir()
         stubs = {"git": GIT_STUB, "gh": GH_STUB, "sleep": SLEEP_STUB, "sha256sum": SHA256SUM_STUB}
-        installed = set(tools) if tools is not None else set(stubs) | {"bash"}
-        for name in sorted(installed):
-            if name == "bash":
-                os.symlink(shutil.which("bash") or "/usr/bin/bash", self.bin / "bash")
-            elif name in stubs:
+        for name, real in REAL_TOOLS.items():
+            stubs[name] = PASSTHROUGH_STUB.format(name=name, real=real)
+        installed = set(tools) if tools is not None else set(stubs)
+        for name in sorted(installed - {"bash", "python3"}):
+            if name in stubs:
                 self._stub(name, stubs[name])
             else:
                 raise AssertionError(f"unknown stub {name}")
+        # The interpreters the stubs and the script are started with are always on
+        # PATH, even when a test deliberately installs nothing else.
+        self._symlink("bash", shutil.which("bash") or "/usr/bin/bash")
+        self._symlink("python3", shutil.which("python3") or sys.executable)
         for name in fail_tools or {}:
             self._stub(name, FAILING_STUB.format(name=name))
         path = str(self.bin) if bare_path else f"{self.bin}:{os.environ['PATH']}"
@@ -269,6 +304,9 @@ class Harness:
         path = self.bin / name
         path.write_text(text, encoding="utf-8")
         os.chmod(path, 0o755)
+
+    def _symlink(self, name: str, target: str) -> None:
+        os.symlink(target, self.bin / name)
 
     def run(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -304,7 +342,7 @@ class CiBuildTests(unittest.TestCase):
         h = self.harness()
         result = h.run()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"git push --quiet origin refs/heads/{BRANCH}:refs/heads/{BRANCH}", h.calls("git"))
+        self.assertIn(f"git push --porcelain origin refs/heads/{BRANCH}:refs/heads/{BRANCH}", h.calls("git"))
         download = h.calls("gh")
         self.assertTrue(any("run download" in call and "--name p1-build" in call for call in download), download)
         self.assertEqual((h.artifact() / "p1").read_bytes(), P1_BYTES)
@@ -344,7 +382,7 @@ class CiBuildTests(unittest.TestCase):
         h = self.harness(**{"STUB_BRANCH": "task/other"})
         result = h.run("task/other")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("git push --quiet origin refs/heads/task/other:refs/heads/task/other", h.calls("git"))
+        self.assertIn("git push --porcelain origin refs/heads/task/other:refs/heads/task/other", h.calls("git"))
 
     def test_refuses_main(self) -> None:
         for name in ("main", "refs/heads/main", "origin/main"):
@@ -387,14 +425,16 @@ class CiBuildTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("unknown option", result.stderr)
         self.assertIn("usage:", result.stderr)
-        self.assertEqual(h.calls(), [])
+        self.assertEqual(h.calls("git"), [])
+        self.assertEqual(h.calls("gh"), [])
 
     def test_two_branches_is_a_usage_error(self) -> None:
         h = self.harness()
         result = h.run("task/a", "task/b")
         self.assertEqual(result.returncode, 2)
         self.assertIn("more than one branch", result.stderr)
-        self.assertEqual(h.calls(), [])
+        self.assertEqual(h.calls("git"), [])
+        self.assertEqual(h.calls("gh"), [])
 
     def test_help_succeeds(self) -> None:
         h = self.harness()
@@ -537,7 +577,7 @@ class CiBuildTests(unittest.TestCase):
         self.assertIn('event=="push"', polls[0])
 
     def test_push_accepts_only_a_run_it_caused(self) -> None:
-        # Run 7 existed before the push; the push moved the branch, so only the new
+        # Run 7 existed before the push; this push moved the branch, so only the new
         # run (9) may be accepted.
         h = self.harness(
             **{
@@ -553,12 +593,28 @@ class CiBuildTests(unittest.TestCase):
         views = [call for call in h.calls("gh") if call.startswith("gh run view 9 ")]
         self.assertTrue(views, h.calls("gh"))
 
-    def test_push_that_moves_nothing_waits_for_that_commits_run(self) -> None:
-        # Re-pushing the same commit creates no run at all, so the commit's own run
-        # is the answer; no exclusion is applied.
+    def test_push_that_moved_the_branch_excludes_the_older_run(self) -> None:
+        # The same setup as the accepted case, but the only run for the commit is the
+        # one seen before the push: it must not be accepted (here: no completion
+        # within the timeout).
         h = self.harness(
             **{
-                "STUB_REMOTE_SHA": SHA,
+                "STUB_IDS_OUT": "9",
+                "STUB_LIST_OUT": "completed\tsuccess\t9",
+                "CI_BUILD_TIMEOUT": "0",
+            }
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("no completed run", result.stderr)
+
+    def test_push_that_moved_nothing_takes_that_commits_run(self) -> None:
+        # An up-to-date push (`=` flag) created no run: another caller already pushed
+        # this commit, so that commit's newest push run is the answer and no
+        # exclusion is applied to it.
+        h = self.harness(
+            **{
+                "STUB_PUSH_FLAG": "=",
                 "STUB_IDS_OUT": "4242",
                 "STUB_LIST_OUT": "completed\tsuccess\t4242",
             }
@@ -568,20 +624,70 @@ class CiBuildTests(unittest.TestCase):
         polls = [call for call in h.calls("gh") if "run list" in call and "@tsv" in call]
         self.assertTrue(polls, h.calls("gh"))
         self.assertNotIn(".databaseId !=", polls[0])
+        self.assertIn("verified with sha256sum -c", result.stdout)
 
-    def test_ls_remote_failure_is_a_tooling_error(self) -> None:
-        h = self.harness(**{"STUB_LS_REMOTE_EXIT": "1"})
+    def test_push_that_moved_nothing_takes_a_run_that_appeared_after_the_snapshot(self) -> None:
+        # Another caller pushed this same SHA while we were running, so our push is a
+        # no-op (`=`), and the run for that commit becomes visible only after our
+        # snapshot. It is this commit's push run, so it is accepted: no hang waiting
+        # for a run the snapshot already covers, and no exclusion of it.
+        h = self.harness(
+            **{
+                "STUB_PUSH_FLAG": "=",
+                "STUB_IDS_OUT": "",
+                "STUB_LIST_OUT": "completed\tsuccess\t9",
+                "STUB_VIEW_OUT": "build [completed/success] https://example.invalid/runs/9",
+            }
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("no completed run", result.stderr)
+        polls = [call for call in h.calls("gh") if "run list" in call and "@tsv" in call]
+        self.assertTrue(polls, h.calls("gh"))
+        self.assertNotIn(".databaseId !=", polls[0])
+        self.assertTrue(any(call.startswith("gh run view 9 ") for call in h.calls("gh")), h.calls("gh"))
+        self.assertEqual((h.artifact() / "p1").read_bytes(), P1_BYTES)
+
+    def test_push_porcelain_new_branch_flag_moved_the_branch(self) -> None:
+        h = self.harness(
+            **{
+                "STUB_PUSH_FLAG": "*",
+                "STUB_IDS_OUT": "7",
+                "STUB_LIST_OUT": "completed\tsuccess\t7|completed\tsuccess\t9",
+            }
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        polls = [call for call in h.calls("gh") if "run list" in call and "@tsv" in call]
+        self.assertIn("and .databaseId != 7", polls[0])
+
+    def test_push_porcelain_rejected_flag_is_a_tooling_error(self) -> None:
+        # A rejected push must not be read as "moved" or as a red run.
+        h = self.harness(**{"STUB_PUSH_FLAG": "!"})
         result = h.run()
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("git ls-remote origin", result.stderr)
-        self.assertFalse(any("push" in call for call in h.calls("git")), "nothing may be pushed")
+        self.assertIn("git push reported '!'", result.stderr)
+        self.assertFalse(any("run download" in call for call in h.calls("gh")))
+
+    def test_push_porcelain_empty_flag_is_a_tooling_error(self) -> None:
+        h = self.harness(**{"STUB_PUSH_FLAG": ""})
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("no status line", result.stderr)
+
+    def test_push_porcelain_without_a_line_for_the_refspec_is_a_tooling_error(self) -> None:
+        h = self.harness(**{"STUB_PUSH_OTHER_REFSPEC": "refs/heads/somewhere-else:refs/heads/somewhere-else"})
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("no status line", result.stderr)
 
     def test_invalid_trigger_is_a_tooling_error(self) -> None:
         h = self.harness(**{"CI_TRIGGER": "webhook"})
         result = h.run()
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("CI_TRIGGER must be push or dispatch, not 'webhook'", result.stderr)
-        self.assertEqual(h.calls(), [], "an invalid trigger must not touch git or gh")
+        self.assertEqual(h.calls("git"), [], "an invalid trigger must not touch git")
+        self.assertEqual(h.calls("gh"), [], "an invalid trigger must not touch gh")
 
     def test_dispatch_starts_a_run_and_waits_for_it(self) -> None:
         h = self.harness(**{"CI_TRIGGER": "dispatch", "STUB_LIST_OUT": ""})
@@ -656,9 +762,10 @@ class CiBuildTests(unittest.TestCase):
         self.assertFalse(any("push" in call for call in h.calls("git")), "wait-only must not push")
         self.assertIn("dispatch: reusing", result.stdout)
 
-    def test_dispatch_accepts_only_the_run_it_started(self) -> None:
-        # Run 7 matched the commit before the dispatch; after the dispatch only the
-        # new run (9) may be accepted.
+    def test_dispatch_accepts_a_run_that_appeared_after_the_snapshot(self) -> None:
+        # Run 7 matched the commit before the dispatch and is excluded; the run that
+        # appears afterwards is accepted whether this invocation started it or a
+        # concurrent caller did (same commit, same workflow file = the same build).
         h = self.harness(
             **{
                 "CI_TRIGGER": "dispatch",
@@ -674,6 +781,23 @@ class CiBuildTests(unittest.TestCase):
         self.assertTrue(any("and .databaseId != 7" in call for call in polls), polls)
         self.assertTrue(any(call.startswith("gh run view 9 ") for call in h.calls("gh")), h.calls("gh"))
 
+    def test_dispatch_does_not_accept_a_run_that_existed_before_the_snapshot(self) -> None:
+        # The pre-action snapshot is the only exclusion: a run id in it is not
+        # accepted after the dispatch, so an unchanged old run is not mistaken for a
+        # new build.
+        h = self.harness(
+            **{
+                "CI_TRIGGER": "dispatch",
+                "STUB_IDS_OUT": "7",
+                "STUB_LIST_OUT": "",
+                "STUB_DISPATCH_OUT": "completed\tsuccess\t7",
+                "CI_BUILD_TIMEOUT": "0",
+            }
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("no completed run", result.stderr)
+
     def test_dispatch_wait_only_without_a_run_does_not_dispatch(self) -> None:
         h = self.harness(
             **{"CI_TRIGGER": "dispatch", "STUB_LIST_OUT": "", "CI_BUILD_TIMEOUT": "0"}
@@ -686,7 +810,8 @@ class CiBuildTests(unittest.TestCase):
         self.assertFalse(any("push" in call for call in h.calls("git")))
 
     def test_tooling_failures_are_exit_two(self) -> None:
-        # A local tool failure is a tooling error (2), never a red run (1).
+        # A local tool failure is a tooling error (2), never a red run (1). tail is
+        # exercised on the red path instead (test_failing_tail_on_a_red_run_...).
         for tool in ("mktemp", "mkdir", "find", "mv", "sha256sum", "cut"):
             with self.subTest(tool=tool):
                 h = self.harness(fail_tools={tool: 1})
@@ -694,19 +819,77 @@ class CiBuildTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2,
                                  f"{tool}: {result.stdout} {result.stderr}")
 
+    def test_failing_tail_on_a_red_run_is_a_tooling_error(self) -> None:
+        # The failed-step log tail needs tail; without a working tail the documented
+        # exit is 2, not a silent 127 or a bogus 1.
+        h = self.harness(
+            fail_tools={"tail": 1},
+            **{"STUB_LIST_OUT": "completed\tfailure\t4242", "STUB_LOG_FAILED": "error: no"},
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot print the failed-step log tail", result.stderr)
+
     def test_failing_sleep_is_a_tooling_error(self) -> None:
         h = self.harness(fail_tools={"sleep": 1}, **{"STUB_LIST_OUT": "in_progress\t\t7"})
         result = h.run()
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("sleep failed", result.stderr)
 
-    def test_missing_git_is_a_tooling_error(self) -> None:
-        # A PATH with only bash: the script must report the missing tool, not fail
-        # with whatever `set -e` reports for the command that is not there.
-        h = self.harness(tools=("bash",), bare_path=True)
+    def test_every_inventory_tool_is_preflighted(self) -> None:
+        # The script's own inventory must match the tools this suite knows about;
+        # test_script_runs_on_the_declared_tool_path then proves behaviourally that
+        # the inventory is complete.
+        text = SCRIPT.read_text(encoding="utf-8")
+        match = re.search(r"^for tool in ([^;]+); do", text, re.MULTILINE)
+        self.assertIsNotNone(match, "the script has no preflight inventory line")
+        self.assertEqual(tuple(match.group(1).split()), TOOL_INVENTORY)
+
+    def test_inventory_has_no_stale_entry(self) -> None:
+        # Drift guard for the inventory line itself: a tool it lists must still be
+        # invoked somewhere in the script. Completeness in the other direction is
+        # proved by test_script_runs_on_the_declared_tool_path.
+        body = "\n".join(line for line in SCRIPT.read_text(encoding="utf-8").splitlines()
+                         if not line.lstrip().startswith("#"))
+        for tool in TOOL_INVENTORY:
+            with self.subTest(tool=tool):
+                self.assertRegex(body, rf"(?m)(^|[|;&($!\s]){re.escape(tool)}\s",
+                                 f"{tool} is preflighted but never invoked")
+
+    def test_missing_tools_are_tooling_errors(self) -> None:
+        # A PATH holding every declared tool but one: the script must name the missing
+        # tool and exit 2, never fail with whatever `set -e` reports for it.
+        for missing in TOOL_INVENTORY:
+            with self.subTest(missing=missing):
+                tools = tuple(name for name in (*TOOL_INVENTORY, "bash") if name != missing)
+                h = self.harness(tools=tools, bare_path=True)
+                result = h.run()
+                self.assertEqual(result.returncode, 2, f"{missing}: {result.stdout} {result.stderr}")
+                self.assertIn(f"{missing} is not on PATH", result.stderr)
+
+    def test_script_runs_on_the_declared_tool_path(self) -> None:
+        # The whole green path on a PATH that holds nothing but the declared tools
+        # plus bash: an external command missing from the inventory would be a
+        # "command not found" (127) here.
+        h = self.harness(tools=(*TOOL_INVENTORY, "bash"), bare_path=True)
         result = h.run()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("git is not on PATH", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("command not found", result.stdout + result.stderr)
+        self.assertIn("verified with sha256sum -c", result.stdout)
+        self.assertEqual((h.artifact() / "p1").read_bytes(), P1_BYTES)
+
+    def test_red_run_on_the_declared_tool_path_exits_one(self) -> None:
+        # The red path, including the failed-step log tail, also needs nothing but
+        # the declared tools.
+        h = self.harness(
+            tools=(*TOOL_INVENTORY, "bash"),
+            bare_path=True,
+            **{"STUB_LIST_OUT": "completed\tfailure\t4242", "STUB_LOG_FAILED": "error: tail me"},
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("command not found", result.stdout + result.stderr)
+        self.assertIn("error: tail me", result.stderr)
 
 
 if __name__ == "__main__":
