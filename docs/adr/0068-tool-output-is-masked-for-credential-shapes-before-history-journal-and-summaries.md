@@ -1,7 +1,7 @@
 ---
 adr: 68
 title: Tool output is masked for credential shapes before history, journal and summaries
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: lead
 supersedes: []

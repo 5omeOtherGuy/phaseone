@@ -73,6 +73,9 @@ pub struct TuiFrontEnd {
     /// (§10 `ctx`'s denominator); `None` fields when the environment has no
     /// `[context]` section.
     context: Mutex<(Option<u64>, Option<u64>)>,
+    /// Effective context windows announced for workers by
+    /// `FrontEnd::worker_context_configured`.
+    worker_windows: Arc<Mutex<HashMap<String, u64>>>,
     /// The parent's route label (ADR-0049 stage 3): a `/model`/`/effort` switch
     /// moves it, the same seam `LineFrontEnd` already uses — the assembled
     /// route fills it in, `route_label()` shares it with `crate::run::ModelSwitch`.
@@ -94,6 +97,7 @@ impl TuiFrontEnd {
             auth: Mutex::new(Some(auth)),
             labels: Mutex::new(None),
             context: Mutex::new((None, None)),
+            worker_windows: Arc::new(Mutex::new(HashMap::new())),
             route_label: Arc::new(Mutex::new(String::new())),
             tools: Mutex::new(Arc::new(Vec::new())),
         }
@@ -141,6 +145,15 @@ impl FrontEnd for TuiFrontEnd {
 
     fn context_configured(&self, window_tokens: Option<u64>, summarize_at_tokens: Option<u64>) {
         *self.context.lock().unwrap() = (window_tokens, summarize_at_tokens);
+    }
+
+    fn worker_context_configured(&self, worker_id: &str, window_tokens: Option<u64>) {
+        let mut worker_windows = self.worker_windows.lock().unwrap();
+        if let Some(window_tokens) = window_tokens {
+            worker_windows.insert(worker_id.to_string(), window_tokens);
+        } else {
+            worker_windows.remove(worker_id);
+        }
     }
 
     /// ADR-0049 stage 3: shared with `crate::run::ModelSwitch`, so a
@@ -276,6 +289,7 @@ impl FrontEnd for TuiFrontEnd {
                 worker_rows,
                 worker_stops,
                 worker_usage: HashMap::new(),
+                worker_windows: self.worker_windows.clone(),
                 branch,
                 tools: self.tools.lock().unwrap().clone(),
                 // Read once above: two `lock()` temporaries in this literal both
@@ -380,6 +394,8 @@ pub(crate) struct Driver {
     /// Usage reported by each worker's own responses; never merged into the
     /// parent's context or spend.
     worker_usage: HashMap<String, WorkerUsage>,
+    /// Effective context windows announced for individual workers.
+    worker_windows: Arc<Mutex<HashMap<String, u64>>>,
     inbox: p1_core::Inbox,
     /// §10 `branch`: refreshed off the render loop (`spawn_branch_refresh`,
     /// called from the async loop, never from a `Driver` method a plain
@@ -755,7 +771,9 @@ impl Driver {
     fn sync_workers(&mut self) {
         let mut rows = self.worker_rows.lock().unwrap().clone();
         self.screen.statusbar.workers = status::running_workers(&rows);
+        let worker_windows = self.worker_windows.lock().unwrap();
         for row in &mut rows {
+            row.context_window = worker_windows.get(&row.id).copied();
             if let Some(usage) = self.worker_usage.get(&row.id) {
                 row.model = Some(usage.model.clone());
                 row.tokens = usage.tokens;
@@ -1714,7 +1732,8 @@ fn spawn_worker_refresher(
                     elapsed,
                     cost_micro_usd: None,
                     tokens: None,
-                    // The child's configured window is not known to the host.
+                    // The driver fills the effective window from
+                    // `FrontEnd::worker_context_configured`.
                     context_window: None,
                     grants,
                     activity,
@@ -1996,6 +2015,36 @@ fn models_command_output(
 
 #[cfg(test)]
 mod tests;
+
+/// The TUI records a worker's effective context window, and removes the fact
+/// when the child reports that it has no configured context.
+#[cfg(test)]
+mod worker_context_window_tests {
+    use super::*;
+
+    #[test]
+    fn worker_context_windows_are_set_and_cleared_by_id() {
+        let front_end = TuiFrontEnd::new(
+            TuiOptions {
+                env: "claude".into(),
+                ask: false,
+                workspace: std::path::PathBuf::from("/workspace"),
+                sandbox: "off".into(),
+                effort: None,
+            },
+            CancellationToken::new(),
+        );
+
+        front_end.worker_context_configured("w1", Some(200_000));
+        assert_eq!(
+            front_end.worker_windows.lock().unwrap().get("w1"),
+            Some(&200_000)
+        );
+
+        front_end.worker_context_configured("w1", None);
+        assert!(!front_end.worker_windows.lock().unwrap().contains_key("w1"));
+    }
+}
 
 /// The worker-end wiring (ADR-0050 item 6): the sentence the line front end prints
 /// reaches the TUI as the note the driver already renders for a provider notice, so

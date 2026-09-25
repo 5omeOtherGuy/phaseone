@@ -1,7 +1,7 @@
 ---
 adr: 65
 title: p1 installs from its release channel into a prefix and the binary names its commit
-status: proposed
+status: accepted
 date: 2026-09-24
 deciders: lead
 supersedes: []

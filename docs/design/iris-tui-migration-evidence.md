@@ -298,3 +298,36 @@ malformed chip followed by visible `OK`. Mutation check: the cells key fails it 
 
 Open: P0 per-symbol/external-reach closure and P2–P6 (scope freeze for the owner's
 ~50-worker workflow). No programme-completion claim.
+
+## Massive run: dry-run (S1, S3)
+
+The judge accepted these slices:
+
+- **S1** — commits `e0c3ceb` (`bound wrap progress`) and `4a04f61` (`keep wrap
+  word units`). Tests cover watchdog-bounded wrapping, oversized wide glyphs,
+  zero-width and ZWJ text, capped indentation, styled wrapping, rendered-bound
+  invariants, and `wrap`/`wrap_len` agreement.
+- **S3** — commit `8d37370` (`gate approval grant keys`). Tests cover
+  non-grantable permission and diff approvals ignoring session/project grant keys
+  without leaking them into the composer, while once/deny and diff-review keys
+  remain available.
+
+Lead check after merging `main`: `cargo test -p p1-tui` (316 passed), clippy
+`-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI
+runs the full gate. Accepted follow-ups are listed on PR #161.
+
+## Massive run: part A (S2, S10)
+
+The judge accepted these slices:
+
+- **S2** — commits `9c8cc32` (`sanitize transcript text before wrapping`) and
+  `707acee` (`preserve transcript lines before wrapping`). Tests cover prose and OSC
+  sanitization before measurement/wrapping, row-count agreement, stored-text
+  immutability, operator paragraph breaks, and exact sanitized measurement.
+- **S10** — commit `fcd927b` (`clamp stale transcript scroll`). Tests cover stale
+  scroll-anchor movement, scroll marks, rendered-bound invariants, and refollowing
+  when the transcript fits.
+
+Lead check after merging `main` (with S1 and S3): `cargo test -p p1-tui` (326 passed), clippy
+`-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI
+runs the full gate. Accepted follow-ups are listed on PR #162.

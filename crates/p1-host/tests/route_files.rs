@@ -815,8 +815,11 @@ fn the_clinepass_routes_bind_only_subscription_wire_ids() {
             .collect();
         assert_eq!(
             bound,
-            [("deepseek-v4.1-flash", "cline-pass/deepseek-v4.1-flash")],
-            "{id}: DeepSeek V4.1 Flash only (owner, 2026-09-24; GLM-5.3 Flash after #115)"
+            [
+                ("deepseek-v4.1-flash", "cline-pass/deepseek-v4.1-flash"),
+                ("glm-5.3-flash-clinepass", "cline-pass/glm-5.3-flash"),
+            ],
+            "{id}: the owner-approved DeepSeek V4.1 Flash and GLM-5.3 Flash set"
         );
     }
 }

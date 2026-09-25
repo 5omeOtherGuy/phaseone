@@ -38,8 +38,9 @@ of a run (`scripts/run-report.py`), so it cannot size one response.
 | deepseek1 | opencode-go-1-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` (same endpoint, another account) |
 | deepseek2 | opencode-go-2-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` |
 | deepseek3 | opencode-go-3-subscription | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` |
-| cline | cline-pass-1 | cline-pass/deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | window **not documented on this route**: docs.cline.bot/getting-started/clinepass publishes no context window (its price table footnotes "DeepSeek API pricing"), so 1,000,000 is the MODEL's window (DeepSeek vendor + OpenCode Go gateway metadata above), carried — the runs behind these values ran on OpenCode Go, not api.cline.bot. reserve **policy** as `deepseek` |
-| cline2 | cline-pass-2 | cline-pass/deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `cline` (same endpoint, another account) |
+| cline | cline-pass-1 | cline-pass/deepseek-v4.1-flash (env default; route also binds cline-pass/glm-5.3-flash) | 1,000,000 | 96,000 | 300,000 | window **not documented on this route**: docs.cline.bot/getting-started/clinepass publishes no context window (its price table footnotes "DeepSeek API pricing"), so 1,000,000 is the MODEL's window (DeepSeek vendor + OpenCode Go gateway metadata above), carried — the runs behind these values ran on OpenCode Go, not api.cline.bot. reserve **policy** as `deepseek` |
+| cline2 | cline-pass-2 | cline-pass/deepseek-v4.1-flash (env default; route also binds cline-pass/glm-5.3-flash) | 1,000,000 | 96,000 | 300,000 | as `cline` (same endpoint, another account) |
+| cline (profile `glm-5.3-flash-clinepass`) | cline-pass-* | cline-pass/glm-5.3-flash | 1,000,000 | 96,000 | 300,000 | as the `cline` environment: this profile states no context or output capacity, so the effective settings come unchanged from the environment |
 | zen | opencode-zen-1 | space-bunny-free (env default; route also binds mimo-v2.6-flash-free, muse-spark-1.3-contributor-free) | 1,048,576 | 524,288 | 500,000 | window **sourced**: models.dev/api.json provider `opencode`, `space-bunny-free`: `limit: {context: 1048576, input: 524288, output: 524288}` (the Zen/Go docs state no limit and `/zen/v1/models` returns only ids). reserve 524,288 = the model's documented output limit; threshold 500,000 = min(500k, 60 %) |
 | zen2 | opencode-zen-2 | space-bunny-free | 1,048,576 | 524,288 | 500,000 | as `zen` |
 | zen3 | opencode-zen-3 | space-bunny-free | 1,048,576 | 524,288 | 500,000 | as `zen` |
@@ -124,8 +125,10 @@ selected profile's own capacity into the effective table (`config_for_route` in
 - effective `output_headroom_tokens` = `min(env reserve, profile.max_output_tokens)`, and always
   strictly below the effective window (a reserve as large as the window would leave no room at all
   for the request that carries the next response);
-- effective `summarize_at_tokens` = `min(env threshold, 60 % of the effective window)`, and always
-  below `window - reserve`;
+- effective `summarize_at_tokens` = `min(env threshold, 60 % of the effective window)` only when
+  the selected profile narrows the environment window; otherwise the environment's own threshold
+  is retained (GPT keeps 220,000 of 272,000). The resulting threshold is always below
+  `window - reserve`;
 - the copied verbatim budgets (`keep_recent_tokens`, `user_verbatim_tokens`) are clamped below the
   wall, because a kept tail larger than what a request can carry would keep the whole history
   verbatim and leave the next request over the wall (a 40,000-token profile on `zen`);

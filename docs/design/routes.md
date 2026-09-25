@@ -234,13 +234,14 @@ Cline credits instead of the subscription (the dashboard showed 0.0000 credits u
 the routes use `thinking-with-reasoning-alias`. **Owner decision 2026-09-24 21:55:** ClinePass runs
 DeepSeek V4.1 Flash and/or GLM-5.3 Flash only; Kimi K3 and the larger GLM/Qwen/MiMo models are not
 bound. The routes bind `deepseek-v4.1-flash` (`cline-pass/deepseek-v4.1-flash`, the environments'
-default; live 2026-09-24 OK from p1 on both accounts). `cline-pass/glm-5.3-flash` answers 200 too,
-but its stream (upstream "AtlasCloud") repeats the finish choice in the final usage chunk, which
-p1's chat parser rejects ("choice after finish reason", #115); it joins the routes once that is
-fixed (profile: thinking `enabled`, effort `high` only — the vendor turns any other value into
-`max`). `cline-pass/deepseek-v4-flash` (listed in the docs) answers 404. Usage is metered
-per subscription in a rolling 5-hour, a weekly and a monthly window; no usage endpoint is
-established, so the routes probe as unsupported.
+default; live 2026-09-24 OK from p1 on both accounts) and `glm-5.3-flash-clinepass`
+(`cline-pass/glm-5.3-flash`). GLM-5.3 Flash's stream (upstream "AtlasCloud") repeats the finish
+choice in the final usage chunk; p1 accepts that shape since #126 (issue #115), and a live p1 run
+answered and called `finish` on 2026-09-25. Its profile has thinking `enabled` and effort `high`
+only — the model card says the vendor turns any other value into `max`.
+`cline-pass/deepseek-v4-flash` (listed in the docs) answers 404. Usage is metered per subscription
+in a rolling 5-hour, a weekly and a monthly window; no usage endpoint is established, so the routes
+probe as unsupported.
 
 ## D. GLM on its Z.ai coding subscription (`openai-chat/glm-subscription`)
 

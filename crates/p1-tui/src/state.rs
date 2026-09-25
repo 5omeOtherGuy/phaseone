@@ -595,12 +595,15 @@ impl Screen {
         self.scroll_top = None;
     }
 
+    // Adapted from iris-donor/src/ui/tui/pager.rs ScrollState (pin
+    // 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa, MIT): a stale anchor is read
+    // through the current layout bound.
     /// The scroll mark while the view is pinned above the live tail. It takes the view's last
     /// row, so the rows below are counted from one row higher.
     pub fn scroll_mark(&self) -> Option<crate::render::scroll::ScrollMark> {
-        let top = self.scroll_top?;
         let (total, fits) = self.last_rendered;
         let shown = fits.saturating_sub(1);
+        let top = self.scroll_top?.min(total.saturating_sub(shown));
         // The working label names the latest started tool; it runs while any call is open.
         let running = self
             .working
@@ -746,12 +749,15 @@ impl Screen {
         }
     }
 
+    // Adapted from iris-donor/src/ui/tui/pager.rs ScrollState (pin
+    // 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa, MIT): movement starts from the
+    // top the current frame actually draws.
     /// Scroll the transcript `delta` rows up (positive) or down (negative).
     /// Scrolling to the newest rows releases the pin back to the live tail.
     pub fn scroll_by(&mut self, delta: isize) {
         let (len, fits) = self.last_rendered;
         let max_top = len.saturating_sub(fits);
-        let top = self.scroll_top.unwrap_or(max_top);
+        let top = self.scroll_top.unwrap_or(max_top).min(max_top);
         let next = top.saturating_add_signed(-delta).min(max_top);
         self.scroll_top = (next < max_top).then_some(next);
     }
@@ -1077,6 +1083,98 @@ mod tests {
         assert_eq!(s.folds.len(), 1, "only the folded output has a handle");
         assert_eq!((s.folds[0].kind.as_str(), s.folds[0].lines), ("shell", 60));
         assert_eq!(s.ledger().folds, s.folds);
+    }
+
+    #[test]
+    fn shrunk_transcript_scrolls_from_the_clamped_top() {
+        let mut up = Screen::new(false);
+        up.last_rendered = (100, 20);
+        up.scroll_top = Some(40);
+        up.last_rendered = (30, 20);
+        up.scroll_by(1);
+        assert_eq!(
+            up.scroll_top,
+            Some(9),
+            "30 - 20 - 1 from the rendered bottom"
+        );
+
+        let mut down = Screen::new(false);
+        down.last_rendered = (100, 20);
+        down.scroll_top = Some(40);
+        down.last_rendered = (30, 20);
+        down.scroll_by(-1);
+        assert_eq!(down.scroll_top, None, "the bottom releases the pin");
+
+        let mut page = Screen::new(false);
+        page.last_rendered = (100, 20);
+        page.scroll_top = Some(40);
+        page.last_rendered = (30, 20);
+        page.page(1);
+        assert_eq!(
+            page.scroll_top,
+            Some(0),
+            "paging from row 10 saturates at row 0"
+        );
+    }
+
+    #[test]
+    fn shrunk_transcript_scroll_mark_names_the_first_drawn_row() {
+        let mut s = Screen::new(false);
+        s.last_rendered = (100, 20);
+        s.scroll_top = Some(40);
+        s.last_rendered = (30, 20);
+
+        let mark = s.scroll_mark().unwrap();
+        let stored_top = 40;
+        let (total, fits) = s.last_rendered;
+        assert_eq!((mark.below, mark.row, mark.total), (0, 12, 30));
+        assert_eq!(
+            mark.row - 1,
+            stored_top.min(total.saturating_sub(fits.saturating_sub(1)))
+        );
+    }
+
+    #[test]
+    fn shrunk_transcript_stays_within_the_rendered_bounds() {
+        for len in 0..=60 {
+            for fits in 2..=30 {
+                for top in 0..=80 {
+                    for delta in [-3, -1, 1, 3] {
+                        let mut s = Screen::new(false);
+                        s.last_rendered = (len, fits);
+                        s.scroll_top = Some(top);
+                        s.scroll_by(delta);
+                        if let Some(next) = s.scroll_top {
+                            assert!(
+                                len <= fits || next < len - fits,
+                                "len={len}, fits={fits}, top={top}, delta={delta}, next={next}"
+                            );
+                        }
+                    }
+
+                    let mut s = Screen::new(false);
+                    s.last_rendered = (len, fits);
+                    s.scroll_top = Some(top);
+                    let mark = s.scroll_mark().unwrap();
+                    assert!(
+                        mark.row <= len.max(1),
+                        "len={len}, fits={fits}, top={top}, row={}",
+                        mark.row
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shrunk_transcript_refollows_when_it_fits() {
+        for delta in [1, -1] {
+            let mut s = Screen::new(false);
+            s.last_rendered = (10, 20);
+            s.scroll_top = Some(5);
+            s.scroll_by(delta);
+            assert_eq!(s.scroll_top, None, "delta={delta}");
+        }
     }
 
     #[test]
