@@ -1,0 +1,124 @@
+name: release
+
+# After the gate is green on main, publish what that commit built — a user installs or
+# updates from the release, never from a checkout (ADR-0063). This is the only place
+# that builds in release profile (AGENTS.md).
+on:
+  workflow_run:
+    workflows: [gate]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # A green gate for a push to main, and nothing else: a pull-request gate must not
+    # publish. The tag is the commit, so a re-run of the same commit is a no-op below.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    # A release build links the whole tree with thin LTO and a cold cache; the gate's
+    # 30 minutes cover a debug build AND the tests, so this is generous, not tight.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-cargo-${{ runner.os }}-
+
+      - name: Identify the commit
+        id: tag
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --short=12 HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=main-$sha" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u -d "@$(git show -s --format=%ct HEAD)" +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Build p1
+        env:
+          P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
+          P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
+        run: cargo build --release --locked -p p1-host
+
+      - name: Package the assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 0755 target/release/p1 dist/p1-linux-x86_64
+          tar -czf dist/p1-share.tar.gz environments routes profiles
+          ( cd dist && sha256sum p1-linux-x86_64 > p1-linux-x86_64.sha256 )
+          ( cd dist && sha256sum p1-share.tar.gz > p1-share.tar.gz.sha256 )
+          ls -l dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          target="${{ github.event.workflow_run.head_sha }}"
+          required=(p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256)
+
+          tag_sha="$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" \
+            | awk '$2 ~ /\^\{\}$/ { peeled=$1 } $2 !~ /\^\{\}$/ { direct=$1 } END { print peeled ? peeled : direct }')"
+          if [ -n "$tag_sha" ] && [ "$tag_sha" != "$target" ]; then
+            echo "tag $tag points to $tag_sha, expected $target" >&2
+            exit 1
+          fi
+
+          release_exists=0
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=1
+          fi
+
+          if [ "$release_exists" -eq 1 ]; then
+            assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            complete=1
+            for asset in "${required[@]}"; do
+              grep -Fxq "$asset" <<<"$assets" || complete=0
+            done
+            if [ "$complete" -eq 1 ]; then
+              echo "release $tag is complete — nothing to publish"
+              exit 0
+            fi
+            # Repair a partial publication. --clobber also repairs an asset left from an
+            # interrupted upload under the expected name.
+            gh release upload "$tag" "${required[@]/#/dist/}" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            echo "completed release $tag"
+            exit 0
+          fi
+
+          # A tag without a release is incomplete, not a reason to skip publication.
+          # Nothing else creates the tag: `gh release create --target` creates it at the
+          # commit verified above, so no --verify-tag (which would abort on a tag that
+          # does not exist yet and could never publish a first release).
+          gh release create "$tag" \
+            dist/p1-linux-x86_64 \
+            dist/p1-linux-x86_64.sha256 \
+            dist/p1-share.tar.gz \
+            dist/p1-share.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$target" \
+            --title "p1 $tag" \
+            --latest \
+            --notes "Built from commit $target after a green gate on main. Assets: p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz (environments/, routes/, profiles/), p1-share.tar.gz.sha256. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"

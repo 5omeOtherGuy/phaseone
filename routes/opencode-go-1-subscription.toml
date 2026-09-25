@@ -1,0 +1,29 @@
+# The owner's FIRST OpenCode Go subscription: allowance used up (2026-09-23) until it renews on
+# 2026-10-07; until then the gateway answers HTTP 402 "Insufficient account funds".
+# Same endpoint, dialect and session header as `opencode-go-subscription`; a different ACCOUNT,
+# therefore a different route id: p1's store keeps one credential per route id (ADR-0061), and a
+# separate origin keeps a recorded session's account meaningful. The key comes from p1's own store (`p1 login opencode-go-1-subscription`, which
+# keys-sync runs from ~/.config/keys/opencode-go-1.key) or from OPENCODE_GO_1_API_KEY; no CLI
+# login file is read (store_only).
+# Owner rule (2026-09-20, carried to this account): an OpenCode Go account serves DeepSeek V4.1
+# Flash ONLY — bind no other profile.
+id           = "opencode-go-1-subscription"
+origin_route = "openai-chat/opencode-go-1-subscription"
+adapter      = "openai-chat"
+endpoint     = "https://opencode.ai/zen/go/v1/chat/completions"
+
+[credential]
+# A reference, never a value. `store_only` (ADR-0061): the documented variable
+# below and p1's own store, and no CLI login file is ever read.
+kind       = "api-key"
+env        = "OPENCODE_GO_1_API_KEY"
+borrow     = []
+store_only = true
+
+[adapter_settings]
+dialect        = "thinking-with-reasoning-alias"
+session_header = "x-opencode-session"
+
+# Only profiles the host ships a policy for; any other profile is refused.
+[models."deepseek-v4.1-flash"]
+wire_model = "deepseek-v4.1-flash"

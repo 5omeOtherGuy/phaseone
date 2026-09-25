@@ -17,7 +17,8 @@ Headers: `content-type: application/json`, `accept: text/event-stream`,
 `anthropic-version: 2023-06-01`, `user-agent`, `Authorization: Bearer <oauth access token>`,
 `anthropic-dangerous-direct-browser-access: true`, `x-app: cli`,
 `anthropic-beta: oauth-2025-04-20,claude-code-20250219` (+ `interleaved-thinking-2025-05-14`
-only for manual-budget thinking; + `extended-cache-ttl-2025-04-11` only if a 1h TTL is used).
+only for manual-budget thinking; + `extended-cache-ttl-2025-04-11` only if a 1h TTL is used; + `context-1m-2025-08-07`
+only when the route file sets `long_context = true`, ADR-0063).
 Never `x-api-key` on this route. (API-key route: `x-api-key`, no Bearer, no identity block.)
 
 **Hard constraint** [donor]: `system` is a block array whose FIRST block is exactly
@@ -181,21 +182,65 @@ coding clients to identify themselves and supply a stable conversation header. p
 its own `user-agent: p1/<version>` and uses the host's cache key as `x-opencode-session`.
 No foreign client identity is impersonated.
 
-Credential precedence: `OPENCODE_API_KEY`; then the `opencode-go` API entry in
-`$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`);
-then the `opencode-go` API-key entry in `$PI_CODING_AGENT_DIR/auth.json` (default
-`~/.pi/agent/auth.json`). OpenCode uses `type: api`; Pi uses `type: api_key`; both
-use a `key` member. Only the selected entry is used. These are read by the credential
-source, never printed or included in the environment manifest. p1 does not execute
-Pi command-backed key configuration; use the environment variable in that case.
+Credential precedence (store-only, ADR-0061): `OPENCODE_API_KEY`, then p1's own store entry for
+the route id (`p1 login opencode-go-subscription`); no other tool's login file is read. The key is
+read by the credential source, never printed or included in the environment manifest.
+
+**Three accounts (2026-09-24, data only).** The owner has three Go subscriptions. Each is its own
+route — `opencode-go-1-subscription` (`OPENCODE_GO_1_API_KEY`; allowance used up until 2026-10-07, HTTP 402 until then),
+`opencode-go-2-subscription` (`OPENCODE_GO_2_API_KEY`) and `opencode-go-3-subscription`
+(`OPENCODE_GO_3_API_KEY`, the current primary) — because p1's store keeps one credential per route
+id (ADR-0061), and a separate origin keeps a recorded session's account meaningful. `opencode-go-subscription` keeps its id and `OPENCODE_API_KEY` and is a
+compatibility alias for the Go-3 account. Environments `deepseek1` and `deepseek3` name the first
+and third accounts; `deepseek` and `deepseek2` are unchanged.
+
+## C2. Free models on OpenCode Zen (`openai-chat/opencode-zen-1`, `-2`, `-3`, alias `-free`)
+
+**[docs + live, 2026-09-24]** `POST https://opencode.ai/zen/v1/chat/completions` — the Zen gateway
+itself, one `/v1` up from the Go subscription surface, reached with the same openai-chat adapter,
+`thinking-with-reasoning-alias` dialect and `x-opencode-session` header. Each of the owner's three
+Zen accounts is its own store-only route with its own variable (`OPENCODE_ZEN_1_API_KEY`,
+`_2_`, `_3_`); `opencode-zen-free` keeps its original name and `OPENCODE_ZEN_API_KEY` as the
+compatibility alias for Zen-1. Every route binds the same three free wire ids — `space-bunny-free`,
+`mimo-v2.6-flash-free` and `muse-spark-1.3-contributor-free` (metadata cost 0 per token, so no paid
+fallback exists) — and environments `zen`, `zen2`, `zen3` all default to `space-bunny-free`, so a
+workflow can spread work across accounts. **[live, 2026-09-24]** Space Bunny answers every account
+key from p1; MiMo and Muse answer HTTP 403 `FreeTierError` ("free tier can only be used from within
+OpenCode") on this chat endpoint to a non-OpenCode client, with or without a real Zen key — bound,
+but not usable from p1. (The Zen docs list Muse on `/zen/v1/responses`; which endpoint serves it
+past the gate is unverified — see its profile.) No Zen usage endpoint is established, so these routes probe as
+unsupported (`docs/design/usage.md`). The Muse Spark model's metadata hint (`@ai-sdk/openai`) is
+not yet confirmed by a live request on this endpoint.
+
+
+## C3. ClinePass subscriptions (`openai-chat/cline-pass-1`, `-2`)
+
+**[docs + live, 2026-09-24]** `POST https://api.cline.bot/api/v1/chat/completions` — the documented
+way to use a ClinePass subscription outside Cline (docs.cline.bot/getting-started/clinepass.md): an
+OpenAI-compatible Chat Completions API, a per-account API key (app.cline.bot → Account → API Keys),
+wire ids `cline-pass/<model>`. Each of the owner's two subscriptions is its own store-only route
+(`CLINE_PASS_1_API_KEY`, `CLINE_PASS_2_API_KEY`); environments `cline` and `cline2`. Only
+`cline-pass/` ids are bound: a bare id (`z-ai/glm-5.3`) is Cline's pay-as-you-go catalogue and bills
+Cline credits instead of the subscription (the dashboard showed 0.0000 credits used for the
+`cline-pass/` test calls). The stream carries reasoning as the OpenRouter-style `reasoning` delta, so
+the routes use `thinking-with-reasoning-alias`. **Owner decision 2026-09-24 21:55:** ClinePass runs
+DeepSeek V4.1 Flash and/or GLM-5.3 Flash only; Kimi K3 and the larger GLM/Qwen/MiMo models are not
+bound. The routes bind `deepseek-v4.1-flash` (`cline-pass/deepseek-v4.1-flash`, the environments'
+default; live 2026-09-24 OK from p1 on both accounts). `cline-pass/glm-5.3-flash` answers 200 too,
+but its stream (upstream "AtlasCloud") repeats the finish choice in the final usage chunk, which
+p1's chat parser rejects ("choice after finish reason", #115); it joins the routes once that is
+fixed (profile: thinking `enabled`, effort `high` only — the vendor turns any other value into
+`max`). `cline-pass/deepseek-v4-flash` (listed in the docs) answers 404. Usage is metered
+per subscription in a rolling 5-hour, a weekly and a monthly window; no usage endpoint is
+established, so the routes probe as unsupported.
 
 ## D. GLM on its Z.ai coding subscription (`openai-chat/glm-subscription`)
 
 **[docs + live, 2026-09-20]** `POST https://api.z.ai/api/coding/paas/v4/chat/completions`.
 Environment `glm` selects `glm-5.3`, high effort, matching the owner's `glm53` profile
 identified by the lead in issue #9. No fallback to the general paid API or Go.
-Credentials: `ZAI_API_KEY`, otherwise the `zai` API-key entry in Pi's auth file at the
-location above. Construction reads no credential. Access re-reads it; rejection re-reads
+Credentials (store-only, ADR-0061): `ZAI_API_KEY`, otherwise p1's own store entry for
+`glm-subscription`; no other tool's login file is read. Construction reads no credential. Access re-reads it; rejection re-reads
 once and only retries with a changed key. Static keys have no OAuth refresh; an unchanged
 rejected key produces an authentication error. Neither credential source writes files.
 

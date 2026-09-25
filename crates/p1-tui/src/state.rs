@@ -6,7 +6,7 @@
 //! direction, carried over from the iris TUI) folds passive chrome away so
 //! the transcript owns the screen; the first edit reveals the composer again.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use p1_contracts::{AgentEvent, Usage};
 
@@ -15,7 +15,7 @@ use crate::render::ledger::{
     ContextView, FoldRef, LedgerPane, LedgerSpend, SessionView, WorkersSummary, WorkspaceView,
 };
 use crate::render::picker::Picker;
-use crate::render::workers::{BlockState, WorkerBlock, WorkersPane};
+use crate::render::workers::{BlockState, WorkerBlock, WorkersPane, display_order};
 use crate::transcript::{Block, Transcript};
 
 /// A pending approval (handoff §7.5): inline as the transcript's running element, or the full
@@ -269,6 +269,11 @@ pub struct Screen {
     pub statusbar: crate::render::statusbar::StatusBar,
     pub pane_width: PaneWidth,
     pub pane_mode: PaneMode,
+    /// Only an automatically selected WORKERS mode may fall back on settlement.
+    /// Explicit pane navigation relinquishes this ownership. Public so
+    /// struct-update test fixtures can construct a screen.
+    #[doc(hidden)]
+    pub worker_mode_auto: bool,
     /// The width the operator held before a live worker forced the pane open
     /// (`Off` → `Wide`); the demotion gives it back. `None` when no such
     /// promotion is outstanding, or when a pin or an operator change owns the
@@ -328,6 +333,9 @@ pub struct Screen {
     /// A worker the operator attached to (`a`, handoff §9.5): its transcript replaces the
     /// parent's in the transcript area.
     pub attached: Option<AttachedWorker>,
+    /// Each worker's transcript while it is detached; attach takes the buffer out and detach
+    /// puts it back, so worker output survives every view change.
+    pub worker_transcripts: HashMap<String, Transcript>,
     /// Steering/follow-up text queued for the next boundary, shown above the
     /// composer hints so the operator sees what will land.
     pub queued: VecDeque<Queued>,
@@ -397,6 +405,7 @@ impl Screen {
 
     pub fn cycle_width(&mut self) {
         self.pane_width = self.pane_width.resolve(self.last_width).cycle();
+        self.promotion_saved_width = None;
     }
 
     /// The modes `^Tab` may land on right now (handoff §9.1): LEDGER always;
@@ -422,6 +431,10 @@ impl Screen {
             Some(at) => available[(at + 1) % available.len()],
             None => available.first().copied().unwrap_or(self.pane_mode),
         };
+        if self.pane_mode != PaneMode::Workers {
+            self.detach_worker();
+        }
+        self.worker_mode_auto = false;
         // A deliberate choice is not a pin, but it outlives a transient peek.
         if matches!(self.promotion, Promotion::Peek { .. }) {
             self.promotion = Promotion::None;
@@ -482,6 +495,55 @@ impl Screen {
                 self.working = None;
             }
             _ => {}
+        }
+    }
+
+    /// Observe one worker event without moving any parent state (handoff §9.5).
+    pub fn apply_worker(&mut self, id: &str, event: &AgentEvent, at_ms: u64) {
+        if let Some(worker) = &mut self.attached
+            && worker.id == id
+        {
+            worker.transcript.apply(event, Some(at_ms));
+        } else {
+            self.worker_transcripts
+                .entry(id.to_string())
+                .or_default()
+                .apply(event, Some(at_ms));
+        }
+    }
+
+    /// Attach the focused WORKERS row, taking over its buffered transcript (handoff §9.5).
+    pub fn attach_selected(&mut self) {
+        if self.pane_mode != PaneMode::Workers {
+            return;
+        }
+        let Some(id) = self.workers.focused.clone() else {
+            return;
+        };
+        let Some(row) = self.workers.workers.iter().find(|worker| worker.id == id) else {
+            return;
+        };
+        if self.attached.as_ref().is_some_and(|worker| worker.id == id) {
+            return;
+        }
+        let route = row.route.clone();
+        let state = row.state;
+        self.detach_worker();
+        let transcript = self.worker_transcripts.remove(&id).unwrap_or_default();
+        self.attached = Some(AttachedWorker {
+            id,
+            route,
+            state,
+            transcript,
+        });
+        // An attachment owns WORKERS, so settlement must not demote the focused view.
+        self.worker_mode_auto = false;
+    }
+
+    /// Return to the parent transcript without changing pane focus or selection.
+    pub fn detach_worker(&mut self) {
+        if let Some(worker) = self.attached.take() {
+            self.worker_transcripts.insert(worker.id, worker.transcript);
         }
     }
 
@@ -640,7 +702,9 @@ impl Screen {
                     menu.step_effort(delta);
                 }
             }
-            V::TogglePaneFocus => self.pane_focused = !self.pane_focused,
+            V::TogglePaneFocus => self.toggle_pane_focus(),
+            V::AttachWorker => self.attach_selected(),
+            V::DetachWorker => self.detach_worker(),
             V::EditGoal => self.edit_goal(),
             V::KeepComposer => self.composer.keep(),
             V::ToggleReview => self.toggle_review(),
@@ -660,14 +724,25 @@ impl Screen {
     }
 
     /// Sync the WORKERS pane from a fresh snapshot, handling the promotion
-    /// rule (SPEC §5, handoff §9.1): a live delegate promotes the pane to
-    /// WORKERS while any worker runs; a worker needing review SELF-PINS
-    /// WORKERS (`^P` need not be pressed — a parked approval is the
-    /// operator's turn); when none is live, nothing needs review, and
-    /// nothing else pinned it, an UNPINNED WORKERS pane falls back to
-    /// LEDGER.
+    /// rule (SPEC §5, handoff §9.1): a newly live delegate promotes the pane
+    /// to WORKERS; new review attention SELF-PINS WORKERS (`^P` need not be
+    /// pressed — a parked approval is the operator's turn). Repeated snapshots
+    /// do not undo navigation. On settlement only an automatically selected,
+    /// unpinned WORKERS pane falls back to LEDGER.
     pub fn sync_workers(&mut self, rows: Vec<WorkerBlock>) {
         self.workers_ever_started |= !rows.is_empty();
+        let newly_active = |state| {
+            rows.iter().any(|row| {
+                row.state == state
+                    && !self
+                        .workers
+                        .workers
+                        .iter()
+                        .any(|old| old.id == row.id && old.state == state)
+            })
+        };
+        let new_live = newly_active(BlockState::Running);
+        let new_review = newly_active(BlockState::NeedsReview);
         let count = |state| rows.iter().filter(|w| w.state == state).count() as u64;
         let live = count(BlockState::Running);
         let queued = count(BlockState::Queued);
@@ -681,16 +756,23 @@ impl Screen {
             self.workers.focused = None;
         }
         self.workers.workers = rows;
-        let live = live > 0;
+        if let Some(worker) = &mut self.attached {
+            let id = &worker.id;
+            if let Some(row) = self.workers.workers.iter().find(|row| &row.id == id) {
+                worker.state = row.state;
+            }
+        }
         // A parked approval is the operator's turn: SELF-pin, no `^P` needed,
-        // so nothing later demotes it out from under them.
+        // so nothing later demotes it out from under them. Only NEW attention
+        // moves the mode; a refresh of the same row cannot undo ^Tab.
         let pinned_before = self.pinned;
-        if needs_review {
+        if new_review {
             self.pinned = true;
         }
-        if needs_review || live {
-            if self.pane_mode != PaneMode::Workers && (needs_review || !pinned_before) {
+        if new_review || (new_live && !pinned_before) {
+            if self.pane_mode != PaneMode::Workers {
                 self.pane_mode = PaneMode::Workers;
+                self.worker_mode_auto = true;
             }
             // The width force is a promotion and a pin from BEFORE this sync
             // always wins it. Save what the operator had so the demotion can
@@ -699,8 +781,12 @@ impl Screen {
                 self.promotion_saved_width = Some(self.pane_width);
                 self.pane_width = PaneWidth::Wide;
             }
-        } else if self.pane_mode == PaneMode::Workers && !self.pinned {
-            self.pane_mode = PaneMode::Ledger;
+        }
+        if !needs_review && live == 0 && !self.pinned {
+            if self.worker_mode_auto && self.pane_mode == PaneMode::Workers {
+                self.pane_mode = PaneMode::Ledger;
+            }
+            self.worker_mode_auto = false;
             // Give back the operator's width only while it is still the one
             // this promotion set: a `^W` since then is their choice to keep.
             if let Some(saved) = self.promotion_saved_width.take()
@@ -709,15 +795,76 @@ impl Screen {
                 self.pane_width = saved;
             }
         }
+        if self.pane_focused
+            && self.pane_mode == PaneMode::Workers
+            && self.workers.focused.is_none()
+        {
+            self.select_first_worker();
+        }
     }
     /// Open a fold handle in the OUTPUT pane (`^O`): switches the pane to
     /// OUTPUT mode and widens it if it is hidden.
     pub fn open_output(&mut self, view: crate::render::output::OutputView) {
         self.output = Some(view);
         self.pane_mode = PaneMode::Output;
+        self.detach_worker();
+        self.worker_mode_auto = false;
+        self.promotion_saved_width = None;
         if matches!(self.pane_width, PaneWidth::Off) {
             self.pane_width = PaneWidth::Wide;
         }
+    }
+
+    fn toggle_pane_focus(&mut self) {
+        self.pane_focused = !self.pane_focused;
+        if !self.pane_focused {
+            self.workers.focused = None;
+            self.detach_worker();
+            return;
+        }
+        if self.pane_mode != PaneMode::Workers {
+            return;
+        }
+        let order = display_order(&self.workers);
+        let selected_is_present = self
+            .workers
+            .focused
+            .as_deref()
+            .is_some_and(|id| order.iter().any(|worker| worker.id == id));
+        if !selected_is_present {
+            self.select_first_worker();
+        }
+    }
+
+    /// Move the focused WORKERS selection, or scroll OUTPUT when another pane mode owns arrows.
+    pub fn pane_step(&mut self, delta: isize) {
+        if self.pane_mode != PaneMode::Workers {
+            self.scroll_output_by(delta);
+            return;
+        }
+        let order = display_order(&self.workers);
+        let Some(last) = order.len().checked_sub(1) else {
+            return;
+        };
+        let current = self.workers.focused.as_deref().and_then(|id| {
+            order
+                .iter()
+                .position(|worker| worker.id == id)
+                .map(|index| index as isize)
+        });
+        let next = match current {
+            Some(current) => current.saturating_add(delta).clamp(0, last as isize) as usize,
+            None if delta > 0 => 0,
+            None if delta < 0 => last,
+            None => return,
+        };
+        self.workers.focused = Some(order[next].id.clone());
+    }
+
+    fn select_first_worker(&mut self) {
+        self.workers.focused = display_order(&self.workers)
+            .first()
+            .map(|worker| worker.id.clone());
     }
 
     /// Scroll the OUTPUT pane's content.
@@ -823,9 +970,12 @@ mod tests {
             id: id.into(),
             task: "task".into(),
             route: "deepseek/v4.1-flash".into(),
+            model: None,
             state,
             elapsed: None,
             cost_micro_usd: None,
+            tokens: None,
+            context_window: None,
             grants: "read finish".into(),
             activity: String::new(),
         }

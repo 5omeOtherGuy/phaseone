@@ -7,6 +7,7 @@
 //! those sections are not negotiable.
 
 pub mod band;
+pub mod dashboard;
 pub mod face;
 pub mod fold;
 pub mod geometry;
@@ -17,5 +18,6 @@ pub mod palette;
 pub mod render;
 pub mod runtime;
 pub mod state;
+mod text;
 pub mod transcript;
 pub mod wrap;

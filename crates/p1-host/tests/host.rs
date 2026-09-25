@@ -1171,7 +1171,13 @@ async fn help_and_version_render_to_stdout() {
 
     let mut version = Harness::new(Vec::new(), &[]);
     assert_eq!(run_args(&mut version, &["--version"]).await, 0);
-    assert!(version.stdout.text().contains("p1 "));
+    // `p1 <version> (<sha> <date>)` — the binary names the commit it was built from.
+    let text = version.stdout.text();
+    assert!(
+        text.contains(&format!("p1 {} (", env!("CARGO_PKG_VERSION"))),
+        "{text}"
+    );
+    assert!(text.trim_end().ends_with(')'), "{text}");
 }
 
 #[tokio::test]
@@ -1206,6 +1212,8 @@ async fn usage_errors_exit_2() {
         max_continuations: 3,
         provider_retries: 3,
         max_idle_summaries: 6,
+        instructions: Vec::new(),
+        skills: Vec::new(),
     };
     let code = p1_host::run::run(&mut harness.deps, options).await;
 

@@ -1,7 +1,8 @@
 //! Every full-screen mock of the handoff (§16, `grids.json` screens S01–F01), composed by
 //! `render::screen::draw` from a `Screen` built through its public API with the state
 //! `lib/p1-screens.js` gives each screen, and compared cell for cell (reduced motion; the
-//! hardware cursor painted where the mocks draw it, one amber cell).
+//! hardware cursor painted where the mocks draw it, one amber cell). The WORKERS mocks were
+//! re-derived from the renderer for #111.
 //!
 //! A screen is asserted WHOLE wherever the state it shows exists. Where a mock needs state or a
 //! seam that does not exist yet, or contradicts a lead decision or the handoff's own rules, the
@@ -409,6 +410,21 @@ fn worker(
         state,
         elapsed: elapsed.map(str::to_string),
         cost_micro_usd: None,
+        model: match id {
+            "w3" | "w2" => Some("deepseek-v4.1-flash".into()),
+            "w4" => Some("glm-5.3".into()),
+            _ => None,
+        },
+        tokens: match id {
+            "w3" => Some(12_400),
+            "w2" => Some(48_213),
+            "w4" => Some(3_100),
+            _ => None,
+        },
+        context_window: match id {
+            "w2" => Some(128_000),
+            _ => None,
+        },
         grants: grants.into(),
         activity: activity.into(),
     }

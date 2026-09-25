@@ -15,6 +15,12 @@ no tools and chooses neither prompt nor tool set.
 
 Adapters depend on `p1-contracts` and `p1-provider-http`; never on the core, a tool or each other.
 
+For the OpenAI Chat Completions stream, the finish choice is terminal except for one
+OpenRouter-proxied gateway shape: ClinePass may repeat the same empty finish choice
+(the delta has no content, reasoning, or tool calls) in the final usage chunk. The
+repeat may carry usage, which is recorded as the latest usage report, but it does not
+emit a second finish; every other choice after a finish remains a protocol error.
+
 ## `p1-provider-http`
 
 ```rust
@@ -47,7 +53,9 @@ Retry loop invariants (each has a test, with a fake clock — `tokio::time::paus
    was yielded) share one budget of `max_retries`.
 3. **Never retry once any `TextDelta`/`ReasoningDelta`/`ToolInputDelta` has been yielded** —
    the failure becomes the terminal `Finished(Failed(Transport))`.
-4. Back-off waits race cancellation and yield `StreamEvent::Activity` so the consumer sees life.
+4. Back-off waits race cancellation. Before each wait the driver emits a `StreamEvent::Notice`
+   (`provider returned HTTP <status>; retry <n>/<max> in <wait>`, or `provider request failed; …`
+   when there is no HTTP status), then `StreamEvent::Activity`, so the consumer sees life.
 5. Error messages and logs carry status, error type and request id only — never a request or
    response body, never a header value.
 
@@ -128,6 +136,21 @@ HTTP 403 and a `FreeTierError`-shaped body while the key is fine.
 - The shared driver finishes immediately on this kind, exactly as on `InsufficientBalance`: no
   credential refresh, no retry, ONE HTTP request in total.
 - The TUI renders `✗ not included in the plan · <message> · not retried` and offers `/model`.
+
+## A used-up usage allowance
+
+A 402/429 whose body names a fixed usage-limit or quota word is not a short rate-limit window.
+- The chat adapter reads the same four JSON positions as the no-balance and plan-refusal checks.
+  The case-insensitive allow-list is `gousagelimiterror`, `insufficient_quota`, and
+  `usage_limit_exceeded`.
+- A hit becomes `ProviderErrorKind::UsageLimitExhausted` with the fixed message
+  `the account's usage allowance is used up`. An integer-seconds `Retry-After` (or rate-limit
+  reset header) appends `(resets in <duration>)`; provider free text is never copied.
+- The shared driver finishes on the first response, with no refresh or retry. The host's
+  turn-level retry does not cover this kind either. Unknown 402/429 bodies keep their existing
+  status classification (`RateLimited` for 429) and retry budget.
+- The TUI renders `✗ usage limit reached · <message> · not retried` and offers the reset or
+  `/model`.
 
 ## The ONE conformance suite — `p1-provider-conformance`
 

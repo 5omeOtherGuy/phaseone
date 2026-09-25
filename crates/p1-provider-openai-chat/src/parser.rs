@@ -3,7 +3,7 @@ use p1_contracts::{
     AssistantBlock, AssistantItem, CompletedResponse, Origin, Outcome, ProviderError,
     ProviderErrorKind, ReplayData, StopReason, StreamEvent, ToolCall, ToolInput, Usage,
 };
-use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status};
+use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status, reset_after};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -14,6 +14,7 @@ pub(crate) struct ChatParser {
     text: Option<usize>,
     reasoning: Option<usize>,
     stop: Option<StopReason>,
+    finish_reason: Option<String>,
     usage: Option<Usage>,
     ended: bool,
 }
@@ -26,6 +27,7 @@ impl ChatParser {
             text: None,
             reasoning: None,
             stop: None,
+            finish_reason: None,
             usage: None,
             ended: false,
         }
@@ -72,6 +74,33 @@ impl ChatParser {
                 text: text.into(),
             }
         }
+    }
+    /// After a finish, accept only an empty repeat of that same finish. OpenRouter-style
+    /// gateways such as ClinePass repeat the finish choice in the usage chunk; any
+    /// non-empty unknown delta field remains a protocol error.
+    fn is_repeated_empty_finish(&self, choice: &Value) -> bool {
+        let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) else {
+            return false;
+        };
+        if self.finish_reason.as_deref() != Some(reason) {
+            return false;
+        }
+        let Some(delta) = choice.get("delta").filter(|value| value.is_object()) else {
+            return false;
+        };
+        let empty = |value: &Value| {
+            value.is_null()
+                || value.as_str() == Some("")
+                || value.as_array().is_some_and(Vec::is_empty)
+        };
+        delta.as_object().is_some_and(|fields| {
+            fields.iter().all(|(field, value)| match field.as_str() {
+                "role" => true,
+                "content" | "reasoning_content" | "reasoning" => empty(value),
+                "tool_calls" => value.is_null() || value.as_array().is_some_and(Vec::is_empty),
+                _ => value.is_null(),
+            })
+        })
     }
     fn fail(&mut self, message: &str) -> Vec<StreamEvent> {
         self.ended = true;
@@ -155,7 +184,12 @@ impl ResponseParser for ChatParser {
                 return self.fail("unexpected chat choice index");
             }
             if self.stop.is_some() {
-                return self.fail("choice after finish reason");
+                // OpenRouter-proxied gateways such as ClinePass repeat the finish
+                // choice in the usage chunk, so accept only that empty repeat.
+                if !self.is_repeated_empty_finish(choice) {
+                    return self.fail("choice after finish reason");
+                }
+                continue;
             }
             let Some(delta) = choice.get("delta").filter(|v| v.is_object()) else {
                 return self.fail("chat choice missing delta");
@@ -254,6 +288,7 @@ impl ResponseParser for ChatParser {
                 }
             }
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.finish_reason = Some(reason.to_owned());
                 self.stop = Some(match reason {
                     "stop" => StopReason::EndTurn,
                     "tool_calls" => StopReason::ToolUse,
@@ -275,9 +310,21 @@ impl ResponseParser for ChatParser {
     fn on_http_error(
         &self,
         status: u16,
-        _headers: &[(String, String)],
+        headers: &[(String, String)],
         body: &[u8],
     ) -> ProviderError {
+        // A usage-limit error is an exhausted allowance, not a short rate-limit
+        // window. Retrying it across the provider's reset only hides the failure.
+        if matches!(status, 402 | 429) && names_usage_limit(body) {
+            let message = match reset_after(headers) {
+                Some(delay) => format!(
+                    "{USAGE_LIMIT_MESSAGE} (resets in {})",
+                    human_duration(delay)
+                ),
+                None => USAGE_LIMIT_MESSAGE.to_string(),
+            };
+            return ProviderError::new(ProviderErrorKind::UsageLimitExhausted, message);
+        }
         // A 401/403 whose body says the account has no balance is not a rejected
         // key (ADR-0046): refreshing the credential cannot help, so the operator
         // must read the balance, not a key error. A plan / free-tier refusal is
@@ -310,6 +357,48 @@ impl ResponseParser for ChatParser {
             Some(code) => ProviderError::new(kind, format!("chat HTTP status {status} ({code})")),
             None => ProviderError::new(kind, format!("chat HTTP status {status}")),
         }
+    }
+}
+
+/// The whole text of an exhausted usage allowance: only the provider's reset
+/// hint is formatted into it, never the server's free text.
+const USAGE_LIMIT_MESSAGE: &str = "the account's usage allowance is used up";
+
+/// Fixed usage-limit/quota words, read in the same four JSON positions as the
+/// no-balance and plan-refusal classifications.
+const USAGE_LIMIT_WORDS: [&str; 3] = [
+    "gousagelimiterror",
+    "insufficient_quota",
+    "usage_limit_exceeded",
+];
+
+fn names_usage_limit(body: &[u8]) -> bool {
+    names_any_position(body, &USAGE_LIMIT_WORDS)
+}
+
+fn human_duration(duration: std::time::Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let parts = [
+        (total_seconds / 86_400, "d"),
+        ((total_seconds % 86_400) / 3_600, "h"),
+        ((total_seconds % 3_600) / 60, "min"),
+        (total_seconds % 60, "s"),
+    ];
+    let mut out = String::new();
+    for (amount, unit) in parts {
+        if amount > 0 {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&amount.to_string());
+            out.push(' ');
+            out.push_str(unit);
+        }
+    }
+    if out.is_empty() {
+        "0 s".to_string()
+    } else {
+        out
     }
 }
 
@@ -405,6 +494,13 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecognised_429_body_stays_rate_limited() {
+        let error =
+            parser().on_http_error(429, &[], br#"{"error":{"type":"temporary_burst_limit"}}"#);
+        assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+    }
+
+    #[test]
     fn a_free_tier_refusal_is_not_entitled_not_authentication() {
         // The live OpenCode Zen shape: a valid key, but the model is gated to
         // OpenCode's own client (ADR-0062).
@@ -454,6 +550,24 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+
+    #[test]
+    fn a_usage_limit_is_terminal_and_its_reset_hint_is_sanitised() {
+        for (header, value) in [("Retry-After", "187200"), ("X-RateLimit-Reset", "187200")] {
+            let error = parser().on_http_error(
+                429,
+                &[(header.into(), value.into())],
+                br#"{"error":{"type":"GoUsageLimitError","message":"wire text"}}"#,
+            );
+            assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
+            assert_eq!(
+                error.message,
+                "the account's usage allowance is used up (resets in 2 d 4 h)"
+            );
+            assert!(!error.message.contains("wire text"));
+        }
+    }
+
     #[test]
     fn a_null_or_empty_tool_type_on_a_continuation_chunk_is_not_a_protocol_error() {
         for filler in [json!(null), json!("")] {

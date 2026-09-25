@@ -1045,6 +1045,7 @@ RUNS
 | ProviderFailed Authentication | `✗ authentication failed · <route>` | | journal | `p1 login <route>` |
 | ProviderFailed InsufficientBalance | `✗ account exhausted · <route> · not retried` | | journal | `/model` another route |
 | ProviderFailed NotEntitled | `✗ not included in the plan · <message> · not retried` | | journal | `/model` another route |
+| ProviderFailed UsageLimitExhausted | `✗ usage limit reached · <message> · not retried` | | journal | wait for the reset, or `/model` |
 | ProviderFailed RateLimited | `✗ rate limited · <route>` | | journal | `wait, or /model` |
 | ProviderFailed Transport | `✗ connection failed · <message>` | lost streamed text size | journal | `⏎ resend` |
 | ProviderFailed Protocol / InvalidRequest | `✗ provider error · <kind> · <message>` | | journal | |
@@ -1389,20 +1390,23 @@ RUNS
 
 ### 9.4 WORKERS
 Header: `WORKERS` dim, right `2 live · 1 queued · pool 3/4`. Order: needs review, running, failed
-and stalled, queued, done, cancelled, lost. Wide grid (48) — 4 rows per worker:
+and stalled, queued, done, cancelled, lost. Wide grid (48) — 2–4 rows per worker:
 ```
 <glyph> <id>  <task first line, ink>                       <state, dim>
-  <env/profile, dim>                              <elapsed ink> · <cost ink>
-  grants  <tools, ink>
-  ↳ <current activity or end line>
+  <model ink> · <route dim, only when the whole suffix fits> <tok>/<ctx> · <elapsed ink> · <cost ink>
+  grants  <tools, ink>                         (only when grants is non-empty)
+  ↳ <current activity or end line>              (only when activity is non-empty)
 ```
-Compact grid (30) — 2 rows: glyph id task / state; route / elapsed. States and glyphs: queued `·`
-faint, running `▪` live, needs review `!` attn (the worker has a parked approval), done `✓` ok (and
-`done · not verified` when it finished without a command tool), failed `✗` fail, cancelled `·`
-faint, stalled `✗` fail (`6 summaries without a change`), lost `·` faint (`not restored on
-resume`, ADR-0034). Cost is `—` until workers carry a usage tap.
-Selection: `^F` focuses the pane, `↑ ↓` move an amber focus row (row 1 of a block), `a` attach,
-`x` stop (asks `y stop  n keep` — the one amber event), `esc` back.
+The route is a dim suffix only when the whole suffix fits; a long model is cut with `…` and the route
+is omitted. Compact grid (30) — 3 rows: glyph id task / state; model (with route suffix only if it
+fits) / elapsed; `tokens` tok/ctx on the left and cost on the right. Unknown values render `—`.
+States and glyphs: queued `·` faint, running `▪` live, needs review `!` attn (the worker has a parked
+approval), done `✓` ok (and `done · not verified` when it finished without a command tool), failed
+`✗` fail, cancelled `·` faint, stalled `✗` fail (`6 summaries without a change`), lost `·` faint
+(`not restored on resume`, ADR-0034). Selection: `^F` focuses the pane, `↑ ↓` move an amber focus
+row (row 1 of a block), `a` attach, `x` stop (asks `y stop  n keep` — the one amber event), `esc`
+back. Rows changed by owner request (#111, 2026-09-24); the WORKERS mocks were re-derived from the
+renderer because the WorkersPane mock component is not in the repo; the state in lib/p1-screens.js carries the new fields.
 **el-workers-pane @ 56** — WorkersPane — wide (56) with every state; compact (38)
 
 TEXT 56×38
@@ -1412,37 +1416,37 @@ TEXT 56×38
 00     WORKERS             1 live · 1 queued · pool 3/4    
 01                                                         
 02     ! w3    audit sandbox read paths    needs review    
-03       deepseek2/v4.1-flash                 0m48s · —    
+03       deepseek-v4.1-flash        12.4k/— · 0m48s · —    
 04       grants  read grep shell finish                    
 05       ↳ shell rm -rf target/ · awaiting approval        
 06                                                         
 07     ▪ w2    split provider-http helpers      running    
-08       deepseek2/v4.1-flash                 0m52s · —    
+08       deepseek-v4.1-flash     48.2k/128k · 0m52s · —    
 09       grants  read edit shell finish                    
 10       ↳ edit crates/p1-provider-http/src/retry.rs       
 11                                                         
 12     ✗ w4    measure summarize threshold       failed    
-13       glm/5.3                              1m03s · —    
+13       glm-5.3 · glm/5.3           3.1k/— · 1m03s · —    
 14       grants  read shell finish                         
 15       ↳ RateLimited: HTTP 429                           
 16                                                         
 17     ✗ w6    rename ToolFace                  stalled    
-18       deepseek/v4.1-flash                  6m40s · —    
+18       deepseek/v4.1-flash            —/— · 6m40s · —    
 19       grants  read edit finish                          
 20       ↳ 6 summaries without a workspace change          
 21                                                         
 22     · w5    doc note for ADR-0050             queued    
-23       claude/sonnet-5                          — · —    
+23       claude/sonnet-5                    —/— · — · —    
 24       grants  read write finish                         
 25       ↳ waiting for a pool slot                         
 26                                                         
 27     ✓ w1    reject cred-dir an…  done · not verified    
-28       gpt/gpt-5.6-luna                     2m10s · —    
+28       gpt/gpt-5.6-luna               —/— · 2m10s · —    
 29       grants  read edit finish                          
 30       ↳ not verified — parent verification required     
 31                                                         
 32     · w0    resume probe                        lost    
-33       claude/opus-5.5                          — · —    
+33       claude/opus-5.5                    —/— · — · —    
 34       grants  read finish                               
 35       ↳ not restored on resume                          
 36                                                         
@@ -1453,37 +1457,37 @@ RUNS
 00 B_×4 Bd×7 B_×13 Bi×1 B_×1 Bd×4 B_×1 Bd×1 B_×1 Bi×1 B_×1 Bd×6 B_×1 Bd×1 B_×1 Bd×4 B_×1 Bi×3 B_×4
 01 B_×56
 02 B_×4 Ba×1 B_×1 Bi×2 B_×4 Bi×5 B_×1 Bi×7 B_×1 Bi×4 B_×1 Bi×5 B_×4 Bd×5 B_×1 Bd×6 B_×4
-03 B_×6 Bd×20 B_×17 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
+03 B_×6 Bi×19 B_×8 Bi×5 Bd×1 Bi×1 B_×1 Bd×1 B_×1 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
 04 B_×6 Bd×6 B_×2 Bi×4 B_×1 Bi×4 B_×1 Bi×5 B_×1 Bi×6 B_×20
 05 B_×6 Bd×1 B_×1 Bi×5 B_×1 Bi×2 B_×1 Bi×3 B_×1 Bi×7 B_×1 Bi×1 B_×1 Bi×8 B_×1 Bi×8 B_×8
 06 B_×56
 07 B_×4 Bl×1 B_×1 Bi×2 B_×4 Bi×5 B_×1 Bi×13 B_×1 Bi×7 B_×6 Bd×7 B_×4
-08 B_×6 Bd×20 B_×17 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
+08 B_×6 Bi×19 B_×5 Bi×5 Bd×1 Bi×4 B_×1 Bd×1 B_×1 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
 09 B_×6 Bd×6 B_×2 Bi×4 B_×1 Bi×4 B_×1 Bi×5 B_×1 Bi×6 B_×20
 10 B_×6 Bd×1 B_×1 Bi×4 B_×1 Bi×36 B_×7
 11 B_×56
 12 B_×4 Bx×1 B_×1 Bi×2 B_×4 Bi×7 B_×1 Bi×9 B_×1 Bi×9 B_×7 Bd×6 B_×4
-13 B_×6 Bd×7 B_×30 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
+13 B_×6 Bi×7 B_×1 Bd×1 B_×1 Bd×7 B_×11 Bi×4 Bd×1 Bi×1 B_×1 Bd×1 B_×1 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
 14 B_×6 Bd×6 B_×2 Bi×4 B_×1 Bi×5 B_×1 Bi×6 B_×25
 15 B_×6 Bd×1 B_×1 Bi×12 B_×1 Bi×4 B_×1 Bi×3 B_×27
 16 B_×56
 17 B_×4 Bx×1 B_×1 Bi×2 B_×4 Bi×6 B_×1 Bi×8 B_×18 Bd×7 B_×4
-18 B_×6 Bd×19 B_×18 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
+18 B_×6 Bd×19 B_×12 Bi×1 Bd×1 Bi×1 B_×1 Bd×1 B_×1 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
 19 B_×6 Bd×6 B_×2 Bi×4 B_×1 Bi×4 B_×1 Bi×6 B_×26
 20 B_×6 Bd×1 B_×1 Bi×1 B_×1 Bi×9 B_×1 Bi×7 B_×1 Bi×1 B_×1 Bi×9 B_×1 Bi×6 B_×10
 21 B_×56
 22 B_×4 Bf×1 B_×1 Bi×2 B_×4 Bd×3 B_×1 Bd×4 B_×1 Bd×3 B_×1 Bd×8 B_×13 Bd×6 B_×4
-23 B_×6 Bd×15 B_×26 Bi×1 B_×1 Bd×1 B_×1 Bi×1 B_×4
+23 B_×6 Bd×15 B_×20 Bi×1 Bd×1 Bi×1 B_×1 Bd×1 B_×1 Bi×1 B_×1 Bd×1 B_×1 Bi×1 B_×4
 24 B_×6 Bd×6 B_×2 Bi×4 B_×1 Bi×5 B_×1 Bi×6 B_×25
 25 B_×6 Bd×1 B_×1 Bd×7 B_×1 Bd×3 B_×1 Bd×1 B_×1 Bd×4 B_×1 Bd×4 B_×25
 26 B_×56
 27 B_×4 Bo×1 B_×1 Bi×2 B_×4 Bi×6 B_×1 Bi×8 B_×1 Bi×3 B_×2 Bd×4 B_×1 Bd×1 B_×1 Bd×3 B_×1 Bd×8 B_×4
-28 B_×6 Bd×16 B_×21 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
+28 B_×6 Bd×16 B_×15 Bi×1 Bd×1 Bi×1 B_×1 Bd×1 B_×1 Bi×5 B_×1 Bd×1 B_×1 Bi×1 B_×4
 29 B_×6 Bd×6 B_×2 Bi×4 B_×1 Bi×4 B_×1 Bi×6 B_×26
 30 B_×6 Bd×1 B_×1 Bi×3 B_×1 Bi×8 B_×1 Bi×1 B_×1 Bi×6 B_×1 Bi×12 B_×1 Bi×8 B_×5
 31 B_×56
 32 B_×4 Bf×1 B_×1 Bi×2 B_×4 Bd×6 B_×1 Bd×5 B_×24 Bd×4 B_×4
-33 B_×6 Bd×15 B_×26 Bi×1 B_×1 Bd×1 B_×1 Bi×1 B_×4
+33 B_×6 Bd×15 B_×20 Bi×1 Bd×1 Bi×1 B_×1 Bd×1 B_×1 Bi×1 B_×1 Bd×1 B_×1 Bi×1 B_×4
 34 B_×6 Bd×6 B_×2 Bi×4 B_×1 Bi×6 B_×31
 35 B_×6 Bd×1 B_×1 Bd×3 B_×1 Bd×8 B_×1 Bd×2 B_×1 Bd×6 B_×26
 36 B_×56

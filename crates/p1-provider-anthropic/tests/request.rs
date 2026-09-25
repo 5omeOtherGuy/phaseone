@@ -14,6 +14,7 @@ use p1_contracts::{
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_anthropic::{
     AnthropicProvider, MessagesAccount, MessagesRoute, ROUTE, build_headers, build_request,
+    with_long_context,
 };
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource, RetryPolicy, Transport};
@@ -30,6 +31,7 @@ fn route() -> MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
         account: MessagesAccount::ClaudeCodeSubscription,
+        long_context: false,
     }
 }
 
@@ -402,6 +404,35 @@ fn interleaved_thinking_beta_is_present_only_for_manual_budget_thinking() {
         .1
         .clone();
     assert_eq!(beta, "oauth-2025-04-20,claude-code-20250219");
+}
+
+#[test]
+fn the_long_context_beta_joins_every_other_beta() {
+    let credential = Credential {
+        bearer: "T".to_string(),
+        account_id: None,
+    };
+    let beta = |headers: Vec<(String, String)>| {
+        headers
+            .into_iter()
+            .find(|(name, _)| name == "anthropic-beta")
+            .unwrap()
+            .1
+    };
+    let plain = with_long_context(build_headers(account(), &credential, &json!({})));
+    assert_eq!(
+        beta(plain),
+        "oauth-2025-04-20,claude-code-20250219,context-1m-2025-08-07"
+    );
+    let manual = with_long_context(build_headers(
+        account(),
+        &credential,
+        &json!({ "thinking": { "type": "enabled", "budget_tokens": 4_096 } }),
+    ));
+    assert_eq!(
+        beta(manual),
+        "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,context-1m-2025-08-07"
+    );
 }
 
 #[test]
