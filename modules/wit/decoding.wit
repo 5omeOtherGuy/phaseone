@@ -29,8 +29,9 @@ interface decoding {
         /// a `transport` failure because the stream ended without its terminal event.
         finish: func() -> stream-event;
 
-        /// The id of the response this decoder saw, if the wire named one: the id a
-        /// WebSocket continuation refers to.
+        /// The id of the response this decoder saw, if the wire named one: the broker reports
+        /// it back as `connection-state.last-clean-response` once the response completed
+        /// cleanly on a WebSocket connection, and a continuation frame refers to it.
         response-id: func() -> option<string>;
     }
 }
