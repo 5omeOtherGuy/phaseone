@@ -146,6 +146,8 @@ HTTP 403 and a `FreeTierError`-shaped body while the key is fine.
   `Authentication`).
 - The shared driver finishes immediately on this kind, exactly as on `InsufficientBalance`: no
   credential refresh, no retry, ONE HTTP request in total.
+- The Anthropic Messages and OpenAI Responses adapters classify 401/403 by status alone: neither
+  route is bound to the Zen free tier, so neither can receive Zen's `FreeTierError` plan-refusal body.
 - The TUI renders `✗ not included in the plan · <message> · not retried` and offers `/model`.
 
 ## A used-up usage allowance

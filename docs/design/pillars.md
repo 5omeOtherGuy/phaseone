@@ -26,8 +26,9 @@ recommendation.
    and modes. Tools are always their own modules; providers only translate wire
    behaviour. Iris donates parts (Nexus as raw material with a reduced interface),
    not structure.
-   *Boundary:* no runtime plugin system, stable third-party API, or fixed crate list
-   committed now. Adding a model through existing contracts should not require
+   *Boundary (amended 2026-09-25 by the owner, ADR-0071):* modules are WebAssembly artifacts
+   the native host loads by name; the core, host and terminal front ends stay native. No
+   marketplace, auto-registration or fixed crate list. Adding a model through existing contracts should not require
    changing the core; a genuinely new capability may.
 
 4. **Efficiency across the whole job.** Low memory and startup cost, lean contexts,

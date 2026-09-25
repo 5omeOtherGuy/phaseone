@@ -30,8 +30,9 @@ pub struct WorkflowSettings {
     /// `agent()` calls one run may make (replayed calls count too).
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
-    /// OS threads one run may use for thunks and pipeline items at once; a thunk that
-    /// finds none free runs inline on its caller's thread (never waits for a thread).
+    /// OS threads one run may use for thunks and pipeline items at once, clamped to 64 (the
+    /// run's memory ceiling assumes it); a thunk that finds none free runs inline on its
+    /// caller's thread (never waits for a thread).
     #[serde(default = "default_max_threads")]
     pub max_threads: usize,
 }

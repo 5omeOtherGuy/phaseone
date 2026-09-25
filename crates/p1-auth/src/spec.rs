@@ -18,6 +18,10 @@ pub enum CredentialKind {
     /// The Codex CLI login: the environment variable (a bearer token), then p1's
     /// store, then the Codex CLI's own auth file.
     CodexOauth,
+    /// NO credential: an egress proxy injects the provider's credential after the
+    /// request leaves the process (issue #134). Nothing is loaded or required, and
+    /// every adapter sends no authentication header for such a route.
+    None,
 }
 
 impl CredentialKind {
@@ -27,6 +31,16 @@ impl CredentialKind {
             CredentialKind::ApiKey => "api-key",
             CredentialKind::ClaudeCodeOauth => "claude-code-oauth",
             CredentialKind::CodexOauth => "codex-oauth",
+            CredentialKind::None => "none",
+        }
+    }
+
+    /// The kind as `p1 login --list` shows it: the route-file spelling, plus, for a
+    /// route that sends no credential, what that means for the operator.
+    pub fn label(self) -> &'static str {
+        match self {
+            CredentialKind::None => "none (proxy-injected)",
+            kind => kind.name(),
         }
     }
 }
@@ -107,7 +121,8 @@ pub struct CredentialSpec {
 impl CredentialSpec {
     /// Check the reference itself. An API key is documented by the environment
     /// variable that holds it, so `api-key` without one is a load error; the two
-    /// OAuth kinds take an optional one (spec §2).
+    /// OAuth kinds take an optional one (spec §2). A `none` route names NO source at
+    /// all — it reads nothing — so naming one is a contradiction and a load error.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(env) = &self.env
             && !is_env_var_name(env)
@@ -122,6 +137,29 @@ impl CredentialSpec {
                  `env = \"…\"` with the documented variable for this route"
                     .into(),
             );
+        }
+        if self.kind == CredentialKind::None {
+            if self.env.is_some() {
+                return Err(
+                    "`[credential]` kind \"none\" also names an environment variable; a route \
+                     that sends no credential reads no variable — delete the `env` line"
+                        .into(),
+                );
+            }
+            if !self.borrow.is_empty() {
+                return Err(
+                    "`[credential]` kind \"none\" also lists `borrow` entries; a route that \
+                     sends no credential reads no borrowed login"
+                        .into(),
+                );
+            }
+            if self.store_only {
+                return Err(
+                    "`[credential]` kind \"none\" also sets `store_only`; a route that sends no \
+                     credential reads no store — delete the `store_only` line"
+                        .into(),
+                );
+            }
         }
         if self.store_only && !self.borrow.is_empty() {
             return Err(

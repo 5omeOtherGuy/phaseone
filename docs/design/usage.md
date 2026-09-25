@@ -17,6 +17,7 @@ The usage snapshot and renderer live in `p1-usage`, not the host or TUI: probing
 | `api-key`, routes `opencode-zen-1` / `opencode-zen-2` / `opencode-zen-3` / `opencode-zen-free` | none | Unsupported: no Zen usage endpoint is established anywhere, so none is invented |
 | `api-key`, routes `cline-pass-1` / `cline-pass-2` | none | Unsupported: ClinePass shows its 5-hour / weekly / monthly usage only on the app.cline.bot dashboard; no usage API is documented |
 | `api-key`, any other route | none | Unsupported: no usage endpoint known for this route |
+| `none` (issue #134) | none | Unsupported: p1 sends no credential on this route, so it has none to present to a usage endpoint and none is invented |
 
 Coverage: the dashboard covers the eight p1 route files with a known endpoint (`anthropic-subscription`, `openai-codex-subscription`, `opencode-go-subscription`, `opencode-go-1-subscription`, `opencode-go-2-subscription`, `opencode-go-3-subscription`, `glm-subscription`, `kimi-coding-subscription`) plus the OpenRouter credits endpoint — nine sources; the four free Zen routes (`opencode-zen-1/2/3`, `opencode-zen-free`) and the two ClinePass routes (`cline-pass-1/2`) appear as `no usage endpoint` rows, because no usage endpoint is established for them. It does **not** cover OpenRouter model routing (credits only) or the free Muse Spark promo (no usage endpoint), and a provider with no usable credential still occupies a `no access` row rather than disappearing.
 

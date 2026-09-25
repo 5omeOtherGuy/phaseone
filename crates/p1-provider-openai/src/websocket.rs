@@ -39,13 +39,15 @@ use p1_contracts::{
 use p1_provider_http::ws::{
     WsBound, WsConnectError, WsConnection, WsConnector, WsHandshake, WsNext,
 };
-use p1_provider_http::{Credential, CredentialSource, ResponseParser, RetryPolicy, SseEvent};
+use p1_provider_http::{
+    Credential, CredentialSource, ResponseParser, RetryPolicy, SseEvent, proxy_refusal_message,
+};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::ResponsesAccount;
 use crate::parser::CodexResponseParser;
-use crate::request::{build_ws_headers, ws_frame};
+use crate::request::{build_ws_headers, build_ws_headers_without_credential, ws_frame};
 
 /// The clock the connection-reuse policy reads (§4). Injected, so a test advances
 /// time instead of sleeping (AGENTS.md forbids sleep-based timing assertions).
@@ -642,6 +644,18 @@ fn refused_upgrade(mut state: State, status: u16, body: &[u8]) -> State {
     let error = state.parser.on_http_error(status, &[], body);
     match status {
         401 | 403 => {
+            // Issue #134: a route whose credential an egress proxy injects sends no
+            // credential at all, so there is nothing p1 could refresh here — the
+            // refusal is the proxy's, reported with the SSE driver's own message so
+            // the two transports cannot drift apart. This never enters
+            // `Phase::Refresh`.
+            if state.request.credentials.proxy_injected() {
+                let error = ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    proxy_refusal_message(status),
+                );
+                return state.finish(Outcome::Failed(error));
+            }
             if state.refreshed {
                 // §5: refused again after the one refresh is an authentication
                 // failure — the same shape `drive` produces for a second 401/403.
@@ -868,13 +882,20 @@ fn new_parser(request: &WebSocketRequest) -> Box<dyn ResponseParser> {
 
 /// The handshake for one attempt (`docs/design/websocket.md` §3): the endpoint the
 /// adapter resolved with its scheme swapped, and the header set §3 names, in order.
+/// A route whose credential an egress proxy injects (issue #134) carries no
+/// credential header at all.
 fn handshake(
     request: &WebSocketRequest,
     credential: &Credential,
 ) -> Result<WsHandshake, ProviderError> {
+    let headers = if request.credentials.proxy_injected() {
+        build_ws_headers_without_credential(request.account, request.cache_key.as_deref())?
+    } else {
+        build_ws_headers(request.account, credential, request.cache_key.as_deref())?
+    };
     Ok(WsHandshake {
         url: websocket_url(&request.url),
-        headers: build_ws_headers(request.account, credential, request.cache_key.as_deref())?,
+        headers,
     })
 }
 

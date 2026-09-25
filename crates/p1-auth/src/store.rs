@@ -251,6 +251,10 @@ fn entry_of(
                     .map(str::to_string),
             }))
         }
+        // A route that sends no credential never reads the store (issue #134): the
+        // arm exists only because the match is total, and it answers what an absent
+        // entry answers.
+        CredentialKind::None => Ok(None),
     }
 }
 

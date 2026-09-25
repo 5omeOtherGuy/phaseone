@@ -13,7 +13,7 @@ step is a worker, never granted the worker or workflow tools.
 |---|---|---|
 | `p1-workflow` | The rhai script engine, the script API, roles/caps resolution, the step envelope, the run journal with prefix replay, cancellation, and the service seams (`WorkflowService`, `StepRunner`, `ModelResolver`, `WorkflowObserver`, `WorkflowSettings`). | No provider, no tool, no worker implementation: it depends only on `p1-contracts` — never `p1-core`, `p1-workers` or a tool crate. |
 | `p1-tool-workflow` | The four model-facing tools (`workflow_start`, `workflow_status`, `workflow_result`, `workflow_cancel`) over the `WorkflowService` trait. | The engine's internals: it never constructs `InProcessWorkflows` and holds no run state. |
-| the host | Composition: implements `StepRunner` over `p1-workers`' prepared start, `ModelResolver` over its environments and routes, parses `[workflows]`, chooses the run root, renders lines, calls `shutdown()`. | No workflow logic of its own — ordinary constructors, no registry. |
+| the host | Composition: implements `StepRunner` over `p1-workers`' prepared start, `ModelResolver` over its environments and routes, parses `[workflows]`, chooses the run root, renders lines, calls `shutdown()`. | No workflow logic of its own — explicit composition in the native host, no registry. |
 
 `api.rs` in `p1-workflow` is the frozen public surface: additions are allowed, renames and
 removals are not.
@@ -64,13 +64,37 @@ process access (`timestamp`, `now`, `rand`, `read_file`, `http_get`, `connect`, 
 started.
 
 **Engine limits.** `max_operations` 5,000,000; `max_call_levels` 24; expression depths
-32/32; string 64 KiB; array 4096; map 4096; `max_variables` 256; `max_functions` 256
-(closures count, which also bounds the thunks of one script); `max_modules` 1.
+32/32; `max_variables` 256; `max_functions` 256 (closures count, which also bounds the
+thunks of one script); `max_modules` 1.
+
+The three DATA limits are sized to the RUN, not to one value. rhai checks `max_string_size`,
+`max_array_size` and `max_map_size` against the SUM of every string, array item and map
+entry inside the whole value a call returns (`eval/data_check.rs`
+`calc_array_sizes`/`calc_map_sizes`), and the result of a native function is checked like
+any other — rhai has no way to exempt a value. The envelope `agent()` returns is the
+HOST's data, one per call, so one `parallel()` of a dozen done envelopes, a map a script
+builds from several envelopes, and one verbose envelope are all ONE budget (issue #121).
+The engine therefore sizes each limit to the run's own step cap — `min(max_steps, 64)`
+envelopes' worth, one envelope being 64 KiB of strings, 4096 array items and 4096 map
+entries — with the cap a constant (`engine.rs` `DATA_BUDGET_ENVELOPES`). At the default
+`max_steps = 200` the limits ARE the cap: 4 MiB of strings, 262,144 array items, 262,144
+map entries in one script value, which a run of any step cap cannot exceed. rhai gives
+each VALUE its own three sums, so the sandbox's ceiling is that cap times the concurrency:
+64 thunks × 4 MiB of strings = 256 MiB, and near 1.5 GiB for a script that fills a string,
+an array and a map in every thunk at once — the cap is what keeps the ceiling independent
+of the operator's own step cap.
+
+A script's OWN strings, arrays and maps stay bounded by the same numbers (a `max_steps = 2`
+run can build a 128 KiB string, not more), and building them is still charged against
+`max_operations`. Because the budget is per VALUE and capped, a fan-out whose envelopes sum
+past 4 MiB of strings — more than 64 full-size (64 KiB) envelopes, about 136 at the 30 KB
+the issue's steps returned — must be SPLIT into several `parallel()` calls; `max_steps`
+200 still allows several such batches.
 
 **The bounded thread rule.** rhai has no async VM: each run's script executes on its own
 OS thread (`p1-wf-script`), and `agent()` blocks that thread on the caller's tokio handle
 (the crate owns no runtime). Concurrency is one OS thread per in-flight thunk
-(`p1-wf-thunk`) from a pool of `max_threads` slots (default 64). A thunk that finds no
+(`p1-wf-thunk`) from a pool of `max_threads` slots (default 64, clamped to at most 64 so the §2 memory ceiling holds). A thunk that finds no
 slot free runs INLINE on its caller's thread — nothing ever waits for a slot, so nested
 `parallel` inside a `pipeline` stage cannot deadlock at any bound, including 1. Results
 keep input order; every thread is joined before the first error (in input order) is
@@ -434,7 +458,10 @@ refusals, every envelope shape, constant `args`, located script errors. `replay.
 proves the replay rules: an unchanged run replays everything, an edited middle call
 re-runs it and everything after, caps are rebuilt from every old dispatch, failed steps
 are not replayed, parallel calls match by content. `sandbox.rs` proves every escape
-vector fails and every engine limit holds; `prompt_example.rs` runs the prompts'
+vector fails and every engine limit holds; `size_limits.rs` proves a completed `parallel`
+of twelve large envelopes comes back whole, that one verbose envelope does too, that a
+script's own string is refused past its run's budget, and that a 200-step run is still
+capped at 64 envelopes' worth; `prompt_example.rs` runs the prompts'
 example on the shipped settings; `fallback.rs` proves the chains (ADR-0054): a route
 failure on the head hands the step to the next link with
 `dispatch/fallback/dispatch` journalled and `fell_back` counted, a capped link is skipped

@@ -19,6 +19,13 @@
 //! store, and no other tool's login file is opened. A route without the field keeps
 //! the chain above unchanged.
 //!
+//! A route may also declare `kind = "none"` (issue #134): it sends NO credential at
+//! all, because an egress proxy injects the provider's credential after the request
+//! leaves the process. Nothing is loaded — no variable, no store entry, no login —
+//! and there is nothing to refresh; [`resolve`] answers with a placeholder no
+//! adapter may send, as [`p1_provider_http::CredentialSource::proxy_injected`]
+//! declares.
+//!
 //! Linux-only today: the store's permission check uses
 //! `std::os::unix::fs::PermissionsExt`, and there is no cfg scaffolding for other
 //! systems (spec §3).

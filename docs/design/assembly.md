@@ -51,7 +51,10 @@ and `{{tool:<module>}}` → that tool's assembled model-facing NAME. An unknown 
 or `{{tool:x}}` for a tool that is not in this environment, is an assembly error — a prompt
 can never mention a tool by placeholder that the agent does not have. No fragment engine.
 
-## Catalog (compile-time composition)
+## Catalog (composition root)
+
+ADR-0071 (owner 2026-09-25): the catalog's entries become WebAssembly modules the host loads by
+name under the same keys; until that migration lands they are the compile-time constructors below.
 
 ```rust
 pub struct Catalog { /* name → constructor closures; built by the host */ }

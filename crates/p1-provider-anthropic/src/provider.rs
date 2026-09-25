@@ -22,7 +22,10 @@ use p1_provider_http::{
 
 use crate::MessagesRoute;
 use crate::parser::AnthropicParser;
-use crate::request::{build_headers, build_messages, build_request, lower, with_long_context};
+use crate::request::{
+    build_headers, build_headers_without_credential, build_messages, build_request, lower,
+    with_long_context,
+};
 
 /// `native` keys in this namespace are route-specific. None are known in this
 /// slice, so any key here is rejected.
@@ -208,10 +211,17 @@ impl Provider for AnthropicProvider {
             let long_context = self.route.long_context;
             let origin_route = self.route.origin_route.clone();
             let model = self.wire_model.clone();
+            // A route whose credential an egress proxy injects sends NO authentication
+            // header (issue #134): the credential the source hands us is a placeholder.
+            let proxy_injected = self.credentials.proxy_injected();
             let build = Box::new(move |credential: &Credential| HttpRequest {
                 url: url.clone(),
                 headers: {
-                    let headers = build_headers(account, credential, &body);
+                    let headers = if proxy_injected {
+                        build_headers_without_credential(account, &body)
+                    } else {
+                        build_headers(account, credential, &body)
+                    };
                     if long_context {
                         with_long_context(headers)
                     } else {
