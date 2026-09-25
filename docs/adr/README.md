@@ -17,7 +17,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0001 | [p1 is a new project; Iris is a parts donor](0001-p1-is-a-new-project-iris-is-a-parts-donor.md) | accepted | 2026-09-19 | owner |
 | ADR-0002 | [One small core with tools and providers as modules](0002-one-small-core-tools-and-providers-as-modules.md) | accepted | 2026-09-19 | owner+lead |
 | ADR-0003 | [The harness reshapes itself around the model](0003-harness-reshapes-itself-around-the-model.md) | accepted | 2026-09-19 | owner+lead |
-| ADR-0004 | [Compile-time composition with one composition root](0004-compile-time-composition-one-root.md) | accepted | 2026-09-19 | lead |
+| ADR-0004 | [Compile-time composition with one composition root](0004-compile-time-composition-one-root.md) | superseded by ADR-0070 | 2026-09-19 | lead |
 | ADR-0005 | [Design baseline copied into the repository](0005-design-baseline-copied-into-the-repo.md) | accepted | 2026-09-19 | lead |
 | ADR-0006 | [MIT licence and donor provenance](0006-mit-licence-and-donor-provenance.md) | accepted | 2026-09-19 | lead |
 | ADR-0007 | [Task state on GitHub Issues and one worktree per task](0007-task-state-on-github-issues-and-worktrees.md) | accepted | 2026-09-19 | lead |
@@ -83,6 +83,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0067 | [Zen free routes present the OpenCode client identity](0067-zen-free-routes-present-the-opencode-client-identity.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0068 | [Tool output is masked for credential shapes before history, journal and summaries](0068-tool-output-is-masked-for-credential-shapes-before-history-journal-and-summaries.md) | accepted | 2026-09-25 | lead |
 | ADR-0069 | [Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s](0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md) | proposed | 2026-09-25 | lead |
+| ADR-0070 | [p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name](0070-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md) | proposed | 2026-09-25 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

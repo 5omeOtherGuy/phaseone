@@ -11,10 +11,10 @@ explicit Rust interface. A public module boundary normally maps to a crate;
 private helper modules need not. A module can implement several closely related
 interfaces. Every tool remains an independently selectable module.
 
-Compose using normal Rust constructors and explicit dependencies. No dynamic
-plugin loader, service locator, hidden global registry, or new dependency-injection
-framework. The application composition root supplies concrete implementations;
-an embeddable library caller can be that root too.
+Since ADR-0070 (owner 2026-09-25) modules are WebAssembly artifacts: the application
+composition root loads each one by name from the environment file and supplies its host
+functions explicitly. No service locator, hidden global registry, auto-registration or
+dependency-injection framework; an embeddable library caller can be that root too.
 
 Dependency rules:
 - Core depends on small contracts, never concrete tools/providers or storage/UI.
@@ -272,10 +272,10 @@ be reconciled against its recorded tool identity and current grant before any
 execution; it does not silently resurrect a removed tool. Environment switching
 should normally wait until outstanding tool calls are settled.
 
-Leave behind #73's fragment frontmatter/slot machinery and #18's WASM/Extism loader,
-override ordering, and plugin policy. Those were Iris proposals, not p1 requirements.
-Keep tool input/output as data suitable for a future process/WASM adapter, but do
-not require a remote ABI or serialize all internal workspace handles today.
+Leave behind #73's fragment frontmatter/slot machinery, override ordering and plugin
+policy; those were Iris proposals. #18's WASM loader idea is now p1's own direction
+(ADR-0070), designed afresh from p1's contracts rather than carried over from Iris. Tool
+input/output stays data; the boundary layer is fixed by the migration plan.
 
 ## 12. Remaining bounded technical work
 
