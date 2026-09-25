@@ -21,17 +21,10 @@ use p1_workflow::{
 };
 
 use crate::HostDeps;
-use crate::catalog::build_catalog;
-use crate::child_assembly::{ChildBuilder, TurnEndCell, compose_children};
-use crate::cli::{self, Options};
 use crate::frontend::{
-    FrontEnd, LineFrontEnd, WorkflowRunEnded, WorkflowRunStarted, WorkflowStepEnded,
-    WorkflowStepStarted,
+    FrontEnd, WorkflowRunEnded, WorkflowRunStarted, WorkflowStepEnded, WorkflowStepStarted,
 };
-use crate::run::{
-    EXIT_CANCELLED, EXIT_FAILURE, EXIT_OK, EXIT_USAGE, RunError, resolve_workspace,
-    spawn_interrupt, write_stderr, write_stdout,
-};
+use crate::run::{ChildBuilder, TurnEndCell};
 
 /// The evidence of a `done` whose outcome established none (ADR-0051 item 3).
 const NOT_VERIFIED: &str = "not verified; parent verification required";
@@ -720,152 +713,6 @@ pub(crate) fn running_workflows(deps: &HostDeps) -> usize {
     deps.workflow_observer
         .as_ref()
         .map_or(0, |observer| observer.running())
-}
-
-// ------------------------------------------------------------------ the `p1 workflow run` entry
-
-/// `p1 workflow run` (ADR-0053): the composition of a run — catalog, worker service,
-/// workflow service, line front end — with NO parent agent. The run's lines go to
-/// stderr as they come; its report, rendered as `workflow_result` renders it, goes to
-/// stdout; the exit code is the outcome.
-#[cfg(feature = "workflows")]
-pub(crate) async fn workflow_run(
-    deps: &mut HostDeps,
-    options: &Options,
-    workflow: &cli::WorkflowRunOptions,
-) -> Result<i32, RunError> {
-    use p1_workflow::WorkflowService as _;
-    let script = std::fs::read_to_string(&workflow.file).map_err(|error| {
-        RunError::usage(format!(
-            "cannot read the workflow script {}: {error}",
-            workflow.file.display()
-        ))
-    })?;
-    let args = workflow_args(workflow).map_err(RunError::usage)?;
-    let workspace = resolve_workspace(options)?;
-    let cancel = CancellationToken::new();
-    let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone()));
-
-    // The same child composition as an interactive run, including the sibling
-    // reservation. A standalone workflow can be invoked repeatedly with one session.
-    let (completion_hub, catalog_slot, child_builder, service, _child_counter) = compose_children(
-        deps,
-        &workspace,
-        front_end.clone(),
-        options,
-        workflow.max_workers,
-    )?;
-    let run_root = match &workflow.out {
-        Some(out) => out.clone(),
-        None => crate::workflow::run_root(deps, options.session.as_deref()),
-    };
-    let workflows = crate::workflow::compose(deps, child_builder, service.clone(), run_root)
-        .map_err(RunError::usage)?;
-    let catalog = Arc::new(build_catalog(
-        deps,
-        options.sandbox,
-        &options.sandbox_write,
-        &options.sandbox_read,
-        &options.env_pass,
-        &completion_hub,
-    )?);
-    let _ = catalog_slot.set(catalog);
-
-    // The run's base commit (ADR-0073): what its steps' new worktrees branch from.
-    let base = crate::worktree::run_base_async(workspace.clone()).await;
-    let request = p1_workflow::StartRequest {
-        script,
-        args,
-        resume_from: workflow.resume_from.clone().map(p1_workflow::RunId),
-        role_models: workflow.roles.iter().cloned().collect(),
-        workspace: Some(workspace),
-        base,
-    };
-    let code = match workflows.service.start(request).await {
-        Err(error) => {
-            write_stderr(deps, &format!("{error}\n"));
-            EXIT_FAILURE
-        }
-        Ok(id) => {
-            let second = Arc::new(tokio::sync::Notify::new());
-            spawn_interrupt(deps.interrupt.clone(), cancel.clone(), second);
-            let mut status = workflows.service.wait(&id, cancel.clone()).await;
-            if matches!(status, Ok(p1_workflow::RunStatus::Running(_))) {
-                // Ctrl-C: cancel the run and wait for its `Ended`, which the engine
-                // journals once the in-flight steps have been cancelled.
-                let _ = workflows.service.cancel(&id).await;
-                status = workflows.service.wait(&id, CancellationToken::new()).await;
-            }
-            // The end line is the observer's; let it out before the report.
-            workflows.observer.settled(&id).await;
-            match status {
-                Ok(p1_workflow::RunStatus::Ended(report)) => {
-                    write_stdout(deps, &(workflow_report(&workflows, &id).await + "\n"));
-                    match report.outcome {
-                        p1_workflow::RunOutcome::Completed => EXIT_OK,
-                        p1_workflow::RunOutcome::CompletedWithIssues => EXIT_USAGE,
-                        p1_workflow::RunOutcome::Failed => EXIT_FAILURE,
-                        p1_workflow::RunOutcome::Cancelled => EXIT_CANCELLED,
-                    }
-                }
-                Ok(p1_workflow::RunStatus::Running(_)) => EXIT_CANCELLED,
-                Err(error) => {
-                    write_stderr(deps, &format!("{error}\n"));
-                    EXIT_FAILURE
-                }
-            }
-        }
-    };
-
-    workflows.service.shutdown().await;
-    service.shutdown().await;
-    front_end.finish();
-    Ok(code)
-}
-
-/// `--args FILE` (a JSON object) with every `--arg k=v` laid over it, in order. A value
-/// that parses as JSON is that JSON (`n=3`, `items=[…]`); anything else is a string.
-#[cfg(feature = "workflows")]
-fn workflow_args(workflow: &cli::WorkflowRunOptions) -> Result<serde_json::Value, String> {
-    let mut args = match &workflow.args_file {
-        None => serde_json::Map::new(),
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|error| format!("cannot read --args {}: {error}", path.display()))?;
-            match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(serde_json::Value::Object(map)) => map,
-                Ok(_) => return Err(format!("--args {} is not a JSON object", path.display())),
-                Err(error) => {
-                    return Err(format!("--args {} is not JSON: {error}", path.display()));
-                }
-            }
-        }
-    };
-    for (key, value) in &workflow.args {
-        let value = serde_json::from_str(value)
-            .unwrap_or_else(|_| serde_json::Value::String(value.clone()));
-        args.insert(key.clone(), value);
-    }
-    Ok(serde_json::Value::Object(args))
-}
-
-/// The report exactly as the `workflow_result` tool renders it for a model.
-#[cfg(feature = "workflows")]
-async fn workflow_report(
-    workflows: &crate::workflow::Workflows,
-    id: &p1_workflow::RunId,
-) -> String {
-    use p1_contracts::{Tool, ToolCall, ToolContext, ToolInput};
-    let tool = p1_tool_workflow::WorkflowResultTool::new(workflows.service.clone());
-    let call = ToolCall {
-        call_id: "workflow-run".to_string(),
-        name: "workflow_result".to_string(),
-        input: ToolInput::Json(serde_json::json!({ "id": id.0 }).to_string()),
-    };
-    let context = ToolContext {
-        cancel: CancellationToken::new(),
-    };
-    tool.execute(&call, context).await.content
 }
 
 /// The observer projects every run event into the structured `FrontEnd` calls the TUI's
