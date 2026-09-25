@@ -73,7 +73,10 @@ fn key(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn hash_of(contents: &[u8]) -> u64 {
+/// The value [`ObservedFiles::record`] stores for `contents`, so a caller that
+/// must hand the hash out too (a snapshot's metadata) can name the very same
+/// value instead of a second, possibly diverging, hash of the same bytes.
+pub(crate) fn hash_of(contents: &[u8]) -> u64 {
     let mut hash = StreamingHash::new();
     hash.update(contents);
     hash.finish()
