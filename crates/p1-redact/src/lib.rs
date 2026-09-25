@@ -230,12 +230,10 @@ mod tests {
         assert_eq!(redaction.masked, 6, "{}", redaction.text);
         assert_eq!(
             redaction.text,
-            format!(
-                "plain=<redacted:sk-:24 chars>\nanthropic=<redacted:sk-ant-:24 chars>\n\
-                 project=<redacted:sk-proj-:24 chars>\n\
-                 header: <redacted:Bearer:40 chars>\nauth: <redacted:Authorization:32 chars>\n\
-                 {{\"api_key\": \"<redacted:api_key:20 chars>\"}}"
-            )
+            "plain=<redacted:sk-:24 chars>\nanthropic=<redacted:sk-ant-:24 chars>\n\
+             project=<redacted:sk-proj-:24 chars>\n\
+             header: <redacted:Bearer:40 chars>\nauth: <redacted:Authorization:32 chars>\n\
+             {\"api_key\": \"<redacted:api_key:20 chars>\"}"
         );
         // No character of any secret survives.
         for secret in [&plain, &anthropic, &project, &bearer, &authorization, &json] {

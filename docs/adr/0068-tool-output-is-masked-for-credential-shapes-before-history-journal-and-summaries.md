@@ -150,6 +150,4 @@ tool call can return a credential-shaped string that was never typed into a file
   `python3 scripts/test_secret_scan.py -q` passes, exercising the bare `sk-`, `sk-ant-`
   and `sk-proj-` families plus a below-threshold negative control, every test vector
   built at runtime (`"sk-" + "a" * 24` and similar) rather than written as a literal.
-- `python3 scripts/adr.py check` still reports ADR-0066 and ADR-0067 as missing: both
-  numbers are claimed by other open PRs and are expected to appear when those merge; this
-  ADR is numbered 0068 to avoid colliding with them.
+- `python3 scripts/adr.py check` passes (ADR-0066 and ADR-0067 merged first).
