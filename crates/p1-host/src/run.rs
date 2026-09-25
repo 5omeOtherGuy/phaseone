@@ -205,13 +205,15 @@ fn config_for_route(
         .map_or(settings.window_tokens, |model_window| {
             settings.window_tokens.min(model_window)
         });
-    // The reserve is the next response; a profile's output ceiling bounds it, because a
-    // reserve larger than the window would leave no room for the request that carries it.
+    // The reserve is the next response; a profile's output ceiling bounds it, and it stays
+    // strictly below the effective window, because a reserve as large as the window would leave
+    // no room at all for the request that carries the next response.
     let headroom = profile
         .and_then(|profile| profile.max_output_tokens)
         .map_or(settings.output_headroom_tokens, |ceiling| {
             settings.output_headroom_tokens.min(u64::from(ceiling))
-        });
+        })
+        .min(window.saturating_sub(1));
     let wall = window.saturating_sub(headroom);
     // The useful point: never later than the environment asked, never past 60% of the
     // effective window, and always below the wall the request has to fit under.
@@ -219,12 +221,18 @@ fn config_for_route(
         .summarize_at_tokens
         .min(window.saturating_mul(60) / 100)
         .min(wall.saturating_sub(1));
+    // The verbatim budgets are copied from the environment, but they are budgets of THIS window:
+    // a kept tail larger than what a request can carry would keep the whole history verbatim and
+    // leave the next request over the wall, so both are clamped below it (the verbatim budget is
+    // a share of the kept tail, so it can never exceed it).
+    let keep_recent = settings.keep_recent_tokens.min(wall.saturating_sub(1));
+    let user_verbatim = settings.user_verbatim_tokens.min(keep_recent);
     p1_context::ContextConfig {
         window_tokens: window,
         output_headroom_tokens: headroom,
         summarize_at_tokens: useful,
-        keep_recent_tokens: settings.keep_recent_tokens,
-        user_verbatim_tokens: settings.user_verbatim_tokens,
+        keep_recent_tokens: keep_recent,
+        user_verbatim_tokens: user_verbatim,
         tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
     }
 }
@@ -3021,6 +3029,26 @@ mod tests {
         config.window_tokens - config.output_headroom_tokens
     }
 
+    /// A profile that is not a shipped file: the folding rule must hold for any capacity a
+    /// profile can state, including ones no shipped binding has.
+    fn synthetic_profile(
+        context_tokens: Option<u64>,
+        max_output_tokens: Option<u32>,
+    ) -> ModelProfile {
+        ModelProfile {
+            id: "synthetic".into(),
+            revision: 1,
+            model_id: "synthetic-model".into(),
+            family: "synthetic".into(),
+            thinking: p1_model_profile::ThinkingPolicy::Enabled,
+            efforts: vec![Effort::Low, Effort::High],
+            default_effort: Some(Effort::High),
+            thinking_budgets: Default::default(),
+            context_tokens,
+            max_output_tokens,
+        }
+    }
+
     /// #125 review: a profile that states a SMALLER window than the environment narrows the
     /// effective table, so selecting MiMo (200k) on `zen` compacts at MiMo's size instead of
     /// sending requests the binding cannot serve.
@@ -3051,6 +3079,81 @@ mod tests {
             wall_of(&config)
         );
         // The effective table must be one the policy accepts.
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+    }
+
+    /// A profile that states MORE than the environment cannot widen it: the environment's table
+    /// is what its route serves, and the profile is only allowed to narrow.
+    #[test]
+    fn a_profile_stating_more_capacity_than_the_environment_cannot_widen_the_table() {
+        let settings = shipped_settings("zen");
+        let roomy = synthetic_profile(Some(4_000_000), Some(900_000));
+        let config = config_for_route(&settings, Some(&roomy));
+        assert_eq!(
+            config.window_tokens, settings.window_tokens,
+            "the environment's window still caps the table"
+        );
+        assert_eq!(
+            config.output_headroom_tokens, settings.output_headroom_tokens,
+            "the environment's reserve still caps the reserve"
+        );
+        assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
+        assert_eq!(config.keep_recent_tokens, settings.keep_recent_tokens);
+        assert_eq!(
+            config,
+            config_for_route(&settings, None),
+            "a roomier profile changes nothing"
+        );
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+    }
+
+    /// A profile far narrower than the environment (40,000 tokens on `zen`) clamps the copied
+    /// budgets to the effective window: the kept tail and the verbatim share are budgets of THIS
+    /// window, and a tail larger than what a request can carry would keep the whole history
+    /// verbatim and send the next request over the wall.
+    #[test]
+    fn a_very_narrow_profile_clamps_the_copied_verbatim_budgets() {
+        let settings = shipped_settings("zen");
+        assert!(
+            settings.keep_recent_tokens > 40_000,
+            "the environment keeps a tail larger than the narrow profile's window"
+        );
+        let narrow = synthetic_profile(Some(40_000), Some(32_000));
+        let config = config_for_route(&settings, Some(&narrow));
+        assert_eq!(config.window_tokens, 40_000);
+        assert_eq!(config.output_headroom_tokens, 32_000);
+        assert!(
+            config.summarize_at_tokens < wall_of(&config),
+            "threshold {} must stay below the wall {}",
+            config.summarize_at_tokens,
+            wall_of(&config)
+        );
+        assert!(
+            config.keep_recent_tokens < wall_of(&config),
+            "the kept tail ({}) must stay below the wall ({})",
+            config.keep_recent_tokens,
+            wall_of(&config)
+        );
+        assert!(
+            config.user_verbatim_tokens <= config.keep_recent_tokens,
+            "the verbatim share ({}) must stay inside the kept tail ({})",
+            config.user_verbatim_tokens,
+            config.keep_recent_tokens
+        );
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+
+        // A profile whose own output ceiling exceeds its own window: the reserve is clamped
+        // below the window, so the table still describes a sendable request.
+        let odd = synthetic_profile(Some(20_000), Some(32_000));
+        let config = config_for_route(&settings, Some(&odd));
+        assert_eq!(config.window_tokens, 20_000);
+        assert!(
+            config.output_headroom_tokens < config.window_tokens,
+            "the reserve ({}) stays below the window ({})",
+            config.output_headroom_tokens,
+            config.window_tokens
+        );
+        assert!(config.keep_recent_tokens < wall_of(&config));
         p1_context::ContextConfig::validate(&config).expect("the effective table validates");
     }
 

@@ -133,7 +133,8 @@ The answer is the concatenated text blocks of the completed response; an empty a
 - A summary that did not END is never accepted: a completed response whose `stop` is
   `MaxOutputTokens` is retried ONCE with the cap doubled (only where a cap is being sent); a
   second truncation, or any stop other than `EndTurn`, is a failure like an empty answer. Both
-  requests' usage is reported (summed by the usual known-parts rule).
+  requests' usage is reported, summed per part — and a part stays `None` when EITHER request left
+  it unknown, because a sum over an unknown part would state a number no route reported.
 - The default prompt gains one section, between "State of the work" and "Verified facts":
   `## Files` — for every file that was read or changed and still matters: its path and, in a few
   words each, the symbols and line ranges that matter in it, so that the work can continue with
@@ -192,16 +193,19 @@ model-family seam). `ResolvedEnvironment` shows the table and the effective prom
 resolves; the HOST constructs `SummarizingContext` (composition root) for the parent and for
 every worker from its own environment. The host also folds the SELECTED model profile into the
 table it hands the policy (#125 review): effective `window_tokens = min(env window,
-profile.context_tokens)`, effective reserve = `min(env reserve, profile.max_output_tokens)`, and
-effective `summarize_at_tokens = min(env threshold, 60 % of the effective window)`, always below
-`window - reserve`. That is what makes selecting a narrower profile (MiMo's 200k on `zen`) compact
+profile.context_tokens)`, effective reserve = `min(env reserve, profile.max_output_tokens)` (always
+strictly below the effective window), and effective `summarize_at_tokens = min(env threshold, 60 %
+of the effective window)`, always below `window - reserve`. The copied verbatim budgets
+(`keep_recent_tokens`, `user_verbatim_tokens`) are clamped below the wall too: they are budgets of
+the effective window, and a tail larger than a request can carry would keep the whole history
+verbatim. That is what makes selecting a narrower profile (MiMo's 200k on `zen`) compact
 at the model's real size instead of failing a request against the environment's wider table; the
 same effective numbers are what `FrontEnd::context_configured` reports. The summarizer runs at the
 lowest effort the profile supports (`Low` without a profile). The renderer prints
 `context: summarized <before> → <after> items · <usage line>` on `ContextReplaced`.
-The shipped environments carry researched per-route values, each with its cited source, in
-`docs/design/context-windows.md`; a route whose window no public source states keeps its
-previous conservative value and says so in the env comment.
+The shipped environments carry researched per-route values in `docs/design/context-windows.md`,
+each marked sourced or policy; a route whose window no public source states keeps its previous
+conservative value and says so in the env comment.
 
 ## 4. Must-pass behaviour (deterministic, scripted provider)
 
