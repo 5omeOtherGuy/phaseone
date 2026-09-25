@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/result-description/1",
+  "title": "Result description",
+  "description": "A tool's description of its result, so the host never decodes private output.",
+  "type": "object",
+  "properties": {
+    "summary": { "type": "string" },
+    "detail": { "$ref": "#/$defs/result_detail" }
+  },
+  "required": ["summary"],
+  "additionalProperties": false,
+  "$defs": {
+    "result_detail": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "diff" },
+            "path": { "type": "string" },
+            "before": { "type": "string" },
+            "after": { "type": "string" }
+          },
+          "required": ["kind", "path", "before", "after"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "command" },
+            "exit_code": { "type": "integer" },
+            "elapsed_ms": { "type": "integer" },
+            "tail": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["kind", "tail"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "matches" },
+            "count": { "type": "integer" },
+            "files": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["kind", "count", "files"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "files" },
+            "paths": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["kind", "paths"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "text" },
+            "text": { "type": "string" }
+          },
+          "required": ["kind", "text"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

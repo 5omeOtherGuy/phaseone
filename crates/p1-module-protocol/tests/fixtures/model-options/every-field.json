@@ -1,0 +1,12 @@
+{
+  "reasoning_effort": "extra_high",
+  "max_output_tokens": 4096,
+  "cache_key": "session-1",
+  "native": {
+    "anthropic-messages.beta": [
+      "a",
+      "b"
+    ],
+    "openai-responses.store": false
+  }
+}

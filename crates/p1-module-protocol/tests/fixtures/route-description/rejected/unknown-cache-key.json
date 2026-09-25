@@ -1,0 +1,9 @@
+{
+  "origin": {
+    "route": "anthropic-messages/claude-subscription",
+    "model": "claude-test"
+  },
+  "supports_freeform_tools": true,
+  "reports_cost": true,
+  "cache_key": "required"
+}

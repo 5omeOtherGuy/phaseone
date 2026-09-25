@@ -1,0 +1,8 @@
+{
+  "origin": {
+    "route": "anthropic-messages/claude-subscription",
+    "model": "claude-test"
+  },
+  "version": 0,
+  "payload": "encrypted-blob"
+}

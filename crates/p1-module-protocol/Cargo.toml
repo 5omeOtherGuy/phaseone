@@ -1,0 +1,16 @@
+[package]
+name = "p1-module-protocol"
+description = "The value protocol between the p1 host and its WebAssembly modules: wire types, JSON schemas, error mapping and the call verb vocabulary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

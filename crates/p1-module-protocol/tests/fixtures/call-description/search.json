@@ -1,0 +1,5 @@
+{
+  "verb": "search",
+  "target": "fn main",
+  "destructive": false
+}

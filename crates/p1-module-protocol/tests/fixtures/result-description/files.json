@@ -1,0 +1,10 @@
+{
+  "summary": "2 files",
+  "detail": {
+    "kind": "files",
+    "paths": [
+      "a.rs",
+      "b.rs"
+    ]
+  }
+}

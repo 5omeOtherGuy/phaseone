@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/tool-call/1",
+  "title": "Tool call",
+  "description": "A complete tool call. The input stays raw text; the tool validates it.",
+  "type": "object",
+  "properties": {
+    "call_id": { "type": "string" },
+    "name": { "type": "string" },
+    "input": { "$ref": "#/$defs/tool_input" }
+  },
+  "required": ["call_id", "name", "input"],
+  "additionalProperties": false,
+  "$defs": {
+    "tool_input": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "json" },
+            "raw": { "type": "string" }
+          },
+          "required": ["kind", "raw"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "text" },
+            "raw": { "type": "string" }
+          },
+          "required": ["kind", "raw"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

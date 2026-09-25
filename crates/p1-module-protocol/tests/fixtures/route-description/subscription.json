@@ -1,0 +1,10 @@
+{
+  "origin": {
+    "route": "anthropic-messages/claude-subscription",
+    "model": "claude-test"
+  },
+  "supports_freeform_tools": false,
+  "mandatory_prompt_prefix": "You are Claude Code.",
+  "reports_cost": false,
+  "cache_key": "unsupported"
+}

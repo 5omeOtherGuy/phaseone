@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/provider-error/1",
+  "title": "Provider error",
+  "description": "A classified provider failure. The kind set is closed: the native retry rules branch on it.",
+  "type": "object",
+  "properties": {
+    "kind": { "$ref": "#/$defs/kind" },
+    "message": { "type": "string" }
+  },
+  "required": ["kind", "message"],
+  "additionalProperties": false,
+  "$defs": {
+    "kind": {
+      "enum": [
+        "invalid_request",
+        "authentication",
+        "insufficient_balance",
+        "not_entitled",
+        "usage_limit_exhausted",
+        "rate_limited",
+        "context_window_exceeded",
+        "transport",
+        "protocol"
+      ]
+    }
+  }
+}

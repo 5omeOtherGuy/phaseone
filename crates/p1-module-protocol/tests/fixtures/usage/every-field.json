@@ -1,0 +1,8 @@
+{
+  "input_uncached": 100,
+  "cache_read": 2000,
+  "cache_write": 300,
+  "output": 40,
+  "reasoning_output": 12,
+  "cost_micro_usd": 5500
+}
