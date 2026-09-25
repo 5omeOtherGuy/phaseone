@@ -6,7 +6,7 @@ date: 2026-09-25
 deciders: lead
 supersedes: []
 superseded_by: []
-sources: [docs/design/credentials.md, docs/design/routes-and-profiles.md, crates/p1-auth/src/spec.rs, crates/p1-auth/src/resolve.rs, crates/p1-provider-http/src/credential.rs, crates/p1-provider-http/src/drive.rs, crates/p1-provider-openai-chat/src/lib.rs, crates/p1-provider-anthropic/src/request.rs, crates/p1-provider-openai/src/request.rs, crates/p1-host/src/login.rs]
+sources: [docs/design/credentials.md, docs/design/routes-and-profiles.md, docs/design/usage.md, crates/p1-auth/src/spec.rs, crates/p1-auth/src/resolve.rs, crates/p1-provider-http/src/credential.rs, crates/p1-provider-http/src/drive.rs, crates/p1-provider-openai-chat/src/lib.rs, crates/p1-provider-anthropic/src/request.rs, crates/p1-provider-openai/src/request.rs, crates/p1-provider-openai/src/websocket.rs, crates/p1-host/src/login.rs, crates/p1-usage/src/probe.rs]
 ---
 # ADR-0070: A route may declare no credential for a proxy that injects it
 
@@ -39,10 +39,13 @@ it needs a decision.
    adapter that would send a credential header sends none when it is true — `openai-chat`,
    `anthropic-messages` and `openai-responses`, on the SSE path and the WebSocket handshake — and
    the placeholder `access()` hands out has an EMPTY bearer that no adapter may send.
-3. **The driver never refreshes such a route.** A 401/403 that classifies as `Authentication` (not
-   `InsufficientBalance`/`NotEntitled`, which keep their own diagnosis) finishes immediately as an
-   Authentication failure naming the missing proxy credential and the status — never a key.
-   `refresh(rejected)` refuses the same way for any direct caller.
+3. **Neither transport ever refreshes such a route.** A 401/403 that classifies as `Authentication`
+   (not `InsufficientBalance`/`NotEntitled`, which keep their own diagnosis) finishes immediately as
+   an Authentication failure naming the missing proxy credential and the status — never a key. That
+   holds for the SSE driver AND for a WebSocket upgrade refused 401/403, which never enters its
+   refresh phase; the two share one message
+   (`p1_provider_http::proxy_refusal_message`), so they cannot drift apart. `refresh(rejected)`
+   refuses the same way for any direct caller.
 4. **It is visible.** `p1 login --list` prints the kind as `none (proxy-injected)` and the source
    line as `none (proxy-injected) — the egress proxy injects the credential`; `p1 login`/`logout`
    on such a route are usage errors (p1 stores nothing for it), and `p1 usage` reports it
@@ -54,9 +57,18 @@ it needs a decision.
   and no header for the proxy to override.
 - The change to the pinned crates is additive: `p1-provider-http` gains one defaulted trait method
   and one driver branch (`proxy_injected()` default `false` keeps every existing source and route
-  byte-identical), and `p1-provider-openai-chat` gains nothing public. `p1-auth` is not pinned and
-  gains the `CredentialKind::None` variant, `CredentialKind::label`, and
-  `CredentialPolicy::ProxyInjected`.
+  byte-identical), and one new free function `proxy_refusal_message`, which the Responses WebSocket
+  path shares so the SSE and handshake messages cannot drift. `p1-provider-openai-chat` gains
+  nothing public. `p1-auth` is not pinned and gains the `CredentialKind::None` variant,
+  `CredentialKind::label`, and `CredentialPolicy::ProxyInjected`.
+- **`CredentialKind` is public and NOT `#[non_exhaustive]`, so `None` is a new variant of an
+  exhaustive enum: a downstream consumer that matches `CredentialKind` exhaustively (the brain
+  research harness consumes p1 crates as pinned git dependencies, issue #134) fails to compile
+  until it adds an arm.** That is accepted rather than papered over: marking the enum
+  `#[non_exhaustive]` would be a second source-compat change, and a downstream `_ =>` arm that
+  silently treats a `none` route as one that holds a key is exactly the bug this ADR prevents. The
+  blast radius is bounded because p1-auth is not pinned (unlike `p1-provider-openai-chat` and
+  `p1-provider-http`), and every in-workspace match site is updated here.
 - A `none` route cannot be probed for usage by p1, and `p1 login` cannot store anything for it.
 - No shipped route uses the kind yet: it is interface for the brain research harness and the cloud
   sessions, which compose their own route files.
@@ -91,7 +103,10 @@ it needs a decision.
   one request, no refresh call, an Authentication failure naming the proxy credential.
 - `crates/p1-provider-{openai-chat,anthropic,openai}/tests/credential_none.rs`: each adapter's
   request carries no credential header when the source is proxy-injected, and still carries it
-  otherwise.
+  otherwise. The Responses file also covers the WebSocket half: a proxy-injected handshake's header
+  list is §3's minus `Authorization` and `chatgpt-account-id`, a resolving credential still sends
+  both, a `refuse(401)` upgrade ends in ONE handshake and an Authentication failure naming the proxy
+  credential with no refresh call, and the same refusal on a resolving route still refreshes once.
 - `crates/p1-host/tests/none_credential.rs`: the SHIPPED route files with their `[credential]`
   table replaced, loaded and composed through the host's own loader and catalog factory, reach the
   transport with no credential header for all three adapters; the same route with an `api-key`

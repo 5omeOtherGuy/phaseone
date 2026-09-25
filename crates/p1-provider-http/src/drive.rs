@@ -399,7 +399,10 @@ async fn on_response(
 /// Issue #134: what a 401/403 means on a route whose credential an egress proxy
 /// injects. The message names the missing proxy credential and the status the
 /// provider refused with; it never names a key p1 could hold.
-fn proxy_refusal_message(status: u16) -> String {
+///
+/// Every transport that can carry such a route reports the refusal through here, so
+/// the SSE driver and the WebSocket handshake cannot drift apart on the wording.
+pub fn proxy_refusal_message(status: u16) -> String {
     format!(
         "the route sends no credential (`kind = \"none\"`): the egress proxy must inject the \
          proxy credential, and the provider answered HTTP {status}"

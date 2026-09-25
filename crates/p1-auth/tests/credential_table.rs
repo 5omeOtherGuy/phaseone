@@ -9,7 +9,7 @@ fn spec(json: &str) -> Result<CredentialSpec, serde_json::Error> {
 }
 
 #[test]
-fn every_kind_parses_by_its_route_file_spelling() {
+fn the_three_kinds_parse_by_their_route_file_spelling() {
     for (text, kind, name) in [
         (
             r#"{"kind":"api-key","env":"A_KEY"}"#,
@@ -26,14 +26,26 @@ fn every_kind_parses_by_its_route_file_spelling() {
             CredentialKind::CodexOauth,
             "codex-oauth",
         ),
-        // Issue #134: the route sends no credential; an egress proxy injects it.
-        (r#"{"kind":"none"}"#, CredentialKind::None, "none"),
     ] {
         let parsed = spec(text).expect("the table parses");
         assert_eq!(parsed.kind, kind);
         assert_eq!(parsed.kind.name(), name);
         assert!(parsed.borrow.is_empty());
     }
+}
+
+/// Issue #134: a fourth kind, `none`, on its own test so the three above stay the
+/// sentence they were (ADR-0029: a pre-existing acceptance test is not renamed).
+#[test]
+fn the_none_kind_parses_and_is_labelled_as_proxy_injected() {
+    let parsed = spec(r#"{"kind":"none"}"#).expect("the table parses");
+    assert_eq!(parsed.kind, CredentialKind::None);
+    assert_eq!(parsed.kind.name(), "none");
+    assert_eq!(parsed.kind.label(), "none (proxy-injected)");
+    assert!(parsed.borrow.is_empty());
+    assert!(parsed.env.is_none());
+    assert!(!parsed.store_only);
+    assert!(parsed.validate().is_ok());
 }
 
 #[test]

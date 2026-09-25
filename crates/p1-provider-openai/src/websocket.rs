@@ -39,7 +39,9 @@ use p1_contracts::{
 use p1_provider_http::ws::{
     WsBound, WsConnectError, WsConnection, WsConnector, WsHandshake, WsNext,
 };
-use p1_provider_http::{Credential, CredentialSource, ResponseParser, RetryPolicy, SseEvent};
+use p1_provider_http::{
+    Credential, CredentialSource, ResponseParser, RetryPolicy, SseEvent, proxy_refusal_message,
+};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -642,6 +644,18 @@ fn refused_upgrade(mut state: State, status: u16, body: &[u8]) -> State {
     let error = state.parser.on_http_error(status, &[], body);
     match status {
         401 | 403 => {
+            // Issue #134: a route whose credential an egress proxy injects sends no
+            // credential at all, so there is nothing p1 could refresh here — the
+            // refusal is the proxy's, reported with the SSE driver's own message so
+            // the two transports cannot drift apart. This never enters
+            // `Phase::Refresh`.
+            if state.request.credentials.proxy_injected() {
+                let error = ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    proxy_refusal_message(status),
+                );
+                return state.finish(Outcome::Failed(error));
+            }
             if state.refreshed {
                 // §5: refused again after the one refresh is an authentication
                 // failure — the same shape `drive` produces for a second 401/403.

@@ -228,17 +228,19 @@ environment variable, no store entry, no other tool's login — and an adapter s
 authentication header for it. `validate` refuses `env`, a nonempty `borrow` or `store_only = true`
 on such a route, because each would name a source the route must not read.
 
-### 9.2 What the adapter and the driver do
+### 9.2 What the adapters and the transports do
 
 - `CredentialSource::proxy_injected() -> bool` (default `false`, `true` for this kind) is the one
   signal. Every adapter that would send `Authorization` (and the Responses account-id header) sends
   NONE when it is true: `p1-provider-openai-chat`, `p1-provider-anthropic` and
   `p1-provider-openai`, on both the SSE path and the WebSocket handshake. The placeholder
   `access()` returns has an EMPTY bearer, and no adapter may send it.
-- The driver never refreshes such a route: there is no credential to rotate and no write-back. A
+- Neither transport refreshes such a route: there is no credential to rotate and no write-back. A
   401/403 that classifies as `Authentication` (not `InsufficientBalance`/`NotEntitled`, which keep
   their own diagnosis) finishes immediately as an Authentication failure whose message names the
-  missing PROXY credential and the status — never a key p1 could hold. A direct
+  missing PROXY credential and the status — never a key p1 could hold. That holds for the SSE driver
+  AND for a WebSocket upgrade refused 401/403, which never enters its refresh phase; both report
+  through `p1_provider_http::proxy_refusal_message`, so the wording cannot drift. A direct
   `refresh(rejected)` still refuses the same way, so a caller that asks anyway gets the refusal and
   never a value.
 
@@ -263,6 +265,6 @@ b. A `kind = "none"` route composes and its request carries no `authorization` (
 c. Nothing is read: with a store file whose mode makes any read fail, and a directory where each
    CLI's login file belongs, the chain still yields the empty placeholder and a request still
    reaches the transport. The files are byte-identical afterwards.
-d. A 401 on such a route is an Authentication failure naming the proxy credential, with exactly one
-   request sent and no refresh call.
+d. A 401 on such a route is an Authentication failure naming the proxy credential and the status,
+   with exactly one request (or, on a WebSocket route, one handshake) and no refresh call.
 e. An api-key route with the very same route file and a readable store still sends `Bearer <key>`.
