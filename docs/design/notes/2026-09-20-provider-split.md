@@ -54,7 +54,7 @@ Two existing behaviors should not become architectural precedents:
 
 ### 2. The smallest concrete design
 
-Use plain structs and ordinary constructors. No `Route` trait, `ModelProfile` trait, universal request intermediate representation, or new dispatch framework.
+Use plain structs and ordinary constructors. No `Route` trait, `ModelProfile` trait, universal request intermediate representation, or new dispatch framework. (Dated note: the compile-time wiring below is superseded by ADR-0070, which makes providers WebAssembly modules the host loads by name; the route × profile × adapter split itself stands.)
 
 A small shared **`p1-model-profile`** crate is justified because assembly and multiple adapters consume the same model policy. It depends on contracts, not providers, transport, or tools. This is the one new architectural crate I would propose; it requires the repository’s normal dependency/ADR decision.
 
@@ -138,7 +138,7 @@ The constructor must reject unsupported profile/dialect combinations. Its reques
 
 **Reuse the current catalog.** Extend [`ProviderSpec`](crates/p1-assembly/src/lib.rs:130) to carry the selected profile. The host reads route records and registers an existing constructor closure for each route. Each closure captures typed route data, model bindings, and the credential source.
 
-That is still compile-time composition: configuration supplies constructor arguments; only implementations explicitly wired in [`register_providers`](crates/p1-host/src/catalog.rs:190) can execute.
+That was compile-time composition as of this note: configuration supplies constructor arguments; only implementations explicitly wired in [`register_providers`](crates/p1-host/src/catalog.rs:190) can execute. Superseded by ADR-0070 (2026-09-25): the same keys will name WebAssembly modules; the rule that only an assembled provider can execute stands.
 
 An environment can become:
 

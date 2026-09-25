@@ -68,7 +68,8 @@ rule; it does not fix those mechanisms.
   on the dedicated EC2 machine (owner); local cargo stays `check` only (ADR-0066).
 - Until a later ADR says otherwise, the host loads only modules from p1's own release
   archive, verified by hash (ADR-0065 extended), so the credential rule holds for provider
-  modules and `unsafe_code = "forbid"` stays (the wasmtime API is safe Rust).
+  modules and `unsafe_code = "forbid"` stays; the plan must show the chosen runtime's API
+  needs no `unsafe` on p1's side.
 - ADRs the plan must revisit: 0015 (`Send` boxed futures at the boundary), 0017 (the
   conformance suite runs over the adapter), 0039 (the wire adapter becomes a module),
   0047 (WebSocket through a host function), 0065 and 0066 (release archive and CI gain
@@ -94,5 +95,5 @@ Owner words 2026-09-25 quoted above (DECISIONS.md D21). dsh survey of the same d
 client about 135k lines, host API about 25k, agent core about 15k, whole repository about
 1M lines with tests (brain note 2026-09-25; two dsh docs copied beside the Astra brief). The
 lead's partition and obstacle analysis: issue #187. The migration plan is pending from
-Astra; its acceptance and the first proving module (the read tool over a JSON-string
-interface, loaded by name) are the next evidence.
+Astra; its acceptance and the first proving module it names (the lead proposed the read
+tool over the simplest interface the plan chooses, loaded by name) are the next evidence.
