@@ -59,6 +59,17 @@ Retry loop invariants (each has a test, with a fake clock — `tokio::time::paus
 5. Error messages and logs carry status, error type and request id only — never a request or
    response body, never a header value.
 
+Read bounds (issue #164). Every provider wait is bounded, so a request that never answers ends as
+a named failure instead of hanging the agent. `FIRST_BYTE_TIMEOUT` = **120 s** is the wait for the
+response headers (HTTP) or the first frame (WebSocket) after the request was sent;
+`STREAM_IDLE_TIMEOUT` = **300 s** is the wait between two chunks/frames of an OPEN stream. ANY
+received byte or frame — an SSE comment, or a WebSocket ping or pong — resets the idle clock, so a
+keep-alive peer is never called idle. An expiry is a `ProviderErrorKind::Transport` failure whose
+message names the bound (`no response within 120 s` / `stream idle for 300 s`); a first-byte expiry
+follows the transient-retry policy above, while an idle expiry after any content event is terminal
+(rule 3). While the first-byte wait is running the driver emits ONE `StreamEvent::Notice`
+(`waiting for the provider (30 s)`), so the wait is visible to the operator.
+
 `ScriptedTransport` (feature `testing`): a queue of canned responses — status, headers, and a
 body given as a list of byte chunks, optionally ending in a transport error or hanging
 forever — and a record of every `HttpRequest` it received.

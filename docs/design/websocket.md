@@ -71,8 +71,12 @@ pub struct WsError(pub String);
   arrives (concurrent `stream` calls), that request uses SSE — never a second socket, never a wait.
 - Reuse only while `age < 55 min` and `idle < 5 min` [donor; vendor: connections last 60 min];
   otherwise drop it and connect anew. Time comes from an injected clock, as elsewhere in the crate.
-- Connect and send are bounded by 10 s each; reads by the adapter's existing idle timeout.
-  Every wait races the request's `CancellationToken`.
+- Connect and send are bounded by 10 s each. A read is bounded inside the connection
+  (`p1-provider-http`): the first frame after a send waits `FIRST_BYTE_TIMEOUT` = 120 s and every
+  later frame waits `STREAM_IDLE_TIMEOUT` = 300 s, and ANY frame — a control ping or pong included
+  — resets the idle clock, so a keep-alive peer is never called idle. An expiry is a
+  `ProviderErrorKind::Transport` failure naming the bound. Every wait races the request's
+  `CancellationToken`.
 - A cancelled or failed response DROPS the connection (a half-read socket is never reused) and
   clears the continuation of §6. Dropping the returned stream counts as cancellation.
 - A connection returns to the slot only after a response completed cleanly.

@@ -9,11 +9,16 @@
 //! As in [`crate::http`], nothing here may put a header value into a `Debug`
 //! output or an error message: a handshake carries the credential.
 //!
-//! Both connection calls return a [`BoxFuture`], so a caller races them against
-//! its own bounds — `docs/design/websocket.md` §4 bounds a connect and a send at
-//! 10 s and every wait races the request's cancellation token. Dropping a connect
-//! drops its socket; §4 is why an abandoned connection is never reused, so a
-//! caller that gives up on a call must drop the connection with it.
+//! A caller races a connect and a send against its own bound —
+//! `docs/design/websocket.md` §4 bounds each at 10 s — and every wait races the
+//! request's cancellation token. A read is bounded HERE, inside the connection,
+//! because only the message loop sees every frame: the first frame after a send
+//! waits [`FIRST_BYTE_TIMEOUT`], every later one waits [`STREAM_IDLE_TIMEOUT`], and
+//! any message (control frames included) resets the idle clock. Dropping a connect
+//! drops its socket; §4 is why an abandoned connection is never reused, so a caller
+//! that gives up on a call must drop the connection with it.
+
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use p1_contracts::BoxFuture;
@@ -25,7 +30,10 @@ use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
-use crate::http::RedactedUrl;
+use crate::http::{
+    FIRST_BYTE_TIMEOUT, RedactedUrl, STREAM_IDLE_TIMEOUT, first_byte_timeout_message,
+    stream_idle_timeout_message,
+};
 
 /// One handshake: the URL to open and the headers to send with it.
 #[derive(Clone, PartialEq, Eq)]
@@ -65,6 +73,64 @@ pub trait WsConnection: Send {
     /// and pong ignored inside the implementation; a close frame or end of stream
     /// is `Ok(None)`.
     fn next_text<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<String>, WsError>>;
+
+    /// The next frame under this connection's read bounds. The first frame after a
+    /// send waits [`FIRST_BYTE_TIMEOUT`]; every later one waits
+    /// [`STREAM_IDLE_TIMEOUT`], and ANY received message — text, binary, ping or
+    /// pong — resets that clock, so a keep-alive peer is never called idle. A bound
+    /// that expires is [`WsNext::Timeout`], distinct from a close, so a caller can
+    /// name it.
+    ///
+    /// The default forwards [`next_text`](WsConnection::next_text) with no bound,
+    /// which is all a simple test double needs; [`TungsteniteConnector`] and
+    /// [`crate::testing::ScriptedWsConnector`] override it.
+    fn next_bounded<'a>(&'a mut self) -> BoxFuture<'a, Result<WsNext, WsError>> {
+        Box::pin(async move {
+            Ok(match self.next_text().await? {
+                Some(text) => WsNext::Text(text),
+                None => WsNext::Closed,
+            })
+        })
+    }
+}
+
+/// Which read bound a connection applies at this moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WsBound {
+    /// No frame arrived after the request frame was sent.
+    FirstFrame,
+    /// No frame arrived for the idle bound on an open stream.
+    Idle,
+}
+
+impl WsBound {
+    /// The deadline this bound allows.
+    pub fn limit(self) -> Duration {
+        match self {
+            Self::FirstFrame => FIRST_BYTE_TIMEOUT,
+            Self::Idle => STREAM_IDLE_TIMEOUT,
+        }
+    }
+
+    /// The `Transport` message an expiry becomes. It is the SSE arm's wording, so
+    /// both transports name the bound identically.
+    pub fn message(self) -> String {
+        match self {
+            Self::FirstFrame => first_byte_timeout_message(),
+            Self::Idle => stream_idle_timeout_message(),
+        }
+    }
+}
+
+/// The outcome of one bounded read ([`WsConnection::next_bounded`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsNext {
+    /// A model-visible payload: TEXT, or BINARY decoded as UTF-8.
+    Text(String),
+    /// The peer closed, or the socket ended.
+    Closed,
+    /// No message arrived within the bound.
+    Timeout(WsBound),
 }
 
 /// A handshake that never became a connection.
@@ -134,7 +200,10 @@ impl WsConnector for TungsteniteConnector {
                 http_request.headers_mut().insert(name, value);
             }
             let (stream, _response) = connect_async(http_request).await.map_err(connect_error)?;
-            Ok(Box::new(TungsteniteConnection { stream }) as Box<dyn WsConnection>)
+            Ok(Box::new(TungsteniteConnection {
+                stream,
+                awaiting_first_frame: false,
+            }) as Box<dyn WsConnection>)
         })
     }
 }
@@ -143,6 +212,9 @@ impl WsConnector for TungsteniteConnector {
 /// so they both take `&mut self`.
 struct TungsteniteConnection {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    /// Whether no frame has arrived since the request frame was sent. The NEXT
+    /// message is awaited under [`WsBound::FirstFrame`]; a received one clears it.
+    awaiting_first_frame: bool,
 }
 
 impl WsConnection for TungsteniteConnection {
@@ -151,45 +223,132 @@ impl WsConnection for TungsteniteConnection {
             self.stream
                 .send(Message::text(text))
                 .await
-                .map_err(|error| WsError(format!("WebSocket send error ({})", class(&error))))
+                .map_err(|error| WsError(format!("WebSocket send error ({})", class(&error))))?;
+            // The next message is what the first-frame bound awaits.
+            self.awaiting_first_frame = true;
+            Ok(())
         })
     }
 
     fn next_text<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<String>, WsError>> {
         Box::pin(async move {
+            // The bounded read is the one that reports a bound expiry; the legacy
+            // text view folds it into `Ok(None)` (a caller that must name the
+            // expiry uses `next_bounded`).
+            match self.next_bounded().await? {
+                WsNext::Text(text) => Ok(Some(text)),
+                WsNext::Closed | WsNext::Timeout(_) => Ok(None),
+            }
+        })
+    }
+
+    fn next_bounded<'a>(&'a mut self) -> BoxFuture<'a, Result<WsNext, WsError>> {
+        Box::pin(
+            async move { read_bounded(&mut self.stream, &mut self.awaiting_first_frame).await },
+        )
+    }
+}
+
+/// One raw protocol message a bounded read can see. Control frames are distinct
+/// from a model-visible payload because they only reset the idle clock.
+pub(crate) enum RawMessage {
+    Text(String),
+    Binary(Vec<u8>),
+    /// A ping carrying this payload; the read loop answers it with a pong.
+    Ping(Vec<u8>),
+    Pong,
+    Close,
+}
+
+/// The raw message channel a bounded read drives. The real socket and a test
+/// double's script both provide one, so the control-frame handling and the
+/// bound reset are a single implementation (issue #164).
+pub(crate) trait MessageChannel: Send {
+    /// The next raw message: `Ok(None)` is the end of the socket, `Err` a
+    /// pre-classified failure (never a header value or a peer byte).
+    fn next_message(&mut self) -> BoxFuture<'_, Result<Option<RawMessage>, WsError>>;
+
+    /// Answer a ping.
+    fn pong(&mut self, payload: Vec<u8>) -> BoxFuture<'_, Result<(), WsError>>;
+}
+
+/// Read the next model-visible frame under the connection's bounds. The wait is
+/// re-armed for EVERY message — a text, a binary, a ping or a pong — so a peer
+/// that answers only with WS control pings is alive, not idle (issue #164).
+pub(crate) async fn read_bounded(
+    channel: &mut dyn MessageChannel,
+    awaiting_first_frame: &mut bool,
+) -> Result<WsNext, WsError> {
+    loop {
+        let bound = if *awaiting_first_frame {
+            WsBound::FirstFrame
+        } else {
+            WsBound::Idle
+        };
+        let message = match tokio::time::timeout(bound.limit(), channel.next_message()).await {
+            Err(_elapsed) => return Ok(WsNext::Timeout(bound)),
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(None)) => return Ok(WsNext::Closed),
+            Ok(Ok(Some(message))) => message,
+        };
+        // Any message is life: it ends the first-frame wait and resets the clock.
+        *awaiting_first_frame = false;
+        match message {
+            RawMessage::Text(text) => return Ok(WsNext::Text(text)),
+            RawMessage::Binary(bytes) => {
+                return String::from_utf8(bytes)
+                    .map(WsNext::Text)
+                    .map_err(|_| WsError("WebSocket binary frame is not UTF-8".to_string()));
+            }
+            // Answered here, inside the read loop, so a peer sees the pong without
+            // the caller having to send anything.
+            RawMessage::Ping(payload) => channel.pong(payload).await?,
+            RawMessage::Pong => {}
+            RawMessage::Close => return Ok(WsNext::Closed),
+        }
+    }
+}
+
+impl MessageChannel for WebSocketStream<MaybeTlsStream<TcpStream>> {
+    fn next_message(&mut self) -> BoxFuture<'_, Result<Option<RawMessage>, WsError>> {
+        Box::pin(async move {
             loop {
-                let message = match self.stream.next().await {
-                    Some(Ok(message)) => message,
+                match self.next().await {
+                    Some(Ok(message)) => {
+                        if let Some(message) = raw_message(message) {
+                            return Ok(Some(message));
+                        }
+                    }
                     // The stream is fused: a close handshake or end of stream.
                     Some(Err(error)) if is_end_of_stream(&error) => return Ok(None),
                     Some(Err(error)) => {
                         return Err(WsError(format!("WebSocket read error ({})", class(&error))));
                     }
                     None => return Ok(None),
-                };
-                match message {
-                    Message::Text(text) => return Ok(Some(text.to_string())),
-                    Message::Binary(bytes) => {
-                        return String::from_utf8(bytes.to_vec()).map(Some).map_err(|_| {
-                            WsError("WebSocket binary frame is not UTF-8".to_string())
-                        });
-                    }
-                    // Answered here, inside `next_text`, so a peer sees the pong
-                    // without the caller having to send anything.
-                    Message::Ping(payload) => {
-                        self.stream
-                            .send(Message::Pong(payload))
-                            .await
-                            .map_err(|error| {
-                                WsError(format!("WebSocket send error ({})", class(&error)))
-                            })?;
-                    }
-                    Message::Pong(_) => {}
-                    Message::Close(_) => return Ok(None),
-                    Message::Frame(_) => {}
                 }
             }
         })
+    }
+
+    fn pong(&mut self, payload: Vec<u8>) -> BoxFuture<'_, Result<(), WsError>> {
+        Box::pin(async move {
+            self.send(Message::Pong(payload.into()))
+                .await
+                .map_err(|error| WsError(format!("WebSocket send error ({})", class(&error))))
+        })
+    }
+}
+
+/// Reduce one `tokio-tungstenite` message to a [`RawMessage`]. `Message::Frame`
+/// is a raw frame no provider route uses, so it is skipped.
+fn raw_message(message: Message) -> Option<RawMessage> {
+    match message {
+        Message::Text(text) => Some(RawMessage::Text(text.to_string())),
+        Message::Binary(bytes) => Some(RawMessage::Binary(bytes.to_vec())),
+        Message::Ping(payload) => Some(RawMessage::Ping(payload.to_vec())),
+        Message::Pong(_) => Some(RawMessage::Pong),
+        Message::Close(_) => Some(RawMessage::Close),
+        Message::Frame(_) => None,
     }
 }
 
@@ -266,5 +425,100 @@ mod tests {
             WsConnectError::Failed("class".to_string()).to_string(),
             "class"
         );
+    }
+
+    /// One step of the scripted raw channel below.
+    enum Step {
+        Message(RawMessage),
+        Wait(Duration),
+    }
+
+    /// The WS test double for the bounded read: a scripted raw channel that drives
+    /// the crate's REAL `read_bounded`, so a test exercises the production clock.
+    struct Scripted {
+        steps: std::collections::VecDeque<Step>,
+    }
+
+    impl Scripted {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: steps.into(),
+            }
+        }
+    }
+
+    impl MessageChannel for Scripted {
+        fn next_message(&mut self) -> BoxFuture<'_, Result<Option<RawMessage>, WsError>> {
+            Box::pin(async move {
+                loop {
+                    match self.steps.pop_front() {
+                        Some(Step::Message(message)) => return Ok(Some(message)),
+                        Some(Step::Wait(delay)) => tokio::time::sleep(delay).await,
+                        None => return Ok(None),
+                    }
+                }
+            })
+        }
+
+        fn pong(&mut self, _payload: Vec<u8>) -> BoxFuture<'_, Result<(), WsError>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    /// Issue #164: a peer that keeps the socket alive with CONTROL pings is not
+    /// idle — every message resets the clock — so 20 minutes of pings then a text
+    /// frame completes instead of being failed as silent.
+    #[tokio::test(start_paused = true)]
+    async fn a_control_ping_resets_the_idle_clock() {
+        let mut steps = Vec::new();
+        for _ in 0..6 {
+            steps.push(Step::Message(RawMessage::Ping(Vec::new())));
+            steps.push(Step::Wait(Duration::from_secs(200)));
+        }
+        steps.push(Step::Message(RawMessage::Text("done".to_string())));
+        let mut channel = Scripted::new(steps);
+        let mut awaiting_first_frame = true;
+
+        let start = tokio::time::Instant::now();
+        let next = tokio::time::timeout(
+            Duration::from_secs(1201),
+            read_bounded(&mut channel, &mut awaiting_first_frame),
+        )
+        .await
+        .expect("control pings must keep the stream alive, not hang CI");
+        assert_eq!(next.unwrap(), WsNext::Text("done".to_string()));
+        assert_eq!(start.elapsed(), Duration::from_secs(1200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_past_the_idle_bound_is_a_timeout() {
+        let mut channel = Scripted::new(vec![Step::Wait(Duration::from_secs(3600))]);
+        let mut awaiting_first_frame = false;
+
+        let start = tokio::time::Instant::now();
+        let next = tokio::time::timeout(
+            Duration::from_secs(301),
+            read_bounded(&mut channel, &mut awaiting_first_frame),
+        )
+        .await
+        .expect("the idle bound must end the wait, not hang CI");
+        assert_eq!(next.unwrap(), WsNext::Timeout(WsBound::Idle));
+        assert_eq!(start.elapsed(), STREAM_IDLE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_first_frame_past_the_first_byte_bound_is_a_timeout() {
+        let mut channel = Scripted::new(vec![Step::Wait(Duration::from_secs(3600))]);
+        let mut awaiting_first_frame = true;
+
+        let start = tokio::time::Instant::now();
+        let next = tokio::time::timeout(
+            Duration::from_secs(121),
+            read_bounded(&mut channel, &mut awaiting_first_frame),
+        )
+        .await
+        .expect("the first-frame bound must end the wait, not hang CI");
+        assert_eq!(next.unwrap(), WsNext::Timeout(WsBound::FirstFrame));
+        assert_eq!(start.elapsed(), FIRST_BYTE_TIMEOUT);
     }
 }

@@ -18,12 +18,14 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use p1_contracts::{
-    CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream, StreamEvent,
+    BoxFuture, CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream,
+    StreamEvent,
 };
 
 use crate::credential::{Credential, CredentialSource};
 use crate::http::{
-    ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, STREAM_IDLE_TIMEOUT, Transport, TransportError,
+    ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, HttpResponse, STREAM_IDLE_TIMEOUT, Transport,
+    TransportError, first_byte_timeout_message,
 };
 use crate::retry::{HttpClass, RetryPolicy, classify_status, retry_after};
 use crate::sse::{SseDecoder, SseEvent};
@@ -81,8 +83,20 @@ pub fn drive(request: DriveRequest) -> ProviderStream {
 enum Phase {
     /// Fetch the credential for the next attempt.
     NeedCredential,
-    /// Build and send the request, then either start reading or apply policy.
+    /// Build and send the request.
     Post,
+    /// The request is in flight: await the response under the first-byte bound,
+    /// after telling the operator once that the provider has not answered yet. The
+    /// in-flight future is held here so a poll can yield the note and resume the
+    /// same request.
+    Posting {
+        parser: Box<dyn ResponseParser>,
+        post: BoxFuture<'static, Result<HttpResponse, TransportError>>,
+        /// Whether the "still waiting" notice has already been emitted.
+        notified: bool,
+        /// When the first-byte bound expires.
+        deadline: tokio::time::Instant,
+    },
     /// Read the streaming body of a 2xx response.
     Read {
         parser: Box<dyn ResponseParser>,
@@ -170,6 +184,12 @@ async fn step(mut state: State) -> (Option<StreamEvent>, State) {
             Phase::Done => return (None, state),
             Phase::NeedCredential => obtain_credential(state).await,
             Phase::Post => post_once(state).await,
+            Phase::Posting {
+                parser,
+                post,
+                notified,
+                deadline,
+            } => await_post(state, parser, post, notified, deadline).await,
             Phase::Read {
                 parser,
                 decoder,
@@ -197,6 +217,9 @@ async fn obtain_credential(mut state: State) -> State {
     }
 }
 
+/// Build the attempt's request and start the post. The in-flight future owns a
+/// clone of the transport, so the state machine can hold it across the "still
+/// waiting" note without borrowing `state`.
 async fn post_once(mut state: State) -> State {
     if state.request.cancel.is_cancelled() {
         return state.finish(Outcome::Cancelled);
@@ -208,31 +231,88 @@ async fn post_once(mut state: State) -> State {
         .expect("a credential is obtained before the first attempt");
     let request = (state.request.build)(&credential);
     let transport = state.request.transport.clone();
-    let cancel = state.request.cancel.clone();
-    let response =
-        match race_bounded(cancel.clone(), FIRST_BYTE_TIMEOUT, transport.post(request)).await {
-            Raced::Cancelled => return state.finish(Outcome::Cancelled),
-            // The provider never answered: the first-byte bound is the one thing that
-            // ends the wait, as a Named Transport failure the retry policy owns.
-            Raced::Done(Err(_elapsed)) => {
-                let error = ProviderError::new(
-                    ProviderErrorKind::Transport,
-                    format!("no response within {} s", FIRST_BYTE_TIMEOUT.as_secs()),
-                );
-                return state.transient_or_fail(error, None, None);
-            }
-            Raced::Done(Ok(Err(error))) => {
-                let error = ProviderError::new(
-                    ProviderErrorKind::Transport,
-                    format!("request failed: {}", error.0),
-                );
-                return state.transient_or_fail(error, None, None);
-            }
-            Raced::Done(Ok(Ok(response))) => response,
-        };
+    let post: BoxFuture<'static, Result<HttpResponse, TransportError>> =
+        Box::pin(async move { transport.post(request).await });
+    state.phase = Phase::Posting {
+        parser,
+        post,
+        notified: false,
+        deadline: tokio::time::Instant::now() + FIRST_BYTE_TIMEOUT,
+    };
+    state
+}
 
+/// Await the in-flight post. It ends on the response, on cancellation, on the
+/// first-byte bound, or — once — on the grace timer that tells the operator the
+/// provider has not answered yet; the last case yields a `Notice` and keeps the
+/// same request in flight.
+async fn await_post(
+    mut state: State,
+    parser: Box<dyn ResponseParser>,
+    mut post: BoxFuture<'static, Result<HttpResponse, TransportError>>,
+    notified: bool,
+    deadline: tokio::time::Instant,
+) -> State {
+    let cancel = state.request.cancel.clone();
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return first_byte_timeout(state);
+    }
+    // The note fires once, after the grace delay; after that only the bound remains.
+    let wake = if notified {
+        deadline
+    } else {
+        (now + WAITING_NOTE_AFTER).min(deadline)
+    };
+    let outcome = race(cancel, tokio::time::timeout(wake - now, post.as_mut())).await;
+    match outcome {
+        Raced::Cancelled => state.finish(Outcome::Cancelled),
+        Raced::Done(Ok(Err(error))) => {
+            let error = ProviderError::new(
+                ProviderErrorKind::Transport,
+                format!("request failed: {}", error.0),
+            );
+            state.transient_or_fail(error, None, None)
+        }
+        Raced::Done(Ok(Ok(response))) => on_response(state, parser, response).await,
+        Raced::Done(Err(_elapsed)) => {
+            if tokio::time::Instant::now() >= deadline {
+                first_byte_timeout(state)
+            } else {
+                state.pending.push_back(StreamEvent::Notice {
+                    text: format!(
+                        "waiting for the provider ({} s)",
+                        WAITING_NOTE_AFTER.as_secs()
+                    ),
+                });
+                state.phase = Phase::Posting {
+                    parser,
+                    post,
+                    notified: true,
+                    deadline,
+                };
+                state
+            }
+        }
+    }
+}
+
+/// The first-byte bound expired: the provider never answered, as a named Transport
+/// failure the retry policy owns.
+fn first_byte_timeout(state: State) -> State {
+    let error = ProviderError::new(ProviderErrorKind::Transport, first_byte_timeout_message());
+    state.transient_or_fail(error, None, None)
+}
+
+/// Apply the status policy to one response, exactly as the driver always has.
+async fn on_response(
+    mut state: State,
+    parser: Box<dyn ResponseParser>,
+    response: HttpResponse,
+) -> State {
     let status = response.status;
     let headers = response.headers;
+    let cancel = state.request.cancel.clone();
     match classify_status(status) {
         HttpClass::Success => {
             state.visible = false;
@@ -286,7 +366,10 @@ async fn post_once(mut state: State) -> State {
             }
             state.reauth_used = true;
             let credentials = state.request.credentials.clone();
-            let rejected = credential;
+            let rejected = state
+                .credential
+                .clone()
+                .expect("a credential is obtained before the first attempt");
             let cancel = state.request.cancel.clone();
             match race(cancel, credentials.refresh(&rejected)).await {
                 Raced::Cancelled => state.finish(Outcome::Cancelled),
@@ -438,6 +521,12 @@ fn format_delay(delay: Duration) -> String {
 
 const ERROR_BODY_LIMIT: usize = 64 * 1024;
 
+/// How long the first-byte wait runs before it tells the operator, once, that the
+/// provider has not answered yet. Issue #164 wanted a note while waiting, and 30 s
+/// is late enough to be a real wait and early enough to be seen. The request is NOT
+/// aborted; it still ends at [`FIRST_BYTE_TIMEOUT`].
+const WAITING_NOTE_AFTER: Duration = Duration::from_secs(30);
+
 fn is_visible(event: &StreamEvent) -> bool {
     matches!(
         event,
@@ -461,17 +550,6 @@ async fn race<T>(cancel: CancellationToken, future: impl Future<Output = T>) -> 
         Either::Left((value, _)) => Raced::Done(value),
         Either::Right(((), _)) => Raced::Cancelled,
     }
-}
-
-/// Await `future` under `bound` and under cancellation. A wait with no bound is the
-/// bug this closes: the SSE path had a connect timeout and nothing else, so a
-/// provider that never answered hung the agent silently (issue #164).
-async fn race_bounded<T>(
-    cancel: CancellationToken,
-    bound: Duration,
-    future: impl Future<Output = T>,
-) -> Raced<Result<T, tokio::time::error::Elapsed>> {
-    race(cancel, tokio::time::timeout(bound, future)).await
 }
 
 /// The next body chunk, bounded by the stream-idle bound and by cancellation. Any
@@ -817,6 +895,32 @@ mod tests {
                     status: 200,
                     headers: Vec::new(),
                     body: Box::pin(stream),
+                })
+            })
+        }
+    }
+
+    /// A transport whose headers arrive only after `after`. On the paused clock the
+    /// delay is virtual, so no test ever sleeps.
+    struct SlowServer {
+        after: Duration,
+    }
+
+    impl Transport for SlowServer {
+        fn post<'a>(
+            &'a self,
+            _request: HttpRequest,
+        ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+            let after = self.after;
+            Box::pin(async move {
+                tokio::time::sleep(after).await;
+                let body = futures_util::stream::iter(vec![Ok::<_, TransportError>(
+                    text_turn().as_bytes().to_vec(),
+                )]);
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Box::pin(body),
                 })
             })
         }
@@ -1387,7 +1491,10 @@ mod tests {
             },
         );
         let start = tokio::time::Instant::now();
-        let events = collect(stream).await;
+        let events =
+            tokio::time::timeout(FIRST_BYTE_TIMEOUT + Duration::from_secs(1), collect(stream))
+                .await
+                .expect("the first-byte bound must end the wait, not hang CI");
 
         let error = match terminal(&events) {
             Outcome::Failed(error) => error.clone(),
@@ -1405,15 +1512,70 @@ mod tests {
         );
     }
 
+    /// Issue #164's "transcript note while waiting": the first-byte wait says so
+    /// ONCE, after the grace delay, without aborting the request — the response
+    /// still arrives under the bound.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_byte_wait_tells_the_operator_once_after_thirty_seconds() {
+        let stream = drive_with(
+            Arc::new(SlowServer {
+                after: Duration::from_secs(60),
+            }),
+            RetryPolicy::default(),
+        );
+        let start = tokio::time::Instant::now();
+        let mut stream = stream;
+
+        let first =
+            tokio::time::timeout(WAITING_NOTE_AFTER + Duration::from_secs(1), stream.next())
+                .await
+                .expect("the waiting note is due before the bound")
+                .expect("an event");
+        assert!(
+            matches!(first, StreamEvent::Notice { ref text }
+                if text == &format!("waiting for the provider ({} s)", WAITING_NOTE_AFTER.as_secs())),
+            "{first:?}"
+        );
+        assert_eq!(
+            start.elapsed(),
+            WAITING_NOTE_AFTER,
+            "the note comes at the grace delay"
+        );
+
+        let rest = tokio::time::timeout(Duration::from_secs(61), collect(stream))
+            .await
+            .expect("the response arrives under the bound");
+        assert!(matches!(terminal(&rest), Outcome::Completed(_)));
+        assert_eq!(
+            rest.iter()
+                .filter(|event| matches!(event, StreamEvent::Notice { .. }))
+                .count(),
+            0,
+            "the note is emitted once: {rest:?}"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(60),
+            "the response at 60 s"
+        );
+    }
+
     /// The same wait under the default policy: it is a `Transport` failure, so it
-    /// retries `max_retries` (3) times with a notice per retry, then fails. This is
+    /// retries `max_retries` (3) times with a retry notice each, then fails. This is
     /// what the operator sees while a silent provider is given its chances.
     #[tokio::test(start_paused = true)]
     async fn a_first_byte_timeout_retries_within_the_budget_then_fails_transport() {
         let server = SilentServer::default();
         let stream = drive_with(Arc::new(server.clone()), RetryPolicy::default());
         let start = tokio::time::Instant::now();
-        let events = collect(stream).await;
+        let policy = RetryPolicy::default();
+        let bound = 4 * FIRST_BYTE_TIMEOUT
+            + policy.delay(1, None)
+            + policy.delay(2, None)
+            + policy.delay(3, None);
+        let events = tokio::time::timeout(bound + Duration::from_secs(1), collect(stream))
+            .await
+            .expect("the retry budget must end the wait, not hang CI");
 
         assert_eq!(
             server.posts.load(Ordering::SeqCst),
@@ -1424,18 +1586,25 @@ mod tests {
             terminal(&events),
             Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport
         ));
-        let notices = events
+        let retry_notices = events
             .iter()
-            .filter(|event| matches!(event, StreamEvent::Notice { .. }))
+            .filter(|event| {
+                matches!(event, StreamEvent::Notice { text }
+                    if text.starts_with("provider request failed"))
+            })
             .count();
-        assert_eq!(notices, 3, "one notice per retry");
-        let policy = RetryPolicy::default();
+        assert_eq!(retry_notices, 3, "one retry notice per retry");
+        let waiting_notes = events
+            .iter()
+            .filter(|event| {
+                matches!(event, StreamEvent::Notice { text }
+                    if text.starts_with("waiting for the provider"))
+            })
+            .count();
+        assert_eq!(waiting_notes, 4, "one waiting note per bounded attempt");
         assert_eq!(
             start.elapsed(),
-            4 * FIRST_BYTE_TIMEOUT
-                + policy.delay(1, None)
-                + policy.delay(2, None)
-                + policy.delay(3, None),
+            bound,
             "four bounded attempts, the retry policy's backoff between them"
         );
     }
@@ -1453,7 +1622,12 @@ mod tests {
         };
         let harness = Harness::new(vec![stalling]);
         let start = tokio::time::Instant::now();
-        let events = collect(harness.start()).await;
+        let events = tokio::time::timeout(
+            STREAM_IDLE_TIMEOUT + Duration::from_secs(1),
+            collect(harness.start()),
+        )
+        .await
+        .expect("the idle bound must end the wait, not hang CI");
 
         assert_eq!(
             harness.transport.requests().len(),
@@ -1493,21 +1667,21 @@ mod tests {
         };
         let harness = Harness::new(vec![stalled(), stalled(), stalled(), stalled()]);
         let start = tokio::time::Instant::now();
-        let events = collect(harness.start()).await;
+        let policy = RetryPolicy::default();
+        let bound = 4 * STREAM_IDLE_TIMEOUT
+            + policy.delay(1, None)
+            + policy.delay(2, None)
+            + policy.delay(3, None);
+        let events = tokio::time::timeout(bound + Duration::from_secs(1), collect(harness.start()))
+            .await
+            .expect("a stalled error body must not hang CI");
 
         assert_eq!(harness.transport.requests().len(), 4);
         assert!(matches!(
             terminal(&events),
             Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport
         ));
-        let policy = RetryPolicy::default();
-        assert_eq!(
-            start.elapsed(),
-            4 * STREAM_IDLE_TIMEOUT
-                + policy.delay(1, None)
-                + policy.delay(2, None)
-                + policy.delay(3, None)
-        );
+        assert_eq!(start.elapsed(), bound);
     }
 
     /// A keep-alive ping (an SSE comment) inside the idle bound keeps the stream
@@ -1522,7 +1696,9 @@ mod tests {
             RetryPolicy::default(),
         );
         let start = tokio::time::Instant::now();
-        let events = collect(stream).await;
+        let events = tokio::time::timeout(Duration::from_secs(1201), collect(stream))
+            .await
+            .expect("keep-alive pings must not be called idle, and must not hang CI");
 
         assert!(
             matches!(terminal(&events), Outcome::Completed(_)),

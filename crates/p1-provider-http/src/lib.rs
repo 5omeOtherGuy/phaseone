@@ -6,8 +6,9 @@
 //! an adapter supplies a request builder and a [`ResponseParser`], and this crate
 //! owns the policy that is identical across routes — one credential refresh per
 //! request, one shared transient-retry budget, bounded backoff that races
-//! cancellation, and the rule that a stream is never retried after any output has
-//! been forwarded.
+//! cancellation, the first-byte and stream-idle read bounds ([`FIRST_BYTE_TIMEOUT`]
+//! 120 s, [`STREAM_IDLE_TIMEOUT`] 300 s) that end a provider which never answers,
+//! and the rule that a stream is never retried after any output has been forwarded.
 //!
 //! The authoritative spec is `docs/design/providers.md`. The five stream rules
 //! the returned stream obeys are at the top of `p1-contracts/src/provider.rs`.
