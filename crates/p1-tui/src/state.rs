@@ -182,11 +182,20 @@ pub struct Composer {
     pub revealed: bool,
     /// While `^G` edits the goal: the text the composer held before, which `esc` restores.
     pub goal_edit: Option<String>,
+    #[doc(hidden)]
+    pub history: Vec<String>,
+    #[doc(hidden)]
+    pub history_cursor: Option<usize>,
 }
 
+// Prompt-history behavior is adapted from `iris-donor/src/ui/tui/screen.rs`
+// (`submit` and the prompt-history methods) and
+// `iris-donor/src/ui/tui_loop.rs` (`prompt_history_key`) at
+// 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT).
 impl Composer {
     /// `^G`: put `/goal <current goal>` in the composer, cursor at the end (handoff §8.4).
     pub fn begin_goal_edit(&mut self, goal: Option<&str>) {
+        self.history_cursor = None;
         if self.goal_edit.is_none() {
             self.goal_edit = Some(std::mem::take(&mut self.text));
         }
@@ -197,6 +206,7 @@ impl Composer {
 
     /// `esc` during a goal edit: the previous composer text comes back.
     pub fn keep(&mut self) {
+        self.history_cursor = None;
         if let Some(previous) = self.goal_edit.take() {
             self.cursor = previous.chars().count();
             self.revealed = !previous.is_empty();
@@ -209,6 +219,7 @@ impl Composer {
     }
 
     pub fn insert(&mut self, ch: char) {
+        self.history_cursor = None;
         let byte = self.byte_index();
         self.text.insert(byte, ch);
         self.cursor += 1;
@@ -216,6 +227,7 @@ impl Composer {
     }
 
     pub fn backspace(&mut self) {
+        self.history_cursor = None;
         if self.cursor == 0 {
             return;
         }
@@ -230,10 +242,12 @@ impl Composer {
     }
 
     pub fn left(&mut self) {
+        self.history_cursor = None;
         self.cursor = self.cursor.saturating_sub(1);
     }
 
     pub fn right(&mut self) {
+        self.history_cursor = None;
         if self.cursor < self.text.chars().count() {
             self.cursor += 1;
         }
@@ -243,7 +257,52 @@ impl Composer {
         self.cursor = 0;
         self.revealed = false;
         self.goal_edit = None;
-        std::mem::take(&mut self.text)
+        self.history_cursor = None;
+        let text = std::mem::take(&mut self.text);
+        if !text.trim().is_empty() && self.history.last() != Some(&text) {
+            self.history.push(text.clone());
+        }
+        text
+    }
+
+    pub fn history_prev(&mut self) -> bool {
+        let Some(next) = self
+            .history_cursor
+            .map(|cursor| cursor.saturating_sub(1))
+            .or_else(|| self.history.len().checked_sub(1))
+        else {
+            return false;
+        };
+        if self.history_cursor == Some(0) {
+            return false;
+        }
+        self.history_cursor = Some(next);
+        self.text = self.history[next].clone();
+        self.cursor = self.text.chars().count();
+        self.revealed = true;
+        true
+    }
+
+    pub fn history_next(&mut self) -> bool {
+        let Some(cursor) = self.history_cursor else {
+            return false;
+        };
+        if cursor + 1 >= self.history.len() {
+            self.history_cursor = None;
+            self.text.clear();
+            self.cursor = 0;
+            self.revealed = false;
+            return true;
+        }
+        self.history_cursor = Some(cursor + 1);
+        self.text = self.history[cursor + 1].clone();
+        self.cursor = self.text.chars().count();
+        self.revealed = true;
+        true
+    }
+
+    pub fn browsing_history(&self) -> bool {
+        self.history_cursor.is_some()
     }
 
     /// Whether the composer occupies rows right now: always outside focus
@@ -740,6 +799,16 @@ impl Screen {
             V::DetachWorker => self.detach_worker(),
             V::EditGoal => self.edit_goal(),
             V::KeepComposer => self.composer.keep(),
+            V::HistoryPrev => {
+                if self.working.is_none() {
+                    self.composer.history_prev();
+                }
+            }
+            V::HistoryNext => {
+                if self.working.is_none() {
+                    self.composer.history_next();
+                }
+            }
             V::ToggleReview => self.toggle_review(),
             V::ReviewFile(delta) => self.review_file(delta),
             V::ReviewPage(pages) => self.review_page(pages),
@@ -1077,6 +1146,124 @@ mod tests {
         assert_eq!(s.folds.len(), 1, "only the folded output has a handle");
         assert_eq!((s.folds[0].kind.as_str(), s.folds[0].lines), ("shell", 60));
         assert_eq!(s.ledger().folds, s.folds);
+    }
+
+    #[test]
+    fn taking_composer_text_records_history_and_resets_the_editor() {
+        let mut composer = Composer::default();
+        composer.insert('a');
+        composer.insert('b');
+
+        assert_eq!(composer.take(), "ab");
+        assert_eq!(
+            (composer.text.as_str(), composer.cursor, composer.revealed),
+            ("", 0, false)
+        );
+        assert_eq!(composer.history, ["ab"]);
+    }
+
+    #[test]
+    fn taking_skips_blank_and_consecutive_duplicate_history() {
+        let mut composer = Composer::default();
+        for text in ["same", "same", " ", "\n"] {
+            composer.text = text.into();
+            assert_eq!(composer.take(), text);
+        }
+
+        assert_eq!(composer.history, ["same"]);
+    }
+
+    #[test]
+    fn history_previous_walks_back_and_stops_at_the_oldest_entry() {
+        let mut composer = Composer::default();
+        for text in ["one", "two"] {
+            composer.text = text.into();
+            composer.take();
+        }
+
+        assert!(composer.history_prev());
+        assert_eq!((composer.text.as_str(), composer.cursor), ("two", 3));
+        assert!(composer.revealed);
+        assert!(composer.browsing_history());
+        assert!(composer.history_prev());
+        assert_eq!((composer.text.as_str(), composer.cursor), ("one", 3));
+        assert!(!composer.history_prev());
+        assert_eq!((composer.text.as_str(), composer.cursor), ("one", 3));
+    }
+
+    #[test]
+    fn history_next_walks_forward_to_an_empty_undisclosed_editor() {
+        let mut composer = Composer::default();
+        for text in ["one", "two"] {
+            composer.text = text.into();
+            composer.take();
+        }
+        composer.history_prev();
+        composer.history_prev();
+
+        assert!(composer.history_next());
+        assert_eq!((composer.text.as_str(), composer.cursor), ("two", 3));
+        assert!(composer.history_next());
+        assert_eq!(
+            (composer.text.as_str(), composer.cursor, composer.revealed),
+            ("", 0, false)
+        );
+        assert!(!composer.browsing_history());
+        assert!(!composer.history_next());
+        assert_eq!(composer.text, "");
+    }
+
+    #[test]
+    fn each_composer_edit_after_recall_ends_history_browsing() {
+        let check = |edit: fn(&mut Composer), expected: &str, cursor: usize| {
+            let mut composer = Composer {
+                text: "two".into(),
+                ..Composer::default()
+            };
+            composer.take();
+            assert!(composer.history_prev());
+
+            edit(&mut composer);
+
+            assert_eq!(
+                (composer.text.as_str(), composer.cursor),
+                (expected, cursor)
+            );
+            assert!(!composer.browsing_history());
+            assert!(!composer.history_next());
+            assert_eq!(composer.text, expected);
+        };
+        check(|composer| composer.insert('!'), "two!", 4);
+        check(Composer::backspace, "tw", 2);
+        check(Composer::left, "two", 2);
+        check(Composer::right, "two", 3);
+    }
+
+    #[test]
+    fn history_recall_preserves_multiline_text_and_sets_the_end_cursor() {
+        let mut composer = Composer {
+            text: "a\nb".into(),
+            ..Composer::default()
+        };
+        composer.take();
+
+        assert!(composer.history_prev());
+        assert_eq!((composer.text.as_str(), composer.cursor), ("a\nb", 3));
+    }
+
+    #[test]
+    fn history_recall_reveals_the_focus_mode_composer() {
+        let mut screen = Screen {
+            focus_explicit: Some(true),
+            ..Screen::default()
+        };
+        screen.composer.text = "one".into();
+        screen.composer.take();
+
+        screen.apply_view(crate::input::ViewCommand::HistoryPrev);
+
+        assert_eq!(screen.composer.text, "one");
+        assert!(screen.composer.visible(true));
     }
 
     #[test]

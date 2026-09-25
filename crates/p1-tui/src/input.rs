@@ -93,6 +93,12 @@ pub enum ViewCommand {
     EditGoal,
     /// `esc` during a goal edit: the previous composer text comes back.
     KeepComposer,
+    // History key selection is adapted from
+    // `iris-donor/src/ui/tui_loop.rs` (`prompt_history_key`) at
+    // 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT).
+    /// `Up` / `Down` recall submitted prompts while idle.
+    HistoryPrev,
+    HistoryNext,
     /// `^D` on a diff decision.
     ToggleReview,
     /// `tab` / `⇧tab` in the full review.
@@ -267,6 +273,18 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
         }
         (KeyCode::Up, false, false) if screen.pane_focused => Some(C(Command::PaneUp)),
         (KeyCode::Down, false, false) if screen.pane_focused => Some(C(Command::PaneDown)),
+        (KeyCode::Up, false, false)
+            if !screen.composer.history.is_empty()
+                && screen.working.is_none()
+                && (screen.composer.text.is_empty() || screen.composer.browsing_history()) =>
+        {
+            Some(V(ViewCommand::HistoryPrev))
+        }
+        (KeyCode::Down, false, false)
+            if screen.working.is_none() && screen.composer.browsing_history() =>
+        {
+            Some(V(ViewCommand::HistoryNext))
+        }
         (KeyCode::Char('/'), false, false) if screen.composer.text.is_empty() => {
             Some(V(ViewCommand::OpenCompletion))
         }
@@ -531,6 +549,57 @@ mod tests {
             view(ViewCommand::ReviewPage(-1))
         );
         assert_eq!(decide(&s, ctrl('d')), view(ViewCommand::ToggleReview));
+    }
+
+    #[test]
+    fn history_arrows_recall_only_an_empty_idle_composer() {
+        let mut s = Screen::default();
+        assert_eq!(decide(&s, key(KeyCode::Up)), None);
+        s.composer.text = "one".into();
+        s.composer.take();
+        assert_eq!(decide(&s, key(KeyCode::Down)), None);
+        assert_eq!(decide(&s, key(KeyCode::Up)), view(ViewCommand::HistoryPrev));
+        s.apply_view(ViewCommand::HistoryPrev);
+        assert_eq!(decide(&s, key(KeyCode::Up)), view(ViewCommand::HistoryPrev));
+        assert_eq!(
+            decide(&s, key(KeyCode::Down)),
+            view(ViewCommand::HistoryNext)
+        );
+
+        s.composer.text = "draft".into();
+        s.composer.take();
+        s.composer.text = "draft".into();
+        assert_eq!(decide(&s, key(KeyCode::Up)), None);
+        s.working = working();
+        assert_eq!(decide(&s, key(KeyCode::Up)), None);
+        assert_eq!(decide(&s, key(KeyCode::Down)), None);
+    }
+
+    #[test]
+    fn history_recall_keeps_pane_picker_and_approval_precedence() {
+        let mut s = Screen {
+            pane_focused: true,
+            ..Screen::default()
+        };
+        s.composer.text = "one".into();
+        s.composer.take();
+        assert_eq!(decide(&s, key(KeyCode::Up)), command(Command::PaneUp));
+        assert_eq!(decide(&s, key(KeyCode::Down)), command(Command::PaneDown));
+
+        s.picker = menu();
+        assert_eq!(decide(&s, key(KeyCode::Up)), command(Command::PickerUp));
+        assert_eq!(decide(&s, key(KeyCode::Down)), command(Command::PickerDown));
+        s.picker = None;
+        s.approval = permission_approval();
+        assert_eq!(
+            decide(&s, key(KeyCode::Up)),
+            None,
+            "the approval remains modal"
+        );
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('y'))),
+            command(Command::ApproveOnce)
+        );
     }
 
     #[test]
