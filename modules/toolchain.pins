@@ -1,13 +1,16 @@
 # Module toolchain pins, read line by line by scripts/module-toolchain.sh (never sourced).
 # Format: KEY=value; blank lines and lines starting with # are ignored.
 
-# 1.82.0 is the first stable Rust that ships wasm32-wasip2 as a tier 2 target;
-# older toolchains cannot build the module packages at all.
-RUST_MIN=1.82.0
+# 1.96.0 is the rust-version of wasmtime 49, the host runtime pinned below; it is also past
+# 1.82.0, the first stable Rust that ships wasm32-wasip2 as a tier 2 target.
+RUST_MIN=1.96.0
 WASM_TARGET=wasm32-wasip2
 
-# Pinned by slice S0.2 once the dependency question Q7 is answered:
-# WASMTIME=<version of the wasmtime crate in Cargo.lock>
-# WASMTIME_FEATURES=<comma-separated wasmtime features>
-# WIT_BINDGEN=<version of the wit-bindgen crate in Cargo.lock and modules/Cargo.lock>
-# WASM_TOOLS=<version printed by wasm-tools --version>
+# The bounded runtime dependency set (owner, Q7). WASMTIME is checked against Cargo.lock,
+# WASMTIME_FEATURES (as a set) against crates/p1-module-runtime/Cargo.toml, WIT_BINDGEN
+# against modules/Cargo.lock (it is a guest-side crate) and WASM_TOOLS against
+# `wasm-tools --version`.
+WASMTIME=49.0.1
+WASMTIME_FEATURES=runtime,cranelift,component-model,async,std
+WIT_BINDGEN=0.62.0
+WASM_TOOLS=1.259.0
