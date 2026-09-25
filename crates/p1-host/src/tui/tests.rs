@@ -893,21 +893,59 @@ fn a_worker_row_without_response_events_keeps_its_metrics_unknown() {
 }
 
 #[test]
-fn elapsed_text_formats_live_time_freezes_the_final_time_and_knows_never_running() {
-    let start = std::time::Instant::now();
-    let elapsed = std::time::Duration::from_secs(252);
+fn worker_clocks_restart_after_continue_and_freeze_once_settled() {
+    let t = std::time::Instant::now();
+    let mut clocks = WorkerClocks::default();
+
+    assert_eq!(clocks.observe("w1", true, t).as_deref(), Some("0m00s"));
     assert_eq!(
-        elapsed_text(start + elapsed, Some(start), None).as_deref(),
+        clocks
+            .observe("w1", true, t + std::time::Duration::from_secs(252))
+            .as_deref(),
         Some("4m12s")
     );
     assert_eq!(
-        elapsed_text(
-            start + std::time::Duration::from_secs(9_999),
-            None,
-            Some(elapsed)
-        )
-        .as_deref(),
-        Some("4m12s")
+        clocks
+            .observe("w1", false, t + std::time::Duration::from_secs(300))
+            .as_deref(),
+        Some("5m00s")
     );
-    assert_eq!(elapsed_text(start + elapsed, None, None), None);
+    assert_eq!(
+        clocks
+            .observe("w1", false, t + std::time::Duration::from_secs(9_999))
+            .as_deref(),
+        Some("5m00s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", true, t + std::time::Duration::from_secs(10_000))
+            .as_deref(),
+        Some("0m00s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", true, t + std::time::Duration::from_secs(10_030))
+            .as_deref(),
+        Some("0m30s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", false, t + std::time::Duration::from_secs(10_060))
+            .as_deref(),
+        Some("1m00s")
+    );
+    assert_eq!(
+        clocks
+            .observe("w1", false, t + std::time::Duration::from_secs(20_000))
+            .as_deref(),
+        Some("1m00s")
+    );
+    assert_eq!(
+        clocks.observe("w2", false, t + std::time::Duration::from_secs(5)),
+        None
+    );
+    assert_eq!(
+        clocks.observe("w2", false, t + std::time::Duration::from_secs(50)),
+        None
+    );
 }

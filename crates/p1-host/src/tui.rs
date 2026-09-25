@@ -750,11 +750,13 @@ impl Driver {
                     {
                         let cost = usage.and_then(|usage| usage.cost_micro_usd);
                         let worker_usage =
-                            self.worker_usage.entry(id.clone()).or_insert(WorkerUsage {
-                                model: model.clone(),
-                                tokens: None,
-                                cost_micro_usd: Some(0),
-                            });
+                            self.worker_usage
+                                .entry(id.clone())
+                                .or_insert_with(|| WorkerUsage {
+                                    model: String::new(),
+                                    tokens: None,
+                                    cost_micro_usd: Some(0),
+                                });
                         worker_usage.model = model.clone();
                         worker_usage.tokens = status::usage_input_total(usage.as_ref());
                         worker_usage.cost_micro_usd = match (worker_usage.cost_micro_usd, cost) {
@@ -1260,18 +1262,33 @@ where
     }
 }
 
-/// Format a worker's live or frozen elapsed time.
-fn elapsed_text(
-    now: std::time::Instant,
-    running_since: Option<std::time::Instant>,
-    frozen: Option<std::time::Duration>,
-) -> Option<String> {
-    frozen
-        .or_else(|| running_since.map(|since| now.saturating_duration_since(since)))
-        .map(|elapsed| {
-            let secs = elapsed.as_secs();
-            format!("{}m{:02}s", secs / 60, secs % 60)
-        })
+/// Worker run clocks, reset when a continued worker starts a new run.
+#[derive(Default)]
+struct WorkerClocks {
+    started: HashMap<String, std::time::Instant>,
+    frozen: HashMap<String, std::time::Duration>,
+}
+
+impl WorkerClocks {
+    fn observe(&mut self, id: &str, running: bool, now: std::time::Instant) -> Option<String> {
+        if running {
+            // worker_continue starts a new run under the same id, so reset its clock.
+            self.frozen.remove(id);
+            let since = *self.started.entry(id.to_string()).or_insert(now);
+            Some(clock_text(now.saturating_duration_since(since)))
+        } else {
+            if let Some(since) = self.started.remove(id) {
+                self.frozen
+                    .insert(id.to_string(), now.saturating_duration_since(since));
+            }
+            self.frozen.get(id).map(|elapsed| clock_text(*elapsed))
+        }
+    }
+}
+
+fn clock_text(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    format!("{}m{:02}s", secs / 60, secs % 60)
 }
 
 /// Poll the worker service into the shared snapshot the driver draws from.
@@ -1285,8 +1302,7 @@ fn spawn_worker_refresher(
     use p1_tui::render::workers::{BlockState, WorkerBlock};
     use p1_workers::ChildStatus;
     tokio::spawn(async move {
-        let mut started: HashMap<String, std::time::Instant> = HashMap::new();
-        let mut frozen: HashMap<String, std::time::Duration> = HashMap::new();
+        let mut clocks = WorkerClocks::default();
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1298,19 +1314,11 @@ fn spawn_worker_refresher(
             let mut next = Vec::with_capacity(list.len());
             for (id, status) in list {
                 let description = service.describe(&id).await.unwrap_or_default();
-                let now = std::time::Instant::now();
-                let running_since = match &status {
-                    ChildStatus::Running => Some(*started.entry(id.0.clone()).or_insert(now)),
-                    _ => {
-                        if let Some(since) = started.get(&id.0) {
-                            frozen
-                                .entry(id.0.clone())
-                                .or_insert_with(|| now.saturating_duration_since(*since));
-                        }
-                        None
-                    }
-                };
-                let elapsed = elapsed_text(now, running_since, frozen.get(&id.0).copied());
+                let elapsed = clocks.observe(
+                    &id.0,
+                    matches!(&status, ChildStatus::Running),
+                    std::time::Instant::now(),
+                );
                 let (state, activity) = match &status {
                     ChildStatus::Running => (BlockState::Running, String::new()),
                     ChildStatus::Finished(_) => (BlockState::Done, String::new()),
