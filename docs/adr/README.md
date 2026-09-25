@@ -83,6 +83,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0067 | [Zen free routes present the OpenCode client identity](0067-zen-free-routes-present-the-opencode-client-identity.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0068 | [Tool output is masked for credential shapes before history, journal and summaries](0068-tool-output-is-masked-for-credential-shapes-before-history-journal-and-summaries.md) | accepted | 2026-09-25 | lead |
 | ADR-0069 | [Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s](0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md) | proposed | 2026-09-25 | lead |
+| ADR-0070 | [A route may declare no credential for a proxy that injects it](0070-a-route-may-declare-no-credential-for-a-proxy-that-injects-it.md) | proposed | 2026-09-25 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

@@ -410,6 +410,25 @@ pub fn build_headers(
     credential: &p1_provider_http::Credential,
     body: &Value,
 ) -> Vec<(String, String)> {
+    headers(account, Some(credential), body)
+}
+
+/// The same header set for a route that sends NO credential (issue #134): an egress
+/// proxy injects the credential, so the request carries no `authorization` header.
+/// Everything else is byte for byte [`build_headers`]'s, because it is the same
+/// function.
+pub fn build_headers_without_credential(
+    account: MessagesAccount,
+    body: &Value,
+) -> Vec<(String, String)> {
+    headers(account, None, body)
+}
+
+fn headers(
+    account: MessagesAccount,
+    credential: Option<&p1_provider_http::Credential>,
+    body: &Value,
+) -> Vec<(String, String)> {
     let mut headers = vec![
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "text/event-stream".to_string()),
@@ -421,16 +440,20 @@ pub fn build_headers(
             "user-agent".to_string(),
             format!("p1/{}", env!("CARGO_PKG_VERSION")),
         ),
-        (
+    ];
+    if let Some(credential) = credential {
+        headers.push((
             "authorization".to_string(),
             format!("Bearer {}", credential.bearer),
-        ),
+        ));
+    }
+    headers.extend([
         (
             "anthropic-dangerous-direct-browser-access".to_string(),
             "true".to_string(),
         ),
         ("x-app".to_string(), "cli".to_string()),
-    ];
+    ]);
 
     let mut beta = account.base_beta().to_string();
     if body

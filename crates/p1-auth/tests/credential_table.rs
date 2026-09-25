@@ -9,7 +9,7 @@ fn spec(json: &str) -> Result<CredentialSpec, serde_json::Error> {
 }
 
 #[test]
-fn the_three_kinds_parse_by_their_route_file_spelling() {
+fn every_kind_parses_by_its_route_file_spelling() {
     for (text, kind, name) in [
         (
             r#"{"kind":"api-key","env":"A_KEY"}"#,
@@ -26,6 +26,8 @@ fn the_three_kinds_parse_by_their_route_file_spelling() {
             CredentialKind::CodexOauth,
             "codex-oauth",
         ),
+        // Issue #134: the route sends no credential; an egress proxy injects it.
+        (r#"{"kind":"none"}"#, CredentialKind::None, "none"),
     ] {
         let parsed = spec(text).expect("the table parses");
         assert_eq!(parsed.kind, kind);
@@ -38,7 +40,7 @@ fn the_three_kinds_parse_by_their_route_file_spelling() {
 fn an_unknown_kind_is_rejected_and_the_error_lists_the_known_ones() {
     let error = spec(r#"{"kind":"bearer-token"}"#).unwrap_err().to_string();
     assert!(error.contains("bearer-token"), "{error}");
-    for name in ["api-key", "claude-code-oauth", "codex-oauth"] {
+    for name in ["api-key", "claude-code-oauth", "codex-oauth", "none"] {
         assert!(error.contains(name), "{error}");
     }
 }
