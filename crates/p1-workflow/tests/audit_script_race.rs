@@ -14,7 +14,6 @@
 mod support;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use p1_workflow::{RunId, RunOutcome, RunReport, SchemaCheck, WorkflowSettings};
 use serde_json::{Value, json};
@@ -60,22 +59,24 @@ fn verdict(verdict: &str) -> p1_workflow::StepEnd {
     )
 }
 
-/// Waits for the first of two parked steps to be reached, lets go of both, and returns the
-/// finished report. Neither hold alone is certain to be the one that gets in first, and a
-/// racy script never reaches the other one at all, so this must not wait for both.
+/// Waits for the first of two parked steps to be reached, then for the sibling thunk to
+/// have settled its borrow — it reached the other parked step, or it failed (the engine
+/// reports that to the observer) — lets go of both, and returns the finished report. A
+/// racy script never reaches the other step, so this must not wait for both.
 async fn release_and_wait(
     harness: &Harness,
     id: &RunId,
     first: &Arc<Hold>,
     second: &Arc<Hold>,
 ) -> RunReport {
+    let other = tokio::select! {
+        _ = first.reached.notified() => second,
+        _ = second.reached.notified() => first,
+    };
     tokio::select! {
-        _ = first.reached.notified() => {}
-        _ = second.reached.notified() => {}
+        _ = other.reached.notified() => {}
+        _ = harness.recorder.thunk_failed.notified() => {}
     }
-    // The sibling thunk (already spawned) needs a moment to attempt its borrow; tokio's
-    // `time` feature is not on for this crate's tests, and nothing else is running yet.
-    std::thread::sleep(Duration::from_millis(200));
     first.release.notify_one();
     second.release.notify_one();
     harness.wait(id).await

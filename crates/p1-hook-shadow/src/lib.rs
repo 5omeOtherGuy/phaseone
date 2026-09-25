@@ -73,6 +73,7 @@ pub struct ShadowHook {
     binary: PathBuf,
     env: Arc<dyn Fn(&str) -> Option<OsString> + Send + Sync>,
     counter: AtomicU64,
+    outcomes: Option<mpsc::Sender<Outcome>>,
 }
 
 impl ShadowHook {
@@ -83,12 +84,27 @@ impl ShadowHook {
             binary,
             env,
             counter: AtomicU64::new(0),
+            outcomes: None,
         }
+    }
+
+    /// Hands every [`ShadowHook::observe`] outcome to `sender` instead of dropping it.
+    ///
+    /// For callers that only hold the hook through a composition root (the host's
+    /// tests): each outcome is sent before `observe` returns, so they can assert what
+    /// the hook decided and wait on a spawned child's exit, never on the clock. A
+    /// closed receiver is ignored; the observation stays fire-and-forget.
+    pub fn with_outcomes(mut self, sender: mpsc::Sender<Outcome>) -> Self {
+        self.outcomes = Some(sender);
+        self
     }
 
     /// Observes an event. All filesystem and process errors are intentionally ignored.
     pub fn observe(&self, event: ShadowEvent) {
-        let _ = self.observe_outcome(event);
+        let outcome = self.observe_outcome(event);
+        if let Some(sender) = &self.outcomes {
+            let _ = sender.send(outcome);
+        }
     }
 
     /// Observes an event like [`ShadowHook::observe`] and reports what the hook decided.
