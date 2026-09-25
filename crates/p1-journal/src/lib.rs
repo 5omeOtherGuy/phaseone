@@ -5,9 +5,12 @@
 //! meaningful boundary; a store only writes bytes and reads them back.
 //!
 //! Format: one `serde_json` [`JournalRecord`] per `\n`-terminated line, preceded by
-//! the header line `{"p1_journal":1}`. Every commit is ONE `write_all` of a complete
-//! line, so a crash leaves at most one partial last line — which [`load`] reports as
-//! a [`TruncatedTail`] instead of guessing.
+//! the header line `{"p1_journal":2}` (new files) or `{"p1_journal":1}` (files
+//! written by earlier builds, still read and appended to as version 1). Version 2
+//! also permits assembly identity lines `{"assembly":{...}}` between records. Every
+//! commit is ONE `write_all` of a complete line, so a crash leaves at most one
+//! partial last line — which [`load`] reports as a [`TruncatedTail`] instead of
+//! guessing.
 //!
 //! Invariants enforced here (see the tests):
 //! - a record is either completely in the file or not at all once `commit` returns
@@ -26,12 +29,80 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use p1_contracts::{BoxFuture, CommitError, CommitSink, JournalRecord};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The one header this format version writes.
-const HEADER_LINE: &[u8] = b"{\"p1_journal\":1}\n";
-/// The only accepted header version.
-const JOURNAL_VERSION: u64 = 1;
+/// The header every new file gets.
+const HEADER_LINE: &[u8] = b"{\"p1_journal\":2}\n";
+/// The version new files are written in; the only one that carries assembly lines.
+pub const JOURNAL_VERSION: u64 = 2;
+/// The format of the released binaries. Still read, and appended to without
+/// rewriting its header, so an old session stays readable by the old binaries.
+pub const JOURNAL_VERSION_1: u64 = 1;
+
+/// What executed the records that follow it: the environment, the host binary and
+/// every assembled module. `deny_unknown_fields` throughout, so extending this is
+/// a format version bump and never a field an older reader silently drops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssemblyIdentity {
+    pub environment: String,
+    pub host: HostIdentity,
+    pub modules: Vec<ModuleIdentity>,
+}
+
+/// The p1 binary that assembled the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostIdentity {
+    pub version: String,
+    pub commit: String,
+}
+
+/// One assembled module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleIdentity {
+    pub name: String,
+    pub kind: ModuleKind,
+    pub package: String,
+    pub version: String,
+    /// sha256 hex of the package bytes the loader verified; `None` for a native
+    /// module, whose code is identified by the host's commit instead.
+    pub digest: Option<String>,
+    pub abi: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleKind {
+    Tool,
+    Provider,
+    ContextPolicy,
+    AuthorizationPolicy,
+}
+
+/// An assembly identity as found in a journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssemblyEntry {
+    /// The seq of the first record after the line; equal to the record count when
+    /// the line follows the last record.
+    pub from_seq: u64,
+    pub identity: AssemblyIdentity,
+}
+
+/// The on-disk shape of an assembly line: the one key tells it apart from a
+/// record, and `deny_unknown_fields` keeps anything else from passing as one.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssemblyLine {
+    assembly: AssemblyIdentity,
+}
+
+#[derive(Serialize)]
+struct AssemblyLineRef<'a> {
+    assembly: &'a AssemblyIdentity,
+}
 
 /// How durable a store promises to be when `commit` returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +128,19 @@ pub enum JournalError {
     /// The header names a format version this build does not understand.
     #[error("unknown journal version; refusing to guess")]
     UnknownVersion,
+    /// A version-1 file holds an assembly identity line (physical 1-based line).
+    /// Version 1 has no such line kind, so the file was not written by a p1 that
+    /// kept it at version 1: refuse rather than guess which format it is.
+    #[error(
+        "assembly identity line at line {line} in a version-1 journal; only version 2 carries assembly lines"
+    )]
+    AssemblyInVersion1 { line: u64 },
+    /// `record_assembly` on a version-1 file: writing the line would make the file
+    /// unreadable as version 1, and its header is never rewritten.
+    #[error(
+        "cannot record an assembly identity in a version-1 journal; only version 2 carries assembly lines"
+    )]
+    AssemblyNeedsVersion2,
     /// `create` refuses to overwrite an existing session file.
     #[error("journal file already exists")]
     AlreadyExists,
@@ -95,12 +179,20 @@ pub struct Resumed {
     pub records: Vec<JournalRecord>,
     /// The incomplete last record that was cut off, if there was one.
     pub repaired_tail: Option<TruncatedTail>,
+    /// The header version the writer continues in (see [`Loaded::version`]).
+    pub version: u64,
+    pub assemblies: Vec<AssemblyEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Loaded {
     pub records: Vec<JournalRecord>,
     pub truncated_tail: Option<TruncatedTail>,
+    /// The header's version. A header torn by a crash reports [`JOURNAL_VERSION`],
+    /// the version the file is re-headed with once the tail is repaired.
+    pub version: u64,
+    /// Every assembly identity line, in file order.
+    pub assemblies: Vec<AssemblyEntry>,
 }
 
 // ------------------------------------------------------------------ memory
@@ -108,6 +200,7 @@ pub struct Loaded {
 #[derive(Debug, Default)]
 struct MemoryInner {
     records: Vec<JournalRecord>,
+    assemblies: Vec<AssemblyEntry>,
     next_seq: u64,
 }
 
@@ -136,13 +229,34 @@ impl MemoryJournal {
         }
         let next_seq = records.len() as u64;
         Ok(Self {
-            inner: Arc::new(Mutex::new(MemoryInner { records, next_seq })),
+            inner: Arc::new(Mutex::new(MemoryInner {
+                records,
+                assemblies: Vec::new(),
+                next_seq,
+            })),
         })
     }
 
     /// A snapshot of every record committed so far, in order.
     pub fn records(&self) -> Vec<JournalRecord> {
         self.inner.lock().unwrap().records.clone()
+    }
+
+    /// Record the assembly that executes the records committed after this call,
+    /// exactly as [`JsonlJournal::record_assembly`] does for a version-2 file.
+    pub fn record_assembly(&self, identity: &AssemblyIdentity) -> Result<(), JournalError> {
+        let mut inner = self.inner.lock().unwrap();
+        let from_seq = inner.next_seq;
+        inner.assemblies.push(AssemblyEntry {
+            from_seq,
+            identity: identity.clone(),
+        });
+        Ok(())
+    }
+
+    /// A snapshot of every assembly identity recorded so far, in order.
+    pub fn assemblies(&self) -> Vec<AssemblyEntry> {
+        self.inner.lock().unwrap().assemblies.clone()
     }
 }
 
@@ -180,6 +294,8 @@ struct JsonlInner {
     path: PathBuf,
     sync: SyncPolicy,
     next_seq: u64,
+    /// The file's header version; decides whether assembly lines may be written.
+    version: u64,
 }
 
 /// JSONL commit sink over one session file.
@@ -207,6 +323,7 @@ impl JsonlJournal {
             path: path.to_path_buf(),
             sync,
             next_seq: 0,
+            version: JOURNAL_VERSION,
         };
         write_header(&mut inner)?;
         Ok(Self {
@@ -240,6 +357,7 @@ impl JsonlJournal {
             path: path.to_path_buf(),
             sync,
             next_seq: loaded.records.len() as u64,
+            version: loaded.version,
         };
         if header_lost {
             write_header(&mut inner)?;
@@ -251,6 +369,8 @@ impl JsonlJournal {
             Resumed {
                 records: loaded.records,
                 repaired_tail: loaded.truncated_tail,
+                version: loaded.version,
+                assemblies: loaded.assemblies,
             },
         ))
     }
@@ -276,6 +396,7 @@ impl JsonlJournal {
         lock_or_err(&file)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(JournalError::from)?;
+        let mut version = JOURNAL_VERSION;
         if bytes.is_empty() {
             if next_seq != 0 {
                 return Err(JournalError::Corrupt { line: 1 });
@@ -295,12 +416,14 @@ impl JsonlJournal {
                     got: next_seq,
                 });
             }
+            version = loaded.version;
         }
         let mut inner = JsonlInner {
             file,
             path: path.to_path_buf(),
             sync,
             next_seq,
+            version,
         };
         if bytes.is_empty() {
             write_header(&mut inner)?;
@@ -308,6 +431,20 @@ impl JsonlJournal {
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
         })
+    }
+
+    /// Record the assembly that executes the records committed after this call.
+    /// Durable like a record commit under the store's [`SyncPolicy`]. Refused
+    /// ([`JournalError::AssemblyNeedsVersion2`]) on a version-1 file, whose header
+    /// is never rewritten.
+    pub fn record_assembly(&self, identity: &AssemblyIdentity) -> Result<(), JournalError> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.version != JOURNAL_VERSION {
+            return Err(JournalError::AssemblyNeedsVersion2);
+        }
+        let line = serde_json::to_vec(&AssemblyLineRef { assembly: identity })
+            .map_err(|error| JournalError::Io(error.to_string()))?;
+        write_line(&mut inner, line)
     }
 }
 
@@ -336,8 +473,13 @@ fn append_blocking(inner: &Mutex<JsonlInner>, record: &JournalRecord) -> Result<
             got: record.seq,
         });
     }
-    let mut line =
-        serde_json::to_vec(record).map_err(|error| JournalError::Io(error.to_string()))?;
+    let line = serde_json::to_vec(record).map_err(|error| JournalError::Io(error.to_string()))?;
+    write_line(&mut inner, line)?;
+    inner.next_seq += 1;
+    Ok(())
+}
+
+fn write_line(inner: &mut JsonlInner, mut line: Vec<u8>) -> Result<(), JournalError> {
     line.push(b'\n');
     // Invariant 8a: ONE `write_all` of the complete line. A crash can therefore
     // leave at most a partial last line, which `load` reports, never misreads.
@@ -345,7 +487,6 @@ fn append_blocking(inner: &Mutex<JsonlInner>, record: &JournalRecord) -> Result<
     if inner.sync == SyncPolicy::EveryRecord {
         inner.file.sync_data().map_err(JournalError::from)?;
     }
-    inner.next_seq += 1;
     Ok(())
 }
 
@@ -420,12 +561,14 @@ fn complete_lines_before(bytes: &[u8], offset: usize) -> u64 {
 
 /// Read every complete valid record from `path`.
 ///
-/// - a final line without `\n`, without valid JSON, or without a valid record →
-///   `truncated_tail` (`byte_offset` = where that line starts);
+/// - a final line without `\n`, without valid JSON, or without a valid record or
+///   assembly line → `truncated_tail` (`byte_offset` = where that line starts);
 /// - an invalid line that is not the final one → `Corrupt{line}` (1-based);
-/// - records whose `seq` is not dense from 0 → `Corrupt{line}`;
+/// - records whose `seq` is not dense from 0 → `Corrupt{line}`; assembly lines
+///   carry no seq and do not count;
+/// - an assembly line in a version-1 file → `AssemblyInVersion1{line}`;
 /// - a zero-byte file or an invalid header → `Corrupt{line: 1}`;
-/// - a header naming another version → `UnknownVersion`.
+/// - a header naming a version other than 1 or 2 → `UnknownVersion`.
 pub fn load(path: &Path) -> Result<Loaded, JournalError> {
     let bytes = std::fs::read(path).map_err(JournalError::from)?;
     parse_records(&bytes)
@@ -435,67 +578,90 @@ fn parse_records(bytes: &[u8]) -> Result<Loaded, JournalError> {
     if bytes.is_empty() {
         return Err(JournalError::Corrupt { line: 1 });
     }
+    let mut loaded = Loaded {
+        records: Vec::new(),
+        truncated_tail: None,
+        version: JOURNAL_VERSION,
+        assemblies: Vec::new(),
+    };
     let mut pos = match next_line(bytes, 0) {
         Line::Complete { start, end } => {
-            parse_header(&bytes[start..end])?;
+            loaded.version = parse_header(&bytes[start..end])?;
             end + 1
         }
         // A header torn by a crash is not a missing header: it is the tail.
         Line::Partial { start } => {
-            return Ok(Loaded {
-                records: Vec::new(),
-                truncated_tail: Some(tail_from(bytes, start)),
-            });
+            loaded.truncated_tail = Some(tail_from(bytes, start));
+            return Ok(loaded);
         }
         Line::None => unreachable!("a non-empty file always yields a first line"),
     };
-    let mut records = Vec::new();
     let mut line = 1u64;
     loop {
         match next_line(bytes, pos) {
             Line::None => break,
             Line::Partial { start } => {
-                return Ok(Loaded {
-                    records,
-                    truncated_tail: Some(tail_from(bytes, start)),
-                });
+                loaded.truncated_tail = Some(tail_from(bytes, start));
+                return Ok(loaded);
             }
             Line::Complete { start, end } => {
                 line += 1;
                 let is_last = end + 1 == bytes.len();
-                match serde_json::from_slice::<JournalRecord>(&bytes[start..end]) {
-                    Ok(record) => {
-                        if record.seq != records.len() as u64 {
+                match parse_line(&bytes[start..end]) {
+                    Some(Parsed::Record(record)) => {
+                        if record.seq != loaded.records.len() as u64 {
                             return Err(JournalError::Corrupt { line });
                         }
-                        records.push(record);
+                        loaded.records.push(record);
+                    }
+                    Some(Parsed::Assembly(identity)) => {
+                        // A valid line of a kind version 1 lacks is not a torn tail:
+                        // it is refused wherever it stands.
+                        if loaded.version == JOURNAL_VERSION_1 {
+                            return Err(JournalError::AssemblyInVersion1 { line });
+                        }
+                        loaded.assemblies.push(AssemblyEntry {
+                            from_seq: loaded.records.len() as u64,
+                            identity,
+                        });
                     }
                     // A complete final line that is not a valid record is the tail,
                     // exactly like a torn one; only a non-final bad line is corrupt.
-                    Err(_) if is_last => {
-                        return Ok(Loaded {
-                            records,
-                            truncated_tail: Some(tail_from(bytes, start)),
-                        });
+                    None if is_last => {
+                        loaded.truncated_tail = Some(tail_from(bytes, start));
+                        return Ok(loaded);
                     }
-                    Err(_) => return Err(JournalError::Corrupt { line }),
+                    None => return Err(JournalError::Corrupt { line }),
                 }
                 pos = end + 1;
             }
         }
     }
-    Ok(Loaded {
-        records,
-        truncated_tail: None,
-    })
+    Ok(loaded)
 }
 
-fn parse_header(line: &[u8]) -> Result<(), JournalError> {
+enum Parsed {
+    Record(JournalRecord),
+    Assembly(AssemblyIdentity),
+}
+
+fn parse_line(line: &[u8]) -> Option<Parsed> {
+    if let Ok(record) = serde_json::from_slice::<JournalRecord>(line) {
+        return Some(Parsed::Record(record));
+    }
+    serde_json::from_slice::<AssemblyLine>(line)
+        .ok()
+        .map(|parsed| Parsed::Assembly(parsed.assembly))
+}
+
+fn parse_header(line: &[u8]) -> Result<u64, JournalError> {
     let value: Value =
         serde_json::from_slice(line).map_err(|_| JournalError::Corrupt { line: 1 })?;
-    match value.get("p1_journal") {
+    match value.get("p1_journal").map(Value::as_u64) {
         None => Err(JournalError::Corrupt { line: 1 }),
-        Some(version) if version.as_u64() == Some(JOURNAL_VERSION) => Ok(()),
+        Some(Some(version)) if version == JOURNAL_VERSION_1 || version == JOURNAL_VERSION => {
+            Ok(version)
+        }
         Some(_) => Err(JournalError::UnknownVersion),
     }
 }
