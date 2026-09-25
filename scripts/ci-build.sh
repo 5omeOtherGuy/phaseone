@@ -378,12 +378,15 @@ if ! cp -a "$root/." "$staging/"; then
   exit 2
 fi
 # The rename is the only write to ci-artifacts/<sha>: an earlier download of the same
-# commit is replaced cleanly, or nothing is written at all.
+# commit is replaced cleanly, or nothing is written at all. -T renames the staging
+# directory onto $dest itself, so a concurrent invocation for the same commit
+# (ADR-0066) that recreated $dest between the rm and this mv fails loudly (exit 2)
+# instead of silently nesting the staging directory inside a fresh destination.
 if ! rm -rf -- "$dest"; then
   echo "ci-build: cannot replace $dest" >&2
   exit 2
 fi
-if ! mv -- "$staging" "$dest"; then
+if ! mv -T -- "$staging" "$dest"; then
   echo "ci-build: cannot move the staged artifact to $dest" >&2
   exit 2
 fi

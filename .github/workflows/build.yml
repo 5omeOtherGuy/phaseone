@@ -122,7 +122,7 @@ jobs:
             echo "| scripts/gate.sh | ${{ steps.gate.outcome }} | $((build_start - gate_start)) |"
             echo "| cargo build -p p1-host | ${{ steps.build.outcome }} | $((now - build_start)) |"
             echo
-            echo "Artifact \`p1-build\`: dist/p1, dist/p1.sha256, gate.log."
+            echo "Artifact \`p1-build\`: p1, p1.sha256, gate.log."
             echo
             echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } | tee -a "$GITHUB_STEP_SUMMARY"

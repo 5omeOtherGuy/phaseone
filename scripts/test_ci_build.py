@@ -102,6 +102,28 @@ PASSTHROUGH_STUB = textwrap.dedent(
     """
 )
 
+# Logs the invocation and delegates to rm, then, when STUB_RM_RECREATE_DEST names the
+# path just removed, recreates it: a concurrent invocation for the same commit
+# (ADR-0066) can win the window between the script's `rm -rf` and its rename.
+RM_STUB = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    echo "rm $*" >> "$STUB_LOG"
+    %s "$@"
+    code=$?
+    if [ -n "${STUB_RM_RECREATE_DEST:-}" ]; then
+      for arg in "$@"; do
+        if [ "$arg" = "$STUB_RM_RECREATE_DEST" ]; then
+          mkdir -p "$arg"
+          printf 'recreated by a concurrent invocation\\n' > "$arg/other.txt"
+        fi
+      done
+    fi
+    exit "$code"
+    """
+    % REAL_TOOLS["rm"]
+)
+
 # Logs the invocation and delegates, so a test can prove the script ran
 # `sha256sum -c` on the downloaded manifest, in the artifact directory.
 SHA256SUM_STUB = textwrap.dedent(
@@ -306,6 +328,8 @@ class Harness:
         stubs = {"git": GIT_STUB, "gh": GH_STUB, "sleep": SLEEP_STUB, "sha256sum": SHA256SUM_STUB}
         for name, real in REAL_TOOLS.items():
             stubs[name] = PASSTHROUGH_STUB.format(name=name, real=real)
+        # rm also models the concurrent-invocation window (STUB_RM_RECREATE_DEST).
+        stubs["rm"] = RM_STUB
         installed = set(tools) if tools is not None else set(stubs)
         for name in sorted(installed - {"bash", "python3"}):
             if name in stubs:
@@ -667,6 +691,22 @@ class CiBuildTests(unittest.TestCase):
         self.assertFalse((dest / "stale.txt").exists(), "the earlier download must be replaced")
         self.assertEqual((dest / "p1").read_bytes(), P1_BYTES)
         self.assertEqual(sorted(path.name for path in (h.repo / "ci-artifacts").iterdir()), [SHA])
+
+    def test_destination_recreated_by_a_concurrent_invocation_fails_loudly(self) -> None:
+        # A concurrent invocation for the same commit (ADR-0066) can recreate
+        # ci-artifacts/<sha> between this invocation's `rm -rf` and its rename. The
+        # rename must fail (exit 2) instead of silently nesting the staging directory
+        # inside the fresh destination.
+        h = self.harness()
+        dest = h.artifact()
+        # The script builds the destination relative to the repo root, which is its cwd.
+        h.env["STUB_RM_RECREATE_DEST"] = f"{dest.parent.name}/{SHA}"
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot move the staged artifact", result.stderr)
+        prefix = f".{SHA}.staging."
+        nested = [path.name for path in dest.iterdir() if path.name.startswith(prefix)]
+        self.assertEqual(nested, [], "the staging directory must not be nested in the destination")
 
     def test_push_is_the_default_trigger(self) -> None:
         h = self.harness(**{"CI_TRIGGER": "push"})
