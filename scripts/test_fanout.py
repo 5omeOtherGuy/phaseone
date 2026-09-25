@@ -391,6 +391,17 @@ class FanoutTest(unittest.TestCase):
                          ["pi-worker", "deepseek", "--dir", "/work", "--effort", "high",
                           "--session", "abc", "--prompt", "fix it"])
 
+    def test_mem_available_mb_returns_none_for_bad_proc_data(self) -> None:
+        for text in ("MemTotal: 100 kB\n", "MemAvailable: nope kB\n",
+                     "MemAvailable:\n"):
+            with self.subTest(text=text):
+                self.assertIsNone(fanout.mem_available_mb(lambda path: io.StringIO(text)))
+
+        def unreadable(path):
+            raise OSError("unreadable")
+
+        self.assertIsNone(fanout.mem_available_mb(unreadable))
+
     def test_waiting_message_is_emitted_once_until_the_reason_changes(self) -> None:
         jobs_path = self.write("waiting-jobs.json", json.dumps([self.p1_job()]))
         out, err = io.StringIO(), io.StringIO()
@@ -401,6 +412,17 @@ class FanoutTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(err.getvalue().count("fanout: waiting —"), 1)
         self.assertIn("1 workers alive (1 max), MemAvailable 2000 MB", err.getvalue())
+
+    def test_waiting_message_does_not_enforce_memory_when_unknown(self) -> None:
+        jobs_path = self.write("unknown-memory-jobs.json", json.dumps([self.p1_job()]))
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(fanout, "workers_alive", side_effect=[1, 0]), \
+             mock.patch.object(fanout, "mem_available_mb", return_value=None), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fanout.main([jobs_path, "--max-parallel", "1", "--min-free-mb", "1500"])
+        self.assertEqual(code, 0)
+        self.assertIn("fanout: MemAvailable unknown — memory floor not enforced", err.getvalue())
+        self.assertIn("1 workers alive (1 max), MemAvailable unknown", err.getvalue())
 
     def test_waiting_message_changes_with_the_blocking_reason(self) -> None:
         jobs_path = self.write("reason-jobs.json", json.dumps([self.p1_job()]))
@@ -436,7 +458,11 @@ class FanoutTest(unittest.TestCase):
             "/x/phaseone-target/debug/p1", "--env", "plain", "--workspace", "/w",
             "--session", "/tmp/session.jsonl", "--yes", BRIEF,
         ]))
-        self.assertTrue(fanout.is_p1_agent(["p1", "--brief-file", "/tmp/brief.md"]))
+        resume_argv = fanout.p1_command(
+            self.p1_job(session="/tmp/session.jsonl", prompt_file=self.brief, sandbox=True),
+            self.bin, "/tmp/session.jsonl", BRIEF, "/tmp/locks", ("/tmp/read",))
+        self.assertTrue(fanout.is_p1_agent(resume_argv))
+        self.assertFalse(fanout.is_p1_agent(["p1", "--brief-file", "/tmp/brief.md"]))
         self.assertFalse(fanout.is_p1_agent(["python3", "scripts/fanout.py", "--env"]))
         self.assertFalse(fanout.is_p1_agent(["p1", "models"]))
 

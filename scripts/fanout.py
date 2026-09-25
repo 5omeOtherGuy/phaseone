@@ -90,11 +90,26 @@ def parse_trailer(text):
     return found
 
 
-def mem_available_mb():
-    for line in open("/proc/meminfo"):
-        if line.startswith("MemAvailable:"):
-            return int(line.split()[1]) // 1024
-    return 0
+def mem_available_mb(reader=None):
+    """Return available memory in MiB, or None when /proc/meminfo cannot be trusted."""
+    if reader is None:
+        reader = open
+    try:
+        with reader("/proc/meminfo") as handle:
+            for line in handle:
+                fields = line.split()
+                if not fields or fields[0] != "MemAvailable:":
+                    continue
+                if len(fields) < 2:
+                    return None
+                try:
+                    value = int(fields[1])
+                except ValueError:
+                    return None
+                return value // 1024 if value >= 0 else None
+    except (OSError, TypeError):
+        return None
+    return None
 
 
 def is_pi_worker(argv):
@@ -115,44 +130,39 @@ def is_pi_worker(argv):
 P1_SUBCOMMANDS = {"env", "models", "usage", "login", "logout", "workflow", "help",
                   "--help", "-h", "--version", "-V"}
 
-# p1 run-mode flags that swallow the NEXT token as their value (cli.rs `take_value`);
-# everything else that does not start with `-` is a prompt word.
+# p1 run-mode flags that swallow the NEXT token as their value (cli.rs `take_value`).
 P1_VALUE_FLAGS = {
     "--env", "--model", "--effort", "--models", "--workspace", "--session",
     "--instructions", "--skills", "--sandbox", "--sandbox-write", "--sandbox-read",
     "--env-pass", "--max-continuations", "--provider-retries", "--max-idle-summaries",
 }
 
-# Prompt-by-file/in-line flags (pi-worker style; p1 itself takes the prompt positionally).
-P1_PROMPT_FLAGS = {"--prompt", "--prompt-file", "--brief-file"}
+# p1 run-mode flags that take no value.
+P1_BOOL_FLAGS = {"--resume", "--ask", "--yes"}
 
 
 def is_p1_agent(argv):
     """A HEADLESS p1 worker, decided from argv alone (/proc/<pid>/cmdline — environ is
-    never read): basename `p1`, no `--tui`, and a prompt on the command line — positional
-    words (the shape fanout itself launches: `p1 --env … --session … --yes <brief>`) or a
-    `--prompt`/`--prompt-file`/`--brief-file`-style flag. An interactive session (`p1`,
-    `p1 --env claude`, anything `--tui`) and meta subcommands (`p1 models`, `p1 login …`)
-    never count toward the pool; a `python3 scripts/fanout.py` process or an editor never
-    did."""
+    never read): basename `p1`, no `--tui`, and a positional prompt. The accepted option
+    shape is the same run grammar used by p1_command; unsupported prompt-file flags do not
+    count because p1 rejects them. An interactive session (`p1`, `p1 --env claude`, or
+    anything `--tui`) and meta subcommands (`p1 models`, `p1 login …`) never count."""
     if not argv or os.path.basename(argv[0]) != "p1":
         return False
     args = argv[1:]
     if not args or args[0] in P1_SUBCOMMANDS or "--tui" in args:
         return False
-    if any(arg in P1_PROMPT_FLAGS and index + 1 < len(args)
-           or arg.startswith(tuple(flag + "=" for flag in P1_PROMPT_FLAGS))
-           for index, arg in enumerate(args)):
-        return True
     index = 0
     while index < len(args):
         arg = args[index]
         if arg in P1_VALUE_FLAGS:
             index += 2
             continue
-        if arg.startswith("-") and arg != "-":
+        if arg in P1_BOOL_FLAGS:
             index += 1
             continue
+        if arg.startswith("-") and arg != "-":
+            return False
         return True  # a bare word: the positional prompt of a headless run
     return False
 
@@ -496,6 +506,7 @@ def main(argv=None):
     pending = {job["label"]: job for job in jobs}
     running, results = {}, {}
     last_wait_reason = None
+    memory_unknown_reported = False
     while pending or running:
         waiting_reason = None
         waiting_snapshot = None
@@ -511,7 +522,12 @@ def main(argv=None):
                 continue
             alive = workers_alive()
             available = mem_available_mb()
-            if alive != 0 and not (alive < a.max_parallel and available >= a.min_free_mb):
+            if available is None and not memory_unknown_reported:
+                print("fanout: MemAvailable unknown — memory floor not enforced",
+                      file=sys.stderr, flush=True)
+                memory_unknown_reported = True
+            if alive != 0 and (alive >= a.max_parallel
+                               or (available is not None and available < a.min_free_mb)):
                 reason = "pool" if alive >= a.max_parallel else "memory"
                 waiting_reason = waiting_reason or reason
                 waiting_snapshot = waiting_snapshot or (alive, available)
@@ -528,7 +544,8 @@ def main(argv=None):
         if waiting_reason is not None and waiting_reason != last_wait_reason:
             alive, available = waiting_snapshot
             print(f"fanout: waiting — {alive} workers alive ({a.max_parallel} max), "
-                  f"MemAvailable {available} MB", file=sys.stderr, flush=True)
+                  f"MemAvailable {'unknown' if available is None else f'{available} MB'}",
+                  file=sys.stderr, flush=True)
         last_wait_reason = waiting_reason
         for label, state in list(running.items()):
             proc = state["proc"]
