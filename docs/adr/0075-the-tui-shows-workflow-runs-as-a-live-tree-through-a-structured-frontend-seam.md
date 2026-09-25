@@ -1,5 +1,5 @@
 ---
-adr: 74
+adr: 75
 title: The TUI shows workflow runs as a live tree through a structured FrontEnd seam
 status: proposed
 date: 2026-09-25
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [issue #198]
 ---
-# ADR-0074: The TUI shows workflow runs as a live tree through a structured FrontEnd seam
+# ADR-0075: The TUI shows workflow runs as a live tree through a structured FrontEnd seam
 
 ## Context
 
@@ -25,14 +25,19 @@ doing which step, live. The TUI must learn this without a dependency on `p1-work
 1. **Data contract owned by p1-tui.** `crates/p1-tui/src/workflow.rs` holds plain
    structs with strings, no `p1-workflow` types — the §7.7 rule, the same pattern as
    `p1_tui::transcript::WorkerReport`: `RunStarted { id, resumed_from }`,
-   `StepStarted { run, call, label, phase, role, model /* "E/P:effort" */, worker_id:
-   Option<String> /* "w3" */, attempt, prompt }`, `StepEnded { run, call, label, model,
-   status /* done|failed|blocked|cancelled */, attempts, replayed, error, worker_id }`,
-   `RunEnded { id, outcome, steps_started, steps_ended, steps_failed, error }`, and a
+   `StepStarted { run, ordinal, call, label, phase, role, model /* "E/P:effort" */,
+   worker_id: Option<String> /* "w3" */, attempt, prompt }`, `StepEnded { run, ordinal,
+   call, label, model, status /* done|failed|blocked|cancelled */, attempts, replayed,
+   error, worker_id }`, `RunEnded { id, outcome, error }` (the tree counts steps itself,
+   so the end carries no counts), and a
    `WorkflowEvent` enum that also carries `Phase(run, name)`, `Log(run, text)`,
    `JobsQueued(run, count)`, `ThunkFailed(run, error)`. `label`/`model` were added to
    `StepEnded` because a replayed or refused step never has a step start, and its row
-   still needs a name.
+   still needs a name. A step's identity is `(run, ordinal)`: the engine's ordinal of
+   the `agent()` call in its run (from 1), carried on `StepRequest.ordinal` and
+   `StepLine.ordinal` (additive; `#[serde(default)]` on the line). The call id is not an
+   identity — two concurrent calls with the same label, prompt and options share it —
+   and a replayed step has its own ordinal too.
 2. **FrontEnd seam.** `crates/p1-host/src/frontend.rs`, feature `workflows`, gets new
    methods with default no-ops: `workflow_run_started`, `workflow_phase`,
    `workflow_log`, `workflow_jobs_queued`, `workflow_step_started`,
@@ -50,12 +55,14 @@ doing which step, live. The TUI must learn this without a dependency on `p1-work
    (`HostStepRunner`) also announces `workflow_step_started` the moment the step's
    worker exists (right after `start_prepared`), so the tree shows a live step with its
    worker; the observer's later call is an idempotent update of the same row (keyed by
-   run + call while the row is running; a fallback link's new worker replaces the
-   worker id).
+   run + ordinal, which the runner reads from the same `StepRequest`; a fallback link's
+   new worker replaces the worker id).
 4. **`jobs_queued` on the engine.** A new `WorkflowObserver::jobs_queued(&self, id:
    &RunId, count: usize)` (default no-op) is called once when `parallel`/`pipeline`
    starts its fan-out, with the number of jobs. The TUI's queued count = jobs queued −
-   steps that appeared since, floored at 0; totals grow, never shrink.
+   steps that appeared since, floored at 0; totals grow, never shrink. When a run ends
+   (cancelled or failed mid-fan-out) with jobs still queued, they stay counted as
+   `N never run` on the ended header and in the total.
 5. **Tree and rendering rules** (`crates/p1-tui/src/render/workers.rs`): when at least
    one run exists the pane is the tree: runs in start order → phases in order (current
    phase marked) → steps in order → the step's worker block (the #111 block, indented)
@@ -72,7 +79,8 @@ doing which step, live. The TUI must learn this without a dependency on `p1-work
    tokens/ctx and tool calls (cost too at ≥ 56); below 48 the activity is a dim
    suffix. Tokens and tool calls are summed on phase and run; a sum with an unknown
    part shows `+?`, all-unknown `—`, never 0 for unknown. Tool calls are the TUI's own
-   count of `ToolStarted` events on the worker's event stream. Collapse: when the pane
+   count of `ToolStarted` events on the worker's event stream — unknown (`—`) until the
+   TUI has seen that stream at all. Collapse: when the pane
    height cannot show every row, ended phases (no running step, not the run's current
    phase of a running run) collapse to one row, oldest first, until it fits; the
    running phase and the selected row's phase never collapse. Compact (< 56) and
@@ -89,7 +97,9 @@ doing which step, live. The TUI must learn this without a dependency on `p1-work
    to three prompt lines and a `… N more lines · p expands` row — six rows for a longer
    prompt at any width, each row cut to the column; esc detaches; `x` on a step asks to stop its worker (the
    existing worker stopper), `x` on a run header asks `cancel wf1?` and `y` calls the
-   workflow service's `cancel(id)` through a host hook next to the worker stopper.
+   workflow service's `cancel(id)` through a host hook next to the worker stopper. A
+   focused run header or step is what `x` acts on even while a worker is attached; the
+   attached worker is the target only when the focus is a worker row or there is none.
    Focus rules of #92/#150 unchanged. Retention: the TUI keeps every worker's
    transcript in memory for the session (`Screen::worker_transcripts`, never pruned)
    and the tree for the session, so an ended step stays openable; nothing is
@@ -108,7 +118,9 @@ doing which step, live. The TUI must learn this without a dependency on `p1-work
 The TUI still learns no `p1-workflow` type; ledger lines are unchanged. A pipeline's
 job count is per item, not per stage, so the queued count is an estimate that only
 reaches 0 as steps appear. Redraw: a running run keeps the heartbeat drawing once a
-second so live elapsed moves. The engine, the host's `WorkflowObserver` trait and the
+second so live elapsed moves — only while the pane shows the tree (not off, not hidden
+by focus mode or the full review, wide enough to be laid out or overlaid), per #141's
+idle rule. The engine, the host's `WorkflowObserver` trait and the
 `FrontEnd` trait each gain one more method to implement (with defaults), and the
 host's step runner now announces a step twice (once early, once from the observer) —
 the projection must stay idempotent on the same row.
@@ -134,7 +146,15 @@ the projection must stay idempotent on the same row.
   `a_run_start_promotes_an_unpinned_pane_and_its_end_demotes_it`,
   `a_moved_past_links_worker_stays_under_its_step_never_in_the_flat_group` and
   `the_operators_keys_open_a_step_expand_its_prompt_and_esc_closes_it` (the operator's
-  exact keys, drawn at 175×42 and 60×30).
+  exact keys, drawn at 175×42 and 60×30),
+  `two_steps_sharing_a_call_id_are_two_rows_with_their_own_workers`,
+  `x_on_a_run_header_cancels_the_run_even_with_a_worker_attached`,
+  `a_run_cancelled_with_jobs_queued_keeps_them_as_never_run` and
+  `a_steps_calls_are_unknown_until_its_workers_stream_arrives`.
+- `crates/p1-workflow/tests/runs.rs`
+  `two_calls_with_one_id_carry_their_own_ordinals_replayed_too`.
+- `crates/p1-host/src/tui/tests.rs`
+  `a_live_run_draws_on_the_heartbeat_only_while_its_tree_is_visible`.
 - `crates/p1-tui/src/workflow.rs` unit test
   `a_repeated_start_updates_the_running_row_and_a_replay_makes_its_own`: the upsert of
   a repeated step start and the queued arithmetic.

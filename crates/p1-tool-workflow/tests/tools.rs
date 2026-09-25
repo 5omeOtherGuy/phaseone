@@ -144,6 +144,7 @@ fn report() -> RunReport {
         steps: vec![
             StepLine {
                 call: CallId("c1".into()),
+                ordinal: 1,
                 label: Some("review".into()),
                 role: "reviewer".into(),
                 model: "route/model".into(),
@@ -158,6 +159,7 @@ fn report() -> RunReport {
             },
             StepLine {
                 call: CallId("c2".into()),
+                ordinal: 2,
                 label: None,
                 role: "judge".into(),
                 model: "other/model".into(),

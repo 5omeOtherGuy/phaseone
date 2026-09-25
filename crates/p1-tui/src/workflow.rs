@@ -1,4 +1,4 @@
-//! Workflow runs as the WORKERS pane's live tree (ADR-0074): the data contract the host
+//! Workflow runs as the WORKERS pane's live tree (ADR-0075): the data contract the host
 //! fills — plain structs, statuses as strings, no `p1-workflow` type (§7.7, the pattern of
 //! [`crate::transcript::WorkerReport`]) — and the tree model the pane keeps from it: runs in
 //! start order, each with its phases in order, each phase with its steps in order.
@@ -13,11 +13,14 @@ pub struct RunStarted {
     pub resumed_from: Option<String>,
 }
 
-/// A step's worker exists. Sent again (same `run` + `call`) when the engine reports the
-/// start or a fallback link starts another worker: the running row is updated, not doubled.
+/// A step's worker exists. Sent again (same `run` + `ordinal`) when the engine reports the
+/// start or a fallback link starts another worker: the row is updated, not doubled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepStarted {
     pub run: String,
+    /// The step's ordinal in its run (from 1, in `agent()` call order): the step's
+    /// identity — two calls with the same `call` id are two steps.
+    pub ordinal: u32,
     pub call: String,
     pub label: Option<String>,
     pub phase: Option<String>,
@@ -36,6 +39,8 @@ pub struct StepStarted {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepEnded {
     pub run: String,
+    /// The same ordinal the step's start carried; a replayed step has its own.
+    pub ordinal: u32,
     pub call: String,
     pub label: Option<String>,
     pub model: String,
@@ -53,9 +58,6 @@ pub struct RunEnded {
     pub id: String,
     /// `completed`, `completed_with_issues`, `failed` or `cancelled`.
     pub outcome: String,
-    pub steps_started: u32,
-    pub steps_ended: u32,
-    pub steps_failed: u32,
     pub error: Option<String>,
 }
 
@@ -121,6 +123,8 @@ impl StepState {
 pub struct WorkflowStep {
     /// The selection key: `<run>/<n>`, `n` counting the run's steps from 1.
     pub key: String,
+    /// The engine's ordinal of the step in its run: its identity.
+    pub ordinal: u32,
     pub call: String,
     pub label: Option<String>,
     pub role: String,
@@ -219,6 +223,9 @@ pub struct WorkflowRun {
     pub note: Option<String>,
     /// Jobs announced by fan-outs that no step has taken yet.
     pub queued: usize,
+    /// Jobs still queued when the run ended (cancelled or failed mid-fan-out): they
+    /// never ran, and stay counted so the total never shrinks.
+    pub never_run: usize,
     /// Steps this run has shown, for the next selection key.
     pub step_count: usize,
 }
@@ -236,6 +243,7 @@ impl WorkflowRun {
             last_log: None,
             note: None,
             queued: 0,
+            never_run: 0,
             step_count: 0,
         }
     }
@@ -267,9 +275,9 @@ impl WorkflowRun {
         self.steps().filter(|step| step.state == state).count()
     }
 
-    /// Every step known: the ones shown plus the jobs still queued.
+    /// Every step known: the ones shown, the jobs still queued and those that never ran.
     pub fn total(&self) -> usize {
-        self.steps().count() + self.queued
+        self.steps().count() + self.queued + self.never_run
     }
 
     /// Phase `index`'s elapsed: from its start to the next phase's or the run's end.
@@ -282,12 +290,11 @@ impl WorkflowRun {
             .saturating_sub(phase.started_ms)
     }
 
-    fn step_mut(&mut self, call: &str, running_only: bool) -> Option<&mut WorkflowStep> {
+    fn step_mut(&mut self, ordinal: u32) -> Option<&mut WorkflowStep> {
         self.phases
             .iter_mut()
-            .rev()
-            .flat_map(|phase| phase.steps.iter_mut().rev())
-            .find(|step| step.call == call && (!running_only || step.running()))
+            .flat_map(|phase| phase.steps.iter_mut())
+            .find(|step| step.ordinal == ordinal)
     }
 
     /// The phase a new step belongs to: the latest one named `phase`, else the current one.
@@ -341,7 +348,7 @@ impl WorkflowTree {
             .map(|step| (run, step))
     }
 
-    /// The step `⏎` opens from the row keyed `key` (ADR-0074): the step itself; for a run
+    /// The step `⏎` opens from the row keyed `key` (ADR-0075): the step itself; for a run
     /// header its first running step with a worker, else its latest step with one; for a
     /// running step's worker block, that step. `None` for any other row.
     pub fn open_target(&self, key: &str) -> Option<&str> {
@@ -430,7 +437,7 @@ impl WorkflowTree {
             }
             WorkflowEvent::StepStarted(started) => {
                 let run = self.run_mut(&started.run, at_ms);
-                if let Some(step) = run.step_mut(&started.call, true) {
+                if let Some(step) = run.step_mut(started.ordinal) {
                     if let Some(worker) = started.worker_id {
                         // Another worker for the same running step: the chain moved past
                         // the link the old one ran on.
@@ -448,6 +455,7 @@ impl WorkflowTree {
                 }
                 let step = WorkflowStep {
                     key: String::new(),
+                    ordinal: started.ordinal,
                     call: started.call,
                     label: started.label,
                     role: started.role,
@@ -467,7 +475,7 @@ impl WorkflowTree {
             WorkflowEvent::StepEnded(ended) => {
                 let run = self.run_mut(&ended.run, at_ms);
                 let state = StepState::from_status(&ended.status);
-                if let Some(step) = run.step_mut(&ended.call, true) {
+                if let Some(step) = run.step_mut(ended.ordinal) {
                     step.state = state;
                     step.attempts = ended.attempts;
                     step.replayed = ended.replayed;
@@ -480,6 +488,7 @@ impl WorkflowTree {
                 }
                 let step = WorkflowStep {
                     key: String::new(),
+                    ordinal: ended.ordinal,
                     call: ended.call,
                     label: ended.label,
                     role: String::new(),
@@ -501,7 +510,7 @@ impl WorkflowTree {
                 if let Some(current) = run.current {
                     run.phases[current].ended_ms.get_or_insert(at_ms);
                 }
-                run.queued = 0;
+                run.never_run += std::mem::take(&mut run.queued);
                 run.ended_ms = Some(at_ms);
                 run.ended = Some(ended);
             }
@@ -558,6 +567,7 @@ mod tests {
     fn started(call: &str, phase: Option<&str>, worker: Option<&str>) -> WorkflowEvent {
         WorkflowEvent::StepStarted(StepStarted {
             run: "wf1".into(),
+            ordinal: call[1..].parse().unwrap(),
             call: call.into(),
             label: Some(format!("label-{call}")),
             phase: phase.map(str::to_string),
@@ -598,6 +608,7 @@ mod tests {
         tree.apply(
             WorkflowEvent::StepEnded(StepEnded {
                 run: "wf1".into(),
+                ordinal: 9,
                 call: "c9".into(),
                 label: None,
                 model: "claude/opus".into(),

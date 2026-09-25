@@ -305,7 +305,7 @@ impl StepRunner for HostStepRunner {
                         }
                         // The engine reports a step's start only after its first turn
                         // (it needs the worker's ref); the live tree hears it the moment
-                        // the worker exists (ADR-0074). The engine's call updates this row.
+                        // the worker exists (ADR-0075). The engine's call updates this row.
                         self.builder
                             .front_end
                             .workflow_step_started(&step_started(request, Some(&id.0)));
@@ -463,10 +463,13 @@ fn model_text(model: &ResolvedModel) -> String {
     }
 }
 
-/// A step's start as the TUI's tree takes it (ADR-0074).
+/// A step's start as the TUI's tree takes it (ADR-0075).
 fn step_started(request: &StepRequest, worker_id: Option<&str>) -> WorkflowStepStarted {
     WorkflowStepStarted {
         run: request.run.0.clone(),
+        // The same ordinal whether the runner announces the step early or the engine
+        // reports it: one step, one row (ADR-0075).
+        ordinal: request.ordinal,
         call: request.call.0.clone(),
         label: request.label.clone(),
         phase: request.phase.clone(),
@@ -530,6 +533,7 @@ impl WorkflowObserver for HostWorkflowObserver {
             ));
         self.front_end.workflow_step_ended(&WorkflowStepEnded {
             run: id.0.clone(),
+            ordinal: line.ordinal,
             call: line.call.0.clone(),
             label: line.label.clone(),
             // The model the step ended on: the last link of its chain.
@@ -561,9 +565,6 @@ impl WorkflowObserver for HostWorkflowObserver {
         self.front_end.workflow_run_ended(&WorkflowRunEnded {
             id: id.0.clone(),
             outcome: outcome.clone(),
-            steps_started: report.counts.steps,
-            steps_ended: report.counts.steps,
-            steps_failed: report.counts.failed,
             error: report.error.clone(),
         });
         if let Some(inbox) = self.inbox.lock().unwrap().as_ref() {
@@ -715,7 +716,7 @@ pub(crate) fn running_workflows(deps: &HostDeps) -> usize {
 }
 
 /// The observer projects every run event into the structured `FrontEnd` calls the TUI's
-/// tree is built from (ADR-0074), beside the unchanged lines.
+/// tree is built from (ADR-0075), beside the unchanged lines.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,6 +833,7 @@ mod tests {
             schema: None,
             workspace: None,
             attempt: 1,
+            ordinal: 3,
             worktree: None,
             base: None,
         }
@@ -857,6 +859,7 @@ mod tests {
         );
         let line = StepLine {
             call: CallId("c1".into()),
+            ordinal: 3,
             label: Some("review:bugs".into()),
             role: "reviewer".into(),
             model: "claude/claude-opus-5-5:high".into(),
@@ -914,6 +917,7 @@ mod tests {
                 "step_started {:?}",
                 WorkflowStepStarted {
                     run: "wf2".into(),
+                    ordinal: 3,
                     call: "c1".into(),
                     label: Some("review:bugs".into()),
                     phase: Some("Review".into()),
@@ -928,6 +932,7 @@ mod tests {
                 "step_ended {:?}",
                 WorkflowStepEnded {
                     run: "wf2".into(),
+                    ordinal: 3,
                     call: "c1".into(),
                     label: Some("review:bugs".into()),
                     model: "claude/claude-opus-5-5:high".into(),
@@ -944,9 +949,6 @@ mod tests {
                 WorkflowRunEnded {
                     id: "wf2".into(),
                     outcome: "completed_with_issues".into(),
-                    steps_started: 1,
-                    steps_ended: 1,
-                    steps_failed: 1,
                     error: None,
                 }
             ),

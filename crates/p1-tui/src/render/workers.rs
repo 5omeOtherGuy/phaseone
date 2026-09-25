@@ -130,7 +130,7 @@ pub struct WorkersPane {
     /// key (`wf1/3`); its first row gets the amber focus fill (§9.4, the Menu
     /// focused-row convention).
     pub focused: Option<String>,
-    /// Workflow runs (ADR-0074): while one exists the pane is their live tree.
+    /// Workflow runs (ADR-0075): while one exists the pane is their live tree.
     pub tree: WorkflowTree,
     /// What each worker is doing and its tool calls, from its own event stream.
     pub activity: BTreeMap<String, WorkerActivity>,
@@ -177,7 +177,7 @@ pub fn render_with(
 }
 
 /// Render WORKERS into `height` rows when known: a workflow tree taller than that
-/// collapses its ended phases (ADR-0074).
+/// collapses its ended phases (ADR-0075).
 pub fn render_in(
     pane: &WorkersPane,
     width: usize,
@@ -193,7 +193,7 @@ pub fn render_in(
     out
 }
 
-/// Every selectable WORKERS row in display order (handoff §9.4, ADR-0074): each run's
+/// Every selectable WORKERS row in display order (handoff §9.4, ADR-0075): each run's
 /// header, its steps in phase order and a running step's worker, then the workers no
 /// step references, in state order.
 pub fn display_order(pane: &WorkersPane) -> Vec<Selectable<'_>> {
@@ -329,10 +329,10 @@ pub fn attach_band(id: &str, route: &str, state: BlockState, width: usize) -> Li
     .render()
 }
 
-/// Prompt lines an opened step shows folded (ADR-0074).
+/// Prompt lines an opened step shows folded (ADR-0075).
 const PROMPT_FOLDED: usize = 3;
 
-/// The rows an opened workflow step puts over its worker's transcript (ADR-0074): a stats
+/// The rows an opened workflow step puts over its worker's transcript (ADR-0075): a stats
 /// band — status · model · phase · attempts · elapsed · tokens · tool calls — then the
 /// step's prompt, its first three lines folded (`p` expands it, wrapped). Empty when the
 /// step is not in the tree.
@@ -636,7 +636,7 @@ fn footer_line(
     .render()
 }
 
-// ------------------------------------------------------------ workflow tree (ADR-0074)
+// ------------------------------------------------------------ workflow tree (ADR-0075)
 
 /// A width at and above which a step shows its second line (activity and metrics).
 const STEP_DETAIL_WIDTH: usize = 48;
@@ -813,14 +813,11 @@ fn step_tokens(pane: &WorkersPane, step: &WorkflowStep) -> Option<Option<u64>> {
     Some(step_worker(pane, step).and_then(|worker| worker.tokens))
 }
 
-/// A step's tool calls: the TUI's own count on its worker's stream.
+/// A step's tool calls: the TUI's own count on its worker's stream — unknown (`None`)
+/// until that stream has shown the TUI anything, and for a step that ran no worker.
 fn step_calls(pane: &WorkersPane, step: &WorkflowStep) -> Option<u64> {
     let id = step.worker_id.as_deref()?;
-    Some(
-        pane.activity
-            .get(id)
-            .map_or(0, |activity| activity.tool_calls),
-    )
+    pane.activity.get(id).map(|activity| activity.tool_calls)
 }
 
 fn sums<'a>(pane: &WorkersPane, steps: impl Iterator<Item = &'a WorkflowStep>) -> (Sum, Sum) {
@@ -829,8 +826,8 @@ fn sums<'a>(pane: &WorkersPane, steps: impl Iterator<Item = &'a WorkflowStep>) -
         if let Some(part) = step_tokens(pane, step) {
             tokens.add(part);
         }
-        if let Some(part) = step_calls(pane, step) {
-            calls.add(Some(part));
+        if step.worker_id.is_some() {
+            calls.add(step_calls(pane, step));
         }
     }
     (tokens, calls)
@@ -949,6 +946,10 @@ fn run_rows(
         {
             Some(error) => note(format!("{} — {error}", ended.outcome)),
             None => note(ended.outcome.clone()),
+        }
+        // Jobs a cancelled or failed run never started stay counted (ADR-0075 item 4).
+        if run.never_run > 0 {
+            note(format!("{} never run", run.never_run));
         }
     }
     if let Some(error) = &run.note {
@@ -1115,7 +1116,9 @@ fn step_rows(pane: &WorkersPane, step: &WorkflowStep, width: usize) -> Vec<Line<
             .and_then(|worker| worker.context_window)
             .map(super::tokens)
             .unwrap_or_else(|| super::UNKNOWN.into());
-        let calls = step_calls(pane, step).unwrap_or_default();
+        let calls = step_calls(pane, step)
+            .map(|calls| calls.to_string())
+            .unwrap_or_else(|| super::UNKNOWN.into());
         right.push(Seg::new(palette::INK, tok));
         right.push(Seg::new(palette::DIM, "/"));
         right.push(Seg::new(palette::INK, ctx));

@@ -501,12 +501,12 @@ pub struct AttachedWorker {
     pub route: String,
     pub state: BlockState,
     pub transcript: Transcript,
-    /// Set when a workflow step was opened (`⏎` on a step, ADR-0074): its stats band and
+    /// Set when a workflow step was opened (`⏎` on a step, ADR-0075): its stats band and
     /// its prompt head the transcript.
     pub step: Option<OpenedStep>,
 }
 
-/// A workflow step opened over its worker's transcript (ADR-0074).
+/// A workflow step opened over its worker's transcript (ADR-0075).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenedStep {
     /// The step's key in the tree (`wf1/3`).
@@ -644,7 +644,7 @@ impl Screen {
         }
     }
 
-    /// Fold one workflow event into the WORKERS tree (ADR-0074). A run makes WORKERS
+    /// Fold one workflow event into the WORKERS tree (ADR-0075). A run makes WORKERS
     /// available like a worker does.
     ///
     /// A run's start — or the first step of a run the tree had not seen start — is new live
@@ -691,7 +691,7 @@ impl Screen {
     }
 
     /// `⏎` on the focused row: a workflow step opens (its stats band and prompt over its
-    /// worker's transcript, ADR-0074); any other row attaches as `a` does.
+    /// worker's transcript, ADR-0075); any other row attaches as `a` does.
     pub fn open_selected(&mut self) {
         self.attach_focused(true);
     }
@@ -776,13 +776,22 @@ impl Screen {
     }
 
     /// Ask before stopping the attached worker, or the selected one when detached: on a
-    /// workflow step its worker, on a run header the run (ADR-0074).
+    /// workflow step its worker, on a run header the run (ADR-0075).
+    ///
+    /// A focused run header or step is what `x` acts on even while a worker is attached
+    /// (ADR-0075): the attached worker is the target only when the focus is a worker row
+    /// or there is no selection.
     pub fn ask_stop(&mut self) {
-        let target = self
-            .attached
-            .as_ref()
-            .map(|worker| worker.id.clone())
-            .or(self.workers.focused.clone());
+        let focused_tree_row = self.workers.focused.clone().filter(|key| {
+            self.pane_focused
+                && (self.workers.tree.run(key).is_some() || self.workers.tree.step(key).is_some())
+        });
+        let target = focused_tree_row.or_else(|| {
+            self.attached
+                .as_ref()
+                .map(|worker| worker.id.clone())
+                .or(self.workers.focused.clone())
+        });
         let Some(target) = target else {
             return;
         };
@@ -1096,7 +1105,7 @@ impl Screen {
         }
     }
     /// New attention in WORKERS (SPEC §5, handoff §9.1): a new live worker, new review
-    /// attention or a workflow run that starts (ADR-0074) moves the pane to WORKERS.
+    /// attention or a workflow run that starts (ADR-0075) moves the pane to WORKERS.
     fn promote_workers(&mut self, pinned_before: bool) {
         if self.pane_mode != PaneMode::Workers {
             self.pane_mode = PaneMode::Workers;

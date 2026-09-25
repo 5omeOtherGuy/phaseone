@@ -60,7 +60,7 @@ pub enum Command {
     /// `y` on a pending worker stop: cancel that worker through the host service.
     StopWorker(String),
     /// `y` on a pending run cancel (`x` on a run header): cancel that workflow run
-    /// through the host's workflow service (ADR-0074).
+    /// through the host's workflow service (ADR-0075).
     CancelRun(String),
 }
 
@@ -86,7 +86,7 @@ pub enum ViewCommand {
     TogglePaneFocus,
     /// `⏎` / `a` on the focused WORKERS row (handoff §9.5).
     AttachWorker,
-    /// `⏎` on a focused workflow step: open it (ADR-0074).
+    /// `⏎` on a focused workflow step: open it (ADR-0075).
     OpenStep,
     /// `p` on an opened step: the whole prompt, or its first three lines.
     TogglePrompt,

@@ -42,7 +42,7 @@ pub struct Stamped {
 pub enum UiEvent {
     Agent(Stamped),
     WorkerStarted(String),
-    /// A workflow event for the WORKERS tree (ADR-0074), stamped on the same clock.
+    /// A workflow event for the WORKERS tree (ADR-0075), stamped on the same clock.
     Workflow {
         at_ms: u64,
         event: crate::workflow::WorkflowEvent,
@@ -93,7 +93,7 @@ impl TuiSink {
         let _ = self.tx.send(UiEvent::WorkerStarted(worker_id.to_string()));
     }
 
-    /// A workflow event for the WORKERS tree (ADR-0074): stamped and ordered with the
+    /// A workflow event for the WORKERS tree (ADR-0075): stamped and ordered with the
     /// agents' events, through the same channel.
     pub fn workflow(&self, event: crate::workflow::WorkflowEvent) {
         let at_ms = self.stamp();

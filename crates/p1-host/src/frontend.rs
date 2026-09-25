@@ -37,7 +37,7 @@ pub use p1_workers::WorkerService;
 #[cfg(not(feature = "delegation"))]
 pub trait WorkerService: Send + Sync {}
 
-/// The TUI-owned data the workflow calls carry (ADR-0074): the host fills them.
+/// The TUI-owned data the workflow calls carry (ADR-0075): the host fills them.
 #[cfg(feature = "workflows")]
 pub use p1_tui::workflow::{
     RunEnded as WorkflowRunEnded, RunStarted as WorkflowRunStarted, StepEnded as WorkflowStepEnded,
@@ -77,7 +77,7 @@ pub trait FrontEnd: Send + Sync {
     #[cfg(feature = "workflows")]
     fn workflow_line(&self, _line: &str) {}
 
-    /// The structured workflow events a live tree is built from (ADR-0074), alongside
+    /// The structured workflow events a live tree is built from (ADR-0075), alongside
     /// [`FrontEnd::workflow_line`], which keeps its lines. Plain p1-tui data, no workflow
     /// type; every default shows nothing, so the line front end ignores them.
     #[cfg(feature = "workflows")]

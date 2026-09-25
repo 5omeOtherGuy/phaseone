@@ -1,4 +1,4 @@
-//! The WORKERS pane's workflow tree (issue #198, ADR-0074): runs → phases → steps → the
+//! The WORKERS pane's workflow tree (issue #198, ADR-0075): runs → phases → steps → the
 //! step's worker, navigable like the flat list, from plain events the host fills.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -24,9 +24,15 @@ fn worker(id: &str, state: BlockState, tokens: Option<u64>) -> WorkerBlock {
     }
 }
 
+/// The fixtures' calls are `c<N>`, the N-th `agent()` call of the run.
+fn ordinal(call: &str) -> u32 {
+    call[1..].parse().expect("a c<N> call")
+}
+
 fn started(call: &str, label: &str, worker: &str) -> WorkflowEvent {
     WorkflowEvent::StepStarted(StepStarted {
         run: "wf1".into(),
+        ordinal: ordinal(call),
         call: call.into(),
         label: Some(label.into()),
         phase: None,
@@ -41,6 +47,7 @@ fn started(call: &str, label: &str, worker: &str) -> WorkflowEvent {
 fn ended(call: &str, status: &str, attempts: u32, error: Option<&str>) -> WorkflowEvent {
     WorkflowEvent::StepEnded(StepEnded {
         run: "wf1".into(),
+        ordinal: ordinal(call),
         call: call.into(),
         label: None,
         model: "claude/opus:high".into(),
@@ -104,6 +111,7 @@ fn screen() -> Screen {
             6_100,
             WorkflowEvent::StepEnded(StepEnded {
                 run: run("wf1"),
+                ordinal: 6,
                 call: "c6".into(),
                 label: Some("review:style".into()),
                 model: "claude/opus:high".into(),
@@ -200,7 +208,7 @@ fn the_run_header_shows_its_phase_resume_and_all_five_counts() {
     // w1 1000 + w3 48213 + w4 2000 + w5 3000; w2's tokens are unknown.
     let sums = find(&lines, "tokens ");
     assert!(sums.contains("54.2k+?"), "{sums}");
-    assert!(sums.contains("1 calls"), "{sums}");
+    assert!(sums.contains("1+? calls"), "{sums}");
     assert!(find(&lines, "reviewing 5 files").starts_with("      reviewing"));
 }
 
@@ -406,7 +414,7 @@ fn a_attaches_a_steps_worker_and_enter_opens_the_step_with_its_prompt() {
         .collect();
     assert!(
         band[0]
-            .contains("fix · running · claude/opus:high · Review · ×1 · 0m00s · — tok · 0 calls"),
+            .contains("fix · running · claude/opus:high · Review · ×1 · 0m00s · — tok · — calls"),
         "{band:#?}"
     );
     assert_eq!(band.len(), 5, "{band:#?}");
@@ -485,9 +493,6 @@ fn a_run_start_promotes_an_unpinned_pane_and_its_end_demotes_it() {
         WorkflowEvent::RunEnded(p1_tui::workflow::RunEnded {
             id: "wf1".into(),
             outcome: "completed".into(),
-            steps_started: 0,
-            steps_ended: 0,
-            steps_failed: 0,
             error: None,
         })
     };
@@ -524,6 +529,7 @@ fn a_moved_past_links_worker_stays_under_its_step_never_in_the_flat_group() {
     let link = |worker: &str, model: &str| {
         WorkflowEvent::StepStarted(StepStarted {
             run: "wf1".into(),
+            ordinal: 1,
             call: "c1".into(),
             label: Some("failover".into()),
             phase: None,
@@ -718,4 +724,192 @@ fn the_operators_keys_open_a_step_expand_its_prompt_and_esc_closes_it() {
     assert_eq!(screen.workers.focused.as_deref(), Some("w3"));
     press(&mut screen, key(KeyCode::Enter));
     assert!(screen.attached.as_ref().unwrap().step.is_some());
+}
+
+/// ADR-0075: two concurrent steps with one call id (same label, prompt and options) are
+/// two rows, keyed by their ordinals — each with its own worker, and a replay of the same
+/// call is a third row.
+#[test]
+fn two_steps_sharing_a_call_id_are_two_rows_with_their_own_workers() {
+    let mut screen = Screen::new(true);
+    screen.pane_width = PaneWidth::Wide;
+    let vote = |ordinal: u32, worker: &str| {
+        WorkflowEvent::StepStarted(StepStarted {
+            run: "wf1".into(),
+            ordinal,
+            call: "vote".into(),
+            label: None,
+            phase: None,
+            role: "worker".into(),
+            model: "claude/opus".into(),
+            worker_id: Some(worker.into()),
+            attempt: 1,
+            prompt: "vote".into(),
+        })
+    };
+    let end = |ordinal: u32, replayed: bool| {
+        WorkflowEvent::StepEnded(StepEnded {
+            run: "wf1".into(),
+            ordinal,
+            call: "vote".into(),
+            label: None,
+            model: "claude/opus".into(),
+            status: "done".into(),
+            attempts: u32::from(!replayed),
+            replayed,
+            error: None,
+            worker_id: None,
+        })
+    };
+    screen.apply_workflow(
+        WorkflowEvent::RunStarted(RunStarted {
+            id: "wf1".into(),
+            resumed_from: None,
+        }),
+        0,
+    );
+    screen.apply_workflow(
+        WorkflowEvent::JobsQueued {
+            run: "wf1".into(),
+            count: 2,
+        },
+        0,
+    );
+    screen.apply_workflow(vote(1, "w1"), 10);
+    screen.apply_workflow(vote(2, "w2"), 20);
+    // The engine's own report of the first start, after its turn: an update.
+    screen.apply_workflow(vote(1, "w1"), 30);
+    screen.sync_workers(vec![
+        worker("w1", BlockState::Running, None),
+        worker("w2", BlockState::Running, None),
+    ]);
+    screen.tick(1_000);
+
+    let lines = text(&screen, 60, None);
+    assert!(
+        find(&lines, "running ·").contains("2 running · 0 done · 0 failed · 0 queued"),
+        "{lines:#?}"
+    );
+    let rows: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("▪ vote"))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(rows.len(), 2, "{lines:#?}");
+    let (w1, w2) = (position(&lines, "▪ w1"), position(&lines, "▪ w2"));
+    assert!(rows[0] < w1 && w1 < rows[1] && rows[1] < w2, "{lines:#?}");
+    assert!(
+        !lines.iter().any(|line| line.contains("    workers")),
+        "{lines:#?}"
+    );
+
+    screen.apply_workflow(end(2, false), 2_000);
+    screen.apply_workflow(end(1, false), 2_100);
+    let lines = text(&screen, 60, None);
+    assert_eq!(
+        lines.iter().filter(|line| line.contains("✓ vote")).count(),
+        2,
+        "{lines:#?}"
+    );
+    assert!(find(&lines, "running ·").contains("0 running · 2 done"));
+
+    // A replay of the same call is its own step, by its own ordinal.
+    screen.apply_workflow(end(3, true), 2_200);
+    let run = screen.workers.tree.run("wf1").unwrap();
+    let ordinals: Vec<u32> = run.steps().map(|step| step.ordinal).collect();
+    assert_eq!(ordinals, [1, 2, 3]);
+    assert!(run.steps().nth(2).unwrap().replayed);
+}
+
+/// ADR-0075: with a worker attached, `x` on a focused run header asks to cancel the run.
+#[test]
+fn x_on_a_run_header_cancels_the_run_even_with_a_worker_attached() {
+    let mut screen = screen();
+    focus(&mut screen, "wf1/3");
+    screen.apply_view(ViewCommand::AttachWorker);
+    assert_eq!(screen.attached.as_ref().map(|w| w.id.as_str()), Some("w3"));
+    focus(&mut screen, "wf1");
+    assert_eq!(
+        input::decide(&screen, key(KeyCode::Char('x'))),
+        Some(Action::View(ViewCommand::AskStopWorker))
+    );
+    screen.apply_view(ViewCommand::AskStopWorker);
+    assert_eq!(screen.stop_pending.as_deref(), Some("wf1"));
+    let lines = text(&screen, 60, None);
+    assert!(
+        lines
+            .last()
+            .unwrap()
+            .contains("cancel wf1?   y cancel   n keep")
+    );
+
+    // On a worker row the attached worker is still the one `x` stops.
+    screen.apply_view(ViewCommand::KeepWorker);
+    focus(&mut screen, "w9");
+    screen.apply_view(ViewCommand::AskStopWorker);
+    assert_eq!(screen.stop_pending.as_deref(), Some("w3"));
+}
+
+/// ADR-0075 item 4: a run cancelled mid-fan-out keeps the jobs it never started counted.
+#[test]
+fn a_run_cancelled_with_jobs_queued_keeps_them_as_never_run() {
+    let mut screen = Screen::new(true);
+    screen.apply_workflow(
+        WorkflowEvent::RunStarted(RunStarted {
+            id: "wf1".into(),
+            resumed_from: None,
+        }),
+        0,
+    );
+    screen.apply_workflow(
+        WorkflowEvent::JobsQueued {
+            run: "wf1".into(),
+            count: 5,
+        },
+        0,
+    );
+    screen.apply_workflow(started("c1", "first", "w1"), 10);
+    screen.apply_workflow(ended("c1", "cancelled", 1, None), 500);
+    screen.apply_workflow(
+        WorkflowEvent::RunEnded(p1_tui::workflow::RunEnded {
+            id: "wf1".into(),
+            outcome: "cancelled".into(),
+            error: Some("cancelled".into()),
+        }),
+        600,
+    );
+    let run = screen.workers.tree.run("wf1").unwrap();
+    assert_eq!((run.queued, run.never_run, run.total()), (0, 4, 5));
+    let lines = text(&screen, 60, None);
+    assert!(find(&lines, "wf1 ·").contains("5 steps"), "{lines:#?}");
+    assert!(find(&lines, "running ·").contains("0 queued"), "{lines:#?}");
+    assert!(
+        find(&lines, "never run").contains("4 never run"),
+        "{lines:#?}"
+    );
+}
+
+/// Unknown stays `—`: a step's tool calls are unknown until its worker's stream reached
+/// the TUI, and a sum over such a step says so.
+#[test]
+fn a_steps_calls_are_unknown_until_its_workers_stream_arrives() {
+    let mut screen = Screen::new(true);
+    screen.apply_workflow(started("c1", "first", "w1"), 10);
+    screen.sync_workers(vec![worker("w1", BlockState::Running, Some(1_000))]);
+    let lines = text(&screen, 60, None);
+    let step = position(&lines, "▪ first");
+    assert!(
+        lines[step + 1].contains("1.0k/128k · — calls"),
+        "{}",
+        lines[step + 1]
+    );
+    assert!(find(&lines, "tokens ").contains("— calls"), "{lines:#?}");
+    screen.apply_worker("w1", &AgentEvent::TurnStarted, 20);
+    let lines = text(&screen, 60, None);
+    assert!(
+        lines[step + 1].contains("1.0k/128k · 0 calls"),
+        "{}",
+        lines[step + 1]
+    );
 }

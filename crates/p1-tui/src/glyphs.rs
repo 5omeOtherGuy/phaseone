@@ -22,7 +22,7 @@ pub const NESTED: char = '↳';
 /// `▪` — working (LED chase).
 pub const WORKING: char = '▪';
 
-/// The workflow tree's own marks (ADR-0074), kept with the vocabulary so no renderer
+/// The workflow tree's own marks (ADR-0075), kept with the vocabulary so no renderer
 /// hard-codes one: an open and a collapsed phase, a step that stopped short of done
 /// (blocked or cancelled), and a step answered from an earlier run's journal (also the
 /// resumed-run mark).

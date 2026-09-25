@@ -130,7 +130,7 @@ impl FrontEnd for TuiFrontEnd {
         });
     }
 
-    /// The workflow tree's events (ADR-0074) take the worker events' path: stamped
+    /// The workflow tree's events (ADR-0075) take the worker events' path: stamped
     /// through the sink's channel, folded into the screen by the driver.
     #[cfg(feature = "workflows")]
     fn workflow_run_started(&self, run: &crate::frontend::WorkflowRunStarted) {
@@ -325,7 +325,7 @@ impl FrontEnd for TuiFrontEnd {
                 .map(|service| spawn_worker_stopper(service.clone(), cancel.child_token()));
             #[cfg(not(feature = "delegation"))]
             let worker_stops: Option<mpsc::UnboundedSender<String>> = None;
-            // `x` on a run header: the workflow service's own cancel (ADR-0074).
+            // `x` on a run header: the workflow service's own cancel (ADR-0075).
             #[cfg(feature = "workflows")]
             let run_cancels = deps
                 .workflow_service
@@ -456,7 +456,7 @@ pub(crate) struct Driver {
     worker_rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
     /// Confirmed worker stops; the task owns the service calls off the UI loop.
     worker_stops: Option<mpsc::UnboundedSender<String>>,
-    /// Confirmed workflow run cancels, likewise (ADR-0074).
+    /// Confirmed workflow run cancels, likewise (ADR-0075).
     run_cancels: Option<mpsc::UnboundedSender<String>>,
     /// Usage reported by each worker's own responses; never merged into the
     /// parent's context or spend.
@@ -1341,11 +1341,21 @@ fn pulsing(screen: &Screen, now_ms: u64) -> bool {
     }
 }
 
-/// Whether a running workflow's tree is on screen (ADR-0074): its elapsed times are read
-/// from the frame's clock, so the heartbeat draws it (once a second while idle).
+/// Whether a running workflow's tree is on screen (ADR-0075): its elapsed times are read
+/// from the frame's clock, so the heartbeat draws it (once a second while idle). A pane
+/// that is off, hidden by focus mode or the full review, or too narrow to be laid out
+/// (and not overlaid) shows no tree, and draws nothing on its own (#141's idle rule).
 fn tree_live(screen: &Screen) -> bool {
-    screen.pane_mode == PaneMode::Workers && screen.workers.tree.any_running()
+    let pane_visible = !screen.focus
+        && !screen.review.open
+        && ((screen.pane_width != p1_tui::state::PaneWidth::Off
+            && screen.last_width >= PANE_MIN_WIDTH)
+            || screen.ledger_overlay);
+    pane_visible && screen.pane_mode == PaneMode::Workers && screen.workers.tree.any_running()
 }
+
+/// The narrowest terminal that lays out a side pane (`p1_tui::geometry::layout`).
+const PANE_MIN_WIDTH: u16 = 100;
 
 /// Whether a §5 PEEK banner is on screen this frame. Its countdown moves once a
 /// second, so it needs the heartbeat to draw (like the pulse), and it cannot be
@@ -1858,7 +1868,7 @@ fn spawn_worker_stopper(
 }
 
 /// Apply confirmed workflow run cancels outside the UI loop; the run's own end reaches the
-/// tree through the observer (ADR-0074).
+/// tree through the observer (ADR-0075).
 #[cfg(feature = "workflows")]
 fn spawn_run_canceller(
     service: Arc<dyn p1_workflow::WorkflowService>,

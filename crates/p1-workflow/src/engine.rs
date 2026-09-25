@@ -189,10 +189,14 @@ impl RunState {
         call: &CallId,
     ) -> Result<StepEnvelope, Box<EvalAltResult>> {
         lock(&self.record).steps_started += 1;
+        // The step's ordinal in its run: what tells two calls with the same id apart
+        // (ADR-0075), so it is taken before anything can end the step.
+        let number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let role = self.roles.get(&opts.role);
         let line = LineContext {
             role: opts.role.clone(),
             model: role.map(Role::head).unwrap_or_default(),
+            ordinal: number,
         };
         let refused = |error: String| StepEnvelope {
             step: call.clone(),
@@ -209,7 +213,6 @@ impl RunState {
             worktree: None,
         };
 
-        let number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if number > self.max_steps {
             let envelope = refused(format!("max_steps: {} reached", self.max_steps));
             return Ok(self.conclude(call, &line, envelope, false, &StepCost::default()));
@@ -245,6 +248,7 @@ impl RunState {
             schema: opts.schema.clone(),
             workspace,
             attempt: 1,
+            ordinal: number,
             worktree: opts.worktree.clone(),
             base: self.base.clone(),
         };
@@ -600,6 +604,7 @@ impl RunState {
         });
         let step_line = StepLine {
             call: call.clone(),
+            ordinal: line.ordinal,
             label: envelope.label.clone(),
             role: line.role.clone(),
             model: line.model.clone(),
@@ -692,6 +697,7 @@ impl RunState {
 struct LineContext {
     role: String,
     model: String,
+    ordinal: u32,
 }
 
 /// Why ONE attempt was not dispatched.

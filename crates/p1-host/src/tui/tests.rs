@@ -2042,7 +2042,7 @@ fn worker_context_window_sync_keeps_filling_usage_from_worker_responses() {
     assert_eq!(row.cost_micro_usd, Some(5));
 }
 
-/// ADR-0074: the front end's workflow calls reach the screen's tree through the sink's
+/// ADR-0075: the front end's workflow calls reach the screen's tree through the sink's
 /// channel, and `x`/`y` on a run header sends the run to the host's canceller.
 #[cfg(feature = "workflows")]
 #[test]
@@ -2104,4 +2104,60 @@ fn workflow_calls_build_the_tree_and_a_run_header_cancels_through_the_run_channe
         block,
         p1_tui::transcript::Block::Meta { text } if text == "↳ wf1 cancel requested"
     )));
+}
+
+/// ADR-0075 / #141's idle rule: a live run's tree redraws on the heartbeat only while the
+/// pane shows it — with the pane off, a running workflow draws no periodic frames.
+#[cfg(feature = "workflows")]
+#[tokio::test(start_paused = true)]
+async fn a_live_run_draws_on_the_heartbeat_only_while_its_tree_is_visible() {
+    use p1_tui::state::{PaneMode, PaneWidth};
+
+    async fn frames_in_five_seconds(pane_width: PaneWidth) -> usize {
+        let mut harness =
+            IdleLoop::with_backend(ratatui::backend::TestBackend::new(120, 40), false);
+        // Pinned, so the run's start does not promote (and open) the pane.
+        harness.driver.screen.pinned = true;
+        harness.driver.screen.pane_mode = PaneMode::Workers;
+        harness.driver.screen.pane_width = pane_width;
+        let wires = harness.wires.clone();
+        let script = async move {
+            wires
+                .events
+                .send(UiEvent::Workflow {
+                    at_ms: 0,
+                    event: p1_tui::workflow::WorkflowEvent::RunStarted(
+                        p1_tui::workflow::RunStarted {
+                            id: "wf1".into(),
+                            resumed_from: None,
+                        },
+                    ),
+                })
+                .expect("the loop reads events");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let before = wires.draws.count();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            wires.cancel.cancel();
+            wires.draws.count() - before
+        };
+        let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = frames.clone();
+        harness
+            .run(async move {
+                seen.store(script.await, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
+        frames.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    assert_eq!(
+        frames_in_five_seconds(PaneWidth::Off).await,
+        0,
+        "a hidden tree draws nothing on its own"
+    );
+    let shown = frames_in_five_seconds(PaneWidth::Wide).await;
+    assert!(
+        (3..=5).contains(&shown),
+        "a visible live tree redraws once a second: {shown}"
+    );
 }

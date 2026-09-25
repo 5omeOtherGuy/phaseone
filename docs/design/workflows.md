@@ -405,7 +405,7 @@ non-JSON return), `Cancelled`.
 **The ONE notification.** The engine reports through `WorkflowObserver` (every method a
 no-op by default): `run_started`, `phase`, `log`, `jobs_queued`, `step_started`, `step_ended`,
 `thunk_failed`, `run_ended`. `jobs_queued(id, count)` fires once when a `parallel`/`pipeline`
-starts its fan-out, with the number of jobs (ADR-0074). `step_started` fires only when the step's worker is known — the runner
+starts its fan-out, with the number of jobs (ADR-0075). `step_started` fires only when the step's worker is known — the runner
 returns the `WorkerRef` at the end — so it is not a start signal. `thunk_failed` fires
 when one `parallel`/`pipeline` job returns an error — a cancelled step's error included —
 before its siblings are joined; a job that panics or never starts reports nothing (tests
@@ -447,7 +447,7 @@ file, else `$XDG_STATE_HOME/p1/workflows` (or `~/.local/state/p1/workflows`), `-
 `run_root/<run id>/` (§6). Choosing it is the host's composition; the module fixes only
 the layout and the numbering.
 
-**The TUI tree (ADR-0074).** `HostWorkflowObserver` also projects every observer event —
+**The TUI tree (ADR-0075).** `HostWorkflowObserver` also projects every observer event —
 `run_started`, `phase`, `log`, `jobs_queued`, `step_started`, `step_ended`, `thunk_failed`,
 `run_ended` — into structured `FrontEnd` calls, so `p1-tui` can show runs as a live tree
 (runs → phases → steps → workers) without depending on `p1-workflow` types (§7.7).
