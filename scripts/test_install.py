@@ -10,7 +10,8 @@ from that fixture and record their argv and URLs; a stub `cargo` fakes a local r
 build. Every home, config dir and prefix is a temp dir, so the machine's real
 `~/.config/p1` is never touched.
 
-`P1_LOCAL_BUILD_ROOT` stands in for `/mnt/build`, the probe `--local` refuses without.
+`CARGO_TARGET_DIR` and `P1_INSTALL_MIN_FREE_BYTES` make the `--local` target and
+admission threshold injectable without touching a real home or filesystem.
 """
 from __future__ import annotations
 
@@ -41,7 +42,8 @@ SYSTEM_PATH = "/usr/bin:/bin"
 # install.sh's external commands, symlinked into a farm of its own: a PATH built from
 # the farm carries no `gh`, which is how the curl fallback is reached deterministically.
 FARM_TOOLS = ("mktemp", "sha256sum", "cut", "awk", "tar", "gzip", "cp", "mv", "mkdir",
-              "rm", "chmod", "basename", "dirname", "env", "cat", "python3")
+              "rm", "chmod", "basename", "dirname", "env", "cat", "python3",
+              "stat", "df", "realpath")
 
 VERSION_LINE = "p1 0.0.1 (deadbeef0000 2026-09-24)"
 
@@ -873,22 +875,14 @@ exec '{real_mv}' \"$@\"
 
     # --- --local -----------------------------------------------------------
 
-    def test_local_refuses_without_a_target_dir(self) -> None:
+    def test_local_uses_the_default_ssd_target_and_two_jobs(self) -> None:
         self.stub("cargo", CARGO_STUB)
-        missing = os.path.join(self.dir, "no-mnt-build")
-        done = self.run_install("--local", "--prefix", self.prefix, P1_LOCAL_BUILD_ROOT=missing)
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn("CARGO_TARGET_DIR", done.stderr)
-        self.assertIn("--local needs a build directory", done.stderr)
-        self.assertEqual(self.log(self.cargo_log), "")
-        self.assert_nothing_installed(self.prefix)
-
-    def test_local_uses_cargo_target_dir_and_two_jobs(self) -> None:
-        self.stub("cargo", CARGO_STUB)
-        target = self.mkdir("target")
-        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target)
+        self.stub("stat", "#!/bin/sh\nprintf '%s\\n' ext2/ext3\n", directory=self.stub_dir)
+        done = self.run_install("--local", "--prefix", self.prefix,
+                                P1_INSTALL_MIN_FREE_BYTES="0")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assert_installed(self.prefix)
+        target = os.path.join(self.home, ".cache", "cargo-target", "p1-release")
         cargo = self.log(self.cargo_log)
         self.assertIn(f"target={target}\n", cargo)
         self.assertIn("jobs=2\n", cargo)
@@ -897,19 +891,58 @@ exec '{real_mv}' \"$@\"
         self.assertTrue(os.path.isdir(os.path.join(self.prefix, "share", "p1", "environments",
                                                    "claude")))
 
-    def test_local_uses_the_build_root_probe_when_it_exists(self) -> None:
+    def test_local_uses_cargo_target_dir_override(self) -> None:
         self.stub("cargo", CARGO_STUB)
-        root = self.mkdir("mnt-build")
-        done = self.run_install("--local", "--prefix", self.prefix, P1_LOCAL_BUILD_ROOT=root)
+        self.stub("stat", "#!/bin/sh\nprintf '%s\\n' ext2/ext3\n", directory=self.stub_dir)
+        target = self.mkdir(os.path.join("home", ".cache", "cargo-target", "task-local"))
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target,
+                                P1_INSTALL_MIN_FREE_BYTES="0")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assert_installed(self.prefix)
-        self.assertIn(f"target={root}/cargo-target/p1-release\n", self.log(self.cargo_log))
+        self.assertIn(f"target={target}\n", self.log(self.cargo_log))
+
+    def test_local_refuses_a_target_outside_the_cache_root(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        target = self.mkdir("outside-target")
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target,
+                                P1_INSTALL_MIN_FREE_BYTES="0")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("must resolve below", done.stderr)
+        self.assertIn(target, done.stderr)
+        self.assertEqual(self.log(self.cargo_log), "")
+        self.assert_nothing_installed(self.prefix)
+
+    def test_local_refuses_a_target_below_the_free_space_threshold(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub("stat", "#!/bin/sh\nprintf '%s\\n' ext2/ext3\n", directory=self.stub_dir)
+        target = self.mkdir(os.path.join("home", ".cache", "cargo-target", "task-local"))
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target,
+                                P1_INSTALL_MIN_FREE_BYTES="9223372036854775807")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("below the 9223372036854775807-byte admission threshold", done.stderr)
+        self.assertIn(target, done.stderr)
+        self.assertEqual(self.log(self.cargo_log), "")
+        self.assert_nothing_installed(self.prefix)
+
+    def test_local_refuses_a_non_ext4_target(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub("stat", "#!/bin/sh\nprintf '%s\\n' tmpfs\n", directory=self.stub_dir)
+        target = self.mkdir(os.path.join("home", ".cache", "cargo-target", "task-local"))
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target,
+                                P1_INSTALL_MIN_FREE_BYTES="0")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("not on an ext4 filesystem", done.stderr)
+        self.assertIn("found tmpfs", done.stderr)
+        self.assertEqual(self.log(self.cargo_log), "")
+        self.assert_nothing_installed(self.prefix)
 
     def test_local_reports_a_missing_build_artifact(self) -> None:
         stub = self.stub("cargo", "#!/bin/sh\nexit 0\n")
+        self.stub("stat", "#!/bin/sh\nprintf '%s\\n' ext2/ext3\n", directory=self.stub_dir)
         self.assertTrue(os.path.isfile(stub))
-        target = self.mkdir("empty-target")
-        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target)
+        target = self.mkdir(os.path.join("home", ".cache", "cargo-target", "empty-target"))
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target,
+                                P1_INSTALL_MIN_FREE_BYTES="0")
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("cargo did not produce", done.stderr)
         self.assert_nothing_installed(self.prefix)
