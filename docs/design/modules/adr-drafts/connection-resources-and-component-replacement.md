@@ -1,5 +1,5 @@
 ---
-adr: draft
+adr: {{number}}
 title: Connection resources and component replacement
 status: proposed
 date: 2026-09-25
@@ -8,10 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [issue #222, epic #206, DECISIONS.md D22, docs/adr/0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md, docs/adr/0047-the-codex-route-may-speak-websocket-an-adapter-local-transport-with-sse-as-the-fallback.md, docs/adr/0049-model-selection-and-switching-a-session-to-another-model.md, docs/adr/0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md, docs/adr/0033-a-session-resumes-only-on-the-route-and-model-that-recorded-it.md, docs/adr/0015-send-capable-boxed-future-contracts.md, docs/design/websocket.md, docs/design/modules/protocol.md]
 ---
-# ADR draft: Connection resources and component replacement
-
-Drafted outside `docs/adr/` under its ledger title; the land step numbers it with
-`scripts/adr.py new` and removes this file.
+# ADR-{{number_padded}}: Connection resources and component replacement
 
 ## Context
 
