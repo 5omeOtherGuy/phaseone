@@ -299,7 +299,7 @@ malformed chip followed by visible `OK`. Mutation check: the cells key fails it 
 Open: P0 per-symbol/external-reach closure and P2–P6 (scope freeze for the owner's
 ~50-worker workflow). No programme-completion claim.
 
-## Massive run
+## Massive run: dry-run (S1, S3)
 
 The judge accepted these slices:
 
@@ -312,4 +312,6 @@ The judge accepted these slices:
   without leaking them into the composer, while once/deny and diff-review keys
   remain available.
 
-This records the accepted slice evidence only. The lead has not yet verified it.
+Lead check after merging `main`: `cargo test -p p1-tui` (316 passed), clippy
+`-D warnings` on p1-tui and p1-host, and `cargo fmt --check` are green; PR CI
+runs the full gate. Accepted follow-ups are listed on the pull request.
