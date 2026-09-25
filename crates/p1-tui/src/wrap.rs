@@ -34,93 +34,132 @@ pub fn fit_cells(s: &str, cells: usize) -> String {
     s[..fit_cells_boundary(s, cells)].to_string()
 }
 
-/// The number of rows `wrap(text, width)` would produce, without building the
-/// strings. The transcript tail pass needs the full height cheaply.
+/// The number of rows `wrap(text, width)` would produce. It reuses `wrap` so
+/// measurement cannot drift from rendering.
 pub(crate) fn wrap_len(text: &str, width: usize) -> usize {
-    if width == 0 {
-        return 1;
+    wrap(text, width).len()
+}
+
+struct Unit<S> {
+    text: String,
+    style: S,
+    width: usize,
+}
+
+type UnitRow<S> = Vec<Unit<S>>;
+
+fn char_width(ch: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn units_for_text<S: Copy>(text: &str, style: S) -> Vec<Unit<S>> {
+    let mut units: Vec<Unit<S>> = Vec::new();
+    for ch in text.chars() {
+        let width = char_width(ch);
+        if width == 0 && !units.is_empty() {
+            units.last_mut().expect("non-empty units").text.push(ch);
+        } else {
+            units.push(Unit {
+                text: ch.to_string(),
+                style,
+                width,
+            });
+        }
     }
-    let indent_len = text.chars().take_while(|c| *c == ' ').count();
-    let body = &text[indent_len..];
-    let body_width = width.saturating_sub(indent_len).max(1);
-    let mut rows = 0;
-    // Display cells used on the current line; kept as a running total so a
-    // word never costs a fresh scan of the line (same reason as `wrap`).
-    let mut current = 0usize;
-    for word in body.split(' ') {
-        if word.is_empty() {
+    units
+}
+
+// Adapted from iris-donor/src/ui/textengine.rs (pin 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa, MIT).
+// The donor's bounded-progress wrapping is retained, while oversized clusters
+// become an ellipsis because SLAB forbids terminal overflow.
+fn wrap_units<S: Copy>(text: &str, width: usize, style: S) -> Vec<Vec<Unit<S>>> {
+    if width == 0 {
+        return vec![Vec::new()];
+    }
+    let leading_spaces = text.chars().take_while(|ch| *ch == ' ').count();
+    let body = &text[leading_spaces..];
+    let indent = leading_spaces.min(width - 1);
+    let body_width = width - indent;
+    let mut body_rows = Vec::new();
+    let mut current: Vec<Unit<S>> = Vec::new();
+    let mut current_width = 0usize;
+    let words = body
+        .split(' ')
+        .filter(|word| !word.is_empty())
+        .map(|word| (cell_width(word), units_for_text(word, style)))
+        .collect::<Vec<_>>();
+    let push_current = |rows: &mut Vec<UnitRow<S>>, current: &mut UnitRow<S>| {
+        if !current.is_empty() {
+            rows.push(std::mem::take(current));
+        }
+    };
+    for (word_width, word) in words {
+        if !current.is_empty() && current_width + 1 + word_width > body_width {
+            push_current(&mut body_rows, &mut current);
+            current_width = 0;
+        }
+        if !current.is_empty() {
+            current.push(Unit {
+                text: " ".to_string(),
+                style: current.last().expect("non-empty current").style,
+                width: 1,
+            });
+            current_width += 1;
+        }
+        if word_width <= body_width {
+            current_width += word_width;
+            current.extend(word);
             continue;
         }
-        let word_len = cell_width(word);
-        if current > 0 && current + 1 + word_len > body_width {
-            rows += 1;
-            current = 0;
-        } else if current > 0 {
-            current += 1;
-        }
-        if word_len > body_width {
-            // A word that cannot fit alone breaks hard at the cell edge.
-            let mut rest = word;
-            while cell_width(rest) > body_width {
-                let cut = fit_cells_boundary(rest, body_width);
-                rows += 1;
-                rest = &rest[cut..];
+        for unit in word {
+            if unit.width > body_width {
+                push_current(&mut body_rows, &mut current);
+                current.push(Unit {
+                    text: "…".to_string(),
+                    style: unit.style,
+                    width: 1,
+                });
+                push_current(&mut body_rows, &mut current);
+                current_width = 0;
+            } else {
+                if !current.is_empty() && current_width + unit.width > body_width {
+                    push_current(&mut body_rows, &mut current);
+                    current_width = 0;
+                }
+                current_width += unit.width;
+                current.push(unit);
             }
-            current = cell_width(rest);
-        } else {
-            current += word_len;
         }
     }
-    rows + 1
+    if !current.is_empty() || body_rows.is_empty() {
+        body_rows.push(current);
+    }
+    let indent_units = || {
+        (0..indent)
+            .map(|_| Unit {
+                text: " ".to_string(),
+                style,
+                width: 1,
+            })
+            .collect::<Vec<_>>()
+    };
+    body_rows
+        .into_iter()
+        .map(|mut row| {
+            let mut with_indent = indent_units();
+            with_indent.append(&mut row);
+            with_indent
+        })
+        .collect()
 }
 
 /// Wrap `text` to `width` columns, returning the lines. Empty input yields one
 /// empty line so a block always occupies its row. Leading indentation is
 /// preserved and hangs: continuation lines keep the same indent.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    let indent: String = text.chars().take_while(|c| *c == ' ').collect();
-    let text = &text[indent.len()..];
-    let body_width = width.saturating_sub(indent.len()).max(1);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    // Display cells used on the current line; running, not recomputed per
-    // word (cell_width walks the whole string).
-    let mut current_cells = 0usize;
-    for word in text.split(' ') {
-        if word.is_empty() {
-            continue;
-        }
-        let word_len = cell_width(word);
-        if current_cells > 0 && current_cells + 1 + word_len > body_width {
-            lines.push(std::mem::take(&mut current));
-            current_cells = 0;
-        } else if current_cells > 0 {
-            current.push(' ');
-            current_cells += 1;
-        }
-        if word_len > body_width {
-            // A word that cannot fit alone breaks hard at the cell edge.
-            let mut rest = word;
-            while cell_width(rest) > body_width {
-                let cut = fit_cells(rest, body_width);
-                current.push_str(&cut);
-                lines.push(std::mem::take(&mut current));
-                rest = &rest[cut.len()..];
-            }
-            current.push_str(rest);
-            current_cells = cell_width(rest);
-        } else {
-            current.push_str(word);
-            current_cells += word_len;
-        }
-    }
-    lines.push(current);
-    lines
+    wrap_units(text, width, ())
         .into_iter()
-        .map(|line| format!("{indent}{line}"))
+        .map(|row| row.into_iter().map(|unit| unit.text).collect())
         .collect()
 }
 
@@ -220,6 +259,123 @@ mod tests {
     }
 
     #[test]
+    fn oversized_glyph_is_one_ellipsis_and_returns() {
+        let (rows, len) = watchdog(|| (wrap("界", 1), wrap_len("界", 1)));
+        assert_eq!(rows, vec!["…"]);
+        assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn oversized_glyph_absorbs_following_zero_width_char() {
+        let (rows, len) = watchdog(|| (wrap("界\u{301}", 1), wrap_len("界\u{301}", 1)));
+        assert_eq!(rows, vec!["…"]);
+        assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn oversized_glyph_after_indent_is_one_ellipsis_and_returns() {
+        let (rows, len) = watchdog(|| (wrap(" 界", 2), wrap_len(" 界", 2)));
+        assert_eq!(rows, vec![" …"]);
+        assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn oversized_glyphs_advance_between_other_characters() {
+        let (rows, len) = watchdog(|| (wrap("a界b", 1), wrap_len("a界b", 1)));
+        assert_eq!(rows, vec!["a", "…", "b"]);
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn a_wide_glyph_that_fits_alone_is_not_replaced() {
+        let (rows, len) = watchdog(|| (wrap("界界", 3), wrap_len("界界", 3)));
+        assert_eq!(rows, vec!["界", "界"]);
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn indentation_is_capped_to_leave_body_cells() {
+        let (rows, narrow) = watchdog(|| (wrap("    ab", 3), wrap("  ab", 1)));
+        assert_eq!(rows, vec!["  a", "  b"]);
+        assert_eq!(narrow, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn combining_marks_stay_with_their_base() {
+        let (rows, len) =
+            watchdog(|| (wrap("e\u{301}e\u{301}", 1), wrap_len("e\u{301}e\u{301}", 1)));
+        assert_eq!(rows, vec!["e\u{301}", "e\u{301}"]);
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn a_fitting_zwj_word_is_not_split_by_character_widths() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let text = format!("x{family}");
+        let expected = text.clone();
+        let rows = watchdog(move || wrap(&text, 3));
+        assert_eq!(rows, vec![expected]);
+    }
+
+    #[test]
+    fn styled_oversized_glyph_keeps_its_style() {
+        let runs = vec![("a".into(), 'x'), ("界".into(), 'y')];
+        let rows = watchdog(move || wrap_styled(&runs, 1));
+        assert_eq!(rows, vec![vec![("a".into(), 'x')], vec![("…".into(), 'y')]]);
+    }
+
+    #[test]
+    fn wrap_and_len_are_bounded_for_all_corpus_widths() {
+        let corpus = [
+            "",
+            " ",
+            "  indented body that wraps",
+            "你好世界 你好 世界",
+            "supercalifragilistic 短",
+            "a bb ccc dddd eeeee ffffff",
+            "   leading",
+            "trailing   ",
+            "x  y   z",
+            "你好a好你",
+            "界",
+            " 界",
+            "a界b",
+            "    ab",
+            "e\u{301}e\u{301}",
+        ];
+        for text in corpus {
+            for width in 0..=14 {
+                let (rows, len) = watchdog(move || (wrap(text, width), wrap_len(text, width)));
+                assert_eq!(
+                    len,
+                    rows.len(),
+                    "wrap_len disagrees for {text:?} at {width}"
+                );
+                if width > 0 {
+                    assert!(
+                        rows.iter().all(|row| cell_width(row) <= width),
+                        "row overflows for {text:?} at {width}: {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn watchdog<T, F>(f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = std::thread::spawn(move || {
+            let _ = sender.send(f());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("wrap watchdog expired")
+    }
+
+    #[test]
     fn wrap_len_matches_wrap_for_every_shape() {
         let cases: &[(&str, usize)] = &[
             ("", 5),
@@ -254,13 +410,8 @@ mod tests {
             "x  y   z",
             "你好a好你",
         ];
-        // CJK needs at least two cells per glyph, so start there; the widths
-        // below that are exercised with ASCII only (a glyph wider than the
-        // body is a pre-existing wrap edge, not this change's concern).
         for text in corpus {
-            let wide = text.chars().any(|c| cell_width(&c.to_string()) > 1);
-            let from = if wide { 2 } else { 0 };
-            for width in from..=14 {
+            for width in 0..=14 {
                 assert_eq!(
                     wrap_len(text, width),
                     wrap(text, width).len(),
