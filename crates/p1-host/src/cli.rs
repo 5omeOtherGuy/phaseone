@@ -146,6 +146,12 @@ pub struct Options {
     /// Run the interactive session in the TUI (issue #12). Interactive only:
     /// headless runs and non-TTY stdout keep the line renderer forever.
     pub tui: bool,
+    /// `--instructions FILE` (repeatable): files appended to the top-level agent's system
+    /// prompt, in order (issue #129).
+    pub instructions: Vec<PathBuf>,
+    /// `--skills DIR` (repeatable): directories whose `*/SKILL.md` the top-level agent's
+    /// prompt lists by name and description (issue #129).
+    pub skills: Vec<PathBuf>,
 }
 
 impl Options {
@@ -205,6 +211,8 @@ pub fn usage() -> String {
     );
     out.push_str("  --workspace DIR   workspace root (default: current directory)\n");
     out.push_str("  --session FILE    write the session journal to FILE as JSONL\n");
+    out.push_str("  --instructions FILE  append FILE to the agent's system prompt (repeatable; e.g.\n                    the global and the repository AGENTS.md)\n");
+    out.push_str("  --skills DIR      list DIR/*/SKILL.md by name and description in the system\n                    prompt; the agent reads one when a task calls for it (repeatable)\n");
     out.push_str("  --resume          continue an existing --session file\n");
     out.push_str(
         "  --ask             ask before permitting a tool call; headless permits only\n                    read-only calls (default: full access, no questions)\n",
@@ -281,6 +289,8 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut ask = false;
     let mut tui = false;
     let mut yes = false;
+    let mut instructions: Vec<PathBuf> = Vec::new();
+    let mut skills: Vec<PathBuf> = Vec::new();
     let mut prompt_words: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -312,6 +322,12 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
                 session = Some(PathBuf::from(value));
             }
             "--resume" => resume = true,
+            "--instructions" => {
+                instructions.push(PathBuf::from(take_value(args, &mut index, arg)?));
+            }
+            "--skills" => {
+                skills.push(PathBuf::from(take_value(args, &mut index, arg)?));
+            }
             "--ask" => ask = true,
             "--yes" => yes = true,
             "--tui" => tui = true,
@@ -415,6 +431,8 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         max_continuations,
         provider_retries,
         max_idle_summaries,
+        instructions,
+        skills,
     })
 }
 
@@ -469,6 +487,8 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         max_continuations: DEFAULT_MAX_CONTINUATIONS,
         provider_retries: DEFAULT_PROVIDER_RETRIES,
         max_idle_summaries: DEFAULT_MAX_IDLE_SUMMARIES,
+        instructions: Vec::new(),
+        skills: Vec::new(),
     })
 }
 
@@ -909,6 +929,8 @@ fn defaults(command: Command) -> Options {
         max_continuations: DEFAULT_MAX_CONTINUATIONS,
         provider_retries: DEFAULT_PROVIDER_RETRIES,
         max_idle_summaries: DEFAULT_MAX_IDLE_SUMMARIES,
+        instructions: Vec::new(),
+        skills: Vec::new(),
     }
 }
 
@@ -999,6 +1021,25 @@ mod tests {
         assert!(parse(&args(&["--resume"])).is_err());
         assert!(parse(&args(&["env", "show"])).is_err());
         assert!(parse(&args(&["env", "list"])).is_err());
+    }
+
+    #[test]
+    fn instructions_and_skills_are_repeatable_paths() {
+        let options = parse(&args(&[
+            "--instructions",
+            "/g/AGENTS.md",
+            "--skills",
+            "/s",
+            "--instructions",
+            "/r/AGENTS.md",
+        ]))
+        .unwrap();
+        assert_eq!(
+            options.instructions,
+            vec![PathBuf::from("/g/AGENTS.md"), PathBuf::from("/r/AGENTS.md")]
+        );
+        assert_eq!(options.skills, vec![PathBuf::from("/s")]);
+        assert!(parse(&args(&["--instructions"])).is_err());
     }
 
     #[test]
