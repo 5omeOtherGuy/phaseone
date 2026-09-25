@@ -1276,9 +1276,12 @@ fn spawn_worker_refresher(
                     id: id.0.clone(),
                     task,
                     route: description,
+                    model: None,
                     state,
                     elapsed,
                     cost_micro_usd: None,
+                    tokens: None,
+                    context_window: None,
                     grants,
                     activity,
                 });
