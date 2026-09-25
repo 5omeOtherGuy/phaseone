@@ -12,8 +12,8 @@ workspace = true
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 p1-module-runtime = { path = "../p1-module-runtime" }
+# Not only a test dependency: the bench binary of src/bin wraps a module tool through
+# `wasm_tool`, which takes a mask counter, and a bin target cannot use a dev-dependency.
+p1-redact = { path = "../p1-redact" }
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
-
-[dev-dependencies]
-p1-redact = { path = "../p1-redact" }
