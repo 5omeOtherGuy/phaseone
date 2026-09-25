@@ -110,6 +110,7 @@ not stand.
 - `scripts/rustc-serial` uses stable `flock` slots (two by default), publishes holder metadata
   only after acquiring a slot, reports stopped or stale holders, and never admits a slot from
   holder metadata alone.
-- `scripts/install.sh` makes `--latest` the default release mode; its `--local` mode builds only
-  when a target has been selected. README.md records the normal release and SSD fallback
-  workflows.
+- `scripts/install.sh` makes `--latest` the default release mode. Its `--local` mode selects
+  `$CARGO_TARGET_DIR` or `$HOME/.cache/cargo-target/p1-release`, refuses a non-ext4 target or
+  one with less than 12 GiB free, and runs Cargo with two jobs. README.md records the normal
+  release and SSD fallback workflows.

@@ -72,9 +72,11 @@ p1 is installed from a published release, and the binary says which commit it is
   the date from `P1_BUILD_DATE`, else `SOURCE_DATE_EPOCH`, else `unknown` — never the wall
   clock, so two builds of one commit print the same string.
 - `--local` is the fallback for a build that cannot run in the cloud. It builds the current
-  checkout with `cargo build --release --locked -p p1-host` into the caller's explicitly set
-  `$CARGO_TARGET_DIR`; that directory must be a distinct per-task target below
-  `~/.cache/cargo-target` on the SSD. The retired internal HDD is not a build tree.
+  checkout with `cargo build --release --locked -p p1-host` into `$CARGO_TARGET_DIR`, or
+  `$HOME/.cache/cargo-target/p1-release` when that variable is unset. The target must be
+  absolute, below `$HOME/.cache/cargo-target`, on an ext4 filesystem, and have at least
+  12 GiB free; `P1_INSTALL_MIN_FREE_BYTES` can lower that admission threshold for hermetic
+  tests. The repository's own `target/` and the retired internal HDD are never used.
 - The installer never reads, writes or deletes anything under
   `${XDG_CONFIG_HOME:-$HOME/.config}/p1`; it refuses a prefix whose prospective `bin` or
   `share` path resolves into that tree.

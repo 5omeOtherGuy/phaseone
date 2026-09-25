@@ -28,19 +28,23 @@ bash p1-install.sh                 # --latest into ~/.local
 bash p1-install.sh --prefix /opt/p1
 bash p1-install.sh --from-release main-1a2b3c4d5e6f   # a specific published commit
 bash p1-install.sh --from-release main-1a2b3c4d5e6f --force  # reinstall the same release
-bash p1-install.sh --local         # fallback: set a per-task CARGO_TARGET_DIR first
 ```
 
 The release install is the normal path: `scripts/install.sh --latest` (also the default when
 the downloaded `p1-install.sh` is run without a mode) installs the GitHub Release built by
-CI, so no Rust toolchain is needed here. A local build is only the fallback. Run
-`scripts/local-cargo-config.sh` first, then use the target it reports in
-`$CARGO_TARGET_DIR` when invoking `scripts/install.sh --local`. That target is a distinct
-per-task directory below `~/.cache/cargo-target` on the SSD; the generated, untracked
-`.cargo/config.toml` limits Cargo to two jobs and routes rustc through the machine-wide
-wrapper that admits at most two concurrent `rustc` processes. Admit a local build only with
-at least 12 GiB free on the SSD and preserve the 8 GiB SSD floor. The internal HDD is retired
-for builds.
+CI, so no Rust toolchain is needed here. A local build is only the fallback, and needs this
+checkout:
+
+```sh
+scripts/local-cargo-config.sh
+CARGO_TARGET_DIR="$HOME/.cache/cargo-target/p1-local" scripts/install.sh --local
+```
+
+The installer requires a distinct per-task target below `~/.cache/cargo-target` on the SSD;
+the generated, untracked `.cargo/config.toml` limits Cargo to two jobs and routes rustc
+through the machine-wide wrapper that admits at most two concurrent `rustc` processes. The
+installer admits a local build only with at least 12 GiB free on the SSD; preserve the 8 GiB
+SSD floor. The internal HDD is retired for builds.
 
 The installer
 
@@ -128,9 +132,11 @@ scripts/gate.sh     # must be green before anything merges into main
 Linux/macOS, Rust stable (2024 edition). On 7 GB-class machines builds default to
 `CARGO_BUILD_JOBS=2`.
 
-Release builds are CI's alone: `.github/workflows/release.yml` builds in release profile on
-a GitHub runner after a green `main` and publishes the release that `install.sh` consumes.
-Do not run `cargo build --release` or `cargo install` on a workstation (AGENTS.md).
+Release builds are normally CI's: `.github/workflows/release.yml` builds in release profile
+on a GitHub runner after a green `main` and publishes the release that `install.sh` consumes.
+The one local exception is the documented `--local` fallback under the SSD admission and
+two-`rustc` rules. Do not run another `cargo build --release` or `cargo install` on a
+workstation (AGENTS.md).
 
 ## Working here
 
