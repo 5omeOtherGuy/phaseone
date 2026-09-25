@@ -22,7 +22,9 @@ use p1_contracts::{
 };
 
 use crate::credential::{Credential, CredentialSource};
-use crate::http::{ByteStream, HttpRequest, Transport, TransportError};
+use crate::http::{
+    ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, STREAM_IDLE_TIMEOUT, Transport, TransportError,
+};
 use crate::retry::{HttpClass, RetryPolicy, classify_status, retry_after};
 use crate::sse::{SseDecoder, SseEvent};
 
@@ -207,17 +209,27 @@ async fn post_once(mut state: State) -> State {
     let request = (state.request.build)(&credential);
     let transport = state.request.transport.clone();
     let cancel = state.request.cancel.clone();
-    let response = match race(cancel.clone(), transport.post(request)).await {
-        Raced::Cancelled => return state.finish(Outcome::Cancelled),
-        Raced::Done(Err(error)) => {
-            let error = ProviderError::new(
-                ProviderErrorKind::Transport,
-                format!("request failed: {}", error.0),
-            );
-            return state.transient_or_fail(error, None, None);
-        }
-        Raced::Done(Ok(response)) => response,
-    };
+    let response =
+        match race_bounded(cancel.clone(), FIRST_BYTE_TIMEOUT, transport.post(request)).await {
+            Raced::Cancelled => return state.finish(Outcome::Cancelled),
+            // The provider never answered: the first-byte bound is the one thing that
+            // ends the wait, as a Named Transport failure the retry policy owns.
+            Raced::Done(Err(_elapsed)) => {
+                let error = ProviderError::new(
+                    ProviderErrorKind::Transport,
+                    format!("no response within {} s", FIRST_BYTE_TIMEOUT.as_secs()),
+                );
+                return state.transient_or_fail(error, None, None);
+            }
+            Raced::Done(Ok(Err(error))) => {
+                let error = ProviderError::new(
+                    ProviderErrorKind::Transport,
+                    format!("request failed: {}", error.0),
+                );
+                return state.transient_or_fail(error, None, None);
+            }
+            Raced::Done(Ok(Ok(response))) => response,
+        };
 
     let status = response.status;
     let headers = response.headers;
@@ -298,7 +310,21 @@ async fn read_body(
     let cancel = state.request.cancel.clone();
     match next_chunk(&cancel, &mut body).await {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
-        Raced::Done(Some(Ok(chunk))) => {
+        // No bytes for the idle bound: the stream is silent, not slow. Any chunk —
+        // including an SSE comment or ping — would have reset this clock.
+        Raced::Done(Err(_elapsed)) => {
+            let failure = ProviderError::new(
+                ProviderErrorKind::Transport,
+                format!("stream idle for {} s", STREAM_IDLE_TIMEOUT.as_secs()),
+            );
+            if state.visible {
+                // Rule 3: never retry once the consumer has seen output.
+                state.finish(Outcome::Failed(failure))
+            } else {
+                state.transient_or_fail(failure, None, None)
+            }
+        }
+        Raced::Done(Ok(Some(Ok(chunk)))) => {
             let events = decoder.push(&chunk);
             if let Some(outcome) = feed(&mut state, parser.as_mut(), events) {
                 state.pending.push_back(StreamEvent::Finished(outcome));
@@ -312,7 +338,7 @@ async fn read_body(
             };
             state
         }
-        Raced::Done(Some(Err(error))) => {
+        Raced::Done(Ok(Some(Err(error)))) => {
             let failure = ProviderError::new(
                 ProviderErrorKind::Transport,
                 format!("provider stream broke: {}", error.0),
@@ -324,7 +350,7 @@ async fn read_body(
                 state.transient_or_fail(failure, None, None)
             }
         }
-        Raced::Done(None) => {
+        Raced::Done(Ok(None)) => {
             // A final event that lacks its trailing blank line is still an event:
             // flush it before deciding that the body ended without a terminal.
             let last = decoder.finish().into_iter().collect();
@@ -382,8 +408,11 @@ async fn drain_body(cancel: &CancellationToken, mut body: ByteStream) -> Raced<V
     loop {
         match next_chunk(cancel, &mut body).await {
             Raced::Cancelled => return Raced::Cancelled,
-            Raced::Done(None) => return Raced::Done(collected),
-            Raced::Done(Some(Ok(chunk))) => {
+            Raced::Done(Ok(None)) => return Raced::Done(collected),
+            // A body that stops answering ends classification: the status policy
+            // does not depend on the rest of an error body (issue #164).
+            Raced::Done(Err(_elapsed)) => return Raced::Done(collected),
+            Raced::Done(Ok(Some(Ok(chunk)))) => {
                 // Classification needs the error type, not the whole body: an
                 // unbounded error body must not be buffered.
                 let room = ERROR_BODY_LIMIT.saturating_sub(collected.len());
@@ -394,7 +423,7 @@ async fn drain_body(cancel: &CancellationToken, mut body: ByteStream) -> Raced<V
             }
             // A body error after a non-2xx status does not change the status
             // policy; classify what arrived.
-            Raced::Done(Some(Err(_))) => return Raced::Done(collected),
+            Raced::Done(Ok(Some(Err(_)))) => return Raced::Done(collected),
         }
     }
 }
@@ -434,18 +463,29 @@ async fn race<T>(cancel: CancellationToken, future: impl Future<Output = T>) -> 
     }
 }
 
+/// Await `future` under `bound` and under cancellation. A wait with no bound is the
+/// bug this closes: the SSE path had a connect timeout and nothing else, so a
+/// provider that never answered hung the agent silently (issue #164).
+async fn race_bounded<T>(
+    cancel: CancellationToken,
+    bound: Duration,
+    future: impl Future<Output = T>,
+) -> Raced<Result<T, tokio::time::error::Elapsed>> {
+    race(cancel, tokio::time::timeout(bound, future)).await
+}
+
+/// The next body chunk, bounded by the stream-idle bound and by cancellation. Any
+/// chunk answered within the bound — an event, a comment or a ping — resets the
+/// clock simply by completing this wait.
 async fn next_chunk(
     cancel: &CancellationToken,
     body: &mut ByteStream,
-) -> Raced<Option<Result<Vec<u8>, TransportError>>> {
-    let cancelled = cancel.cancelled();
-    let next = body.next();
-    let next = std::pin::pin!(next);
-    let cancelled = std::pin::pin!(cancelled);
-    match select(next, cancelled).await {
-        Either::Left((item, _)) => Raced::Done(item),
-        Either::Right(((), _)) => Raced::Cancelled,
-    }
+) -> Raced<Result<Option<Result<Vec<u8>, TransportError>>, tokio::time::error::Elapsed>> {
+    race(
+        cancel.clone(),
+        tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -710,6 +750,75 @@ mod tests {
         match events.last() {
             Some(StreamEvent::Finished(outcome)) => outcome,
             other => panic!("stream did not end with Finished: {other:?}"),
+        }
+    }
+
+    /// Drive one request against an arbitrary transport and policy, with the same
+    /// TestParser and request builder the `Harness` uses. Lets a test inject a
+    /// transport whose waits do not resolve.
+    fn drive_with(transport: Arc<dyn Transport>, retry: RetryPolicy) -> ProviderStream {
+        drive(DriveRequest {
+            transport,
+            credentials: Arc::new(ScriptedCredentials::new("OLD", "NEW")),
+            build: Box::new(|_credential: &Credential| HttpRequest {
+                url: "https://provider.test/v1/stream".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            }),
+            new_parser: Box::new(|| Box::new(TestParser) as Box<dyn ResponseParser>),
+            retry,
+            cancel: CancellationToken::new(),
+        })
+    }
+
+    /// A transport whose `post` never resolves, counting the attempts, so a test
+    /// can prove the first-byte bound retries inside the shared budget.
+    #[derive(Clone, Default)]
+    struct SilentServer {
+        posts: Arc<AtomicUsize>,
+    }
+
+    impl Transport for SilentServer {
+        fn post<'a>(
+            &'a self,
+            _request: HttpRequest,
+        ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+            self.posts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A transport whose body emits one SSE comment every `gap`, then a final turn.
+    /// On the paused clock the gap is virtual, so no test ever sleeps.
+    struct PingingTransport {
+        gap: Duration,
+        pings: usize,
+    }
+
+    impl Transport for PingingTransport {
+        fn post<'a>(
+            &'a self,
+            _request: HttpRequest,
+        ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+            let gap = self.gap;
+            let pings = self.pings;
+            Box::pin(async move {
+                let stream = futures_util::stream::unfold(0usize, move |n| async move {
+                    if n < pings {
+                        tokio::time::sleep(gap).await;
+                        Some((Ok::<_, TransportError>(b": ping\n\n".to_vec()), n + 1))
+                    } else if n == pings {
+                        Some((Ok(text_turn().as_bytes().to_vec()), n + 1))
+                    } else {
+                        None
+                    }
+                });
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Box::pin(stream),
+                })
+            })
         }
     }
 
@@ -1263,5 +1372,166 @@ mod tests {
             terminal(&events),
             Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport
         ));
+    }
+
+    /// Issue #164: a provider that never sends response headers must end as a
+    /// `Transport` failure naming the first-byte bound, not hang the agent.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_never_answers_fails_at_the_first_byte_bound() {
+        // max_retries 0 isolates the bound from the retry loop.
+        let stream = drive_with(
+            Arc::new(HangingTransport),
+            RetryPolicy {
+                max_retries: 0,
+                ..RetryPolicy::default()
+            },
+        );
+        let start = tokio::time::Instant::now();
+        let events = collect(stream).await;
+
+        let error = match terminal(&events) {
+            Outcome::Failed(error) => error.clone(),
+            other => panic!("expected a transport failure, got {other:?}"),
+        };
+        assert_eq!(error.kind, ProviderErrorKind::Transport);
+        assert_eq!(
+            error.message,
+            format!("no response within {} s", FIRST_BYTE_TIMEOUT.as_secs())
+        );
+        assert_eq!(
+            start.elapsed(),
+            FIRST_BYTE_TIMEOUT,
+            "the wait ends at the bound, exactly"
+        );
+    }
+
+    /// The same wait under the default policy: it is a `Transport` failure, so it
+    /// retries `max_retries` (3) times with a notice per retry, then fails. This is
+    /// what the operator sees while a silent provider is given its chances.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_byte_timeout_retries_within_the_budget_then_fails_transport() {
+        let server = SilentServer::default();
+        let stream = drive_with(Arc::new(server.clone()), RetryPolicy::default());
+        let start = tokio::time::Instant::now();
+        let events = collect(stream).await;
+
+        assert_eq!(
+            server.posts.load(Ordering::SeqCst),
+            4,
+            "the first attempt plus max_retries (3)"
+        );
+        assert!(matches!(
+            terminal(&events),
+            Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport
+        ));
+        let notices = events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::Notice { .. }))
+            .count();
+        assert_eq!(notices, 3, "one notice per retry");
+        let policy = RetryPolicy::default();
+        assert_eq!(
+            start.elapsed(),
+            4 * FIRST_BYTE_TIMEOUT
+                + policy.delay(1, None)
+                + policy.delay(2, None)
+                + policy.delay(3, None),
+            "four bounded attempts, the retry policy's backoff between them"
+        );
+    }
+
+    /// Issue #164: a stream that sends one visible event and then goes silent must
+    /// end as a `Transport` failure naming the idle bound. After output it is
+    /// terminal, so there is exactly one request.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_stalls_after_an_event_fails_at_the_idle_bound() {
+        let stalling = ScriptedResponse {
+            status: 200,
+            headers: Vec::new(),
+            chunks: vec![b"data: delta\n\n".to_vec()],
+            end: BodyEnd::Hang,
+        };
+        let harness = Harness::new(vec![stalling]);
+        let start = tokio::time::Instant::now();
+        let events = collect(harness.start()).await;
+
+        assert_eq!(
+            harness.transport.requests().len(),
+            1,
+            "after visible output a stall is terminal: no retry"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::TextDelta { .. }))
+        );
+        let error = match terminal(&events) {
+            Outcome::Failed(error) => error.clone(),
+            other => panic!("expected a transport failure, got {other:?}"),
+        };
+        assert_eq!(error.kind, ProviderErrorKind::Transport);
+        assert_eq!(
+            error.message,
+            format!("stream idle for {} s", STREAM_IDLE_TIMEOUT.as_secs())
+        );
+        assert_eq!(
+            start.elapsed(),
+            STREAM_IDLE_TIMEOUT,
+            "the idle wait ends at the bound, exactly"
+        );
+    }
+
+    /// A stalled non-2xx body must not hang classification either: the status
+    /// policy is read from whatever arrived, then the retry loop proceeds.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_error_body_is_classified_without_hanging() {
+        let stalled = || ScriptedResponse {
+            status: 500,
+            headers: Vec::new(),
+            chunks: Vec::new(),
+            end: BodyEnd::Hang,
+        };
+        let harness = Harness::new(vec![stalled(), stalled(), stalled(), stalled()]);
+        let start = tokio::time::Instant::now();
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 4);
+        assert!(matches!(
+            terminal(&events),
+            Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport
+        ));
+        let policy = RetryPolicy::default();
+        assert_eq!(
+            start.elapsed(),
+            4 * STREAM_IDLE_TIMEOUT
+                + policy.delay(1, None)
+                + policy.delay(2, None)
+                + policy.delay(3, None)
+        );
+    }
+
+    /// A keep-alive ping (an SSE comment) inside the idle bound keeps the stream
+    /// alive: six pings 200 s apart are 20 minutes with no stall.
+    #[tokio::test(start_paused = true)]
+    async fn keep_alive_pings_reset_the_idle_bound() {
+        let stream = drive_with(
+            Arc::new(PingingTransport {
+                gap: Duration::from_secs(200),
+                pings: 6,
+            }),
+            RetryPolicy::default(),
+        );
+        let start = tokio::time::Instant::now();
+        let events = collect(stream).await;
+
+        assert!(
+            matches!(terminal(&events), Outcome::Completed(_)),
+            "{events:?}"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(1200),
+            "20 minutes of pings, none of them past the idle bound"
+        );
     }
 }

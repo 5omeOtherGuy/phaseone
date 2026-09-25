@@ -26,7 +26,8 @@ pub use drive::{DriveRequest, ResponseParser, drive};
 pub use error_code::{http_error_code, kind_for_status, safe_code};
 pub use file_lock::{LOCK_PATIENCE, lock_exclusive};
 pub use http::{
-    ByteStream, HttpRequest, HttpResponse, ReqwestTransport, Transport, TransportError,
+    ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, HttpResponse, ReqwestTransport,
+    STREAM_IDLE_TIMEOUT, Transport, TransportError,
 };
 pub use retry::{HttpClass, RetryPolicy, classify_status, reset_after, retry_after};
 pub use sse::{SseDecoder, SseEvent};
