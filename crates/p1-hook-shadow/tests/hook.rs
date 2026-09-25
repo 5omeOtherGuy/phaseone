@@ -3,8 +3,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use p1_hook_shadow::{Origin, Outcome, ShadowEvent, ShadowHook, find_binary};
@@ -56,6 +56,33 @@ fn event(origin: Origin) -> ShadowEvent {
     }
 }
 
+/// Serialises fake-binary writes against spawns. The tests of this file share one
+/// process: when one test writes a script while another test forks a child, the
+/// forked child inherits the open write descriptor until its exec, and any exec of
+/// that script in the window fails with ETXTBSY. Spawns still run in parallel with
+/// each other under the read lock; only an open write descriptor excludes them.
+static FAKE_BINARY_LOCK: RwLock<()> = RwLock::new(());
+
+/// Writes an executable under the write lock, covering the write and the permission
+/// change, so no forked child can inherit the descriptor mid-write. A poisoned lock
+/// is recovered: one failing test must not cascade into the others.
+fn write_executable(path: &Path, script: &str) {
+    let _guard: RwLockWriteGuard<'static, ()> = FAKE_BINARY_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fs::write(path, script).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Runs a hook call that may spawn a child while holding the read lock, so the fork
+/// cannot happen while any test holds an executable open for writing (ETXTBSY).
+fn spawning<T>(call: impl FnOnce() -> T) -> T {
+    let _guard: RwLockReadGuard<'static, ()> = FAKE_BINARY_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    call()
+}
+
 fn fake_binary(root: &Path) -> (PathBuf, PathBuf) {
     let binary = root.join("fake-shadow");
     let arguments = root.join("arguments");
@@ -65,8 +92,7 @@ fn fake_binary(root: &Path) -> (PathBuf, PathBuf) {
         arguments.display(),
         arguments.display()
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&binary, &script);
     (binary, arguments)
 }
 
@@ -106,7 +132,7 @@ fn kill_file_prevents_file_and_spawn() {
     );
 
     // The hook's own decision, returned synchronously: nothing is left to wait for.
-    let outcome = hook.observe_outcome(event(Origin::UserInput));
+    let outcome = spawning(|| hook.observe_outcome(event(Origin::UserInput)));
     assert!(matches!(outcome, Outcome::Killed), "{outcome:?}");
 
     assert!(!arguments.exists());
@@ -127,7 +153,7 @@ fn every_recursion_guard_prevents_file_and_spawn() {
             ])),
         );
 
-        let outcome = hook.observe_outcome(event(Origin::UserInput));
+        let outcome = spawning(|| hook.observe_outcome(event(Origin::UserInput)));
         assert!(
             matches!(outcome, Outcome::Guarded),
             "guard {guard}: {outcome:?}"
@@ -151,7 +177,7 @@ fn zero_and_empty_recursion_values_do_not_guard() {
                 ("BRAIN_HOME".into(), OsString::from(value)),
             ])),
         );
-        wait_for_spawned_exit(hook.observe_outcome(event(Origin::UserInput)));
+        wait_for_spawned_exit(spawning(|| hook.observe_outcome(event(Origin::UserInput))));
         assert!(arguments.exists(), "no spawn with BRAIN_HOME={value:?}");
     }
 }
@@ -169,10 +195,12 @@ fn normal_dispatch_writes_private_exact_task_and_exact_argv() {
         )])),
     );
 
-    let spawned_task = wait_for_spawned_exit(hook.observe_outcome(event(Origin::Dispatch {
-        family: "researcher".into(),
-        provider: "p1".into(),
-    })));
+    let spawned_task = wait_for_spawned_exit(spawning(|| {
+        hook.observe_outcome(event(Origin::Dispatch {
+            family: "researcher".into(),
+            provider: "p1".into(),
+        }))
+    }));
 
     let entries: Vec<_> = fs::read_dir(state.join("inbox"))
         .unwrap()
@@ -234,7 +262,7 @@ fn user_input_has_exact_argv_and_private_exact_bytes() {
     );
     let mut input = event(Origin::UserInput);
     input.source_ref = None;
-    let spawned_task = wait_for_spawned_exit(hook.observe_outcome(input));
+    let spawned_task = wait_for_spawned_exit(spawning(|| hook.observe_outcome(input)));
     let task = fs::read_dir(state.join("inbox"))
         .unwrap()
         .next()
@@ -291,7 +319,7 @@ fn explicit_episode_and_derived_session_are_used() {
     observed.cache_key = None;
     observed.workspace = Some(PathBuf::from("relative"));
     observed.source_ref = None;
-    wait_for_spawned_exit(hook.observe_outcome(observed));
+    wait_for_spawned_exit(spawning(|| hook.observe_outcome(observed)));
 
     let args = fs::read_to_string(arguments).unwrap();
     assert!(args.contains("--workspace\nunknown\n"));
@@ -315,7 +343,7 @@ fn nonexistent_binary_removes_only_new_task_file() {
         )])),
     );
 
-    let outcome = hook.observe_outcome(event(Origin::UserInput));
+    let outcome = spawning(|| hook.observe_outcome(event(Origin::UserInput)));
     assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
 
     let names: Vec<_> = fs::read_dir(state.join("inbox"))
@@ -331,8 +359,7 @@ fn home_fallback_and_find_binary_use_only_injected_environment() {
     let bin_dir = temp.0.join("bin");
     fs::create_dir(&bin_dir).unwrap();
     let binary = bin_dir.join("brain-packet-shadow");
-    fs::write(&binary, "#!/bin/sh\n").unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&binary, "#!/bin/sh\n");
     let values = HashMap::from([
         ("BRAIN_PACKET_STATE".into(), OsString::new()),
         ("HOME".into(), temp.0.clone().into_os_string()),
@@ -341,7 +368,7 @@ fn home_fallback_and_find_binary_use_only_injected_environment() {
     assert_eq!(find_binary(&*env_for(values.clone())), Some(binary));
 
     let hook = ShadowHook::new(temp.0.join("missing"), env_for(values));
-    hook.observe(event(Origin::UserInput));
+    spawning(|| hook.observe(event(Origin::UserInput)));
     assert!(temp.0.join(".local/state/brain-packet/inbox").exists());
 }
 
@@ -360,7 +387,7 @@ fn twenty_calls_have_under_fifty_millisecond_p95() {
     let mut elapsed = Vec::new();
     for _ in 0..20 {
         let started = Instant::now();
-        hook.observe(event(Origin::UserInput));
+        spawning(|| hook.observe(event(Origin::UserInput)));
         elapsed.push(started.elapsed());
     }
     elapsed.sort();
