@@ -89,6 +89,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0073 | [Workflow steps can run in their own git worktree](0073-workflow-steps-can-run-in-their-own-git-worktree.md) | proposed | 2026-09-25 | lead |
 | ADR-0074 | [A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login](0074-a-second-claude-subscription-route-claude-code-oauth-borrows-a-named-login-directory-and-p1-login-imports-a-login.md) | proposed | 2026-09-25 | owner |
 | ADR-0075 | [The TUI shows workflow runs as a live tree through a structured FrontEnd seam](0075-the-tui-shows-workflow-runs-as-a-live-tree-through-a-structured-frontend-seam.md) | proposed | 2026-09-25 | owner+lead |
+| ADR-0076 | [Builds on the stream boxes](0076-builds-on-the-stream-boxes.md) | proposed | 2026-09-25 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

@@ -1,6 +1,14 @@
-<!-- ADR draft: numbered at landing with scripts/adr.py new "Builds on the stream boxes" --deciders owner+lead -->
+---
+adr: 76
+title: Builds on the stream boxes
+status: proposed
+date: 2026-09-25
+deciders: owner+lead
+supersedes: []
+superseded_by: []
 sources: [DECISIONS.md, docs/adr/0066-p1-builds-and-verifies-on-github-actions-local-cargo-only-for-check-and-the-lead-s-deployed-binary.md, docs/adr/0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md, scripts/gate.sh, scripts/rustc-serial, scripts/local-cargo-config.sh, scripts/module-toolchain.sh, scripts/build-modules.sh, .github/workflows/ci.yml, .github/workflows/build.yml]
-# Builds on the stream boxes
+---
+# ADR-0076: Builds on the stream boxes
 
 ## Context
 
