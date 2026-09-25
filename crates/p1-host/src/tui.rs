@@ -1347,7 +1347,7 @@ fn pulsing(screen: &Screen, now_ms: u64) -> bool {
 /// (and not overlaid) shows no tree, and draws nothing on its own (#141's idle rule).
 fn tree_live(screen: &Screen) -> bool {
     let pane_visible = !screen.focus
-        && !screen.review.open
+        && !p1_tui::render::screen::review_covers(screen, screen.last_width, screen.last_height)
         && ((screen.pane_width != p1_tui::state::PaneWidth::Off
             && screen.last_width >= PANE_MIN_WIDTH)
             || screen.ledger_overlay);

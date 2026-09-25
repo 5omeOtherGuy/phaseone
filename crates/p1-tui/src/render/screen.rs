@@ -37,11 +37,25 @@ pub fn draw(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) {
     screen.cursor = compose(screen, area, buf, now_ms);
 }
 
+/// Whether the full diff review owns a `w`×`h` screen (§7.5), covering the transcript and
+/// the pane: only while a diff decision is on screen, and then on `^D` or by itself when
+/// the diff is taller than the transcript area. The one rule the renderer draws by, and
+/// what the host asks before it keeps a covered pane redrawing.
+pub fn review_covers(screen: &Screen, w: u16, h: u16) -> bool {
+    let Some(Approval::Diff(view)) = &screen.approval else {
+        return false;
+    };
+    let focus = screen.focus_explicit.unwrap_or(screen.focus || h <= 12);
+    let normal = crate::geometry::layout(w, h, screen.pane_width, focus, 2);
+    screen.review.open || review::opens_itself(view.rows.len(), normal.transcript.height as usize)
+}
+
 fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Option<(u16, u16)> {
     if area.width == 0 || area.height == 0 {
         return None;
     }
     screen.last_width = area.width;
+    screen.last_height = area.height;
     fill(area, buf, palette::GROUND);
     let (w, h) = (area.width, area.height);
     // §8.5: explicit `/focus` wins; otherwise the driver's `focus`, and always at 12 rows or
@@ -53,10 +67,7 @@ fn compose(screen: &mut Screen, area: Rect, buf: &mut Buffer, now_ms: u64) -> Op
     // the transcript area of a screen with no pane and no composer, at full width.
     let unobstructed = crate::geometry::layout(w, h, PaneWidth::Off, true, 0);
     if let Some(Approval::Diff(view)) = &screen.approval {
-        let normal = crate::geometry::layout(w, h, screen.pane_width, focus, 2);
-        if screen.review.open
-            || review::opens_itself(view.rows.len(), normal.transcript.height as usize)
-        {
+        if review_covers(screen, w, h) {
             draw_statusline(screen, area, unobstructed.statusline, buf);
             let files = [review::ReviewFile::new(view.clone())];
             let decision = review::Decision::for_call(view.grantable, files.len());

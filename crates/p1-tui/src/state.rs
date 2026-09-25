@@ -472,6 +472,10 @@ pub struct Screen {
     /// The terminal width of the last frame: `^W` resolves the `Auto` start state at it.
     #[doc(hidden)]
     pub last_width: u16,
+    /// The terminal height of the last frame: whether a diff review opens by itself
+    /// depends on it (`render::screen::review_covers`).
+    #[doc(hidden)]
+    pub last_height: u16,
     /// `^F`: the pane owns `↑ ↓` (WORKERS select, OUTPUT scroll) until `esc` or `^F`.
     pub pane_focused: bool,
     /// The full diff review's view state (handoff §7.5).

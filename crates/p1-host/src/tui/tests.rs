@@ -2113,13 +2113,14 @@ fn workflow_calls_build_the_tree_and_a_run_header_cancels_through_the_run_channe
 async fn a_live_run_draws_on_the_heartbeat_only_while_its_tree_is_visible() {
     use p1_tui::state::{PaneMode, PaneWidth};
 
-    async fn frames_in_five_seconds(pane_width: PaneWidth) -> usize {
+    async fn frames_in_five_seconds(pane_width: PaneWidth, setup: fn(&mut Screen)) -> usize {
         let mut harness =
             IdleLoop::with_backend(ratatui::backend::TestBackend::new(120, 40), false);
         // Pinned, so the run's start does not promote (and open) the pane.
         harness.driver.screen.pinned = true;
         harness.driver.screen.pane_mode = PaneMode::Workers;
         harness.driver.screen.pane_width = pane_width;
+        setup(&mut harness.driver.screen);
         let wires = harness.wires.clone();
         let script = async move {
             wires
@@ -2151,13 +2152,46 @@ async fn a_live_run_draws_on_the_heartbeat_only_while_its_tree_is_visible() {
     }
 
     assert_eq!(
-        frames_in_five_seconds(PaneWidth::Off).await,
+        frames_in_five_seconds(PaneWidth::Off, |_| {}).await,
         0,
         "a hidden tree draws nothing on its own"
     );
-    let shown = frames_in_five_seconds(PaneWidth::Wide).await;
+    let shown = frames_in_five_seconds(PaneWidth::Wide, |_| {}).await;
     assert!(
         (3..=5).contains(&shown),
         "a visible live tree redraws once a second: {shown}"
+    );
+    // A review flag left open by an earlier diff decision covers nothing once that
+    // decision is gone: the tree keeps its refresh.
+    let stale = frames_in_five_seconds(PaneWidth::Wide, |screen| {
+        screen.review.open = true;
+        screen.approval = None;
+    })
+    .await;
+    assert!(
+        (3..=5).contains(&stale),
+        "a stale review flag must not stop the tree: {stale}"
+    );
+    // A diff taller than the transcript opens the full review by itself (`review.open`
+    // stays false): it covers the pane, so the tree draws nothing on its own.
+    assert_eq!(
+        frames_in_five_seconds(PaneWidth::Wide, |screen| {
+            let old: String = (0..80).map(|n| format!("old {n}\n")).collect();
+            let new: String = (0..80).map(|n| format!("new {n}\n")).collect();
+            screen.approval = Some(p1_tui::state::Approval::Diff(
+                p1_tui::render::diff::DiffView::from_edit(
+                    "edit",
+                    "src/lib.rs",
+                    &old,
+                    &new,
+                    Some(&old),
+                    (1, 1),
+                ),
+            ));
+            assert!(!screen.review.open);
+        })
+        .await,
+        0,
+        "an auto-opened review covers the pane"
     );
 }
