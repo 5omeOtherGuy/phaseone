@@ -17,7 +17,9 @@
 pub mod activity;
 pub mod auth;
 pub mod catalog;
+mod child_assembly;
 pub mod cli;
+mod delegation;
 pub mod fingerprint;
 pub mod frontend;
 pub mod instructions;
