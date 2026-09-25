@@ -250,12 +250,19 @@ fn config_for_route(
         })
         .min(window.saturating_sub(1));
     let wall = window.saturating_sub(headroom);
-    // The useful point: never later than the environment asked, never past 60% of the
-    // effective window, and always below the wall the request has to fit under.
-    let useful = settings
-        .summarize_at_tokens
-        .min(window.saturating_mul(60) / 100)
-        .min(wall.saturating_sub(1));
+    // The useful point: never later than the environment asked and always below the wall the
+    // request has to fit under. Only a profile that NARROWS the window also caps it at 60% of
+    // the narrower window; an environment's own threshold is a decision about its route (GPT's
+    // 220,000 of 272,000, docs/design/context-windows.md) and a profile that does not narrow
+    // the window leaves it alone.
+    let asked = if window < settings.window_tokens {
+        settings
+            .summarize_at_tokens
+            .min(window.saturating_mul(60) / 100)
+    } else {
+        settings.summarize_at_tokens
+    };
+    let useful = asked.min(wall.saturating_sub(1));
     // The verbatim budgets are copied from the environment, but they are budgets of THIS window:
     // a kept tail larger than what a request can carry would keep the whole history verbatim and
     // leave the next request over the wall, so both are clamped below it (the verbatim budget is
@@ -3304,6 +3311,26 @@ mod tests {
         assert_eq!(config_for_route(&settings, Some(&deepseek)), config);
         assert_eq!(config.window_tokens, 1_000_000);
         assert_eq!(config.summarize_at_tokens, 300_000);
+    }
+
+    /// Review 146 r4: an environment's own threshold survives profile folding when the profile
+    /// does not narrow the window — the shipped `gpt` environment binds a profile and compacts at
+    /// its decided point, not at 60% of its window.
+    #[test]
+    fn a_profile_that_does_not_narrow_the_window_keeps_the_environment_threshold() {
+        let settings = shipped_settings("gpt");
+        let profile = load_environment("gpt", &[shipped_environments()])
+            .expect("the shipped environment loads")
+            .profile
+            .expect("the gpt environment binds a profile");
+        let config = config_for_route(&settings, Some(profile.as_ref()));
+        assert_eq!(config.window_tokens, settings.window_tokens);
+        assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
+        assert!(
+            config.summarize_at_tokens > settings.window_tokens * 60 / 100,
+            "the decided threshold is above 60% of the window, so the rule must not apply"
+        );
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
     }
 
     // ---------------------------- #125 review: the summary's own effort
