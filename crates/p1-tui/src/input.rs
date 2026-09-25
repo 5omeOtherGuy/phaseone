@@ -93,6 +93,22 @@ pub enum ViewCommand {
     EditGoal,
     /// `esc` during a goal edit: the previous composer text comes back.
     KeepComposer,
+    // History key selection is adapted from
+    // `iris-donor/src/ui/tui_loop.rs` (`prompt_history_key`) at
+    // 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT).
+    /// `Up` / `Down` recall submitted prompts while idle.
+    HistoryPrev,
+    HistoryNext,
+    /// Composer line editing, including while a turn is running.
+    //
+    // The key aliases are adapted from `iris-donor/src/ui/tui_loop.rs`
+    // (`pi_editor_key_aliases_work` and `apply_editor_key`) at
+    // 5b04a1ad3412ad0bb663b6355f77a024aec0ddfa (MIT).
+    DeleteToLineStart,
+    DeleteToLineEnd,
+    LineStart,
+    LineEnd,
+    DeleteForward,
     /// `^D` on a diff decision.
     ToggleReview,
     /// `tab` / `⇧tab` in the full review.
@@ -241,6 +257,17 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
         (KeyCode::Char('p'), true, false) => Some(C(Command::TogglePin)),
         (KeyCode::Char('l'), true, false) => Some(C(Command::ToggleLedgerOverlay)),
         (KeyCode::Char('g'), true, false) => Some(V(ViewCommand::EditGoal)),
+        (KeyCode::Char('u'), true, false) if !screen.pane_focused => {
+            Some(V(ViewCommand::DeleteToLineStart))
+        }
+        (KeyCode::Char('k'), true, false) if !screen.pane_focused => {
+            Some(V(ViewCommand::DeleteToLineEnd))
+        }
+        (KeyCode::Home, false, false) if !screen.pane_focused => Some(V(ViewCommand::LineStart)),
+        (KeyCode::End, false, false) if !screen.pane_focused => Some(V(ViewCommand::LineEnd)),
+        (KeyCode::Delete, false, false) if !screen.pane_focused => {
+            Some(V(ViewCommand::DeleteForward))
+        }
         (KeyCode::Char('f'), true, false) if pane_shown => Some(V(ViewCommand::TogglePaneFocus)),
         // Most terminals send plain `Tab` for `^Tab`; `^N` always arrives.
         (KeyCode::Tab, true, false) | (KeyCode::Char('n'), true, false) => {
@@ -267,6 +294,18 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
         }
         (KeyCode::Up, false, false) if screen.pane_focused => Some(C(Command::PaneUp)),
         (KeyCode::Down, false, false) if screen.pane_focused => Some(C(Command::PaneDown)),
+        (KeyCode::Up, false, false)
+            if !screen.composer.history.is_empty()
+                && screen.working.is_none()
+                && (screen.composer.text.is_empty() || screen.composer.browsing_history()) =>
+        {
+            Some(V(ViewCommand::HistoryPrev))
+        }
+        (KeyCode::Down, false, false)
+            if screen.working.is_none() && screen.composer.browsing_history() =>
+        {
+            Some(V(ViewCommand::HistoryNext))
+        }
         (KeyCode::Char('/'), false, false) if screen.composer.text.is_empty() => {
             Some(V(ViewCommand::OpenCompletion))
         }
@@ -534,6 +573,58 @@ mod tests {
     }
 
     #[test]
+    fn history_arrows_recall_only_an_empty_idle_composer() {
+        let mut s = Screen::default();
+        assert_eq!(decide(&s, key(KeyCode::Up)), None);
+        s.composer.text = "one".into();
+        s.composer.take();
+        assert_eq!(decide(&s, key(KeyCode::Down)), None);
+        assert_eq!(decide(&s, key(KeyCode::Up)), view(ViewCommand::HistoryPrev));
+        s.apply_view(ViewCommand::HistoryPrev);
+        assert_eq!(decide(&s, key(KeyCode::Up)), view(ViewCommand::HistoryPrev));
+        assert_eq!(
+            decide(&s, key(KeyCode::Down)),
+            view(ViewCommand::HistoryNext)
+        );
+
+        s.composer.text = "draft".into();
+        s.composer.take();
+        s.composer.text = "draft".into();
+        assert_eq!(decide(&s, key(KeyCode::Up)), None);
+        s.composer.text.clear();
+        s.working = working();
+        assert_eq!(decide(&s, key(KeyCode::Up)), None);
+        assert_eq!(decide(&s, key(KeyCode::Down)), None);
+    }
+
+    #[test]
+    fn history_recall_keeps_pane_picker_and_approval_precedence() {
+        let mut s = Screen {
+            pane_focused: true,
+            ..Screen::default()
+        };
+        s.composer.text = "one".into();
+        s.composer.take();
+        assert_eq!(decide(&s, key(KeyCode::Up)), command(Command::PaneUp));
+        assert_eq!(decide(&s, key(KeyCode::Down)), command(Command::PaneDown));
+
+        s.picker = menu();
+        assert_eq!(decide(&s, key(KeyCode::Up)), command(Command::PickerUp));
+        assert_eq!(decide(&s, key(KeyCode::Down)), command(Command::PickerDown));
+        s.picker = None;
+        s.approval = permission_approval();
+        assert_eq!(
+            decide(&s, key(KeyCode::Up)),
+            None,
+            "the approval remains modal"
+        );
+        assert_eq!(
+            decide(&s, key(KeyCode::Char('y'))),
+            command(Command::ApproveOnce)
+        );
+    }
+
+    #[test]
     fn page_keys_scroll_the_transcript() {
         let s = Screen::default();
         assert_eq!(decide(&s, key(KeyCode::PageUp)), view(ViewCommand::PageUp));
@@ -589,6 +680,93 @@ mod tests {
         // No pane in focus mode: nothing to focus.
         s.focus = true;
         assert_eq!(decide(&s, ctrl('f')), None);
+    }
+
+    #[test]
+    fn composer_line_keys_are_view_commands_idle_and_while_working() {
+        let s = Screen::default();
+        assert_eq!(decide(&s, ctrl('u')), view(ViewCommand::DeleteToLineStart));
+        assert_eq!(decide(&s, ctrl('k')), view(ViewCommand::DeleteToLineEnd));
+        assert_eq!(decide(&s, key(KeyCode::Home)), view(ViewCommand::LineStart));
+        assert_eq!(decide(&s, key(KeyCode::End)), view(ViewCommand::LineEnd));
+        assert_eq!(
+            decide(&s, key(KeyCode::Delete)),
+            view(ViewCommand::DeleteForward)
+        );
+
+        let working = Screen {
+            working: working(),
+            ..Screen::default()
+        };
+        assert_eq!(
+            decide(&working, ctrl('u')),
+            view(ViewCommand::DeleteToLineStart)
+        );
+        assert_eq!(
+            decide(&working, ctrl('k')),
+            view(ViewCommand::DeleteToLineEnd)
+        );
+        assert_eq!(
+            decide(&working, key(KeyCode::Home)),
+            view(ViewCommand::LineStart)
+        );
+        assert_eq!(
+            decide(&working, key(KeyCode::End)),
+            view(ViewCommand::LineEnd)
+        );
+        assert_eq!(
+            decide(&working, key(KeyCode::Delete)),
+            view(ViewCommand::DeleteForward)
+        );
+        let mut goal = Screen::default();
+        goal.composer.begin_goal_edit(None);
+        assert_eq!(
+            decide(&goal, ctrl('u')),
+            view(ViewCommand::DeleteToLineStart)
+        );
+        assert_eq!(decide(&goal, ctrl('k')), view(ViewCommand::DeleteToLineEnd));
+        assert_eq!(
+            decide(&goal, key(KeyCode::Home)),
+            view(ViewCommand::LineStart)
+        );
+        assert_eq!(decide(&goal, key(KeyCode::End)), view(ViewCommand::LineEnd));
+        assert_eq!(
+            decide(&goal, key(KeyCode::Delete)),
+            view(ViewCommand::DeleteForward)
+        );
+    }
+
+    #[test]
+    fn composer_line_keys_keep_modal_layers_and_non_subset_keys_unchanged() {
+        let approval = Screen {
+            approval: permission_approval(),
+            ..Screen::default()
+        };
+        let picker = Screen {
+            picker: menu(),
+            ..Screen::default()
+        };
+        let focused = Screen {
+            pane_focused: true,
+            ..Screen::default()
+        };
+        for screen in [&approval, &picker, &focused] {
+            assert_eq!(decide(screen, ctrl('u')), None);
+            assert_eq!(decide(screen, ctrl('k')), None);
+            assert_eq!(decide(screen, key(KeyCode::Home)), None);
+            assert_eq!(decide(screen, key(KeyCode::End)), None);
+            assert_eq!(decide(screen, key(KeyCode::Delete)), None);
+        }
+
+        let s = Screen::default();
+        assert_eq!(decide(&s, ctrl('w')), command(Command::CyclePaneWidth));
+        assert_eq!(decide(&s, ctrl('r')), command(Command::ExpandReasoning));
+        assert_eq!(decide(&s, ctrl('o')), command(Command::OpenFold));
+        assert_eq!(decide(&s, ctrl('p')), command(Command::TogglePin));
+        assert_eq!(decide(&s, ctrl('g')), view(ViewCommand::EditGoal));
+        assert_eq!(decide(&s, ctrl('f')), view(ViewCommand::TogglePaneFocus));
+        assert_eq!(decide(&s, ctrl('a')), None);
+        assert_eq!(decide(&s, ctrl('d')), None);
     }
 
     #[test]

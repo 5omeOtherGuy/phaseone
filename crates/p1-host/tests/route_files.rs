@@ -447,6 +447,40 @@ fn substitutions(workspace: &Path) -> Substitutions {
     }
 }
 
+/// Assemble one shipped environment through the host's real loading and catalog
+/// path, without a live network or credential lookup.
+fn assemble_shipped(name: &str) -> Assembled {
+    let dirs = shipped_environment_dirs();
+    let harness = Harness::new(dirs.clone(), &[]);
+    let completion = Arc::new(CompletionHub::new());
+    let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
+        .expect("the shipped routes are valid");
+    let mut environment = load_environment(name, &dirs).expect("the shipped environment loads");
+    resolve_environment(&mut environment, &dirs).expect("the shipped route serves its profile");
+    let workspace = tempdir().unwrap();
+    assemble(
+        &catalog,
+        &environment,
+        workspace.path(),
+        &substitutions(workspace.path()),
+    )
+    .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
+}
+
+#[test]
+fn the_shipped_zen_environments_declare_the_free_tier_gate_tools() {
+    for name in ["zen", "zen2", "zen3"] {
+        let assembled = assemble_shipped(name);
+        let declarations: Vec<&str> = assembled
+            .tools
+            .iter()
+            .map(|tool| tool.declaration().name.as_str())
+            .collect();
+        assert!(declarations.contains(&"bash"), "{name}: {declarations:?}");
+        assert!(declarations.contains(&"read"), "{name}: {declarations:?}");
+    }
+}
+
 /// The host's own order over a scratch root: build the catalog (which registers one
 /// factory per route file), load the environment, resolve it, assemble.
 fn assemble_scratch(scratch: &Scratch, name: &str) -> Result<Assembled, String> {
