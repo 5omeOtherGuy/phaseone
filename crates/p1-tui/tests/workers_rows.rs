@@ -21,6 +21,7 @@ fn pane(worker: WorkerBlock) -> WorkersPane {
         header: WorkersHeader::default(),
         workers: vec![worker],
         focused: None,
+        ..Default::default()
     }
 }
 

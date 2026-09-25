@@ -87,6 +87,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0071 | [p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name](0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0072 | [A workflow step that ends without finish gets one repair turn](0072-a-workflow-step-that-ends-without-finish-gets-one-repair-turn.md) | proposed | 2026-09-25 | lead |
 | ADR-0073 | [Workflow steps can run in their own git worktree](0073-workflow-steps-can-run-in-their-own-git-worktree.md) | proposed | 2026-09-25 | lead |
+| ADR-0074 | [The TUI shows workflow runs as a live tree through a structured FrontEnd seam](0074-the-tui-shows-workflow-runs-as-a-live-tree-through-a-structured-frontend-seam.md) | proposed | 2026-09-25 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

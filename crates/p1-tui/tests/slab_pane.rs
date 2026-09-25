@@ -266,6 +266,7 @@ fn el_workers_pane_56_wide() {
         },
         workers: workers_fixture(),
         focused: None,
+        ..Default::default()
     };
     let lines = workers::render(&pane, 56, false);
     let buf = buffer_of(&lines, 56);
@@ -282,6 +283,7 @@ fn el_workers_pane_38_compact() {
         },
         workers: workers_fixture().into_iter().take(4).collect(),
         focused: None,
+        ..Default::default()
     };
     let lines = workers::render(&pane, 38, true);
     let buf = buffer_of(&lines, 38);

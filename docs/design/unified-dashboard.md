@@ -10,7 +10,7 @@ work; unrelated halted observability and owner-decisions TUI WIP are not include
 | --- | --- | --- |
 | Agent home and transcript | `p1-tui`, `p1-host/src/tui.rs` | Pure state/cells versus host-owned async terminal lifecycle (ADR-0043); SLAB oracle (ADR-0056). |
 | Ledger and tool output panes | `p1-tui/src/render/{ledger,output}.rs` | Data supplied by Screen/host; not a quota dashboard. |
-| Worker activity pane | `p1-tui/src/render/workers.rs`, host worker projection | Session-local worker data, attention ordering, unknown cost; not durable fleet observability. |
+| Worker activity pane | `p1-tui/src/render/workers.rs`, host worker projection | Session-local worker data, attention ordering, unknown cost; not durable fleet observability. Also shows workflow runs as a live tree (runs → phases → steps → workers), fed by structured `FrontEnd` workflow calls (ADR-0074). |
 | Diff | `p1-tui/src/render/diff.rs` | Renderer/fixtures exist; generally unavailable mode until host diff seam (#69). |
 | Quota ledger | `p1 usage`, `p1-host/src/usage.rs`, `p1-usage` | Snapshot/probe separation, pure palette-independent renderer, plain/live watch. Separate terminal lifecycle today. |
 | Line frontend | `p1-host` FrontEnd | Preserved; unified dashboard does not make TUI mandatory. |

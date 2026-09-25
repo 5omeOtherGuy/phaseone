@@ -42,6 +42,11 @@ pub struct Stamped {
 pub enum UiEvent {
     Agent(Stamped),
     WorkerStarted(String),
+    /// A workflow event for the WORKERS tree (ADR-0074), stamped on the same clock.
+    Workflow {
+        at_ms: u64,
+        event: crate::workflow::WorkflowEvent,
+    },
 }
 
 /// The `EventSink` for a TUI agent. Created before the agent; the receiving
@@ -88,6 +93,31 @@ impl TuiSink {
         let _ = self.tx.send(UiEvent::WorkerStarted(worker_id.to_string()));
     }
 
+    /// A workflow event for the WORKERS tree (ADR-0074): stamped and ordered with the
+    /// agents' events, through the same channel.
+    pub fn workflow(&self, event: crate::workflow::WorkflowEvent) {
+        let at_ms = self.stamp();
+        let _ = self.tx.send(UiEvent::Workflow { at_ms, event });
+    }
+
+    /// Claim the next stamp: the clock now, strictly after every earlier claim.
+    fn stamp(&self) -> u64 {
+        let now = self.epoch.elapsed().as_millis() as u64;
+        // Monotonic even for concurrent emits (a sink is Send+Sync): claim a
+        // stamp strictly greater than every earlier claim. `fetch_update`
+        // retries its compare-exchange until it publishes `max(now, prev+1)`,
+        // so no two events — parent or child — ever share a stamp.
+        match self
+            .tick
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(now.max(prev + 1))
+            }) {
+            Ok(previous) => now.max(previous + 1),
+            // Unreachable: the closure above always returns `Some`.
+            Err(_) => now,
+        }
+    }
+
     /// Milliseconds since this sink's epoch — the ONE clock the screen runs on
     /// (events arrive stamped on it; the render tick reads it directly). The
     /// epoch is the runtime's `Instant`, so this is real time in production and
@@ -99,20 +129,7 @@ impl TuiSink {
 
 impl EventSink for TuiSink {
     fn emit(&self, event: AgentEvent) {
-        let now = self.epoch.elapsed().as_millis() as u64;
-        // Monotonic even for concurrent emits (a sink is Send+Sync): claim a
-        // stamp strictly greater than every earlier claim. `fetch_update`
-        // retries its compare-exchange until it publishes `max(now, prev+1)`,
-        // so no two events — parent or child — ever share a stamp.
-        let at_ms = match self
-            .tick
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
-                Some(now.max(prev + 1))
-            }) {
-            Ok(previous) => now.max(previous + 1),
-            // Unreachable: the closure above always returns `Some`.
-            Err(_) => now,
-        };
+        let at_ms = self.stamp();
         // Unbounded: observation must never block the agent loop (contract).
         let _ = self.tx.send(UiEvent::Agent(Stamped {
             at_ms,

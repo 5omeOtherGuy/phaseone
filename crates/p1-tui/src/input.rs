@@ -59,6 +59,9 @@ pub enum Command {
     PaneDown,
     /// `y` on a pending worker stop: cancel that worker through the host service.
     StopWorker(String),
+    /// `y` on a pending run cancel (`x` on a run header): cancel that workflow run
+    /// through the host's workflow service (ADR-0074).
+    CancelRun(String),
 }
 
 /// A key decision that only changes what the screen shows. The TUI performs these itself
@@ -83,6 +86,10 @@ pub enum ViewCommand {
     TogglePaneFocus,
     /// `⏎` / `a` on the focused WORKERS row (handoff §9.5).
     AttachWorker,
+    /// `⏎` on a focused workflow step: open it (ADR-0074).
+    OpenStep,
+    /// `p` on an opened step: the whole prompt, or its first three lines.
+    TogglePrompt,
     /// `x` on the focused WORKERS row: ask before stopping it.
     AskStopWorker,
     /// `n` / `esc` on the pending worker stop: keep it running.
@@ -206,6 +213,9 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
     }
     if let Some(id) = &screen.stop_pending {
         return match (key.code, ctrl) {
+            (KeyCode::Char('y'), false) if screen.workers.tree.run(id).is_some() => {
+                Some(C(Command::CancelRun(id.clone())))
+            }
             (KeyCode::Char('y'), false) => Some(C(Command::StopWorker(id.clone()))),
             (KeyCode::Char('n'), false) | (KeyCode::Esc, false) => Some(V(ViewCommand::KeepWorker)),
             (KeyCode::Char('c'), true) => Some(C(Command::CancelOrQuit)),
@@ -215,6 +225,27 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
     let pane_shown =
         !screen.focus && (screen.pane_width != PaneWidth::Off || screen.ledger_overlay);
     match (key.code, ctrl, alt) {
+        (KeyCode::Enter, false, false)
+            if key.modifiers.is_empty()
+                && screen.pane_focused
+                && screen.pane_mode == PaneMode::Workers
+                && screen
+                    .workers
+                    .focused
+                    .as_deref()
+                    .is_some_and(|key| screen.workers.tree.step(key).is_some()) =>
+        {
+            Some(V(ViewCommand::OpenStep))
+        }
+        (KeyCode::Char('p'), false, false)
+            if key.modifiers.is_empty()
+                && screen
+                    .attached
+                    .as_ref()
+                    .is_some_and(|worker| worker.step.is_some()) =>
+        {
+            Some(V(ViewCommand::TogglePrompt))
+        }
         (KeyCode::Enter, false, false) | (KeyCode::Char('a'), false, false)
             if key.modifiers.is_empty()
                 && screen.pane_focused
@@ -902,6 +933,7 @@ mod tests {
                 id: "w2".into(),
                 route: "route".into(),
                 state: crate::render::workers::BlockState::Running,
+                step: None,
                 transcript: crate::transcript::Transcript::new(),
             }),
             ledger_overlay: true,

@@ -608,6 +608,9 @@ pub trait WorkflowObserver: Send + Sync {
     /// error included. Fires when that job ends, before `parallel`/`pipeline` has joined
     /// its siblings and failed the script; a job that panics or never starts reports nothing.
     fn thunk_failed(&self, _id: &RunId, _error: &str) {}
+    /// `parallel`/`pipeline` is starting `count` jobs (thunks or items), before any of
+    /// them runs: how many steps a fan-out will add, as early as the script states it.
+    fn jobs_queued(&self, _id: &RunId, _count: usize) {}
     fn run_ended(&self, _id: &RunId, _report: &RunReport) {}
 }
 

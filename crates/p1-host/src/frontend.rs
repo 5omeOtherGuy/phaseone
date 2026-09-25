@@ -37,6 +37,13 @@ pub use p1_workers::WorkerService;
 #[cfg(not(feature = "delegation"))]
 pub trait WorkerService: Send + Sync {}
 
+/// The TUI-owned data the workflow calls carry (ADR-0074): the host fills them.
+#[cfg(feature = "workflows")]
+pub use p1_tui::workflow::{
+    RunEnded as WorkflowRunEnded, RunStarted as WorkflowRunStarted, StepEnded as WorkflowStepEnded,
+    StepStarted as WorkflowStepStarted,
+};
+
 /// What the host composes against. One value, passed down.
 pub trait FrontEnd: Send + Sync {
     /// The sink the PARENT agent's events go to. The host still wraps it in its
@@ -69,6 +76,31 @@ pub trait FrontEnd: Send + Sync {
     /// default shows nothing.
     #[cfg(feature = "workflows")]
     fn workflow_line(&self, _line: &str) {}
+
+    /// The structured workflow events a live tree is built from (ADR-0074), alongside
+    /// [`FrontEnd::workflow_line`], which keeps its lines. Plain p1-tui data, no workflow
+    /// type; every default shows nothing, so the line front end ignores them.
+    #[cfg(feature = "workflows")]
+    fn workflow_run_started(&self, _run: &WorkflowRunStarted) {}
+    /// The run entered phase `name`.
+    #[cfg(feature = "workflows")]
+    fn workflow_phase(&self, _run: &str, _name: &str) {}
+    /// The run's script logged `text`.
+    #[cfg(feature = "workflows")]
+    fn workflow_log(&self, _run: &str, _text: &str) {}
+    /// A `parallel`/`pipeline` of the run is starting `count` jobs.
+    #[cfg(feature = "workflows")]
+    fn workflow_jobs_queued(&self, _run: &str, _count: usize) {}
+    /// A step's worker exists; may repeat for the same step (an update, not a new step).
+    #[cfg(feature = "workflows")]
+    fn workflow_step_started(&self, _step: &WorkflowStepStarted) {}
+    #[cfg(feature = "workflows")]
+    fn workflow_step_ended(&self, _step: &WorkflowStepEnded) {}
+    /// A `parallel` thunk or `pipeline` item of the run failed.
+    #[cfg(feature = "workflows")]
+    fn workflow_thunk_failed(&self, _run: &str, _error: &str) {}
+    #[cfg(feature = "workflows")]
+    fn workflow_run_ended(&self, _run: &WorkflowRunEnded) {}
 
     /// The authorization policy for the parent and, shared, for every worker.
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy>;

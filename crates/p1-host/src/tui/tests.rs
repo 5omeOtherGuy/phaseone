@@ -72,6 +72,7 @@ fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             submit_pending: None,
             worker_rows: Arc::new(Mutex::new(Vec::new())),
             worker_stops: None,
+            run_cancels: None,
             worker_usage: HashMap::new(),
             worker_windows: Arc::new(Mutex::new(HashMap::new())),
             pending_calls: HashMap::new(),
@@ -2039,4 +2040,68 @@ fn worker_context_window_sync_keeps_filling_usage_from_worker_responses() {
     assert_eq!(row.model.as_deref(), Some("deepseek-v4.1-flash"));
     assert_eq!(row.tokens, Some(48_213));
     assert_eq!(row.cost_micro_usd, Some(5));
+}
+
+/// ADR-0074: the front end's workflow calls reach the screen's tree through the sink's
+/// channel, and `x`/`y` on a run header sends the run to the host's canceller.
+#[cfg(feature = "workflows")]
+#[test]
+fn workflow_calls_build_the_tree_and_a_run_header_cancels_through_the_run_channel() {
+    use p1_tui::state::{PaneMode, PaneWidth};
+
+    let front_end = TuiFrontEnd::new(
+        TuiOptions {
+            env: "claude".into(),
+            ask: false,
+            workspace: std::path::PathBuf::from("/workspace"),
+            sandbox: "off".into(),
+            effort: None,
+        },
+        CancellationToken::new(),
+    );
+    let mut events = front_end.events.lock().unwrap().take().unwrap();
+    front_end.workflow_run_started(&crate::frontend::WorkflowRunStarted {
+        id: "wf1".into(),
+        resumed_from: None,
+    });
+    front_end.workflow_phase("wf1", "Review");
+    front_end.workflow_line("workflow wf1 phase: Review");
+
+    let (mut d, _auth) = driver();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    d.run_cancels = Some(tx);
+    let mut forwarded = 0;
+    while let Ok(event) = events.try_recv() {
+        assert!(matches!(event, UiEvent::Workflow { .. }), "{event:?}");
+        d.on_ui_event(event);
+        forwarded += 1;
+    }
+    assert_eq!(forwarded, 2, "the ledger line is not a tree event");
+    let run = d
+        .screen
+        .workers
+        .tree
+        .run("wf1")
+        .expect("the run is in the tree");
+    assert_eq!(
+        run.current_phase().map(|phase| phase.name.as_str()),
+        Some("Review")
+    );
+
+    d.screen.pane_width = PaneWidth::Wide;
+    d.screen.pane_mode = PaneMode::Workers;
+    d.on_key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert_eq!(d.screen.workers.focused.as_deref(), Some("wf1"));
+    d.on_key(key(KeyCode::Char('x')), None);
+    assert_eq!(d.screen.stop_pending.as_deref(), Some("wf1"));
+    d.on_key(key(KeyCode::Char('y')), None);
+    assert_eq!(d.screen.stop_pending, None);
+    assert_eq!(rx.try_recv(), Ok("wf1".to_string()));
+    assert!(d.screen.transcript.blocks.iter().any(|block| matches!(
+        block,
+        p1_tui::transcript::Block::Meta { text } if text == "↳ wf1 cancel requested"
+    )));
 }

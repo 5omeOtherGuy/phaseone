@@ -1190,6 +1190,7 @@ impl Script {
     /// bound. Results keep input order; every thread is joined before the first error (in
     /// input order) is reported.
     fn fan_out(self: &Arc<Self>, jobs: Vec<Job>) -> Result<Array, Box<EvalAltResult>> {
+        self.run.observer.jobs_queued(&self.run.id, jobs.len());
         let mut pending = Vec::with_capacity(jobs.len());
         for job in jobs {
             let job: Job = Box::new(move |script: &Script| {

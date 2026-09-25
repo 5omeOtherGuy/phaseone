@@ -68,6 +68,7 @@ fn main() {
             activity: "synthetic worker activity".into(),
         }],
         focused: None,
+        ..Default::default()
     };
     let mut dashboard = Dashboard::new(vec![
         Box::new(WorkersView::new(pane)),

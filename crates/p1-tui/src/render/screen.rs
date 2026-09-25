@@ -155,11 +155,24 @@ fn draw_transcript_area(
 ) {
     let width = area.width as usize;
     let rows = area.height as usize;
-    let attach: Vec<Line<'static>> = screen
+    let mut attach: Vec<Line<'static>> = screen
         .attached
         .iter()
         .map(|worker| workers::attach_band(&worker.id, &worker.route, worker.state, width))
         .collect();
+    // An opened workflow step heads its worker's transcript with its stats and prompt.
+    if let Some(step) = screen
+        .attached
+        .as_ref()
+        .and_then(|worker| worker.step.as_ref())
+    {
+        attach.extend(workers::step_band(
+            &screen.workers,
+            &step.key,
+            step.prompt_expanded,
+            width,
+        ));
+    }
     let docked = screen
         .picker
         .as_ref()
@@ -438,11 +451,12 @@ fn draw_pane(screen: &Screen, rect: Rect, buf: &mut Buffer, now_ms: u64) {
             let body = inner.saturating_sub(OUTPUT_HEAD_ROWS);
             output::render(&view.pane(output_source(screen, view), body), width)
         }
-        (PaneMode::Workers, _) => workers::render_with(
+        (PaneMode::Workers, _) => workers::render_in(
             &screen.workers,
             width,
             rect.width < WIDE_PANE,
             screen.stop_pending.as_deref(),
+            Some(inner),
         ),
         _ => ledger::render(&screen.ledger(), width, Some(inner)),
     };

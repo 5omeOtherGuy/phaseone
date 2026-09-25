@@ -16,12 +16,14 @@ use p1_workers::{
 };
 use p1_workflow::{
     InProcessWorkflows, ModelResolver, ResolvedModel, RunId, RunReport, RunStatus, SchemaCheck,
-    StartRequest, StepEnd, StepLine, StepOutcome, StepRequest, StepRunner, WorkerRef,
+    StartRequest, StepEnd, StepLine, StepOutcome, StepRequest, StepRunner, StepStatus, WorkerRef,
     WorkflowError, WorkflowObserver, WorkflowService, WorktreeHold,
 };
 
 use crate::HostDeps;
-use crate::frontend::FrontEnd;
+use crate::frontend::{
+    FrontEnd, WorkflowRunEnded, WorkflowRunStarted, WorkflowStepEnded, WorkflowStepStarted,
+};
 use crate::run::{ChildBuilder, TurnEndCell};
 
 /// The evidence of a `done` whose outcome established none (ADR-0051 item 3).
@@ -301,6 +303,12 @@ impl StepRunner for HostStepRunner {
                                 },
                             );
                         }
+                        // The engine reports a step's start only after its first turn
+                        // (it needs the worker's ref); the live tree hears it the moment
+                        // the worker exists (ADR-0074). The engine's call updates this row.
+                        self.builder
+                            .front_end
+                            .workflow_step_started(&step_started(request, Some(&id.0)));
                         break id;
                     }
                     // A slot seen free is not reserved: a direct start took it.
@@ -447,26 +455,72 @@ impl HostWorkflowObserver {
     }
 }
 
+/// A resolved model as the tree shows it: `environment/profile[:effort]`.
+fn model_text(model: &ResolvedModel) -> String {
+    match &model.effort {
+        Some(effort) => format!("{}/{}:{effort}", model.environment, model.profile),
+        None => format!("{}/{}", model.environment, model.profile),
+    }
+}
+
+/// A step's start as the TUI's tree takes it (ADR-0074).
+fn step_started(request: &StepRequest, worker_id: Option<&str>) -> WorkflowStepStarted {
+    WorkflowStepStarted {
+        run: request.run.0.clone(),
+        call: request.call.0.clone(),
+        label: request.label.clone(),
+        phase: request.phase.clone(),
+        role: request.role.clone(),
+        model: model_text(&request.model),
+        worker_id: worker_id.map(str::to_string),
+        attempt: request.attempt,
+        prompt: request.prompt.clone(),
+    }
+}
+
+/// A step line's worker id: `w3` of `w3 (claude/opus)`.
+fn line_worker(line: &StepLine) -> Option<&str> {
+    line.worker
+        .as_deref()
+        .and_then(|worker| worker.split_whitespace().next())
+}
+
 impl WorkflowObserver for HostWorkflowObserver {
-    fn run_started(&self, id: &RunId, _resumed_from: Option<&RunId>) {
+    fn run_started(&self, id: &RunId, resumed_from: Option<&RunId>) {
         self.in_flight.lock().unwrap().insert(id.0.clone());
+        self.front_end.workflow_run_started(&WorkflowRunStarted {
+            id: id.0.clone(),
+            resumed_from: resumed_from.map(|from| from.0.clone()),
+        });
     }
 
     fn phase(&self, id: &RunId, name: &str) {
         self.front_end
             .workflow_line(&format!("workflow {} phase: {name}", id.0));
+        self.front_end.workflow_phase(&id.0, name);
     }
 
     fn log(&self, id: &RunId, text: &str) {
         self.front_end
             .workflow_line(&format!("workflow {}: {text}", id.0));
+        self.front_end.workflow_log(&id.0, text);
+    }
+
+    fn jobs_queued(&self, id: &RunId, count: usize) {
+        self.front_end.workflow_jobs_queued(&id.0, count);
+    }
+
+    fn step_started(&self, _id: &RunId, request: &StepRequest, worker: &WorkerRef) {
+        self.front_end
+            .workflow_step_started(&step_started(request, Some(&worker.id)));
+    }
+
+    fn thunk_failed(&self, id: &RunId, error: &str) {
+        self.front_end.workflow_thunk_failed(&id.0, error);
     }
 
     fn step_ended(&self, id: &RunId, line: &StepLine) {
-        let worker = line
-            .worker
-            .as_deref()
-            .and_then(|worker| worker.split_whitespace().next());
+        let worker = line_worker(line);
         let needs = worker.and_then(|worker| self.needs.lock().unwrap().get(worker).cloned());
         self.front_end
             .workflow_line(&crate::render::workflow_step_note(
@@ -474,6 +528,27 @@ impl WorkflowObserver for HostWorkflowObserver {
                 line,
                 needs.as_deref(),
             ));
+        self.front_end.workflow_step_ended(&WorkflowStepEnded {
+            run: id.0.clone(),
+            call: line.call.0.clone(),
+            label: line.label.clone(),
+            // The model the step ended on: the last link of its chain.
+            model: line
+                .models
+                .last()
+                .map_or_else(|| line.model.clone(), |tried| tried.model.clone()),
+            status: match line.status {
+                StepStatus::Done => "done",
+                StepStatus::Blocked => "blocked",
+                StepStatus::Failed => "failed",
+                StepStatus::Cancelled => "cancelled",
+            }
+            .to_string(),
+            attempts: line.attempts,
+            replayed: line.replayed,
+            error: line.error.clone(),
+            worker_id: worker.map(str::to_string),
+        });
     }
 
     fn run_ended(&self, id: &RunId, report: &RunReport) {
@@ -483,6 +558,14 @@ impl WorkflowObserver for HostWorkflowObserver {
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
             .unwrap_or_default();
+        self.front_end.workflow_run_ended(&WorkflowRunEnded {
+            id: id.0.clone(),
+            outcome: outcome.clone(),
+            steps_started: report.counts.steps,
+            steps_ended: report.counts.steps,
+            steps_failed: report.counts.failed,
+            error: report.error.clone(),
+        });
         if let Some(inbox) = self.inbox.lock().unwrap().as_ref() {
             inbox.send(
                 InboxKind::Notification,
@@ -629,4 +712,257 @@ pub(crate) fn running_workflows(deps: &HostDeps) -> usize {
     deps.workflow_observer
         .as_ref()
         .map_or(0, |observer| observer.running())
+}
+
+/// The observer projects every run event into the structured `FrontEnd` calls the TUI's
+/// tree is built from (ADR-0074), beside the unchanged lines.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p1_contracts::{AuthorizationPolicy, EventSink};
+    use p1_workflow::{CallId, Counts, ModelTry, RunOutcome};
+
+    /// Records the workflow calls it hears, as plain strings, and renders nothing.
+    #[derive(Default)]
+    struct Recording {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Recording {
+        fn push(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl FrontEnd for Recording {
+        fn event_sink(&self) -> Arc<dyn EventSink> {
+            Arc::new(p1_testkit::RecordingEvents::new())
+        }
+
+        fn child_event_sink(&self, _: &str, _: &str, _: &str) -> Arc<dyn EventSink> {
+            Arc::new(p1_testkit::RecordingEvents::new())
+        }
+
+        fn child_started(&self, _worker_id: &str) {}
+
+        fn worker_ended(&self, _: &str, _: &str, _: &p1_workers::WorkerReport) {}
+
+        fn workflow_line(&self, line: &str) {
+            self.push(format!("line {line}"));
+        }
+
+        fn workflow_run_started(&self, run: &WorkflowRunStarted) {
+            self.push(format!("run_started {run:?}"));
+        }
+
+        fn workflow_phase(&self, run: &str, name: &str) {
+            self.push(format!("phase {run} {name}"));
+        }
+
+        fn workflow_log(&self, run: &str, text: &str) {
+            self.push(format!("log {run} {text}"));
+        }
+
+        fn workflow_jobs_queued(&self, run: &str, count: usize) {
+            self.push(format!("jobs_queued {run} {count}"));
+        }
+
+        fn workflow_step_started(&self, step: &WorkflowStepStarted) {
+            self.push(format!("step_started {step:?}"));
+        }
+
+        fn workflow_step_ended(&self, step: &WorkflowStepEnded) {
+            self.push(format!("step_ended {step:?}"));
+        }
+
+        fn workflow_thunk_failed(&self, run: &str, error: &str) {
+            self.push(format!("thunk_failed {run} {error}"));
+        }
+
+        fn workflow_run_ended(&self, run: &WorkflowRunEnded) {
+            self.push(format!("run_ended {run:?}"));
+        }
+
+        fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
+            Arc::new(p1_testkit::ScriptedAuthorization::permit_all())
+        }
+
+        fn parent_assembled(&self, _: &str, _: &str, _: Option<crate::activity::Completion>) {}
+
+        fn run<'a>(
+            &'a self,
+            _deps: &'a HostDeps,
+            _agent: &'a mut p1_core::Agent,
+            _cancel: &'a CancellationToken,
+            _workers: Option<Arc<dyn crate::frontend::WorkerService>>,
+            _stall: Option<Arc<crate::run::StallGuard>>,
+        ) -> BoxFuture<'a, i32> {
+            Box::pin(async { 0 })
+        }
+
+        fn finish(&self) {}
+    }
+
+    fn observer(front_end: Arc<Recording>) -> HostWorkflowObserver {
+        HostWorkflowObserver {
+            front_end,
+            inbox: Mutex::new(None),
+            needs: Arc::default(),
+            in_flight: Mutex::new(HashSet::new()),
+            settled: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn request() -> StepRequest {
+        StepRequest {
+            run: RunId("wf2".into()),
+            call: CallId("c1".into()),
+            label: Some("review:bugs".into()),
+            phase: Some("Review".into()),
+            role: "reviewer".into(),
+            model: ResolvedModel {
+                reference: "claude/claude-opus-5-5:high".into(),
+                environment: "claude".into(),
+                profile: "claude-opus-5-5".into(),
+                effort: Some("high".into()),
+                wire_model: "claude-opus-5-5".into(),
+            },
+            tools: vec!["read".into()],
+            prompt: "Review the diff.\nList every bug.".into(),
+            schema: None,
+            workspace: None,
+            attempt: 1,
+            worktree: None,
+            base: None,
+        }
+    }
+
+    #[test]
+    fn every_observer_event_is_projected_into_the_structured_calls() {
+        let front_end = Arc::new(Recording::default());
+        let observer = observer(front_end.clone());
+        let run = RunId("wf2".into());
+
+        observer.run_started(&run, Some(&RunId("wf1".into())));
+        observer.phase(&run, "Review");
+        observer.log(&run, "reviewing");
+        observer.jobs_queued(&run, 5);
+        observer.step_started(
+            &run,
+            &request(),
+            &WorkerRef {
+                id: "w3".into(),
+                description: "claude/claude-opus-5-5".into(),
+            },
+        );
+        let line = StepLine {
+            call: CallId("c1".into()),
+            label: Some("review:bugs".into()),
+            role: "reviewer".into(),
+            model: "claude/claude-opus-5-5:high".into(),
+            worker: Some("w3 (claude/claude-opus-5-5)".into()),
+            status: StepStatus::Failed,
+            schema: "failed".into(),
+            evidence: None,
+            attempts: 2,
+            replayed: false,
+            error: Some("invalid_output: missing field".into()),
+            models: vec![ModelTry {
+                model: "claude/claude-opus-5-5:high".into(),
+                moved_on: None,
+            }],
+        };
+        observer.step_ended(&run, &line);
+        observer.thunk_failed(&run, "a thunk failed");
+        observer.run_ended(
+            &run,
+            &RunReport {
+                id: run.clone(),
+                outcome: RunOutcome::CompletedWithIssues,
+                value: serde_json::Value::Null,
+                counts: Counts {
+                    steps: 1,
+                    failed: 1,
+                    ..Counts::default()
+                },
+                steps: vec![line.clone()],
+                error: None,
+                run_dir: PathBuf::from("/runs/wf2"),
+            },
+        );
+
+        let calls: Vec<String> = front_end
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| !call.starts_with("line "))
+            .cloned()
+            .collect();
+        let expected = vec![
+            format!(
+                "run_started {:?}",
+                WorkflowRunStarted {
+                    id: "wf2".into(),
+                    resumed_from: Some("wf1".into()),
+                }
+            ),
+            "phase wf2 Review".to_string(),
+            "log wf2 reviewing".to_string(),
+            "jobs_queued wf2 5".to_string(),
+            format!(
+                "step_started {:?}",
+                WorkflowStepStarted {
+                    run: "wf2".into(),
+                    call: "c1".into(),
+                    label: Some("review:bugs".into()),
+                    phase: Some("Review".into()),
+                    role: "reviewer".into(),
+                    model: "claude/claude-opus-5-5:high".into(),
+                    worker_id: Some("w3".into()),
+                    attempt: 1,
+                    prompt: "Review the diff.\nList every bug.".into(),
+                }
+            ),
+            format!(
+                "step_ended {:?}",
+                WorkflowStepEnded {
+                    run: "wf2".into(),
+                    call: "c1".into(),
+                    label: Some("review:bugs".into()),
+                    model: "claude/claude-opus-5-5:high".into(),
+                    status: "failed".into(),
+                    attempts: 2,
+                    replayed: false,
+                    error: Some("invalid_output: missing field".into()),
+                    worker_id: Some("w3".into()),
+                }
+            ),
+            "thunk_failed wf2 a thunk failed".to_string(),
+            format!(
+                "run_ended {:?}",
+                WorkflowRunEnded {
+                    id: "wf2".into(),
+                    outcome: "completed_with_issues".into(),
+                    steps_started: 1,
+                    steps_ended: 1,
+                    steps_failed: 1,
+                    error: None,
+                }
+            ),
+        ];
+        assert_eq!(calls, expected);
+
+        // The ledger lines are still there, worded as before.
+        let lines: Vec<String> = front_end
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|call| call.strip_prefix("line ").map(str::to_string))
+            .collect();
+        assert_eq!(lines[0], "workflow wf2 phase: Review");
+        assert_eq!(lines[1], "workflow wf2: reviewing");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+    }
 }

@@ -129,6 +129,25 @@ async fn the_review_shape_keeps_order_and_completes() {
     assert_eq!(harness.recorder.steps.lock().unwrap().len(), 9);
 }
 
+/// ADR-0074: a fan-out reports its size before any job runs — `parallel` its
+/// thunks, `pipeline` its items — so the TUI knows how many steps are queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fan_out_reports_its_job_count_when_it_starts() {
+    let harness = Harness::new();
+    let report = harness
+        .run(
+            r#"
+            agent("alone");
+            let pair = parallel([|| agent("a"), || agent("b")]);
+            pipeline([1, 2, 3], |x| agent("p" + x))
+            "#,
+        )
+        .await;
+    assert_eq!(report.outcome, RunOutcome::Completed, "{report:?}");
+    harness.recorder.run_ended.notified().await;
+    assert_eq!(*harness.recorder.jobs.lock().unwrap(), vec![2, 3]);
+}
+
 // (3)
 #[tokio::test(flavor = "multi_thread")]
 async fn nested_parallel_in_a_stage_is_bounded_and_never_deadlocks() {

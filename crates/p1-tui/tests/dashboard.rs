@@ -273,6 +273,7 @@ fn workers_adapter_handles_compact_threshold_and_tiny_viewports_read_only() {
         },
         workers: vec![worker("w-run", BlockState::Running)],
         focused: Some("w-run".into()),
+        ..Default::default()
     };
     let assert_read_only = |output: &str| {
         assert!(!output.contains(" attach"));
@@ -339,6 +340,7 @@ fn workers_keep_order_and_unknown_cost_without_unwired_actions() {
             worker("w-review", BlockState::NeedsReview),
         ],
         focused: Some("w-run".into()),
+        ..Default::default()
     };
     let dashboard = Dashboard::new(vec![Box::new(WorkersView::new(pane))]);
     for (width, height) in [(80, 24), (120, 40)] {
