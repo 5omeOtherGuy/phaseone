@@ -353,10 +353,14 @@ A step line is `  ` + label (or call id) + ` ` + role + ` → ` + the model chai
 `; replayed`, `; attempts N`, `; <error>`. The chain is the role's model, then every link
 the step moved on from as `<model> route failed` or `<model> capped` before ` → `
 (ADR-0054). "Verified" is never printed; the evidence is copied as is. The counts make a
-script unable to hide failed, blocked, not-verified, capped or fell-back workers:
-`Completed` only when none of them is non-zero, `CompletedWithIssues` when the script
-returned but some are, `Failed` when the script itself did not return (parse is refused
-before a run exists; runtime error, limit, panic, non-JSON return), `Cancelled`.
+script unable to hide failed, blocked, not-verified, capped or fell-back workers. Outcome
+selection considers only failed, blocked, cancelled and capped: `Completed` when the script
+returned and all four are zero, `CompletedWithIssues` when the script returned but any is
+non-zero. `not_verified` and `fell_back` remain visible but do not by themselves change the
+outcome. `Completed` is not independent acceptance; every count, including not-verified and
+fell-back counts, and the step evidence must still be inspected. `Failed` when the script
+itself did not return (parse is refused before a run exists; runtime error, limit, panic,
+non-JSON return), `Cancelled`.
 
 **The ONE notification.** The engine reports through `WorkflowObserver` (every method a
 no-op by default): `run_started`, `phase`, `log`, `step_started`, `step_ended`,

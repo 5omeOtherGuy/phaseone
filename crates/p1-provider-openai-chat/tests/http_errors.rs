@@ -27,6 +27,14 @@ const NO_BALANCE_WORDS: [&str; 5] = [
     "quota_exceeded",
     "billing_error",
 ];
+const USAGE_LIMIT_MESSAGE: &str = "the account's usage allowance is used up";
+const USAGE_LIMIT_WORDS: [&str; 3] = [
+    "gousagelimiterror",
+    "insufficient_quota",
+    "usage_limit_exceeded",
+];
+const NOT_ENTITLED_MESSAGE: &str = "the account's plan does not allow this model on this route";
+const NOT_ENTITLED_WORDS: [&str; 3] = ["freetiererror", "not_entitled", "plan_not_allowed"];
 /// The four fixed positions a no-balance word may occupy, as JSON pointers.
 const POSITIONS: [&str; 4] = ["error/type", "error/code", "type", "code"];
 
@@ -113,13 +121,21 @@ fn request() -> ProviderRequest {
 }
 
 /// An error response: `status` with `body` as its single body chunk.
-fn error_response(status: u16, body: &[u8]) -> ScriptedResponse {
+fn error_response_with_headers(
+    status: u16,
+    body: &[u8],
+    headers: Vec<(String, String)>,
+) -> ScriptedResponse {
     ScriptedResponse {
         status,
-        headers: Vec::new(),
+        headers,
         chunks: vec![body.to_vec()],
         end: BodyEnd::Eof,
     }
+}
+
+fn error_response(status: u16, body: &[u8]) -> ScriptedResponse {
+    error_response_with_headers(status, body, Vec::new())
 }
 
 /// One body naming `word` at `position` and nowhere else.
@@ -182,6 +198,114 @@ async fn each_allow_listed_word_in_any_of_the_four_positions_is_insufficient_bal
             );
         }
     }
+}
+
+#[tokio::test]
+async fn each_plan_refusal_word_in_any_position_is_not_entitled() {
+    for word in NOT_ENTITLED_WORDS {
+        for position in POSITIONS {
+            let body = error_body(position, word);
+            let (provider, transport, credentials) = provider(vec![error_response(403, &body)]);
+            let error = failed(finish(&provider).await);
+
+            assert_eq!(
+                error.kind,
+                ProviderErrorKind::NotEntitled,
+                "{position} {word}"
+            );
+            assert_eq!(error.message, NOT_ENTITLED_MESSAGE, "{position} {word}");
+            assert_eq!(
+                transport.requests().len(),
+                1,
+                "{position} {word}: no refresh and no re-send"
+            );
+            assert_eq!(
+                credentials.refreshes.load(Ordering::SeqCst),
+                0,
+                "{position} {word}: the credential is not refreshed"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_usage_limit_word_on_402_or_429_is_terminal_and_sanitised() {
+    for status in [402, 429] {
+        for word in USAGE_LIMIT_WORDS {
+            for position in POSITIONS {
+                let body = error_body(position, word);
+                let (provider, transport, credentials) =
+                    provider(vec![error_response(status, &body)]);
+                let error = failed(finish(&provider).await);
+
+                assert_eq!(
+                    error.kind,
+                    ProviderErrorKind::UsageLimitExhausted,
+                    "{status} {position} {word}"
+                );
+                assert_eq!(
+                    error.message, USAGE_LIMIT_MESSAGE,
+                    "{status} {position} {word}"
+                );
+                assert_eq!(transport.requests().len(), 1, "{status} {position} {word}");
+                assert_eq!(credentials.refreshes.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn usage_limit_reset_hint_is_formatted_without_provider_text() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": {"type": "GoUsageLimitError", "message": SENTINEL},
+    }))
+    .unwrap();
+    let (provider, transport, credentials) = provider(vec![error_response_with_headers(
+        429,
+        &body,
+        vec![("Retry-After".into(), "187200".into())],
+    )]);
+    let error = failed(finish(&provider).await);
+
+    assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
+    assert_eq!(
+        error.message,
+        "the account's usage allowance is used up (resets in 2 d 4 h)"
+    );
+    assert!(!format!("{error} {error:?}").contains(SENTINEL));
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(credentials.refreshes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_429_body_keeps_rate_limited_classification() {
+    let body = br#"{"error":{"type":"temporary_burst_limit"}}"#;
+    // Four responses expose the full unchanged retry budget without a live wait.
+    let (provider, transport, _credentials) = provider(vec![error_response(429, body); 4]);
+    let error = failed(finish(&provider).await);
+    assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+    assert_eq!(transport.requests().len(), 4);
+}
+
+#[tokio::test]
+async fn the_free_tier_error_shape_is_not_entitled_and_hides_the_server_text() {
+    // The observed live shape: HTTP 403 for a model gated to OpenCode's client,
+    // with a valid key. Case-insensitive, and the free text is never copied.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": {"type": "fReEtIeReRrOr", "message": SENTINEL},
+    }))
+    .unwrap();
+    let (provider, transport, credentials) = provider(vec![error_response(403, &body)]);
+    let error = failed(finish(&provider).await);
+
+    assert_eq!(error.kind, ProviderErrorKind::NotEntitled);
+    assert_eq!(error.message, NOT_ENTITLED_MESSAGE);
+    assert!(
+        !format!("{error} {error:?}").contains(SENTINEL),
+        "the body text leaked into {error:?}"
+    );
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(credentials.refreshes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

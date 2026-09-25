@@ -398,9 +398,9 @@ fn chat_route_from(
 }
 
 /// The Messages adapter's view of one route file: the recorded origin route, the
-/// endpoint and the account behaviour the file names (spec §7.2). It carries no
-/// static headers today, so a `[headers]` table on such a route is empty in every
-/// shipped file; nothing else about a Messages route is data.
+/// endpoint, the account behaviour the file names (spec §7.2) and whether it requests
+/// the 1M context window (`long_context`, ADR-0063). It carries no static headers
+/// today, so a `[headers]` table on such a route is empty in every shipped file.
 pub fn messages_route(
     route: &crate::routes::RouteFile,
 ) -> Result<p1_provider_anthropic::MessagesRoute, String> {
@@ -421,6 +421,7 @@ fn messages_route_from(
         origin_route: route.origin_route.clone(),
         endpoint: route.endpoint.clone(),
         account: settings.account,
+        long_context: settings.long_context,
     }
 }
 

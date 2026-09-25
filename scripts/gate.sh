@@ -24,6 +24,8 @@ echo "== gate: adr"
 scripts/adr.py check
 python3 scripts/test_adr.py -q
 python3 scripts/test_fanout.py -q
+python3 scripts/test_install.py -q
+python3 scripts/test_local_cargo_config.py -q
 python3 scripts/test_run_report.py -q
 python3 scripts/test_rustc_serial.py -q
 python3 scripts/test_usage_audit.py -q

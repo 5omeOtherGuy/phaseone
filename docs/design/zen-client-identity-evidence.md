@@ -3,7 +3,7 @@
 Owner decision 2026-09-24 (~21:10): p1 presents the OpenCode client identity to the Zen
 free endpoint so `mimo-v2.6-flash-free` and `muse-spark-1.3-contributor-free` answer from
 p1 natively. This file records what the gate actually accepts, the implementation's shape
-(`ADR-0062`), and the live receipts. Probes were run 2026-09-24 against key 1
+(`ADR-0066`), and the live receipts. Probes were run 2026-09-24 against key 1
 (`~/.config/keys/opencode-zen-1.key`); no key, token or header value with a credential is
 recorded here. Requests were sent from a header file (`curl -H @file`) or a script that
 reads the key file into memory, never on a command line.

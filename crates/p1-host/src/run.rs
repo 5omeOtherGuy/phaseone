@@ -517,6 +517,10 @@ pub async fn run_with_front_end(
     front_end: Arc<dyn FrontEnd>,
 ) -> Result<i32, RunError> {
     let workspace = resolve_workspace(options)?;
+    // Standing instructions and the skill index belong to the top-level agent only
+    // (issue #129): a child's brief carries what it needs.
+    let instructions = crate::instructions::prompt_section(&options.instructions, &options.skills)
+        .map_err(RunError::usage)?;
     // The §3c stall guard is host policy and applies only to unattended runs; the
     // front end decides what "headless" means (the line front end uses the CLI
     // rule, a terminal UI is interactive by definition).
@@ -704,7 +708,7 @@ pub async fn run_with_front_end(
     let parts = AgentParts {
         provider: assembled.provider,
         tools: assembled.tools,
-        system_prompt: assembled.system_prompt,
+        system_prompt: assembled.system_prompt + instructions.as_str(),
         options: assembled.options,
         context,
         authorization: front_end.authorization(),
@@ -760,6 +764,7 @@ pub async fn run_with_front_end(
         ignored: session_journals(options.session.as_deref()),
         scope: options.models.clone(),
         route_label: front_end.route_label(),
+        instructions,
         session: Mutex::new(SessionModel {
             environment: session_environment,
             profile: choice.profile.clone(),
@@ -1493,6 +1498,9 @@ pub(crate) struct ModelSwitch {
     /// The parent renderer's route label, when the front end has one: a successful
     /// switch moves it to the new assembly's route label.
     route_label: Option<Arc<Mutex<String>>>,
+    /// The top-level agent's standing instructions and skill index (issue #129),
+    /// re-appended to every switched assembly.
+    instructions: String,
     session: Mutex<SessionModel>,
 }
 
@@ -1586,7 +1594,7 @@ pub(crate) fn switch_model(
         .reconfigure(Reconfiguration {
             provider: assembled.provider,
             tools: tools.clone(),
-            system_prompt: assembled.system_prompt,
+            system_prompt: assembled.system_prompt + switch.instructions.as_str(),
             options: assembled.options,
             context,
         })
@@ -1923,8 +1931,8 @@ const RATE_LIMITED_RETRY_WAITS: [Duration; 3] = [
 /// The transient kind of a turn end, if it is one (completion.md §3b, amended by
 /// §3c): a dropped transport, a rate limit, or a malformed response are worth
 /// waiting out — the model's or the route's one-off. Everything else
-/// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`) ends the run as it
-/// always did.
+/// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`,
+/// `UsageLimitExhausted`) ends the run as it always did.
 fn transient_kind(end: &TurnEnd) -> Option<ProviderErrorKind> {
     match end {
         TurnEnd::ProviderFailed { error } => match error.kind {
@@ -2742,6 +2750,17 @@ mod tests {
         fn emit(&self, event: AgentEvent) {
             self.0.lock().unwrap().push(event);
         }
+    }
+
+    #[test]
+    fn an_exhausted_usage_limit_is_not_a_transient_host_failure() {
+        let end = TurnEnd::ProviderFailed {
+            error: p1_contracts::ProviderError::new(
+                ProviderErrorKind::UsageLimitExhausted,
+                "the account's usage allowance is used up",
+            ),
+        };
+        assert_eq!(transient_kind(&end), None);
     }
 
     #[test]

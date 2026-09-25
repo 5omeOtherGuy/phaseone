@@ -26,7 +26,15 @@ fn isolated(home: &Path) -> Command {
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
         "OPENCODE_API_KEY",
+        "OPENCODE_GO_1_API_KEY",
         "OPENCODE_GO_2_API_KEY",
+        "OPENCODE_GO_3_API_KEY",
+        "OPENCODE_ZEN_1_API_KEY",
+        "OPENCODE_ZEN_2_API_KEY",
+        "OPENCODE_ZEN_3_API_KEY",
+        "OPENCODE_ZEN_API_KEY",
+        "CLINE_PASS_1_API_KEY",
+        "CLINE_PASS_2_API_KEY",
         "ZAI_API_KEY",
         "KIMI_API_KEY",
     ] {
@@ -87,7 +95,19 @@ fn help_version_and_unknown_flag() {
 
     let output = p1().arg("--version").output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("p1 0.0.1"));
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let prefix = format!("p1 {} (", env!("CARGO_PKG_VERSION"));
+    assert!(version.starts_with(&prefix), "{version:?}");
+    assert!(version.ends_with(')'), "{version:?}");
+    // The sha and the build date, in that order and each non-empty; `unknown` (no git,
+    // no date source) is a valid field.
+    let fields: Vec<&str> = version
+        .trim_start_matches(prefix.as_str())
+        .trim_end_matches(')')
+        .split(' ')
+        .collect();
+    assert_eq!(fields.len(), 2, "{version:?}");
+    assert!(fields.iter().all(|field| !field.is_empty()), "{version:?}");
 
     let output = p1().arg("--bogus").output().unwrap();
     assert_eq!(output.status.code(), Some(2));
@@ -268,9 +288,11 @@ fn models_lists_every_shipped_model() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     // One row per model: every environment × every profile its route binds. The
-    // anthropic-subscription route binds 6 profiles, and `claude-delegating` is gone
-    // (ADR-0050), so 6 Claude + 11 others = 17.
-    assert_eq!(lines.len(), 17, "one row per model: {stdout}");
+    // anthropic-subscription route binds 6 profiles; each of the three OpenCode Go accounts
+    // binds the one DeepSeek profile, each of the three free Zen accounts binds all three
+    // free profiles and each of the two ClinePass accounts binds the DeepSeek profile;
+    // `claude-delegating` is gone (ADR-0050).
+    assert_eq!(lines.len(), 30, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(

@@ -1,105 +1,87 @@
-# p1 — instructions for agents and humans
+# p1 project rules
 
-p1 is a lean, modular Rust coding harness. Direction: `docs/design/` (start at
-`README.md`). Settled choices: `DECISIONS.md`. Work items: GitHub Issues.
-`STATUS.md` is the lead session's resume record — only the lead edits it.
+Read `~/.agents/AGENTS.md`.
+Use `docs/design/README.md` for design, `DECISIONS.md` for settled choices and GitHub Issues for work.
+Let only the lead edit `STATUS.md`.
+Read `docs/worker-observability.md`, `docs/lead-queue.md` and `docs/iris-workflow.md` when working on those programmes.
 
-Several agents work in this repository at the same time. Everything below exists to
-make that fast and conflict-free.
+## Work ownership and landing
 
-## Swarm protocol
-
-- **One worktree per task.** Never run two agents in one checkout.
-  `scripts/new-worktree.sh <task-slug>` creates `../phaseone-<task-slug>` on a fresh
-  `task/<task-slug>` branch with its own seeded cargo target dir (see Build).
-- **Work items are issues.** Claim one by assigning yourself and moving the label
-  `ready` → `in-progress`. Stuck? Add `blocked` and say what you need in a comment.
-  Only owner decisions carry the `owner` label.
-- **Own your paths.** Change only the paths your task owns. Do not reformat, rename
-  or "tidy" anything else — another agent owns it.
-- **Trunk-based.** Commit often on `task/<issue>-<slug>`, push it, and merge into
-  `main` as soon as `scripts/gate.sh` is green. A pull request with auto-merge is the
-  default route (`gh pr create --fill && gh pr merge --auto --squash --delete-branch`);
-  merging locally and pushing `main` is equally fine. No review gate, no long-lived
-  branches, no branch protection.
-- **A small diff is a mergeable diff.** If a conflict needs a judgement call, keep
-  both sides working and re-run the gate.
-- **Shared files** (`AGENTS.md`, `DECISIONS.md`, `Cargo.toml`, `Cargo.lock`,
-  `scripts/`, `.github/`): keep edits minimal and merge `main` immediately before
-  touching them. `DECISIONS.md` is append-only — never rewrite an existing row.
-- **Never `git add -A`; commit by explicit path.** Never force-push `main`.
+Before dispatch or creating a worktree, check `git worktree list`, the board's claims and the worktree inventory, then claim the path (`board-me claim --path <dir>`; no-duplicate-work order in `~/.agents/OWNER-ORDERS.md`).
+Resume the task's existing worktree; create a new one only when the task has none.
+Use `scripts/new-worktree.sh <task-slug>` for a new task checkout at `../phaseone-<task-slug>`.
+Use task branches named `task/<issue>-<slug>`; verify the helper's generated branch.
+Claim an issue by assignment and `ready` → `in-progress`; when blocked, add `blocked` and comment with the specific need.
+Reserve the `owner` label for owner decisions.
+Change only owned paths; do not reformat, rename or tidy another task's files.
+Keep shared-file edits minimal: `AGENTS.md`, `DECISIONS.md`, `Cargo.toml`, `Cargo.lock`, `scripts/`, `.github/`.
+Merge current main immediately before touching shared files.
+Keep `DECISIONS.md` append-only.
+Stage and commit only explicit owned paths; never `git add -A`; never force-push main.
+Commit often on the task branch; keep branches short-lived (no long-lived branches; main has no branch protection).
+Land every slice as the owner's landing order requires (`~/.agents/OWNER-ORDERS.md`, 2026-09-24 21:00): `gh pr create --fill`, an independent cheap review, repair until it approves, then `gh pr merge --auto --squash --delete-branch` on green PR CI; do not bypass review with a local direct-to-main merge.
+A small diff is a mergeable diff; resolve conflicts without breaking either accepted behavior, then rerun the relevant gate.
+Remove a finished worktree with `git worktree remove <path>` only when its work is merged or pushed and its board claim is released by its owner or the lead.
 
 ## Workers
 
-Jobs are dispatched with `scripts/fanout.py <jobs.json>`; it starts them up to a machine-wide
-pool bound and prints one JSON summary when the batch ends. `"runner": "p1"` runs the job
-with p1 itself — full access by default, `"sandbox": true` to confine its shell — and leaves a run directory holding the session journal, the
-agent's stdout/stderr and `report.json` (from `scripts/run-report.py`). The lead still
-verifies independently and records accepted runs in `docs/dogfood/runs.jsonl`.
+Use `scripts/fanout.py <jobs.json>` under the global routing policy; it starts jobs up to a machine-wide pool bound and prints one JSON summary when the batch ends.
+A job with `"runner": "p1"` runs through p1 itself, with full access by default; `"sandbox":true` confines its shell.
+Inspect the run directory's journal, stdout/stderr and `report.json` from `scripts/run-report.py`.
+Verify independently and record accepted dogfood runs in `docs/dogfood/runs.jsonl`.
+Follow model-cards for briefing, nonblocking supervision, repairs and evidence.
 
-## Gate
+## Gate and decisions
 
-`scripts/gate.sh` is the only required check: `cargo fmt --check`,
-`clippy -D warnings`, all tests, core isolation. CI runs exactly the same script.
-It must be green before a merge; it is not required for every intermediate commit.
-After merging into `main`, push with `scripts/push-main.sh`: it waits for the CI run of exactly
-that commit. CI differs from a workstation (no bubblewrap, slower start-up) — a green local gate
-is not a green CI.
+Run `scripts/gate.sh` before merge: fmt check, clippy with `-D warnings`, all tests and core isolation.
+Before a merge, the PR's CI (which runs exactly this script) and an independent review must both be green.
+Intermediate commits need not run the full gate.
+After merging main, use `scripts/push-main.sh` and verify the CI run for exactly that commit.
+Do not equate a green workstation gate with green CI; CI lacks bubblewrap and can start more slowly.
+Create an ADR for changed interfaces, dependency/workflow rules or reversed decisions using `scripts/adr.py new "Title"`.
+Keep it proposed until merged, then accepted or rejected.
+Change accepted ADRs only in `status` and `superseded_by`; reverse a decision with a new ADR using `--supersedes N`.
+Keep small choices in commit messages; `scripts/adr.py check` runs in the gate.
+Reconcile obsolete SSD-target instructions in ADR-0060 with the owner order through the ADR process.
 
-## Decisions
+## Project safety
 
-A decision that changes an interface, a dependency rule, a workflow rule, or that reverses
-an earlier decision gets an Architecture Decision Record in `docs/adr/` — start one with
-`scripts/adr.py new "Title"`. Keep it `proposed` until the change is merged, then set it
-`accepted` (or `rejected`). Never edit an accepted ADR except its `status` and
-`superseded_by`; reverse it with a NEW ADR that supersedes it (`--supersedes N`). Small
-choices stay in commit messages. `scripts/adr.py check` runs in the gate.
-
-## Hard rules
-
-- No sudo, no package installs. Ask in an issue.
-- Never read, print, log, commit or put into fixtures any credential, token,
-  Authorization header, private prompt or raw authenticated traffic.
-- No live network in unit/conformance tests. No real user data directories — use
-  `tempfile`/scratch dirs. No sleep-based timing assertions; use fake time or
-  explicit synchronisation.
-- `/home/phaseonebig/projects/iris-agent` and `iris-agent-clean` are read-only donors.
-  Copy code into p1 and adapt it; name the donor path in the commit message.
-- Never delete, weaken or skip a frozen acceptance test or its fixtures. If a check
-  contradicts the spec, leave it failing and explain.
-- Keep dependencies few. Ask before adding a crate that is not already in the workspace.
+Use no sudo or package installs; raise the need in an issue.
+Never inspect, print, log, commit or put into fixtures credential values, tokens, Authorization headers, private prompts or raw authenticated traffic; p1's own authentication code may read its designated credential source at runtime, keeping values out of agent context and logs.
+Use no live network in unit/conformance tests.
+Use tempfile/scratch data, never real user data directories.
+Use fake time or explicit synchronization, not sleep-based timing assertions.
+Treat `/home/phaseonebig/projects/iris-agent` and `/home/phaseonebig/projects/iris-agent-clean` as read-only donors.
+Copy and adapt donor code into p1; name its donor path in the commit message.
+Never delete, weaken or skip frozen acceptance tests or fixtures; leave a spec-conflicting test failing and explain.
+Keep dependencies few; ask before adding a crate absent from the workspace.
 
 ## Build
 
-- Small SSD, 7 GB RAM. `scripts/new-worktree.sh` sets each worktree up with
-  `scripts/local-cargo-config.sh` (untracked `.cargo/config.toml`): its OWN `target/`,
-  seeded with hardlinks of the already-built third-party dependencies (no extra disk, no
-  rebuild), and `scripts/rustc-serial` as rustc wrapper — a machine-wide semaphore that lets
-  at most two rustc processes run at once, however many agents build. A build that seems to
-  hang is waiting for a slot: wait, do not kill it, do not work around it.
-- Never point a worktree at another checkout's target dir and never set `CARGO_TARGET_DIR`:
-  cargo cannot tell two worktrees' `p1-*` crates apart and links stale artifacts (D20).
-- Build as little as possible: `cargo check -p <crate>` / `cargo test -p <crate> <filter>`
-  while iterating; the full gate once, at the end. No `cargo build --release`, no
-  `cargo install`, no extra toolchains or targets unless your task says so.
-- Remove a finished worktree with `git worktree remove <path>`.
+The machine has a small SSD and 7 GB RAM (global rules: two build jobs, SSD floor).
+Use a distinct task target under the global `/mnt/build/cargo-target/` root.
+Never share another checkout's target; D20 records stale linking of worktree p1 crates.
+Keep `scripts/rustc-serial`; its machine-wide semaphore admits at most two rustc processes.
+Wait for a slot; do not kill a waiting build or bypass the wrapper.
+Verify `scripts/local-cargo-config.sh` and the worktree helper honor the current HDD target rather than obsolete checkout-local target settings.
+`scripts/local-cargo-config.sh` writes an untracked `.cargo/config.toml`; never commit it.
+Use `cargo check -p <crate>` or `cargo test -p <crate> <filter>` while iterating, then the full gate at the integration boundary.
+Use no release build, cargo install, extra toolchain or target unless the task authorizes it.
+The one release build is CI's: `.github/workflows/release.yml` builds `p1` in release profile on a GitHub runner after a green `gate` on main and publishes `main-<shortsha>`, so a user installs without a toolchain (ADR-0065).
+Do not move or remove a running build's target.
 
-## Architecture (owner decisions — do not bend)
+## Architecture
 
-- One small agent core (`p1-core`): loop + API. It depends only on `p1-contracts`.
-  It never names a provider, tool, file format, prompt template or UI.
-- Every tool is its own module (crate). Providers only translate wire behaviour and
-  contain no tools. Tools contain no provider wire formats and no UI types.
-- An agent sees only the prompt and tools assembled for it; an unassembled tool
-  cannot be dispatched.
-- Delegation is an optional tool module. No mandatory coordinating agent.
-- Compile-time composition with ordinary constructors. No plugin loader, service
-  locator, global registry or DI framework.
-- Public async interfaces are `Send`-capable. One owner per agent's mutable state.
-- Unknown usage/cost is `None`, never zero.
-- Rust 2024, `unsafe` forbidden, errors via `thiserror` in libraries. Clear
-  descriptive names — no mythology names.
-
-## Style
-
-Comments explain why, not what. No speculative abstractions or unused generality.
+Keep `p1-core` to the loop and API, depending only on `p1-contracts`.
+Keep providers, tools, file formats, prompt templates and UI names out of p1-core.
+Make each tool a separate module/crate.
+Keep providers limited to wire translation, with no tools.
+Keep provider wire formats and UI types out of tools.
+Expose only assembled prompts and tools to an agent; an unassembled tool cannot dispatch.
+Keep delegation optional, with no mandatory coordinating agent.
+Compose at compile time with ordinary constructors; add no plugin loader, service locator, global registry or DI framework.
+Make public async interfaces Send-capable; give each agent's mutable state one owner.
+Represent unknown usage/cost as None, never zero.
+Use Rust 2024; forbid unsafe; use thiserror for library errors.
+Use descriptive names, not mythology names.
+Comments explain why, not what; add no speculative abstraction or unused generality.

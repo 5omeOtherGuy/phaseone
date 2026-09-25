@@ -462,6 +462,8 @@ Input deltas are display-only: nothing is kept after `ToolStarted`.
 | Cancelled (^C) | `· cancelled at 12.4s` | requests + in/out of the turn | settled calls; the running call settled `cancelled`; `dropped 1 queued` | |
 | ProviderFailed Authentication | `✗ authentication failed · <route>` | | journal | `p1 login <route>` |
 | ProviderFailed InsufficientBalance | `✗ account exhausted · <route> · not retried` | | journal | `/model` another route |
+| ProviderFailed NotEntitled | `✗ not included in the plan · <message> · not retried` | | journal | `/model` another route |
+| ProviderFailed UsageLimitExhausted | `✗ usage limit reached · <message> · not retried` | | journal | wait for the reset, or `/model` |
 | ProviderFailed RateLimited | `✗ rate limited · <route>` | | journal | `wait, or /model` |
 | ProviderFailed Transport | `✗ connection failed · <message>` | lost streamed text size | journal | `⏎ resend` |
 | ProviderFailed Protocol / InvalidRequest | `✗ provider error · <kind> · <message>` | | journal | |
@@ -582,20 +584,23 @@ pane whenever OUTPUT is open — that steals composer keys; §13.)
 
 ### 9.4 WORKERS
 Header: `WORKERS` dim, right `2 live · 1 queued · pool 3/4`. Order: needs review, running, failed
-and stalled, queued, done, cancelled, lost. Wide grid (48) — 4 rows per worker:
+and stalled, queued, done, cancelled, lost. Wide grid (48) — 2–4 rows per worker:
 ```
 <glyph> <id>  <task first line, ink>                       <state, dim>
-  <env/profile, dim>                              <elapsed ink> · <cost ink>
-  grants  <tools, ink>
-  ↳ <current activity or end line>
+  <model ink> · <route dim, only when the whole suffix fits> <tok>/<ctx> · <elapsed ink> · <cost ink>
+  grants  <tools, ink>                         (only when grants is non-empty)
+  ↳ <current activity or end line>              (only when activity is non-empty)
 ```
-Compact grid (30) — 2 rows: glyph id task / state; route / elapsed. States and glyphs: queued `·`
-faint, running `▪` live, needs review `!` attn (the worker has a parked approval), done `✓` ok (and
-`done · not verified` when it finished without a command tool), failed `✗` fail, cancelled `·`
-faint, stalled `✗` fail (`6 summaries without a change`), lost `·` faint (`not restored on
-resume`, ADR-0034). Cost is `—` until workers carry a usage tap.
-Selection: `^F` focuses the pane, `↑ ↓` move an amber focus row (row 1 of a block), `a` attach,
-`x` stop (asks `y stop  n keep` — the one amber event), `esc` back.
+The route is a dim suffix only when the whole suffix fits; a long model is cut with `…` and the route
+is omitted. Compact grid (30) — 3 rows: glyph id task / state; model (with route suffix only if it
+fits) / elapsed; `tokens` tok/ctx on the left and cost on the right. Unknown values render `—`.
+States and glyphs: queued `·` faint, running `▪` live, needs review `!` attn (the worker has a parked
+approval), done `✓` ok (and `done · not verified` when it finished without a command tool), failed
+`✗` fail, cancelled `·` faint, stalled `✗` fail (`6 summaries without a change`), lost `·` faint
+(`not restored on resume`, ADR-0034). Selection: `^F` focuses the pane, `↑ ↓` move an amber focus
+row (row 1 of a block), `a` attach, `x` stop (asks `y stop  n keep` — the one amber event), `esc`
+back. Rows changed by owner request (#111, 2026-09-24); the WORKERS mocks were re-derived from the
+renderer because the WorkersPane mock component is not in the repo; the state in lib/p1-screens.js carries the new fields.
 <!-- MOCK:el-workers-pane -->
 
 ### 9.5 Attached worker

@@ -86,7 +86,7 @@ output_limit  = 32000                  # optional; same rule
   `ses_`/`msg_` id derived from the route's cache key, and the `bash` and `read` tool
   declarations the gate requires (empty-schema stubs when p1 does not already declare the
   name; a call to an injected stub is `Unavailable`). The system prompt and p1's own tools are
-  unchanged. Only the shipped Zen free routes set it (owner decision 2026-09-24, ADR-0062;
+  unchanged. Only the shipped Zen free routes set it (owner decision 2026-09-24, ADR-0066;
   evidence and the minimal accepted shape in `docs/design/zen-client-identity-evidence.md`).
 - A profile that has no `[models.<profile id>]` entry is NOT served by that route. There is no
   pass-through of unknown model names: an aggregator serving 200 models gets entries for the
