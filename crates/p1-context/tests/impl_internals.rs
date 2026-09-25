@@ -504,8 +504,9 @@ async fn the_summary_request_carries_the_lowered_effort_whatever_the_agents_effo
     }
 }
 
-// Without the setting the request keeps the effort its options carry: the whole-provider
-// environment names no profile, so the module has no floor to read.
+// Without the setting the request keeps the effort its options carry. The host never takes this
+// path — it always passes a floor (the profile's lowest level, else `Low`) — but the module has
+// no effort scale of its own, so an unset effort must leave the options alone.
 #[tokio::test(start_paused = true)]
 async fn an_unset_summary_effort_keeps_the_effort_the_options_carry() {
     let history = effort_history();

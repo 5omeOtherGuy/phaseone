@@ -152,9 +152,10 @@ impl SummarizingContext {
     /// must NOT inherit the agent's effort: on a thinking model the route spends part
     /// of the summary-output cap on reasoning before a single summary token, and the
     /// transcript handed to the summarizer is already condensed. The host passes the
-    /// LOWEST effort the model profile supports, so the whole cap buys summary text;
-    /// the one cap-doubling retry is untouched. `None` keeps the effort the options
-    /// carried — the whole-provider form names no profile to read a floor from.
+    /// LOWEST effort the model profile supports, and `Low` when the environment names
+    /// no profile at all, so every summary carries a floor; the one cap-doubling retry
+    /// is untouched. `None` leaves the effort the options carried — a path the host
+    /// does not take, kept because the module cannot invent a route's effort scale.
     pub fn with_summary_effort(mut self, effort: Option<Effort>) -> Self {
         self.options.reasoning_effort = effort;
         self

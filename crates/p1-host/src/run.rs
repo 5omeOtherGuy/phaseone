@@ -162,8 +162,9 @@ impl ContextPolicy for DefaultContext {
 /// `SummarizingContext` when the environment opts in with `[context]`,
 /// passthrough otherwise. The host is the composition root: `p1-assembly` only
 /// carries the plain settings and the prompt override. `profile` is the model
-/// profile the environment selected (the whole-provider form has none), read
-/// here for the summarization request's own effort (#125).
+/// profile the environment selected (the whole-provider form has none): its own
+/// capacity narrows the environment's table, and its effort floor is what the
+/// summarization request runs at (#125).
 fn agent_context(
     assembled: &Assembled,
     profile: Option<&ModelProfile>,
@@ -171,14 +172,7 @@ fn agent_context(
     let Some(settings) = &assembled.resolved.context else {
         return Ok(Arc::new(DefaultContext));
     };
-    let config = p1_context::ContextConfig {
-        window_tokens: settings.window_tokens,
-        output_headroom_tokens: settings.output_headroom_tokens,
-        summarize_at_tokens: settings.summarize_at_tokens,
-        keep_recent_tokens: settings.keep_recent_tokens,
-        user_verbatim_tokens: settings.user_verbatim_tokens,
-        tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
-    };
+    let config = config_for_route(settings, profile);
     let prompt = assembled
         .resolved
         .summarize_prompt
@@ -191,17 +185,61 @@ fn agent_context(
         prompt,
     )?
     .with_summary_output_tokens(settings.summary_output_tokens)?
-    .with_summary_effort(lowest_effort(profile));
+    .with_summary_effort(summary_effort(profile));
     Ok(Arc::new(policy))
 }
 
-/// The lowest reasoning effort a model profile supports (#125): what the
-/// summarization request carries so the summary-output cap is not spent on the
-/// agent's own level of reasoning before any summary text. `None` for a
-/// whole-provider environment, which names no profile; the request then keeps the
-/// effort the assembled options carry.
-fn lowest_effort(profile: Option<&ModelProfile>) -> Option<Effort> {
-    profile.and_then(|profile| profile.efforts.iter().copied().min())
+/// The `ContextConfig` one assembled agent actually gets, with the selected profile's own
+/// capacity folded in (#125 review): an environment states the window of its ROUTE, but a
+/// profile states what THIS model serves, and p1 lets a narrower profile be selected on the
+/// same environment. A profile that names a smaller window or a smaller output ceiling lowers
+/// both the effective window and the reserve, and the useful point is pulled into the result —
+/// so a task that selects MiMo (200k) on `zen` compacts at MiMo's size instead of failing a
+/// request against Space Bunny's 1M window.
+fn config_for_route(
+    settings: &p1_assembly::ContextSettings,
+    profile: Option<&ModelProfile>,
+) -> p1_context::ContextConfig {
+    let window = profile
+        .and_then(|profile| profile.context_tokens)
+        .map_or(settings.window_tokens, |model_window| {
+            settings.window_tokens.min(model_window)
+        });
+    // The reserve is the next response; a profile's output ceiling bounds it, because a
+    // reserve larger than the window would leave no room for the request that carries it.
+    let headroom = profile
+        .and_then(|profile| profile.max_output_tokens)
+        .map_or(settings.output_headroom_tokens, |ceiling| {
+            settings.output_headroom_tokens.min(u64::from(ceiling))
+        });
+    let wall = window.saturating_sub(headroom);
+    // The useful point: never later than the environment asked, never past 60% of the
+    // effective window, and always below the wall the request has to fit under.
+    let useful = settings
+        .summarize_at_tokens
+        .min(window.saturating_mul(60) / 100)
+        .min(wall.saturating_sub(1));
+    p1_context::ContextConfig {
+        window_tokens: window,
+        output_headroom_tokens: headroom,
+        summarize_at_tokens: useful,
+        keep_recent_tokens: settings.keep_recent_tokens,
+        user_verbatim_tokens: settings.user_verbatim_tokens,
+        tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
+    }
+}
+
+/// The reasoning effort the summarization request runs at (#125): the LOWEST level the model
+/// profile supports, so the summary-output cap buys summary text and not the agent's own
+/// reasoning. Without a profile there is no list to read a floor from, and the agent's effort
+/// must still not leak into the summary: the whole-provider form summarizes at `Low`, the
+/// lowest level every route's effort scale starts at.
+fn summary_effort(profile: Option<&ModelProfile>) -> Option<Effort> {
+    Some(
+        profile
+            .and_then(|profile| profile.efforts.iter().copied().min())
+            .unwrap_or(Effort::Low),
+    )
 }
 
 /// A session store plus the records to resume from (when resuming).
@@ -639,14 +677,19 @@ pub async fn run_with_front_end(
     // can describe a call from the tool that owns it instead of matching a name.
     front_end.parent_tools(&assembled.tools);
     // §10 `ctx`'s denominator: unknown (no `[context]` section) stays `None`,
-    // never a guessed window.
+    // never a guessed window. The numbers are the EFFECTIVE ones — the selected
+    // profile's own capacity folded in — so the display shows what the
+    // summarizer acts on, not a window this model cannot serve.
+    let context_numbers = assembled
+        .resolved
+        .context
+        .as_ref()
+        .map(|settings| config_for_route(settings, environment.profile.as_deref()));
     front_end.context_configured(
-        assembled.resolved.context.as_ref().map(|c| c.window_tokens),
-        assembled
-            .resolved
-            .context
+        context_numbers.as_ref().map(|config| config.window_tokens),
+        context_numbers
             .as_ref()
-            .map(|c| c.summarize_at_tokens),
+            .map(|config| config.summarize_at_tokens),
     );
 
     let (journal, records): OpenedSession = open_session(deps, options)?;
@@ -2861,5 +2904,275 @@ mod tests {
             generated_cache_key(Path::new("/tmp/ws"), "plain", PARENT_ORDINAL),
             generated_cache_key(Path::new("/tmp/ws"), "plain", first)
         );
+    }
+
+    // ---------------------------- #125 review: the effective context table
+
+    /// The shipped `environments/` directory, as the host searches it.
+    fn shipped_environments() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")
+    }
+
+    /// The `[context]` table the shipped environment declares.
+    fn shipped_settings(environment: &str) -> p1_assembly::ContextSettings {
+        load_environment(environment, &[shipped_environments()])
+            .expect("the shipped environment loads")
+            .context
+            .expect("the shipped environment opts in with [context]")
+    }
+
+    /// The shipped profile, parsed through the same entry point the loader uses.
+    fn shipped_profile(stem: &str) -> ModelProfile {
+        let path = shipped_environments()
+            .join("../profiles")
+            .join(format!("{stem}.toml"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} is unreadable: {error}", path.display()));
+        ModelProfile::from_toml(stem, &text).expect("the shipped profile parses")
+    }
+
+    /// The reserve the effective table leaves for the next response.
+    fn wall_of(config: &p1_context::ContextConfig) -> u64 {
+        config.window_tokens - config.output_headroom_tokens
+    }
+
+    /// #125 review: a profile that states a SMALLER window than the environment narrows the
+    /// effective table, so selecting MiMo (200k) on `zen` compacts at MiMo's size instead of
+    /// sending requests the binding cannot serve.
+    #[test]
+    fn a_narrower_profile_narrows_the_effective_context_table() {
+        let settings = shipped_settings("zen");
+        let mimo = shipped_profile("mimo-v2.6-flash-free");
+        assert_eq!(
+            mimo.context_tokens,
+            Some(200_000),
+            "the shipped profile states the narrow window"
+        );
+        let config = config_for_route(&settings, Some(&mimo));
+        assert_eq!(config.window_tokens, 200_000, "the profile's window wins");
+        assert_eq!(
+            config.output_headroom_tokens, 32_000,
+            "the reserve is the profile's own output ceiling, below zen's 524,288"
+        );
+        assert!(
+            config.summarize_at_tokens <= 120_000,
+            "threshold {} must stay at or below 60% of the effective window",
+            config.summarize_at_tokens
+        );
+        assert!(
+            config.summarize_at_tokens < wall_of(&config),
+            "threshold {} must stay below the wall {}",
+            config.summarize_at_tokens,
+            wall_of(&config)
+        );
+        // The effective table must be one the policy accepts.
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+    }
+
+    /// The other two zen bindings: Space Bunny is the environment's own table, Muse's output
+    /// ceiling lowers only the reserve (its window is the environment's window).
+    #[test]
+    fn a_profile_bounds_the_reserve_and_keeps_the_window_it_does_not_narrow() {
+        let settings = shipped_settings("zen");
+
+        let space_bunny = shipped_profile("space-bunny-free");
+        let config = config_for_route(&settings, Some(&space_bunny));
+        assert_eq!(config.window_tokens, settings.window_tokens);
+        assert_eq!(
+            config.output_headroom_tokens,
+            settings.output_headroom_tokens
+        );
+        assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
+
+        let muse = shipped_profile("muse-spark-1.3-contributor-free");
+        let config = config_for_route(&settings, Some(&muse));
+        assert_eq!(
+            config.window_tokens, 1_048_576,
+            "the window is not narrowed"
+        );
+        assert_eq!(
+            config.output_headroom_tokens, 131_072,
+            "the profile's output ceiling bounds the reserve"
+        );
+        assert_eq!(config.summarize_at_tokens, 500_000);
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+    }
+
+    /// A profile that states no capacity at all (deepseek-v4.1-flash) leaves the environment's
+    /// table exactly as it is — and so does the whole-provider form, which names no profile.
+    #[test]
+    fn a_profile_that_states_nothing_leaves_the_environment_table_alone() {
+        let settings = shipped_settings("deepseek");
+        let config = config_for_route(&settings, None);
+        assert_eq!(config.window_tokens, settings.window_tokens);
+        assert_eq!(
+            config.output_headroom_tokens,
+            settings.output_headroom_tokens
+        );
+        assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
+        assert_eq!(config.keep_recent_tokens, settings.keep_recent_tokens);
+
+        let deepseek = shipped_profile("deepseek-v4.1-flash");
+        assert_eq!(
+            deepseek.context_tokens, None,
+            "the profile states no window"
+        );
+        assert_eq!(deepseek.max_output_tokens, None, "and no output ceiling");
+        assert_eq!(config_for_route(&settings, Some(&deepseek)), config);
+        assert_eq!(config.window_tokens, 1_000_000);
+        assert_eq!(config.summarize_at_tokens, 300_000);
+    }
+
+    // ---------------------------- #125 review: the summary's own effort
+
+    /// The floor the host passes: the profile's lowest level, and `Low` when there is no profile
+    /// to read one from (the whole-provider form).
+    #[test]
+    fn the_summary_effort_is_the_profiles_lowest_level_or_low_without_a_profile() {
+        assert_eq!(
+            summary_effort(Some(&shipped_profile("mimo-v2.6-flash-free"))),
+            Some(Effort::High),
+            "MiMo states exactly one level"
+        );
+        assert_eq!(
+            summary_effort(Some(&shipped_profile("space-bunny-free"))),
+            Some(Effort::Low),
+            "Space Bunny allows low"
+        );
+        assert_eq!(
+            summary_effort(None),
+            Some(Effort::Low),
+            "no profile must not mean the agent's own effort"
+        );
+    }
+
+    /// An assembled agent for the request-level tests: a scripted provider, one context table
+    /// and the agent's own effort. The settings are tiny so a two-item history crosses the
+    /// threshold (the same shape `crates/p1-context/tests/impl_internals.rs` uses).
+    fn assembled_for_test(
+        context: Option<p1_assembly::ContextSettings>,
+        effort: Effort,
+    ) -> (Assembled, Arc<p1_testkit::ScriptedProvider>) {
+        let provider = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+            p1_testkit::text_response("s"),
+        ]));
+        let options = p1_contracts::ModelOptions {
+            reasoning_effort: Some(effort),
+            ..p1_contracts::ModelOptions::default()
+        };
+        let assembled = Assembled {
+            resolved: p1_assembly::ResolvedEnvironment {
+                environment: "test".into(),
+                family: "test".into(),
+                route: p1_contracts::RouteDescription {
+                    origin: p1_contracts::Origin {
+                        route: "fake".into(),
+                        model: "fake-model".into(),
+                    },
+                    supports_freeform_tools: false,
+                    mandatory_prompt_prefix: None,
+                    reports_cost: false,
+                    cache_key: CacheKeySupport::Optional,
+                },
+                system_prompt: "sys".into(),
+                tools: Vec::new(),
+                options: options.clone(),
+                context,
+                summarize_prompt: None,
+            },
+            provider: provider.clone(),
+            tools: Vec::new(),
+            system_prompt: "sys".into(),
+            options,
+        };
+        (assembled, provider)
+    }
+
+    fn summarizer_history() -> Vec<p1_contracts::Item> {
+        vec![
+            p1_contracts::Item::Assistant(p1_contracts::AssistantItem {
+                origin: p1_testkit::origin(),
+                blocks: vec![p1_contracts::AssistantBlock::Text {
+                    text: "x".repeat(500),
+                }],
+            }),
+            p1_contracts::Item::Assistant(p1_contracts::AssistantItem {
+                origin: p1_testkit::origin(),
+                blocks: vec![p1_contracts::AssistantBlock::Text {
+                    text: "tail".into(),
+                }],
+            }),
+        ]
+    }
+
+    fn summarizer_table() -> p1_assembly::ContextSettings {
+        p1_assembly::ContextSettings {
+            window_tokens: 10_000,
+            output_headroom_tokens: 1_000,
+            summarize_at_tokens: 100,
+            keep_recent_tokens: 80,
+            user_verbatim_tokens: 100,
+            tool_result_excerpt_chars: 2_000,
+            summary_output_tokens: 4_000,
+        }
+    }
+
+    /// #125 review: the request the host's policy actually sends carries the lowered effort,
+    /// whatever the assembled agent's own options name.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_summarizes_at_the_profiles_lowest_effort_whatever_the_agent_runs_at() {
+        for agent_effort in [Effort::High, Effort::ExtraHigh, Effort::Max] {
+            let (assembled, provider) = assembled_for_test(Some(summarizer_table()), agent_effort);
+            let policy = agent_context(&assembled, Some(&shipped_profile("space-bunny-free")))
+                .expect("the environment builds a summarizer");
+            let history = summarizer_history();
+            let cancel = CancellationToken::new();
+            let prepared = policy
+                .prepare(ContextInput {
+                    history: &history,
+                    last_usage: None,
+                    cancel: &cancel,
+                })
+                .await
+                .expect("preparing a summary succeeds");
+            assert!(prepared.is_some(), "the history crosses the threshold");
+            assert_eq!(
+                provider.requests()[0].options.reasoning_effort,
+                Some(Effort::Low),
+                "an agent at {agent_effort:?} still summarizes at the profile's lowest level"
+            );
+        }
+    }
+
+    /// #125 review: with NO profile there is nothing to read a floor from, so the summary runs
+    /// at `Low` — never at the agent's own level.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_summarizes_at_low_when_the_environment_names_no_profile() {
+        for agent_effort in [Effort::High, Effort::Max] {
+            let (assembled, provider) = assembled_for_test(Some(summarizer_table()), agent_effort);
+            let policy =
+                agent_context(&assembled, None).expect("the environment builds a summarizer");
+            let history = summarizer_history();
+            let cancel = CancellationToken::new();
+            let prepared = policy
+                .prepare(ContextInput {
+                    history: &history,
+                    last_usage: None,
+                    cancel: &cancel,
+                })
+                .await
+                .expect("preparing a summary succeeds");
+            assert!(prepared.is_some(), "the history crosses the threshold");
+            assert_eq!(
+                provider.requests()[0].options.reasoning_effort,
+                Some(Effort::Low),
+                "an agent at {agent_effort:?} with no profile"
+            );
+            assert_ne!(
+                provider.requests()[0].options.reasoning_effort,
+                Some(agent_effort),
+                "the agent's own effort must not leak into the summary"
+            );
+        }
     }
 }

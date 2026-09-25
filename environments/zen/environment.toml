@@ -24,9 +24,11 @@ module = "finish"
 # summarizing starts at 500,000 = min(500k, 60% of the window) rounded to 10k, i.e. below it. The
 # Zen docs state no limit and `/zen/v1/models` lists only ids, so this is gateway metadata rather
 # than a vendor claim (docs/design/context-windows.md). Keep a long recent tail for multi-file
-# work. These values describe the DEFAULT profile (space-bunny-free); p1 does not lower the window
-# per selected profile, so selecting mimo-v2.6-flash-free (200k context, models.dev) here keeps
-# this 1M window (role-window plumbing: #113).
+# work. This table describes the DEFAULT profile (space-bunny-free). A profile that states less is
+# honoured: the host narrows the effective window to the selected profile's `context_tokens` and
+# the reserve to its `max_output_tokens`, so selecting mimo-v2.6-flash-free (200,000 context,
+# 32,000 output) compacts at 200,000/120,000 instead of sending requests this binding cannot serve
+# (crates/p1-host/src/run.rs `config_for_route`).
 [context]
 window_tokens = 1048576
 output_headroom_tokens = 524288
