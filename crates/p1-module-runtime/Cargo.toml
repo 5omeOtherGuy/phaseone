@@ -1,0 +1,19 @@
+[package]
+name = "p1-module-runtime"
+description = "The host side of p1's WebAssembly modules: the wasmtime engine that compiles and runs module components"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-module-protocol = { path = "../p1-module-protocol" }
+thiserror = "2"
+# The bounded set of ORCHESTRATION-PLAN §2 (owner, Q7). No `cache`: the loader compiles the
+# verified bytes itself, so a compiled-code cache would be a second, unverified source of
+# code. No `wat` or WASI: modules arrive as binary components and get only p1's own imports.
+wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "async", "std"] }
