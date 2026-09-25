@@ -880,7 +880,15 @@ fn the_two_shipped_routes_have_no_compiled_literals() {
         "glm-5.3",
         "chat/completions",
     ];
-    for file in ["src/catalog.rs", "src/run.rs", "src/cli.rs", "src/auth.rs"] {
+    for file in [
+        "src/catalog/mod.rs",
+        "src/catalog/providers.rs",
+        "src/catalog/tools.rs",
+        "src/catalog/modules.rs",
+        "src/run.rs",
+        "src/cli.rs",
+        "src/auth.rs",
+    ] {
         let path = repo("crates/p1-host").join(file);
         let text = std::fs::read_to_string(&path).expect("the host source is readable");
         for literal in literals {
