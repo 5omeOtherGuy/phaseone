@@ -6,7 +6,7 @@ sits in three places (`p1-provider-anthropic/src/credentials.rs`, `p1-provider-o
 "which source" report. Borrowing stays the default; §6 adds `p1 login` for pasted API keys (ADR-0044).
 §8 adds the opt-in `store_only` policy (ADR-0061): every SHIPPED route is now self-contained and
 reads no other tool's login at runtime, and minting an independent OAuth grant is the remaining work.
-§10 adds `login_dir` and `p1 login <route> --from-claude-code` (ADR-0075): a `claude-code-oauth`
+§10 adds `login_dir` and `p1 login <route> --from-claude-code` (ADR-0074): a `claude-code-oauth`
 route may borrow a NAMED Claude Code directory, and a Claude Code login can be imported into p1's store.
 
 ## 1. Crate and dependencies
@@ -36,7 +36,7 @@ store entry, and no other tool's login. Absent, the rows above are unchanged.
 source beside it is a contradiction, so `env`, a nonempty `borrow` or `store_only = true` on a
 `none` route is a load error.
 
-`login_dir` (ADR-0075, §10) is allowed ONLY on `claude-code-oauth`: the same field on any other
+`login_dir` (ADR-0074, §10) is allowed ONLY on `claude-code-oauth`: the same field on any other
 kind is a load error, and so is a directory that is neither absolute nor starts with `~/`.
 
 `p1_auth::resolve(route_id, &spec, transport, &Locations) -> Arc<dyn CredentialSource>`.
@@ -116,7 +116,7 @@ h. `store_only` (§8): the borrowed source is not in `tried`, the line carries t
    the CLI's login path at all; the same chain WITHOUT the field still reads and names it.
 i. Every shipped `routes/*.toml` sets `store_only = true` and lists no nonempty `borrow` — except
    `anthropic-subscription-2`, which borrows its account's Claude Code login in its `login_dir`
-   by owner order (ADR-0075, §10).
+   by owner order (ADR-0074, §10).
 
 ## 6. `p1 login` — pasted keys into p1's own store (ADR-0044)
 
@@ -126,7 +126,7 @@ implementation." Scope: API KEYS. Browser/OAuth logins stay borrowed from the of
 ```
 p1 login <route>          read one key, store it for that route
 p1 login <route> --from-claude-code [DIR]
-                          copy the Claude Code login in DIR into p1's store (§10, ADR-0075)
+                          copy the Claude Code login in DIR into p1's store (§10, ADR-0074)
 p1 login --list           every route: its credential kind and the source report of §4
 p1 logout <route>         remove the route's entry from p1's store
 ```
@@ -290,7 +290,7 @@ d. A 401 on such a route is an Authentication failure naming the proxy credentia
    with exactly one request (or, on a WebSocket route, one handshake) and no refresh call.
 e. An api-key route with the very same route file and a readable store still sends `Bearer <key>`.
 
-## 10. A named Claude Code login and its import (ADR-0075, issue #199)
+## 10. A named Claude Code login and its import (ADR-0074, issue #199)
 
 Owner order, 2026-09-25: "implement a second claude code subscription provider, so we can switch
 between them when our quota is reached". A second subscription is a second Claude Code login,

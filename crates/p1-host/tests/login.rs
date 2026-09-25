@@ -502,7 +502,7 @@ async fn a_none_route_is_listed_as_proxy_injected_and_cannot_be_logged_in() {
     assert!(!scratch.store_path().exists());
 }
 
-// -------------------------------------------------- --from-claude-code (ADR-0075)
+// -------------------------------------------------- --from-claude-code (ADR-0074)
 
 /// A Claude Code login file under the scratch home, holding the sentinel tokens.
 fn write_claude_login(scratch: &Scratch, relative_dir: &str) -> PathBuf {
@@ -876,7 +876,7 @@ fn the_binary_stores_a_piped_key_and_never_prints_it() {
     assert!(output.status.success());
     assert_eq!(scratch.store(), "{}\n");
 
-    // ADR-0075: the import through the binary — the default directory is the scratch
+    // ADR-0074: the import through the binary — the default directory is the scratch
     // home's `~/.claude`, and neither stream carries the token.
     scratch.write_route("claude-route", "kind = \"claude-code-oauth\"\n");
     write_claude_login(&scratch, ".claude");

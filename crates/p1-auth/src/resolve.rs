@@ -267,7 +267,7 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
         CredentialKind::ClaudeCodeOauth => {
             sources.push(Source::P1StoreOauth(OauthDialect::ClaudeCode));
             if !spec.store_only {
-                // The route's own login directory when it names one (ADR-0075).
+                // The route's own login directory when it names one (ADR-0074).
                 sources.push(Source::ClaudeCodeLogin(spec.login_dir.clone()));
             }
         }

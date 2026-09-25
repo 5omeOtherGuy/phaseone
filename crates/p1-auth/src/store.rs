@@ -7,7 +7,7 @@
 //! refreshed is written back to the store, and `p1 login`/`p1 logout` (spec §6,
 //! ADR-0044) put one pasted API key in and take one out; `p1 login <route>
 //! --from-claude-code` copies one Claude Code login in as an `oauth` entry
-//! (ADR-0075). Every write goes under
+//! (ADR-0074). Every write goes under
 //! the same non-blocking lock, through the same atomic 0600 writer.
 //!
 //! A store file or directory that is group/world-accessible is REFUSED (spec §3):
@@ -332,7 +332,7 @@ impl std::fmt::Display for ImportError {
 }
 
 /// Copy the Claude Code login in `dir` (its `.credentials.json`) into p1's store as
-/// this route's `oauth` entry (ADR-0075): `{"type":"oauth","access","refresh",
+/// this route's `oauth` entry (ADR-0074): `{"type":"oauth","access","refresh",
 /// "expires","account_id"}`, with `null` for a field the login does not record. The
 /// account id is Claude Code's `oauthAccount.accountUuid` from `dir/.claude.json`
 /// when that file has one.

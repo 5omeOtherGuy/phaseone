@@ -13,7 +13,7 @@ use crate::cli::UsageOptions;
 fn label(id: &str) -> String {
     match id {
         "anthropic-subscription" => "claude max".into(),
-        // The second Claude subscription (ADR-0075): its own account, its own row.
+        // The second Claude subscription (ADR-0074): its own account, its own row.
         "anthropic-subscription-2" => "claude max 2".into(),
         "openai-codex-subscription" => "chatgpt pro lite".into(),
         "opencode-go-subscription" => "opencode go".into(),
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(second[0].stale.as_deref(), Some("no access"));
     }
 
-    /// ADR-0075: both Claude subscriptions are their own rows, each probed with its
+    /// ADR-0074: both Claude subscriptions are their own rows, each probed with its
     /// own route's credential reference. The locations are empty, so no real login is
     /// read.
     #[test]

@@ -1,4 +1,4 @@
-//! ADR-0075: a `claude-code-oauth` route may name the Claude Code config directory
+//! ADR-0074: a `claude-code-oauth` route may name the Claude Code config directory
 //! whose login it borrows (`login_dir`), and a Claude Code login can be imported into
 //! p1's store as the route's `oauth` entry. Every directory is a scratch one; every
 //! token is obviously fake.

@@ -1,4 +1,4 @@
-# The owner's SECOND Claude Code subscription (ADR-0075): the same adapter, endpoint,
+# The owner's SECOND Claude Code subscription (ADR-0074): the same adapter, endpoint,
 # long-context setting, models and client identity as `anthropic-subscription`, on
 # another account, so a workflow role can fall back from `claude/…` to `claude2/…` when
 # the first account's quota is exhausted (ADR-0054). Only the id, the origin and the

@@ -116,7 +116,7 @@ pub struct CredentialSpec {
     /// the two OAuth kinds add the CLI's own login after p1's store.
     #[serde(default)]
     pub store_only: bool,
-    /// The Claude Code config directory whose login this route borrows (ADR-0075),
+    /// The Claude Code config directory whose login this route borrows (ADR-0074),
     /// as the file writes it: an absolute path or one that starts with `~/`, which is
     /// expanded against the home directory when it is used. Only a
     /// `claude-code-oauth` route may name one. Absent keeps the default directory

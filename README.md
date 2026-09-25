@@ -95,7 +95,7 @@ store; copying a live CLI refresh token is unsafe because it rotates, and p1 doe
 ship an OAuth browser flow yet, so `p1 login <oauth-route>` says so instead of pointing
 at the CLI (`docs/design/credentials.md` §8).
 
-The second Claude subscription (`claude2/…`, route `anthropic-subscription-2`, ADR-0075)
+The second Claude subscription (`claude2/…`, route `anthropic-subscription-2`, ADR-0074)
 is the exception: it borrows the Claude Code login in `~/.claude-2` in place (log in there
 with `CLAUDE_CONFIG_DIR=~/.claude-2 claude`), after p1's own store. On a machine without
 Claude Code, copy a login into p1's store instead — no token is printed:

@@ -328,7 +328,7 @@ fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
     assert!(!assembled.provider.describe().supports_freeform_tools);
 }
 
-/// ADR-0075: the second Claude subscription is the first route on another account.
+/// ADR-0074: the second Claude subscription is the first route on another account.
 /// Everything but the id, the origin and the credential reference is the same data,
 /// and `environments/claude2` is `environments/claude` with only the route changed.
 #[test]

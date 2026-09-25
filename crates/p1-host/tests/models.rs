@@ -230,7 +230,7 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "claude/claude-opus-5-5",
             "claude/claude-sonnet-4-6",
             "claude/claude-sonnet-5",
-            // The second Claude subscription (ADR-0075) serves the same profiles on its own
+            // The second Claude subscription (ADR-0074) serves the same profiles on its own
             // account, so a role can fall back from `claude/…` to `claude2/…`.
             "claude2/claude-fable-5",
             "claude2/claude-opus-4-6",
@@ -271,7 +271,7 @@ fn every_environment_and_every_bound_profile_is_a_model() {
     );
     // Every main agent carries the worker tools (ADR-0050), so delegation is not an
     // environment property: a model is listed once per environment, not once per
-    // delegating twin. The two Claude accounts are two environments (ADR-0075).
+    // delegating twin. The two Claude accounts are two environments (ADR-0074).
     let opus: Vec<(&str, &str)> = models
         .iter()
         .filter(|model| model.profile == "claude-opus-5")

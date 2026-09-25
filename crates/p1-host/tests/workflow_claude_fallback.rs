@@ -1,4 +1,4 @@
-//! ADR-0075 with ADR-0054, end to end through the host: a workflow role on the first
+//! ADR-0074 with ADR-0054, end to end through the host: a workflow role on the first
 //! Claude subscription (`claude/…`) whose account is out of quota moves its step to the
 //! second subscription (`claude2/…`). No engine change is involved — an exhausted
 //! account is a route failure (ADR-0054) — so this drives the SHIPPED environments and

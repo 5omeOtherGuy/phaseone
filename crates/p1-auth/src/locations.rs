@@ -132,7 +132,7 @@ impl Locations {
     }
 
     /// Claude Code's credential file: `<login_dir>/.credentials.json` when the route
-    /// names a directory (ADR-0075), else `$CLAUDE_CONFIG_DIR/.credentials.json`, else
+    /// names a directory (ADR-0074), else `$CLAUDE_CONFIG_DIR/.credentials.json`, else
     /// `~/.claude/.credentials.json`.
     pub(crate) fn claude_code_path(&self, login_dir: Option<&str>) -> Option<PathBuf> {
         self.claude_code_dir(login_dir)

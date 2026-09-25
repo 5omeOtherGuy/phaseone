@@ -1,5 +1,5 @@
 ---
-adr: 75
+adr: 74
 title: A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login
 status: proposed
 date: 2026-09-25
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [docs/design/credentials.md, docs/design/routes-and-profiles.md, crates/p1-auth/src/spec.rs, crates/p1-auth/src/locations.rs, crates/p1-auth/src/resolve.rs, crates/p1-auth/src/store.rs, crates/p1-host/src/login.rs, crates/p1-host/src/cli.rs, crates/p1-host/src/usage.rs, routes/anthropic-subscription-2.toml, environments/claude2/environment.toml]
 ---
-# ADR-0075: A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login
+# ADR-0074: A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login
 
 ## Context
 

@@ -13,7 +13,7 @@
 //! its credential belongs in p1's store, that `p1 login` reads no OAuth grant from
 //! stdin, and that the CLI login is not read (ADR-0061). No OAuth flow is pretended.
 //!
-//! `p1 login <route> --from-claude-code [DIR]` (ADR-0075) is the one way an OAuth
+//! `p1 login <route> --from-claude-code [DIR]` (ADR-0074) is the one way an OAuth
 //! entry gets into p1's store: it copies an existing Claude Code login — the
 //! directory's `.credentials.json` — for a `claude-code-oauth` route. `p1-auth` reads
 //! the file and writes the store; this module prints paths and routes, never a token.
@@ -114,7 +114,7 @@ pub async fn login_with(
     EXIT_OK
 }
 
-/// `p1 login <route> --from-claude-code [DIR]` (ADR-0075): copy the Claude Code login
+/// `p1 login <route> --from-claude-code [DIR]` (ADR-0074): copy the Claude Code login
 /// in DIR into p1's store as this route's `oauth` entry. DIR defaults to the directory
 /// the route borrows from (its `login_dir`, else the default Claude Code directory); a
 /// leading `~` is expanded. A route that is not `claude-code-oauth`, or a directory
@@ -253,7 +253,7 @@ fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a Rout
         // A self-contained OAuth route reads p1's own store only (ADR-0061). Sending
         // the operator to that CLI's login would be wrong: this route does not read
         // it. p1 has no OAuth flow, so the error says exactly that and never
-        // pretends one exists; a Claude Code login can be imported (ADR-0075).
+        // pretends one exists; a Claude Code login can be imported (ADR-0074).
         kind if route.credential.store_only => Err(format!(
             "route `{route_id}` is a {} route with `store_only`: its credential is read from \
              p1's own store, and `p1 login` reads no OAuth grant from stdin. p1 has no \
@@ -272,7 +272,7 @@ fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a Rout
     }
 }
 
-/// The import a `claude-code-oauth` route offers instead of a pasted key (ADR-0075).
+/// The import a `claude-code-oauth` route offers instead of a pasted key (ADR-0074).
 fn import_hint(kind: CredentialKind, route_id: &str) -> String {
     if kind == CredentialKind::ClaudeCodeOauth {
         format!(

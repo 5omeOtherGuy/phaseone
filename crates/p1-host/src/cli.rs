@@ -60,7 +60,7 @@ pub enum Command {
         route: String,
     },
     /// Copy a Claude Code login into p1's store for this `claude-code-oauth` route
-    /// (ADR-0075). `dir` is the Claude Code config directory; `None` means the one the
+    /// (ADR-0074). `dir` is the Claude Code config directory; `None` means the one the
     /// route borrows (its `login_dir`, else the default).
     LoginFromClaudeCode {
         route: String,
@@ -774,7 +774,7 @@ fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
 }
 
 /// `p1 login <route>`, `p1 login <route> --from-claude-code [DIR]` and `p1 login --list`
-/// (ADR-0044, ADR-0075, spec §6). The key is never an argument: it is read from stdin
+/// (ADR-0044, ADR-0074, spec §6). The key is never an argument: it is read from stdin
 /// or from a Claude Code login file, so arguments would only put it in shell history
 /// and in `ps`.
 fn parse_login(args: &[String]) -> Result<Options, CliError> {
