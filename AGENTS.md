@@ -64,7 +64,7 @@ A `task/**` push runs `scripts/gate.sh` and builds `p1` (debug) in `.github/work
 The machine has a small SSD and 7 GB RAM (global rules: two build jobs, SSD floor).
 Any local build target goes on the SSD, one per task: `CARGO_TARGET_DIR=~/.cache/cargo-target/<task>`, `CARGO_BUILD_JOBS=2`, at most two concurrent rustc, and only above the SSD floor (8 GiB free to keep building; 12 GiB to admit a new build).
 The target belongs to the task and its owner deletes it at task end; never share a target between checkouts (D20 records stale linking of worktree p1 crates).
-The `/mnt/build` HDD target is superseded by that order (2026-09-25 02:40); `scripts/local-cargo-config.sh` and the worktree helper still write it until ADR-0060 is reconciled.
+`scripts/local-cargo-config.sh` (run by the worktree helper) defaults to `~/.cache/cargo-target/<checkout>-<hash>` and refuses a non-ext4 target; the `/mnt/build` HDD target is retired (owner order 2026-09-25 02:40).
 `scripts/local-cargo-config.sh` writes an untracked `.cargo/config.toml`; never commit it.
 Keep `scripts/rustc-serial`; its machine-wide semaphore admits at most two rustc processes.
 Wait for a slot; do not kill a waiting build or bypass the wrapper.
