@@ -32,7 +32,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: wasm32-wasip2
+          targets: wasm32-unknown-unknown
 
       - name: Read the wasm-tools pin
         run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"

@@ -1,8 +1,29 @@
 //! The host side of p1's WebAssembly modules (ADR-0071): the wasmtime engine that compiles
 //! module components ahead of use and runs them asynchronously.
 //!
-//! This crate is the only place the native host touches wasmtime; the loader, linker and
-//! call paths build on the [`engine`] configured here.
+//! This crate is the only place the native host touches wasmtime:
+//! - [`manifest`]: the release manifest, the one source modules load from;
+//! - [`loader`]: verify-then-compile-same-bytes, the digest as identity (freeze item 6);
+//! - [`capabilities`]: the host imports linked per the manifest's grants;
+//! - [`executor`]: the one owner of a module's async Stores (ADR-0015);
+//! - [`restricted`]: the synchronous inspection path (freeze item 4);
+//! - [`tool`]: `WasmTool`, the generic tool adapter (freeze item 12).
+
+pub mod capabilities;
+pub mod executor;
+pub mod loader;
+pub mod manifest;
+pub mod restricted;
+mod sha256;
+pub mod tool;
+
+pub use capabilities::{
+    ExitStatus, LinkError, ProcessCommand, ProcessEvent, ProcessService, RunningProcess, Services,
+};
+pub use executor::ExecutionLimits;
+pub use loader::{LoadError, LoadedModule, Loader, ModuleKind};
+pub use manifest::{ComponentEntry, Digest, ManifestError, ReleaseManifest};
+pub use tool::{ToolError, WasmTool, wasm_tool};
 
 use thiserror::Error;
 use wasmtime::{Config, Engine};
@@ -14,6 +35,9 @@ pub enum RuntimeError {
     /// feature the compiler needs.
     #[error("cannot create the wasmtime engine: {0:#}")]
     Engine(wasmtime::Error),
+    /// The thread that advances the engine's epoch could not start.
+    #[error("cannot start the module epoch thread: {0}")]
+    Ticker(std::io::Error),
 }
 
 /// Builds the engine every module is compiled and instantiated with.

@@ -1,0 +1,19 @@
+[package]
+name = "p1-module-tests"
+description = "Runtime spike and module execution-model tests over the built fixture component (test-only crate; nothing depends on it)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-module-runtime = { path = "../p1-module-runtime" }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+p1-redact = { path = "../p1-redact" }
