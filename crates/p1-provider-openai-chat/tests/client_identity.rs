@@ -4,8 +4,8 @@
 //! that setting produces, and that it changes nothing when it is absent.
 
 use p1_contracts::{
-    BoxFuture, DeclarationKind, Effort, ModelOptions, Provider, ProviderError, ProviderRequest,
-    ToolDeclaration,
+    BoxFuture, DeclarationKind, Effort, ModelOptions, Provider, ProviderError, ProviderErrorKind,
+    ProviderRequest, ToolDeclaration,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::fixtures::chat as fixtures;
@@ -147,6 +147,35 @@ fn assert_opencode_id(id: &str, prefix: &str) {
         rest.bytes().all(|b| b.is_ascii_alphanumeric()),
         "{id}: suffix must be alphanumeric"
     );
+}
+
+#[test]
+fn an_identity_refuses_each_static_header_it_owns() {
+    for name in [
+        "x-opencode-client",
+        "x-opencode-project",
+        "x-opencode-session",
+        "x-opencode-request",
+    ] {
+        let mut route = route(Some(ClientIdentity::Opencode));
+        route
+            .headers
+            .push((name.to_ascii_uppercase(), "duplicate".into()));
+        let error = ChatProvider::new(
+            route,
+            MODEL,
+            profile(),
+            Arc::new(ScriptedTransport::new(vec![])),
+            Arc::new(Fixed),
+        )
+        .expect_err("a static header owned by the identity makes the route malformed");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(
+            error.message.to_ascii_lowercase().contains(name),
+            "{}",
+            error.message
+        );
+    }
 }
 
 #[tokio::test]
