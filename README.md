@@ -95,6 +95,19 @@ store; copying a live CLI refresh token is unsafe because it rotates, and p1 doe
 ship an OAuth browser flow yet, so `p1 login <oauth-route>` says so instead of pointing
 at the CLI (`docs/design/credentials.md` §8).
 
+The second Claude subscription (`claude2/…`, route `anthropic-subscription-2`, ADR-0075)
+is the exception: it borrows the Claude Code login in `~/.claude-2` in place (log in there
+with `CLAUDE_CONFIG_DIR=~/.claude-2 claude`), after p1's own store. On a machine without
+Claude Code, copy a login into p1's store instead — no token is printed:
+
+```sh
+p1 login anthropic-subscription-2 --from-claude-code             # the route's login_dir
+p1 login anthropic-subscription --from-claude-code ~/.claude     # any Claude Code directory
+```
+
+The copied refresh token rotates: once p1 or Claude Code refreshes it, the other copy is
+stale, so import where only p1 uses that login (`docs/design/credentials.md` §10).
+
 ## What makes it different
 
 - **The harness reshapes itself around the model.** An agent gets the prompt, tool

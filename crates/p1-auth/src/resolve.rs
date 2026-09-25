@@ -267,7 +267,8 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
         CredentialKind::ClaudeCodeOauth => {
             sources.push(Source::P1StoreOauth(OauthDialect::ClaudeCode));
             if !spec.store_only {
-                sources.push(Source::ClaudeCodeLogin);
+                // The route's own login directory when it names one (ADR-0075).
+                sources.push(Source::ClaudeCodeLogin(spec.login_dir.clone()));
             }
         }
         CredentialKind::CodexOauth => {
@@ -285,8 +286,12 @@ enum Source {
     Env(String),
     P1StoreApiKey,
     P1StoreOauth(OauthDialect),
-    Login { store: BorrowStore, key: String },
-    ClaudeCodeLogin,
+    Login {
+        store: BorrowStore,
+        key: String,
+    },
+    /// Claude Code's login, in the route's `login_dir` or the default directory.
+    ClaudeCodeLogin(Option<String>),
     CodexLogin,
 }
 
@@ -299,7 +304,7 @@ impl Source {
                 BorrowStore::Opencode => SourceName::OpencodeLogin,
                 BorrowStore::Pi => SourceName::PiLogin,
             },
-            Source::ClaudeCodeLogin => SourceName::ClaudeCodeLogin,
+            Source::ClaudeCodeLogin(_) => SourceName::ClaudeCodeLogin,
             Source::CodexLogin => SourceName::CodexLogin,
         }
     }
@@ -328,7 +333,7 @@ impl Source {
                 None => Presence::Absent,
                 Some(path) => crate::api_key::presence_at(&path, key, *store),
             },
-            Source::ClaudeCodeLogin => match locations.claude_code_path() {
+            Source::ClaudeCodeLogin(dir) => match locations.claude_code_path(dir.as_deref()) {
                 None => Presence::Absent,
                 Some(path) => crate::claude_code::presence_at(&path),
             },
@@ -359,7 +364,7 @@ impl Source {
                 Some(path) => Box::new(SubscriptionCredentials::at(path, &key, store)),
                 None => missing(self_name(&store)),
             },
-            Source::ClaudeCodeLogin => match locations.claude_code_path() {
+            Source::ClaudeCodeLogin(dir) => match locations.claude_code_path(dir.as_deref()) {
                 Some(path) => Box::new(ClaudeCodeCredentials::at(path, transport)),
                 None => missing(SourceName::ClaudeCodeLogin),
             },

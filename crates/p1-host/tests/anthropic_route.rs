@@ -328,6 +328,66 @@ fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
     assert!(!assembled.provider.describe().supports_freeform_tools);
 }
 
+/// ADR-0075: the second Claude subscription is the first route on another account.
+/// Everything but the id, the origin and the credential reference is the same data,
+/// and `environments/claude2` is `environments/claude` with only the route changed.
+#[test]
+fn the_second_claude_route_is_the_first_on_its_own_account() {
+    let dirs = environment_dirs();
+    let first = load_route_by_id(&dirs, "anthropic-subscription").expect("the first route");
+    let second = load_route_by_id(&dirs, "anthropic-subscription-2").expect("the second route");
+    assert_eq!(second.adapter, first.adapter);
+    assert_eq!(second.endpoint, first.endpoint);
+    assert_eq!(second.headers, first.headers);
+    assert_eq!(second.adapter_settings, first.adapter_settings);
+    assert_eq!(second.models, first.models);
+    assert_eq!(second.settings(), first.settings());
+    assert_eq!(
+        second.origin_route, "anthropic-messages/claude-subscription-2",
+        "its own origin, so a session names the account it ran on"
+    );
+    assert_ne!(second.origin_route, first.origin_route);
+    assert_eq!(second.credential.kind, first.credential.kind);
+    assert_eq!(second.credential.login_dir.as_deref(), Some("~/.claude-2"));
+    assert!(
+        !second.credential.store_only,
+        "the second route borrows the login in its own directory"
+    );
+    assert_eq!(
+        first.credential.login_dir, None,
+        "the first route is unchanged"
+    );
+
+    let read = |path: &str| std::fs::read_to_string(repo(path)).unwrap();
+    assert_eq!(
+        read("environments/claude2/environment.toml"),
+        read("environments/claude/environment.toml").replace(
+            "route   = \"anthropic-subscription\"",
+            "route   = \"anthropic-subscription-2\""
+        )
+    );
+    assert_eq!(
+        read("environments/claude2/prompt.md"),
+        read("environments/claude/prompt.md")
+    );
+
+    let (code, stdout, stderr) = show_env("claude2");
+    assert_eq!(code, 0, "claude2: {stderr}");
+    let resolved: serde_json::Value = common::env_show_json(&stdout);
+    assert_eq!(resolved["environment"], "claude2");
+    assert_eq!(
+        resolved["route"]["origin"],
+        serde_json::json!({
+            "route": "anthropic-messages/claude-subscription-2",
+            "model": "claude-sonnet-5",
+        })
+    );
+    assert_eq!(
+        resolved["route"]["mandatory_prompt_prefix"],
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+}
+
 #[test]
 fn every_shipped_claude_profile_carries_its_thinking_policy_and_budgets() {
     for (id, thinking) in [

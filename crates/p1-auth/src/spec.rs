@@ -116,6 +116,14 @@ pub struct CredentialSpec {
     /// the two OAuth kinds add the CLI's own login after p1's store.
     #[serde(default)]
     pub store_only: bool,
+    /// The Claude Code config directory whose login this route borrows (ADR-0075),
+    /// as the file writes it: an absolute path or one that starts with `~/`, which is
+    /// expanded against the home directory when it is used. Only a
+    /// `claude-code-oauth` route may name one. Absent keeps the default directory
+    /// (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). It is also the directory
+    /// `p1 login <route> --from-claude-code` imports from when no directory is given.
+    #[serde(default)]
+    pub login_dir: Option<String>,
 }
 
 impl CredentialSpec {
@@ -159,6 +167,22 @@ impl CredentialSpec {
                      credential reads no store — delete the `store_only` line"
                         .into(),
                 );
+            }
+        }
+        if let Some(dir) = &self.login_dir {
+            if self.kind != CredentialKind::ClaudeCodeOauth {
+                return Err(format!(
+                    "`[credential]` kind \"{}\" also names a `login_dir`; only a \
+                     \"claude-code-oauth\" route borrows a Claude Code login directory — delete \
+                     the `login_dir` line",
+                    self.kind.name()
+                ));
+            }
+            if !(dir == "~" || dir.starts_with("~/") || dir.starts_with('/')) {
+                return Err(format!(
+                    "`[credential]` login_dir \"{dir}\" is neither an absolute path nor one that \
+                     starts with `~/`"
+                ));
             }
         }
         if self.store_only && !self.borrow.is_empty() {

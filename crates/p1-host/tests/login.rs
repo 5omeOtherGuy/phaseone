@@ -502,6 +502,134 @@ async fn a_none_route_is_listed_as_proxy_injected_and_cannot_be_logged_in() {
     assert!(!scratch.store_path().exists());
 }
 
+// -------------------------------------------------- --from-claude-code (ADR-0075)
+
+/// A Claude Code login file under the scratch home, holding the sentinel tokens.
+fn write_claude_login(scratch: &Scratch, relative_dir: &str) -> PathBuf {
+    let dir = scratch.home().join(relative_dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(".credentials.json"),
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{SENTINEL}","refreshToken":"{SENTINEL}-REFRESH","expiresAt":4102444800000}}}}"#
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn from_claude_code_imports_the_routes_login_dir_into_a_private_store() {
+    let scratch = Scratch::new();
+    scratch.write_route(
+        "claude-route-2",
+        "kind      = \"claude-code-oauth\"\nlogin_dir = \"~/.claude-2\"\n",
+    );
+    let dir = write_claude_login(&scratch, ".claude-2");
+    let harness = scratch.harness(&[]);
+
+    let code = p1_host::login::from_claude_code(&harness.deps, "claude-route-2", None).await;
+
+    assert_eq!(code, 0, "{}", harness.stderr.text());
+    assert_eq!(
+        harness.stdout.text(),
+        format!(
+            "imported the Claude Code login in {} for claude-route-2 · source now: p1 store\n",
+            dir.display()
+        )
+    );
+    assert_eq!(mode(&scratch.home().join(".config/p1")), 0o700);
+    assert_eq!(mode(&scratch.store_path()), 0o600);
+    assert_eq!(
+        serde_json::from_str::<Value>(&scratch.store()).unwrap(),
+        serde_json::json!({ "claude-route-2": {
+            "type": "oauth",
+            "access": SENTINEL,
+            "refresh": format!("{SENTINEL}-REFRESH"),
+            "expires": 4_102_444_800_000u64,
+            "account_id": null,
+        } }),
+        "exactly the store's oauth shape"
+    );
+    let said = format!("{}{}", harness.stdout.text(), harness.stderr.text());
+    assert!(!said.contains(SENTINEL), "a token was printed: {said}");
+
+    // An explicit directory wins over the route's own, and a leading `~` is expanded.
+    let scratch = Scratch::new();
+    scratch.write_route(
+        "claude-route",
+        "kind = \"claude-code-oauth\"\nstore_only = true\n",
+    );
+    write_claude_login(&scratch, "elsewhere");
+    let harness = scratch.harness(&[]);
+    assert_eq!(
+        p1_host::login::from_claude_code(&harness.deps, "claude-route", Some("~/elsewhere")).await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&scratch.store()).unwrap()["claude-route"]["access"],
+        SENTINEL
+    );
+    assert!(!harness.stdout.text().contains(SENTINEL));
+}
+
+#[tokio::test]
+async fn from_claude_code_refuses_a_non_oauth_route_and_a_missing_login() {
+    let scratch = Scratch::new();
+    scratch.write_route(ROUTE, api_key());
+    scratch.write_route("codex-route", "kind = \"codex-oauth\"\n");
+    scratch.write_route("claude-route", "kind = \"claude-code-oauth\"\n");
+    write_claude_login(&scratch, ".claude");
+    let harness = scratch.harness(&[]);
+
+    for route in [ROUTE, "codex-route"] {
+        assert_eq!(
+            p1_host::login::from_claude_code(&harness.deps, route, None).await,
+            2,
+            "{route}"
+        );
+    }
+    let stderr = harness.stderr.text();
+    assert!(
+        stderr.contains(&format!("route `{ROUTE}` is a api-key route"))
+            && stderr.contains("route `codex-route` is a codex-oauth route")
+            && stderr.contains("only a claude-code-oauth route reads"),
+        "{stderr}"
+    );
+
+    // A directory with no login names the file and how to log in there.
+    assert_eq!(
+        p1_host::login::from_claude_code(&harness.deps, "claude-route", Some("~/nowhere")).await,
+        2
+    );
+    let stderr = harness.stderr.text();
+    assert!(
+        stderr.contains("no Claude Code login at")
+            && stderr.contains("nowhere/.credentials.json")
+            && stderr.contains("CLAUDE_CONFIG_DIR="),
+        "{stderr}"
+    );
+    assert!(!scratch.store_path().exists(), "nothing was written");
+    assert!(!stderr.contains(SENTINEL), "{stderr}");
+
+    // The plain form on a Claude route now points at the import.
+    assert_eq!(
+        p1_host::login::login_with(&harness.deps, "claude-route", false, &RecordingEcho::new())
+            .await,
+        2
+    );
+    assert!(
+        harness
+            .stderr
+            .text()
+            .contains("`p1 login claude-route --from-claude-code [DIR]`"),
+        "{}",
+        harness.stderr.text()
+    );
+}
+
 // -------------------------------------------------------------------- logout
 
 #[tokio::test]
@@ -747,4 +875,19 @@ fn the_binary_stores_a_piped_key_and_never_prints_it() {
     let output = run(&["logout", ROUTE], "");
     assert!(output.status.success());
     assert_eq!(scratch.store(), "{}\n");
+
+    // ADR-0075: the import through the binary — the default directory is the scratch
+    // home's `~/.claude`, and neither stream carries the token.
+    scratch.write_route("claude-route", "kind = \"claude-code-oauth\"\n");
+    write_claude_login(&scratch, ".claude");
+    let output = run(&["login", "claude-route", "--from-claude-code"], "");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains("imported the Claude Code login"),
+        "{stdout}"
+    );
+    assert!(scratch.store().contains(SENTINEL));
+    assert!(!stdout.contains(SENTINEL) && !stderr.contains(SENTINEL));
 }

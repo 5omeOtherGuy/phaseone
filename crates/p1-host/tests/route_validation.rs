@@ -122,6 +122,7 @@ fn every_shipped_environment_still_assembles() {
     // shipped environment assembles with or without the `delegation` feature.
     let shipped = [
         "claude",
+        "claude2",
         "cline",
         "cline2",
         "gpt",

@@ -6,6 +6,8 @@ sits in three places (`p1-provider-anthropic/src/credentials.rs`, `p1-provider-o
 "which source" report. Borrowing stays the default; §6 adds `p1 login` for pasted API keys (ADR-0044).
 §8 adds the opt-in `store_only` policy (ADR-0061): every SHIPPED route is now self-contained and
 reads no other tool's login at runtime, and minting an independent OAuth grant is the remaining work.
+§10 adds `login_dir` and `p1 login <route> --from-claude-code` (ADR-0075): a `claude-code-oauth`
+route may borrow a NAMED Claude Code directory, and a Claude Code login can be imported into p1's store.
 
 ## 1. Crate and dependencies
 
@@ -22,7 +24,7 @@ The route file's `[credential]` table deserializes into `p1_auth::CredentialSpec
 | kind | fields | sources tried, in order |
 |---|---|---|
 | `api-key` | `env` (required name), `borrow` (ordered list of `opencode:<key>` / `pi:<key>`) | env var → p1 store entry for the route → each borrowed login |
-| `claude-code-oauth` | `env` optional | env var (a bearer token, no refresh) → p1 store → Claude Code's login file |
+| `claude-code-oauth` | `env` optional, `login_dir` optional (§10) | env var (a bearer token, no refresh) → p1 store → Claude Code's login file (`<login_dir>/.credentials.json`, else `$CLAUDE_CONFIG_DIR/.credentials.json`, else `~/.claude/.credentials.json`) |
 | `codex-oauth` | `env` optional | env var → p1 store → Codex CLI's login file |
 | `none` | none | NOTHING. An egress proxy injects the provider's credential after the request leaves the process, so no variable, store entry or login is read, and the adapter sends no authentication header (§9) |
 
@@ -33,6 +35,9 @@ store entry, and no other tool's login. Absent, the rows above are unchanged.
 `kind = "none"` is not a policy but a KIND with no source at all (issue #134, §9). Naming a
 source beside it is a contradiction, so `env`, a nonempty `borrow` or `store_only = true` on a
 `none` route is a load error.
+
+`login_dir` (ADR-0075, §10) is allowed ONLY on `claude-code-oauth`: the same field on any other
+kind is a load error, and so is a directory that is neither absolute nor starts with `~/`.
 
 `p1_auth::resolve(route_id, &spec, transport, &Locations) -> Arc<dyn CredentialSource>`.
 `Locations` carries every directory the chain may touch (home, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
@@ -109,7 +114,9 @@ g. Behaviour on the wire is unchanged: every adapter's characterization and conf
 h. `store_only` (§8): the borrowed source is not in `tried`, the line carries the marker, and a
    store-only chain with an absent or rejected p1 entry fails naming p1's store without opening
    the CLI's login path at all; the same chain WITHOUT the field still reads and names it.
-i. Every shipped `routes/*.toml` sets `store_only = true` and lists no nonempty `borrow`.
+i. Every shipped `routes/*.toml` sets `store_only = true` and lists no nonempty `borrow` — except
+   `anthropic-subscription-2`, which borrows its account's Claude Code login in its `login_dir`
+   by owner order (ADR-0075, §10).
 
 ## 6. `p1 login` — pasted keys into p1's own store (ADR-0044)
 
@@ -118,6 +125,8 @@ implementation." Scope: API KEYS. Browser/OAuth logins stay borrowed from the of
 
 ```
 p1 login <route>          read one key, store it for that route
+p1 login <route> --from-claude-code [DIR]
+                          copy the Claude Code login in DIR into p1's store (§10, ADR-0075)
 p1 login --list           every route: its credential kind and the source report of §4
 p1 logout <route>         remove the route's entry from p1's store
 ```
@@ -125,9 +134,10 @@ p1 logout <route>         remove the route's entry from p1's store
 - `<route>` must be a loaded route file whose credential kind is `api-key`; any other kind is a
   usage error. A LEGACY OAuth route says where its login comes from (`claude` / `codex` CLI). A
   `store_only` OAuth route says instead that its credential is read from p1's own store, that
-  `p1 login` cannot write an OAuth entry yet, that p1 has no independent OAuth flow, and that the
-  CLI login is NOT read (ADR-0061, §8) — it never pretends a browser flow exists. Unknown route →
-  error listing the routes.
+  `p1 login` reads no OAuth grant from stdin, that p1 has no independent OAuth flow, and that the
+  CLI login is NOT read (ADR-0061, §8) — it never pretends a browser flow exists. A
+  `claude-code-oauth` route's message also names `p1 login <route> --from-claude-code [DIR]`
+  (§10). Unknown route → error listing the routes.
 - The key is read from STDIN, never from an argument (arguments land in shell history and in
   `ps`). On a TTY the prompt `key for <route> (input hidden): ` is shown and echo is switched
   off for the read and restored by a guard on every path, including cancel; piped stdin is read
@@ -199,7 +209,8 @@ reads another tool's login at runtime.
 - A store-only route's credential must be in p1's store (`$XDG_CONFIG_HOME/p1/auth.json`,
   `~/.config/p1/auth.json`, 0600 in a 0700 directory) or in its documented environment variable.
   `p1 login <route>` writes `api_key` entries; an OAuth entry is written by the acquisition step
-  below or imported as `{"type":"oauth","access":…,"refresh":…,"expires":…,"account_id":…}`.
+  below or imported as `{"type":"oauth","access":…,"refresh":…,"expires":…,"account_id":…}` —
+  for a `claude-code-oauth` route by `p1 login <route> --from-claude-code [DIR]` (§10).
 - The operator (XO) moved the API keys into p1's store; every route now resolves from there or
   from its variable. `p1 env show <env>` / `p1 login --list` print ` [p1 store only]` so the
   policy is visible per route.
@@ -278,3 +289,59 @@ c. Nothing is read: with a store file whose mode makes any read fail, and a dire
 d. A 401 on such a route is an Authentication failure naming the proxy credential and the status,
    with exactly one request (or, on a WebSocket route, one handshake) and no refresh call.
 e. An api-key route with the very same route file and a readable store still sends `Bearer <key>`.
+
+## 10. A named Claude Code login and its import (ADR-0075, issue #199)
+
+Owner order, 2026-09-25: "implement a second claude code subscription provider, so we can switch
+between them when our quota is reached". A second subscription is a second Claude Code login,
+kept in its own config directory (`CLAUDE_CONFIG_DIR=~/.claude-2 claude`).
+
+### 10.1 `login_dir`
+
+`[credential] login_dir = "<dir>"` names the Claude Code config directory a `claude-code-oauth`
+route borrows: `<dir>/.credentials.json` replaces the default file in the chain of §2. A leading
+`~` (`~` alone or `~/…`) is expanded against the home directory of the `Locations` at use time;
+any other value must be absolute. Absent keeps the default directory (`$CLAUDE_CONFIG_DIR`, else
+`~/.claude`); a route that names one never falls back to the default. The named login is handled
+exactly like the default one — read fresh on every `access`, refreshed under its own `.lock`,
+re-read under the lock, written back to the same file — and nothing is copied. `store_only`
+still means the borrowed login is never opened; `login_dir` then only names the default
+directory of the import below. Any other kind with `login_dir` is a load error (§2).
+
+### 10.2 `p1 login <route> --from-claude-code [DIR]`
+
+- `<route>` must be a loaded `claude-code-oauth` route; any other kind (`api-key`, `codex-oauth`,
+  `none`) is a usage error (exit 2) naming the kind. `DIR` defaults to the route's `login_dir`,
+  else the default directory; a leading `~` is expanded.
+- `DIR/.credentials.json` is read (either Claude Code shape, as the borrowed source reads it)
+  and written into p1's store under the route id as exactly
+  `{"type":"oauth","access":…,"refresh":…,"expires":…,"account_id":…}`, with `null` for a field
+  the login does not record. `account_id` is `oauthAccount.accountUuid` from `DIR/.claude.json`
+  when that file has one.
+- A directory with no `.credentials.json` is a usage error naming the file and how to log in
+  there (`CLAUDE_CONFIG_DIR=<DIR> claude`, then `/login`); a malformed login is an error naming
+  the file. Nothing is written in either case.
+- The write is the store's own (`p1_auth::store::import_claude_code_login`): lock, read-modify-
+  write, atomic 0600 file, 0700 directory when created, a wider existing file or directory
+  refused with the chmod message, every other entry preserved.
+- The output is `imported the Claude Code login in <DIR> for <route> · source now: <§4 line>`.
+  No token is ever an argument or appears in output, an error or a log.
+- An imported refresh token is a COPY (the rotation risk of §8.4): the first refresh on either
+  side invalidates the other. The import is for a machine where only p1 uses the login (an EC2
+  box: the route then reads p1's store), or to be repeated after Claude Code rotated it.
+
+### 10.3 The second shipped route
+
+`routes/anthropic-subscription-2.toml` (environment `claude2`) is `anthropic-subscription` with
+its own id and origin and `kind = "claude-code-oauth"`, `login_dir = "~/.claude-2"`, without
+`store_only`: p1's store entry for the route wins when there is one, else the second account's
+Claude Code login is borrowed in place. `p1 usage` labels it `claude max 2` and probes it with
+its own credential.
+
+### 10.4 Must-pass
+
+`login_dir` parsed, expanded and used (a scratch directory with a fake `.credentials.json`;
+absent → the default directory); `login_dir` on another kind is a load error; the import writes
+exactly the store's `oauth` shape, 0600, refuses a non-`claude-code-oauth` route and a missing
+login as usage errors, and no output or error carries a token
+(`crates/p1-auth/tests/login_dir.rs`, `crates/p1-host/tests/login.rs`).

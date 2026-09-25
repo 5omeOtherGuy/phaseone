@@ -230,6 +230,14 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "claude/claude-opus-5-5",
             "claude/claude-sonnet-4-6",
             "claude/claude-sonnet-5",
+            // The second Claude subscription (ADR-0075) serves the same profiles on its own
+            // account, so a role can fall back from `claude/…` to `claude2/…`.
+            "claude2/claude-fable-5",
+            "claude2/claude-opus-4-6",
+            "claude2/claude-opus-5",
+            "claude2/claude-opus-5-5",
+            "claude2/claude-sonnet-4-6",
+            "claude2/claude-sonnet-5",
             // Each ClinePass account serves DeepSeek V4.1 Flash and GLM-5.3 Flash.
             "cline/deepseek-v4.1-flash",
             "cline/glm-5.3-flash-clinepass",
@@ -263,14 +271,19 @@ fn every_environment_and_every_bound_profile_is_a_model() {
     );
     // Every main agent carries the worker tools (ADR-0050), so delegation is not an
     // environment property: a model is listed once per environment, not once per
-    // delegating twin.
-    let opus: Vec<&Model> = models
+    // delegating twin. The two Claude accounts are two environments (ADR-0075).
+    let opus: Vec<(&str, &str)> = models
         .iter()
         .filter(|model| model.profile == "claude-opus-5")
+        .map(|model| (model.environment.as_str(), model.route.as_str()))
         .collect();
-    assert_eq!(opus.len(), 1);
-    assert_eq!(opus[0].environment, "claude");
-    assert_eq!(opus[0].route, "anthropic-subscription");
+    assert_eq!(
+        opus,
+        [
+            ("claude", "anthropic-subscription"),
+            ("claude2", "anthropic-subscription-2")
+        ]
+    );
     // The efforts are the profile's own, in its own order.
     let older = models
         .iter()
@@ -472,7 +485,7 @@ fn a_pattern_without_a_slash_matches_the_profile_part() {
         .filter(|model| models::in_scope(&patterns, model))
         .map(Model::id)
         .collect::<Vec<_>>();
-    assert_eq!(opus, ["claude/claude-opus-5"]);
+    assert_eq!(opus, ["claude/claude-opus-5", "claude2/claude-opus-5"]);
 
     let patterns = models::check_scope("claude/*", &models).unwrap();
     let claude = models

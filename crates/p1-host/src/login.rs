@@ -10,8 +10,13 @@
 //! history and in `ps`. It never reaches stdout, stderr, an error or a `Debug`; the
 //! store file is the only place it is written. An OAuth route is a usage error:
 //! a legacy one says which CLI login it borrows, and a `store_only` one says that
-//! its credential belongs in p1's store, that `p1 login` cannot write an OAuth entry
-//! yet, and that the CLI login is not read (ADR-0061). No OAuth flow is pretended.
+//! its credential belongs in p1's store, that `p1 login` reads no OAuth grant from
+//! stdin, and that the CLI login is not read (ADR-0061). No OAuth flow is pretended.
+//!
+//! `p1 login <route> --from-claude-code [DIR]` (ADR-0075) is the one way an OAuth
+//! entry gets into p1's store: it copies an existing Claude Code login — the
+//! directory's `.credentials.json` — for a `claude-code-oauth` route. `p1-auth` reads
+//! the file and writes the store; this module prints paths and routes, never a token.
 
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
@@ -109,6 +114,67 @@ pub async fn login_with(
     EXIT_OK
 }
 
+/// `p1 login <route> --from-claude-code [DIR]` (ADR-0075): copy the Claude Code login
+/// in DIR into p1's store as this route's `oauth` entry. DIR defaults to the directory
+/// the route borrows from (its `login_dir`, else the default Claude Code directory); a
+/// leading `~` is expanded. A route that is not `claude-code-oauth`, or a directory
+/// with no login, is a usage error naming the fix. No token is ever printed.
+pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>) -> i32 {
+    let routes = match load_all_routes(&deps.environment_dirs) {
+        Ok(routes) => routes,
+        Err(message) => {
+            err(deps, &format!("error: {message}\n"));
+            return EXIT_FAILURE;
+        }
+    };
+    let route = match find_route(&routes, route_id) {
+        Ok(route) => route,
+        Err(message) => return usage_error(deps, &message),
+    };
+    if route.credential.kind != CredentialKind::ClaudeCodeOauth {
+        return usage_error(
+            deps,
+            &format!(
+                "route `{route_id}` is a {} route; `--from-claude-code` imports a Claude Code \
+                 login, which only a claude-code-oauth route reads",
+                route.credential.kind.label()
+            ),
+        );
+    }
+    let locations = crate::auth::locations(deps);
+    let source = match dir {
+        Some(dir) => locations.expand_home(dir),
+        None => locations.claude_code_dir(route.credential.login_dir.as_deref()),
+    };
+    let Some(source) = source else {
+        return usage_error(
+            deps,
+            "cannot locate the Claude Code config directory: set HOME, or name the directory \
+             after `--from-claude-code`",
+        );
+    };
+    match p1_auth::store::import_claude_code_login(route_id, &source, &locations).await {
+        Ok(()) => {}
+        Err(p1_auth::store::ImportError::NoLogin(message)) => {
+            return usage_error(deps, &message);
+        }
+        Err(p1_auth::store::ImportError::Failed(message)) => {
+            err(deps, &format!("error: {message}\n"));
+            return EXIT_FAILURE;
+        }
+    }
+    let report = p1_auth::describe(route_id, &route.credential, &locations);
+    out(
+        deps,
+        &format!(
+            "imported the Claude Code login in {} for {route_id} · source now: {}\n",
+            source.display(),
+            report.line()
+        ),
+    );
+    EXIT_OK
+}
+
 /// `p1 login --list`: every route, its credential kind, and which source its
 /// credential comes from right now (spec §4). Never a value.
 pub fn list(deps: &HostDeps) -> i32 {
@@ -174,20 +240,7 @@ pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
 /// credential kind is `api-key`. Anything else is a usage error that says where that
 /// login comes from (spec §6).
 fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a RouteFile, String> {
-    let Some(route) = routes.iter().find(|route| route.id == route_id) else {
-        let available = if routes.is_empty() {
-            "none".to_string()
-        } else {
-            routes
-                .iter()
-                .map(|route| route.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        return Err(format!(
-            "route `{route_id}` was not found; available: {available}"
-        ));
-    };
+    let route = find_route(routes, route_id)?;
     match route.credential.kind {
         CredentialKind::ApiKey => Ok(route),
         // A route that sends no credential has nothing to log in to (issue #134):
@@ -199,22 +252,55 @@ fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a Rout
         )),
         // A self-contained OAuth route reads p1's own store only (ADR-0061). Sending
         // the operator to that CLI's login would be wrong: this route does not read
-        // it. p1 has no OAuth flow yet, so the error says exactly that and never
-        // pretends one exists.
+        // it. p1 has no OAuth flow, so the error says exactly that and never
+        // pretends one exists; a Claude Code login can be imported (ADR-0075).
         kind if route.credential.store_only => Err(format!(
             "route `{route_id}` is a {} route with `store_only`: its credential is read from \
-             p1's own store, and `p1 login` cannot write an OAuth entry yet. p1 has no \
+             p1's own store, and `p1 login` reads no OAuth grant from stdin. p1 has no \
              independent OAuth flow, so the grant has to come from elsewhere; the {} login is \
-             NOT read by this route",
+             NOT read by this route{}",
             kind.name(),
-            login_owner(kind)
+            login_owner(kind),
+            import_hint(kind, route_id)
         )),
         kind => Err(format!(
-            "route `{route_id}` is a {} route; its login comes from {}, not from p1's store",
+            "route `{route_id}` is a {} route; its login comes from {}, not from p1's store{}",
             kind.name(),
-            login_owner(kind)
+            login_owner(kind),
+            import_hint(kind, route_id)
         )),
     }
+}
+
+/// The import a `claude-code-oauth` route offers instead of a pasted key (ADR-0075).
+fn import_hint(kind: CredentialKind, route_id: &str) -> String {
+    if kind == CredentialKind::ClaudeCodeOauth {
+        format!(
+            "; to copy a Claude Code login into p1's store, run `p1 login {route_id} \
+             --from-claude-code [DIR]`"
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// The route a login names, or the usage error that lists the loaded ones.
+fn find_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a RouteFile, String> {
+    routes
+        .iter()
+        .find(|route| route.id == route_id)
+        .ok_or_else(|| {
+            let available = if routes.is_empty() {
+                "none".to_string()
+            } else {
+                routes
+                    .iter()
+                    .map(|route| route.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!("route `{route_id}` was not found; available: {available}")
+        })
 }
 
 /// Where a route whose credential is not an API key gets its login (spec §6).
