@@ -50,21 +50,20 @@ fn rerun_when_head_changes() {
     if let Some(path) = git(&["rev-parse", "--git-path", "HEAD"]) {
         paths.push(path);
     }
-    if let Some(name) = git(&["rev-parse", "--symbolic-full-name", "HEAD"]) {
-        if name.starts_with("refs/heads/") {
-            if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
-                paths.push(path);
-            }
-        }
+    if let Some(name) = git(&["rev-parse", "--symbolic-full-name", "HEAD"])
+        && name.starts_with("refs/heads/")
+        && let Some(path) = git(&["rev-parse", "--git-path", &name])
+    {
+        paths.push(path);
     }
     if let Some(path) = git(&["rev-parse", "--git-path", "packed-refs"]) {
         paths.push(path);
     }
     for path in paths {
-        if let Some(path) = absolute(Path::new(&path)) {
-            if path.exists() {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
+        if let Some(path) = absolute(Path::new(&path))
+            && path.exists()
+        {
+            println!("cargo:rerun-if-changed={}", path.display());
         }
     }
 }
