@@ -198,7 +198,12 @@ strictly below the effective window), and effective `summarize_at_tokens = min(e
 of the effective window)`, always below `window - reserve`. The copied verbatim budgets
 (`keep_recent_tokens`, `user_verbatim_tokens`) are clamped below the wall too: they are budgets of
 the effective window, and a tail larger than a request can carry would keep the whole history
-verbatim. That is what makes selecting a narrower profile (MiMo's 200k on `zen`) compact
+verbatim. The summary-output cap (`[context] summary_output_tokens`, 12_000 in the shipped
+environments) is composed the same way: it is clamped to half the effective wall, because the
+summarization request carries the rendered transcript as well as its own answer; a table that
+cannot host `MIN_SUMMARY_OUTPUT_TOKENS` (1_000) fails the agent's construction with an error naming
+the profile and the window it serves, rather than a request failing later. That is what makes
+selecting a narrower profile (MiMo's 200k on `zen`) compact
 at the model's real size instead of failing a request against the environment's wider table; the
 same effective numbers are what `FrontEnd::context_configured` reports. The summarizer runs at the
 lowest effort the profile supports (`Low` without a profile). The renderer prints

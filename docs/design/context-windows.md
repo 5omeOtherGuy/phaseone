@@ -128,7 +128,11 @@ selected profile's own capacity into the effective table (`config_for_route` in
   below `window - reserve`;
 - the copied verbatim budgets (`keep_recent_tokens`, `user_verbatim_tokens`) are clamped below the
   wall, because a kept tail larger than what a request can carry would keep the whole history
-  verbatim and leave the next request over the wall (a 40,000-token profile on `zen`).
+  verbatim and leave the next request over the wall (a 40,000-token profile on `zen`);
+- the summary-output cap (`[context] summary_output_tokens`) is clamped to half the effective wall,
+  since the summarization request also carries the rendered transcript; a table that cannot host
+  1,000 tokens of summary output fails the agent's construction with an error naming the profile
+  and the window it serves.
 
 Examples on `zen*` (whose table describes its DEFAULT profile, `space-bunny-free`):
 
@@ -141,8 +145,10 @@ Examples on `zen*` (whose table describes its DEFAULT profile, `space-bunny-free
 - No other shipped profile states `context_tokens`, so no other environment is narrowed.
 
 `crates/p1-host/src/run.rs` unit tests pin these (MiMo on `zen`, Muse on `zen`, a roomier synthetic
-profile, a 40,000-token profile whose copied budgets are clamped, and an environment whose profile
-states nothing). The same effective numbers are what the front end's `ctx` display is told, so the
+profile, a 40,000-token profile whose copied budgets AND summary cap are clamped — its agent still
+starts and the request carries a 4,000-token cap — a profile with room for no summary at all, whose
+construction fails with an error naming the profile, and an environment whose profile states
+nothing). The same effective numbers are what the front end's `ctx` display is told, so the
 denominator is the window the summarizer actually acts on.
 
 ## How to re-check
