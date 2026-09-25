@@ -126,6 +126,9 @@ pub struct WorkflowStep {
     pub role: String,
     pub model: String,
     pub worker_id: Option<String>,
+    /// The workers of the links the step moved past (a route failure, ADR-0054), in order:
+    /// they belong to the step, never to the flat group.
+    pub moved: Vec<MovedLink>,
     pub attempts: u32,
     pub state: StepState,
     pub replayed: bool,
@@ -168,6 +171,14 @@ impl WorkflowStep {
             word
         }
     }
+}
+
+/// A link of a step's fallback chain the step moved past, and the worker it ran in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedLink {
+    pub worker_id: String,
+    /// The link's `environment/profile[:effort]`.
+    pub model: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +341,27 @@ impl WorkflowTree {
             .map(|step| (run, step))
     }
 
+    /// The step `⏎` opens from the row keyed `key` (ADR-0074): the step itself; for a run
+    /// header its first running step with a worker, else its latest step with one; for a
+    /// running step's worker block, that step. `None` for any other row.
+    pub fn open_target(&self, key: &str) -> Option<&str> {
+        if let Some((_, step)) = self.step(key) {
+            return Some(&step.key);
+        }
+        if let Some(run) = self.run(key) {
+            let with_worker = || run.steps().filter(|step| step.worker_id.is_some());
+            return with_worker()
+                .find(|step| step.running())
+                .or_else(|| with_worker().last())
+                .map(|step| step.key.as_str());
+        }
+        self.runs
+            .iter()
+            .flat_map(WorkflowRun::steps)
+            .find(|step| step.running() && step.worker_id.as_deref() == Some(key))
+            .map(|step| step.key.as_str())
+    }
+
     /// The phase name of the step with selection key `key`.
     pub fn phase_of(&self, key: &str) -> Option<&str> {
         let (run_id, _) = key.rsplit_once('/')?;
@@ -340,12 +372,12 @@ impl WorkflowTree {
             .map(|phase| phase.name.as_str())
     }
 
-    /// Whether a step (running or ended) names worker `id`.
+    /// Whether a step (running or ended) names worker `id`, a moved-past link's included.
     pub fn references(&self, worker: &str) -> bool {
-        self.runs
-            .iter()
-            .flat_map(WorkflowRun::steps)
-            .any(|step| step.worker_id.as_deref() == Some(worker))
+        self.runs.iter().flat_map(WorkflowRun::steps).any(|step| {
+            step.worker_id.as_deref() == Some(worker)
+                || step.moved.iter().any(|link| link.worker_id == worker)
+        })
     }
 
     pub fn any_running(&self) -> bool {
@@ -399,8 +431,16 @@ impl WorkflowTree {
             WorkflowEvent::StepStarted(started) => {
                 let run = self.run_mut(&started.run, at_ms);
                 if let Some(step) = run.step_mut(&started.call, true) {
-                    if started.worker_id.is_some() {
-                        step.worker_id = started.worker_id;
+                    if let Some(worker) = started.worker_id {
+                        // Another worker for the same running step: the chain moved past
+                        // the link the old one ran on.
+                        if let Some(old) = step.worker_id.take_if(|old| *old != worker) {
+                            step.moved.push(MovedLink {
+                                worker_id: old,
+                                model: step.model.clone(),
+                            });
+                        }
+                        step.worker_id = Some(worker);
                     }
                     step.model = started.model;
                     step.attempts = step.attempts.max(started.attempt);
@@ -413,6 +453,7 @@ impl WorkflowTree {
                     role: started.role,
                     model: started.model,
                     worker_id: started.worker_id,
+                    moved: Vec::new(),
                     attempts: started.attempt,
                     state: StepState::Running,
                     replayed: false,
@@ -444,6 +485,7 @@ impl WorkflowTree {
                     role: String::new(),
                     model: ended.model,
                     worker_id: ended.worker_id,
+                    moved: Vec::new(),
                     attempts: ended.attempts,
                     state,
                     replayed: ended.replayed,

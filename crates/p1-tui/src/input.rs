@@ -233,7 +233,7 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
                     .workers
                     .focused
                     .as_deref()
-                    .is_some_and(|key| screen.workers.tree.step(key).is_some()) =>
+                    .is_some_and(|key| screen.workers.tree.open_target(key).is_some()) =>
         {
             Some(V(ViewCommand::OpenStep))
         }

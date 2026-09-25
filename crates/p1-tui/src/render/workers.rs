@@ -12,7 +12,8 @@ use crate::band::{Band, Seg};
 use crate::glyphs;
 use crate::palette;
 use crate::workflow::{
-    StepState, WorkerActivity, WorkflowPhase, WorkflowRun, WorkflowStep, WorkflowTree, clock,
+    MovedLink, StepState, WorkerActivity, WorkflowPhase, WorkflowRun, WorkflowStep, WorkflowTree,
+    clock,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +202,12 @@ pub fn display_order(pane: &WorkersPane) -> Vec<Selectable<'_>> {
         order.push(Selectable::Run(run));
         for step in run.steps() {
             order.push(Selectable::Step(step));
+            order.extend(
+                step.moved
+                    .iter()
+                    .filter_map(|link| block(pane, &link.worker_id))
+                    .map(Selectable::Worker),
+            );
             if let Some(worker) = step_block(pane, step) {
                 order.push(Selectable::Worker(worker));
             }
@@ -219,6 +226,10 @@ fn flat_workers(pane: &WorkersPane) -> Vec<&WorkerBlock> {
         .collect();
     sorted.sort_by_key(|worker| worker.state.rank());
     sorted
+}
+
+fn block<'a>(pane: &'a WorkersPane, id: &str) -> Option<&'a WorkerBlock> {
+    pane.workers.iter().find(|worker| worker.id == id)
 }
 
 /// The worker block shown under a step: only while the step runs.
@@ -696,6 +707,7 @@ fn tree_lines(
             }
             for step in &phase.steps {
                 out.extend(step_rows(pane, step, width));
+                out.extend(step.moved.iter().map(|link| moved_row(pane, link, width)));
                 if let Some(worker) = step_block(pane, step) {
                     let inner = width.saturating_sub(TREE_INDENT);
                     out.extend(
@@ -996,6 +1008,27 @@ fn phase_row(
             Seg::new(palette::INK, format!(" {}/{known}", phase.done())),
         ],
         right,
+    )
+}
+
+/// A link the step moved past: one dim row under the step, its worker's block folded —
+/// selectable and openable by its worker's id like any worker.
+fn moved_row(pane: &WorkersPane, link: &MovedLink, width: usize) -> Line<'static> {
+    let text = format!("moved on · {} · route_failed", link.model);
+    if pane.focused.as_deref() == Some(link.worker_id.as_str()) {
+        return focused_row(
+            width,
+            vec![format!("      {} {text}", glyphs::TOOL)],
+            vec![link.worker_id.clone()],
+        );
+    }
+    row(
+        width,
+        vec![Seg::new(
+            palette::DIM,
+            format!("      {} {text}", glyphs::NESTED),
+        )],
+        vec![Seg::new(palette::DIM, link.worker_id.clone())],
     )
 }
 

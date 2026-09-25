@@ -472,3 +472,250 @@ fn x_on_a_step_stops_its_worker_and_x_on_a_run_header_cancels_the_run() {
         Some(Action::Command(Command::CancelRun("wf1".into())))
     );
 }
+
+#[test]
+fn a_run_start_promotes_an_unpinned_pane_and_its_end_demotes_it() {
+    let run_started = || {
+        WorkflowEvent::RunStarted(RunStarted {
+            id: "wf1".into(),
+            resumed_from: None,
+        })
+    };
+    let run_ended = || {
+        WorkflowEvent::RunEnded(p1_tui::workflow::RunEnded {
+            id: "wf1".into(),
+            outcome: "completed".into(),
+            steps_started: 0,
+            steps_ended: 0,
+            steps_failed: 0,
+            error: None,
+        })
+    };
+    let mut screen = Screen::new(true);
+    screen.pane_width = PaneWidth::Off;
+    assert_eq!(screen.pane_mode, PaneMode::Ledger);
+    screen.apply_workflow(run_started(), 0);
+    assert_eq!(screen.pane_mode, PaneMode::Workers);
+    assert!(screen.worker_mode_auto);
+    // The width force, as for a worker: a hidden pane opens and is given back.
+    assert_eq!(screen.pane_width, PaneWidth::Wide);
+    screen.apply_workflow(run_ended(), 1_000);
+    assert_eq!(screen.pane_mode, PaneMode::Ledger);
+    assert!(!screen.worker_mode_auto);
+    assert_eq!(screen.pane_width, PaneWidth::Off);
+
+    // A pinned pane stays where the operator pinned it.
+    let mut pinned = Screen::new(true);
+    pinned.pinned = true;
+    pinned.apply_workflow(run_started(), 0);
+    assert_eq!(pinned.pane_mode, PaneMode::Ledger);
+    assert!(!pinned.worker_mode_auto);
+
+    // The first step of a run the tree never saw start promotes too.
+    let mut late = Screen::new(true);
+    late.apply_workflow(started("c1", "plan", "w1"), 0);
+    assert_eq!(late.pane_mode, PaneMode::Workers);
+}
+
+#[test]
+fn a_moved_past_links_worker_stays_under_its_step_never_in_the_flat_group() {
+    let mut screen = Screen::new(true);
+    screen.pane_width = PaneWidth::Wide;
+    let link = |worker: &str, model: &str| {
+        WorkflowEvent::StepStarted(StepStarted {
+            run: "wf1".into(),
+            call: "c1".into(),
+            label: Some("failover".into()),
+            phase: None,
+            role: "worker".into(),
+            model: model.into(),
+            worker_id: Some(worker.into()),
+            attempt: 1,
+            prompt: "fail over".into(),
+        })
+    };
+    screen.apply_workflow(
+        WorkflowEvent::RunStarted(RunStarted {
+            id: "wf1".into(),
+            resumed_from: None,
+        }),
+        0,
+    );
+    screen.apply_workflow(link("w2", "ds2/flash"), 10);
+    // The engine reports the first link's start after its turn: the same worker.
+    screen.apply_workflow(link("w2", "ds2/flash"), 20);
+    screen.apply_workflow(link("w3", "cline2/flash"), 30);
+    screen.apply_workflow(ended("c1", "done", 2, None), 3_000);
+    screen.sync_workers(vec![
+        worker("w2", BlockState::Failed, None),
+        worker("w3", BlockState::Done, Some(1_400)),
+    ]);
+    screen.tick(3_000);
+
+    let lines = text(&screen, 60, None);
+    let step = position(&lines, "failover");
+    assert!(
+        lines[step].contains("failover · cline2/flash"),
+        "{}",
+        lines[step]
+    );
+    assert!(lines[step + 1].contains("↳ done"), "{}", lines[step + 1]);
+    let moved = &lines[step + 2];
+    assert!(
+        moved.contains("↳ moved on · ds2/flash · route_failed") && moved.contains("w2"),
+        "{moved}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("    workers")),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("✗ w2")),
+        "{lines:#?}"
+    );
+
+    // Selectable and openable like any worker.
+    screen.apply_view(ViewCommand::TogglePaneFocus);
+    screen.pane_step(1);
+    assert_eq!(screen.workers.focused.as_deref(), Some("wf1/1"));
+    screen.pane_step(1);
+    assert_eq!(screen.workers.focused.as_deref(), Some("w2"));
+    let lines = text(&screen, 60, None);
+    assert!(find(&lines, "moved on").contains("▸ moved on"));
+    screen.apply_view(ViewCommand::AttachWorker);
+    assert_eq!(screen.attached.as_ref().map(|w| w.id.as_str()), Some("w2"));
+}
+
+/// The operator's exact keys (issue #198 live check): `^F`, `↓` to the first step, `⏎`,
+/// `p`, `esc` — each through `input::decide`, as the host's driver applies them. The
+/// opened step heads the TRANSCRIPT area (not the side pane).
+#[test]
+fn the_operators_keys_open_a_step_expand_its_prompt_and_esc_closes_it() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn press(screen: &mut Screen, key: KeyEvent) {
+        match input::decide(screen, key) {
+            Some(Action::View(view)) => screen.apply_view(view),
+            Some(Action::Command(Command::PaneDown)) => screen.pane_step(1),
+            Some(Action::Command(Command::PaneUp)) => screen.pane_step(-1),
+            other => panic!("{key:?} decided {other:?}"),
+        }
+    }
+
+    fn transcript_rows(screen: &mut Screen, w: u16, h: u16) -> (u16, Vec<String>) {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|frame| {
+                p1_tui::render::screen::draw(screen, frame.area(), frame.buffer_mut(), 7_000)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let area = p1_tui::geometry::layout(w, h, screen.pane_width, false, 1).transcript;
+        let rows = (area.y..area.y + 6)
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        (area.y, rows)
+    }
+
+    let mut screen = Screen::new(true);
+    screen.pane_width = PaneWidth::Wide;
+    screen.apply_workflow(
+        WorkflowEvent::RunStarted(RunStarted {
+            id: "wf1".into(),
+            resumed_from: None,
+        }),
+        0,
+    );
+    screen.apply_workflow(
+        WorkflowEvent::Phase {
+            run: "wf1".into(),
+            name: "Review".into(),
+        },
+        0,
+    );
+    screen.apply_workflow(
+        WorkflowEvent::StepStarted(StepStarted {
+            prompt: "one\ntwo\nthree\nfour\nfive".into(),
+            ..match started("c1", "review:bugs", "w3") {
+                WorkflowEvent::StepStarted(step) => step,
+                _ => unreachable!(),
+            }
+        }),
+        100,
+    );
+    screen.sync_workers(vec![worker("w3", BlockState::Running, Some(2_000))]);
+    screen.tick(7_000);
+
+    press(
+        &mut screen,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+    );
+    // Focus starts on the run header.
+    assert_eq!(screen.workers.focused.as_deref(), Some("wf1"));
+    press(&mut screen, key(KeyCode::Down));
+    assert_eq!(screen.workers.focused.as_deref(), Some("wf1/1"));
+    press(&mut screen, key(KeyCode::Enter));
+    let opened = screen.attached.as_ref().expect("the step is open");
+    assert_eq!(opened.id, "w3");
+    assert_eq!(
+        opened.step.as_ref().map(|step| step.key.as_str()),
+        Some("wf1/1")
+    );
+
+    // The band and the folded prompt head the transcript area, at both widths.
+    for (w, h) in [(175, 42), (60, 30)] {
+        let (top, rows) = transcript_rows(&mut screen, w, h);
+        assert_eq!(top, 1, "{w}");
+        assert!(rows[0].contains("attached w3"), "{w}: {rows:#?}");
+        assert!(
+            rows[1].contains("review:bugs · running · claude/opus:high · Review"),
+            "{w}: {rows:#?}"
+        );
+        assert!(
+            rows[2].contains("one") && rows[4].contains("three"),
+            "{w}: {rows:#?}"
+        );
+        assert!(
+            rows[5].contains("… 2 more lines · p expands"),
+            "{w}: {rows:#?}"
+        );
+    }
+
+    press(&mut screen, key(KeyCode::Char('p')));
+    assert!(
+        screen
+            .attached
+            .as_ref()
+            .unwrap()
+            .step
+            .as_ref()
+            .unwrap()
+            .prompt_expanded
+    );
+    let (_, rows) = transcript_rows(&mut screen, 175, 42);
+    assert!(rows[5].contains("four"), "{rows:#?}");
+
+    press(&mut screen, key(KeyCode::Esc));
+    assert!(screen.attached.is_none());
+
+    // `⏎` on the run header opens its running step; on the step's worker block too.
+    press(&mut screen, key(KeyCode::Up));
+    assert_eq!(screen.workers.focused.as_deref(), Some("wf1"));
+    press(&mut screen, key(KeyCode::Enter));
+    let opened = screen.attached.as_ref().expect("opened from the header");
+    assert_eq!(
+        opened.step.as_ref().map(|step| step.key.as_str()),
+        Some("wf1/1")
+    );
+    press(&mut screen, key(KeyCode::Esc));
+    press(&mut screen, key(KeyCode::Down));
+    press(&mut screen, key(KeyCode::Down));
+    assert_eq!(screen.workers.focused.as_deref(), Some("w3"));
+    press(&mut screen, key(KeyCode::Enter));
+    assert!(screen.attached.as_ref().unwrap().step.is_some());
+}

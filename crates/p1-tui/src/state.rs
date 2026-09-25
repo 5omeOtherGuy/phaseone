@@ -646,9 +646,41 @@ impl Screen {
 
     /// Fold one workflow event into the WORKERS tree (ADR-0074). A run makes WORKERS
     /// available like a worker does.
+    ///
+    /// A run's start — or the first step of a run the tree had not seen start — is new live
+    /// attention exactly like a direct worker's start: an unpinned pane is promoted to
+    /// WORKERS. A run's end settles the pane like the last worker's end does.
     pub fn apply_workflow(&mut self, event: crate::workflow::WorkflowEvent, at_ms: u64) {
+        use crate::workflow::WorkflowEvent as E;
         self.workers_ever_started = true;
+        let starts = match &event {
+            E::RunStarted(started) => self.workers.tree.run(&started.id).is_none(),
+            E::StepStarted(step) => self
+                .workers
+                .tree
+                .run(&step.run)
+                .is_none_or(|run| run.steps().next().is_none()),
+            _ => false,
+        };
+        let ends = matches!(event, E::RunEnded(_));
         self.workers.tree.apply(event, at_ms);
+        if starts && !self.pinned {
+            self.promote_workers(false);
+        }
+        if ends {
+            let count = |state| {
+                self.workers
+                    .workers
+                    .iter()
+                    .filter(|worker| worker.state == state)
+                    .count() as u64
+            };
+            let (needs_review, live) = (
+                count(BlockState::NeedsReview) > 0,
+                count(BlockState::Running),
+            );
+            self.demote_if_settled(needs_review, live);
+        }
     }
 
     /// Attach the focused WORKERS row, taking over its buffered transcript (handoff §9.5).
@@ -668,9 +700,12 @@ impl Screen {
         if self.pane_mode != PaneMode::Workers {
             return;
         }
-        let Some(key) = self.workers.focused.clone() else {
+        let Some(mut key) = self.workers.focused.clone() else {
             return;
         };
+        if open && let Some(target) = self.workers.tree.open_target(&key) {
+            key = target.to_string();
+        }
         let (id, step) = match self.workers.tree.step(&key) {
             Some((_, step)) => {
                 let Some(worker) = step.worker_id.clone() else {
@@ -1050,18 +1085,35 @@ impl Screen {
             self.pinned = true;
         }
         if new_review || (new_live && !pinned_before) {
-            if self.pane_mode != PaneMode::Workers {
-                self.pane_mode = PaneMode::Workers;
-                self.worker_mode_auto = true;
-            }
-            // The width force is a promotion and a pin from BEFORE this sync
-            // always wins it. Save what the operator had so the demotion can
-            // restore it.
-            if !pinned_before && matches!(self.pane_width, PaneWidth::Off) {
-                self.promotion_saved_width = Some(self.pane_width);
-                self.pane_width = PaneWidth::Wide;
-            }
+            self.promote_workers(pinned_before);
         }
+        self.demote_if_settled(needs_review, live);
+        if self.pane_focused
+            && self.pane_mode == PaneMode::Workers
+            && self.workers.focused.is_none()
+        {
+            self.select_first_worker();
+        }
+    }
+    /// New attention in WORKERS (SPEC §5, handoff §9.1): a new live worker, new review
+    /// attention or a workflow run that starts (ADR-0074) moves the pane to WORKERS.
+    fn promote_workers(&mut self, pinned_before: bool) {
+        if self.pane_mode != PaneMode::Workers {
+            self.pane_mode = PaneMode::Workers;
+            self.worker_mode_auto = true;
+        }
+        // The width force is a promotion and a pin from BEFORE this sync
+        // always wins it. Save what the operator had so the demotion can
+        // restore it.
+        if !pinned_before && matches!(self.pane_width, PaneWidth::Off) {
+            self.promotion_saved_width = Some(self.pane_width);
+            self.pane_width = PaneWidth::Wide;
+        }
+    }
+
+    /// Settlement: with nothing live, nothing to review and no workflow running, an
+    /// automatically selected, unpinned WORKERS pane falls back to LEDGER.
+    fn demote_if_settled(&mut self, needs_review: bool, live: u64) {
         // A running workflow keeps its tree up between steps.
         let runs_live = self.workers.tree.any_running();
         if !needs_review && live == 0 && !runs_live && !self.pinned {
@@ -1077,13 +1129,8 @@ impl Screen {
                 self.pane_width = saved;
             }
         }
-        if self.pane_focused
-            && self.pane_mode == PaneMode::Workers
-            && self.workers.focused.is_none()
-        {
-            self.select_first_worker();
-        }
     }
+
     /// Open a fold handle in the OUTPUT pane (`^O`): switches the pane to
     /// OUTPUT mode and widens it if it is hidden.
     pub fn open_output(&mut self, view: crate::render::output::OutputView) {

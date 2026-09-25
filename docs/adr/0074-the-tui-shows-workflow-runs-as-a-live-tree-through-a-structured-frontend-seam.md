@@ -82,13 +82,26 @@ doing which step, live. The TUI must learn this without a dependency on `p1-work
    status · model · phase · attempts · elapsed · tokens · tool calls, the prompt
    folded to 3 lines with `p` toggling the full wrapped prompt, then the live
    transcript); `a` attaches the step's worker transcript directly; a step with no
-   worker yet does nothing; esc detaches; `x` on a step asks to stop its worker (the
+   worker yet does nothing; ⏎ on a run header opens its first running step (else its
+   latest step with a worker) and ⏎ on a running step's worker block opens that step,
+   so `^F`, arrows, ⏎ opens something whatever row the focus lands on. The opened step
+   heads the transcript area (not the side pane): the attach band, the stats band, up
+   to three prompt lines and a `… N more lines · p expands` row — six rows for a longer
+   prompt at any width, each row cut to the column; esc detaches; `x` on a step asks to stop its worker (the
    existing worker stopper), `x` on a run header asks `cancel wf1?` and `y` calls the
    workflow service's `cancel(id)` through a host hook next to the worker stopper.
    Focus rules of #92/#150 unchanged. Retention: the TUI keeps every worker's
    transcript in memory for the session (`Screen::worker_transcripts`, never pruned)
    and the tree for the session, so an ended step stays openable; nothing is
    persisted.
+7. **Promotion and moved-past links.** A run's start (or the first step of a run the
+   tree never saw start) is new live attention exactly like a direct worker's start:
+   an unpinned pane is promoted to WORKERS (`worker_mode_auto`, the same width force),
+   and a run's end settles it like the last worker's end. A step whose fallback chain
+   moved past a link keeps that link's worker under it — the runner announces a worker
+   for every link — as a dim row `↳ moved on · <model> · route_failed`, its block
+   folded, selectable and attachable by the worker's id; it never appears in the flat
+   `workers` group.
 
 ## Consequences
 
@@ -118,6 +131,10 @@ the projection must stay idempotent on the same row.
   attempt and a replayed step, the flat `workers` group, collapse under a short pane
   (never the selection's phase), widths 30/46/48/60, selection across headers, steps
   and workers, `a`/`⏎`/`p` on a step, `x` on a step and on a run header.
+  `a_run_start_promotes_an_unpinned_pane_and_its_end_demotes_it`,
+  `a_moved_past_links_worker_stays_under_its_step_never_in_the_flat_group` and
+  `the_operators_keys_open_a_step_expand_its_prompt_and_esc_closes_it` (the operator's
+  exact keys, drawn at 175×42 and 60×30).
 - `crates/p1-tui/src/workflow.rs` unit test
   `a_repeated_start_updates_the_running_row_and_a_replay_makes_its_own`: the upsert of
   a repeated step start and the queued arithmetic.
