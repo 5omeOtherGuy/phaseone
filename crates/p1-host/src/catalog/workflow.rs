@@ -725,8 +725,6 @@ pub(crate) fn running_workflows(deps: &HostDeps) -> usize {
         .map_or(0, |observer| observer.running())
 }
 
-/// The observer projects every run event into the structured `FrontEnd` calls the TUI's
-/// tree is built from (ADR-0075), beside the unchanged lines.
 /// The four `workflow_*` tools over `service` (ADR-0053 item 7). Without a service the
 /// keys are not registered at all, so an environment naming one gets the ordinary
 /// `UnknownToolModule`.
@@ -787,6 +785,8 @@ pub(crate) fn register_workflow_tools(
     );
 }
 
+/// The observer projects every run event into the structured `FrontEnd` calls the TUI's
+/// tree is built from (ADR-0075), beside the unchanged lines.
 #[cfg(test)]
 mod tests {
     use super::*;
