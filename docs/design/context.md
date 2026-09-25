@@ -113,8 +113,9 @@ model the route spends part of the cap on reasoning before a single summary toke
 of ours can switch thinking off entirely (`None` means the route's default, which is the
 profile's own `default_effort`). The host supplies the floor
 (`SummarizingContext::with_summary_effort`, `crates/p1-host/src/run.rs`) because a
-`ModelProfile` is configuration the module does not see; an environment with no profile (the
-whole-provider form) keeps the effort its options carry. Rendering, one block per item, in order:
+`ModelProfile` is configuration the module does not see; an environment with no profile at all
+(the whole-provider form) summarizes at `Low`, the level every effort scale starts at, never at
+the agent's own. Rendering, one block per item, in order:
 `## Previous summary` (the old summary text), `## User` / `## Notification` / `## Steering`,
 `## Assistant` (text blocks; reasoning TEXT is omitted; each call as
 `→ <tool>(<input, first 500 chars>)`), `## Result of <tool> [<status>]` with the content cut
@@ -189,10 +190,16 @@ plus an optional `summarize.md` next to `prompt.md` (whole-file override of the 
 model-family seam). `ResolvedEnvironment` shows the table and the effective prompt.
 `AssemblyError::InvalidContext{message}` when `validate` fails. `p1-assembly` parses and
 resolves; the HOST constructs `SummarizingContext` (composition root) for the parent and for
-every worker from its own environment, and passes it the lowest reasoning effort of the
-environment's model profile (#125). The renderer prints
+every worker from its own environment. The host also folds the SELECTED model profile into the
+table it hands the policy (#125 review): effective `window_tokens = min(env window,
+profile.context_tokens)`, effective reserve = `min(env reserve, profile.max_output_tokens)`, and
+effective `summarize_at_tokens = min(env threshold, 60 % of the effective window)`, always below
+`window - reserve`. That is what makes selecting a narrower profile (MiMo's 200k on `zen`) compact
+at the model's real size instead of failing a request against the environment's wider table; the
+same effective numbers are what `FrontEnd::context_configured` reports. The summarizer runs at the
+lowest effort the profile supports (`Low` without a profile). The renderer prints
 `context: summarized <before> → <after> items · <usage line>` on `ContextReplaced`.
-The shipped environments now carry researched per-route values, each with its cited source, in
+The shipped environments carry researched per-route values, each with its cited source, in
 `docs/design/context-windows.md`; a route whose window no public source states keeps its
 previous conservative value and says so in the env comment.
 
