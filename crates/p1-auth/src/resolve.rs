@@ -59,15 +59,21 @@ pub enum CredentialPolicy {
     /// The documented environment variable and p1's OWN store only. No other tool's
     /// login file is opened, whatever the outcome — absent, unusable or rejected.
     StoreOnly,
+    /// No source at all: the route sends no credential, and an egress proxy injects
+    /// the provider's credential after the request leaves the process (issue #134).
+    /// Nothing is read, and there is nothing to refresh.
+    ProxyInjected,
 }
 
 impl CredentialPolicy {
     /// The marker appended to the source line, so `p1 env show` and `p1 login --list`
-    /// make the policy visible. Empty for the legacy chain, which is the default.
+    /// make the policy visible. Empty for the legacy chain, which is the default —
+    /// and for `ProxyInjected`, whose line already says what it is.
     pub fn marker(self) -> &'static str {
         match self {
             CredentialPolicy::Chain => "",
             CredentialPolicy::StoreOnly => " [p1 store only]",
+            CredentialPolicy::ProxyInjected => "",
         }
     }
 
@@ -76,6 +82,7 @@ impl CredentialPolicy {
         match self {
             CredentialPolicy::Chain => "chain",
             CredentialPolicy::StoreOnly => "store-only",
+            CredentialPolicy::ProxyInjected => "proxy-injected",
         }
     }
 }
@@ -122,8 +129,12 @@ pub struct SourceReport {
 impl SourceReport {
     /// The one line `p1 env show` prints (spec §4): the chosen source, or what to
     /// do when no source has an entry. A store-only route appends the policy marker
-    /// so the operator sees that no other tool's login is tried.
+    /// so the operator sees that no other tool's login is tried; a proxy-injected
+    /// route says that p1 sends nothing and the egress proxy supplies the credential.
     pub fn line(&self) -> String {
+        if self.policy == CredentialPolicy::ProxyInjected {
+            return "none (proxy-injected) — the egress proxy injects the credential".to_string();
+        }
         let base = match &self.chosen {
             Some(name) => name.to_string(),
             None => match self.tried.iter().find_map(|(_, presence)| match presence {
@@ -181,6 +192,12 @@ pub fn resolve(
     transport: Arc<dyn Transport>,
     locations: &Locations,
 ) -> Arc<dyn CredentialSource> {
+    // A `none` route has no chain to build: it reads nothing (issue #134).
+    if spec.kind == CredentialKind::None {
+        return Arc::new(ProxyInjected {
+            route_id: route_id.to_string(),
+        });
+    }
     let entries = sources(spec)
         .into_iter()
         .map(|source| source.entry(route_id, transport.clone(), locations))
@@ -214,7 +231,9 @@ pub fn describe(route_id: &str, spec: &CredentialSpec, locations: &Locations) ->
 
 /// The policy a route's `[credential]` table declares (spec §2, ADR-0061).
 fn policy(spec: &CredentialSpec) -> CredentialPolicy {
-    if spec.store_only {
+    if spec.kind == CredentialKind::None {
+        CredentialPolicy::ProxyInjected
+    } else if spec.store_only {
         CredentialPolicy::StoreOnly
     } else {
         CredentialPolicy::Chain
@@ -223,9 +242,13 @@ fn policy(spec: &CredentialSpec) -> CredentialPolicy {
 
 /// The sources one route's credential is tried from, in order (spec §2). A store-only
 /// route stops after its own store: the borrowed login is not merely skipped when
-/// absent, it is never constructed, so no other tool's file is opened at all.
+/// absent, it is never constructed, so no other tool's file is opened at all. A
+/// `none` route has NO source: an egress proxy injects the credential (issue #134).
 fn sources(spec: &CredentialSpec) -> Vec<Source> {
     let mut sources = Vec::new();
+    if spec.kind == CredentialKind::None {
+        return sources;
+    }
     if let Some(env) = &spec.env {
         sources.push(Source::Env(env.clone()));
     }
@@ -253,6 +276,7 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
                 sources.push(Source::CodexLogin);
             }
         }
+        CredentialKind::None => {}
     }
     sources
 }
@@ -501,5 +525,57 @@ impl CredentialSource for Resolved {
         rejected: &'a Credential,
     ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move { self.select()?.rotated(rejected).await })
+    }
+}
+
+/// A route that sends NO credential: an egress proxy injects the provider's
+/// credential after the request leaves the process (issue #134). It reads nothing —
+/// no environment variable, no store entry, no other tool's login — and it has
+/// nothing to refresh.
+///
+/// [`CredentialSource::access`] answers with a placeholder whose `bearer` is EMPTY:
+/// the driver needs a credential to build a request, and the adapter must send no
+/// authentication header for it. That is what
+/// [`CredentialSource::proxy_injected`] tells every adapter, and the driver never
+/// calls [`CredentialSource::refresh`] on such a route; a direct caller that does
+/// still gets the refusal below, never a value.
+struct ProxyInjected {
+    /// Named in the refusal, so the operator knows which route to fix.
+    route_id: String,
+}
+
+impl ProxyInjected {
+    /// The refusal a rejected request on this route reports. The message names the
+    /// missing proxy credential and never a key p1 could hold.
+    fn refusal(&self) -> ProviderError {
+        auth(format!(
+            "route \"{}\" sends no credential (`kind = \"none\"`): the egress proxy must inject \
+             the proxy credential, and p1 has none to refresh",
+            self.route_id
+        ))
+    }
+}
+
+impl CredentialSource for ProxyInjected {
+    fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        // Nothing is read: this placeholder exists so the driver can build a request
+        // with no authentication header at all.
+        Box::pin(async move {
+            Ok(Credential {
+                bearer: String::new(),
+                account_id: None,
+            })
+        })
+    }
+
+    fn refresh<'a>(
+        &'a self,
+        _rejected: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async move { Err(self.refusal()) })
+    }
+
+    fn proxy_injected(&self) -> bool {
+        true
     }
 }

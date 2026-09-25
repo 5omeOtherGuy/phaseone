@@ -365,6 +365,17 @@ async fn on_response(
                 let error = ProviderError::new(ProviderErrorKind::Authentication, error.message);
                 return state.finish(Outcome::Failed(error));
             }
+            if state.request.credentials.proxy_injected() {
+                // Issue #134: this route sends no credential at all, so there is
+                // nothing p1 could refresh. The refusal is the egress proxy's, and
+                // the message names the missing proxy credential — never a key p1
+                // could hold.
+                let error = ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    proxy_refusal_message(status),
+                );
+                return state.finish(Outcome::Failed(error));
+            }
             state.reauth_used = true;
             let credentials = state.request.credentials.clone();
             let rejected = state
@@ -383,6 +394,19 @@ async fn on_response(
             }
         }
     }
+}
+
+/// Issue #134: what a 401/403 means on a route whose credential an egress proxy
+/// injects. The message names the missing proxy credential and the status the
+/// provider refused with; it never names a key p1 could hold.
+///
+/// Every transport that can carry such a route reports the refusal through here, so
+/// the SSE driver and the WebSocket handshake cannot drift apart on the wording.
+pub fn proxy_refusal_message(status: u16) -> String {
+    format!(
+        "the route sends no credential (`kind = \"none\"`): the egress proxy must inject the \
+         proxy credential, and the provider answered HTTP {status}"
+    )
 }
 
 async fn read_body(
@@ -1003,6 +1027,100 @@ mod tests {
         assert_eq!(harness.transport.requests().len(), 2);
         match terminal(&events) {
             Outcome::Failed(error) => assert_eq!(error.kind, ProviderErrorKind::Authentication),
+            other => panic!("expected an authentication failure, got {other:?}"),
+        }
+    }
+
+    /// A source for a route whose credential an egress proxy injects (issue #134): it
+    /// hands the driver an EMPTY placeholder and counts every refresh, so a test can
+    /// prove the driver never refreshes such a route.
+    struct ProxyInjected {
+        refresh_calls: Mutex<usize>,
+    }
+
+    impl ProxyInjected {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                refresh_calls: Mutex::new(0),
+            })
+        }
+
+        fn refresh_calls(&self) -> usize {
+            *self.refresh_calls.lock().unwrap()
+        }
+    }
+
+    impl CredentialSource for ProxyInjected {
+        fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+            Box::pin(async {
+                Ok(Credential {
+                    bearer: String::new(),
+                    account_id: None,
+                })
+            })
+        }
+
+        fn refresh<'a>(
+            &'a self,
+            _rejected: &'a Credential,
+        ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+            Box::pin(async {
+                *self.refresh_calls.lock().unwrap() += 1;
+                Err(ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    "PROXY-REFRESH-MUST-NOT-RUN",
+                ))
+            })
+        }
+
+        fn proxy_injected(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_proxy_injected_route_is_never_refreshed_and_a_401_names_the_proxy_credential() {
+        let credentials = ProxyInjected::new();
+        let transport = ScriptedTransport::new(vec![status_response(401)]);
+        let stream = drive(DriveRequest {
+            transport: Arc::new(transport.clone()),
+            credentials: credentials.clone(),
+            build: Box::new(|credential: &Credential| HttpRequest {
+                url: "https://provider.test/v1/stream".to_string(),
+                headers: vec![(
+                    "authorization".to_string(),
+                    format!("Bearer {}", credential.bearer),
+                )],
+                body: Vec::new(),
+            }),
+            new_parser: Box::new(|| Box::new(TestParser) as Box<dyn ResponseParser>),
+            retry: RetryPolicy::default(),
+            cancel: CancellationToken::new(),
+        });
+        let events = collect(stream).await;
+
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "a 401 on a route that sends no credential is terminal"
+        );
+        assert_eq!(
+            credentials.refresh_calls(),
+            0,
+            "there is nothing to refresh"
+        );
+        match terminal(&events) {
+            Outcome::Failed(error) => {
+                assert_eq!(error.kind, ProviderErrorKind::Authentication);
+                for part in ["proxy credential", "kind = \"none\"", "HTTP 401"] {
+                    assert!(error.message.contains(part), "{}: {}", error.message, part);
+                }
+                assert!(
+                    !error.message.contains("PROXY-REFRESH-MUST-NOT-RUN"),
+                    "the source's own refresh error must not surface: {}",
+                    error.message
+                );
+            }
             other => panic!("expected an authentication failure, got {other:?}"),
         }
     }

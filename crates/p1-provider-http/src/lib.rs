@@ -23,7 +23,7 @@ mod sse;
 pub mod ws;
 
 pub use credential::{Credential, CredentialSource};
-pub use drive::{DriveRequest, ResponseParser, drive};
+pub use drive::{DriveRequest, ResponseParser, drive, proxy_refusal_message};
 pub use error_code::{http_error_code, kind_for_status, safe_code};
 pub use file_lock::{LOCK_PATIENCE, lock_exclusive};
 pub use http::{

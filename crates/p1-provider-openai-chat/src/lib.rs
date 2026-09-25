@@ -350,6 +350,9 @@ impl Provider for ChatProvider {
             let origin = route.origin(&self.wire_model);
             let dialect = route.dialect;
             let cache_key = request.options.cache_key;
+            // A route whose credential an egress proxy injects sends NO authentication
+            // header (issue #134): the credential the source hands us is a placeholder.
+            let proxy_injected = self.credentials.proxy_injected();
             let build_headers = {
                 let route = route.clone();
                 let identity = route.client_identity;
@@ -363,11 +366,13 @@ impl Provider for ChatProvider {
                     headers.extend([
                         ("content-type".into(), "application/json".into()),
                         ("accept".into(), "text/event-stream".into()),
-                        (
+                    ]);
+                    if !proxy_injected {
+                        headers.push((
                             "authorization".into(),
                             format!("Bearer {}", credential.bearer),
-                        ),
-                    ]);
+                        ));
+                    }
                     match identity {
                         None => {
                             if let (Some(name), Some(value)) = (&route.session_header, &cache_key) {
