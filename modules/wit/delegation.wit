@@ -1,0 +1,149 @@
+package p1:module@1.0.0;
+
+/// Worker agents. Owner: `p1-workers` (the `WorkerService` the host implements).
+///
+/// A worker is a child agent the host assembles from a named environment and runs in the
+/// background. Ids are `w1`, `w2`, … and never reused; a result stays retrievable by id for
+/// the service's lifetime.
+interface workers {
+    use types.{stop-reason, provider-error, usage};
+
+    record child-spec {
+        /// Environment name the host's factory understands.
+        environment: string,
+        /// The task text: the only thing the child receives.
+        task: string,
+        /// Tool module names granted, in order, without duplicates; never `finish` (the
+        /// host adds it) and never a worker tool.
+        tools: list<string>,
+    }
+
+    variant worker-error {
+        unknown-child,
+        /// The child is still running a turn.
+        busy,
+        /// The concurrency bound; the host never queues.
+        limit-reached(u64),
+        invalid-environment(string),
+        ids-exhausted,
+        /// The child's tools were not changed; the reason.
+        regrant(string),
+        shut-down,
+    }
+
+    /// How a child's turn ended. Mirrors `p1_contracts::TurnEnd`.
+    variant turn-end {
+        completed(stop-reason),
+        cancelled,
+        provider-failed(provider-error),
+        commit-failed(string),
+        context-failed(string),
+    }
+
+    /// A `finish` call the child made, as its input said and as the host labelled it.
+    record finish-report {
+        status: string,
+        needs: option<string>,
+        summary: option<string>,
+        /// `commands passed: …` or `not verified; parent verification required`.
+        evidence: option<string>,
+    }
+
+    /// What the host's tap recorded about a child (ADR-0050).
+    record worker-report {
+        /// Model-facing names of the tools the child was assembled with.
+        tools: list<string>,
+        /// The last accepted `finish` of this turn.
+        finish: option<finish-report>,
+        /// Tools the child called but did not have, with counts, in first-seen order.
+        missing-tool-calls: list<tuple<string, u32>>,
+    }
+
+    record child-result {
+        /// The text of the child's last assistant item; empty if it produced none.
+        final-text: string,
+        turn-end: turn-end,
+        /// Unknown is `none`, never zero.
+        usage-total: option<usage>,
+        report: worker-report,
+    }
+
+    variant child-status {
+        running,
+        finished(child-result),
+        cancelled,
+        failed(string),
+    }
+
+    /// Start a child now; the id on success.
+    start: func(spec: child-spec) -> result<string, worker-error>;
+
+    /// The route and model a child runs on, as the host shows it.
+    describe: func(id: string) -> result<string, worker-error>;
+
+    /// The current status; never waits.
+    status: func(id: string) -> result<child-status, worker-error>;
+
+    /// Blocks the module until the child is no longer running. When the call is cancelled
+    /// first, returns `running` at once.
+    wait: func(id: string) -> result<child-status, worker-error>;
+
+    /// Cancel the child's running turn. A finished child is a no-op.
+    cancel: func(id: string) -> result<_, worker-error>;
+
+    /// Another turn in the same child session with `message`, granting the tool modules in
+    /// `add-tools` for it and every later turn (ADR-0050). `busy` while a turn runs.
+    continue-child: func(id: string, message: string, add-tools: list<string>) -> result<_, worker-error>;
+}
+
+/// Workflow runs. Owner: `p1-workflow` (the `WorkflowService` the host implements).
+///
+/// The script interpreter stays native; a module starts, observes and cancels runs. Ids are
+/// `wf1`, `wf2`, … and never reused.
+interface workflows {
+    use types.{json};
+
+    record start-request {
+        /// The workflow script.
+        script: string,
+        /// The script's arguments, a JSON object.
+        args: json,
+        /// Replay the unchanged prefix of this run's journal, then run the rest.
+        resume-from: option<string>,
+    }
+
+    record parse-error {
+        message: string,
+        line: u32,
+        column: u32,
+    }
+
+    variant workflow-error {
+        unknown-run,
+        /// The script does not parse.
+        parse(parse-error),
+        /// The run cannot start: a role that does not resolve, an empty grant, an unknown
+        /// `resume-from`.
+        preflight(string),
+        shut-down,
+        io(string),
+    }
+
+    /// A run's status as JSON text: `p1_workflow::RunStatus` in its serde form, `Running`
+    /// with the progress or `Ended` with the report. Its schema is owned by `p1-workflow`,
+    /// not yet by a `p1-module-protocol` family.
+    type run-status = json;
+
+    /// Compile, preflight and start a run now; the id on success. Nothing starts on `err`.
+    start: func(request: start-request) -> result<string, workflow-error>;
+
+    /// The current status; never waits.
+    status: func(id: string) -> result<run-status, workflow-error>;
+
+    /// Blocks the module until the run ended. When the call is cancelled first, returns the
+    /// running status at once.
+    wait: func(id: string) -> result<run-status, workflow-error>;
+
+    /// Cancel the run and every step in flight. An ended run is a no-op.
+    cancel: func(id: string) -> result<_, workflow-error>;
+}

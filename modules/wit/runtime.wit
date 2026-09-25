@@ -1,0 +1,45 @@
+package p1:module@1.0.0;
+
+/// Cooperative cancellation. Owner: `p1-module-runtime`.
+///
+/// Epoch deadlines and fuel are enforced by the host without any import; this interface is
+/// the cooperative part. A module doing long computation between imports checks it and
+/// returns promptly (a tool with the `cancelled` status, a context policy with
+/// `context-error.cancelled`). A blocking import returns on its own when the call is
+/// cancelled, as each one documents, so a module never needs to poll while it waits.
+interface control {
+    /// Whether the call this module is serving has been cancelled. Once true, it stays true
+    /// for the rest of the call.
+    cancelled: func() -> bool;
+}
+
+/// Time. Owner: `p1-module-runtime`.
+interface clock {
+    /// A wall-clock time since the Unix epoch.
+    record datetime {
+        seconds: u64,
+        nanoseconds: u32,
+    }
+
+    /// The host's wall clock, for values a module stamps into a request (a per-request id).
+    now: func() -> datetime;
+
+    /// Nanoseconds on a monotonic clock whose origin the host fixes per instance, for
+    /// elapsed times a module reports. Never goes backwards.
+    monotonic-now: func() -> u64;
+}
+
+/// Randomness. Owner: `p1-module-runtime`.
+interface random {
+    /// `len` bytes from the host's random source, for nonces and ids. Not a key source: no
+    /// module holds a credential.
+    bytes: func(len: u32) -> list<u8>;
+}
+
+/// Display-only notices for the operator. Owner: the host event layer.
+interface notices {
+    /// Show `text` to the operator (ADR-0048). Never history, never journalled, never sent
+    /// to the model. The text is the module's own constant, never text it received from a
+    /// peer, a file or a process.
+    notice: func(text: string);
+}

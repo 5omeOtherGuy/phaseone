@@ -36,10 +36,10 @@ P1_SHA = hashlib.sha256(P1_BYTES).hexdigest()
 
 # The script's preflight inventory: every external command it runs.
 TOOL_INVENTORY = ("git", "gh", "dirname", "cat", "mktemp", "mkdir", "find",
-                  "mv", "cut", "sha256sum", "tail", "rm", "sleep")
+                  "cp", "mv", "cut", "sha256sum", "tail", "rm", "sleep")
 # The tools whose real binary the logging stub delegates to.
-PASSTHROUGH_TOOLS = ("dirname", "cat", "mktemp", "mkdir", "find", "mv", "cut",
-                     "tail", "rm")
+PASSTHROUGH_TOOLS = ("dirname", "cat", "mktemp", "mkdir", "find", "cp", "mv",
+                     "cut", "tail", "rm")
 REAL_TOOLS = {name: shutil.which(name) or f"/usr/bin/{name}" for name in PASSTHROUGH_TOOLS}
 REAL_SHA256SUM = shutil.which("sha256sum") or "/usr/bin/sha256sum"
 
@@ -100,6 +100,28 @@ PASSTHROUGH_STUB = textwrap.dedent(
     echo "{name} $*" >> "$STUB_LOG"
     exec "{real}" "$@"
     """
+)
+
+# Logs the invocation and delegates to rm, then, when STUB_RM_RECREATE_DEST names the
+# path just removed, recreates it: a concurrent invocation for the same commit
+# (ADR-0066) can win the window between the script's `rm -rf` and its rename.
+RM_STUB = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    echo "rm $*" >> "$STUB_LOG"
+    %s "$@"
+    code=$?
+    if [ -n "${STUB_RM_RECREATE_DEST:-}" ]; then
+      for arg in "$@"; do
+        if [ "$arg" = "$STUB_RM_RECREATE_DEST" ]; then
+          mkdir -p "$arg"
+          printf 'recreated by a concurrent invocation\\n' > "$arg/other.txt"
+        fi
+      done
+    fi
+    exit "$code"
+    """
+    % REAL_TOOLS["rm"]
 )
 
 # Logs the invocation and delegates, so a test can prove the script ran
@@ -233,12 +255,18 @@ GH_STUB = textwrap.dedent(
         code = int(env("STUB_DOWNLOAD_EXIT", "0"))
         if code:
             fail("artifact not found", code)
-        dest = pathlib.Path(args[args.index("--dir") + 1]) / env("STUB_ARTIFACT", "p1-build")
+        base = pathlib.Path(args[args.index("--dir") + 1])
+        # Real `gh run download --name X --dir D` extracts the artifact's contents
+        # directly into D with the relative paths kept (the artifact root is D);
+        # STUB_ARTIFACT_DIR=1 models the other accepted layout, D/<artifact name>/...
+        artifact = env("STUB_ARTIFACT", "p1-build")
+        dest = base / artifact if env("STUB_ARTIFACT_DIR", "0") == "1" else base
         dest.mkdir(parents=True, exist_ok=True)
         if env("STUB_DOWNLOAD_EMPTY", "0") == "1":
             sys.exit(0)
         skip = set(env("STUB_DOWNLOAD_SKIP", "").split(","))
-        if "p1" not in skip:
+        in_subdir = env("STUB_P1_IN_SUBDIR", "0") == "1"
+        if "p1" not in skip and not in_subdir:
             (dest / "p1").write_bytes(P1_BYTES)
         if "p1.sha256" not in skip:
             sha = env("STUB_UPLOADED_SHA", hashlib.sha256(P1_BYTES).hexdigest())
@@ -246,6 +274,28 @@ GH_STUB = textwrap.dedent(
             (dest / "p1.sha256").write_text(sha + "  " + name + "\\n", encoding="utf-8")
         if "gate.log" not in skip:
             (dest / "gate.log").write_text("gate green\\n", encoding="utf-8")
+        # Extra files at their relative paths, exactly as the artifact carries them.
+        for rel in env("STUB_DOWNLOAD_FILES", "").split(","):
+            rel = rel.strip()
+            if not rel:
+                continue
+            path = dest / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(rel + chr(10), encoding="utf-8")
+        if in_subdir:
+            path = dest / env("STUB_P1_SUBDIR", "modules") / "p1"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(P1_BYTES)
+        # A second top-level entry beside the artifact-named directory.
+        extra_top = env("STUB_DOWNLOAD_TOP", "")
+        if extra_top:
+            (base / extra_top).write_text("unexpected" + chr(10), encoding="utf-8")
+        # A symlink or FIFO the script must refuse before staging anything.
+        special = env("STUB_DOWNLOAD_SPECIAL", "")
+        if special == "symlink":
+            os.symlink("p1", dest / "link")
+        elif special == "fifo":
+            os.mkfifo(dest / "pipe")
         sys.exit(0)
 
     fail("unhandled call: " + " ".join(args), 2)
@@ -278,6 +328,8 @@ class Harness:
         stubs = {"git": GIT_STUB, "gh": GH_STUB, "sleep": SLEEP_STUB, "sha256sum": SHA256SUM_STUB}
         for name, real in REAL_TOOLS.items():
             stubs[name] = PASSTHROUGH_STUB.format(name=name, real=real)
+        # rm also models the concurrent-invocation window (STUB_RM_RECREATE_DEST).
+        stubs["rm"] = RM_STUB
         installed = set(tools) if tools is not None else set(stubs)
         for name in sorted(installed - {"bash", "python3"}):
             if name in stubs:
@@ -337,6 +389,13 @@ class CiBuildTests(unittest.TestCase):
         harness = Harness(**kwargs)
         self.addCleanup(harness.cleanup)
         return harness
+
+    def assert_nothing_staged(self, h: Harness) -> None:
+        # A refusal must leave neither ci-artifacts/<sha> nor a staging directory.
+        self.assertFalse(h.artifact().exists())
+        artifacts = h.repo / "ci-artifacts"
+        entries = sorted(path.name for path in artifacts.iterdir()) if artifacts.exists() else []
+        self.assertEqual(entries, [], "nothing may be written under ci-artifacts")
 
     def test_green_run_pushes_downloads_and_verifies(self) -> None:
         h = self.harness()
@@ -552,6 +611,102 @@ class CiBuildTests(unittest.TestCase):
         result = h.run()
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("could not download", result.stderr)
+
+    def test_nested_artifact_files_keep_their_relative_paths(self) -> None:
+        # The artifact carries module packages; they must land at the same relative
+        # paths under ci-artifacts/<sha>/ (the flattening rewrite moved them to the top).
+        h = self.harness(
+            **{"STUB_DOWNLOAD_FILES": "modules/manifest.json,modules/packages/x/a.wasm"}
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((h.artifact() / "p1").read_bytes(), P1_BYTES)
+        self.assertEqual(
+            (h.artifact() / "modules/manifest.json").read_text(encoding="utf-8"),
+            "modules/manifest.json\n",
+        )
+        self.assertEqual(
+            (h.artifact() / "modules/packages/x/a.wasm").read_text(encoding="utf-8"),
+            "modules/packages/x/a.wasm\n",
+        )
+
+    def test_two_files_with_one_basename_both_survive(self) -> None:
+        # The flattening bug overwrote one same-basename file with the other; the
+        # hierarchy-preserving staging keeps both, at their own paths.
+        h = self.harness(**{"STUB_DOWNLOAD_FILES": "a/same.wasm,b/same.wasm"})
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((h.artifact() / "a/same.wasm").read_text(encoding="utf-8"), "a/same.wasm\n")
+        self.assertEqual((h.artifact() / "b/same.wasm").read_text(encoding="utf-8"), "b/same.wasm\n")
+
+    def test_artifact_named_subdirectory_form_is_accepted(self) -> None:
+        # The other layout `gh run download --name X --dir D` can leave: D holds only
+        # the directory named after the artifact.
+        h = self.harness(**{"STUB_ARTIFACT_DIR": "1"})
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((h.artifact() / "p1").read_bytes(), P1_BYTES)
+        self.assertEqual((h.artifact() / "gate.log").read_text(encoding="utf-8"), "gate green\n")
+        self.assertIn("verified with sha256sum -c", result.stdout)
+
+    def test_symlink_in_the_artifact_is_refused(self) -> None:
+        h = self.harness(**{"STUB_DOWNLOAD_SPECIAL": "symlink"})
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("neither a regular file nor a directory", result.stderr)
+        self.assert_nothing_staged(h)
+
+    def test_fifo_in_the_artifact_is_refused(self) -> None:
+        h = self.harness(**{"STUB_DOWNLOAD_SPECIAL": "fifo"})
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("neither a regular file nor a directory", result.stderr)
+        self.assert_nothing_staged(h)
+
+    def test_second_top_level_entry_beside_the_artifact_directory_is_refused(self) -> None:
+        # D holds the artifact-named directory plus another entry: the root cannot be
+        # located deterministically, so exit 2 and nothing is staged.
+        h = self.harness(**{"STUB_ARTIFACT_DIR": "1", "STUB_DOWNLOAD_TOP": "extra.txt"})
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("beside other entries", result.stderr)
+        self.assert_nothing_staged(h)
+
+    def test_p1_in_a_subdirectory_does_not_satisfy_the_required_file(self) -> None:
+        # A p1 that exists only in a subdirectory is not the artifact's p1.
+        h = self.harness(**{"STUB_P1_IN_SUBDIR": "1"})
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("artifact has no p1", result.stderr)
+        self.assert_nothing_staged(h)
+
+    def test_pre_existing_artifact_directory_is_replaced_cleanly(self) -> None:
+        h = self.harness()
+        dest = h.artifact()
+        dest.mkdir(parents=True)
+        (dest / "p1").write_bytes(b"stale binary\n")
+        (dest / "stale.txt").write_text("from an earlier download\n", encoding="utf-8")
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((dest / "stale.txt").exists(), "the earlier download must be replaced")
+        self.assertEqual((dest / "p1").read_bytes(), P1_BYTES)
+        self.assertEqual(sorted(path.name for path in (h.repo / "ci-artifacts").iterdir()), [SHA])
+
+    def test_destination_recreated_by_a_concurrent_invocation_fails_loudly(self) -> None:
+        # A concurrent invocation for the same commit (ADR-0066) can recreate
+        # ci-artifacts/<sha> between this invocation's `rm -rf` and its rename. The
+        # rename must fail (exit 2) instead of silently nesting the staging directory
+        # inside the fresh destination.
+        h = self.harness()
+        dest = h.artifact()
+        # The script builds the destination relative to the repo root, which is its cwd.
+        h.env["STUB_RM_RECREATE_DEST"] = f"{dest.parent.name}/{SHA}"
+        result = h.run()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot move the staged artifact", result.stderr)
+        prefix = f".{SHA}.staging."
+        nested = [path.name for path in dest.iterdir() if path.name.startswith(prefix)]
+        self.assertEqual(nested, [], "the staging directory must not be nested in the destination")
 
     def test_push_is_the_default_trigger(self) -> None:
         h = self.harness(**{"CI_TRIGGER": "push"})
@@ -812,7 +967,7 @@ class CiBuildTests(unittest.TestCase):
     def test_tooling_failures_are_exit_two(self) -> None:
         # A local tool failure is a tooling error (2), never a red run (1). tail is
         # exercised on the red path instead (test_failing_tail_on_a_red_run_...).
-        for tool in ("mktemp", "mkdir", "find", "mv", "sha256sum", "cut"):
+        for tool in ("mktemp", "mkdir", "find", "cp", "mv", "sha256sum", "cut"):
             with self.subTest(tool=tool):
                 h = self.harness(fail_tools={tool: 1})
                 result = h.run()

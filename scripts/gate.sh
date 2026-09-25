@@ -28,6 +28,7 @@ scripts/secret-scan.sh
 echo "== gate: adr"
 scripts/adr.py check
 python3 scripts/test_adr.py -q
+python3 scripts/test_ci_build.py -q
 python3 scripts/test_fanout.py -q
 python3 scripts/test_install.py -q
 python3 scripts/test_local_cargo_config.py -q

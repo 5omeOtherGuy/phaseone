@@ -1,0 +1,91 @@
+package p1:module@1.0.0;
+
+/// Naming the credential a lowered request needs. Owner: `p1-provider-http` with the
+/// `p1-auth` credential broker.
+///
+/// A module never receives a credential value. It names how the route's credential is
+/// attached, and the broker attaches it when it sends; it also refreshes the credential once
+/// after a 401 or 403, and attaches nothing on a route whose credential an egress proxy
+/// injects. No function here returns a value: the interface is the vocabulary the lowered
+/// request uses.
+interface credential-control {
+    enum credential-scheme {
+        /// `Authorization: Bearer <token>`.
+        bearer,
+    }
+
+    record credential-use {
+        scheme: credential-scheme,
+        /// The header that carries the credential's account id, for an account that needs
+        /// one (`chatgpt-account-id`). The broker fails the request as `authentication` when
+        /// the credential has no account id.
+        account-id-header: option<string>,
+    }
+}
+
+/// HTTP requests the transport broker sends. Owner: `p1-provider-http`.
+///
+/// Sending, retry, backoff, the one credential refresh, the first-byte and idle read bounds
+/// and cancellation are the broker's (freeze item 9); a provider module only lowers a request
+/// into these values and classifies what comes back.
+interface http {
+    use credential-control.{credential-use};
+
+    /// A header name and value.
+    type header = tuple<string, string>;
+
+    enum method {
+        /// Every provider route today sends one POST per response.
+        post,
+    }
+
+    record http-request {
+        method: method,
+        /// Path and query relative to the route's endpoint, starting with `/`.
+        path: string,
+        /// Headers without any credential. The broker refuses a request naming
+        /// `authorization`, `proxy-authorization`, `cookie`, `x-api-key` or `api-key`, and
+        /// attaches the credential as `credential` says, ahead of these headers.
+        headers: list<header>,
+        credential: credential-use,
+        body: list<u8>,
+    }
+
+    /// The status and headers of a response or of a refused WebSocket upgrade.
+    record response-head {
+        status: u16,
+        headers: list<header>,
+    }
+}
+
+/// WebSocket requests the transport broker sends. Owner: `p1-provider-http` (ADR-0047).
+///
+/// The broker owns the connection: one per provider instance, reused across responses,
+/// dropped after a cancelled or failed response, with the fallback to the route's HTTP
+/// request that `docs/design/websocket.md` specifies.
+interface websocket {
+    use http.{header};
+    use credential-control.{credential-use};
+
+    /// A shorter frame that continues the response a reused connection completed last
+    /// (`docs/design/websocket.md` §6).
+    record continuation {
+        /// The id of the response this frame continues.
+        previous-response: string,
+        frame: string,
+    }
+
+    record websocket-request {
+        /// Path relative to the route's endpoint; the broker swaps the scheme to `wss`.
+        path: string,
+        /// Handshake headers, under the same credential rule as `http-request.headers`.
+        headers: list<header>,
+        credential: credential-use,
+        /// The one text frame that sends the full request.
+        frame: string,
+        /// Sent instead of `frame` only on the connection whose last cleanly completed
+        /// response the decoder reported with exactly the id `previous-response`; otherwise
+        /// the broker sends `frame`, which is never an error.
+        continuation: option<continuation>,
+    }
+}

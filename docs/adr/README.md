@@ -91,6 +91,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0075 | [The TUI shows workflow runs as a live tree through a structured FrontEnd seam](0075-the-tui-shows-workflow-runs-as-a-live-tree-through-a-structured-frontend-seam.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0076 | [Manual compaction: /compact in the TUI and --compact on resume](0076-manual-compaction-compact-in-the-tui-and-compact-on-resume.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0077 | [Builds on the stream boxes](0077-builds-on-the-stream-boxes.md) | proposed | 2026-09-25 | owner+lead |
+| ADR-0078 | [Connection resources and component replacement](0078-connection-resources-and-component-replacement.md) | proposed | 2026-09-25 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
