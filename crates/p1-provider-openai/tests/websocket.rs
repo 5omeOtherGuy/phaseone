@@ -542,8 +542,9 @@ impl WsConnection for StalledConnection {
         match self.frames.pop_front() {
             Some(ScriptedFrame::Text(text)) => Box::pin(async move { Ok(Some(text)) }),
             Some(ScriptedFrame::Error(message)) => Box::pin(async move { Err(WsError(message)) }),
-            // Past its script this connection never answers again.
-            Some(ScriptedFrame::Close) | None => Box::pin(std::future::pending()),
+            // Past its script — and for any control or pause this stall double does
+            // not model — the connection never answers again.
+            _ => Box::pin(std::future::pending()),
         }
     }
 }
@@ -1330,25 +1331,30 @@ async fn a_read_error_before_any_output_retries_within_the_budget_then_falls_bac
 }
 
 /// Issue #164 for the WebSocket arm: a peer that opens the socket and never sends
-/// the FIRST frame is §5's transient row, each attempt bounded by
-/// [`FIRST_BYTE_TIMEOUT`], and the budget spent falls back to SSE.
+/// the FIRST frame is §5's transient row, each attempt bounded at the first-frame
+/// bound, and the budget spent falls back to SSE. The script waits past the bound
+/// and never delivers a frame, so the connection's own read loop expires.
 #[tokio::test(start_paused = true)]
 async fn a_read_that_never_answers_is_bounded_at_the_first_frame_and_falls_back() {
-    let peer = PendingPeer::stalling_read();
+    let silence =
+        || ScriptedConnection::accept(vec![ScriptedFrame::wait(Duration::from_secs(3600))]);
+    let connector = ScriptedWsConnector::new(vec![silence(), silence(), silence(), silence()]);
     let sse = ScriptedTransport::new(vec![ScriptedResponse::ok_sse(fixtures::NO_USAGE)]);
     let provider = compose(
         ResponsesTransport::Websocket,
         sse.clone(),
-        Some(peer.clone()),
+        Some(Arc::new(connector.clone())),
     )
     .expect("the route composes");
 
     let start = tokio::time::Instant::now();
-    let events = turn(&provider).await;
+    let events = tokio::time::timeout(Duration::from_secs(600), turn(&provider))
+        .await
+        .expect("the first-frame bound must end the wait, not hang CI");
     completed(&events);
 
     assert_eq!(
-        peer.handshakes(),
+        connector.handshakes().len(),
         4,
         "a first-frame timeout is the transient row: the first attempt and the three \
          reconnects the default policy's max_retries allows"
@@ -1369,24 +1375,66 @@ async fn a_read_that_never_answers_is_bounded_at_the_first_frame_and_falls_back(
     );
 }
 
-/// Issue #164 for the WebSocket arm after output: a stream that goes silent past
-/// [`STREAM_IDLE_TIMEOUT`] is this response's own `Transport` failure, naming the
-/// bound — no retry, no fallback.
+/// Issue #164: a WebSocket peer that stays alive with CONTROL pings is not idle —
+/// every frame, a ping included, resets the idle clock — so 20 minutes of pings
+/// then a text frame completes instead of being failed as silent.
 #[tokio::test(start_paused = true)]
-async fn a_stream_that_stalls_after_output_fails_at_the_idle_bound() {
-    // One script per connect: a reconnect would panic the peer's script, so a
-    // single script asserts there is no reconnect. No SSE response is scripted, so
-    // a fallback would panic too.
-    let peer = StallAfterFrames::new(vec![vec![ScriptedFrame::text(DELTA)]]);
+async fn keep_alive_pings_reset_the_idle_bound() {
+    let mut frames = Vec::new();
+    for _ in 0..6 {
+        frames.push(ScriptedFrame::ping());
+        frames.push(ScriptedFrame::wait(Duration::from_secs(200)));
+    }
+    frames.push(ScriptedFrame::ping());
+    frames.extend(turn_frames(1));
+    let connector = ScriptedWsConnector::new(vec![ScriptedConnection::accept(frames)]);
     let provider = compose(
         ResponsesTransport::Websocket,
         ScriptedTransport::new(Vec::new()),
-        Some(peer.clone()),
+        Some(Arc::new(connector.clone())),
     )
     .expect("the route composes");
 
     let start = tokio::time::Instant::now();
-    let events = turn(&provider).await;
+    let events = tokio::time::timeout(Duration::from_secs(1300), turn(&provider))
+        .await
+        .expect("keep-alive pings must keep the stream alive, not hang CI");
+    completed(&events);
+
+    assert_eq!(
+        connector.handshakes().len(),
+        1,
+        "one connection, kept alive"
+    );
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_secs(1200),
+        "six pings 200 s apart: 20 minutes, none of them past the idle bound"
+    );
+}
+
+/// Issue #164 for the WebSocket arm after output: a stream that goes silent past
+/// the idle bound is this response's own `Transport` failure, naming the bound —
+/// no retry, no fallback.
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_stalls_after_output_fails_at_the_idle_bound() {
+    // One script per connect (a reconnect would panic it), no SSE response (a
+    // fallback would panic): the delta is visible, then the peer goes silent.
+    let connector = ScriptedWsConnector::new(vec![ScriptedConnection::accept(vec![
+        ScriptedFrame::text(DELTA),
+        ScriptedFrame::wait(Duration::from_secs(3600)),
+    ])]);
+    let provider = compose(
+        ResponsesTransport::Websocket,
+        ScriptedTransport::new(Vec::new()),
+        Some(Arc::new(connector.clone())),
+    )
+    .expect("the route composes");
+
+    let start = tokio::time::Instant::now();
+    let events = tokio::time::timeout(Duration::from_secs(400), turn(&provider))
+        .await
+        .expect("the idle bound must end the wait, not hang CI");
 
     assert_eq!(failed(&events).kind, ProviderErrorKind::Transport);
     assert_eq!(
@@ -1399,6 +1447,7 @@ async fn a_stream_that_stalls_after_output_fails_at_the_idle_bound() {
             .any(|event| matches!(event, StreamEvent::TextDelta { text, .. } if text == "Hello")),
         "the visible output is preserved: {events:?}"
     );
+    assert_eq!(connector.handshakes().len(), 1, "no reconnect after output");
     assert_eq!(
         start.elapsed(),
         STREAM_IDLE_TIMEOUT,

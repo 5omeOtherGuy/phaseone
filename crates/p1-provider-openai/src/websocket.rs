@@ -36,11 +36,8 @@ use futures_util::stream::unfold;
 use p1_contracts::{
     CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream, StreamEvent,
 };
-use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsHandshake};
-use p1_provider_http::{
-    Credential, CredentialSource, FIRST_BYTE_TIMEOUT, ResponseParser, RetryPolicy,
-    STREAM_IDLE_TIMEOUT, SseEvent,
-};
+use p1_provider_http::ws::{WsConnectError, WsConnection, WsConnector, WsHandshake, WsNext};
+use p1_provider_http::{Credential, CredentialSource, ResponseParser, RetryPolicy, SseEvent};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -702,35 +699,24 @@ async fn send(mut state: State) -> State {
 
 async fn read(mut state: State) -> State {
     let cancel = state.request.cancel.clone();
-    // A read is bounded (§4, extended by issue #164). The FIRST frame of a response
-    // waits [`FIRST_BYTE_TIMEOUT`]; every later frame waits [`STREAM_IDLE_TIMEOUT`],
-    // and any frame resets that clock. Without this a peer that goes silent hangs
-    // the agent forever.
-    let first = state.awaiting_first_frame;
-    let bound = if first {
-        FIRST_BYTE_TIMEOUT
-    } else {
-        STREAM_IDLE_TIMEOUT
-    };
+    // §4: the read is bounded INSIDE the connection, where the message loop sees
+    // every frame — so ANY message, a control ping included, resets the idle clock
+    // (issue #164). Here we only race cancellation and classify the outcome.
     let received = {
         let live = state
             .live
             .as_mut()
             .expect("a connection is open while reading");
-        race_bounded(&cancel, bound, live.connection.next_text()).await
+        race(&cancel, live.connection.next_bounded()).await
     };
     match received {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
-        Raced::Done(Err(_elapsed)) => {
-            let message = if first {
-                format!("no response within {} s", FIRST_BYTE_TIMEOUT.as_secs())
-            } else {
-                format!("stream idle for {} s", STREAM_IDLE_TIMEOUT.as_secs())
-            };
-            state.on_read_timeout(ProviderError::new(ProviderErrorKind::Transport, message))
+        Raced::Done(Ok(WsNext::Timeout(bound))) => {
+            let error = ProviderError::new(ProviderErrorKind::Transport, bound.message());
+            state.on_read_timeout(error)
         }
-        Raced::Done(Ok(Ok(Some(text)))) => state.on_frame(&text),
-        Raced::Done(Ok(Ok(None))) | Raced::Done(Ok(Err(_))) => state.on_close(),
+        Raced::Done(Ok(WsNext::Text(text))) => state.on_frame(&text),
+        Raced::Done(Ok(WsNext::Closed)) | Raced::Done(Err(_)) => state.on_close(),
     }
 }
 
@@ -785,8 +771,8 @@ impl State {
         }
     }
 
-    /// A read that stayed silent past its bound (`FIRST_BYTE_TIMEOUT`, then
-    /// `STREAM_IDLE_TIMEOUT`). Before any output it is §5's transient row — the
+    /// A read whose bound expired (the connection reports it as
+    /// [`WsNext::Timeout`]). Before any output it is §5's transient row — the
     /// reconnect budget, then the SSE fallback. After output it is this response's
     /// own `Transport` failure, whose message names the bound that expired.
     fn on_read_timeout(self, error: ProviderError) -> State {
