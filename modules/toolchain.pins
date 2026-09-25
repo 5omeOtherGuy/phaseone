@@ -1,0 +1,13 @@
+# Module toolchain pins, read line by line by scripts/module-toolchain.sh (never sourced).
+# Format: KEY=value; blank lines and lines starting with # are ignored.
+
+# 1.82.0 is the first stable Rust that ships wasm32-wasip2 as a tier 2 target;
+# older toolchains cannot build the module packages at all.
+RUST_MIN=1.82.0
+WASM_TARGET=wasm32-wasip2
+
+# Pinned by slice S0.2 once the dependency question Q7 is answered:
+# WASMTIME=<version of the wasmtime crate in Cargo.lock>
+# WASMTIME_FEATURES=<comma-separated wasmtime features>
+# WIT_BINDGEN=<version of the wit-bindgen crate in Cargo.lock and modules/Cargo.lock>
+# WASM_TOOLS=<version printed by wasm-tools --version>
