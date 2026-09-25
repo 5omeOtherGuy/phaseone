@@ -1149,6 +1149,12 @@ struct Redraws {
     /// The promotion of the last drawn frame: a PEEK appears and — the one
     /// frame that erases its banner — expires.
     promotion: Promotion,
+    /// Frames in a row the terminal has refused, cleared by the next frame that
+    /// reaches it. It lives here, not in a loop's stack, because the budget
+    /// must survive a turn: a turn that resolves after its first refused frame
+    /// hands the count to the next pump (or back to idle) instead of starting
+    /// over (issue #141 review).
+    failed: u8,
     /// Frames drawn, for the tests.
     draws: DrawCounter,
 }
@@ -1162,6 +1168,7 @@ impl Redraws {
             rows: Vec::new(),
             status: Default::default(),
             promotion: Default::default(),
+            failed: 0,
             draws,
         }
     }
@@ -1180,7 +1187,8 @@ impl Redraws {
     }
 
     /// Remember what was just drawn. Only ever called for a frame that reached
-    /// the terminal: a refused frame stays due for the next wake.
+    /// the terminal: a refused frame stays due for the next wake, and the only
+    /// thing that clears the consecutive-failure count is a frame this far.
     fn drawn(&mut self, screen: &Screen) {
         self.dirty = false;
         self.beat = false;
@@ -1188,6 +1196,14 @@ impl Redraws {
         self.rows = screen.workers.workers.clone();
         self.status = screen.statusbar.clone();
         self.promotion = screen.promotion.clone();
+        self.failed = 0;
+    }
+
+    /// The terminal refused too many frames in a row: there is nothing left to
+    /// draw to, so the loop ends the way `run` does for a terminal it cannot use.
+    /// The count spans turns, so any mix of idle and pump attempts reaches it.
+    fn refused(&self) -> bool {
+        self.failed >= DRAW_FAILURES_BEFORE_EXIT
     }
 
     /// The heartbeat to wait at until the next check: the spinner's while a
@@ -1237,7 +1253,8 @@ fn peek_visible(screen: &Screen) -> bool {
 
 /// How many frames in a row the terminal may refuse before the loop gives up
 /// (issue #141 review): one retry per wake, then the same exit `run` takes for a
-/// terminal it cannot use.
+/// terminal it cannot use. The count lives in [`Redraws`], so a turn that ends
+/// between two refusals cannot reset the budget.
 const DRAW_FAILURES_BEFORE_EXIT: u8 = 3;
 
 /// A terminal that refused [`DRAW_FAILURES_BEFORE_EXIT`] frames in a row. This
@@ -1291,7 +1308,9 @@ impl Heartbeat {
 ///
 /// `Err` is the terminal refusing the frame: nothing was recorded as drawn, so
 /// the frame stays due and the next wake (a heartbeat tick, a key, an event)
-/// retries it. The message is the terminal's own.
+/// retries it. The message is the terminal's own. Every refusal is counted here,
+/// where the only `draw` call is, so the caller can end the loop on a terminal
+/// that keeps refusing — whichever loop (idle or a turn) took the attempt.
 fn frame_if_due<B: Backend>(
     redraws: &mut Redraws,
     terminal: &mut ratatui::Terminal<B>,
@@ -1308,15 +1327,19 @@ fn frame_if_due<B: Backend>(
     let spinning = pulsing(&driver.screen, now_ms);
     let animated = spinning || peek_visible(&driver.screen);
     if redraws.due(&driver.screen, animated) {
-        draw(
+        match draw(
             terminal,
             &mut driver.screen,
             now_ms,
             color_mode,
             &redraws.draws,
-        )
-        .map_err(|error| error.to_string())?;
-        redraws.drawn(&driver.screen);
+        ) {
+            Ok(()) => redraws.drawn(&driver.screen),
+            Err(error) => {
+                redraws.failed = redraws.failed.saturating_add(1);
+                return Err(error.to_string());
+            }
+        }
     }
     Ok(redraws.heartbeat(spinning))
 }
@@ -1349,7 +1372,6 @@ where
         tokio::time::interval_at(tokio::time::Instant::now() + WORKER_POLL, WORKER_POLL);
     workers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = Heartbeat::new();
-    let mut failed_draws = 0u8;
     let mut prompt: Option<String> = None;
     loop {
         if let Some(code) = driver.exit {
@@ -1440,15 +1462,12 @@ where
         // Idle: republish what moves by itself, draw only when a frame input
         // changed, then wait for anything at all.
         match frame_if_due(&mut redraws, terminal, driver, sink.now_ms(), color_mode) {
-            Ok(period) => {
-                failed_draws = 0;
-                heartbeat.set(period);
-            }
+            Ok(period) => heartbeat.set(period),
             // The terminal refused the frame. Keep the frame due and wait at the
-            // rate already armed — one retry per wake, never a spin.
+            // rate already armed — one retry per wake, never a spin — until the
+            // consecutive refusals (idle and turn alike) run out.
             Err(error) => {
-                failed_draws += 1;
-                if failed_draws >= DRAW_FAILURES_BEFORE_EXIT {
+                if redraws.refused() {
                     return terminal_gave_up(&error);
                 }
             }
@@ -1542,9 +1561,10 @@ where
 /// screen while the turn runs: the heartbeat then draws it at the spinner's
 /// rate instead of once a second.
 ///
-/// `Err` is the terminal refusing [`DRAW_FAILURES_BEFORE_EXIT`] frames in a row:
-/// there is no screen left to keep live, so the caller ends the loop the way
-/// `run` does for a terminal it cannot use (the one case where this returns
+/// `Err` is the terminal refusing [`DRAW_FAILURES_BEFORE_EXIT`] frames in a row —
+/// counted in `redraws`, so refusals from an earlier turn or from idle count
+/// too: there is no screen left to keep live, so the caller ends the loop the
+/// way `run` does for a terminal it cannot use (the one case where this returns
 /// without the turn future finishing).
 #[allow(clippy::too_many_arguments)]
 async fn pump<B, K, F>(
@@ -1569,16 +1589,14 @@ where
     workers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = Heartbeat::new();
     let mut keys_done = false;
-    let mut failed_draws = 0u8;
     loop {
         match frame_if_due(redraws, terminal, driver, sink.now_ms(), color_mode) {
-            Ok(period) => {
-                failed_draws = 0;
-                heartbeat.set(period);
-            }
+            Ok(period) => heartbeat.set(period),
+            // A refusal is counted across the whole loop, not per pump: a turn
+            // that resolves after its first refused frame leaves the count to
+            // the next pump (or to idle), so a persistent failure still ends it.
             Err(error) => {
-                failed_draws += 1;
-                if failed_draws >= DRAW_FAILURES_BEFORE_EXIT {
+                if redraws.refused() {
                     return Err(error);
                 }
             }

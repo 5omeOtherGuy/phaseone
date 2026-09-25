@@ -8,10 +8,19 @@ fn key(code: KeyCode) -> KeyEvent {
 }
 
 /// A minimal real agent, for its inbox handle and (in the loop tests) for the
-/// `&mut Agent` the run loop drives. Its provider never answers.
+/// `&mut Agent` the run loop drives. Its provider never answers, so a turn is
+/// never run through it: a test that runs one to its end builds its own agent
+/// with [`agent_with`] (and scripts a provider that does answer).
 fn test_agent() -> Agent {
+    agent_with(Arc::new(p1_testkit::ScriptedProvider::new(vec![])))
+}
+
+/// An agent over `provider`: no tools, no authorization prompt, in-memory
+/// journal. Its inbox handle is what the driver uses. The handle stays with the
+/// caller, so a test can see how many turns the fake was asked for.
+fn agent_with(provider: Arc<p1_testkit::ScriptedProvider>) -> Agent {
     Agent::new(p1_core::AgentParts {
-        provider: Arc::new(p1_testkit::ScriptedProvider::new(vec![])),
+        provider,
         tools: vec![],
         system_prompt: String::new(),
         options: p1_contracts::ModelOptions::default(),
@@ -27,6 +36,13 @@ fn test_agent() -> Agent {
         events: Arc::new(p1_tui::runtime::TuiSink::new().0),
     })
     .expect("agent builds")
+}
+
+/// One scripted turn that RESOLVES on its first poll: a stream that ends with no
+/// events is a transport failure (SPEC §3d), which ends the turn immediately —
+/// the provider is asked nothing further, so a later turn needs another step.
+fn resolving_turn() -> p1_testkit::Step {
+    p1_testkit::Step::Events(vec![])
 }
 
 /// A driver with an `--ask`-off policy and no wiring behind it.
@@ -887,8 +903,13 @@ impl IdleLoop<ratatui::backend::TestBackend> {
 
 impl<B: Backend> IdleLoop<B> {
     fn with_backend(backend: B, ask: bool) -> Self {
+        Self::with_agent(backend, ask, test_agent())
+    }
+
+    /// A loop over a test's own agent. `test_agent`'s provider never answers, so
+    /// only a test that runs a turn to its end needs this.
+    fn with_agent(backend: B, ask: bool, agent: Agent) -> Self {
         let (mut driver, auth) = driver_with(ask);
-        let agent = test_agent();
         driver.inbox = agent.inbox();
         // The sink is the loop's clock — the production wiring — while the
         // events the tests inject go over their own channel, so a test stamps
@@ -1505,6 +1526,51 @@ async fn a_persistent_draw_error_ends_the_loop_like_a_missing_terminal() {
         draws.count(),
         DRAW_FAILURES_BEFORE_EXIT as usize,
         "one refused frame per attempt, then the loop gives up"
+    );
+}
+
+/// Issue #141 review round 2: the retry budget spans turns. A backend that
+/// refuses every frame cannot outlast the loop by finishing turns — the count
+/// lives in `Redraws` — so a turn that resolves right after the pump's first
+/// refused frame hands that refusal to the next pump, and a follow-up queued
+/// behind it adds the third attempt that ends the loop.
+#[tokio::test(start_paused = true)]
+async fn a_persistent_draw_error_ends_the_loop_across_turn_boundaries() {
+    // Two turns: the prompt, then the follow-up. Each resolves on its first poll
+    // (an empty stream is a transport failure), so the pump returns after one
+    // refused frame and the loop moves on.
+    let provider = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        resolving_turn(),
+        resolving_turn(),
+    ]));
+    let agent = agent_with(provider.clone());
+    let mut harness = IdleLoop::with_agent(FailingBackend::refusing(usize::MAX), false, agent);
+    // The prompt the operator sent, and a follow-up queued behind it: the loop
+    // takes the follow-up at the turn boundary, so the second pump starts
+    // without an idle frame in between.
+    harness.driver.screen.composer.insert('g');
+    harness.driver.follow_ups.push_back("next".into());
+    harness
+        .wires
+        .keys
+        .clone()
+        .send(Input::Key(key(KeyCode::Enter)))
+        .expect("the loop reads keys");
+    let draws = harness.wires.draws.clone();
+
+    let code = harness.run_to_end().await;
+
+    assert_eq!(code, 1, "the loop reports the terminal it cannot use");
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "both turns ran: the prompt's, then the queued follow-up's"
+    );
+    assert_eq!(
+        draws.count(),
+        DRAW_FAILURES_BEFORE_EXIT as usize,
+        "the idle frame and the two pumps' first frames share one budget: a turn \
+         that ended between them cannot reset it"
     );
 }
 
