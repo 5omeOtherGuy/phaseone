@@ -10,7 +10,8 @@ from that fixture and record their argv and URLs; a stub `cargo` fakes a local r
 build. Every home, config dir and prefix is a temp dir, so the machine's real
 `~/.config/p1` is never touched.
 
-`P1_LOCAL_BUILD_ROOT` stands in for `/mnt/build`, the probe `--local` refuses without.
+`CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `findmnt`, and `df` make the `--local` target,
+build limits, filesystem, and free-space checks hermetic without touching a real home.
 """
 from __future__ import annotations
 
@@ -41,7 +42,8 @@ SYSTEM_PATH = "/usr/bin:/bin"
 # install.sh's external commands, symlinked into a farm of its own: a PATH built from
 # the farm carries no `gh`, which is how the curl fallback is reached deterministically.
 FARM_TOOLS = ("mktemp", "sha256sum", "cut", "awk", "tar", "gzip", "cp", "mv", "mkdir",
-              "rm", "chmod", "basename", "dirname", "env", "cat", "python3")
+              "rm", "chmod", "basename", "dirname", "env", "cat", "python3",
+              "findmnt", "df", "realpath")
 
 VERSION_LINE = "p1 0.0.1 (deadbeef0000 2026-09-24)"
 
@@ -108,6 +110,7 @@ esac
 CARGO_STUB = """#!/bin/sh
 printf 'target=%s\\n' "$CARGO_TARGET_DIR" >> "$P1_CARGO_LOG"
 printf 'jobs=%s\\n' "${CARGO_BUILD_JOBS:-unset}" >> "$P1_CARGO_LOG"
+printf 'wrapper=%s\\n' "${RUSTC_WRAPPER:-unset}" >> "$P1_CARGO_LOG"
 printf 'argv=%s\\n' "$*" >> "$P1_CARGO_LOG"
 mkdir -p "$CARGO_TARGET_DIR/release"
 cp "$P1_FIXTURE_RELEASE/p1-linux-x86_64" "$CARGO_TARGET_DIR/release/p1"
@@ -137,6 +140,16 @@ class InstallTest(unittest.TestCase):
         self.stub("curl", CURL_STUB)
         # The same curl stub in a directory of its own: `gh` is genuinely absent there.
         self.stub("curl", CURL_STUB, directory=self.curl_dir)
+
+    def stub_local_fs(self, filesystem: str = "ext4", free: int = 12884901888) -> None:
+        self.stub("findmnt", f"#!/bin/sh\nprintf '%s\\n' {filesystem!r}\n", directory=self.stub_dir)
+        self.stub("df", f"#!/bin/sh\nprintf '%s\\n' 'Filesystem 1-blocks Used Available Capacity Mounted on' 'stub 20000000000 0 {free} 0% /stub'\n", directory=self.stub_dir)
+
+    def assert_local_refused(self, done: subprocess.CompletedProcess, message: str) -> None:
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn(message, done.stderr)
+        self.assertEqual(self.log(self.cargo_log), "")
+        self.assert_nothing_installed(self.prefix)
 
     # --- fixture and helpers ----------------------------------------------
 
@@ -873,43 +886,118 @@ exec '{real_mv}' \"$@\"
 
     # --- --local -----------------------------------------------------------
 
-    def test_local_refuses_without_a_target_dir(self) -> None:
+    def test_local_uses_the_default_ssd_target_and_fixed_build_limits(self) -> None:
         self.stub("cargo", CARGO_STUB)
-        missing = os.path.join(self.dir, "no-mnt-build")
-        done = self.run_install("--local", "--prefix", self.prefix, P1_LOCAL_BUILD_ROOT=missing)
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn("CARGO_TARGET_DIR", done.stderr)
-        self.assertIn("--local needs a build directory", done.stderr)
-        self.assertEqual(self.log(self.cargo_log), "")
-        self.assert_nothing_installed(self.prefix)
-
-    def test_local_uses_cargo_target_dir_and_two_jobs(self) -> None:
-        self.stub("cargo", CARGO_STUB)
-        target = self.mkdir("target")
-        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target)
+        self.stub_local_fs()
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_BUILD_JOBS="1")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assert_installed(self.prefix)
+        target = os.path.join(self.home, ".cache", "cargo-target", "p1-release")
         cargo = self.log(self.cargo_log)
         self.assertIn(f"target={target}\n", cargo)
         self.assertIn("jobs=2\n", cargo)
+        self.assertIn(f"wrapper={os.path.join(SCRIPTS, 'rustc-serial')}\n", cargo)
         self.assertIn("argv=build --release --locked -p p1-host", cargo)
         # Share data come from this checkout.
         self.assertTrue(os.path.isdir(os.path.join(self.prefix, "share", "p1", "environments",
                                                    "claude")))
 
-    def test_local_uses_the_build_root_probe_when_it_exists(self) -> None:
+    def test_local_uses_cargo_target_dir_override(self) -> None:
         self.stub("cargo", CARGO_STUB)
-        root = self.mkdir("mnt-build")
-        done = self.run_install("--local", "--prefix", self.prefix, P1_LOCAL_BUILD_ROOT=root)
+        self.stub_local_fs()
+        target = self.mkdir(os.path.join("home", ".cache", "cargo-target", "task-local"))
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assert_installed(self.prefix)
-        self.assertIn(f"target={root}/cargo-target/p1-release\n", self.log(self.cargo_log))
+        self.assertIn(f"target={target}\n", self.log(self.cargo_log))
+
+    def test_local_refuses_a_relative_cargo_target_dir(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs()
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR="task-local")
+        self.assert_local_refused(done, "CARGO_TARGET_DIR must be an absolute path: task-local")
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(SCRIPTS), "task-local")))
+
+    def test_local_refuses_a_target_outside_the_cache_root(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs()
+        target = self.mkdir("outside-target")
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target)
+        self.assert_local_refused(done, "must resolve below")
+
+    def test_local_refuses_more_than_two_build_jobs(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs()
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_BUILD_JOBS="3")
+        self.assert_local_refused(done, "CARGO_BUILD_JOBS must not exceed 2: 3")
+
+    def test_local_refuses_a_target_below_the_free_space_threshold(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs(free=12884901887)
+        target = self.mkdir(os.path.join("home", ".cache", "cargo-target", "task-local"))
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target)
+        self.assert_local_refused(done, "below the 12884901888-byte admission threshold")
+
+    def test_local_admits_exactly_the_free_space_threshold(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs(free=12884901888)
+        done = self.run_install("--local", "--prefix", self.prefix)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assert_installed(self.prefix)
+
+    def test_local_refuses_a_tmpfs_target(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs(filesystem="tmpfs")
+        done = self.run_install("--local", "--prefix", self.prefix)
+        self.assert_local_refused(done, "not on an ext4 filesystem")
+        self.assertIn("found tmpfs", done.stderr)
+
+    def test_local_refuses_an_ext3_target(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs(filesystem="ext3")
+        done = self.run_install("--local", "--prefix", self.prefix)
+        self.assert_local_refused(done, "not on an ext4 filesystem")
+        self.assertIn("found ext3", done.stderr)
+
+    def test_local_refuses_a_failing_findmnt(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub("findmnt", "#!/bin/sh\nexit 7\n", directory=self.stub_dir)
+        done = self.run_install("--local", "--prefix", self.prefix)
+        self.assert_local_refused(done, "cannot inspect target filesystem")
+
+    def test_local_refuses_malformed_findmnt_output(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub("findmnt", "#!/bin/sh\nexit 0\n", directory=self.stub_dir)
+        done = self.run_install("--local", "--prefix", self.prefix)
+        self.assert_local_refused(done, "not on an ext4 filesystem")
+        self.assertIn("found unparseable", done.stderr)
+
+    def test_local_refuses_a_failing_df(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub("findmnt", "#!/bin/sh\nprintf '%s\\n' ext4\n", directory=self.stub_dir)
+        self.stub("df", "#!/bin/sh\nexit 7\n", directory=self.stub_dir)
+        done = self.run_install("--local", "--prefix", self.prefix)
+        self.assert_local_refused(done, "cannot inspect target free space")
+
+    def test_local_refuses_malformed_df_output(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub("findmnt", "#!/bin/sh\nprintf '%s\\n' ext4\n", directory=self.stub_dir)
+        self.stub("df", "#!/bin/sh\nprintf '%s\\n' nonsense\n", directory=self.stub_dir)
+        done = self.run_install("--local", "--prefix", self.prefix)
+        self.assert_local_refused(done, "cannot read target free space")
+
+    def test_local_refuses_a_failing_awk(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs()
+        self.stub("awk", "#!/bin/sh\nexit 9\n", directory=self.stub_dir)
+        done = self.run_install("--local", "--prefix", self.prefix)
+        self.assert_local_refused(done, "cannot parse target free space")
 
     def test_local_reports_a_missing_build_artifact(self) -> None:
         stub = self.stub("cargo", "#!/bin/sh\nexit 0\n")
+        self.stub_local_fs()
         self.assertTrue(os.path.isfile(stub))
-        target = self.mkdir("empty-target")
-        done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target)
+        done = self.run_install("--local", "--prefix", self.prefix)
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("cargo did not produce", done.stderr)
         self.assert_nothing_installed(self.prefix)

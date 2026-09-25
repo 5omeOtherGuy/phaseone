@@ -23,16 +23,22 @@ name   = "bash"
 [[tools]]
 module = "finish"
 
-# The model metadata states a 1,048,576-token context and a 524,288-token output limit. The
-# second value is what leaves room for the next response, so it is the headroom; summarizing
-# then starts below the remaining input wall (524,288). Keep a long recent tail for multi-file
-# work. Operational values for this route, not a capacity claim. These values describe the DEFAULT
-# profile (space-bunny-free); p1 does not lower the window per selected profile, so selecting
-# mimo-v2.6-flash-free (200k context) here keeps this 1M window.
+# The gateway's model metadata (models.dev/api.json, provider `opencode`, model
+# `space-bunny-free`, fetched 2026-09-24) states a 1,048,576-token context with a 524,288 input and
+# a 524,288 output limit. The output limit is what leaves room for the next response, so it is the
+# headroom; the input limit is then the wall our requests must stay under (524,288), and
+# summarizing starts at 500,000 = min(500k, 60% of the window) rounded to 10k, i.e. below it. The
+# Zen docs state no limit and `/zen/v1/models` lists only ids, so this is gateway metadata rather
+# than a vendor claim (docs/design/context-windows.md). Keep a long recent tail for multi-file
+# work. This table describes the DEFAULT profile (space-bunny-free). A profile that states less is
+# honoured: the host narrows the effective window to the selected profile's `context_tokens` and
+# the reserve to its `max_output_tokens`, so selecting mimo-v2.6-flash-free (200,000 context,
+# 32,000 output) compacts at 200,000/120,000 instead of sending requests this binding cannot serve
+# (crates/p1-host/src/run.rs `config_for_route`).
 [context]
 window_tokens = 1048576
 output_headroom_tokens = 524288
-summarize_at_tokens = 450000
+summarize_at_tokens = 500000
 keep_recent_tokens = 60000
 user_verbatim_tokens = 8000
 summary_output_tokens = 12000

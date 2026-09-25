@@ -24,12 +24,13 @@ use p1_assembly::ToolSpec;
 use p1_assembly::{Assembled, EnvironmentFile, Substitutions, assemble, load_environment};
 use p1_contracts::{
     AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, ContextError,
-    ContextInput, ContextPolicy, EventSink, JournalRecord, Prepared, ProviderErrorKind, Tool,
-    TurnEnd,
+    ContextInput, ContextPolicy, Effort, EventSink, JournalRecord, Prepared, ProviderErrorKind,
+    Tool, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, Reconfiguration, ResumeReport};
 #[cfg(feature = "delegation")]
 use p1_journal::MemoryJournal;
+use p1_model_profile::ModelProfile;
 use p1_redact::{MaskCounter, redacted};
 
 #[cfg(feature = "delegation")]
@@ -161,19 +162,18 @@ impl ContextPolicy for DefaultContext {
 /// The context policy for an assembled agent (context.md §3): a
 /// `SummarizingContext` when the environment opts in with `[context]`,
 /// passthrough otherwise. The host is the composition root: `p1-assembly` only
-/// carries the plain settings and the prompt override.
-fn agent_context(assembled: &Assembled) -> Result<Arc<dyn ContextPolicy>, String> {
+/// carries the plain settings and the prompt override. `profile` is the model
+/// profile the environment selected (the whole-provider form has none): its own
+/// capacity narrows the environment's table, and its effort floor is what the
+/// summarization request runs at (#125).
+fn agent_context(
+    assembled: &Assembled,
+    profile: Option<&ModelProfile>,
+) -> Result<Arc<dyn ContextPolicy>, String> {
     let Some(settings) = &assembled.resolved.context else {
         return Ok(Arc::new(DefaultContext));
     };
-    let config = p1_context::ContextConfig {
-        window_tokens: settings.window_tokens,
-        output_headroom_tokens: settings.output_headroom_tokens,
-        summarize_at_tokens: settings.summarize_at_tokens,
-        keep_recent_tokens: settings.keep_recent_tokens,
-        user_verbatim_tokens: settings.user_verbatim_tokens,
-        tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
-    };
+    let (config, summary_output_tokens) = effective_context(settings, profile)?;
     let prompt = assembled
         .resolved
         .summarize_prompt
@@ -185,8 +185,112 @@ fn agent_context(assembled: &Assembled) -> Result<Arc<dyn ContextPolicy>, String
         config,
         prompt,
     )?
-    .with_summary_output_tokens(settings.summary_output_tokens)?;
+    .with_summary_output_tokens(summary_output_tokens)?
+    .with_summary_effort(summary_effort(profile));
     Ok(Arc::new(policy))
+}
+
+/// The smallest summary-output cap worth sending: a cap below this cannot produce a summary
+/// that says anything, so a table that leaves no such cap is a configuration error rather
+/// than an agent that fails on its first long turn.
+const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 1_000;
+
+/// The effective table PLUS the summary-output cap that belongs to it (#125 review round 3):
+/// the cap is a budget of the SAME window as the table, so it is clamped against the effective
+/// wall and not the environment's — a profile that narrows the window must narrow the cap with
+/// it, or a valid narrow profile makes the agent unstartable. Half the wall is the ceiling: the
+/// summarization request carries the rendered transcript as well as its own answer, so a cap
+/// that claimed more than half of what can be sent would leave the transcript no room. A table
+/// that cannot host even [`MIN_SUMMARY_OUTPUT_TOKENS`] fails here, naming the profile and the
+/// window it serves, instead of failing later with a number no operator wrote.
+fn effective_context(
+    settings: &p1_assembly::ContextSettings,
+    profile: Option<&ModelProfile>,
+) -> Result<(p1_context::ContextConfig, u64), String> {
+    let config = config_for_route(settings, profile);
+    let wall = config.window_tokens - config.output_headroom_tokens;
+    let cap = settings.summary_output_tokens.min(wall / 2);
+    if cap < MIN_SUMMARY_OUTPUT_TOKENS {
+        let who = match profile {
+            Some(profile) => format!("profile `{}`", profile.id),
+            None => "this environment".to_string(),
+        };
+        return Err(format!(
+            "the declared summary-output cap ({}) does not fit the context table of {who}: its window \
+             is {} tokens with {} reserved, leaving {wall} to send, and a summary request needs at \
+             least {MIN_SUMMARY_OUTPUT_TOKENS} of them for its own answer",
+            settings.summary_output_tokens, config.window_tokens, config.output_headroom_tokens
+        ));
+    }
+    Ok((config, cap))
+}
+
+/// The `ContextConfig` one assembled agent actually gets, with the selected profile's own
+/// capacity folded in (#125 review): an environment states the window of its ROUTE, but a
+/// profile states what THIS model serves, and p1 lets a narrower profile be selected on the
+/// same environment. A profile that names a smaller window or a smaller output ceiling lowers
+/// both the effective window and the reserve, and the useful point is pulled into the result —
+/// so a task that selects MiMo (200k) on `zen` compacts at MiMo's size instead of failing a
+/// request against Space Bunny's 1M window.
+fn config_for_route(
+    settings: &p1_assembly::ContextSettings,
+    profile: Option<&ModelProfile>,
+) -> p1_context::ContextConfig {
+    let window = profile
+        .and_then(|profile| profile.context_tokens)
+        .map_or(settings.window_tokens, |model_window| {
+            settings.window_tokens.min(model_window)
+        });
+    // The reserve is the next response; a profile's output ceiling bounds it, and it stays
+    // strictly below the effective window, because a reserve as large as the window would leave
+    // no room at all for the request that carries the next response.
+    let headroom = profile
+        .and_then(|profile| profile.max_output_tokens)
+        .map_or(settings.output_headroom_tokens, |ceiling| {
+            settings.output_headroom_tokens.min(u64::from(ceiling))
+        })
+        .min(window.saturating_sub(1));
+    let wall = window.saturating_sub(headroom);
+    // The useful point: never later than the environment asked and always below the wall the
+    // request has to fit under. Only a profile that NARROWS the window also caps it at 60% of
+    // the narrower window; an environment's own threshold is a decision about its route (GPT's
+    // 220,000 of 272,000, docs/design/context-windows.md) and a profile that does not narrow
+    // the window leaves it alone.
+    let asked = if window < settings.window_tokens {
+        settings
+            .summarize_at_tokens
+            .min(window.saturating_mul(60) / 100)
+    } else {
+        settings.summarize_at_tokens
+    };
+    let useful = asked.min(wall.saturating_sub(1));
+    // The verbatim budgets are copied from the environment, but they are budgets of THIS window:
+    // a kept tail larger than what a request can carry would keep the whole history verbatim and
+    // leave the next request over the wall, so both are clamped below it (the verbatim budget is
+    // a share of the kept tail, so it can never exceed it).
+    let keep_recent = settings.keep_recent_tokens.min(wall.saturating_sub(1));
+    let user_verbatim = settings.user_verbatim_tokens.min(keep_recent);
+    p1_context::ContextConfig {
+        window_tokens: window,
+        output_headroom_tokens: headroom,
+        summarize_at_tokens: useful,
+        keep_recent_tokens: keep_recent,
+        user_verbatim_tokens: user_verbatim,
+        tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
+    }
+}
+
+/// The reasoning effort the summarization request runs at (#125): the LOWEST level the model
+/// profile supports, so the summary-output cap buys summary text and not the agent's own
+/// reasoning. Without a profile there is no list to read a floor from, and the agent's effort
+/// must still not leak into the summary: the whole-provider form summarizes at `Low`, the
+/// lowest level every route's effort scale starts at.
+fn summary_effort(profile: Option<&ModelProfile>) -> Option<Effort> {
+    Some(
+        profile
+            .and_then(|profile| profile.efforts.iter().copied().min())
+            .unwrap_or(Effort::Low),
+    )
 }
 
 /// A session store plus the records to resume from (when resuming).
@@ -595,7 +699,7 @@ pub async fn run_with_front_end(
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
     let completion = completion_hub.take();
-    let context = agent_context(&assembled)?;
+    let context = agent_context(&assembled, environment.profile.as_deref())?;
     let route = assembled.resolved.route.origin.route.clone();
     let model = assembled.resolved.route.origin.model.clone();
     // The session's model, for a later switch (ADR-0049 stage 3): the environment it
@@ -610,14 +714,19 @@ pub async fn run_with_front_end(
     // can describe a call from the tool that owns it instead of matching a name.
     front_end.parent_tools(&assembled.tools);
     // §10 `ctx`'s denominator: unknown (no `[context]` section) stays `None`,
-    // never a guessed window.
+    // never a guessed window. The numbers are the EFFECTIVE ones — the selected
+    // profile's own capacity folded in — so the display shows what the
+    // summarizer acts on, not a window this model cannot serve.
+    let context_numbers = assembled
+        .resolved
+        .context
+        .as_ref()
+        .map(|settings| config_for_route(settings, environment.profile.as_deref()));
     front_end.context_configured(
-        assembled.resolved.context.as_ref().map(|c| c.window_tokens),
-        assembled
-            .resolved
-            .context
+        context_numbers.as_ref().map(|config| config.window_tokens),
+        context_numbers
             .as_ref()
-            .map(|c| c.summarize_at_tokens),
+            .map(|config| config.summarize_at_tokens),
     );
 
     let (journal, records): OpenedSession = open_session(deps, options)?;
@@ -1648,7 +1757,7 @@ pub(crate) fn switch_model(
     // The label the renderer names after this switch, exactly as the start path
     // named it (`Origin.route`, `<adapter>/<account>`).
     let route = assembled.resolved.route.origin.route.clone();
-    let context = agent_context(&assembled)?;
+    let context = agent_context(&assembled, environment.profile.as_deref())?;
     let mut tools = assembled.tools;
     // The switched tool set's `finish` must reach the completion the run reads. The
     // session keeps ITS `finish` — the whole session's activity is in that tool's
@@ -2338,7 +2447,9 @@ async fn running_children(deps: &HostDeps) -> usize {
 /// The START path and a re-grant (`worker_continue` with `add_tools`, ADR-0050 item
 /// 6) both go through this, so both build the tool list identically — and a re-grant
 /// passes the child's original ordinal, so its provider-side prompt cache survives
-/// where the route takes a key.
+/// where the route takes a key. The child's profile comes back with the assembly: it
+/// is not otherwise reachable from an `Assembled`, and the child's summarizer needs
+/// its effort floor (#125).
 #[cfg(feature = "delegation")]
 #[allow(clippy::too_many_arguments)]
 fn assemble_child(
@@ -2351,7 +2462,7 @@ fn assemble_child(
     substitutions: &Substitutions,
     ordinal: u64,
     mask: &Arc<MaskCounter>,
-) -> Result<Assembled, String> {
+) -> Result<(Assembled, Option<Arc<ModelProfile>>), String> {
     let mut environment =
         load_environment(environment_name, environment_dirs).map_err(|error| error.to_string())?;
     environment.tools = child_tools(&environment, grant)?;
@@ -2361,14 +2472,16 @@ fn assemble_child(
         crate::models::apply(&mut environment, choice, environment_dirs)?;
     }
     crate::catalog::resolve_environment(&mut environment, environment_dirs)?;
-    assemble_with_cache_key(
+    let profile = environment.profile.clone();
+    let assembled = assemble_with_cache_key(
         catalog,
         &environment,
         workspace,
         substitutions,
         ordinal,
         mask,
-    )
+    )?;
+    Ok((assembled, profile))
 }
 
 /// The tool list of a child: the granted modules in the parent's order, each with the
@@ -2524,7 +2637,7 @@ impl ChildBuilder {
         // Issue #142: the child's own mask counter, shared by its assembled tools and
         // by its notice sink below (a child is its own agent).
         let mask = Arc::new(MaskCounter::new());
-        let mut assembled = assemble_child(
+        let (mut assembled, child_profile) = assemble_child(
             environment_dirs,
             &catalog,
             environment,
@@ -2554,7 +2667,7 @@ impl ChildBuilder {
         if let Some(completion) = &child_completion {
             apply_completion_policy(&mut assembled, completion, contract.clone(), &mask);
         }
-        let context = agent_context(&assembled)?;
+        let context = agent_context(&assembled, child_profile.as_deref())?;
         let route = assembled.resolved.route.origin.route.clone();
         let model = assembled.resolved.route.origin.model.clone();
         let description = format!("{route}/{model}");
@@ -2652,7 +2765,7 @@ impl ChildBuilder {
             // claim, and a freshly assembled one would see an empty session.
             let finish = finish_tool(&assembled);
             Arc::new(move |grant: &[String]| -> Result<Reconfiguration, String> {
-                let assembled = assemble_child(
+                let (assembled, child_profile) = assemble_child(
                     &environment_dirs,
                     &catalog,
                     &environment_name,
@@ -2667,7 +2780,7 @@ impl ChildBuilder {
                 // completion: take it, so the hub cannot hand a stale one to a later
                 // worker assembly.
                 let _issued = completion_hub.take();
-                let context = agent_context(&assembled)?;
+                let context = agent_context(&assembled, child_profile.as_deref())?;
                 let finish_at = finish_index(&assembled);
                 // A re-grant is a new tool set, so the policy is chosen again from it
                 // (ADR-0052 item 1): `add_tools: ["shell"]` puts the worker back on the
@@ -3007,5 +3120,450 @@ mod tests {
             generated_cache_key(Path::new("/tmp/ws"), "plain", PARENT_ORDINAL),
             generated_cache_key(Path::new("/tmp/ws"), "plain", first)
         );
+    }
+
+    // ---------------------------- #125 review: the effective context table
+
+    /// The shipped `environments/` directory, as the host searches it.
+    fn shipped_environments() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")
+    }
+
+    /// The `[context]` table the shipped environment declares.
+    fn shipped_settings(environment: &str) -> p1_assembly::ContextSettings {
+        load_environment(environment, &[shipped_environments()])
+            .expect("the shipped environment loads")
+            .context
+            .expect("the shipped environment opts in with [context]")
+    }
+
+    /// The shipped profile, parsed through the same entry point the loader uses.
+    fn shipped_profile(stem: &str) -> ModelProfile {
+        let path = shipped_environments()
+            .join("../profiles")
+            .join(format!("{stem}.toml"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} is unreadable: {error}", path.display()));
+        ModelProfile::from_toml(stem, &text).expect("the shipped profile parses")
+    }
+
+    /// The reserve the effective table leaves for the next response.
+    fn wall_of(config: &p1_context::ContextConfig) -> u64 {
+        config.window_tokens - config.output_headroom_tokens
+    }
+
+    /// A profile that is not a shipped file: the folding rule must hold for any capacity a
+    /// profile can state, including ones no shipped binding has.
+    fn synthetic_profile(
+        context_tokens: Option<u64>,
+        max_output_tokens: Option<u32>,
+    ) -> ModelProfile {
+        ModelProfile {
+            id: "synthetic".into(),
+            revision: 1,
+            model_id: "synthetic-model".into(),
+            family: "synthetic".into(),
+            thinking: p1_model_profile::ThinkingPolicy::Enabled,
+            efforts: vec![Effort::Low, Effort::High],
+            default_effort: Some(Effort::High),
+            thinking_budgets: Default::default(),
+            context_tokens,
+            max_output_tokens,
+        }
+    }
+
+    /// #125 review: a profile that states a SMALLER window than the environment narrows the
+    /// effective table, so selecting MiMo (200k) on `zen` compacts at MiMo's size instead of
+    /// sending requests the binding cannot serve.
+    #[test]
+    fn a_narrower_profile_narrows_the_effective_context_table() {
+        let settings = shipped_settings("zen");
+        let mimo = shipped_profile("mimo-v2.6-flash-free");
+        assert_eq!(
+            mimo.context_tokens,
+            Some(200_000),
+            "the shipped profile states the narrow window"
+        );
+        let config = config_for_route(&settings, Some(&mimo));
+        assert_eq!(config.window_tokens, 200_000, "the profile's window wins");
+        assert_eq!(
+            config.output_headroom_tokens, 32_000,
+            "the reserve is the profile's own output ceiling, below zen's 524,288"
+        );
+        assert!(
+            config.summarize_at_tokens <= 120_000,
+            "threshold {} must stay at or below 60% of the effective window",
+            config.summarize_at_tokens
+        );
+        assert!(
+            config.summarize_at_tokens < wall_of(&config),
+            "threshold {} must stay below the wall {}",
+            config.summarize_at_tokens,
+            wall_of(&config)
+        );
+        // The effective table must be one the policy accepts.
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+    }
+
+    /// A profile that states MORE than the environment cannot widen it: the environment's table
+    /// is what its route serves, and the profile is only allowed to narrow.
+    #[test]
+    fn a_profile_stating_more_capacity_than_the_environment_cannot_widen_the_table() {
+        let settings = shipped_settings("zen");
+        let roomy = synthetic_profile(Some(4_000_000), Some(900_000));
+        let config = config_for_route(&settings, Some(&roomy));
+        assert_eq!(
+            config.window_tokens, settings.window_tokens,
+            "the environment's window still caps the table"
+        );
+        assert_eq!(
+            config.output_headroom_tokens, settings.output_headroom_tokens,
+            "the environment's reserve still caps the reserve"
+        );
+        assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
+        assert_eq!(config.keep_recent_tokens, settings.keep_recent_tokens);
+        assert_eq!(
+            config,
+            config_for_route(&settings, None),
+            "a roomier profile changes nothing"
+        );
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+    }
+
+    /// A profile far narrower than the environment (40,000 tokens on `zen`) clamps the copied
+    /// budgets to the effective window: the kept tail and the verbatim share are budgets of THIS
+    /// window, and a tail larger than what a request can carry would keep the whole history
+    /// verbatim and send the next request over the wall.
+    #[test]
+    fn a_very_narrow_profile_clamps_the_copied_verbatim_budgets() {
+        let settings = shipped_settings("zen");
+        assert!(
+            settings.keep_recent_tokens > 40_000,
+            "the environment keeps a tail larger than the narrow profile's window"
+        );
+        let narrow = synthetic_profile(Some(40_000), Some(32_000));
+        let config = config_for_route(&settings, Some(&narrow));
+        assert_eq!(config.window_tokens, 40_000);
+        assert_eq!(config.output_headroom_tokens, 32_000);
+        assert!(
+            config.summarize_at_tokens < wall_of(&config),
+            "threshold {} must stay below the wall {}",
+            config.summarize_at_tokens,
+            wall_of(&config)
+        );
+        assert!(
+            config.keep_recent_tokens < wall_of(&config),
+            "the kept tail ({}) must stay below the wall ({})",
+            config.keep_recent_tokens,
+            wall_of(&config)
+        );
+        assert!(
+            config.user_verbatim_tokens <= config.keep_recent_tokens,
+            "the verbatim share ({}) must stay inside the kept tail ({})",
+            config.user_verbatim_tokens,
+            config.keep_recent_tokens
+        );
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+
+        // A profile whose own output ceiling exceeds its own window: the reserve is clamped
+        // below the window, so the table still describes a sendable request. What is left is too
+        // little to send a summary under, and that is a configuration error that NAMES the profile
+        // and the window it serves — not a bare number check the operator never wrote.
+        let odd = synthetic_profile(Some(20_000), Some(32_000));
+        let config = config_for_route(&settings, Some(&odd));
+        assert_eq!(config.window_tokens, 20_000);
+        assert!(
+            config.output_headroom_tokens < config.window_tokens,
+            "the reserve ({}) stays below the window ({})",
+            config.output_headroom_tokens,
+            config.window_tokens
+        );
+        assert!(config.keep_recent_tokens < wall_of(&config));
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+
+        let (assembled, _) = assembled_for_test(Some(settings.clone()), Effort::High);
+        let error = match agent_context(&assembled, Some(&odd)) {
+            Ok(_) => panic!("a table with no room for a summary must not build an agent"),
+            Err(error) => error,
+        };
+        assert!(error.contains("synthetic"), "{error}");
+        assert!(error.contains("20000"), "{error}");
+        assert!(
+            error.contains("summary-output cap"),
+            "the error names the budget that does not fit: {error}"
+        );
+    }
+
+    /// #125 review round 3: the summary-output cap is a budget of the SAME effective window, so a
+    /// profile that narrows the window narrows the cap with it. Under a 40,000-token profile on the
+    /// `zen` table (wall 8,000) the environment's 12,000 cap cannot be sent; the agent must still
+    /// start, with the cap clamped below the wall, and the request it sends must carry that cap.
+    #[tokio::test(start_paused = true)]
+    async fn a_narrow_profile_clamps_the_summary_output_cap_and_the_agent_still_starts() {
+        // The zen table's own window, reserve and summary cap, with a threshold a two-item
+        // history crosses.
+        let settings = p1_assembly::ContextSettings {
+            window_tokens: 1_048_576,
+            output_headroom_tokens: 524_288,
+            summarize_at_tokens: 100,
+            summary_output_tokens: 12_000,
+            ..summarizer_table()
+        };
+        let narrow = synthetic_profile(Some(40_000), Some(32_000));
+        let (assembled, provider) = assembled_for_test(Some(settings), Effort::High);
+        let policy = agent_context(&assembled, Some(&narrow))
+            .expect("a valid narrow profile must not make the agent unstartable");
+        let history = summarizer_history();
+        let cancel = CancellationToken::new();
+        let prepared = policy
+            .prepare(ContextInput {
+                history: &history,
+                last_usage: None,
+                cancel: &cancel,
+            })
+            .await
+            .expect("preparing a summary succeeds")
+            .expect("the history crosses the threshold");
+        assert_eq!(
+            provider.requests()[0].options.max_output_tokens,
+            Some(4_000),
+            "the cap is clamped to half of the effective wall (8,000), not sent at the \
+             environment's 12,000"
+        );
+        assert_eq!(prepared.usage, None);
+    }
+
+    /// The other two zen bindings: Space Bunny is the environment's own table, Muse's output
+    /// ceiling lowers only the reserve (its window is the environment's window).
+    #[test]
+    fn a_profile_bounds_the_reserve_and_keeps_the_window_it_does_not_narrow() {
+        let settings = shipped_settings("zen");
+
+        let space_bunny = shipped_profile("space-bunny-free");
+        let config = config_for_route(&settings, Some(&space_bunny));
+        assert_eq!(config.window_tokens, settings.window_tokens);
+        assert_eq!(
+            config.output_headroom_tokens,
+            settings.output_headroom_tokens
+        );
+        assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
+
+        let muse = shipped_profile("muse-spark-1.3-contributor-free");
+        let config = config_for_route(&settings, Some(&muse));
+        assert_eq!(
+            config.window_tokens, 1_048_576,
+            "the window is not narrowed"
+        );
+        assert_eq!(
+            config.output_headroom_tokens, 131_072,
+            "the profile's output ceiling bounds the reserve"
+        );
+        assert_eq!(config.summarize_at_tokens, 500_000);
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+    }
+
+    /// A profile that states no capacity at all (the one the `deepseek` environment binds) leaves
+    /// the environment's table exactly as it is — and so does the whole-provider form, which names
+    /// no profile.
+    #[test]
+    fn a_profile_that_states_nothing_leaves_the_environment_table_alone() {
+        let settings = shipped_settings("deepseek");
+        let config = config_for_route(&settings, None);
+        assert_eq!(config.window_tokens, settings.window_tokens);
+        assert_eq!(
+            config.output_headroom_tokens,
+            settings.output_headroom_tokens
+        );
+        assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
+        assert_eq!(config.keep_recent_tokens, settings.keep_recent_tokens);
+
+        // The environment's own binding, not a compiled model id: route data stays out of run.rs
+        // (`tests/route_files.rs`).
+        let deepseek = load_environment("deepseek", &[shipped_environments()])
+            .expect("the shipped environment loads")
+            .profile
+            .expect("the deepseek environment binds a profile");
+        let deepseek = deepseek.as_ref().clone();
+        assert_eq!(
+            deepseek.context_tokens, None,
+            "the profile states no window"
+        );
+        assert_eq!(deepseek.max_output_tokens, None, "and no output ceiling");
+        assert_eq!(config_for_route(&settings, Some(&deepseek)), config);
+        assert_eq!(config.window_tokens, 1_000_000);
+        assert_eq!(config.summarize_at_tokens, 300_000);
+    }
+
+    /// Review 146 r4: an environment's own threshold survives profile folding when the profile
+    /// does not narrow the window — the shipped `gpt` environment binds a profile and compacts at
+    /// its decided point, not at 60% of its window.
+    #[test]
+    fn a_profile_that_does_not_narrow_the_window_keeps_the_environment_threshold() {
+        let settings = shipped_settings("gpt");
+        let profile = load_environment("gpt", &[shipped_environments()])
+            .expect("the shipped environment loads")
+            .profile
+            .expect("the gpt environment binds a profile");
+        let config = config_for_route(&settings, Some(profile.as_ref()));
+        assert_eq!(config.window_tokens, settings.window_tokens);
+        assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
+        assert!(
+            config.summarize_at_tokens > settings.window_tokens * 60 / 100,
+            "the decided threshold is above 60% of the window, so the rule must not apply"
+        );
+        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+    }
+
+    // ---------------------------- #125 review: the summary's own effort
+
+    /// The floor the host passes: the profile's lowest level, and `Low` when there is no profile
+    /// to read one from (the whole-provider form).
+    #[test]
+    fn the_summary_effort_is_the_profiles_lowest_level_or_low_without_a_profile() {
+        assert_eq!(
+            summary_effort(Some(&shipped_profile("mimo-v2.6-flash-free"))),
+            Some(Effort::High),
+            "MiMo states exactly one level"
+        );
+        assert_eq!(
+            summary_effort(Some(&shipped_profile("space-bunny-free"))),
+            Some(Effort::Low),
+            "Space Bunny allows low"
+        );
+        assert_eq!(
+            summary_effort(None),
+            Some(Effort::Low),
+            "no profile must not mean the agent's own effort"
+        );
+    }
+
+    /// An assembled agent for the request-level tests: a scripted provider, one context table
+    /// and the agent's own effort. The settings are tiny so a two-item history crosses the
+    /// threshold (the same shape `crates/p1-context/tests/impl_internals.rs` uses).
+    fn assembled_for_test(
+        context: Option<p1_assembly::ContextSettings>,
+        effort: Effort,
+    ) -> (Assembled, Arc<p1_testkit::ScriptedProvider>) {
+        let provider = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+            p1_testkit::text_response("s"),
+        ]));
+        let options = p1_contracts::ModelOptions {
+            reasoning_effort: Some(effort),
+            ..p1_contracts::ModelOptions::default()
+        };
+        let assembled = Assembled {
+            resolved: p1_assembly::ResolvedEnvironment {
+                environment: "test".into(),
+                family: "test".into(),
+                route: p1_contracts::RouteDescription {
+                    origin: p1_contracts::Origin {
+                        route: "fake".into(),
+                        model: "fake-model".into(),
+                    },
+                    supports_freeform_tools: false,
+                    mandatory_prompt_prefix: None,
+                    reports_cost: false,
+                    cache_key: CacheKeySupport::Optional,
+                },
+                system_prompt: "sys".into(),
+                tools: Vec::new(),
+                options: options.clone(),
+                context,
+                summarize_prompt: None,
+            },
+            provider: provider.clone(),
+            tools: Vec::new(),
+            system_prompt: "sys".into(),
+            options,
+        };
+        (assembled, provider)
+    }
+
+    fn summarizer_history() -> Vec<p1_contracts::Item> {
+        vec![
+            p1_contracts::Item::Assistant(p1_contracts::AssistantItem {
+                origin: p1_testkit::origin(),
+                blocks: vec![p1_contracts::AssistantBlock::Text {
+                    text: "x".repeat(500),
+                }],
+            }),
+            p1_contracts::Item::Assistant(p1_contracts::AssistantItem {
+                origin: p1_testkit::origin(),
+                blocks: vec![p1_contracts::AssistantBlock::Text {
+                    text: "tail".into(),
+                }],
+            }),
+        ]
+    }
+
+    fn summarizer_table() -> p1_assembly::ContextSettings {
+        p1_assembly::ContextSettings {
+            window_tokens: 10_000,
+            output_headroom_tokens: 1_000,
+            summarize_at_tokens: 100,
+            keep_recent_tokens: 80,
+            user_verbatim_tokens: 100,
+            tool_result_excerpt_chars: 2_000,
+            summary_output_tokens: 4_000,
+        }
+    }
+
+    /// #125 review: the request the host's policy actually sends carries the lowered effort,
+    /// whatever the assembled agent's own options name.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_summarizes_at_the_profiles_lowest_effort_whatever_the_agent_runs_at() {
+        for agent_effort in [Effort::High, Effort::ExtraHigh, Effort::Max] {
+            let (assembled, provider) = assembled_for_test(Some(summarizer_table()), agent_effort);
+            let policy = agent_context(&assembled, Some(&shipped_profile("space-bunny-free")))
+                .expect("the environment builds a summarizer");
+            let history = summarizer_history();
+            let cancel = CancellationToken::new();
+            let prepared = policy
+                .prepare(ContextInput {
+                    history: &history,
+                    last_usage: None,
+                    cancel: &cancel,
+                })
+                .await
+                .expect("preparing a summary succeeds");
+            assert!(prepared.is_some(), "the history crosses the threshold");
+            assert_eq!(
+                provider.requests()[0].options.reasoning_effort,
+                Some(Effort::Low),
+                "an agent at {agent_effort:?} still summarizes at the profile's lowest level"
+            );
+        }
+    }
+
+    /// #125 review: with NO profile there is nothing to read a floor from, so the summary runs
+    /// at `Low` — never at the agent's own level.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_summarizes_at_low_when_the_environment_names_no_profile() {
+        for agent_effort in [Effort::High, Effort::Max] {
+            let (assembled, provider) = assembled_for_test(Some(summarizer_table()), agent_effort);
+            let policy =
+                agent_context(&assembled, None).expect("the environment builds a summarizer");
+            let history = summarizer_history();
+            let cancel = CancellationToken::new();
+            let prepared = policy
+                .prepare(ContextInput {
+                    history: &history,
+                    last_usage: None,
+                    cancel: &cancel,
+                })
+                .await
+                .expect("preparing a summary succeeds");
+            assert!(prepared.is_some(), "the history crosses the threshold");
+            assert_eq!(
+                provider.requests()[0].options.reasoning_effort,
+                Some(Effort::Low),
+                "an agent at {agent_effort:?} with no profile"
+            );
+            assert_ne!(
+                provider.requests()[0].options.reasoning_effort,
+                Some(agent_effort),
+                "the agent's own effort must not leak into the summary"
+            );
+        }
     }
 }
