@@ -12,7 +12,10 @@ workspace = true
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 p1-module-protocol = { path = "../p1-module-protocol" }
+p1-redact = { path = "../p1-redact" }
 thiserror = "2"
+# The executor task, its request channel and the per-call tasks it owns.
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
 # The bounded set of ORCHESTRATION-PLAN §2 (owner, Q7). No `cache`: the loader compiles the
 # verified bytes itself, so a compiled-code cache would be a second, unverified source of
 # code. No `wat` or WASI: modules arrive as binary components and get only p1's own imports.

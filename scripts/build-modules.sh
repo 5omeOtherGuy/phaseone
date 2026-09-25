@@ -283,6 +283,13 @@ build_package() {
   wasm-tools component wit "$wasm" >"$out/$pkg.wit"
   (cd "$out" && sha256sum "$pkg.wasm") >"$out/$pkg.sha256"
   imported_interfaces "$out/$pkg.wit" >"$out/$pkg.imports"
+  # A guest has no WASI surface (D-XO-4): a wasi: import means std I/O or a WASI adapter got in.
+  local wasi
+  wasi="$(grep '^wasi:' "$out/$pkg.imports" | paste -sd' ' - || true)"
+  if [ -n "$wasi" ]; then
+    rm -rf "$out"
+    fail "$pkg imports wasi: $wasi (no WASI surface, D-XO-4)"
+  fi
   local digest size
   digest="$(awk '{print $1}' "$out/$pkg.sha256")"
   size="$(wc -c <"$wasm" | tr -d ' ')"

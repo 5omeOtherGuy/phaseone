@@ -99,7 +99,7 @@ unwinding guest.
 
 ## The guest target (S0-Q9)
 
-What a guest may import from WASI is the guest-target question S0-Q9, decided on the component's
-actual imports: the build writes every imported interface of the built component to
-`<package>.imports`, which on the `wasm32-wasip2` target includes the `wasi:` interfaces Rust std
-links.
+The guest target is `wasm32-unknown-unknown`, componentized with `wasm-tools component new` and no
+WASI adapter (decision D-XO-4 on S0-Q9): a guest has no std I/O by design, so a built component
+imports only `p1:module` interfaces. The build refuses a package whose `<package>.imports` lists
+any `wasi:` interface, and the loader refuses such a component too, no exceptions.
