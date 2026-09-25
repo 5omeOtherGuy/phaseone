@@ -1,0 +1,12 @@
+# GLM-5.3 Flash on ClinePass (p1 lead 2026-09-25; owner decision 2026-09-24 21:55: DeepSeek V4.1 Flash
+# and/or GLM-5.3 Flash only on ClinePass). The stream repeats its finish choice in the usage chunk,
+# accepted since #126. Only `high` is offered: the model card records that other effort values
+# silently become max. thinking = "enabled" matches the route's reasoning-alias dialect.
+id        = "glm-5.3-flash-clinepass"
+revision  = 1
+model_id  = "glm-5.3-flash"
+family    = "glm"
+thinking  = "enabled"
+
+efforts        = ["high"]
+default_effort = "high"
