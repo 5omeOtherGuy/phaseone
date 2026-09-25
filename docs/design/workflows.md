@@ -94,7 +94,7 @@ the issue's steps returned — must be SPLIT into several `parallel()` calls; `m
 **The bounded thread rule.** rhai has no async VM: each run's script executes on its own
 OS thread (`p1-wf-script`), and `agent()` blocks that thread on the caller's tokio handle
 (the crate owns no runtime). Concurrency is one OS thread per in-flight thunk
-(`p1-wf-thunk`) from a pool of `max_threads` slots (default 64). A thunk that finds no
+(`p1-wf-thunk`) from a pool of `max_threads` slots (default 64, clamped to at most 64 so the §2 memory ceiling holds). A thunk that finds no
 slot free runs INLINE on its caller's thread — nothing ever waits for a slot, so nested
 `parallel` inside a `pipeline` stage cannot deadlock at any bound, including 1. Results
 keep input order; every thread is joined before the first error (in input order) is

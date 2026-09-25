@@ -835,9 +835,9 @@ const ENVELOPE_MAP_ENTRIES: usize = 4096;
 ///
 /// A budget that grew with the whole step cap (`max_steps` defaults to 200, a settings
 /// table may set thousands) is not a machine-safe ceiling: rhai gives every value its own
-/// three sums, so one run can hold this much per VALUE, and `max_threads` (64) thunks may
-/// be in flight at once. The ceiling is therefore this cap times that concurrency, not the
-/// step count.
+/// three sums, so one run can hold this much per VALUE, and at most [`MAX_RUN_THREADS`]
+/// thunks may be in flight at once (`max_threads` is clamped to it). The ceiling is therefore
+/// this cap times that concurrency, not the step count.
 ///
 /// The arithmetic, worst case: 64 thunks × 4 MiB of strings = 256 MiB; a thunk that also
 /// fills an array and a map holds 64 × 262,144 entries — about 6 MiB of array items and
@@ -852,6 +852,11 @@ const ENVELOPE_MAP_ENTRIES: usize = 4096;
 /// envelopes, or about 136 at the 30 KB the issue's steps returned — must be split into
 /// several `parallel()` calls, which `max_steps` 200 still allows.
 const DATA_BUDGET_ENVELOPES: u32 = 64;
+
+/// The most thunk threads one run may use, whatever `max_threads` says: the data budget above
+/// is per value, so the run's aggregate ceiling holds only while concurrency is bounded too
+/// (review of PR #174). A thunk that finds no free thread runs inline on its caller's thread.
+pub(crate) const MAX_RUN_THREADS: usize = 64;
 
 /// The data-size limits for a run that may make `max_steps` `agent()` calls: the smaller of
 /// that cap and [`DATA_BUDGET_ENVELOPES`] envelopes' worth, in each of rhai's three sums.

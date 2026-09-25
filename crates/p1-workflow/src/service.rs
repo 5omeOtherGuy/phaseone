@@ -230,7 +230,7 @@ impl InProcessWorkflows {
             handle,
             journal,
             replay: Mutex::new(replay),
-            free_threads: AtomicUsize::new(self.settings.max_threads),
+            free_threads: AtomicUsize::new(run_threads(self.settings.max_threads)),
             calls: AtomicU32::new(0),
             record: Mutex::default(),
             ended,
@@ -377,5 +377,27 @@ impl WorkflowService for InProcessWorkflows {
                 .map(|state| (state.id.clone(), status_of(state)))
                 .collect()
         })
+    }
+}
+
+/// The thunk threads a run gets: the configured `max_threads`, never more than
+/// [`engine::MAX_RUN_THREADS`] — the data budget is per value, so the run's memory ceiling
+/// holds only while concurrency is bounded too.
+fn run_threads(configured: usize) -> usize {
+    configured.min(engine::MAX_RUN_THREADS)
+}
+
+#[cfg(test)]
+mod run_threads_tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_thread_count_above_the_ceiling_is_clamped() {
+        assert_eq!(run_threads(8), 8);
+        assert_eq!(
+            run_threads(engine::MAX_RUN_THREADS),
+            engine::MAX_RUN_THREADS
+        );
+        assert_eq!(run_threads(10_000), engine::MAX_RUN_THREADS);
     }
 }
