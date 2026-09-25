@@ -10,6 +10,7 @@ use ratatui::text::Line;
 use crate::band::{Band, Seg};
 use crate::glyphs;
 use crate::palette;
+use crate::text::{sanitize_segments, sanitize_text};
 use crate::transcript::{
     Block, CommandOutput, CommandRow, NoticeFact, NoticeKind, RowStatus, Transcript, TurnNotice,
     TurnPhase, TurnWorking, WorkerEnd, WorkerReport,
@@ -137,12 +138,12 @@ fn fact_measure(width: usize) -> usize {
 fn block_rows(transcript: &Transcript, block: &Block, width: usize) -> usize {
     match block {
         Block::Operator { text, steering } => {
-            wrap_paragraphs_len(text, operator_measure(width, *steering))
+            wrap_paragraphs_len(&sanitize_text(text), operator_measure(width, *steering))
         }
         Block::Prose { lines } => lines
             .iter()
             .map(|line| {
-                let plain: String = prose_runs(transcript, line)
+                let plain: String = sanitized_prose_runs(transcript, line)
                     .into_iter()
                     .map(|(text, _)| text)
                     .collect();
@@ -155,7 +156,7 @@ fn block_rows(transcript: &Transcript, block: &Block, width: usize) -> usize {
             let body = if *expanded {
                 lines
                     .iter()
-                    .map(|line| wrap_len(line, measure(width).saturating_sub(HANG)))
+                    .map(|line| wrap_len(&sanitize_text(line), measure(width).saturating_sub(HANG)))
                     .sum()
             } else {
                 0
@@ -164,17 +165,22 @@ fn block_rows(transcript: &Transcript, block: &Block, width: usize) -> usize {
         }
         Block::Call(row) => super::block::lines(row, width, false, 0, true).len(),
         Block::Info { lines } => lines.len(),
-        Block::Meta { text } => wrap_paragraphs_len(meta_glyph(text).1, meta_measure(width, "")),
-        Block::MetaFacts { text, facts } => {
-            wrap_paragraphs_len(meta_glyph(text).1, meta_measure(width, facts))
+        Block::Meta { text } => {
+            wrap_paragraphs_len(&sanitize_text(meta_glyph(text).1), meta_measure(width, ""))
         }
+        Block::MetaFacts { text, facts } => wrap_paragraphs_len(
+            &sanitize_text(meta_glyph(text).1),
+            meta_measure(width, facts),
+        ),
         Block::Notice(notice) => {
-            wrap_paragraphs_len(&notice.headline, measure(width).saturating_sub(HANG))
-                + notice
-                    .facts
-                    .iter()
-                    .map(|(_, value)| wrap_paragraphs_len(value, fact_measure(width)))
-                    .sum::<usize>()
+            wrap_paragraphs_len(
+                &sanitize_text(&notice.headline),
+                measure(width).saturating_sub(HANG),
+            ) + notice
+                .facts
+                .iter()
+                .map(|(_, value)| wrap_paragraphs_len(&sanitize_text(value), fact_measure(width)))
+                .sum::<usize>()
         }
         Block::WorkerReport(_) => 3,
         Block::CommandOutput(output) => 1 + output.body.len(),
@@ -193,7 +199,7 @@ fn block_lines(
         Block::Operator { text, steering } => operator_lines(text, *steering, width, out),
         Block::Prose { lines } => {
             for line in lines {
-                for row in wrap_styled(&prose_runs(transcript, line), measure(width)) {
+                for row in wrap_styled(&sanitized_prose_runs(transcript, line), measure(width)) {
                     let left = row
                         .into_iter()
                         .map(|(text, fg)| Seg::new(fg, text))
@@ -230,7 +236,9 @@ fn block_lines(
             ));
             if *expanded {
                 for line in body {
-                    for part in crate::wrap::wrap(line, measure(width).saturating_sub(HANG)) {
+                    for part in
+                        crate::wrap::wrap(&sanitize_text(line), measure(width).saturating_sub(HANG))
+                    {
                         out.push(ground(
                             vec![Seg::new(palette::DIM, format!("{:HANG$}{part}", ""))],
                             Vec::new(),
@@ -293,7 +301,8 @@ fn band(bg: Color, left: Vec<Seg>, right: Vec<Seg>, width: usize) -> Line<'stati
 
 /// §6.2: `›` attn, the prompt in ink hanging 2; a steering message carries a faint tag.
 fn operator_lines(text: &str, steering: bool, width: usize, out: &mut Vec<Line<'static>>) {
-    for (n, part) in wrap_paragraphs(text, operator_measure(width, steering))
+    let clean = sanitize_text(text);
+    for (n, part) in wrap_paragraphs(&clean, operator_measure(width, steering))
         .into_iter()
         .enumerate()
     {
@@ -353,6 +362,23 @@ fn prose_runs(transcript: &Transcript, line: &str) -> Vec<(String, Color)> {
     runs
 }
 
+/// Sanitize prose runs as one stream so controls split across run boundaries
+/// cannot become visible wrapping cells.
+///
+/// The render-time ordering follows `iris-donor/src/ui/textengine.rs`'s
+/// `clean_text`/`transform` before `wrap_to_width`, pinned at
+/// `5b04a1ad3412ad0bb663b6355f77a024aec0ddfa`, MIT License.
+fn sanitized_prose_runs(transcript: &Transcript, line: &str) -> Vec<(String, Color)> {
+    let segments: Vec<Seg> = prose_runs(transcript, line)
+        .into_iter()
+        .map(|(text, fg)| Seg::new(fg, text))
+        .collect();
+    sanitize_segments(&segments)
+        .into_iter()
+        .map(|segment| (segment.text, segment.fg))
+        .collect()
+}
+
 /// Split a meta row's leading glyph off its text: `·` is faint, `↳` dim (§3.3).
 fn meta_glyph(text: &str) -> (Option<Seg>, &str) {
     for (glyph, fg) in [
@@ -369,7 +395,8 @@ fn meta_glyph(text: &str) -> (Option<Seg>, &str) {
 /// §6.6: glyph, dim text hanging 2, optional dim facts on the right of the first row.
 fn meta_lines(text: &str, facts: &str, width: usize, out: &mut Vec<Line<'static>>) {
     let (glyph, body) = meta_glyph(text);
-    for (n, part) in wrap_paragraphs(body, meta_measure(width, facts))
+    let clean = sanitize_text(body);
+    for (n, part) in wrap_paragraphs(&clean, meta_measure(width, facts))
         .into_iter()
         .enumerate()
     {
@@ -401,7 +428,8 @@ fn notice_lines(notice: &TurnNotice, width: usize, out: &mut Vec<Line<'static>>)
         NoticeKind::Failed => (glyphs::FAILED, palette::FAIL),
         NoticeKind::Stopped => (glyphs::PENDING, palette::FAINT),
     };
-    for (n, part) in wrap_paragraphs(&notice.headline, measure(width).saturating_sub(HANG))
+    let headline = sanitize_text(&notice.headline);
+    for (n, part) in wrap_paragraphs(&headline, measure(width).saturating_sub(HANG))
         .into_iter()
         .enumerate()
     {
@@ -420,7 +448,8 @@ fn notice_lines(notice: &TurnNotice, width: usize, out: &mut Vec<Line<'static>>)
         } else {
             palette::INK
         };
-        for (n, part) in wrap_paragraphs(value, fact_measure(width))
+        let clean = sanitize_text(value);
+        for (n, part) in wrap_paragraphs(&clean, fact_measure(width))
             .into_iter()
             .enumerate()
         {
@@ -729,6 +758,177 @@ mod tests {
                     "count_rows disagrees with a full render at width {width}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prose_sanitizes_before_measuring_and_wrapping() {
+        let mut t = Transcript::new();
+        t.blocks.push(Block::Prose {
+            lines: vec!["a\u{1b}[31mb".into()],
+        });
+        for width in 10..=40 {
+            let rows = lines(&t, width, usize::MAX, false, 0, true);
+            assert_eq!(rows.len(), 1, "unexpected rows at width {width}");
+            let row = plain(&rows).join("");
+            assert!(
+                !row.contains('['),
+                "escape leaked at width {width}: {row:?}"
+            );
+            assert!(
+                !row.contains("31m"),
+                "escape leaked at width {width}: {row:?}"
+            );
+            assert_eq!(row.trim(), "ab", "unexpected text at width {width}");
+            assert_eq!(count_rows(&t, width), rows.len());
+        }
+    }
+
+    #[test]
+    fn prose_sanitizes_osc_hyperlinks_before_wrapping() {
+        let mut t = Transcript::new();
+        t.blocks.push(Block::Prose {
+            lines: vec!["see \u{1b}]8;;https://x.dev/a b c\u{7}link\u{1b}]8;;\u{7} now".into()],
+        });
+        for width in 12..=40 {
+            let rows = lines(&t, width, usize::MAX, false, 0, true);
+            let rendered = plain(&rows);
+            let words: Vec<&str> = rendered
+                .iter()
+                .flat_map(|row| row.split_whitespace())
+                .collect();
+            assert_eq!(
+                words,
+                ["see", "link", "now"],
+                "unexpected words at width {width}"
+            );
+            for row in rendered {
+                assert!(
+                    !row.contains("x.dev"),
+                    "OSC payload leaked at width {width}"
+                );
+                assert!(!row.contains("8;;"), "OSC payload leaked at width {width}");
+                assert!(
+                    !row.contains("b c"),
+                    "wrapped OSC payload leaked at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sanitizing_preserves_operator_paragraph_breaks() {
+        let mut t = Transcript::new();
+        t.blocks.push(Block::Operator {
+            text: "a\nb".into(),
+            steering: false,
+        });
+        let rows = lines(&t, 40, usize::MAX, false, 0, true);
+        assert_eq!(
+            plain(&rows)
+                .iter()
+                .map(|row| row.trim())
+                .collect::<Vec<_>>(),
+            ["› a", "b"]
+        );
+        assert_eq!(count_rows(&t, 40), rows.len());
+    }
+
+    #[test]
+    fn reasoning_and_operator_measure_sanitized_text_exactly() {
+        for width in 10..=40 {
+            let mut reasoning = Transcript::new();
+            reasoning.blocks.push(Block::Reasoning {
+                lines: vec!["run \u{1b}[2Jnow".into()],
+                expanded: true,
+                elapsed_ms: Some(1),
+                started_ms: Some(0),
+            });
+            let reasoning_rows = lines(&reasoning, width, usize::MAX, false, 0, true);
+            let reasoning_rendered = plain(&reasoning_rows);
+            let reasoning_text: Vec<String> = reasoning_rendered[1..]
+                .iter()
+                .flat_map(|row| row.split_whitespace().map(str::to_string))
+                .collect();
+            assert_eq!(
+                reasoning_text,
+                ["run", "now"],
+                "unexpected reasoning text at width {width}"
+            );
+            assert_eq!(count_rows(&reasoning, width), reasoning_rows.len());
+
+            let mut operator = Transcript::new();
+            operator.blocks.push(Block::Operator {
+                text: "run \u{1b}[2Jnow".into(),
+                steering: false,
+            });
+            let operator_rows = lines(&operator, width, usize::MAX, false, 0, true);
+            let operator_rendered = plain(&operator_rows);
+            let operator_text: Vec<String> = operator_rendered
+                .iter()
+                .flat_map(|row| row.split_whitespace().map(str::to_string))
+                .filter(|word| !word.starts_with(glyphs::OPERATOR))
+                .collect();
+            assert_eq!(
+                operator_text,
+                ["run", "now"],
+                "unexpected operator text at width {width}"
+            );
+            assert_eq!(count_rows(&operator, width), operator_rows.len());
+        }
+    }
+
+    #[test]
+    fn escaped_transcript_text_is_not_mutated() {
+        let mut t = Transcript::new();
+        t.blocks.push(Block::Prose {
+            lines: vec!["a\u{1b}[31mb".into()],
+        });
+        t.blocks.push(Block::Operator {
+            text: "run \u{1b}[2Jnow".into(),
+            steering: false,
+        });
+        let before = t.blocks.clone();
+        let _ = lines(&t, 40, usize::MAX, false, 0, true);
+        assert_eq!(t.blocks, before);
+    }
+
+    #[test]
+    fn count_rows_matches_the_full_render_with_terminal_controls() {
+        let mut t = Transcript::new();
+        t.blocks.extend([
+            Block::Prose {
+                lines: vec!["csi \u{1b}[31mplain unterminated \u{1b}[31".into()],
+            },
+            Block::Reasoning {
+                lines: vec![
+                    "osc \u{1b}]8;;https://x\u{7}link\u{1b}]8;;\u{7} st \u{1b}]0;title\u{1b}\\body"
+                        .into(),
+                ],
+                expanded: true,
+                elapsed_ms: Some(1),
+                started_ms: Some(0),
+            },
+            Block::Operator {
+                text: "csi \u{1b}[2Jplain".into(),
+                steering: false,
+            },
+            Block::Meta {
+                text: "· osc \u{1b}]0;title\u{7}plain".into(),
+            },
+        ]);
+        for width in [1usize, 7, 40, 120] {
+            let built = lines(&t, width, usize::MAX, false, 0, true);
+            let rendered = plain(&built);
+            assert!(
+                rendered.iter().all(|row| !row.contains('\u{1b}')),
+                "terminal control leaked at width {width}"
+            );
+            assert_eq!(
+                count_rows(&t, width),
+                built.len(),
+                "count disagreement at width {width}"
+            );
         }
     }
 
