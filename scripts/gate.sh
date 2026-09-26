@@ -144,6 +144,7 @@ python3 scripts/test_release_manifest.py -q
 python3 scripts/test_run_report.py -q
 python3 scripts/test_rustc_serial.py -q
 python3 scripts/test_secret_scan.py -q
+python3 scripts/test_stage_release.py -q
 python3 scripts/test_usage_audit.py -q
 # S7.5.2: the release-candidate smoke test and artifact staging go here, through
 # scripts/stage-release.sh (S7.7).
