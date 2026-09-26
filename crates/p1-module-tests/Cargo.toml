@@ -23,7 +23,7 @@ p1-redact = { path = "../p1-redact" }
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 # The WebSocket boundary suite (tests/websocket_boundary.rs, S5): the host session with
 # its scripted connector, the provider's portable decisions, and the paused clock.
-p1-provider-openai = { path = "../p1-provider-openai" }
+p1-provider-openai = { path = "../p1-provider-openai", default-features = false }
 futures-util = "0.3"
 tokio = { version = "1", default-features = false, features = [
     "macros",
@@ -48,8 +48,10 @@ p1-workflow = { path = "../p1-workflow" }
 # environments over it, with the testkit's scripted provider and fake tools.
 p1-assembly = { path = "../p1-assembly" }
 p1-host = { path = "../p1-host" }
-# replay_switch.rs (S5.8) runs the shipped chat adapter's portable `validate` over the history a
-# session recorded, to hold the replay version the replacement builds declare to that
-# declaration. No transport: the portable half and the profile it is composed with.
-p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false }
+# provider_wire.rs (S4.4): the provider adapters' portable halves, their wire forms and
+# the model policy they are composed with. `default-features = false` because a provider
+# component reaches no transport, runtime or credential code.
+p1-module-protocol = { path = "../p1-module-protocol" }
 p1-model-profile = { path = "../p1-model-profile" }
+p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false }
+p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false }
