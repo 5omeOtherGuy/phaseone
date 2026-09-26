@@ -4,15 +4,15 @@
 //! shared [`ResponseParser`] contract means the retrying driver owns retries,
 //! cancellation and terminal-event bookkeeping. Wire facts: `routes.md` §B.
 
-use p1_contracts::history::{
-    AssistantBlock, AssistantItem, Origin, ReplayData, ToolCall, ToolInput,
-};
+use p1_contracts::history::{AssistantBlock, AssistantItem, Origin, ToolCall, ToolInput};
 use p1_contracts::{
     CompletedResponse, Outcome, ProviderError, ProviderErrorKind, StopReason, StreamEvent, Usage,
     serde_json,
 };
 use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status, safe_code};
 use serde_json::Value;
+
+use crate::replay;
 
 /// Route-native parser. One instance per request attempt.
 pub struct CodexResponseParser {
@@ -22,8 +22,8 @@ pub struct CodexResponseParser {
     blocks: Vec<AssistantBlock>,
     /// Set once a terminal outcome has been produced; later events are ignored.
     terminal: Option<Outcome>,
-    /// Remembered for diagnostics only; the contract has no response-id field.
-    #[allow(dead_code)]
+    /// The `response.created` id; the contract has no response-id field, so only
+    /// [`CodexResponseParser::response_id`] reads it (a component's decoder).
     response_id: Option<String>,
     /// Model-facing names observed when function-call output items are announced.
     call_names: std::collections::HashMap<String, String>,
@@ -47,6 +47,21 @@ impl CodexResponseParser {
         }
     }
 
+    /// The id `response.created` named, if the wire named one so far.
+    pub fn response_id(&self) -> Option<&str> {
+        self.response_id.as_deref()
+    }
+
+    /// The CONFIGURED origin: the composed route and wire model, never the (dated
+    /// alias) name a response echoes, because replay is gated on origin equality
+    /// (providers.md "Replay").
+    fn origin(&self) -> Origin {
+        Origin {
+            route: self.route.clone(),
+            model: self.model.clone(),
+        }
+    }
+
     /// Queue the single terminal outcome.
     fn finish(&mut self, outcome: Outcome) -> Vec<StreamEvent> {
         self.terminal = Some(outcome.clone());
@@ -61,19 +76,13 @@ impl CodexResponseParser {
     /// terminal envelope. `stop` is computed from the blocks for `completed` and
     /// supplied for `incomplete`.
     fn completed(&mut self, response: Option<&Value>, stop: StopReason) -> Vec<StreamEvent> {
-        // Origin is ALWAYS the configured model, never the (dated alias) name the
-        // response echoes: replay is gated on origin equality (providers.md ruling).
-        let model = self.model.clone();
         let usage = response.and_then(parse_usage);
         let stop = match stop {
             StopReason::EndTurn if self.blocks.iter().any(is_tool_call) => StopReason::ToolUse,
             other => other,
         };
         let item = AssistantItem {
-            origin: Origin {
-                route: self.route.to_string(),
-                model,
-            },
+            origin: self.origin(),
             blocks: std::mem::take(&mut self.blocks),
         };
         self.finish(Outcome::Completed(CompletedResponse { item, stop, usage }))
@@ -102,17 +111,7 @@ impl CodexResponseParser {
                     .get("encrypted_content")
                     .and_then(Value::as_str)
                     .filter(|encrypted| !encrypted.is_empty())
-                    .map(|encrypted| ReplayData {
-                        origin: Origin {
-                            route: self.route.to_string(),
-                            model: self.model.clone(),
-                        },
-                        version: 1,
-                        payload: serde_json::json!({
-                            "type": "reasoning",
-                            "encrypted_content": encrypted,
-                        }),
-                    });
+                    .map(|encrypted| replay::encode(&self.origin(), encrypted));
                 self.blocks.push(AssistantBlock::Reasoning { text, replay });
             }
             Some("function_call") => {

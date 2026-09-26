@@ -1,0 +1,36 @@
+[package]
+name = "p1-module-provider-openai"
+description = "The OpenAI Responses (ChatGPT/Codex) provider component: the portable p1-provider-openai lowering, classification and SSE decoding behind the provider world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-provider = { path = "../p1-bindings-provider" }
+# The adapter's portable half only: `native` would bring the transport, a runtime and the
+# credential code into the guest (ADR-0071).
+p1-provider-openai = { path = "../../crates/p1-provider-openai", default-features = false }
+p1-provider-http = { path = "../../crates/p1-provider-http", default-features = false }
+p1-module-protocol = { path = "../../crates/p1-module-protocol", default-features = false }
+p1-contracts = { path = "../../crates/p1-contracts", default-features = false }
+p1-model-profile = { path = "../../crates/p1-model-profile", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The frozen package manifest (docs/design/modules/package.md). The capabilities are exactly
+# the interfaces the built component imports (its `.imports`) among the provider allocation:
+# the world's `use` of the http, websocket and credential-control types. It calls no import.
+[package.metadata.p1-module]
+name = "p1/provider-openai"
+kind = "provider"
+world = "p1:module/provider@1.0.0"
+protocol = "1.0"
+capabilities = ["http", "websocket", "credential-control"]
+variant = "default"
