@@ -40,8 +40,11 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// The capabilities this runtime can link, by the interface name the manifest uses. The
 /// other capability interfaces belong to other native crates and streams; a manifest that
 /// grants one of them is refused until the runtime can provide it. `summary` is linked to
-/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7).
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 8] = [
+/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7);
+/// `http`, `websocket` and `credential-control` to the broker and credential services a
+/// provider component's `stream` uses (S4.7); the worker and workflow interfaces to the
+/// caller's services in [`crate::delegation`] (S6, B-S6-8).
+pub(crate) const LINKABLE_CAPABILITIES: [&str; 12] = [
     "control",
     "clock",
     "random",
@@ -50,10 +53,18 @@ pub(crate) const LINKABLE_CAPABILITIES: [&str; 8] = [
     "http",
     "websocket",
     "credential-control",
+    "workers-start",
+    "workers-observe",
+    "workers-control",
+    "workflows",
 ];
 
 /// The interface every world imports for its types; it grants nothing.
 const TYPES_INTERFACE: &str = "types";
+/// The type-only interface the worker capabilities take their records from
+/// (`modules/capabilities.toml`, `type-only`): it grants nothing, so a manifest need not
+/// declare it.
+const WORKER_TYPES_INTERFACE: &str = crate::delegation::WORKER_TYPES_INTERFACE;
 
 /// Why a module could not be loaded. Every refusal names the module.
 #[derive(Debug, Error)]
@@ -169,15 +180,18 @@ pub enum ModuleKind {
     AuthorizationPolicy,
     /// A workflow implemented as a module.
     WorkflowImplementation,
+    /// A workflow's step decisions (`p1_workflow::Decisions`), its state kept native.
+    WorkflowDecision,
 }
 
 impl ModuleKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Tool,
         Self::Provider,
         Self::ContextPolicy,
         Self::AuthorizationPolicy,
         Self::WorkflowImplementation,
+        Self::WorkflowDecision,
     ];
 
     /// The manifest name of the class.
@@ -188,6 +202,7 @@ impl ModuleKind {
             Self::ContextPolicy => "context-policy",
             Self::AuthorizationPolicy => "authorization-policy",
             Self::WorkflowImplementation => "workflow-implementation",
+            Self::WorkflowDecision => "workflow-decision",
         }
     }
 
@@ -405,7 +420,10 @@ impl Loader {
             .capabilities
             .iter()
             .map(|capability| interface_import(capability))
-            .chain([interface_import(TYPES_INTERFACE)])
+            .chain([
+                interface_import(TYPES_INTERFACE),
+                interface_import(WORKER_TYPES_INTERFACE),
+            ])
             .collect();
         let component_type = component.component_type();
         if let Some((import, _)) = component_type
@@ -509,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn the_linkable_capabilities_are_the_old_four_plus_summary() {
+    fn the_linkable_capabilities_are_the_old_four_plus_summary_delegation_and_providers() {
         assert_eq!(
             LINKABLE_CAPABILITIES,
             [
@@ -520,7 +538,11 @@ mod tests {
                 "summary",
                 "http",
                 "websocket",
-                "credential-control"
+                "credential-control",
+                "workers-start",
+                "workers-observe",
+                "workers-control",
+                "workflows",
             ]
         );
         for refused in ["notices", "completion", "filesystem"] {

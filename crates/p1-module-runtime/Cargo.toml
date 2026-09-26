@@ -15,6 +15,10 @@ p1-module-protocol = { path = "../p1-module-protocol" }
 # The transport broker a provider component's lowered request is sent through (S4.7).
 p1-provider-http = { path = "../p1-provider-http" }
 p1-redact = { path = "../p1-redact" }
+# S6 (B-S6-8, D065): `delegation.rs` links the worker and workflow interfaces over these
+# crates' own traits, passed in by the host.
+p1-workers = { path = "../p1-workers" }
+p1-workflow = { path = "../p1-workflow" }
 thiserror = "2"
 # The executor task, its request channel and the per-call tasks it owns.
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
