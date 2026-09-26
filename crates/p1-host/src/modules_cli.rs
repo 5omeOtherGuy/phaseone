@@ -50,18 +50,24 @@ const CLASSES: [ModuleKind; 5] = [
 /// The capabilities this runtime links: the loader's `LINKABLE_CAPABILITIES`, published in
 /// `docs/design/modules/package.md`. `control`, `clock` and `random` are the runtime's own,
 /// `process` is the service it adapts, `summary` is the context policy's (S5, freeze item
-/// 13 of `docs/design/modules/wit.md`) and `completion` is the host's completion hub (S3.7);
-/// every other interface of `modules/capabilities.toml` arrives with the stream that owns its
-/// native service. The loader refuses a manifest granting anything else, so `verify` must
-/// refuse it too, and the drift guard `verify_and_the_loader_agree_on_every_manifest_field`
-/// fails if this list and the loader's part ways.
-const LINKABLE: [&str; 6] = [
+/// 13 of `docs/design/modules/wit.md`), `completion` is the host's completion hub (S3.7),
+/// and `workers-start`, `workers-observe`, `workers-control` and `workflows` are linked to
+/// the caller's delegation services (S6, B-S6-8); every other interface of
+/// `modules/capabilities.toml` arrives with the stream that owns its native service. The
+/// loader refuses a manifest granting anything else, so `verify` must refuse it too, and the
+/// drift guard `verify_and_the_loader_agree_on_every_manifest_field` fails if this list and
+/// the loader's part ways.
+const LINKABLE: [&str; 10] = [
     "control",
     "clock",
     "random",
     "process",
     "summary",
     "completion",
+    "workers-start",
+    "workers-observe",
+    "workers-control",
+    "workflows",
 ];
 
 /// Run one `p1 modules` command.
