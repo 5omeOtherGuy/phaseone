@@ -680,7 +680,9 @@ fn module_outputs(root: &Path) -> PathBuf {
     published
 }
 
-/// Whether every published package is there and newer than the newest module source.
+/// Whether every published package is there and newer than the newest module source. Only
+/// directories are packages: the build also publishes `manifest.json` (the release manifest
+/// the loader reads, S3.8.0) beside them, and that file is not one.
 fn module_outputs_current(root: &Path, published: &Path) -> bool {
     let newest_source = newest_mtime(&root.join("modules"), Some("target"));
     let Ok(entries) = fs::read_dir(published) else {
@@ -688,6 +690,9 @@ fn module_outputs_current(root: &Path, published: &Path) -> bool {
     };
     let mut packages = 0;
     for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         for suffix in [".wasm", ".sha256", ".manifest.json"] {
             let Ok(meta) = entry.path().join(format!("{name}{suffix}")).metadata() else {
