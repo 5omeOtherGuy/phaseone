@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "crates/p1-hook-shadow", "crates/p1-tool-finish/guest"]
+members = [
+    "crates/*",
+    "crates/p1-hook-shadow",
+    "crates/p1-tool-shell/guest",
+    "crates/p1-tool-finish/guest",
+]
 
 [workspace.package]
 version = "0.0.1"

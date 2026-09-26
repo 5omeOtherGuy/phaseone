@@ -3,14 +3,27 @@
 //! It is assembled once from the workspace root, an environment snapshot, the
 //! env-pass names and optionally a [`Sandbox`]; after that a caller can only hand
 //! it a command text and a timeout. Program, environment, working directory and
-//! sandbox are fixed at assembly, so whatever drives the service (the shell tool
-//! today, a WebAssembly guest later) cannot widen them.
+//! sandbox are fixed at assembly, so whatever drives the service (the native shell
+//! tool, or a WebAssembly guest through [`ProcessCapability`]) cannot widen them.
+//! A run is available whole ([`ProcessService::run`]) or as a stream of events
+//! ([`ProcessService::spawn`]); the first is the second drained.
 
+mod capability;
 mod sandbox;
+mod stream;
+
+/// The paragraph the model reads when the host turned the sandbox on (ADR-0035: the
+/// description says what the boundary is). It belongs to the side that assembled the
+/// sandbox: a tool running over this service cannot know whether it is sandboxed, so
+/// whoever presents the tool appends this to the face's description.
+pub const SANDBOX_PARAGRAPH: &str = "Commands run in a sandbox: only the workspace and /tmp are writable, the rest of the filesystem is read-only, and most of the home directory is not visible. Do not try to install software outside the workspace.";
+
+/// Appended to a tool's identity variant when its commands run in the sandbox, for the
+/// same reason as [`SANDBOX_PARAGRAPH`].
+pub const SANDBOX_VARIANT_SUFFIX: &str = "+sandbox";
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -18,13 +31,14 @@ use std::time::Duration;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use p1_contracts::CancellationToken;
-use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
+pub use capability::ProcessCapability;
 use sandbox::SandboxRuntime;
 pub use sandbox::{
     CREDENTIAL_DIRECTORIES, DEFAULT_HOME_VISIBLE, Sandbox, SandboxError, bwrap_args,
 };
+pub use stream::{ProcessStream, StreamEvent};
 
 /// Bytes of the beginning of the output kept in memory.
 const HEAD_BYTES: usize = 25_000;
@@ -145,28 +159,25 @@ pub enum ProcessEnd {
 
 /// Why no complete run could be observed. `program` is the name the failure
 /// message has always named: `bwrap` or `bash` for a start, `bash` otherwise.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The message is the model-visible error text, so it is the service's to word:
+/// the shell's guest behaviour passes it through unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProcessFailure {
+    #[error("failed to start {program}: {error}")]
     Start {
         program: &'static str,
         error: String,
     },
+    #[error("failed to capture {program} {stream}")]
     Capture {
         program: &'static str,
         stream: &'static str,
     },
+    #[error("failed to wait for {program}: {error}")]
     Wait {
         program: &'static str,
         error: String,
     },
-}
-
-/// How the waiting loop ended.
-enum End {
-    /// Both output streams reached EOF; the shell may still be running.
-    Closed,
-    TimedOut,
-    Cancelled,
 }
 
 impl ProcessService {
@@ -218,15 +229,54 @@ impl ProcessService {
             .await
     }
 
+    /// Start one command and hand back its output as a stream of events (see
+    /// [`ProcessStream`]). `Err` means nothing runs: the start failed, or its output
+    /// could not be captured and what did start was terminated.
+    pub async fn spawn(
+        &self,
+        request: ProcessRequest<'_>,
+        cancel: CancellationToken,
+    ) -> Result<ProcessStream, ProcessFailure> {
+        self.start(request.command, tokio::time::sleep(request.timeout), cancel)
+            .await
+    }
+
     /// `expiry` is the timeout as a future, so a test can fire it on an observed
     /// condition instead of racing the shell's start-up against a wall clock.
+    ///
+    /// A run is its stream drained: there is one capture implementation, so what a
+    /// streaming caller receives is byte for byte what `run` returns.
     pub(crate) async fn run_until(
         &self,
         command: &str,
-        expiry: impl Future<Output = ()>,
+        expiry: impl Future<Output = ()> + Send + 'static,
         cancel: &CancellationToken,
     ) -> ProcessOutcome {
-        let mut expiry = std::pin::pin!(expiry);
+        let mut stream = match self.start(command, expiry, cancel.clone()).await {
+            Ok(stream) => stream,
+            Err(failure) => return failed(failure),
+        };
+        let mut output = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                StreamEvent::Output(bytes) => output.extend_from_slice(&bytes),
+                StreamEvent::Exited(end) => return ProcessOutcome { output, end },
+            }
+        }
+        // Unreachable: a stream yields its exit before it ends. Should that ever
+        // break, no exit was observed, which is what this end says.
+        ProcessOutcome {
+            output,
+            end: ProcessEnd::TerminatedByUnknownSignal,
+        }
+    }
+
+    async fn start(
+        &self,
+        command: &str,
+        expiry: impl Future<Output = ()> + Send + 'static,
+        cancel: CancellationToken,
+    ) -> Result<ProcessStream, ProcessFailure> {
         let root = self.root.as_path();
         // The sandboxed and unsandboxed paths differ only in the spawned program;
         // process group, stdin, capture, timeout and kill are shared.
@@ -271,7 +321,7 @@ impl ProcessService {
                 } else {
                     "bash"
                 };
-                return failed(ProcessFailure::Start {
+                return Err(ProcessFailure::Start {
                     program,
                     error: error.to_string(),
                 });
@@ -279,94 +329,28 @@ impl ProcessService {
         };
         let pgid = child.id().map(|id| id as i32).unwrap_or(0);
 
-        let Some(mut stdout) = child.stdout.take() else {
+        let Some(stdout) = child.stdout.take() else {
             terminate(&mut child, pgid).await;
-            return failed(ProcessFailure::Capture {
+            return Err(ProcessFailure::Capture {
                 program: "bash",
                 stream: "stdout",
             });
         };
-        let Some(mut stderr) = child.stderr.take() else {
+        let Some(stderr) = child.stderr.take() else {
             terminate(&mut child, pgid).await;
-            return failed(ProcessFailure::Capture {
+            return Err(ProcessFailure::Capture {
                 program: "bash",
                 stream: "stderr",
             });
         };
-
-        let mut capture = Capture::default();
-        let mut out_buffer = [0u8; READ_BUFFER_BYTES];
-        let mut err_buffer = [0u8; READ_BUFFER_BYTES];
-        let mut out_open = true;
-        let mut err_open = true;
-
-        // Drain both pipes concurrently. Each ready half wakes the task, so chunks
-        // are appended in arrival order. Cancellation and the timeout are checked
-        // in the same select, so they interrupt a blocked read promptly.
-        let end = loop {
-            if !out_open && !err_open {
-                break End::Closed;
-            }
-            // Unbiased so neither stream is starved; whichever pipe has data is
-            // appended as it arrives. Cancellation and the timeout are polled in
-            // the same round and fire on the next loop iteration.
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    terminate(&mut child, pgid).await;
-                    break End::Cancelled;
-                }
-                _ = &mut expiry => {
-                    terminate(&mut child, pgid).await;
-                    break End::TimedOut;
-                }
-                read = stdout.read(&mut out_buffer), if out_open => match read {
-                    Ok(0) | Err(_) => out_open = false,
-                    Ok(count) => capture.push(&out_buffer[..count]),
-                },
-                read = stderr.read(&mut err_buffer), if err_open => match read {
-                    Ok(0) | Err(_) => err_open = false,
-                    Ok(count) => capture.push(&err_buffer[..count]),
-                },
-            }
-        };
-
-        match end {
-            End::Cancelled => return capture.ended(ProcessEnd::Cancelled),
-            End::TimedOut => return capture.ended(ProcessEnd::TimedOut),
-            End::Closed => {}
-        }
-
-        // The pipes are done; the shell itself may still run (it closed its output)
-        // or may have exited. Wait for it, still honouring cancel/timeout.
-        let status = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                terminate(&mut child, pgid).await;
-                return capture.ended(ProcessEnd::Cancelled);
-            }
-            _ = &mut expiry => {
-                terminate(&mut child, pgid).await;
-                return capture.ended(ProcessEnd::TimedOut);
-            }
-            status = child.wait() => status,
-        };
-
-        let end = match status {
-            Ok(status) => {
-                if let Some(code) = status.code() {
-                    ProcessEnd::Exited(code)
-                } else if let Some(signal) = status.signal() {
-                    ProcessEnd::TerminatedBySignal(signal)
-                } else {
-                    ProcessEnd::TerminatedByUnknownSignal
-                }
-            }
-            Err(error) => ProcessEnd::Failed(ProcessFailure::Wait {
-                program: "bash",
-                error: error.to_string(),
-            }),
-        };
-        capture.ended(end)
+        Ok(ProcessStream::new(
+            child,
+            pgid,
+            stdout,
+            stderr,
+            Box::pin(expiry),
+            cancel,
+        ))
     }
 
     /// The child environment: the snapshot filtered by [`ENV_ALLOW`],
@@ -444,10 +428,11 @@ async fn wait_for_empty_group(group: Pid, until: tokio::time::Instant) {
 
 /// Keeps the first [`HEAD_BYTES`]/[`HEAD_LINES`] and the last
 /// [`TAIL_BYTES`]/[`TAIL_LINES`] of the captured output, no matter how much the
-/// command prints.
+/// command prints. The head is final the moment it arrives, so it is handed on at
+/// once and only counted here; the tail is known only at the end and is held.
 #[derive(Default)]
 struct Capture {
-    head: Vec<u8>,
+    head_len: usize,
     head_newlines: usize,
     tail: VecDeque<u8>,
     tail_newlines: usize,
@@ -455,24 +440,22 @@ struct Capture {
 }
 
 impl Capture {
-    fn push(&mut self, chunk: &[u8]) {
+    /// Take `chunk` in. Returns how many of its leading bytes belong to the head;
+    /// the rest went to the tail.
+    fn push(&mut self, chunk: &[u8]) -> usize {
         self.total += chunk.len() as u64;
-        let mut rest = chunk;
-        if self.head.len() < HEAD_BYTES && self.head_newlines < HEAD_LINES {
-            let mut taken = 0;
-            for &byte in rest {
-                if self.head.len() >= HEAD_BYTES || self.head_newlines >= HEAD_LINES {
-                    break;
-                }
-                if byte == b'\n' {
-                    self.head_newlines += 1;
-                }
-                self.head.push(byte);
-                taken += 1;
+        let mut taken = 0;
+        for &byte in chunk {
+            if self.head_len >= HEAD_BYTES || self.head_newlines >= HEAD_LINES {
+                break;
             }
-            rest = &rest[taken..];
+            if byte == b'\n' {
+                self.head_newlines += 1;
+            }
+            self.head_len += 1;
+            taken += 1;
         }
-        for &byte in rest {
+        for &byte in &chunk[taken..] {
             self.tail.push_back(byte);
             if byte == b'\n' {
                 self.tail_newlines += 1;
@@ -483,6 +466,7 @@ impl Capture {
                 }
             }
         }
+        taken
     }
 
     fn pop_tail_front(&mut self) -> bool {
@@ -497,24 +481,22 @@ impl Capture {
     }
 
     fn dropped(&self) -> u64 {
-        self.total - (self.head.len() + self.tail.len()) as u64
+        self.total - (self.head_len + self.tail.len()) as u64
     }
 
-    fn into_bytes(self) -> Vec<u8> {
+    /// What follows the head once the command is over: the omission marker where
+    /// bytes were dropped, then the tail.
+    fn take_rest(&mut self) -> Vec<u8> {
         let dropped = self.dropped();
-        let mut out = self.head;
+        let mut out = Vec::new();
         if dropped > 0 {
             out.extend_from_slice(format!("\n[… {dropped} bytes omitted …]\n").as_bytes());
         }
-        out.extend(self.tail);
+        out.extend(std::mem::take(&mut self.tail));
+        self.tail_newlines = 0;
+        // Everything is accounted for now; a second call yields nothing.
+        self.total = self.head_len as u64;
         out
-    }
-
-    fn ended(self, end: ProcessEnd) -> ProcessOutcome {
-        ProcessOutcome {
-            output: self.into_bytes(),
-            end,
-        }
     }
 }
 

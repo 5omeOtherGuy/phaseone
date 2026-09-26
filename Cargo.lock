@@ -1972,6 +1972,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-shell-guest"
+version = "0.0.1"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-testkit"
 version = "0.0.1"
 dependencies = [
@@ -2059,9 +2068,9 @@ version = "0.0.1"
 dependencies = [
  "nix",
  "p1-contracts",
+ "p1-module-runtime",
+ "p1-shell-guest",
  "p1-workspace",
- "regex",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
