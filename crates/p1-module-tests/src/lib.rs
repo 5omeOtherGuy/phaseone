@@ -1,6 +1,7 @@
 //! The harness of the module execution-model tests: the built fixture component, a release
 //! manifest written for it into a temporary directory, a fake `process` service driven by
-//! explicit synchronization, and the deadlock guard every case runs under.
+//! explicit synchronization that records what it sees, manually driven epochs, and the
+//! deadlock guard every case runs under.
 //!
 //! The fixture is built by `scripts/build-modules.sh` (the gate runs it before the tests).
 //! When it is missing the harness fails with that instruction; it never skips a case.
@@ -15,7 +16,8 @@ use std::time::Duration;
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{BoxFuture, CancellationToken, ToolCall, ToolInput};
 use p1_module_runtime::{
-    Loader, ProcessCommand, ProcessEvent, ProcessService, ReleaseManifest, RunningProcess,
+    ExitStatus, Loader, ManualEpochs, ProcessCommand, ProcessEvent, ProcessService,
+    ReleaseManifest, RunningProcess,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -125,14 +127,23 @@ impl Release {
     /// Writes `manifest.json` and returns a loader over it, read back from the file as the
     /// host reads a release.
     pub fn loader(&self) -> Loader {
+        Loader::new(self.manifest(), self.dir.path()).expect("loader")
+    }
+
+    /// As [`Release::loader`], with epochs that only the returned [`ManualEpochs`] advance,
+    /// so a case drives deadlines explicitly.
+    pub fn loader_with_manual_epochs(&self) -> (Loader, ManualEpochs) {
+        Loader::with_manual_epochs(self.manifest(), self.dir.path()).expect("loader")
+    }
+
+    fn manifest(&self) -> ReleaseManifest {
         let path = self.dir.path().join("manifest.json");
         let manifest = json!({
             "format": "p1-release-manifest/1",
             "components": self.components,
         });
         std::fs::write(&path, manifest.to_string()).expect("manifest");
-        let manifest = ReleaseManifest::read(&path).expect("release manifest");
-        Loader::new(manifest, self.dir.path()).expect("loader")
+        ReleaseManifest::read(&path).expect("release manifest")
     }
 }
 
@@ -155,9 +166,38 @@ pub struct SpawnedProcess {
     pub dropped: oneshot::Receiver<()>,
 }
 
+/// What the fake process service saw and did, in the order it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessRecord {
+    /// A command was started.
+    Spawned(String),
+    /// `spawn` found no settlement and waits for the test: the module is blocked in the
+    /// import. Only the gated fake ([`gated_processes`]) records this.
+    SpawnWaiting,
+    /// The command's native effect: a `touch <name>` command created this file in
+    /// [`FakeProcesses::markers`] before it started waiting.
+    Effect(PathBuf),
+    /// `next` found no event and waits for the test: the module is blocked on a host wait.
+    NextWaiting,
+    /// `next` returned this output chunk.
+    Output(Vec<u8>),
+    /// `next` returned this exit.
+    Exited(ExitStatus),
+    /// The process group was killed, by `kill` or by dropping a handle that still ran.
+    Killed,
+    /// The runtime dropped the process handle.
+    Dropped,
+}
+
+/// The exit a killed fake process reports, as a real one killed with SIGKILL does.
+pub const KILLED_EXIT: ExitStatus = ExitStatus::Signal(9);
+
 /// The test's side of the fake process service.
 pub struct FakeProcesses {
     spawned: mpsc::UnboundedReceiver<SpawnedProcess>,
+    records: mpsc::UnboundedReceiver<ProcessRecord>,
+    seen: Vec<ProcessRecord>,
+    markers: tempfile::TempDir,
 }
 
 impl FakeProcesses {
@@ -168,25 +208,141 @@ impl FakeProcesses {
             .await
             .expect("the fake process service is gone")
     }
+
+    /// Waits until the service records `expected`, and returns every record so far.
+    pub async fn wait_for(&mut self, expected: &ProcessRecord) -> &[ProcessRecord] {
+        let already = self.seen.iter().position(|record| record == expected);
+        if already.is_none() {
+            loop {
+                let record = self
+                    .records
+                    .recv()
+                    .await
+                    .expect("the fake process service is gone");
+                let found = &record == expected;
+                self.seen.push(record);
+                if found {
+                    break;
+                }
+            }
+        }
+        &self.seen
+    }
+
+    /// Every record so far, without waiting.
+    pub fn records(&mut self) -> &[ProcessRecord] {
+        while let Ok(record) = self.records.try_recv() {
+            self.seen.push(record);
+        }
+        &self.seen
+    }
+
+    /// The directory the fake commands' native effects write into.
+    pub fn markers(&self) -> &Path {
+        self.markers.path()
+    }
 }
 
 struct FakeProcessService {
     spawned: mpsc::UnboundedSender<SpawnedProcess>,
+    records: mpsc::UnboundedSender<ProcessRecord>,
+    markers: PathBuf,
+    /// Present in the gated fake: `spawn` waits for the test's [`Settlement`] before it
+    /// settles the start, so a case can act on a call that is blocked inside the import.
+    gate: Option<tokio::sync::Mutex<mpsc::UnboundedReceiver<Settlement>>>,
 }
 
 struct FakeRunning {
     events: mpsc::UnboundedReceiver<ProcessEvent>,
+    records: mpsc::UnboundedSender<ProcessRecord>,
     dropped: Option<oneshot::Sender<()>>,
+    killed: bool,
+    exited: bool,
 }
 
 /// A `process` service whose every event the test sends explicitly: `next` stays pending
 /// until the test sends one, so a case proves the module really waits on an async import.
+/// It records what happens ([`ProcessRecord`]) and performs one native effect: a command
+/// `touch <name>` creates `<name>` in [`FakeProcesses::markers`] when it starts.
 pub fn fake_processes() -> (Arc<dyn ProcessService>, FakeProcesses) {
-    let (spawned, receiver) = mpsc::unbounded_channel();
+    let (process, records, processes) = fake_parts();
     (
-        Arc::new(FakeProcessService { spawned }),
-        FakeProcesses { spawned: receiver },
+        Arc::new(FakeProcessService {
+            spawned: process,
+            records,
+            markers: processes.markers().to_owned(),
+            gate: None,
+        }),
+        processes,
     )
+}
+
+/// As [`fake_processes`], but its `spawn` waits for the test to settle the start
+/// ([`SpawnGate`]): a case can cancel a call while the module is blocked in `process.spawn`.
+pub fn gated_processes() -> (Arc<dyn ProcessService>, FakeProcesses, SpawnGate) {
+    let (process, records, processes) = fake_parts();
+    let (settle, settlement) = mpsc::unbounded_channel();
+    (
+        Arc::new(FakeProcessService {
+            spawned: process,
+            records,
+            markers: processes.markers().to_owned(),
+            gate: Some(tokio::sync::Mutex::new(settlement)),
+        }),
+        processes,
+        SpawnGate { settle },
+    )
+}
+
+/// The sender halves and the test's side both fakes are built from.
+fn fake_parts() -> (
+    mpsc::UnboundedSender<SpawnedProcess>,
+    mpsc::UnboundedSender<ProcessRecord>,
+    FakeProcesses,
+) {
+    let (spawned, spawned_receiver) = mpsc::unbounded_channel();
+    let (records, records_receiver) = mpsc::unbounded_channel();
+    let markers = tempfile::tempdir().expect("marker dir");
+    (
+        spawned,
+        records,
+        FakeProcesses {
+            spawned: spawned_receiver,
+            records: records_receiver,
+            seen: Vec::new(),
+            markers,
+        },
+    )
+}
+
+/// How the test settles a [`gated_processes`] `spawn` that waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settlement {
+    /// Start the command, as a service does whose start the cancellation did not stop.
+    Start,
+    /// Refuse it, as a service may that noticed the call's cancellation first.
+    Refuse,
+}
+
+/// The test's side of [`gated_processes`]: what the blocked `spawn` settles as.
+pub struct SpawnGate {
+    settle: mpsc::UnboundedSender<Settlement>,
+}
+
+impl SpawnGate {
+    /// Lets the blocked `spawn` start its command.
+    pub fn start(&self) {
+        self.settle
+            .send(Settlement::Start)
+            .expect("the fake process service is gone");
+    }
+
+    /// Lets the blocked `spawn` answer `err` without starting anything.
+    pub fn refuse(&self) {
+        self.settle
+            .send(Settlement::Refuse)
+            .expect("the fake process service is gone");
+    }
 }
 
 impl ProcessService for FakeProcessService {
@@ -196,6 +352,22 @@ impl ProcessService for FakeProcessService {
         _cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<Box<dyn RunningProcess>, String>> {
         Box::pin(async move {
+            if let Some(gate) = &self.gate {
+                let _ = self.records.send(ProcessRecord::SpawnWaiting);
+                let settlement = gate.lock().await.recv().await;
+                // A gate the test dropped settles as a refusal, so a case cannot hang here.
+                if settlement != Some(Settlement::Start) {
+                    return Err("the fake service refused to start a cancelled command".to_owned());
+                }
+            }
+            let _ = self
+                .records
+                .send(ProcessRecord::Spawned(command.script.clone()));
+            if let Some(name) = command.script.strip_prefix("touch ") {
+                let marker = self.markers.join(name);
+                std::fs::write(&marker, b"").map_err(|error| error.to_string())?;
+                let _ = self.records.send(ProcessRecord::Effect(marker));
+            }
             let (events, receiver) = mpsc::unbounded_channel();
             let (dropped, dropped_receiver) = oneshot::channel();
             self.spawned
@@ -207,20 +379,67 @@ impl ProcessService for FakeProcessService {
                 .map_err(|_| "the test stopped listening".to_owned())?;
             Ok(Box::new(FakeRunning {
                 events: receiver,
+                records: self.records.clone(),
                 dropped: Some(dropped),
+                killed: false,
+                exited: false,
             }) as Box<dyn RunningProcess>)
         })
     }
 }
 
+impl FakeRunning {
+    fn deliver(&mut self, event: Option<ProcessEvent>) -> Option<ProcessEvent> {
+        let record = match &event {
+            Some(ProcessEvent::Output(bytes)) => ProcessRecord::Output(bytes.clone()),
+            Some(ProcessEvent::Exited(status)) => {
+                self.exited = true;
+                ProcessRecord::Exited(*status)
+            }
+            None => return None,
+        };
+        let _ = self.records.send(record);
+        event
+    }
+}
+
 impl RunningProcess for FakeRunning {
     fn next(&mut self) -> BoxFuture<'_, Option<ProcessEvent>> {
-        Box::pin(async move { self.events.recv().await })
+        Box::pin(async move {
+            if self.exited {
+                return None;
+            }
+            let event = match self.events.try_recv() {
+                Ok(event) => Some(event),
+                // A killed process prints nothing more than what was already queued.
+                Err(_) if self.killed => Some(ProcessEvent::Exited(KILLED_EXIT)),
+                Err(mpsc::error::TryRecvError::Disconnected) => None,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    let _ = self.records.send(ProcessRecord::NextWaiting);
+                    self.events.recv().await
+                }
+            };
+            self.deliver(event)
+        })
+    }
+
+    fn kill(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.killed && !self.exited {
+                self.killed = true;
+                let _ = self.records.send(ProcessRecord::Killed);
+            }
+        })
     }
 }
 
 impl Drop for FakeRunning {
     fn drop(&mut self) {
+        // A real service kills the process group when its handle is dropped while it runs.
+        if !self.killed && !self.exited {
+            let _ = self.records.send(ProcessRecord::Killed);
+        }
+        let _ = self.records.send(ProcessRecord::Dropped);
         if let Some(dropped) = self.dropped.take() {
             let _ = dropped.send(());
         }

@@ -11,13 +11,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use p1_contracts::ToolIdentity;
 use p1_module_protocol::PROTOCOL_VERSION;
 use thiserror::Error;
+use tokio::sync::watch;
 use wasmtime::Engine;
 use wasmtime::component::Component;
 
@@ -196,33 +196,84 @@ pub(crate) fn interface_import(interface: &str) -> String {
     format!("{WIT_PACKAGE}/{interface}@{WIT_VERSION}")
 }
 
-/// Advances the engine's epoch every [`EPOCH_TICK`] on a thread of its own, so deadlines
-/// hold whatever the caller's Tokio flavour and however busy its threads are. The thread
-/// ends within one tick of the last owner dropping this.
-pub(crate) struct EpochTicker {
-    stop: Arc<AtomicBool>,
+/// The epoch clock of one engine: how many [`EPOCH_TICK`]s have passed, as the per-call
+/// deadlines count them.
+///
+/// The count lives beside the engine's own epoch because the engine's epoch also advances
+/// for another reason: a cancelled call bumps it ([`Epochs::interrupt`]) so that a guest in
+/// a CPU loop reaches its epoch callback at once. Execute deadlines read only this count, so
+/// an interrupt never brings another call's deadline closer. The restricted backstop of
+/// [`crate::restricted`] is the exception: it is the engine's own epoch, so each interrupt
+/// spends one of its [`RESTRICTED_DEADLINE_TICKS`](crate::restricted::RESTRICTED_DEADLINE_TICKS)
+/// ticks and may end an inspection early, which is why the fuel bound rather than the
+/// backstop is what normally stops a runaway inspection.
+pub(crate) struct Epochs {
+    engine: Engine,
+    ticks: watch::Sender<u64>,
 }
 
-impl EpochTicker {
-    fn start(engine: Engine) -> Result<Arc<Self>, RuntimeError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
+impl Epochs {
+    fn new(engine: Engine) -> Arc<Self> {
+        Arc::new(Self {
+            engine,
+            ticks: watch::Sender::new(0),
+        })
+    }
+
+    /// Starts the production ticker: one thread per engine advancing the clock every
+    /// [`EPOCH_TICK`], so deadlines hold whatever the caller's Tokio flavour and however busy
+    /// its threads are. The thread holds only a weak reference and ends within one tick of
+    /// the last owner dropping the clock.
+    fn start_ticker(self: &Arc<Self>) -> Result<(), RuntimeError> {
+        let epochs = Arc::downgrade(self);
         thread::Builder::new()
             .name("p1-module-epoch".to_owned())
             .spawn(move || {
-                while !flag.load(Ordering::Relaxed) {
+                loop {
                     thread::sleep(EPOCH_TICK);
-                    engine.increment_epoch();
+                    match epochs.upgrade() {
+                        Some(epochs) => epochs.advance(1),
+                        None => break,
+                    }
                 }
             })
             .map_err(RuntimeError::Ticker)?;
-        Ok(Arc::new(Self { stop }))
+        Ok(())
+    }
+
+    /// Advances the clock by `ticks`, then the engine's epoch, so an epoch callback that
+    /// runs because of this advance already reads the new count.
+    pub(crate) fn advance(&self, ticks: u64) {
+        self.ticks
+            .send_modify(|now| *now = now.saturating_add(ticks));
+        for _ in 0..ticks {
+            self.engine.increment_epoch();
+        }
+    }
+
+    /// Makes every running guest of this engine reach its epoch callback at its next check,
+    /// without advancing the clock.
+    pub(crate) fn interrupt(&self) {
+        self.engine.increment_epoch();
+    }
+
+    /// A receiver of the clock, for reading it and waiting on it.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.ticks.subscribe()
     }
 }
 
-impl Drop for EpochTicker {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+/// The epochs of a loader built with [`Loader::with_manual_epochs`]: nothing advances them
+/// but [`ManualEpochs::advance`], so a test drives deadlines explicitly instead of sleeping.
+#[derive(Clone)]
+pub struct ManualEpochs {
+    epochs: Arc<Epochs>,
+}
+
+impl ManualEpochs {
+    /// Advances the epoch clock by `ticks` [`EPOCH_TICK`]s.
+    pub fn advance(&self, ticks: u64) {
+        self.epochs.advance(ticks);
     }
 }
 
@@ -231,20 +282,39 @@ pub struct Loader {
     manifest: ReleaseManifest,
     root: PathBuf,
     engine: Engine,
-    ticker: Arc<EpochTicker>,
+    epochs: Arc<Epochs>,
 }
 
 impl Loader {
     /// A loader over `manifest`, whose entry paths are relative to `root` (the directory the
-    /// manifest file is in).
+    /// manifest file is in). Its epochs advance on the production ticker.
     pub fn new(manifest: ReleaseManifest, root: impl Into<PathBuf>) -> Result<Self, LoadError> {
+        let loader = Self::unticked(manifest, root.into())?;
+        loader.epochs.start_ticker()?;
+        Ok(loader)
+    }
+
+    /// A loader whose epochs advance only through the returned [`ManualEpochs`]: the test
+    /// hook for deadlines.
+    pub fn with_manual_epochs(
+        manifest: ReleaseManifest,
+        root: impl Into<PathBuf>,
+    ) -> Result<(Self, ManualEpochs), LoadError> {
+        let loader = Self::unticked(manifest, root.into())?;
+        let epochs = ManualEpochs {
+            epochs: loader.epochs.clone(),
+        };
+        Ok((loader, epochs))
+    }
+
+    fn unticked(manifest: ReleaseManifest, root: PathBuf) -> Result<Self, LoadError> {
         let engine = engine()?;
-        let ticker = EpochTicker::start(engine.clone())?;
+        let epochs = Epochs::new(engine.clone());
         Ok(Self {
             manifest,
-            root: root.into(),
+            root,
             engine,
-            ticker,
+            epochs,
         })
     }
 
@@ -349,7 +419,7 @@ impl Loader {
             },
             component,
             engine: self.engine.clone(),
-            ticker: self.ticker.clone(),
+            epochs: self.epochs.clone(),
         })
     }
 }
@@ -373,7 +443,7 @@ pub struct LoadedModule {
     identity: ToolIdentity,
     pub(crate) component: Component,
     pub(crate) engine: Engine,
-    pub(crate) ticker: Arc<EpochTicker>,
+    pub(crate) epochs: Arc<Epochs>,
 }
 
 impl LoadedModule {

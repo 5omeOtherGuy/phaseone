@@ -9,8 +9,27 @@
 //! Each call gets a fresh Store and a fresh instance from the pre-linked component, so a
 //! trap, a deadline or an abandoned call poisons nothing for the next one; the Store (and
 //! with it every resource the call held, a running process included) is dropped when the
-//! call ends. Fuel and an epoch deadline are set per call from [`ExecutionLimits`].
+//! call ends, however it ends. Nothing the host did for the call is rolled back then: a trap
+//! never undoes a native effect.
+//!
+//! How a call is bounded (freeze item 4):
+//! - **Fuel.** Each call starts with [`ExecutionLimits::fuel`]; running out traps as
+//!   `FuelExhausted`. The guest also yields to the Tokio scheduler every
+//!   [`FUEL_YIELD_INTERVAL`] of fuel, so a busy guest never starves the caller's runtime,
+//!   current-thread included, and the call's task keeps watching its deadline and its
+//!   cancellation while the guest computes.
+//! - **Deadline.** [`ExecutionLimits::deadline`], counted on the engine's epoch clock, bounds
+//!   the whole call, host waits included: past it, the guest's epoch callback traps, or the
+//!   call's task abandons a call that waits in a host import. Either is `DeadlineExceeded`.
+//! - **Cancellation.** When `ToolContext.cancel` fires, `control.cancelled()` answers true,
+//!   every blocked host import returns as its WIT contract says, and the call's task
+//!   interrupts the engine's epoch so a guest in a CPU loop reaches its epoch callback at
+//!   once. The callback cuts the call's fuel to [`CANCEL_GRACE_FUEL`]: enough to return the
+//!   `cancelled` status cooperatively, and a loop that never checks runs out of it, which the
+//!   executor answers as `Cancelled`, not as a fuel or deadline failure.
 
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use p1_contracts::CancellationToken;
@@ -22,19 +41,23 @@ use wasmtime::component::{InstancePre, Val};
 use wasmtime::{Engine, Store, Trap, UpdateDeadline};
 
 use crate::capabilities::{CallState, Services};
-use crate::loader::EPOCH_TICK;
+use crate::loader::{EPOCH_TICK, Epochs};
 
 /// The fuel of one `execute` unless the caller sets its own: a generous bound on pure
 /// computation (host waits cost none), so only a runaway loop meets it.
 pub const DEFAULT_FUEL: u64 = 10_000_000_000;
 
-/// The wall-clock deadline of one `execute` unless the caller sets its own; it bounds the
-/// time the guest runs (checked at every epoch tick while guest code executes).
+/// The wall-clock deadline of one `execute` unless the caller sets its own.
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
 
-/// How many epoch ticks a cancelled call may keep running to return its `cancelled`
-/// status cooperatively (`control.cancelled`) before the host stops it.
-pub const CANCEL_GRACE_TICKS: u64 = 50;
+/// The fuel a cancelled call keeps to return its `cancelled` status cooperatively
+/// (`control.cancelled`, or a blocking import answering the cancellation) before it is
+/// stopped: enough to serialize an outcome, far too little to hide a loop behind.
+pub const CANCEL_GRACE_FUEL: u64 = 50_000_000;
+
+/// How much fuel a guest consumes between two yields to the Tokio scheduler: small against
+/// every budget above, so the call's task looks at its deadline and cancellation often.
+pub const FUEL_YIELD_INTERVAL: u64 = 1_000_000;
 
 /// The per-call limits of `execute`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,8 +89,6 @@ impl ExecutionLimits {
 enum Stopped {
     #[error("the call ran past its deadline")]
     Deadline,
-    #[error("the call was cancelled and did not return")]
-    Cancelled,
 }
 
 struct Request {
@@ -85,6 +106,7 @@ pub(crate) struct Executor {
 /// What every call of one module is built from.
 struct Setup {
     engine: Engine,
+    epochs: Arc<Epochs>,
     pre: InstancePre<CallState>,
     services: Services,
     limits: ExecutionLimits,
@@ -95,6 +117,7 @@ impl Executor {
     pub(crate) fn start(
         handle: &tokio::runtime::Handle,
         engine: Engine,
+        epochs: Arc<Epochs>,
         pre: InstancePre<CallState>,
         services: Services,
         limits: ExecutionLimits,
@@ -102,6 +125,7 @@ impl Executor {
         let (requests, receiver) = mpsc::unbounded_channel();
         let setup = Setup {
             engine,
+            epochs,
             pre,
             services,
             limits,
@@ -137,7 +161,7 @@ fn stopped() -> ModuleFailure {
 }
 
 async fn run(mut receiver: mpsc::UnboundedReceiver<Request>, setup: Setup) {
-    let setup = std::sync::Arc::new(setup);
+    let setup = Arc::new(setup);
     let mut calls = JoinSet::new();
     loop {
         tokio::select! {
@@ -153,14 +177,37 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Request>, setup: Setup) {
     }
 }
 
-async fn serve(setup: std::sync::Arc<Setup>, mut request: Request) {
-    let reply = tokio::select! {
-        result = one_call(&setup, request.export, &request.params, request.cancel.clone()) => result,
-        // The caller dropped its future: the call is abandoned, and dropping it here drops
-        // its Store and everything the call held.
-        () = request.reply.closed() => return,
+async fn serve(setup: Arc<Setup>, request: Request) {
+    let Request {
+        export,
+        params,
+        cancel,
+        mut reply,
+    } = request;
+    let mut clock = setup.epochs.subscribe();
+    let deadline = clock.borrow().saturating_add(setup.limits.deadline_ticks());
+    // Boxed so it can be dropped before the reply is sent: the call's Store, and every
+    // process it held, is gone by the time the caller sees the outcome.
+    let mut call: Pin<Box<_>> =
+        Box::pin(one_call(&setup, export, &params, cancel.clone(), deadline));
+    let mut interrupted = false;
+    let result = loop {
+        tokio::select! {
+            result = &mut call => break result,
+            // The caller dropped its future: the call is abandoned, and returning here
+            // drops its Store and everything the call held.
+            () = reply.closed() => return,
+            // Past the deadline while the guest waits in a host import (a running guest
+            // meets it in its epoch callback first).
+            Ok(_) = clock.wait_for(|now| *now >= deadline) => break Err(ModuleFailure::DeadlineExceeded),
+            () = cancel.cancelled(), if !interrupted => {
+                interrupted = true;
+                setup.epochs.interrupt();
+            }
+        }
     };
-    let _ = request.reply.send(reply);
+    drop(call);
+    let _ = reply.send(result);
 }
 
 async fn one_call(
@@ -168,6 +215,7 @@ async fn one_call(
     export: &str,
     params: &[Val],
     cancel: CancellationToken,
+    deadline: u64,
 ) -> Result<Vec<Val>, ModuleFailure> {
     if cancel.is_cancelled() {
         return Err(ModuleFailure::Cancelled);
@@ -176,49 +224,54 @@ async fn one_call(
     store
         .set_fuel(setup.limits.fuel)
         .map_err(|error| failure(&error))?;
-    let deadline_ticks = setup.limits.deadline_ticks();
-    // Called at every epoch tick while guest code runs: the deadline and the cancellation
-    // grace are counted here, and between ticks the call yields to the Tokio scheduler, so
-    // a busy guest never starves the caller's runtime, current-thread included.
+    store
+        .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
+        .map_err(|error| failure(&error))?;
+    // Called at every epoch tick while guest code runs, and at once after a cancellation
+    // interrupts the engine's epoch.
+    let clock = setup.epochs.subscribe();
     store.set_epoch_deadline(1);
     store.epoch_deadline_callback(move |mut context| {
-        let state = context.data_mut();
-        state.ticks += 1;
-        if state.ticks >= deadline_ticks {
+        if *clock.borrow() >= deadline {
             return Err(wasmtime::Error::new(Stopped::Deadline));
         }
-        if state.cancel.is_cancelled() {
-            state.cancelled_ticks += 1;
-            if state.cancelled_ticks > CANCEL_GRACE_TICKS {
-                return Err(wasmtime::Error::new(Stopped::Cancelled));
-            }
+        if context.data().cancel.is_cancelled() && !context.data().cancel_grace {
+            context.data_mut().cancel_grace = true;
+            let left = context.get_fuel()?;
+            context.set_fuel(left.min(CANCEL_GRACE_FUEL))?;
         }
-        Ok(UpdateDeadline::Yield(1))
+        Ok(UpdateDeadline::Continue(1))
     });
 
     let instance = setup
         .pre
         .instantiate_async(&mut store)
         .await
-        .map_err(|error| failure(&error))?;
+        .map_err(|error| call_failure(&store, &error))?;
     let func = instance
         .get_func(&mut store, export)
         .ok_or_else(|| ModuleFailure::Trap(format!("the module exports no {export}")))?;
     let mut results = vec![Val::Bool(false); func.ty(&store).results().len()];
-    func.call_async(&mut store, params, &mut results)
-        .await
-        .map_err(|error| failure(&error))?;
+    if let Err(error) = func.call_async(&mut store, params, &mut results).await {
+        return Err(call_failure(&store, &error));
+    }
     Ok(results)
+}
+
+/// A cancelled call that used up its grace fuel was stopped for the cancellation, not for
+/// its budget.
+fn call_failure(store: &Store<CallState>, error: &wasmtime::Error) -> ModuleFailure {
+    match failure(error) {
+        ModuleFailure::FuelExhausted if store.data().cancel_grace => ModuleFailure::Cancelled,
+        other => other,
+    }
 }
 
 /// Maps a wasmtime error into the closed failure shapes. The text is wasmtime's or this
 /// runtime's own, never guest memory.
 fn failure(error: &wasmtime::Error) -> ModuleFailure {
-    if let Some(stopped) = error.downcast_ref::<Stopped>() {
-        return match stopped {
-            Stopped::Deadline => ModuleFailure::DeadlineExceeded,
-            Stopped::Cancelled => ModuleFailure::Cancelled,
-        };
+    if let Some(Stopped::Deadline) = error.downcast_ref::<Stopped>() {
+        return ModuleFailure::DeadlineExceeded;
     }
     match error.downcast_ref::<Trap>() {
         Some(Trap::OutOfFuel) => ModuleFailure::FuelExhausted,
@@ -234,9 +287,10 @@ mod tests {
 
     #[test]
     fn stops_and_traps_map_to_the_closed_failures() {
-        let map = |error| failure(&wasmtime::Error::new(error));
-        assert_eq!(map(Stopped::Deadline), ModuleFailure::DeadlineExceeded);
-        assert_eq!(map(Stopped::Cancelled), ModuleFailure::Cancelled);
+        assert_eq!(
+            failure(&wasmtime::Error::new(Stopped::Deadline)),
+            ModuleFailure::DeadlineExceeded
+        );
         assert_eq!(
             failure(&wasmtime::Error::new(Trap::OutOfFuel)),
             ModuleFailure::FuelExhausted

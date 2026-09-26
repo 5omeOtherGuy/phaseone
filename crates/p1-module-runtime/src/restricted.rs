@@ -34,7 +34,8 @@ use wasmtime::{Engine, Store};
 pub const RESTRICTED_FUEL: u64 = 50_000_000;
 
 /// The wall-clock bound of one restricted call, in epoch ticks: a backstop behind the fuel,
-/// which is what normally ends a runaway inspection.
+/// which is what normally ends a runaway inspection. It is the engine's own epoch, so any
+/// call cancelled meanwhile (see `Epochs::interrupt`) spends one of these ticks.
 pub const RESTRICTED_DEADLINE_TICKS: u64 = 200;
 
 pub(crate) struct Restricted {

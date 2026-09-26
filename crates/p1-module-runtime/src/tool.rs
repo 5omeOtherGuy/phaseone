@@ -29,7 +29,7 @@ use wasmtime::component::Val;
 
 use crate::capabilities::{LinkError, Services, capability_linker};
 use crate::executor::{ExecutionLimits, Executor};
-use crate::loader::{EpochTicker, LoadedModule, ModuleKind};
+use crate::loader::{Epochs, LoadedModule, ModuleKind};
 use crate::restricted::Restricted;
 
 /// Why a loaded module could not become a tool.
@@ -81,8 +81,8 @@ pub struct WasmTool {
     identity: ToolIdentity,
     restricted: Restricted,
     executor: Executor,
-    /// Deadlines advance only while the ticker runs; the tool may outlive its loader.
-    _ticker: Arc<EpochTicker>,
+    /// Deadlines advance only while the epoch clock lives; the tool may outlive its loader.
+    _epochs: Arc<Epochs>,
 }
 
 /// Builds the tool for `module`, linking the capabilities its manifest grants from
@@ -138,13 +138,20 @@ impl WasmTool {
                 reason,
             })?;
 
-        let executor = Executor::start(&handle, module.engine.clone(), pre, services, limits);
+        let executor = Executor::start(
+            &handle,
+            module.engine.clone(),
+            module.epochs.clone(),
+            pre,
+            services,
+            limits,
+        );
         Ok(Self {
             declaration,
             identity: module.identity().clone(),
             restricted,
             executor,
-            _ticker: module.ticker.clone(),
+            _epochs: module.epochs.clone(),
         })
     }
 }

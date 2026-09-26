@@ -21,7 +21,7 @@ pub use capabilities::{
     ExitStatus, LinkError, ProcessCommand, ProcessEvent, ProcessService, RunningProcess, Services,
 };
 pub use executor::ExecutionLimits;
-pub use loader::{LoadError, LoadedModule, Loader, ModuleKind};
+pub use loader::{LoadError, LoadedModule, Loader, ManualEpochs, ModuleKind};
 pub use manifest::{ComponentEntry, Digest, ManifestError, ReleaseManifest};
 pub use tool::{ToolError, WasmTool, wasm_tool};
 
