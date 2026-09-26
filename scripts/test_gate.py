@@ -2,7 +2,7 @@
 """Tests for scripts/gate.sh — stdlib only.
 
 The gate runs in a temporary repository whose scripts/ holds stub helpers and whose PATH holds
-stub cargo, wasm-tools, bwrap and timeout. Every stub appends one line to a call log and fails
+stub cargo, wasm-tools, bwrap, timeout, du and df. Every stub appends one line to a call log and fails
 when that line matches the STUB_FAIL regular expression, so each case can break exactly one
 step. Real cargo never runs.
 """
@@ -67,6 +67,30 @@ TIMEOUT_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
 
 HELPER_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + "exit 0\n"
 
+# The size lines of the target dir report.
+DU_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + 'printf \'1G\\t%s\\n\' "$2"\nexit 0\n'
+DF_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + "printf 'Avail\\n 9G\\n'\nexit 0\n"
+
+# Like the real boundary check, a finding when a package imports an interface its manifest's
+# capability allocation does not name.
+BOUNDARY_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
+    """\
+    dir=modules/target/p1-modules
+    [ "${1:-}" = --output-dir ] && dir="$2"
+    status=0
+    for out in "$dir"/*/; do
+      pkg="$(basename "$out")"
+      while IFS= read -r import; do
+        if ! grep -qF "\"$import\"" "$out/$pkg.manifest.json"; then
+          echo "check-module-boundaries: $pkg: FINDING: imports $import beyond its allocation"
+          status=1
+        fi
+      done < "$out/$pkg.imports"
+    done
+    exit "$status"
+    """
+)
+
 # The build stub writes the five build outputs of package.md, then damages them on request.
 BUILD_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
     f"""\
@@ -78,7 +102,7 @@ BUILD_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
     (cd "$out" && sha256sum "$pkg.wasm" > "$pkg.sha256")
     printf 'p1:module/control@1.0.0\\n' > "$out/$pkg.imports"
     digest="$(cut -d' ' -f1 "$out/$pkg.sha256")"
-    printf '{{\\n  "name": "p1/demo",\\n  "digest": "sha256:%s",\\n  "size": 15\\n}}\\n' "$digest" > "$out/$pkg.manifest.json"
+    printf '{{\\n  "name": "p1/demo",\\n  "digest": "sha256:%s",\\n  "capabilities": ["p1:module/control@1.0.0"],\\n  "size": 15\\n}}\\n' "$digest" > "$out/$pkg.manifest.json"
     case "${{STUB_DAMAGE:-}}" in
       digest) printf 'other bytes' > "$out/$pkg.wasm.tmp"; mv "$out/$pkg.wasm.tmp" "$out/$pkg.wasm"
               wasm-tools component wit "$out/$pkg.wasm" > "$out/$pkg.wit" ;;
@@ -86,6 +110,7 @@ BUILD_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
       manifest) sed -i 's/sha256:[0-9a-f]*/sha256:0000/' "$out/$pkg.manifest.json" ;;
       missing) rm "$out/$pkg.imports" ;;
       extra) mkdir -p modules/target/p1-modules/p1-module-gone ;;
+      imports) printf 'p1:module/net@1.0.0\\n' >> "$out/$pkg.imports" ;;
     esac
     exit 0
     """
@@ -126,14 +151,21 @@ ORDER = [
     ("guest check", r"^cargo clippy --manifest-path modules/Cargo\.toml --workspace --locked --target wasm32-unknown-unknown -- -D warnings$"),
     ("module build", r"^build-modules\.sh --all$"),
     ("module validation", r"^wasm-tools validate "),
-    ("module boundary", r"^check-module-boundaries\.sh$"),
+    ("import check", r"^check-module-boundaries\.sh --output-dir modules/target/p1-modules$"),
     ("bwrap probe", r"^bwrap --ro-bind / / --dev /dev --proc /proc true$"),
     ("test guard", r"^timeout --foreground \d+ cargo test --workspace --locked$"),
     ("tests", r"^cargo test --workspace --locked$"),
     ("core isolation", r"^check-core-isolation\.sh$"),
+    ("module boundary", r"^check-module-boundaries\.sh$"),
     ("secret scan", r"^secret-scan\.sh$"),
     ("adr", r"^adr\.py check$"),
-] + [(name, "^" + re.escape(name) + " -q$") for name in PY_TESTS]
+] + [(name, "^" + re.escape(name) + " -q$") for name in PY_TESTS] + [
+    ("target size", r"^du -sh "),
+    ("free space", r"^df -h "),
+]
+
+# The report lines after the last check: informational, they gate nothing.
+REPORT_ONLY = {"target size", "free space"}
 
 
 def write_exec(path: pathlib.Path, text: str) -> None:
@@ -153,8 +185,9 @@ class Harness:
         scripts.mkdir(parents=True)
         shutil.copy2(GATE, scripts / "gate.sh")
         for name in ("local-cargo-config.sh", "module-toolchain.sh", "check-core-isolation.sh",
-                     "check-module-boundaries.sh", "secret-scan.sh"):
+                     "secret-scan.sh"):
             write_exec(scripts / name, HELPER_STUB)
+        write_exec(scripts / "check-module-boundaries.sh", BOUNDARY_STUB)
         write_exec(scripts / "build-modules.sh", BUILD_STUB)
         write_exec(scripts / "adr.py", PY_STUB)
         for name in PY_TESTS:
@@ -176,6 +209,8 @@ class Harness:
         write_exec(bin_dir / "wasm-tools", WASM_TOOLS_STUB)
         write_exec(bin_dir / "bwrap", BWRAP_STUB)
         write_exec(bin_dir / "timeout", TIMEOUT_STUB)
+        write_exec(bin_dir / "du", DU_STUB)
+        write_exec(bin_dir / "df", DF_STUB)
         self.env = {
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "HOME": str(base),
@@ -239,12 +274,12 @@ class GateTests(unittest.TestCase):
         steps = h.steps()
         self.assertLess(steps.index("module build"), steps.index("tests"))
         self.assertLess(steps.index("module validation"), steps.index("tests"))
-        self.assertLess(steps.index("module boundary"), steps.index("tests"))
+        self.assertLess(steps.index("import check"), steps.index("tests"))
 
     def test_every_step_failing_stops_the_gate_red(self) -> None:
         names = [name for name, _ in ORDER]
         for index, (name, pattern) in enumerate(ORDER):
-            if name == "test guard":
+            if name == "test guard" or name in REPORT_ONLY:
                 continue  # the guard only runs the tests; "tests" covers a red test run
             with self.subTest(step=name):
                 h = self.harness()
@@ -254,6 +289,28 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(ran[-1], name, ran)
                 self.assertEqual(ran, names[: index + 1])
 
+    def test_every_step_prints_its_line_before_it_runs(self) -> None:
+        h = self.harness()
+        result = h.run()
+        lines = [l for l in result.stdout.splitlines() if l.startswith("== gate: ")]
+        self.assertEqual(lines, [
+            "== gate: fmt",
+            "== gate: clippy",
+            "== gate: modules toolchain",
+            "== gate: guest check",
+            "== gate: modules",
+            "== gate: module validation",
+            "== gate: bubblewrap",
+            "== gate: test",
+            "== gate: core isolation",
+            "== gate: module boundary",
+            "== gate: secret scan",
+            "== gate: adr",
+            "== gate: installer and CI helpers",
+            "== gate: GREEN",
+        ])
+        self.assertRegex(result.stdout, r"\n== target dir: 1G \S+/target \(free: 9G\)\n== gate: GREEN\n$")
+
     def test_the_gate_reads_no_variable_that_could_turn_a_step_off(self) -> None:
         # CI only relaxes the bubblewrap probe; every other variable the gate reads is a
         # build setting. A new switch would have to be added here, in review.
@@ -262,12 +319,30 @@ class GateTests(unittest.TestCase):
         self.assertEqual(read, {"CI", "CARGO_BUILD_JOBS", "CARGO_TERM_COLOR"})
 
     def test_a_guest_failure_is_red_on_ci_too(self) -> None:
-        for step in ("guest fmt", "guest check", "module build", "module validation", "module boundary"):
+        for step in ("guest fmt", "guest check", "module build", "module validation", "import check"):
             with self.subTest(step=step):
                 h = self.harness()
                 result = h.run(CI="true", STUB_FAIL=dict(ORDER)[step])
                 self.assert_red(result)
                 self.assertNotIn("tests", h.steps())
+
+    def test_no_variable_the_gate_reads_turns_a_guest_failure_off(self) -> None:
+        read = set(re.findall(r"\$\{?([A-Z][A-Z0-9_]*)", GATE.read_text(encoding="utf-8")))
+        for value in ("", "0", "1", "true", "false", "skip"):
+            for step in ("guest check", "module build", "import check"):
+                with self.subTest(value=value, step=step):
+                    h = self.harness()
+                    result = h.run(STUB_FAIL=dict(ORDER)[step], **{name: value for name in read})
+                    self.assert_red(result)
+                    self.assertNotIn("tests", h.steps())
+
+    def test_imports_beyond_the_allocation_fail_module_validation(self) -> None:
+        h = self.harness()
+        result = h.run(STUB_DAMAGE="imports")
+        self.assert_red(result)
+        self.assertIn("beyond its allocation", result.stdout)
+        self.assertEqual(h.steps()[-1], "import check")
+        self.assertNotIn("tests", h.steps())
 
     def test_damaged_build_outputs_fail_module_validation(self) -> None:
         for damage, message in (

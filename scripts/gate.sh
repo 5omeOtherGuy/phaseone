@@ -9,17 +9,24 @@
 #   clippy              native clippy, warnings denied
 #   modules toolchain   the pinned toolchain (scripts/module-toolchain.sh --check)
 #   guest check         the module workspace's clippy for the pinned target, warnings denied
-#   modules             optimized component builds (scripts/build-modules.sh --all)
-#   module validation   every built package is complete, valid and matches its digest and world
+#   modules             optimized component builds (scripts/build-modules.sh --all, release profile)
+#   module validation   every built package is complete, a valid component, matches its digest
+#                       and world, and imports no more than its manifest's capability allocation
+#                       (scripts/check-module-boundaries.sh --output-dir modules/target/p1-modules)
+#   bubblewrap          the boundary tests' own bwrap probe: red outside CI when it fails
+#   test                native tests, including the Wasmtime integration and conformance tests
+#   core isolation      scripts/check-core-isolation.sh
 #   module boundary     imports against the frozen capability allocation, and the unsafe policy
 #                       (scripts/check-module-boundaries.sh, freeze items 11 and 13)
-#   bubblewrap          on a stream box, a usable bwrap (the boundary tests must not skip)
-#   test                native tests, including the Wasmtime integration and conformance tests
-#   core isolation, secret scan, adr, installer and CI helpers
+#   secret scan, adr, installer and CI helpers
 #
 # The module build comes before the tests so the integration and conformance tests exercise the
-# components this commit builds, never stale or missing ones. The bubblewrap boundary tests are
+# components this commit builds, never stale or missing ones; they read them from
+# modules/target/p1-modules/, where the build writes them. The bubblewrap boundary tests are
 # required on a stream box and skip only on GitHub-hosted runners (ADR-0077), where `CI` is set.
+#
+# Exit 0 after `== gate: GREEN`; any other exit status is the failing step's own, and GREEN
+# is not printed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
@@ -93,8 +100,10 @@ echo "== gate: modules"
 scripts/build-modules.sh --all
 echo "== gate: module validation"
 validate_modules
-echo "== gate: module boundary"
-scripts/check-module-boundaries.sh
+# The imports of the components just validated against their manifests' capability
+# allocation, before the tests load them: a component that imports more than it declares
+# must never reach a Wasmtime test.
+scripts/check-module-boundaries.sh --output-dir modules/target/p1-modules
 echo "== gate: bubblewrap"
 if bwrap_usable; then
   echo "bubblewrap: usable; the boundary tests run"
@@ -111,6 +120,10 @@ echo "== gate: test"
 timeout --foreground 3600 cargo test --workspace --locked
 echo "== gate: core isolation"
 scripts/check-core-isolation.sh
+echo "== gate: module boundary"
+# The tag's standing boundary check, next to core isolation: imports and the unsafe policy of
+# every package and crate, over the outputs the tests ran against.
+scripts/check-module-boundaries.sh
 echo "== gate: secret scan"
 scripts/secret-scan.sh
 echo "== gate: adr"
