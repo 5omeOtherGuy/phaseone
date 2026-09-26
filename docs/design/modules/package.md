@@ -5,7 +5,8 @@ Status: published freeze item 6 of the WebAssembly boundary (ADR-0071). The buil
 here, the workspace is [`modules/Cargo.toml`](../../../modules/Cargo.toml) and the first package is
 `modules/p1-module-fixture/`. The loader's own rules (verify the digest, then compile those same
 bytes, never a compiled cache, official source only) are the runtime crate's and are published
-with it.
+below under "The loader"; the decision behind them is
+[ADR-0082](../../adr/0082-component-abi-and-execution-ownership.md).
 
 ## The package
 
@@ -57,6 +58,42 @@ world has no export that returns one, so a module cannot claim another implement
 or its grants. The implementation part comes from the manifest `name` and the variant part from
 the manifest `variant`; the model-facing name of a call is the interface's own business
 (`declaration`), and an environment may present the tool under another name.
+
+## The loader (freeze item 6)
+
+The loader is [`crates/p1-module-runtime/src/loader.rs`](../../../crates/p1-module-runtime/src/loader.rs)
+over the release manifest of
+[`manifest.rs`](../../../crates/p1-module-runtime/src/manifest.rs): p1's release archive ships one
+`manifest.json` (format `p1-release-manifest/1`) whose `components` list names each package by
+its manifest `name`, pins its bytes by `digest`, locates them by a path relative to the manifest
+and carries the frozen manifest fields above (ADR-0079).
+
+- **Official source only.** `Loader::load` takes a name, never a path or bytes. A name outside
+  the reserved `p1/` namespace is `LoadError::NotOfficial`, and a name the release manifest does
+  not list is `LoadError::NotInManifest`; each error says why, naming the module.
+- **Refused before anything is read.** A `kind` the runtime does not speak (`UnknownKind`), a
+  `world` that is not the world of its kind (`WorldMismatch`), a `protocol` whose major is not
+  `PROTOCOL_VERSION`'s (`ProtocolMismatch`) and a granted capability the runtime cannot link
+  (`UnsupportedCapability`) are refused from the manifest entry alone. The runtime links
+  `control`, `clock`, `random` and `process` today; the other capabilities arrive with the
+  streams that own their native services, and until then a grant of one is refused.
+- **Verify, then compile the same bytes.** The component file must be a regular file (a symlink
+  is refused); its bytes are read once, hashed with SHA-256 and compared with the manifest
+  digest (`DigestMismatch` names both), and only then are *those* bytes compiled from memory with
+  `Component::from_binary`. Nothing is read twice, so a file swapped between the check and the
+  compile cannot be the one compiled, and no text format is accepted.
+- **No compiled-cache deserialization.** wasmtime is built without its `cache` feature and
+  `Component::deserialize*` is never called ([`toolchain.md`](toolchain.md#the-pins)), so the
+  digest check is the whole trust decision.
+- **Imports are checked against the grant.** Every import of the compiled component must be the
+  type-only `types` interface or a capability the manifest grants; anything else, every `wasi:`
+  import included, is `LoadError::UndeclaredImport`.
+- **Identity.** The `LoadedModule` carries the verified digest, the class, the granted
+  capabilities and the loader-built `ToolIdentity` (above).
+
+The cases are tested in
+[`runtime_spike.rs`](../../../crates/p1-module-tests/tests/runtime_spike.rs)
+(`load_verifies_then_compiles_the_same_bytes`, `load_refuses_what_the_release_does_not_ship`).
 
 ## Build outputs
 
