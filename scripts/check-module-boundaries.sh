@@ -679,7 +679,9 @@ shipping_implementations() {
 # root of the tree (depth 0) carries `-` as its parent. A workspace crate is a crate cargo
 # prints with a path below $root; cargo prints the path of a repeated crate too (its line
 # carries ` (*)`), and only the first line names it, so the tree is the line order together
-# with the depth.
+# with the depth. An external crate is counted once per `name vversion` — cargo prints a
+# repeated one again with ` (*)`, and one crate can be reached at two versions — so the
+# external figure has the same base as the deduplicated workspace figure next to it.
 SHIPPING_TREE='
   {
     if (match($0, /^[0-9]+/)) {
@@ -687,13 +689,17 @@ SHIPPING_TREE='
       rest = substr($0, RLENGTH + 1)
     } else next
     if (match(rest, /^[A-Za-z0-9_.-]+ v[^ ]+/)) {
-      name = substr(rest, 1, RLENGTH)
+      id = substr(rest, 1, RLENGTH)
+      name = id
       sub(/ v.*$/, "", name)
     } else next
     path = ""
     if (match(rest, /\((\/[^)]*)\)/)) path = substr(rest, RSTART + 1, RLENGTH - 2)
     if (substr(path, 1, length(root) + 1) != root "/") {
-      externals += 1
+      if (!(id in external_seen)) {
+        external_seen[id] = 1
+        externals += 1
+      }
       next
     }
     max = (depth > max) ? depth : max

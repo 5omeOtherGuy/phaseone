@@ -324,6 +324,35 @@ class ShippingModeTests(unittest.TestCase):
         self.assertNotIn("serde", result.stdout)
         self.assertRegex(result.stdout, r"graph: 2 workspace crates, 2 external crates")
 
+    def test_an_external_crate_repeated_in_the_graph_is_counted_once(self) -> None:
+        # cargo prints an external crate a second time with ` (*)`, and one crate can be reached
+        # at two versions: the figure counts distinct `<name> v<version>` pairs, the same base as
+        # the deduplicated workspace figure beside it.
+        h = self.harness("p1-core")
+        h.set_tree(
+            "\n".join(
+                [
+                    f"0p1-host v0.0.1 ({h.repo}/crates/p1-host)",
+                    f"1p1-core v0.0.1 ({h.repo}/crates/p1-core)",
+                    "2serde v1.0.229",
+                    "2serde_core v1.0.229",
+                    "1serde v1.0.229 (*)",
+                    "1serde_json v1.0.145",
+                    "2serde v1.0.229 (*)",
+                    "2serde v1.0.228",
+                    "",
+                ]
+            )
+        )
+        result = h.run("--shipping")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("serde", result.stdout)
+        self.assertRegex(
+            result.stdout,
+            r"(?m)^check-module-boundaries: shipping: graph: 2 workspace crates, 4 external crates "
+            r"\(cargo tree --locked --offline -p p1-host -e normal\)$",
+        )
+
     def test_a_reachable_extension_is_listed_with_its_path_and_the_package(self) -> None:
         h = self.harness("p1-tool-shell", "p1-context")
         result = h.run("--shipping")
