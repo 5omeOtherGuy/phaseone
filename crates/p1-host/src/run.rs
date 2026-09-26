@@ -1582,15 +1582,18 @@ pub(crate) fn model_switch_for_test(
     // workflows, `workflow_*`); a run's service registers them, so a stub stands in.
     let stub: p1_workers::AgentFactory = Arc::new(|_spec| Err("no workers in this test".into()));
     deps.worker_service = Some(p1_workers::InProcessWorkers::new(stub, 1));
-    // The workflow tools are only registered by a run's `workflow_service`. A driver
-    // test has none, so stand-ins go in through the same catalog hook `reload_modules`
-    // builds ITS catalog with — both the session's and the reload's catalogs must
-    // have them, or the main environment will not assemble.
+    // The workflow tools are only registered by a run's `workflow_service`, and the
+    // native members are the ones `with_worker_tools` appends to a main environment
+    // (`WORKFLOW_TOOLS`; `WORKFLOW_MODULES` are the packages a member environment
+    // names instead). A driver test has no service, so stand-ins go in through the
+    // same catalog hook `reload_modules` builds ITS catalog with — both the session's
+    // and the reload's catalogs must have them, or the main environment will not
+    // assemble.
     #[cfg(feature = "workflows")]
     {
         let inner = deps.catalog_hook.take();
         deps.catalog_hook = Some(Box::new(move |catalog: &mut Catalog| {
-            for key in crate::catalog::workflow::WORKFLOW_MODULES {
+            for key in crate::catalog::workflow::WORKFLOW_TOOLS {
                 if !catalog
                     .tool_keys()
                     .iter()
@@ -2144,6 +2147,11 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         shadow: deps.shadow.clone(),
         catalog_hook: hook.map(forward),
         wait: deps.wait.clone(),
+        // The reload rebuilds the same catalog, so it links the module packages through
+        // the same hook and stays inside the member-scope generation the run holds.
+        module_services: deps.module_services.clone(),
+        #[cfg(feature = "delegation")]
+        member_scopes: deps.member_scopes.clone(),
         #[cfg(feature = "delegation")]
         worker_service: deps.worker_service.clone(),
         #[cfg(feature = "workflows")]

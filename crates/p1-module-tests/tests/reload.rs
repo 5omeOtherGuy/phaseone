@@ -409,7 +409,7 @@ impl Session {
         let (process, processes) = fake_processes();
         let process: Arc<dyn ProcessService> = process;
         let counted = instantiations.clone();
-        let services: ModuleServices = Arc::new(move |_: &ToolServices| {
+        let services: ModuleServices = Arc::new(move |_: &str, _: &ToolServices| {
             counted.fetch_add(1, Ordering::SeqCst);
             Services {
                 process: Some(process.clone()),
