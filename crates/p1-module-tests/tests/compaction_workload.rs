@@ -469,7 +469,7 @@ impl Stack {
         .expect("fixture lock");
         let (process, processes) = fake_processes();
         let process: Arc<dyn ProcessService> = process;
-        let services: ModuleServices = Arc::new(move |_: &ToolServices| Services {
+        let services: ModuleServices = Arc::new(move |_: &str, _: &ToolServices| Services {
             process: Some(process.clone()),
             ..Services::default()
         });
