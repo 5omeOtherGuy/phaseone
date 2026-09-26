@@ -11,7 +11,11 @@
 //! the thresholds; nothing here asserts on a time or a size. Every case is `#[ignore]`,
 //! so the gate's `cargo test --workspace` never runs a benchmark. Each case prints exactly one
 //! line on stdout, a JSON object whose `acceptance-row` is its row id in the script's table:
-//! the measurements (statistic, value, unit), the sample count and a detail text.
+//! the measurements (statistic, value, unit), the sample count and a detail text. Where a path
+//! has phases worth separating — the history transfers — the detail carries the p95 of each, so
+//! a row above its target says where its time went; the row's own value and verdict stay the
+//! whole path's, as PLAN §10 measures it. The timed phases hold only copies p1's own path makes:
+//! a history's serialized payload is written once, into the request the module receives.
 //!
 //! Every measured call is checked to have produced the answer the path must produce, so a
 //! broken path fails the case instead of reporting a time for something that did not work.
@@ -414,6 +418,7 @@ fn module_tool(module: &LoadedModule) -> (Arc<dyn Tool>, FakeProcesses) {
         module,
         Services {
             process: Some(process),
+            summary: None,
         },
         ExecutionLimits::default(),
         &Arc::new(MaskCounter::new()),
@@ -491,7 +496,8 @@ fn expect_echo(outcome: &ToolOutcome, payload: &str) {
 // ---- history transfer -----------------------------------------------------------------
 
 /// Transfers a synthetic history of at least `bytes` serialized bytes through the fixture
-/// `samples` times and reports the p95 of the whole transfer.
+/// `samples` times and reports the p95 of the whole transfer. The row's detail carries the
+/// p95 of each phase of that path, so a row above its target says where its time went.
 async fn history_case(row: &'static str, bytes: usize, samples: usize) {
     let history = synthetic_history(bytes);
     let serialized = wire_text(&history).len();
@@ -500,16 +506,18 @@ async fn history_case(row: &'static str, bytes: usize, samples: usize) {
     let (tool, _processes) = module_tool(&module);
 
     for index in 0..HISTORY_WARM_UP {
-        let back = transfer(&tool, &history).await;
+        let (back, _) = transfer(&tool, &history, serialized).await;
         if index == 0 {
             assert!(back == history, "{row}: the history came back changed");
         }
     }
     let mut taken = Vec::with_capacity(samples);
+    let mut phases = Phases::default();
     for _ in 0..samples {
-        let (back, took) = timed(transfer(&tool, &history)).await;
+        let ((back, timings), took) = timed(transfer(&tool, &history, serialized)).await;
         assert_eq!(back.len(), history.len(), "{row}: items were lost");
         taken.push(took);
+        phases.record(timings);
     }
     emit(
         row,
@@ -517,8 +525,9 @@ async fn history_case(row: &'static str, bytes: usize, samples: usize) {
         samples,
         format!(
             "{} items, {serialized} serialized bytes, echoed through the fixture and \
-             validated as protocol history items",
-            history.len()
+             validated as protocol history items; p95 by phase: {}",
+            history.len(),
+            phases.detail()
         ),
     );
 }
@@ -526,26 +535,100 @@ async fn history_case(row: &'static str, bytes: usize, samples: usize) {
 /// One transfer, as a host hands history to a module and takes it back: the native items
 /// to their protocol wire form and JSON, through the tool call, the component and the
 /// redacting wrapper, and back through the protocol's validation (unknown fields and
-/// shapes are refused) into native items.
-async fn transfer(tool: &Arc<dyn Tool>, history: &[Item]) -> Vec<Item> {
-    let text = wire_text(history);
-    let outcome = tool
-        .execute(&call(&format!("echo:{text}")), context())
-        .await;
+/// shapes are refused) into native items. Beside the items it returns the time each phase
+/// of that path took, so the row's one number can be read against its parts.
+async fn transfer(
+    tool: &Arc<dyn Tool>,
+    history: &[Item],
+    serialized: usize,
+) -> (Vec<Item>, Timings) {
+    let (request, serialize_ms) = timed(async { serialize(history, serialized) }).await;
+    let (outcome, call_ms) = timed(tool.execute(&request, context())).await;
     assert_eq!(
         outcome.status,
         ToolStatus::Ok,
         "{}",
         outcome.content.chars().take(200).collect::<String>()
     );
+    let (back, validate_ms) = timed(async { validate(&outcome.content) }).await;
+    (
+        back,
+        Timings {
+            serialize: serialize_ms,
+            call: call_ms,
+            validate: validate_ms,
+        },
+    )
+}
+
+/// The call the fixture reads: its freeform input carries the mode and the payload in one
+/// text, so the host's serialization of the history is written straight into that input.
+/// The payload is therefore written once, where p1's own path would copy it once, and the
+/// buffer is sized from the history (the same every sample) so growing it never doubles as
+/// a second serialization. The call carries the ids the crate's own `call` gives the
+/// fixture; only the input differs, because that one is built here.
+fn serialize(history: &[Item], serialized: usize) -> ToolCall {
+    let mut raw = Vec::with_capacity("echo:".len() + serialized);
+    raw.extend_from_slice(b"echo:");
+    let wire: Vec<WireItem> = history.iter().cloned().map(WireItem::from).collect();
+    serde_json::to_writer(&mut raw, &wire).expect("history serializes");
+    ToolCall {
+        call_id: "c1".to_owned(),
+        name: "fixture".to_owned(),
+        input: ToolInput::Text(String::from_utf8(raw).expect("the wire text is UTF-8")),
+    }
+}
+
+/// The protocol's validation of an answer, as the host does it: the text parses as history
+/// items (unknown fields and shapes are refused) and becomes native items.
+fn validate(content: &str) -> Vec<Item> {
     let wire: Vec<WireItem> =
-        serde_json::from_str(&outcome.content).expect("the history came back as protocol items");
+        serde_json::from_str(content).expect("the history came back as protocol items");
     wire.into_iter().map(Item::from).collect()
 }
 
 fn wire_text(history: &[Item]) -> String {
     let wire: Vec<WireItem> = history.iter().cloned().map(WireItem::from).collect();
     serde_json::to_string(&wire).expect("history serializes")
+}
+
+/// What one transfer spent in each phase of the path, in milliseconds.
+struct Timings {
+    /// The host's serialization: native items to protocol wire items to JSON.
+    serialize: f64,
+    /// The component call: the executor's queue, the host's own call serialization, the
+    /// copy into the guest, the guest's echo and the copy out.
+    call: f64,
+    /// The host's parse and protocol validation of the answer.
+    validate: f64,
+}
+
+/// The [`Timings`] of every sample of one row.
+#[derive(Default)]
+struct Phases {
+    serialize: Vec<f64>,
+    call: Vec<f64>,
+    validate: Vec<f64>,
+}
+
+impl Phases {
+    fn record(&mut self, timings: Timings) {
+        self.serialize.push(timings.serialize);
+        self.call.push(timings.call);
+        self.validate.push(timings.validate);
+    }
+
+    /// The p95 of each phase, in the order the path runs them.
+    fn detail(&self) -> String {
+        let phase =
+            |name: &str, samples: &[f64]| format!("{name} {:.3} ms", percentile(samples, 95));
+        format!(
+            "{}, {}, {}",
+            phase("host serialize", &self.serialize),
+            phase("component call", &self.call),
+            phase("host parse+validate", &self.validate)
+        )
+    }
 }
 
 /// A history shaped like an agent's: user turns, assistant text with a tool call, and
@@ -687,6 +770,8 @@ async fn rounds(
     measured: usize,
 ) -> Vec<Sample> {
     let payload = Arc::new(synthetic_text(NOOP_PAYLOAD, 0));
+    // The history is the same in every round, so the request buffer is sized once.
+    let serialized = wire_text(history).len();
     let mut samples = Vec::with_capacity(measured);
     for round in 0..warm_up + measured {
         if round == warm_up {
@@ -701,7 +786,7 @@ async fn rounds(
                 tokio::spawn(async move {
                     let echo = call(&format!("echo:{payload}"));
                     expect_echo(&tool.execute(&echo, context()).await, &payload);
-                    let back = transfer(&tool, &history).await;
+                    let (back, _) = transfer(&tool, &history, serialized).await;
                     assert_eq!(back.len(), history.len(), "items were lost");
                 })
             })
