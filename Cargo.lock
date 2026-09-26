@@ -1689,6 +1689,7 @@ version = "0.0.1"
 dependencies = [
  "p1-contracts",
  "p1-model-profile",
+ "p1-redact",
  "p1-testkit",
  "p1-workspace",
  "serde",
@@ -1769,6 +1770,7 @@ dependencies = [
  "p1-hook-shadow",
  "p1-journal",
  "p1-model-profile",
+ "p1-module-runtime",
  "p1-provider-anthropic",
  "p1-provider-conformance",
  "p1-provider-http",
@@ -1794,6 +1796,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "toml",
 ]
@@ -1863,8 +1866,10 @@ name = "p1-module-tests"
 version = "0.0.1"
 dependencies = [
  "futures-util",
+ "p1-assembly",
  "p1-contracts",
  "p1-core",
+ "p1-host",
  "p1-module-runtime",
  "p1-provider-http",
  "p1-provider-openai",

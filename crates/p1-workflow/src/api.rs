@@ -605,6 +605,62 @@ pub trait WorkflowService: Send + Sync {
     fn list<'a>(&'a self) -> BoxFuture<'a, Vec<(RunId, RunStatus)>>;
 }
 
+// The narrow operation surfaces the `workflow_*` tool members are built from: each
+// member holds only the one it needs, so `workflow_status` has no `start` to call. The
+// blanket impls make every `WorkflowService` (including `dyn WorkflowService`) satisfy
+// all three unchanged, so the host's one service still builds every member.
+
+/// Starting a run: the `workflow_start` member's surface.
+pub trait StartRuns: Send + Sync {
+    /// As [`WorkflowService::start`].
+    fn start<'a>(&'a self, request: StartRequest) -> BoxFuture<'a, Result<RunId, WorkflowError>>;
+}
+
+/// Reading a run: the `workflow_status` and `workflow_result` members' surface.
+pub trait ObserveRuns: Send + Sync {
+    /// As [`WorkflowService::status`].
+    fn status<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<RunStatus, WorkflowError>>;
+
+    /// As [`WorkflowService::wait`].
+    fn wait<'a>(
+        &'a self,
+        id: &'a RunId,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<RunStatus, WorkflowError>>;
+}
+
+/// Cancelling a run: the `workflow_cancel` member's surface.
+pub trait CancelRuns: Send + Sync {
+    /// As [`WorkflowService::cancel`].
+    fn cancel<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<(), WorkflowError>>;
+}
+
+impl<T: WorkflowService + ?Sized> StartRuns for T {
+    fn start<'a>(&'a self, request: StartRequest) -> BoxFuture<'a, Result<RunId, WorkflowError>> {
+        WorkflowService::start(self, request)
+    }
+}
+
+impl<T: WorkflowService + ?Sized> ObserveRuns for T {
+    fn status<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        WorkflowService::status(self, id)
+    }
+
+    fn wait<'a>(
+        &'a self,
+        id: &'a RunId,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        WorkflowService::wait(self, id, cancel)
+    }
+}
+
+impl<T: WorkflowService + ?Sized> CancelRuns for T {
+    fn cancel<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<(), WorkflowError>> {
+        WorkflowService::cancel(self, id)
+    }
+}
+
 /// What the host renders, one call per event, from the engine's thread. Every method is
 /// a no-op by default. `run_ended` is the ONE place the host wakes the parent from.
 pub trait WorkflowObserver: Send + Sync {
