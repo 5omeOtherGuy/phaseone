@@ -21,6 +21,7 @@ use p1_contracts::{
 };
 use p1_module_protocol::{
     ModuleFailure, WireCallDescription, WireItem, WireResultDescription, WireToolOutcome,
+    WireToolStatus,
 };
 use p1_redact::{MaskCounter, redacted};
 use thiserror::Error;
@@ -180,6 +181,129 @@ fn wire_call(call: &ToolCall) -> Option<String> {
     String::from_utf8(text).ok()
 }
 
+/// The module's `tool_outcome` text as a `ToolOutcome`, exactly as the protocol's
+/// `WireToolOutcome` reads it: unknown fields, unknown statuses and anything not JSON are
+/// `InvalidOutput`.
+fn read_outcome(text: String) -> Result<ToolOutcome, ModuleFailure> {
+    let text = match compact_outcome(text) {
+        Ok(read) => return read,
+        Err(text) => text,
+    };
+    serde_json::from_str::<WireToolOutcome>(&text)
+        .map(ToolOutcome::from)
+        .map_err(|error| ModuleFailure::InvalidOutput(error.to_string()))
+}
+
+/// The outcome of the compact text `{"status":"<status>","content":"<content>"}` whose
+/// content has only short escapes (no `\u`), or the text given back, intact, for the
+/// protocol's own reader.
+///
+/// A tool outcome can be a whole history (tens of MiB). The general reader decodes a string
+/// with escapes into a growing scratch buffer and copies it into a fresh one; this decodes
+/// the content over the text's own buffer, whose pages are already there, where every page
+/// of a fresh buffer that size is a page fault. The compact shape is what every module
+/// writing compact JSON produces, and what this accepts reads the same through
+/// `WireToolOutcome` (a test holds the two readers to that).
+fn compact_outcome(text: String) -> Result<Result<ToolOutcome, ModuleFailure>, String> {
+    let Some((status, body)) = compact_shape(&text) else {
+        return Err(text);
+    };
+    let (start, end) = (body.start, body.end);
+    let bytes = text.as_bytes();
+    // First the whole content is checked, so a text this declines is given back intact.
+    let mut at = start;
+    while let Some(found) = special(&bytes[..end], at) {
+        // The letter must lie inside the content: `\"` just before the end would be an
+        // escaped closing quote, an unterminated literal.
+        let letter = bytes[..end].get(found + 1);
+        if bytes[found] != b'\\' || letter.and_then(|&letter| short(letter)).is_none() {
+            return Err(text);
+        }
+        at = found + 2;
+    }
+    let mut bytes = text.into_bytes();
+    let (mut read, mut write) = (start, 0);
+    while let Some(found) = special(&bytes[..end], read) {
+        bytes.copy_within(read..found, write);
+        write += found - read;
+        // Checked above: every escape is a short one, one ASCII byte decoded.
+        bytes[write] = short(bytes[found + 1]).unwrap_or(b'?');
+        write += 1;
+        read = found + 2;
+    }
+    bytes.copy_within(read..end, write);
+    bytes.truncate(write + (end - read));
+    // Whole runs of a `str` and ASCII bytes are UTF-8 whatever the content was, so this
+    // never fails; were it to, the output is refused rather than trusted.
+    Ok(String::from_utf8(bytes)
+        .map(|content| ToolOutcome {
+            status: status.into(),
+            content,
+        })
+        .map_err(|error| ModuleFailure::InvalidOutput(error.to_string())))
+}
+
+/// The status and the content's byte range of a compact outcome text, before its content
+/// is checked.
+fn compact_shape(text: &str) -> Option<(WireToolStatus, std::ops::Range<usize>)> {
+    const STATUS: &str = "{\"status\":\"";
+    const CONTENT: &str = "\",\"content\":\"";
+    const CLOSE: &str = "\"}";
+    let rest = text.strip_prefix(STATUS)?;
+    let name_end = rest.find(['"', '\\'])?;
+    let (name, rest) = rest.split_at(name_end);
+    let status: WireToolStatus =
+        serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()?;
+    if !rest.starts_with(CONTENT) || !rest.ends_with(CLOSE) {
+        return None;
+    }
+    let start = STATUS.len() + name_end + CONTENT.len();
+    let end = text.len() - CLOSE.len();
+    (start <= end).then_some((status, start..end))
+}
+
+/// The byte a short escape `\<letter>` stands for, or `None` for any other letter.
+fn short(letter: u8) -> Option<u8> {
+    Some(match letter {
+        b'"' => b'"',
+        b'\\' => b'\\',
+        b'/' => b'/',
+        b'b' => 0x08,
+        b'f' => 0x0c,
+        b'n' => b'\n',
+        b'r' => b'\r',
+        b't' => b'\t',
+        _ => return None,
+    })
+}
+
+/// The index of the first quote, backslash or control byte of `bytes` at or after `from`,
+/// testing eight bytes per step: the content between two escapes is usually long.
+fn special(bytes: &[u8], from: usize) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    // A high bit where a byte of `word` is zero; exact for the first such byte, which is
+    // the one the scan below stops at.
+    let zero = |word: u64| word.wrapping_sub(ONES) & !word & HIGHS;
+    let (chunks, _) = bytes.get(from..)?.as_chunks::<8>();
+    let mut offset = from;
+    for &chunk in chunks {
+        let word = u64::from_le_bytes(chunk);
+        let hit = zero(word ^ (ONES * u64::from(b'"')))
+            | zero(word ^ (ONES * u64::from(b'\\')))
+            // A byte below 0x20 has its three top bits clear.
+            | zero(word & (ONES * 0xe0));
+        if hit != 0 {
+            break;
+        }
+        offset += 8;
+    }
+    bytes[offset..]
+        .iter()
+        .position(|&byte| byte == b'"' || byte == b'\\' || byte < 0x20)
+        .map(|found| offset + found)
+}
+
 /// The single string result of a restricted call, if it returned one.
 fn string_result(results: Option<Vec<Val>>) -> Option<String> {
     match results?.into_iter().next()? {
@@ -323,9 +447,7 @@ impl Tool for WasmTool {
                 let text = string_result(Some(results)).ok_or_else(|| {
                     ModuleFailure::InvalidOutput("execute returned no text".to_owned())
                 })?;
-                serde_json::from_str::<WireToolOutcome>(&text)
-                    .map(ToolOutcome::from)
-                    .map_err(|error| ModuleFailure::InvalidOutput(error.to_string()))
+                read_outcome(text)
             });
             outcome.unwrap_or_else(ModuleFailure::into_tool_outcome)
         })
@@ -358,5 +480,92 @@ mod tests {
                 .expect("a wire call serializes");
             assert_eq!(wire_call(&call).as_deref(), Some(expected.as_str()));
         }
+    }
+
+    /// The protocol's own reading of an outcome text.
+    fn general(text: &str) -> Result<ToolOutcome, String> {
+        serde_json::from_str::<WireToolOutcome>(text)
+            .map(ToolOutcome::from)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Every text the compact reader accepts reads the same through `WireToolOutcome`, and
+    /// every text it declines is left to that reader, errors included; the escapes and
+    /// special bytes sit in every lane of its eight-byte scan.
+    #[test]
+    fn the_compact_reader_reads_what_the_protocol_reads() {
+        let mut contents: Vec<String> = Vec::new();
+        for pad in 0..9 {
+            let x = "x".repeat(pad);
+            for piece in [
+                r#"\""#,
+                r"\\",
+                r"\/",
+                r"\b",
+                r"\f",
+                r"\n",
+                r"\r",
+                r"\t",
+                r"\u0041",
+                r"\ud83d\ude00",
+                r"\ud83d",
+                r"\q",
+                "\"",
+                "\u{1}",
+                "\u{7f}",
+                "\u{e9}",
+                "\u{1f600}",
+                r"\",
+            ] {
+                contents.push(format!("{x}{piece}{x}y"));
+                contents.push(format!("{x}{piece}"));
+            }
+        }
+        contents.extend(["", "plain text"].map(str::to_owned));
+        let mut compact = 0;
+        for content in &contents {
+            for status in [
+                "ok",
+                "error",
+                "cancelled",
+                "unknown",
+                "maybe",
+                "OK",
+                "o\\u006b",
+            ] {
+                let text = format!("{{\"status\":\"{status}\",\"content\":\"{content}\"}}");
+                let spaced = format!("{{ \"status\": \"{status}\", \"content\": \"{content}\" }}");
+                let reordered = format!("{{\"content\":\"{content}\",\"status\":\"{status}\"}}");
+                let extra =
+                    format!("{{\"status\":\"{status}\",\"content\":\"{content}\",\"x\":1}}");
+                for text in [text, spaced, reordered, extra] {
+                    let expected = general(&text);
+                    match compact_outcome(text.clone()) {
+                        Ok(read) => {
+                            compact += 1;
+                            let outcome = read.expect("a compact text is read");
+                            assert_eq!(Ok(outcome), expected, "{text}");
+                        }
+                        Err(back) => {
+                            // Declined: the text comes back intact, and the reader the
+                            // runtime falls back to gives the answer.
+                            assert_eq!(back, text);
+                            let read =
+                                read_outcome(text.clone()).map_err(|failure| match failure {
+                                    ModuleFailure::InvalidOutput(message) => message,
+                                    other => panic!("{other:?}"),
+                                });
+                            assert_eq!(read, expected, "{text}");
+                        }
+                    }
+                }
+            }
+        }
+        // The compact shape with short escapes is read by the compact reader.
+        assert!(compact > contents.len(), "{compact}");
+        assert_eq!(
+            compact_outcome(r#"{"status":"ok","content":"a\"b\\c\nd"}"#.to_owned()),
+            Ok(Ok(ToolOutcome::ok("a\"b\\c\nd")))
+        );
     }
 }

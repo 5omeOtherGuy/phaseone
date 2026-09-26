@@ -103,7 +103,7 @@ impl Guest for Fixture {
     fn execute(call: ToolCall) -> ToolOutcome {
         // An echo whose text can go back as it came is answered without decoding it; the
         // general path gives the same answer (wire.rs), at a cost a large echo feels.
-        wire::echo_as_sent(&call).unwrap_or_else(|| execute_decoded(&call))
+        wire::echo_as_sent(call).unwrap_or_else(|call| execute_decoded(&call))
     }
 }
 
@@ -336,7 +336,7 @@ mod tests {
                 text.clone(),
             ] {
                 let json = call(&raw);
-                if let Some(outcome) = wire::echo_as_sent(&json) {
+                if let Ok(outcome) = wire::echo_as_sent(json.clone()) {
                     assert_eq!(outcome, execute_decoded(&json), "{raw:?}");
                     sent_back += 1;
                 }
@@ -371,18 +371,22 @@ mod tests {
             let json = format!(
                 "{{\"call_id\":\"c1\",\"name\":\"fixture\",\"input\":{{\"kind\":\"text\",\"raw\":{literal}}}}}"
             );
-            match wire::echo_as_sent(&json) {
-                Some(outcome) => {
+            match wire::echo_as_sent(json.clone()) {
+                Ok(outcome) => {
                     assert!(as_sent, "{literal} went back as sent");
                     assert_eq!(outcome, execute_decoded(&json), "{literal}");
                 }
-                None => assert!(!as_sent, "{literal} took the general path"),
+                Err(back) => {
+                    assert!(!as_sent, "{literal} took the general path");
+                    // The call comes back as it was, for the general path to read.
+                    assert_eq!(back, json);
+                }
             }
         }
         // The written short escapes and a written `\u00XX` go back as sent.
         assert_eq!(
-            wire::echo_as_sent(&call("echo:q\"b\\t\t\u{1}.")).as_deref(),
-            Some("{\"status\":\"ok\",\"content\":\"q\\\"b\\\\t\\t\\u0001.\"}")
+            wire::echo_as_sent(call("echo:q\"b\\t\t\u{1}.")).as_deref(),
+            Ok("{\"status\":\"ok\",\"content\":\"q\\\"b\\\\t\\t\\u0001.\"}")
         );
     }
 

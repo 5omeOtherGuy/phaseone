@@ -59,32 +59,39 @@ fn field_literal(json: &str, key: &str) -> Option<Literal> {
     None
 }
 
-/// The ok outcome of an `echo:` call answered from the call text as it arrived, or `None`
-/// when the call needs the general path (`string_field`, then the mode, then
+/// The ok outcome of an `echo:` call answered from the call text as it arrived, or the call
+/// given back when it needs the general path (`string_field`, then the mode, then
 /// [`ok_outcome`]), which gives the same text more slowly.
 ///
 /// An echo's answer is its input re-escaped, and when every escape of the `raw` literal is
 /// one [`json_text`] writes, re-escaping the decoded text gives back that literal byte for
 /// byte. So when the literal starts `echo:`, holds no newline (the mode is the first line)
 /// and neither ends in an escape nor in whitespace (the mode is trimmed), the answer's
-/// `content` is the literal after `echo:`, copied once: no decode, no re-encode, none of the
-/// three passes over a payload that can be a whole history.
-pub fn echo_as_sent(call: &str) -> Option<String> {
-    let literal = field_literal(call, "raw")?;
-    if !literal.as_written {
-        return None;
-    }
-    let text = call[literal.start..literal.end].strip_prefix("echo:")?;
-    if literal.last_escape == Some(literal.end) || text.ends_with(char::is_whitespace) {
-        return None;
-    }
+/// `content` is the literal after `echo:`: no decode, no re-encode, none of the three passes
+/// over a payload that can be a whole history. The answer is written over the call's own
+/// buffer, whose head is longer than the outcome's, so a large echo touches no fresh memory
+/// for its answer (each fresh page is a fault in a fresh instance).
+pub fn echo_as_sent(call: String) -> Result<String, String> {
     const OPEN: &str = "{\"status\":\"ok\",\"content\":\"";
     const CLOSE: &str = "\"}";
-    let mut out = String::with_capacity(OPEN.len() + text.len() + CLOSE.len());
-    out.push_str(OPEN);
-    out.push_str(text);
+    let Some(literal) = field_literal(&call, "raw") else {
+        return Err(call);
+    };
+    let Some(text) = call[literal.start..literal.end].strip_prefix("echo:") else {
+        return Err(call);
+    };
+    if !literal.as_written
+        || literal.last_escape == Some(literal.end)
+        || text.ends_with(char::is_whitespace)
+    {
+        return Err(call);
+    }
+    let text_start = literal.end - text.len();
+    let mut out = call;
+    out.truncate(literal.end);
     out.push_str(CLOSE);
-    Some(out)
+    out.replace_range(..text_start, OPEN);
+    Ok(out)
 }
 
 /// The extent of one JSON string literal, found by a byte scan before anything is decoded,
