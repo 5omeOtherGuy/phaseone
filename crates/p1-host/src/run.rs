@@ -5,6 +5,12 @@
 //! Interactive prompts on stderr and drains inbox turns without waiting on
 //! children. First Ctrl-C cancels the run (and, at exit, the children); second
 //! Ctrl-C returns 130 immediately.
+//!
+//! notice: S1's file; S6.8 adds only the passage of the `[capabilities]`
+//! run-time switch — the three main-agent assembly sites (a run's start,
+//! `env show` and a model switch), the `p1 workflow run` refusal and the one
+//! `ModelSwitch` field that pins the switch for the generation (D065/D068
+//! pattern, ADR-0085 item 6).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
