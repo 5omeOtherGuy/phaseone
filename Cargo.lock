@@ -1753,6 +1753,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-finish-guest"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-hook-shadow"
 version = "0.0.1"
 
@@ -1767,6 +1775,7 @@ dependencies = [
  "p1-context",
  "p1-contracts",
  "p1-core",
+ "p1-finish-guest",
  "p1-hook-shadow",
  "p1-journal",
  "p1-model-profile",
@@ -1871,6 +1880,7 @@ name = "p1-module-tests"
 version = "0.0.1"
 dependencies = [
  "futures-util",
+ "nix",
  "p1-assembly",
  "p1-context",
  "p1-contracts",
@@ -1886,8 +1896,12 @@ dependencies = [
  "p1-provider-openai-chat",
  "p1-redact",
  "p1-testkit",
+ "p1-tool-finish",
+ "p1-tool-read",
+ "p1-tool-shell",
  "p1-workers",
  "p1-workflow",
+ "p1-workspace",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1961,6 +1975,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-read-guest"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-redact"
 version = "0.0.1"
 dependencies = [
@@ -2018,7 +2040,7 @@ name = "p1-tool-finish"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
- "serde",
+ "p1-finish-guest",
  "serde_json",
  "tokio",
 ]
@@ -2040,8 +2062,9 @@ name = "p1-tool-read"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "p1-module-runtime",
+ "p1-read-guest",
  "p1-workspace",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",

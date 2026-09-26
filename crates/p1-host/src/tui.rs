@@ -768,6 +768,7 @@ impl Driver {
             "effort" => self.slash_effort(arg, agent),
             "models" => self.slash_models((!arg.is_empty()).then_some(arg)),
             "compact" => self.request_compact(agent.is_some()),
+            "modules" => self.request_reload(arg, agent.is_some()),
             "status" => {
                 let output = status_command_output(self);
                 self.screen.transcript.command_output(output);
@@ -813,16 +814,22 @@ impl Driver {
     }
 
     /// §11: while a turn runs the switch applies at the next boundary —
-    /// `agent` is `None` exactly then (mid-`pump`, borrowed by the turn).
+    /// `agent` is `None` exactly then (mid-`pump`, borrowed by the turn). At idle
+    /// the loop applies it right after this key: the switch commits its
+    /// `Environment` record, which awaits, and a key handler cannot.
     fn request_switch(&mut self, request: PendingSwitch, agent: Option<&mut Agent>) {
-        let Some(agent) = agent else {
+        if agent.is_none() {
             self.screen
                 .transcript
                 .note("· model switch queued · applies at the next boundary");
             self.pending_switch = Some(request);
             return;
-        };
-        self.apply_switch(request, agent);
+        }
+        if self.model_switch.is_none() {
+            self.refuse_switch_unavailable();
+            return;
+        }
+        self.pending_switch = Some(request);
     }
 
     /// ADR-0076: `/compact` queues like a switch (§11). The summary is a provider
@@ -871,25 +878,70 @@ impl Driver {
         self.screen.statusbar.ctx_warn = warn;
     }
 
-    fn apply_switch(&mut self, request: PendingSwitch, agent: &mut Agent) {
+    async fn apply_switch(&mut self, request: PendingSwitch, agent: &mut Agent) {
         let Some(switch) = self.model_switch.clone() else {
-            self.screen
-                .transcript
-                .note("· switch refused · no model switch is available this run");
+            self.refuse_switch_unavailable();
             return;
         };
         let before = self.model.clone();
         let outcome = match &request {
-            PendingSwitch::Model(reference) => crate::run::switch_model(
-                &switch,
-                agent,
-                crate::run::SwitchRequest::Model(reference),
-            ),
+            PendingSwitch::Model(reference) => {
+                crate::run::switch_model(
+                    &switch,
+                    agent,
+                    crate::run::SwitchRequest::Model(reference),
+                )
+                .await
+            }
             PendingSwitch::Effort(level) => {
                 crate::run::switch_model(&switch, agent, crate::run::SwitchRequest::Effort(level))
+                    .await
             }
         };
         self.report_switch(before, outcome);
+    }
+
+    fn refuse_switch_unavailable(&mut self) {
+        self.screen
+            .transcript
+            .note("· switch refused · no model switch is available this run");
+    }
+
+    /// ADR-0084 §3: `/modules reload` queues on the session's reload queue; the
+    /// LOOP applies it where `agent` is free — right after this key when idle, at
+    /// the turn's end (its tool calls settled) otherwise.
+    fn request_reload(&mut self, arg: &str, idle: bool) {
+        if p1_tui::input::modules_command(arg).is_none() {
+            self.screen.transcript.note("· /modules takes reload");
+            return;
+        }
+        let Some(switch) = &self.model_switch else {
+            self.refuse_switch_unavailable();
+            return;
+        };
+        if switch.reload_queue().request(!idle) == crate::run::ReloadRequested::Pending {
+            self.screen
+                .transcript
+                .note(p1_tui::input::RELOAD_PENDING_NOTE);
+        }
+    }
+
+    /// A queued `/modules reload`, applied at a boundary; nothing when none is queued.
+    async fn apply_reload(&mut self, agent: &mut Agent) {
+        let Some(switch) = self.model_switch.clone() else {
+            return;
+        };
+        if !switch.reload_queue().take() {
+            return;
+        }
+        let note = match crate::run::reload_modules(&switch, agent).await {
+            Ok(reloaded) => format!("· modules reloaded · {reloaded} · from the next turn"),
+            Err(reason) => format!(
+                "✗ modules reload refused · {reason} · kept still on {}",
+                self.model
+            ),
+        };
+        self.screen.transcript.note(&note);
     }
 
     /// §11: `switch_model` result → `MetaRow · model a → b · from the next
@@ -1686,8 +1738,10 @@ where
             // §11: a `/model`/`/effort` typed mid-turn applies here, at the
             // first boundary `agent` is free again.
             if let Some(pending) = driver.pending_switch.take() {
-                driver.apply_switch(pending, agent);
+                driver.apply_switch(pending, agent).await;
             }
+            // ADR-0084 §3: a `/modules reload` typed mid-turn applies here too.
+            driver.apply_reload(agent).await;
             // The turn's end moved the screen too: the working row leaves, a
             // cancelled turn drops its queue, a switch renames the chip.
             redraws.dirty = true;
@@ -1727,6 +1781,11 @@ where
                     Input::Key(key) if is_cancel(&key) => driver.exit = Some(0),
                     Input::Key(key) => {
                         driver.on_key(key, Some(agent));
+                        // A `/model` or `/effort` typed at idle applies now.
+                        if let Some(pending) = driver.pending_switch.take() {
+                            driver.apply_switch(pending, agent).await;
+                        }
+                        driver.apply_reload(agent).await;
                         if let Some(text) = driver.submit_pending.take() {
                             prompt = Some(text);
                         }
@@ -1787,8 +1846,9 @@ where
                 }
                 driver.policy.set_turn(None);
                 if let Some(pending) = driver.pending_switch.take() {
-                    driver.apply_switch(pending, agent);
+                    driver.apply_switch(pending, agent).await;
                 }
+                driver.apply_reload(agent).await;
                 redraws.dirty = true;
             }
         }
@@ -2211,7 +2271,7 @@ fn access_command_output(driver: &Driver) -> p1_tui::transcript::CommandOutput {
 /// steering for the model.
 const SLASH_COMMANDS: &[&str] = &[
     "exit", "quit", "focus", "goal", "model", "env", "effort", "models", "compact", "status",
-    "access", "help",
+    "access", "help", "modules",
 ];
 
 fn is_slash_command(text: &str) -> bool {
