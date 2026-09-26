@@ -15,6 +15,14 @@ use std::fmt::Write as _;
 /// colon finds a key at any depth — `raw` inside `input` — without parsing the rest of the
 /// document. Only string values are read: the fixture's two keys are strings.
 pub fn string_field(json: &str, key: &str) -> Option<String> {
+    let literal = field_literal(json, key)?;
+    Some(literal.decode(json)?.into_owned())
+}
+
+/// The literal of the first `key`'s string value in `json`, undecoded, by the reading
+/// [`string_field`] describes: `None` exactly when it would answer `None` for an unreadable
+/// or missing value, bar the value's own escapes, which only decoding checks.
+fn field_literal(json: &str, key: &str) -> Option<Literal> {
     let bytes = json.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -44,11 +52,39 @@ pub fn string_field(json: &str, key: &str) -> Option<String> {
             if bytes.get(start) != Some(&b'"') {
                 return None;
             }
-            return Some(Literal::at(bytes, start)?.decode(json)?.into_owned());
+            return Literal::at(bytes, start);
         }
         i = colon + 1;
     }
     None
+}
+
+/// The ok outcome of an `echo:` call answered from the call text as it arrived, or `None`
+/// when the call needs the general path (`string_field`, then the mode, then
+/// [`ok_outcome`]), which gives the same text more slowly.
+///
+/// An echo's answer is its input re-escaped, and when every escape of the `raw` literal is
+/// one [`json_text`] writes, re-escaping the decoded text gives back that literal byte for
+/// byte. So when the literal starts `echo:`, holds no newline (the mode is the first line)
+/// and neither ends in an escape nor in whitespace (the mode is trimmed), the answer's
+/// `content` is the literal after `echo:`, copied once: no decode, no re-encode, none of the
+/// three passes over a payload that can be a whole history.
+pub fn echo_as_sent(call: &str) -> Option<String> {
+    let literal = field_literal(call, "raw")?;
+    if !literal.as_written {
+        return None;
+    }
+    let text = call[literal.start..literal.end].strip_prefix("echo:")?;
+    if literal.last_escape == Some(literal.end) || text.ends_with(char::is_whitespace) {
+        return None;
+    }
+    const OPEN: &str = "{\"status\":\"ok\",\"content\":\"";
+    const CLOSE: &str = "\"}";
+    let mut out = String::with_capacity(OPEN.len() + text.len() + CLOSE.len());
+    out.push_str(OPEN);
+    out.push_str(text);
+    out.push_str(CLOSE);
+    Some(out)
 }
 
 /// The extent of one JSON string literal, found by a byte scan before anything is decoded,
@@ -60,6 +96,11 @@ struct Literal {
     end: usize,
     /// Whether any escape occurs; a literal without one is its own text.
     escaped: bool,
+    /// Whether every escape is one [`json_text`] writes and none is a newline: the literal
+    /// is then what [`json_text`] writes for its own decoded text, which has one line.
+    as_written: bool,
+    /// The byte just after the last escape, if any.
+    last_escape: Option<usize>,
 }
 
 impl Literal {
@@ -69,6 +110,8 @@ impl Literal {
         let start = open + 1;
         let mut i = start;
         let mut escaped = false;
+        let mut as_written = true;
+        let mut last_escape = None;
         loop {
             i = special(bytes, i)?;
             match bytes[i] {
@@ -77,13 +120,19 @@ impl Literal {
                         start,
                         end: i,
                         escaped,
+                        as_written,
+                        last_escape,
                     });
                 }
                 // The escaped byte is skipped whatever it is: `\"` does not end the literal.
-                // Every escape is ASCII, so the skip never lands inside a character.
+                // A skip may stop inside a multi-byte character after a backslash, but no
+                // byte of one is special, and decoding refuses that escape.
                 b'\\' => {
                     escaped = true;
-                    i += 2;
+                    let length = written_escape(bytes.get(i + 1..)?);
+                    as_written &= length.is_some();
+                    i += length.unwrap_or(2);
+                    last_escape = Some(i);
                 }
                 _ => return None,
             }
@@ -150,6 +199,28 @@ impl Literal {
     }
 }
 
+/// The length, backslash included, of the escape whose bytes after the backslash start
+/// `rest`, when it is one [`json_text`] writes other than the newline; else `None`.
+fn written_escape(rest: &[u8]) -> Option<usize> {
+    match *rest.first()? {
+        b'"' | b'\\' | b'r' | b't' | b'b' | b'f' => Some(2),
+        b'u' => match *rest.get(1..5)? {
+            // `\u00XX` in lowercase hex, for a control character without a short escape.
+            [
+                b'0',
+                b'0',
+                high @ (b'0' | b'1'),
+                low @ (b'0'..=b'9' | b'a'..=b'f'),
+            ] => {
+                let value = char::from(high).to_digit(16)? * 16 + char::from(low).to_digit(16)?;
+                (!matches!(value, 0x08 | 0x09 | 0x0a | 0x0c | 0x0d)).then_some(6)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Reads the four hex digits of a `\uXXXX` escape that start at byte `at`.
 fn hex4(bytes: &[u8], at: usize) -> Option<u32> {
     let mut value = 0;
@@ -170,13 +241,10 @@ fn special(bytes: &[u8], from: usize) -> Option<usize> {
     // A high bit where a byte of `word` is zero; exact for the first such byte, which is
     // the one the scan below stops at.
     let zero = |word: u64| word.wrapping_sub(ONES) & !word & HIGHS;
-    let tail = bytes.get(from..)?;
-    let mut chunks = tail.chunks_exact(8);
+    let (chunks, _) = bytes.get(from..)?.as_chunks::<8>();
     let mut offset = from;
-    for chunk in &mut chunks {
-        let mut word = [0; 8];
-        word.copy_from_slice(chunk);
-        let word = u64::from_le_bytes(word);
+    for &chunk in chunks {
+        let word = u64::from_le_bytes(chunk);
         let hit = zero(word ^ (ONES * u64::from(b'"')))
             | zero(word ^ (ONES * u64::from(b'\\')))
             // A byte below 0x20 has its three top bits clear.

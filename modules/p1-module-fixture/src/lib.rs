@@ -101,16 +101,23 @@ impl Guest for Fixture {
     }
 
     fn execute(call: ToolCall) -> ToolOutcome {
-        let raw = match wire::string_field(&call, "raw") {
-            Some(raw) => raw,
-            None => return wire::error_outcome(&format!("no text input; {KNOWN_MODES}")),
-        };
-        let mode = raw.lines().next().unwrap_or("").trim();
-        run(mode)
+        // An echo whose text can go back as it came is answered without decoding it; the
+        // general path gives the same answer (wire.rs), at a cost a large echo feels.
+        wire::echo_as_sent(&call).unwrap_or_else(|| execute_decoded(&call))
     }
 }
 
 p1_bindings_tool::generated::export!(Fixture);
+
+/// `execute` by the general path: the input text decoded, its first line the mode.
+fn execute_decoded(call: &str) -> ToolOutcome {
+    let raw = match wire::string_field(call, "raw") {
+        Some(raw) => raw,
+        None => return wire::error_outcome(&format!("no text input; {KNOWN_MODES}")),
+    };
+    let mode = raw.lines().next().unwrap_or("").trim();
+    run(mode)
+}
 
 /// Runs one `execute` mode.
 fn run(mode: &str) -> ToolOutcome {
@@ -309,6 +316,74 @@ mod tests {
         assert_eq!(head(&call("")), None);
         assert_eq!(head("{}"), None);
         assert_eq!(head("{\"item\":\"tool_result\",\"content\":\"x\"}"), None);
+    }
+
+    #[test]
+    fn an_echo_sent_back_as_it_came_is_the_decoded_echo() {
+        // Texts the host writes (`json_text`, as serde_json writes them): answered as sent
+        // unless a newline, a trailing escape or trailing whitespace needs the general path.
+        let mut texts: Vec<String> = (0u8..0x80)
+            .map(char::from)
+            .chain(['\u{e9}', '\u{2028}', '\u{1f600}'])
+            .flat_map(|ch| [format!("a{ch}b"), format!("{ch}"), format!("{ch}{ch}x")])
+            .collect();
+        texts.extend(["", "hi", "  padded  ", "two\nlines", "cr\r", "tab\t"].map(str::to_owned));
+        let mut sent_back = 0;
+        for text in &texts {
+            for raw in [
+                format!("echo:{text}"),
+                format!(" echo:{text}"),
+                text.clone(),
+            ] {
+                let json = call(&raw);
+                if let Some(outcome) = wire::echo_as_sent(&json) {
+                    assert_eq!(outcome, execute_decoded(&json), "{raw:?}");
+                    sent_back += 1;
+                }
+            }
+        }
+        // Most echoes are answered as sent; a mismatch above would already have failed.
+        assert!(
+            sent_back > texts.len() * 3 / 4,
+            "{sent_back} of {}",
+            texts.len()
+        );
+
+        // Literals no host writes, and written ones at the edges: whether each goes back as
+        // sent, and when it does, that it is the general path's answer.
+        for (literal, as_sent) in [
+            (r#""echo:a\/b""#, false),
+            (r#""echo:\u0041""#, false),
+            (r#""echo:\u001F""#, false),
+            (r#""echo:\u001f""#, false),
+            (r#""echo:\u001fx""#, true),
+            (r#""echo:a\u000b""#, false),
+            (r#""echo:a\u000bb""#, true),
+            (r#""echo:a\u000a""#, false),
+            (r#""echo:a\u0009b""#, false),
+            (r#""echo:\ud83d\ude00""#, false),
+            (r#""echo:x\ty ""#, false),
+            ("\"echo:x\u{2028}\"", false),
+            (r#""\u0065cho:x""#, false),
+            (r#""echo:x\"""#, false),
+            (r#""echo:\q""#, false),
+        ] {
+            let json = format!(
+                "{{\"call_id\":\"c1\",\"name\":\"fixture\",\"input\":{{\"kind\":\"text\",\"raw\":{literal}}}}}"
+            );
+            match wire::echo_as_sent(&json) {
+                Some(outcome) => {
+                    assert!(as_sent, "{literal} went back as sent");
+                    assert_eq!(outcome, execute_decoded(&json), "{literal}");
+                }
+                None => assert!(!as_sent, "{literal} took the general path"),
+            }
+        }
+        // The written short escapes and a written `\u00XX` go back as sent.
+        assert_eq!(
+            wire::echo_as_sent(&call("echo:q\"b\\t\t\u{1}.")).as_deref(),
+            Some("{\"status\":\"ok\",\"content\":\"q\\\"b\\\\t\\t\\u0001.\"}")
+        );
     }
 
     #[test]

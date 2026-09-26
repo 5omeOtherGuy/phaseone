@@ -9,8 +9,9 @@
 //! - `native`: an echo in native code returning a copy of the payload, the floor;
 //! - `redacting`: the same native echo behind `p1_redact::RedactingTool`, so the wrapper's
 //!   cost on a large clean outcome is `redacting - native`;
-//! - `host-json`: the host's two JSON passes over the text (the call's `raw` escaped as a
-//!   string literal, the outcome's `content` parsed back), as `serde_json` does them;
+//! - `host_escape` and `host_unescape`: the host's two JSON passes over the text (the call's
+//!   `raw` escaped as a string literal, the outcome's `content` parsed back), as
+//!   `serde_json` does them;
 //! - `module`: the fixture's echo through `wasm_tool`, the whole phase, at 1, 8 and 32 MiB;
 //!   the guest and the copies are what is left of it after the rows above.
 //!
@@ -94,15 +95,23 @@ async fn bench() {
         )
         .await;
 
-        let mut host_json = Vec::with_capacity(samples);
+        let mut serialize = Vec::with_capacity(samples);
+        let mut parse = Vec::with_capacity(samples);
+        let mut cpu = (Duration::ZERO, Duration::ZERO);
         for _ in 0..samples {
-            let started = Instant::now();
+            let (started, before) = (Instant::now(), process_cpu());
             let literal = serde_json::to_string(&payload).expect("a string serializes");
+            let (middle, between) = (Instant::now(), process_cpu());
             let back: String = serde_json::from_str(&literal).expect("and parses back");
-            host_json.push(started.elapsed());
+            let after = process_cpu();
+            serialize.push(middle - started);
+            parse.push(middle.elapsed());
+            cpu.0 += between.saturating_sub(before);
+            cpu.1 += after.saturating_sub(between);
             assert_eq!(back.len(), payload.len(), "host-json changed the payload");
         }
-        print_samples(&format!("host_json_{label}"), &mut host_json);
+        print_samples(&format!("host_escape_{label}"), &mut serialize, cpu.0);
+        print_samples(&format!("host_unescape_{label}"), &mut parse, cpu.1);
 
         report(
             &format!("module_{label}"),
@@ -125,25 +134,44 @@ where
         check(&execute().await, payload, name);
     }
     let mut taken = Vec::with_capacity(samples);
+    let cpu = process_cpu();
     for _ in 0..samples {
         let started = Instant::now();
         let outcome = execute().await;
         taken.push(started.elapsed());
         check(&outcome, payload, name);
     }
-    print_samples(name, &mut taken);
+    // The checks are inside this reading; they compare two strings, far below a call.
+    print_samples(name, &mut taken, process_cpu().saturating_sub(cpu));
 }
 
-fn print_samples(name: &str, samples: &mut [Duration]) {
+/// Prints the p95 and median of `samples` and the mean process CPU time of one sample:
+/// on a shared box the wall time waits for other work too, the CPU time much less so.
+fn print_samples(name: &str, samples: &mut [Duration], cpu: Duration) {
     samples.sort_unstable();
     let p95 = samples[(samples.len() * 95).div_ceil(100) - 1];
     let median = samples[samples.len() / 2];
+    let count = u32::try_from(samples.len()).expect("a sample count fits u32");
     println!(
-        "{name}: p95 {} median {} ({} samples)",
+        "{name}: p95 {} median {} cpu/call {} ({} samples)",
         millis(p95),
         millis(median),
+        millis(cpu / count),
         samples.len()
     );
+}
+
+/// The CPU time of this process so far, user and system, every thread: fields 14 and 15 of
+/// `/proc/self/stat`, in the kernel's USER_HZ ticks (100 per second on Linux).
+fn process_cpu() -> Duration {
+    let stat = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
+    // The command name (field 2) may hold spaces; the fields after its `)` do not.
+    let fields: Vec<&str> = stat[stat.rfind(')').expect("a stat line") + 1..]
+        .split_whitespace()
+        .collect();
+    let ticks = |index: usize| fields[index].parse::<u64>().expect("a tick count");
+    // `fields[0]` is field 3 (state), so fields 14 and 15 are at 11 and 12.
+    Duration::from_millis((ticks(11) + ticks(12)) * 10)
 }
 
 fn millis(duration: Duration) -> String {
