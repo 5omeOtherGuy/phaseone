@@ -39,8 +39,11 @@ The frozen boundary (`wasm-boundary-v1`; [`wit.md`](../design/modules/wit.md), f
 3, 4, 10 and 13) gives these two tools capabilities instead: `process` (`spawn` a `bash -lc`
 command with a time limit; the `running` streaming resource), owned by the process service
 extracted from `p1-tool-shell`, and `completion` (the session record, the policy, the output
-contract and `accept`), owned by the host completion hub. Both are in the `tool` row of the
-allocation only. This ADR records where each piece of authority now lives and what the host
+contract and `accept`), owned by the host completion hub. `process` is in the `tool` row of the
+allocation only. `completion` is in the `tool` and `context-policy` rows
+(`modules/capabilities.toml`; [`wit.md`](../design/modules/wit.md)): a context policy may read the
+record, while the commit rules below restrict committing to the finish component's `execute` call.
+This ADR records where each piece of authority now lives and what the host
 verifies, so that no component can move it. It describes the frozen boundary and changes none
 of it.
 
@@ -114,11 +117,12 @@ by these rules:
 1. **`done` with `commands-passed(list)`** commits only if the list is non-empty and every
    command, normalised as [`completion.md`](../design/completion.md) §2 says (trim, collapse
    whitespace, one leading `cd <path> &&` dropped), equals the command of a run in the hub's
-   record (rule 2) that succeeded (exit code 0), is neither piped nor exit-masked, and is newer
-   than the last file change, where a successful command that changed the workspace fingerprint
-   is a file change (ADR-0055). A command no such run matches, a fake command included, and a
-   command older than the last file change are refused. The committed evidence is the hub's own
-   list.
+   record (rule 2) whose LAST run succeeded (exit code 0) — a failing re-run invalidates an
+   earlier success — and that is neither piped nor exit-masked and is newer than the last file
+   change, where a successful command that changed the workspace fingerprint is a file change
+   (ADR-0055). A command no qualifying run matches, a fake command included, a command whose last
+   run failed and a command older than the last file change are refused. The committed evidence is
+   the hub's own list.
 2. **Only a tool whose loader-built identity carries the `records-command-evidence` capability
    produces evidence** (the shell component). `shell-runs` reports every finished `executes`
    call as the frozen WIT says, but the hub counts as evidence only the runs of such a tool; a
@@ -241,4 +245,4 @@ merge commit and evidence bundle: `cargo test --locked -p p1-tool-shell -p p1-to
 wasm-s3 with no skipped case; `cargo test --locked -p p1-module-tests --test effect_settlement`,
 `--test redaction` and `--test finish_boundary` (fake command, old command and re-grant cases);
 `scripts/gate.sh` on the box. This section is completed when the ADR is accepted, in the PR that
-lands P3's last definition-of-done row.
+lands the phase's last definition-of-done row (ADR-0078).
