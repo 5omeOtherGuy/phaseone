@@ -1,5 +1,6 @@
-//! The four model-facing workflow tools. They depend only on the workflow service
-//! trait; the host owns the implementation, background execution and notification.
+//! The four model-facing workflow tools. Each depends only on its own narrow operation
+//! trait (`StartRuns`, `ObserveRuns`, `CancelRuns`), which every `WorkflowService`
+//! satisfies; the host owns the implementation, background execution and notification.
 
 use std::sync::Arc;
 
@@ -9,8 +10,8 @@ use p1_contracts::{
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_workflow::{
-    RunId, RunOutcome, RunProgress, RunReport, RunStatus, StartRequest, StepLine, StepStatus,
-    WorkflowError, WorkflowService,
+    CancelRuns, ObserveRuns, RunId, RunOutcome, RunProgress, RunReport, RunStatus, StartRequest,
+    StartRuns, StepLine, StepStatus, WorkflowError, WorkflowService,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -61,7 +62,8 @@ fn declaration(name: &str, description: &str, schema: Value) -> ToolDeclaration 
     }
 }
 
-/// The four tools, in start/status/result/cancel order.
+/// The four tools, in start/status/result/cancel order. A composition helper only: each
+/// member is built by its own constructor and holds only its own trait of `service`.
 pub fn all(service: Arc<dyn WorkflowService>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(WorkflowStartTool::new(Arc::clone(&service))),
@@ -84,17 +86,49 @@ fn empty_object() -> serde_json::Map<String, Value> {
     serde_json::Map::new()
 }
 
+/// A member's one trait over whatever `Arc` it was built from. Constructors take
+/// `Arc<S>` for any `S: ?Sized` implementing the trait, so both a test fake and the
+/// host's `Arc<dyn WorkflowService>` fit; an unsized `S` cannot coerce to a trait object
+/// directly, so this wrapper is the trait object instead.
+struct Runs<S: ?Sized>(Arc<S>);
+
+impl<S: StartRuns + ?Sized> StartRuns for Runs<S> {
+    fn start<'a>(&'a self, request: StartRequest) -> BoxFuture<'a, Result<RunId, WorkflowError>> {
+        self.0.start(request)
+    }
+}
+
+impl<S: ObserveRuns + ?Sized> ObserveRuns for Runs<S> {
+    fn status<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        self.0.status(id)
+    }
+
+    fn wait<'a>(
+        &'a self,
+        id: &'a RunId,
+        cancel: p1_contracts::CancellationToken,
+    ) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        self.0.wait(id, cancel)
+    }
+}
+
+impl<S: CancelRuns + ?Sized> CancelRuns for Runs<S> {
+    fn cancel<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<(), WorkflowError>> {
+        self.0.cancel(id)
+    }
+}
+
 /// Starts a script in the background; the host sends the completion notification.
 pub struct WorkflowStartTool {
-    service: Arc<dyn WorkflowService>,
+    service: Arc<dyn StartRuns>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkflowStartTool {
-    pub fn new(service: Arc<dyn WorkflowService>) -> Self {
+    pub fn new<S: StartRuns + ?Sized + 'static>(service: Arc<S>) -> Self {
         Self {
-            service,
+            service: Arc::new(Runs(service)),
             declaration: declaration(
                 "workflow_start",
                 START_DESCRIPTION,
@@ -196,15 +230,15 @@ struct IdInput {
 
 /// Nonblocking, compact status; ended runs share the result's first line.
 pub struct WorkflowStatusTool {
-    service: Arc<dyn WorkflowService>,
+    service: Arc<dyn ObserveRuns>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkflowStatusTool {
-    pub fn new(service: Arc<dyn WorkflowService>) -> Self {
+    pub fn new<S: ObserveRuns + ?Sized + 'static>(service: Arc<S>) -> Self {
         Self {
-            service,
+            service: Arc::new(Runs(service)),
             declaration: declaration("workflow_status", STATUS_DESCRIPTION, id_schema()),
             identity: identity("default"),
         }
@@ -276,15 +310,15 @@ struct ResultInput {
 
 /// Reads a retained report, or waits for it using the tool's cancellation token.
 pub struct WorkflowResultTool {
-    service: Arc<dyn WorkflowService>,
+    service: Arc<dyn ObserveRuns>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkflowResultTool {
-    pub fn new(service: Arc<dyn WorkflowService>) -> Self {
+    pub fn new<S: ObserveRuns + ?Sized + 'static>(service: Arc<S>) -> Self {
         Self {
-            service,
+            service: Arc::new(Runs(service)),
             declaration: declaration(
                 "workflow_result",
                 RESULT_DESCRIPTION,
@@ -365,15 +399,15 @@ impl Tool for WorkflowResultTool {
 
 /// Cancels a run; an already ended run is an idempotent success.
 pub struct WorkflowCancelTool {
-    service: Arc<dyn WorkflowService>,
+    service: Arc<dyn CancelRuns>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkflowCancelTool {
-    pub fn new(service: Arc<dyn WorkflowService>) -> Self {
+    pub fn new<S: CancelRuns + ?Sized + 'static>(service: Arc<S>) -> Self {
         Self {
-            service,
+            service: Arc::new(Runs(service)),
             declaration: declaration("workflow_cancel", CANCEL_DESCRIPTION, id_schema()),
             identity: identity("default"),
         }

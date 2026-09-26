@@ -1,15 +1,14 @@
 //! `worker_start` as a guest component (`p1/worker-start`): starts one worker now and reports
 //! it, the native `WorkerStartTool` of `crates/p1-tool-delegate` over the `tool` world.
 //!
-//! Its only capabilities are `control` and `workers-start`, so the built component cannot
-//! observe or control a worker. Two parts of the native tool live in the host instead:
+//! Its capabilities are `control`, `workers-start` and `workers-observe`, so the built
+//! component cannot control a worker. It calls `workers-observe` exactly where the native
+//! tool does and for nothing else: `describe` of the child it has just started, whose route
+//! and model the success text names.
 //!
-//! - The `tools` and `environment` enums of the schema are the host's lists. The component
-//!   declares them empty (see [`delegation::GRANTABLE`]) and leaves membership of a granted
-//!   module to the host's `start`.
-//! - The native success text names the worker's route and model through the service's
-//!   `describe`, an operation of `workers-observe`. This member does not import it, so the
-//!   text is the one the native tool writes when `describe` yields nothing.
+//! The `tools` and `environment` enums of the schema are the host's lists. The component
+//! declares them empty (see [`delegation::GRANTABLE`]) and leaves membership of a granted
+//! module to the host's `start`.
 #![forbid(unsafe_code)]
 
 mod delegation;
@@ -18,7 +17,7 @@ use delegation::{
     ENVIRONMENTS, GRANTABLE, ResultItem, START_DESCRIPTION, START_NAME, STARTED_PREFIX, StartInput,
 };
 use p1_bindings_tool::generated::p1::module::worker_types::ChildSpec;
-use p1_bindings_tool::generated::p1::module::{control, workers_start};
+use p1_bindings_tool::generated::p1::module::{control, workers_observe, workers_start};
 use p1_bindings_tool::generated::{
     CallDescription, CallEffect, Guest, HistoryItem, ResultDescription, ToolCall, ToolDeclaration,
     ToolOutcome,
@@ -103,9 +102,9 @@ impl Guest for WorkerStart {
         };
         match workers_start::start(&spec) {
             Ok(id) => {
-                // The native tool asks `describe` for the route and model and writes nothing
-                // when it fails; `describe` is not this member's to call, so it is that text.
-                let description = String::new();
+                // The description is the factory's route/model, shown to the parent; as in
+                // the native tool, a failed `describe` writes nothing in its place.
+                let description = workers_observe::describe(&id).unwrap_or_else(|_| String::new());
                 // Every worker also gets `finish`, so the grant named here is the
                 // grant plus it — the same list the worker's own prompt carries.
                 tools.push("finish".to_string());
