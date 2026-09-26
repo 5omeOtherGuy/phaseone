@@ -40,9 +40,20 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// The capabilities this runtime can link, by the interface name the manifest uses. The
 /// other capability interfaces belong to other native crates and streams; a manifest that
 /// grants one of them is refused until the runtime can provide it. `summary` is linked to
-/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7).
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 5] =
-    ["control", "clock", "random", "process", "summary"];
+/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7);
+/// `workspace` (its read side) and `snapshot` to the caller's
+/// [`WorkspaceService`](crate::capabilities::WorkspaceService) and
+/// [`SnapshotService`](crate::capabilities::SnapshotService) (S1). `workspace-mutation` is
+/// S2's and stays refused.
+pub(crate) const LINKABLE_CAPABILITIES: [&str; 7] = [
+    "control",
+    "clock",
+    "random",
+    "process",
+    "summary",
+    "workspace",
+    "snapshot",
+];
 
 /// The interface every world imports for its types; it grants nothing.
 const TYPES_INTERFACE: &str = "types";
@@ -501,12 +512,26 @@ mod tests {
     }
 
     #[test]
-    fn the_linkable_capabilities_are_the_old_four_plus_summary() {
+    fn the_linkable_capabilities_are_the_old_four_plus_summary_and_the_workspace_read_side() {
         assert_eq!(
             LINKABLE_CAPABILITIES,
-            ["control", "clock", "random", "process", "summary"]
+            [
+                "control",
+                "clock",
+                "random",
+                "process",
+                "summary",
+                "workspace",
+                "snapshot"
+            ]
         );
-        for refused in ["notices", "completion", "http", "filesystem"] {
+        for refused in [
+            "notices",
+            "completion",
+            "http",
+            "filesystem",
+            "workspace-mutation",
+        ] {
             assert!(!LINKABLE_CAPABILITIES.contains(&refused), "{refused}");
         }
     }

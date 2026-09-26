@@ -21,7 +21,9 @@ pub mod tool;
 
 pub use authorization_policy::{AuthorizationPolicyError, Verdict, WasmAuthorizationPolicy};
 pub use capabilities::{
-    ExitStatus, LinkError, ProcessCommand, ProcessEvent, ProcessService, RunningProcess, Services,
+    EntryKind, ExitStatus, FsError, LinkError, ProcessCommand, ProcessEvent, ProcessService,
+    RunningProcess, Services, SnapshotObservation, SnapshotService, WorkspaceEntry,
+    WorkspaceService,
 };
 pub use context_policy::{
     ContextPolicyError, SummaryError, SummaryRequest, SummaryResponse, SummaryService,

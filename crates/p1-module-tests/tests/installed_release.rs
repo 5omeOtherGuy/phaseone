@@ -710,7 +710,7 @@ async fn load_every_installed_component(modules_root: &Path) {
         &module,
         Services {
             process: Some(process),
-            summary: None,
+            ..Services::default()
         },
         ExecutionLimits::default(),
         &Arc::new(MaskCounter::new()),

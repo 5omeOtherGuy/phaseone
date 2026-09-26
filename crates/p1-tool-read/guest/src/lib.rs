@@ -145,6 +145,32 @@ pub fn missing(display: &str) -> String {
     format!("{display} does not exist.")
 }
 
+/// The path resolves outside the workspace: `p1-workspace`'s own wording, which the native
+/// tool shows as it is.
+pub fn outside_workspace(requested: &str) -> String {
+    format!("path escapes workspace: {requested}")
+}
+
+/// How the workspace displays `requested` where it names nothing, so the host could not:
+/// a relative request with `.` and `..` collapsed as the workspace resolves it. An absolute
+/// request stays as written, since the guest does not know the root to strip.
+pub fn display_of_request(requested: &str) -> String {
+    if requested.starts_with('/') {
+        return requested.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in requested.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            name => parts.push(name),
+        }
+    }
+    parts.join("/")
+}
+
 /// The path is a directory or anything else but a regular file.
 pub fn not_a_regular_file(display: &str) -> String {
     format!("{display} is not a regular file.")
@@ -431,20 +457,20 @@ impl WindowedRender {
     }
 }
 
-/// Render `contents`, a whole file already in memory, in [`READ_BUFFER_BYTES`] chunks
-/// exactly as a streamed read renders it.
-pub fn render(contents: &[u8], display: &str, input: &ReadInput) -> Result<String, String> {
-    let sniffed = sniff_len(contents.len() as u64);
-    let mut render = WindowedRender::start(&contents[..sniffed], display, input)?;
-    for chunk in contents[sniffed..].chunks(READ_BUFFER_BYTES) {
-        render.feed(chunk)?;
-    }
-    render.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `contents`, a whole file in memory, rendered in [`READ_BUFFER_BYTES`] chunks as a
+    /// streamed read renders it.
+    fn render(contents: &[u8], display: &str, input: &ReadInput) -> Result<String, String> {
+        let sniffed = sniff_len(contents.len() as u64);
+        let mut render = WindowedRender::start(&contents[..sniffed], display, input)?;
+        for chunk in contents[sniffed..].chunks(READ_BUFFER_BYTES) {
+            render.feed(chunk)?;
+        }
+        render.finish()
+    }
 
     fn input(offset: Option<i64>, limit: Option<i64>) -> ReadInput {
         ReadInput {
@@ -476,6 +502,13 @@ mod tests {
             render(b"a\0\xff", "x.bin", &input(None, None)).unwrap_err(),
             "x.bin is a binary file."
         );
+    }
+
+    #[test]
+    fn a_missing_request_is_displayed_as_the_workspace_resolves_it() {
+        assert_eq!(display_of_request("nope.txt"), "nope.txt");
+        assert_eq!(display_of_request("./a//b/../nope.txt"), "a/nope.txt");
+        assert_eq!(display_of_request("/abs/nope.txt"), "/abs/nope.txt");
     }
 
     #[test]
