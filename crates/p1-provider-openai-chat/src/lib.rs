@@ -209,6 +209,10 @@ fn opencode_ids(cache_key: Option<&str>) -> (String, String) {
     match cache_key {
         Some(key) => key.hash(&mut hasher),
         None => {
+            // A provider component has no clock import (its capability allocation), and
+            // reading one traps, so the component's ids rest on the instance's counter
+            // alone; its instance lives for the provider, so the ids stay fresh per request.
+            #[cfg(not(target_family = "wasm"))]
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_nanos() as u64)

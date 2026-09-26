@@ -295,6 +295,14 @@ fn allocation(kind: &str) -> Option<Vec<String>> {
 
 /// Registers each verified tool package under its module name. A name a registered tool
 /// already has is refused: a package never silently replaces a compiled-in tool.
+///
+/// A USER-selected provider package takes no catalog key at all: the lock keeps it under the
+/// module name it gave it (`provider-anthropic`, `provider-openai`, `provider-openai-chat`,
+/// the manifest name without the reserved `p1/` namespace, `docs/design/modules/package.md`)
+/// and provider activation resolves that name in the same lock, so the module a user selected
+/// serves the route in place of the release's host entry of that adapter — until #355's debug
+/// discovery is on main, the release's own host entries stay the delivered path for the three
+/// shipped providers (ANSWERS D083b).
 pub fn register_modules(
     catalog: &mut Catalog,
     packages: Vec<ModulePackage>,
@@ -303,9 +311,10 @@ pub fn register_modules(
     let existing = catalog.tool_keys();
     for package in packages {
         let kind = package.loaded.kind();
-        // notice: S5.11 (#357): the policy classes are accepted (S1 approval pending).
         match kind {
             ModuleKind::Tool => {}
+            // Kept by module name in the lock the selection came from; never a tool here.
+            ModuleKind::Provider => continue,
             // A policy package is the session's, not a catalog tool: the shipped policies are
             // official-release host entries the host loads by name (`policy.rs`,
             // `summary.rs`; D083b 2), so a lock selecting one registers no tool.

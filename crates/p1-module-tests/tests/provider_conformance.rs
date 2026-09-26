@@ -29,7 +29,7 @@ use p1_contracts::{
     BoxFuture, CancellationToken, DeclarationKind, Item, ModelOptions, Outcome, Provider,
     ProviderError, ProviderRequest, StreamEvent, ToolDeclaration,
 };
-use p1_host::routes::{RouteFile, load_route};
+use p1_host::routes::{AdapterSettings, RouteFile, load_route};
 use p1_model_profile::ModelProfile;
 use p1_module_runtime::{ExecutionLimits, LoadedModule, ProviderSettings, WasmProvider};
 use p1_module_tests::{Release, fixture_dir};
@@ -230,20 +230,60 @@ impl Case {
         Arc::new(provider)
     }
 
-    /// The native adapter the host composes from the same route file and profile.
+    /// The native adapter the host composed from the same route file and profile until S4.9's
+    /// D083b repair dropped the native arms from `catalog::route_provider`: the reference the
+    /// component's wire form is compared with. The three adapter crates still ship, and the
+    /// WebSocket branch (the shipped Responses route's transport, S5.5) is attached exactly as
+    /// the host attached it.
     fn native(&self, transport: ScriptedTransport) -> Arc<dyn Provider> {
         let binding = self.route.binding(&self.profile).expect("a bound profile");
-        let profile = ModelProfile::from_toml(&self.profile, &self.profile_text())
-            .expect("a shipped profile");
-        p1_host::catalog::route_provider(
-            &self.route,
-            binding,
-            Arc::new(profile),
-            Arc::new(transport),
-            Arc::new(ScriptedWsConnector::new(Vec::new())),
-            Arc::new(FixedCredentials),
-        )
-        .unwrap_or_else(|error| panic!("[{}] native: {error}", self.name))
+        let profile = Arc::new(
+            ModelProfile::from_toml(&self.profile, &self.profile_text())
+                .expect("a shipped profile"),
+        );
+        let provider: Arc<dyn Provider> = match self.route.settings().expect("route settings") {
+            AdapterSettings::OpenAiChat(_) => Arc::new(
+                p1_provider_openai_chat::ChatProvider::new(
+                    p1_host::catalog::chat_route(&self.route, binding, &profile)
+                        .expect("the chat route value"),
+                    &binding.wire_model,
+                    profile,
+                    Arc::new(transport),
+                    Arc::new(FixedCredentials),
+                )
+                .expect("the native chat provider"),
+            ),
+            AdapterSettings::AnthropicMessages(_) => Arc::new(
+                p1_provider_anthropic::AnthropicProvider::new(
+                    p1_host::catalog::messages_route(&self.route)
+                        .expect("the messages route value"),
+                    &binding.wire_model,
+                    profile,
+                    Arc::new(transport),
+                    Arc::new(FixedCredentials),
+                )
+                .expect("the native messages provider"),
+            ),
+            AdapterSettings::OpenAiResponses(settings) => {
+                let composition = p1_provider_openai::OpenAiCodexProvider::builder(
+                    p1_host::catalog::responses_route(&self.route)
+                        .expect("the responses route value"),
+                    &binding.wire_model,
+                    profile,
+                    Arc::new(transport),
+                    Arc::new(FixedCredentials),
+                );
+                let composition = if settings.transport
+                    == p1_provider_openai::ResponsesTransport::Websocket
+                {
+                    composition.with_ws_connector(Arc::new(ScriptedWsConnector::new(Vec::new())))
+                } else {
+                    composition
+                };
+                Arc::new(composition.build().expect("the native responses provider"))
+            }
+        };
+        provider
     }
 }
 
