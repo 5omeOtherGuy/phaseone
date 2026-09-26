@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use p1_contracts::{
-    CancellationToken, Item, ModelOptions, Outcome, Provider, ProviderError, ProviderErrorKind,
-    ProviderRequest, StopReason, StreamEvent, Usage,
+    CancellationToken, Effort, Item, ModelOptions, Outcome, Provider, ProviderError,
+    ProviderErrorKind, ProviderRequest, StopReason, StreamEvent, Usage,
 };
 
 use crate::engine::SummaryRequest;
@@ -52,6 +52,15 @@ impl ProviderSummary {
             options,
             prompt,
         }
+    }
+
+    /// Sets the reasoning effort the summary request carries, as
+    /// [`SummarizingContext::with_summary_effort`](crate::SummarizingContext::with_summary_effort)
+    /// does for the native policy: the host passes the lowest effort the model profile
+    /// supports, and `None` clears it.
+    pub fn with_summary_effort(mut self, effort: Option<Effort>) -> Self {
+        self.options.reasoning_effort = effort;
+        self
     }
 
     pub(crate) fn options_mut(&mut self) -> &mut ModelOptions {
@@ -127,5 +136,38 @@ impl ProviderSummary {
             tools: Vec::new(),
             options,
         }
+    }
+}
+
+/// The context-policy component's `summary` import is answered with this operation: the
+/// request's cap is sent as given, a refusal by `validate` is `Refused`, the text is masked
+/// and unknown usage stays `None`, exactly as for the native driver.
+#[cfg(feature = "component")]
+impl p1_module_runtime::SummaryService for ProviderSummary {
+    fn summarize(
+        &self,
+        request: p1_module_runtime::SummaryRequest,
+        cancel: CancellationToken,
+    ) -> p1_contracts::BoxFuture<
+        '_,
+        Result<p1_module_runtime::SummaryResponse, p1_module_runtime::SummaryError>,
+    > {
+        use p1_module_runtime::{SummaryError, SummaryResponse};
+        Box::pin(async move {
+            let request = SummaryRequest {
+                transcript: request.transcript,
+                max_output_tokens: request.max_output_tokens,
+            };
+            match ProviderSummary::summarize(self, &request, &cancel).await {
+                Ok(answer) => Ok(SummaryResponse {
+                    text: answer.text,
+                    stop: answer.stop,
+                    usage: answer.usage,
+                }),
+                Err(SummaryFailure::Refused(error)) => Err(SummaryError::Refused(error)),
+                Err(SummaryFailure::Failed(error)) => Err(SummaryError::Failed(error)),
+                Err(SummaryFailure::Cancelled) => Err(SummaryError::Cancelled),
+            }
+        })
     }
 }

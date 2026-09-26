@@ -14,6 +14,10 @@ workspace = true
 # policy engine builds, which the context-policy component compiles for the wasm target.
 default = ["native"]
 native = ["dep:p1-redact", "dep:futures-util", "dep:tokio"]
+# `ProviderSummary` as the `SummaryService` the host links a context-policy component's
+# `summary` import to. Off by default: it brings wasmtime, which the host's native
+# composition does not need yet.
+component = ["native", "dep:p1-module-runtime"]
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
@@ -22,8 +26,13 @@ p1-contracts = { path = "../p1-contracts" }
 p1-redact = { path = "../p1-redact", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 tokio = { version = "1", default-features = false, features = ["macros"], optional = true }
+p1-module-runtime = { path = "../p1-module-runtime", optional = true }
 
 [dev-dependencies]
+# The component equivalence suite (tests/component.rs) runs the context-policy component
+# behind `WasmContextPolicy` with `ProviderSummary` as its summary service.
+p1-context = { path = ".", features = ["component"] }
+p1-module-runtime = { path = "../p1-module-runtime" }
 p1-core = { path = "../p1-core" }
 p1-journal = { path = "../p1-journal" }
 p1-testkit = { path = "../p1-testkit" }

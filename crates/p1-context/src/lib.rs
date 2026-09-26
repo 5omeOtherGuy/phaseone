@@ -6,7 +6,9 @@
 //! `native` feature, so the context-policy component (`modules/p1-module-context/`)
 //! runs the same code. The `native` feature (on by default) adds `SummarizingContext`,
 //! the driver that sends the engine's summary requests through `ProviderSummary`, the
-//! native summary operation the component's `summary` import is answered with.
+//! native summary operation the component's `summary` import is answered with. The
+//! `component` feature makes `ProviderSummary` the `p1_module_runtime::SummaryService` the
+//! host links that import to.
 
 pub mod engine;
 mod estimate;
