@@ -1,18 +1,25 @@
 //! A composed Chat Completions provider: wire dialect, route data and model policy.
 //! Credentials are supplied through CredentialSource; this crate performs no login lookup.
+//!
+//! The crate is split like `p1-provider-http` (ADR-0071). PORTABLE, always compiled:
+//! the route and settings types, composition validation, [`validate_request`], the
+//! credential-free lowering ([`lower_request`]), the [`ChatParser`] and its
+//! `on_http_error` classification — what a provider WebAssembly component needs.
+//! NATIVE, behind the default `native` feature: `ChatProvider`, everything that
+//! touches a transport or a credential.
 mod parser;
+#[cfg(feature = "native")]
+mod provider;
 mod request;
 
 use p1_contracts::{
-    BoxFuture, CacheKeySupport, CancellationToken, Effort, Origin, Provider, ProviderError,
-    ProviderRequest, ProviderStream, RouteDescription,
+    CacheKeySupport, Effort, Origin, ProviderError, ProviderRequest, RouteDescription,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
-use p1_provider_http::{
-    CredentialSource, DriveRequest, HttpRequest, RetryPolicy, Transport, drive,
-};
-pub use request::build_request;
-use std::sync::Arc;
+pub use parser::ChatParser;
+#[cfg(feature = "native")]
+pub use provider::ChatProvider;
+pub use request::{build_request, validate as validate_request};
 
 /// Implemented encodings, not service names. Unknown extensions require an implementation.
 /// The names are the kebab-case spellings a route file's `[adapter_settings]` uses.
@@ -92,6 +99,23 @@ impl ChatRoute {
         Origin {
             route: self.origin_route.clone(),
             model: wire_model.into(),
+        }
+    }
+    /// What a provider composed from this route and `wire_model` is.
+    pub fn describe(&self, wire_model: &str) -> RouteDescription {
+        RouteDescription {
+            origin: self.origin(wire_model),
+            supports_freeform_tools: false,
+            mandatory_prompt_prefix: None,
+            reports_cost: false,
+            // `options.cache_key` is consumed exactly as the route's session
+            // header; a route without one takes no key at all (validate rejects
+            // an explicit key on such a route).
+            cache_key: if self.session_header.is_some() {
+                CacheKeySupport::Optional
+            } else {
+                CacheKeySupport::Unsupported
+            },
         }
     }
     fn validate(&self) -> Result<(), ProviderError> {
@@ -201,6 +225,78 @@ fn opencode_ids(cache_key: Option<&str>) -> (String, String) {
     )
 }
 
+type Headers = Vec<(String, String)>;
+
+/// The request's header set in two halves. The native provider puts the credential
+/// between them, where it has always been, so a credential-free set never reorders
+/// the rest. `cache_key` is the request's own key, unclamped.
+fn headers(route: &ChatRoute, cache_key: Option<&str>) -> (Headers, Headers) {
+    let identity = route.client_identity;
+    let mut headers = route.headers.clone();
+    // The identity replaces p1's own user-agent; the identity's session
+    // header replaces the generic cache-key session header.
+    if identity.is_some() {
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("user-agent"));
+    }
+    headers.extend([
+        ("content-type".into(), "application/json".into()),
+        ("accept".into(), "text/event-stream".into()),
+    ]);
+    let mut tail = Vec::new();
+    match identity {
+        None => {
+            if let (Some(name), Some(value)) = (&route.session_header, cache_key) {
+                tail.push((name.clone(), value.to_string()));
+            }
+        }
+        Some(identity) => {
+            tail.extend(client_identity_headers(identity, cache_key));
+        }
+    }
+    (headers, tail)
+}
+
+/// Every header a request on `route` sends except the credential, in the native
+/// order. A client identity without a cache key generates fresh ids on each call.
+pub fn build_headers_without_credential(
+    route: &ChatRoute,
+    cache_key: Option<&str>,
+) -> Vec<(String, String)> {
+    let (mut headers, tail) = headers(route, cache_key);
+    headers.extend(tail);
+    headers
+}
+
+/// One request lowered for the wire WITHOUT any credential: what the native
+/// provider sends, minus its `authorization` header.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoweredRequest {
+    /// Appended to the route's endpoint: empty, because a chat route's endpoint
+    /// is the complete completions URL.
+    pub path: &'static str,
+    /// Every header the native request sends except the credential, in its order.
+    pub headers: Vec<(String, String)>,
+    /// The encoded JSON body.
+    pub body: Vec<u8>,
+}
+
+/// Validate and lower one request exactly as the native provider does before it
+/// opens a transport, so both fail with the same error and send the same bytes.
+pub fn lower_request(
+    route: &ChatRoute,
+    wire_model: &str,
+    profile: &ModelProfile,
+    request: &ProviderRequest,
+) -> Result<LoweredRequest, ProviderError> {
+    let body = serde_json::to_vec(&build_request(route, wire_model, profile, request)?)
+        .map_err(|_| request::invalid("cannot encode request"))?;
+    Ok(LoweredRequest {
+        path: "",
+        headers: build_headers_without_credential(route, request.options.cache_key.as_deref()),
+        body,
+    })
+}
+
 fn header_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -219,38 +315,10 @@ fn header_name(name: &str) -> bool {
         )
 }
 
-pub struct ChatProvider {
-    route: ChatRoute,
-    wire_model: String,
-    profile: Arc<ModelProfile>,
-    transport: Arc<dyn Transport>,
-    credentials: Arc<dyn CredentialSource>,
-    retry: RetryPolicy,
-}
-impl ChatProvider {
-    pub fn new(
-        route: ChatRoute,
-        wire_model: &str,
-        profile: Arc<ModelProfile>,
-        transport: Arc<dyn Transport>,
-        credentials: Arc<dyn CredentialSource>,
-    ) -> Result<Self, ProviderError> {
-        validate_composition(&route, wire_model, &profile)?;
-        Ok(Self {
-            route,
-            wire_model: wire_model.into(),
-            profile,
-            transport,
-            credentials,
-            retry: RetryPolicy::default(),
-        })
-    }
-    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
-        self.retry = retry;
-        self
-    }
-}
-pub(crate) fn validate_composition(
+/// The one composition check, shared by the constructor and the pure request
+/// builder: the route data is usable, the profile is valid, and the dialect can
+/// express the profile's policy.
+pub fn validate_composition(
     route: &ChatRoute,
     wire_model: &str,
     profile: &ModelProfile,
@@ -305,105 +373,6 @@ fn dialect_name(dialect: ChatDialect) -> &'static str {
         ChatDialect::RetainedThinking => "retained-thinking",
     }
 }
-impl std::fmt::Debug for ChatProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChatProvider")
-            .field("route", &self.route)
-            .field("wire_model", &self.wire_model)
-            .finish_non_exhaustive()
-    }
-}
-impl Provider for ChatProvider {
-    fn describe(&self) -> RouteDescription {
-        RouteDescription {
-            origin: self.route.origin(&self.wire_model),
-            supports_freeform_tools: false,
-            mandatory_prompt_prefix: None,
-            reports_cost: false,
-            // `options.cache_key` is consumed exactly as the route's session
-            // header; a route without one takes no key at all (validate rejects
-            // an explicit key on such a route).
-            cache_key: if self.route.session_header.is_some() {
-                CacheKeySupport::Optional
-            } else {
-                CacheKeySupport::Unsupported
-            },
-        }
-    }
-    fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
-        request::validate(&self.route, &self.wire_model, &self.profile, request)
-    }
-    fn stream<'a>(
-        &'a self,
-        request: ProviderRequest,
-        cancel: CancellationToken,
-    ) -> BoxFuture<'a, Result<ProviderStream, ProviderError>> {
-        Box::pin(async move {
-            let body = serde_json::to_vec(&build_request(
-                &self.route,
-                &self.wire_model,
-                &self.profile,
-                &request,
-            )?)
-            .map_err(|_| request::invalid("cannot encode request"))?;
-            let route = self.route.clone();
-            let origin = route.origin(&self.wire_model);
-            let dialect = route.dialect;
-            let cache_key = request.options.cache_key;
-            // A route whose credential an egress proxy injects sends NO authentication
-            // header (issue #134): the credential the source hands us is a placeholder.
-            let proxy_injected = self.credentials.proxy_injected();
-            let build_headers = {
-                let route = route.clone();
-                let identity = route.client_identity;
-                move |credential: &p1_provider_http::Credential| {
-                    let mut headers = route.headers.clone();
-                    // The identity replaces p1's own user-agent; the identity's session
-                    // header replaces the generic cache-key session header.
-                    if identity.is_some() {
-                        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("user-agent"));
-                    }
-                    headers.extend([
-                        ("content-type".into(), "application/json".into()),
-                        ("accept".into(), "text/event-stream".into()),
-                    ]);
-                    if !proxy_injected {
-                        headers.push((
-                            "authorization".into(),
-                            format!("Bearer {}", credential.bearer),
-                        ));
-                    }
-                    match identity {
-                        None => {
-                            if let (Some(name), Some(value)) = (&route.session_header, &cache_key) {
-                                headers.push((name.clone(), value.clone()));
-                            }
-                        }
-                        Some(identity) => {
-                            headers.extend(client_identity_headers(identity, cache_key.as_deref()));
-                        }
-                    }
-                    HttpRequest {
-                        url: route.endpoint.clone(),
-                        headers,
-                        body: body.clone(),
-                    }
-                }
-            };
-            Ok(drive(DriveRequest {
-                transport: self.transport.clone(),
-                credentials: self.credentials.clone(),
-                build: Box::new(build_headers),
-                new_parser: Box::new(move || {
-                    Box::new(parser::ChatParser::new(origin.clone(), dialect))
-                }),
-                retry: self.retry,
-                cancel,
-            }))
-        })
-    }
-}
-
 #[cfg(test)]
 mod test_config {
     use super::*;
@@ -530,5 +499,39 @@ mod tests {
         );
         let error = validate_composition(&route, "claude-example", &profile).unwrap_err();
         assert!(error.message.contains("default"), "{}", error.message);
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    /// The manifest is the split's guard: a transport dependency that the default
+    /// `native` feature does not gate would let a guest build reach sockets, a
+    /// runtime or credentials without any compile error here.
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    fn dependencies() -> &'static str {
+        MANIFEST
+            .split("[dependencies]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("a dependencies table")
+    }
+
+    #[test]
+    fn the_transport_crate_is_native_only_through_the_default_native_feature() {
+        assert!(MANIFEST.contains("default = [\"native\"]"));
+        assert!(MANIFEST.contains("native = [\"p1-provider-http/native\"]"));
+        let http = dependencies()
+            .lines()
+            .find(|line| line.starts_with("p1-provider-http = "))
+            .expect("p1-provider-http is a dependency");
+        assert!(http.contains("default-features = false"), "{http}");
+    }
+
+    #[test]
+    fn no_dependency_on_p1_auth_or_a_runtime() {
+        for name in ["p1-auth", "tokio", "futures", "reqwest"] {
+            assert!(!dependencies().contains(name), "{name} in [dependencies]");
+        }
     }
 }

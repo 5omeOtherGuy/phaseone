@@ -33,6 +33,19 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The guest target the module build compiles for (WASM_TARGET in
+          # modules/toolchain.pins: D-XO-4 on S0-Q9, wasm32-unknown-unknown componentized
+          # with wasm-tools, never wasm32-wasip2).
+          targets: wasm32-unknown-unknown
+
+      - name: Read the wasm-tools pin
+        run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"
+
+      - name: Install wasm-tools (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
 
       - uses: actions/cache@v4
         with:
@@ -59,31 +72,22 @@ jobs:
           P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
         run: cargo build --release --locked -p p1-host
 
+      - name: Build the module packages
+        run: scripts/build-modules.sh --all
+
       - name: Package the assets
         run: |
           set -euo pipefail
-          mkdir -p dist
-          install -m 0755 target/release/p1 dist/p1-linux-x86_64
-          # Stage the share tree, then write the release manifest into it. modules/ here
-          # is the staged archive tree, never the repository's own modules/ sources: the
-          # archive carries manifest.json and packages/ only.
-          rm -rf dist/share
-          mkdir -p dist/share/modules/packages
-          cp -a environments routes profiles dist/share/
-          python3 scripts/release-manifest.py \
-            --root . \
+          # One staging path builds the release archive: the native binary plus the built
+          # module packages, staged in a temporary directory and moved into dist/ only when
+          # the whole archive is complete. The share tree carries environments/, routes/,
+          # profiles/ and modules/ (manifest.json and packages/), never this checkout's own
+          # modules/ sources, and the four asset names are fixed.
+          scripts/stage-release.sh \
+            --native target/release/p1 \
+            --out dist \
             --commit "${{ github.event.workflow_run.head_sha }}" \
-            --tag "${{ steps.tag.outputs.tag }}" \
-            --native dist/p1-linux-x86_64 \
-            --modules-dir dist/share/modules
-          # No compiled-cache blob is ever published; a package build must ship .wasm.
-          if [ -n "$(find dist/share/modules -name '*.cwasm' -print -quit)" ]; then
-            echo "refusing to publish a compiled-cache blob under dist/share/modules" >&2
-            exit 1
-          fi
-          tar -czf dist/p1-share.tar.gz -C dist/share environments routes profiles modules
-          ( cd dist && sha256sum p1-linux-x86_64 > p1-linux-x86_64.sha256 )
-          ( cd dist && sha256sum p1-share.tar.gz > p1-share.tar.gz.sha256 )
+            --tag "${{ steps.tag.outputs.tag }}"
           ls -l dist
 
       - name: Publish the release
