@@ -54,7 +54,9 @@ pub(crate) const WORKFLOW_TOOLS: [&str; 4] = [
 // The worker family's scopes and hook, reachable from outside the crate through this
 // public module (the `delegation` module is the crate's own), so the host-level
 // activation tests drive the same hook the host installs.
-pub use super::delegation::{MemberScopes, WORKER_MODULES, worker_member_services};
+pub use super::delegation::{
+    Capabilities, MemberScopes, WORKER_MODULES, with_worker_tools, worker_member_services,
+};
 
 /// The evidence of a `done` whose outcome established none (ADR-0051 item 3).
 const NOT_VERIFIED: &str = "not verified; parent verification required";
@@ -742,12 +744,16 @@ impl p1_workflow::CancelRuns for MemberRuns {
 }
 
 /// Build the workflow service over the worker service and the child builder, and put
-/// it in `deps` so the catalog registers the `workflow_*` tools.
+/// it in `deps` so the catalog registers the `workflow_*` tools. The service is built
+/// whatever `capabilities` says, so `with_worker_tools` alone decides what a main agent
+/// gets; with workflows disabled the workflow members' module hook is not added, so a
+/// member that still reached assembly fails with `MissingService` (ADR-0085 item 6).
 pub(crate) fn compose(
     deps: &mut HostDeps,
     builder: Arc<ChildBuilder>,
     workers: Arc<InProcessWorkers>,
     run_root: PathBuf,
+    capabilities: Capabilities,
 ) -> Result<Workflows, String> {
     let settings = crate::models::workflow_settings(&crate::auth::locations(deps))?;
     // Created up front so a misplaced `--out`/state directory fails the composition,
@@ -784,7 +790,9 @@ pub(crate) fn compose(
     }) as Arc<dyn WorkflowService>;
     // Workflow members started through a package run on the same service the native
     // members use, so a run's base, lines and notification are the same either way.
-    deps.module_services = Some(member_services(deps.module_services.clone(), based.clone()));
+    if capabilities.workflows {
+        deps.module_services = Some(member_services(deps.module_services.clone(), based.clone()));
+    }
     deps.workflow_service = Some(based);
     deps.workflow_observer = Some(observer.clone());
     Ok(Workflows { service, observer })

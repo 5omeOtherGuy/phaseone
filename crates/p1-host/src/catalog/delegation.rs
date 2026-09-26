@@ -11,6 +11,12 @@
 //!   main agent and bound to the whole worker service, as before. No shipped environment
 //!   names a member package (the shipped `modules.lock` is empty), so every shipped
 //!   environment takes this path.
+//!
+//! Either family can be switched off at run time (ADR-0085 item 6, S6.8): `[capabilities]`
+//! in `settings.toml` ([`Capabilities`]). A disabled family is left out of the next main
+//! agent's assembly on both paths, so its tools and their `{{#tool:...}}` prompt sections
+//! go with it, and an environment that names one of its members fails that assembly. The
+//! cargo features stay a build option; they are no longer the user's switch.
 
 #[cfg(feature = "delegation")]
 use std::sync::Arc;
@@ -35,6 +41,43 @@ use crate::HostDeps;
 use crate::catalog::modules::ModuleServices;
 #[cfg(feature = "workflows")]
 use crate::catalog::workflow::{WORKFLOW_MODULES, WORKFLOW_TOOLS};
+use serde::Deserialize;
+
+/// `[capabilities]` in `settings.toml` (ADR-0085 item 6): which delegation families the
+/// next main-agent assembly gets. Both default to enabled, today's behaviour, so an absent
+/// table or key changes nothing. It is read once when a main agent's assembly generation
+/// starts (a run, `p1 env show`, `p1 workflow run`) and kept for that generation, as the
+/// generation's worker scopes are: a model switch reassembles with the flags its session
+/// started with, so a running session's tool set never changes under its children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Capabilities {
+    /// The four `worker_*` members.
+    pub workers: bool,
+    /// The four `workflow_*` members, and `p1 workflow run`.
+    pub workflows: bool,
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self {
+            workers: true,
+            workflows: true,
+        }
+    }
+}
+
+/// The capabilities from the `settings.toml` the host reads its other settings from.
+pub(crate) fn enabled_capabilities(deps: &crate::HostDeps) -> Result<Capabilities, String> {
+    Ok(crate::models::load_settings(&crate::auth::locations(deps))?.capabilities)
+}
+
+/// The explicit refusal of a disabled family: never a silent skip, and never the native
+/// member in place of the package the environment named.
+#[cfg(feature = "delegation")]
+pub(crate) fn disabled(family: &str) -> String {
+    format!("{family} are disabled (`[capabilities] {family} = false` in settings.toml)")
+}
 
 /// The worker family's member module ids, as the packages' manifests name them, in the
 /// order the native members are appended ([`WORKER_TOOLS`] has the same order).
@@ -84,14 +127,25 @@ fn names_a_member_package(environment: &EnvironmentFile, modules: &[&str]) -> bo
 /// at the three main-agent assembly sites — never in the child factory, so a worker
 /// never gets the worker tools. A no-op when the `delegation` feature is not compiled.
 /// With `workflows` the four `workflow_*` tools follow the same way (ADR-0053 item 7).
+///
+/// A family `capabilities` disables gets nothing appended, and an environment that names
+/// one of its members (a native key or a package's lock key) is refused with the
+/// family's "... are disabled" error (ADR-0085 item 6).
 #[cfg(feature = "delegation")]
-pub(crate) fn with_worker_tools(environment: &mut EnvironmentFile) {
+pub fn with_worker_tools(
+    environment: &mut EnvironmentFile,
+    capabilities: Capabilities,
+) -> Result<(), String> {
     let mut native: Vec<&str> = Vec::new();
-    if !names_a_member_package(environment, &WORKER_MODULES) {
+    if !capabilities.workers {
+        refuse_named_members(environment, "workers", &WORKER_MODULES, &WORKER_TOOLS)?;
+    } else if !names_a_member_package(environment, &WORKER_MODULES) {
         native.extend(WORKER_TOOLS);
     }
     #[cfg(feature = "workflows")]
-    if !names_a_member_package(environment, &WORKFLOW_MODULES) {
+    if !capabilities.workflows {
+        refuse_named_members(environment, "workflows", &WORKFLOW_MODULES, &WORKFLOW_TOOLS)?;
+    } else if !names_a_member_package(environment, &WORKFLOW_MODULES) {
         native.extend(WORKFLOW_TOOLS);
     }
     for module in native {
@@ -104,6 +158,33 @@ pub(crate) fn with_worker_tools(environment: &mut EnvironmentFile) {
             description: None,
             variant: None,
         });
+    }
+    Ok(())
+}
+
+/// Refuse an environment that names a member of the disabled `family`, by its native key
+/// or its package's lock key, with the family's disabled error naming the member.
+#[cfg(feature = "delegation")]
+fn refuse_named_members(
+    environment: &EnvironmentFile,
+    family: &str,
+    modules: &[&str],
+    tools: &[&str],
+) -> Result<(), String> {
+    let named = environment.tools.iter().find(|tool| {
+        tools.contains(&tool.module.as_str())
+            || modules
+                .iter()
+                .any(|&module| tool.module == lock_key(module))
+    });
+    match named {
+        Some(tool) => Err(format!(
+            "{}; the environment `{}` names `{}`",
+            disabled(family),
+            environment.name,
+            tool.module
+        )),
+        None => Ok(()),
     }
 }
 
@@ -192,16 +273,31 @@ fn worker_services(scope: &WorkerScope) -> Services {
 
 /// Install the family's scopes and module hook for the run whose worker service is
 /// `service`: `catalog/modules.rs` links worker members through the hook, and `run.rs`
-/// retires the generation when the main agent's assembly is dropped.
+/// retires the generation when the main agent's assembly is dropped. A new generation
+/// is created for every main-agent assembly generation, whatever `capabilities` says, so
+/// teardown always has one to retire. With workers disabled the hook is not installed:
+/// a worker member that still reached assembly would be linked with no worker service and
+/// fail with the runtime's `MissingService`, never fall back to a native member.
 #[cfg(feature = "delegation")]
-pub(crate) fn install_member_scopes(deps: &mut HostDeps, service: Arc<dyn WorkerService>) {
+pub(crate) fn install_member_scopes(
+    deps: &mut HostDeps,
+    service: Arc<dyn WorkerService>,
+    capabilities: Capabilities,
+) {
     let scopes = MemberScopes::new(service);
-    deps.module_services = Some(worker_member_services(scopes.clone(), None));
+    deps.module_services = capabilities
+        .workers
+        .then(|| worker_member_services(scopes.clone(), None));
     deps.member_scopes = Some(scopes);
 }
 
 #[cfg(not(feature = "delegation"))]
-pub(crate) fn with_worker_tools(_environment: &mut EnvironmentFile) {}
+pub(crate) fn with_worker_tools(
+    _environment: &mut EnvironmentFile,
+    _capabilities: Capabilities,
+) -> Result<(), String> {
+    Ok(())
+}
 
 #[cfg(feature = "delegation")]
 pub(crate) fn register_delegation_tools(
@@ -319,7 +415,7 @@ mod tests {
     #[test]
     fn an_environment_without_member_packages_keeps_every_native_member() {
         let mut env = environment(&["read"]);
-        with_worker_tools(&mut env);
+        with_worker_tools(&mut env, Capabilities::default()).expect("enabled");
         let mut expected = vec!["read"];
         expected.extend(WORKER_TOOLS);
         expected.extend(WORKFLOW_TOOLS);
@@ -329,13 +425,13 @@ mod tests {
     #[test]
     fn naming_a_member_package_takes_the_module_path_for_that_family_only() {
         let mut env = environment(&["read", "worker-result"]);
-        with_worker_tools(&mut env);
+        with_worker_tools(&mut env, Capabilities::default()).expect("enabled");
         let mut expected = vec!["read", "worker-result"];
         expected.extend(WORKFLOW_TOOLS);
         assert_eq!(modules(&env), expected, "no native worker member is added");
 
         let mut env = environment(&["workflow-status"]);
-        with_worker_tools(&mut env);
+        with_worker_tools(&mut env, Capabilities::default()).expect("enabled");
         let mut expected = vec!["workflow-status"];
         expected.extend(WORKER_TOOLS);
         assert_eq!(
@@ -343,6 +439,67 @@ mod tests {
             expected,
             "no native workflow member is added"
         );
+    }
+
+    /// A disabled family appends nothing and leaves the other family as it was.
+    #[test]
+    fn a_disabled_family_is_left_out_of_the_next_assembly() {
+        let workers_off = Capabilities {
+            workers: false,
+            workflows: true,
+        };
+        let mut env = environment(&["read"]);
+        with_worker_tools(&mut env, workers_off).expect("nothing disabled is named");
+        let mut expected = vec!["read"];
+        expected.extend(WORKFLOW_TOOLS);
+        assert_eq!(modules(&env), expected);
+
+        let neither = Capabilities {
+            workers: false,
+            workflows: false,
+        };
+        let mut env = environment(&["read"]);
+        with_worker_tools(&mut env, neither).expect("nothing disabled is named");
+        assert_eq!(modules(&env), ["read"]);
+    }
+
+    /// Naming a member of a disabled family, by native key or by lock key, is the family's
+    /// explicit error, never a skip or the native member in its place.
+    #[test]
+    fn naming_a_disabled_member_is_the_familys_error() {
+        let neither = Capabilities {
+            workers: false,
+            workflows: false,
+        };
+        for (module, family) in [
+            ("worker_result", "workers"),
+            ("worker-start", "workers"),
+            ("workflow_status", "workflows"),
+            ("workflow-cancel", "workflows"),
+        ] {
+            let mut env = environment(&["read", module]);
+            let error = with_worker_tools(&mut env, neither).expect_err(module);
+            assert!(
+                error.starts_with(&format!("{family} are disabled")),
+                "{module}: {error}"
+            );
+            assert!(error.contains(&format!("`{module}`")), "{module}: {error}");
+        }
+    }
+
+    /// Absent, the table and each key default to enabled; an unknown key is refused.
+    #[test]
+    fn the_capabilities_table_defaults_to_enabled() {
+        let parse = |text: &str| toml::from_str::<Capabilities>(text);
+        assert_eq!(parse("").expect("empty"), Capabilities::default());
+        assert_eq!(
+            parse("workflows = false").expect("one key"),
+            Capabilities {
+                workers: true,
+                workflows: false,
+            }
+        );
+        assert!(parse("delegation = false").is_err());
     }
 
     #[test]

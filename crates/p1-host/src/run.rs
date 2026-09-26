@@ -5,6 +5,12 @@
 //! Interactive prompts on stderr and drains inbox turns without waiting on
 //! children. First Ctrl-C cancels the run (and, at exit, the children); second
 //! Ctrl-C returns 130 immediately.
+//!
+//! notice: S1's file; S6.8 adds only the passage of the `[capabilities]`
+//! run-time switch — the three main-agent assembly sites (a run's start,
+//! `env show` and a model switch), the `p1 workflow run` refusal and the one
+//! `ModelSwitch` field that pins the switch for the generation (D065/D068
+//! pattern, ADR-0085 item 6).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -508,7 +514,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             return EXIT_FAILURE;
         }
     };
-    with_worker_tools(&mut environment);
+    // ADR-0085 item 6 (S6): `env show` assembles as a run's start would, so a disabled
+    // family is left out here too, and naming one of its members is the same error.
+    if let Err(message) = crate::catalog::delegation::enabled_capabilities(deps)
+        .and_then(|capabilities| with_worker_tools(&mut environment, capabilities))
+    {
+        write_stderr(deps, &format!("{message}\n"));
+        return EXIT_FAILURE;
+    }
     // Resolve the route binding before assembling: the wire model and the route's
     // own output ceiling come from the route file (spec §2).
     if let Err(message) =
@@ -630,6 +643,10 @@ pub async fn run_with_front_end(
     // front end decides what "headless" means (the line front end uses the CLI
     // rule, a terminal UI is interactive by definition).
     let headless = front_end.is_headless(options);
+    // ADR-0085 item 6 (S6): this assembly generation's worker and workflow switch, read
+    // once and kept by a model switch, as the generation's worker scopes are.
+    let capabilities =
+        crate::catalog::delegation::enabled_capabilities(deps).map_err(RunError::usage)?;
 
     // The delegation service must exist before the catalog so the `worker_*`
     // tools can be registered; the child factory reaches the catalog lazily,
@@ -638,8 +655,14 @@ pub async fn run_with_front_end(
     // must happen before workflows are composed, since a step worker is built by the
     // same service and receives the same id namespace.
     #[cfg(feature = "delegation")]
-    let (completion_hub, generations, child_builder, service, child_counter) =
-        compose_children(deps, &workspace, front_end.clone(), options, 2)?;
+    let (completion_hub, generations, child_builder, service, child_counter) = compose_children(
+        deps,
+        &workspace,
+        front_end.clone(),
+        options,
+        2,
+        capabilities,
+    )?;
     #[cfg(feature = "delegation")]
     let service = Some(service);
     #[cfg(not(feature = "delegation"))]
@@ -654,6 +677,7 @@ pub async fn run_with_front_end(
                 child_builder.clone(),
                 service.clone(),
                 crate::workflow::run_root(deps, options.session.as_deref()),
+                capabilities,
             )
             .map_err(RunError::usage)?,
         ),
@@ -687,7 +711,7 @@ pub async fn run_with_front_end(
     let choice = selection(deps, options).map_err(RunError::usage)?;
     let mut environment = load_environment(&choice.environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment);
+    with_worker_tools(&mut environment, capabilities)?;
     crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
         .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
@@ -902,6 +926,7 @@ pub async fn run_with_front_end(
         route_label: front_end.route_label(),
         instructions,
         mask: mask.clone(),
+        capabilities,
         session: Mutex::new(SessionModel {
             environment: session_environment,
             profile: choice.profile.clone(),
@@ -970,6 +995,12 @@ async fn workflow_run(
         ))
     })?;
     let args = workflow_args(workflow).map_err(RunError::usage)?;
+    // ADR-0085 item 6 (S6): a disabled workflow capability refuses the run explicitly.
+    let capabilities =
+        crate::catalog::delegation::enabled_capabilities(deps).map_err(RunError::usage)?;
+    if !capabilities.workflows {
+        return Err(crate::catalog::delegation::disabled("workflows").into());
+    }
     let workspace = resolve_workspace(options)?;
     let cancel = CancellationToken::new();
     let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone()));
@@ -982,13 +1013,15 @@ async fn workflow_run(
         front_end.clone(),
         options,
         workflow.max_workers,
+        capabilities,
     )?;
     let run_root = match &workflow.out {
         Some(out) => out.clone(),
         None => crate::workflow::run_root(deps, options.session.as_deref()),
     };
-    let workflows = crate::workflow::compose(deps, child_builder, service.clone(), run_root)
-        .map_err(RunError::usage)?;
+    let workflows =
+        crate::workflow::compose(deps, child_builder, service.clone(), run_root, capabilities)
+            .map_err(RunError::usage)?;
     let catalog = Arc::new(build_catalog(
         deps,
         options.sandbox,
@@ -1538,6 +1571,9 @@ pub(crate) struct ModelSwitch {
     /// Issue #142: the top-level agent's mask counter. A switched assembly's tools
     /// feed the SAME counter the parent's notice sink reads.
     mask: Arc<MaskCounter>,
+    /// The worker and workflow switch the session's assembly generation started with
+    /// (ADR-0085 item 6, S6): a switch keeps the generation, so it keeps these too.
+    capabilities: crate::catalog::delegation::Capabilities,
     session: Mutex<SessionModel>,
 }
 
@@ -1657,6 +1693,7 @@ pub(crate) fn model_switch_for_test(
         substitutions,
         ignored: session_journals(None),
         scope: None,
+        capabilities: crate::catalog::delegation::Capabilities::default(),
         route_label: front_end.route_label(),
         instructions: String::new(),
         mask: Arc::new(MaskCounter::new()),
@@ -1737,6 +1774,7 @@ impl ModelSwitch {
             substitutions,
             ignored: Vec::new(),
             scope: None,
+            capabilities: crate::catalog::delegation::Capabilities::default(),
             route_label: None,
             instructions: String::new(),
             mask: Arc::new(MaskCounter::new()),
@@ -1832,7 +1870,7 @@ fn session_candidate(
 ) -> Result<SessionCandidate, String> {
     let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment);
+    with_worker_tools(&mut environment, switch.capabilities)?;
     crate::models::apply(&mut environment, choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
     let assembled = assemble_with_cache_key(

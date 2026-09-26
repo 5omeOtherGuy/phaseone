@@ -74,7 +74,9 @@ fn reserved_worker_ids(session: Option<&Path>) -> Result<usize, String> {
 
 /// Compose the child factory and worker service from one initial id reservation.
 /// Both direct workers and workflow steps consume this same service, so neither
-/// path may begin with an unexamined `w1` journal.
+/// path may begin with an unexamined `w1` journal. `capabilities` only decides the worker
+/// members' module hook: the service is composed either way, because workflow steps are
+/// workers of it and running children must keep it (ADR-0085 item 6).
 #[cfg(feature = "delegation")]
 pub(crate) fn compose_children(
     deps: &mut HostDeps,
@@ -82,6 +84,7 @@ pub(crate) fn compose_children(
     front_end: Arc<dyn FrontEnd>,
     options: &Options,
     max_workers: usize,
+    capabilities: super::delegation::Capabilities,
 ) -> Result<ComposedChildren, String> {
     let generations: Arc<Generations> = Arc::new(Generations::empty());
     let service_slot: Arc<OnceLock<Arc<InProcessWorkers>>> = Arc::new(OnceLock::new());
@@ -109,7 +112,7 @@ pub(crate) fn compose_children(
     deps.worker_service = Some(service.clone());
     // The worker members' scopes are over this same service, so a member package and a
     // native member share one concurrency bound and one id sequence.
-    super::delegation::install_member_scopes(deps, service.clone());
+    super::delegation::install_member_scopes(deps, service.clone(), capabilities);
     Ok((
         child_completion_hub,
         generations,
