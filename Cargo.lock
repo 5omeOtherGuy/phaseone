@@ -1857,6 +1857,7 @@ version = "0.0.1"
 dependencies = [
  "p1-contracts",
  "p1-module-protocol",
+ "p1-provider-http",
  "p1-redact",
  "thiserror 2.0.20",
  "tokio",

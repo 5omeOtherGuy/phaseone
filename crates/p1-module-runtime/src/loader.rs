@@ -41,8 +41,16 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// other capability interfaces belong to other native crates and streams; a manifest that
 /// grants one of them is refused until the runtime can provide it. `summary` is linked to
 /// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7).
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 5] =
-    ["control", "clock", "random", "process", "summary"];
+pub(crate) const LINKABLE_CAPABILITIES: [&str; 8] = [
+    "control",
+    "clock",
+    "random",
+    "process",
+    "summary",
+    "http",
+    "websocket",
+    "credential-control",
+];
 
 /// The interface every world imports for its types; it grants nothing.
 const TYPES_INTERFACE: &str = "types";
@@ -504,9 +512,18 @@ mod tests {
     fn the_linkable_capabilities_are_the_old_four_plus_summary() {
         assert_eq!(
             LINKABLE_CAPABILITIES,
-            ["control", "clock", "random", "process", "summary"]
+            [
+                "control",
+                "clock",
+                "random",
+                "process",
+                "summary",
+                "http",
+                "websocket",
+                "credential-control"
+            ]
         );
-        for refused in ["notices", "completion", "http", "filesystem"] {
+        for refused in ["notices", "completion", "filesystem"] {
             assert!(!LINKABLE_CAPABILITIES.contains(&refused), "{refused}");
         }
     }
