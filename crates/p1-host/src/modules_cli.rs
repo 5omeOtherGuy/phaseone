@@ -39,31 +39,36 @@ const KEY_WIDTH: usize = 12;
 /// same check without reaching the loader, which compiles. A new class is one variant and
 /// one entry, and the drift guard `verify_and_the_loader_agree_on_every_manifest_field` fails
 /// if this list and the loader's part ways.
-const CLASSES: [ModuleKind; 5] = [
+const CLASSES: [ModuleKind; 6] = [
     ModuleKind::Tool,
     ModuleKind::Provider,
     ModuleKind::ContextPolicy,
     ModuleKind::AuthorizationPolicy,
     ModuleKind::WorkflowImplementation,
+    ModuleKind::WorkflowDecision,
 ];
 
 /// The capabilities this runtime links: the loader's `LINKABLE_CAPABILITIES`, published in
 /// `docs/design/modules/package.md`. `control`, `clock` and `random` are the runtime's own,
 /// `process` is the service it adapts, `summary` is the context policy's (S5, freeze item
-/// 13 of `docs/design/modules/wit.md`), `completion` is the host's completion hub (S3.7),
-/// and `workers-start`, `workers-observe`, `workers-control` and `workflows` are linked to
-/// the caller's delegation services (S6, B-S6-8); every other interface of
-/// `modules/capabilities.toml` arrives with the stream that owns its native service. The
-/// loader refuses a manifest granting anything else, so `verify` must refuse it too, and the
-/// drift guard `verify_and_the_loader_agree_on_every_manifest_field` fails if this list and
-/// the loader's part ways.
-const LINKABLE: [&str; 10] = [
+/// 13 of `docs/design/modules/wit.md`), `completion` is the host's completion hub (S3.7);
+/// `http`, `websocket` and `credential-control` are the provider interfaces a provider
+/// component imports (S4.7); `workers-start`, `workers-observe`, `workers-control` and
+/// `workflows` are linked to the caller's delegation services (S6, B-S6-8); every other
+/// interface of `modules/capabilities.toml` arrives with the stream that owns its native
+/// service. The loader refuses a manifest granting anything else, so `verify` must refuse it
+/// too, and the drift guard `verify_and_the_loader_agree_on_every_manifest_field` fails if
+/// this list and the loader's part ways.
+const LINKABLE: [&str; 13] = [
     "control",
     "clock",
     "random",
     "process",
     "summary",
     "completion",
+    "http",
+    "websocket",
+    "credential-control",
     "workers-start",
     "workers-observe",
     "workers-control",
