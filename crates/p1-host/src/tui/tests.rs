@@ -1,7 +1,9 @@
 //! Driver tests: no TTY, no terminal — the driver over plain method calls.
 
 use super::*;
+use crate::policy::{PolicyId, Verdict};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use p1_contracts::Decision;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -53,7 +55,7 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
 /// A driver whose policy is `--ask` (`true`) or full access: the idle-loop tests
 /// park a real authorization on the ask one (handoff §7.5).
 fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
-    let (policy, auth) = TuiPolicy::new(ask, CancellationToken::new());
+    let (policy, auth) = tui_policy(ask, CancellationToken::new());
     // A minimal real agent, for its inbox handle.
     let agent = test_agent();
     (
@@ -477,7 +479,7 @@ fn driver_with_agent() -> (Driver, Agent) {
 
 #[tokio::test]
 async fn a_cancelled_turn_denies_its_parked_approval() {
-    let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
+    let (policy, mut auth_rx) = tui_policy(true, CancellationToken::new());
     let turn = CancellationToken::new();
     policy.set_turn(Some(turn.clone()));
     let call = p1_contracts::ToolCall {
@@ -533,7 +535,7 @@ fn cancel_clears_the_follow_up_queue() {
 
 #[tokio::test]
 async fn an_auth_request_becomes_the_approval_view_and_answers() {
-    let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
+    let (policy, mut auth_rx) = tui_policy(true, CancellationToken::new());
     let (mut d, _auth) = driver();
     d.policy = Arc::new(policy);
     let call = p1_contracts::ToolCall {
@@ -570,6 +572,188 @@ async fn an_auth_request_becomes_the_approval_view_and_answers() {
     assert_eq!(pending.await.unwrap(), Decision::Permit);
     assert!(d.screen.approval.is_none());
     assert!(!d.screen.pinned);
+}
+
+/// One `Executes` call on `policy` (issue #308's cases): the task resolves with the
+/// decision the bridge hands the core.
+fn authorize_call(policy: &Arc<AskBridge>, effect: Effect) -> tokio::task::JoinHandle<Decision> {
+    let policy = policy.clone();
+    tokio::spawn(async move {
+        let call = p1_contracts::ToolCall {
+            call_id: "c1".into(),
+            name: "shell".into(),
+            input: p1_contracts::ToolInput::Json("{\"command\":\"cargo test\"}".into()),
+        };
+        let identity = p1_contracts::ToolIdentity {
+            implementation: "shell".into(),
+            variant: String::new(),
+        };
+        policy
+            .authorize(p1_contracts::AuthorizationRequest {
+                call: &call,
+                identity: &identity,
+                effect,
+            })
+            .await
+    })
+}
+
+/// Park one call, show it, and answer it with `key` on the driver.
+async fn answer_parked(
+    d: &mut Driver,
+    auth_rx: &mut mpsc::UnboundedReceiver<AuthRequest>,
+    answer: char,
+) -> Decision {
+    let pending = authorize_call(&d.policy, Effect::Executes);
+    let request = auth_rx.recv().await.expect("the call parked");
+    d.on_auth(request);
+    assert!(d.screen.approval.is_some());
+    d.on_key(key(KeyCode::Char(answer)), None);
+    assert!(d.screen.approval.is_none());
+    pending.await.unwrap()
+}
+
+/// Issue #308: under `--ask` the TUI resolves the bridge's `Ask`: `y` permits, `n`
+/// is USER_DENY, `a` permits and the bridge remembers it, so the next identical
+/// call never reaches the screen.
+#[tokio::test]
+async fn ask_resolves_through_the_screen_and_always_is_remembered() {
+    let (mut d, mut auth_rx) = driver_with(true);
+
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'y').await,
+        Decision::Permit
+    );
+    assert!(auth_rx.try_recv().is_err(), "one call parks one request");
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'n').await,
+        Decision::Deny {
+            reason: p1_tui::runtime::USER_DENY.into()
+        }
+    );
+    // Neither `y` nor `n` is remembered: the call parks again.
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'a').await,
+        Decision::Permit
+    );
+    assert_eq!(
+        authorize_call(&d.policy, Effect::Executes).await.unwrap(),
+        Decision::Permit
+    );
+    assert!(
+        auth_rx.try_recv().is_err(),
+        "the `always` grant is not asked again"
+    );
+    // ReadOnly is the policy's own permit: never parked.
+    assert_eq!(
+        authorize_call(&d.policy, Effect::ReadOnly).await.unwrap(),
+        Decision::Permit
+    );
+    assert!(auth_rx.try_recv().is_err());
+}
+
+/// A verdict source that always asks, under a policy id the test changes as a
+/// reload would.
+struct ReloadingSource(Mutex<PolicyId>);
+
+impl crate::policy::VerdictSource for ReloadingSource {
+    fn policy(&self) -> PolicyId {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn verdict<'a>(
+        &'a self,
+        _request: p1_contracts::AuthorizationRequest<'a>,
+    ) -> p1_contracts::BoxFuture<'a, Verdict> {
+        Box::pin(async { Verdict::Ask })
+    }
+}
+
+/// Issue #308: an `always` grant is keyed by the deciding policy's package and
+/// digest too, so another policy id asks on the screen again.
+#[tokio::test]
+async fn an_always_grant_is_keyed_by_the_deciding_policy() {
+    let source = Arc::new(ReloadingSource(Mutex::new(PolicyId {
+        package: crate::policy::ASK_POLICY.into(),
+        digest: "sha256:one".into(),
+    })));
+    let cancel = CancellationToken::new();
+    let (asker, mut auth_rx) = TuiPolicy::new(cancel.clone());
+    let (mut d, _auth) = driver_with(true);
+    d.policy = Arc::new(AskBridge::with_asker(
+        source.clone(),
+        false,
+        Arc::new(TuiAsker(asker)),
+        cancel,
+    ));
+
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'a').await,
+        Decision::Permit
+    );
+    assert_eq!(
+        authorize_call(&d.policy, Effect::Executes).await.unwrap(),
+        Decision::Permit
+    );
+    assert!(
+        auth_rx.try_recv().is_err(),
+        "the same policy id reuses the grant"
+    );
+
+    source.0.lock().unwrap().digest = "sha256:two".into();
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'n').await,
+        Decision::Deny {
+            reason: p1_tui::runtime::USER_DENY.into()
+        }
+    );
+}
+
+/// Issue #308: the driver's `set_turn` reaches the bridge and the screen's asker;
+/// a turn cancelled while its call is parked is CANCEL_DENY, and the operator's
+/// late `a` on the abandoned request grants nothing.
+#[tokio::test]
+async fn a_turn_cancelled_while_parked_is_cancel_deny_and_grants_nothing() {
+    let (mut d, mut auth_rx) = driver_with(true);
+    let turn = CancellationToken::new();
+    d.policy.set_turn(Some(turn.clone()));
+
+    let pending = authorize_call(&d.policy, Effect::Executes);
+    let request = auth_rx.recv().await.expect("the call parked");
+    d.on_auth(request);
+    turn.cancel();
+    assert_eq!(
+        pending.await.unwrap(),
+        Decision::Deny {
+            reason: p1_tui::runtime::CANCEL_DENY.into()
+        }
+    );
+    d.on_key(key(KeyCode::Char('a')), None);
+    d.policy.set_turn(None);
+
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'y').await,
+        Decision::Permit
+    );
+}
+
+/// Issue #308 (ADR-0038): without `--ask` the bridge's full access permits every
+/// effect and nothing is ever parked on the screen.
+#[tokio::test]
+async fn full_access_never_parks_on_the_screen() {
+    let (d, mut auth_rx) = driver_with(false);
+    for effect in [
+        Effect::ReadOnly,
+        Effect::WritesFiles,
+        Effect::Executes,
+        Effect::Delegates,
+    ] {
+        assert_eq!(
+            authorize_call(&d.policy, effect).await.unwrap(),
+            Decision::Permit
+        );
+    }
+    assert!(auth_rx.try_recv().is_err(), "no request reached the screen");
 }
 
 #[cfg(feature = "delegation")]
@@ -870,7 +1054,7 @@ struct Wires {
     rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
     /// The driver's policy: an `authorize` call on it parks a request on the
     /// screen when the driver is under `--ask`.
-    policy: Arc<TuiPolicy>,
+    policy: Arc<AskBridge>,
     cancel: CancellationToken,
     draws: DrawCounter,
 }
@@ -1438,7 +1622,7 @@ async fn an_attached_workers_event_draws_immediately() {
 
 /// Park one authorization on the screen (handoff §7.5): the task resolves when
 /// the operator answers, exactly as the running turn's own call would.
-fn park_authorization(policy: &Arc<TuiPolicy>) -> tokio::task::JoinHandle<Decision> {
+fn park_authorization(policy: &Arc<AskBridge>) -> tokio::task::JoinHandle<Decision> {
     let call = p1_contracts::ToolCall {
         call_id: "c1".into(),
         name: "shell".into(),
@@ -1789,7 +1973,7 @@ fn a_worker_stream_is_buffered_for_attach_and_stays_out_of_the_parent() {
 async fn an_approval_while_attached_detaches_the_worker() {
     use p1_tui::state::PaneMode;
 
-    let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
+    let (policy, mut auth_rx) = tui_policy(true, CancellationToken::new());
     let (mut d, _auth) = driver();
     d.policy = Arc::new(policy);
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
