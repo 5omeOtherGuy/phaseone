@@ -3,14 +3,17 @@
 
     scripts/release-manifest.py --root <repository root> --commit <sha> [--tag <tag>]
                                 --native <binary file> --modules-dir <staged modules dir>
+                                [--build-modules-dir <built packages dir>]
 
 The manifest binds the released binary, the source commit, the toolchain and runtime
 pins, the WIT and schema digests and every staged package file, so an installer can
 verify what it unpacks: S7's installer reads exactly this file. The staged `packages/`
-tree holds the module packages; `components` and `environment_locks` stay empty until
-the freeze tag `wasm-boundary-v1` fixes their entry shape, and an absent pin is null,
-never invented. The asset name is the native file's name, so the manifest cannot claim
-a name the archive does not carry.
+tree holds the module packages; the freeze tag `wasm-boundary-v1` fixes the `components`
+entry shape, so with `--build-modules-dir` the frozen fields come from the build outputs'
+`<package>.manifest.json` and each entry is checked against the staged bytes.
+`environment_locks` has no frozen entry shape, so it stays empty, and an absent pin is
+null, never invented. The asset name is the native file's name, so the manifest cannot
+claim a name the archive does not carry.
 
 The pins file is data: it is parsed line by line and never sourced or executed. A
 missing pins file is refused (scripts/module-toolchain.sh reads it the same way) while a
@@ -34,6 +37,13 @@ import sys
 FORMAT = "p1-release-manifest/1"
 
 COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+
+# The frozen `components` entry shape (crates/p1-module-runtime/src/manifest.rs refuses an
+# unknown field): the package's four frozen manifest fields, its name and digest, plus the
+# staged path this generator computes.
+PACKAGE_FIELDS = ("name", "digest", "kind", "world", "protocol", "capabilities", "variant")
+COMPONENT_FIELDS = ("name", "digest", "path", "kind", "world", "protocol", "capabilities",
+                    "variant")
 # The shape scripts/module-toolchain.sh accepts: a KEY=value line with one token of value.
 PIN_LINE_RE = re.compile(r"\A([A-Z][A-Z0-9_]*)=(\S+)\Z")
 
@@ -182,6 +192,89 @@ def digest_entries(
     return entries
 
 
+def component_entries(build_dir: str, modules_dir: str) -> list[dict[str, object]]:
+    """The `components` entries of the staged packages, or refuse an input.
+
+    The staged `packages/` tree holds only what the frozen package format ships (today the
+    `.wasm`), so the frozen fields come from the build outputs' `<package>.manifest.json`:
+    each entry names the package, pins the staged file by the digest of its bytes and carries
+    the fields the loader reads. A build output that names no staged file, or whose digest
+    disagrees with the staged bytes, is refused rather than published.
+    """
+    if not os.path.isdir(build_dir):
+        raise ManifestError(f"--build-modules-dir {build_dir}: not a directory")
+
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for directory in sorted(os.listdir(build_dir)):
+        package_dir = os.path.join(build_dir, directory)
+        if os.path.islink(package_dir) or not os.path.isdir(package_dir):
+            raise ManifestError(f"{directory}: a build output is not a directory")
+        manifests = sorted(
+            name for name in os.listdir(package_dir) if name.endswith(".manifest.json")
+        )
+        if len(manifests) != 1:
+            raise ManifestError(
+                f"{directory}: expected exactly one *.manifest.json, found {len(manifests)}"
+            )
+        manifest_path = os.path.join(package_dir, manifests[0])
+        try:
+            with open(manifest_path, encoding="utf-8") as handle:
+                package = json.load(handle)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ManifestError(f"{manifest_path}: {exc}") from exc
+        if not isinstance(package, dict):
+            raise ManifestError(f"{manifest_path}: not a JSON object")
+
+        fields: dict[str, object] = {}
+        for field in PACKAGE_FIELDS:
+            if field not in package:
+                raise ManifestError(f"{manifest_path}: missing {field}")
+            fields[field] = package[field]
+        for field in ("name", "kind", "world", "protocol", "variant"):
+            if not isinstance(fields[field], str) or not fields[field]:
+                raise ManifestError(f"{manifest_path}: {field} is not a name")
+        capabilities = fields["capabilities"]
+        if not isinstance(capabilities, list) or not all(
+            isinstance(item, str) for item in capabilities
+        ):
+            raise ManifestError(f"{manifest_path}: capabilities is not a list of names")
+
+        name = str(fields["name"])
+        if "/" not in name:
+            raise ManifestError(f"{manifest_path}: name {name!r} is not <namespace>/<name>")
+        if name in seen:
+            raise ManifestError(f"{name}: listed twice under the build outputs")
+        seen.add(name)
+
+        file = name.replace("/", "-")
+        rel = check_relpath(f"packages/{file}/{file}.wasm", "component entry")
+        staged = os.path.join(modules_dir, rel)
+        if os.path.islink(staged) or not os.path.isfile(staged):
+            raise ManifestError(f"{rel}: {manifest_path} names no staged regular file")
+        digest = fields["digest"]
+        actual = f"sha256:{sha256_file(staged)}"
+        if not isinstance(digest, str) or digest != actual:
+            raise ManifestError(
+                f"{rel}: the staged bytes are {actual}, {manifest_path} says {digest!r}"
+            )
+        entries.append(
+            {
+                "name": name,
+                "digest": actual,
+                "path": rel,
+                "kind": fields["kind"],
+                "world": fields["world"],
+                "protocol": fields["protocol"],
+                "capabilities": list(capabilities),
+                "variant": fields["variant"],
+            }
+        )
+
+    entries.sort(key=lambda entry: str(entry["name"]))
+    return entries
+
+
 def build_manifest(args: argparse.Namespace) -> dict[str, object]:
     """Collect the manifest the staged archive describes, or refuse an input."""
     root = os.path.abspath(args.root)
@@ -224,6 +317,31 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
         packages.append({"path": path, "sha256": sha256_file(full), "size": size})
     packages.sort(key=lambda entry: str(entry["path"]))
 
+    components: list[dict[str, object]] = []
+    if args.build_modules_dir:
+        components = component_entries(
+            os.path.abspath(args.build_modules_dir), modules_dir
+        )
+        # Every staged package file must be a component the runtime can load by name, and
+        # every component must name a file that is there: publishing one without the other
+        # would ship bytes no manifest binds, or an entry no archive carries.
+        staged = {str(entry["path"]) for entry in packages}
+        named = {str(entry["path"]) for entry in components}
+        if staged != named:
+            detail = []
+            if staged - named:
+                detail.append(
+                    "without a component entry: " + ", ".join(sorted(staged - named))
+                )
+            if named - staged:
+                detail.append(
+                    "without a staged file: " + ", ".join(sorted(named - staged))
+                )
+            raise ManifestError(
+                "the staged packages and the built components disagree: "
+                + "; ".join(detail)
+            )
+
     return {
         "format": FORMAT,
         "commit": args.commit,
@@ -242,8 +360,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
             recursive=False,
         ),
         "packages": packages,
-        # The entry shape is fixed by the freeze tag wasm-boundary-v1; before it, empty.
-        "components": [],
+        # The freeze tag wasm-boundary-v1 fixes the component entry shape; without a build
+        # output directory there is nothing to fill it from, so it stays empty.
+        "components": components,
+        # No entry shape is frozen for the environment locks; leave it empty.
         "environment_locks": [],
     }
 
@@ -278,6 +398,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--native", required=True, help="the released binary file")
     parser.add_argument(
         "--modules-dir", required=True, help="staged archive modules directory"
+    )
+    parser.add_argument(
+        "--build-modules-dir",
+        default=None,
+        help="built package outputs (scripts/build-modules.sh), for the components entries",
     )
     args = parser.parse_args(argv)
 
