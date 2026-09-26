@@ -4,10 +4,12 @@ package p1:module@1.0.0;
 /// adapter.
 ///
 /// The host sends the environment's summarizer prompt as the system prompt and `transcript`
-/// as the one user item, with the agent's model options at the summary effort the host chose
-/// and `max-output-tokens` as the cap (lowered to the agent's own explicit cap when that is
-/// smaller). It streams the response to its end and masks credential-shaped text in the
-/// summary before the module sees it (issue #142).
+/// as the one user item, with the agent's model options at the summary effort the host chose;
+/// `max-output-tokens` is sent exactly as the module gives it, and the agent's own limit
+/// arrives in the context policy's `configure` settings as `max_output_tokens`. The module
+/// applies that limit to its first request and owns the retry policy: a response that stops at
+/// the cap it sent is retried once with that cap doubled. It streams the response to its end
+/// and masks credential-shaped text in the summary before the module sees it (issue #142).
 interface summary {
     use types.{stop-reason, provider-error, usage};
 

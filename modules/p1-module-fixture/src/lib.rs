@@ -19,6 +19,7 @@
 //! | `stream-drop:<script>` | spawns, takes one event, drops the resource while the process may still run, ok `dropped` |
 //! | `trap-after-terminal:<script>` | spawns, drains to `none`, then calls `next` once more: the host traps that call (`process.wit`) |
 //! | `trap` | a guest trap: the wasm `unreachable` |
+//! | `announce:<mode>` | `process.spawn`s the command `announce`, keeps the resource without reading it and runs `<mode>`: the spawn tells a host test the guest is running, for cases that act on a guest in `spin` or `cooperative`, and the held resource is the one the host drops when the call ends |
 //! | anything else | an error outcome naming the known modes |
 //!
 //! `describe` has one mode of its own, `describe-import`: it reads `clock.monotonic-now`, so a
@@ -26,9 +27,10 @@
 //! Every other mode describes from its input alone.
 //!
 //! The module imports no `wasi:` interface of its own: it never prints, never reads the
-//! environment and never touches a file. The `wasi:` imports in the built component come from
-//! Rust std, which the `wasm32-wasip2` target links (open question S0-Q9; the build writes the
-//! component's full import list to `<package>.imports`).
+//! environment and never touches a file. The guest target is `wasm32-unknown-unknown`
+//! componentized with no WASI adapter (decision D-XO-4 on S0-Q9), so the built component imports
+//! only `p1:module` interfaces; the build writes its full import list to `<package>.imports`, and
+//! the build and the loader refuse any `wasi:` import.
 #![forbid(unsafe_code)]
 
 mod wire;
@@ -45,13 +47,16 @@ use p1_bindings_tool::generated::{
 const TOOL_NAME: &str = "fixture";
 
 /// What the model is told this tool does; the modes are the module's own contract.
-const TOOL_DESCRIPTION: &str = "Test fixture tool for the p1 module runtime: the input text picks one of the fixture's documented modes (echo:<text>, clock, spin, cooperative, stream:<script>, stream-drop:<script>, trap-after-terminal:<script>, trap).";
+const TOOL_DESCRIPTION: &str = "Test fixture tool for the p1 module runtime: the input text picks one of the fixture's documented modes (echo:<text>, clock, spin, cooperative, stream:<script>, stream-drop:<script>, trap-after-terminal:<script>, trap, announce:<mode>).";
 
 /// How long each process mode lets its command run before the host kills it (milliseconds).
 const PROCESS_TIMEOUT_MS: u64 = 30_000;
 
 /// What an unreadable or unknown mode is told, with the list a caller can act on.
-const KNOWN_MODES: &str = "known modes: echo:<text>, clock, spin, cooperative, stream:<script>, stream-drop:<script>, trap-after-terminal:<script>, trap";
+const KNOWN_MODES: &str = "known modes: echo:<text>, clock, spin, cooperative, stream:<script>, stream-drop:<script>, trap-after-terminal:<script>, trap, announce:<mode>";
+
+/// The command `announce:<mode>` spawns.
+const ANNOUNCE_SCRIPT: &str = "announce";
 
 struct Fixture;
 
@@ -101,29 +106,37 @@ impl Guest for Fixture {
             None => return wire::error_outcome(&format!("no text input; {KNOWN_MODES}")),
         };
         let mode = raw.lines().next().unwrap_or("").trim();
-        if let Some(text) = mode.strip_prefix("echo:") {
-            return wire::ok_outcome(text);
-        }
-        if let Some(script) = mode.strip_prefix("stream:") {
-            return stream(script);
-        }
-        if let Some(script) = mode.strip_prefix("stream-drop:") {
-            return stream_drop(script);
-        }
-        if let Some(script) = mode.strip_prefix("trap-after-terminal:") {
-            return trap_after_terminal(script);
-        }
-        match mode {
-            "clock" => clock_reads(),
-            "spin" => spin(),
-            "cooperative" => cooperative(),
-            "trap" => trap(),
-            other => wire::error_outcome(&format!("unknown mode {other:?}; {KNOWN_MODES}")),
-        }
+        run(mode)
     }
 }
 
 p1_bindings_tool::generated::export!(Fixture);
+
+/// Runs one `execute` mode.
+fn run(mode: &str) -> ToolOutcome {
+    if let Some(text) = mode.strip_prefix("echo:") {
+        return wire::ok_outcome(text);
+    }
+    if let Some(script) = mode.strip_prefix("stream:") {
+        return stream(script);
+    }
+    if let Some(script) = mode.strip_prefix("stream-drop:") {
+        return stream_drop(script);
+    }
+    if let Some(script) = mode.strip_prefix("trap-after-terminal:") {
+        return trap_after_terminal(script);
+    }
+    if let Some(inner) = mode.strip_prefix("announce:") {
+        return announce(inner);
+    }
+    match mode {
+        "clock" => clock_reads(),
+        "spin" => spin(),
+        "cooperative" => cooperative(),
+        "trap" => trap(),
+        other => wire::error_outcome(&format!("unknown mode {other:?}; {KNOWN_MODES}")),
+    }
+}
 
 /// The first line of the input text, trimmed, or `None` when there is no input.
 fn head(call: &str) -> Option<String> {
@@ -136,9 +149,14 @@ fn head(call: &str) -> Option<String> {
     }
 }
 
-/// Whether the mode runs a command: the streaming modes and the trap-after-terminal mode.
+/// Whether the mode runs a command: the streaming modes, the trap-after-terminal mode and the
+/// announcing prefix.
 fn executes(mode: Option<&str>) -> bool {
-    mode.is_some_and(|mode| mode.starts_with("stream") || mode.starts_with("trap-after-terminal:"))
+    mode.is_some_and(|mode| {
+        mode.starts_with("stream")
+            || mode.starts_with("trap-after-terminal:")
+            || mode.starts_with("announce:")
+    })
 }
 
 /// The description verb: `run` for a call that runs a command, `call` for every other.
@@ -238,6 +256,17 @@ fn trap() -> ToolOutcome {
     unreachable!("the fixture's trap mode")
 }
 
+/// `announce:<mode>`: spawn [`ANNOUNCE_SCRIPT`], which a host test observes as the sign that
+/// the guest runs, then run `<mode>` while still holding the resource. It is never read or
+/// dropped here, so the host ends it with the call.
+fn announce(mode: &str) -> ToolOutcome {
+    let _running = match spawn(ANNOUNCE_SCRIPT) {
+        Ok(running) => running,
+        Err(error) => return wire::error_outcome(&error),
+    };
+    run(mode)
+}
+
 /// Starts `script` with the fixture's timeout, naming the script when the host refuses it.
 fn spawn(script: &str) -> Result<process::Running, String> {
     process::spawn(&process::Command {
@@ -287,6 +316,7 @@ mod tests {
         assert!(executes(Some("stream:true")));
         assert!(executes(Some("stream-drop:sleep 9")));
         assert!(executes(Some("trap-after-terminal:true")));
+        assert!(executes(Some("announce:spin")));
         assert!(!executes(Some("echo:rm -rf /")));
         assert!(!executes(Some("spin")));
         assert!(!executes(Some("trap")));

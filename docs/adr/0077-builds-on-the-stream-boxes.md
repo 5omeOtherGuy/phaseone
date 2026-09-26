@@ -65,8 +65,10 @@ each stream's box". It supersedes nothing. It replaces the dropped "Dedicated bu
   keeps it bounded.
 - No runner registered with GitHub means fork PRs never execute on owner-controlled machines
   (closes F1).
-- Both the box and CI toolchains must carry the `wasm32-wasip2` target; the workflows install it
-  and `scripts/module-toolchain.sh --check` fails when it is missing.
+- Both the box and CI toolchains must carry the module guest target. The guest target is
+  `wasm32-unknown-unknown`, componentized with `wasm-tools component new` and no WASI adapter
+  (decision D-XO-4 on S0-Q9); the workflows install it and `scripts/module-toolchain.sh --check`
+  fails when it is missing.
 
 ## Alternatives considered
 
