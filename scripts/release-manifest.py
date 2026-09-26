@@ -22,8 +22,10 @@ claim a name the archive does not carry.
 the built set through the unchanged runtime parser: there is no native asset, the commit
 is the checkout's `git rev-parse HEAD` unless `--commit` names one, and each component
 path is the built `<package>/<package>.wasm` relative to the manifest (the manifest sits
-beside the packages, where `--modules-dir` points). The release path (`stage-release.sh`)
-never passes it, so its output is unchanged.
+beside the packages, where `--modules-dir` points). It refuses a run whose
+`--build-modules-dir` is absent or differs from `--modules-dir`: the manifest is written
+into `--modules-dir`, so either would name paths that resolve from nowhere. The release
+path (`stage-release.sh`) never passes `--development`, so its output is unchanged.
 
 The pins file is data: it is parsed line by line and never sourced or executed. A
 missing pins file is refused (scripts/module-toolchain.sh reads it the same way) while a
@@ -354,6 +356,24 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
     if not os.path.isdir(modules_dir):
         raise ManifestError(f"--modules-dir {args.modules_dir}: not a directory")
 
+    if development:
+        # The manifest is written into --modules-dir and every component path is relative to
+        # it, so the built packages must be that same directory: without one the manifest would
+        # silently name no components, and a different one would name paths that resolve from
+        # nowhere.
+        if not args.build_modules_dir:
+            raise ManifestError(
+                "--development: --build-modules-dir is required and must equal --modules-dir: "
+                "the manifest is written beside the built packages and names each component "
+                "relative to it"
+            )
+        if os.path.abspath(args.build_modules_dir) != modules_dir:
+            raise ManifestError(
+                f"--development: --build-modules-dir {args.build_modules_dir!r} must equal "
+                f"--modules-dir {args.modules_dir!r}: the manifest is written into "
+                "--modules-dir and names each component relative to it"
+            )
+
     pins = parse_pins(os.path.join(root, "modules", "toolchain.pins"))
 
     toolchain: dict[str, str | None] = {
@@ -480,6 +500,18 @@ def main(argv: list[str] | None = None) -> int:
              "HEAD as the commit and each component path relative to the manifest",
     )
     args = parser.parse_args(argv)
+
+    # --commit and --native were argparse-required until --development made them optional. A
+    # release run still needs both, so name the missing one here: that keeps the module's
+    # contract (a usage error exits 2) instead of letting build_manifest reject a release run
+    # missing one as bad input (exit 1). An empty value is a rejected input, not a missing flag.
+    missing = [
+        flag
+        for flag, value in (("--commit", args.commit), ("--native", args.native))
+        if value is None
+    ]
+    if not args.development and missing:
+        parser.error(f"{' and '.join(missing)} required unless --development is given")
 
     try:
         manifest = build_manifest(args)

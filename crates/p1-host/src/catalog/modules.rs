@@ -33,6 +33,8 @@ use p1_module_runtime::{
 use thiserror::Error;
 
 use crate::HostDeps;
+#[cfg(debug_assertions)]
+use crate::run::write_stderr;
 
 /// The release manifest's file name inside the module set (ADR-0079).
 pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
@@ -153,7 +155,9 @@ pub struct ModulePackage {
 /// `scripts/build-modules.sh` writes beside the built packages (BLOCKERS S3-B6, D080), the
 /// mirror of `main.rs`'s debug-only source-tree `environments/` fallback; a release binary
 /// never does, because `cfg(debug_assertions)` is false there, so the official-source rule of
-/// ADR-0079/ADR-0087 is unchanged.
+/// ADR-0079/ADR-0087 is unchanged. The choice is not logged here: this function holds no
+/// [`HostDeps`], so [`register_locked_modules`] writes the one-line notice on the host's own
+/// stderr channel, where the TUI's alternate screen and a test's captured stderr both see it.
 pub fn official_release_manifest() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let share = exe
@@ -165,17 +169,7 @@ pub fn official_release_manifest() -> Option<PathBuf> {
     let built = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../modules/target/p1-modules")
         .join(RELEASE_MANIFEST_FILE);
-    let chosen = choose_release_manifest(share, built);
-    // One line on stderr, in a debug build only and once per process, so an operator can see
-    // which module set a development binary loaded without a line per catalog assembly.
-    #[cfg(debug_assertions)]
-    {
-        static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| {
-            eprintln!("p1: debug build: loading modules from {}", chosen.display());
-        });
-    }
-    Some(chosen)
+    Some(choose_release_manifest(share, built))
 }
 
 /// The manifest to load modules from: the share tree's when it is there, else — in a debug
@@ -375,6 +369,24 @@ pub(super) fn register_locked_modules(
         return Ok(());
     }
     let release = official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())?;
+    // One line on the host's stderr, in a debug build only and once per process, so an
+    // operator can see which module set a development binary loaded without a line per catalog
+    // assembly. It goes through `write_stderr` (the injected channel), never `eprintln!`: a
+    // line on the process's real stderr would land on the TUI's drawn screen, and a host test
+    // that captures stderr would never see it.
+    #[cfg(debug_assertions)]
+    {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            write_stderr(
+                deps,
+                &format!(
+                    "p1: debug build: loading modules from {}\n",
+                    release.display()
+                ),
+            );
+        });
+    }
     let packages = load_locked_modules(&lock, &release).map_err(|error| error.to_string())?;
     // The worker and workflow families supply the hook for their own members
     // (`catalog/delegation.rs`, `catalog/workflow.rs`; B-S6-9, D068). Without one, and for
