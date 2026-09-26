@@ -12,7 +12,10 @@
 //!   frozen fields the loader would refuse, and the identity of each entry — because
 //!   ADR-0079 has an installer run it on a staged set before that set replaces the installed
 //!   one. It compiles nothing, starts no session and reads no credential and no user
-//!   configuration, so it also works in an install that has neither.
+//!   configuration, so it also works in an install that has neither. `--integrity-only` is
+//!   its installer mode: a grant this runtime cannot link yet (its native service arrives
+//!   with a later stream) is reported and passed over, while every other problem still fails
+//!   (S1.6.1).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -52,9 +55,10 @@ const CLASSES: [ModuleKind; 5] = [
 /// `process` is the service it adapts, and `summary` is the context policy's (S5, freeze item
 /// 13 of `docs/design/modules/wit.md`); every other interface of `modules/capabilities.toml`
 /// arrives with the stream that owns its native service. The loader refuses a manifest
-/// granting anything else, so `verify` must refuse it too, and the drift guard
-/// `verify_and_the_loader_agree_on_every_manifest_field` fails if this list and the loader's
-/// part ways.
+/// granting anything else, so `verify` must refuse it too — `--integrity-only` reports it
+/// instead, because an installer stages a release before those services land (S1.6.1) — and
+/// the drift guard `verify_and_the_loader_agree_on_every_manifest_field` fails if this list
+/// and the loader's part ways.
 const LINKABLE: [&str; 5] = ["control", "clock", "random", "process", "summary"];
 
 /// Run one `p1 modules` command.
@@ -66,7 +70,7 @@ pub fn modules(deps: &HostDeps, options: &ModulesOptions) -> i32 {
     match &options.action {
         ModulesAction::List => list(deps, &root),
         ModulesAction::Inspect { name } => inspect(deps, &root, name),
-        ModulesAction::Verify => verify(deps, &root),
+        ModulesAction::Verify => verify(deps, &root, options.integrity_only),
     }
 }
 
@@ -285,11 +289,18 @@ fn imports(set: &Path, relative: &str) -> String {
     }
 }
 
-/// `p1 modules verify [--root DIR]`: every package's bytes re-hashed against the manifest,
-/// the frozen fields the loader would refuse, and the identity of each entry. Metadata only:
-/// nothing is compiled, instantiated or executed, and no session, credential or user
-/// configuration is read, because ADR-0079 has an installer run this on a staged set.
-fn verify(deps: &HostDeps, root: &Path) -> i32 {
+/// `p1 modules verify [--root DIR] [--integrity-only]`: every package's bytes re-hashed
+/// against the manifest, the frozen fields the loader would refuse, and the identity of each
+/// entry. Metadata only: nothing is compiled, instantiated or executed, and no session,
+/// credential or user configuration is read, because ADR-0079 has an installer run this on a
+/// staged set.
+///
+/// `integrity_only` is the installer's mode (S7.8): a grant this runtime cannot link is one
+/// `UNLINKED` line per case and never affects the exit code, so an installer accepts a release
+/// whose packages grant `workers-*` or `workflows` before S4.7/S6.7 link them. The checks that
+/// do fail — the digest, the frozen manifest fields, the component ABI, a duplicate identity —
+/// fail in both modes alike.
+fn verify(deps: &HostDeps, root: &Path, integrity_only: bool) -> i32 {
     let (set, manifest) = match read_set(root) {
         Ok(read) => read,
         Err(message) => return fail(deps, &message),
@@ -299,14 +310,18 @@ fn verify(deps: &HostDeps, root: &Path) -> i32 {
     let mut identities: HashMap<Digest, String> = HashMap::new();
     let mut out = String::new();
     for entry in manifest.components() {
-        match entry_problems(&set, entry, &mut identities) {
-            Ok(size) => {
+        let report = entry_problems(&set, entry, &mut identities, integrity_only);
+        for capability in &report.unlinked {
+            let _ = writeln!(out, "UNLINKED {capability} ({})", entry.name);
+        }
+        match report.size {
+            Some(size) => {
                 verified += 1;
                 let _ = writeln!(out, "{} ok {} ({size} bytes)", entry.name, entry.digest);
             }
-            Err(problems) => {
+            None => {
                 failed += 1;
-                for problem in problems {
+                for problem in &report.problems {
                     let _ = writeln!(out, "{} FAILED {problem}", entry.name);
                 }
             }
@@ -317,15 +332,40 @@ fn verify(deps: &HostDeps, root: &Path) -> i32 {
     if failed == 0 { EXIT_OK } else { EXIT_FAILURE }
 }
 
+/// One entry's verification: what it passed with, what it failed on, and the grants this
+/// runtime cannot link. `size` is `Some` exactly when nothing failed, so the entry's verdict
+/// is the one field the two modes read alike.
+struct EntryReport {
+    /// The size of the bytes that passed, or `None` when a check failed.
+    size: Option<u64>,
+    /// One line per problem that fails the entry.
+    problems: Vec<String>,
+    /// The grants this runtime cannot link, in manifest order. `--integrity-only` prints
+    /// them and passes the entry; the default mode states each as a problem instead, so its
+    /// output stays what it was before the flag existed.
+    unlinked: Vec<String>,
+}
+
 /// One entry's whole verification: the manifest-only checks and the component file, in the
-/// order the loader would refuse them. `Ok` is the size of the bytes that passed; `Err` is one
-/// line per problem.
+/// order the loader would refuse them. With `integrity_only`, a grant this runtime cannot link
+/// is reported in [`EntryReport::unlinked`] instead of failing the entry.
 fn entry_problems(
     set: &Path,
     entry: &ComponentEntry,
     identities: &mut HashMap<Digest, String>,
-) -> Result<u64, Vec<String>> {
-    let mut problems = manifest_problems(entry);
+    integrity_only: bool,
+) -> EntryReport {
+    let manifest = manifest_problems(entry);
+    let mut problems = manifest.problems;
+    let unlinked =
+        if integrity_only {
+            manifest.unlinked
+        } else {
+            problems.extend(manifest.unlinked.iter().map(|capability| {
+                format!("capability {capability} cannot be linked by this runtime")
+            }));
+            Vec::new()
+        };
     // Identity is the digest (package.md): the same bytes under two names are one module
     // listed twice, which a release must not ship as two.
     match identities.get(&entry.digest) {
@@ -337,13 +377,18 @@ fn entry_problems(
             identities.insert(entry.digest, entry.name.clone());
         }
     }
-    match component_file(set, entry) {
-        Ok(size) if problems.is_empty() => Ok(size),
-        Ok(_) => Err(problems),
+    let size = match component_file(set, entry) {
+        Ok(size) if problems.is_empty() => Some(size),
+        Ok(_) => None,
         Err(problem) => {
             problems.push(problem);
-            Err(problems)
+            None
         }
+    };
+    EntryReport {
+        size,
+        problems,
+        unlinked,
     }
 }
 
@@ -351,14 +396,30 @@ fn entry_problems(
 /// (`docs/design/modules/package.md` — the loader): the class, its world, the protocol major
 /// and the grants. `verify` may not compile, and the loader exposes these only on the way to
 /// a compile, so they are made here.
-fn manifest_problems(entry: &ComponentEntry) -> Vec<String> {
+///
+/// The grants are split out from the problems: this runtime's linkable set is the loader's
+/// `LINKABLE_CAPABILITIES` today, but a release may ship a package whose granted interface
+/// arrives with the native service of a later stream, and `--integrity-only` is the
+/// installer's answer to exactly that (S1.6.1). `verify` decides by its flag whether an
+/// unlinkable grant fails the run or is only reported.
+struct ManifestProblems {
+    /// The fields the loader refuses whichever mode runs.
+    problems: Vec<String>,
+    /// The granted capabilities outside this runtime's linkable set, in manifest order.
+    unlinked: Vec<String>,
+}
+
+fn manifest_problems(entry: &ComponentEntry) -> ManifestProblems {
     let mut problems = Vec::new();
+    let mut unlinked = Vec::new();
     let Some(kind) = CLASSES.into_iter().find(|class| class.name() == entry.kind) else {
         problems.push(format!(
             "kind {} is not a module class this runtime speaks",
             entry.kind
         ));
-        return problems;
+        // The linkability of a grant says nothing about a class the runtime does not speak,
+        // so the kind alone decides the entry, exactly as the loader refuses it.
+        return ManifestProblems { problems, unlinked };
     };
     let expected = kind.world();
     if entry.world != expected {
@@ -385,12 +446,10 @@ fn manifest_problems(entry: &ComponentEntry) -> Vec<String> {
     }
     for capability in &entry.capabilities {
         if !LINKABLE.contains(&capability.as_str()) {
-            problems.push(format!(
-                "capability {capability} cannot be linked by this runtime"
-            ));
+            unlinked.push(capability.clone());
         }
     }
-    problems
+    ManifestProblems { problems, unlinked }
 }
 
 /// Whether `text` is a non-empty run of ASCII digits, the loader's own test for one part of a

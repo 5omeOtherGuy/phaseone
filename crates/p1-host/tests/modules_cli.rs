@@ -454,6 +454,186 @@ fn verify_refuses_the_manifest_fields_the_loader_would_refuse() {
     }
 }
 
+/// The fixture entry with `workers-start` granted beside its own capabilities: an interface
+/// `modules/capabilities.toml` allocates to the tool class but this runtime has no native
+/// service to link yet. 8 of the 12 shipped packages grant `workers-*`/`workflows`, so the
+/// installer's verify must be able to report this without refusing the release (S1.6.1).
+fn unlinkable_entry(scratch: &Scratch) -> serde_json::Value {
+    let mut entry = scratch.fixture_entry(FIXTURE_NAME);
+    entry["capabilities"] = serde_json::json!(["control", "clock", "process", "workers-start"]);
+    entry
+}
+
+/// The default `verify` still fails an unlinkable grant exactly as it always did, and
+/// `--integrity-only` reports it as `UNLINKED` and passes the entry (S1.6.1).
+#[test]
+fn verify_reports_an_unlinkable_grant_and_integrity_only_passes_it() {
+    let scratch = Scratch::new();
+    scratch.write_components(&[unlinkable_entry(&scratch)]);
+
+    let strict = scratch.run(&["modules", "verify", "--root", &scratch.root()]);
+    assert_eq!(code(&strict), 1, "{}", stderr(&strict));
+    let report = stdout(&strict);
+    assert!(
+        report.contains(&format!(
+            "{FIXTURE_NAME} FAILED capability workers-start cannot be linked by this runtime"
+        )),
+        "the default message is unchanged:\n{report}"
+    );
+    assert!(
+        report.contains("modules verify: 0 ok, 1 failed"),
+        "{report}"
+    );
+
+    // `--integrity-only`: the digest and the manifest fields are what it is about, and the
+    // one grant this runtime cannot link is named rather than failed.
+    let relaxed = scratch.run(&[
+        "modules",
+        "verify",
+        "--integrity-only",
+        "--root",
+        &scratch.root(),
+    ]);
+    assert_eq!(code(&relaxed), 0, "{}", stderr(&relaxed));
+    let report = stdout(&relaxed);
+    assert!(
+        report.contains(&format!("UNLINKED workers-start ({FIXTURE_NAME})")),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!("{FIXTURE_NAME} ok {}", fixture_digest())),
+        "{report}"
+    );
+    assert!(
+        report.contains("modules verify: 1 ok, 0 failed"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("FAILED") && !report.contains("cannot be linked"),
+        "an unlinkable grant is reported, never failed, in this mode:\n{report}"
+    );
+
+    // The flag combines with `--root` at either level and in either order: the module set
+    // itself is as good a root as the share directory above it.
+    let reordered = scratch.run(&[
+        "modules",
+        "verify",
+        "--root",
+        scratch.modules().to_str().unwrap(),
+        "--integrity-only",
+    ]);
+    assert_eq!(code(&reordered), 0, "{}", stderr(&reordered));
+    assert_eq!(stdout(&reordered), report);
+}
+
+/// `--integrity-only` passes linkability alone: the bytes and every other metadata problem
+/// fail it exactly as they fail the default mode.
+#[test]
+fn verify_integrity_only_still_fails_a_corrupted_component() {
+    let scratch = Scratch::new();
+    scratch.write_components(&[unlinkable_entry(&scratch)]);
+    scratch.corrupt_component();
+
+    let done = scratch.run(&[
+        "modules",
+        "verify",
+        "--integrity-only",
+        "--root",
+        &scratch.root(),
+    ]);
+    assert_eq!(code(&done), 1, "{}", stderr(&done));
+    let report = stdout(&done);
+    assert!(
+        report.contains(&format!("{FIXTURE_NAME} FAILED the bytes hash to")),
+        "{report}"
+    );
+    assert!(report.contains(&fixture_digest()), "{report}");
+    assert!(
+        report.contains("modules verify: 0 ok, 1 failed"),
+        "{report}"
+    );
+}
+
+/// A manifest field the loader would refuse still fails `--integrity-only`: the mode passes
+/// only the linkability of a grant.
+#[test]
+fn verify_integrity_only_still_fails_the_manifest_fields_the_loader_would_refuse() {
+    let cases = [
+        (
+            "kind",
+            serde_json::json!("plugin"),
+            "kind plugin is not a module class this runtime speaks",
+        ),
+        (
+            "world",
+            serde_json::json!("p1:module/provider@1.0.0"),
+            "world p1:module/provider@1.0.0 is not p1:module/tool@1.0.0",
+        ),
+        (
+            "protocol",
+            serde_json::json!("2.0"),
+            "protocol 2.0 is refused, this runtime speaks protocol major 1",
+        ),
+    ];
+    for (field, value, expected) in cases {
+        let scratch = Scratch::new();
+        let mut entry = scratch.fixture_entry(FIXTURE_NAME);
+        entry[field] = value;
+        scratch.write_components(&[entry]);
+
+        let done = scratch.run(&[
+            "modules",
+            "verify",
+            "--integrity-only",
+            "--root",
+            &scratch.root(),
+        ]);
+        assert_eq!(code(&done), 1, "{field}: {}", stderr(&done));
+        let report = stdout(&done);
+        assert!(
+            report.contains(expected),
+            "{field}: {expected:?} missing from:\n{report}"
+        );
+        assert!(
+            report.contains("modules verify: 0 ok, 1 failed"),
+            "{field}: {report}"
+        );
+    }
+}
+
+/// `--integrity-only` narrows a verification only: on `list` or `inspect` it changes nothing,
+/// so the parser refuses it rather than taking a flag the caller meant for something else.
+#[test]
+fn integrity_only_is_refused_on_list_and_inspect() {
+    let scratch = Scratch::new();
+    for args in [
+        vec![
+            "modules",
+            "list",
+            "--integrity-only",
+            "--root",
+            &scratch.root(),
+        ],
+        vec![
+            "modules",
+            "inspect",
+            FIXTURE_NAME,
+            "--integrity-only",
+            "--root",
+            &scratch.root(),
+        ],
+    ] {
+        let done = scratch.run(&args);
+        assert_eq!(code(&done), 2, "{}", stderr(&done));
+        assert!(stdout(&done).is_empty(), "{}", stdout(&done));
+        let errors = stderr(&done);
+        assert!(
+            errors.contains("--integrity-only is only for `p1 modules verify`"),
+            "{errors}"
+        );
+    }
+}
+
 /// The class names and the interface names the frozen boundary table `modules/capabilities.toml`
 /// lists: the one file a new class or interface is added to, so driving both commands over them
 /// is what catches `verify`'s copies of the loader's class and capability lists drifting apart
