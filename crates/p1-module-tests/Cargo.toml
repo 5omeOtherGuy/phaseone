@@ -48,3 +48,9 @@ p1-workflow = { path = "../p1-workflow" }
 # environments over it, with the testkit's scripted provider and fake tools.
 p1-assembly = { path = "../p1-assembly" }
 p1-host = { path = "../p1-host" }
+# The shell-boundary suite (S3.4) loads the built `p1/shell` component and binds the native,
+# sandboxed process service of p1-tool-shell to it; its parity cases also build the native
+# `ShellTool` over the same p1-workspace workspace, and it proves "gone" with kill(pid, 0).
+p1-tool-shell = { path = "../p1-tool-shell" }
+p1-workspace = { path = "../p1-workspace" }
+nix = { version = "0.29", default-features = false, features = ["signal"] }
