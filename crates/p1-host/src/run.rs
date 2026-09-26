@@ -1666,6 +1666,10 @@ impl ModelSwitch {
     /// A real switch over a test's own catalog and scratch environment tree, for the
     /// TUI's idle `/model` case (`tui::tests`): it runs the production
     /// [`switch_model`] + `Agent::reconfigure` path through `drive_loop`.
+    ///
+    /// ADR-0084 §3 (S5.7) moved the switch's catalog into a generation, so `catalog`
+    /// becomes generation 0 and the reload inputs — which a `/model` never reads —
+    /// are a minimal stand-in over the same environment tree.
     pub(crate) fn new_for_test(
         catalog: Arc<Catalog>,
         front: Arc<dyn EventSink>,
@@ -1679,8 +1683,33 @@ impl ModelSwitch {
             date: "2026-01-02".to_string(),
             os: std::env::consts::OS.to_string(),
         };
+        // `/model` keeps the agent's policy (`authorization: None`), so the
+        // generation only carries one; a permissive stand-in is enough.
+        let authorization: Arc<dyn AuthorizationPolicy> =
+            Arc::new(p1_testkit::ScriptedAuthorization::permit_all());
+        let policy = authorization.clone();
+        let writer = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
+        let reload_deps = HostDeps::new(
+            writer(),
+            writer(),
+            Arc::new(crate::StdinLines::new()),
+            Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            "2026-01-02".to_string(),
+            Arc::new(crate::SignalInterrupt),
+            environment_dirs.clone(),
+            false,
+        );
         Self {
-            catalog,
+            generations: Arc::new(Generations::new(catalog, authorization)),
+            reload: ReloadInputs {
+                deps: reload_deps,
+                sandbox: cli::SandboxMode::Off,
+                sandbox_write: Vec::new(),
+                sandbox_read: Vec::new(),
+                env_pass: Vec::new(),
+                policy: Box::new(move || policy.clone()),
+                queue: ReloadQueue::default(),
+            },
             completion: Arc::new(CompletionHub::new()),
             activity: Arc::new(ParentActivity::new(
                 front,
@@ -1698,6 +1727,7 @@ impl ModelSwitch {
             session: Mutex::new(SessionModel {
                 environment,
                 profile,
+                effort: None,
                 finish: None,
             }),
         }
