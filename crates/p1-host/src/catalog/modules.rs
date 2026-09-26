@@ -33,6 +33,8 @@ use p1_module_runtime::{
 use thiserror::Error;
 
 use crate::HostDeps;
+#[cfg(debug_assertions)]
+use crate::run::write_stderr;
 
 /// The release manifest's file name inside the module set (ADR-0079).
 pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
@@ -156,7 +158,9 @@ pub struct ModulePackage {
 /// `scripts/build-modules.sh` writes beside the built packages (BLOCKERS S3-B6, D080), the
 /// mirror of `main.rs`'s debug-only source-tree `environments/` fallback; a release binary
 /// never does, because `cfg(debug_assertions)` is false there, so the official-source rule of
-/// ADR-0079/ADR-0087 is unchanged.
+/// ADR-0079/ADR-0087 is unchanged. The choice is not logged here: this function holds no
+/// [`HostDeps`], so [`register_locked_modules`] writes the one-line notice on the host's own
+/// stderr channel, where the TUI's alternate screen and a test's captured stderr both see it.
 pub fn official_release_manifest() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let share = exe
@@ -168,17 +172,7 @@ pub fn official_release_manifest() -> Option<PathBuf> {
     let built = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../modules/target/p1-modules")
         .join(RELEASE_MANIFEST_FILE);
-    let chosen = choose_release_manifest(share, built);
-    // One line on stderr, in a debug build only and once per process, so an operator can see
-    // which module set a development binary loaded without a line per catalog assembly.
-    #[cfg(debug_assertions)]
-    {
-        static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| {
-            eprintln!("p1: debug build: loading modules from {}", chosen.display());
-        });
-    }
-    Some(chosen)
+    Some(choose_release_manifest(share, built))
 }
 
 /// The manifest to load modules from: the share tree's when it is there, else — in a debug
@@ -381,23 +375,67 @@ pub(super) fn register_locked_modules(
     catalog: &mut Catalog,
     deps: &HostDeps,
 ) -> Result<(), String> {
+    register_locked_modules_from(catalog, deps, official_release_manifest())
+}
+
+/// [`register_locked_modules`] over the release whose manifest is `release`.
+fn register_locked_modules_from(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    release: Option<PathBuf>,
+) -> Result<(), String> {
     let lock = load_modules_lock(&deps.environment_dirs).map_err(|error| error.to_string())?;
     if lock.is_empty() {
         return Ok(());
     }
-    let release = official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())?;
+    let release = release.ok_or_else(|| ModulesError::NoRelease.to_string())?;
+    // One line on the host's stderr, in a debug build only and once per process, so an
+    // operator can see which module set a development binary loaded without a line per catalog
+    // assembly. It goes through `write_stderr` (the injected channel), never `eprintln!`: a
+    // line on the process's real stderr would land on the TUI's drawn screen, and a host test
+    // that captures stderr would never see it.
+    #[cfg(debug_assertions)]
+    {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            write_stderr(
+                deps,
+                &format!(
+                    "p1: debug build: loading modules from {}\n",
+                    release.display()
+                ),
+            );
+        });
+    }
     let packages = load_locked_modules(&lock, &release).map_err(|error| error.to_string())?;
-    // The worker and workflow families supply the hook for their own members
-    // (`catalog/delegation.rs`, `catalog/workflow.rs`; B-S6-9, D068). Without one, and for
-    // every other module, no native service backs a module capability in the host yet (the
-    // shell's process service is not bridged to the runtime's `ProcessService`), so a
-    // package granted one fails its assembly with the runtime's `MissingService` rather
-    // than running unlinked.
-    let services: ModuleServices = deps
-        .module_services
-        .clone()
-        .unwrap_or_else(|| Arc::new(|_: &str, _: &ToolServices| Services::default()));
-    register_modules(catalog, packages, services).map_err(|error| error.to_string())
+    register_modules(catalog, packages, locked_module_services(deps))
+        .map_err(|error| error.to_string())
+}
+
+/// The hook every locked package is linked with. The base is the agent's own: the read
+/// side of its workspace and its observations (`super::tools::module_services`, S1.8), for
+/// every module. The worker and workflow families install `deps.module_services` for their
+/// own members (`catalog/delegation.rs`, `catalog/workflow.rs`; B-S6-9, D068); their hooks
+/// give every module they do not serve `Services::default()`, so the base fills the
+/// `workspace` and `snapshot` a family hook left empty, and a module that is no member (the
+/// `p1/read` component) links exactly as without the families. No other native service
+/// backs a module capability in the host yet (the shell's process service is not bridged
+/// to the runtime's `ProcessService`), so a package granted one fails its assembly with the
+/// runtime's `MissingService` rather than running unlinked.
+fn locked_module_services(deps: &HostDeps) -> ModuleServices {
+    let base = super::tools::module_services(deps);
+    let Some(family) = deps.module_services.clone() else {
+        return base;
+    };
+    Arc::new(move |module: &str, services: &ToolServices| {
+        let mut linked = family(module, services);
+        if linked.workspace.is_none() || linked.snapshot.is_none() {
+            let base = base(module, services);
+            linked.workspace = linked.workspace.or(base.workspace);
+            linked.snapshot = linked.snapshot.or(base.snapshot);
+        }
+        linked
+    })
 }
 
 #[cfg(test)]
@@ -440,5 +478,196 @@ mod tests {
         std::fs::remove_file(&share).expect("remove share manifest");
         std::fs::remove_file(&built).expect("remove built manifest");
         assert_eq!(choose_release_manifest(share.clone(), built), share);
+    }
+
+    /// Nothing interrupts the catalog cases.
+    struct NoInterrupt;
+
+    impl crate::InterruptSource for NoInterrupt {
+        fn recv<'a>(
+            &'a self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Host dependencies over `environment_dirs` that touch no terminal, network or home.
+    fn quiet_deps(environment_dirs: Vec<PathBuf>) -> HostDeps {
+        let sink = || -> crate::SharedWriter {
+            Arc::new(std::sync::Mutex::new(Box::new(std::io::sink())))
+        };
+        let mut deps = HostDeps::new(
+            sink(),
+            sink(),
+            Arc::new(crate::ReaderLines::from_reader(tokio::io::empty())),
+            Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            "2026-01-02".to_string(),
+            Arc::new(NoInterrupt),
+            environment_dirs,
+            false,
+        );
+        deps.home = None;
+        deps
+    }
+
+    /// S1-N12: with a family hook installed that serves only a worker member and gives every
+    /// other module `Services::default()` (as `catalog/delegation.rs` installs it), a lock
+    /// that selects `p1/read` still builds the component with `workspace` and `snapshot`
+    /// linked through `register_locked_modules`, and a read returns the file. The same hook
+    /// alone, without the base, is the `MissingService` this merge must not reintroduce.
+    #[tokio::test]
+    async fn the_read_component_resolves_with_a_delegation_hook_installed() {
+        use p1_assembly::{EnvironmentFile, ProviderSpec, Substitutions, assemble};
+        use p1_contracts::serde_json::{Value, json};
+        use p1_contracts::{
+            CancellationToken, ModelOptions, Provider, ToolCall, ToolContext, ToolInput,
+        };
+
+        const PACKAGE: &str = "p1-module-read";
+        let built = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/target/p1-modules")
+            .join(PACKAGE);
+        let read = |path: PathBuf| {
+            std::fs::read(&path).unwrap_or_else(|error| {
+                panic!(
+                    "the {PACKAGE} artifact {} is missing ({error}): run scripts/build-modules.sh first",
+                    path.display()
+                )
+            })
+        };
+        let wasm = read(built.join(format!("{PACKAGE}.wasm")));
+        let manifest: Value = p1_contracts::serde_json::from_slice(&read(
+            built.join(format!("{PACKAGE}.manifest.json")),
+        ))
+        .expect("the package manifest is JSON");
+        let entry = json!({
+            "name": manifest["name"],
+            "digest": manifest["digest"],
+            "path": format!("packages/{PACKAGE}/{PACKAGE}.wasm"),
+            "kind": manifest["kind"],
+            "world": manifest["world"],
+            "protocol": manifest["protocol"],
+            "capabilities": manifest["capabilities"],
+            "variant": manifest["variant"],
+        });
+
+        // The release, and a lock next to the environments directory selecting `p1/read`
+        // under the key `read`.
+        let release = tempfile::tempdir().expect("release dir");
+        let component = release.path().join(entry["path"].as_str().expect("path"));
+        std::fs::create_dir_all(component.parent().expect("package dir")).expect("package dir");
+        std::fs::write(&component, &wasm).expect("component");
+        let release_manifest = release.path().join(RELEASE_MANIFEST_FILE);
+        std::fs::write(
+            &release_manifest,
+            json!({ "format": "p1-release-manifest/1", "components": [entry.clone()] }).to_string(),
+        )
+        .expect("release manifest");
+        let config = tempfile::tempdir().expect("config dir");
+        let environments = config.path().join("environments");
+        std::fs::create_dir_all(&environments).expect("environments dir");
+        std::fs::write(
+            config.path().join("modules.lock"),
+            p1_module_tests::lock_text("read", &entry),
+        )
+        .expect("lock");
+
+        // The family hook: a worker member gets its services, every other module none.
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = asked.clone();
+        let family: ModuleServices = Arc::new(move |module: &str, _: &ToolServices| {
+            recorded.lock().unwrap().push(module.to_owned());
+            match module {
+                "p1/worker-start" => Services {
+                    workers: Some(Default::default()),
+                    ..Services::default()
+                },
+                _ => Services::default(),
+            }
+        });
+        let mut deps = quiet_deps(vec![environments]);
+        deps.module_services = Some(family.clone());
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").expect("file");
+        let environment = EnvironmentFile {
+            name: "read-module".into(),
+            family: "test".into(),
+            provider: "scripted".into(),
+            model: "test-model".into(),
+            profile: None,
+            options: ModelOptions::default(),
+            tools: vec![ToolSpec {
+                module: "read".into(),
+                name: None,
+                description: None,
+                variant: None,
+            }],
+            prompt_template: "tools: {{tool_names}}".into(),
+            context: None,
+            summarize_prompt: None,
+        };
+        let substitutions = Substitutions {
+            workspace: "/work".into(),
+            date: "2026-01-01".into(),
+            os: "linux".into(),
+        };
+        let catalog_with = |register: &dyn Fn(&mut Catalog) -> Result<(), String>| {
+            let mut catalog = Catalog::new();
+            let provider = p1_testkit::ScriptedProvider::new(Vec::new());
+            catalog.provider(
+                "scripted",
+                Box::new(move |_spec: &ProviderSpec| {
+                    Ok(Arc::new(provider.clone()) as Arc<dyn Provider>)
+                }),
+            );
+            register(&mut catalog).expect("registration");
+            catalog
+        };
+
+        let catalog = catalog_with(&|catalog| {
+            register_locked_modules_from(catalog, &deps, Some(release_manifest.clone()))
+        });
+        let assembled = assemble(&catalog, &environment, workspace.path(), &substitutions)
+            .unwrap_or_else(|error| panic!("p1/read assembles under the family hook: {error}"));
+        assert_eq!(asked.lock().unwrap().as_slice(), ["p1/read"]);
+        let tool = &assembled.tools[0];
+        assert_eq!(
+            assembled.resolved.tools[0].identity.implementation,
+            "p1/read"
+        );
+        let outcome = p1_module_tests::within_deadline(
+            "read under a family hook",
+            tool.execute(
+                &ToolCall {
+                    call_id: "c1".into(),
+                    name: "read".into(),
+                    input: ToolInput::Json(json!({ "file_path": "notes.txt" }).to_string()),
+                },
+                ToolContext {
+                    cancel: CancellationToken::new(),
+                },
+            ),
+        )
+        .await;
+        let text = format!("{:?}", outcome.content);
+        assert!(
+            text.contains("alpha") && text.contains("beta"),
+            "{:?}: {text}",
+            outcome.status
+        );
+
+        // The family hook alone leaves `workspace` and `snapshot` unlinked.
+        let bare = catalog_with(&|catalog| {
+            let packages = load_locked_modules(
+                &load_modules_lock(&deps.environment_dirs).expect("lock"),
+                &release_manifest,
+            )
+            .expect("p1/read loads");
+            register_modules(catalog, packages, family.clone()).map_err(|error| error.to_string())
+        });
+        let refused = assemble(&bare, &environment, workspace.path(), &substitutions)
+            .expect_err("the family hook alone cannot link p1/read");
+        assert!(refused.to_string().contains("workspace"), "{refused}");
     }
 }

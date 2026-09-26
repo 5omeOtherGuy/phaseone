@@ -725,6 +725,55 @@ class ReleaseManifestTest(unittest.TestCase):
         )
         self.assertEqual(manifest["components"][0]["digest"], "sha256:" + sha256(data))
 
+    def test_development_run_without_a_build_modules_dir_is_refused(self) -> None:
+        # The manifest is written into --modules-dir and its paths are relative to it, so a
+        # development run without the built packages would name no component at all.
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-alpha", "p1/alpha", b"alpha\n")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--development",
+                "--root",
+                self.root,
+                "--modules-dir",
+                build,
+            ],
+            cwd=self.tmp,
+            env=self.environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("release-manifest:", result.stderr)
+        self.assertIn("--build-modules-dir", result.stderr)
+        self.assertIn("--modules-dir", result.stderr)
+        self.assertFalse(os.path.exists(self.manifest_path(build)))
+
+    def test_development_run_with_a_different_build_modules_dir_is_refused(self) -> None:
+        # A different --build-modules-dir would be written into --modules-dir while naming
+        # paths relative to itself, so no entry would resolve from the manifest's directory.
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-alpha", "p1/alpha", b"alpha\n")
+        elsewhere = os.path.join(self.tmp, "elsewhere-modules")
+        os.makedirs(elsewhere)
+
+        result = self.generate_development(build_modules_dir=build, modules_dir=elsewhere)
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("release-manifest:", result.stderr)
+        self.assertIn("--build-modules-dir", result.stderr)
+        self.assertIn("--modules-dir", result.stderr)
+        self.assertFalse(os.path.exists(self.manifest_path(elsewhere)))
+        self.assertFalse(os.path.exists(self.manifest_path(build)))
+
     # ---- pins --------------------------------------------------------------------
 
     def test_pins_value_with_a_command_is_never_executed(self) -> None:
@@ -843,6 +892,44 @@ class ReleaseManifestTest(unittest.TestCase):
         result = self.generate(native=os.path.dirname(self.native))
 
         self.assert_refused(result, "missing")
+
+    def test_a_release_run_missing_commit_or_native_is_a_usage_error(self) -> None:
+        # --commit and --native became optional when --development made them so; a release run
+        # still needs both, and the module's contract exits 2 on a usage error, so the parser
+        # refuses the missing flag by name rather than rejecting it as input (exit 1).
+        cases = {
+            "no native": ["--commit", COMMIT],
+            "no commit": ["--native", self.native],
+            "neither": [],
+        }
+        for label, flags in cases.items():
+            with self.subTest(case=label):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        SCRIPT,
+                        "--root",
+                        self.root,
+                        "--modules-dir",
+                        self.modules,
+                    ]
+                    + flags,
+                    cwd=self.tmp,
+                    env=self.environment(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("usage: release-manifest.py", result.stderr)
+                if label in ("no native", "neither"):
+                    self.assertIn("--native", result.stderr)
+                if label in ("no commit", "neither"):
+                    self.assertIn("--commit", result.stderr)
+                self.assertFalse(os.path.exists(self.manifest_path()))
 
     # ---- the published archive ---------------------------------------------------
 

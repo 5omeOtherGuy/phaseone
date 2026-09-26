@@ -1,7 +1,7 @@
 ---
 adr: 78
 title: Connection resources and component replacement
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: owner+lead
 supersedes: []
@@ -141,5 +141,37 @@ later "Reloadable policies" ADR.
 
 ## Evidence
 
-No measurement exists yet. This ADR is merged `proposed` before the WebSocket slice lands and is
-accepted with Evidence in the PR that lands the phase's last DoD row.
+Every S5 slice that delivers this decision, with its merge commit on main and the main `gate` run of
+that commit:
+
+- S5.1, PR #227, merge commit `f06fe427` (`f06fe427dec17c998a84d91b79b9db8b63be5fa6`): this ADR,
+  drafted and merged `proposed`; main gate run 36177477102, success.
+- S5.5, PR #294, merge commit `7fe39b04` (`7fe39b04d367e58651fd23727f739b6c952feb4c`): the WebSocket
+  resource of §1–§3 — the native host session (`crates/p1-provider-http/src/ws_session.rs`: TLS, the
+  credential handshake, ping/pong and the ADR-0069 bounds on raw frames), the portable lower decision
+  in `crates/p1-provider-openai/src/websocket_lower.rs`, and the boundary suite
+  `crates/p1-module-tests/tests/websocket_boundary.rs`; main gate run 36228482257, success.
+- S5.2, PR #293, merge commit `a1ba331e` (`a1ba331e4112f33220ff63b8216622a614c24990`): the context
+  policy as the package `p1/context/summarizing`, with the runtime adapter that loads it, one of the
+  components §4 replaces behind the boundary; its own main gate run 36224885320 was cancelled by the
+  concurrency group and is covered by the descendant `9e82751d` run 36225249460, success.
+- S5.3, PR #280, merge commit `7c9dae5e` (`7c9dae5e0f0a5d65f8c577cd13c64717afcf38b7`): the
+  authorization-policy packages `p1/policy/full-access` and `p1/policy/ask`, the runtime adapter and
+  the native ask bridge, the other component the host replaces by name; main gate run 36216644399,
+  success.
+- S5.7, PR #339, merge commit `806bc46e` (`806bc46ef107988957276a4c8522a315d4b8ad9d`): the atomic
+  between-turns replacement of §4 — a model switch and `/modules reload` are one operation,
+  committed and installed with no await between them, while runs, children and workflows keep the
+  generation they were started with; main gate run 36257347985, success.
+- S5.8, PR #337, merge commit `f893c97a` (`f893c97abbd7c571722d128f02a55e8f7d35e182`): replay across
+  a provider switch (`crates/p1-module-tests/tests/replay_switch.rs`), the measured form of "the
+  replacement opens its own connection, and its first turn sends the full input"; main gate run
+  36251278327, success.
+- S5.9, PR #350, merge commit `dd90cc4d` (`dd90cc4d645583b71e1b8c88c32e6b2288d40c14`): the handle
+  lifetime of §3 and §4 across compaction, reload and reconnect
+  (`crates/p1-module-tests/tests/compaction_workload.rs`), and the acceptance row `compaction-16`
+  measured (`growth=none`) by the slice's case in `crates/p1-module-tests/tests/acceptance.rs`; main
+  gate run 36257376533, success.
+- Acceptance: this ADR is accepted with the recorded S5 verdicts — the Fable judge's ACCEPT on
+  S5.1, S5.2, S5.3, S5.5, S5.7 and S5.8, and the lead's XO call on S5.9 (one review round plus a
+  green gate, no judge).
