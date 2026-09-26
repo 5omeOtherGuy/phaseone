@@ -32,12 +32,9 @@ use crate::fingerprint::{self, Fingerprint, FingerprintError};
 use p1_workers::{FinishReport, WorkerReport};
 
 #[cfg(feature = "delegation")]
-use crate::frontend::FrontEnd;
-
-/// The `finish` tool's identity implementation. A worker's `finish` call is found by
-/// this — never by its model-facing name, which a face may change.
+use crate::catalog::capabilities::{SemanticCapability, carries};
 #[cfg(feature = "delegation")]
-const FINISH_IMPLEMENTATION: &str = "p1-tool-finish";
+use crate::frontend::FrontEnd;
 
 /// One finished tool call, in finish order.
 struct Finished {
@@ -414,8 +411,9 @@ impl EventSink for ActivityTee {
 /// - a call to a tool the child does NOT have is answered by the core with a
 ///   `ToolFinished` of status `Unavailable` — no `ToolStarted` is emitted for it —
 ///   and its name is on that result, so the tap counts result names;
-/// - a successful call of the `finish` tool is identified by the tool's identity
-///   implementation, and its JSON input (kept from its `ToolStarted`) is what says
+/// - a successful call of the `finish` tool is identified by the `reports-completion`
+///   capability of the tool's verified identity, and its JSON input (kept from its
+///   `ToolStarted`) is what says
 ///   `status`, `needs` and `summary`: the tool's own content does not carry them;
 /// - the EVIDENCE is not the model's word: it is read from the child's own
 ///   [`FinishOutcome`] cell, which the child's `finish` tool wrote from what it
@@ -447,7 +445,7 @@ pub struct WorkerReportTap {
 #[cfg(feature = "delegation")]
 impl WorkerReportTap {
     /// `tools` are the child's ASSEMBLED tools: their model-facing names become the
-    /// report's `tools`, and the one whose identity implementation is `finish` is the
+    /// report's `tools`, and the one whose identity carries `reports-completion` is the
     /// one whose calls are read. `outcome` is the completion cell the child's `finish`
     /// tool writes — [`FinishOutcome::default`] when the child has no `finish` tool.
     /// `description` is the child's route/model, shown by the front end. With
@@ -480,13 +478,14 @@ impl WorkerReportTap {
 
     /// The child was re-assembled with a larger grant (ADR-0050 item 6): the report's
     /// `tools` becomes the new assembly's model-facing names, and the `finish` tool is
-    /// found again by its identity implementation, so a new tool set keeps reporting
+    /// found again by the `reports-completion` capability of its identity, so a new tool
+    /// set keeps reporting
     /// correctly. The report's other fields (the `finish` of the turn, the missing
     /// calls) are the turn's, and stay.
     pub fn retool(&self, tools: &[Arc<dyn Tool>]) {
         let names: std::collections::HashSet<String> = tools
             .iter()
-            .filter(|tool| tool.identity().implementation == FINISH_IMPLEMENTATION)
+            .filter(|tool| carries(tool.as_ref(), SemanticCapability::ReportsCompletion))
             .map(|tool| tool.declaration().name.clone())
             .collect();
         *self.finish_names.lock().unwrap() = names;
@@ -641,6 +640,16 @@ mod tests {
         AssistantBlock, AssistantItem, Origin, RecordBody, StopReason, ToolIdentity,
     };
     use p1_testkit::FakeTool;
+
+    /// The identity implementation the real `finish` tool builds: a fake that takes it
+    /// is found as the `finish` tool through that identity's declared capability.
+    #[cfg(feature = "delegation")]
+    fn finish_implementation() -> String {
+        p1_tool_finish::FinishTool::new(Arc::new(ActivityLog::default()), FinishOutcome::default())
+            .identity()
+            .implementation
+            .clone()
+    }
 
     fn result(call_id: &str, name: &str, status: ToolStatus, content: &str) -> ToolResultItem {
         ToolResultItem {
@@ -1096,8 +1105,8 @@ mod tests {
 
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(FakeTool::new("read")),
-            // The `finish` tool is found by its identity implementation, not by name.
-            Arc::new(FakeTool::new("finish").with_identity(FINISH_IMPLEMENTATION, "claude")),
+            // The `finish` tool is found by its identity's capability, not by name.
+            Arc::new(FakeTool::new("finish").with_identity(&finish_implementation(), "claude")),
         ];
         let raw = Arc::new(RecordingEvents::new());
         let report = Arc::new(Mutex::new(WorkerReport::new(vec![
@@ -1199,7 +1208,7 @@ mod tests {
     #[test]
     fn the_tap_keeps_only_a_successful_finish_and_resets_each_turn() {
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
-            FakeTool::new("finish").with_identity(FINISH_IMPLEMENTATION, "claude"),
+            FakeTool::new("finish").with_identity(&finish_implementation(), "claude"),
         )];
         let report = Arc::new(Mutex::new(WorkerReport::new(vec!["finish".to_string()])));
         let tap = WorkerReportTap::new(
@@ -1243,6 +1252,46 @@ mod tests {
         assert_eq!(fresh.finish, None);
         assert!(fresh.missing_tool_calls.is_empty());
         assert_eq!(fresh.tools, vec!["finish".to_string()]);
+    }
+
+    /// The report's `finish` is the tool whose identity carries `reports-completion`,
+    /// whatever faces say: a tool merely NAMED `finish` is not read, and the real one
+    /// under another name is.
+    #[cfg(feature = "delegation")]
+    #[test]
+    fn the_tap_reads_the_capable_tool_not_the_one_named_finish() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(FakeTool::new("finish").with_identity("fake-finish", "claude")),
+            Arc::new(FakeTool::new("done").with_identity(&finish_implementation(), "claude")),
+        ];
+        let report = Arc::new(Mutex::new(WorkerReport::new(vec![
+            "finish".to_string(),
+            "done".to_string(),
+        ])));
+        let tap = WorkerReportTap::new(
+            Arc::new(p1_testkit::RecordingEvents::new()),
+            report.clone(),
+            &tools,
+            FinishOutcome::default(),
+            Arc::new(RecordingWorkerEnds::default()),
+            "w1".to_string(),
+            "route/model".to_string(),
+            false,
+        );
+        tap.emit(AgentEvent::TurnStarted);
+        // The real one first: a later call of the named fake would replace it if the
+        // tap read it.
+        for name in ["done", "finish"] {
+            let input = format!(r#"{{"status":"blocked","summary":"{name}","needs":"edit"}}"#);
+            tap.emit(AgentEvent::ToolStarted {
+                call: call(name, name, &input),
+            });
+            tap.emit(AgentEvent::ToolFinished {
+                result: result(name, name, ToolStatus::Ok, "ok"),
+            });
+        }
+        let finish = report.lock().unwrap().finish.clone().expect("a finish");
+        assert_eq!(finish.summary.as_deref(), Some("done"));
     }
 
     #[cfg(feature = "delegation")]
@@ -1320,7 +1369,7 @@ mod tests {
             let outcome = FinishOutcome::default();
             let finish = p1_tool_finish::FinishTool::new(Arc::new(activity), outcome.clone());
             let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
-                FakeTool::new("finish").with_identity(FINISH_IMPLEMENTATION, "claude"),
+                FakeTool::new("finish").with_identity(&finish_implementation(), "claude"),
             )];
             let report = Arc::new(Mutex::new(WorkerReport::new(vec!["finish".to_string()])));
             let tap = WorkerReportTap::new(
