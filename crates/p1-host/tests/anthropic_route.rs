@@ -88,11 +88,14 @@ fn environment_dirs() -> Vec<PathBuf> {
 }
 
 /// The shipped route and profile one environment selects, resolved exactly as the host
-/// resolves them before it assembles (spec §2 steps 1–3).
+/// resolves them before it assembles (spec §2 steps 1–3). `dirs` are the search directories the
+/// resolution read from: activation reads the effective lock and the profile's text from beside
+/// them.
 struct Composed {
     route: RouteFile,
     profile: Arc<ModelProfile>,
     wire_model: String,
+    dirs: Vec<PathBuf>,
 }
 
 fn composed(environment: &str) -> Composed {
@@ -108,18 +111,22 @@ fn composed(environment: &str) -> Composed {
         route,
         profile,
         wire_model: loaded.model,
+        dirs,
     }
 }
 
-/// The provider the catalog factory would build for this composition. The connector
-/// is injected next to the transport (ADR-0047 §1); a Messages route never asks for
-/// WebSocket, so it ignores it.
+/// The provider the catalog factory would build for this composition: the provider component
+/// the route's `adapter` names (D083b), activated from the route file the build published as
+/// `common::provider_components` reads them. The connector is injected next to the transport
+/// (ADR-0047 §1); a Messages route never asks for WebSocket, so it ignores it.
 fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = composed
         .route
         .binding(&composed.profile.id)
         .expect("the route serves this profile");
     route_provider(
+        common::provider_components(),
+        &composed.dirs,
         &composed.route,
         binding,
         composed.profile.clone(),
