@@ -638,7 +638,7 @@ pub async fn run_with_front_end(
     // must happen before workflows are composed, since a step worker is built by the
     // same service and receives the same id namespace.
     #[cfg(feature = "delegation")]
-    let (completion_hub, catalog_slot, child_builder, service, child_counter) =
+    let (completion_hub, generations, child_builder, service, child_counter) =
         compose_children(deps, &workspace, front_end.clone(), options, 2)?;
     #[cfg(feature = "delegation")]
     let service = Some(service);
@@ -670,8 +670,15 @@ pub async fn run_with_front_end(
     )?);
     #[cfg(feature = "delegation")]
     {
-        let _ = catalog_slot.set(catalog.clone());
+        // Generation 0: the start's catalog and policy. The child builder already
+        // shares `generations`, so a child started from now on pins this one until
+        // a reload replaces it (ADR-0084 §3).
+        generations.install(catalog.clone(), front_end.authorization());
     }
+    // Without delegation nothing else reads the generations; the session still has
+    // generation 0 so a `/modules reload` has a current one to replace.
+    #[cfg(not(feature = "delegation"))]
+    let generations = Arc::new(Generations::new(catalog.clone(), front_end.authorization()));
 
     // The chosen model (ADR-0049 stage 1): the environment the reference or
     // `default_model` named, with the selected profile applied on top of it. The
@@ -875,7 +882,7 @@ pub async fn run_with_front_end(
     let reload_deps = catalog_deps(deps);
     let reload_policy = front_end.clone();
     deps.model_switch = Some(Arc::new(ModelSwitch {
-        generations: Generations::new(catalog.clone(), front_end.authorization()),
+        generations: generations.clone(),
         reload: ReloadInputs {
             deps: reload_deps,
             sandbox: options.sandbox,
@@ -917,6 +924,19 @@ pub async fn run_with_front_end(
         );
     }
 
+    // B-S6-9, D068: the main agent's assembly is dropped here, at teardown, so its
+    // generation of worker-member scopes is retired: every child id those scopes held
+    // becomes `unknown-child` through them. Retiring forgets ids only, so a running child
+    // still completes and still notifies. A model switch or a re-grant keeps the
+    // generation; this is the one place it ends.
+    #[cfg(feature = "delegation")]
+    if let Some(scopes) = &deps.member_scopes {
+        scopes
+            .registry()
+            .retire_generation(scopes.generation())
+            .await;
+    }
+
     // Runs first: a run cancelled here cancels its step workers through the worker
     // service, which must still be up to do it and to let the journal get `Ended`.
     #[cfg(feature = "workflows")]
@@ -956,7 +976,7 @@ async fn workflow_run(
 
     // The same child composition as an interactive run, including the sibling
     // reservation. A standalone workflow can be invoked repeatedly with one session.
-    let (completion_hub, catalog_slot, child_builder, service, _child_counter) = compose_children(
+    let (completion_hub, generations, child_builder, service, _child_counter) = compose_children(
         deps,
         &workspace,
         front_end.clone(),
@@ -977,7 +997,9 @@ async fn workflow_run(
         &options.env_pass,
         &completion_hub,
     )?);
-    let _ = catalog_slot.set(catalog);
+    // Generation 0 of this standalone run: the child builder shares it, so every
+    // step worker pins the catalog the run loaded (ADR-0084 §3).
+    generations.install(catalog, front_end.authorization());
 
     // The run's base commit (ADR-0073): what its steps' new worktrees branch from.
     let base = crate::worktree::run_base_async(workspace.clone()).await;
@@ -1488,8 +1510,9 @@ struct SessionModel {
 pub(crate) struct ModelSwitch {
     /// The session's assembly generations (ADR-0084 §3): a switch assembles on the
     /// current generation's catalog exactly as the start path did, and a
-    /// `/modules reload` installs the next one.
-    generations: Generations,
+    /// `/modules reload` installs the next one. The child builder shares THIS cell,
+    /// so a child or workflow step pinning it pins what the reload replaced.
+    generations: Arc<Generations>,
     /// What a `/modules reload` builds its candidate from.
     reload: ReloadInputs,
     /// The hub the catalog's `finish` factory issues into.
@@ -1543,12 +1566,188 @@ impl ModelSwitch {
     }
 }
 
+/// A WORKING [`ModelSwitch`] for the driver's tests (S5.7, issue #331): the session
+/// runs `environment` from `deps.environment_dirs`, generation 0 is a catalog built
+/// exactly as a run builds one, and the front end's own policy answers. The TUI's
+/// `request_reload` and `apply_reload` are driven through it, so the pending note and
+/// the boundary application are tested through the front end the way a run wires them.
+#[cfg(all(test, feature = "delegation"))]
+pub(crate) fn model_switch_for_test(
+    deps: &mut HostDeps,
+    front_end: Arc<dyn FrontEnd>,
+    environment: &str,
+    workspace: PathBuf,
+) -> Result<ModelSwitch, String> {
+    // The session's MAIN environment carries the `worker_*` tools (and, with
+    // workflows, `workflow_*`); a run's service registers them, so a stub stands in.
+    let stub: p1_workers::AgentFactory = Arc::new(|_spec| Err("no workers in this test".into()));
+    deps.worker_service = Some(p1_workers::InProcessWorkers::new(stub, 1));
+    // The workflow tools are only registered by a run's `workflow_service`, and the
+    // native members are the ones `with_worker_tools` appends to a main environment
+    // (`WORKFLOW_TOOLS`; `WORKFLOW_MODULES` are the packages a member environment
+    // names instead). A driver test has no service, so stand-ins go in through the
+    // same catalog hook `reload_modules` builds ITS catalog with — both the session's
+    // and the reload's catalogs must have them, or the main environment will not
+    // assemble.
+    #[cfg(feature = "workflows")]
+    {
+        let inner = deps.catalog_hook.take();
+        deps.catalog_hook = Some(Box::new(move |catalog: &mut Catalog| {
+            for key in crate::catalog::workflow::WORKFLOW_TOOLS {
+                if !catalog
+                    .tool_keys()
+                    .iter()
+                    .any(|registered| registered == key)
+                {
+                    catalog.tool(
+                        key,
+                        Box::new(
+                            |spec: &p1_assembly::ToolSpec, _: &p1_assembly::ToolServices| {
+                                Ok(Arc::new(p1_testkit::FakeTool::new(&spec.module))
+                                    as Arc<dyn Tool>)
+                            },
+                        ),
+                    );
+                }
+            }
+            if let Some(inner) = &inner {
+                inner(catalog);
+            }
+        }));
+    }
+    let reload_deps = catalog_deps(deps);
+    let completion = Arc::new(CompletionHub::new());
+    let catalog = build_catalog(
+        &reload_deps,
+        cli::SandboxMode::Off,
+        &[],
+        &[],
+        &[],
+        &completion,
+    )?;
+    let catalog = Arc::new(catalog);
+    let generations = Arc::new(Generations::new(catalog, front_end.authorization()));
+    // A stand-in sink: a driver test's session environment has no `finish`, so the
+    // activity plumbing is never re-pointed, and the front end's renderer is only
+    // built once a turn announces itself.
+    let activity = Arc::new(ParentActivity::new(
+        Arc::new(p1_testkit::RecordingEvents::new()),
+        Arc::new(ActivityLog::default()),
+        &[],
+    ));
+    let substitutions = substitutions(&reload_deps, &workspace);
+    Ok(ModelSwitch {
+        generations,
+        reload: ReloadInputs {
+            deps: reload_deps,
+            sandbox: cli::SandboxMode::Off,
+            sandbox_write: Vec::new(),
+            sandbox_read: Vec::new(),
+            env_pass: Vec::new(),
+            policy: {
+                let front_end = front_end.clone();
+                Box::new(move || front_end.authorization())
+            },
+            queue: ReloadQueue::default(),
+        },
+        completion,
+        activity,
+        environment_dirs: deps.environment_dirs.clone(),
+        workspace,
+        substitutions,
+        ignored: session_journals(None),
+        scope: None,
+        route_label: front_end.route_label(),
+        instructions: String::new(),
+        mask: Arc::new(MaskCounter::new()),
+        session: Mutex::new(SessionModel {
+            environment: environment.to_string(),
+            profile: None,
+            effort: None,
+            finish: None,
+        }),
+    })
+}
+
 /// [`SessionModel`] read out of its lock.
 struct SessionSnapshot {
     environment: String,
     profile: Option<String>,
     effort: Option<Effort>,
     finish: Option<Arc<dyn Tool>>,
+}
+
+#[cfg(test)]
+impl ModelSwitch {
+    /// A real switch over a test's own catalog and scratch environment tree, for the
+    /// TUI's idle `/model` case (`tui::tests`): it runs the production
+    /// [`switch_model`] + `Agent::reconfigure` path through `drive_loop`.
+    ///
+    /// ADR-0084 §3 (S5.7) moved the switch's catalog into a generation, so `catalog`
+    /// becomes generation 0 and the reload inputs — which a `/model` never reads —
+    /// are a minimal stand-in over the same environment tree.
+    pub(crate) fn new_for_test(
+        catalog: Arc<Catalog>,
+        front: Arc<dyn EventSink>,
+        environment_dirs: Vec<PathBuf>,
+        workspace: PathBuf,
+        environment: String,
+        profile: Option<String>,
+    ) -> Self {
+        let substitutions = Substitutions {
+            workspace: workspace.display().to_string(),
+            date: "2026-01-02".to_string(),
+            os: std::env::consts::OS.to_string(),
+        };
+        // `/model` keeps the agent's policy (`authorization: None`), so the
+        // generation only carries one; a permissive stand-in is enough.
+        let authorization: Arc<dyn AuthorizationPolicy> =
+            Arc::new(p1_testkit::ScriptedAuthorization::permit_all());
+        let policy = authorization.clone();
+        let writer = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
+        let reload_deps = HostDeps::new(
+            writer(),
+            writer(),
+            Arc::new(crate::StdinLines::new()),
+            Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            "2026-01-02".to_string(),
+            Arc::new(crate::SignalInterrupt),
+            environment_dirs.clone(),
+            false,
+        );
+        Self {
+            generations: Arc::new(Generations::new(catalog, authorization)),
+            reload: ReloadInputs {
+                deps: reload_deps,
+                sandbox: cli::SandboxMode::Off,
+                sandbox_write: Vec::new(),
+                sandbox_read: Vec::new(),
+                env_pass: Vec::new(),
+                policy: Box::new(move || policy.clone()),
+                queue: ReloadQueue::default(),
+            },
+            completion: Arc::new(CompletionHub::new()),
+            activity: Arc::new(ParentActivity::new(
+                front,
+                Arc::new(ActivityLog::default()),
+                &[],
+            )),
+            environment_dirs,
+            workspace,
+            substitutions,
+            ignored: Vec::new(),
+            scope: None,
+            route_label: None,
+            instructions: String::new(),
+            mask: Arc::new(MaskCounter::new()),
+            session: Mutex::new(SessionModel {
+                environment,
+                profile,
+                effort: None,
+                finish: None,
+            }),
+        }
+    }
 }
 
 /// What a `/model` or `/effort` line asks for (spec §4).
@@ -1767,23 +1966,60 @@ impl Generation {
 /// and keeps it until it ends: an installed reload replaces the current generation
 /// and never a pinned one, and a generation is dropped with its last pin.
 pub struct Generations {
-    current: Mutex<Arc<Generation>>,
+    /// `None` until the start's catalog exists: the composition reads the
+    /// configuration that names the delegation service before the catalog is
+    /// built, and the child builder is created in between.
+    current: Mutex<Option<Arc<Generation>>>,
 }
 
 impl Generations {
+    /// No generation yet. The child builder is created before the catalog (the
+    /// catalog registers the `worker_*` tools, so the service must exist first);
+    /// [`Generations::install`] installs generation 0 once the catalog is built.
+    pub fn empty() -> Self {
+        Self {
+            current: Mutex::new(None),
+        }
+    }
+
     /// Generation 0: what the session started with.
     pub fn new(catalog: Arc<Catalog>, authorization: Arc<dyn AuthorizationPolicy>) -> Self {
-        Self {
-            current: Mutex::new(Arc::new(Generation {
-                number: 0,
-                catalog,
-                authorization,
-            })),
-        }
+        let generations = Self::empty();
+        generations.install(catalog, authorization);
+        generations
+    }
+
+    /// Install the NEXT generation: the start path's catalog and policy once the
+    /// catalog exists, and a `/modules reload`'s candidate after its agent took it
+    /// ([`install_candidate`]). The swap is here — one lock, no await — so a child or
+    /// workflow step starting after it pins the new generation, and one already
+    /// running keeps the old.
+    pub fn install(
+        &self,
+        catalog: Arc<Catalog>,
+        authorization: Arc<dyn AuthorizationPolicy>,
+    ) -> Arc<Generation> {
+        let mut current = self.current.lock().unwrap();
+        let generation = Arc::new(Generation {
+            number: current
+                .as_ref()
+                .map_or(0, |generation| generation.number + 1),
+            catalog,
+            authorization,
+        });
+        *current = Some(generation.clone());
+        generation
     }
 
     /// The generation a new assembly pins.
     pub fn current(&self) -> Arc<Generation> {
+        self.try_current()
+            .expect("the session's assembly generation is installed")
+    }
+
+    /// The generation a new assembly pins, when the start has installed one: a
+    /// child build asked for before the catalog exists is refused, not a panic.
+    pub fn try_current(&self) -> Option<Arc<Generation>> {
         self.current.lock().unwrap().clone()
     }
 }
@@ -1832,14 +2068,7 @@ pub async fn install_candidate(
             authorization: Some(authorization.clone()),
         })
         .await?;
-    let mut current = generations.current.lock().unwrap();
-    let generation = Arc::new(Generation {
-        number: current.number + 1,
-        catalog,
-        authorization,
-    });
-    *current = generation.clone();
-    Ok(generation)
+    Ok(generations.install(catalog, authorization))
 }
 
 /// What a `/modules reload` request did.
@@ -1918,6 +2147,11 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         shadow: deps.shadow.clone(),
         catalog_hook: hook.map(forward),
         wait: deps.wait.clone(),
+        // The reload rebuilds the same catalog, so it links the module packages through
+        // the same hook and stays inside the member-scope generation the run holds.
+        module_services: deps.module_services.clone(),
+        #[cfg(feature = "delegation")]
+        member_scopes: deps.member_scopes.clone(),
         #[cfg(feature = "delegation")]
         worker_service: deps.worker_service.clone(),
         #[cfg(feature = "workflows")]
@@ -2522,12 +2756,18 @@ pub(crate) fn assemble_with_cache_key(
 ) -> Result<p1_assembly::Assembled, String> {
     let name = environment.name.clone();
     let configured = environment.options.clone();
-    let mut assembled = p1_assembly::assemble_with_route_options(
+    // B-S6-9, D068: a MAIN agent's tools learn which parent they serve, so the worker and
+    // workflow members' scopes are per parent. The parent's ordinal names it: each main
+    // agent has its own catalog, worker service and scope generation, so the ordinal is
+    // unique among the agents that share one scope registry. Workers get none.
+    let agent = (agent_ordinal == PARENT_ORDINAL).then(|| agent_ordinal.to_string());
+    let mut assembled = p1_assembly::assemble_for_agent(
         catalog,
         environment,
         workspace,
         substitutions,
         mask,
+        agent.as_deref(),
         |route| {
             let mut options = configured.clone();
             if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {

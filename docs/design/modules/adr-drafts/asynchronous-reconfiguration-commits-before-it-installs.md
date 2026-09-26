@@ -48,8 +48,14 @@ wrote and knows no package, digest or WIT.
    3. Once that commit has returned, every part is installed synchronously and the
       environment is marked committed, so the next turn writes no second `Environment`.
       Nothing awaits between the commit's return and the installation. A caller that
-      drops the future while the commit is pending therefore leaves the old assembly
-      installed.
+      drops the future while the commit is pending leaves the old assembly installed —
+      but it cannot conclude that nothing was committed. The session store's commit is
+      a write on a blocking thread (`JsonlJournal` uses `spawn_blocking`), and the
+      runtime does not cancel such a task when the awaited future is dropped: the
+      record may already be durable and the store's own sequence ahead of the agent's,
+      so the journal can name an assembly that never answered, which ADR-0078 §4
+      forbids. A caller that can abort must treat the outcome as unknown and resume,
+      never retry on the assumption that the old assembly is also the committed one.
 3. `ReconfigureError::Rejected(BuildError)` reports a failed validation. Nothing is
    committed and nothing is installed. Its message is the `BuildError`'s, unchanged.
 4. `ReconfigureError::CommitFailed(message)` reports a failed commit. Nothing is
@@ -68,8 +74,12 @@ wrote and knows no package, digest or WIT.
 
 ## Consequences
 
-- When `reconfigure` returns `Ok`, the journal already names the assembly that answers
-  every later call, and that includes the authorization policy that decides it.
+- When `reconfigure` returns `Ok`, the journal already carries the `Environment` record
+  of the assembly that answers every later call: its provider route, system prompt,
+  tools and options. The record body names no policy or module identity, so after a
+  policy reload it does not by itself show which authorization policy decided the
+  later calls. That identity is ADR-0080's assembly line, written by the host and
+  p1-journal; its writer lands with S1.9.
 - A journal failure surfaces at the switch and not at the next turn. The old assembly
   keeps answering and no sequence number is used.
 - Callers await the operation. The worker task and the host's model-switch path await

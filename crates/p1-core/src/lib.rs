@@ -154,9 +154,13 @@ impl Agent {
     /// before anything is sent or committed. The candidate's `Environment` record
     /// is then committed, and only once that commit returned are the parts
     /// installed, with no await in between: a caller that drops this future, or a
-    /// journal that fails, leaves the old assembly answering. Journal and events
-    /// are never replaced. A candidate equal to the current environment still
-    /// commits its record: the call is an explicit change and the journal says so.
+    /// journal that fails, leaves the old assembly answering. A dropped future
+    /// leaves the commit's outcome unknown, though — a store whose commit is a
+    /// blocking write its runtime does not cancel may still have written the record
+    /// and advanced its own sequence — so such a caller must resume, not retry (ADR
+    /// draft, item 2.3). Journal and events are never replaced. A candidate equal to
+    /// the current environment still commits its record: the call is an explicit
+    /// change and the journal says so.
     pub async fn reconfigure(&mut self, next: Reconfiguration) -> Result<(), ReconfigureError> {
         let Reconfiguration {
             provider,

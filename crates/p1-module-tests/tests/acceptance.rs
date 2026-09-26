@@ -644,7 +644,7 @@ fn module_tool(module: &LoadedModule) -> (Arc<dyn Tool>, FakeProcesses) {
         module,
         Services {
             process: Some(process),
-            summary: None,
+            ..Services::default()
         },
         ExecutionLimits::default(),
         &Arc::new(MaskCounter::new()),

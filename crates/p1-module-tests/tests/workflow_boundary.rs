@@ -14,17 +14,25 @@
 //!   inside a decision call. One case holds two decision calls live at once on two threads
 //!   with a barrier, which the native decisions must bear.
 //!
+//! - The loaded decision component (S6.9): every case above also runs with the recording
+//!   seam over `WasmWorkflowDecisions`, the adapter over the built
+//!   `p1-module-workflow-decision` component, and must give the same values and counts. There
+//!   the adapter's instance count must equal the decision calls: each call had an instance of
+//!   its own, so no instance was entered twice — neither by two threads at once nor across a
+//!   callback, which the recording seam checks as for the native decisions.
+//!
 //! The runner is a fake, and every wait is on an explicit signal (a barrier, a `Notify`);
 //! no case sleeps or asserts on time. Each case runs under S0's deadlock guard.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
-use p1_contracts::serde_json::{Value, json};
+use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{BoxFuture, CancellationToken};
+use p1_module_runtime::{ExecutionLimits, Loader, ReleaseManifest, WasmWorkflowDecisions};
 use p1_module_tests::within_deadline;
 use p1_workflow::decision::{AttemptOutcome, PlanRequest, Snapshot, Transition};
 use p1_workflow::{
@@ -92,15 +100,29 @@ struct Meet {
     barrier: Barrier,
 }
 
-/// The native decisions with every call counted.
+/// Decisions — the native ones or the loaded component — with every call counted.
 struct Recording {
     seen: Arc<Seen>,
     meet: Option<Meet>,
+    inner: Arc<dyn Decisions>,
 }
 
 impl Recording {
     fn new(seen: Arc<Seen>) -> Self {
-        Self { seen, meet: None }
+        Self {
+            seen,
+            meet: None,
+            inner: Arc::new(NativeDecisions),
+        }
+    }
+
+    /// The loaded decision component behind the recording seam.
+    fn loaded(seen: Arc<Seen>, decisions: Arc<WasmWorkflowDecisions>) -> Self {
+        Self {
+            seen,
+            meet: None,
+            inner: decisions,
+        }
     }
 
     fn call<T>(&self, count: &AtomicUsize, body: impl FnOnce() -> T) -> T {
@@ -134,7 +156,7 @@ impl Decisions for Recording {
             {
                 meet.barrier.wait();
             }
-            NativeDecisions.plan_step(snapshot, request)
+            self.inner.plan_step(snapshot, request)
         })
     }
 
@@ -144,9 +166,62 @@ impl Decisions for Recording {
         outcome: &AttemptOutcome,
     ) -> Result<Transition, String> {
         self.call(&self.seen.accepts, || {
-            NativeDecisions.accept_step(snapshot, outcome)
+            self.inner.accept_step(snapshot, outcome)
         })
     }
+}
+
+// ------------------------------------------------------------------ the loaded component
+
+/// The built decision package, as `scripts/build-modules.sh` publishes it.
+const DECISION_PACKAGE: (&str, &str) = ("p1-module-workflow-decision", "p1/workflow-decision");
+
+/// The adapter over the built decision component, loaded through a release manifest as a
+/// release lays it out.
+fn loaded_decisions() -> Arc<WasmWorkflowDecisions> {
+    let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules/target/p1-modules");
+    let (package, name) = DECISION_PACKAGE;
+    let manifest_path = built.join(package).join(format!("{package}.manifest.json"));
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+            panic!(
+                "the build output {} is missing ({error}): run scripts/build-modules.sh first",
+                manifest_path.display()
+            )
+        }),
+    )
+    .expect("the package manifest is JSON");
+    let entry = json!({
+        "name": manifest["name"],
+        "digest": manifest["digest"],
+        "path": format!("{package}/{package}.wasm"),
+        "kind": manifest["kind"],
+        "world": manifest["world"],
+        "protocol": manifest["protocol"],
+        "capabilities": manifest["capabilities"],
+        "variant": manifest["variant"],
+    });
+    let release = json!({ "format": "p1-release-manifest/1", "components": [entry] });
+    let release = ReleaseManifest::parse(&release.to_string()).expect("release manifest");
+    let module = Loader::new(release, built)
+        .expect("loader")
+        .load(name)
+        .expect("the built decision component loads");
+    Arc::new(
+        WasmWorkflowDecisions::new(&module, ExecutionLimits::default())
+            .expect("the decision adapter builds"),
+    )
+}
+
+/// Every decision call the recording seam saw had an instance of its own.
+fn assert_one_instance_per_call(seen: &Seen, decisions: &WasmWorkflowDecisions) {
+    let calls = seen.plans.load(Ordering::SeqCst) + seen.accepts.load(Ordering::SeqCst);
+    assert!(calls > 0, "the loaded component was asked");
+    assert_eq!(
+        decisions.instances(),
+        calls as u64,
+        "one instance per decision call, none entered twice"
+    );
 }
 
 // ------------------------------------------------------------------ the fakes
@@ -396,8 +471,9 @@ impl Service {
     }
 }
 
-/// Runs `script` natively and through the recording seam; both must end `outcome` with
-/// `value` and `counts`. Returns what the recording seam saw.
+/// Runs `script` natively, through the recording seam over the native decisions and through
+/// the recording seam over the loaded decision component; all three must end `outcome` with
+/// `value` and `counts`. Returns what the recording seam over the native decisions saw.
 async fn both_ways(
     script: &str,
     args: Value,
@@ -412,10 +488,23 @@ async fn both_ways(
 
     let seen = Arc::new(Seen::default());
     let recorded = Service::new(&seen, Seam::Recorded(Recording::new(seen.clone())));
-    let id = recorded.start(script, args).await;
+    let id = recorded.start(script, args.clone()).await;
     let recorded_report = recorded.wait(&id).await;
 
-    for (seam, report) in [("native", &native_report), ("recorded", &recorded_report)] {
+    let loaded_seen = Arc::new(Seen::default());
+    let decisions = loaded_decisions();
+    let loaded = Service::new(
+        &loaded_seen,
+        Seam::Recorded(Recording::loaded(loaded_seen.clone(), decisions.clone())),
+    );
+    let id = loaded.start(script, args).await;
+    let loaded_report = loaded.wait(&id).await;
+
+    for (seam, report) in [
+        ("native", &native_report),
+        ("recorded", &recorded_report),
+        ("loaded", &loaded_report),
+    ] {
         assert_eq!(report.outcome, outcome, "{seam}: {report:?}");
         assert_eq!(report.value, value, "{seam}");
         assert_eq!(report.counts, counts, "{seam}");
@@ -426,6 +515,18 @@ async fn both_ways(
         seen.plans.load(Ordering::SeqCst) >= steps,
         "every step is planned"
     );
+    loaded_seen.assert_no_reentry();
+    assert_eq!(
+        loaded_seen.plans.load(Ordering::SeqCst),
+        seen.plans.load(Ordering::SeqCst),
+        "the loaded component was asked every plan the native decisions were"
+    );
+    assert_eq!(
+        loaded_seen.accepts.load(Ordering::SeqCst),
+        seen.accepts.load(Ordering::SeqCst),
+        "the loaded component was asked every accept the native decisions were"
+    );
+    assert_one_instance_per_call(&loaded_seen, &decisions);
     seen
 }
 
@@ -603,12 +704,15 @@ let refute = |lens| agent("vote " + lens);
 let votes = parallel([|| refute.call("rule"), || refute.call("code")]);
 votes.len()
 "#;
-        for recorded in [false, true] {
+        for way in ["native", "recorded", "loaded"] {
             let seen = Arc::new(Seen::default());
-            let seam = if recorded {
-                Seam::Recorded(Recording::new(seen.clone()))
-            } else {
-                Seam::Native
+            let decisions = (way == "loaded").then(loaded_decisions);
+            let seam = match (way, &decisions) {
+                ("native", _) => Seam::Native,
+                (_, Some(decisions)) => {
+                    Seam::Recorded(Recording::loaded(seen.clone(), decisions.clone()))
+                }
+                _ => Seam::Recorded(Recording::new(seen.clone())),
             };
             let service = Service::new(&seen, seam);
             let rule = service.runner.park("vote rule");
@@ -629,8 +733,11 @@ votes.len()
             let report = service.wait(&id).await;
             assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
             let error = report.error.clone().unwrap_or_default();
-            assert!(error.contains("Data race"), "recorded={recorded}: {error}");
+            assert!(error.contains("Data race"), "{way}: {error}");
             seen.assert_no_reentry();
+            if let Some(decisions) = &decisions {
+                assert_one_instance_per_call(&seen, decisions);
+            }
         }
     })
     .await;
@@ -650,27 +757,35 @@ parallel([
     || { log("thunk b"); agent("b", #{label: "b"}).value },
 ])
 "#;
-        let seen = Arc::new(Seen::default());
-        let recording = Recording {
-            seen: seen.clone(),
-            meet: Some(Meet {
+        // First over the native decisions, then over the loaded component, which then
+        // serves two calls at once on two threads.
+        for loaded in [None, Some(loaded_decisions())] {
+            let seen = Arc::new(Seen::default());
+            let mut recording = match &loaded {
+                Some(decisions) => Recording::loaded(seen.clone(), decisions.clone()),
+                None => Recording::new(seen.clone()),
+            };
+            recording.meet = Some(Meet {
                 labels: ["a", "b"],
                 barrier: Barrier::new(2),
-            }),
-        };
-        let service = Service::new(&seen, Seam::Recorded(recording));
-        let id = service.start(script, Value::Null).await;
-        let report = service.wait(&id).await;
-        assert_eq!(report.outcome, RunOutcome::Completed, "{report:?}");
-        assert_eq!(report.value, json!(["did: a", "did: b"]));
-        assert_eq!(
-            seen.max_live.load(Ordering::SeqCst),
-            2,
-            "the two first plans were live at once"
-        );
-        assert_eq!(seen.plans.load(Ordering::SeqCst), 2);
-        assert_eq!(seen.accepts.load(Ordering::SeqCst), 2);
-        seen.assert_no_reentry();
+            });
+            let service = Service::new(&seen, Seam::Recorded(recording));
+            let id = service.start(script, Value::Null).await;
+            let report = service.wait(&id).await;
+            assert_eq!(report.outcome, RunOutcome::Completed, "{report:?}");
+            assert_eq!(report.value, json!(["did: a", "did: b"]));
+            assert_eq!(
+                seen.max_live.load(Ordering::SeqCst),
+                2,
+                "the two first plans were live at once"
+            );
+            assert_eq!(seen.plans.load(Ordering::SeqCst), 2);
+            assert_eq!(seen.accepts.load(Ordering::SeqCst), 2);
+            seen.assert_no_reentry();
+            if let Some(decisions) = &loaded {
+                assert_one_instance_per_call(&seen, decisions);
+            }
+        }
     })
     .await;
 }
