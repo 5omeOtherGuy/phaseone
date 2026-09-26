@@ -4,6 +4,8 @@
     scripts/release-manifest.py --root <repository root> --commit <sha> [--tag <tag>]
                                 --native <binary file> --modules-dir <staged modules dir>
                                 [--build-modules-dir <built packages dir>]
+    scripts/release-manifest.py --development --root <root> --modules-dir <built modules dir>
+                                --build-modules-dir <built modules dir>
 
 The manifest binds the released binary, the source commit, the toolchain and runtime
 pins, the WIT and schema digests and every staged package file, so an installer can
@@ -14,6 +16,14 @@ entry shape, so with `--build-modules-dir` the frozen fields come from the build
 `environment_locks` has no frozen entry shape, so it stays empty, and an absent pin is
 null, never invented. The asset name is the native file's name, so the manifest cannot
 claim a name the archive does not carry.
+
+`--development` (BLOCKERS S3-B6, D080) writes the same manifest beside the build outputs
+`scripts/build-modules.sh` publishes, so a development build and the test binaries load
+the built set through the unchanged runtime parser: there is no native asset, the commit
+is the checkout's `git rev-parse HEAD` unless `--commit` names one, and each component
+path is the built `<package>/<package>.wasm` relative to the manifest (the manifest sits
+beside the packages, where `--modules-dir` points). The release path (`stage-release.sh`)
+never passes it, so its output is unchanged.
 
 The pins file is data: it is parsed line by line and never sourced or executed. A
 missing pins file is refused (scripts/module-toolchain.sh reads it the same way) while a
@@ -121,6 +131,29 @@ def tool_version(tool: str) -> str | None:
     return proc.stdout.strip() or None
 
 
+def git_head(root: str) -> str:
+    """The checkout's HEAD commit, for a development manifest with no `--commit`.
+
+    The development manifest still names the source commit the built bytes came from, so
+    the runtime's parser sees the same field it sees in a release; only the release path
+    passes `--commit` explicitly, from the release workflow.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root, "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ManifestError(f"--commit is required: git rev-parse HEAD failed ({exc})") from exc
+    if proc.returncode != 0:
+        raise ManifestError("--commit is required: git rev-parse HEAD failed")
+    return proc.stdout.strip()
+
+
 def walk_packages(packages_dir: str) -> list[tuple[str, str, int]]:
     """Return (path, absolute path, size) for every regular file below packages_dir.
 
@@ -192,7 +225,9 @@ def digest_entries(
     return entries
 
 
-def component_entries(build_dir: str, modules_dir: str) -> list[dict[str, object]]:
+def component_entries(
+    build_dir: str, modules_dir: str, *, development: bool = False
+) -> list[dict[str, object]]:
     """The `components` entries of the staged packages, or refuse an input.
 
     The staged `packages/` tree holds only what the frozen package format ships (today the
@@ -200,6 +235,11 @@ def component_entries(build_dir: str, modules_dir: str) -> list[dict[str, object
     each entry names the package, pins the staged file by the digest of its bytes and carries
     the fields the loader reads. A build output that names no staged file, or whose digest
     disagrees with the staged bytes, is refused rather than published.
+
+    In development mode the manifest sits beside the build outputs, so each entry's path is
+    the built `<package>/<package>.wasm` under `build_dir` itself (BLOCKERS S3-B6, D080),
+    relative to the manifest as the runtime resolves every path. `manifest.json` at the top
+    of `build_dir` is the manifest being written, never a package.
     """
     if not os.path.isdir(build_dir):
         raise ManifestError(f"--build-modules-dir {build_dir}: not a directory")
@@ -208,6 +248,10 @@ def component_entries(build_dir: str, modules_dir: str) -> list[dict[str, object
     seen: set[str] = set()
     for directory in sorted(os.listdir(build_dir)):
         package_dir = os.path.join(build_dir, directory)
+        # scripts/build-modules.sh writes the development manifest at the top of its build
+        # outputs directory; it sits beside the packages and names no package of its own.
+        if directory == "manifest.json":
+            continue
         if os.path.islink(package_dir) or not os.path.isdir(package_dir):
             raise ManifestError(f"{directory}: a build output is not a directory")
         manifests = sorted(
@@ -247,9 +291,15 @@ def component_entries(build_dir: str, modules_dir: str) -> list[dict[str, object
             raise ManifestError(f"{name}: listed twice under the build outputs")
         seen.add(name)
 
-        file = name.replace("/", "-")
-        rel = check_relpath(f"packages/{file}/{file}.wasm", "component entry")
-        staged = os.path.join(modules_dir, rel)
+        if development:
+            # The built component sits at <build dir>/<package>/<package>.wasm, so the
+            # manifest written beside the build outputs names it as <package>/<package>.wasm.
+            rel = check_relpath(f"{directory}/{directory}.wasm", "component entry")
+            staged = os.path.join(build_dir, rel)
+        else:
+            file = name.replace("/", "-")
+            rel = check_relpath(f"packages/{file}/{file}.wasm", "component entry")
+            staged = os.path.join(modules_dir, rel)
         if os.path.islink(staged) or not os.path.isfile(staged):
             raise ManifestError(f"{rel}: {manifest_path} names no staged regular file")
         digest = fields["digest"]
@@ -281,14 +331,24 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
     if not os.path.isdir(root):
         raise ManifestError(f"--root {args.root}: not a directory")
 
-    if not COMMIT_RE.match(args.commit or ""):
-        raise ManifestError(
-            f"--commit {args.commit!r}: expected 40 lowercase hex characters"
-        )
+    development = bool(getattr(args, "development", False))
 
-    if not os.path.isfile(args.native):
-        raise ManifestError(f"--native {args.native}: missing")
-    asset = check_relpath(os.path.basename(os.path.abspath(args.native)), "--native")
+    # A development manifest names the checkout's HEAD unless --commit names another source
+    # commit; the release path always passes its own 40-hex commit.
+    commit = args.commit
+    if development and not commit:
+        commit = git_head(root)
+    if not COMMIT_RE.match(commit or ""):
+        raise ManifestError(f"--commit {commit!r}: expected 40 lowercase hex characters")
+
+    if development:
+        # A development build ships no binary: the manifest only names the built components.
+        native = None
+    else:
+        if not os.path.isfile(args.native or ""):
+            raise ManifestError(f"--native {args.native}: missing")
+        asset = check_relpath(os.path.basename(os.path.abspath(args.native)), "--native")
+        native = {"asset": asset, "sha256": sha256_file(args.native)}
 
     modules_dir = os.path.abspath(args.modules_dir)
     if not os.path.isdir(modules_dir):
@@ -320,33 +380,36 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
     components: list[dict[str, object]] = []
     if args.build_modules_dir:
         components = component_entries(
-            os.path.abspath(args.build_modules_dir), modules_dir
+            os.path.abspath(args.build_modules_dir), modules_dir, development=development
         )
         # Every staged package file must be a component the runtime can load by name, and
         # every component must name a file that is there: publishing one without the other
-        # would ship bytes no manifest binds, or an entry no archive carries.
-        staged = {str(entry["path"]) for entry in packages}
-        named = {str(entry["path"]) for entry in components}
-        if staged != named:
-            detail = []
-            if staged - named:
-                detail.append(
-                    "without a component entry: " + ", ".join(sorted(staged - named))
+        # would ship bytes no manifest binds, or an entry no archive carries. A development
+        # manifest has no staged `packages/` tree — it names the build outputs themselves —
+        # so there is nothing to reconcile it against.
+        if not development:
+            staged = {str(entry["path"]) for entry in packages}
+            named = {str(entry["path"]) for entry in components}
+            if staged != named:
+                detail = []
+                if staged - named:
+                    detail.append(
+                        "without a component entry: " + ", ".join(sorted(staged - named))
+                    )
+                if named - staged:
+                    detail.append(
+                        "without a staged file: " + ", ".join(sorted(named - staged))
+                    )
+                raise ManifestError(
+                    "the staged packages and the built components disagree: "
+                    + "; ".join(detail)
                 )
-            if named - staged:
-                detail.append(
-                    "without a staged file: " + ", ".join(sorted(named - staged))
-                )
-            raise ManifestError(
-                "the staged packages and the built components disagree: "
-                + "; ".join(detail)
-            )
 
     return {
         "format": FORMAT,
-        "commit": args.commit,
+        "commit": commit,
         "tag": args.tag or None,
-        "native": {"asset": asset, "sha256": sha256_file(args.native)},
+        "native": native,
         "toolchain": toolchain,
         "runtime": runtime,
         "wit": digest_entries(
@@ -388,14 +451,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--root", required=True, help="repository root")
     parser.add_argument(
-        "--commit", required=True, help="40-character lowercase hex source commit"
+        "--commit",
+        default=None,
+        help="40-character lowercase hex source commit; a --development run defaults to HEAD",
     )
     parser.add_argument(
         "--tag",
         default=None,
         help="release tag, e.g. main-<12 hex>; omit it for a candidate build",
     )
-    parser.add_argument("--native", required=True, help="the released binary file")
+    parser.add_argument(
+        "--native",
+        default=None,
+        help="the released binary file; a --development manifest has no native asset",
+    )
     parser.add_argument(
         "--modules-dir", required=True, help="staged archive modules directory"
     )
@@ -403,6 +472,12 @@ def main(argv: list[str] | None = None) -> int:
         "--build-modules-dir",
         default=None,
         help="built package outputs (scripts/build-modules.sh), for the components entries",
+    )
+    parser.add_argument(
+        "--development",
+        action="store_true",
+        help="write the development manifest beside the build outputs: no native asset, "
+             "HEAD as the commit and each component path relative to the manifest",
     )
     args = parser.parse_args(argv)
 

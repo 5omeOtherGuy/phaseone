@@ -339,5 +339,15 @@ for p in "${packages[@]}"; do
   built=$((built + 1))
 done
 
+# A development build and the test binaries load the built set through one manifest beside the
+# packages (BLOCKERS S3-B6, D080): the same generator the release stages with, in development
+# mode, so a release binary still reads only its own share tree. Every run rewrites it over
+# every package currently built, so a per-package run leaves a manifest naming them all, never
+# only the one just built (release-manifest.py walks the whole build outputs directory).
+python3 scripts/release-manifest.py --development \
+  --root . \
+  --modules-dir modules/target/p1-modules \
+  --build-modules-dir modules/target/p1-modules
+
 # `--all` reports the batch; one named package reports only itself.
 [ -n "$package" ] || echo "build-modules: $built package(s) built"
