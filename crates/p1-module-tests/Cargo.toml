@@ -73,3 +73,17 @@ p1-tool-shell = { path = "../p1-tool-shell" }
 nix = { version = "0.29", default-features = false, features = ["signal"] }
 # provider_conformance.rs (S4.7): the shared provider suite over the built provider components.
 p1-provider-conformance = { path = "../p1-provider-conformance" }
+# The descriptions suite (U-desc) compares the components' describe/describe-result/effect
+# code — the logic crates' functions each module's restricted-path exports call — with the
+# native tools, so it needs both sides. `p1-workspace` builds the native tools' Workspace and
+# observation store; no test-side crate beyond these is added.
+p1-tool-edit = { path = "../p1-tool-edit" }
+p1-tool-edit-logic = { path = "../p1-tool-edit/logic" }
+p1-tool-write = { path = "../p1-tool-write" }
+p1-tool-write-logic = { path = "../p1-tool-write/logic" }
+p1-tool-patch = { path = "../p1-tool-patch" }
+p1-tool-patch-logic = { path = "../p1-tool-patch/logic" }
+p1-tool-search = { path = "../p1-tool-search" }
+p1-tool-search-logic = { path = "../p1-tool-search/logic" }
+# The adversarial filesystem suite (U-adv) also pins the workspace capability's host side
+# directly through p1-workspace, listed above.

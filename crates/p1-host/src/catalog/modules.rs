@@ -120,8 +120,11 @@ pub enum ModulesError {
         /// The capability.
         capability: String,
     },
-    /// Only tool packages have an adapter to register.
-    #[error("module `{module}` is a {kind} package; only tool packages can be registered")]
+    /// A class this host cannot register: only tool packages have a catalog adapter, and
+    /// policy packages are accepted as the session's host entries.
+    #[error(
+        "module `{module}` is a {kind} package; only tool and policy packages can be registered"
+    )]
     NotATool {
         /// The module name.
         module: String,
@@ -297,6 +300,14 @@ fn allocation(kind: &str) -> Option<Vec<String>> {
 /// capabilities under the loader-built identity (S1.5), so a package tool is visible to the
 /// host's capability checks exactly as a native one is. A name a registered tool already has
 /// is refused: a package never silently replaces a compiled-in tool.
+///
+/// A USER-selected provider package takes no catalog key at all: the lock keeps it under the
+/// module name it gave it (`provider-anthropic`, `provider-openai`, `provider-openai-chat`,
+/// the manifest name without the reserved `p1/` namespace, `docs/design/modules/package.md`)
+/// and provider activation resolves that name in the same lock, so the module a user selected
+/// serves the route in place of the release's host entry of that adapter — until #355's debug
+/// discovery is on main, the release's own host entries stay the delivered path for the three
+/// shipped providers (ANSWERS D083b).
 pub fn register_modules(
     catalog: &mut Catalog,
     packages: Vec<ModulePackage>,
@@ -305,13 +316,22 @@ pub fn register_modules(
     let existing = catalog.tool_keys();
     for package in packages {
         let kind = package.loaded.kind();
-        if kind != ModuleKind::Tool {
-            // Provider and policy packages need S4's and S5's adapters, which the runtime
-            // does not have yet; a lock that selects one is refused, never ignored.
-            return Err(ModulesError::NotATool {
-                module: package.module,
-                kind: kind.name(),
-            });
+        match kind {
+            ModuleKind::Tool => {}
+            // Kept by module name in the lock the selection came from; never a tool here.
+            ModuleKind::Provider => continue,
+            // A policy package is the session's, not a catalog tool: the shipped policies are
+            // official-release host entries the host loads by name (`policy.rs`,
+            // `summary.rs`; D083b 2), so a lock selecting one registers no tool.
+            ModuleKind::ContextPolicy | ModuleKind::AuthorizationPolicy => continue,
+            // A class with no adapter here yet: a lock that selects one is refused, never
+            // ignored.
+            _ => {
+                return Err(ModulesError::NotATool {
+                    module: package.module,
+                    kind: kind.name(),
+                });
+            }
         }
         if existing.contains(&package.module) {
             return Err(ModulesError::Collision {

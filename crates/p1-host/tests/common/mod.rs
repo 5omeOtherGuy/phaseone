@@ -7,13 +7,114 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use p1_assembly::Catalog;
 use p1_contracts::Provider;
-use p1_host::{HostDeps, InterruptSource, LineSource, SharedWriter};
+use p1_host::HostDeps;
+use p1_host::catalog::ProviderComponents;
+use p1_host::{InterruptSource, LineSource, SharedWriter};
+use p1_module_tests::Release;
 use p1_provider_http::testing::ScriptedTransport;
 use p1_testkit::ScriptedProvider;
+
+/// The provider packages `scripts/build-modules.sh` publishes: the manifest name the release
+/// calls each one and the package directory the build writes it under.
+pub const PROVIDER_PACKAGES: [(&str, &str); 3] = [
+    ("p1/provider-anthropic", "p1-module-provider-anthropic"),
+    ("p1/provider-openai", "p1-module-provider-openai"),
+    ("p1/provider-openai-chat", "p1-module-provider-openai-chat"),
+];
+
+/// One built provider package: the component bytes the build published and the release entry
+/// its package manifest describes.
+pub struct ProviderPackage {
+    /// The manifest name of the component.
+    pub name: &'static str,
+    /// The `.wasm` component.
+    pub bytes: Vec<u8>,
+    /// The package's release-manifest entry, as the build recorded it.
+    pub entry: serde_json::Value,
+}
+
+/// The built provider packages. A test binary that composes a shipped route needs them, so a
+/// missing artifact fails the case with how to build it instead of skipping.
+pub fn built_provider_packages() -> &'static [ProviderPackage; 3] {
+    static BUILT: OnceLock<[ProviderPackage; 3]> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        PROVIDER_PACKAGES.map(|(name, package)| {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../modules/target/p1-modules")
+                .join(package);
+            let read = |file: String| {
+                let path = dir.join(file);
+                std::fs::read(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "the provider artifact {} is missing ({error}): run scripts/build-modules.sh --all first",
+                        path.display()
+                    )
+                })
+            };
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&read(format!("{package}.manifest.json")))
+                    .expect("a package manifest");
+            assert_eq!(manifest["name"], name, "{package}");
+            let file = name.replace('/', "-");
+            ProviderPackage {
+                name,
+                bytes: read(format!("{package}.wasm")),
+                entry: serde_json::json!({
+                    "name": name,
+                    "digest": manifest["digest"],
+                    "path": format!("packages/{file}/{file}.wasm"),
+                    "kind": manifest["kind"],
+                    "world": manifest["world"],
+                    "protocol": manifest["protocol"],
+                    "capabilities": manifest["capabilities"],
+                    "variant": manifest["variant"],
+                }),
+            }
+        })
+    })
+}
+
+/// A release laid out in a temp directory that holds the built provider components, with
+/// `edit` applied to the entry of every one of them: the way S4.7's `provider_conformance.rs`
+/// loads the same packages, so a test can hold a refusal by tampering with an entry.
+pub fn provider_release(edit: &dyn Fn(&mut serde_json::Value)) -> Release {
+    let mut release = Release::empty();
+    for package in built_provider_packages() {
+        let mut entry = package.entry.clone();
+        edit(&mut entry);
+        release.add(entry, &package.bytes);
+    }
+    release
+}
+
+/// The provider components the build published, read once per test binary through a release
+/// manifest in a temp directory. Production discovery is the ONE path (`official_release_manifest`,
+/// ADR-0079, plus S3.8.0's debug fallback once it is on main); a test binary installs no module
+/// set, so it lays the built packages out as a release and reads it through
+/// `ProviderComponents::read`, exactly as S4.7's conformance suite does. No second path.
+pub fn provider_components() -> &'static ProviderComponents {
+    /// The release directory must outlive the loader that reads the packages out of it.
+    struct Built {
+        _release: Release,
+        components: ProviderComponents,
+    }
+    static COMPONENTS: OnceLock<Built> = OnceLock::new();
+    &COMPONENTS
+        .get_or_init(|| {
+            let release = provider_release(&|_| {});
+            let components = ProviderComponents::read(&release.manifest_file())
+                .expect("the built provider release");
+            Built {
+                _release: release,
+                components,
+            }
+        })
+        .components
+}
 
 /// A writer that appends to an in-memory buffer the test can read.
 pub struct Capture {
