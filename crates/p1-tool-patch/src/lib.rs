@@ -11,8 +11,13 @@
 //! `apply_patch` is exempt from read-before-mutate: the hunks must match the
 //! file's CURRENT contents, which is its own staleness check. It still records
 //! every file it writes in the shared [`ObservedFiles`].
+//!
+//! The declaration's data, input validation, the parser, the plan, the call
+//! and result descriptions and every text the model sees live in
+//! `p1-tool-patch-logic`, which the `p1/patch` component calls too, so both run
+//! the same code. This module owns the native flow: planning over the real
+//! filesystem and applying the writes, under the write gate.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use p1_contracts::tool::{ResultDescription, ResultDetail};
@@ -20,31 +25,8 @@ use p1_contracts::{
     BoxFuture, CallDescription, CancellationToken, DeclarationKind, Effect, Grammar, Tool,
     ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
-use p1_workspace::{ObservedFiles, ToolFace, Workspace, bound_output, write_atomic};
-use serde::Deserialize;
-
-const NAME: &str = "apply_patch";
-const DESCRIPTION: &str = "Apply a V4A patch to files in the workspace.\nThe patch is validated completely before anything is written; if any hunk fails to match, nothing changes and the error names the file and hunk.\nUse `*** Add File:`, `*** Delete File:` and `*** Update File:` hunks inside `*** Begin Patch` / `*** End Patch`.";
-const MAX_OUTPUT_BYTES: usize = 50_000;
-const MAX_OUTPUT_LINES: usize = 2_000;
-
-/// The published Codex V4A grammar, advertised with the freeform declaration.
-const PATCH_GRAMMAR: &str = r#"start: begin_patch hunk+ end_patch
-begin_patch: "*** Begin Patch" LF
-end_patch: "*** End Patch" LF?
-hunk: add_hunk | delete_hunk | update_hunk
-add_hunk: "*** Add File: " filename LF add_line+
-delete_hunk: "*** Delete File: " filename LF
-update_hunk: "*** Update File: " filename LF change_move? change?
-filename: /(.+)/
-add_line: "+" /(.*)/ LF -> line
-change_move: "*** Move to: " filename LF
-change: (change_context | change_line)+ eof_line?
-change_context: ("@@" | "@@ " /(.+)/) LF
-change_line: ("+" | "-" | " ") /(.*)/ LF
-eof_line: "*** End of File" LF
-%import common.LF
-"#;
+use p1_tool_patch_logic::{self as logic, Files, Op, PATCH_GRAMMAR, PatchFailure, RawInput};
+use p1_workspace::{ObservedFiles, ToolFace, Workspace, write_atomic};
 
 /// The `apply_patch` tool. Holds one agent's workspace and observation store.
 pub struct PatchTool {
@@ -99,20 +81,20 @@ impl PatchTool {
 }
 
 fn default_face() -> ToolFace {
-    ToolFace::new(NAME, DESCRIPTION)
+    ToolFace::new(logic::NAME, logic::DESCRIPTION)
 }
 
 fn declaration(face: ToolFace, freeform: bool) -> ToolDeclaration {
     let kind = if freeform {
         DeclarationKind::Freeform {
             grammar: Some(Grammar {
-                syntax: "lark".to_string(),
+                syntax: logic::GRAMMAR_SYNTAX.to_string(),
                 definition: PATCH_GRAMMAR.to_string(),
             }),
         }
     } else {
         DeclarationKind::Function {
-            input_schema: function_schema(),
+            input_schema: logic::function_schema(),
         }
     };
     ToolDeclaration {
@@ -122,17 +104,6 @@ fn declaration(face: ToolFace, freeform: bool) -> ToolDeclaration {
     }
 }
 
-fn function_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "patch": { "type": "string" }
-        },
-        "required": ["patch"],
-        "additionalProperties": false
-    })
-}
-
 fn identity(variant: &str) -> ToolIdentity {
     ToolIdentity {
         implementation: env!("CARGO_PKG_NAME").to_string(),
@@ -140,95 +111,12 @@ fn identity(variant: &str) -> ToolIdentity {
     }
 }
 
-/// One parsed patch hunk.
-enum Hunk {
-    Add {
-        path: String,
-        lines: Vec<String>,
-    },
-    Delete {
-        path: String,
-    },
-    Update {
-        path: String,
-        moveto: Option<String>,
-        groups: Vec<UpdateGroup>,
-    },
-}
-
-/// The paths a parsed patch touches, in patch order (the source path of an
-/// `Update File` hunk, even when it also moves).
-fn hunk_paths(hunks: &[Hunk]) -> Vec<String> {
-    hunks
-        .iter()
-        .map(|hunk| match hunk {
-            Hunk::Add { path, .. } | Hunk::Delete { path } | Hunk::Update { path, .. } => {
-                path.clone()
-            }
-        })
-        .collect()
-}
-
-/// One `@@`-delimited search group inside an Update File hunk.
-struct UpdateGroup {
-    /// The `@@ <header>` seek line, if one was given.
-    header: Option<String>,
-    /// Whether `*** End of File` anchored this group at the end of the file.
-    eof: bool,
-    /// The source line the group starts on, for error messages.
-    line: usize,
-    /// Lines the group expects to find (context and `-` lines).
-    old: Vec<String>,
-    /// Lines the group leaves behind (context and `+` lines).
-    new: Vec<String>,
-}
-
-/// A validated mutation, applied in patch order once planning has succeeded.
-enum Op {
-    Add {
-        path: PathBuf,
-        display: String,
-        contents: Vec<u8>,
-    },
-    Modify {
-        path: PathBuf,
-        display: String,
-        contents: Vec<u8>,
-    },
-    Delete {
-        path: PathBuf,
-        display: String,
-    },
-    Move {
-        from: PathBuf,
-        from_display: String,
-        to: PathBuf,
-        to_display: String,
-        contents: Vec<u8>,
-    },
-}
-
-impl Op {
-    fn success_line(&self) -> String {
-        match self {
-            Op::Add { display, .. } => format!("A {display}"),
-            Op::Modify { display, .. } => format!("M {display}"),
-            Op::Delete { display, .. } => format!("D {display}"),
-            Op::Move {
-                from_display,
-                to_display,
-                ..
-            } => format!("M {from_display} -> {to_display}"),
-        }
+/// The call's input as the logic crate reads it.
+fn raw_input(input: &ToolInput) -> RawInput<'_> {
+    match input {
+        ToolInput::Json(raw) => RawInput::Json(raw),
+        ToolInput::Text(raw) => RawInput::Text(raw),
     }
-}
-
-/// Why applying a patch failed.
-enum PatchFailure {
-    /// A message the model can act on.
-    Message(String),
-    /// The cancellation token was set; nothing was written.
-    Cancelled,
 }
 
 impl Tool for PatchTool {
@@ -248,23 +136,16 @@ impl Tool for PatchTool {
     /// `execute` does, and name the first file it touches — or the count, for a
     /// multi-file patch.
     fn describe(&self, call: &ToolCall) -> CallDescription {
-        let target = patch_text(&self.declaration.name, self.freeform, call)
-            .ok()
-            .and_then(|text| parse_patch(&text).ok())
-            .map(|hunks| hunk_paths(&hunks));
-        let target = match target.as_deref() {
-            None | Some([]) => None,
-            Some([only]) => Some(only.clone()),
-            Some(paths) => Some(format!("{} files", paths.len())),
-        };
+        // Natively the workspace is at hand, so an escape is decided by resolving
+        // the path, symlinks included.
+        let described = logic::describe(self.freeform, raw_input(&call.input), |path| {
+            self.workspace.resolve(path).is_err()
+        });
         CallDescription {
-            verb: "edit",
-            target,
+            verb: logic::VERB,
+            target: described.target,
             edit: None,
-            destructive: patch_text(&self.declaration.name, self.freeform, call)
-                .ok()
-                .and_then(|text| parse_patch(&text).ok())
-                .is_some_and(|hunks| patch_is_destructive(&self.workspace, &hunks)),
+            destructive: described.destructive,
         }
     }
 
@@ -273,40 +154,15 @@ impl Tool for PatchTool {
         call: &ToolCall,
         result: &p1_contracts::ToolResultItem,
     ) -> ResultDescription {
-        if result.status != ToolStatus::Ok {
-            return plain_result(result);
-        }
-        let Ok(text) = patch_text(&self.declaration.name, self.freeform, call) else {
-            return plain_result(result);
-        };
-        let files = describe_patch_files(&text);
-        let added: usize = files.iter().map(|file| file.added).sum();
-        let removed = files
-            .iter()
-            .map(|file| file.removed)
-            .try_fold(0usize, |total, count| count.map(|count| total + count));
-        let summary = match removed {
-            Some(removed) => format!("+{added} −{removed} · {} files", files.len()),
-            None => format!("+{added} · {} files", files.len()),
-        };
+        let described = logic::describe_result(
+            self.freeform,
+            raw_input(&call.input),
+            result.status == ToolStatus::Ok,
+            &result.content,
+        );
         ResultDescription {
-            summary,
-            detail: Some(ResultDetail::Files {
-                paths: files
-                    .into_iter()
-                    .map(|file| {
-                        let facts = if file.kind == 'D' {
-                            "D".to_string()
-                        } else {
-                            match file.removed {
-                                Some(removed) => format!("+{} −{removed}", file.added),
-                                None => format!("+{}", file.added),
-                            }
-                        };
-                        format!("{}\t{facts}", file.path)
-                    })
-                    .collect(),
-            }),
+            summary: described.summary,
+            detail: described.files.map(|paths| ResultDetail::Files { paths }),
         }
     }
 
@@ -323,7 +179,11 @@ impl Tool for PatchTool {
                     content: String::new(),
                 };
             }
-            let patch = match patch_text(&self.declaration.name, self.freeform, call) {
+            let patch = match logic::patch_text(
+                &self.declaration.name,
+                self.freeform,
+                raw_input(&call.input),
+            ) {
                 Ok(patch) => patch,
                 Err(message) => return ToolOutcome::error(message),
             };
@@ -334,9 +194,7 @@ impl Tool for PatchTool {
             match tokio::task::spawn_blocking(move || run(&workspace, &observed, &patch, &cancel))
                 .await
             {
-                Ok(Ok(content)) => {
-                    ToolOutcome::ok(bound_output(&content, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES))
-                }
+                Ok(Ok(content)) => ToolOutcome::ok(logic::bounded(&content)),
                 Ok(Err(PatchFailure::Message(message))) => ToolOutcome::error(message),
                 Ok(Err(PatchFailure::Cancelled)) => ToolOutcome {
                     status: ToolStatus::Cancelled,
@@ -348,649 +206,76 @@ impl Tool for PatchTool {
     }
 }
 
-fn plain_result(result: &p1_contracts::ToolResultItem) -> ResultDescription {
-    ResultDescription {
-        summary: result
-            .content
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        detail: None,
-    }
-}
-
-fn patch_is_destructive(workspace: &Workspace, hunks: &[Hunk]) -> bool {
-    hunks.iter().any(|hunk| match hunk {
-        Hunk::Add { path, .. } | Hunk::Delete { path } => workspace.resolve(path).is_err(),
-        Hunk::Update { path, moveto, .. } => {
-            workspace.resolve(path).is_err()
-                || moveto
-                    .as_deref()
-                    .is_some_and(|path| workspace.resolve(path).is_err())
-        }
-    })
-}
-
-struct DescribedPatchFile {
-    path: String,
-    kind: char,
-    added: usize,
-    removed: Option<usize>,
-}
-
-fn describe_patch_files(text: &str) -> Vec<DescribedPatchFile> {
-    let mut files: Vec<DescribedPatchFile> = Vec::new();
-    for line in strip_wrapper(text).lines() {
-        if let Some(path) = line.strip_prefix("*** Add File: ") {
-            files.push(DescribedPatchFile {
-                path: path.to_string(),
-                kind: 'A',
-                added: 0,
-                removed: Some(0),
-            });
-        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
-            files.push(DescribedPatchFile {
-                path: path.to_string(),
-                kind: 'D',
-                added: 0,
-                removed: None,
-            });
-        } else if let Some(path) = line.strip_prefix("*** Update File: ") {
-            files.push(DescribedPatchFile {
-                path: path.to_string(),
-                kind: 'M',
-                added: 0,
-                removed: Some(0),
-            });
-        } else if line.starts_with("*** Move to: ")
-            || line.starts_with("*** End of File")
-            || line.starts_with("@@")
-            || line.starts_with("*** Begin Patch")
-            || line.starts_with("*** End Patch")
-        {
-            continue;
-        } else if let Some(file) = files.last_mut() {
-            match (file.kind, line.chars().next()) {
-                ('A', _) => file.added += 1,
-                ('M', Some('+')) => file.added += 1,
-                ('M', Some('-')) => *file.removed.get_or_insert(0) += 1,
-                _ => {}
-            }
-        }
-    }
-    files
-}
-
-/// Extract the patch text from the raw call, according to the current shape.
-fn patch_text(tool: &str, freeform: bool, call: &ToolCall) -> Result<String, String> {
-    if freeform {
-        match &call.input {
-            ToolInput::Text(raw) => Ok(raw.clone()),
-            ToolInput::Json(_) => Err(invalid(
-                tool,
-                "expected freeform text input, got a JSON object",
-            )),
-        }
-    } else {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct FunctionInput {
-            patch: String,
-        }
-        match &call.input {
-            ToolInput::Json(raw) => {
-                let input: FunctionInput =
-                    serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
-                Ok(input.patch)
-            }
-            ToolInput::Text(_) => Err(invalid(
-                tool,
-                "expected a JSON object input, got freeform text",
-            )),
-        }
-    }
-}
-
-fn invalid(tool: &str, reason: &str) -> String {
-    format!("Invalid input for {tool}: {reason}")
-}
-
-fn invalid_patch(reason: impl std::fmt::Display, line: usize) -> PatchFailure {
-    PatchFailure::Message(format!("Invalid patch: {reason} (line {line})."))
-}
-
 fn run(
     workspace: &Workspace,
     observed: &ObservedFiles,
     text: &str,
     cancel: &CancellationToken,
 ) -> Result<String, PatchFailure> {
-    let hunks = parse_patch(text)?;
+    let hunks = logic::parse_patch(text)?;
     // Planning reads the files the hunks are located in; applying writes them.
     // Both under the gate: another agent's write cannot land in between and be
     // overwritten by contents planned from the older state.
     let _mutation = workspace.begin_mutation();
-    let ops = plan(workspace, &hunks, cancel)?;
+    let ops = logic::plan(&mut NativeFiles { workspace, cancel }, &hunks)?;
     apply(&ops, observed, cancel)?;
-    Ok(ops
-        .iter()
-        .map(Op::success_line)
-        .collect::<Vec<_>>()
-        .join("\n"))
+    Ok(logic::success_output(&ops))
 }
 
-/// Strip an optional heredoc or fenced-code wrapper, normalize CRLF line
-/// endings, and drop surrounding blank lines.
-fn strip_wrapper(text: &str) -> String {
-    let normalized = text.replace("\r\n", "\n");
-    let mut lines: Vec<&str> = normalized.lines().collect();
-    while lines.first().is_some_and(|line| line.trim().is_empty()) {
-        lines.remove(0);
-    }
-    if let Some(first) = lines.first().map(|line| line.trim().to_string()) {
-        if first.starts_with("```") {
-            lines.remove(0);
-            while lines.last().is_some_and(|line| line.trim().is_empty()) {
-                lines.pop();
-            }
-            if lines
-                .last()
-                .is_some_and(|line| line.trim_start().starts_with("```"))
-            {
-                lines.pop();
-            }
-        } else if let Some(delimiter) = heredoc_delimiter(&first) {
-            lines.remove(0);
-            if let Some(position) = lines.iter().position(|line| line.trim() == delimiter) {
-                lines.truncate(position);
-            }
-        }
-    }
-    while lines.last().is_some_and(|line| line.trim().is_empty()) {
-        lines.pop();
-    }
-    lines.join("\n")
+/// The real filesystem as the logic crate's plan sees it: keys are resolved
+/// paths, so two spellings of one file share its staged contents.
+struct NativeFiles<'a> {
+    workspace: &'a Workspace,
+    cancel: &'a CancellationToken,
 }
 
-/// The terminator word of a `<<'EOF'`-style first line, if any.
-fn heredoc_delimiter(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("<<")?;
-    let rest = rest.strip_prefix('-').unwrap_or(rest);
-    let word = rest.trim_matches(|character| character == '\'' || character == '"');
-    if word.is_empty() {
-        None
-    } else {
-        Some(word.to_string())
+impl Files for NativeFiles<'_> {
+    type Key = PathBuf;
+
+    fn cancelled(&mut self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    fn resolve(&mut self, path: &str) -> Result<(PathBuf, String), PatchFailure> {
+        let resolved = self
+            .workspace
+            .resolve(path)
+            .map_err(|error| PatchFailure::Message(error.to_string()))?;
+        let display = self.workspace.display(&resolved);
+        Ok((resolved, display))
+    }
+
+    fn exists(&mut self, path: &PathBuf) -> bool {
+        path.exists()
+    }
+
+    fn read(&mut self, path: &PathBuf, display: &str) -> Result<Option<Vec<u8>>, PatchFailure> {
+        current_contents(path, display)
     }
 }
 
-fn parse_patch(text: &str) -> Result<Vec<Hunk>, PatchFailure> {
-    let stripped = strip_wrapper(text);
-    let lines: Vec<&str> = stripped.lines().collect();
-    if lines.first() != Some(&"*** Begin Patch") {
-        return Err(invalid_patch(
-            "the first line must be \"*** Begin Patch\"",
-            1,
-        ));
-    }
-
-    let mut hunks = Vec::new();
-    let mut index = 1usize;
-    let mut ended = false;
-    while index < lines.len() {
-        let line = lines[index];
-        let line_number = index + 1;
-        if line == "*** End Patch" {
-            ended = true;
-            index += 1;
-            break;
-        }
-        if let Some(rest) = line.strip_prefix("*** Add File: ") {
-            let path = rest.to_string();
-            if path.is_empty() {
-                return Err(invalid_patch("Add File has an empty path", line_number));
-            }
-            index += 1;
-            let mut added = Vec::new();
-            while index < lines.len() {
-                if let Some(content) = lines[index].strip_prefix('+') {
-                    added.push(content.to_string());
-                    index += 1;
-                } else {
-                    break;
-                }
-            }
-            if added.is_empty() {
-                return Err(invalid_patch(
-                    format!("Add File hunk for {path} has no lines"),
-                    line_number,
-                ));
-            }
-            hunks.push(Hunk::Add { path, lines: added });
-        } else if let Some(rest) = line.strip_prefix("*** Delete File: ") {
-            let path = rest.to_string();
-            if path.is_empty() {
-                return Err(invalid_patch("Delete File has an empty path", line_number));
-            }
-            hunks.push(Hunk::Delete { path });
-            index += 1;
-        } else if let Some(rest) = line.strip_prefix("*** Update File: ") {
-            let path = rest.to_string();
-            if path.is_empty() {
-                return Err(invalid_patch("Update File has an empty path", line_number));
-            }
-            let hunk_line = line_number;
-            index += 1;
-            let mut moveto = None;
-            if index < lines.len()
-                && let Some(target) = lines[index].strip_prefix("*** Move to: ")
-            {
-                if target.is_empty() {
-                    return Err(invalid_patch("Move to has an empty path", index + 1));
-                }
-                moveto = Some(target.to_string());
-                index += 1;
-            }
-            let groups = parse_update_groups(&lines, &mut index)?;
-            if groups.is_empty() && moveto.is_none() {
-                return Err(invalid_patch(
-                    format!("Update File hunk for {path} has no changes"),
-                    hunk_line,
-                ));
-            }
-            for group in &groups {
-                if group.old.is_empty() && group.new.is_empty() {
-                    return Err(invalid_patch(
-                        format!("Update hunk for {path} contains no lines"),
-                        group.line,
-                    ));
-                }
-            }
-            hunks.push(Hunk::Update {
-                path,
-                moveto,
-                groups,
-            });
-        } else {
-            return Err(invalid_patch(
-                format!("expected a hunk header, found {line:?}"),
-                line_number,
-            ));
-        }
-    }
-
-    if !ended {
-        return Err(invalid_patch(
-            "the patch must end with \"*** End Patch\"",
-            lines.len().max(1),
-        ));
-    }
-    while index < lines.len() {
-        if !lines[index].trim().is_empty() {
-            return Err(invalid_patch(
-                "unexpected content after \"*** End Patch\"",
-                index + 1,
-            ));
-        }
-        index += 1;
-    }
-    if hunks.is_empty() {
-        return Err(invalid_patch("the patch contains no hunks", 1));
-    }
-    Ok(hunks)
-}
-
-/// Parse the change groups of one Update File hunk, advancing `index` past them.
-fn parse_update_groups(
-    lines: &[&str],
-    index: &mut usize,
-) -> Result<Vec<UpdateGroup>, PatchFailure> {
-    let mut groups: Vec<UpdateGroup> = Vec::new();
-    let mut current: Option<UpdateGroup> = None;
-    while *index < lines.len() {
-        let line = lines[*index];
-        let line_number = *index + 1;
-        if line == "*** End of File" {
-            let Some(group) = current.as_mut() else {
-                return Err(invalid_patch(
-                    "\"*** End of File\" without a preceding change",
-                    line_number,
-                ));
-            };
-            group.eof = true;
-            *index += 1;
-            if *index < lines.len() && !lines[*index].starts_with("*** ") {
-                return Err(invalid_patch(
-                    format!(
-                        "unexpected line after \"*** End of File\": {:?}",
-                        lines[*index]
-                    ),
-                    *index + 1,
-                ));
-            }
-            continue;
-        }
-        // Any other `***` line starts the next hunk or ends the patch.
-        if line.starts_with("*** ") {
-            break;
-        }
-        if line == "@@" || line.starts_with("@@ ") {
-            if let Some(group) = current.take() {
-                groups.push(group);
-            }
-            let header = if line == "@@" {
-                None
-            } else {
-                Some(line[3..].to_string())
-            };
-            current = Some(UpdateGroup {
-                header,
-                eof: false,
-                line: line_number,
-                old: Vec::new(),
-                new: Vec::new(),
-            });
-            *index += 1;
-            continue;
-        }
-        let Some((prefix, content)) = split_change_line(line) else {
-            return Err(invalid_patch(
-                format!("unexpected line in Update File hunk: {line:?}"),
-                line_number,
-            ));
-        };
-        let group = current.get_or_insert_with(|| UpdateGroup {
-            header: None,
-            eof: false,
-            line: line_number,
-            old: Vec::new(),
-            new: Vec::new(),
-        });
-        if prefix != '+' {
-            group.old.push(content.to_string());
-        }
-        if prefix != '-' {
-            group.new.push(content.to_string());
-        }
-        *index += 1;
-    }
-    if let Some(group) = current.take() {
-        groups.push(group);
-    }
-    Ok(groups)
-}
-
-/// Split a change line. An empty line is a context line with empty content.
-fn split_change_line(line: &str) -> Option<(char, &str)> {
-    match line.chars().next() {
-        None => Some((' ', "")),
-        Some(prefix @ (' ' | '+' | '-')) => Some((prefix, &line[1..])),
-        Some(_) => None,
-    }
-}
-
-/// Validate every hunk and compute every resulting file in memory.
-fn plan(
-    workspace: &Workspace,
-    hunks: &[Hunk],
-    cancel: &CancellationToken,
-) -> Result<Vec<Op>, PatchFailure> {
-    // Staged contents for the paths already touched by this patch, so a later
-    // hunk sees the result of an earlier one without anything being written.
-    let mut staged: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
-    let mut ops = Vec::new();
-
-    for hunk in hunks {
-        if cancel.is_cancelled() {
-            return Err(PatchFailure::Cancelled);
-        }
-        match hunk {
-            Hunk::Add { path, lines } => {
-                let (resolved, display) = resolve(workspace, path)?;
-                if is_present(&resolved, &staged) {
-                    return Err(PatchFailure::Message(format!("{display} already exists.")));
-                }
-                let mut contents = lines.join("\n");
-                if !lines.is_empty() {
-                    contents.push('\n');
-                }
-                let contents = contents.into_bytes();
-                staged.insert(resolved.clone(), Some(contents.clone()));
-                ops.push(Op::Add {
-                    path: resolved,
-                    display,
-                    contents,
-                });
-            }
-            Hunk::Delete { path } => {
-                let (resolved, display) = resolve(workspace, path)?;
-                if current_contents(&resolved, &display, &staged)?.is_none() {
-                    return Err(PatchFailure::Message(format!("{display} does not exist.")));
-                }
-                staged.insert(resolved.clone(), None);
-                ops.push(Op::Delete {
-                    path: resolved,
-                    display,
-                });
-            }
-            Hunk::Update {
-                path,
-                moveto,
-                groups,
-            } => {
-                let (resolved, display) = resolve(workspace, path)?;
-                let bytes = current_contents(&resolved, &display, &staged)?
-                    .ok_or_else(|| PatchFailure::Message(format!("{display} does not exist.")))?;
-                let contents = apply_groups(&bytes, groups, &display)?;
-                match moveto {
-                    Some(target) => {
-                        let (to, to_display) = resolve(workspace, target)?;
-                        if is_present(&to, &staged) {
-                            return Err(PatchFailure::Message(format!(
-                                "{to_display} already exists."
-                            )));
-                        }
-                        staged.insert(resolved.clone(), None);
-                        staged.insert(to.clone(), Some(contents.clone()));
-                        ops.push(Op::Move {
-                            from: resolved,
-                            from_display: display,
-                            to,
-                            to_display,
-                            contents,
-                        });
-                    }
-                    None => {
-                        staged.insert(resolved.clone(), Some(contents.clone()));
-                        ops.push(Op::Modify {
-                            path: resolved,
-                            display,
-                            contents,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    Ok(ops)
-}
-
-fn resolve(workspace: &Workspace, path: &str) -> Result<(PathBuf, String), PatchFailure> {
-    let resolved = workspace
-        .resolve(path)
-        .map_err(|error| PatchFailure::Message(error.to_string()))?;
-    let display = workspace.display(&resolved);
-    Ok((resolved, display))
-}
-
-/// Whether `path` exists, counting a path staged earlier in this patch.
-fn is_present(path: &Path, staged: &HashMap<PathBuf, Option<Vec<u8>>>) -> bool {
-    match staged.get(path) {
-        Some(entry) => entry.is_some(),
-        None => path.exists(),
-    }
-}
-
-/// The current bytes of `path`: staged content when this patch touched it
-/// already, otherwise the file on disk.
-fn current_contents(
-    path: &Path,
-    display: &str,
-    staged: &HashMap<PathBuf, Option<Vec<u8>>>,
-) -> Result<Option<Vec<u8>>, PatchFailure> {
-    if let Some(entry) = staged.get(path) {
-        return Ok(entry.clone());
-    }
+/// The bytes of the file at `path`, or `None` when nothing is there.
+fn current_contents(path: &Path, display: &str) -> Result<Option<Vec<u8>>, PatchFailure> {
     match std::fs::metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(PatchFailure::Message(format!(
-            "{display} could not be read: {error}"
+        Err(error) => Err(PatchFailure::Message(logic::could_not_be_read(
+            display,
+            &error.to_string(),
         ))),
         Ok(metadata) => {
             if !metadata.is_file() {
-                return Err(PatchFailure::Message(format!(
-                    "{display} is not a regular file."
-                )));
+                return Err(PatchFailure::Message(logic::not_a_regular_file(display)));
             }
             let bytes = std::fs::read(path).map_err(|error| {
-                PatchFailure::Message(format!("{display} could not be read: {error}"))
+                PatchFailure::Message(logic::could_not_be_read(display, &error.to_string()))
             })?;
-            if std::str::from_utf8(&bytes).is_err() {
-                return Err(PatchFailure::Message(format!(
-                    "{display} is not valid UTF-8."
-                )));
-            }
             Ok(Some(bytes))
         }
     }
 }
 
-/// Apply the parsed groups to a file's bytes, preserving its CRLF style and
-/// trailing-newline state.
-fn apply_groups(
-    bytes: &[u8],
-    groups: &[UpdateGroup],
-    display: &str,
-) -> Result<Vec<u8>, PatchFailure> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| PatchFailure::Message(format!("{display} is not valid UTF-8.")))?;
-    let crlf = detect_crlf(text);
-    let normalized = text.replace("\r\n", "\n");
-    let trailing_newline = normalized.ends_with('\n');
-    let mut lines = split_lines(&normalized);
-
-    let mut running = 0usize;
-    for (index, group) in groups.iter().enumerate() {
-        let position = locate(&lines, group, running).ok_or_else(|| {
-            PatchFailure::Message(format!(
-                "{display}: hunk {} did not match the file.",
-                index + 1
-            ))
-        })?;
-        let end = position + group.old.len();
-        lines.splice(position..end, group.new.iter().cloned());
-        running = position + group.new.len();
-    }
-
-    let mut joined = lines.join("\n");
-    if trailing_newline && !lines.is_empty() {
-        joined.push('\n');
-    }
-    if crlf {
-        joined = joined.replace('\n', "\r\n");
-    }
-    Ok(joined.into_bytes())
-}
-
-fn split_lines(normalized: &str) -> Vec<String> {
-    if normalized.is_empty() {
-        return Vec::new();
-    }
-    let mut lines: Vec<String> = normalized.split('\n').map(String::from).collect();
-    if normalized.ends_with('\n') {
-        lines.pop();
-    }
-    lines
-}
-
-fn detect_crlf(text: &str) -> bool {
-    match text.find('\n') {
-        Some(index) => index > 0 && text.as_bytes()[index - 1] == b'\r',
-        None => false,
-    }
-}
-
-/// The whitespace-insensitivity ladder, tried in order.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MatchTier {
-    Exact,
-    TrimEnd,
-    TrimBoth,
-}
-
-/// Find where a group's expected lines match, at or after `running`.
-fn locate(lines: &[String], group: &UpdateGroup, running: usize) -> Option<usize> {
-    let start = match &group.header {
-        Some(header) => find_header(lines, header, running)? + 1,
-        None => running,
-    };
-    let pattern = &group.old;
-    if group.eof {
-        if start > lines.len() {
-            return None;
-        }
-        let position = lines.len().checked_sub(pattern.len())?;
-        if position < start {
-            return None;
-        }
-        return [MatchTier::Exact, MatchTier::TrimEnd, MatchTier::TrimBoth]
-            .into_iter()
-            .find(|&tier| matches_at(lines, position, pattern, tier))
-            .map(|_| position);
-    }
-    if pattern.is_empty() {
-        // Codex semantics, which GPT models are trained on: a hunk with nothing to
-        // match (additions only) is appended at the END of the file, with or without
-        // a header. (Lead ruling; the first implementation inserted at the search
-        // position.)
-        return Some(lines.len());
-    }
-    if start + pattern.len() > lines.len() {
-        return None;
-    }
-    for tier in [MatchTier::Exact, MatchTier::TrimEnd, MatchTier::TrimBoth] {
-        for position in start..=(lines.len() - pattern.len()) {
-            if matches_at(lines, position, pattern, tier) {
-                return Some(position);
-            }
-        }
-    }
-    None
-}
-
-/// The `@@ <header>` seek: exact first, then trimmed.
-fn find_header(lines: &[String], header: &str, from: usize) -> Option<usize> {
-    (from..lines.len())
-        .find(|&index| lines[index] == header)
-        .or_else(|| (from..lines.len()).find(|&index| lines[index].trim() == header.trim()))
-}
-
-fn matches_at(lines: &[String], position: usize, pattern: &[String], tier: MatchTier) -> bool {
-    pattern.iter().enumerate().all(|(offset, expected)| {
-        let Some(actual) = lines.get(position + offset) else {
-            return false;
-        };
-        match tier {
-            MatchTier::Exact => actual == expected,
-            MatchTier::TrimEnd => actual.trim_end() == expected.trim_end(),
-            MatchTier::TrimBoth => actual.trim() == expected.trim(),
-        }
-    })
-}
-
 fn apply(
-    ops: &[Op],
+    ops: &[Op<PathBuf>],
     observed: &ObservedFiles,
     cancel: &CancellationToken,
 ) -> Result<(), PatchFailure> {
@@ -1010,13 +295,13 @@ fn apply(
                 contents,
             } => {
                 write_atomic(path, contents).map_err(|error| {
-                    PatchFailure::Message(format!("failed to write {display}: {error}"))
+                    PatchFailure::Message(logic::failed_to_write(display, &error.to_string()))
                 })?;
                 observed.record(path, contents);
             }
             Op::Delete { path, display } => {
                 std::fs::remove_file(path).map_err(|error| {
-                    PatchFailure::Message(format!("failed to delete {display}: {error}"))
+                    PatchFailure::Message(logic::failed_to_delete(display, &error.to_string()))
                 })?;
             }
             Op::Move {
@@ -1027,11 +312,14 @@ fn apply(
                 ..
             } => {
                 write_atomic(to, contents).map_err(|error| {
-                    PatchFailure::Message(format!("failed to write {}: {error}", to.display()))
+                    PatchFailure::Message(logic::failed_to_write(
+                        &to.display().to_string(),
+                        &error.to_string(),
+                    ))
                 })?;
                 observed.record(to, contents);
                 std::fs::remove_file(from).map_err(|error| {
-                    PatchFailure::Message(format!("failed to delete {from_display}: {error}"))
+                    PatchFailure::Message(logic::failed_to_delete(from_display, &error.to_string()))
                 })?;
             }
         }
