@@ -13,6 +13,7 @@ workspace = true
 p1-contracts = { path = "../p1-contracts" }
 p1-module-protocol = { path = "../p1-module-protocol" }
 p1-redact = { path = "../p1-redact" }
+p1-workflow = { path = "../p1-workflow" }
 thiserror = "2"
 # The executor task, its request channel and the per-call tasks it owns.
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }

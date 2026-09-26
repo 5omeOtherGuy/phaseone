@@ -39,12 +39,13 @@ const KEY_WIDTH: usize = 12;
 /// same check without reaching the loader, which compiles. A new class is one variant and
 /// one entry, and the drift guard `verify_and_the_loader_agree_on_every_manifest_field` fails
 /// if this list and the loader's part ways.
-const CLASSES: [ModuleKind; 5] = [
+const CLASSES: [ModuleKind; 6] = [
     ModuleKind::Tool,
     ModuleKind::Provider,
     ModuleKind::ContextPolicy,
     ModuleKind::AuthorizationPolicy,
     ModuleKind::WorkflowImplementation,
+    ModuleKind::WorkflowDecision,
 ];
 
 /// The capabilities this runtime links: the loader's `LINKABLE_CAPABILITIES`, published in
