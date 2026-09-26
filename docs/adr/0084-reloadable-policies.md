@@ -1,7 +1,7 @@
 ---
 adr: 84
 title: Reloadable policies
-status: proposed
+status: accepted
 date: 2026-09-26
 deciders: owner+lead
 supersedes: []
@@ -150,5 +150,32 @@ reconfiguration operation (S1), and the loader and package identity (S0, S1).
 
 ## Evidence
 
-No measurement exists yet. This ADR is merged `proposed` before the reload slice (S5.7) lands and
-is accepted, with Evidence, in the PR that lands the phase's last DoD row.
+Every S5 slice that delivers this decision, with its merge commit on main and the main `gate` run of
+that commit:
+
+- S5.6, PR #274, merge commit `4775380f` (`4775380f32f6a164fc844dd3ec7e55085923ec83`): this ADR,
+  drafted and merged `proposed`; its own main gate run 36217242367 was cancelled by the concurrency
+  group and is covered by the descendant `606b4f71` run 36217440456, success.
+- S5.3, PR #280, merge commit `7c9dae5e` (`7c9dae5e0f0a5d65f8c577cd13c64717afcf38b7`): §1's
+  packages `p1/policy/full-access` and `p1/policy/ask` as components, the runtime adapter and the
+  native ask bridge of §2, where a component may answer `ask` and the host resolves it; main gate
+  run 36216644399, success.
+- S5.3.1, PR #322, merge commit `f35ff6d7` (`f35ff6d7f1180fb3a29d8505a31f6af65e5a3a7e`): the TUI
+  resolves the ask bridge's `ask` through the current front end under the active turn's
+  cancellation scope, the second half of §2; main gate run 36236119165, success.
+- S5.4, PR #311, merge commit `8a292a30` (`8a292a3061eb6bdc34f6ebab0722a8ef66e8e925`): the policies
+  suite `crates/p1-module-tests/tests/policies.rs` — summary recursion avoidance, the ask bridge
+  over the component, cancellation, §2's conservative decision for a policy trap, and §4's approval
+  key carrying no old approval; its own main gate run 36233728392 was cancelled by the concurrency
+  group and is covered by the descendant `8b48e1c3` run 36234001991, success.
+- S5.7, PR #339, merge commit `806bc46e` (`806bc46ef107988957276a4c8522a315d4b8ad9d`): §3's reload
+  between turns — `/modules reload` is ADR-0078's atomic replacement, a request made while the
+  session is busy is queued and reported as pending, and running children and workflows keep their
+  generation; main gate run 36257347985, success.
+- S5.9, PR #350, merge commit `dd90cc4d` (`dd90cc4d645583b71e1b8c88c32e6b2288d40c14`): the handle
+  lifetime across compaction, reload and reconnect that §1 and §3 state, measured by the acceptance
+  row `compaction-16` (`growth=none`) and its case in `crates/p1-module-tests/tests/acceptance.rs`;
+  main gate run 36257376533, success.
+- Acceptance: this ADR is accepted with the recorded S5 verdicts — the Fable judge's ACCEPT on
+  S5.3, S5.3.1 (judge2, after a PR-body-only repair), S5.4, S5.6 and S5.7, and the lead's XO call
+  on S5.9 (one review round plus a green gate, no judge).
