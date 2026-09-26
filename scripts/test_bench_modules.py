@@ -277,7 +277,7 @@ class BenchModulesTests(unittest.TestCase):
         calls = h.calls()
         self.assertEqual(calls[0], "build-modules.sh --all")
         self.assertIn("cargo build --locked --release -p p1-host --bin p1", calls)
-        self.assertIn("cargo test --locked -p p1-tool-shell --test lead_group_cleanup "
+        self.assertIn("cargo test --locked --no-fail-fast -p p1-tool-shell --test lead_group_cleanup "
                       "--test process_service --test review", calls)
 
     def test_a_given_p1_binary_is_not_rebuilt(self) -> None:

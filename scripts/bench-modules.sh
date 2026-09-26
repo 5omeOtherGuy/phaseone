@@ -67,7 +67,7 @@ usage: scripts/bench-modules.sh --suite baseline [--out <path>]
                 (default .worker-scratch/bench-baseline-<shortsha>.txt)
 --row <id>      acceptance: run only this row (repeatable; default every row)
 --check         acceptance: compare each measured row against its threshold
---json <file>   acceptance: also write the rows as JSON to <file>
+--json <file>   acceptance: also write the rows as JSON to <file> (relative to the repository root)
 
 The baseline suite builds missing module packages, builds the bench binary in the debug
 profile the gate uses, runs it under /usr/bin/time -v, and writes one record of wall time,
@@ -270,8 +270,9 @@ run_acceptance() {
   if [ "$contract" = 1 ]; then
     echo "bench-modules: running the process cancellation contract (p1-tool-shell)" >&2
     local_cargo_config
-    if cargo test --locked -p p1-tool-shell --test lead_group_cleanup --test process_service \
-      --test review >"$scratch/contract.out" 2>&1; then
+    # Every contract test binary runs even when one fails, so the row counts them all.
+    if cargo test --locked --no-fail-fast -p p1-tool-shell --test lead_group_cleanup \
+      --test process_service --test review >"$scratch/contract.out" 2>&1; then
       contract_status=0
     else
       contract_status=1
