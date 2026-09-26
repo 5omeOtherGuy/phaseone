@@ -9,10 +9,18 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The native provider: `AnthropicProvider` over the shared transport and drive loop
+# (ADR-0071). Without it only the portable route, validation, request lowering and
+# parser build, so a provider WebAssembly component reaches no socket, runtime or
+# credential code.
+default = ["native"]
+native = ["p1-provider-http/native"]
+
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 p1-model-profile = { path = "../p1-model-profile" }
-p1-provider-http = { path = "../p1-provider-http" }
+p1-provider-http = { path = "../p1-provider-http", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
