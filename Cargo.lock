@@ -1863,6 +1863,7 @@ dependencies = [
  "p1-contracts",
  "p1-module-runtime",
  "p1-redact",
+ "p1-workflow",
  "tempfile",
  "tokio",
 ]
