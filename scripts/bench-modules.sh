@@ -184,10 +184,12 @@ tooling() {
 }
 
 # The machine-local target the gate builds through (scripts/gate.sh does the same); a reading
-# taken against another target directory would describe a build the gate never makes.
+# taken against another target directory would describe a build the gate never makes. A helper
+# that refuses the configuration (no HOME, a target root that is not ext4) is a tooling error of
+# this suite, so it leaves through `tooling` rather than with the helper's own status.
 local_cargo_config() {
   if [ -z "${CI:-}" ] && [ ! -f .cargo/config.toml ]; then
-    scripts/local-cargo-config.sh >&2
+    scripts/local-cargo-config.sh >&2 || tooling "scripts/local-cargo-config.sh failed"
   fi
 }
 
@@ -230,7 +232,7 @@ run_acceptance() {
   done
 
   local scratch
-  scratch="$(mktemp -d)"
+  scratch="$(mktemp -d)" || tooling "cannot create a scratch directory"
   # shellcheck disable=SC2064 # the directory is fixed now, when the trap is set
   trap "rm -rf '$scratch'" EXIT
   printf '%s\n' "$ACCEPTANCE_TABLE" >"$scratch/table"
@@ -447,6 +449,12 @@ except Exception as error:  # a broken report is a tooling error, never exit 1
     print(f"bench-modules: the report failed: {error!r}", file=sys.stderr)
     sys.exit(2)
 PY
+  # The report classifies every row itself and exits 0..3; any other status means python3 did
+  # not run it (a missing interpreter is 127), which is a tooling error, never a failed row.
+  case "$status" in
+    0 | 1 | 2 | 3) ;;
+    *) tooling "the report exited $status without classifying a row" ;;
+  esac
   exit "$status"
 }
 

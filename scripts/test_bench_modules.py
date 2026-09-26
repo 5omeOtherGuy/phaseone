@@ -90,6 +90,44 @@ CARGO_STUB = textwrap.dedent(
 
 HELPER_STUB = "#!/usr/bin/env bash\nprintf '%s\\n' \"$(basename \"$0\") $*\" >> \"$STUB_LOG\"\nexit 0\n"
 
+# The machine-local target helper refuses some boxes (no HOME, a target root that is not ext4);
+# STUB_LOCAL_CARGO_CONFIG_FAIL makes that refusal happen here.
+LOCAL_CARGO_CONFIG_STUB = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    printf '%s\\n' "local-cargo-config.sh $*" >> "$STUB_LOG"
+    if [ -n "${STUB_LOCAL_CARGO_CONFIG_FAIL:-}" ]; then
+      echo "stub: local-cargo-config refuses this box" >&2
+      exit 1
+    fi
+    exit 0
+    """
+)
+
+# mktemp and python3 never fail in these tests unless asked to: the stubs delegate to the real
+# tools, and STUB_MKTEMP_FAIL / STUB_PYTHON3_FAIL stand in for a box where they do not run.
+MKTEMP_STUB = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    if [ -n "${STUB_MKTEMP_FAIL:-}" ]; then
+      echo "stub: mktemp fails" >&2
+      exit 1
+    fi
+    exec /usr/bin/mktemp "$@"
+    """
+)
+
+PYTHON3_STUB = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    if [ -n "${STUB_PYTHON3_FAIL:-}" ]; then
+      echo "stub: python3: command not found" >&2
+      exit 127
+    fi
+    exec /usr/bin/python3 "$@"
+    """
+)
+
 
 def write_exec(path: pathlib.Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,8 +148,10 @@ class Harness:
         scripts.mkdir(parents=True)
         shutil.copy2(SCRIPT, scripts / "bench-modules.sh")
         write_exec(scripts / "build-modules.sh", HELPER_STUB)
-        write_exec(scripts / "local-cargo-config.sh", HELPER_STUB)
+        write_exec(scripts / "local-cargo-config.sh", LOCAL_CARGO_CONFIG_STUB)
         write_exec(base / "bin" / "cargo", CARGO_STUB)
+        write_exec(base / "bin" / "mktemp", MKTEMP_STUB)
+        write_exec(base / "bin" / "python3", PYTHON3_STUB)
         self.env = {
             "PATH": f"{base / 'bin'}:/usr/bin:/bin",
             "HOME": str(base),
@@ -402,6 +442,33 @@ class BenchModulesTests(unittest.TestCase):
         result = h.run("--suite", "acceptance", "--check", "--row", "history-1m", STUB_BUILD_FAIL="1")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(h.measured_cases(), [])
+
+    def test_a_refusing_local_cargo_config_helper_is_a_tooling_error_not_a_failed_row(self) -> None:
+        for row in ("history-1m", "cancel-process"):
+            with self.subTest(row=row):
+                h = self.harness()
+                h.reading("history-1m")
+                result = h.run("--suite", "acceptance", "--check", "--row", row,
+                               STUB_LOCAL_CARGO_CONFIG_FAIL="1")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("scripts/local-cargo-config.sh failed", result.stderr)
+                self.assertEqual(h.measured_cases(), [])
+                self.assertFalse(any("p1-tool-shell" in call for call in h.calls()))
+
+    def test_a_failing_mktemp_is_a_tooling_error(self) -> None:
+        h = self.harness()
+        h.reading("history-1m")
+        result = h.run("--suite", "acceptance", "--check", "--row", "history-1m", STUB_MKTEMP_FAIL="1")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot create a scratch directory", result.stderr)
+        self.assertEqual(h.measured_cases(), [])
+
+    def test_a_missing_python3_is_a_tooling_error(self) -> None:
+        h = self.harness()
+        h.reading("history-1m")
+        result = h.run("--suite", "acceptance", "--check", "--row", "history-1m", STUB_PYTHON3_FAIL="1")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("without classifying a row", result.stderr)
 
     def test_the_process_contract_is_reported_from_its_test_result(self) -> None:
         for contract, verdict, code, value in (
