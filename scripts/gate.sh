@@ -18,6 +18,9 @@
 #   core isolation      scripts/check-core-isolation.sh
 #   module boundary     imports against the frozen capability allocation, and the unsafe policy
 #                       (scripts/check-module-boundaries.sh, freeze items 11 and 13)
+#   shipping audit      the shipping binary's production graph reaches exactly the four native
+#                       tool implementations the sealed D083 A/B arm keeps, and no native twin,
+#                       finding or tool error (scripts/check-module-boundaries.sh --shipping)
 #   secret scan, adr, installer and CI helpers
 #   release candidate   the p1 binary relinked and staged for exactly this commit
 #                       (scripts/stage-release.sh, no tag, a null manifest tag)
@@ -94,6 +97,77 @@ validate_modules() {
   echo "module validation: ${#expected[@]} package(s) valid"
 }
 
+# The shipping audit as a gate step (S7.10.1): scripts/check-module-boundaries.sh --shipping
+# prints the production graph of the shipping binary and every extension crate it still
+# reaches. The audit is red by design until the owning streams cut their crates over, so this
+# step judges what it prints rather than its exit status: the fallback crates must be exactly
+# the ones D083's sealed A/B arm keeps native, and any other fallback, any extension
+# implementation hidden in a foundation crate (`native twin:`) and any crate outside the frozen
+# classification table (`FINDING:`) is red. A status but 0 or 1 is a usage or tool error, never
+# a pass.
+shipping_audit() {
+  local status=0 output="" line="" crate="" pair="" found="" tools=""
+  local -a fallbacks=() twins=() findings=() unexpected=() missing=() problems=()
+  # D083 / D-XO-31: A/B arm sealed; adoption is a later slice
+  # `<crate>:<the tool it implements>`: the whole allowed set in one place.
+  local -a allowed=(p1-tool-edit:edit p1-tool-write:write p1-tool-search:grep p1-tool-patch:apply_patch)
+
+  output="$(scripts/check-module-boundaries.sh --shipping)" || status=$?
+  case "$status" in
+    0 | 1) ;;
+    *)
+      echo "shipping audit: scripts/check-module-boundaries.sh --shipping exited $status; a usage or tool error is red" >&2
+      return 1
+      ;;
+  esac
+
+  while IFS= read -r line; do
+    case "$line" in
+      *"native twin:"*) twins+=("$line") ;;
+      *"FINDING:"*) findings+=("$line") ;;
+    esac
+  done <<<"$output"
+  mapfile -t fallbacks < <(printf '%s\n' "$output" | sed -n 's/^check-module-boundaries: shipping: native fallback: \([^ ]*\) (extension).*$/\1/p')
+
+  # Both directions of the comparison, so the step names every crate that must leave the graph
+  # and every allowed crate the graph no longer reaches.
+  for crate in "${fallbacks[@]}"; do
+    found=0
+    for pair in "${allowed[@]}"; do
+      if [ "$crate" = "${pair%%:*}" ]; then found=1; fi
+    done
+    if [ "$found" -eq 0 ]; then unexpected+=("$crate"); fi
+  done
+  for pair in "${allowed[@]}"; do
+    found=0
+    for crate in "${fallbacks[@]}"; do
+      if [ "$crate" = "${pair%%:*}" ]; then found=1; fi
+    done
+    if [ "$found" -eq 0 ]; then missing+=("${pair%%:*}"); fi
+  done
+
+  for line in "${twins[@]}"; do problems+=("shipping audit: $line"); done
+  for line in "${findings[@]}"; do problems+=("shipping audit: $line"); done
+  if [ "${#unexpected[@]}" -gt 0 ]; then
+    problems+=("shipping audit: native fallback(s) outside the D083 four: ${unexpected[*]}")
+  fi
+  if [ "${#missing[@]}" -gt 0 ]; then
+    problems+=("shipping audit: allowed D083 native fallback(s) missing from the graph: ${missing[*]}")
+  fi
+  if [ "$status" = 1 ] && [ "${#fallbacks[@]}" -eq 0 ]; then
+    problems+=("shipping audit: exit 1 with no native fallback line: findings only is red")
+  fi
+  if [ "${#problems[@]}" -gt 0 ]; then
+    printf '%s\n' "${problems[@]}" >&2
+    return 1
+  fi
+
+  for pair in "${allowed[@]}"; do
+    tools="${tools:+$tools, }${pair#*:}"
+  done
+  echo "shipping audit: ${#allowed[@]} allowed native fallbacks (D083): $tools"
+}
+
 echo "== gate: fmt"
 cargo fmt --all -- --check
 cargo fmt --manifest-path modules/Cargo.toml --all -- --check
@@ -133,6 +207,10 @@ echo "== gate: module boundary"
 # The tag's standing boundary check, next to core isolation: imports and the unsafe policy of
 # every package and crate, over the outputs the tests ran against.
 scripts/check-module-boundaries.sh
+echo "== gate: shipping audit"
+# The shipping graph's own inventory of native fallbacks, run right after the boundary check it
+# shares its script with: S7.10.1.
+shipping_audit
 echo "== gate: secret scan"
 scripts/secret-scan.sh
 echo "== gate: adr"
