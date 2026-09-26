@@ -53,9 +53,12 @@ p1-workflow = { path = "../p1-workflow", optional = true }
 p1-tool-workflow = { path = "../p1-tool-workflow", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# S1.5: a package's semantic capabilities are derived from S0's verified `LoadedModule`
-# (catalog/capabilities.rs). The same entry S1.4 adds for the package loader.
+# S1.4: catalog/modules registers the packages modules.lock selects. The runtime crate
+# verifies, compiles and adapts them, so the host needs no wasmtime of its own.
+# S1.5: a package's semantic capabilities are derived from the same verified `LoadedModule`
+# (catalog/capabilities.rs).
 p1-module-runtime = { path = "../p1-module-runtime" }
+thiserror = "2"
 # Route files are TOML data; `parse` is all this crate needs, exactly like the profile
 # and environment loaders in `p1-model-profile`/`p1-assembly`.
 toml = { version = "0.8", default-features = false, features = ["parse"] }

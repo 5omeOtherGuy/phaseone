@@ -9,6 +9,15 @@
 //! Completion is retained state plus ONE parent notification: the status is stored
 //! first, then the parent is told. A missed or ignored notification loses nothing —
 //! the result stays retrievable by id for the service's lifetime.
+//!
+//! [`scope`] adds the scoped surface a component links (the WIT worker interfaces) over
+//! any [`WorkerService`], without changing the service.
+
+pub mod scope;
+
+pub use scope::{
+    ScopeKey, WorkerScope, WorkerScopes, WorkersControl, WorkersObserve, WorkersStart,
+};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

@@ -1,0 +1,21 @@
+# The shipped module resolutions: module name -> official package, release version, digest
+# (the module's identity) and ABI (WIT world, protocol major.minor). Read by p1-assembly
+# (`load_modules_lock`); the host loader verifies each package against it and against p1's
+# release manifest before it compiles a byte. A lock next to a higher-priority environments
+# directory (e.g. ~/.config/p1/modules.lock) overrides entries of the same name, and can only
+# select another official package.
+#
+# Entry shape:
+#
+#   [modules.<name>]                 # the key an environment's `[[tools]] module = ...` names
+#   package  = "p1/<name>"           # the package manifest `name` (reserved p1/ namespace)
+#   version  = "<release version>"
+#   digest   = "sha256:<64 hex>"     # the package's `.wasm` digest
+#   world    = "p1:module/<kind>@1.0.0"
+#   protocol = "1.0"
+#
+# No shipped environment selects a module package yet: the slices that move a tool into a
+# package add its entry here together with the package itself.
+format = "p1-modules-lock/1"
+
+[modules]

@@ -1,7 +1,7 @@
 ---
 adr: 69
 title: Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: lead
 supersedes: []
@@ -145,3 +145,10 @@ config surface, and the tests use fake time and the crate's existing test transp
   bound fails an assertion instead of hanging CI.
 - Every test uses an injected clock or the paused tokio clock: no real sleep, no socket (except the
   crate's own existing loopback test for the connector, untouched), no credential file.
+- Accepted with ADR-0086 (issue #298, S4.6, epic #206), with the Decision
+  unchanged. On main the bounds still live where it put them: `FIRST_BYTE_TIMEOUT` and
+  `STREAM_IDLE_TIMEOUT` in `crates/p1-provider-http/src/http.rs`, the SSE frame loop and
+  `WAITING_NOTE_AFTER` in `drive.rs`, and `read_bounded` in `ws.rs`. The tests listed above still
+  hold them. The transport broker (`broker.rs`, S4.2 #284) hands a component's lowered request
+  to that same `drive` loop, so a provider component sees no time and sees bytes only after the
+  loop has framed them; it cannot move a bound.

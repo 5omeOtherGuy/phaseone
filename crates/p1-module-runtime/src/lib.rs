@@ -9,7 +9,9 @@
 //! - [`restricted`]: the synchronous inspection path (freeze item 4);
 //! - [`tool`]: `WasmTool`, the generic tool adapter (freeze item 12).
 
+pub mod authorization_policy;
 pub mod capabilities;
+pub mod context_policy;
 pub mod executor;
 pub mod loader;
 pub mod manifest;
@@ -17,8 +19,13 @@ pub mod restricted;
 mod sha256;
 pub mod tool;
 
+pub use authorization_policy::{AuthorizationPolicyError, Verdict, WasmAuthorizationPolicy};
 pub use capabilities::{
     ExitStatus, LinkError, ProcessCommand, ProcessEvent, ProcessService, RunningProcess, Services,
+};
+pub use context_policy::{
+    ContextPolicyError, SummaryError, SummaryRequest, SummaryResponse, SummaryService,
+    WasmContextPolicy,
 };
 pub use executor::ExecutionLimits;
 pub use loader::{LoadError, LoadedModule, Loader, ManualEpochs, ModuleKind};

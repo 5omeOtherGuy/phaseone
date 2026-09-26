@@ -38,6 +38,18 @@ pub enum ManifestError {
     /// field.
     #[error("the release manifest is invalid: {0}")]
     Invalid(String),
+    /// Two components claim one identity: the same manifest name, or the same digest under
+    /// two names. Either makes a lock resolution or a recorded module identity ambiguous,
+    /// so the whole manifest is refused rather than one of the two picked.
+    #[error("the release manifest is refused: {identity} is claimed by both {first} and {second}")]
+    DuplicateIdentity {
+        /// The name or digest claimed twice.
+        identity: String,
+        /// The path of the first component claiming it.
+        first: String,
+        /// The path of the second.
+        second: String,
+    },
 }
 
 /// A module's identity: the SHA-256 of its component bytes.
@@ -149,15 +161,37 @@ impl ReleaseManifest {
         for (index, entry) in entries.iter().enumerate() {
             let entry = component_entry(entry)
                 .map_err(|reason| invalid(format!("components[{index}]: {reason}")))?;
-            if components.iter().any(|known| known.name == entry.name) {
-                return Err(invalid(format!(
-                    "components[{index}]: {} is listed twice",
-                    entry.name
-                )));
+            if let Some(known) = components.iter().find(|known| known.name == entry.name) {
+                return Err(ManifestError::DuplicateIdentity {
+                    identity: entry.name,
+                    first: known.path.clone(),
+                    second: entry.path,
+                });
             }
             components.push(entry);
         }
         Ok(Self { components })
+    }
+
+    /// Refuses a release whose components share a digest under two names. Not part of
+    /// [`ReleaseManifest::parse`]: the runtime's own harness lists derived entries under the
+    /// fixture's digest to prove the loader's per-entry checks, while a release the host
+    /// selects modules from must give each set of bytes exactly one name, or a lock
+    /// resolution and a recorded module identity would be ambiguous.
+    pub fn check_unique_digests(&self) -> Result<(), ManifestError> {
+        for (index, entry) in self.components.iter().enumerate() {
+            if let Some(known) = self.components[..index]
+                .iter()
+                .find(|known| known.digest == entry.digest)
+            {
+                return Err(ManifestError::DuplicateIdentity {
+                    identity: entry.digest.to_string(),
+                    first: known.path.clone(),
+                    second: entry.path.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The entry for manifest name `name`, if the release has one.
@@ -311,5 +345,34 @@ mod tests {
             entry_with("b.wasm")
         ));
         assert!(ReleaseManifest::parse(&twice).is_err());
+    }
+
+    #[test]
+    fn refuses_one_identity_claimed_twice() {
+        let twice = manifest(&format!(
+            "{},{}",
+            entry_with("a.wasm"),
+            entry_with("b.wasm")
+        ));
+        match ReleaseManifest::parse(&twice).unwrap_err() {
+            ManifestError::DuplicateIdentity {
+                identity,
+                first,
+                second,
+            } => {
+                assert_eq!(identity, "p1/fixture");
+                assert_eq!((first.as_str(), second.as_str()), ("a.wasm", "b.wasm"));
+            }
+            other => panic!("expected DuplicateIdentity, got {other}"),
+        }
+        let renamed = entry_with("b.wasm").replace("p1/fixture", "p1/other");
+        let one_digest = manifest(&format!("{},{renamed}", entry_with("a.wasm")));
+        let parsed = ReleaseManifest::parse(&one_digest).expect("names are distinct");
+        assert!(matches!(
+            parsed.check_unique_digests().unwrap_err(),
+            ManifestError::DuplicateIdentity { identity, .. } if identity == DIGEST
+        ));
+        let single = ReleaseManifest::parse(&manifest(&entry_with("a.wasm"))).unwrap();
+        assert!(single.check_unique_digests().is_ok());
     }
 }

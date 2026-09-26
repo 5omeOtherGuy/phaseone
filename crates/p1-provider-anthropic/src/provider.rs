@@ -9,10 +9,9 @@
 
 use std::sync::Arc;
 
-use p1_contracts::tool::DeclarationKind;
 use p1_contracts::{
-    BoxFuture, CacheKeySupport, CancellationToken, ModelOptions, Origin, Provider, ProviderError,
-    ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription,
+    BoxFuture, CancellationToken, Provider, ProviderError, ProviderErrorKind, ProviderRequest,
+    ProviderStream, RouteDescription,
 };
 use p1_model_profile::ModelProfile;
 use p1_provider_http::{
@@ -23,19 +22,9 @@ use p1_provider_http::{
 use crate::MessagesRoute;
 use crate::parser::AnthropicParser;
 use crate::request::{
-    build_headers, build_headers_without_credential, build_messages, build_request, lower,
-    with_long_context,
+    MESSAGES_PATH, build_headers, build_headers_without_credential, build_request,
+    validate_composition, validate_request, with_long_context,
 };
-
-/// `native` keys in this namespace are route-specific. None are known in this
-/// slice, so any key here is rejected.
-const NATIVE_PREFIX: &str = "anthropic-messages.";
-
-/// Namespaces the OTHER compiled adapters own inside `ModelOptions::native`. An
-/// explicit option from one of them was silently dropped on a route switch
-/// before; it is now an error naming the option, this route and this adapter
-/// (ADR-0039). Keys in no adapter's namespace keep their meaning: ignored.
-const FOREIGN_NATIVE_PREFIXES: &[&str] = &["openai-responses.", "openai-chat."];
 
 /// One route file composed with one profile and one credential source.
 pub struct AnthropicProvider {
@@ -80,32 +69,6 @@ impl AnthropicProvider {
         self.route.endpoint = url.trim_end_matches('/').to_string();
         self
     }
-
-    fn origin(&self) -> Origin {
-        self.route.origin(&self.wire_model)
-    }
-}
-
-/// The one composition check, shared by the constructor and the pure request
-/// builder: the route data is usable, the profile is valid, and the profile's
-/// policy has an encoding here. Nothing is decided by a second, parallel table.
-pub(crate) fn validate_composition(
-    route: &MessagesRoute,
-    wire_model: &str,
-    profile: &ModelProfile,
-) -> Result<(), ProviderError> {
-    route.validate()?;
-    profile.validate()?;
-    if wire_model.is_empty() {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "wire model must be nonempty",
-        ));
-    }
-    // The pure lowering decides: an `enabled`/`preserved` profile has no Messages
-    // encoding, so it is refused here, at construction.
-    lower(profile, &ModelOptions::default())?;
-    Ok(())
 }
 
 impl std::fmt::Debug for AnthropicProvider {
@@ -119,73 +82,11 @@ impl std::fmt::Debug for AnthropicProvider {
 
 impl Provider for AnthropicProvider {
     fn describe(&self) -> RouteDescription {
-        RouteDescription {
-            origin: self.origin(),
-            // The Messages route declares JSON-schema function tools only.
-            supports_freeform_tools: false,
-            mandatory_prompt_prefix: Some(crate::request::IDENTITY.to_string()),
-            // A subscription bills by plan, not per request: cost is unknown.
-            reports_cost: false,
-            // This route caches with `cache_control` markers; `options.cache_key`
-            // never reaches the wire, so an explicit one is rejected below.
-            cache_key: CacheKeySupport::Unsupported,
-        }
+        self.route.describe(&self.wire_model)
     }
 
     fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
-        for tool in &request.tools {
-            if matches!(tool.kind, DeclarationKind::Freeform { .. }) {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::InvalidRequest,
-                    format!(
-                        "tool `{}` is declared freeform, which route {} cannot carry",
-                        tool.name, self.route.origin_route
-                    ),
-                ));
-            }
-        }
-        for key in request.options.native.keys() {
-            if key.starts_with(NATIVE_PREFIX) {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::InvalidRequest,
-                    format!("unsupported route-native option `{key}`"),
-                ));
-            }
-            if FOREIGN_NATIVE_PREFIXES
-                .iter()
-                .any(|prefix| key.starts_with(prefix))
-            {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::InvalidRequest,
-                    format!(
-                        "option \"{key}\" is not consumed by route \"{}\" \
-                         (adapter anthropic-messages): it belongs to another adapter's namespace",
-                        self.route.origin_route
-                    ),
-                ));
-            }
-        }
-        if request.options.cache_key.is_some() {
-            return Err(ProviderError::new(
-                ProviderErrorKind::InvalidRequest,
-                format!("route {} takes no cache key", self.route.origin_route),
-            ));
-        }
-        if request.options.max_output_tokens == Some(0) {
-            return Err(ProviderError::new(
-                ProviderErrorKind::InvalidRequest,
-                "max_output_tokens must be greater than zero",
-            ));
-        }
-        // The model policy: the same lowering the request builder runs, so
-        // `validate` can never accept a request the builder would reject.
-        lower(&self.profile, &request.options)?;
-        // The history: everything else the Messages wire cannot carry is lowered
-        // (a freeform call travels as `{"input": …}`), so the message mapping is
-        // the check. A transcript whose first message would be an assistant turn
-        // is refused by name before anything is sent (ADR-0049).
-        build_messages(&self.route.origin_route, &self.wire_model, &request.history)?;
-        Ok(())
+        validate_request(&self.route, &self.wire_model, &self.profile, request)
     }
 
     fn stream<'a>(
@@ -206,7 +107,7 @@ impl Provider for AnthropicProvider {
                 )
             })?;
 
-            let url = format!("{}/v1/messages", self.route.endpoint);
+            let url = format!("{}{MESSAGES_PATH}", self.route.endpoint);
             let account = self.route.account;
             let long_context = self.route.long_context;
             let origin_route = self.route.origin_route.clone();
@@ -249,7 +150,7 @@ impl Provider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p1_contracts::{Effort, Item, ModelOptions};
+    use p1_contracts::{CacheKeySupport, Effort, Item, ModelOptions};
     use p1_model_profile::ThinkingPolicy;
     use std::collections::BTreeMap;
 

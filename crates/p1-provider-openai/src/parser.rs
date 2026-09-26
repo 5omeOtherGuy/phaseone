@@ -15,7 +15,7 @@ use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_statu
 use serde_json::Value;
 
 /// Route-native parser. One instance per request attempt.
-pub(crate) struct CodexResponseParser {
+pub struct CodexResponseParser {
     route: String,
     model: String,
     /// Completed blocks in arrival order.
@@ -35,7 +35,7 @@ pub(crate) struct CodexResponseParser {
 impl CodexResponseParser {
     /// `origin_route` is the composed route's `Origin.route`; the model is the
     /// configured wire model, which `response.completed` may not echo.
-    pub(crate) fn new(origin_route: &str, model: &str) -> Self {
+    pub fn new(origin_route: &str, model: &str) -> Self {
         Self {
             route: origin_route.to_string(),
             model: model.to_string(),
