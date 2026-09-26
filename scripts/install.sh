@@ -25,6 +25,14 @@
 # an error rolls the previous installation back into place. The module set lives inside the
 # share directory, so it is replaced by the same rollback transaction as the shipped data.
 #
+# The module set is checked twice: the inline python check above the rename transaction, then
+# the staged binary itself — `p1 modules verify --integrity-only --root <extracted share>`
+# (ADR-0079, S1.6.1) — over the same extracted stage, still before any prefix write. Only the
+# binary's exit status decides (D069): a grant this runtime does not link yet is reported
+# `UNLINKED` and still verifies, so it never refuses a release. A binary that cannot run,
+# crashes, or rejects the subcommand or the flag refuses the install all the same. A release
+# whose share has no modules/ is not asked, and says so in one line.
+#
 # `--local` builds the share archive from this checkout's environments, routes and profiles
 # only: the local module build arrives with a later slice, so a local install ships no
 # share/p1/modules and is checked exactly like a release that has no modules/.
@@ -520,6 +528,24 @@ stage_binary() {
   chmod 0755 "$staged_bin"
 }
 
+# The staged release's own verification of its module set (S1.6.1, D079): the staged binary is
+# run over the directory the share tarball was extracted into, still before the prefix is
+# touched. Only its exit status decides (D069) — the report is the binary's to print, never the
+# installer's to read, so an `UNLINKED` grant the runtime does not link yet verifies. A binary
+# that is missing, crashes, or rejects the subcommand or the flag refuses the install alike.
+verify_staged_modules() {
+  local root="$1" status
+  if [ ! -d "$root/modules" ]; then
+    printf 'p1 install: this release ships no modules/ — the staged binary is not asked to verify a module set\n'
+    return 0
+  fi
+  status=0
+  "$staged_bin" modules verify --integrity-only --root "$root" || status=$?
+  if [ "$status" -ne 0 ]; then
+    die "the staged binary refused the module set (exit $status) — nothing installed"
+  fi
+}
+
 # The updater is written into the staged share, rather than after its directory is
 # committed, so a copy or chmod failure cannot leave a binary without a working updater.
 stage_self_and_updater() {
@@ -829,6 +855,10 @@ case "$mode" in
     stage_self_and_updater
     ;;
 esac
+
+# The staged binary's own check of the staged module set, after the inline archive checks and
+# still before the rename transaction, so a set that binary refuses never reaches the prefix.
+verify_staged_modules "$staged_share"
 
 publish_staged
 commit_install

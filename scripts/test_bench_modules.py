@@ -40,7 +40,7 @@ ROWS = [
     ("idle-provider", "Aim ≤16 MiB committed memory", "S4"),
     ("agents-16-rss", "Added steady-state RSS ≤400 MiB over native baseline", None),
     ("steady-growth", "No continuing resource/RSS growth after warm-up", None),
-    ("compaction-16", "No continuing growth; history rows within their targets", "S5"),
+    ("compaction-16", "No continuing growth; history rows within their targets", None),
 ]
 PENDING = [row for row, _, owner in ROWS if owner]
 
@@ -54,6 +54,7 @@ PASSING = {
     "idle-tool": ("idle_tool", "per-instance", 0.5, "MiB"),
     "agents-16-rss": ("agents_16_rss", "added-steady", 150.0, "MiB"),
     "steady-growth": ("steady_growth", "growth", "none", ""),
+    "compaction-16": ("compaction_16", "growth", "none", ""),
 }
 
 CARGO_STUB = textwrap.dedent(
@@ -283,7 +284,7 @@ class BenchModulesTests(unittest.TestCase):
         self.assertEqual([re.split(r"\s{2,}", line)[0] for line in lines[:-1]],
                          [row for row, _, _ in ROWS])
         self.assertTrue(lines[-1].startswith("bench-modules: acceptance --check: 14 rows:"), lines[-1])
-        self.assertIn("9 pass, 0 fail, 5 pending, 0 error; exit 3", lines[-1])
+        self.assertIn("10 pass, 0 fail, 4 pending, 0 error; exit 3", lines[-1])
 
     def test_every_row_carries_plans_threshold_verbatim(self) -> None:
         h = self.harness()
@@ -343,9 +344,9 @@ class BenchModulesTests(unittest.TestCase):
 
     def test_a_pending_row_alone_builds_and_runs_nothing(self) -> None:
         h = self.harness()
-        result = h.run("--suite", "acceptance", "--check", "--row", "compaction-16")
+        result = h.run("--suite", "acceptance", "--check", "--row", "read-adapter")
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
-        self.assertEqual(verdicts(result.stdout), {"compaction-16": "PENDING"})
+        self.assertEqual(verdicts(result.stdout), {"read-adapter": "PENDING"})
         self.assertEqual(h.calls(), [])
 
     # ---- thresholds -----------------------------------------------------------------
@@ -379,14 +380,17 @@ class BenchModulesTests(unittest.TestCase):
         self.assertIn("FAIL  p95 26.4 ms > 25 ms", result.stdout)
 
     def test_growth_passes_only_when_none(self) -> None:
-        for value, verdict, code in (("none", "PASS", 0), ("continuing (rss)", "FAIL", 1)):
-            with self.subTest(value=value):
-                h = self.harness()
-                h.reading("steady-growth", value=value)
-                result = h.run("--suite", "acceptance", "--check", "--row", "steady-growth")
-                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
-                self.assertEqual(verdicts(result.stdout), {"steady-growth": verdict})
-                self.assertIn(f"growth {value}", result.stdout)
+        # steady-growth is S7's row; compaction-16 is S5.9's (#333) and carries the same
+        # growth check beside the history rows' own cases.
+        for row in ("steady-growth", "compaction-16"):
+            for value, verdict, code in (("none", "PASS", 0), ("continuing (rss)", "FAIL", 1)):
+                with self.subTest(row=row, value=value):
+                    h = self.harness()
+                    h.reading(row, value=value)
+                    result = h.run("--suite", "acceptance", "--check", "--row", row)
+                    self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                    self.assertEqual(verdicts(result.stdout), {row: verdict})
+                    self.assertIn(f"growth {value}", result.stdout)
 
     def test_a_reading_in_another_unit_or_statistic_is_a_tooling_error(self) -> None:
         for kwargs in ({"unit": "us"}, {"statistic": "p50"}, {"value": "fast"}):
@@ -530,10 +534,14 @@ class BenchModulesTests(unittest.TestCase):
         self.assertEqual(by_id["history-1m"]["samples"], 40)
         self.assertEqual(by_id["read-adapter"]["verdict"], "PENDING")
         self.assertEqual(by_id["read-adapter"]["owner"], "S2")
-        self.assertEqual(by_id["compaction-16"]["owner"], "S5")
-        self.assertEqual(document["summary"]["pass"], 8)
+        # compaction-16 is measured since S5.9 (#333): it reports its growth, not an owner.
+        self.assertEqual(by_id["compaction-16"]["verdict"], "PASS")
+        self.assertEqual(by_id["compaction-16"]["measurements"],
+                         [{"statistic": "growth", "value": "none", "unit": ""}])
+        self.assertNotIn("owner", by_id["compaction-16"])
+        self.assertEqual(document["summary"]["pass"], 9)
         self.assertEqual(document["summary"]["fail"], 1)
-        self.assertEqual(document["summary"]["pending"], 5)
+        self.assertEqual(document["summary"]["pending"], 4)
 
     def test_an_unwritable_json_path_is_a_tooling_error(self) -> None:
         h = self.harness()
