@@ -271,7 +271,13 @@ fn imports(set: &Path, relative: &str) -> String {
                 names.join(", ")
             }
         }
-        Err(error) => format!("not recorded ({}: {error})", file.display()),
+        // A missing record is the ordinary case in a release archive, so it names the file
+        // the build would have written instead of printing an absolute path.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => format!(
+            "not recorded (the module set has no {})",
+            Path::new(relative).with_extension("imports").display()
+        ),
+        Err(error) => format!("not recorded ({error})"),
     }
 }
 
@@ -286,39 +292,55 @@ fn verify(deps: &HostDeps, root: &Path) -> i32 {
     };
     let mut verified = 0_usize;
     let mut failed = 0_usize;
-    // Identity is the digest (package.md): the same bytes under two names are one module
-    // listed twice, which a release must not ship as two.
     let mut identities: HashMap<Digest, String> = HashMap::new();
     let mut out = String::new();
     for entry in manifest.components() {
-        let mut problems = manifest_problems(entry);
-        match identities.get(&entry.digest) {
-            Some(previous) => problems.push(format!(
-                "duplicate identity: {} is also {previous}",
-                entry.digest
-            )),
-            None => {
-                identities.insert(entry.digest, entry.name.clone());
-            }
-        }
-        match component_file(&set, entry) {
+        match entry_problems(&set, entry, &mut identities) {
             Ok(size) => {
-                if problems.is_empty() {
-                    verified += 1;
-                    let _ = writeln!(out, "{} ok {} ({size} bytes)", entry.name, entry.digest);
-                    continue;
+                verified += 1;
+                let _ = writeln!(out, "{} ok {} ({size} bytes)", entry.name, entry.digest);
+            }
+            Err(problems) => {
+                failed += 1;
+                for problem in problems {
+                    let _ = writeln!(out, "{} FAILED {problem}", entry.name);
                 }
             }
-            Err(problem) => problems.push(problem),
-        }
-        failed += 1;
-        for problem in problems {
-            let _ = writeln!(out, "{} FAILED {problem}", entry.name);
         }
     }
     let _ = writeln!(out, "modules verify: {verified} ok, {failed} failed");
     write_stdout(deps, &out);
     if failed == 0 { EXIT_OK } else { EXIT_FAILURE }
+}
+
+/// One entry's whole verification: the manifest-only checks and the component file, in the
+/// order the loader would refuse them. `Ok` is the size of the bytes that passed; `Err` is one
+/// line per problem.
+fn entry_problems(
+    set: &Path,
+    entry: &ComponentEntry,
+    identities: &mut HashMap<Digest, String>,
+) -> Result<u64, Vec<String>> {
+    let mut problems = manifest_problems(entry);
+    // Identity is the digest (package.md): the same bytes under two names are one module
+    // listed twice, which a release must not ship as two.
+    match identities.get(&entry.digest) {
+        Some(previous) => problems.push(format!(
+            "duplicate identity: {} is also {previous}",
+            entry.digest
+        )),
+        None => {
+            identities.insert(entry.digest, entry.name.clone());
+        }
+    }
+    match component_file(set, entry) {
+        Ok(size) if problems.is_empty() => Ok(size),
+        Ok(_) => Err(problems),
+        Err(problem) => {
+            problems.push(problem);
+            Err(problems)
+        }
+    }
 }
 
 /// The checks `Loader::load` makes from the manifest entry alone, before it reads a byte

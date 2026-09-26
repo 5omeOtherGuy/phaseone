@@ -157,6 +157,16 @@ impl Scratch {
         std::fs::write(&path, bytes).unwrap();
     }
 
+    /// Drops the imported-interface record, as a release archive does: it ships the component
+    /// alone (ADR-0079).
+    fn drop_imports(&self) {
+        std::fs::remove_file(
+            self.package_dir()
+                .join(format!("{FIXTURE_PACKAGE}.imports")),
+        )
+        .unwrap();
+    }
+
     /// Runs the real binary on `args` with this scratch home, config directory and no ambient
     /// credential variable, and returns what it printed.
     fn run(&self, args: &[&str]) -> Output {
@@ -320,6 +330,25 @@ fn inspect_reports_the_manifest_fields_the_imports_and_the_grants() {
     ]);
     assert_eq!(code(&done), 0, "{}", stderr(&done));
     assert_eq!(stdout(&done), report);
+
+    // A set that ships the component alone (a release archive) has no import record to read,
+    // and says so instead of inventing a list.
+    let released = Scratch::new();
+    released.drop_imports();
+    let done = released.run(&[
+        "modules",
+        "inspect",
+        FIXTURE_NAME,
+        "--root",
+        &released.root(),
+    ]);
+    assert_eq!(code(&done), 0, "{}", stderr(&done));
+    assert_eq!(
+        inspect_fields(&stdout(&done))["imports"],
+        format!(
+            "not recorded (the module set has no packages/{FIXTURE_PACKAGE}/{FIXTURE_PACKAGE}.imports)"
+        )
+    );
 }
 
 /// An unknown name is an explicit error, never an empty report.
