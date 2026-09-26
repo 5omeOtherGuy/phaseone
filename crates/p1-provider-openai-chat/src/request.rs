@@ -1,3 +1,4 @@
+use crate::replay::{self, Replay};
 use crate::{ChatDialect, ChatRoute};
 use p1_contracts::{
     AssistantBlock, AssistantItem, DeclarationKind, Effort, Item, Origin, ProviderError,
@@ -108,9 +109,10 @@ struct LoweredItem {
 /// rendered as assistant text, and a tool call becomes a function call. A
 /// `ToolInput::Text` — a freeform call made on a route that has such a shape — has
 /// no freeform shape here, so its arguments are the JSON object
-/// `{"input": <raw text>}` (ADR-0049, model-selection.md §3). Everything else is
-/// refused with a sentence naming the item. `validate` and `build_request` share
-/// this, so `validate` can never accept a request the builder would reject.
+/// `{"input": <raw text>}` (ADR-0049, model-selection.md §3). Our own replay data in a
+/// layout this build does not read is refused with a sentence naming the item, its
+/// origin and both versions. `validate` and `build_request` share this, so `validate`
+/// can never accept a request the builder would reject.
 fn lower_item(origin: &Origin, item: &AssistantItem) -> Result<LoweredItem, ProviderError> {
     let mut lowered = LoweredItem {
         text: String::new(),
@@ -123,25 +125,31 @@ fn lower_item(origin: &Origin, item: &AssistantItem) -> Result<LoweredItem, Prov
             AssistantBlock::Text { text } => lowered.text.push_str(text),
             AssistantBlock::Reasoning {
                 replay: Some(data), ..
-            } if data.origin == *origin => {
-                if data.version != 1 {
+            } => match replay::decode(data, origin) {
+                Replay::Foreign => {}
+                Replay::Carried(part) => {
+                    lowered.reasoning.push_str(part);
+                    lowered.has_reasoning = true;
+                }
+                Replay::UnsupportedVersion { version } => {
                     return Err(invalid(&format!(
                         "cannot replay the reasoning block of the assistant item from {}/{}: \
-                         its replay data is version {}, this route reads version 1",
-                        data.origin.route, data.origin.model, data.version
+                         its replay data is version {version}, this route reads version {}",
+                        data.origin.route,
+                        data.origin.model,
+                        replay::REPLAY_VERSION
                     )));
                 }
-                let part = data.payload.as_str().ok_or_else(|| {
-                    invalid(&format!(
+                Replay::UnsupportedPayload => {
+                    return Err(invalid(&format!(
                         "cannot replay the reasoning block of the assistant item from {}/{}: \
                          its replay payload is not text",
                         data.origin.route, data.origin.model
-                    ))
-                })?;
-                lowered.reasoning.push_str(part);
-                lowered.has_reasoning = true;
-            }
-            // Foreign reasoning: dropped entirely (providers.md "Replay").
+                    )));
+                }
+            },
+            // A reasoning block without replay data, and a foreign one: dropped
+            // entirely (providers.md "Replay").
             AssistantBlock::Reasoning { .. } => {}
             AssistantBlock::ToolCall(call) => {
                 let arguments = match &call.input {
