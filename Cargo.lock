@@ -1861,6 +1861,7 @@ name = "p1-module-tests"
 version = "0.0.1"
 dependencies = [
  "futures-util",
+ "p1-context",
  "p1-contracts",
  "p1-core",
  "p1-module-runtime",

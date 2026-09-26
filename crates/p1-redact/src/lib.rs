@@ -24,15 +24,23 @@
 //! A long base64 blob is NOT a credential: it is masked only when it matches one of
 //! the patterns above. A provider's thinking signature is opaque continuation data
 //! (`ReplayData`), never tool-result text, so it is never passed to [`redact`] and
-//! stays byte-for-byte intact.
+//! stays byte-for-byte intact (PLAN.md §9).
 //!
 //! Masking is idempotent: a replaced `<redacted:…>` marker cannot match any of the
 //! patterns again.
+//!
+//! ADR-0083 §4 extends the layer (S3.6) to everything else a component produces that
+//! reaches the model, the journal or the UI: the [`RedactingTool`] decorator masks the
+//! declaration's description once at construction (the trait returns a reference, so the
+//! masked value is stored), and the `target` and `edit` of every `describe` and the
+//! `summary` and every string of the detail of every `describe_result`. `effect` and
+//! `identity` are closed values and pass through. Masking still happens before anything
+//! durable (history, journal, summary, UI) is built from a tool's output.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use p1_contracts::tool::ResultDescription;
+use p1_contracts::tool::{EditPreview, ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
     ToolOutcome, ToolResultItem,
@@ -147,17 +155,96 @@ impl MaskCounter {
     }
 }
 
-/// A [`Tool`] decorator: it forwards declaration, identity, effect and description
-/// to the tool it wraps and rewrites the text of every `ToolOutcome` through
-/// [`redact`] before the core can see it.
+/// A [`Tool`] decorator: it forwards identity and effect to the tool it wraps, masks
+/// its declaration description once at construction, and rewrites the text of every
+/// [`ToolOutcome`], `describe` and `describe_result` through [`redact`] before the core
+/// or the UI can see it. Every masked value is added to `counter`.
 pub struct RedactingTool {
     inner: Arc<dyn Tool>,
+    /// The declaration with its description already masked. `Tool::declaration` returns a
+    /// reference, so the masked value has to be stored at construction (ADR-0083 §4).
+    declaration: ToolDeclaration,
     counter: Arc<MaskCounter>,
 }
 
 impl RedactingTool {
     pub fn new(inner: Arc<dyn Tool>, counter: Arc<MaskCounter>) -> Self {
-        Self { inner, counter }
+        let declared = inner.declaration();
+        let description = redact(&declared.description);
+        counter.add(description.masked);
+        let declaration = ToolDeclaration {
+            name: declared.name.clone(),
+            description: description.text,
+            kind: declared.kind.clone(),
+        };
+        Self {
+            inner,
+            declaration,
+            counter,
+        }
+    }
+
+    /// Mask one text and count what was replaced.
+    fn mask(&self, text: &str) -> String {
+        let redaction = redact(text);
+        self.counter.add(redaction.masked);
+        redaction.text
+    }
+
+    /// Mask every string of a call description: its `target` and an edit preview's
+    /// `path`, `old` and `new`. The verb and the destructive flag are closed values.
+    fn mask_call_description(&self, mut description: CallDescription) -> CallDescription {
+        description.target = description.target.map(|target| self.mask(&target));
+        if let Some(edit) = description.edit.take() {
+            description.edit = Some(EditPreview {
+                path: self.mask(&edit.path),
+                old: self.mask(&edit.old),
+                new: self.mask(&edit.new),
+            });
+        }
+        description
+    }
+
+    /// Mask every string of a result description: its `summary` and every string of its
+    /// detail (a diff's path and sides, a command's tail, match and file paths, free text).
+    fn mask_result_description(&self, mut description: ResultDescription) -> ResultDescription {
+        description.summary = self.mask(&description.summary);
+        description.detail = description
+            .detail
+            .take()
+            .map(|detail| self.mask_detail(detail));
+        description
+    }
+
+    fn mask_detail(&self, detail: ResultDetail) -> ResultDetail {
+        match detail {
+            ResultDetail::Diff {
+                path,
+                before,
+                after,
+            } => ResultDetail::Diff {
+                path: self.mask(&path),
+                before: self.mask(&before),
+                after: self.mask(&after),
+            },
+            ResultDetail::Command {
+                exit_code,
+                elapsed_ms,
+                tail,
+            } => ResultDetail::Command {
+                exit_code,
+                elapsed_ms,
+                tail: tail.iter().map(|line| self.mask(line)).collect(),
+            },
+            ResultDetail::Matches { count, files } => ResultDetail::Matches {
+                count,
+                files: files.iter().map(|file| self.mask(file)).collect(),
+            },
+            ResultDetail::Files { paths } => ResultDetail::Files {
+                paths: paths.iter().map(|path| self.mask(path)).collect(),
+            },
+            ResultDetail::Text(text) => ResultDetail::Text(self.mask(&text)),
+        }
     }
 }
 
@@ -168,7 +255,7 @@ pub fn redacted(tool: Arc<dyn Tool>, counter: &Arc<MaskCounter>) -> Arc<dyn Tool
 
 impl Tool for RedactingTool {
     fn declaration(&self) -> &ToolDeclaration {
-        self.inner.declaration()
+        &self.declaration
     }
 
     fn identity(&self) -> &ToolIdentity {
@@ -180,11 +267,11 @@ impl Tool for RedactingTool {
     }
 
     fn describe(&self, call: &ToolCall) -> CallDescription {
-        self.inner.describe(call)
+        self.mask_call_description(self.inner.describe(call))
     }
 
     fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
-        self.inner.describe_result(call, result)
+        self.mask_result_description(self.inner.describe_result(call, result))
     }
 
     fn execute<'a>(
@@ -342,5 +429,303 @@ mod tests {
 
         assert_eq!(outcome.content, "     1\tfn main() {}\n");
         assert_eq!(counter.take(), 0);
+    }
+
+    use p1_contracts::{DeclarationKind, ToolStatus};
+
+    /// A native tool the masking tests control completely: its declaration and both
+    /// descriptions are whatever the test builds, so masking is observed field by field.
+    struct StubTool {
+        declaration: ToolDeclaration,
+        identity: ToolIdentity,
+        call: CallDescription,
+        result: ResultDescription,
+    }
+
+    impl StubTool {
+        fn new(description: &str) -> Self {
+            Self {
+                declaration: ToolDeclaration {
+                    name: "stub".to_owned(),
+                    description: description.to_owned(),
+                    kind: DeclarationKind::Freeform { grammar: None },
+                },
+                identity: ToolIdentity {
+                    implementation: "stub".to_owned(),
+                    variant: "test".to_owned(),
+                },
+                call: CallDescription {
+                    verb: "call",
+                    target: None,
+                    edit: None,
+                    destructive: false,
+                },
+                result: ResultDescription {
+                    summary: String::new(),
+                    detail: None,
+                },
+            }
+        }
+    }
+
+    impl Tool for StubTool {
+        fn declaration(&self) -> &ToolDeclaration {
+            &self.declaration
+        }
+
+        fn identity(&self) -> &ToolIdentity {
+            &self.identity
+        }
+
+        fn effect(&self, _call: &ToolCall) -> Effect {
+            Effect::ReadOnly
+        }
+
+        fn describe(&self, _call: &ToolCall) -> CallDescription {
+            self.call.clone()
+        }
+
+        fn describe_result(&self, _call: &ToolCall, _result: &ToolResultItem) -> ResultDescription {
+            self.result.clone()
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _call: &'a ToolCall,
+            _context: ToolContext,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            Box::pin(async move { ToolOutcome::ok("unused") })
+        }
+    }
+
+    fn stub_call() -> ToolCall {
+        p1_testkit::json_call("c1", "stub", "{}")
+    }
+
+    fn stub_result_item() -> ToolResultItem {
+        ToolResultItem {
+            call_id: "c1".to_owned(),
+            name: "stub".to_owned(),
+            status: ToolStatus::Ok,
+            content: String::new(),
+        }
+    }
+
+    /// Mask one result description through the decorator and return it with the count.
+    fn masked_result(summary: &str, detail: Option<ResultDetail>) -> (ResultDescription, usize) {
+        let counter = Arc::new(MaskCounter::new());
+        let mut stub = StubTool::new("stub");
+        stub.result = ResultDescription {
+            summary: summary.to_owned(),
+            detail,
+        };
+        let tool = RedactingTool::new(Arc::new(stub), counter.clone());
+        let masked = tool.describe_result(&stub_call(), &stub_result_item());
+        (masked, counter.take())
+    }
+
+    #[test]
+    fn the_declaration_description_is_masked_at_construction() {
+        let secret = key("sk-", 24);
+        let counter = Arc::new(MaskCounter::new());
+        let tool = RedactingTool::new(
+            Arc::new(StubTool::new(&format!("reads {secret} for you"))),
+            counter.clone(),
+        );
+
+        assert_eq!(tool.declaration().name, "stub");
+        assert!(!tool.declaration().description.contains(&secret));
+        assert_eq!(
+            tool.declaration().description,
+            "reads <redacted:sk-:24 chars> for you"
+        );
+        // Construction counts what it masked.
+        assert_eq!(counter.take(), 1);
+    }
+
+    #[test]
+    fn an_already_masked_declaration_is_left_as_it_is() {
+        let counter = Arc::new(MaskCounter::new());
+        let tool = RedactingTool::new(
+            Arc::new(StubTool::new("reads <redacted:sk-:24 chars>")),
+            counter.clone(),
+        );
+
+        assert_eq!(
+            tool.declaration().description,
+            "reads <redacted:sk-:24 chars>"
+        );
+        assert_eq!(counter.take(), 0);
+    }
+
+    #[test]
+    fn a_call_description_masks_the_target_and_the_edit_preview() {
+        let target = key("sk-ant-", 24);
+        let old = key("sk-proj-", 22);
+        let new = key("sk-", 26);
+        let counter = Arc::new(MaskCounter::new());
+        let mut stub = StubTool::new("stub");
+        stub.call = CallDescription {
+            verb: "edit",
+            target: Some(format!("edit {target}")),
+            edit: Some(EditPreview {
+                path: format!("/tmp/{target}"),
+                old: old.clone(),
+                new: new.clone(),
+            }),
+            destructive: false,
+        };
+        let tool = RedactingTool::new(Arc::new(stub), counter.clone());
+
+        let described = tool.describe(&stub_call());
+
+        assert_eq!(described.verb, "edit");
+        assert_eq!(
+            described.target.as_deref(),
+            Some("edit <redacted:sk-ant-:24 chars>")
+        );
+        let edit = described.edit.expect("the edit preview");
+        assert_eq!(edit.path, "/tmp/<redacted:sk-ant-:24 chars>");
+        assert_eq!(edit.old, "<redacted:sk-proj-:22 chars>");
+        assert_eq!(edit.new, "<redacted:sk-:26 chars>");
+        // The target and the path each carry the same key, and the two edit sides one each.
+        assert_eq!(counter.take(), 4);
+    }
+
+    #[test]
+    fn a_result_description_masks_the_summary_and_every_detail_field() {
+        let summary = key("sk-", 24);
+        let (masked, count) = masked_result(&summary, None);
+        assert_eq!(masked.summary, "<redacted:sk-:24 chars>");
+        assert!(masked.detail.is_none());
+        assert_eq!(count, 1);
+
+        let diff = key("sk-ant-", 24);
+        let (masked, count) = masked_result(
+            "",
+            Some(ResultDetail::Diff {
+                path: format!("/tmp/{diff}"),
+                before: diff.clone(),
+                after: "clean".to_owned(),
+            }),
+        );
+        assert_eq!(
+            masked.detail,
+            Some(ResultDetail::Diff {
+                path: "/tmp/<redacted:sk-ant-:24 chars>".to_owned(),
+                before: "<redacted:sk-ant-:24 chars>".to_owned(),
+                after: "clean".to_owned(),
+            })
+        );
+        assert_eq!(count, 2);
+
+        let tail = key("sk-proj-", 22);
+        let (masked, count) = masked_result(
+            "",
+            Some(ResultDetail::Command {
+                exit_code: Some(1),
+                elapsed_ms: Some(5),
+                tail: vec!["ok".to_owned(), tail],
+            }),
+        );
+        match masked.detail {
+            Some(ResultDetail::Command {
+                exit_code,
+                elapsed_ms,
+                tail,
+            }) => {
+                assert_eq!(exit_code, Some(1));
+                assert_eq!(elapsed_ms, Some(5));
+                assert_eq!(
+                    tail,
+                    vec!["ok".to_owned(), "<redacted:sk-proj-:22 chars>".to_owned()]
+                );
+            }
+            other => panic!("expected a command detail, got {other:?}"),
+        }
+        assert_eq!(count, 1);
+
+        let file = key("sk-or-", 24);
+        let (masked, count) = masked_result(
+            "",
+            Some(ResultDetail::Matches {
+                count: 1,
+                files: vec![format!("/tmp/{file}")],
+            }),
+        );
+        assert_eq!(
+            masked.detail,
+            Some(ResultDetail::Matches {
+                count: 1,
+                files: vec!["/tmp/<redacted:sk-or-:24 chars>".to_owned()],
+            })
+        );
+        assert_eq!(count, 1);
+
+        let path = key("sk-svcacct-", 24);
+        let (masked, count) = masked_result(
+            "",
+            Some(ResultDetail::Files {
+                paths: vec![path.clone()],
+            }),
+        );
+        assert_eq!(
+            masked.detail,
+            Some(ResultDetail::Files {
+                paths: vec!["<redacted:sk-svcacct-:24 chars>".to_owned()],
+            })
+        );
+        assert_eq!(count, 1);
+
+        let text = key("sk-admin-", 24);
+        let (masked, count) = masked_result("", Some(ResultDetail::Text(format!("see {text}"))));
+        assert_eq!(
+            masked.detail,
+            Some(ResultDetail::Text(
+                "see <redacted:sk-admin-:24 chars>".to_owned()
+            ))
+        );
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn clean_declarations_and_descriptions_are_left_alone() {
+        let counter = Arc::new(MaskCounter::new());
+        let mut stub = StubTool::new("plain description");
+        stub.call = CallDescription {
+            verb: "read",
+            target: Some("src/lib.rs".to_owned()),
+            edit: None,
+            destructive: false,
+        };
+        stub.result = ResultDescription {
+            summary: "1 file".to_owned(),
+            detail: Some(ResultDetail::Files {
+                paths: vec!["src/lib.rs".to_owned()],
+            }),
+        };
+        let tool = RedactingTool::new(Arc::new(stub), counter.clone());
+
+        assert_eq!(tool.declaration().description, "plain description");
+        assert_eq!(
+            tool.describe(&stub_call()).target.as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            tool.describe_result(&stub_call(), &stub_result_item())
+                .summary,
+            "1 file"
+        );
+        assert_eq!(counter.take(), 0);
+    }
+
+    #[test]
+    fn the_decorator_forwards_effect_and_identity() {
+        let counter = Arc::new(MaskCounter::new());
+        let tool = RedactingTool::new(Arc::new(StubTool::new("stub")), counter);
+
+        assert_eq!(tool.effect(&stub_call()), Effect::ReadOnly);
+        assert_eq!(tool.identity().implementation, "stub");
+        assert_eq!(tool.identity().variant, "test");
     }
 }

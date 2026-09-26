@@ -33,3 +33,6 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 p1-testkit = { path = "../p1-testkit" }
 p1-workers = { path = "../p1-workers" }
+# The redaction suite (S3.6) proves from the outside that a transcript rendered for the
+# summarizer is built from masked history and that p1-context masks the summary's own answer.
+p1-context = { path = "../p1-context" }
