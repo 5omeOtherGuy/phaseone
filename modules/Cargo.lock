@@ -148,6 +148,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-finish-guest"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-module-context"
 version = "0.0.1"
 dependencies = [
@@ -155,6 +163,16 @@ dependencies = [
  "p1-context",
  "p1-contracts",
  "p1-module-protocol",
+]
+
+[[package]]
+name = "p1-module-finish"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "p1-finish-guest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

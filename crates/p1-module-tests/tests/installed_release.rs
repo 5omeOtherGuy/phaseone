@@ -711,6 +711,7 @@ async fn load_every_installed_component(modules_root: &Path) {
         Services {
             process: Some(process),
             summary: None,
+            completion: None,
         },
         ExecutionLimits::default(),
         &Arc::new(MaskCounter::new()),

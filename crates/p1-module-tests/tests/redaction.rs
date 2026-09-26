@@ -56,6 +56,7 @@ fn wrapped(loader: &Loader) -> (Arc<dyn Tool>, Arc<MaskCounter>) {
         Services {
             process: Some(fake_processes().0),
             summary: None,
+            completion: None,
         },
         ExecutionLimits::default(),
         &counter,

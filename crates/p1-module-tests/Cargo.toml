@@ -46,3 +46,6 @@ p1-workflow = { path = "../p1-workflow" }
 # environments over it, with the testkit's scripted provider and fake tools.
 p1-assembly = { path = "../p1-assembly" }
 p1-host = { path = "../p1-host" }
+# S3.7: the finish boundary suite compares the component's committed state and declaration
+# with the native tool's types and texts.
+p1-tool-finish = { path = "../p1-tool-finish" }

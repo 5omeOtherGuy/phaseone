@@ -1,0 +1,32 @@
+[package]
+name = "p1-module-finish"
+description = "The p1 `finish` tool as a component: the guest behaviour of p1-finish-guest over the host's completion capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-tool = { path = "../p1-bindings-tool" }
+# The guest behaviour lives with the native adapter it is tested through (decision S0-R3,
+# docs/design/modules/package.md "Shared guest logic"), so both hosts run the same source.
+p1-finish-guest = { path = "../../crates/p1-tool-finish/guest" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The frozen package manifest (docs/design/modules/package.md). `finish` reads the session
+# record and submits its candidate through the host's completion hub and needs nothing else:
+# no `control` (it never waits) and no `clock` (it reports no time).
+[package.metadata.p1-module]
+name = "p1/finish"
+kind = "tool"
+world = "p1:module/tool@1.0.0"
+protocol = "1.0"
+capabilities = ["completion"]
+variant = "claude"

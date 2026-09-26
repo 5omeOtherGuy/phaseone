@@ -5,12 +5,14 @@
 //! - [`manifest`]: the release manifest, the one source modules load from;
 //! - [`loader`]: verify-then-compile-same-bytes, the digest as identity (freeze item 6);
 //! - [`capabilities`]: the host imports linked per the manifest's grants;
+//! - [`completion`]: the `completion` import, linked to the host's completion hub;
 //! - [`executor`]: the one owner of a module's async Stores (ADR-0015);
 //! - [`restricted`]: the synchronous inspection path (freeze item 4);
 //! - [`tool`]: `WasmTool`, the generic tool adapter (freeze item 12).
 
 pub mod authorization_policy;
 pub mod capabilities;
+pub mod completion;
 pub mod context_policy;
 pub mod executor;
 pub mod loader;
@@ -23,6 +25,7 @@ pub use authorization_policy::{AuthorizationPolicyError, Verdict, WasmAuthorizat
 pub use capabilities::{
     ExitStatus, LinkError, ProcessCommand, ProcessEvent, ProcessService, RunningProcess, Services,
 };
+pub use completion::CompletionService;
 pub use context_policy::{
     ContextPolicyError, SummaryError, SummaryRequest, SummaryResponse, SummaryService,
     WasmContextPolicy,

@@ -69,6 +69,7 @@ async fn bench() {
             Services {
                 process: Some(fake_processes().0),
                 summary: None,
+                completion: None,
             },
             ExecutionLimits::default(),
             &counter,

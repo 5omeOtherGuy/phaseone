@@ -62,6 +62,7 @@ fn fixture_tool(release: &Release) -> (Arc<dyn Tool>, p1_module_tests::FakeProce
         Services {
             process: Some(process),
             summary: None,
+            completion: None,
         },
         ExecutionLimits::default(),
         &Arc::new(MaskCounter::new()),
@@ -125,6 +126,7 @@ async fn load_verifies_then_compiles_the_same_bytes() {
         Services {
             process: Some(fake_processes().0),
             summary: None,
+            completion: None,
         },
         ExecutionLimits::default(),
         &Arc::new(MaskCounter::new()),
@@ -342,6 +344,7 @@ async fn the_host_gets_the_redacting_wrapper() {
         Services {
             process: Some(fake_processes().0),
             summary: None,
+            completion: None,
         },
         ExecutionLimits::default(),
         &counter,
