@@ -17,11 +17,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use p1_assembly::{Catalog, ModulesLock, ToolServices};
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{BoxFuture, Provider, ProviderError};
+use p1_host::catalog::modules::{load_locked_modules, register_modules};
 use p1_host::catalog::{ProviderComponents, provider_component, route_provider};
 use p1_host::routes::{AdapterSettings, RouteFile, load_route, load_route_by_id};
 use p1_model_profile::ModelProfile;
+use p1_module_runtime::Services;
 use p1_module_tests::Release;
 use p1_provider_http::testing::{ScriptedTransport, ScriptedWsConnector};
 use p1_provider_http::{Credential, CredentialSource};
@@ -169,9 +172,20 @@ fn activate_with(
     route: &RouteFile,
     profile: &str,
 ) -> (Result<Arc<dyn Provider>, String>, ScriptedTransport) {
+    activate_in(components, &environment_dirs(), route, profile)
+}
+
+/// As [`activate_with`], for the environment search directories `dirs`: activation reads the
+/// lock next to them and the profile beside them, so a case can hand it its own.
+fn activate_in(
+    components: &ProviderComponents,
+    dirs: &[PathBuf],
+    route: &RouteFile,
+    profile: &str,
+) -> (Result<Arc<dyn Provider>, String>, ScriptedTransport) {
     let transport = ScriptedTransport::new(Vec::new());
     let provider = components.activate(
-        &environment_dirs(),
+        dirs,
         route,
         shipped_profile(profile),
         Arc::new(transport.clone()),
@@ -424,4 +438,95 @@ fn is_websocket_route(route: &RouteFile) -> bool {
         AdapterSettings::OpenAiResponses(settings)
             if settings.transport == p1_provider_openai::ResponsesTransport::Websocket
     )
+}
+
+/// A test-only installation: an environments directory with `lock` written next to it and the
+/// shipped profile `id` copied beside it. Activation reads the lock and the profile text from
+/// there, so nothing here touches the shipped `modules.lock` or a real login.
+fn scratch(lock: &str, profile: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    std::fs::create_dir_all(dir.path().join("environments")).expect("the environments directory");
+    std::fs::create_dir_all(dir.path().join("profiles")).expect("the profiles directory");
+    std::fs::write(dir.path().join("modules.lock"), lock).expect("the test lock");
+    std::fs::copy(
+        repo_root().join("profiles").join(format!("{profile}.toml")),
+        dir.path().join("profiles").join(format!("{profile}.toml")),
+    )
+    .expect("the shipped profile");
+    dir
+}
+
+/// ANSWERS D083b: a user's lock may select a provider package for the module name an adapter's
+/// component carries. `register_modules` accepts that package (it is never a tool), and
+/// activation uses the module the lock selected in place of the release's host entry of the
+/// same adapter. Nothing here reads the shipped `modules.lock`.
+#[test]
+fn a_lock_selected_provider_package_is_accepted_and_is_what_activation_uses() {
+    // The module name the lock gives the adapter's component: its manifest name without the
+    // reserved namespace, as `modules.lock` documents its keys.
+    const MODULE: &str = "provider-anthropic";
+    const PROFILE: &str = "claude-sonnet-5";
+
+    // The built Anthropic component, published under a name of its own as the package a user's
+    // lock selects: this release has no `p1/provider-anthropic` entry, so an activation that
+    // took the release's host entry instead of the lock's package could not succeed.
+    let package = &built()[0];
+    assert_eq!(package.name, "p1/provider-anthropic");
+    let mut entry = package.entry.clone();
+    entry["name"] = json!("p1/anthropic-local");
+    entry["path"] = json!("packages/p1-anthropic-local/p1-anthropic-local.wasm");
+    let mut release = Release::empty();
+    release.add(entry.clone(), &package.bytes);
+    let manifest = release.manifest_file();
+
+    let lock_text = p1_module_tests::lock_text(MODULE, &entry);
+    let installation = scratch(&lock_text, PROFILE);
+    let lock = ModulesLock::parse(&installation.path().join("modules.lock"), &lock_text)
+        .expect("the test lock");
+
+    // A lock that selects a provider package is accepted, and it takes no catalog key.
+    let packages =
+        load_locked_modules(&lock, &manifest).expect("the lock's provider package loads");
+    let mut catalog = Catalog::new();
+    register_modules(
+        &mut catalog,
+        packages,
+        Arc::new(|_: &str, _: &ToolServices| Services::default()),
+    )
+    .expect("a lock-selected provider package is accepted");
+    assert!(
+        !catalog.tool_keys().contains(&MODULE.to_owned()),
+        "a provider package is not a tool: {:?}",
+        catalog.tool_keys()
+    );
+
+    // It is what activation uses: the route becomes the module the lock selected, and its
+    // route value is the native adapter's for the same route file and profile.
+    let components = ProviderComponents::read(&manifest).expect("the release");
+    let route = shipped_route("anthropic-subscription");
+    let dirs = vec![installation.path().join("environments")];
+    let (activated, transport) = activate_in(&components, &dirs, &route, PROFILE);
+    let activated = activated.unwrap_or_else(|error| panic!("{error}"));
+    assert!(transport.requests().is_empty(), "activation sent a request");
+    let native = route_provider(
+        &route,
+        route.binding(PROFILE).expect("a bound profile"),
+        shipped_profile(PROFILE),
+        Arc::new(transport.clone()),
+        Arc::new(ScriptedWsConnector::new(Vec::new())),
+        Arc::new(FixedCredentials),
+    )
+    .unwrap_or_else(|error| panic!("native: {error}"));
+    assert_eq!(activated.describe(), native.describe());
+
+    // The shipped environment directories select no provider package, and this release has no
+    // host entry either, so activation refuses there: the component came through the lock.
+    let (refused, _) = activate_with(&components, &route, PROFILE);
+    let error = refused
+        .err()
+        .unwrap_or_else(|| panic!("{}: the route activated", route.id));
+    assert!(
+        error.contains(&route.id) && error.contains("p1/provider-anthropic"),
+        "{error}"
+    );
 }

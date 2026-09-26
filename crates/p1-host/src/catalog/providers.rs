@@ -2,7 +2,8 @@
 //! of a route file with a profile binding into a provider.
 //!
 //! Since S4.9 a route's `adapter` key names a provider COMPONENT (ADR-0086): the factory
-//! activates the component the installed release ships, configured from the route's own data
+//! activates the component the installed release ships — or the one a user's lock selects for
+//! that adapter's module (ANSWERS D083b) — configured from the route's own data
 //! and the selected profile's text, and the native transport broker sends every request. The
 //! native adapter a route used to build stays reachable in exactly two cases, both stated in
 //! [`ProviderComponents::activate`]: the Responses WebSocket transport (S5.5) and a host with
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use p1_assembly::{Catalog, ProviderSpec};
+use p1_assembly::{Catalog, ProviderSpec, load_modules_lock};
 use p1_contracts::Provider;
 use p1_module_runtime::{
     ExecutionLimits, LoadedModule, Loader, ProviderSettings, ReleaseManifest, WasmProvider,
@@ -292,6 +293,9 @@ impl ProviderComponents {
     /// The native adapter a route used to build stays reachable in exactly two cases: the
     /// Responses route's WebSocket transport, which this broker does not send yet (S5.5), and
     /// a host with no release module set installed (above).
+    ///
+    /// A USER's lock may select another package for the route's adapter module; the module the
+    /// lock names is then what activation uses ([`locked_package`], ANSWERS D083b).
     pub fn activate(
         &self,
         environment_dirs: &[PathBuf],
@@ -309,8 +313,10 @@ impl ProviderComponents {
         if keeps_native || self.loader.is_none() {
             return route_provider(route, binding, profile, transport, ws, credentials);
         }
+        let package = locked_package(environment_dirs, name)
+            .map_err(|reason| activation_refusal(route, name, reason))?;
         let module = self
-            .module(name)
+            .module(&package)
             .map_err(|reason| activation_refusal(route, name, reason))?;
         let settings = ProviderSettings {
             origin_route: route.origin_route.clone(),
@@ -354,6 +360,24 @@ fn selection_refusal(route: &RouteFile, reason: impl std::fmt::Display) -> Strin
         "route \"{}\" cannot activate its provider: {reason}",
         route.id
     )
+}
+
+/// The package activation loads for the provider module `name`: the one the effective
+/// `modules.lock` selects for that module, or `name` itself — the release's own host entry of
+/// the adapter — when no lock selects one.
+///
+/// A lock key is a manifest name without the reserved `p1/` namespace
+/// (`docs/design/modules/package.md`), so `p1/provider-anthropic` is selected under
+/// `provider-anthropic`. The entry's own digest, world and protocol were checked against the
+/// release when the catalog loaded the lock (`modules::load_locked_modules`), and the module
+/// itself is verified and compiled by this component set's loader, so a user can select among
+/// the release's packages and cannot name bytes (freeze item 6).
+fn locked_package(environment_dirs: &[PathBuf], name: &str) -> Result<String, String> {
+    let lock = load_modules_lock(environment_dirs).map_err(|error| error.to_string())?;
+    Ok(lock
+        .resolve(name.strip_prefix("p1/").unwrap_or(name))
+        .map(|locked| locked.package.clone())
+        .unwrap_or_else(|| name.to_owned()))
 }
 
 /// The one wording of an activation refusal: the route that cannot become a provider, the
