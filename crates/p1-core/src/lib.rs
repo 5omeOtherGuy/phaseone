@@ -39,14 +39,18 @@ pub struct AgentParts {
 }
 
 /// The parts of [`AgentParts`] a running agent can be switched to between turns
-/// (ADR-0049). Journal, events and authorization belong to the session, not to the
-/// model it talks to, so a switch never replaces them.
+/// (ADR-0049, ADR-0084). Journal and events belong to the session, not to the
+/// assembly, so a switch never replaces them.
 pub struct Reconfiguration {
     pub provider: Arc<dyn Provider>,
     pub tools: Vec<Arc<dyn Tool>>,
     pub system_prompt: String,
     pub options: ModelOptions,
     pub context: Arc<dyn ContextPolicy>,
+    /// `None` keeps the policy the agent holds. An `Option` rather than a required
+    /// `Arc`: a model switch does not own the session's policy and the core hands
+    /// none of its parts out, so "keep" must be expressible without holding it.
+    pub authorization: Option<Arc<dyn AuthorizationPolicy>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -55,6 +59,19 @@ pub enum BuildError {
     DuplicateToolName(String),
     #[error("the provider rejected this environment: {0}")]
     ProviderRejected(ProviderError),
+}
+
+/// Why [`Agent::reconfigure`] left the current assembly in place.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReconfigureError {
+    /// The candidate failed validation against the current history; nothing was
+    /// written.
+    #[error(transparent)]
+    Rejected(BuildError),
+    /// The candidate's `Environment` record could not be committed; nothing was
+    /// installed and no sequence number was used.
+    #[error("the new environment could not be committed: {0}")]
+    CommitFailed(String),
 }
 
 /// State shared between the `Agent` and every `Inbox` handle.
@@ -128,31 +145,44 @@ impl Agent {
         Self::assemble(parts, Vec::new(), 0, false, HashSet::new(), None)
     }
 
-    /// Switch this agent to another environment/profile pair between turns
-    /// (ADR-0049, model-selection.md §3). Callable only between turns (`&mut self`),
-    /// never inside a tool loop: a boundary has no thinking blocks pending.
+    /// Switch this agent to another assembly between turns (ADR-0049, ADR-0084,
+    /// model-selection.md §3). Callable only between turns (`&mut self`), never
+    /// inside a tool loop: a boundary has no thinking blocks pending.
     ///
     /// Runs exactly [`Agent::new`]'s checks, but `provider.validate` gets the
     /// CURRENT history, so a route that cannot carry this transcript is refused
-    /// before anything is sent or committed. On success the parts are replaced —
-    /// journal, events and authorization stay — and `environment_committed` is
-    /// cleared, so the next turn commits the new `Environment` before its input.
-    /// On failure nothing changes at all.
-    pub fn reconfigure(&mut self, next: Reconfiguration) -> Result<(), BuildError> {
+    /// before anything is sent or committed. The candidate's `Environment` record
+    /// is then committed, and only once that commit returned are the parts
+    /// installed, with no await in between: a caller that drops this future, or a
+    /// journal that fails, leaves the old assembly answering. Journal and events
+    /// are never replaced. A candidate equal to the current environment still
+    /// commits its record: the call is an explicit change and the journal says so.
+    pub async fn reconfigure(&mut self, next: Reconfiguration) -> Result<(), ReconfigureError> {
         let Reconfiguration {
             provider,
             tools,
             system_prompt,
             options,
             context,
+            authorization,
         } = next;
-        check_environment(&provider, &tools, &system_prompt, &options, &self.history)?;
+        check_environment(&provider, &tools, &system_prompt, &options, &self.history)
+            .map_err(ReconfigureError::Rejected)?;
+        let body = environment_record(&provider, &tools, &system_prompt, &options);
+        self.commit(body)
+            .await
+            .map_err(|error| ReconfigureError::CommitFailed(error.0))?;
+        // Nothing below awaits: once the record is durable the candidate is the
+        // agent's, whole, before any other code can observe the agent.
         self.parts.provider = provider;
         self.parts.tools = tools;
         self.parts.system_prompt = system_prompt;
         self.parts.options = options;
         self.parts.context = context;
-        self.environment_committed = false;
+        if let Some(authorization) = authorization {
+            self.parts.authorization = authorization;
+        }
+        self.environment_committed = true;
         Ok(())
     }
 
@@ -274,17 +304,12 @@ impl Agent {
         if self.environment_committed {
             return Ok(());
         }
-        let body = RecordBody::Environment {
-            route: self.parts.provider.describe(),
-            system_prompt: self.parts.system_prompt.clone(),
-            tools: self
-                .parts
-                .tools
-                .iter()
-                .map(|tool| (tool.declaration().clone(), tool.identity().clone()))
-                .collect(),
-            options: self.parts.options.clone(),
-        };
+        let body = environment_record(
+            &self.parts.provider,
+            &self.parts.tools,
+            &self.parts.system_prompt,
+            &self.parts.options,
+        );
         self.commit(body).await.map_err(|error| error.0)?;
         self.environment_committed = true;
         Ok(())
@@ -895,6 +920,25 @@ impl Agent {
                 .collect(),
             options: self.parts.options.clone(),
         }
+    }
+}
+
+/// The ONE `Environment` record, shared by the lazy first commit and
+/// [`Agent::reconfigure`], so a switched and a constructed assembly journal alike.
+fn environment_record(
+    provider: &Arc<dyn Provider>,
+    tools: &[Arc<dyn Tool>],
+    system_prompt: &str,
+    options: &ModelOptions,
+) -> RecordBody {
+    RecordBody::Environment {
+        route: provider.describe(),
+        system_prompt: system_prompt.to_string(),
+        tools: tools
+            .iter()
+            .map(|tool| (tool.declaration().clone(), tool.identity().clone()))
+            .collect(),
+        options: options.clone(),
     }
 }
 
