@@ -432,14 +432,21 @@ const COMPACTION_SIZES: [usize; 3] = [64 * 1024, MIB, 2 * MIB];
 /// outcome either way as a fact.
 const COMPACTION_WALL_SIZE: usize = 4 * MIB;
 
-/// Rounds of the workload before the measured rounds: the allocator and the engine
-/// settle first. The row's growth verdict reads nothing before warm-up is over.
-const COMPACTION_WARM_UP: usize = 4;
-/// Rounds per growth window: fewer than `steady-growth`'s because a compaction round
-/// costs far more than a tool round.
-const COMPACTION_WINDOW: usize = 5;
-/// Measured rounds: `GROWTH_WINDOWS` windows of `COMPACTION_WINDOW`.
-const COMPACTION_WINDOWS: usize = GROWTH_WINDOWS;
+/// Rounds of the workload before the measured rounds: the allocator, the wasm linear
+/// memories and the engine settle first — measured on the box this row was written on,
+/// the process's VmRSS at rest keeps drifting for the first dozen or so rounds of two
+/// MiB histories before it finds its plateau, so warm-up covers it. The row's growth
+/// verdict reads nothing before warm-up is over.
+const COMPACTION_WARM_UP: usize = 8;
+/// Rounds per growth window: `steady-growth`'s window width, so a window's maximum
+/// does not move because one round's allocator noise landed in it.
+const COMPACTION_WINDOW: usize = WORKLOAD_ROUNDS;
+/// Measured rounds: 8 windows of 10. The width is the shape this workload's rest RSS
+/// actually has (measured over 120 rounds on the box this row was written on): the
+/// process wanders within ~10 MiB for the first six or so windows as the allocator and
+/// the wasm linear memories find their plateau, then holds it — 8 windows is where the
+/// plateau is visible and a compounding leak still is not.
+const COMPACTION_WINDOWS: usize = 8;
 /// Measured rounds, in `GROWTH_WINDOWS` windows of `COMPACTION_WINDOW`.
 const COMPACTION_ROUNDS: usize = COMPACTION_WINDOWS * COMPACTION_WINDOW;
 
