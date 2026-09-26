@@ -1,8 +1,13 @@
 //! The `read` tool: line-numbered reads of one workspace file.
 //!
 //! Confinement, atomic writes and observed-file tracking live in `p1-workspace`.
-//! This module owns the model-facing declaration, input validation, rendering
-//! and the read-before-mutate observation.
+//! The model-facing declaration, input validation and rendering live in
+//! `p1-read-guest`, which the component (`p1/read`) runs too. This crate is the
+//! native adapter over both, owns the credential refusal (issue #142), and
+//! provides the `workspace` and `snapshot` capabilities the component reads
+//! through ([`capability`]).
+
+pub mod capability;
 
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -12,21 +17,19 @@ use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
+use p1_read_guest::{
+    DESCRIPTION, NAME, RawInput, ReadInput, WindowedRender, input_schema, sniff_len,
+};
 use p1_workspace::{ObservedFiles, StreamingHash, Workspace};
-use serde::Deserialize;
 
+pub use capability::{ReadCapability, capability_services};
 pub use p1_workspace::ToolFace;
 
-const NAME: &str = "read";
-const DESCRIPTION: &str = "Read a UTF-8 text file from the workspace, with numbered lines.\nUse `offset` and `limit` to page through a long file; the last line gives the next offset.\nRead a file before you edit or overwrite it: a mutation is refused until you have seen its current contents.";
-const DEFAULT_OFFSET: i64 = 1;
-const DEFAULT_LIMIT: i64 = 2_000;
-const MAX_OUTPUT_BYTES: usize = 50_000;
-const MAX_OUTPUT_LINES: usize = 2_000;
-/// A NUL anywhere in the first 8 KiB marks the file as binary.
-const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// The internal read buffer: fixed and small, however large the file is.
-const READ_BUFFER_BYTES: usize = 64 * 1024;
+const READ_BUFFER_BYTES: usize = p1_read_guest::READ_BUFFER_BYTES;
+// The unit tests below predate the guest crate and name these as this crate's items.
+#[cfg(test)]
+use p1_read_guest::{BINARY_SNIFF_BYTES, MAX_OUTPUT_BYTES, Utf8Validator};
 
 /// The `read` tool. Holds one agent's workspace and observation store.
 pub struct ReadTool {
@@ -80,7 +83,11 @@ impl ReadTool {
 /// auth store, anything under `~/.config/keys/`, and the other tools' auth files.
 /// Compared on the canonicalised form, so a symlink or a relative path cannot slip
 /// past. An empty `home` refuses only the XDG-named stores.
-fn refuses_credentials(candidate: &Path, home: Option<&Path>, xdg_credentials: &[PathBuf]) -> bool {
+pub(crate) fn refuses_credentials(
+    candidate: &Path,
+    home: Option<&Path>,
+    xdg_credentials: &[PathBuf],
+) -> bool {
     let candidate = canonical_best_effort(candidate);
     if xdg_credentials
         .iter()
@@ -116,7 +123,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 
 /// The p1 and OpenCode stores move with their XDG override (p1-auth); a home-based
 /// path below covers the default. `None` when the variable is unset.
-fn xdg_credentials() -> Vec<PathBuf> {
+pub(crate) fn xdg_credentials() -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Some(config) = env_path("XDG_CONFIG_HOME") {
         files.push(config.join("p1/auth.json"));
@@ -161,42 +168,6 @@ fn identity(variant: &str) -> ToolIdentity {
     }
 }
 
-fn input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "File path, relative to the workspace root or absolute inside it."
-            },
-            "offset": {
-                "type": "integer",
-                "minimum": 1,
-                "default": 1,
-                "description": "First line to return (1-indexed)."
-            },
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "default": 2000,
-                "description": "Maximum number of lines to return."
-            }
-        },
-        "required": ["file_path"],
-        "additionalProperties": false
-    })
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadInput {
-    file_path: String,
-    #[serde(default)]
-    offset: Option<i64>,
-    #[serde(default)]
-    limit: Option<i64>,
-}
-
 impl Tool for ReadTool {
     fn declaration(&self) -> &ToolDeclaration {
         &self.declaration
@@ -212,18 +183,9 @@ impl Tool for ReadTool {
 
     /// ADR-0057: the file this call reads, from the tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
-        let target = parse_input(&self.declaration.name, call).ok().map(|input| {
-            let mut target = input.file_path;
-            if input.offset.is_some() || input.limit.is_some() {
-                let start = input.offset.unwrap_or(DEFAULT_OFFSET);
-                let end = start + input.limit.unwrap_or(DEFAULT_LIMIT) - 1;
-                target = format!("{target}:{start}-{end}");
-            }
-            target
-        });
         CallDescription {
-            verb: "read",
-            target,
+            verb: p1_read_guest::VERB,
+            target: p1_read_guest::describe_target(&self.declaration.name, raw_input(call)),
             edit: None,
             destructive: false,
         }
@@ -234,14 +196,10 @@ impl Tool for ReadTool {
         _call: &ToolCall,
         result: &p1_contracts::ToolResultItem,
     ) -> ResultDescription {
-        if result.status != ToolStatus::Ok {
-            return plain_result(result);
-        }
         ResultDescription {
-            summary: format!(
-                "{} lines · {:.1} kB",
-                result.content.lines().count(),
-                result.content.len() as f64 / 1000.0
+            summary: p1_read_guest::describe_result(
+                &result.content,
+                result.status == ToolStatus::Ok,
             ),
             detail: None,
         }
@@ -291,41 +249,15 @@ impl Tool for ReadTool {
     }
 }
 
-fn plain_result(result: &p1_contracts::ToolResultItem) -> ResultDescription {
-    ResultDescription {
-        summary: result
-            .content
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        detail: None,
+fn raw_input(call: &ToolCall) -> RawInput<'_> {
+    match &call.input {
+        ToolInput::Json(raw) => RawInput::Json(raw),
+        ToolInput::Text(raw) => RawInput::Text(raw),
     }
 }
 
 fn parse_input(tool: &str, call: &ToolCall) -> Result<ReadInput, String> {
-    let raw = match &call.input {
-        ToolInput::Json(raw) => raw,
-        ToolInput::Text(_) => {
-            return Err(invalid(
-                tool,
-                "expected a JSON object input, got freeform text",
-            ));
-        }
-    };
-    let input: ReadInput =
-        serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
-    if matches!(input.offset, Some(offset) if offset < 1) {
-        return Err(invalid(tool, "`offset` must be at least 1"));
-    }
-    if matches!(input.limit, Some(limit) if limit < 1) {
-        return Err(invalid(tool, "`limit` must be at least 1"));
-    }
-    Ok(input)
-}
-
-fn invalid(tool: &str, reason: &str) -> String {
-    format!("Invalid input for {tool}: {reason}")
+    p1_read_guest::parse_input(tool, raw_input(call))
 }
 
 fn run(
@@ -335,19 +267,7 @@ fn run(
     home: Option<&Path>,
     xdg_credentials: &[PathBuf],
 ) -> Result<String, String> {
-    // Issue #142: a credential file is refused even with full access, BEFORE any
-    // confinement error, so the model is told why and never sees the file's bytes.
-    let candidate = if Path::new(&input.file_path).is_absolute() {
-        PathBuf::from(&input.file_path)
-    } else {
-        workspace.root().join(&input.file_path)
-    };
-    if refuses_credentials(&candidate, home, xdg_credentials) {
-        return Err(format!(
-            "read refuses credential files ({}); credentials never enter the model's context",
-            workspace.display(&candidate)
-        ));
-    }
+    refuse_credentials(workspace, &input.file_path, home, xdg_credentials)?;
 
     let resolved = workspace
         .resolve(&input.file_path)
@@ -357,188 +277,53 @@ fn run(
     let metadata = match std::fs::metadata(&resolved) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(format!("{display} does not exist."));
+            return Err(p1_read_guest::missing(&display));
         }
-        Err(error) => return Err(format!("{display} could not be read: {error}")),
+        Err(error) => {
+            return Err(p1_read_guest::could_not_be_read(
+                &display,
+                &error.to_string(),
+            ));
+        }
     };
     if !metadata.is_file() {
-        return Err(format!("{display} is not a regular file."));
+        return Err(p1_read_guest::not_a_regular_file(&display));
     }
     if metadata.len() == 0 {
         // An empty file is a successful read of zero bytes: record it so a
         // later `write` to it is not treated as an unread blind overwrite.
         observed.record(&resolved, b"");
-        return Ok(format!("{display} is empty."));
+        return Ok(p1_read_guest::empty(&display));
     }
 
     let file = std::fs::File::open(&resolved)
-        .map_err(|error| format!("{display} could not be read: {error}"))?;
+        .map_err(|error| p1_read_guest::could_not_be_read(&display, &error.to_string()))?;
 
     // Only the requested window (plus small fixed buffers) is ever held in
     // memory: the file is streamed line by line, never loaded whole.
     read_windowed(file, metadata.len(), &resolved, &display, input, observed)
 }
 
-/// Incremental UTF-8 validation with only an incomplete trailing character
-/// retained between chunks.
-#[derive(Default)]
-struct Utf8Validator {
-    pending: [u8; 4],
-    pending_len: usize,
-}
-
-impl Utf8Validator {
-    fn update(&mut self, mut bytes: &[u8]) -> Result<(), ()> {
-        if self.pending_len > 0 {
-            let character_len = match self.pending[0] {
-                0xC2..=0xDF => 2,
-                0xE0..=0xEF => 3,
-                0xF0..=0xF4 => 4,
-                _ => return Err(()),
-            };
-            let take = bytes.len().min(character_len - self.pending_len);
-            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&bytes[..take]);
-            self.pending_len += take;
-            bytes = &bytes[take..];
-
-            if self.pending_len == character_len {
-                std::str::from_utf8(&self.pending[..self.pending_len]).map_err(|_| ())?;
-                self.pending_len = 0;
-            }
-        }
-
-        if self.pending_len == 0
-            && let Err(error) = std::str::from_utf8(bytes)
-        {
-            if error.error_len().is_some() {
-                return Err(());
-            }
-            let incomplete = &bytes[error.valid_up_to()..];
-            self.pending[..incomplete.len()].copy_from_slice(incomplete);
-            self.pending_len = incomplete.len();
-        }
-        Ok(())
+/// Issue #142: a credential file is refused even with full access, BEFORE any
+/// confinement error, so the model is told why and never sees the file's bytes.
+/// The component's `workspace` capability applies the same rule ([`capability`]).
+pub(crate) fn refuse_credentials(
+    workspace: &Workspace,
+    requested: &str,
+    home: Option<&Path>,
+    xdg_credentials: &[PathBuf],
+) -> Result<(), String> {
+    let candidate = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        workspace.root().join(requested)
+    };
+    if refuses_credentials(&candidate, home, xdg_credentials) {
+        return Err(p1_read_guest::credential_refusal(
+            &workspace.display(&candidate),
+        ));
     }
-
-    fn finish(self) -> Result<(), ()> {
-        if self.pending_len == 0 {
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-}
-
-/// The bounded portion of the line currently being scanned.
-struct LineBuffer {
-    shown: Vec<u8>,
-    content_bytes: usize,
-    last_byte: Option<u8>,
-}
-
-impl LineBuffer {
-    fn new() -> Self {
-        Self {
-            shown: Vec::with_capacity(MAX_OUTPUT_BYTES),
-            content_bytes: 0,
-            last_byte: None,
-        }
-    }
-
-    fn push(&mut self, bytes: &[u8], retain: bool) {
-        self.content_bytes += bytes.len();
-        if let Some(last) = bytes.last() {
-            self.last_byte = Some(*last);
-        }
-        if retain {
-            let keep = bytes
-                .len()
-                .min(MAX_OUTPUT_BYTES.saturating_sub(self.shown.len()));
-            self.shown.extend_from_slice(&bytes[..keep]);
-        }
-    }
-
-    fn reset(&mut self) {
-        self.shown.clear();
-        self.content_bytes = 0;
-        self.last_byte = None;
-    }
-}
-
-struct Window {
-    start: usize,
-    cap: usize,
-    line_number: usize,
-    emitted: usize,
-    end: usize,
-    stop_collecting: bool,
-    out: String,
-}
-
-impl Window {
-    fn wants_current_line(&self) -> bool {
-        self.line_number + 1 > self.start && !self.stop_collecting && self.emitted < self.cap
-    }
-
-    fn finish_line(&mut self, line: &mut LineBuffer) {
-        self.line_number += 1;
-        if !self.wants_finished_line() {
-            line.reset();
-            return;
-        }
-
-        let content_bytes = line.content_bytes - usize::from(line.last_byte == Some(b'\r'));
-        line.shown.truncate(line.shown.len().min(content_bytes));
-        let shown_end = match std::str::from_utf8(&line.shown) {
-            Ok(_) => line.shown.len(),
-            Err(error) => error.valid_up_to(),
-        };
-        line.shown.truncate(shown_end);
-
-        let prefix = format!("{:>6}\t", self.line_number);
-        let rendered_bytes = prefix.len() + content_bytes;
-        if self.emitted > 0 && self.out.len() + 1 + rendered_bytes > MAX_OUTPUT_BYTES {
-            self.stop_collecting = true;
-            line.reset();
-            return;
-        }
-
-        if self.emitted > 0 {
-            self.out.push('\n');
-        }
-        self.out.push_str(&prefix);
-        if rendered_bytes <= MAX_OUTPUT_BYTES {
-            self.out
-                .push_str(std::str::from_utf8(&line.shown).expect("validated line prefix"));
-        } else {
-            let available = MAX_OUTPUT_BYTES.saturating_sub(self.out.len());
-            let mut display_end = available.min(line.shown.len());
-            while display_end > 0 && std::str::from_utf8(&line.shown[..display_end]).is_err() {
-                display_end -= 1;
-            }
-            self.out
-                .push_str(std::str::from_utf8(&line.shown[..display_end]).expect("UTF-8 boundary"));
-            let shown_bytes = self.out.len();
-            self.out.push('\n');
-            self.out.push_str(&format!(
-                "[output truncated: showing {shown_bytes} of {rendered_bytes} bytes]"
-            ));
-            self.out.push('\n');
-            self.out.push_str(&format!(
-                "[{} bytes omitted from line {}]",
-                content_bytes - display_end,
-                self.line_number
-            ));
-            self.stop_collecting = true;
-        }
-        self.end = self.line_number;
-        self.emitted += 1;
-        line.reset();
-    }
-
-    fn wants_finished_line(&self) -> bool {
-        self.line_number > self.start && !self.stop_collecting && self.emitted < self.cap
-    }
+    Ok(())
 }
 
 struct WindowedRead {
@@ -570,101 +355,38 @@ fn read_windowed_impl<R: Read>(
     input: &ReadInput,
     observed: &ObservedFiles,
 ) -> Result<WindowedRead, String> {
-    // The binary sniff must run to completion, over exactly the bytes it
-    // would see reading the whole file at once, before anything else is
-    // checked — otherwise a NUL later in the file could race a UTF-8 error
-    // from an earlier chunk and change which error is reported. The sniffed
-    // bytes are fed through the normal pass before reading the rest, without
-    // needing `Seek` (a synthetic or piped source may not have one).
-    let sniff_len = total_len.min(BINARY_SNIFF_BYTES as u64) as usize;
-    let mut sniff = vec![0u8; sniff_len];
+    // The sniffed bytes are read first and fed through the normal pass before
+    // the rest, without needing `Seek` (a synthetic or piped source may not
+    // have one); see `WindowedRender::start` for why the sniff goes first.
+    let mut sniff = vec![0u8; sniff_len(total_len)];
     reader
         .read_exact(&mut sniff)
-        .map_err(|error| format!("{display} could not be read: {error}"))?;
-    if sniff.contains(&0) {
-        return Err(format!("{display} is a binary file."));
-    }
-
-    let offset = input.offset.unwrap_or(DEFAULT_OFFSET) as usize;
-    let limit = input.limit.unwrap_or(DEFAULT_LIMIT) as usize;
-    let start = offset - 1;
+        .map_err(|error| p1_read_guest::could_not_be_read(display, &error.to_string()))?;
+    let mut render = WindowedRender::start(&sniff, display, input)?;
     let mut hash = StreamingHash::new();
-    let mut utf8 = Utf8Validator::default();
-    let mut line = LineBuffer::new();
-    let mut window = Window {
-        start,
-        cap: limit.min(MAX_OUTPUT_LINES),
-        line_number: 0,
-        emitted: 0,
-        end: start,
-        stop_collecting: false,
-        out: String::new(),
-    };
-    #[cfg(test)]
-    let mut max_line_buffer_bytes = 0;
+    hash.update(&sniff);
+    drop(sniff);
 
-    {
-        let mut process = |chunk: &[u8]| -> Result<(), String> {
-            hash.update(chunk);
-            utf8.update(chunk)
-                .map_err(|_| format!("{display} is not valid UTF-8."))?;
-            let mut remaining = chunk;
-            while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
-                line.push(&remaining[..newline], window.wants_current_line());
-                #[cfg(test)]
-                {
-                    max_line_buffer_bytes = max_line_buffer_bytes.max(line.shown.len());
-                }
-                window.finish_line(&mut line);
-                remaining = &remaining[newline + 1..];
-            }
-            line.push(remaining, window.wants_current_line());
-            #[cfg(test)]
-            {
-                max_line_buffer_bytes = max_line_buffer_bytes.max(line.shown.len());
-            }
-            Ok(())
-        };
-
-        process(&sniff)?;
-        drop(sniff);
-        let mut buffer = [0u8; READ_BUFFER_BYTES];
-        loop {
-            let bytes_read = reader
-                .read(&mut buffer)
-                .map_err(|error| format!("{display} could not be read: {error}"))?;
-            if bytes_read == 0 {
-                break;
-            }
-            process(&buffer[..bytes_read])?;
+    let mut buffer = [0u8; READ_BUFFER_BYTES];
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|error| p1_read_guest::could_not_be_read(display, &error.to_string()))?;
+        if bytes_read == 0 {
+            break;
         }
+        hash.update(&buffer[..bytes_read]);
+        render.feed(&buffer[..bytes_read])?;
     }
-    utf8.finish()
-        .map_err(|_| format!("{display} is not valid UTF-8."))?;
-    if line.content_bytes > 0 {
-        window.finish_line(&mut line);
-    }
-    let total = window.line_number;
-
-    if start >= total {
-        return Err(format!(
-            "offset {offset} is beyond the end of {display} ({total} lines)."
-        ));
-    }
+    #[cfg(test)]
+    let max_line_buffer_bytes = render.peak_line_bytes();
+    let output = render.finish()?;
     // A read always observes the FULL file, even when offset/limit windows the
     // returned lines: a later edit compares against the whole file.
     observed.record_streamed(resolved, hash);
 
-    if window.end < total {
-        window.out.push('\n');
-        window.out.push_str(&format!(
-            "[{} more lines; continue with offset={}]",
-            total - window.end,
-            window.end + 1
-        ));
-    }
     Ok(WindowedRead {
-        output: window.out,
+        output,
         #[cfg(test)]
         max_line_buffer_bytes,
     })
