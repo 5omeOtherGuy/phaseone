@@ -1862,6 +1862,8 @@ version = "0.0.1"
 dependencies = [
  "p1-contracts",
  "p1-module-runtime",
+ "p1-provider-http",
+ "p1-provider-openai",
  "p1-redact",
  "tempfile",
  "tokio",

@@ -26,9 +26,8 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, MutexGuard};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
@@ -36,29 +35,26 @@ use futures_util::stream::unfold;
 use p1_contracts::{
     CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream, StreamEvent,
 };
-use p1_provider_http::ws::{
-    WsBound, WsConnectError, WsConnection, WsConnector, WsHandshake, WsNext,
+use p1_provider_http::ws::{WsBound, WsConnector, WsNext};
+use p1_provider_http::ws_session::{
+    self, WsAuthority, WsHead, WsLease, WsRead, WsSend, WsSendError, WsSession,
 };
 use p1_provider_http::{
-    Credential, CredentialSource, ResponseParser, RetryPolicy, SseEvent, proxy_refusal_message,
+    Credential, CredentialScheme, CredentialSource, CredentialUse, ResponseParser, RetryPolicy,
+    SseEvent, proxy_refusal_message,
 };
-use serde_json::{Map, Value, json};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use serde_json::Value;
 
 use crate::ResponsesAccount;
 use crate::parser::CodexResponseParser;
 use crate::request::{build_ws_headers, build_ws_headers_without_credential, ws_frame};
+use crate::websocket_lower::{
+    ConnectionState, Lowered, ResponseFacts, WebSocketDecisions, WebSocketHead, WebSocketSend,
+};
 
 /// The clock the connection-reuse policy reads (§4). Injected, so a test advances
 /// time instead of sleeping (AGENTS.md forbids sleep-based timing assertions).
-pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
-
-/// One connect and one send are bounded by this (§4).
-const BOUND: Duration = Duration::from_secs(10);
-/// §4: a connection is reused while it is younger than this …
-const MAX_AGE: Duration = Duration::from_secs(55 * 60);
-/// … and was last used less than this ago.
-const MAX_IDLE: Duration = Duration::from_secs(5 * 60);
+pub use p1_provider_http::ws_session::Clock;
 
 /// The `<reason>` of a fallback notice when no HTTP status refused the upgrade:
 /// a connect failure, a timeout, or a connection that broke before any output.
@@ -74,254 +70,57 @@ fn fallback_notice(reason: &str) -> StreamEvent {
     }
 }
 
-/// The WebSocket half of one provider instance: one connector, one connection
-/// slot, and the switch a fallback turns off for good (§5).
+/// The WebSocket half of one provider instance: the host's session (the one
+/// connection) and the portable decisions (framing, continuation, the fallback
+/// switch §5 turns off for good).
 pub(crate) struct WebSocket {
-    connector: Arc<dyn WsConnector>,
-    clock: Clock,
+    session: WsSession,
     /// §5's transient row waits this policy's backoff, up to its `max_retries`: the
     /// adapter's default policy — 3 retries, 2 s doubling, so the same backoff the
     /// SSE driver waits.
     retry: RetryPolicy,
-    slot: Arc<Mutex<Slot>>,
-    /// Set when a request fell back to SSE: this instance speaks SSE from then on.
-    disabled: AtomicBool,
-}
-
-/// The ONE connection slot. A request takes the connection out of it while it uses
-/// it, so a half-read socket can never be left behind: it is dropped together with
-/// the request that owned it.
-pub(crate) struct Slot {
-    connection: Option<Live>,
-}
-
-/// One open connection and what the reuse policy knows about it.
-struct Live {
-    connection: Box<dyn WsConnection>,
-    connected_at: Instant,
-    last_used_at: Instant,
-    /// Whether this connection was already open when this request took it. §5
-    /// reconnects once for a socket that goes away before its first frame, which
-    /// only a REUSED socket can do: a fresh one that never answered is an ordinary
-    /// connect failure.
-    reused: bool,
-    /// §6: what the response this connection completed last lets the next request
-    /// continue from. It lives HERE, so it cannot outlive the connection: every
-    /// drop, every reconnect and every fallback throws it away with the socket.
-    memory: Option<Memory>,
-}
-
-/// §6: what one connection remembers about the response it completed last. Each
-/// field is read by exactly one of §6's rules.
-struct Memory {
-    /// The FULL body that response answered. Its `input` array is the prefix rule 3
-    /// requires the next `input` to start with, and every other top-level field is
-    /// what rule 2 compares. A continuation's own body IS this body — rule 3 makes
-    /// its `input` the same array — so the memory stays valid turn after turn.
-    body: Value,
-    /// The id the continuation sends as `previous_response_id` (§6 rule 1).
-    response_id: String,
-    /// The output items of that response, in order, as the next request's `input`
-    /// re-encodes them. They are where the echo rule 3 requires ends.
-    items: Vec<EchoedItem>,
-}
-
-impl std::fmt::Debug for Memory {
-    /// Lengths and the response id only: the remembered body holds the whole
-    /// conversation, and no `Debug` output may carry it.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let input_items = self
-            .body
-            .get("input")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        f.debug_struct("Memory")
-            .field("input_items", &input_items)
-            .field("output_items", &self.items.len())
-            .field("response_id", &self.response_id)
-            .finish()
-    }
-}
-
-/// One output item of a remembered response, reduced to the fields the next
-/// request's `input` re-encodes of it (§6 rule 3).
-#[derive(Clone)]
-struct EchoedItem {
-    /// The `type` the next request writes for this item.
-    kind: &'static str,
-    /// The `role` it writes, for a message: what tells the echoed assistant message
-    /// from the user message that follows it.
-    role: Option<&'static str>,
-    /// The item's wire `id`. The encoding does not carry one, so it is only
-    /// compared when a new item happens to have one.
-    id: Option<String>,
-    /// The call id the next request writes — `call_id`, or the `id` the wire put it
-    /// there instead (the parser's own rule, so the two cannot disagree).
-    call_id: Option<String>,
-}
-
-impl EchoedItem {
-    /// Whether `item` is THIS remembered output item as the next request encodes it.
-    /// `type` and `role` are what the encoding writes, and a call's id comes back
-    /// under either of the wire's two spellings (the parser's rule). A plain item
-    /// `id` is NOT re-encoded: one is compared only when a new item has one.
-    fn answers(&self, item: &Value) -> bool {
-        if item.get("type").and_then(Value::as_str) != Some(self.kind) {
-            return false;
-        }
-        item.get("role").and_then(Value::as_str) == self.role
-            && self
-                .call_id
-                .as_deref()
-                .is_none_or(|call_id| item_call_id(item) == call_id)
-            && item
-                .get("id")
-                .and_then(Value::as_str)
-                .is_none_or(|id| self.id.as_deref() == Some(id))
-    }
-}
-
-/// The output item a completed response would contribute to the next request's
-/// `input`, or `None` for one it would not contribute at all: the parser only
-/// builds a block for the four known item types, `input_items` skips an empty
-/// assistant text and a reasoning item without encrypted content, and an unknown
-/// type is nothing on both sides. Only items that DO come back are part of the
-/// echo rule 3 looks for.
-fn echoed_item(item: &Value) -> Option<EchoedItem> {
-    let kind = item.get("type").and_then(Value::as_str)?;
-    let id = item.get("id").and_then(Value::as_str).map(str::to_string);
-    match kind {
-        "message" => has_output_text(item).then_some(EchoedItem {
-            kind: "message",
-            role: Some("assistant"),
-            id,
-            call_id: None,
-        }),
-        "reasoning" => item
-            .get("encrypted_content")
-            .and_then(Value::as_str)
-            .is_some_and(|encrypted| !encrypted.is_empty())
-            .then_some(EchoedItem {
-                kind: "reasoning",
-                role: None,
-                id,
-                call_id: None,
-            }),
-        "function_call" => Some(EchoedItem {
-            kind: "function_call",
-            role: None,
-            id,
-            call_id: Some(item_call_id(item)),
-        }),
-        "custom_tool_call" => Some(EchoedItem {
-            kind: "custom_tool_call",
-            role: None,
-            id,
-            call_id: Some(item_call_id(item)),
-        }),
-        _ => None,
-    }
-}
-
-/// Whether a message item carries any `output_text` (the only part kind that
-/// becomes a text block, and therefore the next request's assistant message).
-fn has_output_text(item: &Value) -> bool {
-    item.get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|content| {
-            content.iter().any(|part| {
-                part.get("type").and_then(Value::as_str) == Some("output_text")
-                    && part
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| !text.is_empty())
-            })
-        })
-}
-
-/// The call id the parser would take from this item, so the fingerprint and the
-/// re-encoded `call_id` are the same string.
-fn item_call_id(item: &Value) -> String {
-    item.get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The response id and the re-encodable output items ONE attempt's stream has
-/// reported, in arrival order. Recorded per frame, read when the response ends.
-#[derive(Default)]
-struct ResponseFacts {
-    id: Option<String>,
-    items: Vec<EchoedItem>,
-}
-
-impl ResponseFacts {
-    /// Read the two envelope facts §6 needs out of one event frame. The parser stays
-    /// the only reader of the event VOCABULARY (`docs/design/websocket.md` §3: no
-    /// second parser); this reads only the fields the continuation rules name, and a
-    /// frame it cannot read changes nothing.
-    fn record(&mut self, text: &str) {
-        let Ok(value) = serde_json::from_str::<Value>(text) else {
-            return;
-        };
-        match value.get("type").and_then(Value::as_str) {
-            Some("response.created")
-            | Some("response.completed")
-            | Some("response.done")
-            | Some("response.incomplete") => {
-                if let Some(id) = value
-                    .get("response")
-                    .and_then(|response| response.get("id"))
-                    .and_then(Value::as_str)
-                {
-                    self.id = Some(id.to_string());
-                }
-            }
-            Some("response.output_item.done") => {
-                if let Some(item) = value.get("item")
-                    && let Some(echoed) = echoed_item(item)
-                {
-                    self.items.push(echoed);
-                }
-            }
-            _ => {}
-        }
-    }
+    /// The component-side state: whether this instance fell back, and §6's memory.
+    /// Only the request holding the session's lease lowers, so the lock is never
+    /// contended across an await.
+    decisions: std::sync::Mutex<WebSocketDecisions>,
 }
 
 impl WebSocket {
     pub(crate) fn new(connector: Arc<dyn WsConnector>, clock: Clock) -> Self {
         Self {
-            connector,
-            clock,
+            session: WsSession::new(connector, clock),
             retry: RetryPolicy::default(),
-            slot: Arc::new(Mutex::new(Slot { connection: None })),
-            disabled: AtomicBool::new(false),
+            decisions: std::sync::Mutex::new(WebSocketDecisions::new(ws_frame)),
         }
     }
 
     /// Whether a fallback has already turned WebSocket off for this instance.
     pub(crate) fn is_disabled(&self) -> bool {
-        self.disabled.load(Ordering::SeqCst)
+        self.decisions().is_turned_off()
     }
 
-    /// Take the slot WITHOUT waiting. `None` means another request holds it, and
-    /// §4 is explicit that such a request uses SSE: never a second socket, never a
-    /// wait.
-    pub(crate) fn try_take(self: &Arc<Self>) -> Option<OwnedMutexGuard<Slot>> {
-        Arc::clone(&self.slot).try_lock_owned().ok()
+    /// Lease the session WITHOUT waiting. `None` means another request holds it,
+    /// and §4 is explicit that such a request uses SSE: never a second socket,
+    /// never a wait.
+    pub(crate) fn try_take(self: &Arc<Self>) -> Option<WsLease> {
+        self.session.try_lease()
+    }
+
+    fn decisions(&self) -> MutexGuard<'_, WebSocketDecisions> {
+        self.decisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
-/// Everything one WebSocket request needs. The connection slot is NOT here: it is
+/// Everything one WebSocket request needs. The session lease is NOT here: it is
 /// taken before the request starts and owned by the stream this module returns.
 pub(crate) struct WebSocketRequest {
     pub(crate) ws: Arc<WebSocket>,
     /// The resolved HTTPS endpoint; the handshake swaps its scheme.
     pub(crate) url: String,
-    /// The body the SSE path would send. §6 will hand a continuation body in here.
+    /// The body the SSE path would send; the decisions frame it, in full or as a
+    /// continuation (§6).
     pub(crate) body: Value,
     pub(crate) account: ResponsesAccount,
     pub(crate) cache_key: Option<String>,
@@ -334,11 +133,11 @@ pub(crate) struct WebSocketRequest {
 }
 
 /// Drive one request over WebSocket, falling back to `request.sse` by §5. The
-/// returned stream is hand-written, like `drive`'s: dropping it drops the
-/// connection, the in-flight read and the slot guard with it, which is exactly
-/// what §4 calls a cancellation.
-pub(crate) fn stream(request: WebSocketRequest, slot: OwnedMutexGuard<Slot>) -> ProviderStream {
-    let stream = unfold(State::new(request, slot), |state| async move {
+/// returned stream is hand-written, like `drive`'s: dropping it drops the lease,
+/// the connection and the in-flight read with it, which is exactly what §4 calls a
+/// cancellation.
+pub(crate) fn stream(request: WebSocketRequest, lease: WsLease) -> ProviderStream {
+    let stream = unfold(State::new(request, lease), |state| async move {
         let (event, state) = step(state).await;
         event.map(|event| (event, state))
     })
@@ -354,10 +153,12 @@ enum Phase {
     Credential,
     /// The forced refresh of a rejected credential (§5, 401/403).
     Refresh { rejected: Credential },
-    /// Open the connection: the one the slot holds, or a new one.
-    Connect,
-    /// Send this request's ONE frame.
-    Send,
+    /// Lower this attempt from the session's connection state: HTTP (the fallback),
+    /// or a send with or without a handshake.
+    Lower,
+    /// Hand this attempt's send to the session: open a connection when the send
+    /// has a head, then write the ONE frame.
+    Send { send: WsSend },
     /// Read frames until the parser's terminal event.
     Read,
     /// Wait out the backoff of §5's transient row, racing cancellation.
@@ -376,12 +177,11 @@ struct State {
     credential: Option<Credential>,
     /// A fresh parser per attempt, exactly as `drive` builds one.
     parser: Box<dyn ResponseParser>,
-    live: Option<Live>,
     /// What THIS attempt's stream has reported for §6: its response id and its
     /// re-encodable output items. Reset with the parser on every attempt.
     facts: ResponseFacts,
-    /// The slot this request owns for its whole life.
-    slot: OwnedMutexGuard<Slot>,
+    /// The session lease this request owns for its whole life.
+    lease: WsLease,
     /// Whether this attempt has seen no frame yet: the state §5's
     /// "a reused socket closes before its first frame" is about.
     awaiting_first_frame: bool,
@@ -396,6 +196,9 @@ struct State {
     once: OnceRows,
     /// Whether the one forced credential refresh has been used.
     refreshed: bool,
+    /// The `<reason>` of the fallback notice, set when §5 allows this request no
+    /// further WebSocket attempt.
+    fallback_reason: Option<String>,
     /// The fallback stream, built the first time `Phase::Fallback` is reached.
     sse: Option<ProviderStream>,
 }
@@ -430,7 +233,7 @@ impl ReconnectRow {
 }
 
 impl State {
-    fn new(request: WebSocketRequest, slot: OwnedMutexGuard<Slot>) -> Self {
+    fn new(request: WebSocketRequest, lease: WsLease) -> Self {
         let parser = new_parser(&request);
         Self {
             request,
@@ -438,48 +241,50 @@ impl State {
             pending: VecDeque::new(),
             credential: None,
             parser,
-            live: None,
             facts: ResponseFacts::default(),
-            slot,
+            lease,
             awaiting_first_frame: false,
             visible: false,
             transient_retries: 0,
             once: OnceRows::default(),
             refreshed: false,
+            fallback_reason: None,
             sse: None,
         }
     }
 
     /// Queue the single terminal event and stop. Every path here reaches it
-    /// without the connection: a connection goes back to its slot only through
+    /// without the connection: a connection goes back to the session only through
     /// [`State::terminal`], and only for a clean completion.
     fn finish(mut self, outcome: Outcome) -> Self {
-        self.live = None;
+        self.lease.drop_connection();
         self.pending.push_back(StreamEvent::Finished(outcome));
         self.phase = Phase::Done;
         self
     }
 
-    /// The end of a response: a completed one returns the connection to its slot
-    /// (§4) — with §6's memory of what it just answered — and every other ending
-    /// drops both.
+    /// The end of a response: a completed one returns the connection to the
+    /// session (§4) with its response id, and the decisions remember what it just
+    /// answered (§6); every other ending drops the connection.
     fn terminal(mut self, outcome: Outcome) -> Self {
-        if matches!(outcome, Outcome::Completed(_))
-            && let Some(mut live) = self.live.take()
-        {
-            live.last_used_at = (self.request.ws.clock)();
-            live.memory = remember(&self.request, &self.facts);
-            self.slot.connection = Some(live);
+        if matches!(outcome, Outcome::Completed(_)) {
+            let response_id = self.facts.response_id().map(str::to_string);
+            self.lease.completed(response_id);
+            self.request
+                .ws
+                .decisions()
+                .completed(&self.request.body, &self.facts);
         }
         self.finish(outcome)
     }
 
     /// §5's "once" rows: drop the connection — a socket we have read from is never
-    /// reused, and §6's memory goes with it — and open a new one at once, which
-    /// sends the FULL body. The caller has already spent that row's one allowance.
+    /// reused — and lower again at once: no connection is open, so the send opens a
+    /// new one with the FULL body. The caller has already spent that row's one
+    /// allowance.
     fn reconnect(mut self) -> Self {
         self.restart();
-        self.phase = Phase::Connect;
+        self.phase = Phase::Lower;
         self
     }
 
@@ -504,26 +309,22 @@ impl State {
 
     /// Drop the connection and everything that belonged to this attempt, so the
     /// next one starts from the beginning of the response on a NEW socket (§4:
-    /// a half-read socket is never reused, and §6's memory lives in the socket).
+    /// a half-read socket is never reused).
     fn restart(&mut self) {
-        self.live = None;
+        self.lease.drop_connection();
         self.parser = new_parser(&self.request);
         self.facts = ResponseFacts::default();
         self.awaiting_first_frame = false;
     }
 
-    /// §5: run today's `drive()` path for THIS request, and turn WebSocket off for
-    /// this provider instance until the process ends. The operator is told, ONCE,
-    /// right here: the notice is queued before the SSE request is even started
-    /// (ADR-0048), so it precedes the response's first event. Every fallback of a
-    /// request that had already fallen back is impossible — a disabled instance
-    /// never starts a WebSocket request again — so one request announces at most
-    /// once, and a later request, already on SSE, announces nothing.
+    /// §5 allows this request no further WebSocket attempt: the session reports the
+    /// failure before output, and the next lowering is the decisions' — which is
+    /// HTTP, running today's `drive()` path for THIS request and turning WebSocket
+    /// off for this provider instance until the process ends.
     fn fall_back(mut self, reason: &str) -> Self {
-        self.request.ws.disabled.store(true, Ordering::SeqCst);
-        self.live = None;
-        self.pending.push_back(fallback_notice(reason));
-        self.phase = Phase::Fallback;
+        self.lease.fail_before_output();
+        self.fallback_reason = Some(reason.to_string());
+        self.phase = Phase::Lower;
         self
     }
 }
@@ -539,8 +340,8 @@ async fn step(mut state: State) -> (Option<StreamEvent>, State) {
             Phase::Done => return (None, state),
             Phase::Credential => obtain_credential(state).await,
             Phase::Refresh { rejected } => refresh(state, rejected).await,
-            Phase::Connect => connect(state).await,
-            Phase::Send => send(state).await,
+            Phase::Lower => lower(state),
+            Phase::Send { send } => send_frame(state, send).await,
             Phase::Read => read(state).await,
             Phase::Wait { delay } => wait(state, delay).await,
             Phase::Fallback => fallback(state).await,
@@ -558,7 +359,7 @@ async fn obtain_credential(mut state: State) -> State {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         Raced::Done(Ok(credential)) => {
             state.credential = Some(credential);
-            state.phase = Phase::Connect;
+            state.phase = Phase::Lower;
             state
         }
         Raced::Done(Err(error)) => state.finish(Outcome::Failed(error)),
@@ -575,65 +376,86 @@ async fn refresh(mut state: State, rejected: Credential) -> State {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         Raced::Done(Ok(credential)) => {
             state.credential = Some(credential);
-            state.phase = Phase::Connect;
+            state.phase = Phase::Lower;
             state
         }
         Raced::Done(Err(error)) => state.finish(Outcome::Failed(error)),
     }
 }
 
-async fn connect(mut state: State) -> State {
-    if state.request.cancel.is_cancelled() {
-        return state.finish(Outcome::Cancelled);
-    }
-    // §4: reuse the connection the slot holds while it is young and recently used;
-    // otherwise drop it and connect anew.
-    if let Some(live) = state.slot.connection.take() {
-        let now = (state.request.ws.clock)();
-        if now.duration_since(live.connected_at) < MAX_AGE
-            && now.duration_since(live.last_used_at) < MAX_IDLE
-        {
-            state.live = Some(Live {
-                reused: true,
-                ..live
-            });
-            state.phase = Phase::Send;
-            return state;
-        }
-    }
-    let credential = state
-        .credential
-        .clone()
-        .expect("a credential is obtained before the first attempt");
-    let handshake = match handshake(&state.request, &credential) {
-        Ok(handshake) => handshake,
+/// WIT `lower(request, connection-state)`: the session reports its facts, the
+/// portable decisions choose. The fallback is announced here, ONCE, before the SSE
+/// request is even started (ADR-0048), so the notice precedes the response's first
+/// event. A disabled instance never starts a WebSocket request again, so one
+/// request announces at most once, and a later request, already on SSE, announces
+/// nothing.
+fn lower(mut state: State) -> State {
+    let connection = connection_state(state.lease.state());
+    let head = match handshake_head(&state.request) {
+        Ok(head) => head,
         Err(error) => return state.finish(Outcome::Failed(error)),
     };
-    let connector = state.request.ws.connector.clone();
-    let cancel = state.request.cancel.clone();
-    match race_bounded(&cancel, BOUND, connector.connect(handshake)).await {
-        Raced::Cancelled => state.finish(Outcome::Cancelled),
-        // §5: a connect error or a timeout is the transient row, whatever the
-        // failure class: the socket never came up, so nothing was sent.
-        Raced::Done(Err(_elapsed)) => state.transient(),
-        Raced::Done(Ok(Err(error))) => match error {
-            WsConnectError::Status { status, body } => refused_upgrade(state, status, &body),
-            WsConnectError::Failed(_) => state.transient(),
-        },
-        Raced::Done(Ok(Ok(connection))) => {
-            let now = (state.request.ws.clock)();
-            state.live = Some(Live {
-                connection,
-                connected_at: now,
-                last_used_at: now,
-                reused: false,
-                // A new connection has answered nothing yet: §6's memory is per
-                // connection, so the next frame is necessarily a FULL body.
-                memory: None,
-            });
-            state.phase = Phase::Send;
+    let lowered = state
+        .request
+        .ws
+        .decisions()
+        .lower(&state.request.body, head, &connection);
+    match lowered {
+        Lowered::Http => {
+            state.lease.drop_connection();
+            let reason = state
+                .fallback_reason
+                .take()
+                .unwrap_or_else(|| NO_CONNECTION.to_string());
+            state.pending.push_back(fallback_notice(&reason));
+            state.phase = Phase::Fallback;
+        }
+        Lowered::WebSocket(send) => {
+            state.phase = Phase::Send {
+                send: host_send(send),
+            };
+        }
+    }
+    state
+}
+
+async fn send_frame(mut state: State, send: WsSend) -> State {
+    // Sending always precedes any output of this request, so §5's "after visible
+    // output" rule cannot apply here. A route whose credential an egress proxy
+    // injects (issue #134) attaches no credential at all.
+    let credential = if state.request.credentials.proxy_injected() {
+        None
+    } else {
+        state.credential.as_ref()
+    };
+    let authority = WsAuthority {
+        endpoint: &state.request.url,
+        credential,
+    };
+    let sent = state
+        .lease
+        .send(authority, send, &state.request.cancel)
+        .await;
+    match sent {
+        Ok(()) => {
+            state.awaiting_first_frame = true;
+            state.phase = Phase::Read;
             state
         }
+        Err(WsSendError::Cancelled) => state.finish(Outcome::Cancelled),
+        Err(WsSendError::Invalid(error)) => state.finish(Outcome::Failed(error)),
+        Err(WsSendError::Refused { status, body }) => refused_upgrade(state, status, &body),
+        // §5: a connect error or a timeout is the transient row, whatever the
+        // failure class: the socket never came up, so nothing was sent.
+        Err(WsSendError::ConnectFailed) => state.transient(),
+        // A send that fails on a connection we reused is that socket having gone
+        // away before our first frame: §5 reconnects once for it — the third
+        // "once" row. Any other send failure is the transient row.
+        Err(WsSendError::WriteFailed) if state.lease.reused() && !state.once.reused_close => {
+            state.once.reused_close = true;
+            state.reconnect()
+        }
+        Err(WsSendError::WriteFailed) => state.transient(),
     }
 }
 
@@ -678,61 +500,19 @@ fn refused_upgrade(mut state: State, status: u16, body: &[u8]) -> State {
     }
 }
 
-async fn send(mut state: State) -> State {
-    if state.request.cancel.is_cancelled() {
-        return state.finish(Outcome::Cancelled);
-    }
-    // Sending always precedes any output of this request, so §5's "after visible
-    // output" rule cannot apply here. §6: what this connection remembers about the
-    // response it completed last decides this frame's shape.
-    let memory = state.live.as_ref().and_then(|live| live.memory.as_ref());
-    let frame = request_frame(&state.request, memory);
-    let cancel = state.request.cancel.clone();
-    let sent = {
-        let live = state
-            .live
-            .as_mut()
-            .expect("a connection is open before a frame is sent");
-        race_bounded(&cancel, BOUND, live.connection.send_text(frame)).await
-    };
-    match sent {
-        Raced::Cancelled => state.finish(Outcome::Cancelled),
-        Raced::Done(Ok(Ok(()))) => {
-            state.awaiting_first_frame = true;
-            state.phase = Phase::Read;
-            state
-        }
-        // A send that fails on a connection we reused is that socket having gone
-        // away before our first frame: §5 reconnects once for it — the third
-        // "once" row. Any other send failure is the transient row.
-        Raced::Done(_) if reused(&state) && !state.once.reused_close => {
-            state.once.reused_close = true;
-            state.reconnect()
-        }
-        Raced::Done(_) => state.transient(),
-    }
-}
-
 async fn read(mut state: State) -> State {
-    let cancel = state.request.cancel.clone();
     // §4: the read is bounded INSIDE the connection, where the message loop sees
     // every frame — so ANY message, a control ping included, resets the idle clock
-    // (issue #164). Here we only race cancellation and classify the outcome.
-    let received = {
-        let live = state
-            .live
-            .as_mut()
-            .expect("a connection is open while reading");
-        race(&cancel, live.connection.next_bounded()).await
-    };
+    // (issue #164). Here we only classify the outcome.
+    let received = state.lease.next(&state.request.cancel).await;
     match received {
-        Raced::Cancelled => state.finish(Outcome::Cancelled),
-        Raced::Done(Ok(WsNext::Timeout(bound))) => {
+        WsRead::Cancelled => state.finish(Outcome::Cancelled),
+        WsRead::Next(WsNext::Timeout(bound)) => {
             let error = ProviderError::new(ProviderErrorKind::Transport, bound.message());
             state.on_read_timeout(bound, error)
         }
-        Raced::Done(Ok(WsNext::Text(text))) => state.on_frame(&text),
-        Raced::Done(Ok(WsNext::Closed)) | Raced::Done(Err(_)) => state.on_close(),
+        WsRead::Next(WsNext::Text(text)) => state.on_frame(&text),
+        WsRead::Next(WsNext::Closed) | WsRead::Failed(_) => state.on_close(),
     }
 }
 
@@ -741,8 +521,8 @@ impl State {
     /// event name (§3).
     fn on_frame(mut self, text: &str) -> State {
         // §5: the two error events that say "this connection cannot carry this
-        // request" reconnect once each and resend the FULL body — which is the only
-        // body this stage sends. After output they are ordinary failures.
+        // request" reconnect once each and resend the FULL body. After output they
+        // are ordinary failures.
         if !self.visible
             && let Some(row) = reconnect_row(text)
             && !self.once.error_event[row.slot()]
@@ -771,7 +551,11 @@ impl State {
 
     /// The connection closed or the read failed.
     fn on_close(mut self) -> State {
-        if self.awaiting_first_frame && reused(&self) && !self.visible && !self.once.reused_close {
+        if self.awaiting_first_frame
+            && self.lease.reused()
+            && !self.visible
+            && !self.once.reused_close
+        {
             self.once.reused_close = true;
             return self.reconnect();
         }
@@ -798,7 +582,10 @@ impl State {
     /// then the SSE fallback. After output it is this response's own `Transport`
     /// failure, whose message names the bound that expired.
     fn on_read_timeout(mut self, bound: WsBound, error: ProviderError) -> State {
-        if bound == WsBound::FirstFrame && reused(&self) && !self.visible && !self.once.reused_close
+        if bound == WsBound::FirstFrame
+            && self.lease.reused()
+            && !self.visible
+            && !self.once.reused_close
         {
             self.once.reused_close = true;
             return self.reconnect();
@@ -811,11 +598,6 @@ impl State {
     }
 }
 
-/// Whether the connection this attempt is using was already open.
-fn reused(state: &State) -> bool {
-    state.live.as_ref().is_some_and(|live| live.reused)
-}
-
 /// Wait out §5's transient-row backoff, racing cancellation. The same wait the SSE
 /// driver performs (`tokio::time::sleep`), so a test drives it on the paused clock
 /// and no test ever sleeps for real.
@@ -824,7 +606,7 @@ async fn wait(mut state: State, delay: Duration) -> State {
     match race(&cancel, tokio::time::sleep(delay)).await {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         Raced::Done(()) => {
-            state.phase = Phase::Connect;
+            state.phase = Phase::Lower;
             state
         }
     }
@@ -859,20 +641,6 @@ async fn fallback(mut state: State) -> State {
     }
 }
 
-/// §6: what this connection remembers now that the response ended cleanly. `None`
-/// when there is nothing to continue from — the stream named no response id, or the
-/// body this request sent has no `input` array — and then the next request sends the
-/// FULL body, which is never an error.
-fn remember(request: &WebSocketRequest, facts: &ResponseFacts) -> Option<Memory> {
-    let response_id = facts.id.clone()?;
-    request.body.get("input")?.as_array()?;
-    Some(Memory {
-        body: request.body.clone(),
-        response_id,
-        items: facts.items.clone(),
-    })
-}
-
 fn new_parser(request: &WebSocketRequest) -> Box<dyn ResponseParser> {
     Box::new(CodexResponseParser::new(
         &request.origin_route,
@@ -880,102 +648,64 @@ fn new_parser(request: &WebSocketRequest) -> Box<dyn ResponseParser> {
     ))
 }
 
-/// The handshake for one attempt (`docs/design/websocket.md` §3): the endpoint the
-/// adapter resolved with its scheme swapped, and the header set §3 names, in order.
-/// A route whose credential an egress proxy injects (issue #134) carries no
-/// credential header at all.
-fn handshake(
-    request: &WebSocketRequest,
-    credential: &Credential,
-) -> Result<WsHandshake, ProviderError> {
-    let headers = if request.credentials.proxy_injected() {
-        build_ws_headers_without_credential(request.account, request.cache_key.as_deref())?
-    } else {
-        build_ws_headers(request.account, credential, request.cache_key.as_deref())?
-    };
-    Ok(WsHandshake {
-        url: websocket_url(&request.url),
-        headers,
+/// The handshake head of an attempt (`docs/design/websocket.md` §3): the resolved
+/// endpoint itself, the header set §3 names without any credential, and where the
+/// session attaches the credential — ahead of these headers, as `request.rs`'s
+/// identity headers order them. On a route whose credential an egress proxy
+/// injects (issue #134) the session attaches nothing.
+fn handshake_head(request: &WebSocketRequest) -> Result<WebSocketHead, ProviderError> {
+    let cache_key = request.cache_key.as_deref();
+    Ok(WebSocketHead {
+        path: String::new(),
+        headers: build_ws_headers_without_credential(request.account, cache_key)?,
+        account_id_header: account_id_header(request.account, cache_key)?,
     })
 }
 
-/// §3: the HTTPS URL the adapter already resolved, scheme swapped `https`→`wss`
-/// (`http`→`ws`). The vendor documents no other difference.
-fn websocket_url(url: &str) -> String {
-    if let Some(rest) = url.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        // `resolve_base_url` already refused anything that is not `http(s)://`.
-        url.to_string()
+/// The header that carries the credential's account id, read off `request.rs`'s
+/// own builders so the two cannot drift: the credential headers are exactly what
+/// [`build_ws_headers`] puts ahead of [`build_ws_headers_without_credential`] —
+/// `Authorization`, then the account id for an account that needs one. The probe
+/// credential is empty; no credential is read here.
+fn account_id_header(
+    account: ResponsesAccount,
+    cache_key: Option<&str>,
+) -> Result<Option<String>, ProviderError> {
+    let probe = Credential {
+        bearer: String::new(),
+        account_id: Some(String::new()),
+    };
+    let with = build_ws_headers(account, &probe, cache_key)?;
+    let without = build_ws_headers_without_credential(account, cache_key)?;
+    let credential_headers = with.len().saturating_sub(without.len());
+    Ok(with[..credential_headers]
+        .iter()
+        .map(|(name, _)| name)
+        .find(|name| !name.eq_ignore_ascii_case("authorization"))
+        .cloned())
+}
+
+/// The session's facts, as the portable decisions read them.
+fn connection_state(state: ws_session::ConnectionState) -> ConnectionState {
+    ConnectionState {
+        open: state.open,
+        last_clean_response: state.last_clean_response,
+        failed_before_output: state.failed_before_output,
     }
 }
 
-/// The ONE frame this request sends (`docs/design/websocket.md` §3).
-///
-/// §6's continuation decision lands EXACTLY here: when the connection remembers a
-/// response that this request's body continues, the frame is that body with `input`
-/// reduced to the new items and `previous_response_id` set; otherwise it is the FULL
-/// body, which is never an error.
-fn request_frame(request: &WebSocketRequest, memory: Option<&Memory>) -> String {
-    let body = &request.body;
-    let continuation = memory.and_then(|memory| continuation_body(memory, body));
-    ws_frame(continuation.as_ref().unwrap_or(body))
-}
-
-/// §6 rules 2 and 3, and what a continuation sends: the body to send with
-/// `previous_response_id` and only the new items, or `None` for the FULL body.
-///
-/// Rule 3 is decided on JSON VALUES, in three steps:
-/// 1. the new `input` starts with the remembered `input` (call it A);
-/// 2. the items after A ARE the output items the remembered response completed, in
-///    order, as this adapter's `input_items` re-encodes them — the echo;
-/// 3. at least one further item follows the echo, and those are the items to send.
-///
-/// Any step failing means the FULL body. Rule 1 holds before this is ever reached:
-/// the memory only exists on the connection that produced the response and
-/// completed it cleanly.
-fn continuation_body(memory: &Memory, body: &Value) -> Option<Value> {
-    if !same_shape(&memory.body, body) {
-        return None;
-    }
-    let base = memory.body.get("input")?.as_array()?;
-    let input = body.get("input")?.as_array()?;
-    let echo = input.get(base.len()..)?;
-    if input.get(..base.len())? != base.as_slice() || echo.len() <= memory.items.len() {
-        return None;
-    }
-    for (item, expected) in echo.iter().zip(&memory.items) {
-        if !expected.answers(item) {
-            return None;
-        }
-    }
-    let mut continuation = body.clone();
-    let fields = continuation.as_object_mut()?;
-    fields.insert(
-        "input".to_string(),
-        Value::Array(echo[memory.items.len()..].to_vec()),
-    );
-    fields.insert(
-        "previous_response_id".to_string(),
-        json!(memory.response_id),
-    );
-    Some(continuation)
-}
-
-/// §6 rule 2: every top-level field of the new body except `input` equals the
-/// remembered one. The key SET counts: a field that appeared or vanished is a
-/// different shape, and then the full body goes out.
-fn same_shape(remembered: &Value, body: &Value) -> bool {
-    fn fields(value: &Value) -> Option<Map<String, Value>> {
-        let mut fields = value.as_object()?.clone();
-        fields.remove("input");
-        Some(fields)
-    }
-    match (fields(remembered), fields(body)) {
-        (Some(remembered), Some(body)) => remembered == body,
-        _ => false,
+/// The decisions' send, as the session executes it.
+fn host_send(send: WebSocketSend) -> WsSend {
+    WsSend {
+        handshake: send.handshake.map(|head| WsHead {
+            path: head.path,
+            headers: head.headers,
+            credential: CredentialUse {
+                scheme: CredentialScheme::Bearer,
+                account_id_header: head.account_id_header,
+            },
+        }),
+        frame: send.frame,
     }
 }
 
@@ -1042,32 +772,12 @@ async fn race<T>(cancel: &CancellationToken, future: impl Future<Output = T>) ->
     }
 }
 
-/// Await `future` under `bound` and under cancellation (§4). The timeout is the
-/// only thing that can give up on a peer that never answers.
-async fn race_bounded<T>(
-    cancel: &CancellationToken,
-    bound: Duration,
-    future: impl Future<Output = T>,
-) -> Raced<Result<T, tokio::time::error::Elapsed>> {
-    race(cancel, tokio::time::timeout(bound, future)).await
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn the_scheme_is_swapped_and_nothing_else_changes() {
-        assert_eq!(
-            websocket_url("https://chatgpt.com/backend-api/codex/responses"),
-            "wss://chatgpt.com/backend-api/codex/responses"
-        );
-        assert_eq!(
-            websocket_url("http://example.test/codex/responses"),
-            "ws://example.test/codex/responses"
-        );
-        assert_eq!(websocket_url("wss://example.test"), "wss://example.test");
-    }
+    use super::*;
+    use crate::websocket_lower::{EchoedItem, Memory, echoed_item};
 
     #[test]
     fn only_the_two_connection_error_events_are_reconnectable() {

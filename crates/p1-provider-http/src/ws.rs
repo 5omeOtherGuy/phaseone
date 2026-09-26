@@ -9,14 +9,15 @@
 //! As in [`crate::http`], nothing here may put a header value into a `Debug`
 //! output or an error message: a handshake carries the credential.
 //!
-//! A caller races a connect and a send against its own bound —
+//! A caller races a connect and a send against [`WRITE_TIMEOUT`] —
 //! `docs/design/websocket.md` §4 bounds each at 10 s — and every wait races the
-//! request's cancellation token. A read is bounded HERE, inside the connection,
-//! because only the message loop sees every frame: the first frame after a send
-//! waits [`FIRST_BYTE_TIMEOUT`], every later one waits [`STREAM_IDLE_TIMEOUT`], and
-//! any message (control frames included) resets the idle clock. Dropping a connect
-//! drops its socket; §4 is why an abandoned connection is never reused, so a caller
-//! that gives up on a call must drop the connection with it.
+//! request's cancellation token; [`crate::ws_session`] is that caller. A read is
+//! bounded HERE, inside the connection, because only the message loop sees every
+//! frame: the first frame after a send waits [`FIRST_BYTE_TIMEOUT`], every later
+//! one waits [`STREAM_IDLE_TIMEOUT`], and any message (control frames included)
+//! resets the idle clock. Dropping a connect drops its socket; §4 is why an
+//! abandoned connection is never reused, so a caller that gives up on a call must
+//! drop the connection with it.
 
 use std::time::Duration;
 
@@ -35,12 +36,12 @@ use crate::http::{
     stream_idle_timeout_message,
 };
 
-/// The write of the pong that answers a peer's ping is bounded like a caller's own
-/// send (10 s, `docs/design/websocket.md` §4), because a peer that stops reading its
-/// socket while the write buffer fills would otherwise block the read loop forever —
-/// the very unbounded provider wait issue #164 removes. Cancellation is no longer
-/// the only thing that ends it.
-const PONG_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The write bound (10 s, `docs/design/websocket.md` §4): one connect, one send,
+/// and the pong that answers a peer's ping. The pong is bounded like a caller's own
+/// send because a peer that stops reading its socket while the write buffer fills
+/// would otherwise block the read loop forever — the very unbounded provider wait
+/// issue #164 removes. Cancellation is no longer the only thing that ends it.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One handshake: the URL to open and the headers to send with it.
 #[derive(Clone, PartialEq, Eq)]
@@ -312,15 +313,15 @@ pub(crate) async fn read_bounded(
             }
             // Answered here, inside the read loop, so a peer sees the pong without
             // the caller having to send anything. The write is bounded like a caller's
-            // own send (see `PONG_WRITE_TIMEOUT`); an expiry or a write error is the
+            // own send (see `WRITE_TIMEOUT`); an expiry or a write error is the
             // read failure it already is, which the caller takes as its close path.
             RawMessage::Ping(payload) => {
-                match tokio::time::timeout(PONG_WRITE_TIMEOUT, channel.pong(payload)).await {
+                match tokio::time::timeout(WRITE_TIMEOUT, channel.pong(payload)).await {
                     Ok(result) => result?,
                     Err(_elapsed) => {
                         return Err(WsError(format!(
                             "WebSocket pong write timed out after {} s",
-                            PONG_WRITE_TIMEOUT.as_secs()
+                            WRITE_TIMEOUT.as_secs()
                         )));
                     }
                 }
@@ -460,7 +461,7 @@ mod tests {
     struct Scripted {
         steps: std::collections::VecDeque<Step>,
         /// A pong write that never completes, the way a peer that stopped reading its
-        /// socket fills the write buffer (see `PONG_WRITE_TIMEOUT`).
+        /// socket fills the write buffer (see `WRITE_TIMEOUT`).
         stalling_pong: bool,
     }
 
@@ -563,14 +564,14 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         let next = tokio::time::timeout(
-            PONG_WRITE_TIMEOUT + Duration::from_secs(1),
+            WRITE_TIMEOUT + Duration::from_secs(1),
             read_bounded(&mut channel, &mut awaiting_first_frame),
         )
         .await
         .expect("a stalled pong write must not hang the read");
         let error = next.expect_err("a stalled pong write is a read failure");
         assert!(error.0.contains("pong"), "{error:?}");
-        assert_eq!(start.elapsed(), PONG_WRITE_TIMEOUT);
+        assert_eq!(start.elapsed(), WRITE_TIMEOUT);
     }
 
     #[tokio::test(start_paused = true)]

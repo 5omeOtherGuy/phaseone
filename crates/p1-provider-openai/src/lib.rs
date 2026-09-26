@@ -22,12 +22,14 @@
 //! - `parser`: the pure SSE state machine, surfaced through [`p1_provider_http::drive`].
 //! - `websocket`: the WebSocket transport — handshake, framing, connection
 //!   lifetime and the failure policy of `docs/design/websocket.md` §5.
+//! - [`websocket_lower`]: its portable decisions (framing, continuation, fallback).
 //! - [`provider`]: the [`p1_contracts::Provider`] implementation.
 
 mod parser;
 mod provider;
 mod request;
 mod websocket;
+pub mod websocket_lower;
 
 pub use provider::{Clock, OpenAiCodexProvider, OpenAiCodexProviderBuilder};
 pub use request::{
