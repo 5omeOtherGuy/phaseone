@@ -72,14 +72,19 @@ validate_modules() {
   fi
   for pkg in "${expected[@]}"; do
     out="modules/target/p1-modules/$pkg"
+    # Per package, so a file missing from one package skips only that package's content checks:
+    # every other package is still validated, and one run reports every finding.
+    local pkg_problems=0
     for f in "$pkg.wasm" "$pkg.wit" "$pkg.sha256" "$pkg.imports" "$pkg.manifest.json"; do
-      [ -f "$out/$f" ] || { echo "module validation: $out/$f is missing" >&2; problems=$((problems + 1)); }
+      [ -f "$out/$f" ] || { echo "module validation: $out/$f is missing" >&2; pkg_problems=$((pkg_problems + 1)); }
     done
-    [ "$problems" -eq 0 ] || continue
-    wasm-tools validate "$out/$pkg.wasm" || { echo "module validation: $pkg.wasm is not a valid component" >&2; problems=$((problems + 1)); }
-    (cd "$out" && sha256sum --quiet -c "$pkg.sha256") || { echo "module validation: $pkg.wasm does not match $pkg.sha256" >&2; problems=$((problems + 1)); }
-    wasm-tools component wit "$out/$pkg.wasm" | cmp -s - "$out/$pkg.wit" || { echo "module validation: $pkg.wit is not the world of $pkg.wasm" >&2; problems=$((problems + 1)); }
-    grep -q "\"digest\": \"sha256:$(cut -d' ' -f1 "$out/$pkg.sha256")\"" "$out/$pkg.manifest.json" || { echo "module validation: $pkg.manifest.json names another digest" >&2; problems=$((problems + 1)); }
+    if [ "$pkg_problems" -eq 0 ]; then
+      wasm-tools validate "$out/$pkg.wasm" || { echo "module validation: $pkg.wasm is not a valid component" >&2; pkg_problems=$((pkg_problems + 1)); }
+      (cd "$out" && sha256sum --quiet -c "$pkg.sha256") || { echo "module validation: $pkg.wasm does not match $pkg.sha256" >&2; pkg_problems=$((pkg_problems + 1)); }
+      wasm-tools component wit "$out/$pkg.wasm" | cmp -s - "$out/$pkg.wit" || { echo "module validation: $pkg.wit is not the world of $pkg.wasm" >&2; pkg_problems=$((pkg_problems + 1)); }
+      grep -q "\"digest\": \"sha256:$(cut -d' ' -f1 "$out/$pkg.sha256")\"" "$out/$pkg.manifest.json" || { echo "module validation: $pkg.manifest.json names another digest" >&2; pkg_problems=$((pkg_problems + 1)); }
+    fi
+    problems=$((problems + pkg_problems))
   done
   [ "$problems" -eq 0 ] || return 1
   echo "module validation: ${#expected[@]} package(s) valid"

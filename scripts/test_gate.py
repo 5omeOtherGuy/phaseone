@@ -91,27 +91,40 @@ BOUNDARY_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
     """
 )
 
-# The build stub writes the five build outputs of package.md, then damages them on request.
+# The build stub writes the five build outputs of package.md for every package in STUB_PACKAGES,
+# then damages the named ones on request. STUB_DAMAGE is either one word, applied to every
+# package (the single-package cases), or a comma-separated <package>:<damage> list.
 BUILD_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
     f"""\
-    pkg={PACKAGE}
-    out="modules/target/p1-modules/$pkg"
-    mkdir -p "$out"
-    printf 'component bytes' > "$out/$pkg.wasm"
-    wasm-tools component wit "$out/$pkg.wasm" > "$out/$pkg.wit"
-    (cd "$out" && sha256sum "$pkg.wasm" > "$pkg.sha256")
-    printf 'p1:module/control@1.0.0\\n' > "$out/$pkg.imports"
-    digest="$(cut -d' ' -f1 "$out/$pkg.sha256")"
-    printf '{{\\n  "name": "p1/demo",\\n  "digest": "sha256:%s",\\n  "capabilities": ["p1:module/control@1.0.0"],\\n  "size": 15\\n}}\\n' "$digest" > "$out/$pkg.manifest.json"
-    case "${{STUB_DAMAGE:-}}" in
-      digest) printf 'other bytes' > "$out/$pkg.wasm.tmp"; mv "$out/$pkg.wasm.tmp" "$out/$pkg.wasm"
-              wasm-tools component wit "$out/$pkg.wasm" > "$out/$pkg.wit" ;;
-      wit) printf 'world other {{}}\\n' > "$out/$pkg.wit" ;;
-      manifest) sed -i 's/sha256:[0-9a-f]*/sha256:0000/' "$out/$pkg.manifest.json" ;;
-      missing) rm "$out/$pkg.imports" ;;
-      extra) mkdir -p modules/target/p1-modules/p1-module-gone ;;
-      imports) printf 'p1:module/net@1.0.0\\n' >> "$out/$pkg.imports" ;;
-    esac
+    damage() {{
+      case "$1" in
+        digest) printf 'other bytes' > "$out/$pkg.wasm.tmp"; mv "$out/$pkg.wasm.tmp" "$out/$pkg.wasm"
+                wasm-tools component wit "$out/$pkg.wasm" > "$out/$pkg.wit" ;;
+        wit) printf 'world other {{}}\\n' > "$out/$pkg.wit" ;;
+        manifest) sed -i 's/sha256:[0-9a-f]*/sha256:0000/' "$out/$pkg.manifest.json" ;;
+        missing) rm "$out/$pkg.imports" ;;
+        extra) mkdir -p modules/target/p1-modules/p1-module-gone ;;
+        imports) printf 'p1:module/net@1.0.0\\n' >> "$out/$pkg.imports" ;;
+        "") ;;
+      esac
+    }}
+    for pkg in ${{STUB_PACKAGES:-{PACKAGE}}}; do
+      out="modules/target/p1-modules/$pkg"
+      mkdir -p "$out"
+      printf 'component bytes %s' "$pkg" > "$out/$pkg.wasm"
+      wasm-tools component wit "$out/$pkg.wasm" > "$out/$pkg.wit"
+      (cd "$out" && sha256sum "$pkg.wasm" > "$pkg.sha256")
+      printf 'p1:module/control@1.0.0\\n' > "$out/$pkg.imports"
+      digest="$(cut -d' ' -f1 "$out/$pkg.sha256")"
+      printf '{{\\n  "name": "p1/demo",\\n  "digest": "sha256:%s",\\n  "capabilities": ["p1:module/control@1.0.0"],\\n  "size": 15\\n}}\\n' "$digest" > "$out/$pkg.manifest.json"
+      case "${{STUB_DAMAGE:-}}" in
+        *:*) for spec in ${{STUB_DAMAGE//,/ }}; do
+               [ "${{spec%%:*}}" = "$pkg" ] || continue
+               damage "${{spec#*:}}"
+             done ;;
+        *) damage "${{STUB_DAMAGE:-}}" ;;
+      esac
+    done
     exit 0
     """
 )
@@ -175,7 +188,12 @@ def write_exec(path: pathlib.Path, text: str) -> None:
 
 
 class Harness:
-    def __init__(self, pins: str = "RUST_MIN=1.96.0\nWASM_TARGET=wasm32-unknown-unknown\n") -> None:
+    def __init__(
+        self,
+        pins: str = "RUST_MIN=1.96.0\nWASM_TARGET=wasm32-unknown-unknown\n",
+        packages: list[str] | None = None,
+    ) -> None:
+        self.packages = list(packages) if packages else [PACKAGE]
         self.tmp = tempfile.TemporaryDirectory(prefix="gate-test-")
         base = pathlib.Path(self.tmp.name)
         self.repo = base / "repo"
@@ -195,11 +213,12 @@ class Harness:
         (self.repo / "target").mkdir()
         (self.repo / ".cargo").mkdir()
         (self.repo / ".cargo" / "config.toml").write_text("", encoding="utf-8")
-        (self.repo / "modules" / PACKAGE).mkdir(parents=True)
-        (self.repo / "modules" / PACKAGE / "Cargo.toml").write_text(
-            '[package]\nname = "p1-module-demo"\n\n[package.metadata.p1-module]\nname = "p1/demo"\n',
-            encoding="utf-8",
-        )
+        for package in self.packages:
+            (self.repo / "modules" / package).mkdir(parents=True)
+            (self.repo / "modules" / package / "Cargo.toml").write_text(
+                f'[package]\nname = "{package}"\n\n[package.metadata.p1-module]\nname = "p1/demo"\n',
+                encoding="utf-8",
+            )
         (self.repo / "modules" / "p1-bindings-demo").mkdir()
         (self.repo / "modules" / "p1-bindings-demo" / "Cargo.toml").write_text(
             '[package]\nname = "p1-bindings-demo"\n', encoding="utf-8"
@@ -215,6 +234,7 @@ class Harness:
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "HOME": str(base),
             "STUB_LOG": str(self.log),
+            "STUB_PACKAGES": " ".join(self.packages),
             "LC_ALL": "C",
         }
 
@@ -358,6 +378,16 @@ class GateTests(unittest.TestCase):
                 self.assert_red(result)
                 self.assertIn(message, result.stderr)
                 self.assertNotIn("tests", h.steps())
+
+    def test_a_missing_file_does_not_skip_another_packages_checks(self) -> None:
+        # One package's missing output must not hide a later package's finding: the counter is
+        # per package, so one run reports every finding.
+        h = self.harness(packages=["p1-module-a", "p1-module-b"])
+        result = h.run(STUB_DAMAGE="p1-module-a:missing,p1-module-b:wit")
+        self.assert_red(result)
+        self.assertIn("p1-module-a/p1-module-a.imports is missing", result.stderr)
+        self.assertIn("p1-module-b.wit is not the world of", result.stderr)
+        self.assertNotIn("tests", h.steps())
 
     def test_missing_build_outputs_fail_module_validation(self) -> None:
         h = self.harness()
