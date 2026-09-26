@@ -14,24 +14,43 @@
 //! pair for the agent it just assembled and installs the tee with that agent's
 //! tools. Child assemblies are serialised by the worker service, so a take always
 //! returns the pair belonging to the assembly that just ran.
+//!
+//! For the `p1/finish` component the hub is also the `completion` capability
+//! (ADR-0083 §2): the accepted state stays the host's. The component reads the record,
+//! checks a call and submits a candidate; the hub re-verifies every candidate against
+//! its own record ([`ActivityLog::evidence_runs`], the last file change, the policy it
+//! chose, the contract it holds) and commits only what passes, and [`CompletionGate`]
+//! turns a refusal into the call's tool error.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
-    AgentEvent, Effect, EventSink, JournalRecord, RecordBody, Tool, ToolCall, ToolInput,
+    AgentEvent, BoxFuture, CallDescription, DeclarationKind, Effect, EventSink, JournalRecord,
+    RecordBody, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome,
     ToolResultItem, ToolStatus,
 };
-use p1_tool_finish::{Accepted, Evidence, FinishOutcome, SessionActivity, ShellRun};
+use p1_module_runtime::completion::{
+    Candidate, CompletionPolicy as WirePolicy, Evidence as CandidateEvidence, ShellRun as WireRun,
+    StructuredResult as WireStructured,
+};
+use p1_module_runtime::{
+    CompletionService, ExecutionLimits, LoadedModule, Services, ToolError, wasm_tool,
+};
+use p1_redact::{MaskCounter, redacted};
+use p1_tool_finish::{
+    Accepted, CompletionPolicy, Evidence, FinishOutcome, OutputContract, SessionActivity, ShellRun,
+    StructuredResult,
+};
 
 use crate::fingerprint::{self, Fingerprint, FingerprintError};
 
 #[cfg(feature = "delegation")]
 use p1_workers::{FinishReport, WorkerReport};
 
-#[cfg(feature = "delegation")]
 use crate::catalog::capabilities::{SemanticCapability, carries};
 #[cfg(feature = "delegation")]
 use crate::frontend::FrontEnd;
@@ -44,6 +63,9 @@ struct Finished {
     order: u64,
     command: Option<String>,
     exit_code: Option<i32>,
+    /// The tool that ran the call records command evidence (ADR-0083 rule 2): only such a
+    /// run can verify a completion the hub commits.
+    records_evidence: bool,
     /// ADR-0055: this successful `Executes` call changed the workspace. It is a file
     /// change for the `finish` check and progress for the stall guard, exactly as a
     /// `WritesFiles` call is.
@@ -54,6 +76,7 @@ struct Finished {
 struct Pending {
     effect: Effect,
     command: Option<String>,
+    records_evidence: bool,
 }
 
 /// Where a command's workspace changes are measured (ADR-0055), and what the last
@@ -94,14 +117,25 @@ impl ActivityLog {
     /// classified. The command is read from a `shell` call's input so a later
     /// `finish` can compare named commands.
     pub fn record_started(&self, call: &ToolCall, effect: Effect) {
+        self.record_started_by(call, effect, false);
+    }
+
+    /// As [`ActivityLog::record_started`], saying whether the tool that runs the call
+    /// records command evidence ([`records_command_evidence`]): the host knows that from
+    /// the tool's loader-built or native identity, never from the call.
+    pub fn record_started_by(&self, call: &ToolCall, effect: Effect, records_evidence: bool) {
         let command = match effect {
             Effect::Executes => shell_command(call),
             _ => None,
         };
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(call.call_id.clone(), Pending { effect, command });
+        self.pending.lock().unwrap().insert(
+            call.call_id.clone(),
+            Pending {
+                effect,
+                command,
+                records_evidence,
+            },
+        );
         if effect == Effect::Executes {
             self.take_baseline();
         }
@@ -111,6 +145,7 @@ impl ActivityLog {
     pub fn record_finished(&self, result: &ToolResultItem) {
         let pending = self.pending.lock().unwrap().remove(&result.call_id);
         let effect = pending.as_ref().map_or(Effect::ReadOnly, |p| p.effect);
+        let records_evidence = pending.as_ref().is_some_and(|p| p.records_evidence);
         let command = pending.and_then(|p| p.command);
         let order = self.next_order.fetch_add(1, Ordering::SeqCst) + 1;
         let exit_code = if effect == Effect::Executes && result.status == ToolStatus::Ok {
@@ -131,6 +166,7 @@ impl ActivityLog {
             order,
             command,
             exit_code,
+            records_evidence,
             changed_workspace,
         });
         // §3c progress: a workspace mutation (a `WritesFiles` call or a command that
@@ -265,10 +301,10 @@ impl ActivityLog {
                     let Some(call) = calls.get(call_id.as_str()) else {
                         continue;
                     };
-                    let effect = by_name
-                        .get(call.name.as_str())
-                        .map_or(Effect::ReadOnly, |tool| tool.effect(call));
-                    self.record_started(call, effect);
+                    let tool = by_name.get(call.name.as_str());
+                    let effect = tool.map_or(Effect::ReadOnly, |tool| tool.effect(call));
+                    let evidence = tool.is_some_and(|tool| records_command_evidence(tool.as_ref()));
+                    self.record_started_by(call, effect, evidence);
                 }
                 RecordBody::ToolFinished { result } => self.record_finished(result),
                 _ => {}
@@ -286,28 +322,22 @@ impl ActivityLog {
             None => finished.len() as u64,
         }
     }
-}
 
-impl SessionActivity for ActivityLog {
-    fn last_file_change(&self) -> Option<u64> {
-        self.finished
-            .lock()
-            .unwrap()
-            .iter()
-            .rev()
-            .find(|entry| {
-                entry.status == ToolStatus::Ok
-                    && (entry.effect == Effect::WritesFiles || entry.changed_workspace)
-            })
-            .map(|entry| entry.order)
+    /// The runs the completion hub counts as evidence (ADR-0083 rule 2): the finished
+    /// `Executes` calls of a tool that records command evidence, ordered as
+    /// [`SessionActivity::shell_runs`] orders every run.
+    pub fn evidence_runs(&self) -> Vec<ShellRun> {
+        self.runs(true)
     }
 
-    fn shell_runs(&self) -> Vec<ShellRun> {
+    /// The successful `Executes` runs, all of them or only those of an evidence tool.
+    fn runs(&self, evidence_only: bool) -> Vec<ShellRun> {
         self.finished
             .lock()
             .unwrap()
             .iter()
             .filter(|entry| entry.effect == Effect::Executes && entry.status == ToolStatus::Ok)
+            .filter(|entry| !evidence_only || entry.records_evidence)
             .map(|entry| ShellRun {
                 command: entry.command.clone().unwrap_or_default(),
                 exit_code: entry.exit_code,
@@ -328,6 +358,27 @@ impl SessionActivity for ActivityLog {
                 },
             })
             .collect()
+    }
+}
+
+impl SessionActivity for ActivityLog {
+    fn last_file_change(&self) -> Option<u64> {
+        self.finished
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.status == ToolStatus::Ok
+                    && (entry.effect == Effect::WritesFiles || entry.changed_workspace)
+            })
+            .map(|entry| entry.order)
+    }
+
+    /// Every successful `Executes` run, whatever tool ran it, as `completion.shell-runs`
+    /// reports them; the hub counts only [`ActivityLog::evidence_runs`].
+    fn shell_runs(&self) -> Vec<ShellRun> {
+        self.runs(false)
     }
 }
 
@@ -390,8 +441,11 @@ impl EventSink for ActivityTee {
         match &event {
             AgentEvent::ToolStarted { call } => {
                 let tool = self.tools.lock().unwrap().get(&call.name).cloned();
-                let effect = tool.map_or(Effect::ReadOnly, |tool| tool.effect(call));
-                self.log.record_started(call, effect);
+                let effect = tool
+                    .as_ref()
+                    .map_or(Effect::ReadOnly, |tool| tool.effect(call));
+                let evidence = tool.is_some_and(|tool| records_command_evidence(tool.as_ref()));
+                self.log.record_started_by(call, effect, evidence);
             }
             AgentEvent::ToolFinished { result } => self.log.record_finished(result),
             _ => {}
@@ -606,9 +660,17 @@ pub struct Completion {
 /// Issues one [`Completion`] per assembly and hands it to the host. The catalog's
 /// `finish` factory calls [`CompletionHub::issue`]; the host calls
 /// [`CompletionHub::take`] for the agent it just assembled.
+///
+/// It also backs the `completion` capability of a component (ADR-0083 §2): at every
+/// assembly boundary [`CompletionHub::grant`] records the agent's [`Completion`] (its
+/// record and accepted cell), chooses the policy (rule 7) and holds the output contract;
+/// the [`CompletionGrant`] it returns is what the component is linked with and wrapped
+/// by, and every candidate the component submits is re-verified here (rules 1–6) before
+/// it reaches the accepted cell.
 #[derive(Default)]
 pub struct CompletionHub {
     last: Mutex<Option<Completion>>,
+    shared: Arc<HubShared>,
 }
 
 impl CompletionHub {
@@ -631,6 +693,553 @@ impl CompletionHub {
     pub fn take(&self) -> Option<Completion> {
         self.last.lock().unwrap().take()
     }
+
+    /// An assembly boundary for the component path (ADR-0083 rules 6 and 7): the first
+    /// assembly of an agent or a re-grant. `completion` is the agent's record and cell,
+    /// kept across its re-grants; `tools` are the other tools assembled with the
+    /// component, whose loader-built or native identities choose the policy; `contract`
+    /// is the output contract the host set for this agent.
+    ///
+    /// Every earlier grant becomes stale: its instances and the calls that started under
+    /// it can no longer commit.
+    pub fn grant(
+        &self,
+        completion: Completion,
+        tools: &[Arc<dyn Tool>],
+        role: AgentRole,
+        contract: Option<OutputContract>,
+    ) -> CompletionGrant {
+        let policy = completion_policy(tools, role);
+        let mut state = self.shared.state.lock().unwrap();
+        state.generation += 1;
+        state.completion = Some(completion.clone());
+        state.policy = policy;
+        state.contract = contract.clone();
+        CompletionGrant {
+            shared: self.shared.clone(),
+            generation: state.generation,
+            completion,
+            policy,
+            contract,
+        }
+    }
+}
+
+/// Whose completion a grant is (ADR-0083 rule 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    /// The main agent: always `recorded-commands`.
+    Main,
+    /// A worker: its assembled tools decide.
+    Worker,
+}
+
+/// The ONE place the host decides whether a tool's runs are evidence (ADR-0083 rule 2):
+/// the `records-command-evidence` capability of its identity — the native shell's
+/// implementation while it runs, a tool package through the declaration the loader's
+/// registration made from its verified manifest (`catalog/capabilities.rs`). Never the
+/// model-facing name, a face or the effect a tool classified, so no component can claim it.
+pub fn records_command_evidence(tool: &dyn Tool) -> bool {
+    carries(tool, SemanticCapability::RecordsCommandEvidence)
+}
+
+/// ADR-0083 rule 7: `recorded-commands` when some assembled tool records command evidence,
+/// `report-to-parent` otherwise; a main agent always gets `recorded-commands`.
+pub fn completion_policy(tools: &[Arc<dyn Tool>], role: AgentRole) -> CompletionPolicy {
+    let can_run_commands = tools
+        .iter()
+        .any(|tool| records_command_evidence(tool.as_ref()));
+    if role == AgentRole::Main || can_run_commands {
+        CompletionPolicy::RecordedCommands
+    } else {
+        CompletionPolicy::ReportToParent
+    }
+}
+
+/// The state every grant of one hub shares.
+#[derive(Default)]
+struct HubShared {
+    state: Mutex<HubState>,
+    /// One `execute` of a component granted `completion` at a time: the frozen `accept`
+    /// carries no call identity, so a candidate belongs to the one open window.
+    calls: tokio::sync::Mutex<()>,
+}
+
+struct HubState {
+    /// Increased at every [`CompletionHub::grant`]; 0 before the first.
+    generation: u64,
+    completion: Option<Completion>,
+    policy: CompletionPolicy,
+    contract: Option<OutputContract>,
+    /// The `execute` call a candidate may belong to, if one runs.
+    window: Option<Window>,
+}
+
+impl Default for HubState {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            completion: None,
+            policy: CompletionPolicy::RecordedCommands,
+            contract: None,
+            window: None,
+        }
+    }
+}
+
+/// One `execute` call of a component: the grant it runs under and the hub's decision on
+/// the last candidate it submitted.
+struct Window {
+    generation: u64,
+    decision: Option<Result<(), Refusal>>,
+}
+
+/// The rules of ADR-0083 §2 a candidate is re-verified by, each named in a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionRule {
+    /// 1: `done` with `commands-passed` needs a qualifying run of every command.
+    CommandsPassed,
+    /// 2: only a tool that records command evidence produces evidence.
+    CommandEvidence,
+    /// 3: `done` with `not-run` only under the rule's conditions.
+    NotRun,
+    /// 4: `blocked` needs non-empty `needs`.
+    Blocked,
+    /// 5: a structured result is the contract's.
+    StructuredResult,
+    /// 6: only a call of the current assembly's component commits.
+    Freshness,
+}
+
+impl CompletionRule {
+    /// The rule's number in ADR-0083 §2.
+    pub fn number(self) -> u8 {
+        match self {
+            Self::CommandsPassed => 1,
+            Self::CommandEvidence => 2,
+            Self::NotRun => 3,
+            Self::Blocked => 4,
+            Self::StructuredResult => 5,
+            Self::Freshness => 6,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::CommandsPassed => "commands passed",
+            Self::CommandEvidence => "command evidence",
+            Self::NotRun => "not run",
+            Self::Blocked => "blocked",
+            Self::StructuredResult => "structured result",
+            Self::Freshness => "freshness",
+        }
+    }
+}
+
+/// Why the hub did not commit a candidate. Its text is the tool error the model reads in
+/// place of the call's own outcome.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "The host did not accept this completion (completion rule {} — {}): {reason}",
+    rule.number(),
+    rule.name()
+)]
+pub struct Refusal {
+    pub rule: CompletionRule,
+    pub reason: String,
+}
+
+impl Refusal {
+    fn new(rule: CompletionRule, reason: impl Into<String>) -> Self {
+        Self {
+            rule,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// One assembly's grant of the `completion` capability: the service a component is linked
+/// with and the gate its calls run through. Cheap to clone.
+#[derive(Clone)]
+pub struct CompletionGrant {
+    shared: Arc<HubShared>,
+    generation: u64,
+    completion: Completion,
+    policy: CompletionPolicy,
+    contract: Option<OutputContract>,
+}
+
+impl CompletionGrant {
+    /// The policy the hub chose at this assembly boundary.
+    pub fn policy(&self) -> CompletionPolicy {
+        self.policy
+    }
+
+    /// The output contract of this assembly.
+    pub fn contract(&self) -> Option<&OutputContract> {
+        self.contract.as_ref()
+    }
+
+    /// The agent's record and accepted cell.
+    pub fn completion(&self) -> &Completion {
+        &self.completion
+    }
+
+    /// The `completion` service of this assembly, for [`Services::completion`].
+    pub fn service(&self) -> Arc<dyn CompletionService> {
+        Arc::new(HubService {
+            shared: self.shared.clone(),
+            generation: self.generation,
+        })
+    }
+
+    /// Opens the window of one `execute` call under this grant: a candidate commits only
+    /// while it is open and only if no re-grant happened since. [`CompletionGate`] opens
+    /// one around every call; closing it returns the hub's refusal of the call's last
+    /// candidate, if it refused it.
+    pub fn open_window(&self) -> CallWindow {
+        self.shared.state.lock().unwrap().window = Some(Window {
+            generation: self.generation,
+            decision: None,
+        });
+        CallWindow {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+/// An open [`Window`]. Dropping it closes it, so an abandoned or cancelled call leaves no
+/// window a later candidate could commit into.
+pub struct CallWindow {
+    shared: Arc<HubShared>,
+}
+
+impl CallWindow {
+    /// Closes the window: the refusal of the call's last candidate, or `None` when the
+    /// last candidate committed or none was submitted.
+    pub fn close(self) -> Option<Refusal> {
+        let window = self.shared.state.lock().unwrap().window.take();
+        match window.and_then(|window| window.decision) {
+            Some(Err(refusal)) => Some(refusal),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for CallWindow {
+    fn drop(&mut self) {
+        self.shared.state.lock().unwrap().window = None;
+    }
+}
+
+/// The hub as one assembly's `completion` service.
+struct HubService {
+    shared: Arc<HubShared>,
+    generation: u64,
+}
+
+impl HubService {
+    fn log(&self) -> Option<Arc<ActivityLog>> {
+        let state = self.shared.state.lock().unwrap();
+        state
+            .completion
+            .as_ref()
+            .map(|completion| completion.log.clone())
+    }
+}
+
+impl CompletionService for HubService {
+    fn last_file_change(&self) -> Option<u64> {
+        self.log().and_then(|log| log.last_file_change())
+    }
+
+    fn shell_runs(&self) -> Vec<WireRun> {
+        // Every finished `executes` call, as the frozen WIT says; which of them count as
+        // evidence is decided again when a candidate arrives.
+        self.log()
+            .map(|log| log.shell_runs())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|run| WireRun {
+                command: run.command,
+                exit_code: run.exit_code,
+                order: run.order,
+            })
+            .collect()
+    }
+
+    fn policy(&self) -> WirePolicy {
+        match self.shared.state.lock().unwrap().policy {
+            CompletionPolicy::RecordedCommands => WirePolicy::RecordedCommands,
+            CompletionPolicy::ReportToParent => WirePolicy::ReportToParent,
+        }
+    }
+
+    fn output_contract(&self) -> Option<String> {
+        let state = self.shared.state.lock().unwrap();
+        state
+            .contract
+            .as_ref()
+            .map(|contract| contract.schema().to_string())
+    }
+
+    fn accept(&self, candidate: Candidate, structured: Option<WireStructured>) {
+        let mut state = self.shared.state.lock().unwrap();
+        let decision = decide(&state, self.generation, candidate, structured);
+        let decision = decision.map(|(accepted, structured, completion)| {
+            completion.outcome.set(accepted, structured);
+        });
+        // A candidate outside any window is refused and has no call to report to.
+        if let Some(window) = state.window.as_mut() {
+            window.decision = Some(decision);
+        }
+    }
+}
+
+/// What a committed candidate stores, and where.
+type Commit = (Accepted, Option<StructuredResult>, Completion);
+
+/// Re-verify a candidate against the hub's own record (ADR-0083 §2, rules 1–6). `Ok` is
+/// what commits — the hub's evidence, reason and schema verdict, never the component's.
+fn decide(
+    state: &HubState,
+    generation: u64,
+    candidate: Candidate,
+    structured: Option<WireStructured>,
+) -> Result<Commit, Refusal> {
+    // Rule 6: within an `execute` call of the current assembly's component only.
+    let Some(window) = &state.window else {
+        return Err(Refusal::new(
+            CompletionRule::Freshness,
+            "a completion is accepted only during a call of the tool the current assembly granted it",
+        ));
+    };
+    if generation != state.generation || window.generation != state.generation {
+        return Err(Refusal::new(
+            CompletionRule::Freshness,
+            "this call belongs to an assembly the host has replaced since (a re-grant); call the tool again",
+        ));
+    }
+    let Some(completion) = state.completion.clone() else {
+        return Err(Refusal::new(
+            CompletionRule::Freshness,
+            "no agent was granted completion",
+        ));
+    };
+    match candidate {
+        Candidate::Blocked {
+            summary,
+            needs,
+            tried,
+        } => {
+            // Rule 4.
+            if needs.trim().is_empty() {
+                return Err(Refusal::new(
+                    CompletionRule::Blocked,
+                    "a blocked completion must say what it needs",
+                ));
+            }
+            Ok((
+                Accepted::Blocked {
+                    summary,
+                    needs,
+                    tried,
+                },
+                None,
+                completion,
+            ))
+        }
+        Candidate::Done { summary, evidence } => {
+            let evidence = verify_evidence(state, &completion.log, evidence)?;
+            let structured = verify_structured(state.contract.as_ref(), structured)?;
+            Ok((
+                Accepted::Done { summary, evidence },
+                Some(structured),
+                completion,
+            ))
+        }
+    }
+}
+
+/// Rules 1–3: the evidence the hub commits for a `done`.
+fn verify_evidence(
+    state: &HubState,
+    log: &ActivityLog,
+    claimed: CandidateEvidence,
+) -> Result<Evidence, Refusal> {
+    let last_change = log.last_file_change();
+    match claimed {
+        // Rule 3: the reason is the hub's, never the component's text.
+        CandidateEvidence::NotRun(_) => match state.policy {
+            CompletionPolicy::ReportToParent => Ok(Evidence::NotRun(
+                p1_finish_guest::NOT_RUN_NO_COMMAND_TOOL.to_string(),
+            )),
+            CompletionPolicy::RecordedCommands if last_change.is_none() => Ok(Evidence::NotRun(
+                p1_finish_guest::NOT_RUN_NO_FILE_CHANGED.to_string(),
+            )),
+            CompletionPolicy::RecordedCommands => Err(Refusal::new(
+                CompletionRule::NotRun,
+                "this session changed files, so a completion without a verifying command is not accepted",
+            )),
+        },
+        CandidateEvidence::CommandsPassed(commands) => {
+            if commands.is_empty() {
+                return Err(Refusal::new(
+                    CompletionRule::CommandsPassed,
+                    "a completion must name the commands that verified it",
+                ));
+            }
+            let evidence = log.evidence_runs();
+            let every_run = log.shell_runs();
+            let mut passed = Vec::with_capacity(commands.len());
+            for command in &commands {
+                if let Some(failure) =
+                    p1_finish_guest::command_failure(command, &evidence, last_change)
+                {
+                    // Rule 2: a run that would count but for the tool that ran it.
+                    if p1_finish_guest::command_failure(command, &every_run, last_change).is_none()
+                    {
+                        return Err(Refusal::new(
+                            CompletionRule::CommandEvidence,
+                            format!(
+                                "`{command}` was run only by a tool that does not record command evidence, so its run verifies nothing"
+                            ),
+                        ));
+                    }
+                    return Err(Refusal::new(CompletionRule::CommandsPassed, failure));
+                }
+                passed.push(p1_finish_guest::normalise_command(command));
+            }
+            Ok(Evidence::CommandsPassed(passed))
+        }
+    }
+}
+
+/// Rule 5: the hub's own check of the result against the contract it holds.
+fn verify_structured(
+    contract: Option<&OutputContract>,
+    claimed: Option<WireStructured>,
+) -> Result<StructuredResult, Refusal> {
+    let value = claimed.and_then(|claimed| claimed.value);
+    match (contract, value) {
+        (None, None) => Ok(StructuredResult::checked(None, None)),
+        (None, Some(_)) => Err(Refusal::new(
+            CompletionRule::StructuredResult,
+            "no structured result was requested for this task",
+        )),
+        (Some(_), None) => Err(Refusal::new(
+            CompletionRule::StructuredResult,
+            "this task requires a structured result with `done`",
+        )),
+        (Some(contract), Some(text)) => {
+            let value = serde_json::from_str(&text).map_err(|error| {
+                Refusal::new(
+                    CompletionRule::StructuredResult,
+                    format!("the structured result is not JSON: {error}"),
+                )
+            })?;
+            Ok(StructuredResult::checked(Some(contract), Some(value)))
+        }
+    }
+}
+
+/// The host adapter of a component granted `completion` (ADR-0083 §2, after the rules):
+/// every call runs inside a window of the component's grant, and when the hub refused the
+/// call's candidate, the call's outcome is replaced by an ordinary tool error naming the
+/// rule, so the model reads it in the same turn. Generic: it names no tool, and presents
+/// the component's own declaration unless the host gives the one to present.
+pub struct CompletionGate {
+    inner: Arc<dyn Tool>,
+    grant: CompletionGrant,
+    declaration: ToolDeclaration,
+}
+
+impl CompletionGate {
+    /// Gate `inner`, a tool linked with `grant`'s service.
+    pub fn new(inner: Arc<dyn Tool>, grant: CompletionGrant) -> Self {
+        let declaration = inner.declaration().clone();
+        Self {
+            inner,
+            grant,
+            declaration,
+        }
+    }
+
+    /// Present `declaration` instead of the component's: the component reads its
+    /// declaration on the restricted path, where `completion` is not linked, so what
+    /// depends on the grant is the host's to present.
+    pub fn presenting(mut self, declaration: ToolDeclaration) -> Self {
+        self.declaration = declaration;
+        self
+    }
+}
+
+impl Tool for CompletionGate {
+    fn declaration(&self) -> &ToolDeclaration {
+        &self.declaration
+    }
+
+    fn identity(&self) -> &ToolIdentity {
+        self.inner.identity()
+    }
+
+    fn effect(&self, call: &ToolCall) -> Effect {
+        self.inner.effect(call)
+    }
+
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        self.inner.describe(call)
+    }
+
+    fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        self.inner.describe_result(call, result)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: ToolContext,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            let _one_call_at_a_time = self.grant.shared.calls.lock().await;
+            let window = self.grant.open_window();
+            let outcome = self.inner.execute(call, context).await;
+            match window.close() {
+                Some(refusal) => ToolOutcome::error(refusal.to_string()),
+                None => outcome,
+            }
+        })
+    }
+}
+
+/// The finish entry's assembly of the `p1/finish` component under `grant` (ADR-0083 §2):
+/// linked with the grant's `completion` service, gated by [`CompletionGate`], presenting
+/// the declaration of the grant's policy and contract — byte-identical to the native
+/// tool's, because both come from `p1-finish-guest` — and masked as every assembled tool
+/// is, the refusal text included.
+pub fn finish_component(
+    module: &LoadedModule,
+    grant: &CompletionGrant,
+    mask: &Arc<MaskCounter>,
+) -> Result<Arc<dyn Tool>, ToolError> {
+    let services = Services {
+        completion: Some(grant.service()),
+        ..Services::default()
+    };
+    let component = wasm_tool(module, services, ExecutionLimits::default(), mask)?;
+    let declaration = ToolDeclaration {
+        name: component.declaration().name.clone(),
+        description: p1_finish_guest::description(grant.policy(), grant.contract()),
+        kind: DeclarationKind::Function {
+            input_schema: p1_finish_guest::input_schema(grant.contract()),
+        },
+    };
+    grant
+        .completion()
+        .log
+        .set_finish_name(declaration.name.clone());
+    let gate = CompletionGate::new(component, grant.clone()).presenting(declaration);
+    Ok(redacted(Arc::new(gate), mask))
 }
 
 #[cfg(test)]

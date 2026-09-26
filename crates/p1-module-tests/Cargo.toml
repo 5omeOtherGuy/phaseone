@@ -41,6 +41,8 @@ p1-workers = { path = "../p1-workers" }
 # summarizer is built from masked history and that p1-context masks the summary's own answer.
 # policies.rs (S5.4) drives the policy components behind the native ask bridge (p1-host) and the
 # native context engine whose estimator builds the settings the component is configured with.
+# compaction_workload.rs (S5.9, issue #333) configures the same component with the same
+# engine's constants (DEFAULT_SUMMARY_OUTPUT_TOKENS among them).
 p1-context = { path = "../p1-context" }
 # workflow_boundary.rs: the workflow substrate driven through its decision seam (S6.3).
 p1-workflow = { path = "../p1-workflow" }
@@ -51,6 +53,9 @@ serde_json = "1"
 # environments over it, with the testkit's scripted provider and fake tools.
 p1-assembly = { path = "../p1-assembly" }
 p1-host = { path = "../p1-host" }
+# S3.7: the finish boundary suite compares the component's committed state and declaration
+# with the native tool's types and texts.
+p1-tool-finish = { path = "../p1-tool-finish" }
 # provider_wire.rs (S4.4): the provider adapters' portable halves, their wire forms and
 # the model policy they are composed with. `default-features = false` because a provider
 # component reaches no transport, runtime or credential code.

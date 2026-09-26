@@ -41,15 +41,17 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// other capability interfaces belong to other native crates and streams; a manifest that
 /// grants one of them is refused until the runtime can provide it. `summary` is linked to
 /// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7);
-/// `http`, `websocket` and `credential-control` to the broker and credential services a
-/// provider component's `stream` uses (S4.7); the worker and workflow interfaces to the
-/// caller's services in [`crate::delegation`] (S6, B-S6-8).
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 12] = [
+/// `completion` to the caller's [`CompletionService`](crate::completion::CompletionService)
+/// (S3.7, D067); `http`, `websocket` and `credential-control` to the broker and credential
+/// services a provider component's `stream` uses (S4.7); the worker and workflow interfaces
+/// to the caller's services in [`crate::delegation`] (S6, B-S6-8).
+pub(crate) const LINKABLE_CAPABILITIES: [&str; 13] = [
     "control",
     "clock",
     "random",
     "process",
     "summary",
+    "completion",
     "http",
     "websocket",
     "credential-control",
@@ -527,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn the_linkable_capabilities_are_the_old_four_plus_summary_delegation_and_providers() {
+    fn the_linkable_capabilities_are_the_old_four_plus_every_linked_service() {
         assert_eq!(
             LINKABLE_CAPABILITIES,
             [
@@ -536,6 +538,7 @@ mod tests {
                 "random",
                 "process",
                 "summary",
+                "completion",
                 "http",
                 "websocket",
                 "credential-control",
@@ -545,7 +548,7 @@ mod tests {
                 "workflows",
             ]
         );
-        for refused in ["notices", "completion", "filesystem"] {
+        for refused in ["notices", "filesystem"] {
             assert!(!LINKABLE_CAPABILITIES.contains(&refused), "{refused}");
         }
     }

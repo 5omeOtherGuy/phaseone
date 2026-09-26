@@ -20,6 +20,10 @@
 //! Every measured call is checked to have produced the answer the path must produce, so a
 //! broken path fails the case instead of reporting a time for something that did not work.
 //!
+//! notice: S5.9 (issue #333) adds exactly the `compaction-16` case and the
+//! compaction-workload section at the end of this file — PLAN §11 risk 5's
+//! repeated-compaction workload (ADR-0071); everything else here is S7's (#297).
+//!
 //! PLAN §10's instance strategy holds throughout: one compiled `Component` per digest (one
 //! `load` per case), a fresh instance per execution (the executor's own rule), no pooling.
 //! "Added" figures compare against the native path of the same operation in the same
@@ -30,18 +34,20 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{
-    AssistantBlock, AssistantItem, BoxFuture, CancellationToken, DeclarationKind, Effect, Item,
-    Origin, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome,
-    ToolResultItem, ToolStatus,
+    AssistantBlock, AssistantItem, BoxFuture, CancellationToken, Compaction, ContextInput,
+    ContextPolicy, DeclarationKind, Effect, Item, Origin, StopReason, Tool, ToolCall, ToolContext,
+    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_module_protocol::WireItem;
 use p1_module_runtime::{
-    ExecutionLimits, ExitStatus, LoadedModule, ProcessEvent, Services, wasm_tool,
+    ExecutionLimits, ExitStatus, LoadedModule, Loader, ProcessEvent, ReleaseManifest, Services,
+    SummaryError, SummaryRequest, SummaryResponse, SummaryService, WasmContextPolicy, wasm_tool,
 };
 use p1_module_tests::{
     FIXTURE_NAME, FakeProcesses, ProcessRecord, Release, call, fake_processes, within_deadline,
@@ -395,6 +401,226 @@ async fn steady_growth() {
                 "window maxima over {GROWTH_WINDOWS} windows of {WORKLOAD_ROUNDS} rounds: \
                  VmRSS {} MiB, fds {fds:?}, threads {threads:?}",
                 rss_mib.join("/")
+            ),
+        );
+    })
+    .await;
+}
+
+// ---- the compaction workload (S5.9) ---------------------------------------------------
+
+/// notice: S5.9 (issue #333) adds everything from here to the end of this section and
+/// the compaction-workload helpers at the end of the file; S7's cases above are
+/// unchanged.
+///
+/// The built package of the summarizing context policy (S5.2), the workload's component.
+const CONTEXT_PACKAGE: (&str, &str) = ("p1-module-context", "p1/context/summarizing");
+
+/// The history sizes the workload compacts: PLAN §11 risk 5's 1 MiB plus a light and a
+/// mid size, the sizes the shipped configuration (the runtime's default limits, 10^10
+/// instructions of fuel) completes. Measured on the box this row was written on, one
+/// compaction costs ≈2 ms at 64 KiB, ≈45 ms at 1 MiB, ≈166 ms at 2 MiB, ≈380 ms at
+/// 3 MiB, and 4 MiB exhausts the default fuel: the component's cost is superlinear in
+/// the history, so PLAN §11's 32 MiB compaction is out of the shipped configuration's
+/// reach today. The case probes one size past the wall (below) and records where the
+/// shipped fuel stops as a fact in the row's detail, instead of pretending the larger
+/// workload ran.
+const COMPACTION_SIZES: [usize; 3] = [64 * 1024, MIB, 2 * MIB];
+
+/// One compaction of this size, run once before the measured rounds, to record where
+/// the shipped fuel wall sits today. It is expected to fail; the case records the
+/// outcome either way as a fact.
+const COMPACTION_WALL_SIZE: usize = 4 * MIB;
+
+/// Rounds of the workload before the measured rounds: the allocator, the wasm linear
+/// memories and the engine settle first — measured on the box this row was written on,
+/// the process's VmRSS at rest keeps drifting for the first dozen or so rounds of two
+/// MiB histories before it finds its plateau, so warm-up covers it. The row's growth
+/// verdict reads nothing before warm-up is over.
+const COMPACTION_WARM_UP: usize = 8;
+/// Rounds per growth window: `steady-growth`'s window width, so a window's maximum
+/// does not move because one round's allocator noise landed in it.
+const COMPACTION_WINDOW: usize = WORKLOAD_ROUNDS;
+/// Measured rounds: 8 windows of 10. The width is the shape this workload's rest RSS
+/// actually has (measured over 120 rounds on the box this row was written on): the
+/// process wanders within ~10 MiB for the first six or so windows as the allocator and
+/// the wasm linear memories find their plateau, then holds it — 8 windows is where the
+/// plateau is visible and a compounding leak still is not.
+const COMPACTION_WINDOWS: usize = 8;
+/// Measured rounds, in `GROWTH_WINDOWS` windows of `COMPACTION_WINDOW`.
+const COMPACTION_ROUNDS: usize = COMPACTION_WINDOWS * COMPACTION_WINDOW;
+
+/// The compaction-16 workload (S5.9, issue #333; PLAN §11 risk 5): 16 agents' context
+/// policies over the one compiled `p1/context/summarizing` component compact synthetic
+/// histories of three sizes, all sixteen every round, after warm-up. The row's value is
+/// the growth verdict over consecutive windows of rounds, `steady-growth`'s rule plus
+/// the workload's own handle: `none` when neither VmRSS, open file descriptors, threads
+/// nor the live [`Store`] count at rest grows between windows. Every compaction is
+/// checked to have replaced its history, and every round to have returned its Stores.
+/// The detail records the measured values as facts: RSS before and after warm-up, the
+/// window maxima, the compaction p95 per history size, the summary requests, and where
+/// the shipped fuel wall sits (a 4 MiB compaction is probed once and its outcome
+/// recorded). The 1 MiB and 32 MiB durations belong to those rows' own cases and their
+/// PLAN §10 targets; nothing here asserts on a time or a size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a benchmark: scripts/bench-modules.sh --suite acceptance runs it"]
+async fn compaction_16() {
+    within_deadline("compaction-16", async {
+        let histories: Vec<_> = COMPACTION_SIZES
+            .iter()
+            .map(|bytes| Arc::new(synthetic_history(*bytes)))
+            .collect();
+        let module = context_module();
+        let summary = CompactionSummary::new();
+        // One instance per agent over the one component: PLAN §10's instance strategy.
+        let policies: Vec<Arc<WasmContextPolicy>> = (0..AGENTS)
+            .map(|_| {
+                Arc::new(
+                    WasmContextPolicy::new(
+                        module,
+                        &context_settings(),
+                        summary.clone() as Arc<dyn SummaryService>,
+                        ExecutionLimits::default(),
+                    )
+                    .expect("the component accepts the settings"),
+                )
+            })
+            .collect();
+        let stores_at_rest = summary.live();
+        let before_warm_up = Memory::read().rss_kib;
+        reset_peak();
+
+        // The fuel wall, recorded as a fact: the next size up from the workload's
+        // largest, through the shipped default limits, once.
+        let wall = {
+            let policy = Arc::clone(&policies[0]);
+            let history = Arc::new(synthetic_history(COMPACTION_WALL_SIZE));
+            tokio::spawn(async move { try_compact_once(&policy, &history).await })
+        };
+        let wall = match wall.await.expect("the fuel-wall probe joins") {
+            Ok((took, before, after)) => format!(
+                "a {} compaction completes within the default fuel in {:.1} ms \
+                 ({} -> {} tokens)",
+                human_bytes(COMPACTION_WALL_SIZE),
+                took,
+                before,
+                after
+            ),
+            Err(error) => format!(
+                "a {} compaction exceeds the default fuel ({error:.120}); \
+                 PLAN §11 risk 5's 32 MiB repeated-compaction size is bounded by the \
+                 component's superlinear cost, not by the runtime",
+                human_bytes(COMPACTION_WALL_SIZE),
+            ),
+        };
+
+        let mut samples: Vec<Sample> = Vec::with_capacity(COMPACTION_ROUNDS);
+        let mut stores: Vec<i64> = Vec::with_capacity(COMPACTION_ROUNDS);
+        let mut took_by_size: [Vec<f64>; COMPACTION_SIZES.len()] = Default::default();
+        let total = (COMPACTION_WARM_UP + COMPACTION_ROUNDS) * AGENTS;
+        for round in 0..COMPACTION_WARM_UP + COMPACTION_ROUNDS {
+            let agents: Vec<_> = (0..AGENTS)
+                .map(|agent| {
+                    let policy = Arc::clone(&policies[agent]);
+                    let history = Arc::clone(&histories[agent % COMPACTION_SIZES.len()]);
+                    tokio::spawn(async move { compact_once(&policy, &history).await })
+                })
+                .collect();
+            for (agent, joined) in agents.into_iter().enumerate() {
+                let (took, ..) = joined.await.expect("an agent's compaction");
+                took_by_size[agent % COMPACTION_SIZES.len()].push(took);
+            }
+            if round >= COMPACTION_WARM_UP {
+                settle("the round's Stores returned with their answers", || {
+                    summary.live() == stores_at_rest
+                })
+                .await;
+                let memory = Memory::read();
+                samples.push(Sample {
+                    rss_kib: memory.rss_kib,
+                    peak_kib: memory.peak_kib,
+                    fds: open_fds(),
+                    threads: memory.threads,
+                });
+                stores.push(summary.live() as i64);
+            }
+        }
+        assert_eq!(samples.len(), COMPACTION_ROUNDS);
+        assert_eq!(
+            summary.requests(),
+            total,
+            "one summary request per compaction, none shared, none retried"
+        );
+
+        // Window maxima, `steady-growth`'s rule at the compaction workload's cadence:
+        // RSS grows only past the plan's 1 MiB tolerance (a page or two of allocator
+        // noise is not growth), fds, threads and Stores-at-rest grow on any increase.
+        let windows = |read: fn(&Sample) -> i64| -> Vec<i64> {
+            samples
+                .chunks(COMPACTION_WINDOW)
+                .map(|window| max_of(window.iter().map(read)))
+                .collect()
+        };
+        let rss = windows(|sample| sample.rss_kib);
+        let fds = windows(|sample| sample.fds);
+        let threads = windows(|sample| sample.threads);
+        let series: [(&str, &Vec<i64>, i64); 4] = [
+            ("rss", &rss, 1024),
+            ("fds", &fds, 0),
+            ("threads", &threads, 0),
+            ("stores", &stores, 0),
+        ];
+        let growing: Vec<&str> = series
+            .iter()
+            .filter(|(_, maxima, tolerance)| {
+                maxima.windows(2).all(|pair| pair[1] > pair[0] + *tolerance)
+            })
+            .map(|(name, _, _)| *name)
+            .collect();
+        let value = if growing.is_empty() {
+            "none".to_owned()
+        } else {
+            format!("continuing ({})", growing.join(", "))
+        };
+        let rss_mib: Vec<String> = rss
+            .iter()
+            .map(|kib| format!("{:.1}", kib_to_mib(*kib)))
+            .collect();
+        let p95_by_size: Vec<String> = COMPACTION_SIZES
+            .iter()
+            .zip(&took_by_size)
+            .map(|(bytes, took)| format!("{} {:.1} ms", human_bytes(*bytes), percentile(took, 95)))
+            .collect();
+        let after_warm_up = samples
+            .first()
+            .map(|sample| sample.rss_kib)
+            .unwrap_or(before_warm_up);
+        emit(
+            "compaction-16",
+            vec![json!({"statistic": "growth", "value": value, "unit": ""})],
+            COMPACTION_ROUNDS,
+            format!(
+                "{AGENTS} agents x sizes [{}], {COMPACTION_ROUNDS} rounds of \
+                 {AGENTS} compactions after {COMPACTION_WARM_UP} warm-up rounds \
+                 ({total} compactions) through p1/context/summarizing; \
+                 VmRSS {} MiB before warm-up, {} MiB after ({:.1} MiB peak); \
+                 window maxima: VmRSS {} MiB, fds {fds:?}, threads {threads:?}, \
+                 Stores live at rest {stores:?} (one executor per agent); \
+                 compaction p95 by size: {}; \
+                 fuel wall: {wall}; \
+                 the 1 MiB and 32 MiB history rows' targets are PLAN §10's, and their \
+                 own cases carry those thresholds; summary requests {}",
+                COMPACTION_SIZES
+                    .iter()
+                    .map(|bytes| human_bytes(*bytes))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                kib_to_mib(before_warm_up),
+                kib_to_mib(after_warm_up),
+                kib_to_mib(max_of(samples.iter().map(|sample| sample.peak_kib))),
+                rss_mib.join("/"),
+                p95_by_size.join(", "),
+                summary.requests(),
             ),
         );
     })
@@ -961,4 +1187,166 @@ fn emit(row: &str, measurements: Vec<Value>, samples: usize, detail: String) {
             "detail": detail,
         })
     );
+}
+
+// ---- the compaction workload (S5.9) ---------------------------------------------------
+
+/// The built `p1/context/summarizing` component, read as a release manifest entry and
+/// compiled once per process: every agent's policy is a new instance over the one
+/// `Component` of its digest, PLAN §10's instance strategy.
+fn context_module() -> &'static LoadedModule {
+    static MODULE: OnceLock<LoadedModule> = OnceLock::new();
+    MODULE.get_or_init(|| {
+        let package = CONTEXT_PACKAGE.0;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules/target/p1-modules");
+        let manifest_path = dir.join(package).join(format!("{package}.manifest.json"));
+        let text = std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+            panic!(
+                "the build output {} is missing ({error}): \
+                 run scripts/build-modules.sh --all first",
+                manifest_path.display()
+            )
+        });
+        let manifest: Value = serde_json::from_str(&text).expect("the package manifest is JSON");
+        let entry = json!({
+            "name": manifest["name"],
+            "digest": manifest["digest"],
+            "path": format!("{package}/{package}.wasm"),
+            "kind": manifest["kind"],
+            "world": manifest["world"],
+            "protocol": manifest["protocol"],
+            "capabilities": manifest["capabilities"],
+            "variant": manifest["variant"],
+        });
+        let release = json!({ "format": "p1-release-manifest/1", "components": [entry] });
+        let manifest = ReleaseManifest::parse(&release.to_string()).expect("release manifest");
+        let loader = Loader::new(manifest, &dir).expect("loader");
+        loader
+            .load(CONTEXT_PACKAGE.1)
+            .expect("the built package loads")
+    })
+}
+
+/// `configure`'s settings: the component's own keys and the summary cap.
+fn context_settings() -> String {
+    json!({
+        "window_tokens": 10_000u64,
+        "output_headroom_tokens": 1_000u64,
+        "summarize_at_tokens": 500u64,
+        "keep_recent_tokens": 80u64,
+        "user_verbatim_tokens": 100u64,
+        "tool_result_excerpt_chars": 2_000u64,
+        "summary_output_tokens": p1_context::DEFAULT_SUMMARY_OUTPUT_TOKENS,
+    })
+    .to_string()
+}
+
+/// The workload's summary service: counts its requests, answers every summary with one
+/// completed end-turn (never the truncated retry), and exposes the strong count of its
+/// one allocation — the workload's live-`Store` check. A `Store` holds a clone for as
+/// long as its call runs, so at rest the count is the keeper plus one executor per
+/// policy, and during a round one more per compaction in flight.
+struct CompactionSummary {
+    me: Weak<CompactionSummary>,
+    requests: AtomicUsize,
+}
+
+impl CompactionSummary {
+    fn new() -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            requests: AtomicUsize::new(0),
+        })
+    }
+
+    /// How many strong handles to this service are alive.
+    fn live(&self) -> usize {
+        self.me.strong_count()
+    }
+
+    /// The summaries answered so far.
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl SummaryService for CompactionSummary {
+    fn summarize(
+        &self,
+        _request: SummaryRequest,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<SummaryResponse, SummaryError>> {
+        Box::pin(async move {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(SummaryResponse {
+                text: "the earlier turns were summarized".to_owned(),
+                stop: StopReason::EndTurn,
+                usage: None,
+            })
+        })
+    }
+}
+
+/// One compaction through the component: the whole path — the host's serialization,
+/// the component call, the summary service, the plan — checked to have replaced the
+/// history. The returned facts are the wall time and the plan's before/after estimates.
+/// A call that cannot complete (the fuel wall, the no-op rule) is an `Err` naming why,
+/// so a case can record the wall as a fact instead of failing.
+async fn try_compact_once(
+    policy: &WasmContextPolicy,
+    history: &Arc<Vec<Item>>,
+) -> Result<(f64, u64, u64), String> {
+    let cancel = CancellationToken::new();
+    let (compaction, took) = timed(policy.compact_now(ContextInput {
+        history: history.as_slice(),
+        last_usage: None,
+        cancel: &cancel,
+    }))
+    .await;
+    match compaction.map_err(|error| error.to_string())? {
+        Compaction::Replaced {
+            tokens_before,
+            tokens_after,
+            ..
+        } => {
+            assert!(
+                tokens_after < tokens_before,
+                "the replacement is smaller: {tokens_before} -> {tokens_after}"
+            );
+            Ok((took, tokens_before, tokens_after))
+        }
+        Compaction::Unchanged { tokens } => Err(format!(
+            "the no-op rule answered Unchanged at {tokens} tokens"
+        )),
+    }
+}
+
+/// [`try_compact_once`], failing the case when the path did not produce a replacement:
+/// a measured call must have worked, or the row reports the failure.
+async fn compact_once(policy: &WasmContextPolicy, history: &Arc<Vec<Item>>) -> (f64, u64, u64) {
+    try_compact_once(policy, history)
+        .await
+        .unwrap_or_else(|error| panic!("the compaction runs: {error}"))
+}
+
+/// Yields — never sleeps — until `holds` or the turn budget runs out: a summary task's
+/// own service handle lands one scheduling beat after its call's answer, and the
+/// Store-at-rest check must read the settled count, not the beat before it.
+async fn settle(what: &str, holds: impl Fn() -> bool) {
+    for _ in 0..10_000 {
+        if holds() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("{what}: never settled within 10_000 scheduler turns");
+}
+
+/// Bytes, readable in the row's detail: KiB-class below a MiB, MiB-class at and above.
+fn human_bytes(bytes: usize) -> String {
+    if bytes >= MIB {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{} KiB", bytes / 1024)
+    }
 }
