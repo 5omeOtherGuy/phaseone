@@ -333,6 +333,33 @@ EOF
   echo "build-modules: $pkg ok sha256:$digest ($size bytes)"
 }
 
+# Equal digests across machines (D083b): a guest embeds the machine-local path of $CARGO_HOME,
+# of this checkout and of its target directory in panic and assert locations, which `strip = true`
+# does not remove, so two builds of one commit from different paths would differ. Remap each
+# prefix to a fixed one, appending the remaps to whatever RUSTFLAGS the caller set and never
+# replacing it; Cargo prefers CARGO_ENCODED_RUSTFLAGS when it is set, whose entries the 0x1f unit
+# separator joins, so extend that instead of RUSTFLAGS in that case.
+cargo_home="${CARGO_HOME:-${HOME:?HOME is unset and CARGO_HOME is not set}/.cargo}"
+root="$(pwd -P)"
+mapfile -t remaps <<<"--remap-path-prefix=$cargo_home=/cargo
+--remap-path-prefix=$root=/p1"
+case "$target_dir" in
+  "$root" | "$root"/*) ;;
+  *) remaps+=("--remap-path-prefix=$target_dir=/p1-target") ;;
+esac
+if [ -n "${CARGO_ENCODED_RUSTFLAGS+x}" ]; then
+  encoded="$CARGO_ENCODED_RUSTFLAGS"
+  for remap in "${remaps[@]}"; do
+    encoded+="${encoded:+$'\x1f'}$remap"
+  done
+  export CARGO_ENCODED_RUSTFLAGS="$encoded"
+else
+  for remap in "${remaps[@]}"; do
+    RUSTFLAGS="${RUSTFLAGS:-}${RUSTFLAGS:+ }$remap"
+  done
+  export RUSTFLAGS
+fi
+
 built=0
 for p in "${packages[@]}"; do
   build_package "$p"
