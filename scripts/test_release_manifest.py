@@ -43,6 +43,9 @@ TOP_LEVEL_KEYS = {
 }
 TOOLCHAIN_KEYS = {"rustc", "cargo", "wasm_target", "wasm_tools", "wit_bindgen"}
 RUNTIME_KEYS = {"wasmtime", "wasmtime_features"}
+# The frozen `components` entry shape (crates/p1-module-runtime/src/manifest.rs).
+COMPONENT_KEYS = {"name", "digest", "path", "kind", "world", "protocol",
+                  "capabilities", "variant"}
 
 FULL_PINS = """# Module toolchain pins; parsed line by line, never sourced.
 WASM_TARGET=wasm32-wasip2
@@ -118,6 +121,49 @@ class ReleaseManifestTest(unittest.TestCase):
         write_file(path, data)
         return path
 
+    def build_outputs(self) -> str:
+        """The directory a `--build-modules-dir` points at, as build-modules.sh publishes it."""
+        directory = os.path.join(self.tmp, "build", "p1-modules")
+        os.makedirs(directory, exist_ok=True)
+        return directory
+
+    def write_build_package(
+        self,
+        directory: str,
+        crate: str,
+        name: str,
+        data: bytes,
+        *,
+        staged_rel: str | None = None,
+        **overrides,
+    ) -> dict:
+        """One build output plus its staged `.wasm`, in the frozen package layout.
+
+        `staged_rel` overrides where the component is staged, and a `digest` override lets a
+        test publish a build manifest that disagrees with the staged bytes.
+        """
+        manifest = {
+            "name": name,
+            "kind": "tool",
+            "world": "p1:module/tool@1.0.0",
+            "protocol": "1.0",
+            "capabilities": ["control", "clock", "process"],
+            "variant": "default",
+            "digest": "sha256:" + sha256(data),
+            "size": len(data),
+        }
+        manifest.update(overrides)
+        out = os.path.join(directory, crate)
+        write_file(os.path.join(out, f"{crate}.wasm"), data)
+        write_file(os.path.join(out, f"{crate}.sha256"),
+                   f"{sha256(data)}  {crate}.wasm\n".encode())
+        write_file(os.path.join(out, f"{crate}.manifest.json"),
+                   (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode())
+        if staged_rel is None:
+            staged_rel = f"{name.replace('/', '-')}/{name.replace('/', '-')}.wasm"
+        self.write_package(staged_rel, data)
+        return manifest
+
     def manifest_path(self, modules_dir: str | None = None) -> str:
         return os.path.join(modules_dir or self.modules, "manifest.json")
 
@@ -143,6 +189,7 @@ class ReleaseManifestTest(unittest.TestCase):
         tag: str | None = TAG,
         native: str | None = None,
         modules_dir: str | None = None,
+        build_modules_dir: str | None = None,
         path: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         argv = [
@@ -157,6 +204,8 @@ class ReleaseManifestTest(unittest.TestCase):
             "--modules-dir",
             modules_dir if modules_dir is not None else self.modules,
         ]
+        if build_modules_dir is not None:
+            argv += ["--build-modules-dir", build_modules_dir]
         if tag is not None:
             argv += ["--tag", tag]
         return subprocess.run(
@@ -415,6 +464,115 @@ class ReleaseManifestTest(unittest.TestCase):
         self.assertNotIn("modules/wit", raw)
         self.assertNotIn("Cargo.toml", raw)
 
+    # ---- components (freeze tag wasm-boundary-v1) --------------------------------
+
+    def test_components_carry_the_frozen_fields_of_the_build_outputs(self) -> None:
+        build = self.build_outputs()
+        data = b"fixture component bytes\n"
+        published = self.write_build_package(build, "p1-module-fixture", "p1/fixture", data)
+
+        manifest = self.generate_ok(build_modules_dir=build)
+
+        self.assertEqual(
+            manifest["components"],
+            [
+                {
+                    "name": "p1/fixture",
+                    "digest": "sha256:" + sha256(data),
+                    "path": "packages/p1-fixture/p1-fixture.wasm",
+                    "kind": "tool",
+                    "world": "p1:module/tool@1.0.0",
+                    "protocol": "1.0",
+                    "capabilities": ["control", "clock", "process"],
+                    "variant": "default",
+                }
+            ],
+        )
+        entry = manifest["components"][0]
+        self.assertEqual(set(entry), COMPONENT_KEYS)
+        self.assertEqual(entry["digest"], published["digest"])
+        # The component entry and the packages entry name the same bytes, so the runtime
+        # loads exactly the file the installer verifies.
+        self.assertEqual(
+            [p for p in manifest["packages"] if p["path"] == entry["path"]],
+            [{"path": entry["path"], "sha256": sha256(data), "size": len(data)}],
+        )
+
+    def test_components_are_sorted_by_name(self) -> None:
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-zeta", "p1/zeta", b"zeta\n")
+        self.write_build_package(build, "p1-module-alpha", "p1/alpha", b"alpha\n")
+
+        manifest = self.generate_ok(build_modules_dir=build)
+
+        names = [entry["name"] for entry in manifest["components"]]
+        self.assertEqual(names, ["p1/alpha", "p1/zeta"])
+        self.assertEqual(
+            [entry["path"] for entry in manifest["components"]],
+            ["packages/p1-alpha/p1-alpha.wasm", "packages/p1-zeta/p1-zeta.wasm"],
+        )
+
+    def test_components_stay_empty_without_a_build_outputs_directory(self) -> None:
+        self.write_package("read.wasm", b"read module\n")
+
+        manifest = self.generate_ok()
+
+        self.assertEqual(manifest["components"], [])
+        self.assertEqual(manifest["environment_locks"], [])
+
+    def test_a_component_whose_staged_bytes_disagree_is_refused(self) -> None:
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-fixture", "p1/fixture",
+                                 b"the real bytes\n", digest="sha256:" + "0" * 64)
+
+        result = self.generate(build_modules_dir=build)
+
+        self.assert_refused(result, "the staged bytes are")
+
+    def test_a_component_without_a_staged_file_is_refused(self) -> None:
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-fixture", "p1/fixture",
+                                 b"fixture\n", staged_rel="elsewhere/fixture.wasm")
+
+        result = self.generate(build_modules_dir=build)
+
+        self.assert_refused(result, "names no staged regular file")
+
+    def test_a_staged_file_without_a_component_is_refused(self) -> None:
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-fixture", "p1/fixture", b"fixture\n")
+        self.write_package("p1-extra/p1-extra.wasm", b"unlisted\n")
+
+        result = self.generate(build_modules_dir=build)
+
+        self.assert_refused(result, "without a component entry")
+
+    def test_a_build_output_without_a_package_manifest_is_refused(self) -> None:
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-fixture", "p1/fixture", b"fixture\n")
+        os.remove(os.path.join(build, "p1-module-fixture", "p1-module-fixture.manifest.json"))
+
+        result = self.generate(build_modules_dir=build)
+
+        self.assert_refused(result, "expected exactly one *.manifest.json")
+
+    def test_a_build_output_missing_a_frozen_field_is_refused(self) -> None:
+        build = self.build_outputs()
+        manifest = self.write_build_package(build, "p1-module-fixture", "p1/fixture",
+                                            b"fixture\n")
+        manifest.pop("variant")
+        write_file(os.path.join(build, "p1-module-fixture", "p1-module-fixture.manifest.json"),
+                   (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode())
+
+        result = self.generate(build_modules_dir=build)
+
+        self.assert_refused(result, "missing variant")
+
+    def test_a_missing_build_outputs_directory_is_refused(self) -> None:
+        result = self.generate(build_modules_dir=os.path.join(self.tmp, "absent"))
+
+        self.assert_refused(result, "not a directory")
+
     # ---- pins --------------------------------------------------------------------
 
     def test_pins_value_with_a_command_is_never_executed(self) -> None:
@@ -536,28 +694,30 @@ class ReleaseManifestTest(unittest.TestCase):
 
     # ---- the published archive ---------------------------------------------------
 
-    def test_release_workflow_packs_the_staged_share_tree(self) -> None:
-        # The workflow is what publishes the archive, so its commands are pinned here:
-        # a share tree staged with an empty modules/packages/, then packed with -C
-        # dist/share so the repository's own modules/ sources can never be an argument.
+    def test_release_workflow_builds_the_modules_and_stages_through_one_path(self) -> None:
+        # The workflow is what publishes the archive, so its commands are pinned here: the
+        # module toolchain from ci.yml, a module build, and then the one staging script that
+        # owns the asset names and the archive layout. The checkout's own modules/ sources
+        # are never an argument to a packer.
         workflow = os.path.join(
             os.path.dirname(HERE), ".github", "workflows", "release.yml"
         )
         with open(workflow, encoding="utf-8") as handle:
             text = handle.read()
 
+        self.assertIn("targets: wasm32-unknown-unknown", text)
+        self.assertIn('sed -n \'s/^WASM_TOOLS=//p\' modules/toolchain.pins', text)
+        self.assertIn("wasm-tools@${{ env.WASM_TOOLS_VERSION }}", text)
+        self.assertIn("scripts/build-modules.sh --all", text)
         for line in (
-            "mkdir -p dist/share/modules/packages",
-            "cp -a environments routes profiles dist/share/",
+            "scripts/stage-release.sh",
+            "--native target/release/p1",
+            "--out dist",
             '--commit "${{ github.event.workflow_run.head_sha }}"',
             '--tag "${{ steps.tag.outputs.tag }}"',
-            "--native dist/p1-linux-x86_64",
-            "--modules-dir dist/share/modules",
-            "tar -czf dist/p1-share.tar.gz -C dist/share environments routes profiles modules",
         ):
             self.assertIn(line, text, line)
-        self.assertNotIn("tar -czf dist/p1-share.tar.gz environments", text)
-        self.assertIn("find dist/share/modules -name '*.cwasm'", text)
+        # The four asset names and the release tag checks stay in the workflow.
         for asset in (
             "p1-linux-x86_64",
             "p1-linux-x86_64.sha256",
@@ -565,6 +725,8 @@ class ReleaseManifestTest(unittest.TestCase):
             "p1-share.tar.gz.sha256",
         ):
             self.assertIn(f"dist/{asset}", text, asset)
+        self.assertNotIn("tar -czf dist/p1-share.tar.gz environments", text)
+        self.assertNotIn("--modules-dir dist/share/modules", text)
 
     @unittest.skipUnless(shutil.which("tar"), "tar is required")
     def test_share_archive_carries_the_manifest_and_packages_beside_the_payload(self) -> None:

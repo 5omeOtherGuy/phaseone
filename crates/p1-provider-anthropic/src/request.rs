@@ -12,7 +12,20 @@ use p1_contracts::{ModelOptions, ProviderError, ProviderErrorKind, ProviderReque
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use serde_json::{Value, json};
 
-use crate::MessagesAccount;
+use crate::{MessagesAccount, MessagesRoute};
+
+/// `native` keys in this namespace are route-specific. None are known in this
+/// slice, so any key here is rejected.
+const NATIVE_PREFIX: &str = "anthropic-messages.";
+
+/// Namespaces the OTHER compiled adapters own inside `ModelOptions::native`. An
+/// explicit option from one of them was silently dropped on a route switch
+/// before; it is now an error naming the option, this route and this adapter
+/// (ADR-0039). Keys in no adapter's namespace keep their meaning: ignored.
+const FOREIGN_NATIVE_PREFIXES: &[&str] = &["openai-responses.", "openai-chat."];
+
+/// The request path, relative to the route's endpoint.
+pub(crate) const MESSAGES_PATH: &str = "/v1/messages";
 
 /// The account-mandated first system block. Without it the subscription account
 /// rejects the request; it is wire behaviour, not part of any prompt file.
@@ -154,6 +167,131 @@ pub(crate) fn lower(
     }
 }
 
+/// The one composition check, shared by the constructor and the pure request
+/// builder: the route data is usable, the profile is valid, and the profile's
+/// policy has an encoding here. Nothing is decided by a second, parallel table.
+pub fn validate_composition(
+    route: &MessagesRoute,
+    wire_model: &str,
+    profile: &ModelProfile,
+) -> Result<(), ProviderError> {
+    route.validate()?;
+    profile.validate()?;
+    if wire_model.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "wire model must be nonempty",
+        ));
+    }
+    // The pure lowering decides: an `enabled`/`preserved` profile has no Messages
+    // encoding, so it is refused here, at construction.
+    lower(profile, &ModelOptions::default())?;
+    Ok(())
+}
+
+/// Refuse what the composed route cannot carry, before a run starts: the
+/// provider's `validate`, a function of the composition so a component shares it.
+pub fn validate_request(
+    route: &MessagesRoute,
+    wire_model: &str,
+    profile: &ModelProfile,
+    request: &ProviderRequest,
+) -> Result<(), ProviderError> {
+    for tool in &request.tools {
+        if matches!(tool.kind, DeclarationKind::Freeform { .. }) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!(
+                    "tool `{}` is declared freeform, which route {} cannot carry",
+                    tool.name, route.origin_route
+                ),
+            ));
+        }
+    }
+    for key in request.options.native.keys() {
+        if key.starts_with(NATIVE_PREFIX) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!("unsupported route-native option `{key}`"),
+            ));
+        }
+        if FOREIGN_NATIVE_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!(
+                    "option \"{key}\" is not consumed by route \"{}\" \
+                     (adapter anthropic-messages): it belongs to another adapter's namespace",
+                    route.origin_route
+                ),
+            ));
+        }
+    }
+    if request.options.cache_key.is_some() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            format!("route {} takes no cache key", route.origin_route),
+        ));
+    }
+    if request.options.max_output_tokens == Some(0) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "max_output_tokens must be greater than zero",
+        ));
+    }
+    // The model policy: the same lowering the request builder runs, so
+    // `validate` can never accept a request the builder would reject.
+    lower(profile, &request.options)?;
+    // The history: everything else the Messages wire cannot carry is lowered
+    // (a freeform call travels as `{"input": …}`), so the message mapping is
+    // the check. A transcript whose first message would be an assistant turn
+    // is refused by name before anything is sent (ADR-0049).
+    build_messages(&route.origin_route, wire_model, &request.history)?;
+    Ok(())
+}
+
+/// One request lowered for the wire WITHOUT any credential: what the native
+/// provider sends, minus the `authorization` header [`build_headers`] adds.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoweredRequest {
+    /// Appended to the route's endpoint.
+    pub path: &'static str,
+    /// Every header the native request sends except the credential, in its order.
+    pub headers: Vec<(String, String)>,
+    /// The encoded JSON body.
+    pub body: Vec<u8>,
+}
+
+/// Validate and lower one request exactly as the native provider does before it
+/// opens a transport, so both fail with the same error and send the same bytes.
+pub fn lower_request(
+    route: &MessagesRoute,
+    wire_model: &str,
+    profile: &ModelProfile,
+    request: &ProviderRequest,
+) -> Result<LoweredRequest, ProviderError> {
+    validate_request(route, wire_model, profile, request)?;
+    let body = build_request(route, wire_model, profile, request)?;
+    let encoded = serde_json::to_vec(&body).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "the request body could not be encoded",
+        )
+    })?;
+    let headers = build_headers_without_credential(route.account, &body);
+    Ok(LoweredRequest {
+        path: MESSAGES_PATH,
+        headers: if route.long_context {
+            with_long_context(headers)
+        } else {
+            headers
+        },
+        body: encoded,
+    })
+}
+
 /// Translate a request into the Messages body. Pure: no credentials and no I/O.
 ///
 /// Returns [`ProviderErrorKind::InvalidRequest`] for a route/profile pair the wire
@@ -166,7 +304,7 @@ pub fn build_request(
     profile: &ModelProfile,
     request: &ProviderRequest,
 ) -> Result<Value, ProviderError> {
-    crate::provider::validate_composition(route, wire_model, profile)?;
+    validate_composition(route, wire_model, profile)?;
     let lowered = lower(profile, &request.options)?;
     let max_tokens = request
         .options
@@ -405,31 +543,40 @@ fn push_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
 /// already-built body. The `anthropic-beta` set is payload-driven: the
 /// interleaved-thinking beta is present exactly when the body carries a
 /// manual-budget thinking block. This route never sends `x-api-key`.
+#[cfg(feature = "native")]
 pub fn build_headers(
     account: MessagesAccount,
     credential: &p1_provider_http::Credential,
     body: &Value,
 ) -> Vec<(String, String)> {
-    headers(account, Some(credential), body)
+    let (mut headers, tail) = headers(account, body);
+    headers.push((
+        "authorization".to_string(),
+        format!("Bearer {}", credential.bearer),
+    ));
+    headers.extend(tail);
+    headers
 }
 
 /// The same header set for a route that sends NO credential (issue #134): an egress
 /// proxy injects the credential, so the request carries no `authorization` header.
-/// Everything else is byte for byte [`build_headers`]'s, because it is the same
-/// function.
+/// Everything else is byte for byte [`build_headers`]'s, because both are built
+/// from the same halves.
 pub fn build_headers_without_credential(
     account: MessagesAccount,
     body: &Value,
 ) -> Vec<(String, String)> {
-    headers(account, None, body)
+    let (mut headers, tail) = headers(account, body);
+    headers.extend(tail);
+    headers
 }
 
-fn headers(
-    account: MessagesAccount,
-    credential: Option<&p1_provider_http::Credential>,
-    body: &Value,
-) -> Vec<(String, String)> {
-    let mut headers = vec![
+type Headers = Vec<(String, String)>;
+
+/// The header set in two halves. [`build_headers`] puts the credential between
+/// them, where it has always been, so a credential-free set never reorders the rest.
+fn headers(account: MessagesAccount, body: &Value) -> (Headers, Headers) {
+    let head = vec![
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "text/event-stream".to_string()),
         (
@@ -441,19 +588,13 @@ fn headers(
             format!("p1/{}", env!("CARGO_PKG_VERSION")),
         ),
     ];
-    if let Some(credential) = credential {
-        headers.push((
-            "authorization".to_string(),
-            format!("Bearer {}", credential.bearer),
-        ));
-    }
-    headers.extend([
+    let mut tail = vec![
         (
             "anthropic-dangerous-direct-browser-access".to_string(),
             "true".to_string(),
         ),
         ("x-app".to_string(), "cli".to_string()),
-    ]);
+    ];
 
     let mut beta = account.base_beta().to_string();
     if body
@@ -465,9 +606,9 @@ fn headers(
         beta.push(',');
         beta.push_str(INTERLEAVED_THINKING_BETA);
     }
-    headers.push(("anthropic-beta".to_string(), beta));
+    tail.push(("anthropic-beta".to_string(), beta));
 
-    headers
+    (head, tail)
 }
 
 /// Add the 1M-context beta to headers [`build_headers`] produced, for a route whose
