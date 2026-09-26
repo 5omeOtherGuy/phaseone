@@ -7,12 +7,17 @@
 //! environment can claim one:
 //! - a package's capabilities are derived from what its verified manifest grants
 //!   ([`package_capabilities`]); the frozen manifest (`docs/design/modules/package.md`)
-//!   has no field for them, and the loader, not the module, builds the identity;
+//!   has no field for them, and the loader, not the module, builds the identity. The
+//!   registration that assembles a loaded module records them ([`declare_package`]), so
+//!   the checks below see a package tool too (ADR-0083 rule 7);
 //! - a still-native tool's capabilities are declared by its catalog registration
 //!   (`catalog/tools.rs`), keyed by the identity its constructor builds.
 //!
 //! An environment's face changes a tool's model-facing name, description and variant,
 //! never its identity implementation, so a face can neither grant nor hide one.
+
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
 use p1_contracts::{Tool, ToolIdentity};
 use p1_module_runtime::{LoadedModule, ModuleKind};
@@ -26,7 +31,7 @@ const COMPLETION_INTERFACE: &str = "completion";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SemanticCapability {
     /// `records-command-evidence`: the tool's outcomes record the commands it ran, so
-    /// its runs are evidence a `finish` verification can name (ADR-0052 item 1,
+    /// its runs are evidence a `finish` verification can name (ADR-0051 item 1,
     /// ADR-0083 rule 2).
     RecordsCommandEvidence,
     /// `reports-completion`: a successful call ends the turn with a completion report
@@ -130,9 +135,42 @@ fn derive(kind: ModuleKind, granted: &[String]) -> Capabilities {
     Capabilities::of(&capabilities)
 }
 
-/// The capabilities the native registrations declare for `identity`; none for an
-/// identity no registration declares.
+/// The package declarations made so far, keyed by the loader-built identity. Only the
+/// loader's registration writes here (through [`declare_package`]), never a module, so a
+/// package reachable by [`carries`] carries no more than its verified manifest grants.
+fn package_declarations() -> &'static RwLock<HashMap<ToolIdentity, Capabilities>> {
+    static DECLARATIONS: OnceLock<RwLock<HashMap<ToolIdentity, Capabilities>>> = OnceLock::new();
+    DECLARATIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Record what a loaded package's verified manifest grants, keyed by the identity the
+/// loader built, and return it. This is a package's equivalent of a [`NativeDeclaration`]:
+/// the registration that assembles the module calls it (`catalog/modules.rs`, S1.4), the
+/// way the native registrations list their declarations. Without it, a package tool's
+/// derived capabilities would be invisible to [`declared`] — and to every check built on
+/// [`carries`] — so a `tool` package granted `process` (ADR-0083 rules 2 and 7) could not
+/// count as evidence.
+pub fn declare_package(module: &LoadedModule) -> Capabilities {
+    let capabilities = package_capabilities(module);
+    package_declarations()
+        .write()
+        .expect("the package declarations lock is never held across a panic")
+        .insert(module.identity().clone(), capabilities);
+    capabilities
+}
+
+/// The capabilities `identity` carries: what the loader declared for that package
+/// identity, else what a native registration declares for it, else none. A package is
+/// keyed by its whole loader-built identity (name and variant), a native tool by its
+/// implementation alone (its registrations build one identity each).
 pub fn declared(identity: &ToolIdentity) -> Capabilities {
+    if let Some(capabilities) = package_declarations()
+        .read()
+        .expect("the package declarations lock is never held across a panic")
+        .get(identity)
+    {
+        return *capabilities;
+    }
     super::tools::NATIVE_CAPABILITIES
         .iter()
         .find(|declaration| declaration.implementation == identity.implementation)
@@ -287,6 +325,45 @@ mod tests {
         // A package identity is never a native declaration's: a package's capabilities
         // come from its grants alone.
         assert_eq!(declared(other.identity()), Capabilities::NONE);
+    }
+
+    /// The carrier ADR-0083 rule 7 needs once S1.4 registers package tools: when the
+    /// registration declares a loaded module, a tool of that loader-built identity is
+    /// visible to `carries`, whatever its model-facing name; until then, nothing is.
+    #[test]
+    fn a_declared_package_reaches_carries_through_its_verified_identity() {
+        let release = Release::with_fixture();
+        let module = release
+            .loader()
+            .load(FIXTURE_NAME)
+            .expect("the fixture loads");
+        let identity = module.identity().clone();
+        let package_tool =
+            FakeTool::new("recall").with_identity(&identity.implementation, &identity.variant);
+        assert!(
+            !carries(&package_tool, SemanticCapability::RecordsCommandEvidence),
+            "an unregistered package identity carries nothing"
+        );
+
+        assert_eq!(
+            declare_package(&module),
+            Capabilities::of(&[SemanticCapability::RecordsCommandEvidence])
+        );
+        assert!(carries(
+            &package_tool,
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!carries(
+            &package_tool,
+            SemanticCapability::ReportsCompletion
+        ));
+        // The declaration is the identity's, not the name's: another tool merely NAMED
+        // the same thing, with another identity, carries nothing.
+        let same_name = FakeTool::new("recall").with_identity("fake-recall", "test");
+        assert!(!carries(
+            &same_name,
+            SemanticCapability::RecordsCommandEvidence
+        ));
     }
 
     /// A capability cannot be had without its verified grant: the fixture imports
