@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use p1_assembly::{Catalog, ToolServices, ToolSpec, load_modules_lock};
+use p1_assembly::{Catalog, ToolServices, ToolSpec};
 use p1_contracts::Tool;
 
 use crate::HostDeps;
@@ -13,9 +13,6 @@ use crate::cli::SandboxMode;
 
 use super::capabilities::{Capabilities, NativeDeclaration, SemanticCapability};
 use super::modules::ModuleServices;
-
-/// The catalog key of the `read` tool, native or the `p1/read` package a lock selects.
-const READ: &str = "read";
 
 /// The capability services a module tool is linked with, from the assembling agent's own:
 /// the read side of its workspace and its observations (`p1-tool-read`'s service over
@@ -32,13 +29,6 @@ pub(super) fn module_services(deps: &HostDeps) -> ModuleServices {
             home.clone(),
         )
     })
-}
-
-/// Whether the `modules.lock` files next to `environment_dirs` name `key`. A lock that
-/// cannot be read selects nothing here; the locked-module registration reports its error.
-fn lock_selects(environment_dirs: &[PathBuf], key: &str) -> bool {
-    load_modules_lock(environment_dirs)
-        .is_ok_and(|lock| lock.iter().any(|(module, _)| module == key))
 }
 
 /// The semantic capabilities the still-native registrations below declare, each on the
@@ -67,25 +57,10 @@ pub(super) fn register_standard_tools(
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) {
-    let read_home = deps.home.clone();
-    // S1.8: a `modules.lock` entry named `read` selects a package for this key, which the
-    // locked-module registration then registers (with `module_services` above). The native
-    // tool stays the default: it is registered whenever no lock selects the key.
-    if !lock_selects(&deps.environment_dirs, READ) {
-        catalog.tool(
-            READ,
-            Box::new(move |spec: &ToolSpec, services: &ToolServices| {
-                // Issue #142: `read` refuses the credential files under the agent's home
-                // (the injected one in tests), whatever access it was granted.
-                let tool = p1_tool_read::ReadTool::new(
-                    services.workspace.clone(),
-                    services.observed.clone(),
-                )
-                .with_home(read_home.clone());
-                Ok(apply_face!(tool, spec))
-            }),
-        );
-    }
+    // S1.8.1 (D083b 2): `read` is the release's host entry `p1/read`, registered by
+    // `catalog::modules::register_host_entries` and loaded from the release manifest; the native
+    // registration that stood here is gone. A `modules.lock` entry named `read` still selects a
+    // package through the locked-module registration, which wins over the host entry.
     catalog.tool(
         "edit",
         Box::new(|spec: &ToolSpec, services: &ToolServices| {
@@ -182,34 +157,4 @@ pub(super) fn register_standard_tools(
             Ok(tool)
         }),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const LOCKED_READ: &str = "format = \"p1-modules-lock/1\"\n\n[modules.read]\n\
-        package = \"p1/read\"\nversion = \"0.0.1\"\ndigest = \"sha256:\
-        0000000000000000000000000000000000000000000000000000000000000000\"\n\
-        world = \"p1:module/tool@1.0.0\"\nprotocol = \"1.0\"\n";
-
-    #[test]
-    fn the_native_read_stays_unless_a_lock_names_the_read_key() {
-        let root = tempfile::tempdir().unwrap();
-        let environments = root.path().join("environments");
-        std::fs::create_dir_all(&environments).unwrap();
-        let dirs = [environments];
-        assert!(!lock_selects(&dirs, READ), "no lock selects nothing");
-
-        std::fs::write(
-            root.path().join("modules.lock"),
-            "format = \"p1-modules-lock/1\"\n\n[modules]\n",
-        )
-        .unwrap();
-        assert!(!lock_selects(&dirs, READ), "the shipped empty lock");
-
-        std::fs::write(root.path().join("modules.lock"), LOCKED_READ).unwrap();
-        assert!(lock_selects(&dirs, READ));
-        assert!(!lock_selects(&dirs, "grep"));
-    }
 }
