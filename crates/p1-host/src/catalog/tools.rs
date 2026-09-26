@@ -11,6 +11,25 @@ use crate::HostDeps;
 use crate::activity::CompletionHub;
 use crate::cli::SandboxMode;
 
+use super::capabilities::{Capabilities, NativeDeclaration, SemanticCapability};
+
+/// The semantic capabilities the still-native registrations below declare, each on the
+/// identity implementation its constructor builds (`env!("CARGO_PKG_NAME")` of the tool
+/// crate). An entry belongs to its tool's registration block and goes with it when
+/// that tool becomes a package, whose manifest grants then decide.
+pub(crate) const NATIVE_CAPABILITIES: [NativeDeclaration; 2] = [
+    // `shell` (S3): every run's outcome carries the command and its exit code.
+    NativeDeclaration {
+        implementation: "p1-tool-shell",
+        capabilities: Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]),
+    },
+    // `finish` (S3): an accepted call ends the turn with the completion report.
+    NativeDeclaration {
+        implementation: "p1-tool-finish",
+        capabilities: Capabilities::of(&[SemanticCapability::ReportsCompletion]),
+    },
+];
+
 pub(super) fn register_standard_tools(
     catalog: &mut Catalog,
     deps: &HostDeps,

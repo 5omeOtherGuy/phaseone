@@ -60,7 +60,8 @@ pub(crate) mod worktree;
 // Providers, the standard tools and the WebAssembly modules each have their own file,
 // so the stream that owns one edits it without touching the others (plan §3). The
 // tools file uses `apply_face!` too, so it is declared below the macro as well.
-mod modules;
+pub mod capabilities;
+pub mod modules;
 mod providers;
 mod tools;
 
@@ -148,6 +149,9 @@ pub fn build_catalog_with_workers(
     register_delegation_tools(&mut catalog, deps, service)?;
     #[cfg(feature = "workflows")]
     register_workflow_tools(&mut catalog, deps.workflow_service.clone());
+    // Module packages last among the built-ins, so a lock entry that collides with a
+    // compiled-in tool is refused rather than replacing it.
+    modules::register_locked_modules(&mut catalog, deps)?;
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
@@ -175,6 +179,7 @@ fn build_catalog_inner(
         env_pass,
         completion,
     );
+    modules::register_locked_modules(&mut catalog, deps)?;
 
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
