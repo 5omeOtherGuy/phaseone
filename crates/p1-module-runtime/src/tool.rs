@@ -17,11 +17,10 @@ use p1_contracts::serde_json;
 use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, Effect, Grammar, Item, Tool, ToolCall,
-    ToolContext, ToolDeclaration, ToolIdentity, ToolOutcome, ToolResultItem,
+    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem,
 };
 use p1_module_protocol::{
-    ModuleFailure, WireCallDescription, WireItem, WireResultDescription, WireToolCall,
-    WireToolOutcome,
+    ModuleFailure, WireCallDescription, WireItem, WireResultDescription, WireToolOutcome,
 };
 use p1_redact::{MaskCounter, redacted};
 use thiserror::Error;
@@ -156,9 +155,29 @@ impl WasmTool {
     }
 }
 
-/// The wire text of a call, as the module reads it.
+/// The wire text of a call, as the module reads it: exactly `WireToolCall`'s JSON.
+///
+/// Written field by field from the borrowed call instead of through a `WireToolCall`, which
+/// owns its strings: a call's input can be a whole history (tens of MiB), and the clone that
+/// conversion needs, plus the doublings of a growing buffer, were copies of it the module
+/// never sees. The buffer starts at the input's size with room for its escapes.
 fn wire_call(call: &ToolCall) -> Option<String> {
-    serde_json::to_string(&WireToolCall::from(call.clone())).ok()
+    let (kind, raw) = match &call.input {
+        ToolInput::Json(raw) => ("json", raw),
+        ToolInput::Text(raw) => ("text", raw),
+    };
+    let size = raw.len() + raw.len() / 4 + call.call_id.len() + call.name.len() + 128;
+    let mut text = Vec::with_capacity(size);
+    text.extend_from_slice(b"{\"call_id\":");
+    serde_json::to_writer(&mut text, &call.call_id).ok()?;
+    text.extend_from_slice(b",\"name\":");
+    serde_json::to_writer(&mut text, &call.name).ok()?;
+    text.extend_from_slice(b",\"input\":{\"kind\":\"");
+    text.extend_from_slice(kind.as_bytes());
+    text.extend_from_slice(b"\",\"raw\":");
+    serde_json::to_writer(&mut text, raw).ok()?;
+    text.extend_from_slice(b"}}");
+    String::from_utf8(text).ok()
 }
 
 /// The single string result of a restricted call, if it returned one.
@@ -310,5 +329,34 @@ impl Tool for WasmTool {
             });
             outcome.unwrap_or_else(ModuleFailure::into_tool_outcome)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use p1_module_protocol::WireToolCall;
+
+    use super::*;
+
+    /// The hand-written call text is the protocol's own serialization, byte for byte, for
+    /// both input kinds and for text every escape of JSON touches.
+    #[test]
+    fn the_call_text_is_the_wire_tool_calls_json() {
+        let awkward = "quote\" backslash\\ newline\n tab\t nul\u{0} del\u{7f} \u{2028} \u{1f600}";
+        for input in [
+            ToolInput::Text("echo:hi".to_owned()),
+            ToolInput::Json("{\"path\":\"src/lib.rs\"}".to_owned()),
+            ToolInput::Text(awkward.to_owned()),
+            ToolInput::Json(String::new()),
+        ] {
+            let call = ToolCall {
+                call_id: format!("c1 {awkward}"),
+                name: "fixture\"".to_owned(),
+                input,
+            };
+            let expected = serde_json::to_string(&WireToolCall::from(call.clone()))
+                .expect("a wire call serializes");
+            assert_eq!(wire_call(&call).as_deref(), Some(expected.as_str()));
+        }
     }
 }
