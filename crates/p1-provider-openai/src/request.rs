@@ -14,19 +14,37 @@ use p1_contracts::{
     Effort, ModelOptions, ProviderError, ProviderErrorKind, ProviderRequest, serde_json,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
+#[cfg(feature = "native")]
 use p1_provider_http::Credential;
 use serde_json::{Map, Value, json};
 
-use crate::ResponsesAccount;
+use crate::{ResponsesAccount, ResponsesRoute};
 
 /// Namespace an adapter owns inside `ModelOptions::native`.
 const NATIVE_PREFIX: &str = "openai-responses.";
 const VERBOSITY_KEY: &str = "openai-responses.verbosity";
 
+/// Namespaces the OTHER compiled adapters own inside `ModelOptions::native`. An
+/// explicit option from one of them was silently dropped on a route switch
+/// before; it is now an error naming the option, this route and this adapter
+/// (ADR-0039). Keys in no adapter's namespace keep their meaning: ignored.
+const FOREIGN_NATIVE_PREFIXES: &[&str] = &["anthropic-messages.", "openai-chat."];
+
+/// The adapter half of this route's identity, for error messages.
+pub(crate) const ADAPTER: &str = "openai-responses";
+
 /// Resolve the responses endpoint from a base URL. A trailing slash, an
 /// already-complete path and a bare `/codex` base all work; anything that is not
 /// `http(s)://` is rejected before a request is attempted.
 pub fn resolve_base_url(base: &str) -> Result<String, ProviderError> {
+    let path = request_path(base)?;
+    Ok(format!("{}{path}", base.trim().trim_end_matches('/')))
+}
+
+/// The path [`resolve_base_url`] appends to the base once surrounding whitespace
+/// and trailing slashes are trimmed: empty for a base that already names the
+/// responses endpoint. One rule, so a lowered request and the native URL agree.
+pub fn request_path(base: &str) -> Result<&'static str, ProviderError> {
     let base = base.trim();
     if !(base.starts_with("http://") || base.starts_with("https://")) {
         return Err(ProviderError::new(
@@ -36,11 +54,11 @@ pub fn resolve_base_url(base: &str) -> Result<String, ProviderError> {
     }
     let base = base.trim_end_matches('/');
     Ok(if base.ends_with("/codex/responses") {
-        base.to_string()
+        ""
     } else if base.ends_with("/codex") {
-        format!("{base}/responses")
+        "/responses"
     } else {
-        format!("{base}/codex/responses")
+        "/codex/responses"
     })
 }
 
@@ -48,13 +66,14 @@ impl ResponsesAccount {
     /// The header that names the ChatGPT account, when this account needs one.
     /// The route cannot bill or cache without it, so the adapter treats a
     /// credential without that id as an authentication failure.
-    fn account_id_header(self) -> Option<&'static str> {
+    pub fn account_id_header(self) -> Option<&'static str> {
         match self {
             ResponsesAccount::CodexSubscription => Some("chatgpt-account-id"),
         }
     }
 
     /// Whether every credential this account uses must carry the account id.
+    #[cfg(feature = "native")]
     pub(crate) fn requires_account_id(self) -> bool {
         self.account_id_header().is_some()
     }
@@ -87,34 +106,51 @@ impl ResponsesAccount {
 /// #134): such a route sends NO credential header at all — no `Authorization` and no
 /// account id — because the proxy supplies the whole credential; the client identity
 /// both transports send is unchanged.
+#[cfg(feature = "native")]
 fn identity_headers(
     account: ResponsesAccount,
     credential: Option<&Credential>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
-    let mut headers = Vec::new();
-    if let Some(credential) = credential {
-        headers.push((
-            "Authorization".to_string(),
-            format!("Bearer {}", credential.bearer),
-        ));
-        if let Some(name) = account.account_id_header() {
-            let account_id = credential.account_id.as_deref().ok_or_else(|| {
-                ProviderError::new(
-                    ProviderErrorKind::Authentication,
-                    "the Codex credential has no ChatGPT account id",
-                )
-            })?;
-            headers.push((name.to_string(), account_id.to_string()));
-        }
+    let mut headers = match credential {
+        Some(credential) => credential_headers(account, credential)?,
+        None => Vec::new(),
+    };
+    headers.extend(client_headers());
+    Ok(headers)
+}
+
+/// `Authorization` and, for an account that needs one, the account-id header: the
+/// credential prefix every native request starts with.
+#[cfg(feature = "native")]
+fn credential_headers(
+    account: ResponsesAccount,
+    credential: &Credential,
+) -> Result<Vec<(String, String)>, ProviderError> {
+    let mut headers = vec![(
+        "Authorization".to_string(),
+        format!("Bearer {}", credential.bearer),
+    )];
+    if let Some(name) = account.account_id_header() {
+        let account_id = credential.account_id.as_deref().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::Authentication,
+                "the Codex credential has no ChatGPT account id",
+            )
+        })?;
+        headers.push((name.to_string(), account_id.to_string()));
     }
-    headers.extend([
+    Ok(headers)
+}
+
+/// The client identity both transports send right after any credential header.
+fn client_headers() -> [(String, String); 2] {
+    [
         ("originator".to_string(), "p1".to_string()),
         (
             "User-Agent".to_string(),
             format!("p1/{}", env!("CARGO_PKG_VERSION")),
         ),
-    ]);
-    Ok(headers)
+    ]
 }
 
 /// Build the fixed header set this account requires from the credential and the
@@ -122,31 +158,29 @@ fn identity_headers(
 /// and `conversation_id`, so the wire's session identity matches the body. The
 /// credential is the only other input; an absent account id on an account that
 /// needs one is an authentication failure.
+#[cfg(feature = "native")]
 pub fn build_headers(
     account: ResponsesAccount,
     credential: &Credential,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
-    headers(account, Some(credential), cache_key)
+    let mut headers = credential_headers(account, credential)?;
+    headers.extend(build_headers_without_credential(account, cache_key)?);
+    Ok(headers)
 }
 
 /// The same header set for a route whose credential an egress proxy injects (issue
 /// #134): the request carries NO credential header, and everything else — the client
 /// identity, the protocol betas and the session headers — is byte for byte
-/// [`build_headers`]'s, because it is the same builder.
+/// [`build_headers`]'s, because [`build_headers`] is this set behind the credential.
 pub fn build_headers_without_credential(
     account: ResponsesAccount,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
-    headers(account, None, cache_key)
-}
-
-fn headers(
-    account: ResponsesAccount,
-    credential: Option<&Credential>,
-    cache_key: Option<&str>,
-) -> Result<Vec<(String, String)>, ProviderError> {
-    let mut headers = identity_headers(account, credential)?;
+    // The account shapes only the credential headers, which this set leaves out;
+    // the parameter keeps the signature the credential-free callers already use.
+    let _ = account;
+    let mut headers = Vec::from(client_headers());
     headers.extend([
         (
             "OpenAI-Beta".to_string(),
@@ -167,6 +201,7 @@ fn headers(
 /// request has a cache key — the session identity under the WebSocket spelling.
 /// Deliberately NO `Content-Type` and no `Accept`: one text frame replaces the
 /// HTTP request, and the answer is not an event stream.
+#[cfg(feature = "native")]
 pub(crate) fn build_ws_headers(
     account: ResponsesAccount,
     credential: &Credential,
@@ -177,6 +212,7 @@ pub(crate) fn build_ws_headers(
 
 /// The handshake header set of a route whose credential an egress proxy injects
 /// (issue #134): the same set as [`build_ws_headers`] minus every credential header.
+#[cfg(feature = "native")]
 pub(crate) fn build_ws_headers_without_credential(
     account: ResponsesAccount,
     cache_key: Option<&str>,
@@ -184,6 +220,7 @@ pub(crate) fn build_ws_headers_without_credential(
     ws_headers(account, None, cache_key)
 }
 
+#[cfg(feature = "native")]
 fn ws_headers(
     account: ResponsesAccount,
     credential: Option<&Credential>,
@@ -207,6 +244,7 @@ fn ws_headers(
 ///
 /// This is the pure half of §3; which BODY goes into it (today always the full
 /// one, later a continuation) is decided by the connection owner.
+#[cfg(feature = "native")]
 pub(crate) fn ws_frame(body: &Value) -> String {
     let mut frame = body.clone();
     if let Value::Object(fields) = &mut frame {
@@ -333,6 +371,99 @@ pub(crate) fn clamped_cache_key(options: &ModelOptions) -> Option<String> {
         .map(|key| key.chars().take(64).collect())
 }
 
+/// The one composition check, shared by the constructor and the pure request
+/// builder: the route data is usable, the profile is valid, and the profile's
+/// policy has an encoding here. Nothing is decided by a second, parallel table.
+pub fn validate_composition(
+    route: &ResponsesRoute,
+    wire_model: &str,
+    profile: &ModelProfile,
+) -> Result<(), ProviderError> {
+    route.validate()?;
+    profile.validate()?;
+    if wire_model.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "wire model must be nonempty",
+        ));
+    }
+    // The pure lowering decides: a `budget`, `enabled` or `preserved` profile has
+    // no Responses encoding, so it is refused here, at construction.
+    lower(profile, &ModelOptions::default())?;
+    Ok(())
+}
+
+/// Refuse what the composed route cannot carry, before a run starts: the
+/// provider's `validate`, a function of the composition so a component shares it.
+pub fn validate_request(
+    route: &ResponsesRoute,
+    profile: &ModelProfile,
+    request: &ProviderRequest,
+) -> Result<(), ProviderError> {
+    for key in request.options.native.keys() {
+        if FOREIGN_NATIVE_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!(
+                    "option \"{key}\" is not consumed by route \"{}\" \
+                     (adapter {ADAPTER}): it belongs to another adapter's namespace",
+                    route.origin_route
+                ),
+            ));
+        }
+    }
+    if request.options.cache_key.as_deref() == Some("") {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "cache_key must not be empty: set a stable nonempty key or leave it unset",
+        ));
+    }
+    // The model policy: the same lowering the request builder runs, so
+    // `validate` can never accept a request the builder would reject.
+    validate(route.account, profile, &request.options)
+}
+
+/// One HTTP/SSE request lowered for the wire WITHOUT any credential: what the
+/// native provider sends, minus the headers [`build_headers`] puts in front.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoweredRequest {
+    /// Appended to the route's endpoint (see [`request_path`]).
+    pub path: &'static str,
+    /// Every header the native request sends except the credential, in its order.
+    pub headers: Vec<(String, String)>,
+    /// The encoded JSON body.
+    pub body: Vec<u8>,
+}
+
+/// Validate and lower one request exactly as the native provider's SSE path does
+/// before it opens a transport, so both fail with the same error and send the same
+/// bytes.
+pub fn lower_request(
+    route: &ResponsesRoute,
+    wire_model: &str,
+    profile: &ModelProfile,
+    request: &ProviderRequest,
+) -> Result<LoweredRequest, ProviderError> {
+    validate_request(route, profile, request)?;
+    let path = request_path(&route.endpoint)?;
+    let body = build_request(route, wire_model, profile, request)?;
+    let body = serde_json::to_vec(&body).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "failed to serialize the request body",
+        )
+    })?;
+    let cache_key = clamped_cache_key(&request.options);
+    Ok(LoweredRequest {
+        path,
+        headers: build_headers_without_credential(route.account, cache_key.as_deref())?,
+        body,
+    })
+}
+
 /// Build the request body. Pure: no transport, no clock, no credentials.
 ///
 /// Returns [`ProviderErrorKind::InvalidRequest`] for a route/profile pair the wire
@@ -343,7 +474,7 @@ pub fn build_request(
     profile: &ModelProfile,
     request: &ProviderRequest,
 ) -> Result<Value, ProviderError> {
-    crate::provider::validate_composition(route, wire_model, profile)?;
+    validate_composition(route, wire_model, profile)?;
     // The same pure validation the provider's `validate` runs, so the builder can
     // never emit a request the provider would refuse.
     validate(route.account, profile, &request.options)?;
