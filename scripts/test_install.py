@@ -966,11 +966,25 @@ exec '{real_mv}' \"$@\"
                           "not asked to verify a module set"], done.stdout + done.stderr)
 
     def test_a_duplicate_identity_is_refused_by_the_staged_binary(self) -> None:
-        # Two names over the same bytes: the inline check sees two distinct paths and accepts
-        # the set, so the staged binary's duplicate-identity check is what refuses it.
-        files = {"tools/first.wasm": b"same bytes\n", "tools/second.wasm": b"same bytes\n"}
+        # S1's `--integrity-only` computes duplicate identity over `components`, never over
+        # `packages`, and the inline check reads that list only for its type: two component
+        # names over one digest pass the inline check, so the staged binary is the only guard
+        # that could refuse them (the mode-driven fake stands in for its verdict). The bytes
+        # are a minimal component, so a real verify reaches the identity check with no other
+        # problem to report.
+        component = b"\0asm\r\x00\x01\x00"
+        files = {"tools/first.wasm": component, "tools/second.wasm": component}
         packages = [self.package_entry(name, data) for name, data in sorted(files.items())]
-        self.publish(modules=self.module_spec(packages, files))
+        digest = "sha256:" + hashlib.sha256(component).hexdigest()
+        components = [
+            {"name": "p1/first", "digest": digest, "path": "packages/tools/first.wasm",
+             "kind": "tool", "world": "p1:module/tool@1.0.0", "protocol": "1.0",
+             "capabilities": [], "variant": "default"},
+            {"name": "p1/second", "digest": digest, "path": "packages/tools/second.wasm",
+             "kind": "tool", "world": "p1:module/tool@1.0.0", "protocol": "1.0",
+             "capabilities": [], "variant": "default"},
+        ]
+        self.publish(modules=self.module_spec(packages, files, components=components))
         done = self.run_install("--prefix", self.prefix, P1_VERIFY_MODE="fail")
         self.assert_binary_refused_untouched(done)
         self.assertIn("duplicate identity", done.stderr)
