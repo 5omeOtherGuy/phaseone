@@ -58,5 +58,11 @@ p1-module-protocol = { path = "../p1-module-protocol" }
 p1-model-profile = { path = "../p1-model-profile" }
 p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false }
 p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false }
+# The shell-boundary suite (S3.4) loads the built `p1/shell` component and binds the native,
+# sandboxed process service of p1-tool-shell to it; its parity cases also build the native
+# `ShellTool` over the same p1-workspace workspace, and it proves "gone" with kill(pid, 0).
+p1-tool-shell = { path = "../p1-tool-shell" }
+p1-workspace = { path = "../p1-workspace" }
+nix = { version = "0.29", default-features = false, features = ["signal"] }
 # provider_conformance.rs (S4.7): the shared provider suite over the built provider components.
 p1-provider-conformance = { path = "../p1-provider-conformance" }
