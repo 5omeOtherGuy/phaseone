@@ -23,8 +23,9 @@
 //! whole and the logs carry no `SKIP`.
 //!
 //! No case touches real user data: every home, workspace and secret is a tempdir, no test
-//! reads or mutates the process environment, and a case that needs a process to be gone
-//! synchronizes on an observed file or an observable pid instead of sleeping.
+//! mutates the process environment (it reads only `PATH` to resolve `bash`/`bwrap`, `HOME` as a
+//! path that is never written, and `P1_REQUIRE_BWRAP`), and a case that needs a process to be
+//! gone synchronizes on an observed file or an observable pid instead of sleeping.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
