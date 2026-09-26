@@ -434,8 +434,8 @@ fn verify_refuses_the_manifest_fields_the_loader_would_refuse() {
         ),
         (
             "capabilities",
-            serde_json::json!(["http"]),
-            "capability http cannot be linked by this runtime",
+            serde_json::json!(["notices"]),
+            "capability notices cannot be linked by this runtime",
         ),
     ];
     for (field, value, expected) in cases {

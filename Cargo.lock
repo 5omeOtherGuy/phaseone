@@ -1857,6 +1857,7 @@ version = "0.0.1"
 dependencies = [
  "p1-contracts",
  "p1-module-protocol",
+ "p1-provider-http",
  "p1-redact",
  "p1-workers",
  "p1-workflow",
@@ -1879,6 +1880,7 @@ dependencies = [
  "p1-module-protocol",
  "p1-module-runtime",
  "p1-provider-anthropic",
+ "p1-provider-conformance",
  "p1-provider-http",
  "p1-provider-openai",
  "p1-provider-openai-chat",
