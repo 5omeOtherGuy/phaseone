@@ -55,9 +55,11 @@ subscription routes with session resume and delegation; the measured record is
 docs/SLICE-REPORT.md (2026-09-20). The migration to WebAssembly modules is in
 progress (ADR-0071): the module boundary is frozen (`wasm-boundary-v1`,
 docs/design/modules/README.md) and every tool, provider, policy, worker and
-workflow member has a component package under `modules/`, but the shipped binary
-still assembles the native implementations unless a `modules.lock` selects the
-component (crates/p1-host/src/catalog/tools.rs);
+workflow member has a component package under `modules/`. The shipped policies,
+providers and worker/workflow members already load as official-release host
+entries (crates/p1-host/src/catalog/modules.rs, `register_host_entry`); the tools
+are still assembled native unless a `modules.lock` selects the component
+(crates/p1-host/src/catalog/tools.rs), and
 `scripts/check-module-boundaries.sh --shipping` lists the remaining native
 fallbacks. Native by design: the core, the journal, the worker service, the
 workflow interpreter, the provider transport, the sandbox boundary and the
