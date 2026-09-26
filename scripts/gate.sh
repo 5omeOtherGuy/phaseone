@@ -139,6 +139,7 @@ echo "== gate: adr"
 scripts/adr.py check
 python3 scripts/test_adr.py -q
 echo "== gate: installer and CI helpers"
+python3 scripts/test_bench_modules.py -q
 python3 scripts/test_check_module_boundaries.py -q
 python3 scripts/test_ci_build.py -q
 python3 scripts/test_fanout.py -q
