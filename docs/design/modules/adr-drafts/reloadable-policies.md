@@ -122,8 +122,12 @@ reconfiguration operation (S1), and the loader and package identity (S0, S1).
   session can name the policy that decided each call.
 - `--ask` and the default keep their observable behaviour: the same verdicts, the same prompt, the
   same deny reasons. The difference is where each half runs.
-- A policy component cannot read input, touch the workspace or reach the network, so a faulty or
-  replaced policy can at worst deny.
+- A policy component cannot read input, touch the workspace or reach the network, so it can affect a
+  call only through the verdict it returns. That verdict includes `permit`, and §2's conservative
+  rule covers a trap, a stopped execution or an invalid output, not a policy that runs and answers
+  `permit`: a faulty or replaced `p1/policy/ask` can wrongly permit every call and silently defeat
+  the operator's `--ask` opt-in. The sandbox limits what a policy can touch, not what it may allow,
+  so the host does not contain a wrong verdict.
 - Risk: a handle held across compaction, reload and reconnect can outlive its meaning. The
   stream's reload suite (S5.7) and compaction-workload suite (S5.9) cover it; until they pass,
   the rules in §1 and §3 are stated, not proven.
