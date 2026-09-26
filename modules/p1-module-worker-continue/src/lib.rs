@@ -2,17 +2,18 @@
 //! worker session, optionally with a larger tool grant (ADR-0050 item 6) — the native
 //! `WorkerContinueTool` of `crates/p1-tool-delegate` over the `tool` world.
 //!
-//! Its only capabilities are `control` and `workers-control`. The `add_tools` enum of the
-//! schema is the host's grantable list: the component declares it empty (see
-//! [`delegation::GRANTABLE`]) and leaves membership of an added module to the host's
-//! `continue-child`, which refuses it as a `regrant` error.
+//! Its capabilities are `control`, `workers-control` and `workers-observe`, the last for
+//! `grantable` alone (D084): the `add_tools` enum of the schema is the host's grantable list,
+//! read in `declaration` (answered on the restricted path, D085). A module outside it is refused
+//! by the host's `continue-child` before anything reaches the worker, as the native tool refuses
+//! it, and the native text is relayed verbatim.
 #![forbid(unsafe_code)]
 
 #[path = "../../p1-module-worker-start/src/delegation.rs"]
 mod delegation;
 
-use delegation::{CONTINUE_DESCRIPTION, CONTINUE_NAME, ContinueInput, GRANTABLE, ResultItem};
-use p1_bindings_tool::generated::p1::module::{control, workers_control};
+use delegation::{CONTINUE_DESCRIPTION, CONTINUE_NAME, ContinueInput, ResultItem};
+use p1_bindings_tool::generated::p1::module::{control, workers_control, workers_observe};
 use p1_bindings_tool::generated::{
     CallDescription, CallEffect, Guest, HistoryItem, ResultDescription, ToolCall, ToolDeclaration,
     ToolOutcome,
@@ -25,7 +26,7 @@ impl Guest for WorkerContinue {
         delegation::declaration(
             CONTINUE_NAME,
             CONTINUE_DESCRIPTION,
-            delegation::continue_schema(GRANTABLE),
+            delegation::continue_schema(&workers_observe::grantable()),
         )
     }
 
@@ -69,8 +70,9 @@ impl Guest for WorkerContinue {
             Ok(input) => input,
             Err(outcome) => return outcome,
         };
-        // Which modules may be added is the host's check at `continue-child`, where the
-        // grantable list lives; duplicates are removed here as the native tool removes them.
+        // Which modules may be added is the host's check at `continue-child`, made before
+        // anything reaches the worker; duplicates are removed here as the native tool removes
+        // them.
         let add_tools = delegation::dedup(input.add_tools);
         // A call cancelled before it reaches the host sends nothing (the world's rule: return
         // promptly with the `cancelled` status).
