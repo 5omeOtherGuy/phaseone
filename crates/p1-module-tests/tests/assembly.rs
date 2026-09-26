@@ -13,14 +13,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use p1_assembly::{
     AssemblyError, Catalog, EnvironmentFile, ModulesLock, ProviderSpec, Substitutions,
-    ToolServices, ToolSpec, assemble,
+    ToolServices, ToolSpec, assemble, assemble_with_route_options,
 };
-use p1_contracts::{ModelOptions, Provider, Tool};
+use p1_contracts::{CancellationToken, ModelOptions, Provider, Tool, ToolContext, ToolStatus};
 use p1_host::catalog::modules::{
     ModuleServices, ModulesError, load_locked_modules, register_modules,
 };
 use p1_module_runtime::{ProcessService, Services};
 use p1_module_tests::{FIXTURE_NAME, FakeProcesses, Release, fake_processes, lock_text};
+use p1_redact::MaskCounter;
 use p1_testkit::{FakeTool, ScriptedProvider};
 
 const PROVIDER: &str = "scripted";
@@ -303,4 +304,55 @@ fn a_face_override_on_a_module_is_refused_before_instantiation() {
         .expect_err("WasmTool has no face to apply");
     assert!(error.to_string().contains("override"), "{error}");
     assert_eq!(instantiations.count(), 0);
+}
+
+// Issue #142/S1.4: the counter a module tool masks into is the assembling agent's OWN
+// (`ToolServices::mask`), the one the turn's notice reads — not a throwaway the factory
+// created and left behind. `wasm_tool` always wraps the module; the counter it binds must
+// be the caller's, so its `take` sees what the module masked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_module_tools_masking_is_counted_in_the_agents_own_counter() {
+    let release = Release::with_fixture();
+    let instantiations = Instantiations::new();
+    let catalog = catalog(&release, &fixture_lock(&release, MODULE), &instantiations);
+    let workspace = tempfile::tempdir().unwrap();
+    // The one counter the assembling agent would report through.
+    let mask = Arc::new(MaskCounter::new());
+
+    let assembled = assemble_with_route_options(
+        &catalog,
+        &environment_of(&["read", MODULE]),
+        workspace.path(),
+        &substitutions(),
+        &mask,
+        |_| ModelOptions::default(),
+    )
+    .expect("assembles");
+    let tool = assembled
+        .tools
+        .iter()
+        .find(|tool| tool.declaration().name == "fixture")
+        .expect("the selected module is assembled")
+        .clone();
+
+    // A key-shaped value built at runtime, the shape p1-redact's own tests use.
+    let secret = format!("sk-{}", "A".repeat(24));
+    let outcome = tool
+        .execute(
+            &p1_module_tests::call(&format!("echo:{secret}")),
+            ToolContext {
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+
+    assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.content);
+    assert!(!outcome.content.contains(&secret));
+    assert_eq!(outcome.content, "<redacted:sk-:24 chars>");
+    assert_eq!(
+        mask.take(),
+        1,
+        "the agent's counter carries the module tool's masking"
+    );
+    assert_eq!(mask.take(), 0);
 }

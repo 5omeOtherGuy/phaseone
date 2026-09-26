@@ -1689,6 +1689,7 @@ version = "0.0.1"
 dependencies = [
  "p1-contracts",
  "p1-model-profile",
+ "p1-redact",
  "p1-testkit",
  "p1-workspace",
  "serde",

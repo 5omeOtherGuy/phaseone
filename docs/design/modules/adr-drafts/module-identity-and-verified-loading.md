@@ -91,7 +91,9 @@ files to their sha256.
   capability services of the assembling agent, runs only when an environment assembles
   the name. An installed but unselected package and an invented name therefore both
   fail to dispatch. A name, description or variant override on a module is refused, as
-  `WasmTool` has no face to apply.
+  `WasmTool` has no face to apply. The adapter is built with the assembling agent's own
+  credential-masking counter (issue #142; `ToolServices::mask`), so a module tool's
+  masking is reported by the turn's notice exactly as the host's own tools' is.
 - `p1 modules list/inspect/verify` shows availability, selected versions, digests,
   imports and effective grants; `verify` is metadata-only and reads neither credentials
   nor user configuration (a later S1 slice).

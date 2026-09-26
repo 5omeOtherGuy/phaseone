@@ -30,7 +30,6 @@ use p1_module_runtime::{
     ComponentEntry, ExecutionLimits, LoadError, LoadedModule, Loader, ManifestError, ModuleKind,
     ReleaseManifest, Services, wasm_tool,
 };
-use p1_redact::MaskCounter;
 use thiserror::Error;
 
 use crate::HostDeps;
@@ -314,14 +313,16 @@ fn instantiate(
             package.module
         ));
     }
-    // The agent's own redacting wrapper (`run.rs`) holds the count the turn reports; this
-    // counter only satisfies `wasm_tool`, which never hands out an unwrapped module tool.
-    let counter = Arc::new(MaskCounter::new());
+    // The turn's own counter is the assembling agent's, carried on `ToolServices`
+    // (issue #142, one counter per agent): `wasm_tool` always wraps the module, and the
+    // host's `assemble_with_cache_key` wraps the SAME counter around the assembled tools,
+    // so a module tool's masking is what the turn's mask notice reports — never a
+    // throwaway counter that always reads zero.
     wasm_tool(
         &package.loaded,
         services(tool_services),
         ExecutionLimits::default(),
-        &counter,
+        &tool_services.mask,
     )
     .map_err(|error| error.to_string())
 }
