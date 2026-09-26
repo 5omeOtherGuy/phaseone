@@ -1861,6 +1861,7 @@ name = "p1-module-tests"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "p1-module-protocol",
  "p1-module-runtime",
  "p1-redact",
  "tempfile",
