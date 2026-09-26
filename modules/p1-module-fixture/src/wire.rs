@@ -101,10 +101,12 @@ impl Literal {
         let bytes = body.as_bytes();
         let mut run = 0;
         let mut i = 0;
-        while i < bytes.len() {
+        // Inside a literal whose extent is known, the only special byte left to meet is the
+        // backslash of an escape: the byte after one is consumed with it below.
+        while let Some(found) = special(bytes, i) {
+            i = found;
             if bytes[i] != b'\\' {
-                i += 1;
-                continue;
+                return None;
             }
             // `run..i` holds no escape and ends before an ASCII byte: whole characters.
             text.push_str(&body[run..i]);
