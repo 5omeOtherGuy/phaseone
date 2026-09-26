@@ -131,6 +131,27 @@ pub enum Action {
     View(ViewCommand),
 }
 
+/// What a `/modules` line asks for (ADR-0084 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModulesCommand {
+    /// `/modules reload`: replace the session's module assembly, policies included,
+    /// between complete turns.
+    Reload,
+}
+
+/// The argument of `/modules`, parsed; `None` for anything it does not name.
+pub fn modules_command(argument: &str) -> Option<ModulesCommand> {
+    match argument.trim() {
+        "reload" => Some(ModulesCommand::Reload),
+        _ => None,
+    }
+}
+
+/// The note a `/modules reload` typed while a turn runs leaves: it waits for that
+/// turn and its tool calls to settle.
+pub const RELOAD_PENDING_NOTE: &str =
+    "· modules reload pending · applies once this turn and its tool calls settle";
+
 /// Map one key event to commands, given the screen state — the driver's entry point until it
 /// applies view commands. Keys whose only meaning is a view change map to the nearest command
 /// the driver already performs, or to nothing.
@@ -955,5 +976,14 @@ mod tests {
             decide(&s, key(KeyCode::Esc)),
             view(ViewCommand::TogglePaneFocus)
         );
+    }
+
+    #[test]
+    fn modules_reload_is_the_one_modules_command() {
+        assert_eq!(modules_command("reload"), Some(ModulesCommand::Reload));
+        assert_eq!(modules_command("  reload "), Some(ModulesCommand::Reload));
+        for other in ["", "list", "reload now", "Reload"] {
+            assert_eq!(modules_command(other), None, "{other:?}");
+        }
     }
 }
