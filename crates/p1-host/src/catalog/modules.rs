@@ -340,10 +340,11 @@ pub(super) fn register_locked_modules(
     }
     let release = official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())?;
     let packages = load_locked_modules(&lock, &release).map_err(|error| error.to_string())?;
-    // No native service backs a module capability in the host yet (the shell's process
-    // service is not bridged to the runtime's `ProcessService`), so a package granted one
-    // fails its assembly with the runtime's `MissingService` rather than running unlinked.
-    let services: ModuleServices = Arc::new(|_: &ToolServices| Services::default());
+    // The workspace read side and the observations are the agent's own (S1.8); no other
+    // native service backs a module capability in the host yet (the shell's process service
+    // is not bridged to the runtime's `ProcessService`), so a package granted one fails its
+    // assembly with the runtime's `MissingService` rather than running unlinked.
+    let services = super::tools::module_services(deps);
     register_modules(catalog, packages, services).map_err(|error| error.to_string())
 }
 

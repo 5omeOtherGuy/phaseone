@@ -48,3 +48,6 @@ p1-workflow = { path = "../p1-workflow" }
 # environments over it, with the testkit's scripted provider and fake tools.
 p1-assembly = { path = "../p1-assembly" }
 p1-host = { path = "../p1-host" }
+# S1.8: read_module.rs runs the native `read` and the `p1/read` component over one workspace.
+p1-tool-read = { path = "../p1-tool-read" }
+p1-workspace = { path = "../p1-workspace" }

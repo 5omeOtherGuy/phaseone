@@ -1878,8 +1878,10 @@ dependencies = [
  "p1-provider-openai",
  "p1-redact",
  "p1-testkit",
+ "p1-tool-read",
  "p1-workers",
  "p1-workflow",
+ "p1-workspace",
  "tempfile",
  "tokio",
 ]
