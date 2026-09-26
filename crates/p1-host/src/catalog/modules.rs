@@ -335,21 +335,35 @@ pub fn register_modules(
             });
         }
         let key = package.module.clone();
-        let services = services.clone();
-        let package = Arc::new(package);
-        catalog.tool(
-            &key,
-            Box::new(move |spec: &ToolSpec, tool_services: &ToolServices| {
-                instantiate(&package, spec, &services, tool_services)
-            }),
-        );
+        register_host_entry(catalog, &key, Arc::new(package.loaded), services.clone());
     }
     Ok(())
 }
 
-/// Builds one agent's instance of a module tool.
+/// Registers the verified module `loaded` under the catalog key `module`, built only when an
+/// environment assembles the key, as [`register_modules`] registers a locked package. The
+/// official-release host entries (the worker and workflow members, S6.11, D083b) come through
+/// here with their fixed `worker_*`/`workflow_*` keys; they are verified against the release
+/// manifest once per process and shared, so they arrive already loaded.
+pub fn register_host_entry(
+    catalog: &mut Catalog,
+    module: &str,
+    loaded: Arc<LoadedModule>,
+    services: ModuleServices,
+) {
+    let key = module.to_owned();
+    catalog.tool(
+        module,
+        Box::new(move |spec: &ToolSpec, tool_services: &ToolServices| {
+            instantiate(&key, &loaded, spec, &services, tool_services)
+        }),
+    );
+}
+
+/// Builds one agent's instance of the module tool `loaded`, registered as `module`.
 fn instantiate(
-    package: &ModulePackage,
+    module: &str,
+    loaded: &LoadedModule,
     spec: &ToolSpec,
     services: &ModuleServices,
     tool_services: &ToolServices,
@@ -359,8 +373,7 @@ fn instantiate(
     // not ask for.
     if spec.name.is_some() || spec.description.is_some() || spec.variant.is_some() {
         return Err(format!(
-            "module `{}` cannot take a name, description or variant override",
-            package.module
+            "module `{module}` cannot take a name, description or variant override"
         ));
     }
     // The turn's own counter is the assembling agent's, carried on `ToolServices`
@@ -369,8 +382,8 @@ fn instantiate(
     // so a module tool's masking is what the turn's mask notice reports — never a
     // throwaway counter that always reads zero.
     wasm_tool(
-        &package.loaded,
-        services(package.loaded.name(), tool_services),
+        loaded,
+        services(loaded.name(), tool_services),
         ExecutionLimits::default(),
         &tool_services.mask,
     )
