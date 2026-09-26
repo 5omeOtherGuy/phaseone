@@ -151,7 +151,7 @@ native crate. Each is sized to what today's native implementation needs.
 | `completion` | the host completion hub | the session record the `finish` tool verifies against, and `accept` |
 | `worker-types` | `p1-workers` | the records and variants the three worker interfaces share; no functions, grants nothing |
 | `workers-start` | `p1-workers` | `start` |
-| `workers-observe` | `p1-workers` | `describe`, `status`, `wait` |
+| `workers-observe` | `p1-workers` | `describe`, `status`, `wait`; the scope's read-only lists `grantable` and `environments` (D084), the only imports the restricted path answers (D085) |
 | `workers-control` | `p1-workers` | `cancel`, `continue-child` |
 | `workflows` | `p1-workflow` | `start`, `status`, `wait`, `cancel` |
 
@@ -331,6 +331,10 @@ provider's `describe` therefore takes no argument of its own and still reads wha
 `configure` stored. What only a capability can know, such as whether a path escapes the
 workspace through a symlink, is judged lexically there and enforced again by the capability
 when the call executes.
+The one exception is D085: a tool granted `workers-observe` gets that interface's `grantable`
+and `environments` answered on the restricted path too, because they take no argument, have no
+effect and return the lists fixed for the assembly (the worker members' schemas are built from
+them in `declaration`); every other import still traps there.
 
 ## Streaming resources (freeze item 10)
 
