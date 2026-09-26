@@ -3006,6 +3006,67 @@ fn a_modules_reload_typed_mid_turn_is_reported_pending() {
     assert!(d.pending_switch.is_none(), "a reload is not a model switch");
 }
 
+/// ADR-0080 (S1.9): a `/modules reload` commits a new `Environment` with the reloaded
+/// modules, so the journal names that assembly — the reloaded set, not the one the
+/// session started with — once the install is `Ok`, before the next turn.
+#[tokio::test]
+async fn a_modules_reload_writes_an_assembly_line_naming_the_reloaded_set() {
+    let (mut d, switch, dir) = driver_with_reload();
+    let mut agent = test_agent();
+    assert!(
+        switch.assemblies_for_test().is_empty(),
+        "nothing is named before the reload"
+    );
+    // The release changes under the session: the reloaded environment assembles a
+    // module the started one did not.
+    std::fs::write(
+        dir.path().join("reload-session").join("environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n\n\
+         [[tools]]\nmodule = \"read\"\n",
+    )
+    .unwrap();
+    d.slash("modules reload", Some(&mut agent));
+    d.apply_reload(&mut agent).await;
+    let rows = meta_rows(&d);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("· modules reloaded · generation 1 ·")),
+        "{rows:?}"
+    );
+    let entries = switch.assemblies_for_test();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one line per installed reload: {entries:?}"
+    );
+    let identity = &entries[0].identity;
+    assert_eq!(identity.environment, "reload-session");
+    let named: Vec<(p1_journal::ModuleKind, &str)> = identity
+        .modules
+        .iter()
+        .map(|module| (module.kind, module.package.as_str()))
+        .collect();
+    // The main environment also carries the `worker_*` (and `workflow_*`) tools the
+    // host appends by feature; the reloaded module, the provider and the policy are
+    // what this reload is about.
+    assert_eq!(
+        named.first(),
+        Some(&(p1_journal::ModuleKind::Tool, "read")),
+        "the line names the reloaded module first: {identity:?}"
+    );
+    assert_eq!(
+        named[named.len() - 2..],
+        [
+            (p1_journal::ModuleKind::Provider, "reload-fake"),
+            (
+                p1_journal::ModuleKind::AuthorizationPolicy,
+                crate::policy::FULL_ACCESS_POLICY
+            ),
+        ],
+        "the line names the reloaded set: {identity:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_modules_reload_at_idle_applies_at_the_following_boundary() {
     let (mut d, switch, _dir) = driver_with_reload();
