@@ -91,13 +91,13 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0075 | [The TUI shows workflow runs as a live tree through a structured FrontEnd seam](0075-the-tui-shows-workflow-runs-as-a-live-tree-through-a-structured-frontend-seam.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0076 | [Manual compaction: /compact in the TUI and --compact on resume](0076-manual-compaction-compact-in-the-tui-and-compact-on-resume.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0077 | [Builds on the stream boxes](0077-builds-on-the-stream-boxes.md) | accepted | 2026-09-25 | owner+lead |
-| ADR-0078 | [Connection resources and component replacement](0078-connection-resources-and-component-replacement.md) | proposed | 2026-09-25 | owner+lead |
+| ADR-0078 | [Connection resources and component replacement](0078-connection-resources-and-component-replacement.md) | accepted | 2026-09-25 | owner+lead |
 | ADR-0079 | [Verified module releases and installation](0079-verified-module-releases-and-installation.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0080 | [Execution manifests in journals](0080-execution-manifests-in-journals.md) | proposed | 2026-09-25 | lead |
 | ADR-0081 | [Native foundation and runtime components](0081-native-foundation-and-runtime-components.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0082 | [Component ABI and execution ownership](0082-component-abi-and-execution-ownership.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0083 | [Privileged process and completion capabilities](0083-privileged-process-and-completion-capabilities.md) | proposed | 2026-09-26 | owner+lead |
-| ADR-0084 | [Reloadable policies](0084-reloadable-policies.md) | proposed | 2026-09-26 | owner+lead |
+| ADR-0084 | [Reloadable policies](0084-reloadable-policies.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0085 | [Runtime delegation and workflow modules](0085-runtime-delegation-and-workflow-modules.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0086 | [Provider components with native authenticated transport](0086-provider-components-with-native-authenticated-transport.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0087 | [Module identity and verified loading](0087-module-identity-and-verified-loading.md) | proposed | 2026-09-26 | lead |
