@@ -68,6 +68,7 @@ async fn bench() {
             &module,
             Services {
                 process: Some(fake_processes().0),
+                summary: None,
             },
             ExecutionLimits::default(),
             &counter,
