@@ -101,6 +101,11 @@ if [ -f "$pins_file" ]; then
 fi
 [ -n "$wasm_target" ] || fail "WASM_TARGET is missing from $pins_file"
 
+# The allocation the capability checks read is frozen data (freeze item 13); without it no
+# package can be checked, so refuse rather than check against an empty table.
+[ -f modules/capabilities.toml ] ||
+  fail "modules/capabilities.toml is missing (the frozen per-class capability allocation, freeze item 13)"
+
 # Cargo's target directory for the module workspace: the machine-local Cargo config redirects
 # it, CI uses modules/target, so ask Cargo rather than guessing.
 target_dir="$(cargo metadata --manifest-path modules/Cargo.toml --format-version 1 --no-deps --locked |
@@ -148,18 +153,30 @@ list_items() {
   done < <(tr ',' '\n' <<<"$text")
 }
 
-# The per-class capability allocation of docs/design/modules/wit.md, "Per-class capability
-# allocation" (freeze item 13), hard-coded until S0.7 moves it into frozen data. `types` is not
-# in it: it carries types only and grants nothing.
+# The capabilities modules/capabilities.toml freezes for the module class in $1 (freeze item
+# 13 of docs/design/modules/wit.md), space-separated. The file is data: it is read line by
+# line and its list is parsed with list_items, never sourced. A class that is not a table
+# there grants nothing, and an unknown class therefore fails every capability check.
 allocation() {
-  case "$1" in
-    tool) echo "completion clock control notices process random snapshot workers workflows workspace workspace-mutation" ;;
-    provider) echo "clock control credential-control http notices random websocket" ;;
-    context-policy) echo "clock completion control notices summary" ;;
-    authorization-policy) echo "clock control notices" ;;
-    workflow-implementation) echo "clock control notices random workers workflows" ;;
-    *) echo "" ;;
-  esac
+  local value
+  value="$(awk -v class="$1" '
+    /^[[:space:]]*\[/ {
+      header = $0
+      sub(/^[[:space:]]*\[/, "", header)
+      sub(/\][[:space:]]*$/, "", header)
+      inside = (header == class)
+      next
+    }
+    !inside { next }
+    /^[[:space:]]*(#|$)/ { next }
+    /^[[:space:]]*imports[[:space:]]*=/ {
+      value = $0
+      sub(/^[^=]*=[[:space:]]*/, "", value)
+      print value
+      exit
+    }
+  ' modules/capabilities.toml)"
+  list_items "$value" | paste -sd' ' -
 }
 
 # JSON text for $1 as a string literal; the fields it carries are package-authored.
@@ -230,8 +247,8 @@ build_package() {
 
   kind="${frozen[kind]}"
   case "$kind" in
-    tool | provider | context-policy | authorization-policy | workflow-implementation) ;;
-    *) fail "$pkg: kind is ${kind}, one of tool, provider, context-policy, authorization-policy, workflow-implementation is required" ;;
+    tool | provider | context-policy | authorization-policy | workflow-implementation | workflow-decision) ;;
+    *) fail "$pkg: kind is ${kind}, one of tool, provider, context-policy, authorization-policy, workflow-implementation, workflow-decision is required" ;;
   esac
 
   world="p1:module/$kind@1.0.0"
