@@ -173,7 +173,9 @@ fn shell_tool(service: ProcessService, counter: &Arc<MaskCounter>) -> Arc<dyn To
         shell_module(),
         Services {
             process: Some(process as Arc<dyn p1_module_runtime::ProcessService>),
-            summary: None,
+            // The shell world imports only `process`, so every other capability stays unset;
+            // `..Default::default()` keeps this compiling when `Services` grows a field.
+            ..Services::default()
         },
         ExecutionLimits::default(),
         counter,
