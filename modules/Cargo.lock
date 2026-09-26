@@ -109,6 +109,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-bindings-context-policy"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "p1-bindings-provider"
 version = "0.0.1"
 dependencies = [
@@ -130,6 +137,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-context"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+]
+
+[[package]]
 name = "p1-contracts"
 version = "0.0.1"
 dependencies = [
@@ -147,6 +161,16 @@ dependencies = [
  "p1-contracts",
  "serde",
  "toml",
+]
+
+[[package]]
+name = "p1-module-context"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-context-policy",
+ "p1-context",
+ "p1-contracts",
+ "p1-module-protocol",
 ]
 
 [[package]]
