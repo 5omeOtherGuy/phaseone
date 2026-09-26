@@ -256,6 +256,26 @@ INSTALL_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
       echo "stub: gh is on the installer PATH" >&2
       exit 3
     fi
+    # The smoke test's isolation: the installer must see a throwaway home and config
+    # directory under the temporary directory the gate created. The real installer
+    # ends by running `p1 login --list`, and XDG_CONFIG_HOME wins over HOME for p1's
+    # credential store, so all three are required and each must be inside the tempdir.
+    for var in HOME P1_CONFIG_DIR XDG_CONFIG_HOME; do
+      value="${!var:-}"
+      if [ -z "$value" ]; then
+        echo "stub: the installer did not see $var" >&2
+        exit 4
+      fi
+      under=""
+      while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        case "$value" in "$root"/*) under="$root" ;; esac
+      done < "${STUB_DIRS:-/dev/null}"
+      if [ -z "$under" ]; then
+        echo "stub: $var=$value is not under a temporary directory" >&2
+        exit 4
+      fi
+    done
     tag=""; prefix=""
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -633,6 +653,26 @@ class GateTests(unittest.TestCase):
         self.assertTrue((h.bin / "gh").exists())
         result = h.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_smoke_requires_a_throwaway_home_and_config(self) -> None:
+        # The installer's env must carry all three into the temporary directory; the
+        # gate copy is edited to drop one at a time and the smoke is red naming it.
+        # XDG_CONFIG_HOME decides p1's credential store, so the installer reading the
+        # worker's own store through an unredirected variable must not pass.
+        for var, assignment in (
+            ("HOME", ' HOME="$smoke_root/home"'),
+            ("P1_CONFIG_DIR", ' P1_CONFIG_DIR="$smoke_root/config"'),
+            ("XDG_CONFIG_HOME", ' XDG_CONFIG_HOME="$smoke_root/config"'),
+        ):
+            with self.subTest(var=var):
+                h = self.harness()
+                gate = h.repo / "scripts" / "gate.sh"
+                text = gate.read_text(encoding="utf-8")
+                self.assertIn(assignment, text)
+                gate.write_text(text.replace(assignment, ""), encoding="utf-8")
+                result = h.run()
+                self.assert_red(result)
+                self.assertIn(var, result.stderr)
 
     def test_a_staging_failure_is_red_without_green(self) -> None:
         h = self.harness()

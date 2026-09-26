@@ -171,7 +171,9 @@ echo "== gate: release smoke"
 # The four staged assets are served over file:// as download/candidate-<12 hex>/,
 # the install runs with a throwaway HOME, config directory and TMPDIR and no gh on
 # its PATH, and the installed share is then checked against the manifest it shipped.
-# The temp directory goes away on every exit path, green or red.
+# XDG_CONFIG_HOME is redirected too: p1's credential store prefers it over HOME, and
+# the installer ends by running `p1 login --list`, so leaving it alone would read the
+# worker's own store. The temp directory goes away on every exit path, green or red.
 smoke_root="$(mktemp -d)"
 trap 'rm -rf -- "$smoke_root"' EXIT
 smoke_farm="$smoke_root/bin"
@@ -189,7 +191,7 @@ done
 release_base="$smoke_root/release"
 mkdir -p -- "$release_base/download/candidate-$short"
 cp -a -- "$target_dir/p1-candidate/." "$release_base/download/candidate-$short/"
-PATH="$smoke_farm" HOME="$smoke_root/home" P1_CONFIG_DIR="$smoke_root/config" TMPDIR="$smoke_root/tmp" P1_RELEASE_BASE_URL="file://$release_base" scripts/install.sh --from-release "candidate-$short" --prefix "$smoke_root/prefix"
+PATH="$smoke_farm" HOME="$smoke_root/home" P1_CONFIG_DIR="$smoke_root/config" XDG_CONFIG_HOME="$smoke_root/config" TMPDIR="$smoke_root/tmp" P1_RELEASE_BASE_URL="file://$release_base" scripts/install.sh --from-release "candidate-$short" --prefix "$smoke_root/prefix"
 installed_version="$("$smoke_root/prefix/bin/p1" --version 2>/dev/null)" || {
   echo "release smoke: the installed p1 --version failed" >&2
   exit 1
