@@ -152,6 +152,7 @@ PY_TESTS = [
     "test_run_report.py",
     "test_rustc_serial.py",
     "test_secret_scan.py",
+    "test_stage_release.py",
     "test_usage_audit.py",
 ]
 
