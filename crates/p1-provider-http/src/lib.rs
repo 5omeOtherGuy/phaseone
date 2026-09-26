@@ -18,10 +18,15 @@
 //! 300 s) that end a provider which never answers, and the rule that a stream is
 //! never retried after any output has been forwarded. The crate owns no route
 //! knowledge: an adapter supplies a request builder and a [`ResponseParser`].
+//! The transport broker ([`broker_drive`]) sends a provider component's
+//! [`LoweredHttpRequest`] through the same [`drive`], after its [`RouteAuthority`]
+//! has kept the request on the route's endpoint and attached the credential itself.
 //!
 //! The authoritative spec is `docs/design/providers.md`. The five stream rules
 //! the returned stream obeys are at the top of `p1-contracts/src/provider.rs`.
 
+#[cfg(feature = "native")]
+mod broker;
 #[cfg(feature = "native")]
 mod credential;
 #[cfg(feature = "native")]
@@ -38,7 +43,14 @@ mod sse;
 mod status;
 #[cfg(feature = "native")]
 pub mod ws;
+#[cfg(feature = "native")]
+pub mod ws_session;
 
+#[cfg(feature = "native")]
+pub use broker::{
+    CredentialScheme, CredentialUse, InvalidEndpoint, LoweredHttpRequest, RouteAuthority,
+    ValidatedRequest, broker_drive, check_lowered_headers,
+};
 #[cfg(feature = "native")]
 pub use credential::{Credential, CredentialSource};
 #[cfg(feature = "native")]

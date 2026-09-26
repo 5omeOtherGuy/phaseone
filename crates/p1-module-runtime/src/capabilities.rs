@@ -1,6 +1,7 @@
 //! The capabilities this runtime links into a module's per-call instance, and only those the
 //! manifest grants (freeze item 3): `control`, `clock` and `random` are the runtime's own,
-//! `process` is a service the caller passes in explicitly — there is no registry.
+//! `process` and `summary` are services the caller passes in explicitly — there is no
+//! registry.
 //!
 //! Every import is an asynchronous host function (`func_wrap_async` / `func_new_async`):
 //! the guest sees a plain call, the host awaits without blocking a thread. The dynamic
@@ -16,6 +17,7 @@ use p1_contracts::{BoxFuture, CancellationToken};
 use wasmtime::component::{Linker, Resource, ResourceAny, ResourceTable, ResourceType, Val};
 use wasmtime::{Engine, bail};
 
+use crate::context_policy::{SummaryService, link_summary};
 use crate::loader::interface_import;
 
 /// A command a module asks to run (`process.command`).
@@ -85,6 +87,9 @@ pub trait RunningProcess: Send {
 pub struct Services {
     /// The `process` capability.
     pub process: Option<Arc<dyn ProcessService>>,
+    /// The `summary` capability of a context policy
+    /// ([`crate::context_policy::link_summary`]).
+    pub summary: Option<Arc<dyn SummaryService>>,
 }
 
 /// A `process.running` as the host holds it, and where it is in the stream `process.wit`
@@ -174,6 +179,7 @@ pub(crate) struct CallState {
     pub(crate) cancel: CancellationToken,
     pub(crate) table: ResourceTable,
     process: Option<Arc<dyn ProcessService>>,
+    pub(crate) summary: Option<Arc<dyn SummaryService>>,
     /// The origin of `clock.monotonic-now`, fixed per instance.
     origin: Instant,
     /// The call was cancelled and its fuel cut to the grace it gets to return.
@@ -186,6 +192,7 @@ impl CallState {
             cancel,
             table: ResourceTable::new(),
             process: services.process.clone(),
+            summary: services.summary.clone(),
             origin: Instant::now(),
             cancel_grace: false,
         }
@@ -235,6 +242,12 @@ pub(crate) fn capability_linker(
                     return Err(LinkError::MissingService(capability.clone()));
                 }
                 link_process(&mut linker)
+            }
+            "summary" => {
+                if services.summary.is_none() {
+                    return Err(LinkError::MissingService(capability.clone()));
+                }
+                link_summary(&mut linker)
             }
             // The loader refuses every other capability before a linker is built.
             other => Err(wasmtime::format_err!(
@@ -439,5 +452,34 @@ mod tests {
             }
         );
         assert!(process_command(&Val::Record(vec![])).is_err());
+    }
+
+    fn granted(capabilities: &[&str]) -> Vec<String> {
+        capabilities.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_runtimes_own_capabilities_link_without_services_as_before() {
+        let engine = crate::engine().expect("engine");
+        let linked = capability_linker(
+            &engine,
+            &granted(&["control", "clock", "random"]),
+            &Services::default(),
+        );
+        assert!(linked.is_ok());
+    }
+
+    #[test]
+    fn a_granted_summary_without_its_service_is_a_missing_service() {
+        let engine = crate::engine().expect("engine");
+        match capability_linker(
+            &engine,
+            &granted(&["control", "summary"]),
+            &Services::default(),
+        ) {
+            Err(LinkError::MissingService(capability)) => assert_eq!(capability, "summary"),
+            Err(other) => panic!("wrong link error: {other}"),
+            Ok(_) => panic!("summary must not link without a summary service"),
+        }
     }
 }

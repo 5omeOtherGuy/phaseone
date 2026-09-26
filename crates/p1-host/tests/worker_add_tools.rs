@@ -21,9 +21,9 @@ use std::sync::Arc;
 use common::{Harness, provider_hook, provider_hook_arc, run_args, write_environment};
 use p1_contracts::{
     BoxFuture, CacheKeySupport, CancellationToken, Item, Provider, ProviderError, ProviderRequest,
-    ProviderStream, RouteDescription,
+    ProviderStream, RouteDescription, StreamEvent,
 };
-use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
+use p1_testkit::{ScriptedProvider, Step, json_call, text_response, tool_call_response};
 use tempfile::tempdir;
 
 /// A parent that can start, read and continue workers, and a scratch child whose
@@ -464,5 +464,307 @@ async fn a_regranted_tools_effect_reaches_finish() {
              child verified it"
                 .to_string(),
         ]
+    );
+}
+
+/// Two child environments on their OWN routes (`fake-child-a`, `fake-child-b`), so a
+/// test can watch each worker's provider requests separately while one parent drives
+/// both. The child's own `[[tools]]` lists the granted module; the module's default
+/// face supplies the rest.
+fn twin_environments(root: &Path) {
+    write_environment(
+        root,
+        "twin-parent",
+        "fake-parent",
+        "model-parent",
+        &["worker_start", "worker_result", "worker_continue"],
+        "PARENT {{tool_names}}",
+    );
+    write_environment(
+        root,
+        "twin-child-a",
+        "fake-child-a",
+        "model-child-a",
+        &["read"],
+        "CHILD-A {{tool_names}}",
+    );
+    write_environment(
+        root,
+        "twin-child-b",
+        "fake-child-b",
+        "model-child-b",
+        &["grep"],
+        "CHILD-B {{tool_names}}",
+    );
+}
+
+/// The parent's script, then a plain answer to every notification after it: how many
+/// wake-ups the worker endings take is the host's business, not this test's.
+struct Tail {
+    inner: ScriptedProvider,
+}
+
+impl Provider for Tail {
+    fn describe(&self) -> RouteDescription {
+        self.inner.describe()
+    }
+
+    fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
+        self.inner.validate(request)
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: ProviderRequest,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ProviderStream, ProviderError>> {
+        Box::pin(async move {
+            if self.inner.remaining_steps() > 0 {
+                self.inner.stream(request, cancel).await
+            } else {
+                ScriptedProvider::new(vec![text_response("noted")])
+                    .stream(request, cancel)
+                    .await
+            }
+        })
+    }
+}
+
+/// (e) A re-grant reassembles ONLY the worker it continues: worker A is continued
+/// with `add_tools: ["edit"]` and its next request carries its grant plus the added
+/// module in order, while worker B's next request still carries its original grant.
+#[tokio::test]
+async fn a_regrant_reassembles_only_the_continued_child() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    twin_environments(environments.path());
+
+    let child_a = ScriptedProvider::new(vec![text_response("a first"), text_response("a second")]);
+    let child_a_handle = child_a.clone();
+    let child_b = ScriptedProvider::new(vec![text_response("b first"), text_response("b second")]);
+    let child_b_handle = child_b.clone();
+    let parent = ScriptedProvider::new(vec![
+        tool_call_response(vec![
+            json_call(
+                "c1",
+                "worker_start",
+                r#"{"environment":"twin-child-a","task":"read it","tools":["read"]}"#,
+            ),
+            json_call(
+                "c2",
+                "worker_start",
+                r#"{"environment":"twin-child-b","task":"grep it","tools":["grep"]}"#,
+            ),
+        ]),
+        // Both first turns end before either is continued, so the continue is never
+        // refused as busy and the re-grant's effect is the only difference.
+        tool_call_response(vec![json_call(
+            "c3",
+            "worker_result",
+            r#"{"id":"w1","wait":true}"#,
+        )]),
+        tool_call_response(vec![json_call(
+            "c4",
+            "worker_result",
+            r#"{"id":"w2","wait":true}"#,
+        )]),
+        tool_call_response(vec![
+            json_call(
+                "c5",
+                "worker_continue",
+                r#"{"id":"w1","message":"here is edit","add_tools":["edit"]}"#,
+            ),
+            json_call(
+                "c6",
+                "worker_continue",
+                r#"{"id":"w2","message":"keep going"}"#,
+            ),
+        ]),
+        tool_call_response(vec![
+            json_call("c7", "worker_result", r#"{"id":"w1","wait":true}"#),
+            json_call("c8", "worker_result", r#"{"id":"w2","wait":true}"#),
+        ]),
+        text_response("parent done"),
+    ]);
+    let parent_handle = parent.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook_arc(vec![
+        (
+            "fake-parent",
+            Arc::new(Tail { inner: parent }) as Arc<dyn Provider>,
+        ),
+        ("fake-child-a", Arc::new(child_a) as Arc<dyn Provider>),
+        ("fake-child-b", Arc::new(child_b) as Arc<dyn Provider>),
+    ]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "twin-parent",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert!(
+        parent_saw(
+            &parent_handle.requests(),
+            "Added tools: edit. Message sent to worker w1."
+        ),
+        "the parent reads the re-grant back: {:?}",
+        parent_handle.requests()
+    );
+
+    let requests_a = child_a_handle.requests();
+    assert_eq!(
+        requests_a.len(),
+        2,
+        "A runs its first turn and the re-granted one"
+    );
+    assert_eq!(tool_names(&requests_a[0]), ["read", "finish"]);
+    assert_eq!(
+        tool_names(&requests_a[1]),
+        ["read", "edit", "finish"],
+        "A's next request is its grant then the added module, then finish"
+    );
+
+    let requests_b = child_b_handle.requests();
+    assert_eq!(requests_b.len(), 2, "B runs two of its own turns");
+    assert_eq!(tool_names(&requests_b[0]), ["grep", "finish"]);
+    assert_eq!(
+        tool_names(&requests_b[1]),
+        ["grep", "finish"],
+        "B's next request is unchanged by A's re-grant"
+    );
+}
+
+/// A parent that can start, continue and cancel workers, and a scratch child whose
+/// prompt names exactly the tools it is assembled with.
+fn busy_environments(root: &Path) {
+    write_environment(
+        root,
+        "busy-parent",
+        "fake-parent",
+        "model-parent",
+        &[
+            "worker_start",
+            "worker_result",
+            "worker_continue",
+            "worker_cancel",
+        ],
+        "PARENT {{tool_names}}",
+    );
+    write_environment(
+        root,
+        "busy-child",
+        "fake-child",
+        "model-child",
+        &["read"],
+        "CHILD {{tool_names}}",
+    );
+}
+
+/// (f) `worker_continue add_tools` is refused while the child's turn is still
+/// running, and the grant is unchanged afterwards: the next turn still carries the
+/// old toolset.
+#[tokio::test]
+async fn a_continue_that_adds_tools_is_refused_while_the_turn_runs() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    busy_environments(environments.path());
+
+    // The worker's first turn yields a delta and then waits for cancellation, so it is
+    // still Running when the parent's next call arrives; the cancel ends it, and the
+    // plain continue after that is the next turn.
+    let child = ScriptedProvider::new(vec![
+        Step::EventsThenAwaitCancel(vec![StreamEvent::TextDelta {
+            block: 0,
+            text: "working".to_string(),
+        }]),
+        text_response("second turn"),
+    ]);
+    let child_handle = child.clone();
+    let parent = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "worker_start",
+            r#"{"environment":"busy-child","task":"do it","tools":["read"]}"#,
+        )]),
+        tool_call_response(vec![json_call(
+            "c2",
+            "worker_continue",
+            r#"{"id":"w1","message":"here is edit","add_tools":["edit"]}"#,
+        )]),
+        tool_call_response(vec![json_call("c3", "worker_cancel", r#"{"id":"w1"}"#)]),
+        tool_call_response(vec![json_call(
+            "c4",
+            "worker_result",
+            r#"{"id":"w1","wait":true}"#,
+        )]),
+        tool_call_response(vec![json_call(
+            "c5",
+            "worker_continue",
+            r#"{"id":"w1","message":"again"}"#,
+        )]),
+        tool_call_response(vec![json_call(
+            "c6",
+            "worker_result",
+            r#"{"id":"w1","wait":true}"#,
+        )]),
+        text_response("parent done"),
+    ]);
+    let parent_handle = parent.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook_arc(vec![
+        (
+            "fake-parent",
+            Arc::new(Tail { inner: parent }) as Arc<dyn Provider>,
+        ),
+        ("fake-child", Arc::new(child) as Arc<dyn Provider>),
+    ]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "busy-parent",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert!(
+        parent_saw(&parent_handle.requests(), "Worker w1 is still running."),
+        "the add_tools continue is refused while the turn runs: {:?}",
+        parent_handle.requests()
+    );
+
+    let requests = child_handle.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the cancelled first turn and the turn after the refusal"
+    );
+    assert_eq!(tool_names(&requests[0]), ["read", "finish"]);
+    assert_eq!(
+        tool_names(&requests[1]),
+        ["read", "finish"],
+        "the refused re-grant changed nothing: the next turn still has the old toolset"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !tool_names(request).contains(&"edit".to_string())),
+        "the refused `edit` reached no turn: {:?}",
+        requests
     );
 }

@@ -2147,6 +2147,7 @@ pub(crate) fn assemble_with_cache_key(
         environment,
         workspace,
         substitutions,
+        mask,
         |route| {
             let mut options = configured.clone();
             if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {
@@ -2160,7 +2161,9 @@ pub(crate) fn assemble_with_cache_key(
     // path, so a tool's result text is masked before p1-core turns it into a
     // `ToolResultItem` — history, journal and every later request only ever see the
     // masked form. Declaration and identity are forwarded unchanged, so dispatch and
-    // the journalled identity do not move.
+    // the journalled identity do not move. `mask` is also the counter in the shared
+    // `ToolServices`, so a module tool `wasm_tool` already wrapped counts into THIS
+    // counter; masking is idempotent, so this second wrapper adds nothing for it.
     for tool in &mut assembled.tools {
         *tool = redacted(tool.clone(), mask);
     }

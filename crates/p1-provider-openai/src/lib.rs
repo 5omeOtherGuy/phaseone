@@ -22,16 +22,34 @@
 //! - `parser`: the pure SSE state machine, surfaced through [`p1_provider_http::drive`].
 //! - `websocket`: the WebSocket transport — handshake, framing, connection
 //!   lifetime and the failure policy of `docs/design/websocket.md` §5.
+//! - [`websocket_lower`]: its portable decisions (framing, continuation, fallback).
 //! - [`provider`]: the [`p1_contracts::Provider`] implementation.
+//!
+//! The crate is split like `p1-provider-http` (ADR-0071). PORTABLE, always
+//! compiled: the route and settings types, composition validation,
+//! [`validate_request`], the credential-free lowering ([`lower_request`]), the
+//! [`websocket_lower`] decisions (framing, continuation and fallback), the
+//! [`CodexResponseParser`] and its `on_http_error` classification — what a
+//! provider WebAssembly component needs. NATIVE, behind the default `native`
+//! feature: the provider, [`build_headers`] and the WebSocket transport itself,
+//! everything that touches a transport, a runtime or a credential.
 
 mod parser;
+#[cfg(feature = "native")]
 mod provider;
 mod request;
+#[cfg(feature = "native")]
 mod websocket;
+pub mod websocket_lower;
 
+pub use parser::CodexResponseParser;
+#[cfg(feature = "native")]
 pub use provider::{Clock, OpenAiCodexProvider, OpenAiCodexProviderBuilder};
+#[cfg(feature = "native")]
+pub use request::build_headers;
 pub use request::{
-    build_headers, build_headers_without_credential, build_request, resolve_base_url,
+    LoweredRequest, build_headers_without_credential, build_request, lower_request, request_path,
+    resolve_base_url, validate_composition, validate_request,
 };
 
 /// The `origin_route` of the shipped `routes/openai-codex-subscription.toml`, byte for
@@ -103,6 +121,19 @@ impl ResponsesRoute {
         }
     }
 
+    /// What a provider composed from this route and `wire_model` is.
+    pub fn describe(&self, wire_model: &str) -> p1_contracts::RouteDescription {
+        p1_contracts::RouteDescription {
+            origin: self.origin(wire_model),
+            supports_freeform_tools: true,
+            mandatory_prompt_prefix: None,
+            reports_cost: false,
+            // The request builder sends `options.cache_key` as the body's
+            // `prompt_cache_key` and the session identity headers.
+            cache_key: p1_contracts::CacheKeySupport::Optional,
+        }
+    }
+
     fn validate(&self) -> Result<(), p1_contracts::ProviderError> {
         let invalid = |message: &str| {
             p1_contracts::ProviderError::new(
@@ -123,5 +154,59 @@ impl ResponsesRoute {
             return Err(invalid("invalid Responses route endpoint"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The manifest is the split's guard: a transport or runtime dependency that
+    /// the default `native` feature does not gate would let a guest build reach
+    /// sockets, a runtime or credentials without any compile error here.
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    fn dependencies() -> &'static str {
+        MANIFEST
+            .split("[dependencies]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("a dependencies table")
+    }
+
+    fn dependency_line(name: &str) -> &'static str {
+        let prefix = format!("{name} = ");
+        dependencies()
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("{name} is not a dependency"))
+    }
+
+    #[test]
+    fn native_only_dependencies_are_optional_and_enabled_by_the_default_native_feature() {
+        assert!(MANIFEST.contains("default = [\"native\"]"));
+        let native = MANIFEST
+            .split("\nnative = [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("a native feature");
+        assert!(native.contains("\"p1-provider-http/native\""), "{native}");
+        assert!(
+            dependency_line("p1-provider-http").contains("default-features = false"),
+            "p1-provider-http must not bring its native default"
+        );
+        for name in ["futures-util", "tokio"] {
+            assert!(
+                dependency_line(name).contains("optional = true"),
+                "{name} must be optional"
+            );
+            assert!(
+                native.contains(&format!("\"dep:{name}\"")),
+                "native must enable {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_dependency_on_p1_auth() {
+        assert!(!MANIFEST.contains("p1-auth"));
     }
 }
