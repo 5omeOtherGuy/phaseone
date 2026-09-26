@@ -31,7 +31,9 @@ use std::time::SystemTime;
 
 use p1_contracts::serde_json::{self, Value};
 use p1_contracts::{CancellationToken, ToolContext, ToolStatus};
-use p1_module_runtime::{Digest, ExecutionLimits, Loader, ReleaseManifest, Services, wasm_tool};
+use p1_module_runtime::{
+    Digest, ExecutionLimits, LoadError, Loader, ReleaseManifest, Services, wasm_tool,
+};
 use p1_module_tests::{FIXTURE_NAME, call, fake_processes};
 use p1_redact::MaskCounter;
 use tempfile::TempDir;
@@ -646,25 +648,58 @@ fn verify_installed_components(modules_root: &Path, manifest: &Value) {
 }
 
 /// Loads every installed component through the release manifest and loader and executes the
-/// shipped fixture once, exactly as the harness's `Release::loader` does.
+/// shipped fixture once, exactly as the harness's `Release::loader` does. A component that
+/// grants an interface the runtime does not link yet is refused from its manifest entry alone
+/// (`docs/design/modules/package.md`, "The loader"; ADR-0085 item 3): that refusal, naming the
+/// component's own grant, is the expected outcome for such a component, while every other
+/// component must load and every other refusal still ends the case.
 async fn load_every_installed_component(modules_root: &Path) {
     let manifest_path = modules_root.join("manifest.json");
     let manifest = ReleaseManifest::read(&manifest_path).expect("read the installed manifest");
-    let names: Vec<String> = manifest
+    // The interfaces the runtime does not link yet: each worker and workflow member imports the
+    // one its own native service owns, and the runtime links an interface only with its service.
+    const UNLINKED: [&str; 4] = [
+        "workers-start",
+        "workers-observe",
+        "workers-control",
+        "workflows",
+    ];
+
+    let entries: Vec<(String, Vec<String>)> = manifest
         .components()
         .iter()
-        .map(|entry| entry.name.clone())
+        .map(|entry| (entry.name.clone(), entry.capabilities.clone()))
         .collect();
     assert!(
-        !names.is_empty(),
+        !entries.is_empty(),
         "the installed release ships no component"
     );
 
     let loader = Loader::new(manifest, modules_root).expect("a loader over the installed set");
-    for name in &names {
-        loader
-            .load(name)
-            .unwrap_or_else(|error| panic!("load {name}: {error}"));
+    for (name, capabilities) in &entries {
+        match loader.load(name) {
+            Ok(_) => assert!(
+                !capabilities
+                    .iter()
+                    .any(|capability| UNLINKED.contains(&capability.as_str())),
+                "{name}: a component of a family this runtime does not link was loaded"
+            ),
+            Err(LoadError::UnsupportedCapability {
+                name: named,
+                capability,
+            }) => {
+                assert_eq!(&named, name, "{name}: the refusal names another component");
+                assert!(
+                    capabilities.contains(&capability),
+                    "{name}: the refusal names {capability}, which its manifest does not grant"
+                );
+                assert!(
+                    UNLINKED.contains(&capability.as_str()),
+                    "{name}: the refusal names {capability}"
+                );
+            }
+            Err(error) => panic!("load {name}: {error}"),
+        }
     }
 
     let (process, _processes) = fake_processes();

@@ -16,9 +16,26 @@ tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
+p1-core = { path = "../p1-core" }
 p1-redact = { path = "../p1-redact" }
+# The transport-authority suite (S4.5) drives S4.2's broker over the scripted
+# transport and the one real transport's redirect policy over a loopback socket.
+p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 # The WebSocket boundary suite (tests/websocket_boundary.rs, S5): the host session with
 # its scripted connector, the provider's portable decisions, and the paused clock.
-p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 p1-provider-openai = { path = "../p1-provider-openai" }
-tokio = { version = "1", default-features = false, features = ["test-util"] }
+futures-util = "0.3"
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+    "test-util",
+] }
+p1-testkit = { path = "../p1-testkit" }
+p1-workers = { path = "../p1-workers" }
+# workflow_boundary.rs: the workflow substrate driven through its decision seam (S6.3).
+p1-workflow = { path = "../p1-workflow" }
