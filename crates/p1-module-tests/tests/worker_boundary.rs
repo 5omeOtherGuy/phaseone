@@ -1,10 +1,11 @@
 //! The worker capability boundary (issue #266): what a component can reach through the
 //! scoped exports of `workers-start`, `workers-observe` and `workers-control`.
 //!
-//! Drafted here while `crates/p1-module-tests` does not exist yet; it depends only on the
-//! public API of `p1-workers`, `p1-core`, `p1-contracts` and `p1-testkit`, so it moves
-//! there unchanged. Every ordering is explicit (a gate, a cancel token, a `wait`); nothing
-//! sleeps or asserts on time.
+//! It uses only the public API of `p1-workers`, `p1-core`, `p1-contracts` and `p1-testkit`:
+//! the scoped surface is native, so no component is loaded. Every ordering is explicit (a
+//! gate, a cancel token, a `wait`); nothing sleeps or asserts on time. Each case runs under
+//! the harness's deadlock guard, so a scope that parked a call forever fails by name instead
+//! of hanging the test binary.
 
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +14,7 @@ use p1_contracts::{
     ProviderStream, RouteDescription,
 };
 use p1_core::{Agent, AgentParts};
+use p1_module_tests::within_deadline;
 use p1_testkit::{
     PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization, ScriptedProvider,
     Step, text_response,
@@ -199,27 +201,33 @@ async fn unknown_everywhere(scope: &p1_workers::WorkerScope, id: &ChildId) {
 /// another parent or another generation — the same answer a never-allocated id gets.
 #[tokio::test]
 async fn another_scopes_or_another_parents_id_is_unknown_child() {
-    let h = harness();
-    let mine = h.scopes.scope(key(1, "delegate", "main"));
-    let id = mine.start(spec("now")).await.unwrap();
-    assert!(matches!(
-        mine.wait(&id, CancellationToken::new()).await,
-        Ok(ChildStatus::Finished(_))
-    ));
+    within_deadline(
+        "another_scopes_or_another_parents_id_is_unknown_child",
+        async {
+            let h = harness();
+            let mine = h.scopes.scope(key(1, "delegate", "main"));
+            let id = mine.start(spec("now")).await.unwrap();
+            assert!(matches!(
+                mine.wait(&id, CancellationToken::new()).await,
+                Ok(ChildStatus::Finished(_))
+            ));
 
-    for other in [
-        key(1, "workflow-run", "main"),
-        key(1, "delegate", "helper"),
-        key(2, "delegate", "main"),
-    ] {
-        unknown_everywhere(&h.scopes.scope(other), &id).await;
-    }
-    unknown_everywhere(&mine, &ChildId("w999".into())).await;
+            for other in [
+                key(1, "workflow-run", "main"),
+                key(1, "delegate", "helper"),
+                key(2, "delegate", "main"),
+            ] {
+                unknown_everywhere(&h.scopes.scope(other), &id).await;
+            }
+            unknown_everywhere(&mine, &ChildId("w999".into())).await;
 
-    // The scope that started it reads it, with the same result `status` gives.
-    let status = mine.status(&id).await.unwrap();
-    assert_eq!(mine.result(&id).await.unwrap(), status);
-    assert_eq!(mine.describe(&id).await.unwrap(), "fake/route");
+            // The scope that started it reads it, with the same result `status` gives.
+            let status = mine.status(&id).await.unwrap();
+            assert_eq!(mine.result(&id).await.unwrap(), status);
+            assert_eq!(mine.describe(&id).await.unwrap(), "fake/route");
+        },
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------- stale handles
@@ -229,68 +237,83 @@ async fn another_scopes_or_another_parents_id_is_unknown_child() {
 /// one notification.
 #[tokio::test]
 async fn a_retired_scopes_ids_are_unknown_and_the_child_still_completes() {
-    let h = harness();
-    let parent = agent(Arc::new(ScriptedProvider::new(Vec::new())));
-    h.service.set_parent_inbox(parent.inbox());
-    let scope = h.scopes.scope(key(1, "delegate", "main"));
-    let id = scope.start(spec("gated")).await.unwrap();
-    assert_eq!(scope.status(&id).await, Ok(ChildStatus::Running));
+    within_deadline(
+        "a_retired_scopes_ids_are_unknown_and_the_child_still_completes",
+        async {
+            let h = harness();
+            let parent = agent(Arc::new(ScriptedProvider::new(Vec::new())));
+            h.service.set_parent_inbox(parent.inbox());
+            let scope = h.scopes.scope(key(1, "delegate", "main"));
+            let id = scope.start(spec("gated")).await.unwrap();
+            assert_eq!(scope.status(&id).await, Ok(ChildStatus::Running));
 
-    h.scopes.retire_generation(1).await;
-    unknown_everywhere(&scope, &id).await;
-    unknown_everywhere(&h.scopes.scope(key(1, "delegate", "main")), &id).await;
-    assert_eq!(
-        h.service.status(&id).await,
-        Ok(ChildStatus::Running),
-        "retiring cancelled nothing"
-    );
+            h.scopes.retire_generation(1).await;
+            unknown_everywhere(&scope, &id).await;
+            unknown_everywhere(&h.scopes.scope(key(1, "delegate", "main")), &id).await;
+            assert_eq!(
+                h.service.status(&id).await,
+                Ok(ChildStatus::Running),
+                "retiring cancelled nothing"
+            );
 
-    h.gate.add_permits(1);
-    match h.service.wait(&id, CancellationToken::new()).await.unwrap() {
-        ChildStatus::Finished(result) => assert_eq!(result.final_text, "done"),
-        other => panic!("{other:?}"),
-    }
-    assert!(
-        parent.has_pending_inbox(),
-        "the parent still hears of it once"
-    );
+            h.gate.add_permits(1);
+            match h.service.wait(&id, CancellationToken::new()).await.unwrap() {
+                ChildStatus::Finished(result) => assert_eq!(result.final_text, "done"),
+                other => panic!("{other:?}"),
+            }
+            assert!(
+                parent.has_pending_inbox(),
+                "the parent still hears of it once"
+            );
+        },
+    )
+    .await;
 }
 
 /// A dropped scope's ids are `unknown-child` through a new handle for the same key, and
 /// the child still completes.
 #[tokio::test]
 async fn a_dropped_scopes_ids_are_unknown_and_the_child_still_completes() {
-    let h = harness();
-    let scope = h.scopes.scope(key(1, "delegate", "main"));
-    let id = scope.start(spec("gated")).await.unwrap();
-    drop(scope);
+    within_deadline(
+        "a_dropped_scopes_ids_are_unknown_and_the_child_still_completes",
+        async {
+            let h = harness();
+            let scope = h.scopes.scope(key(1, "delegate", "main"));
+            let id = scope.start(spec("gated")).await.unwrap();
+            drop(scope);
 
-    let again = h.scopes.scope(key(1, "delegate", "main"));
-    unknown_everywhere(&again, &id).await;
+            let again = h.scopes.scope(key(1, "delegate", "main"));
+            unknown_everywhere(&again, &id).await;
 
-    h.gate.add_permits(1);
-    assert!(matches!(
-        h.service.wait(&id, CancellationToken::new()).await,
-        Ok(ChildStatus::Finished(_))
-    ));
+            h.gate.add_permits(1);
+            assert!(matches!(
+                h.service.wait(&id, CancellationToken::new()).await,
+                Ok(ChildStatus::Finished(_))
+            ));
+        },
+    )
+    .await;
 }
 
 /// A start in a retired scope is refused with `shut-down`, builds nothing and takes no
 /// id: the next live start gets the id that would have been next.
 #[tokio::test]
 async fn a_start_in_a_retired_scope_builds_nothing() {
-    let h = harness();
-    let scope = h.scopes.scope(key(1, "delegate", "main"));
-    scope.retire().await;
+    within_deadline("a_start_in_a_retired_scope_builds_nothing", async {
+        let h = harness();
+        let scope = h.scopes.scope(key(1, "delegate", "main"));
+        scope.retire().await;
 
-    assert_eq!(scope.start(spec("now")).await, Err(WorkerError::ShutDown));
-    assert_eq!(*h.built.lock().unwrap(), 0, "nothing was built");
-    let live = h.scopes.scope(key(2, "delegate", "main"));
-    assert_eq!(
-        live.start(spec("now")).await,
-        Ok(ChildId("w1".into())),
-        "no id was taken"
-    );
+        assert_eq!(scope.start(spec("now")).await, Err(WorkerError::ShutDown));
+        assert_eq!(*h.built.lock().unwrap(), 0, "nothing was built");
+        let live = h.scopes.scope(key(2, "delegate", "main"));
+        assert_eq!(
+            live.start(spec("now")).await,
+            Ok(ChildId("w1".into())),
+            "no id was taken"
+        );
+    })
+    .await;
 }
 
 // ------------------------------------------------------------------ double start
@@ -299,25 +322,31 @@ async fn a_start_in_a_retired_scope_builds_nothing() {
 /// both valid in that scope, both listed in start order, neither valid elsewhere.
 #[tokio::test]
 async fn a_double_start_gives_two_distinct_ids_valid_only_in_scope() {
-    let h = harness();
-    let scope = h.scopes.scope(key(1, "delegate", "main"));
-    let other = h.scopes.scope(key(1, "delegate", "helper"));
+    within_deadline(
+        "a_double_start_gives_two_distinct_ids_valid_only_in_scope",
+        async {
+            let h = harness();
+            let scope = h.scopes.scope(key(1, "delegate", "main"));
+            let other = h.scopes.scope(key(1, "delegate", "helper"));
 
-    let first = scope.start(spec("now")).await.unwrap();
-    let second = scope.start(spec("now")).await.unwrap();
-    assert_ne!(first, second);
-    assert_eq!(*h.built.lock().unwrap(), 2);
+            let first = scope.start(spec("now")).await.unwrap();
+            let second = scope.start(spec("now")).await.unwrap();
+            assert_ne!(first, second);
+            assert_eq!(*h.built.lock().unwrap(), 2);
 
-    for id in [&first, &second] {
-        assert!(matches!(
-            scope.wait(id, CancellationToken::new()).await,
-            Ok(ChildStatus::Finished(_))
-        ));
-        unknown_everywhere(&other, id).await;
-    }
-    let listed: Vec<ChildId> = scope.list().await.into_iter().map(|(id, _)| id).collect();
-    assert_eq!(listed, [first, second]);
-    assert!(other.list().await.is_empty());
+            for id in [&first, &second] {
+                assert!(matches!(
+                    scope.wait(id, CancellationToken::new()).await,
+                    Ok(ChildStatus::Finished(_))
+                ));
+                unknown_everywhere(&other, id).await;
+            }
+            let listed: Vec<ChildId> = scope.list().await.into_iter().map(|(id, _)| id).collect();
+            assert_eq!(listed, [first, second]);
+            assert!(other.list().await.is_empty());
+        },
+    )
+    .await;
 }
 
 // ------------------------------------------------------------------ cancellation
@@ -326,48 +355,57 @@ async fn a_double_start_gives_two_distinct_ids_valid_only_in_scope() {
 /// child keeps running.
 #[tokio::test]
 async fn a_scoped_wait_returns_running_when_cancelled() {
-    let h = harness();
-    let scope = h.scopes.scope(key(1, "delegate", "main"));
-    let id = scope.start(spec("hang")).await.unwrap();
+    within_deadline("a_scoped_wait_returns_running_when_cancelled", async {
+        let h = harness();
+        let scope = h.scopes.scope(key(1, "delegate", "main"));
+        let id = scope.start(spec("hang")).await.unwrap();
 
-    let cancel = CancellationToken::new();
-    cancel.cancel();
-    assert_eq!(scope.wait(&id, cancel).await, Ok(ChildStatus::Running));
-    assert_eq!(scope.status(&id).await, Ok(ChildStatus::Running));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(scope.wait(&id, cancel).await, Ok(ChildStatus::Running));
+        assert_eq!(scope.status(&id).await, Ok(ChildStatus::Running));
 
-    scope.cancel(&id).await.unwrap();
-    assert_eq!(
-        scope.wait(&id, CancellationToken::new()).await,
-        Ok(ChildStatus::Cancelled)
-    );
+        scope.cancel(&id).await.unwrap();
+        assert_eq!(
+            scope.wait(&id, CancellationToken::new()).await,
+            Ok(ChildStatus::Cancelled)
+        );
+    })
+    .await;
 }
 
 /// A `cancel` of another scope's id is `unknown-child` and touches no child: the
 /// target keeps running until its own scope cancels it.
 #[tokio::test]
 async fn a_foreign_cancel_is_unknown_child_and_touches_nothing() {
-    let h = harness();
-    let owner = h.scopes.scope(key(1, "delegate", "main"));
-    let intruder = h.scopes.scope(key(1, "delegate", "helper"));
-    let id = owner.start(spec("hang")).await.unwrap();
+    within_deadline(
+        "a_foreign_cancel_is_unknown_child_and_touches_nothing",
+        async {
+            let h = harness();
+            let owner = h.scopes.scope(key(1, "delegate", "main"));
+            let intruder = h.scopes.scope(key(1, "delegate", "helper"));
+            let id = owner.start(spec("hang")).await.unwrap();
 
-    h.probe.streaming.notified().await;
-    let turn = h
-        .probe
-        .token
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("the turn streams");
+            h.probe.streaming.notified().await;
+            let turn = h
+                .probe
+                .token
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the turn streams");
 
-    assert_eq!(intruder.cancel(&id).await, Err(WorkerError::UnknownChild));
-    assert!(!turn.is_cancelled(), "the foreign cancel reached no turn");
-    assert_eq!(owner.status(&id).await, Ok(ChildStatus::Running));
+            assert_eq!(intruder.cancel(&id).await, Err(WorkerError::UnknownChild));
+            assert!(!turn.is_cancelled(), "the foreign cancel reached no turn");
+            assert_eq!(owner.status(&id).await, Ok(ChildStatus::Running));
 
-    owner.cancel(&id).await.unwrap();
-    assert!(turn.is_cancelled(), "the owner's cancel reaches the turn");
-    assert_eq!(
-        owner.wait(&id, CancellationToken::new()).await,
-        Ok(ChildStatus::Cancelled)
-    );
+            owner.cancel(&id).await.unwrap();
+            assert!(turn.is_cancelled(), "the owner's cancel reaches the turn");
+            assert_eq!(
+                owner.wait(&id, CancellationToken::new()).await,
+                Ok(ChildStatus::Cancelled)
+            );
+        },
+    )
+    .await;
 }
