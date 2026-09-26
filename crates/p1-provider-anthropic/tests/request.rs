@@ -14,7 +14,7 @@ use p1_contracts::{
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_anthropic::{
     AnthropicProvider, MessagesAccount, MessagesRoute, ROUTE, build_headers, build_request,
-    with_long_context,
+    validate_request, with_long_context,
 };
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource, RetryPolicy, Transport};
@@ -575,10 +575,6 @@ fn replay_is_same_origin_gated_and_byte_exact() {
                 replay: Some(thinking(other_model, 1)),
             },
             AssistantBlock::Reasoning {
-                text: "stale thought".to_string(),
-                replay: Some(thinking(same.clone(), 2)),
-            },
-            AssistantBlock::Reasoning {
                 text: "no replay".to_string(),
                 replay: None,
             },
@@ -603,6 +599,44 @@ fn replay_is_same_origin_gated_and_byte_exact() {
             json!({ "type": "text", "text": "answer" }),
         ]
     );
+}
+
+/// ADR-0049: a same-origin replay at another version used to be dropped silently; the
+/// refusal now names the item, its origin and both versions, so a session cannot lose
+/// the thinking it is continuing from without a reason. A foreign origin at that same
+/// version is still dropped (ADR-0018), which the case above pins.
+#[test]
+fn an_own_replay_at_another_version_is_refused_by_name() {
+    let same = Origin {
+        route: ROUTE.to_string(),
+        model: "claude-sonnet-4-6".to_string(),
+    };
+    let history = vec![
+        user("go"),
+        assistant(vec![AssistantBlock::Reasoning {
+            text: "stale thought".to_string(),
+            replay: Some(ReplayData {
+                origin: same,
+                version: 2,
+                payload: json!({ "type": "thinking", "signature": "sig-1" }),
+            }),
+        }]),
+    ];
+    let error = build("claude-sonnet-4-6", &request(history.clone())).unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    for part in [ROUTE, "claude-sonnet-4-6", "version 2", "version 1"] {
+        assert!(error.message.contains(part), "{part}: {}", error.message);
+    }
+    // `validate` shares the lowering, so it refuses the same history.
+    let error = validate_request(
+        &route(),
+        "claude-sonnet-4-6",
+        &profile("claude-sonnet-4-6"),
+        &request(history),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(error.message.contains("version 2"), "{}", error.message);
 }
 
 #[test]
