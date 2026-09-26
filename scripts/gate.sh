@@ -37,6 +37,7 @@ python3 scripts/test_release_manifest.py -q
 python3 scripts/test_run_report.py -q
 python3 scripts/test_rustc_serial.py -q
 python3 scripts/test_secret_scan.py -q
+python3 scripts/test_stage_release.py -q
 python3 scripts/test_usage_audit.py -q
 target_dir="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 echo "== target dir: $(du -sh "$target_dir" 2>/dev/null | cut -f1) $target_dir (free: $(df -h --output=avail "$target_dir" | tail -1 | tr -d ' '))"
