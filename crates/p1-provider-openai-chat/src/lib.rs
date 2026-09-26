@@ -319,13 +319,17 @@ fn cleartext_loopback(endpoint: &str) -> bool {
     // endpoint checks that follow, so the host is what remains after it.
     let authority = endpoint.split(['/', '?', '#']).next().unwrap_or_default();
     let host = authority.rsplit('@').next().unwrap_or_default();
-    match host.strip_prefix('[') {
-        Some(rest) => rest.starts_with("::1]"),
-        None => matches!(
-            host.split(':').next().unwrap_or_default(),
-            "127.0.0.1" | "localhost"
-        ),
-    }
+    // What follows the host is nothing or a port, so `[::1].example.test` and
+    // `127.0.0.1.example.test` do not pass as loopback.
+    let port = |rest: &str| {
+        rest.is_empty()
+            || rest
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+    };
+    ["[::1]", "127.0.0.1", "localhost"]
+        .iter()
+        .any(|loopback| host.strip_prefix(loopback).is_some_and(port))
 }
 
 fn header_name(name: &str) -> bool {
@@ -553,6 +557,8 @@ mod tests {
             "http://127.0.0.1.example.test/v1/chat/completions",
             "http://localhost.evil.test/v1/chat/completions",
             "http://[fe80::1]/v1/chat/completions",
+            "http://[::1].example.test/v1/chat/completions",
+            "http://127.0.0.1:x/v1/chat/completions",
         ] {
             let error = validate_composition(&at(endpoint), "wire", &test_config::profile(false))
                 .expect_err("a non-loopback cleartext endpoint is refused");
