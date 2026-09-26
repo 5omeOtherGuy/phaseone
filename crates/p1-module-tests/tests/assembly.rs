@@ -83,6 +83,9 @@ struct Instantiations {
 }
 
 impl Instantiations {
+    // `..Services::default()` keeps this literal compiling when the runtime grants more
+    // services; until then the update is empty.
+    #[allow(clippy::needless_update)]
     fn new() -> Self {
         let count = Arc::new(AtomicUsize::new(0));
         let (process, processes) = fake_processes();
