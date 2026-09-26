@@ -124,6 +124,14 @@ impl ChatRoute {
         let endpoint = self
             .endpoint
             .strip_prefix("https://")
+            // A cleartext endpoint is accepted on a loopback host alone: the offline provider
+            // a test or an operator runs is a listener on this box, and such a socket never
+            // leaves it. Every other host keeps requiring `https`.
+            .or_else(|| {
+                self.endpoint
+                    .strip_prefix("http://")
+                    .filter(|endpoint| cleartext_loopback(endpoint))
+            })
             .ok_or_else(|| request::invalid("chat endpoint requires HTTPS"))?;
         if endpoint.split('/').next().is_none_or(str::is_empty)
             || endpoint.contains(['@', '?', '#'])
@@ -301,6 +309,23 @@ pub fn lower_request(
         headers: build_headers_without_credential(route, request.options.cache_key.as_deref()),
         body,
     })
+}
+
+/// Whether the part of a `http://` endpoint after its scheme names a loopback host:
+/// `127.0.0.1`, `[::1]` or `localhost`. Only those three are accepted in cleartext, so the
+/// exception cannot name a remote host an attacker reads the traffic to.
+fn cleartext_loopback(endpoint: &str) -> bool {
+    // The authority ends at the first `/`, `?` or `#`; a userinfo part is refused by the
+    // endpoint checks that follow, so the host is what remains after it.
+    let authority = endpoint.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    match host.strip_prefix('[') {
+        Some(rest) => rest.starts_with("::1]"),
+        None => matches!(
+            host.split(':').next().unwrap_or_default(),
+            "127.0.0.1" | "localhost"
+        ),
+    }
 }
 
 fn header_name(name: &str) -> bool {
@@ -505,6 +530,34 @@ mod tests {
         );
         let error = validate_composition(&route, "claude-example", &profile).unwrap_err();
         assert!(error.message.contains("default"), "{}", error.message);
+    }
+
+    #[test]
+    fn chat_takes_a_cleartext_endpoint_on_a_loopback_host_and_refuses_every_other() {
+        let at = |endpoint: &str| {
+            let mut route = test_config::route(false);
+            route.endpoint = endpoint.to_owned();
+            route
+        };
+        for endpoint in [
+            "https://example.test/chat/completions",
+            "http://127.0.0.1:8080/v1/chat/completions",
+            "http://localhost/v1/chat/completions",
+            "http://[::1]:8080/v1/chat/completions",
+        ] {
+            validate_composition(&at(endpoint), "wire", &test_config::profile(false))
+                .unwrap_or_else(|error| panic!("{endpoint}: {error}"));
+        }
+        for endpoint in [
+            "http://example.test/v1/chat/completions",
+            "http://127.0.0.1.example.test/v1/chat/completions",
+            "http://localhost.evil.test/v1/chat/completions",
+            "http://[fe80::1]/v1/chat/completions",
+        ] {
+            let error = validate_composition(&at(endpoint), "wire", &test_config::profile(false))
+                .expect_err("a non-loopback cleartext endpoint is refused");
+            assert_eq!(error.message, "chat endpoint requires HTTPS", "{endpoint}");
+        }
     }
 }
 
