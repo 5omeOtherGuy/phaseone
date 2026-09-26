@@ -17,6 +17,11 @@
 //!
 //! Two components claiming one name or one digest are refused when the release manifest is
 //! read ([`ManifestError::DuplicateIdentity`]).
+//!
+//! `notice: crates/p1-host/src/catalog/modules.rs (S1): S3.8 (D083b) adds `load_release_module`,
+//! the loader path an official-release HOST ENTRY takes: a package loaded BY NAME from the
+//! release manifest, verified against that same manifest, with no `modules.lock` entry. The
+//! existing lock path is unchanged.`
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -225,6 +230,30 @@ pub fn load_locked_modules(
         });
     }
     Ok(packages)
+}
+
+/// Loads one package BY NAME from the installed release module set, verified against the
+/// release manifest through the loader (freeze item 6): the path an official-release HOST
+/// ENTRY takes for a package p1 itself ships (D083b). No `modules.lock` entry takes part —
+/// the lock is for user-selected extra modules only — so the identity is the loader's own:
+/// the manifest `name` and `variant`, checked against the bytes' digest. The discovery path
+/// is [`official_release_manifest`], the same one the lock path uses, never a second one.
+///
+/// A host with no release module set, or a release that does not carry `package`, is an
+/// error naming the module: there is no native fallback for a shipped package.
+pub fn load_release_module(package: &str) -> Result<LoadedModule, String> {
+    let release = official_release_manifest().ok_or_else(|| {
+        format!(
+            "module `{package}`: cannot locate p1's release module set: the executable path is unknown"
+        )
+    })?;
+    let at = |error: ManifestError| format!("module `{package}`: {}: {error}", release.display());
+    let manifest = ReleaseManifest::read(&release).map_err(at)?;
+    manifest.check_unique_digests().map_err(at)?;
+    let root = release.parent().unwrap_or(Path::new("."));
+    let loader = Loader::new(manifest, root)
+        .map_err(|error| format!("module `{package}`: cannot start the module runtime: {error}"))?;
+    loader.load(package).map_err(|error| error.to_string())
 }
 
 /// The lock pins the release's digest, world and protocol, or the selection is refused.

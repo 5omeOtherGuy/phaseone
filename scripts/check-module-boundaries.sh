@@ -607,12 +607,18 @@ check_crate() {
 # protocol it speaks), `core` or `contracts`, or `extension` (a tool, provider, context-policy
 # or authorization-policy implementation that becomes a module). A crate of the shipping graph
 # that is not listed is a finding: the mode never guesses a class.
+# notice: scripts/check-module-boundaries.sh (S7, D083): S3.8 adds the two shared guest crates
+# of the packages it activates to the table below. Each holds the world bindings, the pure
+# decisions and the model-facing text that the NATIVE tool and its component both run from, so
+# it is the contracts the two share rather than an extension implementation: `contracts`, not
+# `extension`, which would count the module side of the same tool as a native fallback.
 SHIPPING_TABLE='
 p1-assembly|foundation|assembles environments, profiles and routes and reads the module lock; assembly is a host step (ADR-0081)
 p1-auth|foundation|the credential source is native and no interface returns a value (ADR-0081)
 p1-contracts|contracts|the contracts the core and its modules share (ADR-0002)
 p1-context|extension|holds the summarizing context policy (src/engine.rs); it becomes the context-policy module and its native driver leaves with it (ADR-0036, ADR-0081)
 p1-core|core|the core runs one loop and depends only on contracts (ADR-0002)
+p1-finish-guest|contracts|the shared guest crate of the `finish` package (S3.7): the world bindings, the declaration text the native tool and the host hub present per policy and output contract, and the wire values both sides convert (ADR-0081, D083)
 p1-hook-shadow|foundation|the brain shadow hook is spawned detached by the host and fails open (ADR-0058)
 p1-host|foundation|the composition root: the OS services it owns (the terminal driver, the worker service, the detached hook shadow) stay native (ADR-0081); its native authorization policies are named as a native twin
 p1-journal|foundation|the session record is native and the single truth, including the version and assembly identity (ADR-0021, ADR-0080)
@@ -624,6 +630,7 @@ p1-provider-http|foundation|sending, retry, backoff, the one credential refresh 
 p1-provider-openai|extension|the OpenAI Responses implementation, a provider that becomes a module (ADR-0081)
 p1-provider-openai-chat|extension|the Chat Completions implementation, a provider that becomes a module (ADR-0081)
 p1-redact|foundation|credential-shape masking runs over the output of every assembled tool (issue #142)
+p1-shell-guest|contracts|the shared guest crate of the `shell` package (S3.2), classified for the reason in the notice above: the world bindings, the input validation, the declaration and the sandbox paragraph the native adapter and the component both present (ADR-0081, D083)
 p1-tool-delegate|extension|the worker_start, worker_result, worker_continue and worker_cancel tool members (ADR-0081)
 p1-tool-edit|extension|the `edit` tool implementation, which becomes a tool module (ADR-0081)
 p1-tool-finish|extension|the `finish` tool and the output contract it checks, which become a tool module (ADR-0081)
@@ -643,8 +650,14 @@ p1-workspace|foundation|confinement resolves paths after symlinks and every writ
 # The module packages that implement what an extension crate still implements natively, as
 # `<crate>|<build output directory>`, one crate per line; a crate with no line ships no package
 # yet, which its fallback line says.
+# notice: scripts/check-module-boundaries.sh (S7, D083): S3.8 makes `shell` and `finish`
+# official-release HOST ENTRIES over the `p1/shell` and `p1/finish` components (D083b: no
+# modules.lock entries), so the fallback lines of `p1-tool-shell` and `p1-tool-finish` name the
+# packages that now implement the tool, exactly as the worker, workflow and context rows do.
 SHIPPING_PACKAGES='
 p1-context|p1-module-context
+p1-tool-finish|p1-module-finish
+p1-tool-shell|p1-module-shell
 p1-tool-delegate|p1-module-worker-start p1-module-worker-continue p1-module-worker-result p1-module-worker-cancel
 p1-tool-workflow|p1-module-workflow-start p1-module-workflow-status p1-module-workflow-result p1-module-workflow-cancel
 '

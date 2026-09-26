@@ -3,6 +3,12 @@
 //! file under its id (§2), and resolves a profile to the wire model the route reaches it
 //! by. The chat adapter's shared conformance suite also runs here, against the
 //! SHIPPED routes built from the shipped files through this same loading path.
+//!
+//! notice: crates/p1-host/tests/route_files.rs (S1): S3.8 makes `shell` and `finish` the
+//! components `p1/shell` and `p1/finish`, and every shipped environment names both, so
+//! assembling one now happens inside a Tokio runtime (a component executor runs there —
+//! the whole host always is). The case that assembled a shipped environment in a plain
+//! `#[test]` runs inside one now; every assertion is unchanged.
 
 mod common;
 
@@ -467,8 +473,8 @@ fn assemble_shipped(name: &str) -> Assembled {
     .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
 }
 
-#[test]
-fn the_shipped_zen_environments_declare_the_free_tier_gate_tools() {
+#[tokio::test]
+async fn the_shipped_zen_environments_declare_the_free_tier_gate_tools() {
     for name in ["zen", "zen2", "zen3"] {
         let assembled = assemble_shipped(name);
         let declarations: Vec<&str> = assembled

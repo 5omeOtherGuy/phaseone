@@ -3,6 +3,12 @@
 //! `profiles/claude-*.toml`, through the host's own loading path. Nothing here is
 //! hand-made except the scripted transport and the fake credential source, and no
 //! test touches a credential file or the network.
+//!
+//! notice: crates/p1-host/tests/anthropic_route.rs (S1): S3.8 makes `shell` and `finish`
+//! the components `p1/shell` and `p1/finish`, and the shipped environments name both, so
+//! assembling one now happens inside a Tokio runtime (a component executor runs there —
+//! the whole host always is). Two cases that assembled a shipped environment in a plain
+//! `#[test]` run inside one now; every assertion is unchanged.
 
 mod common;
 
@@ -283,21 +289,18 @@ fn the_shipped_messages_route_passes_the_conformance_suite() {
 // ------------------------------------------------------------- the shipped environments
 
 /// `p1 env show NAME` through the real CLI and catalog.
-fn show_env(name: &str) -> (i32, String, String) {
+async fn show_env(name: &str) -> (i32, String, String) {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     common::isolated_environment(&mut harness);
-    let code = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(common::run_args(&mut harness, &["env", "show", name]));
+    let code = common::run_args(&mut harness, &["env", "show", name]).await;
     (code, harness.stdout.text(), harness.stderr.text())
 }
 
-#[test]
-fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
+#[tokio::test]
+async fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
     // Every main agent gets the worker tools from the host (ADR-0050), so `claude`
     // assembles unchanged with or without the `delegation` feature.
-    let (code, stdout, stderr) = show_env("claude");
+    let (code, stdout, stderr) = show_env("claude").await;
     assert_eq!(code, 0, "claude: {stderr}");
     let resolved: serde_json::Value = common::env_show_json(&stdout);
     assert_eq!(resolved["environment"], "claude");
@@ -331,8 +334,8 @@ fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
 /// ADR-0074: the second Claude subscription is the first route on another account.
 /// Everything but the id, the origin and the credential reference is the same data,
 /// and `environments/claude2` is `environments/claude` with only the route changed.
-#[test]
-fn the_second_claude_route_is_the_first_on_its_own_account() {
+#[tokio::test]
+async fn the_second_claude_route_is_the_first_on_its_own_account() {
     let dirs = environment_dirs();
     let first = load_route_by_id(&dirs, "anthropic-subscription").expect("the first route");
     let second = load_route_by_id(&dirs, "anthropic-subscription-2").expect("the second route");
@@ -371,7 +374,7 @@ fn the_second_claude_route_is_the_first_on_its_own_account() {
         read("environments/claude/prompt.md")
     );
 
-    let (code, stdout, stderr) = show_env("claude2");
+    let (code, stdout, stderr) = show_env("claude2").await;
     assert_eq!(code, 0, "claude2: {stderr}");
     let resolved: serde_json::Value = common::env_show_json(&stdout);
     assert_eq!(resolved["environment"], "claude2");
