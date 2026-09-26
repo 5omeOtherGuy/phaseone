@@ -126,6 +126,78 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-module-worker-cancel"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-worker-continue"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-worker-result"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-worker-start"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-workflow-cancel"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-workflow-result"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-workflow-start"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-workflow-status"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -166,6 +238,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
