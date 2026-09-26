@@ -52,12 +52,17 @@ async fn cooperative_descendants_end_without_waiting_out_the_grace_period() {
     let dir = tempfile::tempdir().unwrap();
     let tool = ShellTool::new(Workspace::new(dir.path()).unwrap());
     let cancel = CancellationToken::new();
-    // The leader records how its descendant ended: on the group's SIGTERM its trap waits
-    // for the descendant and writes that exit status, then the leader exits too. A SIGKILL
-    // anywhere in the group (the grace run out) leaves no status or a 137.
+    // The descendant records how it ended: on the group's SIGTERM its own trap writes 143
+    // to `cause` and exits, so the status cannot be lost to bash reaping it while the
+    // leader's outer wait returns. It publishes `pid` only after arming that trap, so the
+    // cancellation cannot reach it first. The leader's trap then waits until that pid is
+    // gone and only then copies `cause` to `status` and exits: a SIGKILL anywhere in the
+    // group (the grace run out) leaves no status, no cause, or a non-143 value.
     let call = call(
-        "trap 'wait \"$child\"; echo $? > status; exit 143' TERM; \
-         sleep 300 & child=$!; echo $child > pid; wait",
+        "trap 'child=$(cat pid); while kill -0 \"$child\" 2>/dev/null; do sleep 0.01; done; \
+         cat cause > status; exit 143' TERM; \
+         ( trap 'echo 143 > cause; exit 143' TERM; echo \"$BASHPID\" > pid; sleep 300 & wait \"$!\" ) \
+         & wait",
         None,
     );
     let run = tool.execute(

@@ -30,6 +30,11 @@ p1-usage = { path = "../p1-usage" }
 p1-context = { path = "../p1-context" }
 p1-contracts = { path = "../p1-contracts" }
 p1-model-profile = { path = "../p1-model-profile" }
+# `p1 modules` (ADR-0079, S1.6): the release manifest's format, a package's digest and the
+# loader's checks are the runtime's (freeze item 6), so the host reads a module set with the
+# runtime instead of parsing the format a second time; the protocol major it prints and
+# verifies is the protocol crate's.
+p1-module-protocol = { path = "../p1-module-protocol" }
 p1-core = { path = "../p1-core" }
 p1-journal = { path = "../p1-journal" }
 p1-workspace = { path = "../p1-workspace" }
@@ -53,6 +58,12 @@ p1-workflow = { path = "../p1-workflow", optional = true }
 p1-tool-workflow = { path = "../p1-tool-workflow", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# S1.4: catalog/modules registers the packages modules.lock selects. The runtime crate
+# verifies, compiles and adapts them, so the host needs no wasmtime of its own.
+# S1.5: a package's semantic capabilities are derived from the same verified `LoadedModule`
+# (catalog/capabilities.rs).
+p1-module-runtime = { path = "../p1-module-runtime" }
+thiserror = "2"
 # Route files are TOML data; `parse` is all this crate needs, exactly like the profile
 # and environment loaders in `p1-model-profile`/`p1-assembly`.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
@@ -78,6 +89,8 @@ p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 # The shared provider conformance suite, run over the SHIPPED composed routes in
 # `tests/route_files.rs` through the same host loading path the binary uses.
 p1-provider-conformance = { path = "../p1-provider-conformance" }
+# S1.5: the package-capability cases load the built fixture through S0's release harness.
+p1-module-tests = { path = "../p1-module-tests" }
 futures-util = "0.3"
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = [

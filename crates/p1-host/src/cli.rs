@@ -4,6 +4,7 @@
 //! `p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]
 //! [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
 //! `p1 models [SEARCH]`
+//! `p1 modules list` / `p1 modules inspect NAME` / `p1 modules verify [--root DIR]`
 //! `p1 env show NAME`
 //! `p1 workflow run FILE [--arg k=v]… [--args FILE] [--role r=E/P[:effort]]…`
 //! `p1 login <route>` / `p1 login --list` / `p1 logout <route>`
@@ -55,6 +56,8 @@ pub enum Command {
     Models {
         search: Option<String>,
     },
+    /// The installed module set (ADR-0079, freeze item 6): `p1 modules`.
+    Modules(ModulesOptions),
     /// Read one API key from stdin and store it for this route (ADR-0044, spec §6).
     Login {
         route: String,
@@ -108,6 +111,30 @@ pub struct UsageOptions {
     pub plain: bool,
     pub grid: usize,
     pub search: Option<String>,
+}
+
+/// Parsed arguments for `p1 modules` (ADR-0079).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModulesOptions {
+    pub action: ModulesAction,
+    /// `--root DIR`: the module set to read — the directory that holds its
+    /// `manifest.json`, or the share directory above the `modules/` one. `None` means
+    /// the installed `<binary>/../share/p1`.
+    pub root: Option<PathBuf>,
+}
+
+/// What `p1 modules` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModulesAction {
+    /// Every installed package, its digest and the environments that name it.
+    List,
+    /// One package: its frozen manifest fields, its imports and its effective grants.
+    Inspect {
+        /// The package's manifest name, `<namespace>/<name>`.
+        name: String,
+    },
+    /// The metadata-only check an installer runs on a staged module set.
+    Verify,
 }
 
 /// Parsed command line.
@@ -198,6 +225,9 @@ pub fn usage() -> String {
         "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]\n     [--workspace DIR] [--session FILE] [--resume [--compact]] [--ask]\n     [PROMPT…]\n",
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
+    out.push_str(
+        "  p1 modules list      every installed module package: kind, protocol, digest, selection\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1\n",
+    );
     out.push_str("  p1 env show NAME\n");
     out.push_str(
         "  p1 workflow run FILE [--arg K=V]… [--args FILE] [--role R=E/P[:effort]]…\n     [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]\n     [--max-workers N] [--yes]\n                       run a workflow script without a parent agent; `--arg`\n                       values that parse as JSON are passed as JSON, and lie over\n                       the JSON object in `--args FILE`; exit 0 completed,\n                       2 completed with issues, 1 failed, 130 cancelled\n",
@@ -290,6 +320,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         }
         if first == "models" {
             return parse_models(args);
+        }
+        if first == "modules" {
+            return parse_modules(args);
         }
         if first == "usage" {
             return parse_usage(args);
@@ -501,7 +534,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
 
 /// The subcommands a first positional token can name. Kept in one place so a
 /// near miss suggests from the same list the parser dispatches on.
-const SUBCOMMANDS: [&str; 6] = ["models", "env", "workflow", "usage", "login", "logout"];
+const SUBCOMMANDS: [&str; 7] = [
+    "models", "env", "workflow", "usage", "login", "logout", "modules",
+];
 
 /// The subcommand a lone positional `token` most likely meant, or `None` when it
 /// is not a typo (issue #83). A typo is shaped like a command (`^[a-z][a-z-]*$`),
@@ -644,6 +679,75 @@ fn parse_models(args: &[String]) -> Result<Options, CliError> {
     let mut options = defaults(Command::Models { search });
     options.models = models;
     Ok(options)
+}
+
+/// `p1 modules list | inspect NAME | verify` (ADR-0079): one module set, read only.
+/// An action is required — as `p1 workflow` requires one — so a bare `p1 modules` is
+/// a usage error rather than a listing nobody asked for.
+fn parse_modules(args: &[String]) -> Result<Options, CliError> {
+    const USAGE: &str = "usage: p1 modules list | p1 modules inspect NAME | \
+                         p1 modules verify [--root DIR]";
+    let mut action: Option<String> = None;
+    let mut operand: Option<String> = None;
+    let mut root: Option<PathBuf> = None;
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--root" => root = Some(PathBuf::from(take_value(args, &mut index, "--root")?)),
+            other if other.starts_with('-') && other != "-" => {
+                return Err(CliError {
+                    message: format!("unknown flag `{other}`"),
+                });
+            }
+            other => {
+                if action.is_none() {
+                    if !matches!(other, "list" | "inspect" | "verify") {
+                        return Err(CliError {
+                            message: format!("unknown modules subcommand `{other}`"),
+                        });
+                    }
+                    action = Some(other.to_string());
+                } else if operand.is_none() {
+                    operand = Some(other.to_string());
+                } else {
+                    return Err(CliError {
+                        message: format!("unexpected argument `{other}`"),
+                    });
+                }
+            }
+        }
+        index += 1;
+    }
+    let unexpected = |operand: Option<String>| -> Result<(), CliError> {
+        match operand {
+            Some(extra) => Err(CliError {
+                message: format!("unexpected argument `{extra}`"),
+            }),
+            None => Ok(()),
+        }
+    };
+    let action = match action.as_deref() {
+        Some("list") => {
+            unexpected(operand)?;
+            ModulesAction::List
+        }
+        Some("verify") => {
+            unexpected(operand)?;
+            ModulesAction::Verify
+        }
+        Some("inspect") => ModulesAction::Inspect {
+            name: operand.ok_or_else(|| CliError {
+                message: USAGE.to_string(),
+            })?,
+        },
+        _ => {
+            return Err(CliError {
+                message: USAGE.to_string(),
+            });
+        }
+    };
+    Ok(defaults(Command::Modules(ModulesOptions { action, root })))
 }
 
 fn parse_usage(args: &[String]) -> Result<Options, CliError> {
@@ -1546,14 +1650,75 @@ mod tests {
         assert!(usage().contains("p1 models [SEARCH]"));
     }
 
+    #[test]
+    fn parses_the_modules_subcommand() {
+        assert_eq!(
+            parse(&args(&["modules", "list"])).unwrap().command,
+            Command::Modules(ModulesOptions {
+                action: ModulesAction::List,
+                root: None,
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "modules",
+                "inspect",
+                "p1/fixture",
+                "--root",
+                "/share"
+            ]))
+            .unwrap()
+            .command,
+            Command::Modules(ModulesOptions {
+                action: ModulesAction::Inspect {
+                    name: "p1/fixture".to_string(),
+                },
+                root: Some(PathBuf::from("/share")),
+            })
+        );
+        assert_eq!(
+            parse(&args(&["modules", "verify", "--root", "/share/modules"]))
+                .unwrap()
+                .command,
+            Command::Modules(ModulesOptions {
+                action: ModulesAction::Verify,
+                root: Some(PathBuf::from("/share/modules")),
+            })
+        );
+        assert!(
+            !parse(&args(&["modules", "list"])).unwrap().is_headless(),
+            "reading a module set runs no agent"
+        );
+
+        // An action is required, `inspect` needs its name, and a word that names no
+        // action is refused with the one that does.
+        assert!(parse(&args(&["modules"])).is_err());
+        assert!(parse(&args(&["modules", "inspect"])).is_err());
+        assert!(parse(&args(&["modules", "list", "extra"])).is_err());
+        assert!(parse(&args(&["modules", "verify", "extra"])).is_err());
+        assert!(parse(&args(&["modules", "--bogus"])).is_err());
+        assert!(parse(&args(&["modules", "--root"])).is_err());
+        let error = parse(&args(&["modules", "listt"])).unwrap_err();
+        assert!(
+            error.message.contains("unknown modules subcommand `listt`"),
+            "{}",
+            error.message
+        );
+        assert!(usage().contains("p1 modules list"));
+        assert!(usage().contains("p1 modules inspect NAME"));
+        assert!(usage().contains("p1 modules verify [--root DIR]"));
+    }
+
     /// A lone word that is a near miss for a subcommand is a usage error naming the
-    /// command meant, never a prompt (issue #83).
+    /// command meant, never a prompt (issue #83). `modles` is one edit from `modules`
+    /// and two from `models`, so the nearer command is the one suggested.
     #[test]
     fn a_lone_near_miss_for_a_subcommand_is_a_usage_error() {
         for (typo, meant) in [
             ("envs", "env"),
-            ("modles", "models"),
+            ("modles", "modules"),
             ("model", "models"),
+            ("module", "modules"),
             ("usge", "usage"),
             ("workfow", "workflow"),
             ("loginn", "login"),
