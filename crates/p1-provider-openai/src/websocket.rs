@@ -2,11 +2,15 @@
 //! `docs/design/websocket.md` §3–§5).
 //!
 //! One text frame out, one JSON event per text frame in, fed to the SAME
-//! [`CodexResponseParser`] the SSE path uses — no second parser. This module owns
-//! the connection's lifetime: one connection per provider instance behind an async
-//! mutex, reused while it is young and recently used, dropped the moment a request
-//! is cancelled or a response fails, and returned to its slot only after a clean
-//! completion.
+//! [`CodexResponseParser`] the SSE path uses — no second parser. This module is the
+//! native driver between the two halves ADR-0078 §1–§2 places: the host session
+//! ([`p1_provider_http::ws_session`]) owns the connection's lifetime — one connection
+//! per provider instance behind an async mutex, reused while it is young and recently
+//! used, dropped the moment a request is cancelled or a response fails, and returned
+//! to its slot only after a request reported a clean completion — and the portable
+//! decisions ([`crate::websocket_lower`]) choose what goes over it. The driver leases
+//! the session, hands the request and the session's facts to the decisions, hands the
+//! chosen send back to the session, and classifies every ending.
 //!
 //! §5 is `drive()`'s failure policy re-expressed for a handshake and for error
 //! frames: one forced credential refresh on a refused upgrade, no fallback for a
@@ -17,12 +21,16 @@
 //! failure is an ordinary `Transport` failure of that response. Every row of that
 //! table has a named test in `tests/websocket.rs`.
 //!
-//! §6 (continuation, stage C): the connection also remembers the response it
-//! completed last, and the next request whose body continues that response is sent
-//! with `previous_response_id` and only the new items. [`request_frame`] is the
-//! single place that decision lands, and [`Memory`] is everything it reads. The
-//! memory lives in the connection itself, so §4's rule — every drop, every
-//! reconnect, every fallback — clears it without a second bookkeeping path.
+//! §6 (continuation, stage C): the adapter also remembers the response it completed
+//! last, and the next request whose body continues that response is sent with
+//! `previous_response_id` and only the new items. That decision is the portable
+//! half's: [`crate::websocket_lower::WebSocketDecisions::lower`] is its single place,
+//! and it is taken only while the session reports that very response as the open
+//! connection's last clean one. The memory is therefore instance state, held in
+//! `WebSocketDecisions` beside the fallback flag, and `lower` clears it from the
+//! session's own facts — no open connection, or §5 has turned this instance's
+//! WebSocket off — so §4's rule, that a dropped connection is never continued, holds
+//! without the connection carrying any state of its own.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -49,7 +57,8 @@ use crate::ResponsesAccount;
 use crate::parser::CodexResponseParser;
 use crate::request::{build_ws_headers, build_ws_headers_without_credential, ws_frame};
 use crate::websocket_lower::{
-    ConnectionState, Lowered, ResponseFacts, WebSocketDecisions, WebSocketHead, WebSocketSend,
+    ConnectionState, Lowered, LoweredHttpRequest, ResponseFacts, WebSocketDecisions, WebSocketHead,
+    WebSocketSend,
 };
 
 /// The clock the connection-reuse policy reads (§4). Injected, so a test advances
@@ -122,6 +131,12 @@ pub(crate) struct WebSocketRequest {
     /// The body the SSE path would send; the decisions frame it, in full or as a
     /// continuation (§6).
     pub(crate) body: Value,
+    /// The same request as the frozen `http.http-request` record: what the decisions
+    /// return for the `Http` arm, and the request today's SSE path sends for this
+    /// request. The native fallback runs `sse` rather than this record — retry, the
+    /// one refresh and the read bounds stay in `drive` (freeze item 9) — so the record
+    /// is what a component-side host is handed, not a second send.
+    pub(crate) http: LoweredHttpRequest,
     pub(crate) account: ResponsesAccount,
     pub(crate) cache_key: Option<String>,
     pub(crate) credentials: Arc<dyn CredentialSource>,
@@ -384,24 +399,30 @@ async fn refresh(mut state: State, rejected: Credential) -> State {
 }
 
 /// WIT `lower(request, connection-state)`: the session reports its facts, the
-/// portable decisions choose. The fallback is announced here, ONCE, before the SSE
-/// request is even started (ADR-0048), so the notice precedes the response's first
-/// event. A disabled instance never starts a WebSocket request again, so one
-/// request announces at most once, and a later request, already on SSE, announces
-/// nothing.
+/// portable decisions choose — a `websocket-send`, or the `http.http-request` record
+/// ([`LoweredHttpRequest`]) that the fallback arm carries. The fallback is announced
+/// here, ONCE, before the SSE request is even started (ADR-0048), so the notice
+/// precedes the response's first event. A disabled instance never starts a WebSocket
+/// request again, so one request announces at most once, and a later request, already
+/// on SSE, announces nothing.
 fn lower(mut state: State) -> State {
     let connection = connection_state(state.lease.state());
     let head = match handshake_head(&state.request) {
         Ok(head) => head,
         Err(error) => return state.finish(Outcome::Failed(error)),
     };
-    let lowered = state
-        .request
-        .ws
-        .decisions()
-        .lower(&state.request.body, head, &connection);
+    let lowered = state.request.ws.decisions().lower(
+        &state.request.body,
+        head,
+        &state.request.http,
+        &connection,
+    );
     match lowered {
-        Lowered::Http => {
+        // The decision returned the frozen `http.http-request` record. This native
+        // path sends that same request through today's `drive()` path for this request
+        // (`request.sse`), where retry, the one refresh and the read bounds stay
+        // (freeze item 9), so the record is not sent from here.
+        Lowered::Http(_http) => {
             state.lease.drop_connection();
             let reason = state
                 .fallback_reason

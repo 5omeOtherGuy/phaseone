@@ -3,11 +3,12 @@
 //! S0-R2.2).
 //!
 //! [`WebSocketDecisions::lower`] is WIT `provider.lower(request, connection-state)`
-//! for a route that speaks WebSocket: from the request body and the facts the host
-//! session reports in [`ConnectionState`] it returns [`Lowered::Http`], the fallback,
-//! or [`Lowered::WebSocket`] with a [`WebSocketSend`] — a handshake head exactly when
-//! no connection is open, and the ONE text frame: the full request frame, or the
-//! shorter continuation frame (`previous_response_id` plus only the new items) that
+//! for a route that speaks WebSocket: from the request and the facts the host session
+//! reports in [`ConnectionState`] it returns [`Lowered::Http`] with the frozen
+//! `http.http-request` record ([`LoweredHttpRequest`]), the fallback, or
+//! [`Lowered::WebSocket`] with a [`WebSocketSend`] — a handshake head exactly when no
+//! connection is open, and the ONE text frame: the full request frame, or the shorter
+//! continuation frame (`previous_response_id` plus only the new items) that
 //! `docs/design/websocket.md` §6 allows.
 //!
 //! What lives here is component state: the fact that this instance fell back to
@@ -81,12 +82,44 @@ impl std::fmt::Debug for WebSocketSend {
     }
 }
 
+/// WIT `http.http-request` (`modules/wit/transport.wit`): the request the fallback
+/// arm sends, as the frozen record names it — the same record
+/// `p1_provider_http::LoweredHttpRequest` mirrors on the native broker side. The
+/// method is always POST, the only method the frozen interface has, and no
+/// credential is here: [`Self::account_id_header`] names where the host attaches the
+/// route's own.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoweredHttpRequest {
+    /// Path and query relative to the route's endpoint, starting with `/`.
+    pub path: String,
+    /// Headers without any credential, in the order they go out.
+    pub headers: Vec<(String, String)>,
+    /// The header the host fills with the credential's account id, for an account that
+    /// needs one.
+    pub account_id_header: Option<String>,
+    /// The encoded JSON body.
+    pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for LoweredHttpRequest {
+    /// Header names and lengths only: the body holds the conversation.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("LoweredHttpRequest")
+            .field("path_len", &self.path.len())
+            .field("header_names", &names)
+            .field("account_id_header", &self.account_id_header)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
 /// WIT `provider.lowered-request` for a WebSocket route.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lowered {
-    /// Send the request over HTTP/SSE: the request the request builder makes for
-    /// an SSE route, unchanged.
-    Http,
+    /// Send the request over HTTP/SSE: the record the request builder makes for an
+    /// SSE route, unchanged.
+    Http(LoweredHttpRequest),
     WebSocket(WebSocketSend),
 }
 
@@ -117,17 +150,27 @@ impl WebSocketDecisions {
 
     /// Lower one attempt of the request whose body is `body`.
     ///
-    /// - `Http` once this instance has fallen back, and whenever the host reports
+    /// `head` and `http` are the rest of the request, as the host derived it from the
+    /// route: the handshake a new connection opens with, and the frozen
+    /// `http.http-request` record the fallback arm returns unchanged.
+    ///
+    /// - `Http(http)` once this instance has fallen back, and whenever the host reports
     ///   `failed_before_output` — which also turns WebSocket off for good;
     /// - otherwise a send with `head` exactly when no connection is open, and the
     ///   continuation frame only when the open connection's last clean response is
     ///   the one this instance remembers and the body continues it (§6); every
     ///   other case is the full frame.
-    pub fn lower(&mut self, body: &Value, head: WebSocketHead, state: &ConnectionState) -> Lowered {
+    pub fn lower(
+        &mut self,
+        body: &Value,
+        head: WebSocketHead,
+        http: &LoweredHttpRequest,
+        state: &ConnectionState,
+    ) -> Lowered {
         if self.turned_off || state.failed_before_output {
             self.turned_off = true;
             self.memory = None;
-            return Lowered::Http;
+            return Lowered::Http(http.clone());
         }
         if !state.open {
             // A new connection has answered nothing yet: §6's memory is per

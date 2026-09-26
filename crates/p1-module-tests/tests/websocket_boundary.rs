@@ -6,8 +6,9 @@
 //! (ADR-0069). The provider's portable decisions (`p1_provider_openai::websocket_lower`)
 //! choose from the session's `connection-state` facts: a handshake head exactly when no
 //! connection is open, the continuation frame only on the open connection whose last
-//! clean response it continues, and HTTP once a request failed before any output with no
-//! WebSocket attempt left (ADR-0047's pre-output rule).
+//! clean response it continues, and the frozen `http.http-request` record once a
+//! request failed before any output with no WebSocket attempt left (ADR-0047's
+//! pre-output rule).
 //!
 //! Fake time (`start_paused`) and `ScriptedWsConnector` only: no socket, no network, no
 //! sleep. The session's reuse clock is the paused Tokio clock itself.
@@ -25,7 +26,8 @@ use p1_provider_http::ws_session::{
 };
 use p1_provider_http::{CredentialScheme, CredentialUse, FIRST_BYTE_TIMEOUT, STREAM_IDLE_TIMEOUT};
 use p1_provider_openai::websocket_lower::{
-    ConnectionState, Lowered, ResponseFacts, WebSocketDecisions, WebSocketHead, WebSocketSend,
+    ConnectionState, Lowered, LoweredHttpRequest, ResponseFacts, WebSocketDecisions, WebSocketHead,
+    WebSocketSend,
 };
 
 const ENDPOINT: &str = "https://example.test/backend-api/codex/responses";
@@ -74,6 +76,18 @@ fn component_head() -> WebSocketHead {
     }
 }
 
+/// The rest of the request, as the host derives it from the route: the frozen
+/// `http.http-request` record, which the decisions return unchanged for their `Http`
+/// arm. Its body is the body the case lowers, so a case can tell one from another.
+fn http_request(body: &Value) -> LoweredHttpRequest {
+    LoweredHttpRequest {
+        path: "/codex/responses".to_string(),
+        headers: vec![("originator".to_string(), "p1".to_string())],
+        account_id_header: Some("chatgpt-account-id".to_string()),
+        body: body.to_string().into_bytes(),
+    }
+}
+
 /// The WIT binding between the two sides: the component's facts in, its send out.
 fn component_state(state: ws_session::ConnectionState) -> ConnectionState {
     ConnectionState {
@@ -100,13 +114,13 @@ fn host_send(send: WebSocketSend) -> WsSend {
 /// One `lower` of the component against the lease's current facts.
 fn lower(decisions: &mut WebSocketDecisions, lease: &mut WsLease, body: &Value) -> Lowered {
     let state = component_state(lease.state());
-    decisions.lower(body, component_head(), &state)
+    decisions.lower(body, component_head(), &http_request(body), &state)
 }
 
 fn websocket(lowered: Lowered) -> WebSocketSend {
     match lowered {
         Lowered::WebSocket(send) => send,
-        Lowered::Http => panic!("expected a WebSocket send, got the HTTP fallback"),
+        Lowered::Http(_) => panic!("expected a WebSocket send, got the HTTP fallback"),
     }
 }
 
@@ -431,7 +445,7 @@ fn a_different_last_clean_response_gets_the_full_frame() {
         last_clean_response: Some("resp_other".to_string()),
         failed_before_output: false,
     };
-    let send = websocket(decisions.lower(&body, component_head(), &state));
+    let send = websocket(decisions.lower(&body, component_head(), &http_request(&body), &state));
     assert!(send.handshake.is_none());
     assert_eq!(send.frame, frame_of(&body), "the full frame");
 }
@@ -458,10 +472,11 @@ async fn failed_before_output_falls_back_to_http_for_the_instance() {
     // §5: the endpoint said no, so the native side allows no further attempt.
     first.fail_before_output();
     assert!(first.state().failed_before_output);
+    let http = http_request(&body);
     assert_eq!(
         lower(&mut decisions, &mut first, &body),
-        Lowered::Http,
-        "the retry falls back"
+        Lowered::Http(http.clone()),
+        "the retry falls back with the lowered http-request record"
     );
     assert!(decisions.is_turned_off());
     drop(first);
@@ -473,7 +488,7 @@ async fn failed_before_output_falls_back_to_http_for_the_instance() {
     );
     assert_eq!(
         lower(&mut decisions, &mut second, &body),
-        Lowered::Http,
+        Lowered::Http(http),
         "WebSocket stays off for the instance"
     );
     assert_eq!(
