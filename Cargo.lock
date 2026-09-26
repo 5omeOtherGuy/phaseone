@@ -1869,6 +1869,7 @@ version = "0.0.1"
 dependencies = [
  "futures-util",
  "p1-assembly",
+ "p1-context",
  "p1-contracts",
  "p1-core",
  "p1-host",
