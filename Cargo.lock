@@ -1862,9 +1862,15 @@ dependencies = [
 name = "p1-module-tests"
 version = "0.0.1"
 dependencies = [
+ "futures-util",
  "p1-contracts",
+ "p1-core",
  "p1-module-runtime",
+ "p1-provider-http",
  "p1-redact",
+ "p1-testkit",
+ "p1-workers",
+ "p1-workflow",
  "tempfile",
  "tokio",
 ]

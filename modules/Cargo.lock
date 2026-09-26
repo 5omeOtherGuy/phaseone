@@ -15,12 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
-name = "bytes"
-version = "1.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -31,18 +25,6 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "futures-core"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
-
-[[package]]
-name = "futures-sink"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
 
 [[package]]
 name = "hashbrown"
@@ -109,13 +91,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p1-bindings-context-policy"
-version = "0.0.1"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
 name = "p1-bindings-tool"
 version = "0.0.1"
 dependencies = [
@@ -127,34 +102,6 @@ name = "p1-bindings-workflow-decision"
 version = "0.0.1"
 dependencies = [
  "wit-bindgen",
-]
-
-[[package]]
-name = "p1-context"
-version = "0.0.1"
-dependencies = [
- "p1-contracts",
-]
-
-[[package]]
-name = "p1-contracts"
-version = "0.0.1"
-dependencies = [
- "futures-core",
- "serde",
- "serde_json",
- "thiserror",
- "tokio-util",
-]
-
-[[package]]
-name = "p1-module-context"
-version = "0.0.1"
-dependencies = [
- "p1-bindings-context-policy",
- "p1-context",
- "p1-contracts",
- "p1-module-protocol",
 ]
 
 [[package]]
@@ -179,20 +126,76 @@ dependencies = [
 ]
 
 [[package]]
-name = "p1-module-protocol"
+name = "p1-module-worker-cancel"
 version = "0.0.1"
 dependencies = [
- "p1-contracts",
+ "p1-bindings-tool",
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]
-name = "pin-project-lite"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+name = "p1-module-worker-continue"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-worker-result"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-worker-start"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-workflow-cancel"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-workflow-result"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-workflow-start"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-workflow-status"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "prettyplease"
@@ -280,48 +283,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "thiserror"
-version = "2.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
-dependencies = [
- "thiserror-impl",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "2.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "tokio"
-version = "1.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
-dependencies = [
- "pin-project-lite",
-]
-
-[[package]]
-name = "tokio-util"
-version = "0.7.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
-dependencies = [
- "bytes",
- "futures-core",
- "futures-sink",
- "pin-project-lite",
- "tokio",
 ]
 
 [[package]]
