@@ -1896,9 +1896,17 @@ dependencies = [
  "p1-provider-openai-chat",
  "p1-redact",
  "p1-testkit",
+ "p1-tool-edit",
+ "p1-tool-edit-logic",
  "p1-tool-finish",
+ "p1-tool-patch",
+ "p1-tool-patch-logic",
  "p1-tool-read",
+ "p1-tool-search",
+ "p1-tool-search-logic",
  "p1-tool-shell",
+ "p1-tool-write",
+ "p1-tool-write-logic",
  "p1-workers",
  "p1-workflow",
  "p1-workspace",
@@ -2028,11 +2036,19 @@ name = "p1-tool-edit"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "p1-tool-edit-logic",
  "p1-workspace",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "p1-tool-edit-logic"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2050,11 +2066,19 @@ name = "p1-tool-patch"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "p1-tool-patch-logic",
  "p1-workspace",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "p1-tool-patch-logic"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2077,11 +2101,19 @@ dependencies = [
  "grep",
  "ignore",
  "p1-contracts",
+ "p1-tool-search-logic",
  "p1-workspace",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "p1-tool-search-logic"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2131,11 +2163,19 @@ name = "p1-tool-write"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "p1-tool-write-logic",
  "p1-workspace",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "p1-tool-write-logic"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2195,6 +2235,7 @@ name = "p1-workspace"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "rustix",
  "tempfile",
  "thiserror 2.0.20",
 ]
