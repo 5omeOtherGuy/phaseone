@@ -41,6 +41,8 @@ p1-workers = { path = "../p1-workers" }
 # summarizer is built from masked history and that p1-context masks the summary's own answer.
 # policies.rs (S5.4) drives the policy components behind the native ask bridge (p1-host) and the
 # native context engine whose estimator builds the settings the component is configured with.
+# compaction_workload.rs (S5.9, issue #333) configures the same component with the same
+# engine's constants (DEFAULT_SUMMARY_OUTPUT_TOKENS among them).
 p1-context = { path = "../p1-context" }
 # workflow_boundary.rs: the workflow substrate driven through its decision seam (S6.3).
 p1-workflow = { path = "../p1-workflow" }
