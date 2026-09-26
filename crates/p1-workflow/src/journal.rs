@@ -9,7 +9,9 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-use crate::api::{CallId, JournalRecord, RunId, StepEnvelope, StepStatus};
+use crate::api::{
+    CallId, JournalRecord, RunId, StepEnvelope, StepStatus, WORKFLOW_JOURNAL_VERSION,
+};
 use crate::decision::{ReplayEntry, ReplayView};
 
 /// Appends records to `journal.jsonl`. Each record is written with one `write_all` on an
@@ -46,18 +48,45 @@ impl JournalWriter {
 ///
 /// Public because the host reads run journals to reserve worker ids on resume; the
 /// crash-tolerance rule lives here once, not in every reader.
+///
+/// The journal's format version is read from its leading `started` record before any
+/// record is parsed: a version this build does not know is an error, never a guess — a
+/// newer format could mean something else by the very records this build would accept.
+/// A leading record without a version is version 1 (every journal written before the
+/// version existed).
 pub fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, String> {
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let complete = text.ends_with('\n');
     let lines: Vec<&str> = text.lines().collect();
     let mut records = Vec::with_capacity(lines.len());
+    let mut leading = true;
     for (index, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
+        if std::mem::take(&mut leading) {
+            check_version(line)
+                .map_err(|error| format!("{} line {}: {error}", path.display(), index + 1))?;
+        }
         match serde_json::from_str::<JournalRecord>(line) {
-            Ok(record) => records.push(record),
+            Ok(record) => {
+                // A `started` record past the first line names a format too: still only
+                // the one version is read.
+                if let JournalRecord::Started {
+                    journal_version, ..
+                } = &record
+                    && *journal_version != WORKFLOW_JOURNAL_VERSION
+                {
+                    return Err(format!(
+                        "{} line {}: {}",
+                        path.display(),
+                        index + 1,
+                        unknown_version(&journal_version.to_string())
+                    ));
+                }
+                records.push(record);
+            }
             Err(_) if !complete && index + 1 == lines.len() => {}
             Err(error) => {
                 return Err(format!("{} line {}: {error}", path.display(), index + 1));
@@ -65,6 +94,30 @@ pub fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, String> {
         }
     }
     Ok(records)
+}
+
+/// The key the leading `started` record carries the version under (see `JournalRecord`).
+const JOURNAL_VERSION_KEY: &str = "p1_workflow_journal";
+
+/// The version check of a journal's leading line, on the raw JSON so a newer format is
+/// refused before its records are read as this build's. A line that is not a JSON object
+/// is left to the record parse (a crash-torn tail or a corrupt line, reported there).
+fn check_version(line: &str) -> Result<(), String> {
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(line) else {
+        return Ok(());
+    };
+    match fields.get(JOURNAL_VERSION_KEY) {
+        // Written before the version existed: version 1.
+        None => Ok(()),
+        Some(version) if version.as_u64() == Some(u64::from(WORKFLOW_JOURNAL_VERSION)) => Ok(()),
+        Some(version) => Err(unknown_version(&version.to_string())),
+    }
+}
+
+fn unknown_version(version: &str) -> String {
+    format!(
+        "workflow journal version {version} is not one this build reads (it reads version {WORKFLOW_JOURNAL_VERSION}); refusing to guess"
+    )
 }
 
 /// Attempts the old run spent per wire model: every `Dispatch`, matched on resume or not,
@@ -321,5 +374,117 @@ mod tests {
             "taken once only"
         );
         assert!(replay.take(&CallId("c".into())).is_none(), "latched off");
+    }
+
+    /// A journal file of its own under the temp dir, removed on drop.
+    struct TempJournal(std::path::PathBuf);
+
+    impl TempJournal {
+        fn new(case: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "p1-workflow-journal-{}-{case}.jsonl",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+
+        fn write(case: &str, text: &str) -> Self {
+            let journal = Self::new(case);
+            std::fs::write(&journal.0, text).unwrap();
+            journal
+        }
+    }
+
+    impl Drop for TempJournal {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn started(journal_version: u32) -> JournalRecord {
+        JournalRecord::Started {
+            journal_version,
+            run: RunId("wf1".into()),
+            script_hash: "00".into(),
+            args: json!({}),
+            resumed_from: None,
+            base: None,
+        }
+    }
+
+    const PHASE: &str = r#"{"kind":"phase","name":"p"}"#;
+
+    #[test]
+    fn the_version_record_is_written_first_and_read_back() {
+        let journal = TempJournal::new("written");
+        let writer = JournalWriter::create(&journal.0).unwrap();
+        writer.append(&started(WORKFLOW_JOURNAL_VERSION)).unwrap();
+        let text = std::fs::read_to_string(&journal.0).unwrap();
+        assert!(
+            text.starts_with(r#"{"kind":"started","p1_workflow_journal":1,"run":"wf1","#),
+            "{text}"
+        );
+        assert_eq!(
+            read_journal(&journal.0).unwrap(),
+            [started(WORKFLOW_JOURNAL_VERSION)]
+        );
+    }
+
+    #[test]
+    fn a_journal_without_the_version_record_reads_as_version_1() {
+        let journal = TempJournal::write(
+            "unversioned",
+            &format!(
+                "{}\n{PHASE}\n",
+                r#"{"kind":"started","run":"wf1","script_hash":"00","args":{},"resumed_from":null}"#
+            ),
+        );
+        let records = read_journal(&journal.0).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], started(1));
+    }
+
+    #[test]
+    fn an_unknown_or_newer_version_is_rejected_never_skipped() {
+        for version in ["2", "0", "99", "\"1\"", "null", "1.5"] {
+            let journal = TempJournal::write(
+                "unknown",
+                &format!(
+                    "{{\"kind\":\"started\",\"p1_workflow_journal\":{version},\"run\":\"wf1\",\"script_hash\":\"00\",\"args\":{{}},\"resumed_from\":null}}\n{PHASE}\n"
+                ),
+            );
+            let error = read_journal(&journal.0).unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "line 1: workflow journal version {version} is not one this build reads (it reads version 1)"
+                )),
+                "{version}: {error}"
+            );
+        }
+
+        // The leading line is checked before it is read as a record: a newer format whose
+        // `started` this build could not even parse is still refused for its version.
+        let newer = TempJournal::write(
+            "newer",
+            &format!("{{\"kind\":\"begun\",\"p1_workflow_journal\":2}}\n{PHASE}\n"),
+        );
+        let error = read_journal(&newer.0).unwrap_err();
+        assert!(error.contains("workflow journal version 2"), "{error}");
+
+        // A `started` record past the first line names a version too.
+        let later = TempJournal::write(
+            "later",
+            &format!(
+                "{}\n{}\n",
+                serde_json::to_string(&started(1)).unwrap(),
+                serde_json::to_string(&started(2)).unwrap()
+            ),
+        );
+        let error = read_journal(&later.0).unwrap_err();
+        assert!(
+            error.contains("line 2: workflow journal version 2"),
+            "{error}"
+        );
     }
 }

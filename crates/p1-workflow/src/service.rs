@@ -239,6 +239,7 @@ impl InProcessWorkflows {
         let journal = JournalWriter::create(&run_dir.join("journal.jsonl")).map_err(io)?;
         journal
             .append(&JournalRecord::Started {
+                journal_version: crate::api::WORKFLOW_JOURNAL_VERSION,
                 run: id.clone(),
                 script_hash: script_hash(&request.script),
                 args,
