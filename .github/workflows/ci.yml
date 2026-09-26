@@ -12,8 +12,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A PR's newer push cancels its older run. Main runs never cancel each other (one group per
+# commit): each main commit gets its own finished gate, and its cache save is not lost when the
+# next merge lands minutes later.
 concurrency:
-  group: gate-${{ github.ref }}
+  group: gate-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'pr' }}
   cancel-in-progress: true
 
 env:
@@ -75,8 +78,8 @@ jobs:
             modules/target
           key: cargo-${{ runner.os }}-checks-${{ hashFiles('**/Cargo.lock') }}
 
-  test-modules:
-    name: test (p1-module-tests)
+  test-modules-a:
+    name: test (p1-module-tests, heaviest binaries)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -106,15 +109,16 @@ jobs:
             ~/.cargo/git
             target
             modules/target
-          key: cargo-${{ runner.os }}-test-modules-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-test-modules-a-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            cargo-${{ runner.os }}-test-modules-a-
             cargo-${{ runner.os }}-test-modules-
             cargo-${{ runner.os }}-
 
       - name: Build the modules the tests load (scripts/gate.sh's modules step)
         run: scripts/build-modules.sh --all
-      - name: cargo test -p p1-module-tests
-        run: timeout --foreground 3600 cargo test --locked -p p1-module-tests
+      - name: cargo test -p p1-module-tests (its heaviest test binaries)
+        run: timeout --foreground 3600 cargo test --locked -p p1-module-tests --test installed_release --test provider_conformance
 
       - name: Save the cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
@@ -125,7 +129,77 @@ jobs:
             ~/.cargo/git
             target
             modules/target
-          key: cargo-${{ runner.os }}-test-modules-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-test-modules-a-${{ hashFiles('**/Cargo.lock') }}
+
+  test-modules-b:
+    name: test (p1-module-tests, the rest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Read the wasm-tools pin
+        run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"
+
+      - name: Install wasm-tools (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
+
+      # Each job restores its own cache (its target differs), falling back to its own latest and
+      # then to any gate cache. Only main saves (PR saves of multi-GB entries evicted main's).
+      - name: Restore the cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            modules/target
+          key: cargo-${{ runner.os }}-test-modules-b-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-test-modules-b-
+            cargo-${{ runner.os }}-test-modules-
+            cargo-${{ runner.os }}-
+
+      - name: Build the modules the tests load (scripts/gate.sh's modules step)
+        run: scripts/build-modules.sh --all
+      # Every other target of p1-module-tests, read from cargo metadata so a new test file lands
+      # here by default: the lib and bin unit tests, every integration test not in
+      # test-modules-a, and the doctests. Together with test-modules-a this is exactly
+      # `cargo test -p p1-module-tests`.
+      - name: cargo test -p p1-module-tests (every other target)
+        shell: bash
+        run: |
+          heavy="installed_release provider_conformance"
+          targets=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "p1-module-tests") | .targets[] | select(.kind | index("test")) | .name')
+          # test-modules-a names these two; a rename must fail here, never drop a binary.
+          for h in $heavy; do grep -qx "$h" <<<"$targets" || { echo "no test target $h in p1-module-tests" >&2; exit 1; }; done
+          args=()
+          for t in $targets; do
+            case " $heavy " in *" $t "*) ;; *) args+=(--test "$t") ;; esac
+          done
+          [ "${#args[@]}" -gt 0 ] || { echo "no other test targets found" >&2; exit 1; }
+          echo "test targets: ${args[*]}"
+          timeout --foreground 3600 cargo test --locked -p p1-module-tests --lib --bins "${args[@]}"
+          timeout --foreground 3600 cargo test --locked -p p1-module-tests --doc
+
+      - name: Save the cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            modules/target
+          key: cargo-${{ runner.os }}-test-modules-b-${{ hashFiles('**/Cargo.lock') }}
 
   test-workspace:
     name: test (workspace without p1-module-tests)
@@ -179,15 +253,17 @@ jobs:
             modules/target
           key: cargo-${{ runner.os }}-test-workspace-${{ hashFiles('**/Cargo.lock') }}
 
-  # The required status check. A needed job that failed or was cancelled makes this job fail
-  # (never skip: a skipped required check would count as passing).
+  # The required status check. Fails unless every needed job succeeded: a failed, cancelled or
+  # skipped job never passes (a skipped required check would otherwise count as passing).
   gate:
     name: gate
     if: always()
-    needs: [checks, test-modules, test-workspace]
+    needs: [checks, test-modules-a, test-modules-b, test-workspace]
     runs-on: ubuntu-latest
     steps:
       - name: All gate jobs green
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo "checks=${{ needs.checks.result }} test-modules=${{ needs.test-modules.result }} test-workspace=${{ needs.test-workspace.result }}"
-          [ "${{ needs.checks.result }}" = success ] && [ "${{ needs.test-modules.result }}" = success ] && [ "${{ needs.test-workspace.result }}" = success ]
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)=\(.value.result)"'
+          echo "$NEEDS" | jq -e 'length == 4 and all(.[]; .result == "success")' >/dev/null
