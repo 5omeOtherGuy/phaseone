@@ -9,17 +9,25 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The native provider: `OpenAiCodexProvider` over the shared transport, the drive
+# loop and the WebSocket transport (ADR-0071). Without it only the portable route,
+# validation, request lowering and parser build, so a provider WebAssembly
+# component reaches no socket, runtime or credential code.
+default = ["native"]
+native = ["p1-provider-http/native", "dep:futures-util", "dep:tokio"]
+
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 p1-model-profile = { path = "../p1-model-profile" }
-p1-provider-http = { path = "../p1-provider-http" }
+p1-provider-http = { path = "../p1-provider-http", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The WebSocket transport (`src/websocket.rs`) is their only user: an async mutex
 # for the one connection slot, `time::timeout` for §4's bounds, and
 # `unfold`/`select` for the hand-written stream.
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+tokio = { version = "1", default-features = false, features = ["sync", "time"], optional = true }
 
 [dev-dependencies]
 p1-provider-conformance = { path = "../p1-provider-conformance" }
