@@ -44,8 +44,11 @@ const ALLOCATION: &str = include_str!("../../../../modules/capabilities.toml");
 
 /// Builds the capability services one instance of a module tool is linked with, from the
 /// agent's own services. Called once per instantiation, so only when an environment
-/// assembles the module.
-pub type ModuleServices = Arc<dyn Fn(&ToolServices) -> Services + Send + Sync>;
+/// assembles the module. The first argument is the package's verified manifest name (its
+/// module id, e.g. `p1/worker-start`), never the lock key an installation chose: a hook
+/// that serves some members differently (the worker and workflow families, B-S6-9, D068)
+/// must key on the identity the loader checked.
+pub type ModuleServices = Arc<dyn Fn(&str, &ToolServices) -> Services + Send + Sync>;
 
 /// Why the locked modules could not be loaded or registered. Each refusal has its own
 /// variant; the runtime's refusals keep theirs inside [`ModulesError::Load`] and
@@ -353,7 +356,7 @@ fn instantiate(
     // throwaway counter that always reads zero.
     wasm_tool(
         &package.loaded,
-        services(tool_services),
+        services(package.loaded.name(), tool_services),
         ExecutionLimits::default(),
         &tool_services.mask,
     )
@@ -373,10 +376,16 @@ pub(super) fn register_locked_modules(
     }
     let release = official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())?;
     let packages = load_locked_modules(&lock, &release).map_err(|error| error.to_string())?;
-    // No native service backs a module capability in the host yet (the shell's process
-    // service is not bridged to the runtime's `ProcessService`), so a package granted one
-    // fails its assembly with the runtime's `MissingService` rather than running unlinked.
-    let services: ModuleServices = Arc::new(|_: &ToolServices| Services::default());
+    // The worker and workflow families supply the hook for their own members
+    // (`catalog/delegation.rs`, `catalog/workflow.rs`; B-S6-9, D068). Without one, and for
+    // every other module, no native service backs a module capability in the host yet (the
+    // shell's process service is not bridged to the runtime's `ProcessService`), so a
+    // package granted one fails its assembly with the runtime's `MissingService` rather
+    // than running unlinked.
+    let services: ModuleServices = deps
+        .module_services
+        .clone()
+        .unwrap_or_else(|| Arc::new(|_: &str, _: &ToolServices| Services::default()));
     register_modules(catalog, packages, services).map_err(|error| error.to_string())
 }
 

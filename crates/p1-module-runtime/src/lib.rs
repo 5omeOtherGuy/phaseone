@@ -7,7 +7,8 @@
 //! - [`capabilities`]: the host imports linked per the manifest's grants;
 //! - [`executor`]: the one owner of a module's async Stores (ADR-0015);
 //! - [`restricted`]: the synchronous inspection path (freeze item 4);
-//! - [`tool`]: `WasmTool`, the generic tool adapter (freeze item 12).
+//! - [`tool`]: `WasmTool`, the generic tool adapter (freeze item 12);
+//! - [`workflow_decision`]: `WasmWorkflowDecisions`, a workflow's decisions as a component.
 
 pub mod authorization_policy;
 pub mod capabilities;
@@ -16,9 +17,11 @@ pub mod delegation;
 pub mod executor;
 pub mod loader;
 pub mod manifest;
+pub mod provider;
 pub mod restricted;
 mod sha256;
 pub mod tool;
+pub mod workflow_decision;
 
 pub use authorization_policy::{AuthorizationPolicyError, Verdict, WasmAuthorizationPolicy};
 pub use capabilities::{
@@ -31,7 +34,9 @@ pub use context_policy::{
 pub use executor::ExecutionLimits;
 pub use loader::{LoadError, LoadedModule, Loader, ManualEpochs, ModuleKind};
 pub use manifest::{ComponentEntry, Digest, ManifestError, ReleaseManifest};
+pub use provider::{ProviderError, ProviderSettings, WasmProvider};
 pub use tool::{ToolError, WasmTool, wasm_tool};
+pub use workflow_decision::{WasmWorkflowDecisions, WorkflowDecisionError};
 
 use thiserror::Error;
 use wasmtime::{Config, Engine};
