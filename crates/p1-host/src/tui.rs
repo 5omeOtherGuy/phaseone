@@ -1,5 +1,6 @@
 //! The TUI front end (issue #12): implements the host's [`FrontEnd`] seam —
-//! event observation through `TuiSink`, authorization through `TuiPolicy`, and
+//! event observation through `TuiSink`, authorization through the host's
+//! `AskBridge` asking on the screen through `TuiPolicy` (issue #308), and
 //! the run loop below. The UI itself is `p1-tui`'s pure state machine; this
 //! module is wiring: crossterm keys in, agent events in, authorization
 //! questions parked on the screen, answers back.
@@ -14,8 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
 use p1_contracts::{
-    AuthorizationPolicy, CallDescription, CancellationToken, Decision, Effect, EventSink,
-    InboxKind, Tool, ToolCall, TurnEnd,
+    AuthorizationPolicy, CallDescription, CancellationToken, Effect, EventSink, InboxKind, Tool,
+    ToolCall, TurnEnd,
 };
 use p1_core::Agent;
 use p1_tui::input::{self, Command};
@@ -24,7 +25,7 @@ use p1_tui::render::diff::DiffView;
 use p1_tui::render::home::HomePrelude;
 use p1_tui::render::ledger::{ContextView, SessionView};
 use p1_tui::render::permission::PermissionView;
-use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
+use p1_tui::runtime::{Answer, AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
 use p1_tui::state::{Approval, PaneMode, Promotion, Screen};
 use p1_tui::transcript::Transcript;
 #[cfg(feature = "workflows")]
@@ -36,6 +37,7 @@ use crate::HostDeps;
 use crate::activity::Completion;
 use crate::cli::Options;
 use crate::frontend::{FrontEnd, WorkerService};
+use crate::policy::{AskBridge, Asker, NativeAsk, NativeFullAccess, OperatorAnswer, VerdictSource};
 use crate::run::StallGuard;
 
 mod describer;
@@ -69,7 +71,7 @@ pub struct TuiOptions {
 pub struct TuiFrontEnd {
     options: TuiOptions,
     sink: Arc<TuiSink>,
-    policy: Arc<TuiPolicy>,
+    policy: Arc<AskBridge>,
     events: Mutex<Option<mpsc::UnboundedReceiver<UiEvent>>>,
     auth: Mutex<Option<mpsc::UnboundedReceiver<AuthRequest>>>,
     /// (route, model), announced by the host once assembly has happened.
@@ -93,7 +95,7 @@ pub struct TuiFrontEnd {
 impl TuiFrontEnd {
     pub fn new(options: TuiOptions, cancel: CancellationToken) -> Self {
         let (sink, events) = TuiSink::new();
-        let (policy, auth) = TuiPolicy::new(options.ask, cancel.clone());
+        let (policy, auth) = tui_policy(options.ask, cancel.clone());
         Self {
             options,
             sink: Arc::new(sink),
@@ -106,6 +108,49 @@ impl TuiFrontEnd {
             route_label: Arc::new(Mutex::new(String::new())),
             tools: Mutex::new(Arc::new(Vec::new())),
         }
+    }
+}
+
+/// The TUI's authorization policy (issue #308): the host's [`AskBridge`] over the
+/// native verdict source of its mode (full access without `--ask`, ADR-0038; the
+/// restrictive policy with it), asking on the screen through [`TuiPolicy`]. Only
+/// `Permit` or `Deny` reaches the core (ADR-0024); `always` grants are the bridge's.
+fn tui_policy(
+    ask: bool,
+    cancel: CancellationToken,
+) -> (AskBridge, mpsc::UnboundedReceiver<AuthRequest>) {
+    let source: Arc<dyn VerdictSource> = if ask {
+        Arc::new(NativeAsk)
+    } else {
+        Arc::new(NativeFullAccess)
+    };
+    let (asker, auth) = TuiPolicy::new(cancel.clone());
+    (
+        AskBridge::with_asker(source, false, Arc::new(TuiAsker(asker)), cancel),
+        auth,
+    )
+}
+
+/// The screen as the bridge's [`Asker`]: `TuiPolicy` parks the question, the
+/// operator's `y`/`n`/`a` comes back as the answer.
+struct TuiAsker(TuiPolicy);
+
+impl Asker for TuiAsker {
+    fn ask<'a>(
+        &'a self,
+        request: p1_contracts::AuthorizationRequest<'a>,
+    ) -> p1_contracts::BoxFuture<'a, Option<OperatorAnswer>> {
+        Box::pin(async move {
+            self.0.ask(request).await.map(|answer| match answer {
+                Answer::Yes => OperatorAnswer::Yes,
+                Answer::No => OperatorAnswer::No,
+                Answer::Always => OperatorAnswer::Always,
+            })
+        })
+    }
+
+    fn set_turn(&self, token: Option<CancellationToken>) {
+        self.0.set_turn(token);
     }
 }
 
@@ -438,7 +483,7 @@ pub(crate) struct Driver {
     /// §6.9's `/status`/`/access` read it (the policy itself carries no
     /// public getter — `p1-tui::runtime` is not an owned path here).
     ask: bool,
-    policy: Arc<TuiPolicy>,
+    policy: Arc<AskBridge>,
     /// Parked authorizations; the front one is on screen. Two workers can
     /// park at once (they share this policy) — a second request must QUEUE,
     /// never replace the one the operator is reading (its dropped answer
@@ -604,18 +649,13 @@ impl Driver {
             Command::Right => self.screen.composer.right(),
             // ^C is handled by the loop: cancel the turn, quit at idle.
             Command::CancelOrQuit => {}
-            Command::ApproveOnce => self.answer(Decision::Permit, false),
+            Command::ApproveOnce => self.answer(Answer::Yes),
             Command::ApproveSession | Command::ApproveProject | Command::AllFiles => {
-                // Project grants share the in-memory set until a trust store
-                // exists (issue #12). AllFiles grants the tool under review.
-                self.answer(Decision::Permit, true);
+                // Project grants share the bridge's in-memory set until a trust
+                // store exists (issue #12). AllFiles grants the tool under review.
+                self.answer(Answer::Always);
             }
-            Command::Deny => self.answer(
-                Decision::Deny {
-                    reason: p1_tui::runtime::USER_DENY.to_string(),
-                },
-                false,
-            ),
+            Command::Deny => self.answer(Answer::No),
             Command::NextFile => {}
             Command::OpenFold => {
                 if let Some(id) = self.screen.transcript.latest_fold.clone()
@@ -885,14 +925,12 @@ impl Driver {
         }
     }
 
-    fn answer(&mut self, decision: Decision, grant: bool) {
+    fn answer(&mut self, answer: Answer) {
         let Some(pending) = self.pending_auth.pop_front() else {
             return;
         };
-        if grant {
-            self.policy.grant_session(&pending.call, &pending.identity);
-        }
-        pending.answer(decision);
+        // `Always` is remembered by the ask bridge, under its grant key.
+        pending.answer(answer);
         self.screen.approval = None;
         if self.pinned_by_approval {
             self.screen.pinned = false;
