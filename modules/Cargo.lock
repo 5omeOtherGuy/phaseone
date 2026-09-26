@@ -125,6 +125,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-bindings-provider"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "p1-bindings-tool"
 version = "0.0.1"
 dependencies = [
@@ -154,6 +161,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio-util",
+]
+
+[[package]]
+name = "p1-model-profile"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -195,6 +211,48 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "p1-module-provider-anthropic"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-provider",
+ "p1-contracts",
+ "p1-model-profile",
+ "p1-module-protocol",
+ "p1-provider-anthropic",
+ "p1-provider-http",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-provider-openai"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-provider",
+ "p1-contracts",
+ "p1-model-profile",
+ "p1-module-protocol",
+ "p1-provider-http",
+ "p1-provider-openai",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-provider-openai-chat"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-provider",
+ "p1-contracts",
+ "p1-model-profile",
+ "p1-module-protocol",
+ "p1-provider-http",
+ "p1-provider-openai-chat",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -275,6 +333,46 @@ name = "p1-module-workflow-status"
 version = "0.0.1"
 dependencies = [
  "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-provider-anthropic"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-model-profile",
+ "p1-provider-http",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-provider-http"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+]
+
+[[package]]
+name = "p1-provider-openai"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-model-profile",
+ "p1-provider-http",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-provider-openai-chat"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-model-profile",
+ "p1-provider-http",
  "serde",
  "serde_json",
 ]
@@ -401,6 +499,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "syn"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -454,6 +561,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
+dependencies = [
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_edit",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.22.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "winnow",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -491,6 +632,15 @@ dependencies = [
  "hashbrown",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
