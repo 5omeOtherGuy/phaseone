@@ -6,6 +6,10 @@ members = [
     "crates/p1-tool-read/guest",
     "crates/p1-tool-shell/guest",
     "crates/p1-tool-finish/guest",
+    "crates/p1-tool-edit/logic",
+    "crates/p1-tool-patch/logic",
+    "crates/p1-tool-search/logic",
+    "crates/p1-tool-write/logic",
 ]
 
 [workspace.package]
