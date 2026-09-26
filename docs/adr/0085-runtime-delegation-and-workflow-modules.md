@@ -1,5 +1,5 @@
 ---
-adr: 84
+adr: 85
 title: Runtime delegation and workflow modules
 status: proposed
 date: 2026-09-26
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [epic #206, DECISIONS.md D22, docs/adr/0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md, docs/adr/0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md, docs/adr/0051-a-worker-without-a-command-tool-may-finish-done-the-result-says-it-was-not-verified.md, docs/adr/0053-workflows-are-an-optional-module-a-sandboxed-script-orchestrates-workers-under-roles-and-caps.md, docs/adr/0054-workflow-roles-have-a-fallback-chain-for-route-failures-deepseek-is-the-shipped-worker.md, docs/adr/0081-native-foundation-and-runtime-components.md, docs/adr/0082-component-abi-and-execution-ownership.md, docs/design/modules/wit.md, modules/wit/delegation.wit, modules/wit/worlds.wit, docs/design/delegation.md, docs/design/workflows.md]
 ---
-# ADR-0084: Runtime delegation and workflow modules
+# ADR-0085: Runtime delegation and workflow modules
 
 ## Context
 
