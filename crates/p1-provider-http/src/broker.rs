@@ -220,7 +220,14 @@ impl RouteAuthority {
     /// parsed comparison is the final word on where the request goes.
     fn url_for(&self, path: &str) -> Option<String> {
         let rest = path.strip_prefix('/')?;
+        // `Url::parse` does not decode `%2f`/`%5c`, so an encoded separator stays
+        // inside the endpoint's prefix here, but an origin server that decodes
+        // before resolving dot segments would read `/..%2fx` as `/../x` and leave
+        // the prefix. Refuse the encoded separators exactly like the literal `\`.
+        let lowered = path.to_ascii_lowercase();
         if rest.starts_with('/')
+            || lowered.contains("%2f")
+            || lowered.contains("%5c")
             || path
                 .chars()
                 .any(|c| matches!(c, '\\' | '#' | '@') || c.is_whitespace() || c.is_control())
@@ -634,6 +641,8 @@ mod tests {
             "/%2E%2e/responses",
             "/.%2e/x",
             "/%2e/x",
+            "/..%2fx",
+            "/..%5cx",
             "/responses#fragment",
             "/responses\r\nx-injected: 1",
             "/responses\n",
