@@ -17,6 +17,7 @@ pub mod delegation;
 pub mod executor;
 pub mod loader;
 pub mod manifest;
+pub mod provider;
 pub mod restricted;
 mod sha256;
 pub mod tool;
@@ -33,6 +34,7 @@ pub use context_policy::{
 pub use executor::ExecutionLimits;
 pub use loader::{LoadError, LoadedModule, Loader, ManualEpochs, ModuleKind};
 pub use manifest::{ComponentEntry, Digest, ManifestError, ReleaseManifest};
+pub use provider::{ProviderError, ProviderSettings, WasmProvider};
 pub use tool::{ToolError, WasmTool, wasm_tool};
 pub use workflow_decision::{WasmWorkflowDecisions, WorkflowDecisionError};
 

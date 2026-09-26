@@ -41,6 +41,8 @@ p1-workers = { path = "../p1-workers" }
 # summarizer is built from masked history and that p1-context masks the summary's own answer.
 # policies.rs (S5.4) drives the policy components behind the native ask bridge (p1-host) and the
 # native context engine whose estimator builds the settings the component is configured with.
+# compaction_workload.rs (S5.9, issue #333) configures the same component with the same
+# engine's constants (DEFAULT_SUMMARY_OUTPUT_TOKENS among them).
 p1-context = { path = "../p1-context" }
 # workflow_boundary.rs: the workflow substrate driven through its decision seam (S6.3).
 p1-workflow = { path = "../p1-workflow" }
@@ -58,3 +60,11 @@ p1-module-protocol = { path = "../p1-module-protocol" }
 p1-model-profile = { path = "../p1-model-profile" }
 p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false }
 p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false }
+# The shell-boundary suite (S3.4) loads the built `p1/shell` component and binds the native,
+# sandboxed process service of p1-tool-shell to it; its parity cases also build the native
+# `ShellTool` over the same p1-workspace workspace, and it proves "gone" with kill(pid, 0).
+p1-tool-shell = { path = "../p1-tool-shell" }
+p1-workspace = { path = "../p1-workspace" }
+nix = { version = "0.29", default-features = false, features = ["signal"] }
+# provider_conformance.rs (S4.7): the shared provider suite over the built provider components.
+p1-provider-conformance = { path = "../p1-provider-conformance" }
