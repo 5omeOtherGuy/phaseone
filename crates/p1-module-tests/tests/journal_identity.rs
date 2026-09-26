@@ -84,7 +84,7 @@ struct Processes {
 fn processes() -> Processes {
     let (process, fakes) = fake_processes();
     Processes {
-        services: Arc::new(move |_: &ToolServices| Services {
+        services: Arc::new(move |_: &str, _: &ToolServices| Services {
             process: Some(process.clone()),
             ..Services::default()
         }),
