@@ -1,7 +1,7 @@
 ---
 adr: 71
 title: p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: owner+lead
 supersedes: [4]
@@ -99,3 +99,17 @@ client about 135k lines, host API about 25k, agent core about 15k, whole reposit
 lead's partition and obstacle analysis: issue #187. The migration plan is pending from
 Astra; its acceptance and the first proving module it names (the lead proposed the read
 tool over the simplest interface the plan chooses, loaded by name) are the next evidence.
+
+Acceptance (stream S1, issue #327): the read tool is the first real component and the
+proving module named above. `p1/read` (`modules/p1-module-read`) is built by
+`scripts/build-modules.sh --package p1-module-read`, loaded by name through the runtime
+loader from the release manifest, and executed by the real host loader over the native
+`workspace` and `snapshot` capabilities with output identical to the native tool's
+(`crates/p1-module-tests/tests/read_module.rs`). It rests on S1.1 host-split (#229, merge
+86fcf25), S1.2 workspace-read-exports (#233, cbfa1c4), S1.3 journal-version (#228,
+6d6978f), S1.4 package-loader (#287, 74e47ee2, tagged `wasm-loader-v1`), S1.5
+semantic-capabilities (#291, a25ddb0), S1.6 modules-cli (#286, bb8af75) and S1.8
+read-component (the pull request closing #327). DoD commands: `scripts/build-modules.sh
+--package p1-module-read`, `cargo test --locked -p p1-module-tests --test read_module`,
+`cargo test --locked -p p1-tool-read`, `scripts/check-module-boundaries.sh`,
+`cargo test --locked --workspace`, `scripts/gate.sh` and `python3 scripts/adr.py check`.
