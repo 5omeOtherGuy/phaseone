@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
+p1-module-runtime = { path = "../p1-module-runtime" }
 p1-shell-guest = { path = "guest" }
 p1-workspace = { path = "../p1-workspace" }
 tempfile = "3"

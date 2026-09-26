@@ -10,7 +10,7 @@
 //!
 //! Pure computation (programme decision D-XO-8): no filesystem, process, clock or
 //! environment access, and no dependency beyond `serde`, `serde_json` and `regex`, so the
-//! same source builds for the host and for `wasm32-wasip2`. Contract values are this
+//! same source builds for the host and for `wasm32-unknown-unknown`. Contract values are this
 //! crate's own small types; each host converts them to its wire or `p1_contracts` form.
 #![forbid(unsafe_code)]
 

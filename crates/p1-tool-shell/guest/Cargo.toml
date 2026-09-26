@@ -10,7 +10,8 @@ publish.workspace = true
 workspace = true
 
 # Pure computation only (programme decision D-XO-8): these three crates and nothing else, so
-# the same code builds for the native adapter and for the `wasm32-wasip2` component.
+# the same code builds for the native adapter and for the `wasm32-unknown-unknown` component
+# (docs/design/modules/package.md, "Shared guest logic", decision S0-R3).
 [dependencies]
 regex = "1"
 serde = { version = "1", features = ["derive"] }

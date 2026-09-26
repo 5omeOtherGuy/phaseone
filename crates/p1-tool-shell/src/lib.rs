@@ -19,6 +19,8 @@
 //! is `p1-shell-guest`, which the `p1/shell` component also runs. [`ShellTool`] is
 //! the native adapter over the two: the same code the component ships, driven by
 //! the native `Tool` contract, so the frozen tests of this crate prove it.
+//! [`ProcessCapability`] links the same service to the component's `process`
+//! import (the runtime's `ProcessService` and `RunningProcess` traits).
 
 mod process;
 
@@ -34,9 +36,9 @@ use p1_shell_guest::{End, Outcome, RawInput, ShellInput, Status};
 use p1_workspace::{ToolFace, Workspace};
 
 pub use process::{
-    CREDENTIAL_DIRECTORIES, DEFAULT_HOME_VISIBLE, ENV_ALLOW, ENV_ALLOW_PREFIXES, ProcessEnd,
-    ProcessFailure, ProcessOutcome, ProcessRequest, ProcessService, SANDBOX_PARAGRAPH,
-    SANDBOX_VARIANT_SUFFIX, Sandbox, SandboxError, bwrap_args,
+    CREDENTIAL_DIRECTORIES, DEFAULT_HOME_VISIBLE, ENV_ALLOW, ENV_ALLOW_PREFIXES, ProcessCapability,
+    ProcessEnd, ProcessFailure, ProcessOutcome, ProcessRequest, ProcessService, ProcessStream,
+    SANDBOX_PARAGRAPH, SANDBOX_VARIANT_SUFFIX, Sandbox, SandboxError, StreamEvent, bwrap_args,
 };
 
 /// The `shell` tool. Holds one agent's workspace and the process service that

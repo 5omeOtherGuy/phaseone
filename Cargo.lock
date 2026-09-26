@@ -2041,6 +2041,7 @@ version = "0.0.1"
 dependencies = [
  "nix",
  "p1-contracts",
+ "p1-module-runtime",
  "p1-shell-guest",
  "p1-workspace",
  "serde_json",
