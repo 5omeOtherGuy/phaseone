@@ -119,7 +119,14 @@ const STUBBORN_GROUP: &str = "echo $$ > leader; \
 // ------------------------------------------------------------------------ (a)
 
 /// The bound and the omission marker are applied natively, before any byte reaches a
-/// caller: a flooding command's events concatenate to exactly what `run` returns.
+/// caller: a command's events concatenate to exactly what `run` returns.
+///
+/// The exact bytes are asserted for commands writing ONE stream (either one). With
+/// two streams open, which chunk a read takes is the reader's scheduling choice, so
+/// two runs of the same command may interleave them differently and byte equality
+/// would be a property of the scheduler, not of the capture; the two-stream command
+/// below is compared as the same bytes in arrival order instead, which still catches
+/// a dropped, duplicated or re-encoded byte.
 #[tokio::test]
 async fn a_streamed_run_is_byte_identical_to_run_even_when_flooding() {
     let dir = tempfile::tempdir().unwrap();
@@ -127,9 +134,10 @@ async fn a_streamed_run_is_byte_identical_to_run_even_when_flooding() {
     for script in [
         "echo hi",
         "printf 'no newline'",
+        "echo err >&2; exit 3",
+        "seq 1 500",
         "seq 1 2000000",
         "yes | head -c 5000000",
-        "seq 1 500; echo err >&2; exit 3",
     ] {
         let run = service
             .run(request(script), &CancellationToken::new())
@@ -150,6 +158,35 @@ async fn a_streamed_run_is_byte_identical_to_run_even_when_flooding() {
         let (output, _) = drain_running(&mut running).await;
         assert_eq!(output, run.output, "{script} through the capability");
     }
+
+    let script = "seq 1 500; echo err >&2; exit 3";
+    let run = service
+        .run(request(script), &CancellationToken::new())
+        .await;
+    let mut stream = service
+        .spawn(request(script), CancellationToken::new())
+        .await
+        .unwrap();
+    let (streamed, end) = drain(&mut stream).await;
+    assert_eq!(end, run.end, "{script}");
+    let capability = ProcessCapability::new(Arc::new(self::service(dir.path())));
+    let mut running = capability
+        .spawn(command(script, 3_600_000), CancellationToken::new())
+        .await
+        .unwrap();
+    let (through, status) = drain_running(&mut running).await;
+    assert_eq!(
+        status,
+        ExitStatus::Code(3),
+        "{script} through the capability"
+    );
+    for (got, what) in [(streamed, "the stream"), (through, "the capability")] {
+        let (mut got, mut want) = (got, run.output.clone());
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want, "{script} through {what}: the same bytes");
+    }
+
     let flood = service
         .run(request("seq 1 2000000"), &CancellationToken::new())
         .await;
