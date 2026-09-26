@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn the_linkable_capabilities_are_the_old_four_plus_summary_completion_delegation_and_providers() {
+    fn the_linkable_capabilities_are_the_old_four_plus_every_linked_service() {
         assert_eq!(
             LINKABLE_CAPABILITIES,
             [
