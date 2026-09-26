@@ -1868,6 +1868,7 @@ dependencies = [
  "p1-redact",
  "p1-testkit",
  "p1-workers",
+ "p1-workflow",
  "tempfile",
  "tokio",
 ]
