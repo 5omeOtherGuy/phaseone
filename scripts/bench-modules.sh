@@ -50,7 +50,10 @@
 # suite applies; every other row is this suite's own bound, which the row names, and the memory
 # rows carry their measured values as facts (ANSWERS S4-B6, D076). The cases are the cases of
 # crates/p1-module-tests/tests/provider_streaming.rs, run in the release profile one case per
-# test process; the memory row runs its case twice, once at N and once at 10·N events.
+# test process; the memory row runs its case twice, once at N and once at 10·N events. The
+# summary line names that workload, so a run shortened with P1_STREAM_EVENTS cannot be mistaken
+# for the design workload; P1_STREAM_EVENTS must be a positive integer, and any other value is a
+# usage error (exit 2).
 #
 # Exit codes:
 #   baseline:   0 when the record is written, 1 when a fact could not be measured,
@@ -527,6 +530,12 @@ run_streaming() {
   # The measured workload: the design's 100 000 deltas, and ten times as many for the memory
   # rows' growth. An explicit P1_STREAM_EVENTS is honoured, which keeps a manual run cheap.
   local events="${P1_STREAM_EVENTS:-100000}"
+  # The value reaches shell arithmetic and the memory rows' divisor. A non-integer would abort
+  # the script on `events * 10`, with the status of a failed row; a word such as `abc` evaluates
+  # as 0, which only surfaces as the report's division by zero. So it is validated here, before
+  # either, and refused as the usage error it is.
+  [[ "$events" =~ ^[1-9][0-9]*$ ]] ||
+    tooling "P1_STREAM_EVENTS must be a positive integer, got $events"
   local large="$((events * 10))"
 
   # Stale components would be measured as if they were this commit's.
@@ -729,7 +738,7 @@ def main():
         code = 1
     else:
         code = 0
-    print(f"bench-modules: streaming: {len(results)} rows: {counts['PASS']} pass, "
+    print(f"bench-modules: streaming: {len(results)} rows at {small} events: {counts['PASS']} pass, "
           f"{counts['FAIL']} fail, {counts['ERROR']} error; exit {code}")
     return code
 
