@@ -1871,6 +1871,7 @@ name = "p1-module-tests"
 version = "0.0.1"
 dependencies = [
  "futures-util",
+ "nix",
  "p1-assembly",
  "p1-context",
  "p1-contracts",
@@ -1886,8 +1887,10 @@ dependencies = [
  "p1-provider-openai-chat",
  "p1-redact",
  "p1-testkit",
+ "p1-tool-shell",
  "p1-workers",
  "p1-workflow",
+ "p1-workspace",
  "serde_json",
  "tempfile",
  "tokio",

@@ -1,5 +1,11 @@
 name: gate
 
+# The gate (scripts/gate.sh) split into parallel jobs so a PR waits for the longest part, not
+# the sum. `checks` runs scripts/gate.sh itself — every step, unchanged — except its one
+# workspace test run, which the two test jobs run instead, split by package: together they
+# are exactly `cargo test --workspace --locked`, and a new crate lands in test-workspace by
+# default. The required check is the final job `gate`: green only when all three are green.
+
 on:
   push:
     branches: [main]
@@ -10,10 +16,17 @@ concurrency:
   group: gate-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_TERM_COLOR: never
+  # No debug info on CI: nothing debugs a runner's binaries; compiles, links and caches shrink.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
 jobs:
-  gate:
+  checks:
+    name: checks (gate.sh without the workspace tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -30,29 +43,151 @@ jobs:
         with:
           tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
 
-      # Restore from any earlier gate cache (restore-keys), so a PR whose Cargo.lock
-      # differs from main's starts warm instead of cold. Only main saves: each entry is
-      # ~3.5 GB and the repository store holds 10 GiB, so per-PR saves evicted main's
-      # cache and left every PR gate cold (~15 min instead of a warm build).
-      - name: Restore the gate cache
-        id: gate-cache
+      # Each job restores its own cache (its target differs), falling back to its own latest and
+      # then to any gate cache. Only main saves (PR saves of multi-GB entries evicted main's).
+      - name: Restore the cache
+        id: cache
         uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+            modules/target
+          key: cargo-${{ runner.os }}-checks-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-checks-
+            cargo-${{ runner.os }}-
 
-      - run: scripts/gate.sh
+      - name: scripts/gate.sh (workspace tests handed to the test jobs)
+        run: |
+          export PATH="$PWD/.github/ci:$PATH"
+          scripts/gate.sh
 
-      - name: Save the gate cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gate-cache.outputs.cache-hit != 'true'
+      - name: Save the cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+            modules/target
+          key: cargo-${{ runner.os }}-checks-${{ hashFiles('**/Cargo.lock') }}
+
+  test-modules:
+    name: test (p1-module-tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Read the wasm-tools pin
+        run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"
+
+      - name: Install wasm-tools (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
+
+      # Each job restores its own cache (its target differs), falling back to its own latest and
+      # then to any gate cache. Only main saves (PR saves of multi-GB entries evicted main's).
+      - name: Restore the cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            modules/target
+          key: cargo-${{ runner.os }}-test-modules-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-test-modules-
+            cargo-${{ runner.os }}-
+
+      - name: Build the modules the tests load (scripts/gate.sh's modules step)
+        run: scripts/build-modules.sh --all
+      - name: cargo test -p p1-module-tests
+        run: timeout --foreground 3600 cargo test --locked -p p1-module-tests
+
+      - name: Save the cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            modules/target
+          key: cargo-${{ runner.os }}-test-modules-${{ hashFiles('**/Cargo.lock') }}
+
+  test-workspace:
+    name: test (workspace without p1-module-tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Read the wasm-tools pin
+        run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"
+
+      - name: Install wasm-tools (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
+
+      # Each job restores its own cache (its target differs), falling back to its own latest and
+      # then to any gate cache. Only main saves (PR saves of multi-GB entries evicted main's).
+      - name: Restore the cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            modules/target
+          key: cargo-${{ runner.os }}-test-workspace-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-test-workspace-
+            cargo-${{ runner.os }}-
+
+      - name: Build the modules the tests load (scripts/gate.sh's modules step)
+        run: scripts/build-modules.sh --all
+      - name: cargo test --workspace --exclude p1-module-tests
+        run: timeout --foreground 3600 cargo test --workspace --locked --exclude p1-module-tests
+
+      - name: Save the cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            modules/target
+          key: cargo-${{ runner.os }}-test-workspace-${{ hashFiles('**/Cargo.lock') }}
+
+  # The required status check. A needed job that failed or was cancelled makes this job fail
+  # (never skip: a skipped required check would count as passing).
+  gate:
+    name: gate
+    if: always()
+    needs: [checks, test-modules, test-workspace]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All gate jobs green
+        run: |
+          echo "checks=${{ needs.checks.result }} test-modules=${{ needs.test-modules.result }} test-workspace=${{ needs.test-workspace.result }}"
+          [ "${{ needs.checks.result }}" = success ] && [ "${{ needs.test-modules.result }}" = success ] && [ "${{ needs.test-workspace.result }}" = success ]
