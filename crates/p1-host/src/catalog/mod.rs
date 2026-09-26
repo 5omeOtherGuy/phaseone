@@ -60,6 +60,7 @@ pub(crate) mod worktree;
 // Providers, the standard tools and the WebAssembly modules each have their own file,
 // so the stream that owns one edits it without touching the others (plan §3). The
 // tools file uses `apply_face!` too, so it is declared below the macro as well.
+pub mod capabilities;
 mod modules;
 mod providers;
 mod tools;

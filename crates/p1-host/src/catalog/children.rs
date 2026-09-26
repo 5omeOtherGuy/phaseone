@@ -116,24 +116,22 @@ pub(crate) fn compose_children(
     ))
 }
 
-/// The shell tool's identity implementation: the one identity the host's completion
-/// policy reads (ADR-0052 item 1) to decide whether a child can verify anything
-/// itself. Never a model-facing name, which an environment's face may change.
-#[cfg(feature = "delegation")]
-const SHELL_IMPLEMENTATION: &str = "p1-tool-shell";
-
 /// The completion policy a CHILD's assembled tools call for (ADR-0052 item 1): a
 /// worker whose tools include no tool that records command runs cannot verify
 /// anything itself, so it reports to its parent instead of naming a command it cannot
-/// run. The check is on the tools' IDENTITIES — the technique `WorkerReportTap` uses
-/// to find `finish` — never on grant names, so a face cannot hide the shell tool.
+/// run. The check is the `records-command-evidence` capability of the tools' verified
+/// IDENTITIES (`catalog/capabilities.rs`) — never a grant name or an implementation
+/// name, so a face cannot hide the shell tool.
 ///
 /// MAIN agents never come through here: their `finish` keeps the strict rule.
 #[cfg(feature = "delegation")]
 fn completion_policy(tools: &[Arc<dyn Tool>]) -> CompletionPolicy {
-    let can_run_commands = tools
-        .iter()
-        .any(|tool| tool.identity().implementation == SHELL_IMPLEMENTATION);
+    let can_run_commands = tools.iter().any(|tool| {
+        super::capabilities::carries(
+            tool.as_ref(),
+            super::capabilities::SemanticCapability::RecordsCommandEvidence,
+        )
+    });
     if can_run_commands {
         CompletionPolicy::RecordedCommands
     } else {
