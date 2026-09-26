@@ -41,7 +41,7 @@ use p1_module_protocol::{
     WireItem, WireModelOptions, WireProviderError, WireRouteDescription, WireStreamEvent,
 };
 use p1_provider_http::{ResponseParser, SseEvent};
-use p1_provider_openai::{CodexResponseParser, lower_request, validate_request};
+use p1_provider_openai::{CodexResponseParser, lower_request, validate_history, validate_request};
 
 use settings::Composition;
 
@@ -168,7 +168,11 @@ impl Guest for Component {
     fn validate(request: ProviderRequest) -> Result<(), String> {
         with_composition(|composition| {
             let request = decode_request(request)?;
-            validate_request(&composition.route, &composition.profile, &request)
+            validate_request(&composition.route, &composition.profile, &request)?;
+            // The replay half of the history check needs the configured wire model, which
+            // the portable `validate_request` does not take; without it here an unreadable
+            // same-origin replay would fail only at `lower`, not at activation (ADR-0049).
+            validate_history(&composition.route, &composition.wire_model, &request)
         })
         .map_err(error_json)
     }
@@ -304,6 +308,7 @@ p1_bindings_provider::generated::export!(Component);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p1_contracts::{AssistantBlock, AssistantItem, Origin, ReplayData};
 
     const PROFILE: &str = r#"
 id       = "gpt-6-sol"
@@ -387,6 +392,45 @@ efforts  = ["low", "medium", "high", "extra_high", "max"]
             event(&decoder.finish()),
             WireStreamEvent::Finished { .. }
         ));
+    }
+
+    /// ADR-0049 at activation: the host calls this `validate` before a run, so replay data
+    /// of our own origin in a layout this build cannot read must fail HERE, exactly as the
+    /// native provider's `validate` does, not only later at `lower`.
+    #[test]
+    fn activation_refuses_an_unreadable_same_origin_replay() {
+        configure("https://chatgpt.com/backend-api");
+        let origin = Origin {
+            route: "openai-responses/codex-subscription".to_string(),
+            model: "gpt-6-sol".to_string(),
+        };
+        let item = Item::Assistant(AssistantItem {
+            origin: origin.clone(),
+            blocks: vec![AssistantBlock::Reasoning {
+                text: "shown".to_string(),
+                replay: Some(ReplayData {
+                    origin,
+                    version: p1_provider_openai::REPLAY_VERSION + 1,
+                    payload: serde_json::json!({
+                        "type": "reasoning",
+                        "encrypted_content": "enc-1",
+                    }),
+                }),
+            }],
+        });
+        let wire = serde_json::to_string(&WireItem::from(item)).expect("a history item encodes");
+        let refused = error(&Component::validate(request(vec![wire])).unwrap_err());
+        assert_eq!(
+            ProviderErrorKind::from(refused.kind),
+            ProviderErrorKind::InvalidRequest
+        );
+        for part in ["version 2", "version 1"] {
+            assert!(
+                refused.message.contains(part),
+                "{part}: {}",
+                refused.message
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@
 pub mod authorization_policy;
 pub mod capabilities;
 pub mod context_policy;
+pub mod delegation;
 pub mod executor;
 pub mod loader;
 pub mod manifest;

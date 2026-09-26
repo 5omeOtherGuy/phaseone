@@ -40,12 +40,27 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// The capabilities this runtime can link, by the interface name the manifest uses. The
 /// other capability interfaces belong to other native crates and streams; a manifest that
 /// grants one of them is refused until the runtime can provide it. `summary` is linked to
-/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7).
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 5] =
-    ["control", "clock", "random", "process", "summary"];
+/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7); the
+/// worker and workflow interfaces to the caller's services in [`crate::delegation`] (S6,
+/// B-S6-8).
+pub(crate) const LINKABLE_CAPABILITIES: [&str; 9] = [
+    "control",
+    "clock",
+    "random",
+    "process",
+    "summary",
+    "workers-start",
+    "workers-observe",
+    "workers-control",
+    "workflows",
+];
 
 /// The interface every world imports for its types; it grants nothing.
 const TYPES_INTERFACE: &str = "types";
+/// The type-only interface the worker capabilities take their records from
+/// (`modules/capabilities.toml`, `type-only`): it grants nothing, so a manifest need not
+/// declare it.
+const WORKER_TYPES_INTERFACE: &str = crate::delegation::WORKER_TYPES_INTERFACE;
 
 /// Why a module could not be loaded. Every refusal names the module.
 #[derive(Debug, Error)]
@@ -401,7 +416,10 @@ impl Loader {
             .capabilities
             .iter()
             .map(|capability| interface_import(capability))
-            .chain([interface_import(TYPES_INTERFACE)])
+            .chain([
+                interface_import(TYPES_INTERFACE),
+                interface_import(WORKER_TYPES_INTERFACE),
+            ])
             .collect();
         let component_type = component.component_type();
         if let Some((import, _)) = component_type
@@ -505,10 +523,20 @@ mod tests {
     }
 
     #[test]
-    fn the_linkable_capabilities_are_the_old_four_plus_summary() {
+    fn the_linkable_capabilities_are_the_old_four_plus_summary_and_delegation() {
         assert_eq!(
             LINKABLE_CAPABILITIES,
-            ["control", "clock", "random", "process", "summary"]
+            [
+                "control",
+                "clock",
+                "random",
+                "process",
+                "summary",
+                "workers-start",
+                "workers-observe",
+                "workers-control",
+                "workflows",
+            ]
         );
         for refused in ["notices", "completion", "http", "filesystem"] {
             assert!(!LINKABLE_CAPABILITIES.contains(&refused), "{refused}");

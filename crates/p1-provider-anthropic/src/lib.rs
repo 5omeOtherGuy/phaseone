@@ -31,11 +31,13 @@
 mod parser;
 #[cfg(feature = "native")]
 mod provider;
+mod replay;
 mod request;
 
 pub use parser::AnthropicParser;
 #[cfg(feature = "native")]
 pub use provider::AnthropicProvider;
+pub use replay::{REPLAY_VERSION, Replay, WireBlock, decode, encode};
 #[cfg(feature = "native")]
 pub use request::build_headers;
 pub use request::{
