@@ -1,8 +1,11 @@
-//! S6.7.1 (#313): the eight worker and workflow members, as built packages, run through the
-//! runtime's worker and workflow link (`p1_module_runtime::delegation`, B-S6-8, D065).
+//! S6.7 (#313): the eight worker and workflow members, as built packages, run through the
+//! runtime's worker and workflow link (`p1_module_runtime::delegation`, B-S6-8, D065) and
+//! through the host's assembly (B-S6-9, D068).
 //!
-//! Each case loads the built packages through the runtime `Loader`, builds a `WasmTool` with a
-//! filled `Services` and calls it; there is no host here (the host assembly is S6.7.2). The
+//! The runtime cases (S6.7.1) load the built packages through the runtime `Loader`, build a
+//! `WasmTool` with a filled `Services` and call it, with no host. The host cases (S6.7.2, the
+//! section at the end) select the members by `modules.lock` key and assemble them for a main
+//! agent through the host's catalog entry point and module hook. The
 //! worker members run over a real `p1_workers::WorkerScope` on a fake `WorkerService` that
 //! records what reached it, and the workflow members over a fake run service. Every ordering is
 //! explicit (a `Notify`, a cancel token); nothing sleeps or asserts on time, and each case runs
@@ -12,27 +15,42 @@ use std::future::pending;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use p1_assembly::{
+    AssemblyError, Catalog, EnvironmentFile, ModulesLock, ProviderSpec, Substitutions,
+    ToolServices, ToolSpec, assemble_for_agent,
+};
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{
-    BoxFuture, CancellationToken, StopReason, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome,
-    ToolStatus, TurnEnd,
+    BoxFuture, CancellationToken, ModelOptions, Provider, ProviderError, ProviderRequest,
+    ProviderStream, RouteDescription, StopReason, Tool, ToolCall, ToolContext, ToolInput,
+    ToolOutcome, ToolStatus, TurnEnd,
+};
+use p1_core::{Agent, AgentParts};
+use p1_host::catalog::modules::{ModuleServices, load_locked_modules, register_modules};
+use p1_host::workflow::{
+    MemberScopes, WORKER_MODULES, WORKFLOW_MODULES, member_services, worker_member_services,
 };
 use p1_module_runtime::delegation::{WorkerServices, WorkflowServices};
 use p1_module_runtime::{
     ExecutionLimits, LinkError, LoadedModule, Loader, ReleaseManifest, Services, ToolError,
     wasm_tool,
 };
-use p1_module_tests::within_deadline;
+use p1_module_tests::{Release, within_deadline};
 use p1_redact::MaskCounter;
+use p1_testkit::{
+    FakeTool, PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization,
+    ScriptedProvider, text_response,
+};
 use p1_workers::{
-    ChildId, ChildResult, ChildSpec, ChildStatus, FinishReport, ScopeKey, WorkerError,
-    WorkerReport, WorkerScope, WorkerScopes, WorkerService, WorkersObserve, WorkersStart,
+    AgentFactory, ChildAgent, ChildId, ChildResult, ChildSpec, ChildStatus, FinishReport,
+    InProcessWorkers, ScopeKey, WorkerError, WorkerReport, WorkerScope, WorkerScopes,
+    WorkerService, WorkersObserve, WorkersStart,
 };
 use p1_workflow::{
     CancelRuns, Counts, ObserveRuns, RunId, RunOutcome, RunProgress, RunReport, RunStatus,
-    StartRequest, StartRuns, WorkflowError,
+    StartRequest, StartRuns, WorkflowError, WorkflowService,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 /// The eight members: package directory, manifest name, model-facing tool name.
 const MEMBERS: [(&str, &str, &str); 8] = [
@@ -814,6 +832,637 @@ async fn a_cancelled_wait_answers_running_through_the_wit() {
         cancel.cancel();
         let outcome = waiting.await.expect("the call task");
         assert_eq!(outcome.status, ToolStatus::Cancelled, "{}", outcome.content);
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------- the host assembly (S6.7.2)
+//
+// The cases below go through the host: the members are selected by `modules.lock` keys,
+// loaded and registered by the host's catalog entry point (`p1_host::catalog::modules`) with
+// the module hook the host installs (`p1_host::workflow::member_services` over
+// `worker_member_services`, as `catalog/children.rs` and `workflow::compose` install it), and
+// assembled for a main agent through `p1_assembly::assemble_for_agent`, the call the host's
+// `assemble_with_cache_key` makes (B-S6-9, D068).
+
+/// A run service over [`FakeRuns`]: the host hook takes the whole `WorkflowService`, as the
+/// host's composed service is one.
+struct HostRuns(Arc<FakeRuns>);
+
+impl WorkflowService for HostRuns {
+    fn start<'a>(&'a self, request: StartRequest) -> BoxFuture<'a, Result<RunId, WorkflowError>> {
+        StartRuns::start(self.0.as_ref(), request)
+    }
+
+    fn status<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        ObserveRuns::status(self.0.as_ref(), id)
+    }
+
+    fn wait<'a>(
+        &'a self,
+        id: &'a RunId,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        ObserveRuns::wait(self.0.as_ref(), id, cancel)
+    }
+
+    fn cancel<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<(), WorkflowError>> {
+        CancelRuns::cancel(self.0.as_ref(), id)
+    }
+
+    fn list<'a>(&'a self) -> BoxFuture<'a, Vec<(RunId, RunStatus)>> {
+        Box::pin(async move { self.0.runs.lock().unwrap().clone() })
+    }
+}
+
+/// A release holding the eight built member packages, laid out as p1's release ships them.
+fn host_release() -> Release {
+    let mut release = Release::empty();
+    for (package, _, _) in MEMBERS {
+        let manifest: Value =
+            serde_json::from_str(&package_file(package, ".manifest.json")).expect("JSON");
+        let wasm_path = built().join(package).join(format!("{package}.wasm"));
+        let bytes = std::fs::read(&wasm_path).expect("the built component");
+        release.add(
+            json!({
+                "name": manifest["name"],
+                "digest": manifest["digest"],
+                "path": format!("packages/{package}/{package}.wasm"),
+                "kind": manifest["kind"],
+                "world": manifest["world"],
+                "protocol": manifest["protocol"],
+                "capabilities": manifest["capabilities"],
+                "variant": manifest["variant"],
+            }),
+            &bytes,
+        );
+    }
+    release
+}
+
+/// The `modules.lock` a release of the members is selected by: each member under its
+/// documented key (the module id without `p1/`), pinning what the release ships.
+fn host_lock(release: &Release) -> ModulesLock {
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(release.manifest_file()).expect("release manifest"),
+    )
+    .expect("JSON");
+    let mut text = String::from("format = \"p1-modules-lock/1\"\n");
+    for entry in manifest["components"].as_array().expect("components") {
+        let name = entry["name"].as_str().expect("name");
+        let key = name.strip_prefix("p1/").expect("a p1 module");
+        text.push_str(&format!(
+            "\n[modules.{key}]\npackage = \"{name}\"\nversion = \"0.0.1\"\n\
+             digest = \"{}\"\nworld = \"{}\"\nprotocol = \"{}\"\n",
+            entry["digest"].as_str().expect("digest"),
+            entry["world"].as_str().expect("world"),
+            entry["protocol"].as_str().expect("protocol"),
+        ));
+    }
+    ModulesLock::parse(&release.root().join("modules.lock"), &text).expect("lock")
+}
+
+/// The hook the host installs for a run: the worker family's over `scopes`, with the
+/// workflow family's over `runs` added. `asked` records each module id it is asked for.
+fn host_hook(
+    scopes: &Arc<MemberScopes>,
+    runs: Arc<dyn WorkflowService>,
+    asked: Arc<Mutex<Vec<String>>>,
+) -> ModuleServices {
+    let hook = member_services(Some(worker_member_services(scopes.clone(), None)), runs);
+    Arc::new(move |module: &str, services: &ToolServices| {
+        asked.lock().unwrap().push(module.to_owned());
+        hook(module, services)
+    })
+}
+
+/// A catalog with a scripted provider, a `probe` tool that keeps the `ToolServices` it is
+/// assembled with, and the eight members registered through the host's entry point.
+struct HostCatalog {
+    catalog: Catalog,
+    probed: Arc<Mutex<Option<ToolServices>>>,
+    asked: Arc<Mutex<Vec<String>>>,
+    _release: Release,
+}
+
+fn host_catalog(scopes: &Arc<MemberScopes>, runs: Arc<dyn WorkflowService>) -> HostCatalog {
+    let release = host_release();
+    let mut catalog = Catalog::new();
+    let provider = ScriptedProvider::new(Vec::new());
+    catalog.provider(
+        "scripted",
+        Box::new(move |_spec: &ProviderSpec| Ok(Arc::new(provider.clone()) as Arc<dyn Provider>)),
+    );
+    let probed = Arc::new(Mutex::new(None));
+    let slot = probed.clone();
+    catalog.tool(
+        "probe",
+        Box::new(move |_spec: &ToolSpec, services: &ToolServices| {
+            *slot.lock().unwrap() = Some(services.clone());
+            Ok(Arc::new(FakeTool::new("probe")) as Arc<dyn Tool>)
+        }),
+    );
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let packages = load_locked_modules(&host_lock(&release), &release.manifest_file())
+        .expect("the members load through the host");
+    register_modules(
+        &mut catalog,
+        packages,
+        host_hook(scopes, runs, asked.clone()),
+    )
+    .expect("registration");
+    HostCatalog {
+        catalog,
+        probed,
+        asked,
+        _release: release,
+    }
+}
+
+impl HostCatalog {
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+fn host_environment(modules: &[&str]) -> EnvironmentFile {
+    EnvironmentFile {
+        name: "activation-host".into(),
+        family: "test".into(),
+        provider: "scripted".into(),
+        model: "test-model".into(),
+        profile: None,
+        options: ModelOptions::default(),
+        tools: modules
+            .iter()
+            .map(|module| ToolSpec {
+                module: (*module).into(),
+                name: None,
+                description: None,
+                variant: None,
+            })
+            .collect(),
+        prompt_template: "tools: {{tool_names}}".into(),
+        context: None,
+        summarize_prompt: None,
+    }
+}
+
+/// Assembles `modules` for the main agent `agent`, as the host assembles a parent.
+fn assemble_main(
+    catalog: &HostCatalog,
+    modules: &[&str],
+    agent: &str,
+    workspace: &Path,
+) -> Vec<Arc<dyn Tool>> {
+    assemble_for_agent(
+        &catalog.catalog,
+        &host_environment(modules),
+        workspace,
+        &Substitutions {
+            workspace: workspace.display().to_string(),
+            date: "2026-01-01".into(),
+            os: "linux".into(),
+        },
+        &Arc::new(MaskCounter::new()),
+        Some(agent),
+        |_| ModelOptions::default(),
+    )
+    .unwrap_or_else(|error| panic!("assembly: {error}"))
+    .tools
+}
+
+fn named<'a>(tools: &'a [Arc<dyn Tool>], name: &str) -> &'a Arc<dyn Tool> {
+    tools
+        .iter()
+        .find(|tool| tool.declaration().name == name)
+        .unwrap_or_else(|| panic!("{name} is not assembled"))
+}
+
+fn names(tools: &[Arc<dyn Tool>]) -> Vec<String> {
+    tools
+        .iter()
+        .map(|tool| tool.declaration().name.clone())
+        .collect()
+}
+
+fn start_input() -> Value {
+    json!({"environment": "child", "task": "do it", "tools": ["read"]})
+}
+
+/// Every member, selected by its lock key and assembled for a main agent through the host
+/// catalog, runs against the service the host scoped for that parent: the child the
+/// `worker_start` member starts is in the parent's scope and in no other, and the workflow
+/// members reach the run service through their adapters.
+#[tokio::test]
+async fn a_member_assembled_by_name_through_the_host_runs_against_the_scoped_service() {
+    within_deadline("host assembly by name", async {
+        let (service, _) = scopes();
+        let member_scopes = MemberScopes::new(service.clone() as Arc<dyn WorkerService>);
+        let runs = Arc::new(FakeRuns::default());
+        let catalog = host_catalog(&member_scopes, Arc::new(HostRuns(runs.clone())));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let keys: Vec<&str> = WORKER_MODULES
+            .iter()
+            .chain(WORKFLOW_MODULES.iter())
+            .map(|module| module.strip_prefix("p1/").expect("a p1 module"))
+            .collect();
+        let tools = assemble_main(&catalog, &keys, "0", workspace.path());
+        assert_eq!(
+            names(&tools),
+            MEMBERS.map(|(_, _, tool)| tool),
+            "each member is its package"
+        );
+        let mut asked = catalog.asked();
+        asked.sort();
+        let mut expected: Vec<&str> = MEMBERS.iter().map(|(_, name, _)| *name).collect();
+        expected.sort();
+        assert_eq!(asked, expected, "the hook is asked by module id");
+
+        let outcome = run(named(&tools, "worker_start"), "worker_start", start_input()).await;
+        assert_ok(&outcome, "worker_start");
+        assert_eq!(service.calls(), ["start child do it [read] None"]);
+        let child = ChildId("w1".to_owned());
+        assert_eq!(
+            member_scopes.workers("0").status(&child).await,
+            Ok(ChildStatus::Running),
+            "the child is in the parent's scope"
+        );
+        assert_eq!(
+            member_scopes.workers("1").status(&child).await,
+            Err(WorkerError::UnknownChild),
+            "and in no other parent's"
+        );
+        let outcome = run(
+            named(&tools, "worker_result"),
+            "worker_result",
+            json!({"id": "w1"}),
+        )
+        .await;
+        assert_ok(&outcome, "worker_result");
+        assert_eq!(outcome.content, "Worker w1: running");
+
+        let outcome = run(
+            named(&tools, "workflow_start"),
+            "workflow_start",
+            json!({"script": "1", "args": {}}),
+        )
+        .await;
+        assert_ok(&outcome, "workflow_start");
+        assert_eq!(runs.starts.lock().unwrap().len(), 1);
+        let outcome = run(
+            named(&tools, "workflow_status"),
+            "workflow_status",
+            json!({"id": "wf1"}),
+        )
+        .await;
+        assert_ok(&outcome, "workflow_status");
+        let outcome = run(
+            named(&tools, "workflow_cancel"),
+            "workflow_cancel",
+            json!({"id": "wf1"}),
+        )
+        .await;
+        assert_ok(&outcome, "workflow_cancel");
+        assert_eq!(*runs.cancels.lock().unwrap(), [RunId("wf1".to_owned())]);
+    })
+    .await;
+}
+
+/// The host's adapter gives each workflow member the operations it owns and answers every
+/// other one with `preflight("not granted: <op>")` before the run service is asked (D045).
+#[tokio::test]
+async fn the_host_adapter_refuses_a_workflow_member_what_it_does_not_own() {
+    within_deadline("host adapter", async {
+        let (service, _) = scopes();
+        let member_scopes = MemberScopes::new(service as Arc<dyn WorkerService>);
+        let runs = Arc::new(FakeRuns::default());
+        let host_runs: Arc<dyn WorkflowService> = Arc::new(HostRuns(runs.clone()));
+        let catalog = host_catalog(&member_scopes, host_runs.clone());
+        let workspace = tempfile::tempdir().expect("workspace");
+        assemble_main(&catalog, &["probe"], "0", workspace.path());
+        let services = catalog
+            .probed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the probe was assembled");
+        assert_eq!(
+            services.agent.as_deref(),
+            Some("0"),
+            "a main agent is named"
+        );
+        let hook = member_services(None, host_runs);
+        let adapter = |module: &str| hook(module, &services).workflows.expect(module);
+        fn refused<T>(operation: &str) -> Result<T, WorkflowError> {
+            Err(WorkflowError::Preflight(format!(
+                "not granted: {operation}"
+            )))
+        }
+        let run_id = RunId("wf1".to_owned());
+        let request = || StartRequest {
+            script: "1".to_owned(),
+            args: json!({}),
+            resume_from: None,
+            role_models: Default::default(),
+            workspace: None,
+            base: None,
+        };
+
+        let status = adapter("p1/workflow-status");
+        assert_eq!(status.start.start(request()).await, refused("start"));
+        assert_eq!(
+            status.observe.wait(&run_id, CancellationToken::new()).await,
+            refused("wait")
+        );
+        assert_eq!(status.cancel.cancel(&run_id).await, refused("cancel"));
+        assert_eq!(
+            status.observe.status(&run_id).await,
+            Err(WorkflowError::UnknownRun)
+        );
+
+        let result = adapter("p1/workflow-result");
+        assert_eq!(result.start.start(request()).await, refused("start"));
+        assert_eq!(result.cancel.cancel(&run_id).await, refused("cancel"));
+        assert_eq!(
+            result.observe.wait(&run_id, CancellationToken::new()).await,
+            Err(WorkflowError::UnknownRun),
+            "wait is its own"
+        );
+
+        let cancel = adapter("p1/workflow-cancel");
+        assert_eq!(cancel.start.start(request()).await, refused("start"));
+        assert_eq!(cancel.observe.status(&run_id).await, refused("status"));
+
+        let start = adapter("p1/workflow-start");
+        assert_eq!(start.observe.status(&run_id).await, refused("status"));
+        assert_eq!(start.cancel.cancel(&run_id).await, refused("cancel"));
+        assert!(
+            runs.starts.lock().unwrap().is_empty(),
+            "no refused start reached the service"
+        );
+        assert_eq!(
+            start.start.start(request()).await,
+            Ok(RunId("wf1".to_owned()))
+        );
+    })
+    .await;
+}
+
+/// An environment that names only `worker-result` gets that member and nothing else of the
+/// family: no `worker_start` is assembled, so none can be dispatched, and the one member's
+/// component has no start to call.
+#[tokio::test]
+async fn worker_result_assembled_alone_cannot_dispatch_worker_start() {
+    within_deadline("worker_result alone", async {
+        let (service, _) = scopes();
+        let member_scopes = MemberScopes::new(service.clone() as Arc<dyn WorkerService>);
+        let catalog = host_catalog(&member_scopes, Arc::new(HostRuns(Arc::default())));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let tools = assemble_main(&catalog, &["worker-result"], "0", workspace.path());
+        assert_eq!(names(&tools), ["worker_result"]);
+        assert_eq!(catalog.asked(), ["p1/worker-result"]);
+        assert!(
+            !package_file("p1-module-worker-result", ".imports").contains("workers-start"),
+            "its component does not import workers-start"
+        );
+        let outcome = run(&tools[0], "worker_result", json!({"id": "w1"})).await;
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert_eq!(outcome.content, "No worker w1.");
+        assert!(service.calls().is_empty(), "nothing started a child");
+    })
+    .await;
+}
+
+/// A member the release installs and the lock resolves, but the environment does not name,
+/// is never instantiated and cannot be dispatched; a module id is not a selectable name.
+#[tokio::test]
+async fn an_installed_but_unassembled_member_cannot_dispatch() {
+    within_deadline("installed but unassembled", async {
+        let (service, _) = scopes();
+        let member_scopes = MemberScopes::new(service.clone() as Arc<dyn WorkerService>);
+        let catalog = host_catalog(&member_scopes, Arc::new(HostRuns(Arc::default())));
+        assert!(
+            catalog
+                .catalog
+                .tool_keys()
+                .contains(&"worker-start".to_owned()),
+            "installed and resolved"
+        );
+        let workspace = tempfile::tempdir().expect("workspace");
+        let tools = assemble_main(
+            &catalog,
+            &["probe", "workflow-status"],
+            "0",
+            workspace.path(),
+        );
+        assert_eq!(names(&tools), ["probe", "workflow_status"]);
+        assert_eq!(
+            catalog.asked(),
+            ["p1/workflow-status"],
+            "no worker member was instantiated"
+        );
+        assert!(service.calls().is_empty());
+
+        let assembled = assemble_for_agent(
+            &catalog.catalog,
+            &host_environment(&["p1/worker-start"]),
+            workspace.path(),
+            &Substitutions {
+                workspace: "/work".into(),
+                date: "2026-01-01".into(),
+                os: "linux".into(),
+            },
+            &Arc::new(MaskCounter::new()),
+            Some("0"),
+            |_| ModelOptions::default(),
+        );
+        match assembled {
+            Err(AssemblyError::UnknownToolModule { module, .. }) => {
+                assert_eq!(module, "p1/worker-start")
+            }
+            Err(other) => panic!("wrong refusal: {other}"),
+            Ok(_) => panic!("a module id is not a catalog key"),
+        }
+    })
+    .await;
+}
+
+/// Two main agents never reach each other's children: not two parents sharing one
+/// generation, and not two main agents each with its own generation under the same name.
+#[tokio::test]
+async fn two_main_agents_scopes_cannot_reach_each_others_children() {
+    within_deadline("two main agents", async {
+        let (service, _) = scopes();
+        let member_scopes = MemberScopes::new(service.clone() as Arc<dyn WorkerService>);
+        let catalog = host_catalog(&member_scopes, Arc::new(HostRuns(Arc::default())));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let members = ["worker-start", "worker-result", "worker-cancel"];
+        let first = assemble_main(&catalog, &members, "a", workspace.path());
+        let second = assemble_main(&catalog, &members, "b", workspace.path());
+
+        let outcome = run(named(&first, "worker_start"), "worker_start", start_input()).await;
+        assert_ok(&outcome, "worker_start");
+        for (tool, name) in [
+            (named(&second, "worker_result"), "worker_result"),
+            (named(&second, "worker_cancel"), "worker_cancel"),
+        ] {
+            let outcome = run(tool, name, json!({"id": "w1"})).await;
+            assert_eq!(outcome.status, ToolStatus::Error, "{name}");
+            assert_eq!(outcome.content, "No worker w1.", "{name}");
+        }
+        assert_eq!(service.calls(), ["start child do it [read] None"]);
+        let outcome = run(
+            named(&first, "worker_result"),
+            "worker_result",
+            json!({"id": "w1"}),
+        )
+        .await;
+        assert_eq!(outcome.content, "Worker w1: running");
+
+        // Another main agent of the same process: its own generation over the same service,
+        // with the same name the host gives every parent.
+        let other_scopes = MemberScopes::new(service.clone() as Arc<dyn WorkerService>);
+        assert_ne!(other_scopes.generation(), member_scopes.generation());
+        let other = host_catalog(&other_scopes, Arc::new(HostRuns(Arc::default())));
+        let theirs = assemble_main(&other, &members, "a", workspace.path());
+        let outcome = run(
+            named(&theirs, "worker_result"),
+            "worker_result",
+            json!({"id": "w1"}),
+        )
+        .await;
+        assert_eq!(outcome.content, "No worker w1.");
+    })
+    .await;
+}
+
+/// A provider whose every stream waits for one permit of `gate`, so a child stays running
+/// exactly until the test lets it finish.
+struct GatedProvider {
+    gate: Arc<Semaphore>,
+    inner: ScriptedProvider,
+}
+
+impl Provider for GatedProvider {
+    fn describe(&self) -> RouteDescription {
+        self.inner.describe()
+    }
+
+    fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
+        self.inner.validate(request)
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: ProviderRequest,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ProviderStream, ProviderError>> {
+        Box::pin(async move {
+            self.gate
+                .acquire()
+                .await
+                .expect("the test never closes the gate")
+                .forget();
+            self.inner.stream(request, cancel).await
+        })
+    }
+}
+
+fn test_agent(provider: Arc<dyn Provider>) -> Agent {
+    Agent::new(AgentParts {
+        provider,
+        tools: Vec::new(),
+        system_prompt: "agent".into(),
+        options: ModelOptions::default(),
+        context: Arc::new(PassthroughContext),
+        authorization: Arc::new(ScriptedAuthorization::permit_all()),
+        journal: Arc::new(RecordingJournal::new()),
+        events: Arc::new(RecordingEvents::new()),
+    })
+    .expect("the test agent builds")
+}
+
+/// Teardown retires the main agent's generation as `run.rs` does: the member's ids become
+/// unknown through every scope of it, a later assembly of the same generation starts
+/// nothing, and the running child is untouched: it completes and the parent hears of it.
+#[tokio::test]
+async fn teardown_retires_the_generation_and_a_running_child_still_completes_and_notifies() {
+    within_deadline("teardown retire", async {
+        let gate = Arc::new(Semaphore::new(0));
+        let built = Arc::new(Mutex::new(0_usize));
+        let factory: AgentFactory = {
+            let gate = gate.clone();
+            let built = built.clone();
+            Arc::new(move |_spec: &ChildSpec| {
+                *built.lock().unwrap() += 1;
+                Ok(ChildAgent {
+                    agent: test_agent(Arc::new(GatedProvider {
+                        gate: gate.clone(),
+                        inner: ScriptedProvider::new(vec![text_response("done")]),
+                    })),
+                    description: "fake/route".into(),
+                    report: Arc::new(WorkerReport::default),
+                    regrant: None,
+                })
+            })
+        };
+        let service = InProcessWorkers::new(factory, 8);
+        let parent = test_agent(Arc::new(ScriptedProvider::new(Vec::new())));
+        service.set_parent_inbox(parent.inbox());
+        let member_scopes = MemberScopes::new(service.clone() as Arc<dyn WorkerService>);
+        let catalog = host_catalog(&member_scopes, Arc::new(HostRuns(Arc::default())));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let members = ["worker-start", "worker-result"];
+        let tools = assemble_main(&catalog, &members, "0", workspace.path());
+
+        let outcome = run(named(&tools, "worker_start"), "worker_start", start_input()).await;
+        assert_ok(&outcome, "worker_start");
+        let child = ChildId("w1".to_owned());
+        let outcome = run(
+            named(&tools, "worker_result"),
+            "worker_result",
+            json!({"id": "w1"}),
+        )
+        .await;
+        assert_eq!(outcome.content, "Worker w1: running");
+
+        // What `run.rs` does when the main agent's assembly is dropped.
+        member_scopes
+            .registry()
+            .retire_generation(member_scopes.generation())
+            .await;
+
+        let outcome = run(
+            named(&tools, "worker_result"),
+            "worker_result",
+            json!({"id": "w1"}),
+        )
+        .await;
+        assert_eq!(outcome.content, "No worker w1.");
+        let again = assemble_main(&catalog, &members, "0", workspace.path());
+        let outcome = run(named(&again, "worker_start"), "worker_start", start_input()).await;
+        assert_eq!(outcome.status, ToolStatus::Error, "{}", outcome.content);
+        assert_eq!(
+            *built.lock().unwrap(),
+            1,
+            "a retired generation builds no child"
+        );
+        assert_eq!(
+            service.status(&child).await,
+            Ok(ChildStatus::Running),
+            "retiring cancelled nothing"
+        );
+
+        gate.add_permits(1);
+        match service.wait(&child, CancellationToken::new()).await {
+            Ok(ChildStatus::Finished(result)) => assert_eq!(result.final_text, "done"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            parent.has_pending_inbox(),
+            "the parent still hears of it once"
+        );
     })
     .await;
 }

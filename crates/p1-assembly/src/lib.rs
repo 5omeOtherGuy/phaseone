@@ -211,6 +211,11 @@ pub struct ToolServices {
     /// decorator binds THIS counter — the module catalog factory does, so a module
     /// tool's masking is counted in the turn's own notice rather than a throwaway.
     pub mask: Arc<MaskCounter>,
+    /// The main agent this assembly is for, as the host names it; `None` for every other
+    /// assembly (a worker, `p1 env show`, a plain [`assemble`]). A factory that hands out
+    /// per-parent state (the worker and workflow members' scopes, B-S6-9, D068) keys on it,
+    /// so two main agents never share children.
+    pub agent: Option<String>,
 }
 
 /// Builds one provider instance. `Err` is a human-readable reason.
@@ -733,6 +738,29 @@ pub fn assemble_with_route_options(
     mask: &Arc<MaskCounter>,
     route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
 ) -> Result<Assembled, AssemblyError> {
+    assemble_for_agent(
+        catalog,
+        environment,
+        workspace,
+        substitutions,
+        mask,
+        None,
+        route_options,
+    )
+}
+
+/// As [`assemble_with_route_options`], for the main agent `agent`: the name is put in the
+/// shared [`ToolServices`] ([`ToolServices::agent`]), so a factory can key per-parent
+/// state on it. `None` is exactly [`assemble_with_route_options`].
+pub fn assemble_for_agent(
+    catalog: &Catalog,
+    environment: &EnvironmentFile,
+    workspace: &Path,
+    substitutions: &Substitutions,
+    mask: &Arc<MaskCounter>,
+    agent: Option<&str>,
+    route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
+) -> Result<Assembled, AssemblyError> {
     let workspace = Workspace::new(workspace)
         .map_err(|error| AssemblyError::InvalidWorkspace {
             message: error.to_string(),
@@ -742,6 +770,7 @@ pub fn assemble_with_route_options(
         workspace,
         observed: ObservedFiles::new(),
         mask: mask.clone(),
+        agent: agent.map(str::to_owned),
     };
 
     let provider_key = environment.provider.as_str();
