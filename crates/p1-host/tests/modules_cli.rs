@@ -454,6 +454,132 @@ fn verify_refuses_the_manifest_fields_the_loader_would_refuse() {
     }
 }
 
+/// The class names and the interface names the frozen boundary table `modules/capabilities.toml`
+/// lists: the one file a new class or interface is added to, so driving both commands over them
+/// is what catches `verify`'s copies of the loader's class and capability lists drifting apart
+/// from the loader's own.
+fn published_boundary() -> (Vec<String>, Vec<String>) {
+    let text = std::fs::read_to_string(shipped("modules/capabilities.toml")).unwrap();
+    let table: toml::Value = toml::from_str(&text).unwrap();
+    let mut classes = Vec::new();
+    let mut interfaces = Vec::new();
+    for (key, value) in table.as_table().unwrap() {
+        if key == "type-only" {
+            // `types` and `worker-types` grant nothing; a manifest naming either as a grant is
+            // refused by both checks, which is the agreement this guard asserts.
+            for name in value.as_array().unwrap() {
+                interfaces.push(name.as_str().unwrap().to_string());
+            }
+            continue;
+        }
+        classes.push(key.clone());
+        for name in value.get("imports").unwrap().as_array().unwrap() {
+            interfaces.push(name.as_str().unwrap().to_string());
+        }
+    }
+    interfaces.sort();
+    interfaces.dedup();
+    (classes, interfaces)
+}
+
+/// ADR-0079 has an installer run `verify` on a staged set before that set replaces the installed
+/// one, so `verify`'s manifest-only checks must be the loader's own: a set `verify` refuses must
+/// be one `Loader::load` refuses too, and a set it accepts must load. `inspect` goes through the
+/// real loader, so driving both commands over one manifest and asserting their verdicts agree is
+/// the drift guard for `verify`'s copies of the loader's class and capability lists (finding
+/// S1.6-2): a class or a linkable capability added to the runtime without them makes one command
+/// accept what the other refuses.
+#[test]
+fn verify_and_the_loader_agree_on_every_manifest_field() {
+    let fixture = fixture_manifest();
+    let fixture_kind = fixture["kind"].as_str().unwrap().to_string();
+    let fixture_world = fixture["world"].as_str().unwrap().to_string();
+    let fixture_capabilities = fixture["capabilities"].clone();
+    let (classes, interfaces) = published_boundary();
+    assert!(
+        classes.len() >= 5,
+        "the boundary table's classes: {classes:?}"
+    );
+    assert!(
+        interfaces.len() >= 10,
+        "the boundary table's interfaces: {interfaces:?}"
+    );
+
+    // The world of `class`, under the same version as the fixture's own world, so the guard
+    // keeps exercising the class check if the WIT version moves.
+    let world_of = |class: &str| {
+        fixture_world.replacen(&format!("/{fixture_kind}@"), &format!("/{class}@"), 1)
+    };
+
+    let base = Scratch::new().fixture_entry(FIXTURE_NAME);
+    // The exit codes of `verify` and of `inspect` (which loads) over one manifest.
+    let verdicts = |entry: &serde_json::Value| -> (i32, i32) {
+        let scratch = Scratch::new();
+        scratch.write_components(std::slice::from_ref(entry));
+        let verified = scratch.run(&["modules", "verify", "--root", &scratch.root()]);
+        let inspected = scratch.run(&[
+            "modules",
+            "inspect",
+            FIXTURE_NAME,
+            "--root",
+            &scratch.root(),
+        ]);
+        (code(&verified), code(&inspected))
+    };
+    let agree = |what: String, entry: &serde_json::Value| {
+        let (verified, inspected) = verdicts(entry);
+        assert_eq!(
+            verified == 0,
+            inspected == 0,
+            "{what}: verify said {verified}, the loader said {inspected}"
+        );
+    };
+
+    // The fixture's own entry: the set both commands must accept.
+    agree("the fixture manifest".to_string(), &base);
+
+    for class in &classes {
+        let mut entry = base.clone();
+        entry["kind"] = serde_json::json!(class);
+        entry["world"] = serde_json::json!(world_of(class));
+        agree(format!("class {class}"), &entry);
+    }
+
+    // A class neither speaks.
+    let mut entry = base.clone();
+    entry["kind"] = serde_json::json!("plugin");
+    agree("kind plugin".to_string(), &entry);
+
+    // The fixture's class under another class's world.
+    if let Some(other) = classes.iter().find(|class| class.as_str() != fixture_kind) {
+        let mut entry = base.clone();
+        entry["world"] = serde_json::json!(world_of(other));
+        agree(
+            format!("world of class {other} under kind {fixture_kind}"),
+            &entry,
+        );
+    }
+
+    // The protocol's `major.minor` shape, including the edges `u32::parse` alone accepts.
+    for protocol in [
+        "1.0", "1.9", "01.0", "1.+5", "1.-0", "1.", ".0", "1.0.0", "2.0", "1", "", "a.0", "+1.0",
+    ] {
+        let mut entry = base.clone();
+        entry["protocol"] = serde_json::json!(protocol);
+        agree(format!("protocol {protocol:?}"), &entry);
+    }
+
+    // Every published interface, granted beside the fixture's own: a linkable one both accept,
+    // anything else both refuse.
+    for interface in &interfaces {
+        let mut grants = fixture_capabilities.as_array().unwrap().clone();
+        grants.push(serde_json::json!(interface));
+        let mut entry = base.clone();
+        entry["capabilities"] = serde_json::Value::Array(grants);
+        agree(format!("capability {interface}"), &entry);
+    }
+}
+
 /// Identity is the digest, so one package's bytes under two names is a duplicate the release
 /// must not carry.
 #[test]

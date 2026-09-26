@@ -364,12 +364,16 @@ fn manifest_problems(entry: &ComponentEntry) -> Vec<String> {
         ));
     }
     // The protocol's major must be the runtime's, over the `major.minor` shape
-    // `docs/design/modules/protocol.md` fixes (the loader's own version rule).
-    let (major, minor) = entry
-        .protocol
-        .split_once('.')
-        .unwrap_or((entry.protocol.as_str(), ""));
-    if major != PROTOCOL_VERSION.major.to_string() || minor.parse::<u32>().is_err() {
+    // `docs/design/modules/protocol.md` fixes. This is the loader's own rule, mirrored exactly
+    // because the loader's `protocol_major` is private: both parts must be non-empty ASCII
+    // digits and the parsed major must be the runtime's. A looser rule would pass a set the
+    // loader then refuses — a signed minor such as `1.+5`, say, which `u32::parse` accepts but
+    // the loader's digits-only test does not — defeating the installer's pre-commit check.
+    let protocol_major = match entry.protocol.split_once('.') {
+        Some((major, minor)) if digits(major) && digits(minor) => major.parse::<u32>().ok(),
+        _ => None,
+    };
+    if protocol_major != Some(PROTOCOL_VERSION.major) {
         problems.push(format!(
             "protocol {} is refused, this runtime speaks protocol major {}",
             entry.protocol, PROTOCOL_VERSION.major
@@ -383,6 +387,12 @@ fn manifest_problems(entry: &ComponentEntry) -> Vec<String> {
         }
     }
     problems
+}
+
+/// Whether `text` is a non-empty run of ASCII digits, the loader's own test for one part of a
+/// `major.minor` protocol version.
+fn digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The component file of one entry: the loader's own reading rules (a regular file, never a
