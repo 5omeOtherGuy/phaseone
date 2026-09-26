@@ -38,6 +38,18 @@ pub enum ManifestError {
     /// field.
     #[error("the release manifest is invalid: {0}")]
     Invalid(String),
+    /// Two components claim one identity: the same manifest name, or the same digest under
+    /// two names. Either makes a lock resolution or a recorded module identity ambiguous,
+    /// so the whole manifest is refused rather than one of the two picked.
+    #[error("the release manifest is refused: {identity} is claimed by both {first} and {second}")]
+    DuplicateIdentity {
+        /// The name or digest claimed twice.
+        identity: String,
+        /// The path of the first component claiming it.
+        first: String,
+        /// The path of the second.
+        second: String,
+    },
 }
 
 /// A module's identity: the SHA-256 of its component bytes.
@@ -149,11 +161,19 @@ impl ReleaseManifest {
         for (index, entry) in entries.iter().enumerate() {
             let entry = component_entry(entry)
                 .map_err(|reason| invalid(format!("components[{index}]: {reason}")))?;
-            if components.iter().any(|known| known.name == entry.name) {
-                return Err(invalid(format!(
-                    "components[{index}]: {} is listed twice",
-                    entry.name
-                )));
+            if let Some(known) = components.iter().find(|known| known.name == entry.name) {
+                return Err(ManifestError::DuplicateIdentity {
+                    identity: entry.name,
+                    first: known.path.clone(),
+                    second: entry.path,
+                });
+            }
+            if let Some(known) = components.iter().find(|known| known.digest == entry.digest) {
+                return Err(ManifestError::DuplicateIdentity {
+                    identity: entry.digest.to_string(),
+                    first: known.path.clone(),
+                    second: entry.path,
+                });
             }
             components.push(entry);
         }
@@ -311,5 +331,31 @@ mod tests {
             entry_with("b.wasm")
         ));
         assert!(ReleaseManifest::parse(&twice).is_err());
+    }
+
+    #[test]
+    fn refuses_one_identity_claimed_twice() {
+        let twice = manifest(&format!(
+            "{},{}",
+            entry_with("a.wasm"),
+            entry_with("b.wasm")
+        ));
+        match ReleaseManifest::parse(&twice).unwrap_err() {
+            ManifestError::DuplicateIdentity {
+                identity,
+                first,
+                second,
+            } => {
+                assert_eq!(identity, "p1/fixture");
+                assert_eq!((first.as_str(), second.as_str()), ("a.wasm", "b.wasm"));
+            }
+            other => panic!("expected DuplicateIdentity, got {other}"),
+        }
+        let renamed = entry_with("b.wasm").replace("p1/fixture", "p1/other");
+        let one_digest = manifest(&format!("{},{renamed}", entry_with("a.wasm")));
+        assert!(matches!(
+            ReleaseManifest::parse(&one_digest).unwrap_err(),
+            ManifestError::DuplicateIdentity { identity, .. } if identity == DIGEST
+        ));
     }
 }
