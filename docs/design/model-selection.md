@@ -59,12 +59,17 @@ selects one. Rule 2 below is that behaviour, pinned by
 
 ## 3. Stage 2 — switch within a session (core, supersedes ADR-0033)
 
-- Core: `Agent::reconfigure(Reconfiguration { provider, tools, system_prompt, options, context })`
-  — callable only between turns (`&mut self`). It runs exactly `assemble`'s checks (duplicate
-  tool names; `provider.validate`) but validates against the CURRENT history, not an empty one.
-  On success the next turn commits a new `Environment` record before its input (the existing
-  `environment_committed = false` path; journal.md already says "again whenever the environment
-  is explicitly changed"). On failure nothing changes and the error names the reason.
+- Core: `Agent::reconfigure(&mut self, next: Reconfiguration) -> Result<(), ReconfigureError>`
+  is `async` — callable only between turns (`&mut self`). `Reconfiguration` carries `provider`,
+  `tools`, `system_prompt`, `options`, `context` and `authorization:
+  Option<Arc<dyn AuthorizationPolicy>>` (ADR-0084 item 3; `None` keeps the current policy). It
+  runs exactly `assemble`'s checks (duplicate tool names; `provider.validate`) but validates
+  against the CURRENT history, not an empty one; then it commits the candidate's `Environment`
+  record and only once that commit returned installs every part, with no await in between, so
+  the journal names the assembly that answers before it answers. A rejected candidate or a
+  failed commit changes nothing and reports the reason as `ReconfigureError`. This amends
+  ADR-0049's lazy commit for this path only (the first turn's commit and resume are unchanged):
+  see `docs/design/modules/adr-drafts/asynchronous-reconfiguration-commits-before-it-installs.md`.
 - Resume: `ResumeError::RouteChanged` is removed. A journal whose last origin differs from the
   assembled provider's resumes iff the provider validates the projected history — the same rule
   as a live switch, so a session can always be resumed on the model it was switched to, and on

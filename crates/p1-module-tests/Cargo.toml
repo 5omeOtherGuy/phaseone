@@ -58,3 +58,5 @@ p1-module-protocol = { path = "../p1-module-protocol" }
 p1-model-profile = { path = "../p1-model-profile" }
 p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false }
 p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false }
+# provider_conformance.rs (S4.7): the shared provider suite over the built provider components.
+p1-provider-conformance = { path = "../p1-provider-conformance" }
