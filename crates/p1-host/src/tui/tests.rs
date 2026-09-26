@@ -2905,3 +2905,346 @@ fn slash_compact_is_listed_in_help_and_is_a_command_while_working() {
     assert!(!is_slash_command("/usr/bin is where it lives"));
     assert!(!is_slash_command("compact"));
 }
+
+// ------------------------------------------------------ /modules reload (ADR-0084 §3)
+
+/// A scratch session environment: provider `reload-fake` (registered by the catalog
+/// hook [`driver_with_reload`] sets), no profile and no tools of its own.
+fn reload_environment() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join("reload-session");
+    std::fs::create_dir_all(&env).unwrap();
+    std::fs::write(
+        env.join("environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    std::fs::write(env.join("prompt.md"), "hi").unwrap();
+    dir
+}
+
+/// A driver wired to the host's REAL model switch over [`reload_environment`], so a
+/// `/modules reload` really installs the next generation and leaves the run's own
+/// note. The scratch directory comes back with it: the caller keeps it alive.
+fn driver_with_reload() -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::TempDir) {
+    let dir = reload_environment();
+    let writer = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
+    let mut deps = HostDeps::new(
+        writer(),
+        writer(),
+        Arc::new(crate::StdinLines::new()),
+        Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+        "2026-01-01".to_string(),
+        Arc::new(crate::SignalInterrupt),
+        vec![dir.path().to_path_buf()],
+        false,
+    );
+    // No test reads the process environment.
+    deps.shell_env = Some(Vec::new());
+    let provider = Arc::new(p1_testkit::ScriptedProvider::new(Vec::new()));
+    deps.catalog_hook = Some(Box::new(move |catalog: &mut p1_assembly::Catalog| {
+        let provider = provider.clone();
+        catalog.provider(
+            "reload-fake",
+            Box::new(move |_spec| Ok(provider.clone() as Arc<dyn p1_contracts::Provider>)),
+        );
+    }));
+    let options = crate::cli::parse(&[
+        "--env".to_string(),
+        "reload-session".to_string(),
+        "--workspace".to_string(),
+        dir.path().display().to_string(),
+        "go".to_string(),
+    ])
+    .expect("the test args parse");
+    let front_end: Arc<dyn FrontEnd> = Arc::new(crate::frontend::LineFrontEnd::new(
+        &deps,
+        &options,
+        CancellationToken::new(),
+    ));
+    let switch = Arc::new(
+        crate::run::model_switch_for_test(
+            &mut deps,
+            front_end,
+            "reload-session",
+            dir.path().to_path_buf(),
+        )
+        .expect("the test's model switch builds"),
+    );
+    let (mut d, _auth) = driver();
+    d.model_switch = Some(switch.clone());
+    (d, switch, dir)
+}
+
+#[test]
+fn modules_takes_only_reload() {
+    let (mut d, _auth) = driver();
+    d.slash("modules list", None);
+    assert_eq!(meta_rows(&d), ["· /modules takes reload"]);
+}
+
+#[test]
+fn modules_reload_with_no_switch_refuses_cleanly() {
+    let (mut d, mut agent) = driver_with_agent();
+    d.slash("modules reload", Some(&mut agent));
+    assert_eq!(
+        meta_rows(&d),
+        ["· switch refused · no model switch is available this run"]
+    );
+}
+
+#[test]
+fn a_modules_reload_typed_mid_turn_is_reported_pending() {
+    let (mut d, switch, _dir) = driver_with_reload();
+    // `agent` is `None` exactly while a turn borrows it: the session is busy.
+    d.slash("modules reload", None);
+    assert_eq!(meta_rows(&d), [p1_tui::input::RELOAD_PENDING_NOTE]);
+    assert!(
+        switch.reload_queue().take(),
+        "the busy request waits on the session's reload queue"
+    );
+    assert!(d.pending_switch.is_none(), "a reload is not a model switch");
+}
+
+/// ADR-0080 (S1.9): a `/modules reload` commits a new `Environment` with the reloaded
+/// modules, so the journal names that assembly — the reloaded set, not the one the
+/// session started with — once the install is `Ok`, before the next turn.
+#[tokio::test]
+async fn a_modules_reload_writes_an_assembly_line_naming_the_reloaded_set() {
+    let (mut d, switch, dir) = driver_with_reload();
+    let mut agent = test_agent();
+    assert!(
+        switch.assemblies_for_test().is_empty(),
+        "nothing is named before the reload"
+    );
+    // The release changes under the session: the reloaded environment assembles a
+    // module the started one did not.
+    std::fs::write(
+        dir.path().join("reload-session").join("environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n\n\
+         [[tools]]\nmodule = \"read\"\n",
+    )
+    .unwrap();
+    d.slash("modules reload", Some(&mut agent));
+    d.apply_reload(&mut agent).await;
+    let rows = meta_rows(&d);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("· modules reloaded · generation 1 ·")),
+        "{rows:?}"
+    );
+    let entries = switch.assemblies_for_test();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one line per installed reload: {entries:?}"
+    );
+    let identity = &entries[0].identity;
+    assert_eq!(identity.environment, "reload-session");
+    let named: Vec<(p1_journal::ModuleKind, &str)> = identity
+        .modules
+        .iter()
+        .map(|module| (module.kind, module.package.as_str()))
+        .collect();
+    // The main environment also carries the `worker_*` (and `workflow_*`) tools the
+    // host appends by feature; the reloaded module, the provider and the policy are
+    // what this reload is about.
+    assert_eq!(
+        named.first(),
+        Some(&(p1_journal::ModuleKind::Tool, "read")),
+        "the line names the reloaded module first: {identity:?}"
+    );
+    assert_eq!(
+        named[named.len() - 2..],
+        [
+            (p1_journal::ModuleKind::Provider, "reload-fake"),
+            (
+                p1_journal::ModuleKind::AuthorizationPolicy,
+                crate::policy::FULL_ACCESS_POLICY
+            ),
+        ],
+        "the line names the reloaded set: {identity:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_modules_reload_at_idle_applies_at_the_following_boundary() {
+    let (mut d, switch, _dir) = driver_with_reload();
+    let mut agent = test_agent();
+    // Idle: `agent` is `Some`, so nothing is queued as pending — the loop applies
+    // the request right after the key.
+    d.slash("modules reload", Some(&mut agent));
+    assert!(meta_rows(&d).is_empty(), "{:?}", meta_rows(&d));
+    d.apply_reload(&mut agent).await;
+    let rows = meta_rows(&d);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].starts_with("· modules reloaded · generation 1 ·"),
+        "{rows:?}"
+    );
+    assert!(!switch.reload_queue().take(), "one request applies once");
+}
+
+#[tokio::test]
+async fn apply_reload_with_nothing_queued_changes_nothing() {
+    let (mut d, _switch, _dir) = driver_with_reload();
+    let mut agent = test_agent();
+    d.apply_reload(&mut agent).await;
+    assert!(meta_rows(&d).is_empty(), "{:?}", meta_rows(&d));
+}
+
+/// ADR-0084 §3: a `/modules reload` typed while a turn runs queues on the session and
+/// applies at the turn's end — the same boundary a pending `/model` uses — through the
+/// real `drive_loop`, so the routing is exercised, not just the pieces of it.
+#[tokio::test(start_paused = true)]
+async fn a_modules_reload_typed_mid_turn_applies_at_the_turns_end() {
+    let (_d, switch, _dir) = driver_with_reload();
+    let scripted = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        p1_testkit::text_response("answer"),
+    ]));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(HeldProvider {
+        inner: scripted,
+        started: started.clone(),
+        release: release.clone(),
+        held: std::sync::atomic::AtomicBool::new(false),
+    });
+    let agent = Agent::new(p1_core::AgentParts {
+        provider,
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+        journal: Arc::new(p1_journal::MemoryJournal::new()),
+        events: Arc::new(p1_testkit::RecordingEvents::new()),
+    })
+    .expect("the turn's agent builds");
+    let mut harness =
+        IdleLoop::with_agent(ratatui::backend::TestBackend::new(96, 24), false, agent);
+    harness.driver.model_switch = Some(switch);
+    harness.driver.screen.composer.insert('g');
+    let keys = harness.wires.keys.clone();
+    let events = harness.wires.events.clone();
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    let script = async move {
+        // The turn's request is in flight and held: the session is busy.
+        started.notified().await;
+        events
+            .send(UiEvent::Agent(p1_tui::runtime::Stamped {
+                worker: None,
+                at_ms: 0,
+                event: p1_contracts::AgentEvent::TurnStarted,
+            }))
+            .unwrap();
+        for c in "/modules reload".chars() {
+            keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+        }
+        keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+        // Let the loop take every key (explicit scheduling, no clock).
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_one();
+        drop(keys);
+        drop(events);
+    };
+
+    let (code, driver, _agent) = run_with_own_wires(harness, script).await;
+
+    assert_eq!(code, 0);
+    let rows = meta_rows(&driver);
+    assert!(
+        rows.contains(&p1_tui::input::RELOAD_PENDING_NOTE),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("· modules reloaded · generation 1 ·")),
+        "the queued reload applied at the turn's end: {rows:?}"
+    );
+}
+
+/// §11 / ADR-0084 §3: a `/modules reload` typed AT IDLE applies right after that key —
+/// the loop's second boundary, where `agent` is free.
+#[tokio::test(start_paused = true)]
+async fn a_modules_reload_typed_at_idle_applies_right_after_the_key() {
+    let (_d, switch, _dir) = driver_with_reload();
+    let mut harness = IdleLoop::with_agent(
+        ratatui::backend::TestBackend::new(96, 24),
+        false,
+        test_agent(),
+    );
+    harness.driver.model_switch = Some(switch);
+    let keys = harness.wires.keys.clone();
+    for c in "/modules reload".chars() {
+        keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+    }
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    drop(keys);
+
+    let (code, driver, _agent) = run_with_own_wires(harness, async {}).await;
+
+    assert_eq!(code, 0);
+    let rows = meta_rows(&driver);
+    assert!(
+        !rows.contains(&p1_tui::input::RELOAD_PENDING_NOTE),
+        "at idle nothing is queued as pending: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("· modules reloaded · generation 1 ·")),
+        "the reload applied at once: {rows:?}"
+    );
+}
+
+/// ADR-0084 §3: the loop's third boundary — an inbox turn drains a worker's
+/// completion and the queued reload applies when that turn ends.
+#[tokio::test(start_paused = true)]
+async fn a_modules_reload_applies_after_an_inbox_turn() {
+    let (_d, switch, _dir) = driver_with_reload();
+    let scripted = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        p1_testkit::text_response("noted"),
+    ]));
+    let agent = Agent::new(p1_core::AgentParts {
+        provider: scripted,
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+        journal: Arc::new(p1_journal::MemoryJournal::new()),
+        events: Arc::new(p1_testkit::RecordingEvents::new()),
+    })
+    .expect("the inbox turn's agent builds");
+    let inbox = agent.inbox();
+    let mut harness =
+        IdleLoop::with_agent(ratatui::backend::TestBackend::new(96, 24), false, agent);
+    harness.driver.model_switch = Some(switch.clone());
+    // A reload requested while busy, and the worker's completion that drives the
+    // inbox turn the loop drains next.
+    switch.reload_queue().request(true);
+    inbox.send(p1_contracts::InboxKind::Notification, "w1 finished");
+    let keys = harness.wires.keys.clone();
+    let events = harness.wires.events.clone();
+    let script = async move {
+        // Let the inbox turn run and the boundary take the queued request; the
+        // senders stay open until then, so the loop cannot end early.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        drop(keys);
+        drop(events);
+    };
+
+    let (code, driver, _agent) = run_with_own_wires(harness, script).await;
+
+    assert_eq!(code, 0);
+    let rows = meta_rows(&driver);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("· modules reloaded · generation 1 ·")),
+        "the reload applied at the inbox boundary: {rows:?}"
+    );
+}

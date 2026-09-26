@@ -95,6 +95,9 @@ EOF
 # `contract` (cancel-process) or `pending <missing component>/<owning stream>`.
 # compaction-16 also needs the history rows within their targets, which it will check
 # beside its own growth once the context-policy component exists.
+# notice: S5.9 (issue #333) switches only the compaction-16 row's measured-by column to
+# its own case (compaction_16, PLAN §11 risk 5 over the context-policy component S5.2
+# built); every other row, threshold and check here is S7's (#297) and unchanged.
 ACCEPTANCE_TABLE='
 boundary-noop-1k|p95 added latency ≤1 ms|added-p95<=1ms|case boundary_noop_1k
 read-adapter|p95 ≤2 ms|p95<=2ms|pending read-tool component/S2
@@ -109,7 +112,7 @@ idle-tool|Aim ≤8 MiB committed memory|per-instance<=8MiB|case idle_tool
 idle-provider|Aim ≤16 MiB committed memory|per-instance<=16MiB|pending provider component/S4
 agents-16-rss|Added steady-state RSS ≤400 MiB over native baseline|added-steady<=400MiB|case agents_16_rss
 steady-growth|No continuing resource/RSS growth after warm-up|growth=none|case steady_growth
-compaction-16|No continuing growth; history rows within their targets|growth=none|pending context-policy component/S5
+compaction-16|No continuing growth; history rows within their targets|growth=none|case compaction_16
 '
 
 suite=""
