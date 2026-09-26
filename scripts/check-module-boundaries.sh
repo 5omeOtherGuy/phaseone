@@ -645,17 +645,23 @@ p1-workspace|foundation|confinement resolves paths after symlinks and every writ
 # yet, which its fallback line says.
 SHIPPING_PACKAGES='
 p1-context|p1-module-context
+p1-provider-anthropic|p1-module-provider-anthropic
+p1-provider-openai|p1-module-provider-openai
+p1-provider-openai-chat|p1-module-provider-openai-chat
 p1-tool-delegate|p1-module-worker-start p1-module-worker-continue p1-module-worker-result p1-module-worker-cancel
+p1-tool-finish|p1-module-finish
+p1-tool-read|p1-module-read
+p1-tool-shell|p1-module-shell
 p1-tool-workflow|p1-module-workflow-start p1-module-workflow-status p1-module-workflow-result p1-module-workflow-cancel
 '
 
 # The extension implementations a *foundation* crate still answers natively, as
 # `<crate>|<what>|<package directory> [...]`, one line each. The audit names them (a `native
 # twin:` line) rather than leaving them inside a class that would hide them; the class of the
-# crate they live in does not decide whether the audit may hide them.
-SHIPPING_TWINS='
-p1-host|the native authorization policies p1/policy/ask and p1/policy/full-access (crates/p1-host/src/policy.rs)|p1-module-policy-ask p1-module-policy-full-access
-'
+# crate they live in does not decide whether the audit may hide them. The list is empty: S5.11
+# removed the native authorization policies, the one extension implementation a foundation crate
+# (p1-host) still answered natively.
+SHIPPING_TWINS=''
 
 # The class the frozen table gives crate $1, or nothing when the table does not list the crate.
 shipping_class() {
