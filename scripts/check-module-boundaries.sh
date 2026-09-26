@@ -613,8 +613,9 @@ p1-auth|foundation|the credential source is native and no interface returns a va
 p1-contracts|contracts|the contracts the core and its modules share (ADR-0002)
 p1-context|extension|holds the summarizing context policy (src/engine.rs); it becomes the context-policy module and its native driver leaves with it (ADR-0036, ADR-0081)
 p1-core|core|the core runs one loop and depends only on contracts (ADR-0002)
+p1-finish-guest|contracts|the shared guest logic of `finish` (S0-R3): pure computation the p1/finish component ships and the native completion hub reuses to re-verify a candidate (ADR-0083); the native tool itself is p1-tool-finish, listed as extension
 p1-hook-shadow|foundation|the brain shadow hook is spawned detached by the host and fails open (ADR-0058)
-p1-host|foundation|the composition root: the OS services it owns (the terminal driver, the worker service, the detached hook shadow) stay native (ADR-0081); its native authorization policies are named as a native twin
+p1-host|foundation|the composition root: the OS services it owns (the terminal driver, the worker service, the detached hook shadow) stay native (ADR-0081)
 p1-journal|foundation|the session record is native and the single truth, including the version and assembly identity (ADR-0021, ADR-0080)
 p1-model-profile|foundation|model policy is host data read at assembly, not an extension (ADR-0004, ADR-0081)
 p1-module-protocol|runtime|the value protocol a module speaks; it is a runtime crate (ADR-0081)
@@ -623,6 +624,7 @@ p1-provider-anthropic|extension|the Anthropic Messages implementation, a provide
 p1-provider-http|foundation|sending, retry, backoff, the one credential refresh after a 401 or 403 and the read bounds stay native (ADR-0081)
 p1-provider-openai|extension|the OpenAI Responses implementation, a provider that becomes a module (ADR-0081)
 p1-provider-openai-chat|extension|the Chat Completions implementation, a provider that becomes a module (ADR-0081)
+p1-read-guest|contracts|the shared guest logic of `read` (S0-R3): pure computation the p1/read component ships; natively it is reached only through p1-tool-read, listed as extension
 p1-redact|foundation|credential-shape masking runs over the output of every assembled tool (issue #142)
 p1-tool-delegate|extension|the worker_start, worker_result, worker_continue and worker_cancel tool members (ADR-0081)
 p1-tool-edit|extension|the `edit` tool implementation, which becomes a tool module (ADR-0081)
