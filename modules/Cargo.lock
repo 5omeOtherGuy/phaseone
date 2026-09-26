@@ -93,6 +93,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "p1-bindings-authorization-policy"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "p1-bindings-tool"
 version = "0.0.1"
 dependencies = [
@@ -111,6 +118,20 @@ name = "p1-module-fixture"
 version = "0.0.1"
 dependencies = [
  "p1-bindings-tool",
+]
+
+[[package]]
+name = "p1-module-policy-ask"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-authorization-policy",
+]
+
+[[package]]
+name = "p1-module-policy-full-access"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-authorization-policy",
 ]
 
 [[package]]
