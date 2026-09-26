@@ -48,10 +48,48 @@ FARM_TOOLS = ("mktemp", "sha256sum", "cut", "awk", "tar", "gzip", "cp", "mv", "m
 
 VERSION_LINE = "p1 0.0.1 (deadbeef0000 2026-09-24)"
 
+# The installed binary the release channel serves. Besides `--version` and `login --list` it
+# answers the `modules verify --integrity-only --root DIR` call install.sh makes before it
+# touches the prefix: P1_VERIFY_MODE picks the outcome (the default verifies), and every call
+# appends `self=`, `argv=`, the prefix's own marker and its `.p1.new.` count to
+# P1_VERIFY_LOG — that record is how a test shows the argv, and that the call happened while
+# the prefix still held the previous generation.
 FAKE_P1 = """#!/bin/sh
 case "$1" in
   --version) printf '%s\\n' "@VERSION@" ;;
   login) printf '%s\\n' "route  kind  source" "plain  api_key  p1 store only" ;;
+  modules)
+    if [ -n "${P1_VERIFY_LOG:-}" ]; then
+      {
+        printf 'self=%s\\n' "$0"
+        printf 'argv=%s\\n' "$*"
+        printf 'prefix_marker=%s\\n' "$(cat "${P1_FAKE_PREFIX:-/nonexistent}/share/p1/environments/marker.txt" 2>/dev/null)"
+        printf 'new_entries=%s\\n' "$(ls -A "${P1_FAKE_PREFIX:-/nonexistent}/bin" 2>/dev/null | grep -c '^\\.p1\\.new\\.')"
+      } >>"$P1_VERIFY_LOG"
+    fi
+    case "${P1_VERIFY_MODE:-ok}" in
+      ok) printf '%s\\n' "modules verify: 1 ok, 0 failed" ;;
+      unlinked)
+        printf '%s\\n' "UNLINKED workers-start (tools-tool)"
+        printf '%s\\n' "modules verify: 1 ok, 0 failed" ;;
+      report)
+        # A report that reads like a failure while the exit status says verified: the
+        # installer may not read the text (D069).
+        printf '%s\\n' "tools-tool FAILED duplicate identity: sha256:00 is also tools-other"
+        printf '%s\\n' "modules verify: 0 ok, 1 failed" ;;
+      fail)
+        printf '%s\\n' "tools-tool FAILED duplicate identity: sha256:00 is also tools-other" >&2
+        printf '%s\\n' "modules verify: 0 ok, 1 failed"
+        exit 1 ;;
+      crash) kill -s SEGV $$ ;;
+      flag)
+        printf '%s\\n' 'unknown flag `--integrity-only`' >&2
+        exit 2 ;;
+      unusable)
+        printf '%s\\n' 'p1: cannot run the staged binary' >&2
+        exit 126 ;;
+    esac
+    ;;
   *) printf 'fake p1: %s\\n' "$*" ;;
 esac
 """.replace("@VERSION@", VERSION_LINE)
@@ -139,6 +177,7 @@ class InstallTest(unittest.TestCase):
         self.gh_log = os.path.join(self.dir, "gh.log")
         self.curl_log = os.path.join(self.dir, "curl.log")
         self.cargo_log = os.path.join(self.dir, "cargo.log")
+        self.verify_log = os.path.join(self.dir, "verify.log")
         self.publish(marker="one", binary=FAKE_P1)
         self.stub("gh", GH_STUB)
         self.stub("curl", CURL_STUB)
@@ -303,15 +342,26 @@ class InstallTest(unittest.TestCase):
             "P1_GH_LOG": self.gh_log,
             "P1_CURL_LOG": self.curl_log,
             "P1_CARGO_LOG": self.cargo_log,
+            # The staged binary's own verification: where it records itself, and the prefix it
+            # reports the state of at the moment it ran.
+            "P1_VERIFY_LOG": self.verify_log,
+            "P1_FAKE_PREFIX": self.prefix,
         }
         env.update(overrides)
         return env
 
+    def start_verify_record(self) -> None:
+        """One record per invocation, so a call assertion speaks about this run alone."""
+        if os.path.exists(self.verify_log):
+            os.remove(self.verify_log)
+
     def run_install(self, *args: str, **overrides) -> subprocess.CompletedProcess:
+        self.start_verify_record()
         return subprocess.run([BASH, INSTALL, *args], env=self.env(**overrides),
                               capture_output=True, text=True)
 
     def run_script(self, script: str, *args: str) -> subprocess.CompletedProcess:
+        self.start_verify_record()
         return subprocess.run([BASH, script, *args], env=self.env(),
                               capture_output=True, text=True)
 
@@ -373,14 +423,54 @@ class InstallTest(unittest.TestCase):
                                         handle.read())
         return entries
 
+    def verify_runs(self) -> list:
+        """The staged binary's `modules verify` calls, one dict per invocation."""
+        runs: list = []
+        for line in self.log(self.verify_log).splitlines():
+            if not line:
+                continue
+            key, _, value = line.partition("=")
+            if key == "self":
+                runs.append({"self": value})
+            elif runs:
+                runs[-1][key] = value
+        return runs
+
+    def assert_verify_never_called(self) -> None:
+        """The inline python check refused, so the staged binary was never asked to verify."""
+        self.assertEqual(self.log(self.verify_log), "",
+                         "the inline module check refused, so `modules verify` must not have run")
+
     def assert_refused_untouched(self, done: subprocess.CompletedProcess, message: str,
                                  before: dict | None = None) -> None:
-        """A verification failure names the problem, ends with the promise and changes nothing."""
+        """A verification failure names the problem, ends with the promise and changes nothing.
+
+        Every caller is refused by the inline python check in `verify_modules`, which runs
+        before the staged binary is asked anything, so the staged binary must not have run."""
         self.assertNotEqual(done.returncode, 0, done.stdout)
         self.assertIn(message, done.stderr)
         self.assertIn("nothing installed", done.stderr)
+        self.assert_verify_never_called()
         if before is None:
             # The prefix did not exist before the refusal, so the refusal must not create it.
+            self.assertFalse(os.path.exists(self.prefix), f"a refusal created {self.prefix}")
+        else:
+            self.assertEqual(self.snapshot(self.prefix), before)
+
+    def assert_binary_refused_untouched(self, done: subprocess.CompletedProcess,
+                                        before: dict | None = None) -> None:
+        """The staged binary refused the set, and the prefix did not move for it.
+
+        The refusal is the binary's exit status alone; the argv it recorded shows the call went
+        to the staged copy over the extracted stage, with the prefix still holding whatever it
+        held before (no `.p1.new.` copy beside the installed binary)."""
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("the staged binary refused the module set", done.stderr)
+        self.assertIn("nothing installed", done.stderr)
+        runs = self.verify_runs()
+        self.assertGreaterEqual(len(runs), 1, "the staged binary was never asked")
+        self.assertEqual(runs[-1]["new_entries"], "0", "the prefix was already being written")
+        if before is None:
             self.assertFalse(os.path.exists(self.prefix), f"a refusal created {self.prefix}")
         else:
             self.assertEqual(self.snapshot(self.prefix), before)
@@ -602,6 +692,12 @@ class InstallTest(unittest.TestCase):
                     binary_sha=binary_sha),
                  "files": {}},
                 "has an empty, '.' or '..' component"),
+            "an absolute manifest path": (
+                {"manifest": self.manifest(
+                    [{"path": "/tmp/escaped.wasm", "sha256": "0" * 64, "size": 1}],
+                    binary_sha=binary_sha),
+                 "files": {}},
+                "has no packages/ prefix"),
             "a symlink under modules": (
                 {"manifest": None, "files": {},
                  "members": [self.tar_member("modules/link", kind=tarfile.SYMTYPE,
@@ -681,6 +777,11 @@ class InstallTest(unittest.TestCase):
 
     def test_a_traversing_manifest_path_is_refused(self) -> None:
         spec, fragment = self.refusing_releases()["a traversing manifest path"]
+        self.publish(modules=spec)
+        self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
+
+    def test_an_absolute_manifest_path_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["an absolute manifest path"]
         self.publish(modules=spec)
         self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
 
@@ -817,6 +918,191 @@ exec '{real_mv}' \"$@\"
         self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1", ".p1-release")),
                          "v1.0.0\n")
         self.assertFalse(os.path.exists(os.path.join(self.prefix, "share", "p1", "modules")))
+
+    # --- the staged binary's own verification (S1.6.1, D079) ----------------
+
+    def test_the_staged_binary_verifies_the_extracted_set_before_the_prefix_moves(self) -> None:
+        files = {"tools/tool.wasm": b"tool v1\n"}
+        self.publish(marker="one", modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", files["tools/tool.wasm"])], files))
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(self.verify_runs()), 1, "the staged binary was not asked once")
+
+        new_files = {"tools/tool.wasm": b"tool v2\n"}
+        self.publish(marker="two", binary=NEW_RELEASE, modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", new_files["tools/tool.wasm"])], new_files))
+        second = self.run_install("--prefix", self.prefix)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("modules verify: 1 ok, 0 failed", second.stdout)
+
+        runs = self.verify_runs()
+        self.assertEqual(len(runs), 1, runs)
+        call = runs[-1]
+        # The subcommand and the flag are the frozen ones, and --root names the directory the
+        # share tarball was extracted into (the one that holds modules/).
+        prefix_argv = "modules verify --integrity-only --root "
+        self.assertTrue(call["argv"].startswith(prefix_argv), call)
+        root = call["argv"][len(prefix_argv):]
+        self.assertEqual(os.path.basename(root), "share", call)
+        # The staged copy was run, not the installed binary: it sits beside the extracted
+        # share, under the temporary stage, never under the prefix.
+        self.assertEqual(os.path.dirname(call["self"]), os.path.dirname(root), call)
+        self.assertEqual(os.path.basename(call["self"]), "p1", call)
+        self.assertFalse(call["self"].startswith(self.prefix + os.sep), call)
+        # Nothing under the prefix had moved when the binary ran: the installed release was
+        # still the previous generation, with no .new copy written beside it.
+        self.assertEqual(call["prefix_marker"], "environments one", call)
+        self.assertEqual(call["new_entries"], "0", call)
+
+    def test_a_release_without_modules_skips_the_staged_verification_in_one_line(self) -> None:
+        self.publish()
+        done = self.run_install("--prefix", self.prefix)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assert_verify_never_called()
+        self.assertEqual([line for line in (done.stdout + done.stderr).splitlines()
+                          if "modules/" in line],
+                         ["p1 install: this release ships no modules/ — the staged binary is "
+                          "not asked to verify a module set"], done.stdout + done.stderr)
+
+    def test_a_duplicate_identity_is_refused_by_the_staged_binary(self) -> None:
+        # Two names over the same bytes: the inline check sees two distinct paths and accepts
+        # the set, so the staged binary's duplicate-identity check is what refuses it.
+        files = {"tools/first.wasm": b"same bytes\n", "tools/second.wasm": b"same bytes\n"}
+        packages = [self.package_entry(name, data) for name, data in sorted(files.items())]
+        self.publish(modules=self.module_spec(packages, files))
+        done = self.run_install("--prefix", self.prefix, P1_VERIFY_MODE="fail")
+        self.assert_binary_refused_untouched(done)
+        self.assertIn("duplicate identity", done.stderr)
+        self.assertIn("modules verify: 0 ok, 1 failed", done.stdout)
+        self.assertEqual(len(self.verify_runs()), 1)
+
+    def test_a_staged_binary_that_refuses_the_set_leaves_an_existing_install_untouched(self) -> None:
+        files = {"tools/tool.wasm": b"tool v1\n"}
+        self.publish(marker="one", modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", files["tools/tool.wasm"])], files))
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = self.snapshot(self.prefix)
+
+        new_files = {"tools/tool.wasm": b"tool v2\n"}
+        self.publish(marker="two", binary=NEW_RELEASE, modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", new_files["tools/tool.wasm"])], new_files))
+        done = self.run_install("--prefix", self.prefix, P1_VERIFY_MODE="fail")
+        self.assert_binary_refused_untouched(done, before)
+        self.assertEqual(self.verify_runs()[-1]["prefix_marker"], "environments one")
+
+    def test_a_staged_binary_that_crashes_is_refused(self) -> None:
+        files = {"tools/tool.wasm": b"tool bytes\n"}
+        self.publish(modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", files["tools/tool.wasm"])], files))
+        done = self.run_install("--prefix", self.prefix, P1_VERIFY_MODE="crash")
+        self.assert_binary_refused_untouched(done)
+        self.assertIn("(exit 139)", done.stderr)
+
+    def test_a_staged_binary_that_rejects_the_flag_is_refused(self) -> None:
+        files = {"tools/tool.wasm": b"tool bytes\n"}
+        self.publish(modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", files["tools/tool.wasm"])], files))
+        done = self.run_install("--prefix", self.prefix, P1_VERIFY_MODE="flag")
+        self.assert_binary_refused_untouched(done)
+        self.assertIn("unknown flag", done.stderr)
+        self.assertIn("(exit 2)", done.stderr)
+
+    def test_a_staged_binary_that_cannot_run_is_refused(self) -> None:
+        files = {"tools/tool.wasm": b"tool bytes\n"}
+        self.publish(modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", files["tools/tool.wasm"])], files))
+        done = self.run_install("--prefix", self.prefix, P1_VERIFY_MODE="unusable")
+        self.assert_binary_refused_untouched(done)
+        self.assertIn("(exit 126)", done.stderr)
+
+    def test_an_unlinked_grant_with_exit_zero_installs(self) -> None:
+        files = {"tools/tool.wasm": b"tool bytes\n"}
+        self.publish(modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", files["tools/tool.wasm"])], files))
+        done = self.run_install("--prefix", self.prefix, P1_VERIFY_MODE="unlinked")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("UNLINKED workers-start", done.stdout)
+        self.assert_installed(self.prefix)
+        self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1", "modules",
+                                                "packages", "tools", "tool.wasm")),
+                         "tool bytes\n")
+
+    def test_a_report_that_reads_like_a_failure_but_exits_zero_installs(self) -> None:
+        # D069: the exit status decides, never the text — a report that reads like a refusal
+        # while the status says verified installs.
+        files = {"tools/tool.wasm": b"tool bytes\n"}
+        self.publish(modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", files["tools/tool.wasm"])], files))
+        done = self.run_install("--prefix", self.prefix, P1_VERIFY_MODE="report")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("modules verify: 0 ok, 1 failed", done.stdout)
+        self.assertTrue(os.path.isdir(os.path.join(self.prefix, "share", "p1", "modules")))
+
+    # --- pinned generations: the set is renamed, never rewritten ------------
+
+    def test_an_update_replaces_the_module_set_by_a_rename_not_in_place(self) -> None:
+        """A session that opened the installed generation keeps reading those bytes."""
+        old_files = {"tools/tool.wasm": b"tool v1\n"}
+        self.publish(marker="one", modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", old_files["tools/tool.wasm"])], old_files))
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        packages = os.path.join(self.prefix, "share", "p1", "modules", "packages")
+        tool = os.path.join(packages, "tools", "tool.wasm")
+        open_file = open(tool, "rb")
+        self.addCleanup(open_file.close)
+        # Both inodes are held open, so the filesystem cannot hand either to the new tree: a
+        # difference after the update proves the path was replaced, never written through.
+        held_file_inode = os.fstat(open_file.fileno()).st_ino
+        held_dir = os.open(packages, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, held_dir)
+        held_dir_inode = os.fstat(held_dir).st_ino
+
+        new_files = {"tools/tool.wasm": b"tool v2, a longer generation\n"}
+        self.publish(marker="two", binary=NEW_RELEASE, modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", new_files["tools/tool.wasm"])], new_files))
+        second = self.run_install("--prefix", self.prefix)
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+        # The handle a running session holds still reads the generation it opened, at the very
+        # inode it opened: the update renamed a fresh tree into place.
+        self.assertEqual(open_file.read(), b"tool v1\n")
+        self.assertEqual(os.fstat(open_file.fileno()).st_ino, held_file_inode)
+        self.assertNotEqual(os.stat(tool).st_ino, held_file_inode)
+        self.assertNotEqual(os.stat(packages).st_ino, held_dir_inode)
+        with open(tool, "rb") as fresh:
+            self.assertEqual(fresh.read(), b"tool v2, a longer generation\n")
+
+    def test_a_failed_commit_restores_the_module_set_byte_for_byte(self) -> None:
+        old_files = {"tools/tool.wasm": b"tool v1\n", "providers/route.wasm": b"route v1\n"}
+        self.publish(marker="one", modules=self.module_spec(
+            [self.package_entry(name, data) for name, data in sorted(old_files.items())],
+            old_files))
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        modules = os.path.join(self.prefix, "share", "p1", "modules")
+        before = self.snapshot(modules)
+
+        new_files = {"tools/tool.wasm": b"tool v2\n"}
+        self.publish(marker="two", binary=NEW_RELEASE, modules=self.module_spec(
+            [self.package_entry("tools/tool.wasm", new_files["tools/tool.wasm"])], new_files))
+
+        fail_dir = self.mkdir("fail-commit-module-set")
+        real_mv = shutil.which("mv")
+        self.stub("mv", f"""#!/bin/sh
+case \" $* \" in
+  *".p1.new."*"/share/p1 "*) exit 71 ;;
+esac
+exec '{real_mv}' \"$@\"
+""", directory=fail_dir)
+        done = self.run_install("--prefix", self.prefix,
+                                PATH=fail_dir + ":" + self.stub_dir + ":" + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("could not commit", done.stderr)
+        self.assertEqual(self.snapshot(modules), before)
 
     # --- the interpreter the archive checks need ---------------------------
 
