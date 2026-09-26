@@ -1,8 +1,11 @@
 //! The `edit` tool: exact string replacement in one workspace file.
 //!
 //! Confinement, atomic replacement and observed-file tracking live in
-//! `p1-workspace`. This module owns the model-facing declaration, input
-//! validation, the exact-match search and line-ending preservation.
+//! `p1-workspace`. The model-facing declaration, input validation, the
+//! exact-match search, line-ending preservation, the output text and the
+//! descriptions live in `p1-tool-edit-logic`, the one copy the `edit`
+//! component (`modules/p1-module-edit/`) runs too; this crate adapts them to
+//! the native `Tool` contract.
 
 use std::io::ErrorKind;
 
@@ -11,15 +14,10 @@ use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
-use p1_workspace::{Observation, ObservedFiles, Workspace, bound_output, write_atomic};
-use serde::Deserialize;
+use p1_tool_edit_logic::{self as logic, EditInput};
+use p1_workspace::{Observation, ObservedFiles, Workspace, write_atomic};
 
 pub use p1_workspace::ToolFace;
-
-const NAME: &str = "edit";
-const DESCRIPTION: &str = "Replace an exact string in an existing workspace file.\n`old_string` must match uniquely unless `replace_all` is set; it must differ from `new_string`.\nRead the file first: the edit is refused if you have never read it, or if it changed on disk since you did.\nThe file's line endings and final newline are preserved.";
-const MAX_OUTPUT_BYTES: usize = 50_000;
-const MAX_OUTPUT_LINES: usize = 2_000;
 
 /// The `edit` tool. Holds one agent's workspace and observation store.
 pub struct EditTool {
@@ -53,7 +51,7 @@ impl EditTool {
 }
 
 fn default_face() -> ToolFace {
-    ToolFace::new(NAME, DESCRIPTION)
+    ToolFace::new(logic::NAME, logic::DESCRIPTION)
 }
 
 fn declaration(face: ToolFace) -> ToolDeclaration {
@@ -61,7 +59,7 @@ fn declaration(face: ToolFace) -> ToolDeclaration {
         name: face.name,
         description: face.description,
         kind: DeclarationKind::Function {
-            input_schema: input_schema(),
+            input_schema: logic::input_schema(),
         },
     }
 }
@@ -71,44 +69,6 @@ fn identity(variant: &str) -> ToolIdentity {
         implementation: env!("CARGO_PKG_NAME").to_string(),
         variant: variant.to_string(),
     }
-}
-
-fn input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "File path, relative to the workspace root or absolute inside it."
-            },
-            "old_string": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Exact text to replace; must be unique unless replace_all is set."
-            },
-            "new_string": {
-                "type": "string",
-                "description": "Replacement text; must differ from old_string."
-            },
-            "replace_all": {
-                "type": "boolean",
-                "default": false,
-                "description": "Replace every occurrence instead of requiring a unique match."
-            }
-        },
-        "required": ["file_path", "old_string", "new_string"],
-        "additionalProperties": false
-    })
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EditInput {
-    file_path: String,
-    old_string: String,
-    new_string: String,
-    #[serde(default)]
-    replace_all: bool,
 }
 
 impl Tool for EditTool {
@@ -127,11 +87,13 @@ impl Tool for EditTool {
     /// ADR-0057: the file this call edits, from the tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
         let parsed = parse_input(&self.declaration.name, call).ok();
+        // Natively the real resolution decides, symlinks included; the component, which
+        // cannot resolve on the restricted path, decides lexically.
         let destructive = parsed
             .as_ref()
             .is_some_and(|input| self.workspace.resolve(&input.file_path).is_err());
         CallDescription {
-            verb: "edit",
+            verb: logic::VERB,
             target: parsed.as_ref().map(|input| input.file_path.clone()),
             edit: parsed.map(|input| EditPreview {
                 path: input.file_path,
@@ -147,23 +109,17 @@ impl Tool for EditTool {
         call: &ToolCall,
         result: &p1_contracts::ToolResultItem,
     ) -> ResultDescription {
-        if result.status != ToolStatus::Ok {
-            return plain_result(result);
-        }
-        let Ok(input) = parse_input(&self.declaration.name, call) else {
-            return plain_result(result);
-        };
-        let replacements = parenthesized_count(&result.content, "replacement").unwrap_or(1);
+        let described = logic::describe_result(
+            parse_input(&self.declaration.name, call).ok(),
+            result.status == ToolStatus::Ok,
+            &result.content,
+        );
         ResultDescription {
-            summary: format!(
-                "+{} −{}",
-                input.new_string.lines().count() * replacements,
-                input.old_string.lines().count() * replacements
-            ),
-            detail: Some(ResultDetail::Diff {
-                path: input.file_path,
-                before: input.old_string,
-                after: input.new_string,
+            summary: described.summary,
+            detail: described.diff.map(|diff| ResultDetail::Diff {
+                path: diff.path,
+                before: diff.before,
+                after: diff.after,
             }),
         }
     }
@@ -191,9 +147,7 @@ impl Tool for EditTool {
             // All filesystem work runs on a blocking thread; the async thread
             // is never used for synchronous I/O.
             match tokio::task::spawn_blocking(move || run(&workspace, &observed, &input)).await {
-                Ok(Ok(content)) => {
-                    ToolOutcome::ok(bound_output(&content, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES))
-                }
+                Ok(Ok(content)) => ToolOutcome::ok(content),
                 Ok(Err(message)) => ToolOutcome::error(message),
                 Err(error) => ToolOutcome::error(format!("{tool} failed: {error}")),
             }
@@ -201,51 +155,11 @@ impl Tool for EditTool {
     }
 }
 
-fn plain_result(result: &p1_contracts::ToolResultItem) -> ResultDescription {
-    ResultDescription {
-        summary: result
-            .content
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        detail: None,
-    }
-}
-
-fn parenthesized_count(content: &str, unit: &str) -> Option<usize> {
-    let rest = &content[content.rfind('(')? + 1..];
-    let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
-    let count = rest[..digits_end].parse().ok()?;
-    rest[digits_end..]
-        .trim_start()
-        .starts_with(unit)
-        .then_some(count)
-}
-
 fn parse_input(tool: &str, call: &ToolCall) -> Result<EditInput, String> {
-    let raw = match &call.input {
-        ToolInput::Json(raw) => raw,
-        ToolInput::Text(_) => {
-            return Err(invalid(
-                tool,
-                "expected a JSON object input, got freeform text",
-            ));
-        }
-    };
-    let input: EditInput =
-        serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
-    if input.old_string.is_empty() {
-        return Err(invalid(tool, "`old_string` must not be empty"));
+    match &call.input {
+        ToolInput::Json(raw) => logic::parse_json_input(tool, raw),
+        ToolInput::Text(_) => Err(logic::text_input_error(tool)),
     }
-    if input.old_string == input.new_string {
-        return Err(invalid(tool, "`old_string` and `new_string` must differ"));
-    }
-    Ok(input)
-}
-
-fn invalid(tool: &str, reason: &str) -> String {
-    format!("Invalid input for {tool}: {reason}")
 }
 
 fn run(
@@ -264,138 +178,27 @@ fn run(
     let bytes = match std::fs::read(&resolved) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(format!("{display} does not exist."));
+            return Err(logic::does_not_exist(&display));
         }
-        Err(error) => return Err(format!("{display} could not be read: {error}")),
+        Err(error) => return Err(logic::could_not_read(&display, &error.to_string())),
     };
 
     // Read-before-mutate: refuse to touch a file this agent has not seen, or
     // whose contents changed since it last saw them.
     match observed.check_unchanged(&resolved, &bytes) {
-        Observation::NeverObserved => {
-            return Err(format!("You must read {display} before changing it."));
-        }
-        Observation::ChangedSinceObserved => {
-            return Err(format!(
-                "{display} changed on disk since you last read it; read it again."
-            ));
-        }
+        Observation::NeverObserved => return Err(logic::never_observed(&display)),
+        Observation::ChangedSinceObserved => return Err(logic::changed_since_observed(&display)),
         Observation::Unchanged => {}
     }
 
-    let text = std::str::from_utf8(&bytes).map_err(|_| format!("{display} is not valid UTF-8."))?;
-    let (body, had_bom) = strip_bom(text);
-    // Matching happens on LF-normalized text; the file's own ending is
-    // restored on write, so a CRLF file stays CRLF and a missing final newline
-    // stays missing.
-    let ending = detect_line_ending(body);
-    let normalized = normalize_to_lf(body);
-    let old_string = normalize_to_lf(&input.old_string);
-    let matches = find_all(&normalized, &old_string);
-    if matches.is_empty() {
-        return Err(format!("old_string was not found in {display}."));
-    }
-    if matches.len() > 1 && !input.replace_all {
-        return Err(format!(
-            "old_string occurs {} times in {display}; add context to make it unique or set replace_all.",
-            matches.len()
-        ));
-    }
-    let replacements = if input.replace_all { matches.len() } else { 1 };
-
-    let new_string = normalize_to_lf(&input.new_string);
-    let mut replaced = String::with_capacity(normalized.len());
-    let mut cursor = 0;
-    for start in matches {
-        replaced.push_str(&normalized[cursor..start]);
-        replaced.push_str(&new_string);
-        cursor = start + old_string.len();
-    }
-    replaced.push_str(&normalized[cursor..]);
-
-    let restored = restore_line_endings(&replaced, ending);
-    let final_text = if had_bom {
-        format!("\u{FEFF}{restored}")
-    } else {
-        restored
-    };
-
-    write_atomic(&resolved, final_text.as_bytes())
-        .map_err(|error| format!("failed to write {display}: {error}"))?;
+    let edited = logic::edit_text(&display, &bytes, input)?;
+    write_atomic(&resolved, edited.contents.as_bytes())
+        .map_err(|error| logic::failed_to_write(&display, &error.to_string()))?;
     // A successful mutation records the new contents, so consecutive edits need
     // no re-read.
-    observed.record(&resolved, final_text.as_bytes());
+    observed.record(&resolved, edited.contents.as_bytes());
 
-    let plural = if replacements == 1 { "" } else { "s" };
-    Ok(format!(
-        "Edited {display} ({replacements} replacement{plural})."
-    ))
-}
-
-/// All non-overlapping occurrences of `needle`, as ascending byte offsets.
-fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let mut positions = Vec::new();
-    let mut from = 0;
-    while let Some(relative) = haystack[from..].find(needle) {
-        let absolute = from + relative;
-        positions.push(absolute);
-        from = absolute + needle.len();
-    }
-    positions
-}
-
-fn strip_bom(text: &str) -> (&str, bool) {
-    text.strip_prefix('\u{FEFF}')
-        .map_or((text, false), |stripped| (stripped, true))
-}
-
-/// The file's dominant line ending, taken from its first line break.
-fn detect_line_ending(text: &str) -> &'static str {
-    let bytes = text.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        match byte {
-            b'\r' => {
-                return if bytes.get(index + 1) == Some(&b'\n') {
-                    "\r\n"
-                } else {
-                    "\r"
-                };
-            }
-            b'\n' => return "\n",
-            _ => {}
-        }
-    }
-    "\n"
-}
-
-fn normalize_to_lf(text: &str) -> String {
-    if !text.contains('\r') {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\r' {
-            out.push('\n');
-            if characters.peek() == Some(&'\n') {
-                characters.next();
-            }
-        } else {
-            out.push(character);
-        }
-    }
-    out
-}
-
-fn restore_line_endings(text: &str, ending: &str) -> String {
-    match ending {
-        "\r\n" => text.replace('\n', "\r\n"),
-        "\r" => text.replace('\n', "\r"),
-        _ => text.to_string(),
-    }
+    Ok(logic::edited_output(&display, edited.replacements))
 }
 
 #[cfg(test)]
