@@ -59,7 +59,9 @@ files to their sha256.
   verifier.
 - **One identity, one component.** The release manifest is refused whole when two
   components claim one name or one digest (`ManifestError::DuplicateIdentity`, added to
-  `p1-module-runtime`'s `manifest.rs`), so neither a lock resolution nor a journal's
+  `p1-module-runtime`'s `manifest.rs`: a duplicate name when the manifest is parsed, a
+  duplicate digest by `ReleaseManifest::check_unique_digests`, which the host runs on the
+  release it loads from), so neither a lock resolution nor a journal's
   recorded module identity can be ambiguous.
 - **The lock pins what the release ships.** Before the loader runs, the host compares
   the lock entry's `digest`, `world` and `protocol` with the release manifest's entry

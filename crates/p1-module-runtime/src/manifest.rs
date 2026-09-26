@@ -168,16 +168,30 @@ impl ReleaseManifest {
                     second: entry.path,
                 });
             }
-            if let Some(known) = components.iter().find(|known| known.digest == entry.digest) {
-                return Err(ManifestError::DuplicateIdentity {
-                    identity: entry.digest.to_string(),
-                    first: known.path.clone(),
-                    second: entry.path,
-                });
-            }
             components.push(entry);
         }
         Ok(Self { components })
+    }
+
+    /// Refuses a release whose components share a digest under two names. Not part of
+    /// [`ReleaseManifest::parse`]: the runtime's own harness lists derived entries under the
+    /// fixture's digest to prove the loader's per-entry checks, while a release the host
+    /// selects modules from must give each set of bytes exactly one name, or a lock
+    /// resolution and a recorded module identity would be ambiguous.
+    pub fn check_unique_digests(&self) -> Result<(), ManifestError> {
+        for (index, entry) in self.components.iter().enumerate() {
+            if let Some(known) = self.components[..index]
+                .iter()
+                .find(|known| known.digest == entry.digest)
+            {
+                return Err(ManifestError::DuplicateIdentity {
+                    identity: entry.digest.to_string(),
+                    first: known.path.clone(),
+                    second: entry.path.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The entry for manifest name `name`, if the release has one.
@@ -353,9 +367,12 @@ mod tests {
         }
         let renamed = entry_with("b.wasm").replace("p1/fixture", "p1/other");
         let one_digest = manifest(&format!("{},{renamed}", entry_with("a.wasm")));
+        let parsed = ReleaseManifest::parse(&one_digest).expect("names are distinct");
         assert!(matches!(
-            ReleaseManifest::parse(&one_digest).unwrap_err(),
+            parsed.check_unique_digests().unwrap_err(),
             ManifestError::DuplicateIdentity { identity, .. } if identity == DIGEST
         ));
+        let single = ReleaseManifest::parse(&manifest(&entry_with("a.wasm"))).unwrap();
+        assert!(single.check_unique_digests().is_ok());
     }
 }

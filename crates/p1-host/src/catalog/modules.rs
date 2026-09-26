@@ -162,11 +162,12 @@ pub fn load_locked_modules(
     lock: &ModulesLock,
     release_manifest: &Path,
 ) -> Result<Vec<ModulePackage>, ModulesError> {
-    let manifest =
-        ReleaseManifest::read(release_manifest).map_err(|source| ModulesError::Release {
-            path: release_manifest.to_owned(),
-            source: Box::new(source),
-        })?;
+    let release_error = |source| ModulesError::Release {
+        path: release_manifest.to_owned(),
+        source: Box::new(source),
+    };
+    let manifest = ReleaseManifest::read(release_manifest).map_err(release_error)?;
+    manifest.check_unique_digests().map_err(release_error)?;
     let mut packages = Vec::new();
     // The loader starts an epoch thread; a release nothing selects needs none.
     if lock.is_empty() {
