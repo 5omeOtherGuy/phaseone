@@ -2,43 +2,57 @@
 //! the step that appends them to every main agent. Kept apart from `run.rs` so the
 //! family can later be built as a module of its own without touching the run drivers.
 //!
-//! Two paths build the family (ADR-0085, S6.7):
-//! - an environment that names a member PACKAGE (a `modules.lock` key resolving to one of
-//!   [`WORKER_MODULES`]) takes the module path for the whole family: the host appends no
-//!   native member, the members it names are instantiated from their packages, and each
-//!   instance is linked against the parent's [`WorkerScope`] ([`worker_member_services`]);
-//! - every other environment keeps the native `p1-tool-delegate` members, appended to each
-//!   main agent and bound to the whole worker service, as before. No shipped environment
-//!   names a member package (the shipped `modules.lock` is empty), so every shipped
-//!   environment takes this path.
+//! The members are components (ADR-0085, S6.7) and official-release HOST ENTRIES (S6.11,
+//! D083b): the eight packages of [`MEMBER_ENTRIES`] are loaded by package name from the
+//! one release manifest (`official_release_manifest`, with its debug fallback) and verified
+//! against it, never selected by `modules.lock`; a release missing one, or shipping one
+//! that does not verify, fails the catalog build naming the package. Each is registered
+//! under its catalog key (`worker_start`, …, `workflow_cancel`) through the module path
+//! (`register_host_entry`), and each instance is linked through the member hook
+//! ([`worker_member_services`], `workflow::member_services`) against the parent's
+//! [`WorkerScope`]. No native member is registered any more; `p1-tool-delegate` stays for
+//! `workers_started_in` (`children.rs`) and `p1-tool-workflow` for the `p1 workflow run`
+//! report (`run.rs`).
+//!
+//! An environment that names a member package by its `modules.lock` key still gets only the
+//! members of that family it names; every other main agent gets the whole family appended.
 //!
 //! Either family can be switched off at run time (ADR-0085 item 6, S6.8): `[capabilities]`
 //! in `settings.toml` ([`Capabilities`]). A disabled family is left out of the next main
-//! agent's assembly on both paths, so its tools and their `{{#tool:...}}` prompt sections
-//! go with it, and an environment that names one of its members fails that assembly. The
-//! cargo features stay a build option; they are no longer the user's switch.
+//! agent's assembly, so its tools and their `{{#tool:...}}` prompt sections go with it, and
+//! an environment that names one of its members fails that assembly. The cargo features
+//! stay a build option; they are no longer the user's switch.
 
 #[cfg(feature = "delegation")]
-use std::sync::Arc;
+use std::collections::HashMap;
+#[cfg(feature = "delegation")]
+use std::path::{Path, PathBuf};
 #[cfg(feature = "delegation")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "delegation")]
+use std::sync::{Arc, Mutex, PoisonError};
 
 use p1_assembly::EnvironmentFile;
 #[cfg(feature = "delegation")]
 use p1_assembly::{Catalog, ToolServices, ToolSpec};
 #[cfg(feature = "delegation")]
-use p1_contracts::Tool;
+use p1_contracts::BoxFuture;
 #[cfg(feature = "delegation")]
-use p1_module_runtime::Services;
+use p1_module_runtime::delegation::{WorkerLists, WorkerServices};
 #[cfg(feature = "delegation")]
-use p1_module_runtime::delegation::WorkerServices;
+use p1_module_runtime::{LoadedModule, Loader, ReleaseManifest, Services};
 #[cfg(feature = "delegation")]
-use p1_workers::{ScopeKey, WorkerScope, WorkerScopes, WorkerService};
+use p1_workers::{
+    ChildId, ChildSpec, ScopeKey, WorkerError, WorkerScope, WorkerScopes, WorkerService,
+    WorkersControl, WorkersStart,
+};
 
 #[cfg(feature = "delegation")]
 use crate::HostDeps;
 #[cfg(feature = "delegation")]
-use crate::catalog::modules::ModuleServices;
+use crate::catalog::modules::{
+    ModuleServices, ModulesError, official_release_manifest, register_host_entry,
+};
 #[cfg(feature = "workflows")]
 use crate::catalog::workflow::{WORKFLOW_MODULES, WORKFLOW_TOOLS};
 use serde::Deserialize;
@@ -80,7 +94,7 @@ pub(crate) fn disabled(family: &str) -> String {
 }
 
 /// The worker family's member module ids, as the packages' manifests name them, in the
-/// order the native members are appended ([`WORKER_TOOLS`] has the same order).
+/// order the members are appended ([`WORKER_TOOLS`] has the same order).
 #[cfg(feature = "delegation")]
 pub const WORKER_MODULES: [&str; 4] = [
     "p1/worker-start",
@@ -89,7 +103,8 @@ pub const WORKER_MODULES: [&str; 4] = [
     "p1/worker-cancel",
 ];
 
-/// The native members' catalog keys, in the order the host appends them to a main agent.
+/// The members' catalog keys, in the order the host appends them to a main agent: each is
+/// its package's host entry.
 #[cfg(feature = "delegation")]
 pub(crate) const WORKER_TOOLS: [&str; 4] = [
     "worker_start",
@@ -107,8 +122,8 @@ pub(crate) fn lock_key(module: &str) -> &str {
     module.strip_prefix("p1/").unwrap_or(module)
 }
 
-/// Whether `environment` names a member package of the family `modules`: then it takes
-/// the module path for that family, and no native member is appended.
+/// Whether `environment` names a member package of the family `modules` by its lock key:
+/// then it has the members of that family it names, and none is appended.
 #[cfg(feature = "delegation")]
 fn names_a_member_package(environment: &EnvironmentFile, modules: &[&str]) -> bool {
     environment.tools.iter().any(|tool| {
@@ -119,11 +134,11 @@ fn names_a_member_package(environment: &EnvironmentFile, modules: &[&str]) -> bo
 }
 
 /// Give every MAIN agent the worker tools (ADR-0050 item 1). Appends a default-face
-/// [`ToolSpec`] for each native worker member the environment does not already list, in
+/// [`ToolSpec`] for each worker member the environment does not already list, in
 /// `worker_start`, `worker_result`, `worker_continue`, `worker_cancel` order; an
-/// environment that lists one keeps its own entry (which carries a face). An environment
-/// that names a member package of a family gets no native member of that family: it has
-/// the members it named, each from its package, and nothing else (ADR-0085). Called only
+/// environment that lists one keeps its own entry. An environment that names a member
+/// package of a family by its lock key gets nothing appended for that family: it has the
+/// members it named, and nothing else (ADR-0085). Every key is a package (S6.11). Called only
 /// at the three main-agent assembly sites — never in the child factory, so a worker
 /// never gets the worker tools. A no-op when the `delegation` feature is not compiled.
 /// With `workflows` the four `workflow_*` tools follow the same way (ADR-0053 item 7).
@@ -136,19 +151,19 @@ pub fn with_worker_tools(
     environment: &mut EnvironmentFile,
     capabilities: Capabilities,
 ) -> Result<(), String> {
-    let mut native: Vec<&str> = Vec::new();
+    let mut appended: Vec<&str> = Vec::new();
     if !capabilities.workers {
         refuse_named_members(environment, "workers", &WORKER_MODULES, &WORKER_TOOLS)?;
     } else if !names_a_member_package(environment, &WORKER_MODULES) {
-        native.extend(WORKER_TOOLS);
+        appended.extend(WORKER_TOOLS);
     }
     #[cfg(feature = "workflows")]
     if !capabilities.workflows {
         refuse_named_members(environment, "workflows", &WORKFLOW_MODULES, &WORKFLOW_TOOLS)?;
     } else if !names_a_member_package(environment, &WORKFLOW_MODULES) {
-        native.extend(WORKFLOW_TOOLS);
+        appended.extend(WORKFLOW_TOOLS);
     }
-    for module in native {
+    for module in appended {
         if environment.tools.iter().any(|tool| tool.module == module) {
             continue;
         }
@@ -162,7 +177,7 @@ pub fn with_worker_tools(
     Ok(())
 }
 
-/// Refuse an environment that names a member of the disabled `family`, by its native key
+/// Refuse an environment that names a member of the disabled `family`, by its catalog key
 /// or its package's lock key, with the family's disabled error naming the member.
 #[cfg(feature = "delegation")]
 fn refuse_named_members(
@@ -203,6 +218,9 @@ static GENERATIONS: AtomicU64 = AtomicU64::new(1);
 pub struct MemberScopes {
     registry: WorkerScopes,
     generation: u64,
+    /// The service the scopes are over, kept for the one call a member's assembly makes on
+    /// it: naming the result tool in the completion notification.
+    service: Arc<dyn WorkerService>,
 }
 
 #[cfg(feature = "delegation")]
@@ -210,8 +228,9 @@ impl MemberScopes {
     /// A new generation of scopes over `service`.
     pub fn new(service: Arc<dyn WorkerService>) -> Arc<Self> {
         Arc::new(Self {
-            registry: WorkerScopes::new(service),
+            registry: WorkerScopes::new(service.clone()),
             generation: GENERATIONS.fetch_add(1, Ordering::Relaxed),
+            service,
         })
     }
 
@@ -241,6 +260,10 @@ impl MemberScopes {
 /// other instance — another module, or no main agent (a worker never delegates) — gets
 /// what `fallback` gives, or no service at all, so a grant it cannot be given fails its
 /// assembly with the runtime's `MissingService`.
+///
+/// Assembling `worker_result` for a main agent names it in the service's completion
+/// notification ("Use worker_result to read its result."), as constructing the native
+/// member did (ADR-0057); a member has no face, so the name is always its own.
 #[cfg(feature = "delegation")]
 pub fn worker_member_services(
     scopes: Arc<MemberScopes>,
@@ -249,7 +272,12 @@ pub fn worker_member_services(
     Arc::new(move |module: &str, services: &ToolServices| {
         if WORKER_MODULES.contains(&module) {
             return match &services.agent {
-                Some(parent) => worker_services(&scopes.workers(parent)),
+                Some(parent) => {
+                    if module == WORKER_MODULES[1] {
+                        scopes.service.set_result_tool_name(WORKER_TOOLS[1]);
+                    }
+                    worker_services(&scopes.workers(parent))
+                }
                 None => Services::default(),
             };
         }
@@ -299,6 +327,9 @@ pub(crate) fn with_worker_tools(
     Ok(())
 }
 
+/// The four worker members over `service`, each registered from its host entry under its
+/// catalog key (S6.11): the grantable tools and the environment names are fixed here, from
+/// this catalog, and every member instance is linked with them ([`WorkerLists`]).
 #[cfg(feature = "delegation")]
 pub(crate) fn register_delegation_tools(
     catalog: &mut Catalog,
@@ -312,7 +343,7 @@ pub(crate) fn register_delegation_tools(
     };
 
     // What a parent may grant is the host's own knowledge, never a compiled list in
-    // the tool crate: every tool module this catalog registers, minus `finish` (the
+    // a member: every tool module this catalog registers, minus `finish` (the
     // factory adds it to every worker), the `worker_*` modules (a worker never
     // delegates) and the `workflow_*` modules (a worker never orchestrates). The environments a worker may run are the host's environment dirs.
     let grantable: Vec<String> = catalog
@@ -323,55 +354,235 @@ pub(crate) fn register_delegation_tools(
         })
         .collect();
     let environments = crate::models::environment_names(&deps.environment_dirs)?;
+    let lists = WorkerLists {
+        grantable,
+        environments,
+    };
 
-    let service_for = service.clone();
-    let grantable_for_start = grantable.clone();
-    catalog.tool(
-        "worker_start",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_delegate::WorkerStartTool::new(
-                    service_for.clone(),
-                    grantable_for_start.clone(),
-                    environments.clone(),
-                ),
-                spec
-            ))
-        }),
-    );
-
-    let service_for = service.clone();
-    catalog.tool(
-        "worker_result",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_delegate::WorkerResultTool::new(service_for.clone()),
-                spec
-            ))
-        }),
-    );
-
-    let service_for = service.clone();
-    catalog.tool(
-        "worker_continue",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_delegate::WorkerContinueTool::new(service_for.clone(), grantable.clone()),
-                spec
-            ))
-        }),
-    );
-
-    catalog.tool(
-        "worker_cancel",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_delegate::WorkerCancelTool::new(service.clone()),
-                spec
-            ))
-        }),
-    );
+    let entries = official_member_entries()?;
+    let hook = member_hook(deps, service, lists);
+    for (module, key) in WORKER_MODULES.into_iter().zip(WORKER_TOOLS) {
+        register_host_entry(catalog, key, entry(&entries, module)?, hook.clone());
+    }
+    // With a run's workflow service the workflow members are registered here too, over the
+    // same hook, so both families link through the run's member hook; `p1 env show` has no
+    // run and registers them through `register_workflow_tools` instead.
+    #[cfg(feature = "workflows")]
+    if deps.workflow_service.is_some() {
+        for (module, key) in WORKFLOW_MODULES.into_iter().zip(WORKFLOW_TOOLS) {
+            register_host_entry(catalog, key, entry(&entries, module)?, hook.clone());
+        }
+    }
     Ok(())
+}
+
+// ------------------------------------------------------------------ host entries
+
+/// The official-release host entries of both families (S6.11, D083b): every member package,
+/// by the module id its manifest names. The host loads them by these names from the release
+/// manifest, never through `modules.lock`.
+#[cfg(feature = "delegation")]
+pub fn member_entries() -> Vec<&'static str> {
+    let entries = WORKER_MODULES.to_vec();
+    #[cfg(feature = "workflows")]
+    let entries = [entries, WORKFLOW_MODULES.to_vec()].concat();
+    entries
+}
+
+/// The verified member entries of one release, by package name.
+#[cfg(feature = "delegation")]
+pub type MemberEntries = HashMap<&'static str, Arc<LoadedModule>>;
+
+/// Loads every [`member_entries`] package from the release manifest `release_manifest`,
+/// verifying each against that same manifest (official source, class, world, protocol,
+/// digest, grants: `p1_module_runtime::Loader`). The first package that is missing or does
+/// not verify is the error, and the error names it.
+#[cfg(feature = "delegation")]
+pub fn load_member_entries(release_manifest: &Path) -> Result<MemberEntries, String> {
+    let unreadable = |error: String| {
+        format!(
+            "cannot load the host entries {}: {}: {error}",
+            member_entries().join(", "),
+            release_manifest.display()
+        )
+    };
+    let manifest =
+        ReleaseManifest::read(release_manifest).map_err(|error| unreadable(error.to_string()))?;
+    manifest
+        .check_unique_digests()
+        .map_err(|error| unreadable(error.to_string()))?;
+    // A release that lacks a member is refused before any member is compiled, naming it.
+    if let Some(package) = member_entries()
+        .into_iter()
+        .find(|package| manifest.entry(package).is_none())
+    {
+        return Err(format!(
+            "host entry {package} from {}: the release manifest has no such component",
+            release_manifest.display()
+        ));
+    }
+    let root = release_manifest.parent().unwrap_or(Path::new("."));
+    let loader = Loader::new(manifest, root).map_err(|error| unreadable(error.to_string()))?;
+    let mut entries = HashMap::new();
+    for package in member_entries() {
+        let module = loader.load(package).map_err(|error| {
+            format!(
+                "host entry {package} from {}: {error}",
+                release_manifest.display()
+            )
+        })?;
+        entries.insert(package, Arc::new(module));
+    }
+    Ok(entries)
+}
+
+/// The member entries of the official release, loaded and verified once per process (and
+/// again only when the official manifest's path changes): every catalog build shares the
+/// compiled components.
+#[cfg(feature = "delegation")]
+pub(crate) fn official_member_entries() -> Result<MemberEntries, String> {
+    static OFFICIAL: Mutex<Option<(PathBuf, MemberEntries)>> = Mutex::new(None);
+    let release = official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())?;
+    let mut cached = OFFICIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    match &*cached {
+        Some((path, entries)) if *path == release => Ok(entries.clone()),
+        _ => {
+            let entries = load_member_entries(&release)?;
+            *cached = Some((release, entries.clone()));
+            Ok(entries)
+        }
+    }
+}
+
+/// The loaded host entry `module`.
+#[cfg(feature = "delegation")]
+fn entry(entries: &MemberEntries, module: &str) -> Result<Arc<LoadedModule>, String> {
+    entries
+        .get(module)
+        .cloned()
+        .ok_or_else(|| format!("{module} is not one of p1's host entries"))
+}
+
+/// The hook the host entries of one catalog are linked through. In a run (the run composed
+/// its member scopes, `children.rs`) it is the run's own member hook, `deps.module_services`,
+/// so a disabled family's members link nothing and fail with `MissingService`. A catalog no
+/// run composed (`p1 env show`, whose `service` starts nothing) gets the members linked over
+/// scopes of its own `service`, for whatever agent assembles them, so the environment still
+/// shows them. Either way a worker member gets `lists` and the host's grant check.
+#[cfg(feature = "delegation")]
+fn member_hook(
+    deps: &HostDeps,
+    service: Arc<dyn WorkerService>,
+    lists: WorkerLists,
+) -> ModuleServices {
+    let family: ModuleServices = if deps.member_scopes.is_some() {
+        deps.module_services
+            .clone()
+            .unwrap_or_else(|| Arc::new(|_: &str, _: &ToolServices| Services::default()))
+    } else {
+        inspection_services(MemberScopes::new(service))
+    };
+    Arc::new(move |module: &str, services: &ToolServices| {
+        let mut linked = family(module, services);
+        if WORKER_MODULES.contains(&module) {
+            linked.workers = linked.workers.map(|workers| checked(workers, &lists));
+        }
+        linked
+    })
+}
+
+/// The member hook of a catalog no run composed: the worker members over `scopes`, keyed
+/// by the assembling agent or, for `p1 env show`'s plain assembly, by no agent.
+#[cfg(feature = "delegation")]
+fn inspection_services(scopes: Arc<MemberScopes>) -> ModuleServices {
+    Arc::new(move |module: &str, services: &ToolServices| {
+        if WORKER_MODULES.contains(&module) {
+            worker_services(&scopes.workers(services.agent.as_deref().unwrap_or_default()))
+        } else {
+            Services::default()
+        }
+    })
+}
+
+/// A worker member's services with the host's lists and its grant check: the member's
+/// schemas and texts name the lists, and a module outside `grantable` is refused before
+/// the scope is asked, with the native tools' text.
+#[cfg(feature = "delegation")]
+fn checked(workers: WorkerServices, lists: &WorkerLists) -> WorkerServices {
+    let grantable: Arc<[String]> = lists.grantable.clone().into();
+    WorkerServices {
+        start: workers.start.map(|inner| {
+            Arc::new(GrantChecked {
+                inner,
+                grantable: grantable.clone(),
+            }) as Arc<dyn WorkersStart>
+        }),
+        observe: workers.observe,
+        control: workers.control.map(|inner| {
+            Arc::new(GrantChecked {
+                inner,
+                grantable: grantable.clone(),
+            }) as Arc<dyn WorkersControl>
+        }),
+        lists: lists.clone(),
+    }
+}
+
+/// A worker interface that checks a grant against the host's grantable list first, as the
+/// native `worker_start` and `worker_continue` did before calling the service: nothing
+/// starts and nothing reaches the child when a module is not grantable.
+#[cfg(feature = "delegation")]
+struct GrantChecked<T: ?Sized> {
+    inner: Arc<T>,
+    grantable: Arc<[String]>,
+}
+
+#[cfg(feature = "delegation")]
+impl<T: ?Sized> GrantChecked<T> {
+    /// The native refusal of the first module in `modules` a worker cannot be granted, after
+    /// the tool's own prefix; the members relay it verbatim.
+    fn refusal(&self, modules: &[String]) -> Option<String> {
+        let module = modules
+            .iter()
+            .find(|module| !self.grantable.contains(module))?;
+        Some(format!(
+            "`{module}` is not a tool module a worker can be granted. Valid tools: {}",
+            self.grantable.join(", ")
+        ))
+    }
+}
+
+#[cfg(feature = "delegation")]
+impl WorkersStart for GrantChecked<dyn WorkersStart> {
+    fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        // `invalid-environment` is the start error the member renders as
+        // "Cannot start worker: <reason>", the native text.
+        match self.refusal(&spec.tools) {
+            Some(reason) => Box::pin(async move { Err(WorkerError::InvalidEnvironment(reason)) }),
+            None => self.inner.start(spec),
+        }
+    }
+}
+
+#[cfg(feature = "delegation")]
+impl WorkersControl for GrantChecked<dyn WorkersControl> {
+    fn cancel<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<(), WorkerError>> {
+        self.inner.cancel(id)
+    }
+
+    fn continue_child<'a>(
+        &'a self,
+        id: &'a ChildId,
+        message: String,
+        add_tools: Vec<String>,
+    ) -> BoxFuture<'a, Result<(), WorkerError>> {
+        // Checked before the id, as the native tool checks it: an unknown module is refused
+        // whatever the child's state, and `worker_continue` relays the reason verbatim.
+        match self.refusal(&add_tools) {
+            Some(reason) => Box::pin(async move { Err(WorkerError::Regrant(reason)) }),
+            None => self.inner.continue_child(id, message, add_tools),
+        }
+    }
 }
 
 /// Which path each family takes (ADR-0085, S6.7): an environment naming a member package
