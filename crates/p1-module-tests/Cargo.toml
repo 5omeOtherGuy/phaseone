@@ -48,3 +48,12 @@ p1-workflow = { path = "../p1-workflow" }
 # environments over it, with the testkit's scripted provider and fake tools.
 p1-assembly = { path = "../p1-assembly" }
 p1-host = { path = "../p1-host" }
+# provider_wire.rs (S4.4): the provider adapters' portable halves, their wire forms and
+# the model policy they are composed with. `default-features = false` because a provider
+# component reaches no transport, runtime or credential code.
+p1-module-protocol = { path = "../p1-module-protocol" }
+p1-model-profile = { path = "../p1-model-profile" }
+p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false }
+p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false }
+# provider_conformance.rs (S4.7): the shared provider suite over the built provider components.
+p1-provider-conformance = { path = "../p1-provider-conformance" }

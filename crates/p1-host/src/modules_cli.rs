@@ -55,7 +55,16 @@ const CLASSES: [ModuleKind; 5] = [
 /// granting anything else, so `verify` must refuse it too, and the drift guard
 /// `verify_and_the_loader_agree_on_every_manifest_field` fails if this list and the loader's
 /// part ways.
-const LINKABLE: [&str; 5] = ["control", "clock", "random", "process", "summary"];
+const LINKABLE: [&str; 8] = [
+    "control",
+    "clock",
+    "random",
+    "process",
+    "summary",
+    "http",
+    "websocket",
+    "credential-control",
+];
 
 /// Run one `p1 modules` command.
 pub fn modules(deps: &HostDeps, options: &ModulesOptions) -> i32 {

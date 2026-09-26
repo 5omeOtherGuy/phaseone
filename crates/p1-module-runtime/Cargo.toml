@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 p1-module-protocol = { path = "../p1-module-protocol" }
+# The transport broker a provider component's lowered request is sent through (S4.7).
+p1-provider-http = { path = "../p1-provider-http" }
 p1-redact = { path = "../p1-redact" }
 thiserror = "2"
 # The executor task, its request channel and the per-call tasks it owns.

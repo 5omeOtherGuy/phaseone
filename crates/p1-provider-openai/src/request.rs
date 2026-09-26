@@ -18,6 +18,7 @@ use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_http::Credential;
 use serde_json::{Map, Value, json};
 
+use crate::replay::{self, Replay};
 use crate::{ResponsesAccount, ResponsesRoute};
 
 /// Namespace an adapter owns inside `ModelOptions::native`.
@@ -438,6 +439,20 @@ pub struct LoweredRequest {
     pub body: Vec<u8>,
 }
 
+/// The replay half of `validate_request`: which stored reasoning data is this
+/// instance's OWN is decided by the configured origin, and the portable
+/// `validate_request` takes no wire model — the route, profile and request alone are
+/// what S4.3.2's provider component hands it. `build_request` (and so
+/// `lower_request`) and the native provider's `validate` both run this, so no path
+/// that sends a request skips the ADR-0049 refusal.
+pub fn validate_history(
+    route: &ResponsesRoute,
+    wire_model: &str,
+    request: &ProviderRequest,
+) -> Result<(), ProviderError> {
+    input_items(request, &route.origin(wire_model)).map(|_| ())
+}
+
 /// Validate and lower one request exactly as the native provider's SSE path does
 /// before it opens a transport, so both fail with the same error and send the same
 /// bytes.
@@ -480,7 +495,7 @@ pub fn build_request(
     validate(route.account, profile, &request.options)?;
     let lowered = lower(profile, &request.options)?;
     let origin = route.origin(wire_model);
-    let input = input_items(request, &origin);
+    let input = input_items(request, &origin)?;
 
     let mut body = Map::new();
     body.insert("model".to_string(), json!(wire_model));
@@ -514,7 +529,7 @@ pub fn build_request(
     Ok(Value::Object(body))
 }
 
-fn input_items(request: &ProviderRequest, origin: &Origin) -> Vec<Value> {
+fn input_items(request: &ProviderRequest, origin: &Origin) -> Result<Vec<Value>, ProviderError> {
     let mut items = Vec::new();
     // call_id -> was the call freeform (`ToolInput::Text`). A tool result is
     // answered with the matching output item kind; a result without a matching
@@ -553,7 +568,7 @@ fn input_items(request: &ProviderRequest, origin: &Origin) -> Vec<Value> {
                             }
                         },
                         AssistantBlock::Reasoning { replay, .. } => {
-                            if let Some(replayed) = replayed_reasoning(replay.as_ref(), origin) {
+                            if let Some(replayed) = replayed_reasoning(replay.as_ref(), origin)? {
                                 items.push(replayed);
                             }
                         }
@@ -575,7 +590,7 @@ fn input_items(request: &ProviderRequest, origin: &Origin) -> Vec<Value> {
             }
         }
     }
-    items
+    Ok(items)
 }
 
 fn message_item(role: &str, text: &str) -> Value {
@@ -591,22 +606,39 @@ fn message_item(role: &str, text: &str) -> Value {
     })
 }
 
-/// Replay a reasoning block only for the origin that produced it, at version 1.
-/// A foreign or stale block is dropped rather than downgraded to text.
-fn replayed_reasoning(replay: Option<&ReplayData>, origin: &Origin) -> Option<Value> {
-    let replay = replay?;
-    if &replay.origin != origin || replay.version != 1 {
-        return None;
+/// The ONE replay rule for one reasoning block, so `validate_history`, `build_request`
+/// and the native provider's `validate` cannot disagree: a block of the configured
+/// origin that this build reads goes back byte-exact, one another origin wrote is
+/// dropped — never downgraded to assistant text (ADR-0018) — and one of OUR origin
+/// that this build does not read is refused, naming the item and both versions
+/// (ADR-0049).
+fn replayed_reasoning(
+    replay: Option<&ReplayData>,
+    origin: &Origin,
+) -> Result<Option<Value>, ProviderError> {
+    let Some(data) = replay else {
+        return Ok(None);
+    };
+    match replay::decode(data, origin) {
+        Replay::Foreign => Ok(None),
+        Replay::Carried(encrypted_content) => Ok(Some(json!({
+            "type": "reasoning",
+            "encrypted_content": encrypted_content,
+            "summary": [],
+        }))),
+        Replay::UnsupportedVersion { version } => Err(invalid(&format!(
+            "cannot replay the reasoning block of the assistant item from {}/{}: its replay \
+             data is version {version}, this route reads version {}",
+            data.origin.route,
+            data.origin.model,
+            replay::REPLAY_VERSION
+        ))),
+        Replay::UnsupportedPayload => Err(invalid(&format!(
+            "cannot replay the reasoning block of the assistant item from {}/{}: its replay \
+             payload carries no encrypted content",
+            data.origin.route, data.origin.model
+        ))),
     }
-    let encrypted = replay
-        .payload
-        .get("encrypted_content")
-        .and_then(Value::as_str)?;
-    Some(json!({
-        "type": "reasoning",
-        "encrypted_content": encrypted,
-        "summary": [],
-    }))
 }
 
 fn tool_declarations(tools: &[ToolDeclaration]) -> Vec<Value> {
@@ -1240,12 +1272,11 @@ mod tests {
             },
             ..matching.clone()
         };
-        let old_version = ReplayData {
-            version: 2,
-            ..matching.clone()
-        };
 
-        for replay in [foreign_route, foreign_model, old_version] {
+        // A foreign origin is dropped, whatever version it carries (ADR-0018).
+        let mut foreign_at_another_version = foreign_route.clone();
+        foreign_at_another_version.version = replay::REPLAY_VERSION + 1;
+        for replay in [foreign_route, foreign_model, foreign_at_another_version] {
             let request = request_with(
                 vec![assistant(vec![AssistantBlock::Reasoning {
                     text: "summary".to_string(),
@@ -1279,6 +1310,37 @@ mod tests {
             json!(["reasoning.encrypted_content"]),
             "replayed reasoning must request encrypted content"
         );
+    }
+
+    /// ADR-0049: a same-origin replay at another version used to be dropped silently;
+    /// the refusal now names the item, its origin and both versions. The native
+    /// provider's `validate` and `build_request` share the one lowering, so neither can
+    /// send a request the other would refuse.
+    #[test]
+    fn an_own_replay_at_another_version_is_refused_by_name() {
+        let stale = ReplayData {
+            origin: Origin {
+                route: crate::ROUTE.to_string(),
+                model: "gpt-test".to_string(),
+            },
+            version: replay::REPLAY_VERSION + 1,
+            payload: json!({ "type": "reasoning", "encrypted_content": "enc-1" }),
+        };
+        let request = request_with(
+            vec![assistant(vec![AssistantBlock::Reasoning {
+                text: "summary".to_string(),
+                replay: Some(stale),
+            }])],
+            Vec::new(),
+        );
+        let error = build("gpt-test", &request).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        for part in [crate::ROUTE, "gpt-test", "version 2", "version 1"] {
+            assert!(error.message.contains(part), "{part}: {}", error.message);
+        }
+        let error = validate_history(&route(), "gpt-test", &request).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(error.message.contains("version 2"), "{}", error.message);
     }
 
     #[test]
