@@ -161,24 +161,57 @@ impl WasmTool {
 /// Written field by field from the borrowed call instead of through a `WireToolCall`, which
 /// owns its strings: a call's input can be a whole history (tens of MiB), and the clone that
 /// conversion needs, plus the doublings of a growing buffer, were copies of it the module
-/// never sees. The buffer starts at the input's size with room for its escapes.
-fn wire_call(call: &ToolCall) -> Option<String> {
+/// never sees. The buffer starts at the input's size with room for its escapes, and the
+/// literals are written run by run ([`push_literal`]).
+fn wire_call(call: &ToolCall) -> String {
     let (kind, raw) = match &call.input {
         ToolInput::Json(raw) => ("json", raw),
         ToolInput::Text(raw) => ("text", raw),
     };
     let size = raw.len() + raw.len() / 4 + call.call_id.len() + call.name.len() + 128;
-    let mut text = Vec::with_capacity(size);
-    text.extend_from_slice(b"{\"call_id\":");
-    serde_json::to_writer(&mut text, &call.call_id).ok()?;
-    text.extend_from_slice(b",\"name\":");
-    serde_json::to_writer(&mut text, &call.name).ok()?;
-    text.extend_from_slice(b",\"input\":{\"kind\":\"");
-    text.extend_from_slice(kind.as_bytes());
-    text.extend_from_slice(b"\",\"raw\":");
-    serde_json::to_writer(&mut text, raw).ok()?;
-    text.extend_from_slice(b"}}");
-    String::from_utf8(text).ok()
+    let mut text = String::with_capacity(size);
+    text.push_str("{\"call_id\":");
+    push_literal(&mut text, &call.call_id);
+    text.push_str(",\"name\":");
+    push_literal(&mut text, &call.name);
+    text.push_str(",\"input\":{\"kind\":\"");
+    text.push_str(kind);
+    text.push_str("\",\"raw\":");
+    push_literal(&mut text, raw);
+    text.push_str("}}");
+    text
+}
+
+/// Appends `value` as a JSON string literal with serde_json's escapes: the short escape of
+/// a quote, a backslash, `\b`, `\f`, `\n`, `\r` and `\t`, `\u00xx` for every other control
+/// character, and nothing else escaped. Runs between two special bytes are copied whole;
+/// every special byte is ASCII, so each run is whole characters.
+fn push_literal(text: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = value.as_bytes();
+    text.push('"');
+    let mut run = 0;
+    while let Some(found) = special(bytes, run) {
+        text.push_str(&value[run..found]);
+        let byte = bytes[found];
+        match byte {
+            b'"' => text.push_str("\\\""),
+            b'\\' => text.push_str("\\\\"),
+            0x08 => text.push_str("\\b"),
+            0x0c => text.push_str("\\f"),
+            b'\n' => text.push_str("\\n"),
+            b'\r' => text.push_str("\\r"),
+            b'\t' => text.push_str("\\t"),
+            control => {
+                text.push_str("\\u00");
+                text.push(char::from(HEX[usize::from(control >> 4)]));
+                text.push(char::from(HEX[usize::from(control & 0xf)]));
+            }
+        }
+        run = found + 1;
+    }
+    text.push_str(&value[run..]);
+    text.push('"');
 }
 
 /// The module's `tool_outcome` text as a `ToolOutcome`, exactly as the protocol's
@@ -385,10 +418,9 @@ impl Tool for WasmTool {
     }
 
     fn effect(&self, call: &ToolCall) -> Effect {
-        let Some(call) = wire_call(call) else {
-            return Effect::Executes;
-        };
-        let results = self.restricted.call("effect", &[Val::String(call)]);
+        let results = self
+            .restricted
+            .call("effect", &[Val::String(wire_call(call))]);
         match results.and_then(|results| results.into_iter().next()) {
             Some(Val::Enum(case)) => match case.as_str() {
                 "read-only" => Effect::ReadOnly,
@@ -402,8 +434,10 @@ impl Tool for WasmTool {
     }
 
     fn describe(&self, call: &ToolCall) -> CallDescription {
-        wire_call(call)
-            .and_then(|call| string_result(self.restricted.call("describe", &[Val::String(call)])))
+        let results = self
+            .restricted
+            .call("describe", &[Val::String(wire_call(call))]);
+        string_result(results)
             .and_then(|text| serde_json::from_str::<WireCallDescription>(&text).ok())
             .map(CallDescription::from)
             .unwrap_or_else(empty_description)
@@ -411,13 +445,12 @@ impl Tool for WasmTool {
 
     fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
         let item = serde_json::to_string(&WireItem::from(Item::ToolResult(result.clone()))).ok();
-        let described = wire_call(call)
-            .zip(item)
-            .and_then(|(call, item)| {
-                string_result(
-                    self.restricted
-                        .call("describe-result", &[Val::String(call), Val::String(item)]),
-                )
+        let described = item
+            .and_then(|item| {
+                string_result(self.restricted.call(
+                    "describe-result",
+                    &[Val::String(wire_call(call)), Val::String(item)],
+                ))
             })
             .and_then(|text| serde_json::from_str::<WireResultDescription>(&text).ok())
             .and_then(|wire| ResultDescription::try_from(wire).ok());
@@ -435,13 +468,13 @@ impl Tool for WasmTool {
         context: ToolContext,
     ) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
-            let Some(call) = wire_call(call) else {
-                return ModuleFailure::InvalidOutput("the call cannot be serialized".to_owned())
-                    .into_tool_outcome();
-            };
             let results = self
                 .executor
-                .call("execute", vec![Val::String(call)], context.cancel)
+                .call(
+                    "execute",
+                    vec![Val::String(wire_call(call))],
+                    context.cancel,
+                )
                 .await;
             let outcome = results.and_then(|results| {
                 let text = string_result(Some(results)).ok_or_else(|| {
@@ -461,16 +494,25 @@ mod tests {
     use super::*;
 
     /// The hand-written call text is the protocol's own serialization, byte for byte, for
-    /// both input kinds and for text every escape of JSON touches.
+    /// both input kinds and for text every escape of JSON touches, each special byte in
+    /// every lane of the eight-byte scan.
     #[test]
     fn the_call_text_is_the_wire_tool_calls_json() {
         let awkward = "quote\" backslash\\ newline\n tab\t nul\u{0} del\u{7f} \u{2028} \u{1f600}";
-        for input in [
+        let mut inputs = vec![
             ToolInput::Text("echo:hi".to_owned()),
             ToolInput::Json("{\"path\":\"src/lib.rs\"}".to_owned()),
             ToolInput::Text(awkward.to_owned()),
             ToolInput::Json(String::new()),
-        ] {
+        ];
+        for pad in 0..9 {
+            let every: String = (0u8..0x80).map(char::from).collect();
+            inputs.push(ToolInput::Text(format!(
+                "{}{every}{every}",
+                "x".repeat(pad)
+            )));
+        }
+        for input in inputs {
             let call = ToolCall {
                 call_id: format!("c1 {awkward}"),
                 name: "fixture\"".to_owned(),
@@ -478,7 +520,7 @@ mod tests {
             };
             let expected = serde_json::to_string(&WireToolCall::from(call.clone()))
                 .expect("a wire call serializes");
-            assert_eq!(wire_call(&call).as_deref(), Some(expected.as_str()));
+            assert_eq!(wire_call(&call), expected);
         }
     }
 
