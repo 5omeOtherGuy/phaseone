@@ -35,3 +35,11 @@ p1-testkit = { path = "../p1-testkit" }
 p1-workers = { path = "../p1-workers" }
 # workflow_boundary.rs: the workflow substrate driven through its decision seam (S6.3).
 p1-workflow = { path = "../p1-workflow" }
+# provider_wire.rs (S4.4): the provider adapters' portable halves, their wire forms and
+# the model policy they are composed with. `default-features = false` because a provider
+# component reaches no transport, runtime or credential code.
+p1-module-protocol = { path = "../p1-module-protocol" }
+p1-model-profile = { path = "../p1-model-profile" }
+p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false }
+p1-provider-openai = { path = "../p1-provider-openai", default-features = false }
+p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false }

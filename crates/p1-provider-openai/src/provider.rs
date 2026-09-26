@@ -30,7 +30,7 @@ use crate::ResponsesRoute;
 use crate::parser::CodexResponseParser;
 use crate::request::{
     build_headers, build_headers_without_credential, build_request, clamped_cache_key,
-    resolve_base_url, validate_composition, validate_request,
+    resolve_base_url, validate_composition, validate_history, validate_request,
 };
 use crate::websocket::{self, WebSocket};
 
@@ -253,7 +253,10 @@ impl Provider for OpenAiCodexProvider {
     }
 
     fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
-        validate_request(&self.route, &self.profile, request)
+        validate_request(&self.route, &self.profile, request)?;
+        // The replay half of the history check needs the configured wire model, which
+        // the portable `validate_request` does not take (ADR-0049).
+        validate_history(&self.route, &self.wire_model, request)
     }
 
     fn stream<'a>(
