@@ -54,8 +54,11 @@ pub enum ProcessEvent {
 /// The native process service a module's `process` capability is linked to. The real one
 /// is the service extracted from `p1-tool-shell`; the runtime only adapts it.
 pub trait ProcessService: Send + Sync {
-    /// Starts `command` for a call whose cancellation is `cancel`. `Err` names why nothing
-    /// started.
+    /// Starts `command` for a call whose cancellation is `cancel`. The future settles the
+    /// start even when `cancel` fires while it runs: a service that started the command
+    /// returns its handle (the runtime reports the cancellation to the guest through it), and
+    /// one that started nothing returns `Err`. `Err` names why nothing started, never the
+    /// cancellation, which `process.wit` has no `spawn` error for.
     fn spawn(
         &self,
         command: ProcessCommand,
@@ -143,6 +146,26 @@ impl HostRunning {
             None => self.finished = true,
         }
         event
+    }
+}
+
+/// The `process.running` a cancelled call gets when its service refused to start a command:
+/// the guest reads the cancellation where `process.wit` says it is — `exited(cancelled)` on
+/// the resource — instead of a `spawn` error it could only report as a plain failure. No
+/// command ran, so there is nothing to kill and nothing to read.
+struct CancelledStart;
+
+fn cancelled_start() -> Box<dyn RunningProcess> {
+    Box::new(CancelledStart)
+}
+
+impl RunningProcess for CancelledStart {
+    fn next(&mut self) -> BoxFuture<'_, Option<ProcessEvent>> {
+        Box::pin(async { Some(ProcessEvent::Exited(ExitStatus::Cancelled)) })
+    }
+
+    fn kill(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
     }
 }
 
@@ -305,12 +328,16 @@ fn link_process(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
                 bail!("process.spawn called without a process service");
             };
             let cancel = store.data().cancel.clone();
-            // A cancelled call starts nothing; a cancellation while the service is starting
-            // the command ends the wait, and the half-started process is dropped, which ends it.
-            let spawned = tokio::select! {
-                biased;
-                () = cancel.cancelled() => Err("the call was cancelled".to_owned()),
-                spawned = service.spawn(command, cancel.clone()) => spawned,
+            // A cancellation is never answered with `err`: `process.wit` reserves that for a
+            // command that could not start and gives the guest one way to read a cancellation
+            // — the resource's `exited(cancelled)`. So this wait is not raced against the
+            // cancellation (the service holds the token and settles the start itself), and a
+            // service that refused to start for the cancellation yields a resource reporting
+            // that ending at once instead of an `err` the guest would report as a failure.
+            let spawned = service.spawn(command, cancel.clone()).await;
+            let spawned = match spawned {
+                Err(_) if cancel.is_cancelled() => Ok(cancelled_start()),
+                spawned => spawned,
             };
             results[0] = match spawned {
                 Ok(process) => {

@@ -201,8 +201,12 @@ pub(crate) fn interface_import(interface: &str) -> String {
 ///
 /// The count lives beside the engine's own epoch because the engine's epoch also advances
 /// for another reason: a cancelled call bumps it ([`Epochs::interrupt`]) so that a guest in
-/// a CPU loop reaches its epoch callback at once. Deadlines read only this count, so an
-/// interrupt never brings another call's deadline closer.
+/// a CPU loop reaches its epoch callback at once. Execute deadlines read only this count, so
+/// an interrupt never brings another call's deadline closer. The restricted backstop of
+/// [`crate::restricted`] is the exception: it is the engine's own epoch, so each interrupt
+/// spends one of its [`RESTRICTED_DEADLINE_TICKS`](crate::restricted::RESTRICTED_DEADLINE_TICKS)
+/// ticks and may end an inspection early, which is why the fuel bound rather than the
+/// backstop is what normally stops a runaway inspection.
 pub(crate) struct Epochs {
     engine: Engine,
     ticks: watch::Sender<u64>,

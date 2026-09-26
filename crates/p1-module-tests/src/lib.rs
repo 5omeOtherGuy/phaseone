@@ -171,6 +171,9 @@ pub struct SpawnedProcess {
 pub enum ProcessRecord {
     /// A command was started.
     Spawned(String),
+    /// `spawn` found no settlement and waits for the test: the module is blocked in the
+    /// import. Only the gated fake ([`gated_processes`]) records this.
+    SpawnWaiting,
     /// The command's native effect: a `touch <name>` command created this file in
     /// [`FakeProcesses::markers`] before it started waiting.
     Effect(PathBuf),
@@ -244,6 +247,9 @@ struct FakeProcessService {
     spawned: mpsc::UnboundedSender<SpawnedProcess>,
     records: mpsc::UnboundedSender<ProcessRecord>,
     markers: PathBuf,
+    /// Present in the gated fake: `spawn` waits for the test's [`Settlement`] before it
+    /// settles the start, so a case can act on a call that is blocked inside the import.
+    gate: Option<tokio::sync::Mutex<mpsc::UnboundedReceiver<Settlement>>>,
 }
 
 struct FakeRunning {
@@ -259,15 +265,47 @@ struct FakeRunning {
 /// It records what happens ([`ProcessRecord`]) and performs one native effect: a command
 /// `touch <name>` creates `<name>` in [`FakeProcesses::markers`] when it starts.
 pub fn fake_processes() -> (Arc<dyn ProcessService>, FakeProcesses) {
+    let (process, records, processes) = fake_parts();
+    (
+        Arc::new(FakeProcessService {
+            spawned: process,
+            records,
+            markers: processes.markers().to_owned(),
+            gate: None,
+        }),
+        processes,
+    )
+}
+
+/// As [`fake_processes`], but its `spawn` waits for the test to settle the start
+/// ([`SpawnGate`]): a case can cancel a call while the module is blocked in `process.spawn`.
+pub fn gated_processes() -> (Arc<dyn ProcessService>, FakeProcesses, SpawnGate) {
+    let (process, records, processes) = fake_parts();
+    let (settle, settlement) = mpsc::unbounded_channel();
+    (
+        Arc::new(FakeProcessService {
+            spawned: process,
+            records,
+            markers: processes.markers().to_owned(),
+            gate: Some(tokio::sync::Mutex::new(settlement)),
+        }),
+        processes,
+        SpawnGate { settle },
+    )
+}
+
+/// The sender halves and the test's side both fakes are built from.
+fn fake_parts() -> (
+    mpsc::UnboundedSender<SpawnedProcess>,
+    mpsc::UnboundedSender<ProcessRecord>,
+    FakeProcesses,
+) {
     let (spawned, spawned_receiver) = mpsc::unbounded_channel();
     let (records, records_receiver) = mpsc::unbounded_channel();
     let markers = tempfile::tempdir().expect("marker dir");
     (
-        Arc::new(FakeProcessService {
-            spawned,
-            records,
-            markers: markers.path().to_owned(),
-        }),
+        spawned,
+        records,
         FakeProcesses {
             spawned: spawned_receiver,
             records: records_receiver,
@@ -277,6 +315,36 @@ pub fn fake_processes() -> (Arc<dyn ProcessService>, FakeProcesses) {
     )
 }
 
+/// How the test settles a [`gated_processes`] `spawn` that waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settlement {
+    /// Start the command, as a service does whose start the cancellation did not stop.
+    Start,
+    /// Refuse it, as a service may that noticed the call's cancellation first.
+    Refuse,
+}
+
+/// The test's side of [`gated_processes`]: what the blocked `spawn` settles as.
+pub struct SpawnGate {
+    settle: mpsc::UnboundedSender<Settlement>,
+}
+
+impl SpawnGate {
+    /// Lets the blocked `spawn` start its command.
+    pub fn start(&self) {
+        self.settle
+            .send(Settlement::Start)
+            .expect("the fake process service is gone");
+    }
+
+    /// Lets the blocked `spawn` answer `err` without starting anything.
+    pub fn refuse(&self) {
+        self.settle
+            .send(Settlement::Refuse)
+            .expect("the fake process service is gone");
+    }
+}
+
 impl ProcessService for FakeProcessService {
     fn spawn(
         &self,
@@ -284,6 +352,14 @@ impl ProcessService for FakeProcessService {
         _cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<Box<dyn RunningProcess>, String>> {
         Box::pin(async move {
+            if let Some(gate) = &self.gate {
+                let _ = self.records.send(ProcessRecord::SpawnWaiting);
+                let settlement = gate.lock().await.recv().await;
+                // A gate the test dropped settles as a refusal, so a case cannot hang here.
+                if settlement != Some(Settlement::Start) {
+                    return Err("the fake service refused to start a cancelled command".to_owned());
+                }
+            }
             let _ = self
                 .records
                 .send(ProcessRecord::Spawned(command.script.clone()));

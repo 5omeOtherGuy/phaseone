@@ -1,25 +1,28 @@
 //! Cancellation and the streaming-resource contract (S0.6, freeze items 4 and 10): epoch
 //! deadline, fuel, cooperative `control.cancelled()`, the cancellation interrupt of a CPU
-//! loop, a blocked `process.running.next` woken by cancellation, the caller dropping a call
-//! while it waits, the guest dropping its resource, `next` after the terminal event, and the
-//! rule that a trap never undoes a native effect.
+//! loop, a blocked `process.spawn` and a blocked `process.running.next` woken by a
+//! cancellation, the caller dropping a call while it waits, the guest dropping its resource,
+//! `next` after the terminal event, and the rule that a trap never undoes a native effect.
 //!
 //! Every case runs on a current-thread and a multi-thread Tokio runtime under the deadlock
 //! guard. Epochs never advance on their own here (`Loader::with_manual_epochs`) and every
 //! wait is on an explicit signal from the fake process service, never on a sleep. Where a
 //! case must act on a guest that is already running a CPU loop, it uses the fixture's
 //! `announce:<mode>` prefix: the guest spawns the command `announce` before the loop, and
-//! the fake's record of that spawn is the signal.
+//! the fake's record of that spawn is the signal. Where it must act on a guest blocked
+//! inside `process.spawn`, it uses the gated fake ([`gated_processes`]), whose `spawn`
+//! stays pending until the case settles it.
 
 use std::sync::Arc;
 
 use p1_contracts::{CancellationToken, Tool, ToolContext, ToolStatus};
 use p1_module_runtime::loader::EPOCH_TICK;
 use p1_module_runtime::{
-    ExecutionLimits, ExitStatus, ManualEpochs, ProcessEvent, Services, wasm_tool,
+    ExecutionLimits, ExitStatus, ManualEpochs, ProcessEvent, ProcessService, Services, wasm_tool,
 };
 use p1_module_tests::{
     FIXTURE_NAME, FakeProcesses, KILLED_EXIT, ProcessRecord, Release, call, fake_processes,
+    gated_processes,
 };
 use p1_redact::MaskCounter;
 
@@ -54,6 +57,8 @@ on_both_flavours!(
     a_small_fuel_budget_stops_a_cpu_loop,
     a_cooperative_guest_returns_cancelled,
     cancellation_interrupts_a_cpu_loop,
+    a_cancellation_during_spawn_ends_the_call_cancelled,
+    a_refused_cancelled_spawn_ends_the_call_cancelled,
     cancellation_wakes_a_blocked_next,
     dropping_the_call_while_next_is_blocked_kills_the_process,
     a_guest_drop_kills_the_process,
@@ -75,10 +80,23 @@ struct Case {
 }
 
 fn case(limits: ExecutionLimits) -> Case {
+    let (process, processes) = fake_processes();
+    let (tool, epochs) = tool_over(process, limits);
+    Case {
+        tool,
+        processes,
+        epochs,
+    }
+}
+
+/// The fixture tool over `process`, with epochs only [`ManualEpochs::advance`] moves.
+fn tool_over(
+    process: Arc<dyn ProcessService>,
+    limits: ExecutionLimits,
+) -> (Arc<dyn Tool>, ManualEpochs) {
     let release = Release::with_fixture();
     let (loader, epochs) = release.loader_with_manual_epochs();
     let module = loader.load(FIXTURE_NAME).expect("load the fixture");
-    let (process, processes) = fake_processes();
     let tool = wasm_tool(
         &module,
         Services {
@@ -88,11 +106,7 @@ fn case(limits: ExecutionLimits) -> Case {
         &Arc::new(MaskCounter::new()),
     )
     .expect("the fixture is a tool");
-    Case {
-        tool,
-        processes,
-        epochs,
-    }
+    (tool, epochs)
 }
 
 fn context(cancel: &CancellationToken) -> ToolContext {
@@ -223,6 +237,57 @@ async fn cancellation_interrupts_a_cpu_loop() {
     let records = processes.wait_for(&ProcessRecord::Dropped).await;
     assert!(records.contains(&ProcessRecord::Killed), "{records:?}");
     assert_usable(&tool, "an interrupted loop").await;
+}
+
+async fn a_cancellation_during_spawn_ends_the_call_cancelled() {
+    // The guest is blocked inside `process.spawn` when the cancellation fires. The service
+    // settles the start it was asked for, and the guest reads the cancellation in the one
+    // place `process.wit` has for it — the resource's `exited(cancelled)`, which the
+    // fixture's `stream` mode answers with its `cancelled` status. It is never a `spawn`
+    // error, which no guest could tell from a command that could not start.
+    let (process, mut processes, gate) = gated_processes();
+    let (tool, _epochs) = tool_over(process, ExecutionLimits::default());
+    let cancel = CancellationToken::new();
+    let running = start(&tool, "stream:make it", &cancel);
+    processes.wait_for(&ProcessRecord::SpawnWaiting).await;
+
+    cancel.cancel();
+    gate.start();
+    let outcome = running.await.expect("the executing task");
+    assert_eq!(outcome.status, ToolStatus::Cancelled, "{}", outcome.content);
+    assert_eq!(outcome.content, "");
+    let records = processes.wait_for(&ProcessRecord::Dropped).await.to_vec();
+    assert!(
+        records.contains(&ProcessRecord::Spawned("make it".to_owned())),
+        "{records:?}"
+    );
+    // The host killed the group of the call that was cancelled, as `process.wit` says.
+    assert!(records.contains(&ProcessRecord::Killed), "{records:?}");
+    assert_usable(&tool, "a cancellation during spawn").await;
+}
+
+async fn a_refused_cancelled_spawn_ends_the_call_cancelled() {
+    // A service may notice the cancellation while it starts and refuse the command. That is
+    // not a failure the guest may act on either: `process.wit` gives `spawn` no cancellation
+    // return, so the host hands the guest a resource that reports the cancelled ending at
+    // once, and nothing was started to kill or drop.
+    let (process, mut processes, gate) = gated_processes();
+    let (tool, _epochs) = tool_over(process, ExecutionLimits::default());
+    let cancel = CancellationToken::new();
+    let running = start(&tool, "stream:make it", &cancel);
+    processes.wait_for(&ProcessRecord::SpawnWaiting).await;
+
+    cancel.cancel();
+    gate.refuse();
+    let outcome = running.await.expect("the executing task");
+    assert_eq!(outcome.status, ToolStatus::Cancelled, "{}", outcome.content);
+    assert_eq!(outcome.content, "");
+    let records = processes.records().to_vec();
+    assert!(
+        !records.contains(&ProcessRecord::Spawned("make it".to_owned())),
+        "{records:?}"
+    );
+    assert_usable(&tool, "a refused cancelled spawn").await;
 }
 
 async fn cancellation_wakes_a_blocked_next() {
