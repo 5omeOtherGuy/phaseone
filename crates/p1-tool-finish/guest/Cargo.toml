@@ -1,0 +1,17 @@
+[package]
+name = "p1-finish-guest"
+description = "The guest behaviour of the p1 `finish` tool: input, declaration texts, the check of a call against the session record, every result and rejection text and the output-contract check, shared by the component, the native adapter and the host's completion hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Pure computation only (programme decision D-XO-8): serde and serde_json and nothing else,
+# so the same code builds for the native adapter and for the `wasm32-unknown-unknown`
+# component (docs/design/modules/package.md, "Shared guest logic", decision S0-R3).
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

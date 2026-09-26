@@ -45,6 +45,9 @@ p1-tool-search = { path = "../p1-tool-search" }
 p1-tool-shell = { path = "../p1-tool-shell" }
 p1-tool-patch = { path = "../p1-tool-patch" }
 p1-tool-finish = { path = "../p1-tool-finish" }
+# S3.7: the completion hub re-verifies a `finish` component's candidates with the same
+# command rules and contract check the component ships (ADR-0083 §2).
+p1-finish-guest = { path = "../p1-tool-finish/guest" }
 # Issue #142: credential-shape masking for every assembled tool and its per-turn count.
 p1-redact = { path = "../p1-redact" }
 p1-hook-shadow = { path = "../p1-hook-shadow", optional = true }
