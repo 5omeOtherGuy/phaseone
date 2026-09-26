@@ -1,7 +1,7 @@
 ---
 adr: 77
 title: Builds on the stream boxes
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: owner+lead
 supersedes: []
@@ -80,6 +80,28 @@ each stream's box". It supersedes nothing. It replaces the dropped "Dedicated bu
 ## Evidence
 
 - The bwrap probe succeeds on box wasm-s0 (the sandbox tests run rather than skip).
-- `scripts/module-toolchain.sh --check` and `scripts/gate.sh` pass on box wasm-s0 and in the
-  PR's `gate` check on a GitHub-hosted runner (the lead adds the run ids and the merge commit at
-  acceptance).
+- This ADR landed with S0.1, PR #205, merge commit `0c359b8d`
+  (`0c359b8df904acdc9badb1f21b9fcca9b8758ed5`), together with `scripts/module-toolchain.sh`,
+  `scripts/build-modules.sh` and the gate's module hook. `scripts/module-toolchain.sh --check`
+  and `scripts/gate.sh` passed on box wasm-s0 and in the PR's `gate` check on a GitHub-hosted
+  runner.
+- Every S0 PR since ran both gate variants of the table above: the full `scripts/gate.sh` on box
+  wasm-s0, ending `== gate: GREEN` with the bubblewrap tests running, recorded per slice in the
+  evidence bundle `.wasm/up/evidence/` on box wasm-s0; the PR's `gate` check on a GitHub-hosted
+  runner; and main's `gate` check on the merge commit.
+
+  | Slice | PR | Merge commit | PR `gate` run (GitHub-hosted) | Main `gate` run on the merge commit |
+  |---|---|---|---|---|
+  | S0.1 | #205 | `0c359b8d` | 36159802836, success | 36160382357, success |
+  | S0.3.1 | #209 | `07881e99` | 36165077022, success | 36166930390, success |
+  | S0.2 | #218 | `89922da2` | 36169318570, success | 36173616397, success |
+  | S0.3.2 | #226 | `2f9c2223` | 36176257703, success | 36176731212 cancelled by the concurrency group; covered by the descendant `e850cb88` run 36176937286, success |
+  | S0.4 | #240 | `a64d9e76` | 36188133134, success | 36188665897, success |
+  | S0.3.3 | #245 | `36ec6e16` | 36189476717, success | 36190044937, success |
+  | S0.5 | #252 | `4872fd78` | 36197210537, success | 36199422718, success |
+  | S0.7 | #270 | `e8682c7e` | 36204319435, success | 36207266519, success |
+  | S0.6 | #272 | `a808a2ed` | 36208129255, success | 36208468329 cancelled by the concurrency group; covered by the descendant `acbe4304` run 36208581179, success |
+  | S0.8 | #271 | `acbe4304` | 36208278230, success | 36208581179, success |
+
+- Accepted with S0's boundary ADRs (ADR-0081, ADR-0082) in slice S0.9, PR #269, on the `judge`
+  role's ACCEPT of that slice.

@@ -90,10 +90,12 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0074 | [A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login](0074-a-second-claude-subscription-route-claude-code-oauth-borrows-a-named-login-directory-and-p1-login-imports-a-login.md) | proposed | 2026-09-25 | owner |
 | ADR-0075 | [The TUI shows workflow runs as a live tree through a structured FrontEnd seam](0075-the-tui-shows-workflow-runs-as-a-live-tree-through-a-structured-frontend-seam.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0076 | [Manual compaction: /compact in the TUI and --compact on resume](0076-manual-compaction-compact-in-the-tui-and-compact-on-resume.md) | proposed | 2026-09-25 | owner+lead |
-| ADR-0077 | [Builds on the stream boxes](0077-builds-on-the-stream-boxes.md) | proposed | 2026-09-25 | owner+lead |
+| ADR-0077 | [Builds on the stream boxes](0077-builds-on-the-stream-boxes.md) | accepted | 2026-09-25 | owner+lead |
 | ADR-0078 | [Connection resources and component replacement](0078-connection-resources-and-component-replacement.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0079 | [Verified module releases and installation](0079-verified-module-releases-and-installation.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0080 | [Execution manifests in journals](0080-execution-manifests-in-journals.md) | proposed | 2026-09-25 | lead |
+| ADR-0081 | [Native foundation and runtime components](0081-native-foundation-and-runtime-components.md) | accepted | 2026-09-26 | owner+lead |
+| ADR-0082 | [Component ABI and execution ownership](0082-component-abi-and-execution-ownership.md) | accepted | 2026-09-26 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

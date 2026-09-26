@@ -1,7 +1,8 @@
 # Module WIT: worlds, capabilities and streaming resources
 
-Status: published freeze items 1, 3 and 10 of the WebAssembly boundary (ADR-0071), with the
-per-class capability allocation of item 13 and the restricted path of item 4. The package is
+Status: published freeze items 1, 3, 9 and 10 of the WebAssembly boundary (ADR-0071), with the
+per-class capability allocation of item 13 and the WIT part of item 4 (the runtime's part is
+[`cancellation.md`](cancellation.md)). The package is
 [`modules/wit/`](../../../modules/wit/); the values it carries are described in
 [`protocol.md`](protocol.md).
 
@@ -247,10 +248,55 @@ holds unchanged: a WebSocket failure before any output of a request is reported 
 and the component chooses the retry's form; a failure after output ends the response as a
 failure, with no retry and no fallback.
 
-## Decisions S0-R1 and S0-R2
+## Transport: retry, backoff and the one refresh stay native (freeze item 9)
+
+A provider component lowers requests and classifies events; everything that sends, waits or
+retries is the native transport broker's (F2). The broker is `p1-provider-http`'s native half —
+the retrying driver [`drive.rs`](../../../crates/p1-provider-http/src/drive.rs), the retry policy
+[`retry.rs`](../../../crates/p1-provider-http/src/retry.rs) and the credential seam
+[`credential.rs`](../../../crates/p1-provider-http/src/credential.rs), behind the crate's `native`
+feature — with the `p1-auth` credential source. It keeps, for HTTP and WebSocket alike:
+
+- **Sending** and the connection's lifetime: the request, TLS, the WebSocket handshake,
+  ping/pong, bounded writes and raw-frame activity, and dropping a connection after a cancelled
+  or failed response.
+- **Retry and backoff**: one shared transient-retry budget (`RetryPolicy`) with bounded backoff
+  that races the request's cancellation, honouring a server `Retry-After`, and never a retry
+  once any output of the response has been forwarded.
+- **The one credential refresh**: after a 401 or 403 the broker refreshes the rejected
+  credential once and re-sends; a second 401 or 403 is terminal as `authentication`; a route
+  whose credential an egress proxy injects is never refreshed.
+- **The read bounds**: the first-byte and stream-idle bounds that end a provider which never
+  answers.
+- **Credentials**: the broker attaches the credential as the lowered request's
+  `credential-use` names and refuses a lowered request whose own headers carry one; no import
+  returns a credential value.
+
+The component's part is pure translation, and each export is the module form of a native
+parser seam:
+
+| Export | What the component decides | Native counterpart |
+|---|---|---|
+| `lower` | the request's method, path, headers without credentials, credential placement and body; for a WebSocket route the handshake head, the frame, a continuation or the fallback to HTTP, from the broker's `connection-state` | the adapter's request builder |
+| `classify` | the closed `provider-error` kind and message of a non-2xx response or a refused upgrade | `ResponseParser::on_http_error` |
+| `decoding.decoder` | the stream events of each framed event (`feed`), and the ending of a body that stops without a terminal event (`finish`) | `ResponseParser` over the shared SSE decoder |
+
+The broker classifies the status itself (`classify_status` in
+[`status.rs`](../../../crates/p1-provider-http/src/status.rs)), calls `classify` on every
+non-2xx response, and applies its own policy to the status class and the returned kind exactly
+as `drive` does for a native adapter: a kind that says the account is exhausted or not entitled
+is not refreshed, and a usage-limit kind is not retried. So a component can shape a failure's
+kind but never trigger a retry, a refresh or a re-send; after a WebSocket failure before any
+output the broker calls `lower` again and the component only chooses that retry's form (above).
+A module failure on the provider path maps to a provider error the broker's policy already
+knows — `DeadlineExceeded` to `transport`, a trap or invalid output to `protocol`, never
+retried ([`protocol.md`](protocol.md#error-mapping-freeze-item-5)).
+
+## Decisions S0-R1, S0-R2, S0-R4 and S0-R5
 
 Boundary changes other streams asked for, routed by the programme lead and decided by the S0
-lead before the freeze. The package version stays `1.0.0`: nothing is frozen yet.
+lead before the freeze. The package version stays `1.0.0`: the decisions were made before
+`wasm-boundary-v1`, which freezes them with the rest of the package.
 
 | Decision | Asked by | What changed |
 |---|---|---|
@@ -259,6 +305,11 @@ lead before the freeze. The package version stays `1.0.0`: nothing is frozen yet
 | S0-R1.3 | S6 | `workers` is split into `worker-types`, `workers-start`, `workers-observe` and `workers-control`, so per-member worker capabilities stay a static fact of a component's imports. `workflows` stays one interface. |
 | S0-R2.1 | S5 | `authorize` returns the world-local `verdict` (`permit`, `deny`, `ask`); the host resolves `ask`, and `types.decision` is unchanged. |
 | S0-R2.2 | S5 | The continuation and the HTTP/SSE fallback move from the broker into the provider component, decided from the broker's `connection-state`; `lowered-request` becomes a variant and the `continuation` record goes away. |
+| S0-R4 | S6 | `workflow-decision` is a manifest `kind` with the allocation `control`, `clock` ([`package.md`](package.md#manifest-fields-frozen), [`modules/capabilities.toml`](../../../modules/capabilities.toml)); the three worker interfaces of S0-R1.3 are separate entries of the frozen allocation data, so a manifest may grant `workers-observe` alone; `modules/p1-bindings-workflow-decision/` holds the world's bindings on the binding-crate pattern ([`capabilities.md`](capabilities.md#the-unsafe-policy-freeze-item-11)). Landed with S0.7 (PR #270). |
+| S0-R5 | S5 | Doc comment of `summary` in [`session.wit`](../../../modules/wit/session.wit), no type change: the host sends `max-output-tokens` exactly as the module gives it; the agent's own limit reaches the module in the context policy's `configure` settings as `max_output_tokens`, and the module applies it to its first request and owns the retry policy. Landed with S0.7 (PR #270). |
+
+S0-R3 (S3, shared guest logic) is published in
+[`package.md`](package.md#shared-guest-logic-s0-r3).
 
 ## Cancellation and the restricted path (freeze item 4, the WIT part)
 
