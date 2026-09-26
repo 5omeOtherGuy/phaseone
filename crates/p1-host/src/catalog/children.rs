@@ -274,6 +274,28 @@ impl EventSink for TurnEndTap {
     }
 }
 
+/// `records` with every tool start of a worker member package (S6.11) under the identity
+/// the native `p1-tool-delegate` members journalled, the one `workers_started_in` reads:
+/// the member's `worker_start` result text is the native one, so a session journalled by
+/// either reports its workers the same way.
+#[cfg(feature = "delegation")]
+fn as_delegate_records(
+    records: &[p1_contracts::JournalRecord],
+) -> Vec<p1_contracts::JournalRecord> {
+    records
+        .iter()
+        .map(|record| {
+            let mut record = record.clone();
+            if let p1_contracts::RecordBody::ToolStarted { identity, .. } = &mut record.body
+                && super::delegation::WORKER_MODULES.contains(&identity.implementation.as_str())
+            {
+                identity.implementation = "p1-tool-delegate".to_string();
+            }
+            record
+        })
+        .collect()
+}
+
 /// Workers live in the process that started them: their sessions are in memory and
 /// are NOT restored with the parent's (ADR-0034). A resumed history that mentions
 /// workers is therefore talking about agents that no longer exist. Say so — to the
@@ -287,7 +309,7 @@ pub(crate) fn announce_lost_workers(
     session_file: Option<&Path>,
     records: &[p1_contracts::JournalRecord],
 ) -> Result<(), String> {
-    let earlier = p1_tool_delegate::workers_started_in(records);
+    let earlier = p1_tool_delegate::workers_started_in(&as_delegate_records(records));
     // `workers_started_in` reads only the delegate tool's own results, so workers a
     // WORKFLOW started are missing from it. Their run journals name them, and the
     // step's own `<session>.w<N>.jsonl` file may be gone or still there; every source

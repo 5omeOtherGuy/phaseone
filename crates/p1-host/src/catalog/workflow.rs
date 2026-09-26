@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use p1_assembly::{Catalog, ToolServices, ToolSpec};
-use p1_contracts::{BoxFuture, CancellationToken, InboxKind, Tool};
+use p1_assembly::{Catalog, ToolServices};
+use p1_contracts::{BoxFuture, CancellationToken, InboxKind};
 use p1_core::Inbox;
 use p1_module_runtime::Services;
 use p1_module_runtime::delegation::WorkflowServices;
@@ -24,16 +24,17 @@ use p1_workflow::{
 };
 
 use crate::HostDeps;
-use crate::catalog::modules::ModuleServices;
+use crate::catalog::modules::{ModuleServices, register_host_entry};
 use crate::frontend::{
     FrontEnd, WorkflowRunEnded, WorkflowRunStarted, WorkflowStepEnded, WorkflowStepStarted,
 };
 use crate::run::{ChildBuilder, TurnEndCell};
 
 /// The workflow family's member module ids, as the packages' manifests name them, in the
-/// order the native members are appended after the worker tools ([`WORKFLOW_TOOLS`] has
-/// the same order). An environment that names one of their packages takes the module path
-/// for the family, exactly as the worker family does (`catalog/delegation.rs`).
+/// order the members are appended after the worker tools ([`WORKFLOW_TOOLS`] has the same
+/// order). Each is an official-release host entry (S6.11); an environment that names one of
+/// their packages by its lock key gets only the members it names, exactly as the worker
+/// family does (`catalog/delegation.rs`).
 #[cfg(feature = "workflows")]
 pub const WORKFLOW_MODULES: [&str; 4] = [
     "p1/workflow-start",
@@ -42,7 +43,7 @@ pub const WORKFLOW_MODULES: [&str; 4] = [
     "p1/workflow-cancel",
 ];
 
-/// The native members' catalog keys, appended after the worker tools.
+/// The members' catalog keys, appended after the worker tools.
 #[cfg(feature = "workflows")]
 pub(crate) const WORKFLOW_TOOLS: [&str; 4] = [
     "workflow_start",
@@ -55,7 +56,8 @@ pub(crate) const WORKFLOW_TOOLS: [&str; 4] = [
 // public module (the `delegation` module is the crate's own), so the host-level
 // activation tests drive the same hook the host installs.
 pub use super::delegation::{
-    Capabilities, MemberScopes, WORKER_MODULES, with_worker_tools, worker_member_services,
+    Capabilities, MemberEntries, MemberScopes, WORKER_MODULES, load_member_entries, member_entries,
+    with_worker_tools, worker_member_services,
 };
 
 /// The evidence of a `done` whose outcome established none (ADR-0051 item 3).
@@ -865,9 +867,14 @@ pub(crate) fn running_workflows(deps: &HostDeps) -> usize {
         .map_or(0, |observer| observer.running())
 }
 
-/// The four `workflow_*` tools over `service` (ADR-0053 item 7). Without a service the
-/// keys are not registered at all, so an environment naming one gets the ordinary
-/// `UnknownToolModule`.
+/// The four `workflow_*` tools over `service` (ADR-0053 item 7), each from its host entry
+/// (S6.11). Without a service the keys are not registered at all, so an environment naming
+/// one gets the ordinary `UnknownToolModule`. A run's catalog already has them, registered
+/// with the worker members over the run's member hook (`register_delegation_tools`), so
+/// this registers them only for a catalog without a run, `p1 env show`'s: there `service`
+/// starts nothing, and the members are linked to it for whatever agent assembles them.
+/// A release whose member entries do not load has already failed that catalog's build
+/// (the worker members are loaded first, from the same entries), so nothing is registered.
 #[cfg(feature = "workflows")]
 pub(crate) fn register_workflow_tools(
     catalog: &mut Catalog,
@@ -876,53 +883,28 @@ pub(crate) fn register_workflow_tools(
     let Some(service) = service else {
         return;
     };
-
-    let service_for = service.clone();
-    catalog.tool(
-        "workflow_start",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_workflow::WorkflowStartTool::new(service_for.clone()),
-                spec,
-                p1_tool_workflow::ToolFace
-            ))
-        }),
-    );
-
-    let service_for = service.clone();
-    catalog.tool(
-        "workflow_status",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_workflow::WorkflowStatusTool::new(service_for.clone()),
-                spec,
-                p1_tool_workflow::ToolFace
-            ))
-        }),
-    );
-
-    let service_for = service.clone();
-    catalog.tool(
-        "workflow_result",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_workflow::WorkflowResultTool::new(service_for.clone()),
-                spec,
-                p1_tool_workflow::ToolFace
-            ))
-        }),
-    );
-
-    catalog.tool(
-        "workflow_cancel",
-        Box::new(move |spec: &ToolSpec, _services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_workflow::WorkflowCancelTool::new(service.clone()),
-                spec,
-                p1_tool_workflow::ToolFace
-            ))
-        }),
-    );
+    if catalog
+        .tool_keys()
+        .iter()
+        .any(|key| key == WORKFLOW_TOOLS[0])
+    {
+        return;
+    }
+    let Ok(entries) = super::delegation::official_member_entries() else {
+        return;
+    };
+    let hook: ModuleServices = Arc::new(move |module: &str, _services: &ToolServices| {
+        if WORKFLOW_MODULES.contains(&module) {
+            workflow_services(module, &service)
+        } else {
+            Services::default()
+        }
+    });
+    for (module, key) in WORKFLOW_MODULES.into_iter().zip(WORKFLOW_TOOLS) {
+        if let Some(loaded) = entries.get(module) {
+            register_host_entry(catalog, key, loaded.clone(), hook.clone());
+        }
+    }
 }
 
 /// The observer projects every run event into the structured `FrontEnd` calls the TUI's

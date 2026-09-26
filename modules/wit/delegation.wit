@@ -106,6 +106,18 @@ interface workers-observe {
     /// Blocks the module until the child is no longer running. When the call is cancelled
     /// first, returns `running` at once.
     wait: func(id: string) -> result<child-status, worker-error>;
+
+    /// The tool module names a child of this scope may be granted, in the host's order: what
+    /// `child-spec.tools` and `continue-child`'s `add-tools` may name. Never `finish` and
+    /// never a worker or workflow tool. Takes nothing, changes nothing, and is fixed for the
+    /// scope's assembly, so the host also answers it where every other import traps (the
+    /// restricted path `declaration`, `effect` and `describe` run on, D085).
+    grantable: func() -> list<string>;
+
+    /// The environment names a child of this scope may run on, in the host's order: what
+    /// `child-spec.environment` may name. Read-only and fixed like `grantable`, and answered
+    /// on the restricted path too (D085).
+    environments: func() -> list<string>;
 }
 
 /// Controlling workers this scope started. Owner: `p1-workers`.

@@ -2,20 +2,19 @@
 //! it, the native `WorkerStartTool` of `crates/p1-tool-delegate` over the `tool` world.
 //!
 //! Its capabilities are `control`, `workers-start` and `workers-observe`, so the built
-//! component cannot control a worker. It calls `workers-observe` exactly where the native
-//! tool does and for nothing else: `describe` of the child it has just started, whose route
-//! and model the success text names.
+//! component cannot control a worker. It calls `workers-observe` for the host's two lists and
+//! otherwise exactly where the native tool does: `describe` of the child it has just started,
+//! whose route and model the success text names.
 //!
-//! The `tools` and `environment` enums of the schema are the host's lists. The component
-//! declares them empty (see [`delegation::GRANTABLE`]) and leaves membership of a granted
-//! module to the host's `start`.
+//! The `tools` and `environment` enums of the schema are the host's lists, read from
+//! `workers-observe.grantable` and `.environments` (D084; answered on the restricted path
+//! `declaration` runs on, D085). A module outside the grantable list is refused by the host's
+//! `start` before anything starts, and its native text is relayed as the start error.
 #![forbid(unsafe_code)]
 
 mod delegation;
 
-use delegation::{
-    ENVIRONMENTS, GRANTABLE, ResultItem, START_DESCRIPTION, START_NAME, STARTED_PREFIX, StartInput,
-};
+use delegation::{ResultItem, START_DESCRIPTION, START_NAME, STARTED_PREFIX, StartInput};
 use p1_bindings_tool::generated::p1::module::worker_types::ChildSpec;
 use p1_bindings_tool::generated::p1::module::{control, workers_observe, workers_start};
 use p1_bindings_tool::generated::{
@@ -30,7 +29,10 @@ impl Guest for WorkerStart {
         delegation::declaration(
             START_NAME,
             START_DESCRIPTION,
-            delegation::start_schema(GRANTABLE, ENVIRONMENTS),
+            delegation::start_schema(
+                &workers_observe::grantable(),
+                &workers_observe::environments(),
+            ),
         )
     }
 
@@ -81,15 +83,12 @@ impl Guest for WorkerStart {
             Ok(input) => input,
             Err(outcome) => return outcome,
         };
-        // Nothing is started until the grant is non-empty; which modules may be granted is
-        // the host's check at `start`, where the grantable list lives.
-        let mut tools = delegation::dedup(input.tools);
-        if tools.is_empty() {
-            return delegation::error_outcome(&format!(
-                "`tools` is required: list every tool module the worker needs, from: {}",
-                GRANTABLE.join(", ")
-            ));
-        }
+        // Nothing is started until the grant is non-empty; which modules may be granted is the
+        // host's check at `start`, made before anything starts, as the native tool makes it.
+        let mut tools = match grant(input.tools, &workers_observe::grantable()) {
+            Ok(tools) => tools,
+            Err(outcome) => return outcome,
+        };
         // A call cancelled before it reaches the host starts nothing (the world's rule: return
         // promptly with the `cancelled` status).
         if control::cancelled() {
@@ -119,6 +118,19 @@ impl Guest for WorkerStart {
     }
 }
 
+/// The grant a start asks for, without duplicates, or the native refusal of an empty one,
+/// which names the host's `grantable` list.
+fn grant(tools: Vec<String>, grantable: &[String]) -> Result<Vec<String>, ToolOutcome> {
+    let tools = delegation::dedup(tools);
+    if tools.is_empty() {
+        return Err(delegation::error_outcome(&format!(
+            "`tools` is required: list every tool module the worker needs, from: {}",
+            grantable.join(", ")
+        )));
+    }
+    Ok(tools)
+}
+
 p1_bindings_tool::generated::export!(WorkerStart);
 
 #[cfg(test)]
@@ -132,19 +144,17 @@ mod tests {
     }
 
     #[test]
-    fn declares_the_native_declaration_over_empty_lists() {
-        let declaration = WorkerStart::declaration();
-        assert_eq!(declaration.name, "worker_start");
-        assert_eq!(declaration.description, START_DESCRIPTION);
-    }
-
-    #[test]
-    fn an_empty_grant_is_refused_before_any_import() {
+    fn a_grant_gets_the_native_refusals() {
+        let grantable = vec!["read".to_owned(), "shell".to_owned()];
         assert_eq!(
-            WorkerStart::execute(call(r#"{"environment":"e","task":"t","tools":[]}"#)),
-            delegation::error_outcome(
-                "`tools` is required: list every tool module the worker needs, from: "
-            )
+            grant(Vec::new(), &grantable),
+            Err(delegation::error_outcome(
+                "`tools` is required: list every tool module the worker needs, from: read, shell"
+            ))
+        );
+        assert_eq!(
+            grant(vec!["read".into(), "read".into()], &grantable),
+            Ok(vec!["read".to_owned()])
         );
     }
 
