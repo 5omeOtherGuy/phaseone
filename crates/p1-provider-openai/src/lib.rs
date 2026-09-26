@@ -28,9 +28,10 @@
 //! The crate is split like `p1-provider-http` (ADR-0071). PORTABLE, always
 //! compiled: the route and settings types, composition validation,
 //! [`validate_request`], the credential-free lowering ([`lower_request`]), the
+//! [`websocket_lower`] decisions (framing, continuation and fallback), the
 //! [`CodexResponseParser`] and its `on_http_error` classification — what a
 //! provider WebAssembly component needs. NATIVE, behind the default `native`
-//! feature: the provider, [`build_headers`] and the WebSocket transport,
+//! feature: the provider, [`build_headers`] and the WebSocket transport itself,
 //! everything that touches a transport, a runtime or a credential.
 
 mod parser;
