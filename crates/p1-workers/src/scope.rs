@@ -339,6 +339,72 @@ impl WorkersControl for WorkerScope {
     }
 }
 
+/// The three worker traits over a whole [`WorkerService`], with NO scope: every call is
+/// the service's own, so any id the service knows is reachable.
+///
+/// This is today's native behaviour kept as it is: a parent's delegate tools reach every
+/// child of the service they were built over. The delegate tool members take the narrow
+/// traits, and this adapter lets the host keep building them from its one service until
+/// it switches to [`WorkerScope`]s (S6.7). Nothing is checked or recorded here.
+#[derive(Clone)]
+pub struct UnscopedWorkers {
+    service: Arc<dyn WorkerService>,
+}
+
+impl UnscopedWorkers {
+    pub fn new(service: Arc<dyn WorkerService>) -> Self {
+        Self { service }
+    }
+}
+
+impl WorkersStart for UnscopedWorkers {
+    fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        self.service.start(spec)
+    }
+}
+
+impl WorkersObserve for UnscopedWorkers {
+    fn describe<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<String, WorkerError>> {
+        self.service.describe(id)
+    }
+
+    fn status<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        self.service.status(id)
+    }
+
+    fn wait<'a>(
+        &'a self,
+        id: &'a ChildId,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        self.service.wait(id, cancel)
+    }
+
+    fn result<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        // The same reading a scope gives: the retained status, never a wait.
+        self.service.status(id)
+    }
+
+    fn list<'a>(&'a self) -> BoxFuture<'a, Vec<(ChildId, ChildStatus)>> {
+        self.service.list()
+    }
+}
+
+impl WorkersControl for UnscopedWorkers {
+    fn cancel<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<(), WorkerError>> {
+        self.service.cancel(id)
+    }
+
+    fn continue_child<'a>(
+        &'a self,
+        id: &'a ChildId,
+        message: String,
+        add_tools: Vec<String>,
+    ) -> BoxFuture<'a, Result<(), WorkerError>> {
+        self.service.continue_child(id, message, add_tools)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
