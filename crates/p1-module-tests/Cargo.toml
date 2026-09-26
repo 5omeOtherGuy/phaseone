@@ -56,6 +56,9 @@ p1-host = { path = "../p1-host" }
 # S1.8: read_module.rs runs the native `read` and the `p1/read` component over one workspace.
 p1-tool-read = { path = "../p1-tool-read" }
 p1-workspace = { path = "../p1-workspace" }
+# S3.7: the finish boundary suite compares the component's committed state and declaration
+# with the native tool's types and texts.
+p1-tool-finish = { path = "../p1-tool-finish" }
 # provider_wire.rs (S4.4): the provider adapters' portable halves, their wire forms and
 # the model policy they are composed with. `default-features = false` because a provider
 # component reaches no transport, runtime or credential code.

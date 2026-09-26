@@ -1,7 +1,7 @@
 //! The capabilities this runtime links into a module's per-call instance, and only those the
 //! manifest grants (freeze item 3): `control`, `clock` and `random` are the runtime's own,
-//! `process`, `summary`, `workspace` and `snapshot` are services the caller passes in
-//! explicitly — there is no registry.
+//! `process`, `summary`, `completion`, `workspace` and `snapshot` are services the caller
+//! passes in explicitly — there is no registry.
 //!
 //! Every import is an asynchronous host function (`func_wrap_async` / `func_new_async`):
 //! the guest sees a plain call, the host awaits without blocking a thread. The dynamic
@@ -17,6 +17,7 @@ use p1_contracts::{BoxFuture, CancellationToken};
 use wasmtime::component::{Linker, Resource, ResourceAny, ResourceTable, ResourceType, Val};
 use wasmtime::{Engine, bail};
 
+use crate::completion::{CompletionService, link_completion};
 use crate::context_policy::{SummaryService, link_summary};
 use crate::delegation::{
     WorkerServices, WorkflowServices, link_workers_control, link_workers_observe,
@@ -181,6 +182,9 @@ pub struct Services {
     /// The `summary` capability of a context policy
     /// ([`crate::context_policy::link_summary`]).
     pub summary: Option<Arc<dyn SummaryService>>,
+    /// The `completion` capability: the host's completion hub
+    /// ([`crate::completion::link_completion`]).
+    pub completion: Option<Arc<dyn CompletionService>>,
     /// The `workspace` capability, read side (S1).
     pub workspace: Option<Arc<dyn WorkspaceService>>,
     /// The `snapshot` capability (S1).
@@ -280,6 +284,7 @@ pub(crate) struct CallState {
     pub(crate) table: ResourceTable,
     process: Option<Arc<dyn ProcessService>>,
     pub(crate) summary: Option<Arc<dyn SummaryService>>,
+    pub(crate) completion: Option<Arc<dyn CompletionService>>,
     workspace: Option<Arc<dyn WorkspaceService>>,
     snapshot: Option<Arc<dyn SnapshotService>>,
     /// The origin of `clock.monotonic-now`, fixed per instance.
@@ -295,6 +300,7 @@ impl CallState {
             table: ResourceTable::new(),
             process: services.process.clone(),
             summary: services.summary.clone(),
+            completion: services.completion.clone(),
             workspace: services.workspace.clone(),
             snapshot: services.snapshot.clone(),
             origin: Instant::now(),
@@ -352,6 +358,12 @@ pub(crate) fn capability_linker(
                     return Err(LinkError::MissingService(capability.clone()));
                 }
                 link_summary(&mut linker)
+            }
+            "completion" => {
+                if services.completion.is_none() {
+                    return Err(LinkError::MissingService(capability.clone()));
+                }
+                link_completion(&mut linker)
             }
             "workspace" => {
                 if services.workspace.is_none() {
@@ -849,5 +861,15 @@ mod tests {
             vec![1, 2]
         );
         assert!(bytes_param(&[Val::List(vec![Val::U32(1)])], 0, "f").is_err());
+    }
+
+    #[test]
+    fn a_granted_completion_without_its_service_is_a_missing_service() {
+        let engine = crate::engine().expect("engine");
+        match capability_linker(&engine, &granted(&["completion"]), &Services::default()) {
+            Err(LinkError::MissingService(capability)) => assert_eq!(capability, "completion"),
+            Err(other) => panic!("wrong link error: {other}"),
+            Ok(_) => panic!("completion must not link without a completion service"),
+        }
     }
 }
