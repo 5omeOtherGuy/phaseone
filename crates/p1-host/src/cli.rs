@@ -4,7 +4,8 @@
 //! `p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]
 //! [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
 //! `p1 models [SEARCH]`
-//! `p1 modules list` / `p1 modules inspect NAME` / `p1 modules verify [--root DIR]`
+//! `p1 modules list` / `p1 modules inspect NAME` /
+//! `p1 modules verify [--root DIR] [--integrity-only]`
 //! `p1 env show NAME`
 //! `p1 workflow run FILE [--arg k=v]… [--args FILE] [--role r=E/P[:effort]]…`
 //! `p1 login <route>` / `p1 login --list` / `p1 logout <route>`
@@ -121,6 +122,10 @@ pub struct ModulesOptions {
     /// `manifest.json`, or the share directory above the `modules/` one. `None` means
     /// the installed `<binary>/../share/p1`.
     pub root: Option<PathBuf>,
+    /// `--integrity-only` for `verify`: report a grant this runtime cannot link as
+    /// `UNLINKED` and pass it, instead of failing the verification. The parser refuses
+    /// the flag on `list` and `inspect`, which have nothing to narrow (S1.6.1).
+    pub integrity_only: bool,
 }
 
 /// What `p1 modules` reads.
@@ -226,7 +231,7 @@ pub fn usage() -> String {
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str(
-        "  p1 modules list      every installed module package: kind, protocol, digest, selection\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1\n",
+        "  p1 modules list      every installed module package: kind, protocol, digest, selection\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR] [--integrity-only]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1. --integrity-only\n                       reports a grant this runtime cannot link as UNLINKED, failing none\n",
     );
     out.push_str("  p1 env show NAME\n");
     out.push_str(
@@ -686,15 +691,17 @@ fn parse_models(args: &[String]) -> Result<Options, CliError> {
 /// a usage error rather than a listing nobody asked for.
 fn parse_modules(args: &[String]) -> Result<Options, CliError> {
     const USAGE: &str = "usage: p1 modules list | p1 modules inspect NAME | \
-                         p1 modules verify [--root DIR]";
+                         p1 modules verify [--root DIR] [--integrity-only]";
     let mut action: Option<String> = None;
     let mut operand: Option<String> = None;
     let mut root: Option<PathBuf> = None;
+    let mut integrity_only = false;
     let mut index = 1;
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
             "--root" => root = Some(PathBuf::from(take_value(args, &mut index, "--root")?)),
+            "--integrity-only" => integrity_only = true,
             other if other.starts_with('-') && other != "-" => {
                 return Err(CliError {
                     message: format!("unknown flag `{other}`"),
@@ -727,16 +734,17 @@ fn parse_modules(args: &[String]) -> Result<Options, CliError> {
             None => Ok(()),
         }
     };
-    let action = match action.as_deref() {
-        Some("list") => {
+    let subcommand = action.as_deref().unwrap_or_default().to_string();
+    let action = match subcommand.as_str() {
+        "list" => {
             unexpected(operand)?;
             ModulesAction::List
         }
-        Some("verify") => {
+        "verify" => {
             unexpected(operand)?;
             ModulesAction::Verify
         }
-        Some("inspect") => ModulesAction::Inspect {
+        "inspect" => ModulesAction::Inspect {
             name: operand.ok_or_else(|| CliError {
                 message: USAGE.to_string(),
             })?,
@@ -747,7 +755,21 @@ fn parse_modules(args: &[String]) -> Result<Options, CliError> {
             });
         }
     };
-    Ok(defaults(Command::Modules(ModulesOptions { action, root })))
+    // `--integrity-only` narrows a verification and nothing else: taking it on `list` or
+    // `inspect` would silently ignore what the caller asked for, so the parser refuses it
+    // rather than accepting a flag that changes nothing (S1.6.1).
+    if integrity_only && subcommand != "verify" {
+        return Err(CliError {
+            message: format!(
+                "--integrity-only is only for `p1 modules verify`, not `p1 modules {subcommand}`"
+            ),
+        });
+    }
+    Ok(defaults(Command::Modules(ModulesOptions {
+        action,
+        root,
+        integrity_only,
+    })))
 }
 
 fn parse_usage(args: &[String]) -> Result<Options, CliError> {
@@ -1657,6 +1679,7 @@ mod tests {
             Command::Modules(ModulesOptions {
                 action: ModulesAction::List,
                 root: None,
+                integrity_only: false,
             })
         );
         assert_eq!(
@@ -1674,6 +1697,7 @@ mod tests {
                     name: "p1/fixture".to_string(),
                 },
                 root: Some(PathBuf::from("/share")),
+                integrity_only: false,
             })
         );
         assert_eq!(
@@ -1683,6 +1707,23 @@ mod tests {
             Command::Modules(ModulesOptions {
                 action: ModulesAction::Verify,
                 root: Some(PathBuf::from("/share/modules")),
+                integrity_only: false,
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "modules",
+                "verify",
+                "--integrity-only",
+                "--root",
+                "/share/modules"
+            ]))
+            .unwrap()
+            .command,
+            Command::Modules(ModulesOptions {
+                action: ModulesAction::Verify,
+                root: Some(PathBuf::from("/share/modules")),
+                integrity_only: true,
             })
         );
         assert!(
@@ -1698,6 +1739,27 @@ mod tests {
         assert!(parse(&args(&["modules", "verify", "extra"])).is_err());
         assert!(parse(&args(&["modules", "--bogus"])).is_err());
         assert!(parse(&args(&["modules", "--root"])).is_err());
+        // `--integrity-only` narrows `verify` only; the other two actions have nothing to
+        // narrow, so the parser refuses it instead of taking a flag that changes nothing.
+        assert!(parse(&args(&["modules", "list", "--integrity-only"])).is_err());
+        assert!(
+            parse(&args(&[
+                "modules",
+                "inspect",
+                "p1/fixture",
+                "--integrity-only"
+            ]))
+            .is_err()
+        );
+        assert!(parse(&args(&["modules", "--integrity-only"])).is_err());
+        let error = parse(&args(&["modules", "list", "--integrity-only"])).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("--integrity-only is only for `p1 modules verify`"),
+            "{}",
+            error.message
+        );
         let error = parse(&args(&["modules", "listt"])).unwrap_err();
         assert!(
             error.message.contains("unknown modules subcommand `listt`"),
@@ -1707,6 +1769,7 @@ mod tests {
         assert!(usage().contains("p1 modules list"));
         assert!(usage().contains("p1 modules inspect NAME"));
         assert!(usage().contains("p1 modules verify [--root DIR]"));
+        assert!(usage().contains("--integrity-only"));
     }
 
     /// A lone word that is a near miss for a subcommand is a usage error naming the

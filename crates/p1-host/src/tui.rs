@@ -813,16 +813,22 @@ impl Driver {
     }
 
     /// §11: while a turn runs the switch applies at the next boundary —
-    /// `agent` is `None` exactly then (mid-`pump`, borrowed by the turn).
+    /// `agent` is `None` exactly then (mid-`pump`, borrowed by the turn). At idle
+    /// the loop applies it right after this key: the switch commits its
+    /// `Environment` record, which awaits, and a key handler cannot.
     fn request_switch(&mut self, request: PendingSwitch, agent: Option<&mut Agent>) {
-        let Some(agent) = agent else {
+        if agent.is_none() {
             self.screen
                 .transcript
                 .note("· model switch queued · applies at the next boundary");
             self.pending_switch = Some(request);
             return;
-        };
-        self.apply_switch(request, agent);
+        }
+        if self.model_switch.is_none() {
+            self.refuse_switch_unavailable();
+            return;
+        }
+        self.pending_switch = Some(request);
     }
 
     /// ADR-0076: `/compact` queues like a switch (§11). The summary is a provider
@@ -871,25 +877,33 @@ impl Driver {
         self.screen.statusbar.ctx_warn = warn;
     }
 
-    fn apply_switch(&mut self, request: PendingSwitch, agent: &mut Agent) {
+    async fn apply_switch(&mut self, request: PendingSwitch, agent: &mut Agent) {
         let Some(switch) = self.model_switch.clone() else {
-            self.screen
-                .transcript
-                .note("· switch refused · no model switch is available this run");
+            self.refuse_switch_unavailable();
             return;
         };
         let before = self.model.clone();
         let outcome = match &request {
-            PendingSwitch::Model(reference) => crate::run::switch_model(
-                &switch,
-                agent,
-                crate::run::SwitchRequest::Model(reference),
-            ),
+            PendingSwitch::Model(reference) => {
+                crate::run::switch_model(
+                    &switch,
+                    agent,
+                    crate::run::SwitchRequest::Model(reference),
+                )
+                .await
+            }
             PendingSwitch::Effort(level) => {
                 crate::run::switch_model(&switch, agent, crate::run::SwitchRequest::Effort(level))
+                    .await
             }
         };
         self.report_switch(before, outcome);
+    }
+
+    fn refuse_switch_unavailable(&mut self) {
+        self.screen
+            .transcript
+            .note("· switch refused · no model switch is available this run");
     }
 
     /// §11: `switch_model` result → `MetaRow · model a → b · from the next
@@ -1686,7 +1700,7 @@ where
             // §11: a `/model`/`/effort` typed mid-turn applies here, at the
             // first boundary `agent` is free again.
             if let Some(pending) = driver.pending_switch.take() {
-                driver.apply_switch(pending, agent);
+                driver.apply_switch(pending, agent).await;
             }
             // The turn's end moved the screen too: the working row leaves, a
             // cancelled turn drops its queue, a switch renames the chip.
@@ -1727,6 +1741,10 @@ where
                     Input::Key(key) if is_cancel(&key) => driver.exit = Some(0),
                     Input::Key(key) => {
                         driver.on_key(key, Some(agent));
+                        // A `/model` or `/effort` typed at idle applies now.
+                        if let Some(pending) = driver.pending_switch.take() {
+                            driver.apply_switch(pending, agent).await;
+                        }
                         if let Some(text) = driver.submit_pending.take() {
                             prompt = Some(text);
                         }
@@ -1787,7 +1805,7 @@ where
                 }
                 driver.policy.set_turn(None);
                 if let Some(pending) = driver.pending_switch.take() {
-                    driver.apply_switch(pending, agent);
+                    driver.apply_switch(pending, agent).await;
                 }
                 redraws.dirty = true;
             }
