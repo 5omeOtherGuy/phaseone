@@ -123,14 +123,14 @@ ORDER = [
     ("guest fmt", r"^cargo fmt --manifest-path modules/Cargo\.toml --all -- --check$"),
     ("native clippy", r"^cargo clippy --workspace --all-targets --locked -- -D warnings$"),
     ("toolchain", r"^module-toolchain\.sh --check$"),
-    ("guest check", r"^cargo clippy --manifest-path modules/Cargo\.toml --workspace --locked --target wasm32-wasip2 -- -D warnings$"),
+    ("guest check", r"^cargo clippy --manifest-path modules/Cargo\.toml --workspace --locked --target wasm32-unknown-unknown -- -D warnings$"),
     ("module build", r"^build-modules\.sh --all$"),
     ("module validation", r"^wasm-tools validate "),
+    ("module boundary", r"^check-module-boundaries\.sh$"),
     ("bwrap probe", r"^bwrap --ro-bind / / --dev /dev --proc /proc true$"),
     ("test guard", r"^timeout --foreground \d+ cargo test --workspace --locked$"),
     ("tests", r"^cargo test --workspace --locked$"),
     ("core isolation", r"^check-core-isolation\.sh$"),
-    ("module boundary", r"^check-module-boundaries\.sh$"),
     ("secret scan", r"^secret-scan\.sh$"),
     ("adr", r"^adr\.py check$"),
 ] + [(name, "^" + re.escape(name) + " -q$") for name in PY_TESTS]
@@ -143,7 +143,7 @@ def write_exec(path: pathlib.Path, text: str) -> None:
 
 
 class Harness:
-    def __init__(self, pins: str = "RUST_MIN=1.96.0\nWASM_TARGET=wasm32-wasip2\n") -> None:
+    def __init__(self, pins: str = "RUST_MIN=1.96.0\nWASM_TARGET=wasm32-unknown-unknown\n") -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="gate-test-")
         base = pathlib.Path(self.tmp.name)
         self.repo = base / "repo"
@@ -239,6 +239,7 @@ class GateTests(unittest.TestCase):
         steps = h.steps()
         self.assertLess(steps.index("module build"), steps.index("tests"))
         self.assertLess(steps.index("module validation"), steps.index("tests"))
+        self.assertLess(steps.index("module boundary"), steps.index("tests"))
 
     def test_every_step_failing_stops_the_gate_red(self) -> None:
         names = [name for name, _ in ORDER]
@@ -261,7 +262,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(read, {"CI", "CARGO_BUILD_JOBS", "CARGO_TERM_COLOR"})
 
     def test_a_guest_failure_is_red_on_ci_too(self) -> None:
-        for step in ("guest fmt", "guest check", "module build", "module validation"):
+        for step in ("guest fmt", "guest check", "module build", "module validation", "module boundary"):
             with self.subTest(step=step):
                 h = self.harness()
                 result = h.run(CI="true", STUB_FAIL=dict(ORDER)[step])

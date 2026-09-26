@@ -5,7 +5,8 @@ Status: published freeze item 6 of the WebAssembly boundary (ADR-0071). The buil
 here, the workspace is [`modules/Cargo.toml`](../../../modules/Cargo.toml) and the first package is
 `modules/p1-module-fixture/`. The loader's own rules (verify the digest, then compile those same
 bytes, never a compiled cache, official source only) are the runtime crate's and are published
-with it.
+below under "The loader"; the decision behind them is
+[ADR-0082](../../adr/0082-component-abi-and-execution-ownership.md).
 
 ## The package
 
@@ -22,17 +23,17 @@ for the wasm target only, and the host crates never depend on them.
 | Field | Meaning |
 |---|---|
 | `name` | the package's identity, `<namespace>/<name>` |
-| `kind` | the module class: `tool`, `provider`, `context-policy`, `authorization-policy` or `workflow-implementation` |
+| `kind` | the module class: `tool`, `provider`, `context-policy`, `authorization-policy`, `workflow-implementation` or `workflow-decision` |
 | `world` | the WIT world the package implements: `p1:module/<kind>@1.0.0`, the class's world in the package of [`wit.md`](wit.md) |
 | `protocol` | the major.minor of the value protocol the module speaks: `p1-module-protocol`'s `PROTOCOL_VERSION` ([`protocol.md`](protocol.md)) |
 | `capabilities` | what the module may be linked with, a subset of its class's allocation in [`wit.md`](wit.md) |
 | `variant` | the model-facing variant of the loader-built `ToolIdentity`: two packages may ship the same tool under different variants |
 
 Every field is present in every package. The build refuses a package with an explicit message when
-a field is missing, `kind` is not one of the five, `world` is not the world of its kind, `name` is
-not `<namespace>/<name>`, or a capability is outside the class's allocation (the allocation is
-hard-coded in the script's `allocation`, each line pointing at [`wit.md`](wit.md), until frozen
-data replaces it).
+a field is missing, `kind` is not one of the six, `world` is not the world of its kind, `name` is
+not `<namespace>/<name>`, or a capability is outside the class's allocation (the frozen data in
+[`modules/capabilities.toml`](../../../modules/capabilities.toml), the allocation table of
+[`wit.md`](wit.md)).
 
 ### The reserved `p1/` namespace
 
@@ -57,6 +58,42 @@ world has no export that returns one, so a module cannot claim another implement
 or its grants. The implementation part comes from the manifest `name` and the variant part from
 the manifest `variant`; the model-facing name of a call is the interface's own business
 (`declaration`), and an environment may present the tool under another name.
+
+## The loader (freeze item 6)
+
+The loader is [`crates/p1-module-runtime/src/loader.rs`](../../../crates/p1-module-runtime/src/loader.rs)
+over the release manifest of
+[`manifest.rs`](../../../crates/p1-module-runtime/src/manifest.rs): p1's release archive ships one
+`manifest.json` (format `p1-release-manifest/1`) whose `components` list names each package by
+its manifest `name`, pins its bytes by `digest`, locates them by a path relative to the manifest
+and carries the frozen manifest fields above (ADR-0079).
+
+- **Official source only.** `Loader::load` takes a name, never a path or bytes. A name outside
+  the reserved `p1/` namespace is `LoadError::NotOfficial`, and a name the release manifest does
+  not list is `LoadError::NotInManifest`; each error says why, naming the module.
+- **Refused before anything is read.** A `kind` the runtime does not speak (`UnknownKind`), a
+  `world` that is not the world of its kind (`WorldMismatch`), a `protocol` whose major is not
+  `PROTOCOL_VERSION`'s (`ProtocolMismatch`) and a granted capability the runtime cannot link
+  (`UnsupportedCapability`) are refused from the manifest entry alone. The runtime links
+  `control`, `clock`, `random` and `process` today; the other capabilities arrive with the
+  streams that own their native services, and until then a grant of one is refused.
+- **Verify, then compile the same bytes.** The component file must be a regular file (a symlink
+  is refused); its bytes are read once, hashed with SHA-256 and compared with the manifest
+  digest (`DigestMismatch` names both), and only then are *those* bytes compiled from memory with
+  `Component::from_binary`. Nothing is read twice, so a file swapped between the check and the
+  compile cannot be the one compiled, and no text format is accepted.
+- **No compiled-cache deserialization.** wasmtime is built without its `cache` feature and
+  `Component::deserialize*` is never called ([`toolchain.md`](toolchain.md#the-pins)), so the
+  digest check is the whole trust decision.
+- **Imports are checked against the grant.** Every import of the compiled component must be the
+  type-only `types` interface or a capability the manifest grants; anything else, every `wasi:`
+  import included, is `LoadError::UndeclaredImport`.
+- **Identity.** The `LoadedModule` carries the verified digest, the class, the granted
+  capabilities and the loader-built `ToolIdentity` (above).
+
+The cases are tested in
+[`runtime_spike.rs`](../../../crates/p1-module-tests/tests/runtime_spike.rs)
+(`load_verifies_then_compiles_the_same_bytes`, `load_refuses_what_the_release_does_not_ship`).
 
 ## Build outputs
 
@@ -99,7 +136,32 @@ unwinding guest.
 
 ## The guest target (S0-Q9)
 
-What a guest may import from WASI is the guest-target question S0-Q9, decided on the component's
-actual imports: the build writes every imported interface of the built component to
-`<package>.imports`, which on the `wasm32-wasip2` target includes the `wasi:` interfaces Rust std
-links.
+The guest target is `wasm32-unknown-unknown`, componentized with `wasm-tools component new` and no
+WASI adapter (decision D-XO-4 on S0-Q9): a guest has no std I/O by design, so a built component
+imports only `p1:module` interfaces. The build refuses a package whose `<package>.imports` lists
+any `wasi:` interface, and the loader refuses such a component too, no exceptions.
+
+## Shared guest logic (S0-R3)
+
+Decision S0-R3, asked by S3 and decided by the S0 lead: guest logic MAY be a target-independent
+library crate under `crates/` used by both the native adapter's tests (in `crates/p1-tool-<x>/`)
+and the component package (`modules/p1-module-<x>/`), so the frozen native tests — for example
+[`crates/p1-tool-shell/tests/output_filters.rs`](../../../crates/p1-tool-shell/tests/output_filters.rs),
+byte-for-byte — keep running over the same code the component ships. The decision adds a crate
+beside a package; it replaces no package and no world.
+
+Rules:
+
+- The crate lives in the root workspace under `crates/`, is a member of it, and never lives under
+  `modules/`. The stream that owns the tool owns the crate; the module package depends on it by
+  `path`.
+- It is pure computation per D-XO-8: no filesystem, network, process, thread, clock or
+  environment access, and no host-specific I/O. A guest that needs any of those goes through the
+  imported capability interfaces of [`wit.md`](wit.md), never this crate.
+- It depends only on std, `serde` (derive), `serde_json` and `regex`, at the versions the root
+  `Cargo.lock` pins. It does not depend on `p1-contracts`, `p1-module-protocol` or any other
+  host crate.
+- It inherits the root workspace's `unsafe_code = "forbid"` (`Cargo.toml`).
+- It compiles natively and for the guest target `wasm32-unknown-unknown`; the component build is
+  what proves it, since a crate built only for the host workspace would not.
+- `scripts/check-module-boundaries.sh` (slice S0.7) counts it as handwritten guest code.

@@ -1,0 +1,36 @@
+# The per-class capability allocation of the p1 WebAssembly boundary, freeze item 13 of
+# docs/design/modules/wit.md: one table per module class, listing the `p1:module` interfaces a
+# module of that class may import. A module's manifest narrows it, the host links only what the
+# manifest grants, and scripts/check-module-boundaries.sh compares a built component's imports
+# to this table.
+#
+# This file is frozen with `wasm-boundary-v1`: a change to it is a boundary change, not an
+# ordinary edit. `types` and `worker-types` carry types only and grant nothing, so every class
+# may import them and a manifest need not declare them.
+
+# Interfaces that grant nothing: imported for their types, allowed in any class that lists them.
+type-only = ["types", "worker-types"]
+
+# p1:module/tool@1.0.0: a tool module (p1_contracts::Tool).
+[tool]
+imports = ["types", "control", "clock", "random", "notices", "workspace", "snapshot", "workspace-mutation", "process", "worker-types", "workers-start", "workers-observe", "workers-control", "workflows", "completion"]
+
+# p1:module/provider@1.0.0: a provider module (p1_contracts::Provider).
+[provider]
+imports = ["types", "control", "clock", "random", "notices", "http", "websocket", "credential-control"]
+
+# p1:module/context-policy@1.0.0: a context policy (p1_contracts::ContextPolicy).
+[context-policy]
+imports = ["types", "control", "clock", "notices", "summary", "completion"]
+
+# p1:module/authorization-policy@1.0.0: an authorization policy (p1_contracts::AuthorizationPolicy).
+[authorization-policy]
+imports = ["types", "control", "clock", "notices"]
+
+# p1:module/workflow-implementation@1.0.0: a workflow written as a module.
+[workflow-implementation]
+imports = ["types", "control", "clock", "random", "notices", "worker-types", "workers-start", "workers-observe", "workers-control", "workflows"]
+
+# p1:module/workflow-decision@1.0.0: a workflow's decisions as a component, its state native.
+[workflow-decision]
+imports = ["types", "control", "clock"]

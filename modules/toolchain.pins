@@ -1,10 +1,12 @@
 # Module toolchain pins, read line by line by scripts/module-toolchain.sh (never sourced).
 # Format: KEY=value; blank lines and lines starting with # are ignored.
 
-# 1.96.0 is the rust-version of wasmtime 49, the host runtime pinned below; it is also past
-# 1.82.0, the first stable Rust that ships wasm32-wasip2 as a tier 2 target.
+# 1.96.0 is the rust-version of wasmtime 49, the host runtime pinned below.
 RUST_MIN=1.96.0
-WASM_TARGET=wasm32-wasip2
+# wasm32-unknown-unknown, componentized with `wasm-tools component new` and no WASI adapter
+# (decision D-XO-4 on S0-Q9): a guest has no std I/O by design, so the built component
+# imports only p1:module interfaces and the build and the loader refuse every wasi: import.
+WASM_TARGET=wasm32-unknown-unknown
 
 # The bounded runtime dependency set (owner, Q7). WASMTIME is checked against Cargo.lock,
 # WASMTIME_FEATURES (as a set) against crates/p1-module-runtime/Cargo.toml, WIT_BINDGEN

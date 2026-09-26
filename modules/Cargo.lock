@@ -91,6 +91,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-bindings-workflow-decision"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "p1-module-fixture"
 version = "0.0.1"
 dependencies = [

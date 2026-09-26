@@ -11,9 +11,11 @@
 #   guest check         the module workspace's clippy for the pinned target, warnings denied
 #   modules             optimized component builds (scripts/build-modules.sh --all)
 #   module validation   every built package is complete, valid and matches its digest and world
+#   module boundary     imports against the frozen capability allocation, and the unsafe policy
+#                       (scripts/check-module-boundaries.sh, freeze items 11 and 13)
 #   bubblewrap          on a stream box, a usable bwrap (the boundary tests must not skip)
 #   test                native tests, including the Wasmtime integration and conformance tests
-#   core isolation, module boundary, secret scan, adr, installer and CI helpers
+#   core isolation, secret scan, adr, installer and CI helpers
 #
 # The module build comes before the tests so the integration and conformance tests exercise the
 # components this commit builds, never stale or missing ones. The bubblewrap boundary tests are
@@ -91,6 +93,8 @@ echo "== gate: modules"
 scripts/build-modules.sh --all
 echo "== gate: module validation"
 validate_modules
+echo "== gate: module boundary"
+scripts/check-module-boundaries.sh
 echo "== gate: bubblewrap"
 if bwrap_usable; then
   echo "bubblewrap: usable; the boundary tests run"
@@ -107,8 +111,6 @@ echo "== gate: test"
 timeout --foreground 3600 cargo test --workspace --locked
 echo "== gate: core isolation"
 scripts/check-core-isolation.sh
-echo "== gate: module boundary"
-scripts/check-module-boundaries.sh
 echo "== gate: secret scan"
 scripts/secret-scan.sh
 echo "== gate: adr"
