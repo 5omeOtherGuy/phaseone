@@ -454,13 +454,14 @@ fn verify_refuses_the_manifest_fields_the_loader_would_refuse() {
     }
 }
 
-/// The fixture entry with `workers-start` granted beside its own capabilities: an interface
+/// The fixture entry with `notices` granted beside its own capabilities: an interface
 /// `modules/capabilities.toml` allocates to the tool class but this runtime has no native
-/// service to link yet. 8 of the 12 shipped packages grant `workers-*`/`workflows`, so the
-/// installer's verify must be able to report this without refusing the release (S1.6.1).
+/// service to link yet. Shipped packages grant such interfaces before their streams link them
+/// (`workers-*`/`workflows` did until S6.7), so the installer's verify must be able to report
+/// this without refusing the release (S1.6.1).
 fn unlinkable_entry(scratch: &Scratch) -> serde_json::Value {
     let mut entry = scratch.fixture_entry(FIXTURE_NAME);
-    entry["capabilities"] = serde_json::json!(["control", "clock", "process", "workers-start"]);
+    entry["capabilities"] = serde_json::json!(["control", "clock", "process", "notices"]);
     entry
 }
 
@@ -476,7 +477,7 @@ fn verify_reports_an_unlinkable_grant_and_integrity_only_passes_it() {
     let report = stdout(&strict);
     assert!(
         report.contains(&format!(
-            "{FIXTURE_NAME} FAILED capability workers-start cannot be linked by this runtime"
+            "{FIXTURE_NAME} FAILED capability notices cannot be linked by this runtime"
         )),
         "the default message is unchanged:\n{report}"
     );
@@ -497,7 +498,7 @@ fn verify_reports_an_unlinkable_grant_and_integrity_only_passes_it() {
     assert_eq!(code(&relaxed), 0, "{}", stderr(&relaxed));
     let report = stdout(&relaxed);
     assert!(
-        report.contains(&format!("UNLINKED workers-start ({FIXTURE_NAME})")),
+        report.contains(&format!("UNLINKED notices ({FIXTURE_NAME})")),
         "{report}"
     );
     assert!(

@@ -1858,6 +1858,8 @@ dependencies = [
  "p1-contracts",
  "p1-module-protocol",
  "p1-redact",
+ "p1-workers",
+ "p1-workflow",
  "thiserror 2.0.20",
  "tokio",
  "wasmtime",
@@ -1869,12 +1871,17 @@ version = "0.0.1"
 dependencies = [
  "futures-util",
  "p1-assembly",
+ "p1-context",
  "p1-contracts",
  "p1-core",
  "p1-host",
+ "p1-model-profile",
+ "p1-module-protocol",
  "p1-module-runtime",
+ "p1-provider-anthropic",
  "p1-provider-http",
  "p1-provider-openai",
+ "p1-provider-openai-chat",
  "p1-redact",
  "p1-testkit",
  "p1-workers",
@@ -1958,6 +1965,15 @@ dependencies = [
  "p1-testkit",
  "regex",
  "tokio",
+]
+
+[[package]]
+name = "p1-shell-guest"
+version = "0.0.1"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2048,9 +2064,9 @@ version = "0.0.1"
 dependencies = [
  "nix",
  "p1-contracts",
+ "p1-module-runtime",
+ "p1-shell-guest",
  "p1-workspace",
- "regex",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",

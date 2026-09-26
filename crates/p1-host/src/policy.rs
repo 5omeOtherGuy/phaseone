@@ -7,8 +7,9 @@
 //!
 //! "Ask" lives HERE, inside the policy, so the core never sees UI (D18). A policy
 //! (a `p1/policy/*` component, or its native twin below) answers a [`Verdict`]:
-//! `Permit`, `Deny` or `Ask`. The [`AskBridge`] resolves `Ask` through the line
-//! front end, so only `Permit` or `Deny` reaches the core (ADR-0024).
+//! `Permit`, `Deny` or `Ask`. The [`AskBridge`] resolves `Ask` through the front
+//! end's [`Asker`] (the line prompt, or the TUI's approval view), so only `Permit`
+//! or `Deny` reaches the core (ADR-0024).
 //!
 //! The verdict sources are native for now: the host has no module loader yet, so
 //! [`NativeFullAccess`] and [`NativeAsk`] carry exactly the rules the packages
@@ -114,7 +115,76 @@ impl VerdictSource for NativeAsk {
 /// deciding policy's package name and digest.
 type GrantKey = (String, ToolIdentity, PolicyId);
 
-/// The native ask bridge: a [`VerdictSource`] plus the line front end's asker.
+/// The operator's answer to one ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorAnswer {
+    /// Permit this call.
+    Yes,
+    /// Deny this call ([`USER_DENY`]).
+    No,
+    /// Permit this call and remember the grant for this process.
+    Always,
+}
+
+/// How the bridge asks the operator: the line front end's prompt ([`LineAsker`]) or
+/// the TUI's approval view. The asker only asks; the rules (which verdict asks, which
+/// grant is remembered) stay in the bridge.
+///
+/// The turn's cancellation race stays in the bridge too: it races `ask` against the
+/// active turn's token and drops the question when the turn is cancelled
+/// ([`CANCEL_DENY`]).
+pub trait Asker: Send + Sync {
+    /// Ask the operator about `request`. `None` when no operator can answer any more
+    /// (the UI is gone): the bridge denies with [`CANCEL_DENY`], nothing runs unanswered.
+    fn ask<'a>(
+        &'a self,
+        request: AuthorizationRequest<'a>,
+    ) -> BoxFuture<'a, Option<OperatorAnswer>>;
+
+    /// The front end's live turn token, forwarded by [`AskBridge::set_turn`] for an
+    /// asker that races the turn itself as well.
+    fn set_turn(&self, _token: Option<CancellationToken>) {}
+}
+
+/// The line front end's asker: the prompt on stderr, the answer from the next line.
+pub struct LineAsker {
+    lines: Arc<dyn LineSource>,
+    stderr: SharedWriter,
+}
+
+impl LineAsker {
+    pub fn new(lines: Arc<dyn LineSource>, stderr: SharedWriter) -> Self {
+        Self { lines, stderr }
+    }
+}
+
+impl Asker for LineAsker {
+    fn ask<'a>(
+        &'a self,
+        request: AuthorizationRequest<'a>,
+    ) -> BoxFuture<'a, Option<OperatorAnswer>> {
+        // The prompt is written when the question is asked, before the bridge races
+        // the line against the turn's cancellation.
+        let tool = &request.call.name;
+        let summary = summarize_input(request.call.input.raw());
+        let prompt = format!("allow {tool} {summary}? [y]es / [n]o / [a]lways for this tool: ");
+        {
+            let mut writer = self.stderr.lock().unwrap();
+            let _ = writer.write_all(prompt.as_bytes());
+            let _ = writer.flush();
+        }
+        Box::pin(async move {
+            let line = self.lines.next_line().await;
+            Some(match line.as_deref().map(str::trim) {
+                Some("y") | Some("yes") => OperatorAnswer::Yes,
+                Some("a") | Some("always") => OperatorAnswer::Always,
+                _ => OperatorAnswer::No,
+            })
+        })
+    }
+}
+
+/// The native ask bridge: a [`VerdictSource`] plus the front end's [`Asker`].
 ///
 /// Authorization is bound to the active turn's cancellation scope: the bridge
 /// holds the turn's token, which the front end sets with [`AskBridge::set_turn`];
@@ -122,8 +192,7 @@ type GrantKey = (String, ToolIdentity, PolicyId);
 pub struct AskBridge {
     source: Arc<dyn VerdictSource>,
     headless: bool,
-    lines: Arc<dyn LineSource>,
-    stderr: SharedWriter,
+    asker: Arc<dyn Asker>,
     /// The scope when no turn token is set.
     scope: CancellationToken,
     /// The live turn's token, set by the front end.
@@ -133,6 +202,7 @@ pub struct AskBridge {
 }
 
 impl AskBridge {
+    /// The line front end's bridge: [`AskBridge::with_asker`] over a [`LineAsker`].
     pub fn new(
         source: Arc<dyn VerdictSource>,
         headless: bool,
@@ -140,11 +210,25 @@ impl AskBridge {
         stderr: SharedWriter,
         cancel: CancellationToken,
     ) -> Self {
+        Self::with_asker(
+            source,
+            headless,
+            Arc::new(LineAsker::new(lines, stderr)),
+            cancel,
+        )
+    }
+
+    /// A bridge asking through `asker`.
+    pub fn with_asker(
+        source: Arc<dyn VerdictSource>,
+        headless: bool,
+        asker: Arc<dyn Asker>,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             source,
             headless,
-            lines,
-            stderr,
+            asker,
             scope: cancel,
             turn: Mutex::new(None),
             always: Mutex::new(HashSet::new()),
@@ -152,9 +236,10 @@ impl AskBridge {
     }
 
     /// The front end marks the live turn's token; `None` returns to the
-    /// constructor's token.
+    /// constructor's token. The asker is told as well.
     pub fn set_turn(&self, token: Option<CancellationToken>) {
-        *self.turn.lock().unwrap() = token;
+        *self.turn.lock().unwrap() = token.clone();
+        self.asker.set_turn(token);
     }
 
     /// The token the current authorization races.
@@ -164,13 +249,6 @@ impl AskBridge {
             .unwrap()
             .clone()
             .unwrap_or_else(|| self.scope.clone())
-    }
-
-    fn ask(&self, tool: &str, summary: &str) {
-        let prompt = format!("allow {tool} {summary}? [y]es / [n]o / [a]lways for this tool: ");
-        let mut writer = self.stderr.lock().unwrap();
-        let _ = writer.write_all(prompt.as_bytes());
-        let _ = writer.flush();
     }
 }
 
@@ -208,22 +286,22 @@ impl AuthorizationPolicy for AskBridge {
                 return Decision::Permit;
             }
 
-            let summary = summarize_input(request.call.input.raw());
-            self.ask(&request.call.name, &summary);
-            let line = tokio::select! {
+            let asking = self.asker.ask(request);
+            let answer = tokio::select! {
                 biased;
                 _ = turn.cancelled() => return cancelled(),
-                line = self.lines.next_line() => line,
+                answer = asking => answer,
             };
-            match line.as_deref().map(str::trim) {
-                Some("y") | Some("yes") => Decision::Permit,
-                Some("a") | Some("always") => {
+            match answer {
+                Some(OperatorAnswer::Yes) => Decision::Permit,
+                Some(OperatorAnswer::Always) => {
                     self.always.lock().unwrap().insert(key);
                     Decision::Permit
                 }
-                _ => Decision::Deny {
+                Some(OperatorAnswer::No) => Decision::Deny {
                     reason: USER_DENY.to_string(),
                 },
+                None => cancelled(),
             }
         })
     }
@@ -526,6 +604,131 @@ mod tests {
         // Back to the constructor's token, which is cancelled.
         harness.bridge.set_turn(None);
         assert_eq!(harness.authorize(Effect::Executes).await, deny(CANCEL_DENY));
+    }
+
+    /// An asker answering scripted answers in order, counting every question.
+    struct ScriptedAsker {
+        answers: Mutex<Vec<OperatorAnswer>>,
+        asked: AtomicUsize,
+    }
+
+    impl ScriptedAsker {
+        fn new(answers: &[OperatorAnswer]) -> Arc<Self> {
+            Arc::new(Self {
+                answers: Mutex::new(answers.iter().rev().copied().collect()),
+                asked: AtomicUsize::new(0),
+            })
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Asker for ScriptedAsker {
+        fn ask<'a>(
+            &'a self,
+            _request: AuthorizationRequest<'a>,
+        ) -> BoxFuture<'a, Option<OperatorAnswer>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let answer = self.answers.lock().unwrap().pop();
+            Box::pin(async move { answer })
+        }
+    }
+
+    async fn authorize_with(bridge: &AskBridge, effect: Effect) -> Decision {
+        let (call, identity) = (call(), identity());
+        bridge
+            .authorize(AuthorizationRequest {
+                call: &call,
+                identity: &identity,
+                effect,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn the_asker_is_never_asked_for_permit_or_deny() {
+        for verdict in [Verdict::Permit, Verdict::Deny("policy says no".to_string())] {
+            let asker = ScriptedAsker::new(&[OperatorAnswer::No]);
+            let bridge = AskBridge::with_asker(
+                ScriptedSource::new(verdict.clone()),
+                false,
+                asker.clone(),
+                CancellationToken::new(),
+            );
+            let expected = match verdict {
+                Verdict::Deny(reason) => Decision::Deny { reason },
+                _ => Decision::Permit,
+            };
+            for effect in [Effect::ReadOnly, Effect::Executes] {
+                assert_eq!(authorize_with(&bridge, effect).await, expected);
+            }
+            assert_eq!(asker.asked(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn always_keys_the_grant_with_the_policy_id() {
+        let source = ScriptedSource::new(Verdict::Ask);
+        let asker = ScriptedAsker::new(&[
+            OperatorAnswer::Always,
+            OperatorAnswer::Always,
+            OperatorAnswer::No,
+        ]);
+        let bridge = AskBridge::with_asker(
+            source.clone(),
+            false,
+            asker.clone(),
+            CancellationToken::new(),
+        );
+        assert_eq!(
+            authorize_with(&bridge, Effect::Executes).await,
+            Decision::Permit
+        );
+        assert_eq!(
+            authorize_with(&bridge, Effect::Executes).await,
+            Decision::Permit
+        );
+        assert_eq!(asker.asked(), 1);
+        let key = (call().name, identity(), source.policy());
+        assert!(bridge.always.lock().unwrap().contains(&key));
+
+        // Another digest is another policy: asked again, granted under the new id.
+        source.set_digest("sha256:two");
+        assert_eq!(
+            authorize_with(&bridge, Effect::Executes).await,
+            Decision::Permit
+        );
+        assert_eq!(asker.asked(), 2);
+        assert_eq!(bridge.always.lock().unwrap().len(), 2);
+        let key = (call().name, identity(), source.policy());
+        assert!(bridge.always.lock().unwrap().contains(&key));
+
+        // Another package with the first digest is not granted either.
+        source.set_digest("sha256:one");
+        source.policy.lock().unwrap().package = FULL_ACCESS_POLICY.to_string();
+        assert_eq!(
+            authorize_with(&bridge, Effect::Executes).await,
+            deny(USER_DENY)
+        );
+        assert_eq!(asker.asked(), 3);
+    }
+
+    #[tokio::test]
+    async fn no_operator_left_is_cancel_deny() {
+        let asker = ScriptedAsker::new(&[]);
+        let bridge = AskBridge::with_asker(
+            ScriptedSource::new(Verdict::Ask),
+            false,
+            asker.clone(),
+            CancellationToken::new(),
+        );
+        assert_eq!(
+            authorize_with(&bridge, Effect::Executes).await,
+            deny(CANCEL_DENY)
+        );
+        assert_eq!(asker.asked(), 1);
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@
 mod parser;
 #[cfg(feature = "native")]
 mod provider;
+mod replay;
 mod request;
 
 use p1_contracts::{
@@ -19,6 +20,7 @@ use p1_model_profile::{ModelProfile, ThinkingPolicy};
 pub use parser::ChatParser;
 #[cfg(feature = "native")]
 pub use provider::ChatProvider;
+pub use replay::{REPLAY_VERSION, Replay, decode, encode};
 pub use request::{build_request, validate as validate_request};
 
 /// Implemented encodings, not service names. Unknown extensions require an implementation.

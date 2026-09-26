@@ -11,11 +11,24 @@
 #   check-module-boundaries: <package|crate>: FINDING: <why>
 # and the last line is `check-module-boundaries: clean (<n> packages, <m> crates)` when no
 # finding was seen, else `check-module-boundaries: <k> finding(s)`.
+#
+# `--shipping` (D059, approved for S0 in ANSWERS B-S7-2) is a separate mode, not a second
+# check of the packages: it prints the production dependency graph of the shipping binary `p1`
+# (`cargo tree --locked --offline -p p1-host -e normal`), the classification of every
+# workspace crate in it from the frozen ADR-0081 table this script carries as data, the
+# shipped packages' imports, and every `extension` crate the graph still reaches — a native
+# fallback, listed rather than hidden. It builds nothing, reads no component and needs no
+# module toolchain. Its last line is
+#   check-module-boundaries: shipping: clean (<n> crates, <k> packages, 0 native fallbacks)
+# or `check-module-boundaries: shipping: <f> native fallback(s)`; before the cutover it is red
+# by design and the gate does not run it.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 root="$(pwd -P)"
 
 output_dir="modules/target/p1-modules"
+shipping=0
+release_manifest=""
 findings=0
 packages_checked=0
 crates_checked=0
@@ -34,6 +47,14 @@ and the unsafe policy (a crate inherits unsafe_code = "forbid"; handwritten sour
                     (each package's outputs are <dir>/<package>/<package>.{wasm,wit,imports,
                     manifest.json}); a copy of it is how the check is tried against a
                     tampered import list.
+--shipping          the shipping audit (D059): print the production dependency graph of the
+                    binary `p1`, restricted to workspace crates, the classification of each
+                    crate against the frozen ADR-0081 table, the shipped packages' imports and
+                    every extension crate still reachable as a native fallback. Reads no
+                    component and needs no wasm-tools; combines with --output-dir.
+--release-manifest <file>
+                    with --shipping, take the shipped packages from the components of this
+                    release manifest instead of from the build outputs under --output-dir.
 --help, -h          print this help and exit 0.
 
 Exit 0 when clean, 1 when there is a finding, 2 on a usage or tool error.
@@ -60,6 +81,19 @@ while [ "$#" -gt 0 ]; do
       output_dir="${1#*=}"
       shift
       ;;
+    --shipping)
+      shipping=1
+      shift
+      ;;
+    --release-manifest)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      release_manifest="$2"
+      shift 2
+      ;;
+    --release-manifest=*)
+      release_manifest="${1#*=}"
+      shift
+      ;;
     *)
       echo "check-module-boundaries: unknown argument $1" >&2
       usage >&2
@@ -68,10 +102,23 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-command -v wasm-tools >/dev/null 2>&1 ||
-  tool_error "wasm-tools is not on PATH (the pinned module toolchain)"
-[ -f modules/capabilities.toml ] ||
-  tool_error "modules/capabilities.toml is missing (the frozen capability allocation)"
+# The release manifest names the shipped packages of the shipping audit; the default mode reads
+# no manifest, so the option alone is a usage error rather than a silently ignored argument.
+if [ -n "$release_manifest" ] && [ "$shipping" -eq 0 ]; then
+  echo "check-module-boundaries: --release-manifest is a shipping option; add --shipping" >&2
+  usage >&2
+  exit 2
+fi
+
+# The package checks read the built components with wasm-tools and compare them to the frozen
+# allocation; the shipping audit reads the shipping binary's graph and the build outputs'
+# manifests, so it needs neither.
+if [ "$shipping" -eq 0 ]; then
+  command -v wasm-tools >/dev/null 2>&1 ||
+    tool_error "wasm-tools is not on PATH (the pinned module toolchain)"
+  [ -f modules/capabilities.toml ] ||
+    tool_error "modules/capabilities.toml is missing (the frozen capability allocation)"
+fi
 
 # The reasons collected for the package or crate currently checked.
 REASONS=()
@@ -538,6 +585,386 @@ check_crate() {
     echo "check-module-boundaries: $name: ok"
   fi
 }
+
+# ---------------------------------------------------------------------------------------
+# --shipping (D059): the shipping audit of the binary `p1`
+#
+# The graph is the production dependency graph of the composition root,
+# `cargo tree --locked --offline -p p1-host -e normal`, restricted to workspace crates: cargo
+# prints a path dependency with its path, so a line whose path lies below this checkout is one
+# of ours and every other line is an external crate — counted, never listed. Every workspace
+# crate is then classified from the frozen table below, which is the ADR-0081 line as data
+# (D059 keeps it here rather than in modules/capabilities.toml, which holds the per-class
+# capability allocation). An `extension` crate the graph still reaches is a native fallback:
+# the audit prints it with the path from `p1-host` and the module package that implements the
+# same thing, so a compiled-in tool, provider or policy can never hide behind the module
+# loader; an extension implementation inside a *foundation* crate is named as a "native twin".
+# The shipped packages' imports come from the build outputs under --output-dir, or from the
+# components of the release manifest --release-manifest names.
+
+# The frozen classification table: `<crate>|<class>|<reason>`, one crate per line. The class is
+# `foundation` (a component ADR-0081 keeps native), `runtime` (the module runtime and the
+# protocol it speaks), `core` or `contracts`, or `extension` (a tool, provider, context-policy
+# or authorization-policy implementation that becomes a module). A crate of the shipping graph
+# that is not listed is a finding: the mode never guesses a class.
+SHIPPING_TABLE='
+p1-assembly|foundation|assembles environments, profiles and routes and reads the module lock; assembly is a host step (ADR-0081)
+p1-auth|foundation|the credential source is native and no interface returns a value (ADR-0081)
+p1-contracts|contracts|the contracts the core and its modules share (ADR-0002)
+p1-context|extension|holds the summarizing context policy (src/engine.rs); it becomes the context-policy module and its native driver leaves with it (ADR-0036, ADR-0081)
+p1-core|core|the core runs one loop and depends only on contracts (ADR-0002)
+p1-hook-shadow|foundation|the brain shadow hook is spawned detached by the host and fails open (ADR-0058)
+p1-host|foundation|the composition root: the OS services it owns (the terminal driver, the worker service, the detached hook shadow) stay native (ADR-0081); its native authorization policies are named as a native twin
+p1-journal|foundation|the session record is native and the single truth, including the version and assembly identity (ADR-0021, ADR-0080)
+p1-model-profile|foundation|model policy is host data read at assembly, not an extension (ADR-0004, ADR-0081)
+p1-module-protocol|runtime|the value protocol a module speaks; it is a runtime crate (ADR-0081)
+p1-module-runtime|runtime|wasmtime, the loader, the executor and the per-contract adapters live in the host, never in the core (ADR-0081)
+p1-provider-anthropic|extension|the Anthropic Messages implementation, a provider that becomes a module (ADR-0081)
+p1-provider-http|foundation|sending, retry, backoff, the one credential refresh after a 401 or 403 and the read bounds stay native (ADR-0081)
+p1-provider-openai|extension|the OpenAI Responses implementation, a provider that becomes a module (ADR-0081)
+p1-provider-openai-chat|extension|the Chat Completions implementation, a provider that becomes a module (ADR-0081)
+p1-redact|foundation|credential-shape masking runs over the output of every assembled tool (issue #142)
+p1-tool-delegate|extension|the worker_start, worker_result, worker_continue and worker_cancel tool members (ADR-0081)
+p1-tool-edit|extension|the `edit` tool implementation, which becomes a tool module (ADR-0081)
+p1-tool-finish|extension|the `finish` tool and the output contract it checks, which become a tool module (ADR-0081)
+p1-tool-patch|extension|the `apply_patch` tool implementation, which becomes a tool module (ADR-0081)
+p1-tool-read|extension|the `read` tool implementation, which becomes a tool module (ADR-0081)
+p1-tool-search|extension|the `grep` tool implementation, which becomes a tool module (ADR-0081)
+p1-tool-shell|extension|the `shell` tool logic is extension; the crate also holds the bubblewrap boundary and the native process service (S3.1), so it stays extension until that service leaves it (ADR-0081)
+p1-tool-workflow|extension|the workflow_start, workflow_status, workflow_result and workflow_cancel tool members (ADR-0081)
+p1-tool-write|extension|the `write` tool implementation, which becomes a tool module (ADR-0081)
+p1-tui|foundation|the terminal driver is native; the state machine it renders is not a module (ADR-0043)
+p1-usage|foundation|usage and cost accounting is native (ADR-0019)
+p1-workers|foundation|the in-process worker service is native; the worker packages answer the tool members over the module interfaces (ADR-0027, ADR-0081)
+p1-workflow|foundation|the workflow interpreter keeps all run state and drives a run (ADR-0081)
+p1-workspace|foundation|confinement resolves paths after symlinks and every write is the native atomic replacement (ADR-0081)
+'
+
+# The module packages that implement what an extension crate still implements natively, as
+# `<crate>|<build output directory>`, one crate per line; a crate with no line ships no package
+# yet, which its fallback line says.
+SHIPPING_PACKAGES='
+p1-context|p1-module-context
+p1-tool-delegate|p1-module-worker-start p1-module-worker-continue p1-module-worker-result p1-module-worker-cancel
+p1-tool-workflow|p1-module-workflow-start p1-module-workflow-status p1-module-workflow-result p1-module-workflow-cancel
+'
+
+# The extension implementations a *foundation* crate still answers natively, as
+# `<crate>|<what>|<package directory> [...]`, one line each. The audit names them (a `native
+# twin:` line) rather than leaving them inside a class that would hide them; the class of the
+# crate they live in does not decide whether the audit may hide them.
+SHIPPING_TWINS='
+p1-host|the native authorization policies p1/policy/ask and p1/policy/full-access (crates/p1-host/src/policy.rs)|p1-module-policy-ask p1-module-policy-full-access
+'
+
+# The class the frozen table gives crate $1, or nothing when the table does not list the crate.
+shipping_class() {
+  awk -F'|' -v crate="$1" '$1 == crate { print $2; exit }' <<<"$SHIPPING_TABLE"
+}
+
+# The frozen ADR-0081 reason the table gives crate $1.
+shipping_reason() {
+  awk -F'|' -v crate="$1" '$1 == crate { print $3; exit }' <<<"$SHIPPING_TABLE"
+}
+
+# The build output directory of every module package that implements crate $1, one per line.
+shipping_implementations() {
+  awk -F'|' -v crate="$1" '$1 == crate { print $2; exit }' <<<"$SHIPPING_PACKAGES" |
+    tr ' ' '\n' | sed '/^$/d'
+}
+
+# The parser of `cargo tree --prefix depth` output, used in two passes: with
+# `-v count=externals` it prints the number of external crates, otherwise one
+# `<depth>\t<name>\t<parent>\t<path>` line per distinct workspace crate in tree order, where the
+# root of the tree (depth 0) carries `-` as its parent. A workspace crate is a crate cargo
+# prints with a path below $root; cargo prints the path of a repeated crate too (its line
+# carries ` (*)`), and only the first line names it, so the tree is the line order together
+# with the depth. An external crate is counted once per `name vversion` — cargo prints a
+# repeated one again with ` (*)`, and one crate can be reached at two versions — so the
+# external figure has the same base as the deduplicated workspace figure next to it.
+SHIPPING_TREE='
+  {
+    if (match($0, /^[0-9]+/)) {
+      depth = substr($0, 1, RLENGTH) + 0
+      rest = substr($0, RLENGTH + 1)
+    } else next
+    if (match(rest, /^[A-Za-z0-9_.-]+ v[^ ]+/)) {
+      id = substr(rest, 1, RLENGTH)
+      name = id
+      sub(/ v.*$/, "", name)
+    } else next
+    path = ""
+    if (match(rest, /\((\/[^)]*)\)/)) path = substr(rest, RSTART + 1, RLENGTH - 2)
+    if (substr(path, 1, length(root) + 1) != root "/") {
+      if (!(id in external_seen)) {
+        external_seen[id] = 1
+        externals += 1
+      }
+      next
+    }
+    max = (depth > max) ? depth : max
+    for (d = depth + 1; d <= max; d++) delete stack[d]
+    max = depth
+    parent = (depth == 0) ? "-" : stack[depth - 1]
+    stack[depth] = name
+    if (count) next
+    if (name in seen) next
+    seen[name] = 1
+    print depth "\t" name "\t" parent "\t" path
+  }
+  END { if (count) print externals + 0 }
+'
+
+# The component entries of the release manifest $1 as `<name>\t<kind>`, one per line, read with
+# python3 because the manifest is JSON (scripts/stage-release.sh reads package manifests the
+# same way). A manifest that cannot be read, or carries no components list, is refused: the
+# audit prints no inventory it cannot stand behind.
+shipping_release_components() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+except (OSError, ValueError) as exc:
+    raise SystemExit(f"check-module-boundaries: cannot read the release manifest {path}: {exc}")
+
+components = manifest.get("components") if isinstance(manifest, dict) else None
+if not isinstance(components, list):
+    raise SystemExit(f"check-module-boundaries: {path} is no release manifest with components")
+
+for entry in components:
+    name = entry.get("name") if isinstance(entry, dict) else None
+    kind = entry.get("kind") if isinstance(entry, dict) else None
+    if not isinstance(name, str) or not name or not isinstance(kind, str) or not kind:
+        raise SystemExit(f"check-module-boundaries: {path}: a component entry names no package and kind")
+    print(f"{name}\t{kind}")
+PY
+}
+
+# The chain of workspace crates from `p1-host` down to crate $1, ` > `-joined: the path through
+# the shipping graph by which the graph reaches the crate (shipping_audit's arrays).
+shipping_chain() {
+  local chain="" name="$1" i="${crate_index[$1]:-}"
+  if [ -z "$i" ]; then
+    printf '%s' "$name"
+    return 0
+  fi
+  while :; do
+    chain="${crate_name[$i]}${chain:+ > $chain}"
+    name="${crate_parent[$i]}"
+    [ -n "$name" ] || break
+    i="${crate_index[$name]:-}"
+    if [ -z "$i" ]; then
+      chain="$name > $chain"
+      break
+    fi
+  done
+  printf '%s' "$chain"
+}
+
+# The module packages $* as `<manifest name> (<directory>)`, comma separated, with
+# `<directory> (not built)` for a package the build outputs do not hold
+# (shipping_audit's arrays).
+shipping_package_names() {
+  local dir name entry out=""
+  for dir in "$@"; do
+    [ -n "$dir" ] || continue
+    name=""
+    for entry in "${!out_dir[@]}"; do
+      if [ "${out_dir[$entry]}" = "$dir" ]; then
+        name="${out_name[$entry]}"
+        break
+      fi
+    done
+    if [ -z "$name" ]; then
+      out="${out:+$out, }$dir (not built)"
+    else
+      out="${out:+$out, }$name ($dir)"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# The module packages that implement crate $1, as shipping_package_names formats them.
+shipping_implemented_by() {
+  local -a dirs=()
+  mapfile -t dirs < <(shipping_implementations "$1")
+  [ "${#dirs[@]}" -gt 0 ] || return 0
+  shipping_package_names "${dirs[@]}"
+}
+
+# The shipping audit (D059): the production graph of `p1-host`, the classification of every
+# workspace crate in it, the shipped packages' imports and every extension implementation the
+# graph still reaches. Exits 0 only when the graph reaches no extension implementation.
+shipping_audit() {
+  local tree="" graph="" externals=0 crate_count=0 package_count=0 fallbacks=0
+  local depth=0 name="" parent="" path="" class="" reason="" dir="" cname="" ckind="" entry=0
+  local imports="" twins="" implements=""
+  local -a crate_name=() crate_parent=() crate_class=()
+  local -A crate_index=()
+  local -a out_dir=() out_name=() out_kind=() out_shipped=()
+  local i=0 index=0 manifest=""
+
+  if ! tree="$(cargo tree --locked --offline -p p1-host -e normal --prefix depth)"; then
+    tool_error "cannot read the production graph of p1-host (cargo tree --locked --offline -p p1-host -e normal)"
+  fi
+  externals="$(printf '%s\n' "$tree" | awk -v root="$root" -v count=externals "$SHIPPING_TREE")"
+  graph="$(printf '%s\n' "$tree" | awk -v root="$root" "$SHIPPING_TREE")"
+  crate_count="$(printf '%s\n' "$graph" | grep -c . || true)"
+
+  echo "check-module-boundaries: shipping: graph: $crate_count workspace crates, $externals external crates (cargo tree --locked --offline -p p1-host -e normal)"
+
+  # The graph restricted to workspace crates, in tree order with the depth that places each
+  # crate, and its class from the frozen table.
+  while IFS=$'\t' read -r depth name parent path; do
+    [ -n "$name" ] || continue
+    class="$(shipping_class "$name")"
+    if [ -z "$class" ]; then
+      echo "check-module-boundaries: shipping: FINDING: $name (depth $depth) is not in the frozen classification table"
+      findings=$((findings + 1))
+      continue
+    fi
+    # `read` collapses an empty field between tabs, so the root's parent is written as `-`.
+    [ "$parent" = - ] && parent=""
+    crate_name+=("$name")
+    crate_parent+=("$parent")
+    crate_class+=("$class")
+    crate_index[$name]="$((${#crate_name[@]} - 1))"
+    echo "check-module-boundaries: shipping: graph: $depth $name ($class: $(shipping_reason "$name"))"
+  done <<<"$graph"
+
+  # The build outputs: every package directory under --output-dir that carries the package's own
+  # manifest and its imports. A directory without either is a finding, never a skipped package.
+  for dir in "$output_dir"/*/; do
+    [ -d "$dir" ] || continue
+    dir="$(basename "$dir")"
+    if [ ! -f "$output_dir/$dir/$dir.manifest.json" ]; then
+      echo "check-module-boundaries: shipping: FINDING: $output_dir/$dir/$dir.manifest.json is missing"
+      findings=$((findings + 1))
+      continue
+    fi
+    if [ ! -f "$output_dir/$dir/$dir.imports" ]; then
+      echo "check-module-boundaries: shipping: FINDING: $output_dir/$dir/$dir.imports is missing"
+      findings=$((findings + 1))
+      continue
+    fi
+    name="$(json_string_field "$output_dir/$dir/$dir.manifest.json" name)"
+    ckind="$(json_string_field "$output_dir/$dir/$dir.manifest.json" kind)"
+    if [ -z "$name" ] || [ -z "$ckind" ]; then
+      echo "check-module-boundaries: shipping: FINDING: $output_dir/$dir/$dir.manifest.json names no package and kind"
+      findings=$((findings + 1))
+      continue
+    fi
+    out_dir+=("$dir")
+    out_name+=("$name")
+    out_kind+=("$ckind")
+    out_shipped+=(1)
+  done
+
+  # With a release manifest, the manifest decides what ships: every component entry must have
+  # its build output, whose kind it must agree with, and a build output the manifest does not
+  # name is not shipped.
+  if [ -n "$release_manifest" ]; then
+    if ! manifest="$(shipping_release_components "$release_manifest")"; then
+      exit 2
+    fi
+    echo "check-module-boundaries: shipping: imports: the components of $release_manifest"
+    index=0
+    while [ "$index" -lt "${#out_shipped[@]}" ]; do
+      out_shipped[index]=0
+      index=$((index + 1))
+    done
+    while IFS=$'\t' read -r cname ckind; do
+      [ -n "$cname" ] || continue
+      index=-1
+      entry=0
+      while [ "$entry" -lt "${#out_name[@]}" ]; do
+        if [ "${out_name[$entry]}" = "$cname" ]; then
+          index="$entry"
+          break
+        fi
+        entry=$((entry + 1))
+      done
+      if [ "$index" -lt 0 ]; then
+        echo "check-module-boundaries: shipping: FINDING: $release_manifest names $cname, and no build output under $output_dir does"
+        findings=$((findings + 1))
+        continue
+      fi
+      if [ "$ckind" != "${out_kind[$index]}" ]; then
+        echo "check-module-boundaries: shipping: FINDING: $cname is kind $ckind in $release_manifest and ${out_kind[$index]} in its build output"
+        findings=$((findings + 1))
+      fi
+      out_shipped[index]=1
+    done <<<"$manifest"
+    index=0
+    while [ "$index" -lt "${#out_dir[@]}" ]; do
+      if [ "${out_shipped[$index]}" -eq 0 ]; then
+        echo "check-module-boundaries: shipping: not shipped: ${out_name[$index]} (${out_dir[$index]}) is built and $release_manifest does not name it"
+      fi
+      index=$((index + 1))
+    done
+  fi
+
+  # Every shipped package's imports, its class first so the inventory is grouped by class.
+  while IFS=$'\t' read -r ckind dir cname; do
+    [ -n "$dir" ] || continue
+    imports="$(paste -sd, "$output_dir/$dir/$dir.imports" | sed 's/,/, /g')"
+    [ -n "$imports" ] || imports="none"
+    echo "check-module-boundaries: shipping: imports: $ckind $dir ($cname): $imports"
+    package_count=$((package_count + 1))
+  done < <(
+    index=0
+    while [ "$index" -lt "${#out_dir[@]}" ]; do
+      if [ "${out_shipped[$index]}" -eq 1 ]; then
+        printf '%s\t%s\t%s\n' "${out_kind[$index]}" "${out_dir[$index]}" "${out_name[$index]}"
+      fi
+      index=$((index + 1))
+    done | LC_ALL=C sort
+  )
+  if [ "$package_count" -eq 0 ]; then
+    echo "check-module-boundaries: shipping: imports: no build output under $output_dir"
+  fi
+
+  # Every extension crate the graph reaches is a native fallback, printed with the path from
+  # `p1-host` and the module package that implements the same thing. A reachable extension crate
+  # that is not printed is the bug this mode exists to prevent.
+  for i in "${!crate_name[@]}"; do
+    [ "${crate_class[$i]}" = extension ] || continue
+    fallbacks=$((fallbacks + 1))
+    implements="$(shipping_implemented_by "${crate_name[$i]}")"
+    if [ -n "$implements" ]; then
+      echo "check-module-boundaries: shipping: native fallback: ${crate_name[$i]} (extension) via $(shipping_chain "${crate_name[$i]}"); implements $implements"
+    else
+      echo "check-module-boundaries: shipping: native fallback: ${crate_name[$i]} (extension) via $(shipping_chain "${crate_name[$i]}"); no module package ships it yet"
+    fi
+  done
+
+  # The extension implementations a foundation crate answers natively: named rather than left
+  # inside a class that would hide them, and not a crate of the graph, so they are not one of
+  # the crate fallbacks counted above.
+  while IFS='|' read -r name reason twins; do
+    [ -n "$name" ] || continue
+    echo "check-module-boundaries: shipping: native twin: $name (extension: $reason) via $(shipping_chain "$name"); implements $(shipping_package_names $twins)"
+  done <<<"$SHIPPING_TWINS"
+
+  if [ "$fallbacks" -gt 0 ]; then
+    echo "check-module-boundaries: shipping: $fallbacks native fallback(s)"
+    exit 1
+  fi
+  if [ "$findings" -gt 0 ]; then
+    echo "check-module-boundaries: shipping: $findings finding(s)"
+    exit 1
+  fi
+  echo "check-module-boundaries: shipping: clean ($crate_count crates, $package_count packages, 0 native fallbacks)"
+  exit 0
+}
+
+if [ "$shipping" -eq 1 ]; then
+  shipping_audit
+fi
 
 mapfile -t packages < <(module_packages)
 for pkg in "${packages[@]}"; do
