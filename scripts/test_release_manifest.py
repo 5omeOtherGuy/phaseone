@@ -57,6 +57,8 @@ WASM_TOOLS=1.220.0
 
 RUSTC_STUB = f"#!/bin/sh\nprintf '%s\\n' '{RUSTC_VERSION}'\n"
 CARGO_STUB = f"#!/bin/sh\nprintf '%s\\n' '{CARGO_VERSION}'\n"
+# A checkout's HEAD, as `git rev-parse HEAD` reports it in a development run.
+GIT_STUB = f"#!/bin/sh\nprintf '%s\\n' '{COMMIT}'\n"
 
 
 def write_file(path: str, data: bytes, mode: int = 0o644) -> None:
@@ -92,6 +94,7 @@ class ReleaseManifestTest(unittest.TestCase):
         os.mkdir(self.bin_cargo_only)
         write_file(os.path.join(self.bin, "rustc"), RUSTC_STUB.encode(), 0o755)
         write_file(os.path.join(self.bin, "cargo"), CARGO_STUB.encode(), 0o755)
+        write_file(os.path.join(self.bin, "git"), GIT_STUB.encode(), 0o755)
         write_file(os.path.join(self.bin_cargo_only, "cargo"), CARGO_STUB.encode(), 0o755)
         write_file(self.native, self.native_bytes, 0o755)
 
@@ -224,6 +227,41 @@ class ReleaseManifestTest(unittest.TestCase):
         result = self.generate(**kwargs)
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.read_manifest(kwargs.get("modules_dir"))
+
+    def generate_development(
+        self,
+        *,
+        build_modules_dir: str,
+        modules_dir: str | None = None,
+        root: str | None = None,
+        commit: str | None = None,
+        path: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the development mode: no native asset and the build outputs as the modules dir."""
+        argv = [
+            sys.executable,
+            SCRIPT,
+            "--development",
+            "--root",
+            root if root is not None else self.root,
+            "--modules-dir",
+            modules_dir if modules_dir is not None else build_modules_dir,
+            "--build-modules-dir",
+            build_modules_dir,
+        ]
+        if commit is not None:
+            argv += ["--commit", commit]
+        return subprocess.run(
+            argv,
+            cwd=self.tmp,
+            env=self.environment(path),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
 
     def assert_refused(self, result: subprocess.CompletedProcess[str], message: str) -> None:
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -572,6 +610,120 @@ class ReleaseManifestTest(unittest.TestCase):
         result = self.generate(build_modules_dir=os.path.join(self.tmp, "absent"))
 
         self.assert_refused(result, "not a directory")
+
+    # ---- development mode (BLOCKERS S3-B6, D080) ---------------------------------
+
+    def test_development_manifest_names_every_built_package_relative_to_itself(self) -> None:
+        build = self.build_outputs()
+        first = b"first component bytes\n"
+        second = b"second component bytes\n"
+        self.write_build_package(build, "p1-module-alpha", "p1/alpha", first)
+        self.write_build_package(build, "p1-module-zeta", "p1/zeta", second)
+
+        result = self.generate_development(build_modules_dir=build)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.read_manifest(build)
+        self.assertEqual(manifest["format"], "p1-release-manifest/1")
+        # The checkout's HEAD: the git stub answers `rev-parse HEAD` on PATH.
+        self.assertEqual(manifest["commit"], COMMIT)
+        self.assertIsNone(manifest["native"])
+        self.assertIsNone(manifest["tag"])
+        self.assertEqual(manifest["packages"], [])
+        self.assertEqual(
+            manifest["components"],
+            [
+                {
+                    "name": "p1/alpha",
+                    "digest": "sha256:" + sha256(first),
+                    # Relative to the manifest, which sits beside the built packages.
+                    "path": "p1-module-alpha/p1-module-alpha.wasm",
+                    "kind": "tool",
+                    "world": "p1:module/tool@1.0.0",
+                    "protocol": "1.0",
+                    "capabilities": ["control", "clock", "process"],
+                    "variant": "default",
+                },
+                {
+                    "name": "p1/zeta",
+                    "digest": "sha256:" + sha256(second),
+                    "path": "p1-module-zeta/p1-module-zeta.wasm",
+                    "kind": "tool",
+                    "world": "p1:module/tool@1.0.0",
+                    "protocol": "1.0",
+                    "capabilities": ["control", "clock", "process"],
+                    "variant": "default",
+                },
+            ],
+        )
+        # The runtime parser is closed over the component entry: the development entry carries
+        # exactly the frozen fields, and its path resolves to the built `.wasm`.
+        for entry in manifest["components"]:
+            self.assertEqual(set(entry), COMPONENT_KEYS)
+            resolved = os.path.join(build, entry["path"])
+            self.assertTrue(os.path.isfile(resolved), resolved)
+            with open(resolved, "rb") as handle:
+                self.assertEqual("sha256:" + sha256(handle.read()), entry["digest"])
+
+    def test_a_development_run_rewrites_the_manifest_over_every_built_package(self) -> None:
+        # A per-package build refreshes the manifest, so it must name every package built so
+        # far, never only the one just rebuilt.
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-alpha", "p1/alpha", b"alpha\n")
+        self.assertEqual(self.generate_development(build_modules_dir=build).returncode, 0)
+        self.write_build_package(build, "p1-module-zeta", "p1/zeta", b"zeta\n")
+
+        self.assertEqual(self.generate_development(build_modules_dir=build).returncode, 0)
+
+        manifest = self.read_manifest(build)
+        self.assertEqual(
+            [entry["name"] for entry in manifest["components"]], ["p1/alpha", "p1/zeta"]
+        )
+
+    def test_development_commit_argument_wins_over_the_checkout_head(self) -> None:
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-alpha", "p1/alpha", b"alpha\n")
+        other = "fedcba9876543210fedcba9876543210fedcba98"
+
+        result = self.generate_development(build_modules_dir=build, commit=other)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_manifest(build)["commit"], other)
+
+    def test_development_run_without_git_is_refused(self) -> None:
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-alpha", "p1/alpha", b"alpha\n")
+        # A PATH with no git at all: HEAD cannot be read, so the run must refuse rather than
+        # invent a commit.
+        bin_no_git = os.path.join(self.tmp, "bin-no-git")
+        os.mkdir(bin_no_git)
+        write_file(os.path.join(bin_no_git, "rustc"), RUSTC_STUB.encode(), 0o755)
+        write_file(os.path.join(bin_no_git, "cargo"), CARGO_STUB.encode(), 0o755)
+
+        result = self.generate_development(build_modules_dir=build, path=bin_no_git)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release-manifest:", result.stderr)
+        self.assertIn("git rev-parse HEAD failed", result.stderr)
+
+    def test_a_development_manifest_beside_the_build_outputs_is_not_a_package(self) -> None:
+        # scripts/build-modules.sh writes modules/target/p1-modules/manifest.json beside the
+        # packages, and the release path points stage-release.sh at that same directory: the
+        # release manifest must still be built from the packages, not refuse the extra file.
+        build = self.build_outputs()
+        data = b"fixture component bytes\n"
+        self.write_build_package(build, "p1-module-fixture", "p1/fixture", data)
+        write_file(
+            os.path.join(build, "manifest.json"),
+            b'{"format": "p1-release-manifest/1", "components": []}\n',
+        )
+
+        manifest = self.generate_ok(build_modules_dir=build)
+
+        self.assertEqual(
+            [entry["name"] for entry in manifest["components"]], ["p1/fixture"]
+        )
+        self.assertEqual(manifest["components"][0]["digest"], "sha256:" + sha256(data))
 
     # ---- pins --------------------------------------------------------------------
 

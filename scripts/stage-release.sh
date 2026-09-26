@@ -146,6 +146,10 @@ packages=0
 shopt -s nullglob
 for entry in "$modules"/*; do
   package="$(basename -- "$entry")"
+  # scripts/build-modules.sh writes the development manifest (BLOCKERS S3-B6, D080) at the top
+  # of the directory it published the packages into, and that is the same directory this script
+  # reads: it sits beside the packages and is not one.
+  [ "$package" = manifest.json ] && continue
   [ -d "$entry" ] && [ ! -L "$entry" ] ||
     fail "$modules/$package: not a package directory"
   for file in "$entry"/*; do
