@@ -62,18 +62,19 @@ pub(crate) fn transition(
             }
         }
         (Action::MoveOn { reason, .. }, Ask::Accept(attempt)) => {
+            // A link is left only for a route failure or a cap, and only on its first
+            // attempt: a capped repair ends the step (ADR-0054 item 3).
             let earned = step.repair.is_none()
-                && match (reason, attempt) {
+                && matches!(
+                    (reason, attempt),
                     (
                         MovedOn::RouteFailed,
                         Attempt::Ended {
                             end: StepEnd::RouteFailed { .. },
                             ..
                         },
-                    ) => true,
-                    (MovedOn::Capped, Attempt::Capped { .. }) => true,
-                    _ => false,
-                };
+                    ) | (MovedOn::Capped, Attempt::Capped { .. })
+                );
             if !earned {
                 return Err(
                     "it moves on to the next link without a route failure or a cap".to_string(),
