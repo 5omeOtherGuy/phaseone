@@ -192,6 +192,15 @@ pub struct HostDeps {
     /// catalog and the parent's activity plumbing exist, so the line mode — and the
     /// TUI's run loop — can switch the model between turns.
     pub(crate) model_switch: Option<Arc<run::ModelSwitch>>,
+    /// The module hook `catalog/modules.rs` links locked module packages with (B-S6-9,
+    /// D068). The worker and workflow families set it when they are composed; the base every
+    /// package gets (the agent's workspace read side and observations, S1.8) fills what it
+    /// leaves empty, and alone links every package when it is `None`.
+    pub(crate) module_services: Option<catalog::modules::ModuleServices>,
+    /// The main agent's generation of worker-member scopes (B-S6-9, D068), set with the
+    /// worker service; `run.rs` retires it when the agent's assembly is dropped.
+    #[cfg(feature = "delegation")]
+    pub(crate) member_scopes: Option<Arc<catalog::delegation::MemberScopes>>,
 }
 
 impl HostDeps {
@@ -233,6 +242,9 @@ impl HostDeps {
             #[cfg(feature = "workflows")]
             workflow_observer: None,
             model_switch: None,
+            module_services: None,
+            #[cfg(feature = "delegation")]
+            member_scopes: None,
         }
     }
 }

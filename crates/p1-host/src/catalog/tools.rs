@@ -25,7 +25,7 @@ const READ: &str = "read";
 /// package's manifest grants it.
 pub(super) fn module_services(deps: &HostDeps) -> ModuleServices {
     let home = deps.home.clone();
-    Arc::new(move |services: &ToolServices| {
+    Arc::new(move |_module: &str, services: &ToolServices| {
         p1_tool_read::capability_services(
             services.workspace.clone(),
             services.observed.clone(),

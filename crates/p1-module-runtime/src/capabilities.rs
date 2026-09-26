@@ -18,6 +18,10 @@ use wasmtime::component::{Linker, Resource, ResourceAny, ResourceTable, Resource
 use wasmtime::{Engine, bail};
 
 use crate::context_policy::{SummaryService, link_summary};
+use crate::delegation::{
+    WorkerServices, WorkflowServices, link_workers_control, link_workers_observe,
+    link_workers_start, link_workflows,
+};
 use crate::loader::interface_import;
 
 /// A command a module asks to run (`process.command`).
@@ -181,6 +185,11 @@ pub struct Services {
     pub workspace: Option<Arc<dyn WorkspaceService>>,
     /// The `snapshot` capability (S1).
     pub snapshot: Option<Arc<dyn SnapshotService>>,
+    /// The `workers-start`, `workers-observe` and `workers-control` capabilities, one
+    /// optional service each ([`crate::delegation`], S6).
+    pub workers: Option<WorkerServices>,
+    /// The `workflows` capability ([`crate::delegation`], S6).
+    pub workflows: Option<WorkflowServices>,
 }
 
 /// A `process.running` as the host holds it, and where it is in the stream `process.wit`
@@ -356,6 +365,22 @@ pub(crate) fn capability_linker(
                 }
                 link_snapshot(&mut linker)
             }
+            "workers-start" => match services.workers.as_ref().and_then(|w| w.start.clone()) {
+                Some(start) => link_workers_start(&mut linker, start),
+                None => return Err(LinkError::MissingService(capability.clone())),
+            },
+            "workers-observe" => match services.workers.as_ref().and_then(|w| w.observe.clone()) {
+                Some(observe) => link_workers_observe(&mut linker, observe),
+                None => return Err(LinkError::MissingService(capability.clone())),
+            },
+            "workers-control" => match services.workers.as_ref().and_then(|w| w.control.clone()) {
+                Some(control) => link_workers_control(&mut linker, control),
+                None => return Err(LinkError::MissingService(capability.clone())),
+            },
+            "workflows" => match services.workflows.clone() {
+                Some(workflows) => link_workflows(&mut linker, workflows),
+                None => return Err(LinkError::MissingService(capability.clone())),
+            },
             // The loader refuses every other capability before a linker is built.
             other => Err(wasmtime::format_err!(
                 "{other} is not a capability of this runtime"

@@ -321,6 +321,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-module-workflow-decision"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-workflow-decision",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-module-workflow-result"
 version = "0.0.1"
 dependencies = [

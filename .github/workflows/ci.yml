@@ -30,12 +30,29 @@ jobs:
         with:
           tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
 
-      - uses: actions/cache@v4
+      # Restore from any earlier gate cache (restore-keys), so a PR whose Cargo.lock
+      # differs from main's starts warm instead of cold. Only main saves: each entry is
+      # ~3.5 GB and the repository store holds 10 GiB, so per-PR saves evicted main's
+      # cache and left every PR gate cold (~15 min instead of a warm build).
+      - name: Restore the gate cache
+        id: gate-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
 
       - run: scripts/gate.sh
+
+      - name: Save the gate cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gate-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}

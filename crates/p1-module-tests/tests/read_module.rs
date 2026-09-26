@@ -475,7 +475,7 @@ async fn the_read_key_assembles_the_component_through_the_catalog() {
         let packages = load_locked_modules(&lock, &release.manifest_file()).expect("p1/read loads");
         let home = home_with_credentials();
         let host_home = Some(home.path().to_path_buf());
-        let services: ModuleServices = Arc::new(move |services: &ToolServices| {
+        let services: ModuleServices = Arc::new(move |_module: &str, services: &ToolServices| {
             capability_services(
                 services.workspace.clone(),
                 services.observed.clone(),

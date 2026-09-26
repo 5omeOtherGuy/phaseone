@@ -44,8 +44,11 @@ const ALLOCATION: &str = include_str!("../../../../modules/capabilities.toml");
 
 /// Builds the capability services one instance of a module tool is linked with, from the
 /// agent's own services. Called once per instantiation, so only when an environment
-/// assembles the module.
-pub type ModuleServices = Arc<dyn Fn(&ToolServices) -> Services + Send + Sync>;
+/// assembles the module. The first argument is the package's verified manifest name (its
+/// module id, e.g. `p1/worker-start`), never the lock key an installation chose: a hook
+/// that serves some members differently (the worker and workflow families, B-S6-9, D068)
+/// must key on the identity the loader checked.
+pub type ModuleServices = Arc<dyn Fn(&str, &ToolServices) -> Services + Send + Sync>;
 
 /// Why the locked modules could not be loaded or registered. Each refusal has its own
 /// variant; the runtime's refusals keep theirs inside [`ModulesError::Load`] and
@@ -320,7 +323,7 @@ fn instantiate(
     // throwaway counter that always reads zero.
     wasm_tool(
         &package.loaded,
-        services(tool_services),
+        services(package.loaded.name(), tool_services),
         ExecutionLimits::default(),
         &tool_services.mask,
     )
@@ -340,12 +343,34 @@ pub(super) fn register_locked_modules(
     }
     let release = official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())?;
     let packages = load_locked_modules(&lock, &release).map_err(|error| error.to_string())?;
-    // The workspace read side and the observations are the agent's own (S1.8); no other
-    // native service backs a module capability in the host yet (the shell's process service
-    // is not bridged to the runtime's `ProcessService`), so a package granted one fails its
-    // assembly with the runtime's `MissingService` rather than running unlinked.
-    let services = super::tools::module_services(deps);
-    register_modules(catalog, packages, services).map_err(|error| error.to_string())
+    register_modules(catalog, packages, locked_module_services(deps))
+        .map_err(|error| error.to_string())
+}
+
+/// The hook every locked package is linked with. The base is the agent's own: the read
+/// side of its workspace and its observations (`super::tools::module_services`, S1.8), for
+/// every module. The worker and workflow families install `deps.module_services` for their
+/// own members (`catalog/delegation.rs`, `catalog/workflow.rs`; B-S6-9, D068); their hooks
+/// give every module they do not serve `Services::default()`, so the base fills the
+/// `workspace` and `snapshot` a family hook left empty, and a module that is no member (the
+/// `p1/read` component) links exactly as without the families. No other native service
+/// backs a module capability in the host yet (the shell's process service is not bridged
+/// to the runtime's `ProcessService`), so a package granted one fails its assembly with the
+/// runtime's `MissingService` rather than running unlinked.
+fn locked_module_services(deps: &HostDeps) -> ModuleServices {
+    let base = super::tools::module_services(deps);
+    let Some(family) = deps.module_services.clone() else {
+        return base;
+    };
+    Arc::new(move |module: &str, services: &ToolServices| {
+        let mut linked = family(module, services);
+        if linked.workspace.is_none() || linked.snapshot.is_none() {
+            let base = base(module, services);
+            linked.workspace = linked.workspace.or(base.workspace);
+            linked.snapshot = linked.snapshot.or(base.snapshot);
+        }
+        linked
+    })
 }
 
 #[cfg(test)]

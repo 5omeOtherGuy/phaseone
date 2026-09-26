@@ -107,6 +107,9 @@ pub(crate) fn compose_children(
     service.reserve_ids(reserved);
     let _ = service_slot.set(service.clone());
     deps.worker_service = Some(service.clone());
+    // The worker members' scopes are over this same service, so a member package and a
+    // native member share one concurrency bound and one id sequence.
+    super::delegation::install_member_scopes(deps, service.clone());
     Ok((
         child_completion_hub,
         catalog_slot,
@@ -707,6 +710,7 @@ impl ChildBuilder {
                     system_prompt: assembled.system_prompt,
                     options: assembled.options,
                     context,
+                    authorization: None,
                 })
             })
         };
