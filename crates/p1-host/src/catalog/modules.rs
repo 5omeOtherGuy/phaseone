@@ -145,14 +145,47 @@ pub struct ModulePackage {
 
 /// Where p1's own release keeps its module set: `<exe dir>/../share/p1/modules/manifest.json`
 /// (ADR-0079), next to the shipped `environments/`. Never a configuration directory, so an
-/// override lock can only select among what the release ships.
+/// override lock can only select among what the release ships. A debug build has no install
+/// to read, so when the share tree carries no manifest it falls back to the manifest
+/// `scripts/build-modules.sh` writes beside the built packages (BLOCKERS S3-B6, D080), the
+/// mirror of `main.rs`'s debug-only source-tree `environments/` fallback; a release binary
+/// never does, because `cfg(debug_assertions)` is false there, so the official-source rule of
+/// ADR-0079/ADR-0087 is unchanged.
 pub fn official_release_manifest() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    Some(
-        exe.parent()?
-            .join("../share/p1/modules")
-            .join(RELEASE_MANIFEST_FILE),
-    )
+    let share = exe
+        .parent()?
+        .join("../share/p1/modules")
+        .join(RELEASE_MANIFEST_FILE);
+    // Compiled in, so the fallback is the checkout's own path, never a place an installation
+    // could edit.
+    let built = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../modules/target/p1-modules")
+        .join(RELEASE_MANIFEST_FILE);
+    let chosen = choose_release_manifest(share, built);
+    // One line on stderr, in a debug build only and once per process, so an operator can see
+    // which module set a development binary loaded without a line per catalog assembly.
+    #[cfg(debug_assertions)]
+    {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            eprintln!("p1: debug build: loading modules from {}", chosen.display());
+        });
+    }
+    Some(chosen)
+}
+
+/// The manifest to load modules from: the share tree's when it is there, else — in a debug
+/// build only — the built set's when the share tree has none, else the share path, so the
+/// loader's error names the release it looked for.
+fn choose_release_manifest(share: PathBuf, built: PathBuf) -> PathBuf {
+    if share.is_file() {
+        return share;
+    }
+    if cfg!(debug_assertions) && built.is_file() {
+        return built;
+    }
+    share
 }
 
 /// Verifies and compiles every package `lock` resolves, from the release whose manifest is
@@ -362,5 +395,30 @@ mod tests {
         let provider = allocation("provider").expect("provider class");
         assert!(!provider.iter().any(|c| c == "process"));
         assert!(allocation("plugin").is_none());
+    }
+
+    #[test]
+    fn the_debug_fallback_is_taken_only_when_the_share_tree_has_no_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let share = dir.path().join("share/p1/modules/manifest.json");
+        let built = dir.path().join("modules/target/p1-modules/manifest.json");
+        std::fs::create_dir_all(share.parent().expect("share parent")).expect("share dir");
+        std::fs::create_dir_all(built.parent().expect("built parent")).expect("built dir");
+        std::fs::write(&built, "{}\n").expect("write built manifest");
+
+        // Only the built set exists: a debug build takes it, and a release build does not.
+        #[cfg(debug_assertions)]
+        assert_eq!(choose_release_manifest(share.clone(), built.clone()), built);
+        #[cfg(not(debug_assertions))]
+        assert_eq!(choose_release_manifest(share.clone(), built.clone()), share);
+
+        // The share tree's manifest always wins, whichever else exists.
+        std::fs::write(&share, "{}\n").expect("write share manifest");
+        assert_eq!(choose_release_manifest(share.clone(), built.clone()), share);
+
+        // Neither exists: the share path is returned, so the loader's error names the release.
+        std::fs::remove_file(&share).expect("remove share manifest");
+        std::fs::remove_file(&built).expect("remove built manifest");
+        assert_eq!(choose_release_manifest(share.clone(), built), share);
     }
 }
