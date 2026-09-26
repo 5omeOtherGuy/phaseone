@@ -657,12 +657,16 @@ async fn load_every_installed_component(modules_root: &Path) {
     let manifest_path = modules_root.join("manifest.json");
     let manifest = ReleaseManifest::read(&manifest_path).expect("read the installed manifest");
     // The interfaces the runtime does not link yet: each worker and workflow member imports the
-    // one its own native service owns, and the runtime links an interface only with its service.
-    const UNLINKED: [&str; 4] = [
+    // one its own native service owns, and the runtime links an interface only with its service;
+    // the provider interfaces a provider component imports are linked by S4.7.
+    const UNLINKED: [&str; 7] = [
         "workers-start",
         "workers-observe",
         "workers-control",
         "workflows",
+        "http",
+        "websocket",
+        "credential-control",
     ];
 
     let entries: Vec<(String, Vec<String>)> = manifest
