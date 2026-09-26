@@ -1873,6 +1873,7 @@ dependencies = [
  "p1-host",
  "p1-module-runtime",
  "p1-provider-http",
+ "p1-provider-openai",
  "p1-redact",
  "p1-testkit",
  "p1-workers",
