@@ -5,9 +5,10 @@
 //! activates the component the installed release ships — or the one a user's lock selects for
 //! that adapter's module (ANSWERS D083b) — configured from the route's own data
 //! and the selected profile's text, and the native transport broker sends every request. The
-//! native adapter a route used to build stays reachable in exactly two cases, both stated in
-//! [`ProviderComponents::activate`]: the Responses WebSocket transport (S5.5) and a host with
-//! no release module set installed.
+//! native adapter a route used to build stays reachable in exactly one case, stated in
+//! [`route_provider`]: the Responses route's WebSocket transport (S5.5). A host with no release
+//! module set installed has no component to activate, so activation REFUSES — naming the route
+//! and the module — instead of falling back to a native adapter.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,7 +46,8 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
     let locations = crate::auth::locations(deps);
     // The provider components the installed release ships, discovered once per catalog
     // through the one manifest path modules are read from (ADR-0079). A host with no module
-    // set installed has none, and every route keeps the native adapter.
+    // set installed has none, and every route then REFUSES activation instead of building a
+    // native adapter.
     let components = Arc::new(ProviderComponents::installed()?);
     for route in crate::routes::load_all_routes(&deps.environment_dirs)? {
         if WHOLE_PROVIDERS.contains(&route.id.as_str()) {
@@ -70,11 +72,14 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
             &route.id,
             Box::new(move |spec: &ProviderSpec| {
                 let profile = require_profile(spec)?;
+                let binding = data.binding(&profile.id)?;
                 let credentials =
                     crate::auth::credential_source_at(&data, transport.clone(), &locations);
-                components.activate(
+                route_provider(
+                    &components,
                     &environment_dirs,
                     &data,
+                    binding,
                     profile,
                     transport.clone(),
                     ws.clone(),
@@ -140,66 +145,57 @@ pub fn reject_profile(spec: &ProviderSpec) -> Result<(), String> {
     Ok(())
 }
 
-/// The composition of one route file with one profile binding: the adapter key the
-/// file names builds its provider from the file's own data (spec §2 step 4). The live
-/// checks and the tests come through here, and so does the catalog factory wherever no
-/// provider component can serve the route today: [`ProviderComponents::activate`] builds the
-/// component the release ships, and this native composition is what remains.
+/// The composition of one route file with one profile binding: the one construction path
+/// (spec §2 step 4). The adapter key the file names selects a provider COMPONENT (ADR-0086),
+/// which [`ProviderComponents::activate`] configures from the route's own data and the selected
+/// profile's text; the native transport broker then sends every request.
 ///
-/// `ws` is the WebSocket connector, next to the HTTP transport (ADR-0047 §1): the
-/// production factory passes the real one and a test or live check injects its own,
-/// so a test that composes a shipped WebSocket route never opens a socket. A route
-/// that does not ask for WebSocket ignores it.
+/// The ONE route that still builds a native adapter is the Responses route's WebSocket
+/// transport (`environments/gpt` → `routes/openai-codex-subscription.toml`): this broker sends
+/// the HTTP lowering only, and the WebSocket branch is S5.5's. `components` and
+/// `environment_dirs` are unused for it, because a WebSocket route reaches no component.
+///
+/// `environment_dirs` are the directories the host resolves an environment from: activation
+/// reads the effective lock (`modules.lock`) and the selected profile's text from beside them.
+/// `ws` is the WebSocket connector, next to the HTTP transport (ADR-0047 §1): the production
+/// factory passes the real one and a test or live check injects its own, so a test that
+/// composes a shipped WebSocket route never opens a socket. A route that does not ask for
+/// WebSocket ignores it.
+#[allow(clippy::too_many_arguments)]
 pub fn route_provider(
+    components: &ProviderComponents,
+    environment_dirs: &[PathBuf],
     route: &crate::routes::RouteFile,
     binding: &crate::routes::ModelBinding,
     profile: Arc<p1_model_profile::ModelProfile>,
     transport: Arc<dyn p1_provider_http::Transport>,
-    ws: Arc<dyn p1_provider_http::ws::WsConnector>,
+    ws: Arc<dyn WsConnector>,
     credentials: Arc<dyn p1_provider_http::CredentialSource>,
 ) -> Result<Arc<dyn Provider>, String> {
     use crate::routes::AdapterSettings;
     match route.settings()? {
-        AdapterSettings::OpenAiChat(settings) => {
-            let provider = p1_provider_openai_chat::ChatProvider::new(
-                chat_route_from(route, binding, &profile, settings)?,
-                &binding.wire_model,
-                profile,
-                transport,
-                credentials,
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(Arc::new(provider) as Arc<dyn Provider>)
-        }
-        AdapterSettings::AnthropicMessages(settings) => {
-            let provider = p1_provider_anthropic::AnthropicProvider::new(
-                messages_route_from(route, settings),
-                &binding.wire_model,
-                profile,
-                transport,
-                credentials,
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(Arc::new(provider) as Arc<dyn Provider>)
-        }
-        AdapterSettings::OpenAiResponses(settings) => {
-            // ADR-0047 §1: a route that asks for `transport = "websocket"` gets the
-            // injected connector here, at composition. The provider refuses a
-            // WebSocket route without one, so the two cannot drift apart.
-            let transport_mode = settings.transport;
-            let mut composition = p1_provider_openai::OpenAiCodexProvider::builder(
+        // ADR-0047 §1: a route that asks for `transport = "websocket"` gets the injected
+        // connector here, at composition. The provider refuses a WebSocket route without one,
+        // so the two cannot drift apart. This is the native adapter's one remaining caller.
+        AdapterSettings::OpenAiResponses(settings)
+            if settings.transport == p1_provider_openai::ResponsesTransport::Websocket =>
+        {
+            let composition = p1_provider_openai::OpenAiCodexProvider::builder(
                 responses_route_from(route, settings),
                 &binding.wire_model,
                 profile,
                 transport,
                 credentials,
-            );
-            if transport_mode == p1_provider_openai::ResponsesTransport::Websocket {
-                composition = composition.with_ws_connector(ws);
-            }
-            let provider = composition.build().map_err(|error| error.to_string())?;
-            Ok(Arc::new(provider) as Arc<dyn Provider>)
+            )
+            .with_ws_connector(ws);
+            composition
+                .build()
+                .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
+                .map_err(|error| error.to_string())
         }
+        // Every other route activates the provider COMPONENT its adapter names: the release's
+        // host entry of that component, or the package a user's lock selects for it (D083b).
+        _ => components.activate(environment_dirs, route, profile, transport, credentials),
     }
 }
 
@@ -231,8 +227,10 @@ pub struct ProviderComponents {
 }
 
 impl ProviderComponents {
-    /// A host with no release module set: no route has a component to activate.
-    fn none() -> Self {
+    /// A host with no release module set: no route has a component to activate, so every
+    /// activation refuses. Public because [`ProviderComponents::installed`] returns exactly this
+    /// in a checkout with no module set, and the refusal is what a test must hold.
+    pub fn none() -> Self {
         Self {
             loader: None,
             loaded: Mutex::new(HashMap::new()),
@@ -258,7 +256,7 @@ impl ProviderComponents {
     /// The components of the installed release module set: the one discovery path (S1's
     /// `official_release_manifest`, ADR-0079). A build that has no module set — a development
     /// checkout, where S3.8.0's debug discovery is what finds the built components — has
-    /// none, and every route keeps the native adapter.
+    /// none, and every activation then refuses instead of building a native adapter.
     pub fn installed() -> Result<Self, String> {
         let Some(path) = super::modules::official_release_manifest() else {
             return Ok(Self::none());
@@ -271,10 +269,9 @@ impl ProviderComponents {
 
     /// The compiled component `name`.
     fn module(&self, name: &str) -> Result<Arc<LoadedModule>, String> {
-        let loader = self
-            .loader
-            .as_ref()
-            .expect("a component is only asked of a release module set");
+        let Some(loader) = self.loader.as_ref() else {
+            return Err(missing_module(name));
+        };
         let mut loaded = self.loaded.lock().expect("the component cache");
         if let Some(module) = loaded.get(name) {
             return Ok(module.clone());
@@ -290,9 +287,9 @@ impl ProviderComponents {
     /// no component can name (ADR-0086). A refusal names the route and the module and is
     /// reported like a route-file load error; nothing is sent.
     ///
-    /// The native adapter a route used to build stays reachable in exactly two cases: the
-    /// Responses route's WebSocket transport, which this broker does not send yet (S5.5), and
-    /// a host with no release module set installed (above).
+    /// There is NO native fallback: a host with no release module set installed, or a release
+    /// that does not ship the component, refuses here. The one route the native adapter still
+    /// serves is [`route_provider`]'s: the Responses route's WebSocket transport (S5.5).
     ///
     /// A USER's lock may select another package for the route's adapter module; the module the
     /// lock names is then what activation uses ([`locked_package`], ANSWERS D083b).
@@ -302,17 +299,11 @@ impl ProviderComponents {
         route: &RouteFile,
         profile: Arc<p1_model_profile::ModelProfile>,
         transport: Arc<dyn Transport>,
-        ws: Arc<dyn WsConnector>,
         credentials: Arc<dyn CredentialSource>,
     ) -> Result<Arc<dyn Provider>, String> {
         let binding = route.binding(&profile.id)?;
         let name = provider_component(&route.adapter)
             .map_err(|reason| selection_refusal(route, reason))?;
-        let keeps_native =
-            keeps_native(route).map_err(|reason| selection_refusal(route, reason))?;
-        if keeps_native || self.loader.is_none() {
-            return route_provider(route, binding, profile, transport, ws, credentials);
-        }
         let package = locked_package(environment_dirs, name)
             .map_err(|reason| activation_refusal(route, name, reason))?;
         let module = self
@@ -342,14 +333,13 @@ impl ProviderComponents {
     }
 }
 
-/// Whether only the native adapter can serve this route today: the Responses route's
-/// WebSocket transport is S5.5's, and this broker sends the HTTP lowering only.
-fn keeps_native(route: &RouteFile) -> Result<bool, String> {
-    Ok(matches!(
-        route.settings()?,
-        crate::routes::AdapterSettings::OpenAiResponses(settings)
-            if settings.transport == p1_provider_openai::ResponsesTransport::Websocket
-    ))
+/// Why a route cannot activate its provider component because no module set is installed: the
+/// sentence names the module the route asked for, so an operator sees which one is missing.
+fn missing_module(name: &str) -> String {
+    format!(
+        "provider module {name} is not installed: this host has no release module set \
+         (no manifest.json beside the executable)"
+    )
 }
 
 /// The refusal of a route that cannot select a provider at all: no component serves its

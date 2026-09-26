@@ -3,31 +3,40 @@
 //! profile's text, and a route that cannot activate one is refused before the first turn with
 //! a sentence naming the route and the module.
 //!
-//! The components are the ones `scripts/build-modules.sh` published, read through a release
-//! manifest written into a temp directory. Production discovery is S3.8.0's debug-build
-//! fallback in `catalog::modules::official_release_manifest`, so this slice adds no second
-//! path: the layout here is S0's `p1_module_tests::Release`, the same one S4.7's
-//! `provider_conformance.rs` loads the same artifacts with.
+//! There is no native fallback any more: a host with no release module set, and a release that
+//! does not ship the component, both refuse. The ONE route the native adapter still serves is
+//! the Responses route's WebSocket transport (S5.5), and the cases below say so.
+//!
+//! The components are the ones `scripts/build-modules.sh --all` published, read through a
+//! release manifest written into a temp directory (`common::provider_release`), the way S4.7's
+//! `provider_conformance.rs` loads the same artifacts. Production discovery is the ONE path,
+//! `catalog::modules::official_release_manifest` (with S3.8.0's debug fallback once it is on
+//! main), so this file adds none.
 //!
 //! Nothing here opens a socket or reads a credential: the transport is scripted and the
-//! credential source is a fixture. One shipped route keeps the native adapter — the
-//! Responses route's WebSocket transport, which is S5.5's and is why this broker sends no
-//! WebSocket lowering — and the case says so.
+//! credential source is a fixture.
+
+mod common;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
+use common::{built_provider_packages, provider_release};
 use p1_assembly::{Catalog, ModulesLock, ToolServices};
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{BoxFuture, Provider, ProviderError};
 use p1_host::catalog::modules::{load_locked_modules, register_modules};
-use p1_host::catalog::{ProviderComponents, provider_component, route_provider};
-use p1_host::routes::{AdapterSettings, RouteFile, load_route, load_route_by_id};
+use p1_host::catalog::{
+    ProviderComponents, chat_route, messages_route, provider_component, responses_route,
+    route_provider,
+};
+use p1_host::routes::{AdapterSettings, ModelBinding, RouteFile, load_route, load_route_by_id};
 use p1_model_profile::ModelProfile;
 use p1_module_runtime::Services;
 use p1_module_tests::Release;
 use p1_provider_http::testing::{ScriptedTransport, ScriptedWsConnector};
-use p1_provider_http::{Credential, CredentialSource};
+use p1_provider_http::ws::WsConnector;
+use p1_provider_http::{Credential, CredentialSource, Transport};
 
 const BEARER: &str = "ACTIVATION-FAKE-BEARER";
 const ACCOUNT: &str = "acct-activation";
@@ -41,75 +50,10 @@ fn environment_dirs() -> Vec<PathBuf> {
     vec![repo_root().join("environments")]
 }
 
-/// One built provider package: the bytes the build published and the release entry its package
-/// manifest describes.
-struct Package {
-    name: &'static str,
-    bytes: Vec<u8>,
-    entry: Value,
-}
-
-impl Package {
-    /// A copy of this package's entry with `edit` applied, for a case that holds a refusal.
-    fn edited(&self, edit: &dyn Fn(&mut Value)) -> Value {
-        let mut entry = self.entry.clone();
-        edit(&mut entry);
-        entry
-    }
-}
-
-/// The provider packages, as the build names and publishes them.
-const PROVIDER_PACKAGES: [(&str, &str); 3] = [
-    ("p1/provider-anthropic", "p1-module-provider-anthropic"),
-    ("p1/provider-openai", "p1-module-provider-openai"),
-    ("p1/provider-openai-chat", "p1-module-provider-openai-chat"),
-];
-
-fn read_package(name: &'static str, package: &str) -> Package {
-    let dir = repo_root().join("modules/target/p1-modules").join(package);
-    let read = |file: String| {
-        let path = dir.join(file);
-        std::fs::read(&path).unwrap_or_else(|error| {
-            panic!(
-                "the provider artifact {} is missing ({error}): run scripts/build-modules.sh first",
-                path.display()
-            )
-        })
-    };
-    let manifest: Value = serde_json::from_slice(&read(format!("{package}.manifest.json")))
-        .expect("a package manifest");
-    assert_eq!(manifest["name"], name, "{package}");
-    let file = name.replace('/', "-");
-    Package {
-        name,
-        bytes: read(format!("{package}.wasm")),
-        entry: json!({
-            "name": name,
-            "digest": manifest["digest"],
-            "path": format!("packages/{file}/{file}.wasm"),
-            "kind": manifest["kind"],
-            "world": manifest["world"],
-            "protocol": manifest["protocol"],
-            "capabilities": manifest["capabilities"],
-            "variant": manifest["variant"],
-        }),
-    }
-}
-
-/// The built provider packages, read once.
-fn built() -> &'static [Package; 3] {
-    static BUILT: OnceLock<[Package; 3]> = OnceLock::new();
-    BUILT.get_or_init(|| PROVIDER_PACKAGES.map(|(name, package)| read_package(name, package)))
-}
-
-/// A release laid out in a temp directory, with `edit` applied to the entry of every package
-/// (`name` is the module's manifest name): the loader reads it as an installation's host does.
+/// A release laid out in a temp directory, with `edit` applied to the entry of every provider
+/// package (`name` is the module's manifest name): the loader reads it as an installation does.
 fn release(edit: &dyn Fn(&mut Value)) -> Release {
-    let mut release = Release::empty();
-    for package in built() {
-        release.add(package.edited(edit), &package.bytes);
-    }
-    release
+    provider_release(edit)
 }
 
 /// The release the build published, unedited.
@@ -165,6 +109,62 @@ fn shipped_route(id: &str) -> RouteFile {
     load_route(&path).unwrap_or_else(|error| panic!("{error}"))
 }
 
+/// The native adapter built from the same route file and profile, the way `route_provider` built
+/// it before this slice: the route value the component's `describe` is compared with. The three
+/// adapter crates are still shipped, and S4.7's conformance suite compares the component with
+/// them the same way; no production path builds a native adapter for these routes any more.
+fn native(
+    route: &RouteFile,
+    binding: &ModelBinding,
+    profile: Arc<ModelProfile>,
+    transport: Arc<dyn Transport>,
+    ws: Arc<dyn WsConnector>,
+    credentials: Arc<dyn CredentialSource>,
+) -> Result<Arc<dyn Provider>, String> {
+    match route.settings()? {
+        AdapterSettings::OpenAiChat(_) => {
+            let provider = p1_provider_openai_chat::ChatProvider::new(
+                chat_route(route, binding, &profile)?,
+                &binding.wire_model,
+                profile,
+                transport,
+                credentials,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(Arc::new(provider))
+        }
+        AdapterSettings::AnthropicMessages(_) => {
+            let provider = p1_provider_anthropic::AnthropicProvider::new(
+                messages_route(route)?,
+                &binding.wire_model,
+                profile,
+                transport,
+                credentials,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(Arc::new(provider))
+        }
+        AdapterSettings::OpenAiResponses(settings) => {
+            let composition = p1_provider_openai::OpenAiCodexProvider::builder(
+                responses_route(route)?,
+                &binding.wire_model,
+                profile,
+                transport,
+                credentials,
+            );
+            let composition =
+                if settings.transport == p1_provider_openai::ResponsesTransport::Websocket {
+                    composition.with_ws_connector(ws)
+                } else {
+                    composition
+                };
+            Ok(Arc::new(
+                composition.build().map_err(|error| error.to_string())?,
+            ))
+        }
+    }
+}
+
 /// Activate `route` for `profile` through `components`: the provider or the activation
 /// refusal, and the scripted transport the caller checks stayed silent.
 fn activate_with(
@@ -189,7 +189,6 @@ fn activate_in(
         route,
         shipped_profile(profile),
         Arc::new(transport.clone()),
-        Arc::new(ScriptedWsConnector::new(Vec::new())),
         Arc::new(FixedCredentials),
     );
     (provider, transport)
@@ -218,6 +217,22 @@ fn refusal(release: &Release, route: &RouteFile, profile: &str) -> String {
         route.id
     );
     error
+}
+
+/// The native provider for `route` and `profile`, for a case that holds a comparison against
+/// the component's own route value.
+fn native_of(route: &RouteFile, profile: &str) -> Arc<dyn Provider> {
+    let profile = shipped_profile(profile);
+    let binding = route.binding(&profile.id).expect("a bound profile");
+    native(
+        route,
+        binding,
+        profile,
+        Arc::new(ScriptedTransport::new(Vec::new())),
+        Arc::new(ScriptedWsConnector::new(Vec::new())),
+        Arc::new(FixedCredentials),
+    )
+    .unwrap_or_else(|error| panic!("{}: native: {error}", route.id))
 }
 
 #[test]
@@ -250,7 +265,9 @@ fn a_route_names_a_provider_component_and_profiles_stay_data() {
         let component = provider_component(&route.adapter)
             .unwrap_or_else(|error| panic!("{}: {error}", route.id));
         assert!(
-            built().iter().any(|package| package.name == component),
+            built_provider_packages()
+                .iter()
+                .any(|package| package.name == component),
             "{}: {component} is not a built provider package",
             route.id
         );
@@ -278,16 +295,11 @@ fn a_route_names_a_provider_component_and_profiles_stay_data() {
             transport.requests().is_empty(),
             "{route_id}: activation sent a request"
         );
-        let native = route_provider(
-            &route,
-            route.binding(profile).expect("a bound profile"),
-            shipped_profile(profile),
-            Arc::new(transport.clone()),
-            Arc::new(ScriptedWsConnector::new(Vec::new())),
-            Arc::new(FixedCredentials),
-        )
-        .unwrap_or_else(|error| panic!("{route_id}: native: {error}"));
-        assert_eq!(activated.describe(), native.describe(), "{route_id}");
+        assert_eq!(
+            activated.describe(),
+            native_of(&route, profile).describe(),
+            "{route_id}"
+        );
     }
 }
 
@@ -389,7 +401,7 @@ fn the_shipped_environments_resolve_their_provider_references_to_modules() {
         // The environment's provider reference resolves to a module the build ships.
         let component =
             provider_component(&route.adapter).unwrap_or_else(|error| panic!("{name}: {error}"));
-        let package = built()
+        let package = built_provider_packages()
             .iter()
             .find(|package| package.name == component)
             .unwrap_or_else(|| panic!("{name}: {component} is not a built provider package"));
@@ -403,16 +415,11 @@ fn the_shipped_environments_resolve_their_provider_references_to_modules() {
             transport.requests().is_empty(),
             "{name}: a request was sent"
         );
-        let native = route_provider(
-            &route,
-            route.binding(&profile.id).expect("a bound profile"),
-            profile.clone(),
-            Arc::new(transport.clone()),
-            Arc::new(ScriptedWsConnector::new(Vec::new())),
-            Arc::new(FixedCredentials),
-        )
-        .unwrap_or_else(|error| panic!("{name}: native: {error}"));
-        assert_eq!(activated.describe(), native.describe(), "{name}");
+        assert_eq!(
+            activated.describe(),
+            native_of(&route, &profile.id).describe(),
+            "{name}"
+        );
 
         if is_websocket_route(&route) {
             native_websocket += 1;
@@ -470,7 +477,7 @@ fn a_lock_selected_provider_package_is_accepted_and_is_what_activation_uses() {
     // The built Anthropic component, published under a name of its own as the package a user's
     // lock selects: this release has no `p1/provider-anthropic` entry, so an activation that
     // took the release's host entry instead of the lock's package could not succeed.
-    let package = &built()[0];
+    let package = &built_provider_packages()[0];
     assert_eq!(package.name, "p1/provider-anthropic");
     let mut entry = package.entry.clone();
     entry["name"] = json!("p1/anthropic-local");
@@ -508,16 +515,7 @@ fn a_lock_selected_provider_package_is_accepted_and_is_what_activation_uses() {
     let (activated, transport) = activate_in(&components, &dirs, &route, PROFILE);
     let activated = activated.unwrap_or_else(|error| panic!("{error}"));
     assert!(transport.requests().is_empty(), "activation sent a request");
-    let native = route_provider(
-        &route,
-        route.binding(PROFILE).expect("a bound profile"),
-        shipped_profile(PROFILE),
-        Arc::new(transport.clone()),
-        Arc::new(ScriptedWsConnector::new(Vec::new())),
-        Arc::new(FixedCredentials),
-    )
-    .unwrap_or_else(|error| panic!("native: {error}"));
-    assert_eq!(activated.describe(), native.describe());
+    assert_eq!(activated.describe(), native_of(&route, PROFILE).describe());
 
     // The shipped environment directories select no provider package, and this release has no
     // host entry either, so activation refuses there: the component came through the lock.
@@ -529,4 +527,108 @@ fn a_lock_selected_provider_package_is_accepted_and_is_what_activation_uses() {
         error.contains(&route.id) && error.contains("p1/provider-anthropic"),
         "{error}"
     );
+}
+
+/// D083b, the native drop: every route a shipped environment names activates its release host
+/// entry COMPONENT — or the package a user's lock selects — and only the Responses route's
+/// WebSocket transport still builds a native adapter. With a host that has no release module
+/// set at all, every other route therefore REFUSES, naming the route and the module it asked
+/// for: a missing module set is never a fallback to a native adapter.
+#[test]
+fn a_route_activates_no_native_provider_except_the_websocket_route() {
+    let components = ProviderComponents::none();
+    let dirs = environment_dirs();
+    let mut refused = 0;
+    let mut native_websocket = 0;
+    for entry in std::fs::read_dir(dirs[0].clone()).expect("the shipped environments") {
+        let dir = entry.expect("an environment entry").path();
+        if !dir.join("environment.toml").is_file() {
+            continue;
+        }
+        let name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("an environment name")
+            .to_owned();
+        let environment = p1_assembly::load_environment(&name, &dirs)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let profile = environment
+            .profile
+            .clone()
+            .unwrap_or_else(|| panic!("{name}: no profile"));
+        let route = load_route_by_id(&dirs, &environment.provider)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let module =
+            provider_component(&route.adapter).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let transport = ScriptedTransport::new(Vec::new());
+        let binding = route.binding(&profile.id).expect("a bound profile");
+        let activated = route_provider(
+            &components,
+            &dirs,
+            &route,
+            binding,
+            profile.clone(),
+            Arc::new(transport.clone()),
+            Arc::new(ScriptedWsConnector::new(Vec::new())),
+            Arc::new(FixedCredentials),
+        );
+
+        if is_websocket_route(&route) {
+            // S5.5's branch: the one route that still builds a native adapter, with no module
+            // set in sight.
+            let provider = activated.unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(
+                provider.describe(),
+                native_of(&route, &profile.id).describe(),
+                "{name}"
+            );
+            native_websocket += 1;
+            continue;
+        }
+        let error = activated
+            .err()
+            .unwrap_or_else(|| panic!("{name}: the route activated a native provider"));
+        assert!(
+            error.contains(&route.id) && error.contains(module),
+            "{name}: the refusal must name the route and the module: {error}"
+        );
+        assert!(
+            error.contains("no release module set"),
+            "{name}: the refusal must say why: {error}"
+        );
+        assert!(
+            transport.requests().is_empty(),
+            "{name}: a request was sent"
+        );
+        refused += 1;
+    }
+    assert!(refused > 10, "only {refused} shipped environments refused");
+    assert_eq!(
+        native_websocket, 1,
+        "exactly the Responses route's WebSocket transport keeps the native adapter (S5.5)"
+    );
+}
+
+/// A release that ships no provider component at all (an installation built before the
+/// providers were added): activation refuses naming the module the route asked for, and no
+/// request is sent.
+#[test]
+fn a_missing_release_module_refuses_activation_naming_the_module() {
+    let empty = Release::empty();
+    for (route_id, profile) in [
+        ("glm-subscription", "glm-5.3"),
+        ("anthropic-subscription", "claude-sonnet-5"),
+    ] {
+        let route = shipped_route(route_id);
+        let module = provider_component(&route.adapter).expect("a component");
+        let error = refusal(&empty, &route, profile);
+        assert!(
+            error.contains(&route.id) && error.contains(module),
+            "{route_id}: the refusal must name the route and the module: {error}"
+        );
+        assert!(
+            error.contains("not in the release manifest"),
+            "{route_id}: the refusal must say why: {error}"
+        );
+    }
 }
