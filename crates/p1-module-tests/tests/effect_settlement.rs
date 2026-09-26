@@ -13,7 +13,10 @@
 //! Every case runs on a current-thread and a multi-thread Tokio runtime under the harness's
 //! deadlock guard and is bounded by it. Synchronization is explicit, through the fake process
 //! service's records: no case waits on a sleep. The cases build on S0's `cancellation.rs`
-//! (`cancellation_wakes_a_blocked_next`, `next_after_the_terminal_event_traps_and_keeps_the_effect`,
+//! (`an_epoch_deadline_stops_a_cpu_loop` and `a_small_fuel_budget_stops_a_cpu_loop`, whose
+//! `announce:spin`/`ManualEpochs` and `SMALL_FUEL` setups the deadline and fuel cases here
+//! refocus on settlement before the answer, `cancellation_wakes_a_blocked_next`,
+//! `next_after_the_terminal_event_traps_and_keeps_the_effect`,
 //! `a_trapped_or_cancelled_call_poisons_nothing`) and do not repeat them; where a case here
 //! restates one of those, it is because it also owes the settlement contract a caller relies
 //! on — the effect settled *before* the answer, the answer never `Ok`, the call never retried.
