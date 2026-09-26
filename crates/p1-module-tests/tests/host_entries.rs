@@ -290,8 +290,11 @@ fn headless_turn(release: &Release, run: Run) -> Output {
         .arg(run.environment)
         .arg("--session")
         .arg(release.session())
-        // A transient provider failure would otherwise back off between attempts; the case's
-        // bound is the missing package, never the transport.
+        // `--provider-retries 0` bounds the host's turn-level loop, which otherwise waits out a
+        // transient provider failure and continues the turn instead of ending on it
+        // (`crates/p1-host/src/run.rs`). It does not bound the provider transport, whose retry
+        // budget is fixed: a case still fails on its own assertion, never on the transport's
+        // timing.
         .arg("--provider-retries")
         .arg("0")
         .args(run.flags)
