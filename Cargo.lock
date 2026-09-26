@@ -1859,6 +1859,8 @@ dependencies = [
  "p1-module-protocol",
  "p1-provider-http",
  "p1-redact",
+ "p1-workers",
+ "p1-workflow",
  "thiserror 2.0.20",
  "tokio",
  "wasmtime",
