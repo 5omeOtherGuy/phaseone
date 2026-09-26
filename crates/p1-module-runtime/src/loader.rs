@@ -40,15 +40,19 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// The capabilities this runtime can link, by the interface name the manifest uses. The
 /// other capability interfaces belong to other native crates and streams; a manifest that
 /// grants one of them is refused until the runtime can provide it. `summary` is linked to
-/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7); the
-/// worker and workflow interfaces to the caller's services in [`crate::delegation`] (S6,
-/// B-S6-8).
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 9] = [
+/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7);
+/// `http`, `websocket` and `credential-control` to the broker and credential services a
+/// provider component's `stream` uses (S4.7); the worker and workflow interfaces to the
+/// caller's services in [`crate::delegation`] (S6, B-S6-8).
+pub(crate) const LINKABLE_CAPABILITIES: [&str; 12] = [
     "control",
     "clock",
     "random",
     "process",
     "summary",
+    "http",
+    "websocket",
+    "credential-control",
     "workers-start",
     "workers-observe",
     "workers-control",
@@ -176,15 +180,18 @@ pub enum ModuleKind {
     AuthorizationPolicy,
     /// A workflow implemented as a module.
     WorkflowImplementation,
+    /// A workflow's step decisions (`p1_workflow::Decisions`), its state kept native.
+    WorkflowDecision,
 }
 
 impl ModuleKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Tool,
         Self::Provider,
         Self::ContextPolicy,
         Self::AuthorizationPolicy,
         Self::WorkflowImplementation,
+        Self::WorkflowDecision,
     ];
 
     /// The manifest name of the class.
@@ -195,6 +202,7 @@ impl ModuleKind {
             Self::ContextPolicy => "context-policy",
             Self::AuthorizationPolicy => "authorization-policy",
             Self::WorkflowImplementation => "workflow-implementation",
+            Self::WorkflowDecision => "workflow-decision",
         }
     }
 
@@ -519,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn the_linkable_capabilities_are_the_old_four_plus_summary_and_delegation() {
+    fn the_linkable_capabilities_are_the_old_four_plus_summary_delegation_and_providers() {
         assert_eq!(
             LINKABLE_CAPABILITIES,
             [
@@ -528,13 +536,16 @@ mod tests {
                 "random",
                 "process",
                 "summary",
+                "http",
+                "websocket",
+                "credential-control",
                 "workers-start",
                 "workers-observe",
                 "workers-control",
                 "workflows",
             ]
         );
-        for refused in ["notices", "completion", "http", "filesystem"] {
+        for refused in ["notices", "completion", "filesystem"] {
             assert!(!LINKABLE_CAPABILITIES.contains(&refused), "{refused}");
         }
     }
