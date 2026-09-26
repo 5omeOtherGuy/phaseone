@@ -176,15 +176,18 @@ pub enum ModuleKind {
     AuthorizationPolicy,
     /// A workflow implemented as a module.
     WorkflowImplementation,
+    /// A workflow's step decisions (`p1_workflow::Decisions`), its state kept native.
+    WorkflowDecision,
 }
 
 impl ModuleKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Tool,
         Self::Provider,
         Self::ContextPolicy,
         Self::AuthorizationPolicy,
         Self::WorkflowImplementation,
+        Self::WorkflowDecision,
     ];
 
     /// The manifest name of the class.
@@ -195,6 +198,7 @@ impl ModuleKind {
             Self::ContextPolicy => "context-policy",
             Self::AuthorizationPolicy => "authorization-policy",
             Self::WorkflowImplementation => "workflow-implementation",
+            Self::WorkflowDecision => "workflow-decision",
         }
     }
 

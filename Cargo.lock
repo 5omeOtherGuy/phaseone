@@ -1886,6 +1886,7 @@ dependencies = [
  "p1-testkit",
  "p1-workers",
  "p1-workflow",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
