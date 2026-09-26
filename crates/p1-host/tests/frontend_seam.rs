@@ -332,7 +332,9 @@ async fn recording_front_end_sees_parent_and_worker_events_and_worker_authorizat
     ])
     .unwrap();
     let cancel = CancellationToken::new();
-    let line = LineFrontEnd::new(&harness.deps, &options, cancel.clone());
+    // notice: S5.11 (#357): the line front end's policy is the release's host entry.
+    let line = LineFrontEnd::new(&harness.deps, &options, cancel.clone())
+        .expect("the official release ships the policy");
     let front_end = Arc::new(RecordingFrontEnd::new(line));
 
     let code = run_with_front_end(

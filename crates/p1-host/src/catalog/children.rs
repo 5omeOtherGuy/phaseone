@@ -955,11 +955,11 @@ mod tests {
                     .expect("a generation's catalog builds"),
             )
         };
-        let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(
-            &deps,
-            &options,
-            p1_contracts::CancellationToken::new(),
-        ));
+        // notice: S5.11 (#357): the line front end's policy is the release's host entry.
+        let front_end: Arc<dyn FrontEnd> = Arc::new(
+            LineFrontEnd::new(&deps, &options, p1_contracts::CancellationToken::new())
+                .expect("the official release ships the policy"),
+        );
         let generations = Arc::new(Generations::new(build(), front_end.authorization()));
         let builder = ChildBuilder::new(
             &deps,

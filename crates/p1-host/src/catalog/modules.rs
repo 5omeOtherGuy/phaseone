@@ -115,8 +115,11 @@ pub enum ModulesError {
         /// The capability.
         capability: String,
     },
-    /// Only tool packages have an adapter to register.
-    #[error("module `{module}` is a {kind} package; only tool packages can be registered")]
+    /// A class this host cannot register: only tool packages have a catalog adapter, and
+    /// policy packages are accepted as the session's host entries.
+    #[error(
+        "module `{module}` is a {kind} package; only tool and policy packages can be registered"
+    )]
     NotATool {
         /// The module name.
         module: String,
@@ -306,13 +309,21 @@ pub fn register_modules(
     let existing = catalog.tool_keys();
     for package in packages {
         let kind = package.loaded.kind();
-        if kind != ModuleKind::Tool {
-            // Provider and policy packages need S4's and S5's adapters, which the runtime
-            // does not have yet; a lock that selects one is refused, never ignored.
-            return Err(ModulesError::NotATool {
-                module: package.module,
-                kind: kind.name(),
-            });
+        // notice: S5.11 (#357): the policy classes are accepted (S1 approval pending).
+        match kind {
+            ModuleKind::Tool => {}
+            // A policy package is the session's, not a catalog tool: the shipped policies are
+            // official-release host entries the host loads by name (`policy.rs`,
+            // `summary.rs`; D083b 2), so a lock selecting one registers no tool.
+            ModuleKind::ContextPolicy | ModuleKind::AuthorizationPolicy => continue,
+            // A class with no adapter here yet: a lock that selects one is refused, never
+            // ignored.
+            _ => {
+                return Err(ModulesError::NotATool {
+                    module: package.module,
+                    kind: kind.name(),
+                });
+            }
         }
         if existing.contains(&package.module) {
             return Err(ModulesError::Collision {
