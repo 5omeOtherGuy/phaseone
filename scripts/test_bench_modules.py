@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Tests for scripts/bench-modules.sh --suite acceptance — stdlib only.
+"""Tests for scripts/bench-modules.sh — its acceptance and streaming branches — stdlib only.
 
 The script runs in a temporary repository whose scripts/ holds stub helpers and whose PATH
 holds a stub cargo. The stub logs every call and answers an acceptance case with the JSON
 line a test put in STUB_CASES/<case>.json (or fails the case when there is none), and the
-process contract run with the result STUB_CONTRACT names. Real cargo never runs, so these
-tests prove the script's argument handling, classification, exit codes and output, never a
-measurement.
+process contract run with the result STUB_CONTRACT names. A streaming case is answered the
+same way from STUB_STREAM/<case>.<events>.json, the size being the P1_STREAM_EVENTS the
+script set for that case's process. Real cargo never runs, so these tests prove the script's
+argument handling, classification, exit codes and output, never a measurement.
 """
 from __future__ import annotations
 
@@ -57,6 +58,42 @@ PASSING = {
     "compaction-16": ("compaction_16", "growth", "none", ""),
 }
 
+# The streaming suite's rows (S4.8): row id -> (its case, whether the row measures the case
+# twice — the memory rows, over N and 10·N events). scripts/bench-modules.sh's STREAMING_TABLE
+# holds the same rows; these tests pin the classifier that judges them.
+STREAMING = {
+    "latency-anthropic": ("streaming_latency_anthropic", False),
+    "latency-responses": ("streaming_latency_responses", False),
+    "latency-chat": ("streaming_latency_chat", False),
+    "slow-consumer-anthropic": ("streaming_slow_consumer_anthropic", False),
+    "slow-consumer-responses": ("streaming_slow_consumer_responses", False),
+    "slow-consumer-chat": ("streaming_slow_consumer_chat", False),
+    "tool-call-anthropic": ("streaming_tool_call_anthropic", False),
+    "tool-call-responses": ("streaming_tool_call_responses", False),
+    "tool-call-chat": ("streaming_tool_call_chat", False),
+    "memory-anthropic": ("streaming_peak_rss_anthropic", True),
+    "memory-responses": ("streaming_peak_rss_responses", True),
+    "memory-chat": ("streaming_peak_rss_chat", True),
+}
+
+# The workload these tests ask the script for; the script's own default is 100000.
+EVENTS = 1000
+
+
+def streaming_measurements(row: str, size: int) -> list[tuple[str, float, str]]:
+    """A passing reading of the row's case at `size` events: (statistic, value, unit)."""
+    if row.startswith("latency-"):
+        return [("p50", 19.9, "us"), ("p95", 22.2, "us"), ("p99", 29.7, "us"),
+                ("max", 489.6, "us"), ("rate", 47919.1, "events/s"), ("read-ahead", 0.0, "chunks")]
+    if row.startswith("slow-consumer-"):
+        return [("read-ahead", 0.0, "chunks"), ("chunks-handed", size + 1.0, "chunks"),
+                ("gates", float(size), "events")]
+    if row.startswith("tool-call-"):
+        return [("tool-input-deltas", 2.0, "deltas"), ("read-ahead", 0.0, "chunks"),
+                ("p95", 92.196, "us")]
+    return [("peak-rss-delta", 0.5, "MiB"), ("peak-rss", 100.0, "MiB"),
+            ("text-deltas", float(size), "deltas")]
+
 CARGO_STUB = textwrap.dedent(
     """\
     #!/usr/bin/env bash
@@ -77,6 +114,21 @@ CARGO_STUB = textwrap.dedent(
         name="${@: -1}"
         if [ -f "$STUB_CASES/$name.json" ]; then
           printf 'test %s ... %s\\n' "$name" "$(cat "$STUB_CASES/$name.json")"
+          echo "test result: ok. 1 passed; 0 failed"
+          exit 0
+        fi
+        echo "test $name ... FAILED"
+        echo "stub: case $name panicked" >&2
+        exit 101 ;;
+      *" --test provider_streaming "*)
+        name="${@: -1}"
+        printf '%s\\n' "streaming $name at ${P1_STREAM_EVENTS:-none}" >> "$STUB_LOG"
+        if [ "$name" = "${STUB_STREAM_QUIET:-}" ]; then
+          echo "test $name ... ok"
+          exit 0
+        fi
+        if [ -f "${STUB_STREAM:-}/$name.${P1_STREAM_EVENTS:-none}.json" ]; then
+          printf 'test %s ... %s\\n' "$name" "$(cat "${STUB_STREAM:-}/$name.${P1_STREAM_EVENTS:-none}.json")"
           echo "test result: ok. 1 passed; 0 failed"
           exit 0
         fi
@@ -144,6 +196,8 @@ class Harness:
         self.repo = base / "repo"
         self.cases = base / "cases"
         self.cases.mkdir()
+        self.stream = base / "stream"
+        self.stream.mkdir()
         self.log = base / "calls.log"
         scripts = self.repo / "scripts"
         scripts.mkdir(parents=True)
@@ -158,6 +212,7 @@ class Harness:
             "HOME": str(base),
             "STUB_LOG": str(self.log),
             "STUB_CASES": str(self.cases),
+            "STUB_STREAM": str(self.stream),
             "LC_ALL": "C",
             "CI": "",
         }
@@ -179,6 +234,27 @@ class Harness:
     def all_passing(self) -> None:
         for row in PASSING:
             self.reading(row)
+
+    def stream_reading(self, row: str, size: int, replace: dict | None = None) -> None:
+        """The JSON line the stub prints for `row`'s case at `size` events.
+
+        `replace` overrides a statistic's (value, unit), which is how a test puts one reading
+        out of its bound or in the wrong unit without writing the whole line.
+        """
+        case, _ = STREAMING[row]
+        measurements = []
+        for statistic, value, unit in streaming_measurements(row, size):
+            if replace and statistic in replace:
+                value, unit = replace[statistic]
+            measurements.append({"statistic": statistic, "value": value, "unit": unit})
+        line = {"streaming-row": row, "measurements": measurements, "samples": size,
+                "detail": f"stub reading of {row}"}
+        (self.stream / f"{case}.{size}.json").write_text(json.dumps(line), encoding="utf-8")
+
+    def all_streaming_passing(self, size: int = EVENTS) -> None:
+        for row, (_, twice) in STREAMING.items():
+            for events in ((size, size * 10) if twice else (size,)):
+                self.stream_reading(row, events)
 
     def run(self, *args: str, **extra: str) -> subprocess.CompletedProcess[str]:
         env = dict(self.env)
@@ -202,6 +278,10 @@ class Harness:
     def measured_cases(self) -> list[str]:
         return [call.split()[-1] for call in self.calls()
                 if " --test acceptance " in call and "--exact" in call]
+
+    def streamed(self) -> list[str]:
+        """`<case> at <events>` for every measurement the script asked of a streaming case."""
+        return [call[len("streaming "):] for call in self.calls() if call.startswith("streaming ")]
 
     def cleanup(self) -> None:
         self.tmp.cleanup()
@@ -550,6 +630,152 @@ class BenchModulesTests(unittest.TestCase):
                        "--json", str(h.base / "missing-dir" / "rows.json"))
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("cannot write", result.stderr)
+
+
+class StreamingBenchModulesTests(unittest.TestCase):
+    """--suite streaming: the S4.8 rows, their bounds and the workload that measured them."""
+
+    def harness(self) -> Harness:
+        h = Harness()
+        self.addCleanup(h.cleanup)
+        return h
+
+    def streaming(self, h: Harness, *args: str, **extra: str) -> subprocess.CompletedProcess[str]:
+        extra.setdefault("P1_STREAM_EVENTS", str(EVENTS))
+        return h.run("--suite", "streaming", *args, **extra)
+
+    # ---- arguments ------------------------------------------------------------------
+
+    def test_streaming_takes_the_other_suites_options_only_as_errors(self) -> None:
+        h = self.harness()
+        for args in (["--check"], ["--row", "latency-chat"], ["--json", "rows.json"],
+                     ["--out", "record.txt"]):
+            with self.subTest(args=args):
+                result = self.streaming(h, *args)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(h.calls(), [])
+
+    def test_the_stream_events_value_must_be_a_positive_integer(self) -> None:
+        h = self.harness()
+        for value in ("1e5", "abc", "0", "-1"):
+            with self.subTest(value=value):
+                result = self.streaming(h, P1_STREAM_EVENTS=value)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(f"bench-modules: P1_STREAM_EVENTS must be a positive integer, got {value}",
+                              result.stderr)
+        # Refused before the build and before any case, so no reading can be mistaken for one of
+        # a shorter workload.
+        self.assertEqual(h.calls(), [])
+
+    # ---- the whole suite ------------------------------------------------------------
+
+    def test_the_whole_suite_reports_every_row_once_in_table_order(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        result = self.streaming(h)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line]
+        self.assertEqual([re.split(r"\s{2,}", line)[0] for line in lines[:-1]], list(STREAMING))
+        self.assertEqual(lines[-1], "bench-modules: streaming: 12 rows at 1000 events: "
+                                    "12 pass, 0 fail, 0 error; exit 0")
+
+    def test_each_case_runs_once_per_size_in_its_own_release_test_process(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        self.streaming(h)
+        expected = [f"{case} at {events}"
+                    for case, twice in STREAMING.values()
+                    for events in ((EVENTS, EVENTS * 10) if twice else (EVENTS,))]
+        self.assertEqual(sorted(h.streamed()), sorted(expected))
+        for call in h.calls():
+            if "--exact" in call:
+                self.assertRegex(call, r"^cargo test --locked --release -p p1-module-tests "
+                                       r"--test provider_streaming -- --nocapture "
+                                       r"--test-threads=1 --exact \w+$")
+        self.assertEqual(h.calls()[0], "build-modules.sh --all")
+
+    # ---- classification and exit codes ----------------------------------------------
+
+    def test_one_threshold_row_over_its_limit_fails_the_suite(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        h.stream_reading("latency-anthropic", EVENTS, {"p95": (2500.0, "us")})
+        result = self.streaming(h)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(verdicts(result.stdout)["latency-anthropic"], "FAIL")
+        self.assertIn("p95 2500 us > 2000 us", result.stdout)
+        self.assertEqual(result.stdout.splitlines()[-1],
+                         "bench-modules: streaming: 12 rows at 1000 events: "
+                         "11 pass, 1 fail, 0 error; exit 1")
+
+    def test_the_suites_own_bound_fails_a_slow_consumer_row(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        h.stream_reading("slow-consumer-chat", EVENTS, {"read-ahead": (1.0, "chunks")})
+        result = self.streaming(h)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(verdicts(result.stdout)["slow-consumer-chat"], "FAIL")
+        self.assertIn("read-ahead 1 chunks > 0 chunks", result.stdout)
+
+    def test_a_memory_row_is_computed_from_both_of_its_readings(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        h.stream_reading("memory-anthropic", EVENTS, {"peak-rss-delta": (0.5, "MiB")})
+        h.stream_reading("memory-anthropic", EVENTS * 10, {"peak-rss-delta": (1.5, "MiB")})
+        result = self.streaming(h)
+        # 1 MiB over the 9000 extra events is 116.508 bytes per extra delta, over the suite's
+        # own 32 B/delta bound; the same two readings also carry the growth.
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        columns = row_lines(result.stdout)["memory-anthropic"]
+        self.assertEqual(columns[1], "peak-rss-delta 0.5 MiB at 1000 deltas, 1.5 MiB at 10000 "
+                                     "deltas, growth 1 MiB (116.508 B per extra delta)")
+        self.assertEqual(columns[3], "FAIL")
+        self.assertIn("growth-per-delta 116.508 B/delta > 32 B/delta", result.stdout)
+
+    def test_a_memory_row_missing_one_of_its_sizes_is_a_tooling_error(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        (h.stream / f"streaming_peak_rss_responses.{EVENTS * 10}.json").unlink()
+        result = self.streaming(h)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(verdicts(result.stdout)["memory-responses"], "ERROR")
+        self.assertIn("the case reported the sizes [1000], the suite asked for 1000 and 10000",
+                      result.stdout)
+
+    def test_a_case_that_prints_no_measurement_is_a_tooling_error(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        result = self.streaming(h, STUB_STREAM_QUIET="streaming_tool_call_chat")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(verdicts(result.stdout)["tool-call-chat"], "ERROR")
+        self.assertIn("case streaming_tool_call_chat printed no measurement", result.stdout)
+        # The rows whose cases did report were still classified.
+        self.assertEqual(verdicts(result.stdout)["latency-anthropic"], "PASS")
+
+    def test_a_case_that_fails_is_a_tooling_error(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        (h.stream / f"streaming_slow_consumer_chat.{EVENTS}.json").unlink()
+        result = self.streaming(h)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(verdicts(result.stdout)["slow-consumer-chat"], "ERROR")
+        self.assertIn("case streaming_slow_consumer_chat failed", result.stdout)
+
+    def test_a_reading_in_another_unit_is_a_tooling_error(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        h.stream_reading("latency-chat", EVENTS, {"p95": (22.2, "ns")})
+        result = self.streaming(h)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(verdicts(result.stdout)["latency-chat"], "ERROR")
+        self.assertIn("p95 came in ns, the check is in us", result.stdout)
+
+    def test_a_missing_python3_is_a_tooling_error(self) -> None:
+        h = self.harness()
+        h.all_streaming_passing()
+        result = self.streaming(h, STUB_PYTHON3_FAIL="1")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("without classifying a row", result.stderr)
 
 
 if __name__ == "__main__":

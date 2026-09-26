@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Measures what p1's WebAssembly modules cost, in one of two suites.
+# Measures what p1's WebAssembly modules cost, in one of three suites.
 #
 # --suite baseline (S0.8) records what the module runtime costs on this box: the cold and warm
 # readings of `crates/p1-module-tests/src/bin/bench-baseline.rs`, the box's max RSS for them,
@@ -41,6 +41,20 @@
 # PENDING and names the missing component and the stream that owns it; PENDING is never a pass.
 # The gate never runs this suite; it runs scripts/test_bench_modules.py.
 #
+# --suite streaming (S4.8) measures the three provider components while a stream runs: the
+# added latency of forwarding one event, whether the stream stays incremental (the scripted
+# transport hands out one SSE block per poll and reports every poll that asked for a block
+# before the consumer acknowledged the event before it), what a slow consumer sees, and the
+# process's own peak RSS over a stream of `P1_STREAM_EVENTS` (default 100000) text deltas and
+# over ten times that many. PLAN §10's `provider-events` row is the only PLAN threshold this
+# suite applies; every other row is this suite's own bound, which the row names, and the memory
+# rows carry their measured values as facts (ANSWERS S4-B6, D076). The cases are the cases of
+# crates/p1-module-tests/tests/provider_streaming.rs, run in the release profile one case per
+# test process; the memory row runs its case twice, once at N and once at 10·N events. The
+# summary line names that workload, so a run shortened with P1_STREAM_EVENTS cannot be mistaken
+# for the design workload; P1_STREAM_EVENTS must be a positive integer, and any other value is a
+# usage error (exit 2).
+#
 # Exit codes:
 #   baseline:   0 when the record is written, 1 when a fact could not be measured,
 #               2 on a usage error.
@@ -53,6 +67,9 @@
 #                 produce its measurement; such a row is reported as ERROR).
 #   acceptance without --check: the rows are reported with the verdict MEASURED or PENDING;
 #               0 when every measurable row was measured, 2 on a usage or tooling error.
+#   streaming:  0 when every row passed, 1 when a row failed its threshold or this suite's own
+#               bound, 2 on a usage or tooling error (a case that did not produce its
+#               measurement is reported as ERROR).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -60,9 +77,10 @@ usage() {
   cat <<'EOF'
 usage: scripts/bench-modules.sh --suite baseline [--out <path>]
        scripts/bench-modules.sh --suite acceptance [--row <id>]... [--check] [--json <file>]
+       scripts/bench-modules.sh --suite streaming
        scripts/bench-modules.sh --help
 
---suite <name>  the suite to run: baseline or acceptance
+--suite <name>  the suite to run: baseline, acceptance or streaming
 --out <path>    baseline: where the record goes
                 (default .worker-scratch/bench-baseline-<shortsha>.txt)
 --row <id>      acceptance: run only this row (repeatable; default every row)
@@ -79,6 +97,9 @@ The acceptance suite prints one line per row, `<row id>  <measured value>  <thre
 <verdict>  <reason>`, and a summary line after them. With --check: exit 0 when every
 selected row passes, 1 when a row fails, 3 when none fails but one is PENDING, 2 on a usage
 or tooling error. Without --check: exit 0, or 2 on a usage or tooling error.
+
+The streaming suite prints the same one line per row and a summary line. It takes no other
+option: it exits 0 when every row passed, 1 when a row failed, 2 on a usage or tooling error.
 EOF
 }
 
@@ -174,8 +195,14 @@ case "$suite" in
       exit 2
     fi
     ;;
+  streaming)
+    if [ -n "$out" ] || [ "${#rows[@]}" -gt 0 ] || [ "$check" = 1 ] || [ -n "$json_out" ]; then
+      echo "bench-modules: --out, --row, --check and --json belong to the baseline and acceptance suites" >&2
+      exit 2
+    fi
+    ;;
   *)
-    echo "bench-modules: suite $suite is neither baseline nor acceptance" >&2
+    echo "bench-modules: suite $suite is neither baseline, acceptance nor streaming" >&2
     exit 2
     ;;
 esac
@@ -461,8 +488,285 @@ PY
   exit "$status"
 }
 
+# The streaming rows (S4.8), one row per line: id | the row's threshold, verbatim from PLAN
+# §10 where one exists | the checks the script evaluates | the kind of row | who measures it.
+#
+# A check is `<statistic><=<limit><unit>`: the case must report that statistic in that unit and
+# the row passes when its value is at most the limit. The kinds are:
+#   threshold  PLAN §10's row is this row's threshold; failing it fails the suite.
+#   bound      this suite's own bound (the row names it); failing it fails the suite. The row's
+#              value carries the measurements as facts, since PLAN §10 has no row for them.
+# The measured-by column is `case <test name>` (one test process) or `memory <test name>` (two
+# test processes, one at N and one at 10·N events, so the row's growth is one reading).
+#
+# The latency check is PLAN §10's `provider-events` row, in the units the case reports: the
+# case measures the added latency of one forwarded event (the transport releases a block, the
+# consumer receives its event) and reports p95/p99 in microseconds. PLAN §10 paces that row at
+# 200 events/s; the case drives events back to back, never waiting on the provider, so its
+# reading is the forwarding cost itself and the rate it observed is printed beside it.
+STREAMING_TABLE='
+latency-anthropic|PLAN §10: Provider event forwarding — p95 added latency ≤2 ms; p99 ≤10 ms at 200 events/s|p95<=2000us p99<=10000us read-ahead<=0chunks|threshold|case streaming_latency_anthropic
+latency-responses|PLAN §10: Provider event forwarding — p95 added latency ≤2 ms; p99 ≤10 ms at 200 events/s|p95<=2000us p99<=10000us read-ahead<=0chunks|threshold|case streaming_latency_responses
+latency-chat|PLAN §10: Provider event forwarding — p95 added latency ≤2 ms; p99 ≤10 ms at 200 events/s|p95<=2000us p99<=10000us read-ahead<=0chunks|threshold|case streaming_latency_chat
+slow-consumer-anthropic|- (S4.8 bound: read-ahead ≤0 chunks; PLAN §10 has no slow-consumer row)|read-ahead<=0chunks|bound|case streaming_slow_consumer_anthropic
+slow-consumer-responses|- (S4.8 bound: read-ahead ≤0 chunks; PLAN §10 has no slow-consumer row)|read-ahead<=0chunks|bound|case streaming_slow_consumer_responses
+slow-consumer-chat|- (S4.8 bound: read-ahead ≤0 chunks; PLAN §10 has no slow-consumer row)|read-ahead<=0chunks|bound|case streaming_slow_consumer_chat
+tool-call-anthropic|- (S4.8 bound: read-ahead ≤0 chunks; PLAN §10 has no tool-call row)|read-ahead<=0chunks|bound|case streaming_tool_call_anthropic
+tool-call-responses|- (S4.8 bound: read-ahead ≤0 chunks; PLAN §10 has no tool-call row)|read-ahead<=0chunks|bound|case streaming_tool_call_responses
+tool-call-chat|- (S4.8 bound: read-ahead ≤0 chunks; PLAN §10 has no tool-call row)|read-ahead<=0chunks|bound|case streaming_tool_call_chat
+memory-anthropic|- (S4.8 bound: peak-RSS growth ≤32 bytes per extra event, N vs 10·N deltas; PLAN §10 has no streaming row, its provider memory row is idle-provider)|growth-per-delta<=32B/delta|bound|memory streaming_peak_rss_anthropic
+memory-responses|- (S4.8 bound: peak-RSS growth ≤32 bytes per extra event, N vs 10·N deltas; PLAN §10 has no streaming row, its provider memory row is idle-provider)|growth-per-delta<=32B/delta|bound|memory streaming_peak_rss_responses
+memory-chat|- (S4.8 bound: peak-RSS growth ≤32 bytes per extra event, N vs 10·N deltas; PLAN §10 has no streaming row, its provider memory row is idle-provider)|growth-per-delta<=32B/delta|bound|memory streaming_peak_rss_chat
+'
+
+# S4.8's streaming suite: the components' own streaming cost. Each row is one case process, and
+# a memory row is two (N and 10·N events); the rows and their bounds are STREAMING_TABLE's.
+run_streaming() {
+  local scratch
+  scratch="$(mktemp -d)" || tooling "cannot create a scratch directory"
+  # shellcheck disable=SC2064 # the directory is fixed now, when the trap is set
+  trap "rm -rf '$scratch'" EXIT
+  printf '%s\n' "$STREAMING_TABLE" >"$scratch/table"
+  : >"$scratch/cases.out"
+  : >"$scratch/cases.failed"
+
+  # The measured workload: the design's 100 000 deltas, and ten times as many for the memory
+  # rows' growth. An explicit P1_STREAM_EVENTS is honoured, which keeps a manual run cheap.
+  local events="${P1_STREAM_EVENTS:-100000}"
+  # The value reaches shell arithmetic and the memory rows' divisor. A non-integer would abort
+  # the script on `events * 10`, with the status of a failed row; a word such as `abc` evaluates
+  # as 0, which only surfaces as the report's division by zero. So it is validated here, before
+  # either, and refused as the usage error it is.
+  [[ "$events" =~ ^[1-9][0-9]*$ ]] ||
+    tooling "P1_STREAM_EVENTS must be a positive integer, got $events"
+  local large="$((events * 10))"
+
+  # Stale components would be measured as if they were this commit's.
+  echo "bench-modules: building the module packages (scripts/build-modules.sh --all)" >&2
+  scripts/build-modules.sh --all >&2 || tooling "scripts/build-modules.sh --all failed"
+  local_cargo_config
+  echo "bench-modules: building the streaming cases in the release profile" >&2
+  cargo test --locked --release -p p1-module-tests --test provider_streaming --no-run >&2 ||
+    tooling "the streaming cases do not build"
+
+  local row_id target checks kind source case_name size
+  while IFS='|' read -r row_id target checks kind source; do
+    [ -n "$row_id" ] || continue
+    case "$source" in
+      case\ *)
+        case_name="${source#case }"
+        echo "bench-modules: measuring $case_name at $events events" >&2
+        if ! P1_STREAM_EVENTS="$events" cargo test --locked --release -p p1-module-tests \
+          --test provider_streaming -- --nocapture --test-threads=1 --exact "$case_name" \
+          >>"$scratch/cases.out"; then
+          echo "$case_name" >>"$scratch/cases.failed"
+        fi
+        ;;
+      memory\ *)
+        case_name="${source#memory }"
+        # One process per size: the peak RSS of one reading must not carry the other's.
+        for size in "$events" "$large"; do
+          echo "bench-modules: measuring $case_name at $size events" >&2
+          if ! P1_STREAM_EVENTS="$size" cargo test --locked --release -p p1-module-tests \
+            --test provider_streaming -- --nocapture --test-threads=1 --exact "$case_name" \
+            >>"$scratch/cases.out"; then
+            echo "$case_name" >>"$scratch/cases.failed"
+          fi
+        done
+        ;;
+      *)
+        tooling "unknown source $source in the streaming table"
+        ;;
+    esac
+  done <"$scratch/table"
+
+  local commit
+  commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  local status=0
+  PYTHONUTF8=1 python3 - "$scratch" "$events" "$large" "$commit" <<'PY' || status=$?
+import json
+import re
+import sys
+
+
+def objects(line):
+    """Every JSON object on `line`, wherever it starts and whatever order its keys are in."""
+    for start, char in enumerate(line):
+        if char != "{":
+            continue
+        try:
+            value, _ = json.JSONDecoder().raw_decode(line[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            yield value
+
+
+def main():
+    scratch, small, large, commit = sys.argv[1:5]
+    small, large = int(small), int(large)
+
+    # id | the row's threshold | the checks | the kind | who measures it
+    table = []
+    for line in open(f"{scratch}/table", encoding="utf-8"):
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        row_id, target, checks, kind, source = line.split("|")
+        table.append((row_id, target, checks.split(), kind, source))
+    failed_cases = {line.strip() for line in open(f"{scratch}/cases.failed", encoding="utf-8") if line.strip()}
+
+    # One JSON object per case line; libtest prints `test <name> ... ` before it on the same
+    # line. The object is found by decoding each `{` on the line and keeping the one that
+    # carries the row key, so the report does not depend on the key order serde_json writes.
+    # A memory row's case runs twice, so a row can carry more than one reading.
+    reported = {}
+    for line in open(f"{scratch}/cases.out", encoding="utf-8"):
+        for value in objects(line):
+            if "streaming-row" in value:
+                reported.setdefault(value["streaming-row"], []).append(value)
+
+    form = re.compile(r"^(?P<statistic>[a-z0-9-]+)<=(?P<limit>[0-9]+(?:\.[0-9]+)?)(?P<unit>[A-Za-z/]+)$")
+
+    def found(measurements, statistic):
+        for measurement in measurements:
+            if measurement.get("statistic") == statistic:
+                return measurement
+        return None
+
+    def evaluate(spec, measurements):
+        """(passed, text, problem) of one check; problem is set when it cannot be evaluated."""
+        match = form.match(spec)
+        if not match:
+            return None, "", f"the table's check {spec} is not a known form"
+        statistic, limit, unit = match["statistic"], float(match["limit"]), match["unit"]
+        measured = found(measurements, statistic)
+        if measured is None:
+            return None, "", f"the case reported no {statistic}"
+        if measured.get("unit") != unit:
+            return None, "", f"{statistic} came in {measured.get('unit')}, the check is in {unit}"
+        value = measured.get("value")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None, "", f"{statistic} is not a number"
+        text = f"{statistic} {value:g} {unit}"
+        if value <= limit:
+            return True, text, None
+        return False, text, f"{statistic} {value:g} {unit} > {limit:g} {unit}"
+
+    def shown(measurements):
+        return "; ".join(
+            f"{measurement['statistic']} {measurement['value']:g} {measurement['unit']}"
+            for measurement in measurements
+        )
+
+    results = []
+    for row_id, target, checks, kind, source in table:
+        case_name = source.split(" ", 1)[1]
+        result = {"id": row_id, "threshold": target, "kind": kind, "value": "-",
+                  "samples": 0, "detail": "", "verdict": "", "reason": ""}
+        values = reported.get(row_id, [])
+        if not values:
+            why = "failed" if case_name in failed_cases else "printed no measurement"
+            result.update(verdict="ERROR", reason=f"case {case_name} {why}")
+            results.append(result)
+            continue
+        if source.startswith("memory "):
+            # Two readings of the same case, one per size; the growth between them is the bound.
+            by_size = {}
+            for value in values:
+                measured_size = found(value.get("measurements", []), "text-deltas")
+                delta = found(value.get("measurements", []), "peak-rss-delta")
+                if measured_size is None or delta is None:
+                    continue
+                by_size[int(measured_size["value"])] = delta
+            if small not in by_size or large not in by_size:
+                result.update(
+                    verdict="ERROR",
+                    reason=f"the case reported the sizes {sorted(by_size)}, the suite asked for "
+                           f"{small} and {large}",
+                )
+                results.append(result)
+                continue
+            delta_small, delta_large = by_size[small], by_size[large]
+            growth = delta_large["value"] - delta_small["value"]
+            # The bound is per extra event, not per workload: the streaming path must cost the
+            # same whatever the stream's length is, and a per-event leak of a whole event
+            # object is an order of magnitude above the bound.
+            per_delta = round(growth * 1024 * 1024 / (large - small), 3)
+            measurements = [
+                {"statistic": "growth", "value": growth, "unit": "MiB"},
+                {"statistic": "growth-per-delta", "value": per_delta, "unit": "B/delta"},
+            ]
+            result["value"] = (
+                f"peak-rss-delta {delta_small['value']:g} MiB at {small} deltas, "
+                f"{delta_large['value']:g} MiB at {large} deltas, growth {growth:g} MiB "
+                f"({per_delta:g} B per extra delta)"
+            )
+            result["samples"] = values[-1].get("samples", 0)
+            result["detail"] = values[-1].get("detail", "")
+        else:
+            value = values[0]
+            measurements = value.get("measurements", [])
+            result["value"] = shown(measurements) or "-"
+            result["samples"] = value.get("samples", 0)
+            result["detail"] = value.get("detail", "")
+        texts, problems, failures = [], [], []
+        for spec in checks:
+            passed, text, problem = evaluate(spec, measurements)
+            if passed is None:
+                problems.append(problem)
+                continue
+            texts.append(text)
+            if not passed:
+                failures.append(problem)
+        if problems:
+            result.update(verdict="ERROR", reason="; ".join(problems))
+        elif failures:
+            result.update(verdict="FAIL", reason="; ".join(failures))
+        elif case_name in failed_cases:
+            result.update(verdict="FAIL", reason=f"case {case_name} failed")
+        else:
+            result.update(verdict="PASS", reason=f"{result['samples']} samples; {result['detail']}")
+        results.append(result)
+
+    for result in results:
+        print(f"{result['id']:<22}  {result['value']}  {result['threshold']}  "
+              f"{result['verdict']}  {result['reason']}")
+
+    counts = {verdict: sum(1 for r in results if r["verdict"] == verdict)
+              for verdict in ("PASS", "FAIL", "ERROR")}
+    if counts["ERROR"]:
+        code = 2
+    elif counts["FAIL"]:
+        code = 1
+    else:
+        code = 0
+    print(f"bench-modules: streaming: {len(results)} rows at {small} events: {counts['PASS']} pass, "
+          f"{counts['FAIL']} fail, {counts['ERROR']} error; exit {code}")
+    return code
+
+
+try:
+    sys.exit(main())
+except Exception as error:  # a broken report is a tooling error, never exit 1
+    print(f"bench-modules: the report failed: {error!r}", file=sys.stderr)
+    sys.exit(2)
+PY
+  # The report classifies every row itself and exits 0..2; any other status means python3 did
+  # not run it (a missing interpreter is 127), which is a tooling error, never a failed row.
+  case "$status" in
+    0 | 1 | 2) ;;
+    *) tooling "the report exited $status without classifying a row" ;;
+  esac
+  exit "$status"
+}
+
 if [ "$suite" = acceptance ]; then
   run_acceptance
+fi
+
+if [ "$suite" = streaming ]; then
+  run_streaming
 fi
 
 fail() {
