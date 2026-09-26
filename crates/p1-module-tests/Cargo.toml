@@ -35,3 +35,7 @@ p1-testkit = { path = "../p1-testkit" }
 p1-workers = { path = "../p1-workers" }
 # workflow_boundary.rs: the workflow substrate driven through its decision seam (S6.3).
 p1-workflow = { path = "../p1-workflow" }
+# policies.rs (S5.4): the policy components behind the native ask bridge, and the native
+# context engine whose estimator builds the settings the component is configured with.
+p1-host = { path = "../p1-host" }
+p1-context = { path = "../p1-context" }
