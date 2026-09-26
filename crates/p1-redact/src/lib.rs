@@ -36,6 +36,14 @@
 //! `summary` and every string of the detail of every `describe_result`. `effect` and
 //! `identity` are closed values and pass through. Masking still happens before anything
 //! durable (history, journal, summary, UI) is built from a tool's output.
+//!
+//! The declaration's `kind` is deliberately NOT masked and passes through unchanged: a
+//! `Function`'s `input_schema` and a `Freeform` tool's `grammar` are machine-consumed
+//! JSON-schema and grammar text, and running the matcher over that text could corrupt a
+//! legitimate schema (a property named `key` whose 16+ character enum, `const` or default
+//! value is not a credential). ADR-0083 §4's masking therefore stops at the `description` a
+//! provider shows the model; a schema- or grammar-borne credential is named as out of scope
+//! in the slice's PR.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -175,6 +183,8 @@ impl RedactingTool {
         let declaration = ToolDeclaration {
             name: declared.name.clone(),
             description: description.text,
+            // `kind` passes through: its schema/grammar text is machine-consumed and masking
+            // it could corrupt a legitimate schema (see the crate doc comment).
             kind: declared.kind.clone(),
         };
         Self {

@@ -55,6 +55,7 @@ fn wrapped(loader: &Loader) -> (Arc<dyn Tool>, Arc<MaskCounter>) {
         &module,
         Services {
             process: Some(fake_processes().0),
+            summary: None,
         },
         ExecutionLimits::default(),
         &counter,
@@ -388,8 +389,10 @@ fn opaque_replay_is_left_unmasked() {
 
     let before = p1_contracts::serde_json::to_string(&item).expect("serialize");
     // Nothing the layer exposes takes an assistant item, so the payload is unchanged and the
-    // key-shaped string survives in it.
-    let after = p1_contracts::serde_json::to_string(&item).expect("serialize");
+    // key-shaped string survives in it. Read the serialized item back through the serde path
+    // history and the journal use and re-serialize that value, so this proves the round trip.
+    let reread: Item = p1_contracts::serde_json::from_str(&before).expect("deserialize");
+    let after = p1_contracts::serde_json::to_string(&reread).expect("serialize");
     assert_eq!(after, before);
     assert!(before.contains(&secret), "{before}");
 }
