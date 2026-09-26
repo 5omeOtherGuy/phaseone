@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use serde_json::Value;
 
 use crate::api::{CallId, JournalRecord, RunId, StepEnvelope, StepStatus};
+use crate::decision::{ReplayEntry, ReplayView};
 
 /// Appends records to `journal.jsonl`. Each record is written with one `write_all` on an
 /// unbuffered file, so a crash loses at most the line being written and never reorders.
@@ -119,7 +120,51 @@ impl Replay {
         }
     }
 
-    /// The recorded envelope for `call` and the run it came from, or `None` (latching off).
+    /// The prefix as a decision sees it: the entries not yet taken, and the latch.
+    pub(crate) fn view(&self) -> ReplayView {
+        ReplayView {
+            latched_off: self.latched_off,
+            open: self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !self.taken[*index])
+                .filter_map(|(index, (call, _))| {
+                    Some(ReplayEntry {
+                        index: u32::try_from(index).ok()?,
+                        call: call.clone(),
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// The recorded envelope at `index` for `call` and the run it came from; `None` when
+    /// another call took it or missed the prefix since the decision saw it. Checked and
+    /// taken under the one lock the caller holds, so two calls never take one entry.
+    pub(crate) fn take_entry(
+        &mut self,
+        index: u32,
+        call: &CallId,
+    ) -> Option<(StepEnvelope, RunId)> {
+        let index = usize::try_from(index).ok()?;
+        let from = self.from.as_ref()?;
+        let (id, envelope) = self.entries.get(index)?;
+        if self.latched_off || self.taken[index] || id != call {
+            return None;
+        }
+        self.taken[index] = true;
+        Some((envelope.clone(), from.clone()))
+    }
+
+    /// The first call the prefix did not answer: nothing after it is replayed.
+    pub(crate) fn latch_off(&mut self) {
+        self.latched_off = true;
+    }
+
+    /// The recorded envelope for `call` and the run it came from, or `None` (latching off):
+    /// the matching rule the decisions apply, in one call.
+    #[cfg(test)]
     pub(crate) fn take(&mut self, call: &CallId) -> Option<(StepEnvelope, RunId)> {
         if self.latched_off {
             return None;

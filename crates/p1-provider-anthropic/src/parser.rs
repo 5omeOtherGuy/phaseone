@@ -23,7 +23,7 @@ use p1_provider_http::{ResponseParser, SseEvent, kind_for_status};
 use serde_json::{Value, json};
 
 /// Parse one streaming Messages response into contract events.
-pub(crate) struct AnthropicParser {
+pub struct AnthropicParser {
     origin_route: String,
     /// Starts as the requested model and is re-keyed by `message_start` to the
     /// RESPONSE model, so replay data carries the model that actually produced it.
@@ -56,7 +56,7 @@ enum OpenKind {
 impl AnthropicParser {
     /// `origin_route` is the composed route's `Origin.route`; the model is the
     /// configured wire model that `message_start` re-keys to the RESPONSE model.
-    pub(crate) fn new(origin_route: &str, model: &str) -> Self {
+    pub fn new(origin_route: &str, model: &str) -> Self {
         Self {
             origin_route: origin_route.to_string(),
             origin_model: model.to_string(),

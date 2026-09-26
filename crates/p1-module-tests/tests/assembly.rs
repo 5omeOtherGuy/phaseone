@@ -92,6 +92,7 @@ impl Instantiations {
             counted.fetch_add(1, Ordering::SeqCst);
             Services {
                 process: Some(process.clone()),
+                ..Services::default()
             }
         });
         Self {

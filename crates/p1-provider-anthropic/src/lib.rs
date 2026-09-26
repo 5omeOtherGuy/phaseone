@@ -19,14 +19,28 @@
 //!
 //! No credential value, header value or response-body text ever reaches a
 //! [`p1_contracts::ProviderError`], a `Debug` output or a panic message.
+//!
+//! The crate is split like `p1-provider-http` (ADR-0071). PORTABLE, always
+//! compiled: the route and settings types, composition validation,
+//! [`validate_request`], the credential-free lowering ([`lower_request`]), the
+//! [`AnthropicParser`] and its `on_http_error` classification — what a provider
+//! WebAssembly component needs. NATIVE, behind the default `native` feature:
+//! [`AnthropicProvider`] and [`build_headers`], everything that touches a
+//! transport or a credential.
 
 mod parser;
+#[cfg(feature = "native")]
 mod provider;
 mod request;
 
+pub use parser::AnthropicParser;
+#[cfg(feature = "native")]
 pub use provider::AnthropicProvider;
+#[cfg(feature = "native")]
+pub use request::build_headers;
 pub use request::{
-    build_headers, build_headers_without_credential, build_request, with_long_context,
+    LoweredRequest, build_headers_without_credential, build_request, lower_request,
+    validate_composition, validate_request, with_long_context,
 };
 
 /// The `origin_route` of the shipped `routes/anthropic-subscription.toml`, byte for
@@ -84,6 +98,21 @@ impl MessagesRoute {
         }
     }
 
+    /// What a provider composed from this route and `wire_model` is.
+    pub fn describe(&self, wire_model: &str) -> p1_contracts::RouteDescription {
+        p1_contracts::RouteDescription {
+            origin: self.origin(wire_model),
+            // The Messages route declares JSON-schema function tools only.
+            supports_freeform_tools: false,
+            mandatory_prompt_prefix: Some(crate::request::IDENTITY.to_string()),
+            // A subscription bills by plan, not per request: cost is unknown.
+            reports_cost: false,
+            // This route caches with `cache_control` markers; `options.cache_key`
+            // never reaches the wire, so an explicit one is rejected by validation.
+            cache_key: p1_contracts::CacheKeySupport::Unsupported,
+        }
+    }
+
     fn validate(&self) -> Result<(), p1_contracts::ProviderError> {
         let invalid = |message: &str| {
             p1_contracts::ProviderError::new(
@@ -104,5 +133,41 @@ impl MessagesRoute {
             return Err(invalid("invalid Messages route endpoint"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The manifest is the split's guard: a transport dependency that the default
+    /// `native` feature does not gate would let a guest build reach sockets, a
+    /// runtime or credentials without any compile error here.
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    #[test]
+    fn the_transport_crate_is_native_only_through_the_default_native_feature() {
+        assert!(MANIFEST.contains("default = [\"native\"]"));
+        assert!(MANIFEST.contains("native = [\"p1-provider-http/native\"]"));
+        let dependencies = MANIFEST
+            .split("[dependencies]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("a dependencies table");
+        let http = dependencies
+            .lines()
+            .find(|line| line.starts_with("p1-provider-http = "))
+            .expect("p1-provider-http is a dependency");
+        assert!(http.contains("default-features = false"), "{http}");
+    }
+
+    #[test]
+    fn no_dependency_on_p1_auth_or_a_runtime() {
+        let dependencies = MANIFEST
+            .split("[dependencies]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("a dependencies table");
+        for name in ["p1-auth", "tokio", "futures", "reqwest"] {
+            assert!(!dependencies.contains(name), "{name} in [dependencies]");
+        }
     }
 }
