@@ -46,6 +46,7 @@ use crate::cli::{self, Command, Options};
 use crate::frontend::{FrontEnd, LineFrontEnd};
 use crate::render::Renderer;
 use crate::session;
+use crate::summary::ContextTable;
 use crate::{HostDeps, InterruptSource};
 use p1_tool_finish::Accepted;
 
@@ -166,13 +167,14 @@ impl ContextPolicy for DefaultContext {
     }
 }
 
-/// The context policy for an assembled agent (context.md §3): a
-/// `SummarizingContext` when the environment opts in with `[context]`,
-/// passthrough otherwise. The host is the composition root: `p1-assembly` only
-/// carries the plain settings and the prompt override. `profile` is the model
-/// profile the environment selected (the whole-provider form has none): its own
-/// capacity narrows the environment's table, and its effort floor is what the
-/// summarization request runs at (#125).
+/// The context policy for an assembled agent (context.md §3): the summarizing
+/// context component (the host entry `p1/context/summarizing`, `summary.rs`) when the
+/// environment opts in with `[context]`, passthrough otherwise. The host is the
+/// composition root: `p1-assembly` only carries the plain settings and the prompt
+/// override. `profile` is the model profile the environment selected (the
+/// whole-provider form has none): its own capacity narrows the environment's table,
+/// and its effort floor is what the summarization request runs at (#125).
+// notice: S5.11 (#357): the component replaces the native `SummarizingContext`.
 pub(crate) fn agent_context(
     assembled: &Assembled,
     profile: Option<&ModelProfile>,
@@ -185,15 +187,15 @@ pub(crate) fn agent_context(
         .resolved
         .summarize_prompt
         .clone()
-        .unwrap_or_else(|| p1_context::DEFAULT_SUMMARIZER_PROMPT.to_string());
-    let policy = p1_context::SummarizingContext::new(
+        .unwrap_or_else(|| crate::summary::DEFAULT_SUMMARIZER_PROMPT.to_string());
+    let policy = crate::summary::summarizing_context(
         assembled.provider.clone(),
         assembled.options.clone(),
-        config,
+        &config,
+        summary_output_tokens,
         prompt,
-    )?
-    .with_summary_output_tokens(summary_output_tokens)?
-    .with_summary_effort(summary_effort(profile));
+        summary_effort(profile),
+    )?;
     Ok(Arc::new(policy))
 }
 
@@ -213,7 +215,7 @@ const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 1_000;
 fn effective_context(
     settings: &p1_assembly::ContextSettings,
     profile: Option<&ModelProfile>,
-) -> Result<(p1_context::ContextConfig, u64), String> {
+) -> Result<(ContextTable, u64), String> {
     let config = config_for_route(settings, profile);
     let wall = config.window_tokens - config.output_headroom_tokens;
     let cap = settings.summary_output_tokens.min(wall / 2);
@@ -242,7 +244,7 @@ fn effective_context(
 pub(crate) fn config_for_route(
     settings: &p1_assembly::ContextSettings,
     profile: Option<&ModelProfile>,
-) -> p1_context::ContextConfig {
+) -> ContextTable {
     let window = profile
         .and_then(|profile| profile.context_tokens)
         .map_or(settings.window_tokens, |model_window| {
@@ -277,7 +279,7 @@ pub(crate) fn config_for_route(
     // a share of the kept tail, so it can never exceed it).
     let keep_recent = settings.keep_recent_tokens.min(wall.saturating_sub(1));
     let user_verbatim = settings.user_verbatim_tokens.min(keep_recent);
-    p1_context::ContextConfig {
+    ContextTable {
         window_tokens: window,
         output_headroom_tokens: headroom,
         summarize_at_tokens: useful,
@@ -634,9 +636,9 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
                 compact: options.compact,
             },
             cancel.clone(),
-        ))
+        )?)
     } else {
-        Arc::new(LineFrontEnd::new(deps, options, cancel.clone()))
+        Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?)
     };
     run_with_front_end(deps, options, cancel, front_end).await
 }
@@ -956,7 +958,7 @@ pub async fn run_with_front_end(
             sandbox_write: options.sandbox_write.clone(),
             sandbox_read: options.sandbox_read.clone(),
             env_pass: options.env_pass.clone(),
-            policy: Box::new(move || reload_policy.authorization()),
+            policy: Box::new(move || reload_policy_of(reload_policy.as_ref())),
             queue: ReloadQueue::default(),
         },
         completion: completion_hub.clone(),
@@ -1053,7 +1055,7 @@ async fn workflow_run(
     }
     let workspace = resolve_workspace(options)?;
     let cancel = CancellationToken::new();
-    let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone()));
+    let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?);
 
     // The same child composition as an interactive run, including the sibling
     // reservation. A standalone workflow can be invoked repeatedly with one session.
@@ -2148,7 +2150,7 @@ pub(crate) fn model_switch_for_test(
             env_pass: Vec::new(),
             policy: {
                 let front_end = front_end.clone();
-                Box::new(move || front_end.authorization())
+                Box::new(move || reload_policy_of(front_end.as_ref()))
             },
             queue: ReloadQueue::default(),
         },
@@ -2244,7 +2246,7 @@ impl ModelSwitch {
                 sandbox_write: Vec::new(),
                 sandbox_read: Vec::new(),
                 env_pass: Vec::new(),
-                policy: Box::new(move || policy.clone()),
+                policy: Box::new(move || Ok((policy.clone(), None))),
                 queue: ReloadQueue::default(),
             },
             completion: Arc::new(CompletionHub::new()),
@@ -2676,12 +2678,33 @@ pub(crate) struct ReloadInputs {
     sandbox_write: Vec<PathBuf>,
     sandbox_read: Vec<PathBuf>,
     env_pass: Vec<String>,
-    /// The policy the session selects. The host's policies are still the native
-    /// twins of `p1/policy/*` (`policy.rs`), owned by the front end that asks
-    /// through them, so this hands back the front end's; a loaded policy package
-    /// is built here once the host loads them.
-    policy: Box<dyn Fn() -> Arc<dyn AuthorizationPolicy> + Send + Sync>,
+    /// The policy the session selects: the front end's, which asks through it, and
+    /// the shipped policy package it asks loaded again from the release
+    /// ([`reload_policy_of`]).
+    // notice: S5.11 (#357): fallible, and the reloaded package answers once installed.
+    policy: Box<dyn Fn() -> Result<ReloadedPolicy, String> + Send + Sync>,
     queue: ReloadQueue,
+}
+
+/// A reload candidate's policy: the front end's bridge, and the shipped package it asks
+/// loaded again from the release, which answers once the candidate is installed.
+type ReloadedPolicy = (
+    Arc<dyn AuthorizationPolicy>,
+    Option<crate::policy::PolicyReload>,
+);
+
+// notice: S5.11 (#357): the reload policy closure over the loaded components.
+/// The policy of a reload candidate for `front_end`: its own policy, which keeps its
+/// asker, its turn and its grants, and — when it asks a shipped policy
+/// (`p1/policy/full-access` or `p1/policy/ask`) — that package loaded and verified again
+/// from the official release. A package that is gone or does not verify fails the
+/// reload, naming it, and the current policy keeps answering.
+fn reload_policy_of(front_end: &dyn FrontEnd) -> Result<ReloadedPolicy, String> {
+    let reloaded = front_end
+        .shipped_policy()
+        .map(|shipped| shipped.reload())
+        .transpose()?;
+    Ok((front_end.authorization(), reloaded))
 }
 
 /// A copy of what [`build_catalog`] reads of `deps`, for a reload that runs where
@@ -2757,12 +2780,13 @@ pub(crate) async fn reload_modules(
         profile: current.profile,
     };
     let candidate = session_candidate(switch, &catalog, &lock, &choice, &current.finish)?;
+    let (authorization, reloaded) = (inputs.policy)()?;
     let generation = install_candidate(
         &switch.generations,
         agent,
         Candidate {
             catalog,
-            authorization: (inputs.policy)(),
+            authorization,
             parts: CandidateParts {
                 provider: candidate.parts.provider.clone(),
                 tools: candidate.parts.tools.clone(),
@@ -2774,6 +2798,10 @@ pub(crate) async fn reload_modules(
     )
     .await
     .map_err(|error| error.to_string())?;
+    // The reloaded component answers from the installed generation on, never before.
+    if let Some(reloaded) = reloaded {
+        reloaded.install();
+    }
     // The install committed a new `Environment` with the reloaded modules: the journal
     // names that assembly before the next turn, and later switches resolve module keys
     // against the reloaded lock. A store that refuses the line has already accepted the
@@ -3515,8 +3543,22 @@ mod tests {
     }
 
     /// The reserve the effective table leaves for the next response.
-    fn wall_of(config: &p1_context::ContextConfig) -> u64 {
+    fn wall_of(config: &ContextTable) -> u64 {
         config.window_tokens - config.output_headroom_tokens
+    }
+
+    // notice: S5.11 (#357): the table is the host's own type now; the component's source
+    // crate still validates it, as the component's `configure` does.
+    /// The effective table as the context engine's own config, to validate it.
+    fn native_table(table: &ContextTable) -> p1_context::ContextConfig {
+        p1_context::ContextConfig {
+            window_tokens: table.window_tokens,
+            output_headroom_tokens: table.output_headroom_tokens,
+            summarize_at_tokens: table.summarize_at_tokens,
+            keep_recent_tokens: table.keep_recent_tokens,
+            user_verbatim_tokens: table.user_verbatim_tokens,
+            tool_result_excerpt_chars: table.tool_result_excerpt_chars,
+        }
     }
 
     /// A profile that is not a shipped file: the folding rule must hold for any capacity a
@@ -3569,7 +3611,9 @@ mod tests {
             wall_of(&config)
         );
         // The effective table must be one the policy accepts.
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     /// A profile that states MORE than the environment cannot widen it: the environment's table
@@ -3594,7 +3638,9 @@ mod tests {
             config_for_route(&settings, None),
             "a roomier profile changes nothing"
         );
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     /// A profile far narrower than the environment (40,000 tokens on `zen`) clamps the copied
@@ -3630,7 +3676,9 @@ mod tests {
             config.user_verbatim_tokens,
             config.keep_recent_tokens
         );
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
 
         // A profile whose own output ceiling exceeds its own window: the reserve is clamped
         // below the window, so the table still describes a sendable request. What is left is too
@@ -3646,7 +3694,9 @@ mod tests {
             config.window_tokens
         );
         assert!(config.keep_recent_tokens < wall_of(&config));
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
 
         let (assembled, _) = assembled_for_test(Some(settings.clone()), Effort::High);
         let error = match agent_context(&assembled, Some(&odd)) {
@@ -3726,7 +3776,9 @@ mod tests {
             "the profile's output ceiling bounds the reserve"
         );
         assert_eq!(config.summarize_at_tokens, 500_000);
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     /// A profile that states no capacity at all (the one the `deepseek` environment binds) leaves
@@ -3778,7 +3830,9 @@ mod tests {
             config.summarize_at_tokens > settings.window_tokens * 60 / 100,
             "the decided threshold is above 60% of the window, so the rule must not apply"
         );
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     // ---------------------------- #125 review: the summary's own effort
