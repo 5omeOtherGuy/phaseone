@@ -1,0 +1,30 @@
+[package]
+name = "p1-module-context"
+description = "The summarizing context policy as a component: p1-context's engine over the native summary capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-context-policy = { path = "../p1-bindings-context-policy" }
+# The policy engine without its native driver: the same decisions the host's
+# SummarizingContext makes.
+p1-context = { path = "../../crates/p1-context", default-features = false }
+p1-contracts = { path = "../../crates/p1-contracts" }
+# The wire forms of history items, usage and provider errors (protocol.md).
+p1-module-protocol = { path = "../../crates/p1-module-protocol" }
+
+[package.metadata.p1-module]
+name = "p1/context/summarizing"
+kind = "context-policy"
+world = "p1:module/context-policy@1.0.0"
+protocol = "1.0"
+capabilities = ["control", "summary"]
+variant = "default"

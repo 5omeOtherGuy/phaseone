@@ -101,6 +101,7 @@ fn tool_over(
         &module,
         Services {
             process: Some(process),
+            summary: None,
         },
         limits,
         &Arc::new(MaskCounter::new()),

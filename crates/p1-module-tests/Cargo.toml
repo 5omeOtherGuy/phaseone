@@ -33,3 +33,5 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 p1-testkit = { path = "../p1-testkit" }
 p1-workers = { path = "../p1-workers" }
+# workflow_boundary.rs: the workflow substrate driven through its decision seam (S6.3).
+p1-workflow = { path = "../p1-workflow" }

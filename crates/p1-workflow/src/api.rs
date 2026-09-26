@@ -228,8 +228,10 @@ pub enum SchemaCheck {
 }
 
 /// How one worker turn ended, as the host read it from the worker's own report and
-/// its accepted `finish` outcome — never from its prose.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// its accepted `finish` outcome — never from its prose. Serde because the decision
+/// contract carries it to `accept-step` ([`crate::decision::Attempt`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StepEnd {
     Done {
         summary: String,
