@@ -211,6 +211,115 @@ async fn an_empty_grant_is_refused_and_starts_nothing() {
     );
 }
 
+/// Two child environments on their OWN routes (`fake-child-a`, `fake-child-b`), so a
+/// test can watch each worker's provider requests separately while one parent starts
+/// both. Worker A is started on the grant `read`, worker B on `grep`.
+fn exact_environments(root: &Path) {
+    write_environment(
+        root,
+        "exact-parent",
+        "fake-parent",
+        "model-parent",
+        &["worker_start", "worker_result"],
+        "PARENT {{tool_names}}",
+    );
+    write_environment(
+        root,
+        "exact-child-a",
+        "fake-child-a",
+        "model-child-a",
+        &["read"],
+        "CHILD-A {{tool_names}}",
+    );
+    write_environment(
+        root,
+        "exact-child-b",
+        "fake-child-b",
+        "model-child-b",
+        &["grep"],
+        "CHILD-B {{tool_names}}",
+    );
+}
+
+/// (e) Two workers started with different grants each see exactly their own grant plus
+/// `finish`: each first request's tool names are the whole list, and no worker tool is
+/// assembled into either.
+#[tokio::test]
+async fn two_workers_each_see_exactly_their_own_grant() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    exact_environments(environments.path());
+
+    let child_a = ScriptedProvider::new(vec![text_response("a done")]);
+    let child_a_handle = child_a.clone();
+    let child_b = ScriptedProvider::new(vec![text_response("b done")]);
+    let child_b_handle = child_b.clone();
+    let parent = ScriptedProvider::new(vec![
+        tool_call_response(vec![
+            json_call(
+                "c1",
+                "worker_start",
+                r#"{"environment":"exact-child-a","task":"read it","tools":["read"]}"#,
+            ),
+            json_call(
+                "c2",
+                "worker_start",
+                r#"{"environment":"exact-child-b","task":"grep it","tools":["grep"]}"#,
+            ),
+        ]),
+        text_response("parent done"),
+        // One plain answer per worker completion: how many inbox turns two endings
+        // take is the host's business, not this test's.
+        text_response("noted"),
+        text_response("noted"),
+    ]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![
+        ("fake-parent", parent),
+        ("fake-child-a", child_a),
+        ("fake-child-b", child_b),
+    ]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "exact-parent",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let requests_a = child_a_handle.requests();
+    let requests_b = child_b_handle.requests();
+    assert_eq!(requests_a.len(), 1, "worker A runs one turn");
+    assert_eq!(requests_b.len(), 1, "worker B runs one turn");
+    assert_eq!(
+        tool_names(&requests_a[0]),
+        ["read", "finish"],
+        "worker A's first request is exactly its own grant plus finish"
+    );
+    assert_eq!(
+        tool_names(&requests_b[0]),
+        ["grep", "finish"],
+        "worker B's first request is exactly its own grant plus finish"
+    );
+    for request in [&requests_a[0], &requests_b[0]] {
+        assert!(
+            request
+                .tools
+                .iter()
+                .all(|tool| !tool.name.starts_with("worker_")),
+            "no worker tool is assembled into a worker: {:?}",
+            tool_names(request)
+        );
+    }
+}
+
 /// (d) The success text names the grant plus `finish` (its `Started worker ` prefix
 /// is unchanged, so `workers_started_in` still reads it).
 #[tokio::test]

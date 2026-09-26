@@ -30,9 +30,10 @@ use crate::ResponsesRoute;
 use crate::parser::CodexResponseParser;
 use crate::request::{
     build_headers, build_headers_without_credential, build_request, clamped_cache_key,
-    resolve_base_url, validate_composition, validate_history, validate_request,
+    request_path, resolve_base_url, validate_composition, validate_history, validate_request,
 };
 use crate::websocket::{self, WebSocket};
+use crate::websocket_lower::LoweredHttpRequest;
 
 pub use crate::websocket::Clock;
 
@@ -281,6 +282,20 @@ impl Provider for OpenAiCodexProvider {
             // the session identity headers.
             let cache_key = clamped_cache_key(&request.options);
 
+            // The same request as the frozen `http.http-request` record (ADR-0078
+            // §1): the path relative to the route's endpoint, the headers without
+            // any credential, and the body bytes today's SSE path sends. The
+            // portable decisions return it for the `Http` arm of §5's fallback.
+            let http = LoweredHttpRequest {
+                path: request_path(&self.route.endpoint)?.to_string(),
+                headers: build_headers_without_credential(
+                    self.route.account,
+                    cache_key.as_deref(),
+                )?,
+                account_id_header: self.route.account.account_id_header().map(str::to_string),
+                body: body_bytes.clone(),
+            };
+
             // Today's request, byte for byte: the same body bytes, the same
             // headers and the same driver. A WebSocket failure before any output
             // runs exactly this for the request that hit it (§5).
@@ -303,6 +318,7 @@ impl Provider for OpenAiCodexProvider {
                     ws: ws.clone(),
                     url,
                     body,
+                    http,
                     account: self.route.account,
                     cache_key,
                     credentials: self.credentials.clone(),

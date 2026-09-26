@@ -305,6 +305,9 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
         // route binds. No catalog and no network — the credential column is the same
         // non-secret probe `env show` prints.
         Command::Models { search } => models_command(deps, &options, search.as_deref()),
+        // The installed module set (ADR-0079, freeze item 6). No catalog, no provider and
+        // no network; `verify` reads the module set and nothing else at all.
+        Command::Modules(modules) => crate::modules_cli::modules(deps, &modules),
         // The login surface (ADR-0044, spec §6): no catalog, no provider and no
         // network — the store is written and the "which source" report is printed.
         // The route quota ledger (ADR-0052): route metadata and p1-auth credential
@@ -2105,7 +2108,9 @@ fn substitutions(deps: &HostDeps, workspace: &Path) -> Substitutions {
     }
 }
 
-fn write_stdout(deps: &HostDeps, text: &str) {
+/// Print `text` on the host's stdout. `pub(crate)`: the module CLI (ADR-0079) prints
+/// through the same writer the other read-only commands use.
+pub(crate) fn write_stdout(deps: &HostDeps, text: &str) {
     let mut writer = deps.stdout.lock().unwrap();
     let _ = writer.write_all(text.as_bytes());
     let _ = writer.flush();
@@ -2142,6 +2147,7 @@ pub(crate) fn assemble_with_cache_key(
         environment,
         workspace,
         substitutions,
+        mask,
         |route| {
             let mut options = configured.clone();
             if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {
@@ -2155,7 +2161,9 @@ pub(crate) fn assemble_with_cache_key(
     // path, so a tool's result text is masked before p1-core turns it into a
     // `ToolResultItem` — history, journal and every later request only ever see the
     // masked form. Declaration and identity are forwarded unchanged, so dispatch and
-    // the journalled identity do not move.
+    // the journalled identity do not move. `mask` is also the counter in the shared
+    // `ToolServices`, so a module tool `wasm_tool` already wrapped counts into THIS
+    // counter; masking is idempotent, so this second wrapper adds nothing for it.
     for tool in &mut assembled.tools {
         *tool = redacted(tool.clone(), mask);
     }
