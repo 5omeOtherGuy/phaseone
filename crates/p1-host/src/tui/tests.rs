@@ -434,6 +434,194 @@ fn report_switch_err_keeps_state_and_names_what_stayed() {
     );
 }
 
+/// A real `ModelSwitch` over a scratch tree (`environments/`, `routes/`,
+/// `profiles/`). The whole production path runs behind the `/model` key —
+/// `switch_model`, the catalog assembly and `Agent::reconfigure`'s commit — so the
+/// drive-loop tests below exercise the wiring this slice added at idle, not a stub.
+struct SwitchFixture {
+    _root: tempfile::TempDir,
+    environments: Vec<std::path::PathBuf>,
+    switch: Arc<crate::run::ModelSwitch>,
+}
+
+/// `e-one` runs `r-one`'s `p-one`; nothing else is selectable.
+const SWITCH_ENVIRONMENT: &str = "route   = \"r-one\"\nprofile = \"p-one\"\n";
+
+const SWITCH_ROUTE: &str = r#"
+id           = "r-one"
+origin_route = "openai-chat/one"
+adapter      = "openai-chat"
+endpoint     = "https://example.invalid/v1/chat/completions"
+
+[credential]
+kind = "api-key"
+env  = "ONE_API_KEY"
+
+[adapter_settings]
+dialect = "thinking-with-reasoning-alias"
+
+[models."p-one"]
+wire_model = "wire-one"
+"#;
+
+const SWITCH_PROFILE: &str = r#"
+id             = "p-one"
+revision       = 1
+model_id       = "p-one-model"
+family         = "temp"
+thinking       = "enabled"
+efforts        = ["low", "high"]
+default_effort = "high"
+"#;
+
+/// Every tool module a main assembly gets in this build (ADR-0050's `worker_*` set
+/// plus the `workflow_*` set when workflows are compiled). The fixture registers a
+/// fake for each, so the switched assembly resolves them exactly as a real run's
+/// catalog would.
+const SWITCH_TOOL_MODULES: [&str; 8] = [
+    "worker_start",
+    "worker_result",
+    "worker_continue",
+    "worker_cancel",
+    "workflow_start",
+    "workflow_status",
+    "workflow_result",
+    "workflow_cancel",
+];
+
+impl SwitchFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let environments = root.path().join("environments");
+        std::fs::create_dir_all(environments.join("e-one")).unwrap();
+        std::fs::write(
+            environments.join("e-one/environment.toml"),
+            SWITCH_ENVIRONMENT,
+        )
+        .unwrap();
+        std::fs::write(environments.join("e-one/prompt.md"), "one\n").unwrap();
+        std::fs::create_dir_all(root.path().join("routes")).unwrap();
+        std::fs::write(root.path().join("routes/r-one.toml"), SWITCH_ROUTE).unwrap();
+        std::fs::create_dir_all(root.path().join("profiles")).unwrap();
+        std::fs::write(root.path().join("profiles/p-one.toml"), SWITCH_PROFILE).unwrap();
+
+        let mut catalog = p1_assembly::Catalog::new();
+        catalog.provider(
+            "r-one",
+            Box::new(|_spec: &p1_assembly::ProviderSpec| {
+                Ok(Arc::new(p1_testkit::ScriptedProvider::new(vec![]))
+                    as Arc<dyn p1_contracts::Provider>)
+            }),
+        );
+        for module in SWITCH_TOOL_MODULES {
+            catalog.tool(
+                module,
+                Box::new(
+                    move |_spec: &p1_assembly::ToolSpec, _services: &p1_assembly::ToolServices| {
+                        Ok(Arc::new(p1_testkit::FakeTool::new(module))
+                            as Arc<dyn p1_contracts::Tool>)
+                    },
+                ),
+            );
+        }
+        let dirs = vec![environments.clone()];
+        let switch = Arc::new(crate::run::ModelSwitch::new_for_test(
+            Arc::new(catalog),
+            Arc::new(p1_testkit::RecordingEvents::new()),
+            dirs.clone(),
+            root.path().to_path_buf(),
+            "e-one".into(),
+            Some("p-one".into()),
+        ));
+        Self {
+            _root: root,
+            environments: dirs,
+            switch,
+        }
+    }
+}
+
+/// The idle `/model` path end to end: the key queues the switch and the drive loop
+/// applies it right after the key, awaiting the commit. Without the take/apply in
+/// the idle key arm `pending_switch` would sit until the next key, and a refusal
+/// there while a switch exists would leave `/model` dead at idle; both wire
+/// mistakes leave every other test green.
+#[tokio::test(start_paused = true)]
+async fn a_model_typed_at_idle_applies_through_the_drive_loop() {
+    let fixture = SwitchFixture::new();
+    let journal = Arc::new(p1_testkit::RecordingJournal::new());
+    let agent = Agent::new(p1_core::AgentParts {
+        provider: Arc::new(p1_testkit::ScriptedProvider::new(vec![])),
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+        journal: journal.clone(),
+        events: Arc::new(p1_testkit::RecordingEvents::new()),
+    })
+    .unwrap();
+    let mut harness =
+        IdleLoop::with_agent(ratatui::backend::TestBackend::new(96, 24), false, agent);
+    harness.driver.model_switch = Some(fixture.switch.clone());
+    harness.driver.environment_dirs = fixture.environments.clone();
+    let keys = harness.wires.keys.clone();
+    for c in "/model e-one/p-one".chars() {
+        keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+    }
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    drop(keys);
+
+    let (code, driver, _agent) = run_with_own_wires(harness, async {}).await;
+
+    assert_eq!(code, 0);
+    assert!(
+        meta_rows(&driver).contains(&"· model sonnet-4.5 → e-one/p-one · from the next turn"),
+        "{:?}",
+        meta_rows(&driver)
+    );
+    assert_eq!(driver.model, "e-one/p-one");
+    assert_eq!(driver.env, "e-one");
+    // The switch committed before it installed: the candidate's `Environment` is in
+    // the agent's journal when the loop returns, and nothing else was written.
+    let records = journal.records();
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert!(matches!(
+        &records[0].body,
+        p1_contracts::RecordBody::Environment { .. }
+    ));
+}
+
+/// With a switch seam present, an idle `/model` that does not resolve is refused at
+/// once through the loop — reported, not queued — and the session keeps its model.
+#[tokio::test(start_paused = true)]
+async fn a_model_typed_at_idle_that_does_not_resolve_is_refused_not_queued() {
+    let fixture = SwitchFixture::new();
+    let mut harness = IdleLoop::new();
+    harness.driver.model_switch = Some(fixture.switch.clone());
+    let keys = harness.wires.keys.clone();
+    for c in "/model nope/p-one".chars() {
+        keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+    }
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    drop(keys);
+
+    let (code, driver, _agent) = run_with_own_wires(harness, async {}).await;
+
+    assert_eq!(code, 0);
+    assert_eq!(driver.model, "sonnet-4.5", "the old model stays");
+    let rows = meta_rows(&driver);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("✗ switch refused · ")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("queued")),
+        "an idle refusal is not queued: {rows:?}"
+    );
+}
+
 // ------------------------------------------------------------------- context
 
 #[test]

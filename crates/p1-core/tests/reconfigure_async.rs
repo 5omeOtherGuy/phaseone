@@ -365,6 +365,17 @@ async fn a_failed_commit_installs_nothing_uses_no_seq_and_a_later_switch_commits
 /// waits, and the agent is then observed whole and unchanged. Letting a second
 /// attempt's commit complete installs the candidate. No timing is involved: the
 /// journal itself announces the pending commit.
+///
+/// This holds for the fake below because it blocks BEFORE it writes. It is not a
+/// claim about the session store: `JsonlJournal::commit` is
+/// `spawn_blocking(append_blocking).await`, and tokio does not cancel a
+/// `spawn_blocking` task when the awaited future is dropped, so a dropped
+/// reconfigure can still leave the candidate's `Environment` durable and the store's
+/// own sequence ahead of `Agent::next_seq` — the next turn's `UserInput` then takes
+/// that same seq and is refused as out of order, and the journal names an assembly
+/// that never answered, which ADR-0078 §4 forbids. The install guarantee holds in
+/// both cases; a caller that can abort must treat the outcome as unknown and resume
+/// (ADR draft, item 2.3).
 #[tokio::test]
 async fn nothing_is_installed_while_the_commit_is_pending() {
     let journal = Arc::new(GatedJournal::new(3));
@@ -396,7 +407,7 @@ async fn nothing_is_installed_while_the_commit_is_pending() {
     assert_eq!(
         journal.inner.records().len(),
         3,
-        "and nothing was committed"
+        "and this fake, which writes only after the gate opens, committed nothing"
     );
 
     // Open the gate: the old assembly's turn commits at seq 3, unchanged.

@@ -1495,6 +1495,49 @@ impl ModelSwitch {
     }
 }
 
+#[cfg(test)]
+impl ModelSwitch {
+    /// A real switch over a test's own catalog and scratch environment tree, for the
+    /// TUI's idle `/model` case (`tui::tests`): it runs the production
+    /// [`switch_model`] + `Agent::reconfigure` path through `drive_loop`.
+    pub(crate) fn new_for_test(
+        catalog: Arc<Catalog>,
+        front: Arc<dyn EventSink>,
+        environment_dirs: Vec<PathBuf>,
+        workspace: PathBuf,
+        environment: String,
+        profile: Option<String>,
+    ) -> Self {
+        let substitutions = Substitutions {
+            workspace: workspace.display().to_string(),
+            date: "2026-01-02".to_string(),
+            os: std::env::consts::OS.to_string(),
+        };
+        Self {
+            catalog,
+            completion: Arc::new(CompletionHub::new()),
+            activity: Arc::new(ParentActivity::new(
+                front,
+                Arc::new(ActivityLog::default()),
+                &[],
+            )),
+            environment_dirs,
+            workspace,
+            substitutions,
+            ignored: Vec::new(),
+            scope: None,
+            route_label: None,
+            instructions: String::new(),
+            mask: Arc::new(MaskCounter::new()),
+            session: Mutex::new(SessionModel {
+                environment,
+                profile,
+                finish: None,
+            }),
+        }
+    }
+}
+
 /// What a `/model` or `/effort` line asks for (spec §4).
 pub(crate) enum SwitchRequest<'a> {
     /// `/model REF`: a model reference — `E/P`, a bare `P`, optionally `:effort`.
