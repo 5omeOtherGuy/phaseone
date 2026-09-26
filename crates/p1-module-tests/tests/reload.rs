@@ -769,8 +769,11 @@ async fn policy_change() {
 }
 
 /// The children's factory: every child pins the generation current when it starts and
-/// builds its agent from that generation's catalog and policy, as the host's child
-/// builder does; its description names the generation.
+/// builds its agent from that generation's catalog and policy — the same expression
+/// `ChildBuilder::build_child` uses for the host (`crates/p1-host/src/catalog/children.rs`,
+/// where `a_child_pins_the_generation_current_when_it_starts` builds a real child across
+/// a reload; `worker_start` and a workflow step share that builder); its description
+/// names the generation.
 fn child_factory(generations: Arc<Generations>, workspace: PathBuf) -> AgentFactory {
     Arc::new(move |_spec: &ChildSpec| {
         let generation: Arc<Generation> = generations.current();

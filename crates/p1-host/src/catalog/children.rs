@@ -24,19 +24,19 @@ use crate::activity::{ActivityLog, ActivityTee, Completion, CompletionHub, Worke
 use crate::cli::Options;
 use crate::frontend::FrontEnd;
 use crate::run::{
-    FINISH_MODULE, MaskNoticeSink, agent_context, assemble_with_cache_key, config_for_route,
-    finish_index, finish_tool, session_journals, stall_message, write_stderr,
+    FINISH_MODULE, Generations, MaskNoticeSink, agent_context, assemble_with_cache_key,
+    config_for_route, finish_index, finish_tool, session_journals, stall_message, write_stderr,
 };
 #[cfg(feature = "shadow-hook")]
 use crate::run::{ShadowJournal, ShadowOrigin};
 use crate::session;
 
-/// What `compose_children` hands back: the completion hub, the catalog slot, the
-/// child builder, the worker service and the direct-child id counter.
+/// What `compose_children` hands back: the completion hub, the session's assembly
+/// generations, the child builder, the worker service and the direct-child id counter.
 #[cfg(feature = "delegation")]
 type ComposedChildren = (
     Arc<CompletionHub>,
-    Arc<OnceLock<Arc<Catalog>>>,
+    Arc<Generations>,
     Arc<ChildBuilder>,
     Arc<InProcessWorkers>,
     Arc<AtomicUsize>,
@@ -83,7 +83,7 @@ pub(crate) fn compose_children(
     options: &Options,
     max_workers: usize,
 ) -> Result<ComposedChildren, String> {
-    let catalog_slot: Arc<OnceLock<Arc<Catalog>>> = Arc::new(OnceLock::new());
+    let generations: Arc<Generations> = Arc::new(Generations::empty());
     let service_slot: Arc<OnceLock<Arc<InProcessWorkers>>> = Arc::new(OnceLock::new());
     let reserved = reserved_worker_ids(options.session.as_deref())?;
     if reserved >= usize::MAX - 1 {
@@ -95,7 +95,7 @@ pub(crate) fn compose_children(
         deps,
         workspace,
         front_end,
-        catalog_slot.clone(),
+        generations.clone(),
         child_counter.clone(),
         Arc::new(AtomicUsize::new(1)),
         child_completion_hub.clone(),
@@ -109,7 +109,7 @@ pub(crate) fn compose_children(
     deps.worker_service = Some(service.clone());
     Ok((
         child_completion_hub,
-        catalog_slot,
+        generations,
         child_builder,
         service,
         child_counter,
@@ -441,7 +441,10 @@ pub(crate) struct ChildBuilder {
     date: String,
     pub(crate) parent_workspace: PathBuf,
     pub(crate) front_end: Arc<dyn FrontEnd>,
-    catalog_slot: Arc<OnceLock<Arc<Catalog>>>,
+    /// The session's assembly generations (ADR-0084 §3). A child pins the one current
+    /// when it starts: an installed `/modules reload` replaces what is current and
+    /// never the generation a running child holds.
+    generations: Arc<Generations>,
     counter: Arc<AtomicUsize>,
     agent_ordinals: Arc<AtomicUsize>,
     completion_hub: Arc<CompletionHub>,
@@ -460,7 +463,7 @@ impl ChildBuilder {
         deps: &HostDeps,
         parent_workspace: &Path,
         front_end: Arc<dyn FrontEnd>,
-        catalog_slot: Arc<OnceLock<Arc<Catalog>>>,
+        generations: Arc<Generations>,
         counter: Arc<AtomicUsize>,
         agent_ordinals: Arc<AtomicUsize>,
         completion_hub: Arc<CompletionHub>,
@@ -473,7 +476,7 @@ impl ChildBuilder {
             date: deps.date.clone(),
             parent_workspace: parent_workspace.to_path_buf(),
             front_end,
-            catalog_slot,
+            generations,
             counter,
             agent_ordinals,
             completion_hub,
@@ -487,8 +490,8 @@ impl ChildBuilder {
 
     /// Build the child `Agent` through the SAME load + assemble path the top-level
     /// agent uses. The child gets its own fresh `ToolServices` (inside `assemble`),
-    /// `workspace`, the front end's shared authorization policy, its own session
-    /// journal, and the front end's labelled sink for `worker_id`.
+    /// `workspace`, the policy of the generation it pins (ADR-0084 §3), its own
+    /// session journal, and the front end's labelled sink for `worker_id`.
     ///
     /// `choice` selects a profile/effort on top of the environment (a workflow role's
     /// model); `contract` is the output contract the child's `finish` checks; with
@@ -513,11 +516,16 @@ impl ChildBuilder {
         let completion_hub = &self.completion_hub;
         let environment_dirs = &self.environment_dirs;
         let max_idle_summaries = self.max_idle_summaries;
-        let catalog = self
-            .catalog_slot
-            .get()
-            .ok_or_else(|| "the host catalog is not ready".to_string())?
-            .clone();
+        // ADR-0084 §3: this child pins the generation current NOW — the catalog it
+        // assembles on and the policy it answers with. A `/modules reload` installs
+        // the next generation and never this one, so a child started after a reload
+        // takes the new assembly and one already running keeps its own.
+        let generation = self
+            .generations
+            .try_current()
+            .ok_or_else(|| "the host catalog is not ready".to_string())?;
+        let catalog = generation.catalog().clone();
+        let authorization = generation.authorization();
         let workspace = workspace.to_path_buf();
         let substitutions = Substitutions {
             workspace: workspace.display().to_string(),
@@ -758,7 +766,7 @@ impl ChildBuilder {
             system_prompt: assembled.system_prompt,
             options: assembled.options,
             context,
-            authorization: front_end.authorization(),
+            authorization,
             journal,
             events,
         };
@@ -858,5 +866,153 @@ mod tests {
             generated_cache_key(Path::new("/tmp/ws"), "plain", PARENT_ORDINAL),
             generated_cache_key(Path::new("/tmp/ws"), "plain", first)
         );
+    }
+
+    /// A scratch child environment: one provider key (`child`), no profile, and no
+    /// `[[tools]]` — the child's grant supplies the modules.
+    #[cfg(feature = "delegation")]
+    fn scratch_child(root: &Path) {
+        let dir = root.join("child");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("environment.toml"),
+            "family = \"child\"\nprovider = \"child\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("prompt.md"), "do it").unwrap();
+    }
+
+    /// ADR-0084 §3: a child built through the HOST's own [`ChildBuilder`] pins the
+    /// generation current when it starts, so a `/modules reload`'s swap
+    /// ([`Generations::install`], what `install_candidate` performs) is taken by the
+    /// NEXT child while a child already running keeps the catalog it started on.
+    /// `worker_start`'s factory and a workflow step both build through
+    /// [`ChildBuilder::build_child`], so this is the path both really use.
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn a_child_pins_the_generation_current_when_it_starts() {
+        use crate::cli::SandboxMode;
+        use crate::frontend::LineFrontEnd;
+        use p1_contracts::Provider;
+        use p1_testkit::{ScriptedProvider, text_response};
+
+        let root = tempfile::tempdir().unwrap();
+        scratch_child(root.path());
+        let options = crate::cli::parse(&[
+            "--env".to_string(),
+            "child".to_string(),
+            "--workspace".to_string(),
+            root.path().display().to_string(),
+            "go".to_string(),
+        ])
+        .expect("the test args parse");
+
+        // One scripted provider per generation's catalog: the catalog hook registers
+        // `child`, answering through the provider of the build it is called for.
+        let providers: Vec<Arc<ScriptedProvider>> = (0..2)
+            .map(|_| {
+                Arc::new(ScriptedProvider::new(vec![
+                    text_response("done"),
+                    text_response("done again"),
+                ]))
+            })
+            .collect();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let providers = providers.clone();
+            let builds = builds.clone();
+            Box::new(move |catalog: &mut Catalog| {
+                let provider = providers[builds.fetch_add(1, Ordering::SeqCst)].clone();
+                catalog.provider(
+                    "child",
+                    Box::new(move |_spec| Ok(provider.clone() as Arc<dyn Provider>)),
+                );
+            }) as crate::catalog::CatalogHook
+        };
+
+        let writer = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
+        let mut deps = HostDeps::new(
+            writer(),
+            writer(),
+            Arc::new(crate::StdinLines::new()),
+            Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            "2026-01-01".to_string(),
+            Arc::new(crate::SignalInterrupt),
+            vec![root.path().to_path_buf()],
+            false,
+        );
+        deps.catalog_hook = Some(hook);
+        // The shell tool must never read the process environment in a test.
+        deps.shell_env = Some(Vec::new());
+
+        let completion = Arc::new(CompletionHub::new());
+        let build = || {
+            Arc::new(
+                crate::catalog::build_catalog(&deps, SandboxMode::Off, &[], &[], &[], &completion)
+                    .expect("a generation's catalog builds"),
+            )
+        };
+        let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(
+            &deps,
+            &options,
+            p1_contracts::CancellationToken::new(),
+        ));
+        let generations = Arc::new(Generations::new(build(), front_end.authorization()));
+        let builder = ChildBuilder::new(
+            &deps,
+            root.path(),
+            front_end.clone(),
+            generations.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(1)),
+            completion.clone(),
+            None,
+            0,
+            Arc::new(OnceLock::new()),
+        );
+
+        // Generation 0's child, running one turn on its own catalog's provider.
+        let (mut old, _outcome) = builder
+            .build_child("child", None, &[], root.path(), "w1", None, false, None)
+            .expect("generation 0's child builds");
+        run_child(&mut old).await;
+        assert_eq!(providers[0].requests().len(), 1);
+        assert_eq!(providers[1].requests().len(), 0);
+
+        // The reload's swap: generation 1's catalog loaded again (ADR-0084 §3).
+        generations.install(build(), front_end.authorization());
+
+        let (mut new, _outcome) = builder
+            .build_child("child", None, &[], root.path(), "w2", None, false, None)
+            .expect("generation 1's child builds");
+        run_child(&mut new).await;
+        assert_eq!(
+            providers[1].requests().len(),
+            1,
+            "a child started after the reload runs the new generation's catalog"
+        );
+
+        // The child that was running keeps generation 0's catalog for its whole life.
+        run_child(&mut old).await;
+        assert_eq!(
+            providers[0].requests().len(),
+            2,
+            "the child started before the reload still answers through generation 0"
+        );
+        assert_eq!(
+            providers[1].requests().len(),
+            1,
+            "and never through the generation it did not start on"
+        );
+    }
+
+    /// One child turn, to its end.
+    #[cfg(feature = "delegation")]
+    async fn run_child(child: &mut ChildAgent) {
+        let end = child
+            .agent
+            .run_turn("hi".into(), p1_contracts::CancellationToken::new())
+            .await;
+        assert!(matches!(end, TurnEnd::Completed { .. }), "{end:?}");
     }
 }
