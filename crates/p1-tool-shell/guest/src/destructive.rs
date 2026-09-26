@@ -3,6 +3,12 @@
 //! This is a small shell lexer rather than a substring search. In particular,
 //! operators inside quotes stay in words and command-looking quoted text is
 //! never treated as a command.
+//!
+//! The workspace root is optional because the component cannot know it: `describe` runs
+//! on the restricted path with no capability and the `tool` world has no `configure`.
+//! Without a root every absolute path counts as a write outside the workspace, and a
+//! relative one only when it climbs above its start — the safe side of the
+//! authorization boundary. The native adapter passes its root and classifies as before.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -13,7 +19,7 @@ enum Token {
     Separator,
 }
 
-pub(super) fn is_destructive(command: &str, workspace: &Path) -> bool {
+pub(crate) fn is_destructive(command: &str, workspace: Option<&Path>) -> bool {
     let Some(tokens) = lex(command) else {
         // Unbalanced shell syntax is invalid/ambiguous, so use the safe side of
         // the authorization boundary.
@@ -34,7 +40,7 @@ pub(super) fn is_destructive(command: &str, workspace: &Path) -> bool {
         .any(|segment| destructive_segment(segment, workspace))
 }
 
-fn destructive_segment(tokens: &[Token], workspace: &Path) -> bool {
+fn destructive_segment(tokens: &[Token], workspace: Option<&Path>) -> bool {
     let words: Vec<&str> = tokens
         .iter()
         .filter_map(|token| match token {
@@ -125,7 +131,7 @@ fn destructive_git(args: &[&str]) -> bool {
     }
 }
 
-fn path_writes_outside(path: &str, workspace: &Path) -> bool {
+fn path_writes_outside(path: &str, workspace: Option<&Path>) -> bool {
     if path.is_empty()
         || path.starts_with('&')
         || matches!(path, "/dev/null" | "/dev/stdout" | "/dev/stderr")
@@ -136,6 +142,9 @@ fn path_writes_outside(path: &str, workspace: &Path) -> bool {
         return true;
     }
 
+    let Some(workspace) = workspace else {
+        return climbs_out(Path::new(path));
+    };
     let workspace = normalize(workspace);
     let candidate = if Path::new(path).is_absolute() {
         normalize(Path::new(path))
@@ -143,6 +152,26 @@ fn path_writes_outside(path: &str, workspace: &Path) -> bool {
         normalize(&workspace.join(path))
     };
     !candidate.starts_with(workspace)
+}
+
+/// Whether `path`, read from an unknown root, may leave it: absolute, or a `..` that goes
+/// above where it started.
+fn climbs_out(path: &Path) -> bool {
+    if path.is_absolute() {
+        return true;
+    }
+    let mut depth: usize = 0;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return true,
+            },
+            _ => depth += 1,
+        }
+    }
+    false
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -274,7 +303,9 @@ mod tests {
             "cargo test | tee -a /var/tmp/test.log",
             "echo x > /work/project/../outside",
         ] {
-            assert!(is_destructive(command, root), "{command:?}");
+            assert!(is_destructive(command, Some(root)), "{command:?}");
+            // Without a root the classifier only ever gets more cautious.
+            assert!(is_destructive(command, None), "{command:?}");
         }
     }
 
@@ -295,7 +326,25 @@ mod tests {
             "echo 'tee /tmp/file'",
             "echo ok > /dev/null",
         ] {
-            assert!(!is_destructive(command, root), "{command:?}");
+            assert!(!is_destructive(command, Some(root)), "{command:?}");
+            assert!(!is_destructive(command, None), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_root_absolute_and_climbing_paths_are_outside() {
+        let root = Path::new("/work/project");
+        // Inside the known root, and not provably inside an unknown one.
+        for command in [
+            "echo x > /work/project/out",
+            "cargo test | tee /work/project/test.log",
+            "echo x > target/../../project/out",
+        ] {
+            assert!(!is_destructive(command, Some(root)), "{command:?}");
+            assert!(is_destructive(command, None), "{command:?}");
+        }
+        for command in ["echo x > a/../b", "echo x > ./target/out"] {
+            assert!(!is_destructive(command, None), "{command:?}");
         }
     }
 }
