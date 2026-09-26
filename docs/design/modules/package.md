@@ -31,8 +31,8 @@ for the wasm target only, and the host crates never depend on them.
 Every field is present in every package. The build refuses a package with an explicit message when
 a field is missing, `kind` is not one of the six, `world` is not the world of its kind, `name` is
 not `<namespace>/<name>`, or a capability is outside the class's allocation (the frozen data in
-[`modules/capabilities.toml`](../../../modules/capabilities.toml), described in [`wit.md`](wit.md)
-and [`capabilities.md`](capabilities.md)).
+[`modules/capabilities.toml`](../../../modules/capabilities.toml), the allocation table of
+[`wit.md`](wit.md)).
 
 ### The reserved `p1/` namespace
 
