@@ -21,7 +21,7 @@
 //! missing toolchain fails the case with the command to run.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -269,7 +269,10 @@ fn p1_binary(root: &Path) -> PathBuf {
     if fresh(&candidate, &sources) {
         return candidate;
     }
-    if let Err(reason) = run_locked(root, "cargo", &build_p1_args()) {
+    // `CARGO` is the toolchain cargo set for this test process, so the nested build uses the
+    // same one that is running the tests rather than whatever PATH happens to hold.
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    if let Err(reason) = run_locked(root, &cargo, &build_p1_args()) {
         assert!(
             fresh(&candidate, &sources),
             "no usable p1 binary at {}: {reason}; run `cargo build --locked -p p1-host --bin p1`",
@@ -335,7 +338,9 @@ fn newest_mtime(path: &Path, skip: Option<&str>) -> Option<SystemTime> {
 /// Runs one build that may take cargo's build-directory lock, ending it as soon as cargo says
 /// it is waiting for that lock: the outer `cargo test` holds it while this test runs, so a
 /// nested build could never finish and the caller falls back to what is already built.
-fn run_locked(root: &Path, program: &str, args: &[&str]) -> Result<(), String> {
+fn run_locked(root: &Path, program: impl AsRef<OsStr>, args: &[&str]) -> Result<(), String> {
+    let program = program.as_ref();
+    let name = program.to_string_lossy();
     let mut child = Command::new(program)
         .args(args)
         .current_dir(root)
@@ -343,7 +348,7 @@ fn run_locked(root: &Path, program: &str, args: &[&str]) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("cannot run {program}: {error}"))?;
+        .map_err(|error| format!("cannot run {name}: {error}"))?;
     let stderr = child.stderr.take().expect("stderr pipe");
     let mut tail: Vec<String> = Vec::new();
     let mut locked = false;
@@ -365,10 +370,10 @@ fn run_locked(root: &Path, program: &str, args: &[&str]) -> Result<(), String> {
     }
     let status = child
         .wait()
-        .map_err(|error| format!("cannot wait for {program}: {error}"))?;
+        .map_err(|error| format!("cannot wait for {name}: {error}"))?;
     if !status.success() {
         return Err(format!(
-            "{program} {} exited {status}: {}",
+            "{name} {} exited {status}: {}",
             args.join(" "),
             tail.join(" | ")
         ));

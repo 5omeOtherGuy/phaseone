@@ -110,7 +110,9 @@ class StageReleaseTest(unittest.TestCase):
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def assert_no_out(self, done: subprocess.CompletedProcess, message: str) -> None:
-        self.assertNotEqual(done.returncode, 0, done.stdout)
+        # A rejected input is exit 1 by the script's frozen contract; the usage errors, which
+        # exit 2, are pinned by their own cases.
+        self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn("stage-release:", done.stderr)
         self.assertIn(message, done.stderr)
         self.assertFalse(os.path.exists(self.out),

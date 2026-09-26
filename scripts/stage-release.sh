@@ -129,6 +129,8 @@ cleanup() {
   rm -rf -- "$work" "$share"
 }
 trap cleanup EXIT
+# An interrupt kills the shell without running the EXIT trap, so clean up explicitly.
+trap 'cleanup; exit 130' INT TERM
 
 mkdir -p -- "$share/modules/packages"
 for dir in environments routes profiles; do
