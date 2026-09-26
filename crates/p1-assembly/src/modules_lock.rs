@@ -4,9 +4,10 @@
 //! host resolves a key that no compiled-in tool claims through `modules.lock` to one
 //! package of p1's release: its manifest name, the release version, the digest of its
 //! component (the module's identity) and its ABI (WIT world and protocol major.minor).
-//! This file is plain data and resolution only: verifying the bytes against the digest,
-//! checking the ABI and compiling are the host loader's (`p1-host`), and nothing here
-//! names wasmtime.
+//! This file is plain data and resolution only: comparing the lock with p1's release
+//! manifest is the host's (`p1-host`, `catalog/modules.rs`), verifying the bytes against
+//! the digest, checking the ABI and compiling are the module runtime's loader, and nothing
+//! here names wasmtime.
 //!
 //! # Format (`p1-modules-lock/1`)
 //!

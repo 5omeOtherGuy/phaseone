@@ -50,7 +50,8 @@ pub type ModuleServices = Arc<dyn Fn(&ToolServices) -> Services + Send + Sync>;
 
 /// Why the locked modules could not be loaded or registered. Each refusal has its own
 /// variant; the runtime's refusals keep theirs inside [`ModulesError::Load`] and
-/// [`ModulesError::Release`].
+/// [`ModulesError::Release`]. The runtime's errors are boxed: they are large, and every
+/// `Result` of this file would otherwise carry their size.
 #[derive(Debug, Error)]
 pub enum ModulesError {
     /// A `modules.lock` could not be read.
@@ -65,11 +66,11 @@ pub enum ModulesError {
         /// The release manifest file.
         path: PathBuf,
         /// Why.
-        source: ManifestError,
+        source: Box<ManifestError>,
     },
     /// The module runtime could not start (engine or epoch thread).
     #[error("cannot start the module runtime: {0}")]
-    Runtime(LoadError),
+    Runtime(Box<LoadError>),
     /// The runtime loader refused the package the lock selects.
     #[error("module `{module}` selected by {}: {source}", lock.display())]
     Load {
@@ -78,12 +79,12 @@ pub enum ModulesError {
         /// The lock file that selected the package: the source of the selection.
         lock: PathBuf,
         /// The loader's refusal.
-        source: LoadError,
+        source: Box<LoadError>,
     },
     /// The lock entry pins something other than what the release ships.
     #[error(
         "module `{module}` selected by {}: the lock's {field} is {locked}, \
-         the release manifest's {package} has {released}",
+         the release manifest has {released}",
         lock.display()
     )]
     LockMismatch {
@@ -91,8 +92,6 @@ pub enum ModulesError {
         module: String,
         /// The lock file.
         lock: PathBuf,
-        /// The package.
-        package: String,
         /// `digest`, `world` or `protocol`.
         field: &'static str,
         /// The lock's value.
@@ -166,7 +165,7 @@ pub fn load_locked_modules(
     let manifest =
         ReleaseManifest::read(release_manifest).map_err(|source| ModulesError::Release {
             path: release_manifest.to_owned(),
-            source,
+            source: Box::new(source),
         })?;
     let mut packages = Vec::new();
     // The loader starts an epoch thread; a release nothing selects needs none.
@@ -174,7 +173,8 @@ pub fn load_locked_modules(
         return Ok(packages);
     }
     let root = release_manifest.parent().unwrap_or(Path::new("."));
-    let loader = Loader::new(manifest.clone(), root).map_err(ModulesError::Runtime)?;
+    let loader = Loader::new(manifest.clone(), root)
+        .map_err(|error| ModulesError::Runtime(Box::new(error)))?;
     for (module, locked) in lock.iter() {
         if let Some(entry) = manifest.entry(&locked.package) {
             check_lock(module, locked, entry)?;
@@ -186,7 +186,7 @@ pub fn load_locked_modules(
             .map_err(|source| ModulesError::Load {
                 module: module.to_owned(),
                 lock: locked.source.clone(),
-                source,
+                source: Box::new(source),
             })?;
         packages.push(ModulePackage {
             module: module.to_owned(),
@@ -206,7 +206,6 @@ fn check_lock(
     let mismatch = |field, locked_value: String, released: String| ModulesError::LockMismatch {
         module: module.to_owned(),
         lock: locked.source.clone(),
-        package: entry.name.clone(),
         field,
         locked: locked_value,
         released,

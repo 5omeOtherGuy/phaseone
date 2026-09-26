@@ -1,7 +1,9 @@
 //! The harness of the module execution-model tests: the built fixture component, a release
 //! manifest written for it into a temporary directory, a fake `process` service driven by
 //! explicit synchronization that records what it sees, manually driven epochs, and the
-//! deadlock guard every case runs under.
+//! deadlock guard every case runs under. The loader and assembly cases (S1.4) add the
+//! `modules.lock` text selecting a release entry ([`lock_text`]) and read the written
+//! manifest back through the host ([`Release::manifest_file`]).
 //!
 //! The fixture is built by `scripts/build-modules.sh` (the gate runs it before the tests).
 //! When it is missing the harness fails with that instruction; it never skips a case.

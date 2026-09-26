@@ -6,7 +6,7 @@ date: 2026-09-25
 deciders: lead
 supersedes: []
 superseded_by: []
-sources: [ADR-0016, ADR-0021, ADR-0065, ADR-0071, ADR-0079, migration plan findings F7 and F8, freeze items 6 and 13]
+sources: [ADR-0016, ADR-0021, ADR-0065, ADR-0071, ADR-0079, ADR-0081, ADR-0082, migration plan findings F7 and F8, freeze items 6, 12 and 13]
 ---
 # ADR-{{number_padded}}: Module identity and verified loading
 
@@ -44,41 +44,52 @@ files to their sha256.
   repository ships `modules.lock` at its root; in a release it travels in the archive
   (the manifest's `environment_locks`). An override can only select: the loader accepts
   nothing but official packages, whatever a lock says.
-- **Official source only.** p1's release module set is `<exe dir>/../share/p1/modules/`,
-  never a configuration directory. A package is official when both of its files
-  (`packages/<pkg>/<pkg>.wasm` and `<pkg>.manifest.json`) are named by the release
-  manifest's `packages` list with the sha256 it records, and its name is in the `p1/`
-  namespace. A package the release manifest does not name, or a lock entry outside `p1/`,
-  is refused with an explicit error naming its source.
-- **Verify, then compile the same bytes.** The loader (`p1-host`,
-  `catalog/modules/loader.rs`, `Release::open` / `Release::load`) reads the component
-  once into memory, hashes that buffer with the in-tree SHA-256, compares the digest
-  with the release manifest, the package manifest and the lock, and compiles exactly
-  that buffer with the engine of `p1-module-runtime`. It never reads the file twice and
-  never deserializes a compiled cache.
-- **Refusals, each with its own error** (`LoadError`): `DigestMismatch` (naming the
-  record that disagrees), `UnsupportedAbi` (a world this host does not implement, or a
-  protocol of another major or a newer minor), `DuplicateIdentity` (two packages of one
-  release claiming one name or one digest: the release is refused whole), `NotOfficial`
-  (naming the source), `PackageNotFound` (a lock names a package the release does not
-  ship), `LockMismatch` (lock and package disagree on world or protocol),
-  `CapabilityNotAllocated` (a manifest capability outside the class allocation of
-  freeze item 13) and `ImportNotGranted` (the compiled component imports an interface
-  the manifest does not grant).
-- **The loader builds `ToolIdentity`** from the verified manifest: implementation from
-  `name`, variant from `variant`; a package does not name its own identity. Host
+- **Official source only.** p1's release module set is
+  `<exe dir>/../share/p1/modules/manifest.json` (ADR-0079), never a configuration
+  directory. The one loader is S0's `p1_module_runtime::Loader` (docs/design/modules/
+  package.md, "The loader"): it loads by manifest name only, refuses a name outside
+  `p1/` (`NotOfficial`) or one the release manifest's `components` do not list
+  (`NotInManifest`). The host wraps every loader refusal with the module name and the
+  lock file that selected it, so the error names the source of the selection; a lock
+  entry outside `p1/` or with any key but the five above is refused while the lock is
+  read, naming the lock file.
+- **Verify, then compile the same bytes** is the runtime loader's: the component is read
+  once, hashed, compared with the release manifest's digest (`DigestMismatch`) and those
+  bytes compiled; no compiled cache is ever deserialized. The host keeps no second
+  verifier.
+- **One identity, one component.** The release manifest is refused whole when two
+  components claim one name or one digest (`ManifestError::DuplicateIdentity`, added to
+  `p1-module-runtime`'s `manifest.rs`), so neither a lock resolution nor a journal's
+  recorded module identity can be ambiguous.
+- **The lock pins what the release ships.** Before the loader runs, the host compares
+  the lock entry's `digest`, `world` and `protocol` with the release manifest's entry
+  (`ModulesError::LockMismatch`), so an override lock cannot silently select other bytes
+  or another ABI than it states. The ABI the runtime accepts is its own: the world of the
+  kind (`ModuleKind::world`, `WorldMismatch`) and the protocol major of
+  `PROTOCOL_VERSION` (`ProtocolMismatch`); a newer minor is the value protocol's business
+  (protocol.md).
+- **Grants.** A granted capability outside the class allocation of
+  `modules/capabilities.toml` (freeze item 13, compiled into the host) is refused
+  (`CapabilityNotAllocated`); the runtime refuses a grant it cannot link
+  (`UnsupportedCapability`) and a component import the manifest does not grant, every
+  `wasi:` import included (`UndeclaredImport`). The three worker interfaces are three
+  grants, never one.
+- **The loader builds `ToolIdentity`** from the release manifest entry: implementation
+  from `name`, variant from `variant`; a package does not name its own identity. Host
   behaviour that depended on which tool ran keys on semantic capabilities the manifest
   declares and the loader verifies (for example `records-command-evidence` replaces the
   literal `SHELL_IMPLEMENTATION` match; a later slice).
 - **Registration and the assembly rule.** The catalog build path
   (`catalog/mod.rs` → `catalog/modules.rs`) loads what the effective lock resolves and
   registers each verified tool package under its module name, after the compiled-in
-  tools; a name a compiled-in tool already has is refused rather than replaced. An
-  empty lock loads nothing and needs no release. Registration instantiates nothing: the
-  catalog factory, which hands the verified component to the generic tool adapter
-  (`WasmTool`, freeze item 12), runs only when an environment assembles the name. An
-  installed but unselected package and an invented name therefore both fail to
-  dispatch.
+  tools; a name a compiled-in tool already has is refused rather than replaced, and a
+  non-tool package is refused until its class has an adapter. An empty lock loads
+  nothing and needs no release. Registration instantiates nothing: the catalog factory,
+  which builds the generic tool adapter (`wasm_tool`, freeze item 12) with the
+  capability services of the assembling agent, runs only when an environment assembles
+  the name. An installed but unselected package and an invented name therefore both
+  fail to dispatch. A name, description or variant override on a module is refused, as
+  `WasmTool` has no face to apply.
 - `p1 modules list/inspect/verify` shows availability, selected versions, digests,
   imports and effective grants; `verify` is metadata-only and reads neither credentials
   nor user configuration (a later S1 slice).
@@ -106,9 +117,10 @@ files to their sha256.
 ## Evidence
 
 `cargo test --locked -p p1-module-tests --test loader` (digest mismatch with the
-corruption fixture, unsupported world and protocol, duplicate identity with the collision
-fixture, non-official source, ungranted import, one distinct error per refusal);
-`cargo test --locked -p p1-module-tests --test assembly` (installed-but-unselected and
-invented-name cases, with a selected-package control); `cargo test --locked -p
-p1-assembly --test modules_lock` (lock format and override order). PRs and merge commits
-are cited when this ADR is flipped to accepted.
+corruption fixture, unsupported world and protocol, duplicate name and duplicate digest
+with the collision fixture, non-official source, lock-vs-release mismatches, ungranted
+import, grant outside the allocation, one distinct error per refusal);
+`cargo test --locked -p p1-module-tests --test assembly` (installed-but-unselected,
+unresolved and invented-name cases, with a selected-package control built by the real
+`WasmTool`); `cargo test --locked -p p1-assembly --test modules_lock` (lock format and
+override order). PRs and merge commits are cited when this ADR is flipped to accepted.

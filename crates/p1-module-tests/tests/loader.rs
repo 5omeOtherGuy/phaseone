@@ -82,6 +82,22 @@ fn refusal(result: Result<Vec<ModulePackage>, ModulesError>) -> ModulesError {
     }
 }
 
+/// The runtime loader's refusal inside a host refusal.
+fn load_refusal(error: &ModulesError) -> &LoadError {
+    match error {
+        ModulesError::Load { source, .. } => source,
+        other => panic!("expected the loader's refusal, got {other:?}"),
+    }
+}
+
+/// The release manifest's refusal inside a host refusal.
+fn release_refusal(error: &ModulesError) -> &ManifestError {
+    match error {
+        ModulesError::Release { source, .. } => source,
+        other => panic!("expected the release manifest's refusal, got {other:?}"),
+    }
+}
+
 // ------------------------------------------------------------------ control
 
 #[test]
@@ -117,18 +133,16 @@ fn an_empty_lock_loads_nothing() {
 fn a_flipped_byte_is_refused_as_a_digest_mismatch() {
     let (release, entry) = corrupted_release();
     let error = refusal(load(&release, &entry));
-    match &error {
-        ModulesError::Load {
-            module,
-            source:
-                LoadError::DigestMismatch {
-                    name,
-                    expected,
-                    actual,
-                },
-            ..
+    assert!(
+        matches!(&error, ModulesError::Load { module, .. } if module == MODULE),
+        "{error:?}"
+    );
+    match load_refusal(&error) {
+        LoadError::DigestMismatch {
+            name,
+            expected,
+            actual,
         } => {
-            assert_eq!(module, MODULE);
             assert_eq!(name, FIXTURE_NAME);
             assert_ne!(expected, actual);
             assert_eq!(
@@ -168,15 +182,11 @@ fn a_world_the_host_does_not_implement_is_refused() {
         entry["world"] = json!("p1:module/tool@2.0.0");
     });
     let error = refusal(load(&release, &entry));
-    match &error {
-        ModulesError::Load {
-            source:
-                LoadError::WorldMismatch {
-                    name,
-                    world,
-                    expected,
-                    ..
-                },
+    match load_refusal(&error) {
+        LoadError::WorldMismatch {
+            name,
+            world,
+            expected,
             ..
         } => {
             assert_eq!(name, FIXTURE_NAME);
@@ -195,9 +205,8 @@ fn a_protocol_the_host_does_not_implement_is_refused() {
         });
         let error = refusal(load(&release, &entry));
         assert!(
-            matches!(&error, ModulesError::Load {
-                source: LoadError::ProtocolMismatch { protocol: written, .. }, ..
-            } if written == protocol),
+            matches!(load_refusal(&error),
+                LoadError::ProtocolMismatch { protocol: written, .. } if written == protocol),
             "{protocol}: {error:?}"
         );
     }
@@ -224,17 +233,16 @@ fn a_lock_naming_another_abi_than_the_release_is_refused() {
 fn two_packages_claiming_one_name_are_refused() {
     let (release, entry) = colliding_release(FIXTURE_NAME, FIXTURE_NAME);
     let error = refusal(load(&release, &entry));
-    match &error {
-        ModulesError::Release {
-            path,
-            source:
-                ManifestError::DuplicateIdentity {
-                    identity,
-                    first,
-                    second,
-                },
+    assert!(
+        matches!(&error, ModulesError::Release { path, .. } if path == &release.manifest_file()),
+        "{error:?}"
+    );
+    match release_refusal(&error) {
+        ManifestError::DuplicateIdentity {
+            identity,
+            first,
+            second,
         } => {
-            assert_eq!(path, &release.manifest_file());
             assert_eq!(identity, FIXTURE_NAME);
             assert_ne!(first, second);
         }
@@ -247,9 +255,8 @@ fn two_names_claiming_one_digest_are_refused() {
     let (release, entry) = colliding_release(FIXTURE_NAME, "p1/fixture-two");
     let error = refusal(load(&release, &entry));
     assert!(
-        matches!(&error, ModulesError::Release {
-            source: ManifestError::DuplicateIdentity { identity, .. }, ..
-        } if Some(identity.as_str()) == release.fixture().manifest["digest"].as_str()),
+        matches!(release_refusal(&error), ManifestError::DuplicateIdentity { identity, .. }
+            if Some(identity.as_str()) == release.fixture().manifest["digest"].as_str()),
         "{error:?}"
     );
 }
@@ -261,10 +268,11 @@ fn a_package_the_release_manifest_does_not_name_is_refused_naming_its_source() {
     let (release, entry) = unlisted_release();
     let error = refusal(load(&release, &entry));
     assert!(
-        matches!(&error, ModulesError::Load {
-            lock,
-            source: LoadError::NotInManifest { name }, ..
-        } if name == FIXTURE_NAME && lock == &lock_path(&release)),
+        matches!(&error, ModulesError::Load { lock, .. } if lock == &lock_path(&release)),
+        "{error:?}"
+    );
+    assert!(
+        matches!(load_refusal(&error), LoadError::NotInManifest { name } if name == FIXTURE_NAME),
         "{error:?}"
     );
     let message = error.to_string();
@@ -311,9 +319,8 @@ fn a_component_importing_more_than_its_manifest_grants_is_refused() {
     });
     let error = refusal(load(&release, &entry));
     assert!(
-        matches!(&error, ModulesError::Load {
-            source: LoadError::UndeclaredImport { import, .. }, ..
-        } if import.starts_with("p1:module/process@")),
+        matches!(load_refusal(&error), LoadError::UndeclaredImport { import, .. }
+            if import.starts_with("p1:module/process@")),
         "{error:?}"
     );
 }
