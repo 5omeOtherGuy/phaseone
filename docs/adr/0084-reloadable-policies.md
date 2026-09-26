@@ -1,5 +1,5 @@
 ---
-adr: {{number}}
+adr: 84
 title: Reloadable policies
 status: proposed
 date: 2026-09-26
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [issue #238, epic #206, DECISIONS.md D22, migration plan finding F8, docs/adr/0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md, docs/adr/0024-authorization-permit-deny-at-the-core.md, docs/adr/0036-context-control-is-a-summarizing-policy-module-with-a-durable-validated-replacement.md, docs/adr/0038-full-access-is-the-default-asking-is-opt-in.md, docs/adr/0049-model-selection-and-switching-a-session-to-another-model.md, docs/adr/0078-connection-resources-and-component-replacement.md, docs/adr/0021-journal-is-the-single-truth.md, docs/adr/0068-tool-output-is-masked-for-credential-shapes-before-history-journal-and-summaries.md, docs/adr/0080-execution-manifests-in-journals.md, docs/design/modules/wit.md, docs/design/modules/package.md, crates/p1-host/src/policy.rs, crates/p1-tui/src/runtime.rs]
 ---
-# ADR-{{number_padded}}: Reloadable policies
+# ADR-0084: Reloadable policies
 
 ## Context
 
