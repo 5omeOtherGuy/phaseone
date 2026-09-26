@@ -84,20 +84,20 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0068 | [Tool output is masked for credential shapes before history, journal and summaries](0068-tool-output-is-masked-for-credential-shapes-before-history-journal-and-summaries.md) | accepted | 2026-09-25 | lead |
 | ADR-0069 | [Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s](0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md) | accepted | 2026-09-25 | lead |
 | ADR-0070 | [A route may declare no credential for a proxy that injects it](0070-a-route-may-declare-no-credential-for-a-proxy-that-injects-it.md) | proposed | 2026-09-25 | lead |
-| ADR-0071 | [p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name](0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md) | proposed | 2026-09-25 | owner+lead |
+| ADR-0071 | [p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name](0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md) | accepted | 2026-09-25 | owner+lead |
 | ADR-0072 | [A workflow step that ends without finish gets one repair turn](0072-a-workflow-step-that-ends-without-finish-gets-one-repair-turn.md) | proposed | 2026-09-25 | lead |
 | ADR-0073 | [Workflow steps can run in their own git worktree](0073-workflow-steps-can-run-in-their-own-git-worktree.md) | proposed | 2026-09-25 | lead |
 | ADR-0074 | [A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login](0074-a-second-claude-subscription-route-claude-code-oauth-borrows-a-named-login-directory-and-p1-login-imports-a-login.md) | proposed | 2026-09-25 | owner |
 | ADR-0075 | [The TUI shows workflow runs as a live tree through a structured FrontEnd seam](0075-the-tui-shows-workflow-runs-as-a-live-tree-through-a-structured-frontend-seam.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0076 | [Manual compaction: /compact in the TUI and --compact on resume](0076-manual-compaction-compact-in-the-tui-and-compact-on-resume.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0077 | [Builds on the stream boxes](0077-builds-on-the-stream-boxes.md) | accepted | 2026-09-25 | owner+lead |
-| ADR-0078 | [Connection resources and component replacement](0078-connection-resources-and-component-replacement.md) | proposed | 2026-09-25 | owner+lead |
+| ADR-0078 | [Connection resources and component replacement](0078-connection-resources-and-component-replacement.md) | accepted | 2026-09-25 | owner+lead |
 | ADR-0079 | [Verified module releases and installation](0079-verified-module-releases-and-installation.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0080 | [Execution manifests in journals](0080-execution-manifests-in-journals.md) | proposed | 2026-09-25 | lead |
 | ADR-0081 | [Native foundation and runtime components](0081-native-foundation-and-runtime-components.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0082 | [Component ABI and execution ownership](0082-component-abi-and-execution-ownership.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0083 | [Privileged process and completion capabilities](0083-privileged-process-and-completion-capabilities.md) | proposed | 2026-09-26 | owner+lead |
-| ADR-0084 | [Reloadable policies](0084-reloadable-policies.md) | proposed | 2026-09-26 | owner+lead |
+| ADR-0084 | [Reloadable policies](0084-reloadable-policies.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0085 | [Runtime delegation and workflow modules](0085-runtime-delegation-and-workflow-modules.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0086 | [Provider components with native authenticated transport](0086-provider-components-with-native-authenticated-transport.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0087 | [Module identity and verified loading](0087-module-identity-and-verified-loading.md) | proposed | 2026-09-26 | lead |
