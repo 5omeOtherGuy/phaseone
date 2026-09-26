@@ -1,5 +1,5 @@
 ---
-adr: {{number}}
+adr: 86
 title: Provider components with native authenticated transport
 status: proposed
 date: 2026-09-26
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [issue #298, epic #206, DECISIONS.md D22, migration plan finding F2, docs/adr/0039-a-provider-is-composed-from-a-wire-adapter-a-route-and-a-model-profile.md, docs/adr/0046-an-exhausted-account-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md, docs/adr/0061-a-route-may-be-self-contained-store-only-credentials-never-read-another-tool-s-login.md, docs/adr/0062-a-plan-refusal-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md, docs/adr/0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md, docs/adr/0070-a-route-may-declare-no-credential-for-a-proxy-that-injects-it.md, docs/adr/0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md, docs/adr/0078-connection-resources-and-component-replacement.md, docs/design/modules/wit.md, docs/design/modules/protocol.md, docs/design/modules/adapters.md, docs/design/routes-and-profiles.md, modules/wit/worlds.wit, modules/wit/transport.wit, crates/p1-host/src/routes.rs, crates/p1-host/src/catalog/providers.rs, crates/p1-provider-http/src/broker.rs, crates/p1-provider-http/src/drive.rs, crates/p1-provider-http/src/http.rs, crates/p1-provider-http/src/ws.rs, crates/p1-module-tests/tests/transport_authority.rs]
 ---
-# ADR-{{number_padded}}: Provider components with native authenticated transport
+# ADR-0086: Provider components with native authenticated transport
 
 ## Context
 

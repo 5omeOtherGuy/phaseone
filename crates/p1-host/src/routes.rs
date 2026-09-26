@@ -66,7 +66,7 @@ pub struct RouteFile {
 }
 
 /// The keys the host adds to a provider component's `adapter-settings` object, next to
-/// the route file's own `[adapter_settings]` keys (the provider-components ADR). The
+/// the route file's own `[adapter_settings]` keys (ADR-0086). The
 /// component removes them before it parses its settings type, which denies unknown
 /// fields, so no adapter may ever name a settings field like one of these.
 pub const MODEL_PROFILE_KEY: &str = "model_profile";

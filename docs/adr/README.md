@@ -99,6 +99,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0083 | [Privileged process and completion capabilities](0083-privileged-process-and-completion-capabilities.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0084 | [Reloadable policies](0084-reloadable-policies.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0085 | [Runtime delegation and workflow modules](0085-runtime-delegation-and-workflow-modules.md) | proposed | 2026-09-26 | owner+lead |
+| ADR-0086 | [Provider components with native authenticated transport](0086-provider-components-with-native-authenticated-transport.md) | proposed | 2026-09-26 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
