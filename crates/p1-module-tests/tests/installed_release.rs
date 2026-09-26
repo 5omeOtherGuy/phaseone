@@ -917,7 +917,13 @@ fn sandbox_cover(
     for arg in ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"] {
         args.push(OsString::from(arg));
     }
-    for hidden in [Some(root), real_home].into_iter().flatten() {
+    // An ancestor's tmpfs hides every mount below it, so the parents come first: a worktree
+    // usually sits below the real HOME, and both must end up EMPTY rather than merely
+    // unreachable, which is what lets the cover be probed.
+    let mut hidden: Vec<&Path> = [Some(root), real_home].into_iter().flatten().collect();
+    hidden.sort_by_key(|path| path.components().count());
+    hidden.dedup();
+    for hidden in hidden {
         if hidden != Path::new("/") {
             args.push(OsString::from("--tmpfs"));
             args.push(hidden.as_os_str().to_owned());
