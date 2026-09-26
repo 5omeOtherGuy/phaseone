@@ -117,8 +117,11 @@ pub enum ModulesError {
         /// The capability.
         capability: String,
     },
-    /// Only tool packages have an adapter to register.
-    #[error("module `{module}` is a {kind} package; only tool packages can be registered")]
+    /// A class this host cannot register: only tool packages have a catalog adapter, and
+    /// policy packages are accepted as the session's host entries.
+    #[error(
+        "module `{module}` is a {kind} package; only tool and policy packages can be registered"
+    )]
     NotATool {
         /// The module name.
         module: String,
@@ -307,13 +310,18 @@ pub fn register_modules(
 ) -> Result<(), ModulesError> {
     let existing = catalog.tool_keys();
     for package in packages {
-        match package.loaded.kind() {
+        let kind = package.loaded.kind();
+        match kind {
             ModuleKind::Tool => {}
             // Kept by module name in the lock the selection came from; never a tool here.
             ModuleKind::Provider => continue,
-            // Every other class still has no adapter in the runtime. S5.11 adds its policy
-            // arms to this match, so a provider arm stays the only non-tool arm for now.
-            kind => {
+            // A policy package is the session's, not a catalog tool: the shipped policies are
+            // official-release host entries the host loads by name (`policy.rs`,
+            // `summary.rs`; D083b 2), so a lock selecting one registers no tool.
+            ModuleKind::ContextPolicy | ModuleKind::AuthorizationPolicy => continue,
+            // A class with no adapter here yet: a lock that selects one is refused, never
+            // ignored.
+            _ => {
                 return Err(ModulesError::NotATool {
                     module: package.module,
                     kind: kind.name(),

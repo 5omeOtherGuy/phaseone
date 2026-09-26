@@ -27,13 +27,16 @@ fn agent_with(provider: Arc<p1_testkit::ScriptedProvider>) -> Agent {
         system_prompt: String::new(),
         options: p1_contracts::ModelOptions::default(),
         context: Arc::new(crate::run::DefaultContext),
-        authorization: Arc::new(crate::policy::HostPolicy::new(
-            false,
-            false,
-            Arc::new(crate::StdinLines::new()),
-            Arc::new(std::sync::Mutex::new(Box::new(std::io::sink()))),
-            CancellationToken::new(),
-        )),
+        authorization: Arc::new(
+            crate::policy::HostPolicy::new(
+                false,
+                false,
+                Arc::new(crate::StdinLines::new()),
+                Arc::new(std::sync::Mutex::new(Box::new(std::io::sink()))),
+                CancellationToken::new(),
+            )
+            .expect("the official release ships the policy"),
+        ),
         journal: Arc::new(p1_journal::MemoryJournal::new()),
         events: Arc::new(p1_tui::runtime::TuiSink::new().0),
     })
@@ -52,10 +55,16 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
     driver_with(false)
 }
 
+// notice: S5.11 (#357): the TUI's policy is the release's host entry (D080's built set here).
+/// The shipped policy of the mode, loaded from the official release as the TUI loads it.
+fn shipped(ask: bool) -> Arc<crate::policy::ShippedPolicy> {
+    crate::policy::ShippedPolicy::official(ask).expect("the official release ships the policy")
+}
+
 /// A driver whose policy is `--ask` (`true`) or full access: the idle-loop tests
 /// park a real authorization on the ask one (handoff §7.5).
 fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
-    let (policy, auth) = tui_policy(ask, CancellationToken::new());
+    let (policy, auth) = tui_policy(shipped(ask), CancellationToken::new());
     // A minimal real agent, for its inbox handle.
     let agent = test_agent();
     (
@@ -667,7 +676,7 @@ fn driver_with_agent() -> (Driver, Agent) {
 
 #[tokio::test]
 async fn a_cancelled_turn_denies_its_parked_approval() {
-    let (policy, mut auth_rx) = tui_policy(true, CancellationToken::new());
+    let (policy, mut auth_rx) = tui_policy(shipped(true), CancellationToken::new());
     let turn = CancellationToken::new();
     policy.set_turn(Some(turn.clone()));
     let call = p1_contracts::ToolCall {
@@ -723,7 +732,7 @@ fn cancel_clears_the_follow_up_queue() {
 
 #[tokio::test]
 async fn an_auth_request_becomes_the_approval_view_and_answers() {
-    let (policy, mut auth_rx) = tui_policy(true, CancellationToken::new());
+    let (policy, mut auth_rx) = tui_policy(shipped(true), CancellationToken::new());
     let (mut d, _auth) = driver();
     d.policy = Arc::new(policy);
     let call = p1_contracts::ToolCall {
@@ -1225,12 +1234,19 @@ fn worker_test_row(id: &str) -> p1_tui::render::workers::WorkerBlock {
 
 /// A key stream over a channel, so a script can deliver an input at a chosen
 /// simulated instant — the shape `run` builds from crossterm's events.
+// notice: S5.11 (#357): fused, as crossterm's never-ending stream effectively is: the
+// summarizing component answers a `/compact` on a later poll, so the pump can see the
+// end of the keys before the idle loop polls them again.
 fn key_stream(
     rx: mpsc::UnboundedReceiver<Input>,
 ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Input>>> {
-    Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|input| (input, rx))
-    }))
+    use futures_util::StreamExt;
+    Box::pin(
+        futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|input| (input, rx))
+        })
+        .fuse(),
+    )
 }
 
 /// The handles a test script uses to poke the running loop.
@@ -2161,7 +2177,7 @@ fn a_worker_stream_is_buffered_for_attach_and_stays_out_of_the_parent() {
 async fn an_approval_while_attached_detaches_the_worker() {
     use p1_tui::state::PaneMode;
 
-    let (policy, mut auth_rx) = tui_policy(true, CancellationToken::new());
+    let (policy, mut auth_rx) = tui_policy(shipped(true), CancellationToken::new());
     let (mut d, _auth) = driver();
     d.policy = Arc::new(policy);
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
@@ -2432,7 +2448,8 @@ fn workflow_calls_build_the_tree_and_a_run_header_cancels_through_the_run_channe
             compact: false,
         },
         CancellationToken::new(),
-    );
+    )
+    .expect("the official release ships the policy");
     let mut events = front_end.events.lock().unwrap().take().unwrap();
     front_end.workflow_run_started(&crate::frontend::WorkflowRunStarted {
         id: "wf1".into(),
@@ -2644,10 +2661,11 @@ fn compacting_agent(
     journal: Arc<p1_testkit::RecordingJournal>,
     records: &[p1_contracts::JournalRecord],
 ) -> Agent {
-    let context = p1_context::SummarizingContext::new(
+    // notice: S5.11 (#357): the summarizer is the host entry p1/context/summarizing.
+    let context = crate::summary::summarizing_context(
         provider.clone(),
         p1_contracts::ModelOptions::default(),
-        p1_context::ContextConfig {
+        &crate::summary::ContextTable {
             window_tokens: 20_000,
             output_headroom_tokens: 1_000,
             summarize_at_tokens: 10_000,
@@ -2655,7 +2673,9 @@ fn compacting_agent(
             user_verbatim_tokens: 100,
             tool_result_excerpt_chars: 2_000,
         },
+        p1_context::DEFAULT_SUMMARY_OUTPUT_TOKENS,
         "summary prompt".into(),
+        None,
     )
     .expect("the summarizer builds");
     Agent::resume(
@@ -2957,11 +2977,10 @@ fn driver_with_reload() -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::Temp
         "go".to_string(),
     ])
     .expect("the test args parse");
-    let front_end: Arc<dyn FrontEnd> = Arc::new(crate::frontend::LineFrontEnd::new(
-        &deps,
-        &options,
-        CancellationToken::new(),
-    ));
+    let front_end: Arc<dyn FrontEnd> = Arc::new(
+        crate::frontend::LineFrontEnd::new(&deps, &options, CancellationToken::new())
+            .expect("the official release ships the policy"),
+    );
     let switch = Arc::new(
         crate::run::model_switch_for_test(
             &mut deps,
