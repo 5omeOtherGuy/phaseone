@@ -25,6 +25,8 @@ use p1_contracts::Tool;
 #[cfg(feature = "delegation")]
 use p1_module_runtime::Services;
 #[cfg(feature = "delegation")]
+use p1_module_runtime::delegation::WorkerServices;
+#[cfg(feature = "delegation")]
 use p1_workers::{ScopeKey, WorkerScope, WorkerScopes, WorkerService};
 
 #[cfg(feature = "delegation")]
@@ -177,13 +179,15 @@ pub fn worker_member_services(
     })
 }
 
-/// The services of one worker member instance over `scope`.
+/// The services of one worker member instance: all three worker interfaces over its
+/// parent's scope. The runtime links only what the member's manifest grants, so
+/// `worker_result` (granted `workers-observe` alone) has no start to call.
 #[cfg(feature = "delegation")]
-fn worker_services(_scope: &WorkerScope) -> Services {
-    // The runtime link of the worker interfaces (S6.7.1) is not in this tree yet: without
-    // it no field of `Services` can carry the scope, so the member keeps today's
-    // `MissingService` refusal.
-    Services::default()
+fn worker_services(scope: &WorkerScope) -> Services {
+    Services {
+        workers: Some(WorkerServices::scoped(scope.clone())),
+        ..Services::default()
+    }
 }
 
 /// Install the family's scopes and module hook for the run whose worker service is
