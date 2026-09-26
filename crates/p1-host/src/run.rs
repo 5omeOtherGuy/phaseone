@@ -924,6 +924,19 @@ pub async fn run_with_front_end(
         );
     }
 
+    // B-S6-9, D068: the main agent's assembly is dropped here, at teardown, so its
+    // generation of worker-member scopes is retired: every child id those scopes held
+    // becomes `unknown-child` through them. Retiring forgets ids only, so a running child
+    // still completes and still notifies. A model switch or a re-grant keeps the
+    // generation; this is the one place it ends.
+    #[cfg(feature = "delegation")]
+    if let Some(scopes) = &deps.member_scopes {
+        scopes
+            .registry()
+            .retire_generation(scopes.generation())
+            .await;
+    }
+
     // Runs first: a run cancelled here cancels its step workers through the worker
     // service, which must still be up to do it and to let the journal get `Ended`.
     #[cfg(feature = "workflows")]
@@ -2735,12 +2748,18 @@ pub(crate) fn assemble_with_cache_key(
 ) -> Result<p1_assembly::Assembled, String> {
     let name = environment.name.clone();
     let configured = environment.options.clone();
-    let mut assembled = p1_assembly::assemble_with_route_options(
+    // B-S6-9, D068: a MAIN agent's tools learn which parent they serve, so the worker and
+    // workflow members' scopes are per parent. The parent's ordinal names it: each main
+    // agent has its own catalog, worker service and scope generation, so the ordinal is
+    // unique among the agents that share one scope registry. Workers get none.
+    let agent = (agent_ordinal == PARENT_ORDINAL).then(|| agent_ordinal.to_string());
+    let mut assembled = p1_assembly::assemble_for_agent(
         catalog,
         environment,
         workspace,
         substitutions,
         mask,
+        agent.as_deref(),
         |route| {
             let mut options = configured.clone();
             if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {
