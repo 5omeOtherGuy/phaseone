@@ -274,6 +274,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-module-read"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "p1-read-guest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-module-shell"
 version = "0.0.1"
 dependencies = [
@@ -400,6 +410,14 @@ dependencies = [
  "p1-contracts",
  "p1-model-profile",
  "p1-provider-http",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-read-guest"
+version = "0.0.1"
+dependencies = [
  "serde",
  "serde_json",
 ]

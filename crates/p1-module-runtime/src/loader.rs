@@ -44,8 +44,11 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// `completion` to the caller's [`CompletionService`](crate::completion::CompletionService)
 /// (S3.7, D067); `http`, `websocket` and `credential-control` to the broker and credential
 /// services a provider component's `stream` uses (S4.7); the worker and workflow interfaces
-/// to the caller's services in [`crate::delegation`] (S6, B-S6-8).
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 13] = [
+/// to the caller's services in [`crate::delegation`] (S6, B-S6-8); `workspace` (its read side)
+/// and `snapshot` to the caller's [`WorkspaceService`](crate::capabilities::WorkspaceService)
+/// and [`SnapshotService`](crate::capabilities::SnapshotService) (S1). `workspace-mutation` is
+/// S2's and stays refused.
+pub(crate) const LINKABLE_CAPABILITIES: [&str; 15] = [
     "control",
     "clock",
     "random",
@@ -59,6 +62,8 @@ pub(crate) const LINKABLE_CAPABILITIES: [&str; 13] = [
     "workers-observe",
     "workers-control",
     "workflows",
+    "workspace",
+    "snapshot",
 ];
 
 /// The interface every world imports for its types; it grants nothing.
@@ -546,9 +551,11 @@ mod tests {
                 "workers-observe",
                 "workers-control",
                 "workflows",
+                "workspace",
+                "snapshot",
             ]
         );
-        for refused in ["notices", "filesystem"] {
+        for refused in ["notices", "filesystem", "workspace-mutation"] {
             assert!(!LINKABLE_CAPABILITIES.contains(&refused), "{refused}");
         }
     }

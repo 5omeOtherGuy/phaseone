@@ -1897,6 +1897,7 @@ dependencies = [
  "p1-redact",
  "p1-testkit",
  "p1-tool-finish",
+ "p1-tool-read",
  "p1-tool-shell",
  "p1-workers",
  "p1-workflow",
@@ -1971,6 +1972,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "p1-read-guest"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2053,8 +2062,9 @@ name = "p1-tool-read"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "p1-module-runtime",
+ "p1-read-guest",
  "p1-workspace",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",

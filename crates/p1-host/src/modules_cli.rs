@@ -57,14 +57,15 @@ const CLASSES: [ModuleKind; 6] = [
 /// 13 of `docs/design/modules/wit.md`), `completion` is the host's completion hub (S3.7);
 /// `http`, `websocket` and `credential-control` are the provider interfaces a provider
 /// component imports (S4.7); `workers-start`, `workers-observe`, `workers-control` and
-/// `workflows` are linked to the caller's delegation services (S6, B-S6-8); every other
-/// interface of `modules/capabilities.toml` arrives with the stream that owns its native
-/// service. The loader refuses a manifest granting anything else, so `verify` must refuse it
-/// too — `--integrity-only` reports it instead, because an installer stages a release before
-/// those services land (S1.6.1) — and the drift guard
+/// `workflows` are linked to the caller's delegation services (S6, B-S6-8); `workspace` (read
+/// side) and `snapshot` are the workspace's (S1); every other interface of
+/// `modules/capabilities.toml` arrives with the stream that owns its native service. The
+/// loader refuses a manifest granting anything else, so `verify` must refuse it too —
+/// `--integrity-only` reports it instead, because an installer stages a release before those
+/// services land (S1.6.1) — and the drift guard
 /// `verify_and_the_loader_agree_on_every_manifest_field` fails if this list and the loader's
 /// part ways.
-const LINKABLE: [&str; 13] = [
+const LINKABLE: [&str; 15] = [
     "control",
     "clock",
     "random",
@@ -78,6 +79,8 @@ const LINKABLE: [&str; 13] = [
     "workers-observe",
     "workers-control",
     "workflows",
+    "workspace",
+    "snapshot",
 ];
 
 /// Run one `p1 modules` command.
