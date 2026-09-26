@@ -1374,7 +1374,7 @@ pub(crate) async fn run_interactive(
             } else {
                 report_model(
                     deps,
-                    switch_model(switch, agent, SwitchRequest::Model(reference)),
+                    switch_model(switch, agent, SwitchRequest::Model(reference)).await,
                 );
             }
             continue;
@@ -1384,7 +1384,7 @@ pub(crate) async fn run_interactive(
         {
             report_model(
                 deps,
-                switch_model(switch, agent, SwitchRequest::Effort(level)),
+                switch_model(switch, agent, SwitchRequest::Effort(level)).await,
             );
             continue;
         }
@@ -1508,6 +1508,49 @@ impl ModelSwitch {
     }
 }
 
+#[cfg(test)]
+impl ModelSwitch {
+    /// A real switch over a test's own catalog and scratch environment tree, for the
+    /// TUI's idle `/model` case (`tui::tests`): it runs the production
+    /// [`switch_model`] + `Agent::reconfigure` path through `drive_loop`.
+    pub(crate) fn new_for_test(
+        catalog: Arc<Catalog>,
+        front: Arc<dyn EventSink>,
+        environment_dirs: Vec<PathBuf>,
+        workspace: PathBuf,
+        environment: String,
+        profile: Option<String>,
+    ) -> Self {
+        let substitutions = Substitutions {
+            workspace: workspace.display().to_string(),
+            date: "2026-01-02".to_string(),
+            os: std::env::consts::OS.to_string(),
+        };
+        Self {
+            catalog,
+            completion: Arc::new(CompletionHub::new()),
+            activity: Arc::new(ParentActivity::new(
+                front,
+                Arc::new(ActivityLog::default()),
+                &[],
+            )),
+            environment_dirs,
+            workspace,
+            substitutions,
+            ignored: Vec::new(),
+            scope: None,
+            route_label: None,
+            instructions: String::new(),
+            mask: Arc::new(MaskCounter::new()),
+            session: Mutex::new(SessionModel {
+                environment,
+                profile,
+                finish: None,
+            }),
+        }
+    }
+}
+
 /// What a `/model` or `/effort` line asks for (spec §4).
 pub(crate) enum SwitchRequest<'a> {
     /// `/model REF`: a model reference — `E/P`, a bare `P`, optionally `:effort`.
@@ -1526,16 +1569,25 @@ pub(crate) enum SwitchRequest<'a> {
 /// On success the new `E/P[:effort]` is returned and the session's model state is
 /// updated. On any failure the reason is returned and NOTHING changes: the agent
 /// keeps its model.
-pub(crate) fn switch_model(
+pub(crate) async fn switch_model(
     switch: &ModelSwitch,
     agent: &mut Agent,
     request: SwitchRequest<'_>,
 ) -> Result<String, String> {
-    let mut session = switch.session.lock().unwrap();
+    // A snapshot rather than the guard: a std guard must not live across the
+    // commit's await below, and `&mut Agent` already serializes switches.
+    let (current_environment, current_profile, current_finish) = {
+        let session = switch.session.lock().unwrap();
+        (
+            session.environment.clone(),
+            session.profile.clone(),
+            session.finish.clone(),
+        )
+    };
     let choice = match request {
         SwitchRequest::Model(reference) => {
             let models = crate::models::enumerate(&switch.environment_dirs)?;
-            let resolved = crate::models::resolve(reference, &session.environment, &models)?;
+            let resolved = crate::models::resolve(reference, &current_environment, &models)?;
             crate::models::Choice {
                 environment: resolved.environment,
                 profile: Some(resolved.profile),
@@ -1544,8 +1596,8 @@ pub(crate) fn switch_model(
         }
         // `/effort LEVEL` keeps the model and replaces only the effort.
         SwitchRequest::Effort(level) => crate::models::Choice {
-            environment: session.environment.clone(),
-            profile: session.profile.clone(),
+            environment: current_environment,
+            profile: current_profile,
             effort: Some(crate::models::parse_effort(level)?),
         },
     };
@@ -1578,7 +1630,7 @@ pub(crate) fn switch_model(
     // otherwise the switched tool set's own is the session's from now on, and the
     // plumbing follows the completion the catalog just issued it (which the `finish`
     // factory always does).
-    let adopted = match (&session.finish, finish_at) {
+    let adopted = match (&current_finish, finish_at) {
         (Some(kept), Some(index)) if kept.declaration().name == tools[index].declaration().name => {
             tools[index] = kept.clone();
             None
@@ -1586,8 +1638,9 @@ pub(crate) fn switch_model(
         (_, Some(_)) => issued,
         _ => None,
     };
-    // `reconfigure` validates against the CURRENT history and, on failure, changes
-    // nothing at all — so the session state below is only updated once it is `Ok`.
+    // `reconfigure` validates against the CURRENT history and commits the new
+    // `Environment` before it installs; on either failure it changes nothing at all,
+    // so the session state below is only updated once it is `Ok`.
     agent
         .reconfigure(Reconfiguration {
             provider: assembled.provider,
@@ -1595,8 +1648,11 @@ pub(crate) fn switch_model(
             system_prompt: assembled.system_prompt + switch.instructions.as_str(),
             options: assembled.options,
             context,
+            authorization: None,
         })
+        .await
         .map_err(|error| error.to_string())?;
+    let mut session = switch.session.lock().unwrap();
     if let Some(completion) = adopted {
         // The switched `finish` writes the completion the catalog issued: point the
         // parent's activity plumbing (and the §3c guard, which reads it) at it, so

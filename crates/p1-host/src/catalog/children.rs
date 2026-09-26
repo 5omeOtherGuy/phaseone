@@ -710,6 +710,7 @@ impl ChildBuilder {
                     system_prompt: assembled.system_prompt,
                     options: assembled.options,
                     context,
+                    authorization: None,
                 })
             })
         };

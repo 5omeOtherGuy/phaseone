@@ -339,7 +339,8 @@ enum ChildCommand {
     Continue {
         message: String,
         token: CancellationToken,
-        reconfig: Option<Reconfiguration>,
+        // Boxed: the command queue should not size every `Shutdown` after it.
+        reconfig: Option<Box<Reconfiguration>>,
         reply: Option<oneshot::Sender<Result<(), String>>>,
     },
     Shutdown,
@@ -759,7 +760,7 @@ impl WorkerService for InProcessWorkers {
                             id.0
                         )));
                     };
-                    Some(regrant(&grant).map_err(WorkerError::Regrant)?)
+                    Some(Box::new(regrant(&grant).map_err(WorkerError::Regrant)?))
                 };
                 let (reply, reply_tx) = if reconfig.is_some() {
                     let (tx, rx) = oneshot::channel();
@@ -951,7 +952,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                 return;
             };
             if let Some(reconfig) = reconfig {
-                match agent.reconfigure(reconfig) {
+                match agent.reconfigure(*reconfig).await {
                     Ok(()) => {
                         if let Some(reply) = reply {
                             let _ = reply.send(Ok(()));
@@ -1248,6 +1249,7 @@ mod tests {
             system_prompt: "child".into(),
             options: ModelOptions::default(),
             context: Arc::new(PassthroughContext),
+            authorization: None,
         }
     }
 
