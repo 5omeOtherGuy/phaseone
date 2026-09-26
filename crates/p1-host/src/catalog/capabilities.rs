@@ -331,13 +331,22 @@ mod tests {
     /// The carrier ADR-0083 rule 7 needs once S1.4 registers package tools: when the
     /// registration declares a loaded module, a tool of that loader-built identity is
     /// visible to `carries`, whatever its model-facing name; until then, nothing is.
+    ///
+    /// A declaration lives for the whole test process, and `catalog/modules.rs`'s
+    /// registration cases declare the fixture under the name the build published
+    /// (`p1/fixture`): this case loads the same verified bytes under a name of its own, so
+    /// "nothing is declared yet" holds whatever order the cases run in.
     #[test]
     fn a_declared_package_reaches_carries_through_its_verified_identity() {
-        let release = Release::with_fixture();
+        let mut release = Release::empty();
+        let mut entry = release.fixture_entry("p1/carrier");
+        entry["variant"] = "carrier".into();
+        let bytes = release.fixture().wasm.clone();
+        release.add(entry, &bytes);
         let module = release
             .loader()
-            .load(FIXTURE_NAME)
-            .expect("the fixture loads");
+            .load("p1/carrier")
+            .expect("the fixture bytes load");
         let identity = module.identity().clone();
         let package_tool =
             FakeTool::new("recall").with_identity(&identity.implementation, &identity.variant);

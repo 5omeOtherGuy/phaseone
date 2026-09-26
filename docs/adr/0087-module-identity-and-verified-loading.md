@@ -78,8 +78,8 @@ files to their sha256.
   grants, never one.
 - **The loader builds `ToolIdentity`** from the release manifest entry: implementation
   from `name`, variant from `variant`; a package does not name its own identity. Host
-  behaviour that depends on which tool ran keys on a semantic capability of that identity,
-  never on an implementation or model-facing name.
+  behaviour that depends on which tool ran keys on a semantic capability of that identity
+  (below), never on an implementation or model-facing name.
 - **Semantic capabilities.** Host behaviour that depends on which tool ran keys on a
   semantic capability of the tool's loader-built identity. There are two, and neither is a
   `p1:module` interface of the frozen allocation, so no manifest grants one directly; both
