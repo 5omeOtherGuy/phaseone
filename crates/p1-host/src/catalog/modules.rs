@@ -586,8 +586,7 @@ mod tests {
             register_modules(catalog, packages, family.clone()).map_err(|error| error.to_string())
         });
         let refused = assemble(&bare, &environment, workspace.path(), &substitutions)
-            .err()
-            .expect("the family hook alone cannot link p1/read");
+            .expect_err("the family hook alone cannot link p1/read");
         assert!(refused.to_string().contains("workspace"), "{refused}");
     }
 }
