@@ -3,17 +3,21 @@
 //!
 //! The acceptance row times `tool.execute` on the fixture tool as one phase: the redacting
 //! wrapper, `WasmTool`'s own call serialization, the executor, the canonical-ABI copy into
-//! the guest, the guest's decode and re-encode of the echo, the copy out and the host's
-//! parse of the outcome. This bench times the parts it can take apart from outside:
+//! the guest, the guest's echo, the copy out and the host's read of the outcome. This bench
+//! times the parts it can take apart from outside:
 //!
 //! - `native`: an echo in native code returning a copy of the payload, the floor;
 //! - `redacting`: the same native echo behind `p1_redact::RedactingTool`, so the wrapper's
 //!   cost on a large clean outcome is `redacting - native`;
 //! - `host_escape` and `host_unescape`: the host's two JSON passes over the text (the call's
-//!   `raw` escaped as a string literal, the outcome's `content` parsed back), as
-//!   `serde_json` does them;
+//!   `raw` escaped as a string literal, the outcome's `content` read back) as `serde_json`
+//!   does them, which is how `WasmTool` did them before S1.11: the reference its own
+//!   writer and compact reader are measured against inside `module`;
 //! - `module`: the fixture's echo through `wasm_tool`, the whole phase, at 1, 8 and 32 MiB;
 //!   the guest and the copies are what is left of it after the rows above.
+//!
+//! Each row prints its p95, its median and the process CPU time per call: on a shared box
+//! the wall time also waits for other work, the CPU time much less so.
 //!
 //! Nothing here asserts a bound and the gate never runs it; every measured call is checked
 //! to have produced the payload, so a broken path fails the bench instead of timing it.
