@@ -6,11 +6,12 @@ reasoning_effort = "high"
 
 # The OpenCode Zen free-tier gate accepts a request only when it declares tools
 # named `bash` and `read`. The environment grants them (a provider owns no tool):
-# `shell` is presented as `bash`, `read` as `read`. Evidence:
+# `shell` is presented as `bash`, and `read` declares its own name. A module tool
+# takes no face override (S1.8.1), so the tool that carries the `read` key is the
+# release's `p1/read` component and its declaration is already `read`. Evidence:
 # docs/design/zen-client-identity-evidence.md.
 [[tools]]
 module = "read"
-name   = "read"
 [[tools]]
 module = "edit"
 [[tools]]

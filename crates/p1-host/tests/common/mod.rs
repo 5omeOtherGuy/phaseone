@@ -123,6 +123,21 @@ pub fn provider_hook_arc(
     })
 }
 
+/// Run `f` inside a current-thread Tokio runtime.
+///
+/// A module tool must be built inside a runtime, which runs its executor. Since S1.8.1 the
+/// release's `p1/read` host entry answers to the `read` key, so a SYNC test that assembles one
+/// of the shipped environments — every one that names `read` does — needs a runtime here; an
+/// `#[tokio::test]` already has one and calls nothing of this. A case that also EXECUTES a
+/// module tool keeps its own runtime (an `#[tokio::test]`), because a tool built on a runtime
+/// that is gone cannot run.
+pub fn on_runtime<T>(f: impl FnOnce() -> T) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a current-thread runtime")
+        .block_on(async { f() })
+}
+
 /// The path to the shipped environments directory.
 pub fn shipped_environments() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")
