@@ -10,7 +10,9 @@ pub(crate) fn invalid(message: &str) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
 }
 
-pub(crate) fn validate(
+/// Refuse what the composed route cannot carry, before a run starts: the
+/// provider's `validate`, a function of the composition so a component shares it.
+pub fn validate(
     route: &ChatRoute,
     model: &str,
     profile: &ModelProfile,

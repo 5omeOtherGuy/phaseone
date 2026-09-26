@@ -18,6 +18,7 @@ use crate::api::{
     WorkflowError, WorkflowObserver, WorkflowService, WorkflowSettings,
 };
 use crate::caps::CapCounter;
+use crate::decision::{Decisions, NativeDecisions};
 use crate::engine::{self, Role, RunState, forbidden_tool};
 use crate::journal::{JournalWriter, Replay, dispatch_charges, read_journal, script_hash};
 
@@ -25,6 +26,7 @@ pub struct InProcessWorkflows {
     runner: Arc<dyn StepRunner>,
     resolver: Arc<dyn ModelResolver>,
     observer: Arc<dyn WorkflowObserver>,
+    decisions: Arc<dyn Decisions>,
     settings: WorkflowSettings,
     run_root: PathBuf,
     inner: Mutex<Inner>,
@@ -45,7 +47,8 @@ struct RunEntry {
 impl InProcessWorkflows {
     /// `run_root` is where every run gets its directory `run_root/<run id>/`. Numbering
     /// continues after the highest `wf<N>` already there, so ids stay unique across
-    /// processes and `resume_from: wf3` always names `run_root/wf3`.
+    /// processes and `resume_from: wf3` always names `run_root/wf3`. The steps' decisions
+    /// are the native ones ([`NativeDecisions`]).
     pub fn new(
         runner: Arc<dyn StepRunner>,
         resolver: Arc<dyn ModelResolver>,
@@ -53,11 +56,32 @@ impl InProcessWorkflows {
         settings: WorkflowSettings,
         run_root: PathBuf,
     ) -> Arc<Self> {
+        Self::with_decisions(
+            runner,
+            resolver,
+            observer,
+            settings,
+            run_root,
+            Arc::new(NativeDecisions),
+        )
+    }
+
+    /// [`Self::new`] with the steps' decisions chosen by the caller: every run of this
+    /// service asks `decisions` (S6.3; the loaded decision component is S6.9's).
+    pub fn with_decisions(
+        runner: Arc<dyn StepRunner>,
+        resolver: Arc<dyn ModelResolver>,
+        observer: Arc<dyn WorkflowObserver>,
+        settings: WorkflowSettings,
+        run_root: PathBuf,
+        decisions: Arc<dyn Decisions>,
+    ) -> Arc<Self> {
         let last_number = highest_run_number(&run_root);
         Arc::new(Self {
             runner,
             resolver,
             observer,
+            decisions,
             settings,
             run_root,
             inner: Mutex::new(Inner {
@@ -229,6 +253,7 @@ impl InProcessWorkflows {
             run_dir: run_dir.clone(),
             resumed_from: request.resume_from.clone(),
             runner: self.runner.clone(),
+            decisions: self.decisions.clone(),
             observer: self.observer.clone(),
             roles,
             caps: CapCounter::new(self.settings.caps.clone(), charged),

@@ -11,6 +11,7 @@
 
 pub mod authorization_policy;
 pub mod capabilities;
+pub mod context_policy;
 pub mod executor;
 pub mod loader;
 pub mod manifest;
@@ -21,6 +22,10 @@ pub mod tool;
 pub use authorization_policy::{AuthorizationPolicyError, Verdict, WasmAuthorizationPolicy};
 pub use capabilities::{
     ExitStatus, LinkError, ProcessCommand, ProcessEvent, ProcessService, RunningProcess, Services,
+};
+pub use context_policy::{
+    ContextPolicyError, SummaryError, SummaryRequest, SummaryResponse, SummaryService,
+    WasmContextPolicy,
 };
 pub use executor::ExecutionLimits;
 pub use loader::{LoadError, LoadedModule, Loader, ManualEpochs, ModuleKind};

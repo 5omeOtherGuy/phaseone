@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use p1_contracts::{
-    BoxFuture, CacheKeySupport, CancellationToken, ModelOptions, Provider, ProviderError,
-    ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription,
+    BoxFuture, CancellationToken, Provider, ProviderError, ProviderErrorKind, ProviderRequest,
+    ProviderStream, RouteDescription,
 };
 use p1_model_profile::ModelProfile;
 use p1_provider_http::ws::WsConnector;
@@ -29,21 +29,12 @@ use p1_provider_http::{
 use crate::ResponsesRoute;
 use crate::parser::CodexResponseParser;
 use crate::request::{
-    build_headers, build_headers_without_credential, build_request, clamped_cache_key, lower,
-    resolve_base_url, validate as validate_options,
+    build_headers, build_headers_without_credential, build_request, clamped_cache_key,
+    resolve_base_url, validate_composition, validate_request,
 };
 use crate::websocket::{self, WebSocket};
 
 pub use crate::websocket::Clock;
-
-/// Namespaces the OTHER compiled adapters own inside `ModelOptions::native`. An
-/// explicit option from one of them was silently dropped on a route switch
-/// before; it is now an error naming the option, this route and this adapter
-/// (ADR-0039). Keys in no adapter's namespace keep their meaning: ignored.
-const FOREIGN_NATIVE_PREFIXES: &[&str] = &["anthropic-messages.", "openai-chat."];
-
-/// The adapter half of this route's identity, for error messages.
-const ADAPTER: &str = "openai-responses";
 
 /// One route file composed with one profile and one credential source.
 pub struct OpenAiCodexProvider {
@@ -256,66 +247,13 @@ impl OpenAiCodexProviderBuilder {
     }
 }
 
-/// The one composition check, shared by the constructor and the pure request
-/// builder: the route data is usable, the profile is valid, and the profile's
-/// policy has an encoding here. Nothing is decided by a second, parallel table.
-pub(crate) fn validate_composition(
-    route: &ResponsesRoute,
-    wire_model: &str,
-    profile: &ModelProfile,
-) -> Result<(), ProviderError> {
-    route.validate()?;
-    profile.validate()?;
-    if wire_model.is_empty() {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "wire model must be nonempty",
-        ));
-    }
-    // The pure lowering decides: a `budget`, `enabled` or `preserved` profile has
-    // no Responses encoding, so it is refused here, at construction.
-    lower(profile, &ModelOptions::default())?;
-    Ok(())
-}
-
 impl Provider for OpenAiCodexProvider {
     fn describe(&self) -> RouteDescription {
-        RouteDescription {
-            origin: self.route.origin(&self.wire_model),
-            supports_freeform_tools: true,
-            mandatory_prompt_prefix: None,
-            reports_cost: false,
-            // The request builder sends `options.cache_key` as the body's
-            // `prompt_cache_key` and the session identity headers.
-            cache_key: CacheKeySupport::Optional,
-        }
+        self.route.describe(&self.wire_model)
     }
 
     fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
-        for key in request.options.native.keys() {
-            if FOREIGN_NATIVE_PREFIXES
-                .iter()
-                .any(|prefix| key.starts_with(prefix))
-            {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::InvalidRequest,
-                    format!(
-                        "option \"{key}\" is not consumed by route \"{}\" \
-                         (adapter {ADAPTER}): it belongs to another adapter's namespace",
-                        self.route.origin_route
-                    ),
-                ));
-            }
-        }
-        if request.options.cache_key.as_deref() == Some("") {
-            return Err(ProviderError::new(
-                ProviderErrorKind::InvalidRequest,
-                "cache_key must not be empty: set a stable nonempty key or leave it unset",
-            ));
-        }
-        // The model policy: the same lowering the request builder runs, so
-        // `validate` can never accept a request the builder would reject.
-        validate_options(self.route.account, &self.profile, &request.options)
+        validate_request(&self.route, &self.profile, request)
     }
 
     fn stream<'a>(
@@ -436,11 +374,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use futures_util::StreamExt;
+    use p1_contracts::CacheKeySupport;
     use p1_contracts::{Effort, ModelOptions, Outcome, Provider};
     use p1_model_profile::ThinkingPolicy;
     use p1_provider_http::testing::ScriptedTransport;
 
     use super::*;
+    use crate::request::ADAPTER;
 
     struct NoCredentials;
 
