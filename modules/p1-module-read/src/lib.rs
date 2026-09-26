@@ -135,7 +135,9 @@ fn read_whole(display: &str, size: u64, input: &ReadInput) -> Result<String, Fai
     let Some(render) = render else {
         // The file shrank below what `stat` reported before its sniff could be read: the
         // native tool's short read says the same.
-        return Err(p1_read_guest::could_not_be_read(display, "failed to fill whole buffer").into());
+        return Err(
+            p1_read_guest::could_not_be_read(display, "failed to fill whole buffer").into(),
+        );
     };
     let output = render.finish()?;
     // A read always observes the FULL file, even when offset/limit windows the returned
@@ -149,9 +151,7 @@ fn fs_failure(requested: &str, error: FsError) -> Failure {
     match error {
         FsError::Cancelled => Failure::Cancelled,
         FsError::Io(message) => Failure::Message(message),
-        FsError::OutsideWorkspace => {
-            Failure::Message(p1_read_guest::outside_workspace(requested))
-        }
+        FsError::OutsideWorkspace => Failure::Message(p1_read_guest::outside_workspace(requested)),
         FsError::NotFound => Failure::Message(p1_read_guest::missing(
             &p1_read_guest::display_of_request(requested),
         )),
