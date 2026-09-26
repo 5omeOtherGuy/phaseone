@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use p1_assembly::{Catalog, ToolServices, ToolSpec};
 use p1_contracts::{BoxFuture, CancellationToken, InboxKind, Tool};
 use p1_core::Inbox;
+use p1_module_runtime::Services;
 use p1_tool_finish::{FinishOutcome, OutputContract};
 use p1_workers::{
     ChildId, ChildStatus, InProcessWorkers, PreparedStart, WorkerError, WorkerService,
@@ -22,19 +23,37 @@ use p1_workflow::{
 };
 
 use crate::HostDeps;
+use crate::catalog::modules::ModuleServices;
 use crate::frontend::{
     FrontEnd, WorkflowRunEnded, WorkflowRunStarted, WorkflowStepEnded, WorkflowStepStarted,
 };
 use crate::run::{ChildBuilder, TurnEndCell};
 
-/// The four workflow tools, appended after the worker tools.
+/// The workflow family's member module ids, as the packages' manifests name them, in the
+/// order the native members are appended after the worker tools ([`WORKFLOW_TOOLS`] has
+/// the same order). An environment that names one of their packages takes the module path
+/// for the family, exactly as the worker family does (`catalog/delegation.rs`).
 #[cfg(feature = "workflows")]
-pub(crate) const WORKFLOW_MODULES: [&str; 4] = [
+pub const WORKFLOW_MODULES: [&str; 4] = [
+    "p1/workflow-start",
+    "p1/workflow-status",
+    "p1/workflow-result",
+    "p1/workflow-cancel",
+];
+
+/// The native members' catalog keys, appended after the worker tools.
+#[cfg(feature = "workflows")]
+pub(crate) const WORKFLOW_TOOLS: [&str; 4] = [
     "workflow_start",
     "workflow_status",
     "workflow_result",
     "workflow_cancel",
 ];
+
+// The worker family's scopes and hook, reachable from outside the crate through this
+// public module (the `delegation` module is the crate's own), so the host-level
+// activation tests drive the same hook the host installs.
+pub use super::delegation::{MemberScopes, WORKER_MODULES, worker_member_services};
 
 /// The evidence of a `done` whose outcome established none (ADR-0051 item 3).
 const NOT_VERIFIED: &str = "not verified; parent verification required";
@@ -613,6 +632,36 @@ pub fn run_root(deps: &HostDeps, session: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("p1").join("workflows"))
 }
 
+/// The module hook with the workflow family added (B-S6-9, D068): a workflow member
+/// assembled for a main agent is linked with `service` through its own member adapter;
+/// every other module goes to `workers` (the worker family's hook), or gets no service.
+/// A workflow member without a main agent gets none either: a worker never orchestrates.
+pub fn member_services(
+    workers: Option<ModuleServices>,
+    service: Arc<dyn WorkflowService>,
+) -> ModuleServices {
+    Arc::new(move |module: &str, services: &ToolServices| {
+        if WORKFLOW_MODULES.contains(&module) {
+            return match &services.agent {
+                Some(_) => workflow_services(module, &service),
+                None => Services::default(),
+            };
+        }
+        match &workers {
+            Some(workers) => workers(module, services),
+            None => Services::default(),
+        }
+    })
+}
+
+/// The services of one workflow member instance over `service`.
+fn workflow_services(_module: &str, _service: &Arc<dyn WorkflowService>) -> Services {
+    // The runtime link of the `workflows` interface (S6.7.1) is not in this tree yet:
+    // without it no field of `Services` can carry the service, so the member keeps
+    // today's `MissingService` refusal.
+    Services::default()
+}
+
 /// Build the workflow service over the worker service and the child builder, and put
 /// it in `deps` so the catalog registers the `workflow_*` tools.
 pub(crate) fn compose(
@@ -650,10 +699,14 @@ pub(crate) fn compose(
         worktrees: Arc::default(),
     });
     let service = InProcessWorkflows::new(runner, resolver, observer.clone(), settings, run_root);
-    deps.workflow_service = Some(Arc::new(BasedWorkflows {
+    let based = Arc::new(BasedWorkflows {
         inner: service.clone(),
         workspace: parent_workspace,
-    }) as Arc<dyn WorkflowService>);
+    }) as Arc<dyn WorkflowService>;
+    // Workflow members started through a package run on the same service the native
+    // members use, so a run's base, lines and notification are the same either way.
+    deps.module_services = Some(member_services(deps.module_services.clone(), based.clone()));
+    deps.workflow_service = Some(based);
     deps.workflow_observer = Some(observer.clone());
     Ok(Workflows { service, observer })
 }
