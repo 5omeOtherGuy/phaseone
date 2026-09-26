@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 use p1_contracts::{CallDescription, CancellationToken, ToolContext, ToolOutcome, ToolStatus};
 use p1_module_runtime::{ExecutionLimits, Services, wasm_tool};
 use p1_module_tests::{FIXTURE_NAME, Release, call, fake_processes};
-use p1_redact::MaskCounter;
 
 /// How many warm samples each warm measurement takes. Printed with the readings, because
 /// they describe exactly this many calls and mean nothing without the count.
@@ -61,13 +60,17 @@ async fn bench() {
     // The tool over the loaded module: pre-linked, pre-instantiated, its declaration read
     // through the restricted path, and its executor task started.
     let (tool, cold_tool) = time(|| {
+        // The mask counter `wasm_tool` takes, built through its `Default` impl with the type
+        // taken from that signature: `p1-redact` is a dev-dependency of this crate, which a
+        // bin target cannot use, and this bench needs the counter, not the crate's name.
+        let counter: Arc<_> = Arc::new(Default::default());
         wasm_tool(
             &module,
             Services {
                 process: Some(fake_processes().0),
             },
             ExecutionLimits::default(),
-            &Arc::new(MaskCounter::new()),
+            &counter,
         )
         .expect("the fixture is a tool")
     });
