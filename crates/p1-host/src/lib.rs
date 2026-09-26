@@ -23,6 +23,7 @@ pub mod frontend;
 pub mod instructions;
 pub mod login;
 pub mod models;
+pub mod modules_cli;
 pub mod policy;
 pub mod render;
 pub mod routes;
