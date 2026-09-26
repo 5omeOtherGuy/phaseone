@@ -1,6 +1,6 @@
 [package]
 name = "p1-module-tests"
-description = "Runtime spike and module execution-model tests over the built fixture component (test-only crate; nothing depends on it)"
+description = "Runtime spike, module execution-model, package loader and assembly-rule tests over the built fixture component (test-only crate; nothing depends on it)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,3 +17,8 @@ tokio = { version = "1", default-features = false, features = ["macros", "rt", "
 
 [dev-dependencies]
 p1-redact = { path = "../p1-redact" }
+# S1.4: the loader and assembly cases drive the host's catalog entry point and assemble
+# environments over it, with the testkit's scripted provider and fake tools.
+p1-assembly = { path = "../p1-assembly" }
+p1-host = { path = "../p1-host" }
+p1-testkit = { path = "../p1-testkit" }

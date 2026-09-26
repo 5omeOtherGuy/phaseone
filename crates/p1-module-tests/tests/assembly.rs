@@ -1,26 +1,42 @@
-//! The assembly rule over module packages (ADR-0071, S1.4 BRIEF §3/§4): a module the
-//! environment does not name is never instantiated and cannot dispatch, whether it is an
-//! installed package the environment did not select or a name nobody ships.
+//! The assembly rule over module packages (ADR-0071, S1.4): a module the environment does
+//! not name is never instantiated and cannot dispatch, whether it is an installed package
+//! the environment did not select or a name nobody ships.
 //!
-//! The package is the real fixture, verified and compiled by the loader and registered
-//! through the host's catalog entry point. The tool adapter is a counting stand-in for
-//! S0's `WasmTool`: a call of it is an instantiation, so "never instantiated" is a count.
+//! The package is the real fixture, verified and compiled by the runtime loader, registered
+//! through the host's catalog entry point and built by `WasmTool` when assembled. The
+//! registration's services hook runs once per instantiation, so "never instantiated" is a
+//! count of its calls.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use p1_assembly::{
-    AssemblyError, Catalog, EnvironmentFile, ModulesLock, ProviderSpec, Substitutions, ToolSpec,
-    assemble,
+    AssemblyError, Catalog, EnvironmentFile, ModulesLock, ProviderSpec, Substitutions,
+    ToolServices, ToolSpec, assemble,
 };
 use p1_contracts::{ModelOptions, Provider, Tool};
-use p1_host::catalog::modules::{LoadError, Release, load_locked_modules, register_modules};
-use p1_module_tests::{CountingAdapter, FIXTURE_PACKAGE, ScratchRelease, fixture, lock_entry};
+use p1_host::catalog::modules::{
+    ModuleServices, ModulesError, load_locked_modules, register_modules,
+};
+use p1_module_runtime::{ProcessService, Services};
+use p1_module_tests::{FIXTURE_NAME, FakeProcesses, Release, fake_processes, lock_text};
 use p1_testkit::{FakeTool, ScriptedProvider};
 
 const PROVIDER: &str = "scripted";
+/// The module name the fixture lock gives the fixture package.
+const MODULE: &str = "fixture";
 
-fn environment(tools: &[&str]) -> EnvironmentFile {
+fn tool_spec(module: &str) -> ToolSpec {
+    ToolSpec {
+        module: module.into(),
+        name: None,
+        description: None,
+        variant: None,
+    }
+}
+
+fn environment(tools: Vec<ToolSpec>) -> EnvironmentFile {
     EnvironmentFile {
         name: "modules-test".into(),
         family: "test".into(),
@@ -28,19 +44,15 @@ fn environment(tools: &[&str]) -> EnvironmentFile {
         model: "test-model".into(),
         profile: None,
         options: ModelOptions::default(),
-        tools: tools
-            .iter()
-            .map(|module| ToolSpec {
-                module: (*module).into(),
-                name: None,
-                description: None,
-                variant: None,
-            })
-            .collect(),
+        tools,
         prompt_template: "tools: {{tool_names}}".into(),
         context: None,
         summarize_prompt: None,
     }
+}
+
+fn environment_of(modules: &[&str]) -> EnvironmentFile {
+    environment(modules.iter().map(|module| tool_spec(module)).collect())
 }
 
 fn substitutions() -> Substitutions {
@@ -51,15 +63,51 @@ fn substitutions() -> Substitutions {
     }
 }
 
-/// The `modules.lock` text resolving `fixture` to the built fixture package.
-fn fixture_lock() -> ModulesLock {
-    let text = fixture_lock_text_for("fixture", "p1/fixture");
-    ModulesLock::parse(&PathBuf::from("modules.lock"), &text).expect("fixture lock")
+/// The lock resolving `module` to the fixture package of `release`.
+fn fixture_lock(release: &Release, module: &str) -> ModulesLock {
+    let entry = release.fixture_entry(FIXTURE_NAME);
+    ModulesLock::parse(
+        &release.root().join("modules.lock"),
+        &lock_text(module, &entry),
+    )
+    .expect("fixture lock")
+}
+
+/// Counts instantiations: the registration calls its services hook once per instance.
+struct Instantiations {
+    count: Arc<AtomicUsize>,
+    services: ModuleServices,
+    /// The test's side of the fake `process` service, kept so the service stays usable.
+    _processes: FakeProcesses,
+}
+
+impl Instantiations {
+    fn new() -> Self {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (process, processes) = fake_processes();
+        let process: Arc<dyn ProcessService> = process;
+        let counted = count.clone();
+        let services: ModuleServices = Arc::new(move |_: &ToolServices| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Services {
+                process: Some(process.clone()),
+            }
+        });
+        Self {
+            count,
+            services,
+            _processes: processes,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
 }
 
 /// A catalog with a scripted provider, the compiled-in stand-in tool `read`, and every
 /// package `lock` resolves in `release`, registered through the host's entry point.
-fn catalog(release: &ScratchRelease, lock: &ModulesLock, adapter: &CountingAdapter) -> Catalog {
+fn catalog(release: &Release, lock: &ModulesLock, instantiations: &Instantiations) -> Catalog {
     let mut catalog = Catalog::new();
     let provider = ScriptedProvider::new(Vec::new());
     catalog.provider(
@@ -68,12 +116,13 @@ fn catalog(release: &ScratchRelease, lock: &ModulesLock, adapter: &CountingAdapt
     );
     catalog.tool(
         "read",
-        Box::new(|_spec: &ToolSpec, _services: &p1_assembly::ToolServices| {
+        Box::new(|_spec: &ToolSpec, _services: &ToolServices| {
             Ok(Arc::new(FakeTool::new("read")) as Arc<dyn Tool>)
         }),
     );
-    let modules = load_locked_modules(lock, &release.modules_dir).expect("the fixture loads");
-    register_modules(&mut catalog, modules, adapter.adapter()).expect("registration");
+    let packages = load_locked_modules(lock, &release.manifest_file()).expect("the fixture loads");
+    register_modules(&mut catalog, packages, instantiations.services.clone())
+        .expect("registration");
     catalog
 }
 
@@ -84,50 +133,54 @@ fn tool_names(tools: &[Arc<dyn Tool>]) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn a_selected_package_is_instantiated_once_and_dispatches_under_its_loader_built_identity() {
-    // Control for the two refusals below: selecting the module does reach the adapter.
-    let release = ScratchRelease::with_fixture();
-    let adapter = CountingAdapter::default();
-    let catalog = catalog(&release, &fixture_lock(), &adapter);
+fn assemble_in(
+    catalog: &Catalog,
+    environment: &EnvironmentFile,
+    workspace: &Path,
+) -> Result<p1_assembly::Assembled, AssemblyError> {
+    assemble(catalog, environment, workspace, &substitutions())
+}
+
+// `WasmTool` starts its executor on the current Tokio runtime, so the case that
+// instantiates runs inside one, as the host's assembly does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_selected_package_is_instantiated_once_under_its_loader_built_identity() {
+    // Control for the refusals below: selecting the module does instantiate it.
+    let release = Release::with_fixture();
+    let instantiations = Instantiations::new();
+    let catalog = catalog(&release, &fixture_lock(&release, MODULE), &instantiations);
     let workspace = tempfile::tempdir().unwrap();
 
-    let assembled = assemble(
+    let assembled = assemble_in(
         &catalog,
-        &environment(&["read", "fixture"]),
+        &environment_of(&["read", MODULE]),
         workspace.path(),
-        &substitutions(),
     )
     .expect("assembles");
-    assert_eq!(adapter.calls(), 1);
+    assert_eq!(instantiations.count(), 1);
     assert_eq!(tool_names(&assembled.tools), ["read", "fixture"]);
     let resolved = &assembled.resolved.tools[1];
-    assert_eq!(resolved.module, "fixture");
-    assert_eq!(resolved.identity.implementation, "p1/fixture");
+    assert_eq!(resolved.module, MODULE);
+    assert_eq!(resolved.identity.implementation, FIXTURE_NAME);
     assert_eq!(resolved.identity.variant, "default");
 }
 
 #[test]
 fn an_installed_but_unselected_package_cannot_dispatch() {
-    let release = ScratchRelease::with_fixture();
-    let adapter = CountingAdapter::default();
-    let catalog = catalog(&release, &fixture_lock(), &adapter);
+    let release = Release::with_fixture();
+    let instantiations = Instantiations::new();
+    let catalog = catalog(&release, &fixture_lock(&release, MODULE), &instantiations);
     assert!(
-        catalog.tool_keys().contains(&"fixture".to_string()),
+        catalog.tool_keys().contains(&MODULE.to_owned()),
         "the package is installed and resolved"
     );
     let workspace = tempfile::tempdir().unwrap();
 
-    let assembled = assemble(
-        &catalog,
-        &environment(&["read"]),
-        workspace.path(),
-        &substitutions(),
-    )
-    .expect("assembles");
+    let assembled =
+        assemble_in(&catalog, &environment_of(&["read"]), workspace.path()).expect("assembles");
 
     assert_eq!(
-        adapter.calls(),
+        instantiations.count(),
         0,
         "an unselected module is never instantiated"
     );
@@ -137,7 +190,7 @@ fn an_installed_but_unselected_package_cannot_dispatch() {
             .resolved
             .tools
             .iter()
-            .all(|tool| tool.identity.implementation != "p1/fixture"),
+            .all(|tool| tool.identity.implementation != FIXTURE_NAME),
         "nothing of the package is assembled"
     );
     assert!(
@@ -150,99 +203,104 @@ fn an_installed_but_unselected_package_cannot_dispatch() {
 #[test]
 fn an_installed_package_no_lock_resolves_cannot_dispatch() {
     // Installed in the release, but no lock names it: it is not even a catalog key, and
-    // neither its module name nor its package name can be assembled.
-    let release = ScratchRelease::with_fixture();
-    let adapter = CountingAdapter::default();
-    let catalog = catalog(&release, &ModulesLock::default(), &adapter);
+    // neither a module name nor its package name can be assembled.
+    let release = Release::with_fixture();
+    let instantiations = Instantiations::new();
+    let catalog = catalog(&release, &ModulesLock::default(), &instantiations);
     let workspace = tempfile::tempdir().unwrap();
 
-    for name in ["fixture", "p1/fixture", FIXTURE_PACKAGE] {
-        let error = assemble(
-            &catalog,
-            &environment(&["read", name]),
-            workspace.path(),
-            &substitutions(),
-        )
-        .expect_err("an unresolved package cannot be assembled");
+    for name in [MODULE, FIXTURE_NAME] {
+        let error = assemble_in(&catalog, &environment_of(&["read", name]), workspace.path())
+            .expect_err("an unresolved package cannot be assembled");
         assert!(
             matches!(&error, AssemblyError::UnknownToolModule { module, .. } if module == name),
             "{name}: {error:?}"
         );
     }
-    assert_eq!(adapter.calls(), 0);
+    assert_eq!(instantiations.count(), 0);
 }
 
 #[test]
 fn an_invented_name_cannot_dispatch() {
-    let release = ScratchRelease::with_fixture();
-    let adapter = CountingAdapter::default();
-    let catalog = catalog(&release, &fixture_lock(), &adapter);
+    let release = Release::with_fixture();
+    let instantiations = Instantiations::new();
+    let catalog = catalog(&release, &fixture_lock(&release, MODULE), &instantiations);
     let workspace = tempfile::tempdir().unwrap();
 
-    let error = assemble(
+    let error = assemble_in(
         &catalog,
-        &environment(&["read", "no_such_module"]),
+        &environment_of(&["read", "no_such_module"]),
         workspace.path(),
-        &substitutions(),
     )
     .expect_err("an invented name is refused");
     match &error {
         AssemblyError::UnknownToolModule { module, available } => {
             assert_eq!(module, "no_such_module");
-            assert!(available.contains(&"fixture".to_string()));
+            assert!(available.contains(&MODULE.to_owned()));
         }
         other => panic!("expected UnknownToolModule, got {other:?}"),
     }
     assert_eq!(
-        adapter.calls(),
+        instantiations.count(),
         0,
         "nothing is instantiated for a refused environment"
     );
 }
 
 #[test]
-fn a_lock_resolving_an_invented_package_is_refused_before_registration() {
-    // An override lock can only select what the release ships: a package name the
-    // release does not have never becomes a catalog key.
-    let release = ScratchRelease::with_fixture();
-    let text = fixture_lock_text_for("ghost", "p1/ghost");
-    let lock = ModulesLock::parse(&PathBuf::from("modules.lock"), &text).unwrap();
-    let error = load_locked_modules(&lock, &release.modules_dir).expect_err("no such package");
+fn a_lock_resolving_an_invented_package_registers_nothing() {
+    // An override lock can only select what the release ships: a package the release does
+    // not have never becomes a catalog key.
+    let release = Release::with_fixture();
+    let mut entry = release.fixture_entry(FIXTURE_NAME);
+    entry["name"] = "p1/ghost".into();
+    let lock = ModulesLock::parse(
+        &release.root().join("modules.lock"),
+        &lock_text("ghost", &entry),
+    )
+    .unwrap();
+    let error = match load_locked_modules(&lock, &release.manifest_file()) {
+        Ok(_) => panic!("no such package"),
+        Err(error) => error,
+    };
     assert!(
-        matches!(&error, LoadError::PackageNotFound { module, package, .. }
-            if module == "ghost" && package == "p1/ghost"),
+        matches!(&error, ModulesError::Load { module, .. } if module == "ghost"),
         "{error:?}"
     );
-    // And the release itself has only the fixture.
-    let opened = Release::open(&release.modules_dir).unwrap();
-    assert_eq!(opened.package_names(), ["p1/fixture"]);
 }
 
 #[test]
 fn a_package_cannot_replace_a_compiled_in_tool() {
-    let release = ScratchRelease::with_fixture();
-    let text = fixture_lock_text_for("read", "p1/fixture");
-    let lock = ModulesLock::parse(&PathBuf::from("modules.lock"), &text).unwrap();
-    let modules = load_locked_modules(&lock, &release.modules_dir).expect("loads");
+    let release = Release::with_fixture();
+    let packages = load_locked_modules(&fixture_lock(&release, "read"), &release.manifest_file())
+        .expect("loads");
     let mut catalog = Catalog::new();
     catalog.tool(
         "read",
-        Box::new(|_spec: &ToolSpec, _services: &p1_assembly::ToolServices| {
+        Box::new(|_spec: &ToolSpec, _services: &ToolServices| {
             Ok(Arc::new(FakeTool::new("read")) as Arc<dyn Tool>)
         }),
     );
-    let adapter = CountingAdapter::default();
-    let error = register_modules(&mut catalog, modules, adapter.adapter())
+    let instantiations = Instantiations::new();
+    let error = register_modules(&mut catalog, packages, instantiations.services.clone())
         .expect_err("a collision is refused");
-    assert!(error.contains("`read`"), "{error}");
+    assert!(
+        matches!(&error, ModulesError::Collision { module, .. } if module == "read"),
+        "{error:?}"
+    );
 }
 
-/// A lock resolving `module` to `package` with the fixture's digest and ABI.
-fn fixture_lock_text_for(module: &str, package: &str) -> String {
-    let entry = lock_entry(&fixture().manifest);
-    format!(
-        "format = \"p1-modules-lock/1\"\n\n[modules.{module}]\npackage = \"{package}\"\n\
-         version = \"{}\"\ndigest = \"{}\"\nworld = \"{}\"\nprotocol = \"{}\"\n",
-        entry.version, entry.digest, entry.world, entry.protocol
-    )
+#[test]
+fn a_face_override_on_a_module_is_refused_before_instantiation() {
+    let release = Release::with_fixture();
+    let instantiations = Instantiations::new();
+    let catalog = catalog(&release, &fixture_lock(&release, MODULE), &instantiations);
+    let workspace = tempfile::tempdir().unwrap();
+    let mut renamed = tool_spec(MODULE);
+    renamed.name = Some("renamed".into());
+
+    let error = assemble_in(&catalog, &environment(vec![renamed]), workspace.path())
+        .expect_err("WasmTool has no face to apply");
+    assert!(error.to_string().contains("override"), "{error}");
+    assert_eq!(instantiations.count(), 0);
 }
