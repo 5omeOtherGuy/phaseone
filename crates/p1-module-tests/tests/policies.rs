@@ -778,9 +778,10 @@ async fn cancellation() {
         assert_eq!(decision, deny(CANCEL_DENY));
         assert_eq!(harness.prompts(), PROMPT.repeat(3));
 
-        // A cancel before `authorize` returns promptly: the bridge asks, then races the
-        // turn's token ahead of the line source, so an already-cancelled turn reads no
-        // line and never waits for one.
+        // A cancel before `authorize` returns promptly: the component's verdict future is
+        // not ready on its first poll (the executor answers over a oneshot), so the first
+        // `biased` race returns the cancel deny before `ask` writes a prompt — an
+        // already-cancelled turn reads no line and never waits for one.
         let cancelled = CancellationToken::new();
         harness.set_turn(Some(cancelled.clone()));
         cancelled.cancel();
@@ -799,10 +800,11 @@ async fn cancellation() {
 /// Frozen case 3: a policy trap yields a conservative decision.
 ///
 /// Neither shipped policy traps on its own and S5.3 left the guest trap to this suite, so
-/// the trap is produced through the call's limits (see the module documentation): a policy
-/// with `fuel: 1` cannot instantiate, and the executor's `FuelExhausted` reaches the core
-/// as a `Deny` naming the package, never as a `Permit`. The deadline stop is shown beside
-/// it on the context policy, the one policy call a manual epoch clock can end.
+/// the trap is produced through the call's limits (see the module documentation): a call
+/// with `fuel: 1` runs out of fuel in its first guest instructions, and the executor's
+/// `FuelExhausted` reaches the core as a `Deny` naming the package, never as a `Permit`.
+/// The deadline stop is shown beside it on the context policy, the one policy call a manual
+/// epoch clock can end.
 #[tokio::test]
 async fn a_policy_trap_yields_a_conservative_decision() {
     within_deadline("a policy trap yields a conservative decision", async {
