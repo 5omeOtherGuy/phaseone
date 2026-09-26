@@ -30,8 +30,8 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use p1_contracts::serde_json::{self, Value, json};
@@ -545,6 +545,10 @@ fn p1_binary(root: &Path) -> PathBuf {
         );
         return path;
     }
+    // The cases run in parallel; a second nested build would see the first one's lock and
+    // give up, so one case builds while the other waits and then takes the fresh binary.
+    static BUILD: Mutex<()> = Mutex::new(());
+    let _build = BUILD.lock().unwrap_or_else(PoisonError::into_inner);
     let candidate = profile_dir().join("p1");
     let sources = root.join("crates/p1-host");
     if fresh(&candidate, &sources) {
