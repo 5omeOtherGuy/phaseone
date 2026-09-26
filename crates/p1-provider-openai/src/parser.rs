@@ -22,8 +22,8 @@ pub struct CodexResponseParser {
     blocks: Vec<AssistantBlock>,
     /// Set once a terminal outcome has been produced; later events are ignored.
     terminal: Option<Outcome>,
-    /// Remembered for diagnostics only; the contract has no response-id field.
-    #[allow(dead_code)]
+    /// The `response.created` id; the contract has no response-id field, so only
+    /// [`CodexResponseParser::response_id`] reads it (a component's decoder).
     response_id: Option<String>,
     /// Model-facing names observed when function-call output items are announced.
     call_names: std::collections::HashMap<String, String>,
@@ -45,6 +45,11 @@ impl CodexResponseParser {
             call_names: std::collections::HashMap::new(),
             reasoning_emitted_in_item: false,
         }
+    }
+
+    /// The id `response.created` named, if the wire named one so far.
+    pub fn response_id(&self) -> Option<&str> {
+        self.response_id.as_deref()
     }
 
     /// Queue the single terminal outcome.

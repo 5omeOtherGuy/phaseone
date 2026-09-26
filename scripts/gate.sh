@@ -19,6 +19,10 @@
 #   module boundary     imports against the frozen capability allocation, and the unsafe policy
 #                       (scripts/check-module-boundaries.sh, freeze items 11 and 13)
 #   secret scan, adr, installer and CI helpers
+#   release candidate   the p1 binary relinked and staged for exactly this commit
+#                       (scripts/stage-release.sh, no tag, a null manifest tag)
+#   release smoke       the staged candidate installed from a file:// base with no gh
+#                       on PATH, and verified against the manifest it shipped
 #
 # The module build comes before the tests so the integration and conformance tests exercise the
 # components this commit builds, never stale or missing ones; they read them from
@@ -147,8 +151,115 @@ python3 scripts/test_rustc_serial.py -q
 python3 scripts/test_secret_scan.py -q
 python3 scripts/test_stage_release.py -q
 python3 scripts/test_usage_audit.py -q
-# S7.5.2: the release-candidate smoke test and artifact staging go here, through
-# scripts/stage-release.sh (S7.7).
+# S7.5.2: the release-candidate smoke test. The candidate is staged for exactly this
+# commit through scripts/stage-release.sh (S7.7) and then installed from a file://
+# release base and verified against the manifest it ships; anything that fails ends
+# the gate red before `== gate: GREEN`.
 target_dir="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+
+echo "== gate: release candidate"
+# The test step already built the workspace; this only relinks the p1 binary they
+# built, so the smoke test installs exactly what this commit produced.
+cargo build --locked -p p1-host --bin p1
+commit="$(git rev-parse HEAD)"
+short="${commit:0:12}"
+# No --tag: the manifest names the commit and a null tag, so this is a candidate.
+# stage-release.sh stages in a temporary directory and moves it into place, so a
+# stale p1-candidate from an earlier run is replaced, never merged into.
+scripts/stage-release.sh --native "$target_dir/debug/p1" --out "$target_dir/p1-candidate" --commit "$commit"
+
+echo "== gate: release smoke"
+# The four staged assets are served over file:// as download/candidate-<12 hex>/,
+# the install runs with a throwaway HOME, config directory and TMPDIR and no gh on
+# its PATH, and the installed share is then checked against the manifest it shipped.
+# XDG_CONFIG_HOME is redirected too: p1's credential store prefers it over HOME, and
+# the installer ends by running `p1 login --list`, so leaving it alone would read the
+# worker's own store. The temp directory goes away on every exit path, green or red.
+smoke_root="$(mktemp -d)"
+trap 'rm -rf -- "$smoke_root"' EXIT
+smoke_farm="$smoke_root/bin"
+mkdir -p -- "$smoke_farm" "$smoke_root/home" "$smoke_root/config" "$smoke_root/tmp"
+# Only the tools scripts/install.sh runs reach the installer, so its PATH cannot
+# carry gh and the public file:// path is the one the smoke test exercises.
+for tool in bash mktemp sha256sum cut awk basename dirname cp mv mkdir rm chmod cat tar python3 curl; do
+  tool_path="$(command -v "$tool" 2>/dev/null || true)"
+  if [ -z "$tool_path" ]; then
+    echo "release smoke: $tool is not on PATH" >&2
+    exit 1
+  fi
+  ln -s -- "$tool_path" "$smoke_farm/$tool"
+done
+release_base="$smoke_root/release"
+mkdir -p -- "$release_base/download/candidate-$short"
+cp -a -- "$target_dir/p1-candidate/." "$release_base/download/candidate-$short/"
+PATH="$smoke_farm" HOME="$smoke_root/home" P1_CONFIG_DIR="$smoke_root/config" XDG_CONFIG_HOME="$smoke_root/config" TMPDIR="$smoke_root/tmp" P1_RELEASE_BASE_URL="file://$release_base" scripts/install.sh --from-release "candidate-$short" --prefix "$smoke_root/prefix"
+installed_version="$("$smoke_root/prefix/bin/p1" --version 2>/dev/null)" || {
+  echo "release smoke: the installed p1 --version failed" >&2
+  exit 1
+}
+case "$installed_version" in
+  *"$short"*) ;;
+  *) { echo "release smoke: the installed p1 --version does not name $short: $installed_version" >&2; exit 1; } ;;
+esac
+python3 - "$smoke_root/prefix" "$commit" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+prefix = pathlib.Path(sys.argv[1])
+commit = sys.argv[2]
+
+
+def fail(message):
+    print("release smoke: " + message, file=sys.stderr)
+    sys.exit(1)
+
+
+modules = prefix / "share/p1/modules"
+manifest_path = modules / "manifest.json"
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    fail(f"cannot read the installed {manifest_path}: {error}")
+
+installed = prefix / "bin/p1"
+try:
+    installed_bytes = installed.read_bytes()
+except OSError as error:
+    fail(f"cannot read the installed {installed}: {error}")
+native = manifest.get("native", {}).get("sha256")
+installed_sha = hashlib.sha256(installed_bytes).hexdigest()
+if installed_sha != native:
+    fail(f"the installed bin/p1 sha256 {installed_sha} is not the manifest's native.sha256 {native}")
+
+listed = {}
+for entry in manifest.get("packages", []):
+    path = entry.get("path")
+    if not isinstance(path, str):
+        fail("a manifest packages entry names no path")
+    listed[path] = entry
+found = []
+packages_root = modules / "packages"
+if packages_root.is_dir():
+    for path in sorted(packages_root.rglob("*")):
+        if path.is_file():
+            found.append(path.relative_to(modules).as_posix())
+if sorted(found) != sorted(listed):
+    fail(f"the installed packages {sorted(found)} are not the manifest's packages {sorted(listed)}")
+for path in sorted(listed):
+    entry = listed[path]
+    try:
+        data = (modules / path).read_bytes()
+    except OSError as error:
+        fail(f"cannot read the installed {path}: {error}")
+    if len(data) != entry.get("size") or hashlib.sha256(data).hexdigest() != entry.get("sha256"):
+        fail(f"the installed {path} does not match its manifest packages entry")
+
+if manifest.get("commit") != commit:
+    fail(f"the installed manifest commit {manifest.get('commit')} is not HEAD {commit}")
+PY
+echo "release smoke: candidate $short installed and verified"
+
 echo "== target dir: $(du -sh "$target_dir" 2>/dev/null | cut -f1) $target_dir (free: $(df -h --output=avail "$target_dir" | tail -1 | tr -d ' '))"
 echo "== gate: GREEN"

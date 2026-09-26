@@ -1,6 +1,6 @@
 [package]
 name = "p1-module-tests"
-description = "Runtime spike and module execution-model tests over the built fixture component (test-only crate; nothing depends on it)"
+description = "Runtime spike, module execution-model, package loader and assembly-rule tests over the built fixture component (test-only crate; nothing depends on it)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -22,6 +22,9 @@ p1-redact = { path = "../p1-redact" }
 # The transport-authority suite (S4.5) drives S4.2's broker over the scripted
 # transport and the one real transport's redirect policy over a loopback socket.
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
+# The WebSocket boundary suite (tests/websocket_boundary.rs, S5): the host session with
+# its scripted connector, the provider's portable decisions, and the paused clock.
+p1-provider-openai = { path = "../p1-provider-openai" }
 futures-util = "0.3"
 tokio = { version = "1", default-features = false, features = [
     "macros",
@@ -31,8 +34,18 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "net",
     "io-util",
+    "test-util",
 ] }
 p1-testkit = { path = "../p1-testkit" }
 p1-workers = { path = "../p1-workers" }
+# The redaction suite (S3.6) proves from the outside that a transcript rendered for the
+# summarizer is built from masked history and that p1-context masks the summary's own answer.
+# policies.rs (S5.4) drives the policy components behind the native ask bridge (p1-host) and the
+# native context engine whose estimator builds the settings the component is configured with.
+p1-context = { path = "../p1-context" }
 # workflow_boundary.rs: the workflow substrate driven through its decision seam (S6.3).
 p1-workflow = { path = "../p1-workflow" }
+# S1.4: the loader and assembly cases drive the host's catalog entry point and assemble
+# environments over it, with the testkit's scripted provider and fake tools.
+p1-assembly = { path = "../p1-assembly" }
+p1-host = { path = "../p1-host" }

@@ -1,7 +1,9 @@
 //! The harness of the module execution-model tests: the built fixture component, a release
 //! manifest written for it into a temporary directory, a fake `process` service driven by
 //! explicit synchronization that records what it sees, manually driven epochs, and the
-//! deadlock guard every case runs under.
+//! deadlock guard every case runs under. The loader and assembly cases (S1.4) add the
+//! `modules.lock` text selecting a release entry ([`lock_text`]) and read the written
+//! manifest back through the host ([`Release::manifest_file`]).
 //!
 //! The fixture is built by `scripts/build-modules.sh` (the gate runs it before the tests).
 //! When it is missing the harness fails with that instruction; it never skips a case.
@@ -137,14 +139,41 @@ impl Release {
     }
 
     fn manifest(&self) -> ReleaseManifest {
+        let path = self.manifest_file();
+        ReleaseManifest::read(&path).expect("release manifest")
+    }
+
+    /// Writes `manifest.json` and returns its path, for a caller that reads the release
+    /// itself (the host's catalog entry point). Nothing checks the entries here, so a case
+    /// can write a release the loader must refuse.
+    pub fn manifest_file(&self) -> PathBuf {
         let path = self.dir.path().join("manifest.json");
         let manifest = json!({
             "format": "p1-release-manifest/1",
             "components": self.components,
         });
         std::fs::write(&path, manifest.to_string()).expect("manifest");
-        ReleaseManifest::read(&path).expect("release manifest")
+        path
     }
+
+    /// The directory the release is laid out in.
+    pub fn root(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// The `modules.lock` text resolving module name `module` to release entry `entry`, pinning
+/// its package, digest, world and protocol as the release states them.
+pub fn lock_text(module: &str, entry: &Value) -> String {
+    let field = |key: &str| entry[key].as_str().expect("entry field").to_owned();
+    format!(
+        "format = \"p1-modules-lock/1\"\n\n[modules.{module}]\npackage = \"{}\"\n\
+         version = \"0.0.1\"\ndigest = \"{}\"\nworld = \"{}\"\nprotocol = \"{}\"\n",
+        field("name"),
+        field("digest"),
+        field("world"),
+        field("protocol"),
+    )
 }
 
 /// A freeform call to the fixture with `raw` as its input.
