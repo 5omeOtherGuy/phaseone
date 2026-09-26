@@ -43,6 +43,8 @@ mod sse;
 mod status;
 #[cfg(feature = "native")]
 pub mod ws;
+#[cfg(feature = "native")]
+pub mod ws_session;
 
 #[cfg(feature = "native")]
 pub use broker::{
