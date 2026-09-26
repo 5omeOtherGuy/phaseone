@@ -48,3 +48,8 @@ p1-workflow = { path = "../p1-workflow" }
 # environments over it, with the testkit's scripted provider and fake tools.
 p1-assembly = { path = "../p1-assembly" }
 p1-host = { path = "../p1-host" }
+# replay_switch.rs (S5.8) runs the shipped chat adapter's portable `validate` over the history a
+# session recorded, to hold the replay version the replacement builds declare to that
+# declaration. No transport: the portable half and the profile it is composed with.
+p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false }
+p1-model-profile = { path = "../p1-model-profile" }
