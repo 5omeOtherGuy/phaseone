@@ -10,7 +10,9 @@ use p1_contracts::{
     AgentEvent, BoxFuture, CancellationToken, Item, ModelOptions, Origin, Provider, ProviderError,
     ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody, RouteDescription, TurnEnd,
 };
-use p1_core::{Agent, AgentParts, BuildError, Reconfiguration, ResumeError, project};
+use p1_core::{
+    Agent, AgentParts, BuildError, Reconfiguration, ReconfigureError, ResumeError, project,
+};
 use p1_testkit::{
     FakeTool, PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization,
     ScriptedProvider, json_call, origin, text_response, tool_call_response,
@@ -105,8 +107,15 @@ async fn a_switch_commits_the_new_environment_and_asks_the_new_provider_with_the
                 ..ModelOptions::default()
             },
             context: Arc::new(PassthroughContext),
+            authorization: None,
         })
+        .await
         .expect("the new provider accepts the current history");
+    assert_eq!(
+        journal.records().len(),
+        4,
+        "the switch commits its Environment before it returns"
+    );
 
     // The check is the same one construction runs, but against the CURRENT history.
     let validated = second.validated();
@@ -134,9 +143,10 @@ async fn a_switch_commits_the_new_environment_and_asks_the_new_provider_with_the
     .unwrap();
     assert!(matches!(end, TurnEnd::Completed { .. }), "{end:?}");
 
-    // The new `Environment` is committed before the turn's input.
+    // The new `Environment` precedes the turn's input, and the turn adds no second one.
     let records = journal.records();
     assert_eq!(records.len(), 6, "{records:#?}");
+    assert_eq!(environment_records(&records).len(), 2);
     match &records[3].body {
         RecordBody::Environment {
             route,
@@ -198,9 +208,14 @@ async fn a_rejected_reconfigure_leaves_the_old_provider_in_use_and_commits_nothi
             system_prompt: "second prompt".into(),
             options: ModelOptions::default(),
             context: Arc::new(PassthroughContext),
+            authorization: None,
         })
+        .await
         .expect_err("the new provider rejects the history");
-    assert_eq!(error, BuildError::ProviderRejected(refusal));
+    assert_eq!(
+        error,
+        ReconfigureError::Rejected(BuildError::ProviderRejected(refusal))
+    );
     assert_eq!(
         journal.records().len(),
         3,
@@ -254,9 +269,14 @@ async fn duplicate_tool_names_are_rejected_before_the_provider_is_asked() {
             system_prompt: "second prompt".into(),
             options: ModelOptions::default(),
             context: Arc::new(PassthroughContext),
+            authorization: None,
         })
+        .await
         .expect_err("two tools with one call name");
-    assert_eq!(error, BuildError::DuplicateToolName("read".into()));
+    assert_eq!(
+        error,
+        ReconfigureError::Rejected(BuildError::DuplicateToolName("read".into()))
+    );
     assert!(
         second.validated().is_empty(),
         "the duplicate-name check runs before `provider.validate`"
@@ -335,7 +355,10 @@ async fn a_switch_keeps_the_journal_the_events_and_the_authorization() {
             system_prompt: "second prompt".into(),
             options: ModelOptions::default(),
             context: Arc::new(PassthroughContext),
+            // `None` keeps the session's policy.
+            authorization: None,
         })
+        .await
         .expect("the new provider accepts the current history");
     let end = tokio::time::timeout(
         std::time::Duration::from_secs(5),
