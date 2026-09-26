@@ -110,6 +110,17 @@ struct Setup {
     pre: InstancePre<CallState>,
     services: Services,
     limits: ExecutionLimits,
+    prelude: Option<Prelude>,
+}
+
+/// An export called on each fresh instance before the requested one, inside the same call
+/// and under the same limits: how a context policy is `configure`d (S5, GO S5-B7). A trap
+/// in it fails the call as the export's own trap would; an `err` result fails it too, and
+/// the requested export is then never called.
+#[derive(Clone)]
+pub(crate) struct Prelude {
+    pub(crate) export: &'static str,
+    pub(crate) params: Vec<Val>,
 }
 
 impl Executor {
@@ -122,6 +133,20 @@ impl Executor {
         services: Services,
         limits: ExecutionLimits,
     ) -> Self {
+        Self::start_with_prelude(handle, engine, epochs, pre, services, limits, None)
+    }
+
+    /// [`Executor::start`], with `prelude` called on each fresh instance before the
+    /// requested export.
+    pub(crate) fn start_with_prelude(
+        handle: &tokio::runtime::Handle,
+        engine: Engine,
+        epochs: Arc<Epochs>,
+        pre: InstancePre<CallState>,
+        services: Services,
+        limits: ExecutionLimits,
+        prelude: Option<Prelude>,
+    ) -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
         let setup = Setup {
             engine,
@@ -129,6 +154,7 @@ impl Executor {
             pre,
             services,
             limits,
+            prelude,
         };
         handle.spawn(run(receiver, setup));
         Self { requests }
@@ -248,6 +274,21 @@ async fn one_call(
         .instantiate_async(&mut store)
         .await
         .map_err(|error| call_failure(&store, &error))?;
+    if let Some(prelude) = &setup.prelude {
+        let func = instance
+            .get_func(&mut store, prelude.export)
+            .ok_or_else(|| {
+                ModuleFailure::Trap(format!("the module exports no {}", prelude.export))
+            })?;
+        let mut results = vec![Val::Bool(false); func.ty(&store).results().len()];
+        if let Err(error) = func
+            .call_async(&mut store, &prelude.params, &mut results)
+            .await
+        {
+            return Err(call_failure(&store, &error));
+        }
+        prelude_refusal(prelude.export, &results)?;
+    }
     let func = instance
         .get_func(&mut store, export)
         .ok_or_else(|| ModuleFailure::Trap(format!("the module exports no {export}")))?;
@@ -256,6 +297,18 @@ async fn one_call(
         return Err(call_failure(&store, &error));
     }
     Ok(results)
+}
+
+/// A prelude that answered `err` refused the call: the export's own trap shape, naming the
+/// prelude and, when it gave one, its reason.
+fn prelude_refusal(export: &str, results: &[Val]) -> Result<(), ModuleFailure> {
+    match results.first() {
+        Some(Val::Result(Err(reason))) => Err(ModuleFailure::Trap(match reason.as_deref() {
+            Some(Val::String(reason)) => format!("{export} refused: {reason}"),
+            _ => format!("{export} refused"),
+        })),
+        _ => Ok(()),
+    }
 }
 
 /// A cancelled call that used up its grace fuel was stopped for the cancellation, not for
@@ -314,5 +367,27 @@ mod tests {
         let limits = |deadline| ExecutionLimits { fuel: 1, deadline };
         assert_eq!(limits(EPOCH_TICK * 30).deadline_ticks(), 30);
         assert_eq!(limits(Duration::ZERO).deadline_ticks(), 1);
+    }
+
+    #[test]
+    fn only_an_err_prelude_refuses_the_call() {
+        assert_eq!(prelude_refusal("configure", &[]), Ok(()));
+        assert_eq!(
+            prelude_refusal("configure", &[Val::Result(Ok(None))]),
+            Ok(())
+        );
+        assert_eq!(
+            prelude_refusal(
+                "configure",
+                &[Val::Result(Err(Some(Box::new(Val::String(
+                    "bad key".to_owned()
+                )))))]
+            ),
+            Err(ModuleFailure::Trap("configure refused: bad key".to_owned()))
+        );
+        assert_eq!(
+            prelude_refusal("configure", &[Val::Result(Err(None))]),
+            Err(ModuleFailure::Trap("configure refused".to_owned()))
+        );
     }
 }

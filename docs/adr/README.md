@@ -82,7 +82,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0066 | [p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary](0066-p1-builds-and-verifies-on-github-actions-local-cargo-only-for-check-and-the-lead-s-deployed-binary.md) | accepted | 2026-09-24 | lead |
 | ADR-0067 | [Zen free routes present the OpenCode client identity](0067-zen-free-routes-present-the-opencode-client-identity.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0068 | [Tool output is masked for credential shapes before history, journal and summaries](0068-tool-output-is-masked-for-credential-shapes-before-history-journal-and-summaries.md) | accepted | 2026-09-25 | lead |
-| ADR-0069 | [Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s](0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md) | proposed | 2026-09-25 | lead |
+| ADR-0069 | [Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s](0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md) | accepted | 2026-09-25 | lead |
 | ADR-0070 | [A route may declare no credential for a proxy that injects it](0070-a-route-may-declare-no-credential-for-a-proxy-that-injects-it.md) | proposed | 2026-09-25 | lead |
 | ADR-0071 | [p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name](0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0072 | [A workflow step that ends without finish gets one repair turn](0072-a-workflow-step-that-ends-without-finish-gets-one-repair-turn.md) | proposed | 2026-09-25 | lead |
@@ -99,7 +99,8 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0083 | [Privileged process and completion capabilities](0083-privileged-process-and-completion-capabilities.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0084 | [Reloadable policies](0084-reloadable-policies.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0085 | [Runtime delegation and workflow modules](0085-runtime-delegation-and-workflow-modules.md) | proposed | 2026-09-26 | owner+lead |
-| ADR-0086 | [Module identity and verified loading](0086-module-identity-and-verified-loading.md) | proposed | 2026-09-26 | lead |
+| ADR-0086 | [Provider components with native authenticated transport](0086-provider-components-with-native-authenticated-transport.md) | proposed | 2026-09-26 | owner+lead |
+| ADR-0087 | [Module identity and verified loading](0087-module-identity-and-verified-loading.md) | proposed | 2026-09-26 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

@@ -1,5 +1,5 @@
 ---
-adr: 86
+adr: 87
 title: Module identity and verified loading
 status: proposed
 date: 2026-09-26
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [ADR-0016, ADR-0021, ADR-0065, ADR-0071, ADR-0079, ADR-0081, ADR-0082, migration plan findings F7 and F8, freeze items 6, 12 and 13]
 ---
-# ADR-0086: Module identity and verified loading
+# ADR-0087: Module identity and verified loading
 
 ## Context
 
