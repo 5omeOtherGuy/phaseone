@@ -1,5 +1,5 @@
 ---
-adr: 91
+adr: 92
 title: Resume scanner and workflow report formatter move into the foundation crates
 status: proposed
 date: 2026-09-27
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [issue #392, ~/.agents/xo/reports/cutover-fallbacks/PLAN.md rows p1-tool-delegate · S6 and p1-tool-workflow · S6]
 ---
-# ADR-0091: Resume scanner and workflow report formatter move into the foundation crates
+# ADR-0092: Resume scanner and workflow report formatter move into the foundation crates
 
 ## Context
 

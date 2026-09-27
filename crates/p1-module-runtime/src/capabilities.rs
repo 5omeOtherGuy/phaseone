@@ -59,7 +59,8 @@ pub enum ProcessEvent {
 }
 
 /// The native process service a module's `process` capability is linked to. The real one
-/// is the service extracted from `p1-tool-shell`; the runtime only adapts it.
+/// is [`process::ProcessCapability`](crate::process::ProcessCapability) over this crate's
+/// native process service.
 pub trait ProcessService: Send + Sync {
     /// Starts `command` for a call whose cancellation is `cancel`. The future settles the
     /// start even when `cancel` fires while it runs: a service that started the command

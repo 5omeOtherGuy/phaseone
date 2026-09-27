@@ -140,7 +140,7 @@ fn apply_completion_policy(
     assembled: &mut Assembled,
     hub: &CompletionHub,
     completion: &Completion,
-    contract: Option<p1_tool_finish::OutputContract>,
+    contract: Option<p1_finish_guest::OutputContract>,
     mask: &Arc<MaskCounter>,
 ) -> Result<(), String> {
     let Some(index) = finish_at(assembled) else {
@@ -494,10 +494,10 @@ impl ChildBuilder {
         grant: &[String],
         workspace: &Path,
         worker_id: &str,
-        contract: Option<p1_tool_finish::OutputContract>,
+        contract: Option<p1_finish_guest::OutputContract>,
         silent_end: bool,
         turn_end: Option<TurnEndCell>,
-    ) -> Result<(ChildAgent, p1_tool_finish::FinishOutcome), String> {
+    ) -> Result<(ChildAgent, crate::activity::FinishOutcome), String> {
         let front_end = &self.front_end;
         let completion_hub = &self.completion_hub;
         let environment_dirs = &self.environment_dirs;
