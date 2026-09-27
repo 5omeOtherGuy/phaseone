@@ -140,8 +140,7 @@ fn environment_dirs() -> Vec<PathBuf> {
 }
 
 /// The provider the host's catalog factory builds for one route and one bound profile: the
-/// provider component the route's `adapter` names (D083b), or — for the WebSocket Codex route —
-/// S5.5's one remaining native branch.
+/// provider component the route's `adapter` names (D083b), the WebSocket Codex route included.
 fn provider(
     route: &RouteFile,
     profile_id: &str,

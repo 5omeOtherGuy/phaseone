@@ -4,8 +4,8 @@
 //! a sentence naming the route and the module.
 //!
 //! There is no native fallback any more: a host with no release module set, and a release that
-//! does not ship the component, both refuse. The ONE route the native adapter still serves is
-//! the Responses route's WebSocket transport (S5.5), and the cases below say so.
+//! does not ship the component, both refuse. Since S7.10-R5 that includes the Responses route's
+//! WebSocket transport, which its component lowers and the broker sends (ADR-0078).
 //!
 //! The components are the ones `scripts/build-modules.sh --all` published, read through a
 //! release manifest written into a temp directory (`common::provider_release`), the way S4.7's
@@ -34,7 +34,7 @@ use p1_host::routes::{AdapterSettings, ModelBinding, RouteFile, load_route, load
 use p1_model_profile::ModelProfile;
 use p1_module_runtime::Services;
 use p1_module_tests::Release;
-use p1_provider_http::testing::{ScriptedTransport, ScriptedWsConnector};
+use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport, ScriptedWsConnector};
 use p1_provider_http::ws::WsConnector;
 use p1_provider_http::{Credential, CredentialSource, Transport};
 
@@ -189,6 +189,7 @@ fn activate_in(
         route,
         shipped_profile(profile),
         Arc::new(transport.clone()),
+        Arc::new(RefusingWsConnector::default()),
         Arc::new(FixedCredentials),
     );
     (provider, transport)
@@ -378,7 +379,6 @@ fn the_shipped_environments_resolve_their_provider_references_to_modules() {
     let components = ProviderComponents::read(&manifest).expect("the built release");
     let environments = repo_root().join("environments");
     let mut through_the_component = 0;
-    let mut native_websocket = 0;
     for entry in std::fs::read_dir(&environments).expect("the shipped environments") {
         let dir = entry.expect("an environment entry").path();
         if !dir.join("environment.toml").is_file() {
@@ -421,30 +421,12 @@ fn the_shipped_environments_resolve_their_provider_references_to_modules() {
             "{name}"
         );
 
-        if is_websocket_route(&route) {
-            native_websocket += 1;
-        } else {
-            through_the_component += 1;
-        }
+        through_the_component += 1;
     }
     assert!(
         through_the_component > 10,
         "only {through_the_component} shipped environments took the component path"
     );
-    assert_eq!(
-        native_websocket, 1,
-        "exactly the Responses route's WebSocket transport keeps the native adapter (S5.5)"
-    );
-}
-
-/// Whether only the native adapter can serve this route today: the Responses route's
-/// WebSocket transport, which S5.5 owns.
-fn is_websocket_route(route: &RouteFile) -> bool {
-    matches!(
-        route.settings().expect("the shipped settings parse"),
-        AdapterSettings::OpenAiResponses(settings)
-            if settings.transport == p1_provider_openai::ResponsesTransport::Websocket
-    )
 }
 
 /// A test-only installation: an environments directory with `lock` written next to it and the
@@ -530,16 +512,15 @@ fn a_lock_selected_provider_package_is_accepted_and_is_what_activation_uses() {
 }
 
 /// D083b, the native drop: every route a shipped environment names activates its release host
-/// entry COMPONENT — or the package a user's lock selects — and only the Responses route's
-/// WebSocket transport still builds a native adapter. With a host that has no release module
-/// set at all, every other route therefore REFUSES, naming the route and the module it asked
-/// for: a missing module set is never a fallback to a native adapter.
+/// entry COMPONENT — or the package a user's lock selects — the Responses route's WebSocket
+/// transport included (S7.10-R5). With a host that has no release module set at all, every
+/// route therefore REFUSES, naming the route and the module it asked for: a missing module set
+/// is never a fallback to a native adapter.
 #[test]
-fn a_route_activates_no_native_provider_except_the_websocket_route() {
+fn a_route_activates_no_native_provider() {
     let components = ProviderComponents::none();
     let dirs = environment_dirs();
     let mut refused = 0;
-    let mut native_websocket = 0;
     for entry in std::fs::read_dir(dirs[0].clone()).expect("the shipped environments") {
         let dir = entry.expect("an environment entry").path();
         if !dir.join("environment.toml").is_file() {
@@ -572,19 +553,6 @@ fn a_route_activates_no_native_provider_except_the_websocket_route() {
             Arc::new(ScriptedWsConnector::new(Vec::new())),
             Arc::new(FixedCredentials),
         );
-
-        if is_websocket_route(&route) {
-            // S5.5's branch: the one route that still builds a native adapter, with no module
-            // set in sight.
-            let provider = activated.unwrap_or_else(|error| panic!("{name}: {error}"));
-            assert_eq!(
-                provider.describe(),
-                native_of(&route, &profile.id).describe(),
-                "{name}"
-            );
-            native_websocket += 1;
-            continue;
-        }
         let error = activated
             .err()
             .unwrap_or_else(|| panic!("{name}: the route activated a native provider"));
@@ -603,10 +571,6 @@ fn a_route_activates_no_native_provider_except_the_websocket_route() {
         refused += 1;
     }
     assert!(refused > 10, "only {refused} shipped environments refused");
-    assert_eq!(
-        native_websocket, 1,
-        "exactly the Responses route's WebSocket transport keeps the native adapter (S5.5)"
-    );
 }
 
 /// A release that ships no provider component at all (an installation built before the

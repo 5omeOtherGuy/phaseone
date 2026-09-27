@@ -213,12 +213,17 @@ pub(crate) fn build_ws_headers(
 
 /// The handshake header set of a route whose credential an egress proxy injects
 /// (issue #134): the same set as [`build_ws_headers`] minus every credential header.
-#[cfg(feature = "native")]
-pub(crate) fn build_ws_headers_without_credential(
+/// It is also the credential-free head a provider component lowers, the broker
+/// attaching the credential ahead of it, so it is portable.
+pub fn build_ws_headers_without_credential(
     account: ResponsesAccount,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
-    ws_headers(account, None, cache_key)
+    // The account shapes only the credential headers, which this set leaves out.
+    let _ = account;
+    let mut headers = Vec::from(client_headers());
+    headers.extend(ws_protocol_headers(cache_key));
+    Ok(headers)
 }
 
 #[cfg(feature = "native")]
@@ -228,15 +233,22 @@ fn ws_headers(
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
     let mut headers = identity_headers(account, credential)?;
-    headers.push((
+    headers.extend(ws_protocol_headers(cache_key));
+    Ok(headers)
+}
+
+/// What a handshake appends to the identity headers: the WebSocket `OpenAI-Beta`
+/// value and, with a cache key, the session identity under the WebSocket spelling.
+fn ws_protocol_headers(cache_key: Option<&str>) -> Vec<(String, String)> {
+    let mut headers = vec![(
         "OpenAI-Beta".to_string(),
         "responses_websockets=2026-02-06".to_string(),
-    ));
+    )];
     if let Some(key) = cache_key {
         headers.push(("session-id".to_string(), key.to_string()));
         headers.push(("x-client-request-id".to_string(), format!("p1-{key}")));
     }
-    Ok(headers)
+    headers
 }
 
 /// The ONE text frame a WebSocket request sends (`docs/design/websocket.md` §3):
@@ -245,8 +257,7 @@ fn ws_headers(
 ///
 /// This is the pure half of §3; which BODY goes into it (today always the full
 /// one, later a continuation) is decided by the connection owner.
-#[cfg(feature = "native")]
-pub(crate) fn ws_frame(body: &Value) -> String {
+pub fn ws_frame(body: &Value) -> String {
     let mut frame = body.clone();
     if let Value::Object(fields) = &mut frame {
         fields.remove("stream");
@@ -365,7 +376,7 @@ pub(crate) fn validate(
 /// The route's `prompt_cache_key` for a request: clamped to the 64-character
 /// cap the wire enforces, or `None` when the caller asked for no caching. The
 /// body and the session headers both go through here so they cannot diverge.
-pub(crate) fn clamped_cache_key(options: &ModelOptions) -> Option<String> {
+pub fn clamped_cache_key(options: &ModelOptions) -> Option<String> {
     options
         .cache_key
         .as_ref()
