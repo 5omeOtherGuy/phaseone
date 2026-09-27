@@ -177,7 +177,7 @@ fn read_window_inner(
     Ok(window)
 }
 
-/// Resolve the path to search (the root when absent); it must exist.
+/// The real path of the object `file` refers to, so policy checks see what was opened.
 fn opened_object_path(file: &std::fs::File) -> io::Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -194,6 +194,7 @@ fn opened_object_path(file: &std::fs::File) -> io::Result<PathBuf> {
     }
 }
 
+/// Resolve the path to search (the root when absent); it must exist.
 fn scope(workspace: &Workspace, requested: Option<&str>) -> Result<PathBuf, FsError> {
     let search_path = match requested {
         Some(requested) => workspace.resolve(requested).map_err(workspace_error)?,
