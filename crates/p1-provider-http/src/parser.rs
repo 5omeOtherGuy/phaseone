@@ -34,4 +34,12 @@ pub trait ResponseParser: Send {
     fn response_id(&self) -> Option<String> {
         None
     }
+
+    /// Whether the component instance that decoded this response was dropped while it
+    /// was asked for the response id. The connection the response used belongs to that
+    /// instance and must not outlive it (ADR-0078 §3), so the broker drops it rather than
+    /// returning it to the session. A native parser has no instance to lose.
+    fn instance_lost(&self) -> bool {
+        false
+    }
 }

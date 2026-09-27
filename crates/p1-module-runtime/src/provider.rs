@@ -509,11 +509,22 @@ impl<T> Reply<T> {
 
 /// What one decoder `feed` answers: the events it produced and, when this attempt's
 /// response completed, the id a continuation may name (`decoding.decoder.response-id`).
-type FeedReply = (Vec<StreamEvent>, Option<String>);
+type FeedReply = (Vec<StreamEvent>, DecodedId);
 
 /// What one decoder `finish` answers: this attempt's terminal outcome and, when that
 /// completed the response, the id a continuation may name.
-type FinishReply = (Outcome, Option<String>);
+type FinishReply = (Outcome, DecodedId);
+
+/// What `decoding.decoder.response-id` answered for a completed response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodedId {
+    /// No completed response yet, or the decoder named no id.
+    Unknown,
+    Known(String),
+    /// Asking failed: the instance was dropped with its decoders, and so must the
+    /// connection it used be (ADR-0078 §3).
+    InstanceLost,
+}
 
 enum Command {
     Validate {
@@ -592,7 +603,7 @@ struct ComponentParser {
     /// The terminal outcome was returned: nothing more is decoded.
     terminated: bool,
     /// The response id of a response the decoder completed (`decoder.response-id`).
-    response_id: Option<String>,
+    response_id: DecodedId,
 }
 
 impl ComponentParser {
@@ -603,7 +614,7 @@ impl ComponentParser {
             key,
             created: false,
             terminated: false,
-            response_id: None,
+            response_id: DecodedId::Unknown,
         }
     }
 
@@ -697,7 +708,14 @@ impl ResponseParser for ComponentParser {
     }
 
     fn response_id(&self) -> Option<String> {
-        self.response_id.clone()
+        match &self.response_id {
+            DecodedId::Known(id) => Some(id.clone()),
+            DecodedId::Unknown | DecodedId::InstanceLost => None,
+        }
+    }
+
+    fn instance_lost(&self) -> bool {
+        self.response_id == DecodedId::InstanceLost
     }
 }
 
@@ -923,7 +941,7 @@ impl Machine {
         let response_id = if completed {
             self.response_id(decoder)
         } else {
-            None
+            DecodedId::Unknown
         };
         Ok((events, response_id))
     }
@@ -940,24 +958,25 @@ impl Machine {
         let response_id = if matches!(outcome, Outcome::Completed(_)) {
             self.response_id(decoder)
         } else {
-            None
+            DecodedId::Unknown
         };
         Ok((outcome, response_id))
     }
 
     /// The response id `decoder` saw. It only lets the next request continue this response on
-    /// its connection, so a call that fails leaves it unknown rather than failing a response
-    /// that completed.
-    fn response_id(&mut self, decoder: ResourceAny) -> Option<String> {
-        let results = self
-            .call(|exports| &exports.response_id, &[Val::Resource(decoder)])
-            .ok()?;
+    /// its connection, so a call that fails does not fail a response that completed; it
+    /// reports the instance lost, since the failed call dropped it.
+    fn response_id(&mut self, decoder: ResourceAny) -> DecodedId {
+        let Ok(results) = self.call(|exports| &exports.response_id, &[Val::Resource(decoder)])
+        else {
+            return DecodedId::InstanceLost;
+        };
         match results.into_iter().next() {
             Some(Val::Option(Some(id))) => match *id {
-                Val::String(id) => Some(id),
-                _ => None,
+                Val::String(id) => DecodedId::Known(id),
+                _ => DecodedId::Unknown,
             },
-            _ => None,
+            _ => DecodedId::Unknown,
         }
     }
 

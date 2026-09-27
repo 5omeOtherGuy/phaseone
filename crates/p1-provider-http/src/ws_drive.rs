@@ -265,9 +265,10 @@ impl State {
     }
 
     /// The end of a response: a completed one returns the connection to the session (§4)
-    /// with the response id its decoder saw; every other ending drops the connection.
+    /// with the response id its decoder saw, unless the decoder's instance was lost on the
+    /// way (ADR-0078 §3); every other ending drops the connection.
     fn terminal(mut self, outcome: Outcome) -> Self {
-        if matches!(outcome, Outcome::Completed(_)) {
+        if matches!(outcome, Outcome::Completed(_)) && !self.parser.instance_lost() {
             let response_id = self.parser.response_id();
             if let Some(mut lease) = self.lease.take() {
                 lease.completed(response_id);
