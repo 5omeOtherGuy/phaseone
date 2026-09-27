@@ -1,0 +1,34 @@
+[package]
+name = "p1-module-edit"
+description = "The edit tool module: exact string replacement in one workspace file, through the workspace capabilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-tool = { path = "../p1-bindings-tool" }
+# The guest logic shared with the native tool (S0-R3), so both run the same code.
+p1-tool-edit-logic = { path = "../../crates/p1-tool-edit/logic" }
+
+# The frozen package manifest (docs/design/modules/package.md). `scripts/build-modules.sh`
+# reads these fields, checks them and copies them into the built module's manifest.
+[package.metadata.p1-module]
+name = "p1/edit"
+kind = "tool"
+world = "p1:module/tool@1.0.0"
+protocol = "1.0"
+# `snapshot` beside the workspace read and the observed mutation is the one grant wider than
+# the brief's U-cat row, recorded in ADR-0088 point 4 and
+# docs/design/modules/workspace-mutation.md: `check` keeps the native order of refusals
+# ("You must read … before changing it." before a match failure) and `observe` records the
+# contents a write wrote, as the native tool does. A catalog row that does not link it fails
+# this component's assembly.
+capabilities = ["control", "workspace", "snapshot", "workspace-mutation"]
+variant = "default"

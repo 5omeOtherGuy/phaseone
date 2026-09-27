@@ -36,13 +36,15 @@ pub const CANCEL_DESCRIPTION: &str =
 /// How a successful `worker_start` result begins; the host's `workers_started_in` reads it back.
 pub const STARTED_PREFIX: &str = "Started worker ";
 
-/// The tool modules a worker may be granted and the environments it may run, as this component
-/// knows them: none. The frozen `tool` world has no settings export and reads `declaration` on
-/// the restricted path, so the host's lists cannot reach a component; the schemas carry empty
-/// enums, exactly the native declaration built over empty lists, and module membership is the
-/// host's to enforce where the lists live (`workers-start.start`, `workers-control.continue-child`).
-pub const GRANTABLE: &[String] = &[];
-pub const ENVIRONMENTS: &[String] = &[];
+// The tool modules a worker may be granted and the environments it may run are the host's
+// lists, read by each member from `workers-observe.grantable` and `.environments` (D084), which
+// the host answers on the restricted path too (D085): the schemas below are built from them in
+// `declaration`. Membership of a granted module is the host's check, made first in `start` and
+// `continue-child` as the native tools make it, and its refusal is relayed verbatim.
+
+/// What the host's refusal of a module no worker can be granted says after the module name:
+/// the native tools' text, which `id_error` relays without the regrant wording.
+pub const NOT_GRANTABLE: &str = " is not a tool module a worker can be granted. Valid tools: ";
 
 // ---------------------------------------------------------------- inputs
 
@@ -228,6 +230,11 @@ pub fn id_error(id: &str, error: WorkerError) -> String {
     match error {
         WorkerError::UnknownChild => error_outcome(&format!("No worker {id}.")),
         WorkerError::Busy => error_outcome(&format!("Worker {id} is still running.")),
+        // A module outside the grantable list: the host checked the grant before anything
+        // else, as the native tool does, and its text is the native refusal, relayed as is.
+        WorkerError::Regrant(reason) if reason.contains(NOT_GRANTABLE) => {
+            error_outcome(&format!("Cannot add tools to worker {id}: {reason}"))
+        }
         // The re-grant was refused: no turn ran and the worker kept its tools, so the
         // parent can act on the reason (ADR-0050 item 6).
         WorkerError::Regrant(reason) => error_outcome(&format!(
@@ -487,6 +494,25 @@ mod tests {
         assert_eq!(
             id_error("w1", WorkerError::IdsExhausted),
             error_outcome("the worker id namespace is exhausted: no id can be allocated")
+        );
+    }
+
+    #[test]
+    fn the_hosts_grant_refusal_is_relayed_verbatim() {
+        let reason = format!("`nope`{NOT_GRANTABLE}read, shell");
+        assert_eq!(
+            id_error("w1", WorkerError::Regrant(reason.clone())),
+            error_outcome(
+                "Cannot add tools to worker w1: `nope` is not a tool module a worker can be \
+                 granted. Valid tools: read, shell"
+            )
+        );
+        assert_eq!(
+            start_error(WorkerError::InvalidEnvironment(reason)),
+            error_outcome(
+                "Cannot start worker: `nope` is not a tool module a worker can be granted. \
+                 Valid tools: read, shell"
+            )
         );
     }
 

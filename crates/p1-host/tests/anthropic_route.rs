@@ -3,12 +3,6 @@
 //! `profiles/claude-*.toml`, through the host's own loading path. Nothing here is
 //! hand-made except the scripted transport and the fake credential source, and no
 //! test touches a credential file or the network.
-//!
-//! notice: crates/p1-host/tests/anthropic_route.rs (S1): S3.8 makes `shell` and `finish`
-//! the components `p1/shell` and `p1/finish`, and the shipped environments name both, so
-//! assembling one now happens inside a Tokio runtime (a component executor runs there —
-//! the whole host always is). Two cases that assembled a shipped environment in a plain
-//! `#[test]` run inside one now; every assertion is unchanged.
 
 mod common;
 
@@ -94,11 +88,14 @@ fn environment_dirs() -> Vec<PathBuf> {
 }
 
 /// The shipped route and profile one environment selects, resolved exactly as the host
-/// resolves them before it assembles (spec §2 steps 1–3).
+/// resolves them before it assembles (spec §2 steps 1–3). `dirs` are the search directories the
+/// resolution read from: activation reads the effective lock and the profile's text from beside
+/// them.
 struct Composed {
     route: RouteFile,
     profile: Arc<ModelProfile>,
     wire_model: String,
+    dirs: Vec<PathBuf>,
 }
 
 fn composed(environment: &str) -> Composed {
@@ -114,18 +111,22 @@ fn composed(environment: &str) -> Composed {
         route,
         profile,
         wire_model: loaded.model,
+        dirs,
     }
 }
 
-/// The provider the catalog factory would build for this composition. The connector
-/// is injected next to the transport (ADR-0047 §1); a Messages route never asks for
-/// WebSocket, so it ignores it.
+/// The provider the catalog factory would build for this composition: the provider component
+/// the route's `adapter` names (D083b), activated from the route file the build published as
+/// `common::provider_components` reads them. The connector is injected next to the transport
+/// (ADR-0047 §1); a Messages route never asks for WebSocket, so it ignores it.
 fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = composed
         .route
         .binding(&composed.profile.id)
         .expect("the route serves this profile");
     route_provider(
+        common::provider_components(),
+        &composed.dirs,
         &composed.route,
         binding,
         composed.profile.clone(),
@@ -152,16 +153,20 @@ fn assemble_shipped(name: &str) -> Assembled {
     resolve_environment(&mut environment, &harness.deps.environment_dirs)
         .expect("the shipped route serves its profile");
     let workspace = tempdir().unwrap();
-    assemble(
-        &catalog,
-        &environment,
-        workspace.path(),
-        &Substitutions {
-            workspace: workspace.path().display().to_string(),
-            date: "2026-09-20".into(),
-            os: "linux".into(),
-        },
-    )
+    // The `read` key is the release's `p1/read` host entry (S1.8.1), and a module tool is built
+    // inside a Tokio runtime, which runs its executor.
+    common::on_runtime(|| {
+        assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &Substitutions {
+                workspace: workspace.path().display().to_string(),
+                date: "2026-09-20".into(),
+                os: "linux".into(),
+            },
+        )
+    })
     .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
 }
 
@@ -289,18 +294,21 @@ fn the_shipped_messages_route_passes_the_conformance_suite() {
 // ------------------------------------------------------------- the shipped environments
 
 /// `p1 env show NAME` through the real CLI and catalog.
-async fn show_env(name: &str) -> (i32, String, String) {
+fn show_env(name: &str) -> (i32, String, String) {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     common::isolated_environment(&mut harness);
-    let code = common::run_args(&mut harness, &["env", "show", name]).await;
+    let code = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(common::run_args(&mut harness, &["env", "show", name]));
     (code, harness.stdout.text(), harness.stderr.text())
 }
 
-#[tokio::test]
-async fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
+#[test]
+fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
     // Every main agent gets the worker tools from the host (ADR-0050), so `claude`
     // assembles unchanged with or without the `delegation` feature.
-    let (code, stdout, stderr) = show_env("claude").await;
+    let (code, stdout, stderr) = show_env("claude");
     assert_eq!(code, 0, "claude: {stderr}");
     let resolved: serde_json::Value = common::env_show_json(&stdout);
     assert_eq!(resolved["environment"], "claude");
@@ -334,8 +342,8 @@ async fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged(
 /// ADR-0074: the second Claude subscription is the first route on another account.
 /// Everything but the id, the origin and the credential reference is the same data,
 /// and `environments/claude2` is `environments/claude` with only the route changed.
-#[tokio::test]
-async fn the_second_claude_route_is_the_first_on_its_own_account() {
+#[test]
+fn the_second_claude_route_is_the_first_on_its_own_account() {
     let dirs = environment_dirs();
     let first = load_route_by_id(&dirs, "anthropic-subscription").expect("the first route");
     let second = load_route_by_id(&dirs, "anthropic-subscription-2").expect("the second route");
@@ -374,7 +382,7 @@ async fn the_second_claude_route_is_the_first_on_its_own_account() {
         read("environments/claude/prompt.md")
     );
 
-    let (code, stdout, stderr) = show_env("claude2").await;
+    let (code, stdout, stderr) = show_env("claude2");
     assert_eq!(code, 0, "claude2: {stderr}");
     let resolved: serde_json::Value = common::env_show_json(&stdout);
     assert_eq!(resolved["environment"], "claude2");

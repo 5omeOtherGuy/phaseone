@@ -2,12 +2,6 @@
 //! profile, `p1-host` resolves the model policy from `profiles/<id>.toml`, and each
 //! catalog key accepts exactly one form. Assembling touches no network and no
 //! credential: a provider is constructed lazily.
-//!
-//! notice: crates/p1-host/tests/profile_selection.rs (S1): S3.8 makes `shell` and `finish`
-//! the components `p1/shell` and `p1/finish`, and every shipped environment names both, so
-//! assembling one now happens inside a Tokio runtime (a component executor runs there —
-//! the whole host always is). The two cases that assembled a shipped environment in a
-//! plain `#[test]` run inside one now; every assertion is unchanged.
 
 mod common;
 
@@ -72,12 +66,16 @@ fn assemble_shipped(name: &str) -> Assembled {
     let catalog = catalog(&harness);
     let environment = load_environment(name, &harness.deps.environment_dirs).unwrap();
     let workspace = tempdir().unwrap();
-    assemble(
-        &catalog,
-        &environment,
-        workspace.path(),
-        &substitutions(workspace.path()),
-    )
+    // The `read` key is the release's `p1/read` host entry (S1.8.1), and a module tool is built
+    // inside a Tokio runtime, which runs its executor.
+    common::on_runtime(|| {
+        assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &substitutions(workspace.path()),
+        )
+    })
     .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
 }
 
@@ -90,8 +88,8 @@ fn origin(route: &str, model: &str) -> Origin {
 
 // ------------------------------------------------------ the shipped environments
 
-#[tokio::test]
-async fn the_shipped_deepseek_environment_selects_its_route_and_profile() {
+#[test]
+fn the_shipped_deepseek_environment_selects_its_route_and_profile() {
     let assembled = assemble_shipped("deepseek");
     assert_eq!(assembled.resolved.family, "deepseek");
     // Byte-for-byte what the pre-split host recorded.
@@ -104,8 +102,8 @@ async fn the_shipped_deepseek_environment_selects_its_route_and_profile() {
     );
 }
 
-#[tokio::test]
-async fn the_shipped_glm_environment_selects_its_route_and_profile() {
+#[test]
+fn the_shipped_glm_environment_selects_its_route_and_profile() {
     let assembled = assemble_shipped("glm");
     assert_eq!(assembled.resolved.family, "glm");
     assert_eq!(

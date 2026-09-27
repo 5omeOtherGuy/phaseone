@@ -28,7 +28,8 @@ use p1_contracts::{
 use p1_core::{Agent, AgentParts};
 use p1_host::catalog::modules::{ModuleServices, load_locked_modules, register_modules};
 use p1_host::workflow::{
-    MemberScopes, WORKER_MODULES, WORKFLOW_MODULES, member_services, worker_member_services,
+    MemberScopes, WORKER_MODULES, WORKFLOW_MODULES, load_member_entries, member_entries,
+    member_services, worker_member_services,
 };
 use p1_module_runtime::delegation::{WorkerServices, WorkflowServices};
 use p1_module_runtime::{
@@ -900,6 +901,41 @@ fn host_release() -> Release {
     release
 }
 
+/// A release of the eight built members as p1's release ships them, without the package
+/// `missing`, and with the bytes of `swapped` replaced by another member's, so its manifest
+/// digest no longer verifies.
+fn member_release(missing: Option<&str>, swapped: Option<&str>) -> Release {
+    let mut release = Release::empty();
+    for (index, (package, name, _)) in MEMBERS.iter().enumerate() {
+        if missing == Some(*name) {
+            continue;
+        }
+        let manifest: Value =
+            serde_json::from_str(&package_file(package, ".manifest.json")).expect("JSON");
+        let source = if swapped == Some(*name) {
+            MEMBERS[(index + 1) % MEMBERS.len()].0
+        } else {
+            package
+        };
+        let bytes = std::fs::read(built().join(source).join(format!("{source}.wasm")))
+            .expect("the built component");
+        release.add(
+            json!({
+                "name": manifest["name"],
+                "digest": manifest["digest"],
+                "path": format!("packages/{package}/{package}.wasm"),
+                "kind": manifest["kind"],
+                "world": manifest["world"],
+                "protocol": manifest["protocol"],
+                "capabilities": manifest["capabilities"],
+                "variant": manifest["variant"],
+            }),
+            &bytes,
+        );
+    }
+    release
+}
+
 /// The `modules.lock` a release of the members is selected by: each member under its
 /// documented key (the module id without `p1/`), pinning what the release ships.
 fn host_lock(release: &Release) -> ModulesLock {
@@ -1465,4 +1501,51 @@ async fn teardown_retires_the_generation_and_a_running_child_still_completes_and
         );
     })
     .await;
+}
+
+/// S6.11 (D083b): the eight members are host entries loaded from the release manifest. A
+/// release that ships them all loads each; a release missing any one of them, or shipping the
+/// first, a middle or the last one with bytes that do not verify against its digest, fails
+/// the load, and the error names that package. (The members before a wrong digest are
+/// compiled first, so the digest cases are three positions, not all eight.)
+#[test]
+fn a_release_missing_a_member_or_with_a_wrong_digest_fails_naming_it() {
+    let mut expected: Vec<&str> = MEMBERS.iter().map(|(_, name, _)| *name).collect();
+    expected.sort();
+    let mut listed = member_entries();
+    listed.sort();
+    assert_eq!(listed, expected, "the host entries are the eight members");
+
+    let release = member_release(None, None);
+    let entries = load_member_entries(&release.manifest_file()).expect("a whole release");
+    let mut loaded: Vec<&str> = entries.keys().copied().collect();
+    loaded.sort();
+    assert_eq!(loaded, expected);
+    for (name, module) in &entries {
+        assert_eq!(module.name(), *name);
+    }
+
+    let order = member_entries();
+    let wrong = [order[0], order[order.len() / 2], order[order.len() - 1]];
+    let cases = MEMBERS
+        .iter()
+        .map(|(_, name, _)| ("missing", *name, member_release(Some(name), None)))
+        .chain(
+            wrong
+                .iter()
+                .map(|name| ("wrong digest", *name, member_release(None, Some(name)))),
+        );
+    for (case, name, release) in cases {
+        let error = match load_member_entries(&release.manifest_file()) {
+            Ok(_) => panic!("{case} {name}: the release loads"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains(&format!("host entry {name} ")),
+            "{case} {name}: {error}"
+        );
+        if case == "wrong digest" {
+            assert!(error.contains("failed verification"), "{name}: {error}");
+        }
+    }
 }

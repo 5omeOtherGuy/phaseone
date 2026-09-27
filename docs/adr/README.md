@@ -98,9 +98,11 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0082 | [Component ABI and execution ownership](0082-component-abi-and-execution-ownership.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0083 | [Privileged process and completion capabilities](0083-privileged-process-and-completion-capabilities.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0084 | [Reloadable policies](0084-reloadable-policies.md) | accepted | 2026-09-26 | owner+lead |
-| ADR-0085 | [Runtime delegation and workflow modules](0085-runtime-delegation-and-workflow-modules.md) | proposed | 2026-09-26 | owner+lead |
+| ADR-0085 | [Runtime delegation and workflow modules](0085-runtime-delegation-and-workflow-modules.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0086 | [Provider components with native authenticated transport](0086-provider-components-with-native-authenticated-transport.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0087 | [Module identity and verified loading](0087-module-identity-and-verified-loading.md) | proposed | 2026-09-26 | lead |
+| ADR-0088 | [Workspace capabilities across components](0088-workspace-capabilities-across-components.md) | proposed | 2026-09-26 | owner+lead |
+| ADR-0089 | [Cleartext chat endpoints on loopback hosts only](0089-cleartext-chat-endpoints-on-loopback-hosts-only.md) | proposed | 2026-09-26 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

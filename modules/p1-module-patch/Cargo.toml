@@ -1,0 +1,38 @@
+[package]
+name = "p1-module-patch"
+description = "The p1/patch tool component: V4A patches confined to the workspace, over the workspace capabilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-tool = { path = "../p1-bindings-tool" }
+# The shared guest logic (S0-R3): the native p1-tool-patch runs the same code.
+p1-tool-patch-logic = { path = "../../crates/p1-tool-patch/logic" }
+
+# The frozen package manifest (docs/design/modules/package.md). `scripts/build-modules.sh`
+# reads these fields, checks them and copies them into the built module's manifest.
+[package.metadata.p1-module]
+name = "p1/patch"
+kind = "tool"
+world = "p1:module/tool@1.0.0"
+protocol = "1.0"
+# No `snapshot`: the patch exemption (ADR-0025) means the component checks no observation
+# and records none — the host records every file a patch-authorized change writes in the
+# agent's observations itself (ADR-0088 point 4, docs/design/modules/workspace-mutation.md,
+# "patch links no snapshot"). The exemption itself is granted by the host catalog
+# assembling the mutation patch-authorized, never by this manifest.
+capabilities = ["control", "workspace", "workspace-mutation"]
+# The loader builds the `ToolIdentity` from this field (package.md). The component's face is
+# the native default one (`logic::NAME`, freeform with the V4A grammar, GPT family), so the
+# module carries the variant the native `PatchTool::new` defaults to rather than the fixture's
+# placeholder `default`, as `p1-module-write` does; U-patch.2 pins it when the loader builds
+# the identity.
+variant = "gpt"

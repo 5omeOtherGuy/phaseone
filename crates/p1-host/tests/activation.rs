@@ -1,13 +1,15 @@
 //! S3.8 (ADR-0083, D083b): the host assembles `shell` and `finish` BY NAME as the
 //! components `p1/shell` (`modules/p1-module-shell/`) and `p1/finish`
 //! (`modules/p1-module-finish/`). Each is an official-release HOST ENTRY: it loads its
-//! package from the release manifest through the loader, with no `modules.lock` entry, so
-//! what the model sees is the package's own name, description and variant — the sandbox
-//! paragraph and the `+sandbox` variant stay the host's (`tests/sandbox.rs`).
+//! package from the release manifest through the shared host-entry step, with no
+//! `modules.lock` entry, so what the model sees is the package's own name, description and
+//! variant — the sandbox paragraph and the `+sandbox` variant stay the host's
+//! (`tests/sandbox.rs`).
 //!
 //! A granted import without its service fails assembly (`MissingService`), never runs
 //! unlinked, and a release that does not carry the package fails naming the module: there
-//! is no native fallback left to fall back to.
+//! is no native fallback left to fall back to. Those two cases drive the loading step the
+//! host entries share and live with it (`catalog/tools.rs`, `catalog/modules.rs`).
 //!
 //! The cases need the packages `scripts/build-modules.sh` publishes; a missing artifact
 //! (or a missing release manifest) fails with the loader's own message, never a skip.
@@ -18,8 +20,6 @@ use std::sync::Arc;
 
 use common::{Harness, isolated_environment, provider_hook, run_args, write_environment};
 use p1_contracts::Tool;
-use p1_module_runtime::{ExecutionLimits, LinkError, Services, ToolError, wasm_tool};
-use p1_redact::MaskCounter;
 use p1_testkit::{ScriptedProvider, text_response};
 use tempfile::tempdir;
 
@@ -108,40 +108,12 @@ async fn the_shell_and_finish_assemble_as_their_packages() {
     }
 }
 
-/// (b) A package is linked with exactly the services its manifest grants: the shell
-/// imports `process`, so assembling it without the host's process service is a
-/// `MissingService`, never a component that runs unlinked. The completion half of the same
-/// rule is `crates/p1-module-tests/tests/finish_boundary.rs`.
-#[tokio::test]
-async fn a_granted_service_that_is_absent_fails_assembly() {
-    let module = p1_host::catalog::modules::load_release_module("p1/shell")
-        .expect("the shell package loads from the release");
-    assert_eq!(module.identity().implementation, "p1/shell");
-    match wasm_tool(
-        &module,
-        Services::default(),
-        ExecutionLimits::default(),
-        &Arc::new(MaskCounter::new()),
-    ) {
-        Err(ToolError::Link {
-            source: LinkError::MissingService(capability),
-            ..
-        }) => assert_eq!(capability, "process"),
-        Err(other) => panic!("wrong error: {other}"),
-        Ok(_) => panic!("the shell must not link without a process service"),
-    }
-}
-
-/// (b, second half) No native fallback: a name the release does not carry is an error that
-/// names the module, in the loader's own words.
-#[test]
-fn a_package_the_release_does_not_carry_fails_naming_the_module() {
-    let error = match p1_host::catalog::modules::load_release_module("p1/absent") {
-        Err(error) => error,
-        Ok(_) => panic!("a release that does not carry the package must refuse"),
-    };
-    assert!(
-        error.contains("p1/absent"),
-        "the error names the module: {error}"
-    );
-}
+// (b) A package is linked with exactly the services its manifest grants: the shell's package
+// imports `process`, so linking it without the host's process service is a `MissingService`,
+// never a component that runs unlinked; and a name the release does not carry is refused naming
+// it. Both cases drive the loading step the host entries share — the shared host-entry step
+// `catalog::modules` runs for `shell` and `finish` (D-XO-49) — so they live beside the release
+// fixtures they need: `catalog/modules.rs`'s
+// `a_package_the_release_does_not_carry_fails_naming_the_key` and `catalog/tools.rs`'s
+// `a_shell_service_that_is_absent_fails_assembly`. The completion half of the same rule is
+// `crates/p1-module-tests/tests/finish_boundary.rs`.
