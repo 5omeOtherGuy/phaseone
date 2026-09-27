@@ -356,9 +356,16 @@ impl WorkspaceService for SearchCapability {
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
-            file_walk::read_window_excluding(workspace, &path, offset, length, &|candidate| {
-                credential_policy.refuses(candidate)
-            })
+            file_walk::read_window_excluding(
+                workspace,
+                &path,
+                offset,
+                length,
+                &|candidate, file| {
+                    CredentialPolicy::new(home.as_deref(), &xdg_credentials)
+                        .refuses_opened(candidate, file)
+                },
+            )
         })
     }
 
@@ -386,9 +393,16 @@ impl WorkspaceService for SearchCapability {
         let xdg_credentials = self.xdg_credentials.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            file_walk::search_excluding(workspace, &query, cancel, |candidate| {
-                credential_policy.refuses(candidate)
-            })
+            file_walk::search_excluding_opened(
+                workspace,
+                &query,
+                cancel,
+                |candidate| credential_policy.refuses(candidate),
+                |candidate, file| {
+                    CredentialPolicy::new(home.as_deref(), &xdg_credentials)
+                        .refuses_opened(candidate, file)
+                },
+            )
         })
     }
 }
@@ -1072,6 +1086,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["notes.txt"],
             "content search must neither match nor list credential files"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_refuses_hard_link_to_credential() {
+        let home = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "hard-link-marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("notes.txt")).unwrap();
+        let capability = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().to_path_buf()),
+        );
+        assert_eq!(
+            capability.read("notes.txt".into(), 0, 64).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("notes.txt")))
+        );
+        assert!(
+            capability
+                .search(SearchQuery {
+                    pattern: "hard-link-marker".into(),
+                    path: None,
+                    glob: None,
+                    case_insensitive: false,
+                    context: 0,
+                    max_lines: 10,
+                })
+                .await
+                .unwrap()
+                .files
+                .is_empty()
         );
     }
 

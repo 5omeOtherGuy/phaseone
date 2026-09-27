@@ -87,6 +87,32 @@ impl CredentialPolicy {
                 .is_some_and(|keys| candidate == *keys || candidate.starts_with(keys))
     }
 
+    /// Check the object already opened, including hard links to exact credential files.
+    /// Directory targets remain path-prefix checks; file identities are checked from the
+    /// opened descriptor rather than a second lookup of the candidate spelling.
+    pub fn refuses_opened(&self, candidate: &Path, file: &std::fs::File) -> bool {
+        if self.refuses(candidate) {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Ok(opened) = file.metadata() else {
+                return true;
+            };
+            self.exact_paths.iter().any(|target| {
+                std::fs::metadata(target).is_ok_and(|credential| {
+                    credential.dev() == opened.dev() && credential.ino() == opened.ino()
+                })
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            false
+        }
+    }
+
     /// The credential refusal for a request, before workspace confinement.
     pub fn refuse(&self, workspace: &Workspace, requested: &str) -> Result<(), String> {
         let candidate = if Path::new(requested).is_absolute() {
