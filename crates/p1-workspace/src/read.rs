@@ -9,8 +9,12 @@
 //! The mutation side ([`crate::WriteGate`], [`crate::Mutation`],
 //! [`crate::write_atomic`]) stays where it is; nothing here writes.
 
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+
+use rustix::fs::{CWD, Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::observe::{ObservedFiles, hash_of};
 use crate::{Workspace, WorkspaceError};
@@ -141,6 +145,64 @@ impl Workspace {
         Ok(CheckedPath { path, display })
     }
 
+    /// Open the regular file named by `requested` from the workspace root without
+    /// following links, then verify the opened handle's type. NONBLOCK ensures a
+    /// swapped FIFO cannot park a host thread between path validation and open.
+    pub fn open_file(&self, requested: &str) -> Result<File, WorkspaceError> {
+        let path = self.resolve(requested)?;
+        let relative =
+            path.strip_prefix(&self.root)
+                .map_err(|_| WorkspaceError::OutsideWorkspace {
+                    requested: requested.to_string(),
+                })?;
+        let mut directory = rustix::fs::openat(
+            CWD,
+            &self.root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| io_at(&path, error))?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(WorkspaceError::NotADirectory(path));
+            };
+            if components.peek().is_some() {
+                directory = rustix::fs::openat(
+                    &directory,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| io_at(&path, error))?;
+            } else {
+                let fd = rustix::fs::openat(
+                    &directory,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| match error {
+                    Errno::LOOP | Errno::NOTDIR => WorkspaceError::NotADirectory(path.clone()),
+                    other => io_at(&path, other),
+                })?;
+                let file = File::from(fd);
+                if !file
+                    .metadata()
+                    .map_err(|error| WorkspaceError::Io {
+                        path: path.clone(),
+                        source: error,
+                    })?
+                    .is_file()
+                {
+                    return Err(WorkspaceError::NotADirectory(path));
+                }
+                return Ok(file);
+            }
+        }
+        Err(WorkspaceError::NotADirectory(path))
+    }
+
     /// The kind and size in bytes of `requested`.
     ///
     /// The leaf is looked at as itself (not followed) — see [`FileKind::Symlink`].
@@ -224,7 +286,13 @@ impl Workspace {
         if metadata.is_dir() {
             return Err(WorkspaceError::NotADirectory(path));
         }
-        let bytes = std::fs::read(&path).map_err(|error| missing_or_io(requested, &path, error))?;
+        let mut file = self.open_file(requested).map_err(|error| match error {
+            WorkspaceError::Io { path, source } => missing_or_io(requested, &path, source),
+            other => other,
+        })?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)
+            .map_err(|error| missing_or_io(requested, &path, error))?;
 
         // `record` stores `hash_of(contents)`: computing the same value here with
         // the same function makes the snapshot's hash and the stored observation
@@ -255,6 +323,42 @@ fn kind_of(file_type: std::fs::FileType) -> FileKind {
 
 /// A filesystem failure on `requested`. A missing path is its own variant, so a
 /// host import can tell "absent" from "unreadable" without parsing a message.
+fn io_at(path: &Path, error: Errno) -> WorkspaceError {
+    WorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: error.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ObservedFiles;
+    use rustix::fs::{CWD, Mode};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn reading_fifo_returns_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("pipe");
+        rustix::fs::mkfifoat(CWD, &fifo, Mode::from_raw_mode(0o600)).unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = workspace.read("pipe", &ObservedFiles::new());
+            sender
+                .send(matches!(result, Err(WorkspaceError::NotADirectory(_))))
+                .unwrap();
+        });
+
+        assert!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "reading a FIFO should return the existing wrong-kind error"
+        );
+    }
+}
+
 fn missing_or_io(requested: &str, path: &Path, source: std::io::Error) -> WorkspaceError {
     if source.kind() == std::io::ErrorKind::NotFound {
         WorkspaceError::NotFound {
