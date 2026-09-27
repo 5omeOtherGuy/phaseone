@@ -32,8 +32,42 @@ impl Workspace {
     /// ancestor is canonicalized and must be inside the root.
     pub fn resolve(&self, requested: &str) -> Result<PathBuf, WorkspaceError>;
     pub fn display(&self, path: &Path) -> String;                         // root-relative, `/` separators
+
+    /// Read side of the `workspace` capability: the thinnest native surface the
+    /// `workspace`/`snapshot` host imports call. `stat`/`list` look at the leaf
+    /// WITHOUT following it, so a symlink is reported as a symlink.
+    pub fn check_path(&self, requested: &str) -> Result<CheckedPath, WorkspaceError>;
+    pub fn stat(&self, requested: &str) -> Result<Stat, WorkspaceError>;
+    pub fn list(&self, requested: &str) -> Result<Vec<DirEntry>, WorkspaceError>;
+    /// Read the whole file once, record the observation in `observed` and return an
+    /// immutable snapshot of exactly those bytes (the mutation side stays elsewhere).
+    pub fn read(&self, requested: &str, observed: &ObservedFiles) -> Result<Snapshot, WorkspaceError>;
 }
-pub enum WorkspaceError { NotADirectory(..), OutsideWorkspace{requested}, Io{..} }
+pub enum WorkspaceError {
+    NotADirectory(PathBuf),        // `new`/`list` target, or a `read` of a directory, is not a directory
+    NotFound{requested},           // resolves inside the root but does not exist
+    OutsideWorkspace{requested},   // `..`, absolute, or symlink escape
+    Io{path, source},
+}
+
+/// A confined path plus its root-relative display form (from `check_path`).
+pub struct CheckedPath;
+impl CheckedPath {
+    pub fn path(&self) -> &Path;    // inside the root after symlink resolution
+    pub fn display(&self) -> &str;
+}
+pub enum FileKind { File, Directory, Symlink, Other }
+pub struct Stat { pub kind: FileKind, pub size: u64 }
+pub struct DirEntry { pub name: String, pub kind: FileKind }             // name within its directory, never a path
+
+/// One file's bytes as `Workspace::read` found them. Immutable: a later write to the
+/// file changes the file, never the snapshot. The whole file is held in memory.
+pub struct Snapshot;
+impl Snapshot {
+    pub fn metadata(&self) -> SnapshotMetadata;                          // path, size, content hash
+    pub fn read(&self, offset: usize, len: usize) -> &[u8];              // byte range; past the end returns what exists
+}
+pub struct SnapshotMetadata { pub path: String, pub size: u64, pub content_hash: u64 }
 
 /// Atomic replace: write a sibling temp file, fsync, rename over the target; keeps the
 /// target's permission bits; creates missing parent directories.

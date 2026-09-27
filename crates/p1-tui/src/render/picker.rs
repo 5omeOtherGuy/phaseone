@@ -79,7 +79,9 @@ pub struct Picker {
 }
 
 /// The completion rows (handoff C01): the design's command set, in its order.
-const COMMANDS: [(&str, &str); 10] = [
+/// `/compact` (ADR-0076) came after the handoff and is appended, so the design's
+/// order stays as it was.
+const COMMANDS: [(&str, &str); 11] = [
     ("/model", "switch model or effort"),
     ("/effort", "set effort for this model"),
     ("/goal", "set the session objective"),
@@ -90,6 +92,7 @@ const COMMANDS: [(&str, &str); 10] = [
     ("/help", "commands and keys"),
     ("/models", "every model p1 can run"),
     ("/exit", "quit p1"),
+    ("/compact", "summarize the session now"),
 ];
 
 impl Picker {
@@ -417,6 +420,20 @@ mod tests {
         p.step_effort(1);
         assert_eq!(p.groups[0].rows[0].effort, 2);
         assert!(lines(&p, 60)[1].to_string().contains("effort ← high →"));
+    }
+
+    #[test]
+    fn the_command_menu_lists_compact() {
+        let mut p = Picker::commands();
+        let rows = &p.groups[0].rows;
+        assert!(
+            rows.iter().any(
+                |row| row.label == "/compact" && row.description == "summarize the session now"
+            )
+        );
+        p.filter = "/comp".into();
+        p.select_first();
+        assert_eq!(p.completion().as_deref(), Some("/compact"));
     }
 
     #[test]

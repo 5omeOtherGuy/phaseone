@@ -1,21 +1,20 @@
 //! The runtime bridges: how the agent core reaches the screen and how the
 //! screen answers back. `TuiSink` is the `EventSink` (observation only, never
 //! blocks — events go into an unbounded channel stamped with millisecond
-//! time). `TuiPolicy` is the `AuthorizationPolicy`: under full access (the
-//! default, ADR-0038) it permits everything without a whisper; under `--ask`
-//! it permits read-only calls and parks the rest on the screen until the
-//! operator decides or the turn is cancelled.
+//! time). `TuiPolicy` is the screen's asker: the host's ask bridge decides
+//! which calls ask (full access by default, ADR-0038; `--ask` opts in) and
+//! remembers `always` grants; `TuiPolicy` only parks the question on the
+//! screen until the operator answers or the turn is cancelled.
 //!
 //! Both live here (not in the host) so the host's `tui.rs` driver is thin
 //! wiring: it owns the terminal, the agent task, and the render tick.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use p1_contracts::{
-    AgentEvent, AuthorizationPolicy, AuthorizationRequest, BoxFuture, CancellationToken, Decision,
-    Effect, EventSink, ToolCall, ToolIdentity,
+    AgentEvent, AuthorizationRequest, BoxFuture, CancellationToken, Effect, EventSink, ToolCall,
+    ToolIdentity,
 };
 use tokio::sync::{mpsc, oneshot};
 // The sink's epoch is the RUNTIME's clock, not `std`'s: outside a paused
@@ -144,7 +143,19 @@ pub struct AuthRequest {
     pub call: ToolCall,
     pub identity: ToolIdentity,
     pub effect: Effect,
-    reply: oneshot::Sender<Decision>,
+    reply: oneshot::Sender<Answer>,
+}
+
+/// The operator's answer to a parked request (the host's bridge turns it into a
+/// decision and keeps the `Always` grants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Permit this call.
+    Yes,
+    /// Deny this call.
+    No,
+    /// Permit this call and remember the grant.
+    Always,
 }
 
 impl std::fmt::Debug for AuthRequest {
@@ -157,25 +168,21 @@ impl std::fmt::Debug for AuthRequest {
 }
 
 impl AuthRequest {
-    /// Answer the parked request. Dropping without an answer denies.
-    pub fn answer(self, decision: Decision) {
-        let _ = self.reply.send(decision);
+    /// Answer the parked request. Dropping without an answer is `No`.
+    pub fn answer(self, answer: Answer) {
+        let _ = self.reply.send(answer);
     }
 }
 
-/// The TUI's authorization policy. Grant scopes: `session` is remembered in
-/// memory; `project` is the same in-memory set for now — p1 has no trust store
-/// yet (flagged on issue #12; when one lands, `project` persists).
+/// The TUI's asker: parks each question on the screen. The rules (which calls
+/// ask, which grants are remembered) live in the host's ask bridge.
 pub struct TuiPolicy {
-    ask: bool,
     cancel: CancellationToken,
     /// The live turn's token, swapped by the driver at turn start/end: an
     /// approval parked when its turn is cancelled resolves CANCEL_DENY instead
     /// of waiting for a decision about a dead turn.
     turn: Mutex<Option<CancellationToken>>,
     tx: mpsc::UnboundedSender<AuthRequest>,
-    /// (tool name, identity) granted for the session.
-    granted: Mutex<HashSet<(String, ToolIdentity)>>,
 }
 
 /// The exact refusal when the operator answers `n` (matches the host's line
@@ -185,18 +192,13 @@ pub const USER_DENY: &str = "Denied by the user.";
 pub const CANCEL_DENY: &str = "Cancelled while awaiting authorization.";
 
 impl TuiPolicy {
-    pub fn new(
-        ask: bool,
-        cancel: CancellationToken,
-    ) -> (Self, mpsc::UnboundedReceiver<AuthRequest>) {
+    pub fn new(cancel: CancellationToken) -> (Self, mpsc::UnboundedReceiver<AuthRequest>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
-                ask,
                 cancel,
                 turn: Mutex::new(None),
                 tx,
-                granted: Mutex::new(HashSet::new()),
             },
             rx,
         )
@@ -207,28 +209,11 @@ impl TuiPolicy {
         *self.turn.lock().unwrap() = token;
     }
 
-    /// The operator's `a` answer: remember the grant, then permit this call.
-    pub fn grant_session(&self, call: &ToolCall, identity: &ToolIdentity) {
-        self.granted
-            .lock()
-            .unwrap()
-            .insert((call.name.clone(), identity.clone()));
-    }
-}
-
-impl AuthorizationPolicy for TuiPolicy {
-    fn authorize<'a>(&'a self, request: AuthorizationRequest<'a>) -> BoxFuture<'a, Decision> {
+    /// Park `request` on the screen and wait for the operator. `None` when the
+    /// turn is cancelled first or the UI is gone (CANCEL_DENY): nothing may run
+    /// unanswered. A dropped request is `No`.
+    pub fn ask<'a>(&'a self, request: AuthorizationRequest<'a>) -> BoxFuture<'a, Option<Answer>> {
         Box::pin(async move {
-            if !self.ask {
-                return Decision::Permit;
-            }
-            if request.effect == Effect::ReadOnly {
-                return Decision::Permit;
-            }
-            let key = (request.call.name.clone(), request.identity.clone());
-            if self.granted.lock().unwrap().contains(&key) {
-                return Decision::Permit;
-            }
             let (reply, answer) = oneshot::channel();
             let parked = AuthRequest {
                 call: request.call.clone(),
@@ -238,9 +223,7 @@ impl AuthorizationPolicy for TuiPolicy {
             };
             if self.tx.send(parked).is_err() {
                 // The UI is gone: nothing may run unanswered.
-                return Decision::Deny {
-                    reason: CANCEL_DENY.to_string(),
-                };
+                return None;
             }
             let turn = self.turn.lock().unwrap().clone();
             let turn_cancelled = async move {
@@ -251,9 +234,9 @@ impl AuthorizationPolicy for TuiPolicy {
             };
             tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => Decision::Deny { reason: CANCEL_DENY.to_string() },
-                _ = turn_cancelled => Decision::Deny { reason: CANCEL_DENY.to_string() },
-                answer = answer => answer.unwrap_or(Decision::Deny { reason: USER_DENY.to_string() }),
+                _ = self.cancel.cancelled() => None,
+                _ = turn_cancelled => None,
+                answer = answer => Some(answer.unwrap_or(Answer::No)),
             }
         })
     }
@@ -304,49 +287,55 @@ mod tests {
         )
     }
 
+    // The rules moved to the host's ask bridge (issue #308): full access never
+    // parking and `always` grants skipping the prompt are the bridge's cases now
+    // (`p1-host`'s `policy` and `tui` tests). `TuiPolicy` only asks.
+
     #[tokio::test]
-    async fn full_access_never_parks() {
-        let (policy, mut rx) = TuiPolicy::new(false, CancellationToken::new());
+    async fn a_gone_screen_is_no_answer() {
+        let (policy, rx) = TuiPolicy::new(CancellationToken::new());
+        drop(rx);
         let (call, identity) = request();
-        let decision = policy
-            .authorize(AuthorizationRequest {
+        let answer = policy
+            .ask(AuthorizationRequest {
                 call: &call,
                 identity: &identity,
                 effect: Effect::Executes,
             })
             .await;
-        assert_eq!(decision, Decision::Permit);
-        assert!(rx.try_recv().is_err(), "no request reached the screen");
+        assert_eq!(answer, None, "nothing may run unanswered");
     }
 
     #[tokio::test]
     async fn ask_parks_and_the_screen_answers() {
-        let (policy, mut rx) = TuiPolicy::new(true, CancellationToken::new());
-        let (call, identity) = request();
-        let pending = tokio::spawn({
-            let (call, identity) = (call.clone(), identity.clone());
-            async move {
-                policy
-                    .authorize(AuthorizationRequest {
-                        call: &call,
-                        identity: &identity,
-                        effect: Effect::WritesFiles,
-                    })
-                    .await
-            }
-        });
-        let parked = rx.recv().await.expect("the request parked");
-        parked.answer(Decision::Permit);
-        assert_eq!(pending.await.unwrap(), Decision::Permit);
+        for reply in [Answer::Yes, Answer::No, Answer::Always] {
+            let (policy, mut rx) = TuiPolicy::new(CancellationToken::new());
+            let (call, identity) = request();
+            let pending = tokio::spawn({
+                let (call, identity) = (call.clone(), identity.clone());
+                async move {
+                    policy
+                        .ask(AuthorizationRequest {
+                            call: &call,
+                            identity: &identity,
+                            effect: Effect::WritesFiles,
+                        })
+                        .await
+                }
+            });
+            let parked = rx.recv().await.expect("the request parked");
+            parked.answer(reply);
+            assert_eq!(pending.await.unwrap(), Some(reply));
+        }
     }
 
     #[tokio::test]
     async fn a_dropped_answer_denies() {
-        let (policy, mut rx) = TuiPolicy::new(true, CancellationToken::new());
+        let (policy, mut rx) = TuiPolicy::new(CancellationToken::new());
         let (call, identity) = request();
         let pending = tokio::spawn(async move {
             policy
-                .authorize(AuthorizationRequest {
+                .ask(AuthorizationRequest {
                     call: &call,
                     identity: &identity,
                     effect: Effect::WritesFiles,
@@ -355,28 +344,27 @@ mod tests {
         });
         let parked = rx.recv().await.unwrap();
         drop(parked);
-        assert_eq!(
-            pending.await.unwrap(),
-            Decision::Deny {
-                reason: USER_DENY.into()
-            }
-        );
+        assert_eq!(pending.await.unwrap(), Some(Answer::No));
     }
 
     #[tokio::test]
-    async fn session_grants_skip_the_prompt() {
-        let (policy, mut rx) = TuiPolicy::new(true, CancellationToken::new());
+    async fn a_cancelled_turn_resolves_the_parked_ask() {
+        let (policy, mut rx) = TuiPolicy::new(CancellationToken::new());
+        let turn = CancellationToken::new();
+        policy.set_turn(Some(turn.clone()));
         let (call, identity) = request();
-        policy.grant_session(&call, &identity);
-        let decision = policy
-            .authorize(AuthorizationRequest {
-                call: &call,
-                identity: &identity,
-                effect: Effect::WritesFiles,
-            })
-            .await;
-        assert_eq!(decision, Decision::Permit);
-        assert!(rx.try_recv().is_err());
+        let pending = tokio::spawn(async move {
+            policy
+                .ask(AuthorizationRequest {
+                    call: &call,
+                    identity: &identity,
+                    effect: Effect::Executes,
+                })
+                .await
+        });
+        let _parked = rx.recv().await.expect("the request parked");
+        turn.cancel();
+        assert_eq!(pending.await.unwrap(), None);
     }
 
     #[test]

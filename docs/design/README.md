@@ -1,5 +1,25 @@
 # Design notes
 
+This directory holds the design notes for p1: the seams between the agent core and
+its modules — providers, tools, context and completion policies, assembly, the
+journal, delegation, workflows — and the WebAssembly module boundary the migration
+builds against (ADR-0071).
+
+Current architecture (2026-09-26): `p1-core` is the agent loop and depends only on
+`p1-contracts`; the host (`p1-host`) is the single composition root and holds the
+wasmtime runtime, the loader and the per-contract adapters (ADR-0081). Every tool,
+provider, context policy and authorization policy has a WebAssembly component
+package under `modules/`; the host instantiates a component only when the
+environment file or the release's host entries name it (ADR-0071). Today the
+policies, the worker/workflow members and the five file tools (`read`, `edit`,
+`write`, `apply_patch`, `grep` — S7.10-R1, ADR-0095) load as host entries, while
+the providers and the remaining keys run native unless a `modules.lock` selects a
+component (crates/p1-host/src/catalog/tools.rs).
+Enforcement, transport, interpreters and OS services stay native: the sandbox
+boundary, the provider transport broker, the workflow interpreter, workspace
+confinement, credentials, the journal and the terminal UI (ADR-0081). The boundary
+is frozen at `wasm-boundary-v1`; `docs/design/modules/README.md` publishes it.
+
 The baseline for the first slice:
 
 | File | What |
