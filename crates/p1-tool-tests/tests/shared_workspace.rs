@@ -18,7 +18,7 @@ use p1_tool_patch::PatchTool;
 use p1_tool_read::ReadTool;
 use p1_tool_write::WriteTool;
 use p1_workspace::{
-    MutationError, MutationPolicy, Observation, ObservedFiles, Workspace, WriteGate,
+    MutationError, MutationPolicy, Observation, ObservedFiles, ReadRecord, Workspace, WriteGate,
 };
 
 /// One agent's file tools: its own observations, the shared gate.
@@ -231,16 +231,20 @@ async fn a_parent_and_a_worker_share_the_gate_through_the_owned_api_and_keep_sep
         .unwrap()
         .with_write_gate(gate.clone());
     let (parent_observed, worker_observed) = (ObservedFiles::new(), ObservedFiles::new());
+    // One read record per agent, as each agent's tool services carry one: these cases read
+    // through the workspace API alone, so no target of theirs carries a read identity.
+    let (parent_reads, worker_reads) = (ReadRecord::new(), ReadRecord::new());
     let worker_edit = EditTool::new(worker.clone(), worker_observed.clone());
     parent.read("notes.txt", &parent_observed).unwrap();
     worker.read("notes.txt", &worker_observed).unwrap();
 
     // The parent's module holds the gate…
     let parent_mutation = parent
-        .begin_owned(&parent_observed, MutationPolicy::Observed)
+        .begin_owned(&parent_observed, &parent_reads, MutationPolicy::Observed)
         .await;
     // …so the worker's module queues behind it, and so does the worker's native edit.
-    let mut worker_begin = Box::pin(worker.begin_owned(&worker_observed, MutationPolicy::Observed));
+    let mut worker_begin =
+        Box::pin(worker.begin_owned(&worker_observed, &worker_reads, MutationPolicy::Observed));
     let mut context = Context::from_waker(Waker::noop());
     assert!(matches!(
         worker_begin.as_mut().poll(&mut context),
@@ -286,7 +290,7 @@ async fn a_parent_and_a_worker_share_the_gate_through_the_owned_api_and_keep_sep
 
     // The worker's file is the worker's observation; the parent must read it first.
     let parent_mutation = parent
-        .begin_owned(&parent_observed, MutationPolicy::Observed)
+        .begin_owned(&parent_observed, &parent_reads, MutationPolicy::Observed)
         .await;
     assert_eq!(
         parent_mutation.write("from-worker.txt", "overwritten\n"),

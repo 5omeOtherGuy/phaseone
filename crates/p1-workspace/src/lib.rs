@@ -11,6 +11,7 @@ mod gate;
 mod observe;
 mod path;
 mod read;
+mod reads;
 mod text;
 
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ pub use gate::{Mutation, WriteGate};
 pub use observe::{Observation, ObservedFiles, StreamingHash};
 pub use p1_contracts::tool::ToolFace;
 pub use read::{CheckedPath, DirEntry, FileKind, Snapshot, SnapshotMetadata, Stat};
+pub use reads::ReadRecord;
 pub use text::{bound_output, write_atomic};
 
 /// Why a workspace path could not be used.
