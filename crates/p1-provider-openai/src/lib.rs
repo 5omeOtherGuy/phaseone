@@ -50,8 +50,9 @@ pub use replay::{REPLAY_VERSION, Replay, decode, encode};
 #[cfg(feature = "native")]
 pub use request::build_headers;
 pub use request::{
-    LoweredRequest, build_headers_without_credential, build_request, lower_request, request_path,
-    resolve_base_url, validate_composition, validate_history, validate_request,
+    LoweredRequest, build_headers_without_credential, build_request,
+    build_ws_headers_without_credential, clamped_cache_key, lower_request, request_path,
+    resolve_base_url, validate_composition, validate_history, validate_request, ws_frame,
 };
 
 /// The `origin_route` of the shipped `routes/openai-codex-subscription.toml`, byte for

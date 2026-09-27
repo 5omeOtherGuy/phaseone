@@ -45,6 +45,7 @@
 //! provider shows the model; a schema- or grammar-borne credential is named as out of scope
 //! in the slice's PR.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -86,15 +87,23 @@ pub struct Redaction {
 /// Mask every credential-shaped string in `text`. A text with no match is returned
 /// unchanged (`masked == 0`).
 pub fn redact(text: &str) -> Redaction {
+    let (replaced, masked) = redact_in_place(text);
+    Redaction {
+        text: replaced.into_owned(),
+        masked,
+    }
+}
+
+/// [`redact`] without the copy of a clean text: one scan, and the text is borrowed back
+/// unless a value was replaced. A tool outcome can be a whole history (tens of MiB), almost
+/// always clean, and copying it only to drop the copy was most of the wrapper's cost.
+fn redact_in_place(text: &str) -> (Cow<'_, str>, usize) {
     let mut masked = 0usize;
     let replaced = patterns().replace_all(text, |captures: &Captures| {
         masked += 1;
         marker(captures)
     });
-    Redaction {
-        text: replaced.into_owned(),
-        masked,
-    }
+    (replaced, masked)
 }
 
 /// The `<redacted:family:N chars>` marker for one match. `N` is the length of the
@@ -291,14 +300,14 @@ impl Tool for RedactingTool {
     ) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
             let outcome = self.inner.execute(call, context).await;
-            let redaction = redact(&outcome.content);
-            if redaction.masked == 0 {
+            let (text, masked) = redact_in_place(&outcome.content);
+            let Cow::Owned(content) = text else {
                 return outcome;
-            }
-            self.counter.add(redaction.masked);
+            };
+            self.counter.add(masked);
             ToolOutcome {
                 status: outcome.status,
-                content: redaction.text,
+                content,
             }
         })
     }

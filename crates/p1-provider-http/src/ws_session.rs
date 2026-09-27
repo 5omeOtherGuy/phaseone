@@ -2,9 +2,8 @@
 //! (ADR-0078 §1, `docs/design/modules/wit.md` "WebSocket: who decides what").
 //!
 //! One [`WsSession`] per provider instance owns that instance's ONE connection behind
-//! an async mutex (`docs/design/websocket.md` §4). A request leases it without
-//! waiting ([`WsSession::try_lease`]; a busy session means the request uses HTTP,
-//! never a second socket and never a wait) and, through the [`WsLease`]:
+//! an async mutex (`docs/design/websocket.md` §4). A request leases it — never a second
+//! socket either way — and, through the [`WsLease`]:
 //!
 //! - reads the facts of WIT `websocket.connection-state` ([`WsLease::state`]): whether
 //!   a connection is open, the response id of the last response it completed
@@ -30,6 +29,14 @@
 //! Reuse follows §4: a connection is reported open only while it is younger than
 //! [`MAX_AGE`] and was last used less than [`MAX_IDLE`] ago, on an injected
 //! [`Clock`]; an older one is dropped when the state is read.
+//!
+//! Which lease a caller takes is the caller's rule, and the two callers differ:
+//! the native adapter takes [`WsSession::try_lease`], so a busy session sends that
+//! request over HTTP (§4 never waits), while the provider-component broker waits
+//! ([`WsSession::lease`]) because the frozen `websocket.connection-state` has no
+//! fact for a busy session: reported `open = true` on a socket another response is
+//! mid-read on would make the component send a frame and, worse, a handshake.
+//! A wait races the request's cancellation, so it ends as the request does.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -209,6 +216,21 @@ impl WsSession {
         }
     }
 
+    /// Lease the session for one request, waiting while another request holds it. The
+    /// provider-component broker waits here: the frozen `connection-state` has no fact for
+    /// "busy", and a lease is released as soon as its response's terminal event is queued.
+    pub async fn lease(&self) -> WsLease {
+        let slot = Arc::clone(&self.slot).lock_owned().await;
+        WsLease {
+            connector: Arc::clone(&self.connector),
+            clock: Arc::clone(&self.clock),
+            slot,
+            live: None,
+            reused: false,
+            failed_before_output: false,
+        }
+    }
+
     /// Lease the session for one request WITHOUT waiting. `None` means another
     /// request holds it, and §4 sends such a request over HTTP.
     pub fn try_lease(&self) -> Option<WsLease> {
@@ -366,6 +388,14 @@ impl WsLease {
     /// response, or a reconnect).
     pub fn drop_connection(&mut self) {
         self.live = None;
+    }
+
+    /// Drop every connection, the idle one in the session included: the
+    /// component instance that opened it is gone, and a connection must not
+    /// outlive it.
+    pub fn drop_session_connection(&mut self) {
+        self.live = None;
+        self.slot.live = None;
     }
 
     /// The attempt failed before any output and the caller allows it no further
@@ -556,6 +586,38 @@ mod tests {
             assert_eq!(error.message, PATH_REFUSED, "{path}");
         }
         assert!(handshake_for(authority, &head("/sub/path", Vec::new())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_session_connection_also_drops_the_idle_one() {
+        let connector = crate::testing::ScriptedWsConnector::new(vec![
+            crate::testing::ScriptedConnection::Accept(Vec::new()),
+        ]);
+        let session = WsSession::new(Arc::new(connector), Arc::new(Instant::now));
+        let credential = credential();
+        let authority = WsAuthority {
+            endpoint: "https://host.test/codex/responses",
+            credential: Some(&credential),
+        };
+        let cancel = CancellationToken::new();
+        let mut lease = session.lease().await;
+        let send = WsSend {
+            handshake: Some(head("", Vec::new())),
+            frame: "{}".to_string(),
+        };
+        lease.send(authority, send, &cancel).await.unwrap();
+        lease.completed(None);
+        drop(lease);
+
+        let mut lease = session.lease().await;
+        assert!(
+            lease.state().open,
+            "a completed response keeps the connection"
+        );
+        // The instance failed before this lease took the idle connection.
+        lease.drop_session_connection();
+        drop(lease);
+        assert!(!session.lease().await.state().open);
     }
 
     #[test]
