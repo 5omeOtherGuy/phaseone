@@ -2,11 +2,11 @@
 //!
 //! An unattended model ends its work by calling this tool. The tool does NOT take
 //! the model's word for it: it reads the session through the [`SessionActivity`]
-//! trait (implemented by the host from its event stream) and refuses `done` until
+//! trait (implemented by whoever drives this native adapter) and refuses `done` until
 //! each named verification command really ran, succeeded, and ran after the last
 //! file change. A `blocked` call records what the model needs and stops the run.
 //!
-//! The accepted outcome is stored in a shared [`FinishOutcome`] cell the host
+//! The accepted outcome is stored in a shared [`FinishOutcome`] cell the caller
 //! reads after the turn; a rejected call stores nothing. Invalid input is an
 //! ordinary tool result the model can act on — never a panic.
 //!
@@ -15,8 +15,10 @@
 //! and the verdict travels next to the outcome in the same cell.
 //!
 //! Every rule and every text is `p1-finish-guest`'s, the code the `p1/finish` component
-//! ships (decision S0-R3); this crate is the native adapter that runs it over the host's
-//! session view and stores what it accepts.
+//! ships (decision S0-R3); this crate is the native adapter that runs it over a session
+//! view and stores what it accepts. The host runs the component: its session record and
+//! its accepted cell are the host's own (`p1-host`'s `activity`, S7.10-R3), and this
+//! adapter remains the reference its tests compare the component against.
 
 use std::sync::{Arc, Mutex};
 
@@ -30,8 +32,8 @@ pub use p1_finish_guest::{
 };
 use p1_finish_guest::{RawInput, Record, ResultStatus};
 
-/// What the `finish` tool can see of the session so far. Implemented by the host
-/// from the event stream it already receives.
+/// What the `finish` tool can see of the session so far. The native adapter's view;
+/// the host's own record serves the component through `completion` instead.
 pub trait SessionActivity: Send + Sync {
     /// `order` of the last finished tool call whose effect was `WritesFiles`, if any.
     fn last_file_change(&self) -> Option<u64>;
@@ -47,8 +49,8 @@ struct OutcomeCell {
     structured: Option<StructuredResult>,
 }
 
-/// The shared cell the host reads after a turn. Cheap to clone; all clones share
-/// one value. The tool writes it; the host reads and clears it.
+/// The shared cell the caller reads after a turn. Cheap to clone; all clones share
+/// one value. The tool writes it; the caller reads and clears it.
 #[derive(Clone, Default)]
 pub struct FinishOutcome {
     inner: Arc<Mutex<OutcomeCell>>,
@@ -74,8 +76,7 @@ impl FinishOutcome {
     }
 
     /// Store an accepted call; the last one wins. The native tool writes what it
-    /// accepted; for a component, only the host's completion hub writes here, after it
-    /// re-verified the candidate itself (ADR-0083 §2).
+    /// accepted.
     pub fn set(&self, accepted: Accepted, structured: Option<StructuredResult>) {
         let mut cell = self.inner.lock().unwrap();
         cell.accepted = Some(accepted);
