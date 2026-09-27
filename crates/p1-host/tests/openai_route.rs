@@ -11,11 +11,13 @@
 //! assertion is unchanged.
 
 mod common;
+mod native_routes;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{Harness, shipped_environments};
+use native_routes::responses_route;
 use p1_assembly::{Assembled, AssemblyError, Substitutions, assemble, load_environment};
 use p1_contracts::{
     BoxFuture, DeclarationKind, Effort, Item, ModelOptions, Origin, Provider, ProviderError,
@@ -23,18 +25,19 @@ use p1_contracts::{
 };
 use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
-use p1_host::catalog::{build_catalog, resolve_environment, responses_route, route_provider};
+use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
-use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
+use p1_host::routes::{
+    AdapterSettings, ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport, RouteFile,
+    load_route_by_id,
+};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, fixtures::responses as responses_fixtures, run_all,
 };
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
-use p1_provider_openai::{
-    ROUTE, ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport, build_request,
-};
+use p1_provider_openai::{ROUTE, build_request};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
 

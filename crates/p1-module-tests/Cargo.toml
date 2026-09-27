@@ -71,8 +71,10 @@ p1-tool-workflow = { path = "../p1-tool-workflow" }
 # component reaches no transport, runtime or credential code.
 p1-module-protocol = { path = "../p1-module-protocol" }
 p1-model-profile = { path = "../p1-model-profile" }
-p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false }
-p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false }
+# provider_conformance.rs holds each component against the NATIVE adapter composed from the
+# same route file, which p1-host no longer links (S7.10-R4), so this crate enables `native`.
+p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false, features = ["native"] }
+p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false, features = ["native"] }
 # The shell-boundary suite (S3.4) loads the built `p1/shell` component and binds the native,
 # sandboxed process service of p1-tool-shell to it; its parity cases also build the native
 # `ShellTool` over the same p1-workspace workspace, and it proves "gone" with kill(pid, 0).

@@ -70,8 +70,8 @@ use delegation::register_delegation_tools;
 // Re-exported so the `crate::catalog::…` paths other crates and the tests use stay valid.
 use providers::register_providers;
 pub use providers::{
-    ProviderComponents, WHOLE_PROVIDERS, chat_route, credential_line, credential_line_for_route,
-    messages_route, provider_component, reject_profile, responses_route, route_provider,
+    ProviderComponents, WHOLE_PROVIDERS, credential_line, credential_line_for_route,
+    provider_component, reject_profile, route_provider,
 };
 use tools::register_standard_tools;
 // The mutation mode of a tool's row and the capability services that row's link assembles
