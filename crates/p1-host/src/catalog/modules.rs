@@ -11,6 +11,9 @@
 //!   other bytes or another ABI than it names;
 //! - the granted capabilities must lie inside the class allocation of
 //!   `modules/capabilities.toml` (freeze item 13);
+//! - the registration declares each accepted tool package's semantic capabilities under the
+//!   loader-built identity (S1.5's `capabilities::declare_package`), so a package tool is
+//!   visible to the host's capability checks exactly as its native twin is (ADR-0083 rule 7);
 //! - registration builds no instance: [`p1_module_runtime::wasm_tool`] runs only in the
 //!   catalog factory, i.e. only when an environment assembles the key, so an installed but
 //!   unselected package and an invented name both never dispatch (the assembly rule).
@@ -432,8 +435,10 @@ fn allocation(kind: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Registers each verified tool package under its module name. A name a registered tool
-/// already has is refused: a package never silently replaces a compiled-in tool.
+/// Registers each verified tool package under its module name and declares its semantic
+/// capabilities under the loader-built identity (S1.5), so a package tool is visible to the
+/// host's capability checks exactly as a native one is. A name a registered tool already has
+/// is refused: a package never silently replaces a compiled-in tool.
 ///
 /// A USER-selected provider package takes no catalog key at all: the lock keeps it under the
 /// module name it gave it (`provider-anthropic`, `provider-openai`, `provider-openai-chat`,
@@ -473,6 +478,13 @@ pub fn register_modules(
                 lock: package.lock,
             });
         }
+        // S1.5's carrier, filled here: the registration that accepts a verified tool
+        // package declares its semantic capabilities under the identity the loader built,
+        // exactly as a native registration lists its `NativeDeclaration`. The call sits after
+        // the refusals, so a package that is not registered declares nothing; a package
+        // reaches `completion_policy` and `WorkerReportTap::retool` only through it
+        // (ADR-0083 rule 7).
+        super::capabilities::declare_package(&package.loaded);
         let key = package.module.clone();
         register_locked_entry(catalog, &key, Arc::new(package.loaded), services.clone());
     }
@@ -1054,6 +1066,15 @@ pub(crate) fn quiet_deps(environment_dirs: Vec<PathBuf>) -> HostDeps {
 
 #[cfg(test)]
 mod tests {
+    use p1_assembly::{EnvironmentFile, ProviderSpec, Substitutions, assemble};
+    use p1_contracts::{ModelOptions, Provider, ToolIdentity};
+    use p1_module_runtime::ProcessService;
+    use p1_module_tests::{FIXTURE_NAME, FakeProcesses, Release, fake_processes, lock_text};
+    use p1_testkit::{FakeTool, ScriptedProvider};
+    use p1_tool_finish::CompletionPolicy;
+
+    use crate::catalog::capabilities::{Capabilities, SemanticCapability, carries, declared};
+
     use super::*;
 
     #[test]
@@ -1092,6 +1113,196 @@ mod tests {
         std::fs::remove_file(&share).expect("remove share manifest");
         std::fs::remove_file(&built).expect("remove built manifest");
         assert_eq!(choose_release_manifest(share.clone(), built), share);
+    }
+
+    /// The child completion policy (ADR-0051 item 1) exactly as `catalog/children.rs`
+    /// computes it over assembled tools: `RecordedCommands` iff one of them carries
+    /// `records-command-evidence`. That function is private to the delegation module, so its
+    /// one-line rule is restated here; the cases below are about the registration's
+    /// declaration, which is what the rule reads.
+    fn child_policy(tools: &[Arc<dyn Tool>]) -> CompletionPolicy {
+        let can_run_commands = tools
+            .iter()
+            .any(|tool| carries(tool.as_ref(), SemanticCapability::RecordsCommandEvidence));
+        if can_run_commands {
+            CompletionPolicy::RecordedCommands
+        } else {
+            CompletionPolicy::ReportToParent
+        }
+    }
+
+    /// A `modules.lock` resolving `module` to the fixture package of `release`.
+    fn fixture_lock(release: &Release, module: &str) -> ModulesLock {
+        let entry = release.fixture_entry(FIXTURE_NAME);
+        ModulesLock::parse(
+            &release.root().join("modules.lock"),
+            &lock_text(module, &entry),
+        )
+        .expect("fixture lock")
+    }
+
+    /// A catalog built the host's way: a scripted provider, and every package `lock` selects
+    /// registered through [`register_modules`] with a fake `process` service (the fixture
+    /// imports `process`). The fake's receiving end comes back with the catalog so the caller
+    /// keeps it alive for the assembled tool's life.
+    fn registered_catalog(release: &Release, lock: &ModulesLock) -> (Catalog, FakeProcesses) {
+        let mut catalog = Catalog::new();
+        let provider = ScriptedProvider::new(Vec::new());
+        catalog.provider(
+            "scripted",
+            Box::new(move |_spec: &ProviderSpec| {
+                Ok(Arc::new(provider.clone()) as Arc<dyn Provider>)
+            }),
+        );
+        let (process, processes) = fake_processes();
+        let process: Arc<dyn ProcessService> = process;
+        let services: ModuleServices = Arc::new(move |_: &str, _: &ToolServices| Services {
+            process: Some(process.clone()),
+            ..Services::default()
+        });
+        let packages =
+            load_locked_modules(lock, &release.manifest_file()).expect("the package loads");
+        register_modules(&mut catalog, packages, services).expect("registration");
+        (catalog, processes)
+    }
+
+    /// An environment naming `modules`, assembled in a scratch workspace.
+    fn assemble_modules(
+        catalog: &Catalog,
+        modules: &[&str],
+    ) -> Result<p1_assembly::Assembled, p1_assembly::AssemblyError> {
+        let environment = EnvironmentFile {
+            name: "package-capabilities-test".into(),
+            family: "test".into(),
+            provider: "scripted".into(),
+            model: "test-model".into(),
+            profile: None,
+            options: ModelOptions::default(),
+            tools: modules
+                .iter()
+                .map(|module| ToolSpec {
+                    module: (*module).into(),
+                    name: None,
+                    description: None,
+                    variant: None,
+                })
+                .collect(),
+            prompt_template: "tools: {{tool_names}}".into(),
+            context: None,
+            summarize_prompt: None,
+        };
+        let workspace = tempfile::tempdir().expect("scratch workspace");
+        assemble(
+            catalog,
+            &environment,
+            workspace.path(),
+            &Substitutions {
+                workspace: "/work".into(),
+                date: "2026-01-01".into(),
+                os: "linux".into(),
+            },
+        )
+    }
+
+    /// The built tool package in `dir` (manifest name `name`) as a release entry and its
+    /// bytes, laid out as `scripts/build-modules.sh` publishes it.
+    fn built_package(dir: &str, name: &str) -> (serde_json::Value, Vec<u8>) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/target/p1-modules")
+            .join(dir);
+        let wasm_path = root.join(format!("{dir}.wasm"));
+        let wasm = std::fs::read(&wasm_path).unwrap_or_else(|error| {
+            panic!(
+                "the built package {} is missing ({error}): run scripts/build-modules.sh",
+                wasm_path.display()
+            )
+        });
+        let manifest_path = root.join(format!("{dir}.manifest.json"));
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", manifest_path.display())),
+        )
+        .expect("the built manifest is JSON");
+        let entry = serde_json::json!({
+            "name": name,
+            "digest": manifest["digest"],
+            "path": format!("packages/{dir}/{dir}.wasm"),
+            "kind": manifest["kind"],
+            "world": manifest["world"],
+            "protocol": manifest["protocol"],
+            "capabilities": manifest["capabilities"],
+            "variant": manifest["variant"],
+        });
+        (entry, wasm)
+    }
+
+    /// S1.5.1: the real registration declares a tool package's verified grants under the
+    /// identity the loader built, so a child assembled with the package is treated exactly as
+    /// one assembled with its native twin. The fixture package grants `process`, so its
+    /// assembled tool carries `records-command-evidence` and a child's completion policy is
+    /// the strict `CompletionPolicy::RecordedCommands` (ADR-0051 item 1, ADR-0083 rule 7).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registering_a_process_package_makes_it_a_command_tool_for_a_child() {
+        let release = Release::with_fixture();
+        let (catalog, _processes) =
+            registered_catalog(&release, &fixture_lock(&release, "fixture"));
+        let assembled = assemble_modules(&catalog, &["fixture"]).expect("the package assembles");
+
+        assert_eq!(
+            assembled.tools.len(),
+            1,
+            "the granted package, and nothing else"
+        );
+        let module_tool = assembled.tools[0].clone();
+        assert_eq!(module_tool.identity().implementation, FIXTURE_NAME);
+        assert!(
+            carries(
+                module_tool.as_ref(),
+                SemanticCapability::RecordsCommandEvidence
+            ),
+            "the registration declared the package's verified `process` grant"
+        );
+        assert_eq!(
+            child_policy(&assembled.tools),
+            CompletionPolicy::RecordedCommands
+        );
+    }
+
+    /// S1.5.1: a tool package WITHOUT the `process` grant gets no capability, so a child
+    /// assembled with it stays on `CompletionPolicy::ReportToParent`. The package is a real
+    /// built tool component (`p1/worker-result`, granted `control` and `workers-observe`)
+    /// registered through the same host entry point, so the case is the registration's
+    /// declaration and not a hand-written one.
+    #[test]
+    fn registering_a_package_without_process_is_not_a_command_tool() {
+        let mut release = Release::empty();
+        let (entry, bytes) = built_package("p1-module-worker-result", "p1/worker-result");
+        release.add(entry.clone(), &bytes);
+        let lock = ModulesLock::parse(
+            &release.root().join("modules.lock"),
+            &lock_text("worker_result", &entry),
+        )
+        .expect("lock");
+        let mut catalog = Catalog::new();
+        let packages =
+            load_locked_modules(&lock, &release.manifest_file()).expect("the package loads");
+        let services: ModuleServices = Arc::new(|_: &str, _: &ToolServices| Services::default());
+        register_modules(&mut catalog, packages, services).expect("registration");
+
+        let identity = ToolIdentity {
+            implementation: "p1/worker-result".into(),
+            variant: "default".into(),
+        };
+        assert_eq!(
+            declared(&identity),
+            Capabilities::NONE,
+            "no `process` grant, so no `records-command-evidence`"
+        );
+        let tool: Arc<dyn Tool> = Arc::new(
+            FakeTool::new("worker_result")
+                .with_identity(&identity.implementation, &identity.variant),
+        );
+        assert_eq!(child_policy(&[tool]), CompletionPolicy::ReportToParent);
     }
 
     /// The built `p1-module-read` component's bytes, or a panic naming the build script.

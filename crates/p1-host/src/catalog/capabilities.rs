@@ -8,8 +8,9 @@
 //! - a package's capabilities are derived from what its verified manifest grants
 //!   ([`package_capabilities`]); the frozen manifest (`docs/design/modules/package.md`)
 //!   has no field for them, and the loader, not the module, builds the identity. The
-//!   registration that assembles a loaded module records them ([`declare_package`]), so
-//!   the checks below see a package tool too (ADR-0083 rule 7);
+//!   host's registration records them for every tool package it accepts
+//!   ([`declare_package`], `catalog/modules.rs`), so the checks below see a package tool
+//!   too (ADR-0083 rule 7);
 //! - a still-native tool's capabilities are declared by its catalog registration
 //!   (`catalog/tools.rs`), keyed by the identity its constructor builds.
 //!
@@ -150,11 +151,11 @@ fn package_declarations() -> &'static RwLock<HashMap<ToolIdentity, Capabilities>
 
 /// Record what a loaded package's verified manifest grants, keyed by the identity the
 /// loader built, and return it. This is a package's equivalent of a [`NativeDeclaration`]:
-/// the registration that assembles the module calls it (`catalog/modules.rs`, S1.4), the
-/// way the native registrations list their declarations. Without it, a package tool's
-/// derived capabilities would be invisible to [`declared`] — and to every check built on
-/// [`carries`] — so a `tool` package granted `process` (ADR-0083 rules 2 and 7) could not
-/// count as evidence.
+/// the host's registration calls it for every tool package it accepts (`catalog/modules.rs`,
+/// `register_modules`), the way the native registrations list their declarations. Without
+/// it, a package tool's derived capabilities would be invisible to [`declared`] — and to
+/// every check built on [`carries`] — so a `tool` package granted `process` (ADR-0083 rules 2
+/// and 7) could not count as evidence.
 pub fn declare_package(module: &LoadedModule) -> Capabilities {
     let capabilities = package_capabilities(module);
     package_declarations()
@@ -419,13 +420,22 @@ mod tests {
     /// The carrier ADR-0083 rule 7 needs once S1.4 registers package tools: when the
     /// registration declares a loaded module, a tool of that loader-built identity is
     /// visible to `carries`, whatever its model-facing name; until then, nothing is.
+    ///
+    /// A declaration lives for the whole test process, and `catalog/modules.rs`'s
+    /// registration cases declare the fixture under the name the build published
+    /// (`p1/fixture`): this case loads the same verified bytes under a name of its own, so
+    /// "nothing is declared yet" holds whatever order the cases run in.
     #[test]
     fn a_declared_package_reaches_carries_through_its_verified_identity() {
-        let release = Release::with_fixture();
+        let mut release = Release::empty();
+        let mut entry = release.fixture_entry("p1/carrier");
+        entry["variant"] = "carrier".into();
+        let bytes = release.fixture().wasm.clone();
+        release.add(entry, &bytes);
         let module = release
             .loader()
-            .load(FIXTURE_NAME)
-            .expect("the fixture loads");
+            .load("p1/carrier")
+            .expect("the fixture bytes load");
         let identity = module.identity().clone();
         let package_tool =
             FakeTool::new("recall").with_identity(&identity.implementation, &identity.variant);

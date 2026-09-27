@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use p1_module_protocol::PROTOCOL_VERSION;
 use p1_module_runtime::loader::OFFICIAL_NAMESPACE;
 use p1_module_runtime::manifest::{ComponentEntry, Digest, ReleaseManifest};
-use p1_module_runtime::{Loader, ModuleKind};
+use p1_module_runtime::{LINKABLE_CAPABILITIES, Loader, ModuleKind};
 
 use crate::HostDeps;
 use crate::cli::{ModulesAction, ModulesOptions};
@@ -36,52 +36,6 @@ const MANIFEST_FILE: &str = "manifest.json";
 const MODULES_DIR: &str = "modules";
 /// The key column width of the `inspect` report.
 const KEY_WIDTH: usize = 12;
-
-/// Every module class this runtime speaks, as `Loader::load` reads the manifest's `kind`.
-/// The loader's own list is private; naming the variants here is what lets `verify` make the
-/// same check without reaching the loader, which compiles. A new class is one variant and
-/// one entry, and the drift guard `verify_and_the_loader_agree_on_every_manifest_field` fails
-/// if this list and the loader's part ways.
-const CLASSES: [ModuleKind; 6] = [
-    ModuleKind::Tool,
-    ModuleKind::Provider,
-    ModuleKind::ContextPolicy,
-    ModuleKind::AuthorizationPolicy,
-    ModuleKind::WorkflowImplementation,
-    ModuleKind::WorkflowDecision,
-];
-
-/// The capabilities this runtime links: the loader's `LINKABLE_CAPABILITIES`, published in
-/// `docs/design/modules/package.md`. `control`, `clock` and `random` are the runtime's own,
-/// `process` is the service it adapts, `summary` is the context policy's (S5, freeze item
-/// 13 of `docs/design/modules/wit.md`), `completion` is the host's completion hub (S3.7);
-/// `http`, `websocket` and `credential-control` are the provider interfaces a provider
-/// component imports (S4.7); `workers-start`, `workers-observe`, `workers-control` and
-/// `workflows` are linked to the caller's delegation services (S6, B-S6-8); `workspace` (read
-/// side) and `snapshot` are the workspace's (S1); every other interface of
-/// `modules/capabilities.toml` arrives with the stream that owns its native service. The
-/// loader refuses a manifest granting anything else, so `verify` must refuse it too —
-/// `--integrity-only` reports it instead, because an installer stages a release before those
-/// services land (S1.6.1) — and the drift guard
-/// `verify_and_the_loader_agree_on_every_manifest_field` fails if this list and the loader's
-/// part ways.
-const LINKABLE: [&str; 15] = [
-    "control",
-    "clock",
-    "random",
-    "process",
-    "summary",
-    "completion",
-    "http",
-    "websocket",
-    "credential-control",
-    "workers-start",
-    "workers-observe",
-    "workers-control",
-    "workflows",
-    "workspace",
-    "snapshot",
-];
 
 /// Run one `p1 modules` command.
 pub fn modules(deps: &HostDeps, options: &ModulesOptions) -> i32 {
@@ -434,7 +388,14 @@ struct ManifestProblems {
 fn manifest_problems(entry: &ComponentEntry) -> ManifestProblems {
     let mut problems = Vec::new();
     let mut unlinked = Vec::new();
-    let Some(kind) = CLASSES.into_iter().find(|class| class.name() == entry.kind) else {
+    // The class list is the runtime's (`ModuleKind::ALL`), never a copy: a class added
+    // there is one `verify` accepts here without an edit, and the drift guard
+    // `verify_and_the_loader_agree_on_every_manifest_field` still holds the two verdicts
+    // together.
+    let Some(kind) = ModuleKind::ALL
+        .into_iter()
+        .find(|class| class.name() == entry.kind)
+    else {
         problems.push(format!(
             "kind {} is not a module class this runtime speaks",
             entry.kind
@@ -467,7 +428,7 @@ fn manifest_problems(entry: &ComponentEntry) -> ManifestProblems {
         ));
     }
     for capability in &entry.capabilities {
-        if !LINKABLE.contains(&capability.as_str()) {
+        if !LINKABLE_CAPABILITIES.contains(&capability.as_str()) {
             unlinked.push(capability.clone());
         }
     }
