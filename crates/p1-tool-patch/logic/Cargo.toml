@@ -1,0 +1,16 @@
+[package]
+name = "p1-tool-patch-logic"
+description = "The target-independent logic of the p1 `apply_patch` tool, shared by the native tool and its component (S0-R3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# S0-R3: std, serde (derive), serde_json and regex only, at the versions the root Cargo.lock
+# pins; no host crate, so the same code builds natively and for the guest target.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

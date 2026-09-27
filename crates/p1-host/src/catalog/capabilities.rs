@@ -8,13 +8,19 @@
 //! - a package's capabilities are derived from what its verified manifest grants
 //!   ([`package_capabilities`]); the frozen manifest (`docs/design/modules/package.md`)
 //!   has no field for them, and the loader, not the module, builds the identity. The
-//!   registration that assembles a loaded module records them ([`declare_package`]), so
-//!   the checks below see a package tool too (ADR-0083 rule 7);
+//!   host's registration records them for every tool package it accepts
+//!   ([`declare_package`], `catalog/modules.rs`), so the checks below see a package tool
+//!   too (ADR-0083 rule 7);
 //! - a still-native tool's capabilities are declared by its catalog registration
 //!   (`catalog/tools.rs`), keyed by the identity its constructor builds.
 //!
 //! An environment's face changes a tool's model-facing name, description and variant,
 //! never its identity implementation, so a face can neither grant nor hide one.
+//!
+//! notice: crates/p1-host/src/catalog/capabilities.rs (S1): S3.8 (D083b) makes `declared`
+//! fall back to a declared package of the same identity IMPLEMENTATION, so a host-applied
+//! presentation variant of a verified package (the shell's `+sandbox`) carries the package's
+//! capabilities; the exact-identity lookup and the native declarations are unchanged.
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
@@ -145,11 +151,11 @@ fn package_declarations() -> &'static RwLock<HashMap<ToolIdentity, Capabilities>
 
 /// Record what a loaded package's verified manifest grants, keyed by the identity the
 /// loader built, and return it. This is a package's equivalent of a [`NativeDeclaration`]:
-/// the registration that assembles the module calls it (`catalog/modules.rs`, S1.4), the
-/// way the native registrations list their declarations. Without it, a package tool's
-/// derived capabilities would be invisible to [`declared`] — and to every check built on
-/// [`carries`] — so a `tool` package granted `process` (ADR-0083 rules 2 and 7) could not
-/// count as evidence.
+/// the host's registration calls it for every tool package it accepts (`catalog/modules.rs`,
+/// `register_modules`), the way the native registrations list their declarations. Without
+/// it, a package tool's derived capabilities would be invisible to [`declared`] — and to
+/// every check built on [`carries`] — so a `tool` package granted `process` (ADR-0083 rules 2
+/// and 7) could not count as evidence.
 pub fn declare_package(module: &LoadedModule) -> Capabilities {
     let capabilities = package_capabilities(module);
     package_declarations()
@@ -163,13 +169,27 @@ pub fn declare_package(module: &LoadedModule) -> Capabilities {
 /// identity, else what a native registration declares for it, else none. A package is
 /// keyed by its whole loader-built identity (name and variant), a native tool by its
 /// implementation alone (its registrations build one identity each).
+///
+/// A host-applied presentation VARIANT of a declared package — the shell entry's
+/// `+sandbox` (ADR-0083 §1) or an environment's face — still carries the package's
+/// capabilities: the grant is the manifest's and belongs to the package, not to the
+/// variant the host presents it under.
 pub fn declared(identity: &ToolIdentity) -> Capabilities {
-    if let Some(capabilities) = package_declarations()
+    let declarations = package_declarations()
         .read()
-        .expect("the package declarations lock is never held across a panic")
-        .get(identity)
-    {
+        .expect("the package declarations lock is never held across a panic");
+    if let Some(capabilities) = declarations.get(identity) {
         return *capabilities;
+    }
+    // A host-applied presentation variant of a declared package still carries the
+    // package's capabilities: the grant is the manifest's and belongs to the package,
+    // not to the variant the host presents it under.
+    if let Some(capabilities) = declarations
+        .iter()
+        .find(|(declared, _)| declared.implementation == identity.implementation)
+        .map(|(_, capabilities)| *capabilities)
+    {
+        return capabilities;
     }
     super::tools::NATIVE_CAPABILITIES
         .iter()
@@ -181,6 +201,48 @@ pub fn declared(identity: &ToolIdentity) -> Capabilities {
 /// model-facing name, which a face may change, plays no part.
 pub fn carries(tool: &dyn Tool, capability: SemanticCapability) -> bool {
     declared(tool.identity()).contains(capability)
+}
+
+/// The built package `package`, loaded through a test release whose one entry is the
+/// package's own build manifest: the identity and the grants the loader verifies. Test-only
+/// support for the cases that need a REAL package rather than the fixture.
+#[cfg(test)]
+pub(crate) fn built_package(package: &str) -> p1_module_runtime::LoadedModule {
+    use p1_module_tests::Release;
+    let dir = p1_module_tests::fixture_dir()
+        .parent()
+        .expect("the publish directory")
+        .join(package);
+    let read = |file: String| {
+        let path = dir.join(file);
+        std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "{} is missing ({error}): run scripts/build-modules.sh first",
+                path.display()
+            )
+        })
+    };
+    let wasm = read(format!("{package}.wasm"));
+    let manifest: p1_contracts::serde_json::Value =
+        p1_contracts::serde_json::from_slice(&read(format!("{package}.manifest.json")))
+            .expect("the package manifest is JSON");
+    let entry = p1_contracts::serde_json::json!({
+        "name": manifest["name"],
+        "digest": manifest["digest"],
+        "path": format!("packages/{package}/{package}.wasm"),
+        "kind": manifest["kind"],
+        "world": manifest["world"],
+        "protocol": manifest["protocol"],
+        "capabilities": manifest["capabilities"],
+        "variant": manifest["variant"],
+    });
+    let name = manifest["name"]
+        .as_str()
+        .expect("the manifest name")
+        .to_owned();
+    let mut release = Release::empty();
+    release.add(entry, &wasm);
+    release.loader().load(&name).expect("the package loads")
 }
 
 #[cfg(test)]
@@ -213,20 +275,40 @@ mod tests {
         assert_eq!(Capabilities::NONE.names(), Vec::<&str>::new());
     }
 
-    /// The native registrations declare the shell's and `finish`'s capabilities on the
-    /// identities their constructors build, and nothing else carries either.
+    /// S3.8 (D083b): the shell's and `finish`'s capabilities come from their verified
+    /// manifest grants through [`package_capabilities`], not from a native declaration,
+    /// which left with its registration; nothing else carries either.
     #[test]
-    fn the_native_registrations_declare_shell_and_finish() {
+    fn the_shell_and_finish_packages_declare_their_grants() {
         let dir = tempfile::tempdir().unwrap();
-        let shell = shell_in(dir.path());
-        assert!(carries(&shell, SemanticCapability::RecordsCommandEvidence));
-        assert!(!carries(&shell, SemanticCapability::ReportsCompletion));
-        let finish = finish();
-        assert!(carries(&finish, SemanticCapability::ReportsCompletion));
-        assert!(!carries(
-            &finish,
-            SemanticCapability::RecordsCommandEvidence
-        ));
+        // The native adapters carry nothing on their own now.
+        assert_eq!(
+            declared(shell_in(dir.path()).identity()),
+            Capabilities::NONE
+        );
+        assert_eq!(declared(finish().identity()), Capabilities::NONE);
+        for (package, capability, variant) in [
+            (
+                "p1-module-shell",
+                SemanticCapability::RecordsCommandEvidence,
+                "claude+sandbox",
+            ),
+            (
+                "p1-module-finish",
+                SemanticCapability::ReportsCompletion,
+                "claude",
+            ),
+        ] {
+            let module = built_package(package);
+            assert_eq!(
+                declare_package(&module),
+                Capabilities::of(&[capability]),
+                "{package}"
+            );
+            // A host-applied presentation variant of the same verified package carries it.
+            let presented = FakeTool::new("x").with_identity(module.name(), variant);
+            assert!(carries(&presented, capability), "{package}");
+        }
         let read = p1_tool_read::ReadTool::new(
             p1_workspace::Workspace::new(dir.path()).unwrap(),
             Default::default(),
@@ -234,17 +316,25 @@ mod tests {
         assert_eq!(declared(read.identity()), Capabilities::NONE);
     }
 
-    /// A face can neither grant nor hide a capability: a shell presented as `run` with
-    /// another variant still records command evidence, and a tool merely NAMED `shell`
-    /// (or `finish`) carries nothing.
+    /// A face can neither grant nor hide a capability: the shell PACKAGE presented under
+    /// another model-facing name and variant still records command evidence, and a tool
+    /// merely NAMED `shell` (or `finish`) carries nothing.
     #[test]
     fn a_face_neither_grants_nor_hides_a_capability() {
         let dir = tempfile::tempdir().unwrap();
         let renamed = shell_in(dir.path()).with_face(ToolFace::new("run", "Runs things."), "gpt");
         assert_eq!(renamed.declaration().name, "run");
-        let renamed: Arc<dyn Tool> = Arc::new(renamed);
+        // The native adapter is not declared any more, so the face names nothing.
+        assert!(!carries(
+            &renamed,
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        // The package's identity carries it whatever the model is told.
+        let module = built_package("p1-module-shell");
+        declare_package(&module);
+        let presented = FakeTool::new("run").with_identity(module.name(), "gpt");
         assert!(carries(
-            renamed.as_ref(),
+            &presented,
             SemanticCapability::RecordsCommandEvidence
         ));
         let named_shell = FakeTool::new("shell").with_identity("fake-shell", "claude");
@@ -330,13 +420,22 @@ mod tests {
     /// The carrier ADR-0083 rule 7 needs once S1.4 registers package tools: when the
     /// registration declares a loaded module, a tool of that loader-built identity is
     /// visible to `carries`, whatever its model-facing name; until then, nothing is.
+    ///
+    /// A declaration lives for the whole test process, and `catalog/modules.rs`'s
+    /// registration cases declare the fixture under the name the build published
+    /// (`p1/fixture`): this case loads the same verified bytes under a name of its own, so
+    /// "nothing is declared yet" holds whatever order the cases run in.
     #[test]
     fn a_declared_package_reaches_carries_through_its_verified_identity() {
-        let release = Release::with_fixture();
+        let mut release = Release::empty();
+        let mut entry = release.fixture_entry("p1/carrier");
+        entry["variant"] = "carrier".into();
+        let bytes = release.fixture().wasm.clone();
+        release.add(entry, &bytes);
         let module = release
             .loader()
-            .load(FIXTURE_NAME)
-            .expect("the fixture loads");
+            .load("p1/carrier")
+            .expect("the fixture bytes load");
         let identity = module.identity().clone();
         let package_tool =
             FakeTool::new("recall").with_identity(&identity.implementation, &identity.variant);

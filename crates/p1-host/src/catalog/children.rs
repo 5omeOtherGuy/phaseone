@@ -2,18 +2,23 @@
 //! worker (a direct `worker_start` child or a workflow step) as an agent of its own.
 //! Kept apart from `run.rs` so the delegation family can later be built as a module
 //! without touching the run drivers; the parent's assembly path stays in `run.rs`.
+//!
+//! notice: crates/p1-host/src/catalog/children.rs (S1): S3.8 drops the child `finish`
+//! SELECTION (the native rebuild under the child's policy) — the `finish` tool is the
+//! `p1/finish` component the catalog assembles, and the `CompletionHub` decides the policy
+//! and the output contract at every assembly boundary (ADR-0083 rule 7). The child's own
+//! environment, grant, history, name and variant are unchanged.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use p1_assembly::{Assembled, Catalog, EnvironmentFile, Substitutions, ToolSpec, load_environment};
-use p1_contracts::{AgentEvent, CommitSink, EventSink, Tool, TurnEnd};
+use p1_contracts::{AgentEvent, CommitSink, EventSink, TurnEnd};
 use p1_core::{Agent, AgentParts, Reconfiguration};
 use p1_journal::MemoryJournal;
 use p1_model_profile::ModelProfile;
-use p1_redact::{MaskCounter, redacted};
-use p1_tool_finish::CompletionPolicy;
+use p1_redact::MaskCounter;
 use p1_workers::{
     AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers, Regrant,
     WorkerReport,
@@ -25,7 +30,7 @@ use crate::cli::Options;
 use crate::frontend::FrontEnd;
 use crate::run::{
     FINISH_MODULE, Generations, MaskNoticeSink, agent_context, assemble_with_cache_key,
-    config_for_route, finish_index, finish_tool, session_journals, stall_message, write_stderr,
+    config_for_route, session_journals, stall_message, write_stderr,
 };
 #[cfg(feature = "shadow-hook")]
 use crate::run::{ShadowJournal, ShadowOrigin};
@@ -122,87 +127,51 @@ pub(crate) fn compose_children(
     ))
 }
 
-/// The completion policy a CHILD's assembled tools call for (ADR-0052 item 1): a
-/// worker whose tools include no tool that records command runs cannot verify
-/// anything itself, so it reports to its parent instead of naming a command it cannot
-/// run. The check is the `records-command-evidence` capability of the tools' verified
-/// IDENTITIES (`catalog/capabilities.rs`) — never a grant name or an implementation
-/// name, so a face cannot hide the shell tool.
-///
-/// MAIN agents never come through here: their `finish` keeps the strict rule.
-#[cfg(feature = "delegation")]
-fn completion_policy(tools: &[Arc<dyn Tool>]) -> CompletionPolicy {
-    let can_run_commands = tools.iter().any(|tool| {
-        super::capabilities::carries(
-            tool.as_ref(),
-            super::capabilities::SemanticCapability::RecordsCommandEvidence,
-        )
-    });
-    if can_run_commands {
-        CompletionPolicy::RecordedCommands
-    } else {
-        CompletionPolicy::ReportToParent
-    }
-}
-
-/// Apply the child's policy to the `finish` tool the catalog assembled (ADR-0052 item
-/// 1). The catalog builds the tool before the host knows the assembled tools, and the
-/// policy follows from THEM, so it is applied here: the tool keeps the child's own
-/// activity log and outcome cell — its whole history, which a freshly assembled
-/// `finish` would not see — and its model-facing name and variant.
+/// Give the child's `finish` COMPONENT the policy and the output contract the hub chose
+/// for this agent (ADR-0083 rule 7). The catalog assembled it for a MAIN agent, and a
+/// worker's policy follows from ITS assembled tools, which the catalog cannot know; so
+/// the hub re-grants the agent's own completion here — the same record and accepted cell,
+/// its whole history — and the component is rebuilt under that grant, keeping the
+/// model-facing name and variant the environment presented it with. The hub is the one
+/// that decides the policy from the assembled tools' verified identities: never a grant
+/// name or an implementation name, so a face cannot hide the shell tool.
 #[cfg(feature = "delegation")]
 fn apply_completion_policy(
     assembled: &mut Assembled,
+    hub: &CompletionHub,
     completion: &Completion,
     contract: Option<p1_tool_finish::OutputContract>,
     mask: &Arc<MaskCounter>,
-) {
-    let Some(index) = finish_index(assembled) else {
-        return;
+) -> Result<(), String> {
+    let Some(index) = finish_at(assembled) else {
+        return Ok(());
     };
-    let policy = completion_policy(&assembled.tools);
-    let finish = finish_under_policy(
+    let finish = hub.finish_for(
         &assembled.tools[index],
-        completion.log.clone(),
-        completion.outcome.clone(),
-        policy,
+        completion,
+        &assembled.tools,
+        crate::activity::AgentRole::Worker,
         contract,
         mask,
-    );
+    )?;
     // `resolved` is what the host journals and prints: keep the declaration in step
     // with the tool the model is actually given.
     assembled.resolved.tools[index].declaration = finish.declaration().clone();
     assembled.tools[index] = finish;
+    Ok(())
 }
 
-/// The same `finish` tool under `policy`, on the given activity log and outcome cell.
-/// The description follows the policy — it is what tells the model which completion
-/// rule applies to it — while the name and variant stay the ones the agent was
-/// assembled with. A `contract` (a workflow step's schema) is set before the face is
-/// taken, so the description carries the contract paragraph: a face pins the text it
-/// is given and would never gain it afterwards.
+/// Where the assembly's `finish` tool sits: found by the `reports-completion` capability
+/// of its identity (`catalog/capabilities.rs`), never by a model-facing name, so a face
+/// cannot make some other tool look like `finish`.
 #[cfg(feature = "delegation")]
-fn finish_under_policy(
-    finish: &Arc<dyn Tool>,
-    log: Arc<ActivityLog>,
-    outcome: p1_tool_finish::FinishOutcome,
-    policy: CompletionPolicy,
-    contract: Option<p1_tool_finish::OutputContract>,
-    mask: &Arc<MaskCounter>,
-) -> Arc<dyn Tool> {
-    let name = finish.declaration().name.clone();
-    let variant = finish.identity().variant.clone();
-    let mut tool = p1_tool_finish::FinishTool::new(log, outcome).with_policy(policy);
-    if let Some(contract) = contract {
-        tool = tool.with_output_contract(contract);
-    }
-    let face = p1_tool_finish::ToolFace::new(name, tool.declaration().description.clone());
-    // Issue #142: this `finish` is assembled after the general wrapping pass, so it
-    // is wrapped here too; the marker keeps the face and identity above.
-    redacted(
-        Arc::new(tool.with_face(face, &variant)) as Arc<dyn Tool>,
-        mask,
-    )
+fn finish_at(assembled: &Assembled) -> Option<usize> {
+    assembled.tools.iter().position(|tool| {
+        super::capabilities::carries(
+            tool.as_ref(),
+            super::capabilities::SemanticCapability::ReportsCompletion,
+        )
+    })
 }
 
 // -------------------------------------------------- the same guard for a child
@@ -274,6 +243,28 @@ impl EventSink for TurnEndTap {
     }
 }
 
+/// `records` with every tool start of a worker member package (S6.11) under the identity
+/// the native `p1-tool-delegate` members journalled, the one `workers_started_in` reads:
+/// the member's `worker_start` result text is the native one, so a session journalled by
+/// either reports its workers the same way.
+#[cfg(feature = "delegation")]
+fn as_delegate_records(
+    records: &[p1_contracts::JournalRecord],
+) -> Vec<p1_contracts::JournalRecord> {
+    records
+        .iter()
+        .map(|record| {
+            let mut record = record.clone();
+            if let p1_contracts::RecordBody::ToolStarted { identity, .. } = &mut record.body
+                && super::delegation::WORKER_MODULES.contains(&identity.implementation.as_str())
+            {
+                identity.implementation = "p1-tool-delegate".to_string();
+            }
+            record
+        })
+        .collect()
+}
+
 /// Workers live in the process that started them: their sessions are in memory and
 /// are NOT restored with the parent's (ADR-0034). A resumed history that mentions
 /// workers is therefore talking about agents that no longer exist. Say so — to the
@@ -287,7 +278,7 @@ pub(crate) fn announce_lost_workers(
     session_file: Option<&Path>,
     records: &[p1_contracts::JournalRecord],
 ) -> Result<(), String> {
-    let earlier = p1_tool_delegate::workers_started_in(records);
+    let earlier = p1_tool_delegate::workers_started_in(&as_delegate_records(records));
     // `workers_started_in` reads only the delegate tool's own results, so workers a
     // WORKFLOW started are missing from it. Their run journals name them, and the
     // step's own `<session>.w<N>.jsonl` file may be gone or still there; every source
@@ -569,10 +560,17 @@ impl ChildBuilder {
             .as_ref()
             .map(|completion| completion.outcome.clone())
             .unwrap_or_default();
-        // ADR-0052 item 1: the policy follows the assembled tools' identities, so it
-        // is applied here, after assembly, to the `finish` tool the catalog built.
+        // ADR-0083 rule 7: the policy and the output contract are applied by the hub at
+        // this assembly boundary, which rebuilds the catalog's `finish` component under
+        // the grant it chooses from the assembled tools' identities.
         if let Some(completion) = &child_completion {
-            apply_completion_policy(&mut assembled, completion, contract.clone(), &mask);
+            apply_completion_policy(
+                &mut assembled,
+                completion_hub,
+                completion,
+                contract.clone(),
+                &mask,
+            )?;
         }
         let context = agent_context(&assembled, child_profile.as_deref())?;
         let route = assembled.resolved.route.origin.route.clone();
@@ -670,15 +668,15 @@ impl ChildBuilder {
             let completion_hub = completion_hub.clone();
             let tap = tap.clone();
             let tee = tee.clone();
-            let log = log.clone();
-            let outcome = outcome.clone();
             let mask = mask.clone();
-            // The worker's OWN `finish` tool survives every re-grant: its activity
-            // log is the worker's whole history, which `finish` reads to verify a
-            // claim, and a freshly assembled one would see an empty session.
-            let finish = finish_tool(&assembled);
+            // The worker's OWN completion survives every re-grant: its activity log is
+            // the worker's whole history, which `finish` reads to verify a claim, and a
+            // freshly issued one would see an empty session. The hub re-grants it and
+            // rebuilds the component, so a re-grant with `add_tools: ["shell"]` puts the
+            // worker back on the strict rule from the next turn on (ADR-0083 rule 7).
+            let completion = child_completion.clone();
             Arc::new(move |grant: &[String]| -> Result<Reconfiguration, String> {
-                let (assembled, child_profile) = assemble_child(
+                let (mut assembled, child_profile) = assemble_child(
                     &environment_dirs,
                     &catalog,
                     &environment_name,
@@ -693,23 +691,19 @@ impl ChildBuilder {
                 // completion: take it, so the hub cannot hand a stale one to a later
                 // worker assembly.
                 let _issued = completion_hub.take();
-                let context = agent_context(&assembled, child_profile.as_deref())?;
-                let finish_at = finish_index(&assembled);
-                // A re-grant is a new tool set, so the policy is chosen again from it
-                // (ADR-0052 item 1): `add_tools: ["shell"]` puts the worker back on the
-                // strict rule for every later turn.
-                let policy = completion_policy(&assembled.tools);
-                let mut tools = assembled.tools;
-                if let (Some(finish), Some(index)) = (&finish, finish_at) {
-                    tools[index] = finish_under_policy(
-                        finish,
-                        log.clone(),
-                        outcome.clone(),
-                        policy,
+                // A re-grant is a new tool set, so the hub chooses the policy again from
+                // it and rebuilds the `finish` component under the new grant.
+                if let Some(completion) = &completion {
+                    apply_completion_policy(
+                        &mut assembled,
+                        &completion_hub,
+                        completion,
                         contract.clone(),
                         &mask,
-                    );
+                    )?;
                 }
+                let context = agent_context(&assembled, child_profile.as_deref())?;
+                let tools = assembled.tools;
                 // The report's `tools` becomes the new assembly's names, its `finish`
                 // tool is found again by identity, and the child's activity records
                 // the effect of a re-granted tool from that tool itself.
@@ -958,11 +952,11 @@ mod tests {
                     .expect("a generation's catalog builds"),
             )
         };
-        let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(
-            &deps,
-            &options,
-            p1_contracts::CancellationToken::new(),
-        ));
+        // notice: S5.11 (#357): the line front end's policy is the release's host entry.
+        let front_end: Arc<dyn FrontEnd> = Arc::new(
+            LineFrontEnd::new(&deps, &options, p1_contracts::CancellationToken::new())
+                .expect("the official release ships the policy"),
+        );
         let generations = Arc::new(Generations::new(build(), front_end.authorization()));
         let builder = ChildBuilder::new(
             &deps,

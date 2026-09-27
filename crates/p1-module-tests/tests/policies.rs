@@ -9,13 +9,22 @@
 //!   summary, and a second call started while the first one's summary is parked runs on
 //!   its own fresh instance instead of deadlocking.
 //! - *the ask bridge and cancellation*: [`the_ask_bridge_over_the_component`] and
-//!   [`cancellation`], over `p1/policy/ask` and `p1/policy/full-access` through
-//!   `WasmAuthorizationPolicy` behind an `AskBridge`: read-only is permitted silently,
-//!   headless denies the component's `ask`, `y`/`n`/`a` mean what ADR-0038 says, and an
-//!   open question resolves to the cancel deny when the active turn's token fires.
+//!   [`cancellation`], over `p1/policy/ask` and `p1/policy/full-access` through the host's
+//!   `ShippedPolicy` (the host-entry adapter over `WasmAuthorizationPolicy`, S5.11) behind
+//!   an `AskBridge`: read-only is permitted silently, headless denies the component's
+//!   `ask`, `y`/`n`/`a` mean what ADR-0038 says, and an open question resolves to the
+//!   cancel deny when the active turn's token fires.
 //! - *a policy trap yields a conservative decision*: [`a_policy_trap_yields_a_conservative_decision`],
 //!   an out-of-fuel stop of a shipped policy and the deadline stop beside it.
 //! - *a changed approval key does not carry an old approval*: [`a_changed_approval_key_does_not_carry_an_old_approval`].
+//!
+//! The host entries (S5.11, issue #357; D083b):
+//! - [`the_host_policy_asks_the_official_host_entries`]: `HostPolicy` over the official
+//!   release's `p1/policy/*` (D080's built set in a test build), full access by default and
+//!   `ask` with the flag, the grant keyed by the real component digest;
+//! - [`a_release_missing_a_host_entry_fails_naming_it`] (D083b 4): a release without one of
+//!   the three packages, or with one that does not verify, fails naming it;
+//! - [`a_policy_package_is_registered_and_another_class_is_still_refused`].
 //!
 //! How the trap is produced, and why: no trap fixture package is shipped and neither
 //! `p1/policy/ask` nor `p1/policy/full-access` traps on its own, so the suite makes a
@@ -40,6 +49,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use p1_assembly::Catalog;
 use p1_context::{ContextConfig, DEFAULT_SUMMARY_OUTPUT_TOKENS, estimate_tokens};
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{
@@ -47,16 +57,17 @@ use p1_contracts::{
     CancellationToken, Compaction, ContextError, ContextInput, ContextPolicy, Decision, Effect,
     Item, Origin, Prepared, StopReason, ToolCall, ToolIdentity, ToolInput,
 };
+use p1_host::catalog::modules::{ModulePackage, ModulesError, register_modules};
 use p1_host::policy::{
-    ASK_POLICY, AskBridge, CANCEL_DENY, FULL_ACCESS_POLICY, HEADLESS_DENY, PolicyId, USER_DENY,
-    Verdict as HostVerdict, VerdictSource,
+    ASK_POLICY, AskBridge, CANCEL_DENY, FULL_ACCESS_POLICY, HEADLESS_DENY, HOST_ENTRIES,
+    HostPolicy, PolicyId, ShippedPolicy, USER_DENY, Verdict as HostVerdict, VerdictSource,
+    load_host_entries,
 };
 use p1_host::{LineSource, SharedWriter};
 use p1_module_runtime::loader::EPOCH_TICK;
 use p1_module_runtime::{
     ExecutionLimits, LoadedModule, Loader, ManualEpochs, ReleaseManifest, SummaryError,
-    SummaryRequest, SummaryResponse, SummaryService, Verdict as WasmVerdict,
-    WasmAuthorizationPolicy, WasmContextPolicy,
+    SummaryRequest, SummaryResponse, SummaryService, WasmContextPolicy,
 };
 use p1_module_tests::within_deadline;
 use tokio::sync::{Notify, mpsc};
@@ -135,9 +146,9 @@ fn load(loader: &Loader, package: (&str, &str)) -> LoadedModule {
     loader.load(package.1).expect("the built package loads")
 }
 
-/// The authorization policy adapter over the built `package`.
-fn authorization_policy(package: (&str, &str), limits: ExecutionLimits) -> WasmAuthorizationPolicy {
-    WasmAuthorizationPolicy::new(&load(&loader(&[package]), package), limits)
+/// The host's shipped-policy adapter over the built `package`.
+fn authorization_policy(package: (&str, &str), limits: ExecutionLimits) -> Arc<ShippedPolicy> {
+    ShippedPolicy::with_limits(Arc::new(load(&loader(&[package]), package)), limits)
         .expect("the policy adapter builds")
 }
 
@@ -335,20 +346,17 @@ fn watched_context(
 
 // ------------------------------------------------------------------ the ask bridge harness
 
-/// The component's verdicts with the host's shape, under the policy id the bridge keys
-/// remembered approvals by: the package name and the digest of the loaded bytes. The test
+/// The host's shipped policy, under the policy id the bridge keys remembered approvals by:
+/// the package name and the digest of the loaded bytes, as the host reports them. The test
 /// can switch the digest, as a reload to a different artifact would.
 struct ComponentSource {
-    policy: WasmAuthorizationPolicy,
+    policy: Arc<ShippedPolicy>,
     id: Mutex<PolicyId>,
 }
 
 impl ComponentSource {
-    fn new(policy: WasmAuthorizationPolicy) -> Arc<Self> {
-        let id = PolicyId {
-            package: policy.name().to_owned(),
-            digest: policy.digest().to_string(),
-        };
+    fn new(policy: Arc<ShippedPolicy>) -> Arc<Self> {
+        let id = policy.policy();
         Arc::new(Self {
             policy,
             id: Mutex::new(id),
@@ -372,13 +380,7 @@ impl VerdictSource for ComponentSource {
     }
 
     fn verdict<'a>(&'a self, request: AuthorizationRequest<'a>) -> BoxFuture<'a, HostVerdict> {
-        Box::pin(async move {
-            match self.policy.verdict(request).await {
-                WasmVerdict::Permit => HostVerdict::Permit,
-                WasmVerdict::Deny(reason) => HostVerdict::Deny(reason),
-                WasmVerdict::Ask => HostVerdict::Ask,
-            }
-        })
+        self.policy.verdict(request)
     }
 }
 
@@ -641,6 +643,13 @@ async fn the_ask_bridge_over_the_component() {
             "{:?}",
             interactive.policy_id()
         );
+        // The grant key carries the digest the build pinned for the component.
+        assert_eq!(
+            interactive.policy_id().digest,
+            package_manifest(ASK.0)["digest"]
+                .as_str()
+                .expect("a digest")
+        );
 
         // Read-only: the component permits it and no question is asked.
         assert_eq!(
@@ -825,7 +834,7 @@ async fn a_policy_trap_yields_a_conservative_decision() {
                 })
                 .await;
             match verdict {
-                WasmVerdict::Deny(reason) => {
+                HostVerdict::Deny(reason) => {
                     assert!(
                         reason.starts_with(&format!("authorization policy {} failed: ", ASK.1)),
                         "{reason}"
@@ -977,6 +986,262 @@ async fn a_changed_approval_key_does_not_carry_an_old_approval() {
             );
             assert_eq!(harness.reads(), 4, "the remembered identity still answers");
             assert_eq!(harness.prompts(), PROMPT.repeat(4));
+        },
+    )
+    .await;
+}
+
+// ------------------------------------------------------------------ the host entries (S5.11)
+
+/// The release manifest `scripts/build-modules.sh` writes beside the built packages: the
+/// official release of a test build (D080).
+fn built_release() -> Value {
+    let path = built().join("manifest.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "the built release manifest {} is missing ({error}): run scripts/build-modules.sh first",
+            path.display()
+        )
+    });
+    serde_json::from_str(&text).expect("the release manifest is JSON")
+}
+
+/// The digest the built release pins for `package`.
+fn released_digest(package: &str) -> String {
+    built_release()["components"]
+        .as_array()
+        .expect("components")
+        .iter()
+        .find(|entry| entry["name"] == package)
+        .and_then(|entry| entry["digest"].as_str())
+        .unwrap_or_else(|| panic!("the built release ships {package}"))
+        .to_owned()
+}
+
+/// A release laid out in `dir` from the built one: every component `edit` keeps (and may
+/// change), its file copied beside the manifest. Returns the manifest's path.
+fn staged_release(dir: &Path, edit: impl Fn(&mut Value) -> bool) -> PathBuf {
+    let mut release = built_release();
+    let mut components = Vec::new();
+    for mut entry in release["components"]
+        .as_array()
+        .expect("components")
+        .clone()
+    {
+        let path = entry["path"].as_str().expect("a path").to_owned();
+        if !edit(&mut entry) {
+            continue;
+        }
+        let target = dir.join(&path);
+        std::fs::create_dir_all(target.parent().expect("a package directory")).expect("mkdir");
+        std::fs::copy(built().join(&path), &target).expect("copy the component");
+        components.push(entry);
+    }
+    release["components"] = Value::Array(components);
+    let manifest = dir.join("manifest.json");
+    std::fs::write(&manifest, release.to_string()).expect("write the release manifest");
+    manifest
+}
+
+/// Asks `policy` to authorize [`call`] under the `default` identity.
+async fn authorize(policy: &HostPolicy, effect: Effect) -> Decision {
+    let (tool_call, tool_identity) = (call(), identity("default"));
+    policy
+        .authorize(AuthorizationRequest {
+            call: &tool_call,
+            identity: &tool_identity,
+            effect,
+        })
+        .await
+}
+
+/// `HostPolicy` answers through the official release's host entries: full access by
+/// default, `p1/policy/ask` with `--ask`, and a remembered grant is keyed by the digest the
+/// release pins for the component that decided (F8).
+#[tokio::test]
+async fn the_host_policy_asks_the_official_host_entries() {
+    within_deadline("the host policy asks the official host entries", async {
+        let lines = |answers: &[&str]| {
+            let (send, receiver) = mpsc::unbounded_channel();
+            for answer in answers {
+                send.send((*answer).to_owned()).expect("the test reads");
+            }
+            let (asked, _) = mpsc::unbounded_channel();
+            Arc::new(ScriptedLines {
+                lines: tokio::sync::Mutex::new(receiver),
+                asked,
+                reads: AtomicUsize::new(0),
+            })
+        };
+        let stderr = || -> SharedWriter { Arc::new(Mutex::new(Box::new(Buffer::default()))) };
+
+        // The default: `p1/policy/full-access`, every effect permitted, nothing asked.
+        let full_lines = lines(&[]);
+        let full = HostPolicy::new(
+            false,
+            false,
+            full_lines.clone(),
+            stderr(),
+            CancellationToken::new(),
+        )
+        .expect("the official release ships the default policy");
+        assert_eq!(
+            full.shipped().policy(),
+            PolicyId {
+                package: FULL_ACCESS_POLICY.to_owned(),
+                digest: released_digest(FULL_ACCESS_POLICY),
+            }
+        );
+        for effect in EFFECTS {
+            assert_eq!(
+                authorize(&full, effect).await,
+                Decision::Permit,
+                "{effect:?}"
+            );
+        }
+        assert_eq!(full_lines.reads.load(Ordering::SeqCst), 0);
+
+        // `--ask`: `p1/policy/ask`, read-only silently, `a` remembered under its digest.
+        let ask_lines = lines(&["a"]);
+        let ask = HostPolicy::new(
+            true,
+            false,
+            ask_lines.clone(),
+            stderr(),
+            CancellationToken::new(),
+        )
+        .expect("the official release ships the ask policy");
+        assert_eq!(
+            ask.shipped().policy(),
+            PolicyId {
+                package: ASK_POLICY.to_owned(),
+                digest: released_digest(ASK_POLICY),
+            }
+        );
+        assert_eq!(authorize(&ask, Effect::ReadOnly).await, Decision::Permit);
+        assert_eq!(ask_lines.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(authorize(&ask, Effect::Executes).await, Decision::Permit);
+        assert_eq!(authorize(&ask, Effect::Executes).await, Decision::Permit);
+        assert_eq!(
+            ask_lines.reads.load(Ordering::SeqCst),
+            1,
+            "the grant answered the second call"
+        );
+
+        // Headless `--ask`: only Permit or Deny reaches the core.
+        let headless = HostPolicy::new(true, true, lines(&[]), stderr(), CancellationToken::new())
+            .expect("the official release ships the ask policy");
+        assert_eq!(
+            authorize(&headless, Effect::WritesFiles).await,
+            deny(HEADLESS_DENY)
+        );
+
+        // A reload loads the package again from the same release: the same id, and the
+        // reloaded component answers once installed.
+        let reload = ask.shipped().reload().expect("the release still ships it");
+        assert_eq!(reload.policy(), ask.shipped().policy());
+        reload.install();
+        assert_eq!(authorize(&ask, Effect::ReadOnly).await, Decision::Permit);
+    })
+    .await;
+}
+
+/// D083b 4: a release manifest without one of the three host entries, or with one whose
+/// bytes do not match the digest it pins, fails the load naming that package. There is no
+/// native default to fall back on.
+#[tokio::test]
+async fn a_release_missing_a_host_entry_fails_naming_it() {
+    within_deadline("a release missing a host entry fails naming it", async {
+        // The complete release loads all three.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let complete = staged_release(dir.path(), |_| true);
+        let entries = load_host_entries(&complete).expect("the complete release loads");
+        for package in HOST_ENTRIES {
+            assert_eq!(
+                entries[package].digest().to_string(),
+                released_digest(package),
+                "{package}"
+            );
+        }
+
+        for missing in HOST_ENTRIES {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let release = staged_release(dir.path(), |entry| entry["name"] != missing);
+            let error = match load_host_entries(&release) {
+                Ok(_) => panic!("a release without {missing} must not load"),
+                Err(error) => error,
+            };
+            assert!(error.contains(missing), "{missing}: {error}");
+            assert!(error.contains("not in the release manifest"), "{error}");
+            for other in HOST_ENTRIES.iter().filter(|other| **other != missing) {
+                assert!(
+                    !error.contains(&format!("host entry {other} ")),
+                    "only {missing} is named: {error}"
+                );
+            }
+
+            // Present but not the bytes the release pins: unverifiable, named the same way.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let release = staged_release(dir.path(), |entry| {
+                if entry["name"] == missing {
+                    entry["digest"] = json!(format!("sha256:{}", "0".repeat(64)));
+                }
+                true
+            });
+            let error = match load_host_entries(&release) {
+                Ok(_) => panic!("an unverifiable {missing} must not load"),
+                Err(error) => error,
+            };
+            assert!(error.contains(missing), "{missing}: {error}");
+            assert!(error.contains("failed verification"), "{error}");
+        }
+    })
+    .await;
+}
+
+/// `register_modules` accepts a policy package (the shipped ones are the session's host
+/// entries, so it registers no tool), and a class it has no adapter for keeps its named
+/// refusal.
+#[tokio::test]
+async fn a_policy_package_is_registered_and_another_class_is_still_refused() {
+    within_deadline(
+        "a policy package is registered and another class is still refused",
+        async {
+            const DECISION: (&str, &str) = ("p1-module-workflow-decision", "p1/workflow-decision");
+            let packages = [CONTEXT, ASK, FULL_ACCESS, DECISION];
+            let loader = loader(&packages);
+            let package = |package: (&str, &str)| ModulePackage {
+                module: package.0.to_owned(),
+                lock: PathBuf::from("modules.lock"),
+                loaded: load(&loader, package),
+            };
+            let services: p1_host::catalog::modules::ModuleServices =
+                Arc::new(|_: &str, _: &p1_assembly::ToolServices| {
+                    p1_module_runtime::Services::default()
+                });
+
+            let mut catalog = Catalog::new();
+            let before = catalog.tool_keys();
+            register_modules(
+                &mut catalog,
+                vec![package(CONTEXT), package(ASK), package(FULL_ACCESS)],
+                services.clone(),
+            )
+            .expect("policy packages are accepted");
+            assert_eq!(
+                catalog.tool_keys(),
+                before,
+                "a policy is not a catalog tool"
+            );
+
+            match register_modules(&mut catalog, vec![package(DECISION)], services) {
+                Err(ModulesError::NotATool { module, kind }) => {
+                    assert_eq!(module, DECISION.0);
+                    assert_eq!(kind, "workflow-decision");
+                }
+                Err(other) => panic!("not the named refusal: {other}"),
+                Ok(()) => panic!("a workflow-decision package must still be refused"),
+            }
         },
     )
     .await;
