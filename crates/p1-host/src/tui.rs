@@ -1,5 +1,6 @@
 //! The TUI front end (issue #12): implements the host's [`FrontEnd`] seam —
-//! event observation through `TuiSink`, authorization through `TuiPolicy`, and
+//! event observation through `TuiSink`, authorization through the host's
+//! `AskBridge` asking on the screen through `TuiPolicy` (issue #308), and
 //! the run loop below. The UI itself is `p1-tui`'s pure state machine; this
 //! module is wiring: crossterm keys in, agent events in, authorization
 //! questions parked on the screen, answers back.
@@ -14,8 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
 use p1_contracts::{
-    AuthorizationPolicy, CallDescription, CancellationToken, Decision, Effect, EventSink,
-    InboxKind, Tool, ToolCall, TurnEnd,
+    AuthorizationPolicy, CallDescription, CancellationToken, Effect, EventSink, InboxKind, Tool,
+    ToolCall, TurnEnd,
 };
 use p1_core::Agent;
 use p1_tui::input::{self, Command};
@@ -24,7 +25,7 @@ use p1_tui::render::diff::DiffView;
 use p1_tui::render::home::HomePrelude;
 use p1_tui::render::ledger::{ContextView, SessionView};
 use p1_tui::render::permission::PermissionView;
-use p1_tui::runtime::{AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
+use p1_tui::runtime::{Answer, AuthRequest, TerminalGuard, TuiPolicy, TuiSink, UiEvent};
 use p1_tui::state::{Approval, PaneMode, Promotion, Screen};
 use p1_tui::transcript::Transcript;
 #[cfg(feature = "workflows")]
@@ -36,6 +37,7 @@ use crate::HostDeps;
 use crate::activity::Completion;
 use crate::cli::Options;
 use crate::frontend::{FrontEnd, WorkerService};
+use crate::policy::{AskBridge, Asker, OperatorAnswer, ShippedPolicy};
 use crate::run::StallGuard;
 
 mod describer;
@@ -59,6 +61,9 @@ pub struct TuiOptions {
     /// assembled environment, which is not known this early (`run_agent`
     /// builds this before `assemble`).
     pub effort: Option<String>,
+    /// `--compact` on `--resume` (ADR-0076): a `/compact` queued before the
+    /// first turn, so its line lands in the transcript.
+    pub compact: bool,
 }
 
 /// The TUI front end. Created before the agent so its sink and policy install
@@ -66,7 +71,9 @@ pub struct TuiOptions {
 pub struct TuiFrontEnd {
     options: TuiOptions,
     sink: Arc<TuiSink>,
-    policy: Arc<TuiPolicy>,
+    policy: Arc<AskBridge>,
+    // notice: S5.11 (#357): the host entry the bridge asks, for `/modules reload`.
+    shipped: Arc<ShippedPolicy>,
     events: Mutex<Option<mpsc::UnboundedReceiver<UiEvent>>>,
     auth: Mutex<Option<mpsc::UnboundedReceiver<AuthRequest>>>,
     /// (route, model), announced by the host once assembly has happened.
@@ -88,13 +95,17 @@ pub struct TuiFrontEnd {
 }
 
 impl TuiFrontEnd {
-    pub fn new(options: TuiOptions, cancel: CancellationToken) -> Self {
+    // notice: S5.11 (#357): fallible, because its policy is the release's host entry (a
+    // release that lacks it or ships one that does not verify fails, naming it).
+    pub fn new(options: TuiOptions, cancel: CancellationToken) -> Result<Self, String> {
         let (sink, events) = TuiSink::new();
-        let (policy, auth) = TuiPolicy::new(options.ask, cancel.clone());
-        Self {
+        let shipped = ShippedPolicy::official(options.ask)?;
+        let (policy, auth) = tui_policy(shipped.clone(), cancel.clone());
+        Ok(Self {
             options,
             sink: Arc::new(sink),
             policy: Arc::new(policy),
+            shipped,
             events: Mutex::new(Some(events)),
             auth: Mutex::new(Some(auth)),
             labels: Mutex::new(None),
@@ -102,7 +113,47 @@ impl TuiFrontEnd {
             worker_windows: Arc::new(Mutex::new(HashMap::new())),
             route_label: Arc::new(Mutex::new(String::new())),
             tools: Mutex::new(Arc::new(Vec::new())),
-        }
+        })
+    }
+}
+
+/// The TUI's authorization policy (issue #308): the host's [`AskBridge`] over the
+/// shipped policy of its mode (the host entry `p1/policy/full-access` without
+/// `--ask`, ADR-0038; `p1/policy/ask` with it), asking on the screen through
+/// [`TuiPolicy`]. Only `Permit` or `Deny` reaches the core (ADR-0024); `always`
+/// grants are the bridge's.
+// notice: S5.11 (#357): takes the loaded host entry instead of building a native one.
+fn tui_policy(
+    source: Arc<ShippedPolicy>,
+    cancel: CancellationToken,
+) -> (AskBridge, mpsc::UnboundedReceiver<AuthRequest>) {
+    let (asker, auth) = TuiPolicy::new(cancel.clone());
+    (
+        AskBridge::with_asker(source, false, Arc::new(TuiAsker(asker)), cancel),
+        auth,
+    )
+}
+
+/// The screen as the bridge's [`Asker`]: `TuiPolicy` parks the question, the
+/// operator's `y`/`n`/`a` comes back as the answer.
+struct TuiAsker(TuiPolicy);
+
+impl Asker for TuiAsker {
+    fn ask<'a>(
+        &'a self,
+        request: p1_contracts::AuthorizationRequest<'a>,
+    ) -> p1_contracts::BoxFuture<'a, Option<OperatorAnswer>> {
+        Box::pin(async move {
+            self.0.ask(request).await.map(|answer| match answer {
+                Answer::Yes => OperatorAnswer::Yes,
+                Answer::No => OperatorAnswer::No,
+                Answer::Always => OperatorAnswer::Always,
+            })
+        })
+    }
+
+    fn set_turn(&self, token: Option<CancellationToken>) {
+        self.0.set_turn(token);
     }
 }
 
@@ -186,6 +237,10 @@ impl FrontEnd for TuiFrontEnd {
 
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
         self.policy.clone()
+    }
+
+    fn shipped_policy(&self) -> Option<Arc<ShippedPolicy>> {
+        Some(self.shipped.clone())
     }
 
     fn parent_assembled(&self, route: &str, model: &str, _completion: Option<Completion>) {
@@ -371,6 +426,9 @@ impl FrontEnd for TuiFrontEnd {
                 environment_dirs: deps.environment_dirs.clone(),
                 route_label: self.route_label.clone(),
                 pending_switch: None,
+                // ADR-0076: `--compact --resume` is a `/compact` queued before
+                // the first turn; the loop applies it before anything else.
+                pending_compact: self.options.compact,
                 _workers: workers,
             };
 
@@ -432,7 +490,7 @@ pub(crate) struct Driver {
     /// §6.9's `/status`/`/access` read it (the policy itself carries no
     /// public getter — `p1-tui::runtime` is not an owned path here).
     ask: bool,
-    policy: Arc<TuiPolicy>,
+    policy: Arc<AskBridge>,
     /// Parked authorizations; the front one is on screen. Two workers can
     /// park at once (they share this policy) — a second request must QUEUE,
     /// never replace the one the operator is reading (its dropped answer
@@ -494,6 +552,10 @@ pub(crate) struct Driver {
     /// boundary"), since `agent` is exclusively borrowed by the turn future
     /// until then.
     pending_switch: Option<PendingSwitch>,
+    /// A `/compact` (ADR-0076), queued exactly like a switch: while a turn runs
+    /// it waits for the turn's end; at idle the loop applies it at once. Its own
+    /// flag, so a `/model` and a `/compact` typed in one turn both apply.
+    pending_compact: bool,
     _workers: Option<Arc<dyn WorkerService>>,
 }
 
@@ -561,6 +623,13 @@ impl Driver {
                 self.screen.composer.take();
                 self.submit(text, agent);
             }
+            Command::QueueSteering(text) if is_slash_command(&text) => {
+                // §11: a command typed while a turn runs is a command, never
+                // steering for the model; the ones that need `agent` queue for
+                // the turn's end (`agent` is `None` here).
+                self.screen.composer.take();
+                self.submit(text, agent);
+            }
             Command::QueueSteering(text) => {
                 self.screen.composer.take();
                 self.screen.queue(false, text.clone());
@@ -587,18 +656,13 @@ impl Driver {
             Command::Right => self.screen.composer.right(),
             // ^C is handled by the loop: cancel the turn, quit at idle.
             Command::CancelOrQuit => {}
-            Command::ApproveOnce => self.answer(Decision::Permit, false),
+            Command::ApproveOnce => self.answer(Answer::Yes),
             Command::ApproveSession | Command::ApproveProject | Command::AllFiles => {
-                // Project grants share the in-memory set until a trust store
-                // exists (issue #12). AllFiles grants the tool under review.
-                self.answer(Decision::Permit, true);
+                // Project grants share the bridge's in-memory set until a trust
+                // store exists (issue #12). AllFiles grants the tool under review.
+                self.answer(Answer::Always);
             }
-            Command::Deny => self.answer(
-                Decision::Deny {
-                    reason: p1_tui::runtime::USER_DENY.to_string(),
-                },
-                false,
-            ),
+            Command::Deny => self.answer(Answer::No),
             Command::NextFile => {}
             Command::OpenFold => {
                 if let Some(id) = self.screen.transcript.latest_fold.clone()
@@ -710,6 +774,8 @@ impl Driver {
             "model" | "env" => self.slash_model(arg, agent),
             "effort" => self.slash_effort(arg, agent),
             "models" => self.slash_models((!arg.is_empty()).then_some(arg)),
+            "compact" => self.request_compact(agent.is_some()),
+            "modules" => self.request_reload(arg, agent.is_some()),
             "status" => {
                 let output = status_command_output(self);
                 self.screen.transcript.command_output(output);
@@ -755,37 +821,134 @@ impl Driver {
     }
 
     /// §11: while a turn runs the switch applies at the next boundary —
-    /// `agent` is `None` exactly then (mid-`pump`, borrowed by the turn).
+    /// `agent` is `None` exactly then (mid-`pump`, borrowed by the turn). At idle
+    /// the loop applies it right after this key: the switch commits its
+    /// `Environment` record, which awaits, and a key handler cannot.
     fn request_switch(&mut self, request: PendingSwitch, agent: Option<&mut Agent>) {
-        let Some(agent) = agent else {
+        if agent.is_none() {
             self.screen
                 .transcript
                 .note("· model switch queued · applies at the next boundary");
             self.pending_switch = Some(request);
             return;
-        };
-        self.apply_switch(request, agent);
+        }
+        if self.model_switch.is_none() {
+            self.refuse_switch_unavailable();
+            return;
+        }
+        self.pending_switch = Some(request);
     }
 
-    fn apply_switch(&mut self, request: PendingSwitch, agent: &mut Agent) {
-        let Some(switch) = self.model_switch.clone() else {
+    /// ADR-0076: `/compact` queues like a switch (§11). The summary is a provider
+    /// request, so the LOOP applies it where `agent` is free — at once when idle
+    /// (`idle`), at the turn's end otherwise.
+    fn request_compact(&mut self, idle: bool) {
+        if !idle {
             self.screen
                 .transcript
-                .note("· switch refused · no model switch is available this run");
+                .note("· compact queued · applies at the end of this turn");
+        }
+        self.pending_compact = true;
+    }
+
+    /// The ONE line a `/compact` leaves (ADR-0076), and the `ctx` it moved: the
+    /// estimate of the history the next request carries.
+    fn report_compaction(
+        &mut self,
+        result: Result<p1_contracts::Compaction, p1_contracts::ContextError>,
+    ) {
+        if let Ok(compaction) = &result {
+            let tokens = match compaction {
+                p1_contracts::Compaction::Replaced { tokens_after, .. } => tokens_after,
+                p1_contracts::Compaction::Unchanged { tokens } => tokens,
+            };
+            self.set_context_used(Some(*tokens));
+        }
+        let line = crate::run::compaction_line(&result);
+        self.screen.transcript.note(&format!("· {line}"));
+    }
+
+    /// §10 `ctx`: the used tokens against the configured window and threshold;
+    /// unknown (no `[context]` section) stays `None`, never a guessed `0`.
+    fn set_context_used(&mut self, used: Option<u64>) {
+        self.screen.context =
+            self.context_window
+                .zip(self.context_warn_at)
+                .map(|(window, summarize_at)| ContextView {
+                    used,
+                    window,
+                    summarize_at,
+                    parts: vec![],
+                });
+        let (ctx, warn) = status::ctx_status(used, self.context_window, self.context_warn_at);
+        self.screen.statusbar.ctx = ctx;
+        self.screen.statusbar.ctx_warn = warn;
+    }
+
+    async fn apply_switch(&mut self, request: PendingSwitch, agent: &mut Agent) {
+        let Some(switch) = self.model_switch.clone() else {
+            self.refuse_switch_unavailable();
             return;
         };
         let before = self.model.clone();
         let outcome = match &request {
-            PendingSwitch::Model(reference) => crate::run::switch_model(
-                &switch,
-                agent,
-                crate::run::SwitchRequest::Model(reference),
-            ),
+            PendingSwitch::Model(reference) => {
+                crate::run::switch_model(
+                    &switch,
+                    agent,
+                    crate::run::SwitchRequest::Model(reference),
+                )
+                .await
+            }
             PendingSwitch::Effort(level) => {
                 crate::run::switch_model(&switch, agent, crate::run::SwitchRequest::Effort(level))
+                    .await
             }
         };
         self.report_switch(before, outcome);
+    }
+
+    fn refuse_switch_unavailable(&mut self) {
+        self.screen
+            .transcript
+            .note("· switch refused · no model switch is available this run");
+    }
+
+    /// ADR-0084 §3: `/modules reload` queues on the session's reload queue; the
+    /// LOOP applies it where `agent` is free — right after this key when idle, at
+    /// the turn's end (its tool calls settled) otherwise.
+    fn request_reload(&mut self, arg: &str, idle: bool) {
+        if p1_tui::input::modules_command(arg).is_none() {
+            self.screen.transcript.note("· /modules takes reload");
+            return;
+        }
+        let Some(switch) = &self.model_switch else {
+            self.refuse_switch_unavailable();
+            return;
+        };
+        if switch.reload_queue().request(!idle) == crate::run::ReloadRequested::Pending {
+            self.screen
+                .transcript
+                .note(p1_tui::input::RELOAD_PENDING_NOTE);
+        }
+    }
+
+    /// A queued `/modules reload`, applied at a boundary; nothing when none is queued.
+    async fn apply_reload(&mut self, agent: &mut Agent) {
+        let Some(switch) = self.model_switch.clone() else {
+            return;
+        };
+        if !switch.reload_queue().take() {
+            return;
+        }
+        let note = match crate::run::reload_modules(&switch, agent).await {
+            Ok(reloaded) => format!("· modules reloaded · {reloaded} · from the next turn"),
+            Err(reason) => format!(
+                "✗ modules reload refused · {reason} · kept still on {}",
+                self.model
+            ),
+        };
+        self.screen.transcript.note(&note);
     }
 
     /// §11: `switch_model` result → `MetaRow · model a → b · from the next
@@ -821,14 +984,12 @@ impl Driver {
         }
     }
 
-    fn answer(&mut self, decision: Decision, grant: bool) {
+    fn answer(&mut self, answer: Answer) {
         let Some(pending) = self.pending_auth.pop_front() else {
             return;
         };
-        if grant {
-            self.policy.grant_session(&pending.call, &pending.identity);
-        }
-        pending.answer(decision);
+        // `Always` is remembered by the ask bridge, under its grant key.
+        pending.answer(answer);
         self.screen.approval = None;
         if self.pinned_by_approval {
             self.screen.pinned = false;
@@ -942,19 +1103,7 @@ impl Driver {
                     // §10 `ctx`: `FrontEnd::context_configured` carries the
                     // assembled `[context]` window and threshold; unknown (no
                     // `[context]` section) stays `None`, never a guessed `0`.
-                    let used = status::usage_input_total(usage.as_ref());
-                    self.screen.context = self.context_window.zip(self.context_warn_at).map(
-                        |(window, summarize_at)| ContextView {
-                            used,
-                            window,
-                            summarize_at,
-                            parts: vec![],
-                        },
-                    );
-                    let (ctx, warn) =
-                        status::ctx_status(used, self.context_window, self.context_warn_at);
-                    self.screen.statusbar.ctx = ctx;
-                    self.screen.statusbar.ctx_warn = warn;
+                    self.set_context_used(status::usage_input_total(usage.as_ref()));
                 }
                 self.track_task(&stamped.event);
                 self.screen.apply(&stamped.event, stamped.at_ms);
@@ -1498,6 +1647,40 @@ where
         if cancel.is_cancelled() {
             return 130;
         }
+        // ADR-0076: a `/compact` applies here, where `agent` is free: at once
+        // when it was typed at idle, and at the end of the turn it was typed in
+        // (a follow-up that boundary took waits until the summary is in). The
+        // summary request is pumped like a turn, so the screen stays live and
+        // ^C cancels it.
+        if std::mem::take(&mut driver.pending_compact) {
+            redraws.dirty = true;
+            let child = cancel.child_token();
+            let result = match pump(
+                terminal,
+                driver,
+                &mut keys,
+                &mut events,
+                &mut auth,
+                sink,
+                &child,
+                color_mode,
+                &mut redraws,
+                Box::pin(agent.compact_now(&child)),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => return terminal_gave_up(&error),
+            };
+            driver.report_compaction(result);
+            // The pump's last frame predates the line just written: a failed or
+            // no-op compaction touches nothing else the frame test compares.
+            redraws.dirty = true;
+            if prompt.is_none() {
+                prompt = driver.submit_pending.take();
+            }
+            continue;
+        }
         // Start the next turn (submitted prompt, or a queued follow-up from
         // the last turn's end), then drain the inbox after it — the
         // interactive loop's drain rule, unchanged.
@@ -1562,8 +1745,10 @@ where
             // §11: a `/model`/`/effort` typed mid-turn applies here, at the
             // first boundary `agent` is free again.
             if let Some(pending) = driver.pending_switch.take() {
-                driver.apply_switch(pending, agent);
+                driver.apply_switch(pending, agent).await;
             }
+            // ADR-0084 §3: a `/modules reload` typed mid-turn applies here too.
+            driver.apply_reload(agent).await;
             // The turn's end moved the screen too: the working row leaves, a
             // cancelled turn drops its queue, a switch renames the chip.
             redraws.dirty = true;
@@ -1603,6 +1788,11 @@ where
                     Input::Key(key) if is_cancel(&key) => driver.exit = Some(0),
                     Input::Key(key) => {
                         driver.on_key(key, Some(agent));
+                        // A `/model` or `/effort` typed at idle applies now.
+                        if let Some(pending) = driver.pending_switch.take() {
+                            driver.apply_switch(pending, agent).await;
+                        }
+                        driver.apply_reload(agent).await;
                         if let Some(text) = driver.submit_pending.take() {
                             prompt = Some(text);
                         }
@@ -1663,8 +1853,9 @@ where
                 }
                 driver.policy.set_turn(None);
                 if let Some(pending) = driver.pending_switch.take() {
-                    driver.apply_switch(pending, agent);
+                    driver.apply_switch(pending, agent).await;
                 }
+                driver.apply_reload(agent).await;
                 redraws.dirty = true;
             }
         }
@@ -1685,7 +1876,7 @@ where
 /// way `run` does for a terminal it cannot use (the one case where this returns
 /// without the turn future finishing).
 #[allow(clippy::too_many_arguments)]
-async fn pump<B, K, F>(
+async fn pump<B, K, F, T>(
     terminal: &mut ratatui::Terminal<B>,
     driver: &mut Driver,
     keys: &mut K,
@@ -1696,11 +1887,11 @@ async fn pump<B, K, F>(
     color_mode: ColorMode,
     redraws: &mut Redraws,
     mut turn: std::pin::Pin<Box<F>>,
-) -> Result<TurnEnd, String>
+) -> Result<T, String>
 where
     B: Backend,
     K: futures_util::Stream<Item = Input> + Unpin,
-    F: std::future::Future<Output = TurnEnd>,
+    F: std::future::Future<Output = T>,
 {
     let mut workers =
         tokio::time::interval_at(tokio::time::Instant::now() + WORKER_POLL, WORKER_POLL);
@@ -2082,6 +2273,20 @@ fn access_command_output(driver: &Driver) -> p1_tui::transcript::CommandOutput {
     }
 }
 
+/// The names `Driver::slash` runs. A line that starts with one of them is a
+/// command even while a turn runs; any other text — `/usr/bin` included — stays
+/// steering for the model.
+const SLASH_COMMANDS: &[&str] = &[
+    "exit", "quit", "focus", "goal", "model", "env", "effort", "models", "compact", "status",
+    "access", "help", "modules",
+];
+
+fn is_slash_command(text: &str) -> bool {
+    text.strip_prefix('/')
+        .map(|rest| rest.split_once(' ').map_or(rest, |(name, _)| name))
+        .is_some_and(|name| SLASH_COMMANDS.contains(&name))
+}
+
 /// §11: `/help` — the command list with descriptions. `/resume` is left off:
 /// the TUI does not implement it yet (a listed-but-inert command would be
 /// worse than an incomplete list).
@@ -2089,6 +2294,7 @@ fn help_command_output() -> p1_tui::transcript::CommandOutput {
     use p1_tui::transcript::{CommandOutput, CommandRow};
     const COMMANDS: &[(&str, &str)] = &[
         ("/model [REF]", "switch model or effort · alias /env"),
+        ("/compact", "summarize the session now"),
         ("/effort LEVEL", "low medium high max"),
         (
             "/goal [TEXT]",
@@ -2155,9 +2361,11 @@ mod worker_context_window_tests {
                 workspace: std::path::PathBuf::from("/workspace"),
                 sandbox: "off".into(),
                 effort: None,
+                compact: false,
             },
             CancellationToken::new(),
-        );
+        )
+        .expect("the official release ships the policy");
 
         front_end.worker_context_configured("w1", Some(200_000));
         assert_eq!(
@@ -2187,9 +2395,11 @@ mod worker_end_tests {
                 workspace: std::path::PathBuf::from("/workspace"),
                 sandbox: "off".into(),
                 effort: None,
+                compact: false,
             },
             CancellationToken::new(),
-        );
+        )
+        .expect("the official release ships the policy");
         let mut events = front_end
             .events
             .lock()

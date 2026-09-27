@@ -23,7 +23,7 @@ use p1_workers::WorkerReport;
 
 use crate::activity::Completion;
 use crate::cli::Options;
-use crate::policy::HostPolicy;
+use crate::policy::{HostPolicy, ShippedPolicy};
 use crate::render::Renderer;
 use crate::run::{StallGuard, run_headless, run_interactive};
 use crate::{HostDeps, SharedWriter};
@@ -104,6 +104,14 @@ pub trait FrontEnd: Send + Sync {
 
     /// The authorization policy for the parent and, shared, for every worker.
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy>;
+
+    // notice: S5.11 (#357) adds this method to the S1-owned seam; S1 approval pending.
+    /// The shipped policy component [`FrontEnd::authorization`] asks, which a
+    /// `/modules reload` loads again from the release (ADR-0084 §3). `None` (a front
+    /// end with a policy of its own) keeps the policy as it is across a reload.
+    fn shipped_policy(&self) -> Option<Arc<ShippedPolicy>> {
+        None
+    }
 
     /// The host announces the assembled parent once, before the agent is built
     /// and before any event: its resolved route/model and its `finish` state
@@ -192,15 +200,21 @@ pub struct LineFrontEnd {
 }
 
 impl LineFrontEnd {
-    pub fn new(deps: &HostDeps, options: &Options, cancel: CancellationToken) -> Self {
+    // notice: S5.11 (#357): fallible, because its policy is the release's host entry; a
+    // release that lacks it or ships one that does not verify fails, naming it.
+    pub fn new(
+        deps: &HostDeps,
+        options: &Options,
+        cancel: CancellationToken,
+    ) -> Result<Self, String> {
         let policy = Arc::new(HostPolicy::new(
             options.ask,
             options.is_headless(),
             deps.lines.clone(),
             deps.stderr.clone(),
             cancel,
-        ));
-        Self {
+        )?);
+        Ok(Self {
             stdout: deps.stdout.clone(),
             stderr: deps.stderr.clone(),
             tty: deps.stdout_is_tty,
@@ -211,7 +225,7 @@ impl LineFrontEnd {
             completion: OnceLock::new(),
             #[cfg(feature = "delegation")]
             worker_usage: Arc::new(crate::render::WorkerUsage::new()),
-        }
+        })
     }
 
     fn renderer(&self) -> &Arc<Renderer> {
@@ -279,6 +293,10 @@ impl FrontEnd for LineFrontEnd {
 
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
         self.policy.clone()
+    }
+
+    fn shipped_policy(&self) -> Option<Arc<ShippedPolicy>> {
+        Some(self.policy.shipped().clone())
     }
 
     fn parent_assembled(&self, route: &str, model: &str, completion: Option<Completion>) {
