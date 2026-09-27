@@ -17,6 +17,9 @@ use p1_workspace::{Observation, ObservedFiles, Workspace, write_atomic};
 
 pub use p1_workspace::ToolFace;
 
+pub mod capability;
+pub use capability::{MutationCapability, mutation_service, mutation_service_over};
+
 /// The `write` tool. Holds one agent's workspace and observation store.
 pub struct WriteTool {
     workspace: Workspace,

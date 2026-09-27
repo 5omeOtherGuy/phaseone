@@ -14,7 +14,8 @@ use p1_tool_edit_logic::exec::{
     CallInput, Capabilities, Entry, EntryKind, FsError, Mutation, Observation, Outcome, execute,
 };
 use p1_workspace::{
-    MutationError, MutationPolicy, ObservedFiles, OwnedMutation, Workspace, WorkspaceError,
+    MutationError, MutationPolicy, ObservedFiles, OwnedMutation, ReadRecord, Workspace,
+    WorkspaceError,
 };
 
 /// The host side of the four imports, over one agent's workspace and observations.
@@ -111,12 +112,15 @@ impl Capabilities for Host {
     }
 
     fn begin(&self) -> HeldMutation {
-        HeldMutation(
-            self.runtime.block_on(
-                self.workspace
-                    .begin_owned(&self.observed, MutationPolicy::Observed),
-            ),
-        )
+        // An empty read record: this emulation models the observation registry and the
+        // mutation service of one agent, not the read record the host's read side fills
+        // (nothing here reads through `p1_tool_read`), so the identity recheck is inert —
+        // as it is for the native tool this emulation is compared against.
+        HeldMutation(self.runtime.block_on(self.workspace.begin_owned(
+            &self.observed,
+            &ReadRecord::new(),
+            MutationPolicy::Observed,
+        )))
     }
 }
 

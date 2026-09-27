@@ -26,34 +26,81 @@ use p1_contracts::{
 };
 use p1_module_runtime::process::{ProcessCapability, ProcessService, Sandbox};
 use p1_module_runtime::{ExecutionLimits, LoadedModule, Services, wasm_tool};
+use p1_workspace::{MutationPolicy, ObservedFiles, Workspace};
 
 use crate::HostDeps;
 use crate::activity::{AgentRole, CompletionHub, finish_component};
 use crate::cli::SandboxMode;
 
 use super::capabilities::NativeDeclaration;
-use super::modules::{HostEntryRegistration, ModuleServices, register_composed_host_entries};
+use super::modules::{
+    HostEntryRegistration, ModuleServices, lock_selects, register_composed_host_entries,
+};
 
 /// The catalog keys of the two host entries this file composes its own tool for (S3.8):
 /// `HOST_ENTRIES` names the packages the release must ship for them.
 const SHELL: &str = "shell";
 const FINISH: &str = "finish";
 
+/// The catalog key of the `edit` tool, native or the `p1/edit` package a lock selects.
+const EDIT: &str = "edit";
+/// The catalog key of the `write` tool, native or the `p1/write` package a lock selects.
+const WRITE: &str = "write";
+/// The catalog key of the `apply_patch` tool, native or the `p1/patch` package a lock
+/// selects.
+const PATCH: &str = "apply_patch";
+/// The catalog key of the `grep` tool, native or the `p1/search` package a lock selects.
+const SEARCH: &str = "grep";
+
 /// The capability services a module tool is linked with, from the assembling agent's own:
 /// the read side of its workspace and its observations (`p1-tool-read`'s service over
-/// `p1-workspace`, S1.8). The credential files under the host's home are refused there
-/// exactly as the native `read` refuses them (issue #142), so selecting the `p1/read`
-/// package never widens what an agent can read. Each service is linked only where a
-/// package's manifest grants it.
+/// `p1-workspace`, S1.8), the search tool's walk beside it, and — for the mutating rows —
+/// the owned mutation with the mode the row grants (S2). The credential files under the
+/// host's home are refused there exactly as the native `read` refuses them (issue #142), so
+/// selecting a package never widens what an agent can read. Each service is linked only
+/// where a package's manifest grants it.
+///
+/// The hook keys on the module identity the loader verified (`p1/edit`, `p1/patch`, …), so
+/// a lock entry can serve another key of the same package without moving a grant.
 pub(super) fn module_services(deps: &HostDeps) -> ModuleServices {
     let home = deps.home.clone();
-    Arc::new(move |_module: &str, services: &ToolServices| {
-        p1_tool_read::capability_services(
+    Arc::new(move |module: &str, services: &ToolServices| {
+        capability_services_for(
+            module,
             services.workspace.clone(),
             services.observed.clone(),
             home.clone(),
         )
     })
+}
+
+/// The mutation mode the catalog row of the module `module` (its verified manifest name,
+/// e.g. `p1/edit`) assembles: observed for the edit and write components, patch-authorized
+/// for patch, and none for a tool that never mutates
+/// (`docs/design/modules/workspace-mutation.md`, the per-tool table; ADR-0088 point 4).
+pub fn mutation_mode(module: &str) -> Option<MutationPolicy> {
+    match module {
+        "p1/edit" | "p1/write" => Some(MutationPolicy::Observed),
+        "p1/patch" => Some(MutationPolicy::PatchAuthorized),
+        _ => None,
+    }
+}
+
+/// The capability services the locked tool module `module` is linked with, from the
+/// assembling agent's own workspace and observations: the catalog row's grants. The search
+/// component is linked the search capability alone (its manifest grants the walk and no
+/// snapshot); every other tool gets the read side, with the mutation its row grants. Public
+/// so the module acceptance suite links a component exactly as the host does.
+pub fn capability_services_for(
+    module: &str,
+    workspace: Workspace,
+    observed: ObservedFiles,
+    home: Option<PathBuf>,
+) -> Services {
+    if module == "p1/search" {
+        return p1_tool_search::search_services(workspace);
+    }
+    p1_tool_read::tool_services(workspace, observed, home, mutation_mode(module))
 }
 
 /// The semantic capabilities a still-native registration declares, each on the identity
@@ -310,48 +357,64 @@ pub(super) fn register_standard_tools(
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) -> Result<(), String> {
-    catalog.tool(
-        "edit",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_edit::EditTool::new(services.workspace.clone(), services.observed.clone()),
-                spec
-            ))
-        }),
-    );
-    catalog.tool(
-        "write",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_write::WriteTool::new(
-                    services.workspace.clone(),
-                    services.observed.clone()
-                ),
-                spec
-            ))
-        }),
-    );
-    catalog.tool(
-        "grep",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_search::GrepTool::new(services.workspace.clone()),
-                spec
-            ))
-        }),
-    );
-    catalog.tool(
-        "apply_patch",
-        Box::new(|spec: &ToolSpec, services: &ToolServices| {
-            Ok(apply_face!(
-                p1_tool_patch::PatchTool::new(
-                    services.workspace.clone(),
-                    services.observed.clone()
-                ),
-                spec
-            ))
-        }),
-    );
+    // S2: as `read` for S1.8, a `modules.lock` entry named `edit`, `write`, `apply_patch`
+    // or `grep` selects the package of that key (`p1/edit`, `p1/write`, `p1/patch`,
+    // `p1/search`), which the locked-module registration then registers. The native tool
+    // stays the fallback: it is registered whenever no lock selects the key (D083b keeps
+    // the four fallbacks until the cutover audit changes).
+    if !lock_selects(&deps.environment_dirs, EDIT) {
+        catalog.tool(
+            EDIT,
+            Box::new(|spec: &ToolSpec, services: &ToolServices| {
+                Ok(apply_face!(
+                    p1_tool_edit::EditTool::new(
+                        services.workspace.clone(),
+                        services.observed.clone()
+                    ),
+                    spec
+                ))
+            }),
+        );
+    }
+    if !lock_selects(&deps.environment_dirs, WRITE) {
+        catalog.tool(
+            WRITE,
+            Box::new(|spec: &ToolSpec, services: &ToolServices| {
+                Ok(apply_face!(
+                    p1_tool_write::WriteTool::new(
+                        services.workspace.clone(),
+                        services.observed.clone()
+                    ),
+                    spec
+                ))
+            }),
+        );
+    }
+    if !lock_selects(&deps.environment_dirs, SEARCH) {
+        catalog.tool(
+            SEARCH,
+            Box::new(|spec: &ToolSpec, services: &ToolServices| {
+                Ok(apply_face!(
+                    p1_tool_search::GrepTool::new(services.workspace.clone()),
+                    spec
+                ))
+            }),
+        );
+    }
+    if !lock_selects(&deps.environment_dirs, PATCH) {
+        catalog.tool(
+            PATCH,
+            Box::new(|spec: &ToolSpec, services: &ToolServices| {
+                Ok(apply_face!(
+                    p1_tool_patch::PatchTool::new(
+                        services.workspace.clone(),
+                        services.observed.clone()
+                    ),
+                    spec
+                ))
+            }),
+        );
+    }
     // S3.8: the `shell` and `finish` entries are the release's `p1/shell` and `p1/finish` host
     // entries (ADR-0083, D083b, D-XO-49). They are listed in `HOST_ENTRIES` beside `read`'s, and
     // the one shared host-entry step loads each package from the release manifest, verifies it
@@ -423,6 +486,76 @@ mod tests {
         std::fs::write(root.path().join("modules.lock"), LOCKED_SHELL).unwrap();
         assert!(super::super::modules::lock_selects(&dirs, SHELL));
         assert!(!super::super::modules::lock_selects(&dirs, "grep"));
+    }
+
+    /// A lock naming one module, as an installation writes it.
+    fn lock_naming(module: &str, package: &str) -> String {
+        format!(
+            "format = \"p1-modules-lock/1\"\n\n[modules.{module}]\npackage = \"{package}\"\n\
+             version = \"0.0.1\"\ndigest = \"sha256:\
+             0000000000000000000000000000000000000000000000000000000000000000\"\n\
+             world = \"p1:module/tool@1.0.0\"\nprotocol = \"1.0\"\n"
+        )
+    }
+
+    #[test]
+    fn the_native_file_tools_stay_unless_a_lock_names_their_key() {
+        let root = tempfile::tempdir().unwrap();
+        let environments = root.path().join("environments");
+        std::fs::create_dir_all(&environments).unwrap();
+        let dirs = [environments];
+        std::fs::write(
+            root.path().join("modules.lock"),
+            "format = \"p1-modules-lock/1\"\n\n[modules]\n",
+        )
+        .unwrap();
+        for key in [EDIT, WRITE, PATCH, SEARCH] {
+            assert!(!lock_selects(&dirs, key), "the shipped empty lock: {key}");
+        }
+
+        // S2's four keys, each its own lock entry.
+        for (key, package) in [
+            (EDIT, "p1/edit"),
+            (WRITE, "p1/write"),
+            (PATCH, "p1/patch"),
+            (SEARCH, "p1/search"),
+        ] {
+            std::fs::write(root.path().join("modules.lock"), lock_naming(key, package)).unwrap();
+            assert!(lock_selects(&dirs, key), "{key} is selected");
+            for other in [EDIT, WRITE, PATCH, SEARCH] {
+                if other != key {
+                    assert!(
+                        !lock_selects(&dirs, other),
+                        "{other} is not selected by {key}"
+                    );
+                }
+            }
+        }
+
+        // A lock entry of another tool selects none of the four.
+        std::fs::write(
+            root.path().join("modules.lock"),
+            lock_naming("read", "p1/read"),
+        )
+        .unwrap();
+        for key in [EDIT, WRITE, PATCH, SEARCH] {
+            assert!(!lock_selects(&dirs, key), "{key} stays native");
+        }
+    }
+
+    #[test]
+    fn the_mutation_mode_is_the_row_of_the_component() {
+        assert_eq!(mutation_mode("p1/edit"), Some(MutationPolicy::Observed));
+        assert_eq!(mutation_mode("p1/write"), Some(MutationPolicy::Observed));
+        assert_eq!(
+            mutation_mode("p1/patch"),
+            Some(MutationPolicy::PatchAuthorized)
+        );
+        // The read component links no mutation, and neither does any other module: a
+        // component is granted only what its own row assembles.
+        for module in ["p1/read", "p1/search", "p1/worker-start", "p1/summary"] {
+            assert_eq!(mutation_mode(module), None, "{module}");
+        }
     }
 
     /// One catalog compiles a shipped package at most once, and the assembly it serves is

@@ -7,17 +7,27 @@
 //! the credential files under the agent's home (issue #142) are refused before confinement,
 //! with the same model-facing text. Every message a module receives is complete and safe to
 //! show the model, so the component passes `io` text through unchanged.
+//!
+//! This crate also hosts the one builder of the services the release's tool components are
+//! linked with ([`capability_services`] and [`tool_services`]): the read side above and its
+//! `snapshot`, the search tool's walk beside them (`p1-tool-search`, U-search.3) and the
+//! owned mutation (`p1-tool-write`, U-mut), so `p1/read`, `p1/edit`, `p1/write`, `p1/patch`
+//! and `p1/search` are all linked from one place. A read through this capability is not an
+//! observation; it is recorded in the call's [`ReadRecord`] instead, which the mutation
+//! rechecks under the gate (docs/design/modules/workspace-mutation.md, step 3; ADR-0092).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use p1_contracts::BoxFuture;
+use p1_module_runtime::capabilities::{SearchQuery, SearchResult, WorkspaceService};
 use p1_module_runtime::{
     EntryKind, FsError, Services, SnapshotObservation, SnapshotService, WorkspaceEntry,
-    WorkspaceService,
 };
+use p1_tool_search::SearchCapability;
 use p1_workspace::{
-    CheckedPath, FileKind, Observation, ObservedFiles, Snapshot, Workspace, WorkspaceError,
+    CheckedPath, FileKind, MutationPolicy, Observation, ObservedFiles, ReadRecord, Snapshot,
+    Workspace, WorkspaceError,
 };
 
 use crate::{refuse_credentials, xdg_credentials};
@@ -37,6 +47,9 @@ pub struct ReadCapability {
 struct Inner {
     workspace: Workspace,
     observed: ObservedFiles,
+    /// What this tool read, so a mutation assembled with the same record can refuse a
+    /// target that changed after the read (the gated recheck's read identity).
+    reads: ReadRecord,
     home: Option<PathBuf>,
     xdg_credentials: Vec<PathBuf>,
     /// The snapshots of files being read window by window, oldest first.
@@ -48,10 +61,23 @@ impl ReadCapability {
     /// `home` (the host's injected `HOME`) and the XDG-named stores, as the native
     /// [`crate::ReadTool`] built with that home does.
     pub fn new(workspace: Workspace, observed: ObservedFiles, home: Option<PathBuf>) -> Self {
+        Self::with_reads(workspace, observed, ReadRecord::new(), home)
+    }
+
+    /// The same, recording every read into `reads`: one assembly shares that record between
+    /// this read side and the mutation service it builds, so a change computed from a read
+    /// is rechecked against it under the gate.
+    pub fn with_reads(
+        workspace: Workspace,
+        observed: ObservedFiles,
+        reads: ReadRecord,
+        home: Option<PathBuf>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 workspace,
                 observed,
+                reads,
                 home,
                 xdg_credentials: xdg_credentials(),
                 open: Mutex::new(Vec::new()),
@@ -74,18 +100,118 @@ impl ReadCapability {
     }
 }
 
-/// The `workspace` and `snapshot` services of one agent, for the module tools the host
-/// links: `home` is the host's (issue #142), passed in as it is to the native `read`.
+/// The workspace, `snapshot` and `workspace-mutation` services of one agent, for the tool
+/// components the release links: `home` is the host's (issue #142), passed in as it is to
+/// the native `read`. `mutation` is the mode the assembling row grants: `Some(Observed)`
+/// for the edit and write rows, `Some(PatchAuthorized)` for the patch row, `None` for a
+/// tool that does not mutate (its manifest does not grant `workspace-mutation` either way).
+///
+/// The services are call-scoped (ADR-0092): every export call gets its own read side and
+/// mutation service over one fresh [`ReadRecord`], so the gated write of a call refuses a
+/// target another agent changed after THIS call's read, and no read of an earlier or a
+/// concurrent call of the same tool satisfies or blocks it.
+pub fn tool_services(
+    workspace: Workspace,
+    observed: ObservedFiles,
+    home: Option<PathBuf>,
+    mutation: Option<MutationPolicy>,
+) -> Services {
+    Services::call_scoped(move || call_services(&workspace, &observed, home.clone(), mutation))
+}
+
+/// The services of one call: the read side and the mutation over the call's own record.
+fn call_services(
+    workspace: &Workspace,
+    observed: &ObservedFiles,
+    home: Option<PathBuf>,
+    mutation: Option<MutationPolicy>,
+) -> Services {
+    let reads = ReadRecord::new();
+    let read = Arc::new(ReadCapability::with_reads(
+        workspace.clone(),
+        observed.clone(),
+        reads.clone(),
+        home,
+    ));
+    Services {
+        workspace: Some(read.clone()),
+        snapshot: Some(read),
+        workspace_mutation: mutation.map(|policy| {
+            p1_tool_write::mutation_service_over(workspace.clone(), observed.clone(), reads, policy)
+        }),
+        ..Services::default()
+    }
+}
+
+/// [`tool_services`] with the search walk (`list-files`, `search`) beside the read side, so
+/// one builder serves every tool component of the release — `p1/read`, `p1/edit`,
+/// `p1/write`, `p1/patch` and `p1/search`.
+///
+/// The mutation is assembled patch-authorized, the only mode that serves all of them: the
+/// patch component must never be held to an agent's observation (ADR-0025's exemption), and
+/// the edit and write components check the observation themselves before they begin
+/// (ADR-0088 point 4). What the host enforces for all three, whatever the mode, is the read
+/// record, call-scoped as in [`tool_services`]. A caller that knows the module's row uses
+/// [`tool_services`] with its mode (the catalog does; a row that grants no mutation passes
+/// `None`).
 pub fn capability_services(
     workspace: Workspace,
     observed: ObservedFiles,
     home: Option<PathBuf>,
 ) -> Services {
-    let capability = Arc::new(ReadCapability::new(workspace, observed, home));
-    Services {
-        workspace: Some(capability.clone()),
-        snapshot: Some(capability),
-        ..Services::default()
+    Services::call_scoped(move || {
+        let mut services = call_services(
+            &workspace,
+            &observed,
+            home.clone(),
+            Some(MutationPolicy::PatchAuthorized),
+        );
+        let read = services
+            .workspace
+            .take()
+            .expect("call_services links the read side");
+        services.workspace = Some(Arc::new(ToolWorkspace {
+            read,
+            search: Arc::new(SearchCapability::new(workspace.clone())),
+        }));
+        services
+    })
+}
+
+/// The workspace service of every tool component whose assembly carries the walk: the read
+/// side (its credential refusal included), with the search tool's walk beside it. `stat`,
+/// `read` and `snapshot` are the read tool's; the walk is the search tool's, and a search
+/// module is linked the search service alone over its own workspace
+/// (`p1_tool_search::search_services`).
+struct ToolWorkspace {
+    read: Arc<dyn WorkspaceService>,
+    search: Arc<SearchCapability>,
+}
+
+impl WorkspaceService for ToolWorkspace {
+    fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>> {
+        self.read.stat(path)
+    }
+
+    fn read(
+        &self,
+        path: String,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, FsError>> {
+        self.read.read(path, offset, length)
+    }
+
+    fn list_files(
+        &self,
+        path: String,
+        glob: Option<String>,
+    ) -> BoxFuture<'_, Result<Vec<String>, FsError>> {
+        self.search.list_files(path, glob)
+    }
+
+    fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<SearchResult, FsError>> {
+        self.search.search(query)
     }
 }
 
@@ -161,6 +287,15 @@ impl Inner {
         let length = usize::try_from(length).unwrap_or(usize::MAX);
         let window = snapshot.read(offset, length).to_vec();
         let size = snapshot.metadata().size;
+        // What this read returned is this tool's read identity of the file, whatever window
+        // was asked for: the whole-file digest of the snapshot the bytes come from. The
+        // latest read of a path wins, and a mutation assembled with the same record refuses
+        // any other bytes at that path under the gate.
+        self.reads.record_read(
+            &self.workspace.spelling(requested),
+            &key,
+            snapshot.metadata().content_hash,
+        );
         if (offset as u64).saturating_add(window.len() as u64) < size {
             self.keep_open(key, snapshot);
         }
@@ -247,6 +382,53 @@ mod tests {
             Some(root.to_path_buf()),
         );
         (capability, observed)
+    }
+
+    #[tokio::test]
+    async fn a_read_records_the_whole_file_whatever_window_was_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let reads = ReadRecord::new();
+        let capability = ReadCapability::with_reads(
+            Workspace::new(dir.path()).unwrap(),
+            ObservedFiles::new(),
+            reads.clone(),
+            None,
+        );
+        assert_eq!(reads.recorded(&path), None, "nothing is read yet");
+
+        // A window that stops before the end records the whole file, not the window.
+        let window = WorkspaceService::read(&capability, "a.txt".into(), 0, 4)
+            .await
+            .unwrap();
+        assert_eq!(window, b"alph");
+        let whole = ReadRecord::new();
+        whole.record(&path, b"alpha\nbeta\n");
+        assert_eq!(
+            reads.recorded(&path),
+            whole.recorded(&path),
+            "the identity is the whole file the window came from"
+        );
+
+        // A read of the new contents is the new identity, as the design says.
+        std::fs::write(&path, "ALPHA\nBETA\n").unwrap();
+        assert_eq!(reads.recorded(&path), whole.recorded(&path));
+        WorkspaceService::read(&capability, "a.txt".into(), 0, 64)
+            .await
+            .unwrap();
+        let changed = ReadRecord::new();
+        changed.record(&path, b"ALPHA\nBETA\n");
+        assert_eq!(reads.recorded(&path), changed.recorded(&path));
+        assert_ne!(reads.recorded(&path), whole.recorded(&path));
+
+        // A read that finds nothing records nothing: there is no contents to refuse
+        // another state against, and a new file needs no observation either way.
+        assert_eq!(
+            WorkspaceService::read(&capability, "missing.txt".into(), 0, 64).await,
+            Err(FsError::NotFound)
+        );
+        assert_eq!(reads.recorded(&dir.path().join("missing.txt")), None);
     }
 
     #[tokio::test]
