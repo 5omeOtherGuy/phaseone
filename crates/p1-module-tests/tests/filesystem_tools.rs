@@ -4,8 +4,8 @@
 //! through the production loader over the artifacts `scripts/build-modules.sh --all`
 //! published, and links it as the host's catalog links its row
 //! (`p1_host::catalog::capability_services_for`): the agent's read side and search walk, the
-//! mutation mode the row grants, and one read record shared by the read side and the
-//! mutation.
+//! mutation mode the row grants, and a read record shared by the read side and the
+//! mutation, fresh for every call (ADR-0090).
 //!
 //! A parity case then runs the SAME call through the component and through the native tool
 //! the catalog registers while no lock selects the key, each over its own workspace seeded
@@ -115,7 +115,7 @@ impl Row {
     }
 
     /// The services the host links this row's component with, as `catalog/tools.rs` builds
-    /// them for the module (the row's mutation mode, the shared read record).
+    /// them for the module (the row's mutation mode, the call's read record).
     fn services(
         self,
         workspace: &Workspace,
@@ -422,20 +422,32 @@ fn key() -> String {
     format!("sk-{}", "a".repeat(24))
 }
 
-/// A component linked with its row's services, with its mutation service wrapped so a case
-/// learns when a call asks for the write gate — no sleep, no polling.
+/// A component linked with its row's services, with each call's mutation service wrapped so
+/// a case learns when a call asks for the write gate — no sleep, no polling. The row's
+/// services are call-scoped (ADR-0090), so the wrapping is too: every call's own mutation
+/// service, over that call's read record, is the one that announces.
 fn announcing(
     row: Row,
     workspace: &Workspace,
     observed: &ObservedFiles,
     waiting: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> Arc<dyn Tool> {
-    let mut services = row.services(workspace, observed, None);
-    let inner = services
-        .workspace_mutation
-        .take()
-        .expect("a mutating row links a mutation service");
-    services.workspace_mutation = Some(Arc::new(Announcing { inner, waiting }));
+    let scope = row
+        .services(workspace, observed, None)
+        .call_scope
+        .expect("the row's services are call-scoped");
+    let services = Services::call_scoped(move || {
+        let mut call = scope();
+        let inner = call
+            .workspace_mutation
+            .take()
+            .expect("a mutating row links a mutation service");
+        call.workspace_mutation = Some(Arc::new(Announcing {
+            inner,
+            waiting: waiting.clone(),
+        }));
+        call
+    });
     let release = Release::of(row.package());
     release.tool(row, services, &Arc::new(MaskCounter::new()))
 }
@@ -977,16 +989,109 @@ async fn a_change_between_the_components_read_and_its_gated_write_is_refused() {
     .await;
 }
 
+/// The read record is the call's own (ADR-0090): a later call of the same assembled tool does
+/// not inherit an earlier call's read. One patch moves `a.txt` away — it read `a.txt` to do so
+/// — and the next patch creates `a.txt` afresh, which a record shared across calls refused as
+/// "changed on disk" (the file its digest names is gone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_call_does_not_inherit_an_earlier_calls_read() {
+    within_deadline("call-scoped record, sequential", async {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), "one\n").unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        let release = Release::of(Row::Patch.package());
+        let patch = release.tool(
+            Row::Patch,
+            Row::Patch.services(&workspace, &ObservedFiles::new(), None),
+            &Arc::new(MaskCounter::new()),
+        );
+        let call = |text: &str| ToolCall {
+            call_id: "c1".into(),
+            name: "apply_patch".into(),
+            input: ToolInput::Text(text.to_owned()),
+        };
+
+        let moved = execute(
+            patch.as_ref(),
+            &call(
+                "*** Begin Patch\n*** Update File: a.txt\n*** Move to: b.txt\n@@\n-one\n+one\n\
+                 *** End Patch\n",
+            ),
+        )
+        .await;
+        assert_eq!(moved.status, ToolStatus::Ok, "{}", moved.content);
+        let added = execute(
+            patch.as_ref(),
+            &call("*** Begin Patch\n*** Add File: a.txt\n+fresh\n*** End Patch\n"),
+        )
+        .await;
+        assert_eq!(added.status, ToolStatus::Ok, "{}", added.content);
+        assert_eq!(added.content, "A a.txt");
+        assert_eq!(
+            entries(root.path()),
+            vec!["a.txt = fresh\n".to_owned(), "b.txt = one\n".to_owned()]
+        );
+    })
+    .await;
+}
+
+/// Two concurrent calls of one assembled tool never share a read record (ADR-0090): call A
+/// reads `a.txt`, another agent changes it, call B reads the new contents, and only then do
+/// both reach the gate. A's change was computed from the old contents and is refused whichever
+/// call writes first; with one record per assembly B's read overwrote A's digest, so A's
+/// stale change could pass the recheck and undo the other agent's line. B's change lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_calls_of_one_tool_keep_their_own_read_identity() {
+    within_deadline("call-scoped record, concurrent", async {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), "one\n").unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        let (waiting, mut waits) = tokio::sync::mpsc::unbounded_channel();
+        let patch = announcing(Row::Patch, &workspace, &ObservedFiles::new(), waiting);
+        let spawn = |text: &'static str| {
+            let patch = patch.clone();
+            let call = ToolCall {
+                call_id: "c1".into(),
+                name: "apply_patch".into(),
+                input: ToolInput::Text(text.to_owned()),
+            };
+            tokio::spawn(async move { execute(patch.as_ref(), &call).await })
+        };
+
+        // Another agent holds the gate, so each call reads and plans, then waits on it.
+        let other = workspace.begin_mutation();
+        let first =
+            spawn("*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+ONE\n*** End Patch\n");
+        waits.recv().await.expect("call A asks for the gate");
+        fs::write(root.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let second =
+            spawn("*** Begin Patch\n*** Update File: a.txt\n@@\n-two\n+TWO\n*** End Patch\n");
+        waits.recv().await.expect("call B asks for the gate");
+        drop(other);
+
+        let first = first.await.expect("call A");
+        let second = second.await.expect("call B");
+        assert_eq!(first.status, ToolStatus::Error, "{}", first.content);
+        assert_eq!(
+            first.content,
+            "a.txt changed on disk since you last read it; read it again."
+        );
+        assert_eq!(second.status, ToolStatus::Ok, "{}", second.content);
+        assert_eq!(entries(root.path()), vec!["a.txt = one\nTWO\n".to_owned()]);
+    })
+    .await;
+}
+
 /// A replacement is per file and atomic: a reader sees the old file or the new one, never a
 /// half-written state, while a component's write runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_component_replacement_is_never_observed_partially() {
     within_deadline("atomicity", async {
-        // Two megabytes: big enough that an in-place write is caught mid-write, and inside
-        // the per-hostcall budget a component's whole-buffer imports run in
-        // (`Store::set_hostcall_fuel`: wasmtime charges imported bytes with its own scale).
-        let before = "a".repeat(2 * 1024 * 1024);
-        let after = "b".repeat(2 * 1024 * 1024);
+        // Four megabytes, the oracle's size: big enough that an in-place write is caught
+        // mid-write, and above the three megabytes wasmtime's default hostcall budget let a
+        // component hand the host (ADR-0090, `p1_module_runtime::executor::HOSTCALL_FUEL`).
+        let before = "a".repeat(4 * 1024 * 1024);
+        let after = "b".repeat(4 * 1024 * 1024);
         let pair = Pair::of(Row::Write, &[("big.txt", &before)]);
         pair.record("big.txt", before.as_bytes());
         let path = pair.module_side.root.path().join("big.txt");
@@ -1002,7 +1107,7 @@ async fn a_component_replacement_is_never_observed_partially() {
             }
             partial
         });
-        // The call description previews the new contents; a two-megabyte preview is not what
+        // The call description previews the new contents; a four-megabyte preview is not what
         // this case is about, so it compares the outcome and the tree.
         let written = pair
             .same_outcome(&json!({"file_path": "big.txt", "content": after}).to_string())

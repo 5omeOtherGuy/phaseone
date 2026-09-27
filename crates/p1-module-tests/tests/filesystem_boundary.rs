@@ -18,7 +18,7 @@
 //! name through the production loader over the artifacts `scripts/build-modules.sh`
 //! published, linked with the services the host links their catalog rows with
 //! (`p1_host::catalog::capability_services_for`): the read side and the mutation of one
-//! assembly share one read record (S2).
+//! call share that call's read record (S2, ADR-0090).
 
 use std::fs;
 use std::future::Future;
@@ -1225,14 +1225,21 @@ async fn a_call_waiting_for_a_held_gate_returns_promptly_when_cancelled() {
         let release = Release::of(&["p1-module-write"]);
         let observed = ObservedFiles::new();
         let (waiting, mut waits) = tokio::sync::mpsc::unbounded_channel();
-        let mut services = services_with(&ws, &observed, MutationPolicy::Observed);
-        services.workspace_mutation = Some(Arc::new(Announcing {
-            inner: services
-                .workspace_mutation
-                .take()
-                .expect("the mutating row links a mutation service"),
-            waiting,
-        }));
+        // The services are call-scoped (ADR-0090), so each call's mutation is the one wrapped.
+        let scope = services_with(&ws, &observed, MutationPolicy::Observed)
+            .call_scope
+            .expect("the row's services are call-scoped");
+        let services = Services::call_scoped(move || {
+            let mut call = scope();
+            call.workspace_mutation = Some(Arc::new(Announcing {
+                inner: call
+                    .workspace_mutation
+                    .take()
+                    .expect("the mutating row links a mutation service"),
+                waiting: waiting.clone(),
+            }));
+            call
+        });
         let write = release.with_services("p1/write", services);
 
         // Another agent holds the gate for as long as this case runs.
