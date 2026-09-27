@@ -91,6 +91,12 @@ pub enum SandboxError {
     )]
     ReadableUnresolved { path: PathBuf },
     #[error(
+        "the sandbox readable path {} resolves under writable root {}: choose another path, or pass --sandbox off",
+        .path.display(),
+        .root.display()
+    )]
+    ReadableUnderWritable { path: PathBuf, root: PathBuf },
+    #[error(
         "the sandbox readable path {} would uncover the credential directory {}: choose another path, or pass --sandbox off",
         .path.display(),
         .directory.display()
@@ -134,6 +140,11 @@ impl SandboxRuntime {
             .map_err(|error| {
                 SandboxError::Unavailable(format!("could not create a private /tmp: {error}"))
             })?;
+        let writable_roots =
+            sandbox_writable_roots(&workspace, &sandbox.writable, private_tmp.path());
+        for readable in &sandbox.readable {
+            canonical_readable_source(readable, &writable_roots)?;
+        }
         let bwrap_path = resolve_bwrap(
             std::env::var_os("PATH").as_deref(),
             &workspace,
@@ -180,6 +191,7 @@ pub fn bwrap_args(
     private_tmp: &Path,
 ) -> Result<Vec<OsString>, SandboxError> {
     let home = &sandbox.home;
+    let writable_roots = sandbox_writable_roots(workspace_root, &sandbox.writable, private_tmp);
     let mut args: Vec<OsString> = Vec::new();
     // 1. The host filesystem, read-only, with fresh /dev and /proc.
     for arg in ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"] {
@@ -207,15 +219,7 @@ pub fn bwrap_args(
         }
     }
     for readable in &sandbox.readable {
-        if !readable.is_absolute() {
-            return Err(SandboxError::ReadableUnresolved {
-                path: readable.clone(),
-            });
-        }
-        let resolved =
-            std::fs::canonicalize(readable).map_err(|_| SandboxError::ReadableUnresolved {
-                path: readable.clone(),
-            })?;
+        let resolved = canonical_readable_source(readable, &writable_roots)?;
         for candidate in [readable.as_path(), resolved.as_path()] {
             if let Some(directory) = credential_directory(home, candidate) {
                 return Err(SandboxError::ReadableCredential {
@@ -275,15 +279,7 @@ fn resolve_bwrap(
     private_tmp: &Path,
 ) -> Option<PathBuf> {
     let path = path?;
-    let mut forbidden = vec![
-        std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf()),
-        std::fs::canonicalize(private_tmp).unwrap_or_else(|_| private_tmp.to_path_buf()),
-    ];
-    forbidden.extend(
-        writable
-            .iter()
-            .filter_map(|path| std::fs::canonicalize(path).ok()),
-    );
+    let forbidden = sandbox_writable_roots(workspace, writable, private_tmp);
     for directory in std::env::split_paths(path) {
         if !directory.is_absolute() {
             continue;
@@ -316,6 +312,49 @@ fn resolve_bwrap(
         }
     }
     None
+}
+
+/// Canonical destinations outside these roots cannot be redirected by sandboxed writes.
+fn sandbox_writable_roots(
+    workspace: &Path,
+    writable: &[PathBuf],
+    private_tmp: &Path,
+) -> Vec<PathBuf> {
+    let mut roots = vec![
+        std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf()),
+        std::fs::canonicalize(private_tmp).unwrap_or_else(|_| private_tmp.to_path_buf()),
+    ];
+    roots.extend(
+        writable
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok()),
+    );
+    roots
+}
+
+fn canonical_readable_source(
+    readable: &Path,
+    writable_roots: &[PathBuf],
+) -> Result<PathBuf, SandboxError> {
+    if !readable.is_absolute() {
+        return Err(SandboxError::ReadableUnresolved {
+            path: readable.to_path_buf(),
+        });
+    }
+    let resolved =
+        std::fs::canonicalize(readable).map_err(|_| SandboxError::ReadableUnresolved {
+            path: readable.to_path_buf(),
+        })?;
+    if let Some(root) = writable_roots
+        .iter()
+        .find(|root| resolved.starts_with(root))
+    {
+        return Err(SandboxError::ReadableUnderWritable {
+            path: readable.to_path_buf(),
+            root: root.clone(),
+        });
+    }
+    Ok(resolved)
 }
 
 fn push_ro_bind(args: &mut Vec<OsString>, path: &Path) {
@@ -403,7 +442,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Sandbox, SandboxError, bwrap_args, resolve_bwrap};
+    use super::{Sandbox, SandboxError, SandboxRuntime, bwrap_args, resolve_bwrap};
     use std::ffi::OsStr;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
@@ -546,6 +585,127 @@ mod tests {
             result,
             Err(SandboxError::ReadableUnresolved { .. })
         ));
+    }
+
+    #[test]
+    fn assembly_rejects_readable_source_under_workspace_before_probe() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let target = workspace.join("readable");
+        std::fs::create_dir(&target).unwrap();
+        let configured = home.join("workspace-link");
+        symlink(&target, &configured).unwrap();
+        let sandbox = Sandbox {
+            home,
+            home_visible: Vec::new(),
+            readable: vec![configured],
+            writable: Vec::new(),
+            runtime_dir: None,
+        };
+
+        assert!(matches!(
+            SandboxRuntime::assemble(sandbox, &workspace),
+            Err(SandboxError::ReadableUnderWritable { .. })
+        ));
+    }
+
+    #[test]
+    fn readable_symlink_into_workspace_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        let private_tmp = temp.path().join("private-tmp");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&private_tmp).unwrap();
+        let target = workspace.join("readable");
+        std::fs::create_dir(&target).unwrap();
+        let configured = home.join("workspace-link");
+        symlink(&target, &configured).unwrap();
+        let sandbox = Sandbox {
+            home,
+            home_visible: Vec::new(),
+            readable: vec![configured],
+            writable: Vec::new(),
+            runtime_dir: None,
+        };
+
+        assert!(matches!(
+            bwrap_args(&sandbox, &workspace, &private_tmp),
+            Err(SandboxError::ReadableUnderWritable { .. })
+        ));
+    }
+
+    #[test]
+    fn readable_symlink_into_writable_root_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        let writable = temp.path().join("writable");
+        let private_tmp = temp.path().join("private-tmp");
+        for directory in [&home, &workspace, &writable, &private_tmp] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let target = writable.join("readable");
+        std::fs::create_dir(&target).unwrap();
+        let configured = home.join("writable-link");
+        symlink(&target, &configured).unwrap();
+        let sandbox = Sandbox {
+            home,
+            home_visible: Vec::new(),
+            readable: vec![configured],
+            writable: vec![writable],
+            runtime_dir: None,
+        };
+
+        assert!(matches!(
+            bwrap_args(&sandbox, &workspace, &private_tmp),
+            Err(SandboxError::ReadableUnderWritable { .. })
+        ));
+    }
+
+    #[test]
+    fn readable_directory_outside_writable_roots_is_bound_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        let readable = temp.path().join("readable");
+        let writable = temp.path().join("writable");
+        let private_tmp = temp.path().join("private-tmp");
+        for directory in [&home, &workspace, &readable, &writable, &private_tmp] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let sandbox = Sandbox {
+            home,
+            home_visible: Vec::new(),
+            readable: vec![readable.clone()],
+            writable: vec![writable],
+            runtime_dir: None,
+        };
+
+        let args = bwrap_args(&sandbox, &workspace, &private_tmp).unwrap();
+        let args: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(3).any(|window| {
+            window[0] == "--ro-bind"
+                && window[1]
+                    == std::fs::canonicalize(&readable)
+                        .unwrap()
+                        .display()
+                        .to_string()
+                && window[2] == readable.display().to_string()
+        }));
     }
 
     #[test]

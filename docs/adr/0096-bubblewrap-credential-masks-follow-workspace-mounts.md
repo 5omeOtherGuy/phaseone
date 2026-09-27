@@ -19,8 +19,7 @@ order and declared `bwrap_args` infallible. A later bind can cover an earlier cr
 ## Decision
 
 Place credential masks after readable, writable and workspace binds. Make `bwrap_args` return
-`Result<Vec<OsString>, SandboxError>` so unresolved or credential-exposing readable paths fail
-closed. This supersedes ADR-0035's mount-order contract only; its sandbox boundary remains.
+`Result<Vec<OsString>, SandboxError>` so unresolved, credential-exposing, or writable-root readable paths fail closed. Canonical readable sources under workspace, writable mounts, or private `/tmp` are refused to avoid symlink races. This supersedes ADR-0035's mount-order contract only; its sandbox boundary remains.
 
 ## Consequences
 
