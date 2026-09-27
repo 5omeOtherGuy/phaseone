@@ -20,9 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use p1_assembly::Catalog;
-use p1_assembly::{
-    Assembled, ModulesLock, Substitutions, assemble, load_environment, load_modules_lock,
-};
+use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
     AgentEvent, AuthorizationPolicy, BoxFuture, CacheKeySupport, CancellationToken, CommitSink,
     Compaction, ContextError, ContextInput, ContextPolicy, Effort, EventSink, JournalRecord,
@@ -42,6 +40,7 @@ use crate::catalog::build_catalog;
 #[cfg(feature = "delegation")]
 use crate::catalog::children::{announce_lost_workers, compose_children, running_children};
 use crate::catalog::delegation::with_worker_tools;
+use crate::catalog::modules::{ModuleSources, module_sources};
 use crate::cli::{self, Command, Options};
 use crate::frontend::{FrontEnd, LineFrontEnd};
 use crate::render::Renderer;
@@ -500,14 +499,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     };
     // The same for the workflow tools: they assemble, and no run can start.
     #[cfg(feature = "workflows")]
-    let catalog = catalog.map(|mut catalog| {
+    let catalog = catalog.and_then(|mut catalog| {
         if deps.workflow_service.is_none() {
             crate::catalog::register_workflow_tools(
                 &mut catalog,
                 Some(Arc::new(crate::workflow::RefusingWorkflows)),
-            );
+            )?;
         }
-        catalog
+        Ok(catalog)
     });
     #[cfg(not(feature = "delegation"))]
     let catalog = build_catalog(
@@ -790,11 +789,12 @@ pub async fn run_with_front_end(
     let records = opened.records.clone();
     // ADR-0080: the execution manifest of THIS assembly, written before the `Environment`
     // record the first turn commits, and compared with the identity the journal already names
-    // when the session is resumed. The lock the catalog's module registration read resolves a
-    // package key to the identity the loader verified; a changed artifact never blocks the
-    // resume, it is reported.
-    let lock = module_lock(deps)?;
-    let identity = assembly_identity(&assembled, &environment.provider, options.ask, &lock);
+    // when the session is resumed. The package sources the catalog's module registration read
+    // resolve a package key to the identity the loader verified — the `modules.lock`, and the
+    // official-release host entries (D083b 2); a changed artifact never blocks the resume, it is
+    // reported.
+    let sources = module_sources(deps)?;
+    let identity = assembly_identity(&assembled, &environment.provider, options.ask, &sources);
     let lines = Arc::new(AssemblyLines::new(opened.store, opened.version));
     let changed = arm_assembly(&lines, &opened.assemblies, &identity);
     if !changed.is_empty() {
@@ -972,7 +972,7 @@ pub async fn run_with_front_end(
         instructions,
         mask: mask.clone(),
         lines: lines.clone(),
-        lock: Mutex::new(lock),
+        sources: Mutex::new(sources),
         ask: options.ask,
         capabilities,
         session: Mutex::new(SessionModel {
@@ -1351,13 +1351,15 @@ impl CommitSink for NamingJournal {
 /// it runs, the p1 binary that built it, and one entry per assembled tool, the provider
 /// and the host's two policies.
 ///
-/// A module key the lock resolves is a package entry: `name` is the manifest name,
-/// `package` the key the environment selects the module by (the lock key), `version` the
-/// release version the lock pins, `digest` the bare sha256 hex and `abi` the package's
-/// `<world>+<protocol>`. The digest comes from the lock rather than from a second load: the
-/// lock is checked against the release manifest ([`load_locked_modules`]'s `check_lock`) and
-/// the loader verifies the compiled bytes against that same manifest digest, so the lock's
-/// digest is the loader-verified one. Every other key is native: `name` is the crate or
+/// A module key `sources` resolves to a package is a package entry: `name` is the manifest
+/// name, `package` the key the environment selects the module by, `version` the release version
+/// the package runs at, `digest` the loader-verified sha256 hex and `abi` the package's
+/// `<world>+<protocol>`. `sources` is the `modules.lock` the catalog's module registration read,
+/// plus the official-release host entries it registered (D083b 2), so a host entry such as
+/// `read`'s `p1/read` is a package entry exactly as a lock-selected one is. The digest comes
+/// from the release manifest rather than from a second load: the loader verified the bytes
+/// against that entry when the catalog registered the package, so it is the loader-verified
+/// digest. Every other key is native: `name` is the crate or
 /// policy name the host can state for it, `package` the key it is selected by, `version` the
 /// p1 version, and `digest` is `None` — the host's `commit` identifies that code.
 ///
@@ -1367,7 +1369,7 @@ pub fn assembly_identity(
     assembled: &Assembled,
     provider_key: &str,
     ask: bool,
-    lock: &ModulesLock,
+    sources: &ModuleSources,
 ) -> AssemblyIdentity {
     let mut modules = Vec::new();
     for tool in &assembled.resolved.tools {
@@ -1383,14 +1385,14 @@ pub fn assembly_identity(
             ModuleKind::Tool,
             &tool.module,
             &tool.identity.implementation,
-            lock,
+            sources,
         ));
     }
     modules.push(module_identity(
         ModuleKind::Provider,
         provider_key,
         provider_key,
-        lock,
+        sources,
     ));
     // The two host policies are native today, with the names their component twins carry
     // (`crate::policy` uses the same names for the authorization pair). The context policy
@@ -1433,22 +1435,23 @@ pub fn host_identity() -> HostIdentity {
     }
 }
 
-/// The identity of the module an environment selects by `key`: a package entry when `lock`
-/// resolves the key, a native entry otherwise.
+/// The identity of the module an environment selects by `key`: a package entry when `sources`
+/// resolves the key — the `modules.lock` the catalog read, or an official-release host entry it
+/// registered (D083b 2) — and a native entry otherwise.
 fn module_identity(
     kind: ModuleKind,
     key: &str,
     implementation: &str,
-    lock: &ModulesLock,
+    sources: &ModuleSources,
 ) -> ModuleIdentity {
-    match lock.resolve(key) {
-        Some(locked) => ModuleIdentity {
-            name: locked.package.clone(),
+    match sources.resolve(key) {
+        Some(package) => ModuleIdentity {
+            name: package.name,
             kind,
             package: key.to_string(),
-            version: locked.version.clone(),
-            digest: Some(bare_digest(&locked.digest)),
-            abi: Some(format!("{}+{}", locked.world, locked.protocol)),
+            version: package.version,
+            digest: Some(bare_digest(&package.digest)),
+            abi: Some(package.abi),
         },
         None => native_module(kind, implementation, key),
     }
@@ -1601,14 +1604,6 @@ fn digest_label(digest: Option<&str>) -> &str {
 
 fn abi_label(abi: Option<&str>) -> &str {
     abi.unwrap_or("none")
-}
-
-/// The `modules.lock` the catalog's own module registration read (ADR-0087): the key, the
-/// manifest name, the release version, the digest and the ABI of every package an environment
-/// can select. Read again here because the identity names what the loader verified, and the
-/// catalog keeps no list of what it registered.
-fn module_lock(deps: &HostDeps) -> Result<ModulesLock, String> {
-    load_modules_lock(&deps.environment_dirs).map_err(|error| error.to_string())
 }
 
 pub(crate) async fn run_headless(
@@ -2030,9 +2025,10 @@ pub(crate) struct ModelSwitch {
     /// The session's assembly identity lines (ADR-0080): a switch that commits a new
     /// `Environment` names the assembly that will execute the records after it.
     lines: Arc<AssemblyLines>,
-    /// The lock resolving a module key to the identity the loader verified: the
-    /// current generation's, replaced when a `/modules reload` installs.
-    lock: Mutex<ModulesLock>,
+    /// The package sources resolving a module key to the identity the loader verified: the
+    /// current generation's `modules.lock` and its official-release host entries (D083b 2),
+    /// replaced when a `/modules reload` installs.
+    sources: Mutex<ModuleSources>,
     /// Whether `--ask` selected the restrictive authorization policy: part of the
     /// switched assembly's identity.
     ask: bool,
@@ -2137,9 +2133,9 @@ pub(crate) fn model_switch_for_test(
         &[],
     ));
     let substitutions = substitutions(&reload_deps, &workspace);
-    // The lock the catalog above registered its modules from, read as the start path's
-    // `module_lock` reads it.
-    let lock = module_lock(&reload_deps)?;
+    // The package sources the catalog above registered its modules from, read as the start
+    // path's `module_sources` reads them.
+    let sources = module_sources(&reload_deps)?;
     Ok(ModelSwitch {
         generations,
         reload: ReloadInputs {
@@ -2171,7 +2167,7 @@ pub(crate) fn model_switch_for_test(
             AssemblyStore::Memory(session::memory()),
             JOURNAL_VERSION,
         )),
-        lock: Mutex::new(lock),
+        sources: Mutex::new(sources),
         // No `--ask`: the default policy the start path uses without the flag.
         ask: false,
         session: Mutex::new(SessionModel {
@@ -2221,7 +2217,8 @@ impl ModelSwitch {
             date: "2026-01-02".to_string(),
             os: std::env::consts::OS.to_string(),
         };
-        let lock = load_modules_lock(&environment_dirs).expect("the test's modules.lock reads");
+        let lock = p1_assembly::load_modules_lock(&environment_dirs)
+            .expect("the test's modules.lock reads");
         // `/model` keeps the agent's policy (`authorization: None`), so the
         // generation only carries one; a permissive stand-in is enough.
         let authorization: Arc<dyn AuthorizationPolicy> =
@@ -2270,9 +2267,11 @@ impl ModelSwitch {
                 AssemblyStore::Memory(session::memory()),
                 JOURNAL_VERSION,
             )),
-            // The lock of the test's own environment tree, read as `module_lock` reads it;
-            // a tree without `modules.lock` gives the empty lock.
-            lock: Mutex::new(lock),
+            // The lock of the test's own environment tree, read as `module_sources` reads it;
+            // a tree without `modules.lock` gives the empty set. This switch case reads no
+            // release: its tree is a fixture, and a build's host entries are the catalog's own
+            // step (the start and reload paths call `module_sources`).
+            sources: Mutex::new(ModuleSources::of_lock(lock)),
             // No `--ask`: the default policy the start path uses without the flag.
             ask: false,
             session: Mutex::new(SessionModel {
@@ -2327,11 +2326,11 @@ pub(crate) async fn switch_model(
         },
     };
     let generation = switch.generations.current();
-    let lock = switch.lock.lock().unwrap().clone();
+    let sources = switch.sources.lock().unwrap().clone();
     let candidate = session_candidate(
         switch,
         generation.catalog(),
-        &lock,
+        &sources,
         &choice,
         &current.finish,
     )?;
@@ -2377,13 +2376,13 @@ struct SessionCandidate {
 
 /// Load `choice`, apply the selection, resolve the route binding and assemble on
 /// `catalog` EXACTLY as the start path does — the same cache-key policy with the
-/// parent's ordinal, the same standing instructions. `lock` is the `modules.lock`
-/// the catalog's module registration read, for the candidate's assembly identity
-/// (ADR-0080). Nothing is installed.
+/// parent's ordinal, the same standing instructions. `sources` is the `modules.lock`
+/// the catalog's module registration read plus the host entries it registered, for the
+/// candidate's assembly identity (ADR-0080). Nothing is installed.
 fn session_candidate(
     switch: &ModelSwitch,
     catalog: &Catalog,
-    lock: &ModulesLock,
+    sources: &ModuleSources,
     choice: &crate::models::Choice,
     current_finish: &Option<Arc<dyn Tool>>,
 ) -> Result<SessionCandidate, String> {
@@ -2413,7 +2412,7 @@ fn session_candidate(
     // the assembly. It is written only once the agent installed the candidate, and then
     // before the next turn: the `Environment` the install committed, and every record
     // after it, are executed by THIS assembly.
-    let identity = assembly_identity(&assembled, &environment.provider, switch.ask, lock);
+    let identity = assembly_identity(&assembled, &environment.provider, switch.ask, sources);
     let mut tools = assembled.tools;
     // The switched tool set's `finish` must reach the completion the run reads. The
     // session keeps ITS `finish` — the whole session's activity is in that tool's
@@ -2761,9 +2760,10 @@ pub(crate) async fn reload_modules(
     agent: &mut Agent,
 ) -> Result<String, String> {
     let inputs = &switch.reload;
-    // The lock the reloaded catalog's module registration reads: the reloaded modules'
-    // identities, which the assembly line after the install names (ADR-0080).
-    let lock = module_lock(&inputs.deps)?;
+    // The package sources of the reloaded catalog's module registration — its lock and its
+    // release host entries (D083b 2): the reloaded modules' identities, which the assembly line
+    // after the install names (ADR-0080).
+    let sources = module_sources(&inputs.deps)?;
     let catalog = Arc::new(build_catalog(
         &inputs.deps,
         inputs.sandbox,
@@ -2779,7 +2779,11 @@ pub(crate) async fn reload_modules(
         effort: current.profile.as_ref().and(current.effort),
         profile: current.profile,
     };
-    let candidate = session_candidate(switch, &catalog, &lock, &choice, &current.finish)?;
+    // The reloaded assembly's identity is what the package sources name (the lock and the
+    // release host entries, `module_sources`), and the session's policy comes from the front
+    // end's reload bridge, which loads the shipped policy package again (S5.11): a reload
+    // keeps both behaviours.
+    let candidate = session_candidate(switch, &catalog, &sources, &choice, &current.finish)?;
     let (authorization, reloaded) = (inputs.policy)()?;
     let generation = install_candidate(
         &switch.generations,
@@ -2804,9 +2808,9 @@ pub(crate) async fn reload_modules(
     }
     // The install committed a new `Environment` with the reloaded modules: the journal
     // names that assembly before the next turn, and later switches resolve module keys
-    // against the reloaded lock. A store that refuses the line has already accepted the
+    // against the reloaded sources. A store that refuses the line has already accepted the
     // reload, so the message says so; the session state follows the install first.
-    *switch.lock.lock().unwrap() = lock;
+    *switch.sources.lock().unwrap() = sources;
     let identity = candidate.identity.clone();
     let model = adopt_candidate(switch, candidate);
     switch.lines.switched(&identity).map_err(|error| {

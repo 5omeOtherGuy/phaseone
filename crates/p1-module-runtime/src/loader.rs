@@ -48,7 +48,11 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// and `snapshot` to the caller's [`WorkspaceService`](crate::capabilities::WorkspaceService)
 /// and [`SnapshotService`](crate::capabilities::SnapshotService) (S1); `workspace-mutation` to
 /// the caller's [`MutationService`](crate::capabilities::MutationService) (S2, beside S1's).
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 16] = [
+///
+/// Public, and re-exported from the crate root, because it is the ONE list of what this
+/// runtime links: the host's `p1 modules verify` checks a manifest against it instead of
+/// keeping a copy that could drift (S1.5.1). A new capability is added here alone.
+pub const LINKABLE_CAPABILITIES: [&str; 16] = [
     "control",
     "clock",
     "random",
@@ -193,7 +197,10 @@ pub enum ModuleKind {
 }
 
 impl ModuleKind {
-    const ALL: [Self; 6] = [
+    /// Every class this runtime speaks, in the order a manifest may name them. Public
+    /// because the host's `p1 modules verify` reads a manifest's `kind` without the loader
+    /// (it may not compile) and must accept exactly the classes the loader does (S1.5.1).
+    pub const ALL: [Self; 6] = [
         Self::Tool,
         Self::Provider,
         Self::ContextPolicy,

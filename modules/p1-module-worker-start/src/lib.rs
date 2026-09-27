@@ -85,7 +85,7 @@ impl Guest for WorkerStart {
         };
         // Nothing is started until the grant is non-empty; which modules may be granted is the
         // host's check at `start`, made before anything starts, as the native tool makes it.
-        let mut tools = match grant(input.tools, &workers_observe::grantable()) {
+        let mut tools = match grant(input.tools, &grantable()) {
             Ok(tools) => tools,
             Err(outcome) => return outcome,
         };
@@ -115,6 +115,21 @@ impl Guest for WorkerStart {
             }
             Err(error) => delegation::start_error(error),
         }
+    }
+}
+
+/// The host's `workers-observe.grantable` list (D084), for the empty-grant refusal `execute`
+/// builds. A built component reads it from the host; the crate's own unit tests link no
+/// import (which would trap), so there it is the empty list the member declared before
+/// S6.11, which is what the refusal names.
+fn grantable() -> Vec<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        workers_observe::grantable()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Vec::new()
     }
 }
 
@@ -155,6 +170,20 @@ mod tests {
         assert_eq!(
             grant(vec!["read".into(), "read".into()], &grantable),
             Ok(vec!["read".to_owned()])
+        );
+    }
+
+    /// The empty grant is refused at EXECUTION, not only in `grant`: `execute` builds the
+    /// refusal before it reaches `control::cancelled` or `workers_start::start`. The crate's
+    /// own tests link no host, so `grantable()` answers an empty list here and the refusal
+    /// names that; the built component names the host's list instead.
+    #[test]
+    fn an_empty_grant_is_refused_at_execution() {
+        assert_eq!(
+            WorkerStart::execute(call(r#"{"environment":"e","task":"t","tools":[]}"#)),
+            delegation::error_outcome(
+                "`tools` is required: list every tool module the worker needs, from: "
+            )
         );
     }
 

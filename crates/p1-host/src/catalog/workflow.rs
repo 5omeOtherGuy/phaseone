@@ -868,30 +868,46 @@ pub(crate) fn running_workflows(deps: &HostDeps) -> usize {
 }
 
 /// The four `workflow_*` tools over `service` (ADR-0053 item 7), each from its host entry
-/// (S6.11). Without a service the keys are not registered at all, so an environment naming
-/// one gets the ordinary `UnknownToolModule`. A run's catalog already has them, registered
-/// with the worker members over the run's member hook (`register_delegation_tools`), so
-/// this registers them only for a catalog without a run, `p1 env show`'s: there `service`
-/// starts nothing, and the members are linked to it for whatever agent assembles them.
-/// A release whose member entries do not load has already failed that catalog's build
-/// (the worker members are loaded first, from the same entries), so nothing is registered.
+/// (S6.11), read from the official release manifest. Without a service the keys are not
+/// registered at all, so an environment naming one gets the ordinary `UnknownToolModule`. A
+/// run's catalog already has them, registered with the worker members over the run's member
+/// hook (`register_delegation_tools`), so this registers them only for a catalog without a
+/// run, `p1 env show`'s: there `service` starts nothing, and the members are linked to it for
+/// whatever agent assembles them.
+///
+/// A release whose member entries do not load — one missing `p1/workflow-start`, say — is
+/// the loader's error, returned so the catalog build fails naming the package, never a
+/// catalog silently built without the workflow tools (ADR-0079, the S7.10.3 contract).
 #[cfg(feature = "workflows")]
 pub(crate) fn register_workflow_tools(
     catalog: &mut Catalog,
     service: Option<Arc<dyn p1_workflow::WorkflowService>>,
-) {
+) -> Result<(), String> {
+    register_workflow_tools_from(catalog, service, None)
+}
+
+/// [`register_workflow_tools`] over the release whose manifest is `release`, or the official
+/// installation's release when it is `None`. The seam exists so a caller — the host's own
+/// tests among them — can name the release whose member entries are read.
+#[cfg(feature = "workflows")]
+pub fn register_workflow_tools_from(
+    catalog: &mut Catalog,
+    service: Option<Arc<dyn p1_workflow::WorkflowService>>,
+    release: Option<&Path>,
+) -> Result<(), String> {
     let Some(service) = service else {
-        return;
+        return Ok(());
     };
     if catalog
         .tool_keys()
         .iter()
         .any(|key| key == WORKFLOW_TOOLS[0])
     {
-        return;
+        return Ok(());
     }
-    let Ok(entries) = super::delegation::official_member_entries() else {
-        return;
+    let entries = match release {
+        Some(release) => super::delegation::load_member_entries(release)?,
+        None => super::delegation::official_member_entries()?,
     };
     let hook: ModuleServices = Arc::new(move |module: &str, _services: &ToolServices| {
         if WORKFLOW_MODULES.contains(&module) {
@@ -905,6 +921,7 @@ pub(crate) fn register_workflow_tools(
             register_host_entry(catalog, key, loaded.clone(), hook.clone());
         }
     }
+    Ok(())
 }
 
 /// The observer projects every run event into the structured `FrontEnd` calls the TUI's

@@ -153,16 +153,20 @@ fn assemble_shipped(name: &str) -> Assembled {
     resolve_environment(&mut environment, &harness.deps.environment_dirs)
         .expect("the shipped route serves its profile");
     let workspace = tempdir().unwrap();
-    assemble(
-        &catalog,
-        &environment,
-        workspace.path(),
-        &Substitutions {
-            workspace: workspace.path().display().to_string(),
-            date: "2026-09-20".into(),
-            os: "linux".into(),
-        },
-    )
+    // The `read` key is the release's `p1/read` host entry (S1.8.1), and a module tool is built
+    // inside a Tokio runtime, which runs its executor.
+    common::on_runtime(|| {
+        assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &Substitutions {
+                workspace: workspace.path().display().to_string(),
+                date: "2026-09-20".into(),
+                os: "linux".into(),
+            },
+        )
+    })
     .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
 }
 

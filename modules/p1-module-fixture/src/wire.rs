@@ -15,6 +15,14 @@ use std::fmt::Write as _;
 /// colon finds a key at any depth — `raw` inside `input` — without parsing the rest of the
 /// document. Only string values are read: the fixture's two keys are strings.
 pub fn string_field(json: &str, key: &str) -> Option<String> {
+    let literal = field_literal(json, key)?;
+    Some(literal.decode(json)?.into_owned())
+}
+
+/// The literal of the first `key`'s string value in `json`, undecoded, by the reading
+/// [`string_field`] describes: `None` exactly when it would answer `None` for an unreadable
+/// or missing value, bar the value's own escapes, which only decoding checks.
+fn field_literal(json: &str, key: &str) -> Option<Literal> {
     let bytes = json.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -23,17 +31,20 @@ pub fn string_field(json: &str, key: &str) -> Option<String> {
             i += 1;
             continue;
         }
-        let (text, after) = string_literal(json, i)?;
+        let literal = Literal::at(bytes, i)?;
+        let after = literal.end + 1;
         let mut colon = after;
         while bytes.get(colon).is_some_and(u8::is_ascii_whitespace) {
             colon += 1;
         }
         if bytes.get(colon) != Some(&b':') {
-            // A string in a value position; keep scanning after it.
+            // A string in a value position; keep scanning after it, once it has proved
+            // readable: an undecodable literal anywhere makes the text unreadable.
+            literal.decode(json)?;
             i = after;
             continue;
         }
-        if text == key {
+        if literal.decode(json)? == key {
             let mut start = colon + 1;
             while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
                 start += 1;
@@ -41,47 +52,143 @@ pub fn string_field(json: &str, key: &str) -> Option<String> {
             if bytes.get(start) != Some(&b'"') {
                 return None;
             }
-            let (value, _) = string_literal(json, start)?;
-            return Some(value);
+            return Literal::at(bytes, start);
         }
         i = colon + 1;
     }
     None
 }
 
-/// Decodes the JSON string literal that starts at byte `start` (which holds `"`), returning
-/// its text and the byte index just after the closing quote.
-fn string_literal(json: &str, start: usize) -> Option<(String, usize)> {
-    let mut text = String::new();
-    let mut chars = json[start + 1..].char_indices().peekable();
-    while let Some((offset, ch)) = chars.next() {
-        match ch {
-            '"' => return Some((text, start + 1 + offset + 1)),
-            '\\' => match chars.next()?.1 {
-                '"' => text.push('"'),
-                '\\' => text.push('\\'),
-                '/' => text.push('/'),
-                'b' => text.push('\u{8}'),
-                'f' => text.push('\u{c}'),
-                'n' => text.push('\n'),
-                'r' => text.push('\r'),
-                't' => text.push('\t'),
-                'u' => {
-                    let mut unit = hex4(&mut chars)?;
+/// The ok outcome of an `echo:` call answered from the call text as it arrived, or the call
+/// given back when it needs the general path (`string_field`, then the mode, then
+/// [`ok_outcome`]), which gives the same text more slowly.
+///
+/// An echo's answer is its input re-escaped, and when every escape of the `raw` literal is
+/// one [`json_text`] writes, re-escaping the decoded text gives back that literal byte for
+/// byte. So when the literal starts `echo:`, holds no newline (the mode is the first line)
+/// and neither ends in an escape nor in whitespace (the mode is trimmed), the answer's
+/// `content` is the literal after `echo:`: no decode, no re-encode, none of the three passes
+/// over a payload that can be a whole history. The answer is written over the call's own
+/// buffer, whose head is longer than the outcome's, so a large echo touches no fresh memory
+/// for its answer (each fresh page is a fault in a fresh instance).
+pub fn echo_as_sent(call: String) -> Result<String, String> {
+    const OPEN: &str = "{\"status\":\"ok\",\"content\":\"";
+    const CLOSE: &str = "\"}";
+    let Some(literal) = field_literal(&call, "raw") else {
+        return Err(call);
+    };
+    let Some(text) = call[literal.start..literal.end].strip_prefix("echo:") else {
+        return Err(call);
+    };
+    if !literal.as_written
+        || literal.last_escape == Some(literal.end)
+        || text.ends_with(char::is_whitespace)
+    {
+        return Err(call);
+    }
+    let text_start = literal.end - text.len();
+    let mut out = call;
+    out.truncate(literal.end);
+    out.push_str(CLOSE);
+    out.replace_range(..text_start, OPEN);
+    Ok(out)
+}
+
+/// The extent of one JSON string literal, found by a byte scan before anything is decoded,
+/// so that its text is copied once, into an allocation of the right size.
+struct Literal {
+    /// The byte just after the opening quote.
+    start: usize,
+    /// The closing quote.
+    end: usize,
+    /// Whether any escape occurs; a literal without one is its own text.
+    escaped: bool,
+    /// Whether every escape is one [`json_text`] writes and none is a newline: the literal
+    /// is then what [`json_text`] writes for its own decoded text, which has one line.
+    as_written: bool,
+    /// The byte just after the last escape, if any.
+    last_escape: Option<usize>,
+}
+
+impl Literal {
+    /// The literal whose opening quote is at byte `open`, or `None` when it is unterminated
+    /// or holds a raw control character, which JSON text never does.
+    fn at(bytes: &[u8], open: usize) -> Option<Self> {
+        let start = open + 1;
+        let mut i = start;
+        let mut escaped = false;
+        let mut as_written = true;
+        let mut last_escape = None;
+        loop {
+            i = special(bytes, i)?;
+            match bytes[i] {
+                b'"' => {
+                    return Some(Self {
+                        start,
+                        end: i,
+                        escaped,
+                        as_written,
+                        last_escape,
+                    });
+                }
+                // The escaped byte is skipped whatever it is: `\"` does not end the literal.
+                // A skip may stop inside a multi-byte character after a backslash, but no
+                // byte of one is special, and decoding refuses that escape.
+                b'\\' => {
+                    escaped = true;
+                    let length = written_escape(bytes.get(i + 1..)?);
+                    as_written &= length.is_some();
+                    i += length.unwrap_or(2);
+                    last_escape = Some(i);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The literal's text with its escapes decoded; `None` when an escape is not JSON.
+    fn decode<'a>(&self, json: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+        let body = &json[self.start..self.end];
+        if !self.escaped {
+            return Some(std::borrow::Cow::Borrowed(body));
+        }
+        // Escapes only shrink the text, so the body's length is enough room.
+        let mut text = String::with_capacity(body.len());
+        let bytes = body.as_bytes();
+        let mut run = 0;
+        let mut i = 0;
+        // Inside a literal whose extent is known, the only special byte left to meet is the
+        // backslash of an escape: the byte after one is consumed with it below.
+        while let Some(found) = special(bytes, i) {
+            i = found;
+            if bytes[i] != b'\\' {
+                return None;
+            }
+            // `run..i` holds no escape and ends before an ASCII byte: whole characters.
+            text.push_str(&body[run..i]);
+            i += 1;
+            match *bytes.get(i)? {
+                b'"' => text.push('"'),
+                b'\\' => text.push('\\'),
+                b'/' => text.push('/'),
+                b'b' => text.push('\u{8}'),
+                b'f' => text.push('\u{c}'),
+                b'n' => text.push('\n'),
+                b'r' => text.push('\r'),
+                b't' => text.push('\t'),
+                b'u' => {
+                    let mut unit = hex4(bytes, i + 1)?;
+                    i += 4;
                     if (0xd800..0xdc00).contains(&unit) {
                         // A character outside the BMP arrives as two escapes, and only a
                         // following low surrogate makes them one char.
-                        let mut look = chars.clone();
-                        let low = match look.next() {
-                            Some((_, '\\')) => match look.next() {
-                                Some((_, 'u')) => hex4(&mut look),
-                                _ => None,
-                            },
+                        let low = match bytes.get(i + 1..i + 3) {
+                            Some(b"\\u") => hex4(bytes, i + 3),
                             _ => None,
                         };
                         match low {
                             Some(low) if (0xdc00..0xe000).contains(&low) => {
-                                chars = look;
+                                i += 6;
                                 unit = 0x10000 + ((unit - 0xd800) << 10) + (low - 0xdc00);
                             }
                             _ => unit = 0xfffd,
@@ -90,22 +197,74 @@ fn string_literal(json: &str, start: usize) -> Option<(String, usize)> {
                     text.push(char::from_u32(unit).unwrap_or('\u{fffd}'));
                 }
                 _ => return None,
-            },
-            ch if (ch as u32) < 0x20 => return None,
-            ch => text.push(ch),
+            }
+            i += 1;
+            run = i;
         }
+        text.push_str(&body[run..]);
+        Some(std::borrow::Cow::Owned(text))
     }
-    // Unterminated literal.
-    None
 }
 
-/// Reads four hex digits of a `\uXXXX` escape.
-fn hex4(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>) -> Option<u32> {
+/// The length, backslash included, of the escape whose bytes after the backslash start
+/// `rest`, when it is one [`json_text`] writes other than the newline; else `None`.
+fn written_escape(rest: &[u8]) -> Option<usize> {
+    match *rest.first()? {
+        b'"' | b'\\' | b'r' | b't' | b'b' | b'f' => Some(2),
+        b'u' => match *rest.get(1..5)? {
+            // `\u00XX` in lowercase hex, for a control character without a short escape.
+            [
+                b'0',
+                b'0',
+                high @ (b'0' | b'1'),
+                low @ (b'0'..=b'9' | b'a'..=b'f'),
+            ] => {
+                let value = char::from(high).to_digit(16)? * 16 + char::from(low).to_digit(16)?;
+                (!matches!(value, 0x08 | 0x09 | 0x0a | 0x0c | 0x0d)).then_some(6)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Reads the four hex digits of a `\uXXXX` escape that start at byte `at`.
+fn hex4(bytes: &[u8], at: usize) -> Option<u32> {
     let mut value = 0;
-    for _ in 0..4 {
-        value = value * 16 + chars.next()?.1.to_digit(16)?;
+    for &byte in bytes.get(at..at + 4)? {
+        value = value * 16 + char::from(byte).to_digit(16)?;
     }
     Some(value)
+}
+
+/// The index of the first byte at or after `from` that a JSON string literal cannot hold
+/// as it is — a quote, a backslash or a control character — or `None` when there is none.
+///
+/// It tests eight bytes per step, because the guest runs metered: every wasm instruction
+/// costs fuel and time, and a byte at a time is most of a large echo's cost.
+fn special(bytes: &[u8], from: usize) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    // A high bit where a byte of `word` is zero; exact for the first such byte, which is
+    // the one the scan below stops at.
+    let zero = |word: u64| word.wrapping_sub(ONES) & !word & HIGHS;
+    let (chunks, _) = bytes.get(from..)?.as_chunks::<8>();
+    let mut offset = from;
+    for &chunk in chunks {
+        let word = u64::from_le_bytes(chunk);
+        let hit = zero(word ^ (ONES * u64::from(b'"')))
+            | zero(word ^ (ONES * u64::from(b'\\')))
+            // A byte below 0x20 has its three top bits clear.
+            | zero(word & (ONES * 0xe0));
+        if hit != 0 {
+            break;
+        }
+        offset += 8;
+    }
+    bytes[offset..]
+        .iter()
+        .position(|&byte| byte == b'"' || byte == b'\\' || byte < 0x20)
+        .map(|found| offset + found)
 }
 
 /// The tool outcome of a call that ended successfully.
@@ -123,13 +282,19 @@ pub fn error_outcome(content: &str) -> String {
     outcome("error", content)
 }
 
-/// The `tool_outcome` shape: `status` is the closed set of `ToolStatus` names.
+/// The `tool_outcome` shape: `status` is the closed set of `ToolStatus` names. Written into
+/// one allocation of its final size, because `content` may be a whole echoed history.
 fn outcome(status: &str, content: &str) -> String {
-    format!(
-        "{{\"status\":{},\"content\":{}}}",
-        json_text(status),
-        json_text(content)
-    )
+    const OPEN: &str = "{\"status\":";
+    const MIDDLE: &str = ",\"content\":";
+    let size = OPEN.len() + json_len(status) + MIDDLE.len() + json_len(content) + 1;
+    let mut out = String::with_capacity(size);
+    out.push_str(OPEN);
+    push_json_text(&mut out, status);
+    out.push_str(MIDDLE);
+    push_json_text(&mut out, content);
+    out.push('}');
+    out
 }
 
 /// The `call_description` shape: `destructive` is always stated, `target` only when known.
@@ -151,25 +316,69 @@ pub fn result_description(summary: &str) -> String {
 /// be read as something other than the value it was given. Every output of this module goes
 /// through it; the tests build their input with it too.
 pub(crate) fn json_text(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            ch if (ch as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", ch as u32);
-            }
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
+    let mut out = String::with_capacity(json_len(text));
+    push_json_text(&mut out, text);
     out
+}
+
+/// The escape of one byte a literal cannot hold as it is ([`special`]): a short escape where
+/// JSON has one, else `\u00XX`.
+fn escape(byte: u8) -> Escape {
+    match byte {
+        b'"' => Escape::Short(b'"'),
+        b'\\' => Escape::Short(b'\\'),
+        b'\n' => Escape::Short(b'n'),
+        b'\r' => Escape::Short(b'r'),
+        b'\t' => Escape::Short(b't'),
+        0x08 => Escape::Short(b'b'),
+        0x0c => Escape::Short(b'f'),
+        control => Escape::Unicode(control),
+    }
+}
+
+/// How [`escape`] writes one byte: `\` and a letter, or `\u00XX` for the other controls.
+enum Escape {
+    Short(u8),
+    Unicode(u8),
+}
+
+/// The length of [`json_text`]`(text)`, found by the same scan, so the output is allocated
+/// once at its final size.
+fn json_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut size = text.len() + 2;
+    let mut i = 0;
+    while let Some(found) = special(bytes, i) {
+        size += match escape(bytes[found]) {
+            Escape::Short(_) => 1,
+            Escape::Unicode(_) => 5,
+        };
+        i = found + 1;
+    }
+    size
+}
+
+/// Appends `text` as a JSON string literal: runs without a special byte are copied whole,
+/// and every special byte is ASCII, so each run is whole characters.
+fn push_json_text(out: &mut String, text: &str) {
+    let bytes = text.as_bytes();
+    out.push('"');
+    let mut run = 0;
+    while let Some(found) = special(bytes, run) {
+        out.push_str(&text[run..found]);
+        match escape(bytes[found]) {
+            Escape::Short(letter) => {
+                out.push('\\');
+                out.push(char::from(letter));
+            }
+            Escape::Unicode(control) => {
+                let _ = write!(out, "\\u{control:04x}");
+            }
+        }
+        run = found + 1;
+    }
+    out.push_str(&text[run..]);
+    out.push('"');
 }
 
 #[cfg(test)]
@@ -278,5 +487,78 @@ mod tests {
         let text = "quote\" backslash\\ newline\n tab\t bell\u{7} non-bmp \u{1f600}";
         let json = format!("{{\"content\":{}}}", json_text(text));
         assert_eq!(string_field(&json, "content").as_deref(), Some(text));
+    }
+
+    /// Every ASCII byte and a few multi-byte characters, each at every offset of an eight-byte
+    /// step, so the word-at-a-time scan meets each special byte in every lane and at the tail.
+    fn every_byte_in_every_lane() -> Vec<String> {
+        let mut alphabet: Vec<char> = (0u8..0x80).map(char::from).collect();
+        alphabet.extend(['\u{e9}', '\u{2028}', '\u{1f600}']);
+        let mut texts = Vec::new();
+        for pad in 0..9 {
+            for &ch in &alphabet {
+                texts.push(format!("{}{ch}{}", "x".repeat(pad), "y".repeat(8 - pad)));
+            }
+        }
+        texts.push(alphabet.iter().cycle().take(1000).collect());
+        texts
+    }
+
+    /// The escaping of the character-by-character writer this module had before its
+    /// byte scans, kept as the reference its output must equal.
+    fn reference_json_text(text: &str) -> String {
+        let mut out = String::from("\"");
+        for ch in text.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                ch if (ch as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", ch as u32);
+                }
+                ch => out.push(ch),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    #[test]
+    fn the_byte_scans_write_and_read_what_the_character_loop_did() {
+        for text in every_byte_in_every_lane() {
+            let written = json_text(&text);
+            assert_eq!(written, reference_json_text(&text), "{text:?}");
+            assert_eq!(json_len(&text), written.len(), "{text:?}");
+            assert_eq!(
+                ok_outcome(&text),
+                format!("{{\"status\":\"ok\",\"content\":{written}}}")
+            );
+            let json = format!("{{\"raw\":{written}}}");
+            assert_eq!(string_field(&json, "raw").as_deref(), Some(text.as_str()));
+        }
+    }
+
+    #[test]
+    fn an_escape_is_read_in_every_lane_and_a_lone_surrogate_is_replaced() {
+        for pad in 0..9 {
+            let x = "x".repeat(pad);
+            let json = format!("{{\"raw\":\"{x}\\u0041\\/\\ud83d{x}\\ud83d\\ude00\"}}");
+            assert_eq!(
+                string_field(&json, "raw"),
+                Some(format!("{x}A/\u{fffd}{x}\u{1f600}"))
+            );
+            // An escape the literal ends inside, or one JSON does not have, is unreadable.
+            for bad in ["\\u12\"", "\\x", "\\ud83d\\u12"] {
+                let json = format!("{{\"raw\":\"{x}{bad}\"}}");
+                assert_eq!(string_field(&json, "raw"), None, "{json}");
+            }
+        }
+        // An unreadable literal in a value position makes the whole text unreadable, as
+        // before the byte scans.
+        assert_eq!(string_field("{\"a\":\"\\q\",\"raw\":\"x\"}", "raw"), None);
     }
 }

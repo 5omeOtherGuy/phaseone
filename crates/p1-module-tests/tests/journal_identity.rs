@@ -19,7 +19,9 @@ use p1_assembly::{
 };
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{JournalRecord, ModelOptions, Provider, RecordBody, Tool};
-use p1_host::catalog::modules::{ModuleServices, load_locked_modules, register_modules};
+use p1_host::catalog::modules::{
+    ModuleServices, ModuleSources, load_locked_modules, register_modules,
+};
 use p1_host::run::{
     AssemblyEntry, AssemblyIdentity, AssemblyLines, AssemblyStore, JOURNAL_VERSION, arm_assembly,
     assembly_identity, changed_artifacts, host_identity,
@@ -34,7 +36,10 @@ const PROVIDER: &str = "scripted";
 const MODULE: &str = "fixture";
 /// The second module name the lock resolves to the variant package.
 const EXTRA: &str = "extra";
-/// The compiled-in stand-in tool every environment below also names.
+/// The compiled-in stand-in tool every environment below also names. It keeps the key the host
+/// registered natively until S1.8.1: these cases drive the identity builder over THIS fixture
+/// catalog, whose `read` is native (`ModuleSources::of_lock`), so the native arm of
+/// `module_identity` stays exercised.
 const NATIVE: &str = "read";
 /// A second compiled-in stand-in tool: how a module JOINS an assembly without another package.
 const GREP: &str = "grep";
@@ -135,7 +140,15 @@ fn identity_for(
         &substitutions(),
     )
     .expect("assembles");
-    assembly_identity(&assembled, PROVIDER, false, lock)
+    // The lock alone: the fixture cases drive the identity builder over a fixture release, so
+    // no official-release host entry contributes a row (`ModuleSources::of_lock`). The row a
+    // build's own host entry gets is the host's case (`p1-host/tests/read_host_entry.rs`).
+    assembly_identity(
+        &assembled,
+        PROVIDER,
+        false,
+        &ModuleSources::of_lock(lock.clone()),
+    )
 }
 
 /// The lock resolving `module` to the fixture entry of `release`.
