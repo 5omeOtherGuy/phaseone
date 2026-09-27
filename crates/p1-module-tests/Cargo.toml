@@ -12,12 +12,14 @@ workspace = true
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 p1-module-runtime = { path = "../p1-module-runtime" }
+# The transfer bench (src/bin/bench-transfer.rs, S1.11) times the redacting wrapper on its
+# own, around a native tool; a bin target cannot use a dev-dependency.
+p1-redact = { path = "../p1-redact" }
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 p1-core = { path = "../p1-core" }
-p1-redact = { path = "../p1-redact" }
 # The transport-authority suite (S4.5) drives S4.2's broker over the scripted
 # transport and the one real transport's redirect policy over a loopback socket.
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
