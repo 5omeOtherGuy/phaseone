@@ -128,14 +128,19 @@ impl SandboxRuntime {
                 });
             }
         }
-        let bwrap_path = resolve_bwrap(std::env::var_os("PATH").as_deref(), &workspace)
-            .ok_or(SandboxError::NotInstalled)?;
         let private_tmp = tempfile::Builder::new()
             .prefix("p1-shell-sandbox-")
             .tempdir()
             .map_err(|error| {
                 SandboxError::Unavailable(format!("could not create a private /tmp: {error}"))
             })?;
+        let bwrap_path = resolve_bwrap(
+            std::env::var_os("PATH").as_deref(),
+            &workspace,
+            &sandbox.writable,
+            private_tmp.path(),
+        )
+        .ok_or(SandboxError::NotInstalled)?;
         let args = bwrap_args(&sandbox, &workspace, private_tmp.path())?;
         let mut probe = std::process::Command::new(&bwrap_path);
         probe
@@ -262,11 +267,24 @@ pub fn bwrap_args(
     Ok(args)
 }
 
-/// Resolve bubblewrap using only absolute PATH entries outside the workspace.
-/// The resolved executable is retained by the runtime so no later command can
-/// re-resolve it against a model-controlled working directory or PATH.
-fn resolve_bwrap(path: Option<&OsStr>, workspace: &Path) -> Option<PathBuf> {
+/// Resolve bubblewrap using absolute PATH entries outside every sandbox-writable
+/// root. The result is retained so later commands never re-resolve model-controlled PATH.
+fn resolve_bwrap(
+    path: Option<&OsStr>,
+    workspace: &Path,
+    writable: &[PathBuf],
+    private_tmp: &Path,
+) -> Option<PathBuf> {
     let path = path?;
+    let mut forbidden = vec![
+        std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf()),
+        std::fs::canonicalize(private_tmp).unwrap_or_else(|_| private_tmp.to_path_buf()),
+    ];
+    forbidden.extend(
+        writable
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok()),
+    );
     for directory in std::env::split_paths(path) {
         if !directory.is_absolute() {
             continue;
@@ -274,14 +292,17 @@ fn resolve_bwrap(path: Option<&OsStr>, workspace: &Path) -> Option<PathBuf> {
         let Ok(resolved_directory) = std::fs::canonicalize(&directory) else {
             continue;
         };
-        if resolved_directory.starts_with(workspace) {
+        if forbidden
+            .iter()
+            .any(|root| resolved_directory.starts_with(root))
+        {
             continue;
         }
         let candidate = resolved_directory.join("bwrap");
         let Ok(resolved) = std::fs::canonicalize(candidate) else {
             continue;
         };
-        if resolved.starts_with(workspace) {
+        if forbidden.iter().any(|root| resolved.starts_with(root)) {
             continue;
         }
         let Ok(metadata) = std::fs::metadata(&resolved) else {
@@ -395,9 +416,13 @@ mod tests {
     fn resolver_skips_relative_and_workspace_path_entries() {
         let workspace = tempfile::tempdir().unwrap();
         executable(&workspace.path().join("bwrap"));
+        let private_tmp = tempfile::tempdir().unwrap();
         let path = std::env::join_paths([OsStr::new("."), workspace.path().as_os_str()]).unwrap();
 
-        assert_eq!(resolve_bwrap(Some(&path), workspace.path()), None);
+        assert_eq!(
+            resolve_bwrap(Some(&path), workspace.path(), &[], private_tmp.path()),
+            None
+        );
     }
 
     #[test]
@@ -408,13 +433,43 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&trusted).unwrap();
         executable(&trusted.join("bwrap"));
+        let private_tmp = temp.path().join("private-tmp");
+        std::fs::create_dir(&private_tmp).unwrap();
         let path = std::env::join_paths([trusted.as_os_str()]).unwrap();
 
-        let program = resolve_bwrap(Some(&path), &workspace).unwrap();
+        let program = resolve_bwrap(Some(&path), &workspace, &[], &private_tmp).unwrap();
         assert!(
             program.is_absolute(),
             "spawn must use an absolute program path"
         );
+        assert_eq!(
+            program,
+            std::fs::canonicalize(trusted.join("bwrap")).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolver_skips_writable_and_private_tmp_entries_for_safe_absolute_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let writable = temp.path().join("writable");
+        let private_tmp = temp.path().join("private-tmp");
+        let trusted = temp.path().join("trusted");
+        for directory in [&workspace, &writable, &private_tmp, &trusted] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        executable(&writable.join("bwrap"));
+        executable(&private_tmp.join("bwrap"));
+        executable(&trusted.join("bwrap"));
+        let path = std::env::join_paths([
+            writable.as_os_str(),
+            private_tmp.as_os_str(),
+            trusted.as_os_str(),
+        ])
+        .unwrap();
+
+        let program = resolve_bwrap(Some(&path), &workspace, &[writable], &private_tmp).unwrap();
+
         assert_eq!(
             program,
             std::fs::canonicalize(trusted.join("bwrap")).unwrap()
