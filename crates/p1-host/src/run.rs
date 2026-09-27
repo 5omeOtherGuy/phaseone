@@ -499,14 +499,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     };
     // The same for the workflow tools: they assemble, and no run can start.
     #[cfg(feature = "workflows")]
-    let catalog = catalog.map(|mut catalog| {
+    let catalog = catalog.and_then(|mut catalog| {
         if deps.workflow_service.is_none() {
             crate::catalog::register_workflow_tools(
                 &mut catalog,
                 Some(Arc::new(crate::workflow::RefusingWorkflows)),
-            );
+            )?;
         }
-        catalog
+        Ok(catalog)
     });
     #[cfg(not(feature = "delegation"))]
     let catalog = build_catalog(
