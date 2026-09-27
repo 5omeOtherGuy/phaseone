@@ -1347,7 +1347,7 @@ mod tests {
         register_entries_from(
             &mut catalog,
             &deps,
-            &HOST_ENTRIES,
+            &[("shell", "p1/shell")],
             Some(manifest.clone()),
             &[("shell", registration)],
         )

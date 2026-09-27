@@ -185,7 +185,14 @@ fn finish_entry(completion: &Arc<CompletionHub>) -> HostEntryRegistration {
                 let grant = hub.grant(completion, &[], AgentRole::Main, None);
                 let tool = finish_component(&loaded, &grant, None, &services.mask)
                     .map_err(|error| error.to_string())?;
-                Ok(apply_face!(FacedTool::new(tool, false), spec))
+                let faced = apply_face!(FacedTool::new(tool, false), spec);
+                // A main agent never passes through `finish_for`, so the log must learn the
+                // environment's name for finish here, or calls under it count as progress.
+                grant
+                    .completion()
+                    .log
+                    .set_finish_name(faced.declaration().name.clone());
+                Ok(faced)
             }),
         );
         Ok(())
