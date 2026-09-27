@@ -3,7 +3,9 @@ name: codex-review-relay
 # Codex submits a PR review only when it has findings. Routine GitHub triggers cannot subscribe to
 # pull_request_review, so this job turns each such review into a `pull_request.labeled` event:
 # it removes and re-adds `codex-reviewed`, which starts the Opus fix routine (ADR-0090). The
-# routine removes only that label when it is done.
+# routine removes only that label when it is done. The reviewer must be exactly the Codex bot, since
+# any account can review a public PR. Fork PRs are excluded: their token is read-only, so labelling
+# them would fail; their findings wait for the hourly or manual routine run.
 
 on:
   pull_request_review:
@@ -15,7 +17,11 @@ permissions:
 
 jobs:
   relay:
-    if: contains(github.event.review.user.login, 'codex') && !github.event.pull_request.draft
+    if: >-
+      github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.review.user.type == 'Bot' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

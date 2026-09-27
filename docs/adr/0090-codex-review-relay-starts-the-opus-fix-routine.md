@@ -16,7 +16,7 @@ OpenAI Codex reviews every pull request and submits a PR review only when it has
 
 ## Decision
 
-`.github/workflows/codex-review-relay.yml` runs on `pull_request_review` (submitted) when the reviewer login contains `codex` and the PR is not a draft; it removes and re-adds the label `codex-reviewed` with the job's `GITHUB_TOKEN`. The routine subscribes to `pull_request.labeled`, works only on a PR that carries that label, and removes only that label when done.
+`.github/workflows/codex-review-relay.yml` runs on `pull_request_review` (submitted) when the reviewer is exactly the bot `chatgpt-codex-connector[bot]` (type `Bot`; any account can review a public PR, so a login substring would let others start the routine), the PR is not a draft and its head branch is in this repository (a fork PR's token is read-only and cannot label; its findings wait for the hourly or manual run); it removes and re-adds the label `codex-reviewed` with the job's `GITHUB_TOKEN`. The routine subscribes to `pull_request.labeled`, works only on a PR that carries that label, and removes only that label when done.
 
 ## Consequences
 
