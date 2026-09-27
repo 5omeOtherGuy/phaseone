@@ -2,8 +2,8 @@
 //! block, so the stream that turns one tool into a module replaces only that block.
 //!
 //! Since S3.8 the `shell` and `finish` entries are official-release HOST ENTRIES
-//! (ADR-0083, D083b, D-XO-49): `HOST_ENTRIES` lists the two keys beside `read`'s, and
-//! [`register_composed_host_entries`] — the shared host-entry step — loads each package
+//! (ADR-0083, D083b, D-XO-49): `HOST_ENTRIES` lists the two keys beside the file tools',
+//! and [`register_composed_host_entries`] — the shared host-entry step — loads each package
 //! (`p1/shell`, `p1/finish`) BY NAME from the installed release manifest, verifies it
 //! against that same manifest and hands it to the registration this file owns, which
 //! links it exactly the allocation and the services its manifest grants — `process` (the
@@ -13,6 +13,15 @@
 //! missing release or package fails the catalog build naming the module. What depends on
 //! the host and not on the component — the sandbox paragraph and variant, the face, and
 //! `finish`'s policy/contract declaration — the host presents here (ADR-0083 §1 and §2).
+//!
+//! Since S7.10-R1 (ADR-0091) the five file tools are release host entries as well — `read`
+//! since S1.8.1, and `edit`, `write`, `apply_patch` and `grep` since their crates left the
+//! host's normal graph — so this file registers NO native file tool: those keys are served by
+//! the release's `p1/read`, `p1/edit`, `p1/write`, `p1/patch` and `p1/search` components,
+//! loaded and verified by the shared host-entry step and linked through the service hook this
+//! file owns ([`module_services`] → [`capability_services_for`], now over the host's
+//! `p1_module_runtime::file_services`). A release that does not carry one of them fails the
+//! catalog build naming the module, and nothing compiled in answers for the key.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,32 +41,24 @@ use crate::activity::{AgentRole, CompletionHub, finish_component};
 use crate::cli::SandboxMode;
 
 use super::capabilities::NativeDeclaration;
-use super::modules::{
-    HostEntryRegistration, ModuleServices, lock_selects, register_composed_host_entries,
-};
+use super::modules::{HostEntryRegistration, ModuleServices, register_composed_host_entries};
 
 /// The catalog keys of the two host entries this file composes its own tool for (S3.8):
 /// `HOST_ENTRIES` names the packages the release must ship for them.
 const SHELL: &str = "shell";
 const FINISH: &str = "finish";
 
-/// The catalog key of the `edit` tool, native or the `p1/edit` package a lock selects.
-const EDIT: &str = "edit";
-/// The catalog key of the `write` tool, native or the `p1/write` package a lock selects.
-const WRITE: &str = "write";
-/// The catalog key of the `apply_patch` tool, native or the `p1/patch` package a lock
-/// selects.
-const PATCH: &str = "apply_patch";
-/// The catalog key of the `grep` tool, native or the `p1/search` package a lock selects.
-const SEARCH: &str = "grep";
+/// The module identity of the search component (its verified manifest name): the one file-tool
+/// package whose row grants the walk and no mutation, linked the search capability alone.
+const SEARCH_MODULE: &str = "p1/search";
 
 /// The capability services a module tool is linked with, from the assembling agent's own:
-/// the read side of its workspace and its observations (`p1-tool-read`'s service over
-/// `p1-workspace`, S1.8), the search tool's walk beside it, and — for the mutating rows —
-/// the owned mutation with the mode the row grants (S2). The credential files under the
-/// host's home are refused there exactly as the native `read` refuses them (issue #142), so
-/// selecting a package never widens what an agent can read. Each service is linked only
-/// where a package's manifest grants it.
+/// the read side of its workspace and its observations (the host's read service over
+/// `p1-workspace`, `p1_module_runtime::file_services`, S1.8), the search tool's walk beside
+/// it, and — for the mutating rows — the owned mutation with the mode the row grants (S2).
+/// The credential files under the host's home are refused there exactly as the native `read`
+/// refuses them (issue #142), so selecting a package never widens what an agent can read.
+/// Each service is linked only where a package's manifest grants it.
 ///
 /// The hook keys on the module identity the loader verified (`p1/edit`, `p1/patch`, …), so
 /// a lock entry can serve another key of the same package without moving a grant.
@@ -85,21 +86,26 @@ pub fn mutation_mode(module: &str) -> Option<MutationPolicy> {
     }
 }
 
-/// The capability services the locked tool module `module` is linked with, from the
-/// assembling agent's own workspace and observations: the catalog row's grants. The search
-/// component is linked the search capability alone (its manifest grants the walk and no
-/// snapshot); every other tool gets the read side, with the mutation its row grants. Public
-/// so the module acceptance suite links a component exactly as the host does.
+/// The capability services the module `module` is linked with, from the assembling agent's own
+/// workspace and observations: the catalog row's grants. The search component is linked the
+/// search capability alone (its manifest grants the walk and no snapshot); every other tool
+/// gets the read side, with the mutation its row grants. Public so the module acceptance suite
+/// links a component exactly as the host does.
 pub fn capability_services_for(
     module: &str,
     workspace: Workspace,
     observed: ObservedFiles,
     home: Option<PathBuf>,
 ) -> Services {
-    if module == "p1/search" {
-        return p1_tool_search::search_services(workspace);
+    if module == SEARCH_MODULE {
+        return p1_module_runtime::file_services::search_services(workspace);
     }
-    p1_tool_read::tool_services(workspace, observed, home, mutation_mode(module))
+    p1_module_runtime::file_services::tool_services(
+        workspace,
+        observed,
+        home,
+        mutation_mode(module),
+    )
 }
 
 /// The semantic capabilities a still-native registration declares, each on the identity
@@ -358,69 +364,19 @@ pub(super) fn register_standard_tools(
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) -> Result<(), String> {
-    // S2: as `read` for S1.8, a `modules.lock` entry named `edit`, `write`, `apply_patch`
-    // or `grep` selects the package of that key (`p1/edit`, `p1/write`, `p1/patch`,
-    // `p1/search`), which the locked-module registration then registers. The native tool
-    // stays the fallback: it is registered whenever no lock selects the key (D083b keeps
-    // the four fallbacks until the cutover audit changes).
-    if !lock_selects(&deps.environment_dirs, EDIT) {
-        catalog.tool(
-            EDIT,
-            Box::new(|spec: &ToolSpec, services: &ToolServices| {
-                Ok(apply_face!(
-                    p1_tool_edit::EditTool::new(
-                        services.workspace.clone(),
-                        services.observed.clone()
-                    ),
-                    spec
-                ))
-            }),
-        );
-    }
-    if !lock_selects(&deps.environment_dirs, WRITE) {
-        catalog.tool(
-            WRITE,
-            Box::new(|spec: &ToolSpec, services: &ToolServices| {
-                Ok(apply_face!(
-                    p1_tool_write::WriteTool::new(
-                        services.workspace.clone(),
-                        services.observed.clone()
-                    ),
-                    spec
-                ))
-            }),
-        );
-    }
-    if !lock_selects(&deps.environment_dirs, SEARCH) {
-        catalog.tool(
-            SEARCH,
-            Box::new(|spec: &ToolSpec, services: &ToolServices| {
-                Ok(apply_face!(
-                    p1_tool_search::GrepTool::new(services.workspace.clone()),
-                    spec
-                ))
-            }),
-        );
-    }
-    if !lock_selects(&deps.environment_dirs, PATCH) {
-        catalog.tool(
-            PATCH,
-            Box::new(|spec: &ToolSpec, services: &ToolServices| {
-                Ok(apply_face!(
-                    p1_tool_patch::PatchTool::new(
-                        services.workspace.clone(),
-                        services.observed.clone()
-                    ),
-                    spec
-                ))
-            }),
-        );
-    }
+    // S7.10-R1: no native file tool is registered here any more. `read` left in S1.8.1 and
+    // `edit`, `write`, `apply_patch` and `grep` with this slice: each key is a `HOST_ENTRIES`
+    // entry, so `modules::register_host_entries` loads the release's package of that key, verifies
+    // it against the release manifest and registers it through this file's service hook
+    // (`module_services`). A release that does not carry one of them fails the catalog build
+    // naming the module — there is no native fallback to hide behind. A `modules.lock` entry that
+    // names one of the keys still wins over the release's, exactly as it does for `read`.
+    //
     // S3.8: the `shell` and `finish` entries are the release's `p1/shell` and `p1/finish` host
-    // entries (ADR-0083, D083b, D-XO-49). They are listed in `HOST_ENTRIES` beside `read`'s, and
-    // the one shared host-entry step loads each package from the release manifest, verifies it
-    // against that same manifest — its class allocation included — and hands it to the
-    // registration built here, so `load_release_module` is gone. A key a user lock names takes
+    // entries (ADR-0083, D083b, D-XO-49). They are listed in `HOST_ENTRIES` beside the file
+    // tools', and the one shared host-entry step loads each package from the release manifest,
+    // verifies it against that same manifest — its class allocation included — and hands it to
+    // the registration built here, so `load_release_module` is gone. A key a user lock names takes
     // the lock's package instead, through the same registration, so it keeps the host's
     // process service and completion hub.
     register_composed_host_entries(
@@ -499,49 +455,85 @@ mod tests {
         )
     }
 
+    /// S7.10-R1 (ADR-0091): the five file-tool keys are the release's host entries, and this
+    /// file registers NO native tool for any of them. Building the standard entries over a
+    /// catalog with no lock leaves exactly the two entries the HOST composes its own tool around
+    /// (`shell`, `finish`): `read`, `edit`, `write`, `apply_patch` and `grep` come from the
+    /// shared host-entry step ([`super::super::modules::register_host_entries`], over
+    /// [`HOST_ENTRIES`]) or from a `modules.lock` entry an installation wrote — a release (or a
+    /// lock) that cannot serve one of them fails the assembly naming the module instead of
+    /// quietly dispatching a compiled-in tool.
     #[test]
-    fn the_native_file_tools_stay_unless_a_lock_names_their_key() {
+    fn the_file_tool_keys_have_no_native_registration() {
+        for (key, package) in [
+            ("read", "p1/read"),
+            ("edit", "p1/edit"),
+            ("write", "p1/write"),
+            ("apply_patch", "p1/patch"),
+            ("grep", "p1/search"),
+        ] {
+            assert_eq!(package_of(key), package, "`{key}` is a host entry");
+        }
+
         let root = tempfile::tempdir().unwrap();
         let environments = root.path().join("environments");
         std::fs::create_dir_all(&environments).unwrap();
-        let dirs = [environments];
         std::fs::write(
             root.path().join("modules.lock"),
             "format = \"p1-modules-lock/1\"\n\n[modules]\n",
         )
         .unwrap();
-        for key in [EDIT, WRITE, PATCH, SEARCH] {
-            assert!(!lock_selects(&dirs, key), "the shipped empty lock: {key}");
+        let deps = quiet_deps(vec![environments]);
+        let mut catalog = Catalog::new();
+        register_standard_tools(
+            &mut catalog,
+            &deps,
+            SandboxMode::Off,
+            &[],
+            &[],
+            &[],
+            &Arc::new(CompletionHub::new()),
+        )
+        .expect("the standard entries register");
+
+        let mut keys = catalog.tool_keys();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [FINISH, SHELL],
+            "only the host's own composed entries come from this file"
+        );
+        for key in ["read", "edit", "write", "apply_patch", "grep"] {
+            assert!(
+                !catalog
+                    .tool_keys()
+                    .iter()
+                    .any(|registered| registered == key),
+                "`{key}` has no native registration: {key}"
+            );
         }
 
-        // S2's four keys, each its own lock entry.
-        for (key, package) in [
-            (EDIT, "p1/edit"),
-            (WRITE, "p1/write"),
-            (PATCH, "p1/patch"),
-            (SEARCH, "p1/search"),
-        ] {
-            std::fs::write(root.path().join("modules.lock"), lock_naming(key, package)).unwrap();
-            assert!(lock_selects(&dirs, key), "{key} is selected");
-            for other in [EDIT, WRITE, PATCH, SEARCH] {
-                if other != key {
-                    assert!(
-                        !lock_selects(&dirs, other),
-                        "{other} is not selected by {key}"
-                    );
-                }
-            }
-        }
-
-        // A lock entry of another tool selects none of the four.
+        // A lock that names one of the keys is the locked-module registration's, not this
+        // file's: the key is still not registered here.
         std::fs::write(
             root.path().join("modules.lock"),
-            lock_naming("read", "p1/read"),
+            lock_naming("grep", "p1/search"),
         )
         .unwrap();
-        for key in [EDIT, WRITE, PATCH, SEARCH] {
-            assert!(!lock_selects(&dirs, key), "{key} stays native");
-        }
+        let mut locked = Catalog::new();
+        register_standard_tools(
+            &mut locked,
+            &deps,
+            SandboxMode::Off,
+            &[],
+            &[],
+            &[],
+            &Arc::new(CompletionHub::new()),
+        )
+        .expect("a lock-selected key is not this file's");
+        let mut keys = locked.tool_keys();
+        keys.sort();
+        assert_eq!(keys, [FINISH, SHELL]);
     }
 
     #[test]

@@ -63,13 +63,20 @@ pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
 /// The official-release host entries this host registers (D083b 2), as `(catalog key, package)`.
 ///
 /// The key is what an environment selects the entry by and what an assembly identity names as
-/// the module's `package`; the package name is what the release must ship. `read` is a tool
-/// entry whose native registration is gone (S1.8.1) and whose component the shared registration
-/// builds; `shell` and `finish` are S3.8's entries ([`HOST_COMPOSED_ENTRIES`]), whose catalog
-/// tool the host composes around the loaded package. A user lock that names a key here still
-/// wins ([`lock_selects`]), and S5.11's policy entries are one more list passed to the same step.
-pub const HOST_ENTRIES: [(&str, &str); 3] = [
+/// the module's `package`; the package name is what the release must ship. The five file tools
+/// are entries whose native registrations are gone (S1.8.1 for `read`, S7.10-R1 for the other
+/// four, ADR-0091) and whose components the shared registration builds, so an environment that
+/// names `edit`, `write`, `apply_patch` or `grep` runs the release's component with no lock and
+/// no compiled-in tool behind it; `shell` and `finish` are S3.8's entries
+/// ([`HOST_COMPOSED_ENTRIES`]), whose catalog tool the host composes around the loaded package.
+/// A user lock that names a key here still wins ([`lock_selects`]), and S5.11's policy entries
+/// are one more list passed to the same step.
+pub const HOST_ENTRIES: [(&str, &str); 7] = [
     ("read", "p1/read"),
+    ("edit", "p1/edit"),
+    ("write", "p1/write"),
+    ("apply_patch", "p1/patch"),
+    ("grep", "p1/search"),
     ("shell", "p1/shell"),
     ("finish", "p1/finish"),
 ];
@@ -1543,7 +1550,7 @@ mod tests {
         register_host_entries_from(
             &mut catalog,
             &deps,
-            &HOST_ENTRIES,
+            &[("read", "p1/read")],
             Some(empty_manifest.clone()),
         )
         .expect("a lock-selected key leaves the host entry alone");
@@ -1558,7 +1565,7 @@ mod tests {
         assert_eq!(catalog.tool_keys(), ["read"]);
 
         // And the identity names the lock's package, not the release's.
-        let sources = module_sources_from(&deps, &HOST_ENTRIES, Some(empty_manifest))
+        let sources = module_sources_from(&deps, &[("read", "p1/read")], Some(empty_manifest))
             .expect("a lock-selected key needs no release");
         let resolved = sources.resolve("read").expect("the lock resolves the key");
         assert_eq!(resolved.name, p1_module_tests::FIXTURE_NAME);
@@ -1625,12 +1632,17 @@ mod tests {
         let deps = quiet_deps(dirs);
 
         let mut catalog = Catalog::new();
-        register_host_entries_from(&mut catalog, &deps, &HOST_ENTRIES, Some(manifest.clone()))
-            .expect("the release's p1/read registers");
+        register_host_entries_from(
+            &mut catalog,
+            &deps,
+            &[("read", "p1/read")],
+            Some(manifest.clone()),
+        )
+        .expect("the release's p1/read registers");
         assert_eq!(catalog.tool_keys(), ["read"]);
 
-        let sources =
-            module_sources_from(&deps, &HOST_ENTRIES, Some(manifest)).expect("the release reads");
+        let sources = module_sources_from(&deps, &[("read", "p1/read")], Some(manifest))
+            .expect("the release reads");
         let resolved = sources
             .resolve("read")
             .expect("the host entry resolves the key");
@@ -1644,6 +1656,37 @@ mod tests {
                 entry["protocol"].as_str().expect("protocol")
             )
         );
+    }
+
+    /// S7.10-R1 (ADR-0091): the five file tools are release host entries — `edit`, `write`,
+    /// `apply_patch` and `grep` beside `read` — so a key no lock names runs the release's
+    /// component, and a release that does not carry one fails the build naming the key and the
+    /// package, exactly as a missing `read` does. No compiled-in registration answers for any of
+    /// them any more, so such a release has nothing to fall back to.
+    #[test]
+    fn the_file_tool_keys_are_release_host_entries() {
+        let release = tempfile::tempdir().expect("release dir");
+        let manifest = write_release_manifest(release.path(), &[]);
+
+        for (key, package) in [
+            ("read", "p1/read"),
+            ("edit", "p1/edit"),
+            ("write", "p1/write"),
+            ("apply_patch", "p1/patch"),
+            ("grep", "p1/search"),
+        ] {
+            assert!(
+                HOST_ENTRIES.contains(&(key, package)),
+                "`{key}` is the release host entry of `{package}`"
+            );
+            let error = match load_host_entry(key, package, &manifest) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("a release that does not carry {package} must refuse"),
+            };
+            assert!(error.contains(key), "{error}");
+            assert!(error.contains(package), "{error}");
+            assert!(error.contains(&manifest.display().to_string()), "{error}");
+        }
     }
 
     /// S3.8 (D083b, D-XO-49): `shell` and `finish` are HOST ENTRIES beside `read`, so the identity

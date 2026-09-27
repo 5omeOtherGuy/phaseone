@@ -37,12 +37,12 @@ p1-module-protocol = { path = "../p1-module-protocol" }
 p1-core = { path = "../p1-core" }
 p1-journal = { path = "../p1-journal" }
 p1-workspace = { path = "../p1-workspace" }
-p1-tool-read = { path = "../p1-tool-read" }
-p1-tool-edit = { path = "../p1-tool-edit" }
-p1-tool-write = { path = "../p1-tool-write" }
-p1-tool-search = { path = "../p1-tool-search" }
+# S7.10-R1 (ADR-0091): `read`, `edit`, `write`, `apply_patch` and `grep` are the release's
+# host entries now, so their crates are out of the host's NORMAL graph — the file-tool
+# capability services they used to carry are the runtime's (`module-runtime/file_services.rs`)
+# and the credential policy is `p1-workspace`'s. The five stay dev-dependencies below: the
+# host's own cases build the native tools to compare a component against them.
 p1-tool-shell = { path = "../p1-tool-shell" }
-p1-tool-patch = { path = "../p1-tool-patch" }
 p1-tool-finish = { path = "../p1-tool-finish" }
 # S3.7: the completion hub re-verifies a `finish` component's candidates with the same
 # command rules and contract check the component ships (ADR-0083 §2).
@@ -87,6 +87,15 @@ tokio = { version = "1", default-features = false, features = [
 
 [dev-dependencies]
 p1-testkit = { path = "../p1-testkit" }
+# S7.10-R1 (ADR-0091): the native file tools, built by the host's own cases and by
+# tests/call_description.rs and tests/describe_results.rs to compare a component's
+# declaration, description and effect against the native tool's. The components themselves are
+# the release's host entries, so nothing in the host's normal graph names these crates.
+p1-tool-read = { path = "../p1-tool-read" }
+p1-tool-edit = { path = "../p1-tool-edit" }
+p1-tool-write = { path = "../p1-tool-write" }
+p1-tool-search = { path = "../p1-tool-search" }
+p1-tool-patch = { path = "../p1-tool-patch" }
 # S5.11: the host runs the summarizing context as the host entry p1/context/summarizing
 # (src/summary.rs); its source crate stays the reference the host's tests check the table,
 # the prompt and the summaries against.
