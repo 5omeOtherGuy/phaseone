@@ -7,7 +7,7 @@
 //! (`p1/shell`, `p1/finish`) BY NAME from the installed release manifest, verifies it
 //! against that same manifest and hands it to the registration this file owns, which
 //! links it exactly the allocation and the services its manifest grants — `process` (the
-//! native [`p1_tool_shell::ProcessService`] the host assembles from the workspace, the
+//! native [`ProcessService`] the host assembles from the workspace, the
 //! environment snapshot, the `--env-pass` names and the sandbox) plus `clock` for
 //! `shell`, and the completion hub's `completion` for `finish`. No native fallback: a
 //! missing release or package fails the catalog build naming the module. What depends on
@@ -24,6 +24,7 @@ use p1_contracts::{
     BoxFuture, CallDescription, Effect, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
     ToolOutcome, ToolResultItem,
 };
+use p1_module_runtime::process::{ProcessCapability, ProcessService, Sandbox};
 use p1_module_runtime::{ExecutionLimits, LoadedModule, Services, wasm_tool};
 
 use crate::HostDeps;
@@ -118,7 +119,7 @@ fn shell_entry(
                 // fixed for this agent: a request carries only the command text and its time
                 // limit (ADR-0083 §1). The sandbox is applied before the face, so a face
                 // override keeps the sandbox paragraph and the `+sandbox` variant.
-                let mut process = p1_tool_shell::ProcessService::new(services.workspace.root());
+                let mut process = ProcessService::new(services.workspace.root());
                 if let Some(snapshot) = &setup.shell_env {
                     process = process.with_env_snapshot(snapshot.clone());
                 }
@@ -133,7 +134,7 @@ fn shell_entry(
                                     .to_string(),
                             );
                         };
-                        let mut sandbox = p1_tool_shell::Sandbox::for_home(home);
+                        let mut sandbox = Sandbox::for_home(home);
                         sandbox.readable = setup.readable.clone();
                         sandbox.writable = setup.writable.clone();
                         sandbox.runtime_dir = setup.runtime_dir.clone();
@@ -146,9 +147,7 @@ fn shell_entry(
                     }
                 };
                 let linked = Services {
-                    process: Some(Arc::new(p1_tool_shell::ProcessCapability::new(Arc::new(
-                        process,
-                    )))),
+                    process: Some(Arc::new(ProcessCapability::new(Arc::new(process)))),
                     ..Services::default()
                 };
                 let component =
@@ -249,13 +248,13 @@ impl FacedTool {
             format!(
                 "{}\n{}",
                 self.face.description,
-                p1_tool_shell::SANDBOX_PARAGRAPH
+                p1_shell_guest::SANDBOX_PARAGRAPH
             )
         } else {
             self.face.description.clone()
         };
         let variant = if self.sandboxed {
-            format!("{}{}", self.variant, p1_tool_shell::SANDBOX_VARIANT_SUFFIX)
+            format!("{}{}", self.variant, p1_shell_guest::SANDBOX_VARIANT_SUFFIX)
         } else {
             self.variant.clone()
         };

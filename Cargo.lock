@@ -1788,6 +1788,7 @@ dependencies = [
  "p1-provider-openai",
  "p1-provider-openai-chat",
  "p1-redact",
+ "p1-shell-guest",
  "p1-testkit",
  "p1-tool-delegate",
  "p1-tool-edit",
@@ -1864,12 +1865,14 @@ dependencies = [
 name = "p1-module-runtime"
 version = "0.0.1"
 dependencies = [
+ "nix",
  "p1-contracts",
  "p1-module-protocol",
  "p1-provider-http",
  "p1-redact",
  "p1-workers",
  "p1-workflow",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "wasmtime",
@@ -2127,7 +2130,6 @@ dependencies = [
  "p1-workspace",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
  "tokio",
 ]
 
