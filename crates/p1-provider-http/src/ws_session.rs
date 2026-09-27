@@ -2,9 +2,8 @@
 //! (ADR-0078 §1, `docs/design/modules/wit.md` "WebSocket: who decides what").
 //!
 //! One [`WsSession`] per provider instance owns that instance's ONE connection behind
-//! an async mutex (`docs/design/websocket.md` §4). A request leases it without
-//! waiting ([`WsSession::try_lease`]; a busy session means the request uses HTTP,
-//! never a second socket and never a wait) and, through the [`WsLease`]:
+//! an async mutex (`docs/design/websocket.md` §4). A request leases it — never a second
+//! socket either way — and, through the [`WsLease`]:
 //!
 //! - reads the facts of WIT `websocket.connection-state` ([`WsLease::state`]): whether
 //!   a connection is open, the response id of the last response it completed
@@ -30,6 +29,14 @@
 //! Reuse follows §4: a connection is reported open only while it is younger than
 //! [`MAX_AGE`] and was last used less than [`MAX_IDLE`] ago, on an injected
 //! [`Clock`]; an older one is dropped when the state is read.
+//!
+//! Which lease a caller takes is the caller's rule, and the two callers differ:
+//! the native adapter takes [`WsSession::try_lease`], so a busy session sends that
+//! request over HTTP (§4 never waits), while the provider-component broker waits
+//! ([`WsSession::lease`]) because the frozen `websocket.connection-state` has no
+//! fact for a busy session: reported `open = true` on a socket another response is
+//! mid-read on would make the component send a frame and, worse, a handshake.
+//! A wait races the request's cancellation, so it ends as the request does.
 
 use std::future::Future;
 use std::sync::Arc;

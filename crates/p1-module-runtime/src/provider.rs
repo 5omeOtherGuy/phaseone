@@ -507,6 +507,14 @@ impl<T> Reply<T> {
     }
 }
 
+/// What one decoder `feed` answers: the events it produced and, when this attempt's
+/// response completed, the id a continuation may name (`decoding.decoder.response-id`).
+type FeedReply = (Vec<StreamEvent>, Option<String>);
+
+/// What one decoder `finish` answers: this attempt's terminal outcome and, when that
+/// completed the response, the id a continuation may name.
+type FinishReply = (Outcome, Option<String>);
+
 enum Command {
     Validate {
         request: Val,
@@ -536,12 +544,12 @@ enum Command {
         key: u64,
         create: bool,
         event: SseEvent,
-        reply: Reply<Result<(Vec<StreamEvent>, Option<String>), ModuleFailure>>,
+        reply: Reply<Result<FeedReply, ModuleFailure>>,
     },
     Finish {
         key: u64,
         create: bool,
-        reply: Reply<Result<(Outcome, Option<String>), ModuleFailure>>,
+        reply: Reply<Result<FinishReply, ModuleFailure>>,
     },
     Drop {
         key: u64,
@@ -892,7 +900,7 @@ impl Machine {
         key: u64,
         create: bool,
         event: SseEvent,
-    ) -> Result<(Vec<StreamEvent>, Option<String>), ModuleFailure> {
+    ) -> Result<FeedReply, ModuleFailure> {
         let decoder = self.decoder(key, create)?;
         let event = Val::Record(vec![
             (
@@ -920,11 +928,7 @@ impl Machine {
         Ok((events, response_id))
     }
 
-    fn finish(
-        &mut self,
-        key: u64,
-        create: bool,
-    ) -> Result<(Outcome, Option<String>), ModuleFailure> {
+    fn finish(&mut self, key: u64, create: bool) -> Result<FinishReply, ModuleFailure> {
         let decoder = self.decoder(key, create)?;
         let results = self.call(|exports| &exports.finish, &[Val::Resource(decoder)])?;
         let outcome = match results.into_iter().next().map(stream_event) {

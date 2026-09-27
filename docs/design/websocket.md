@@ -86,6 +86,10 @@ pub struct WsError(pub String);
 
 - One connection, behind an async mutex, reused across turns. If it is busy when a request
   arrives (concurrent `stream` calls), that request uses SSE — never a second socket, never a wait.
+  Through the provider component (ADR-0078, S7.10-R5) the same request WAITS for the session
+  instead: the frozen `websocket.connection-state` has no fact for a busy session, and reporting
+  the socket open would make the component send on a connection another response is mid-read on.
+  The wait races the request's cancellation, so a cancelled request does not hold the session.
 - Reuse only while `age < 55 min` and `idle < 5 min` [donor; vendor: connections last 60 min];
   otherwise drop it and connect anew. Time comes from an injected clock, as elsewhere in the crate.
 - Connect, send, and the pong the read loop sends to answer a ping are each bounded by 10 s.
