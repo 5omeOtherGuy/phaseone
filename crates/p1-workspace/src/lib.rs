@@ -5,11 +5,18 @@
 //! variable: every path a file tool touches must resolve inside the workspace
 //! root *after* symlink resolution (see [`Workspace::resolve`]). This is an
 //! invariant of the tools, not a policy the host may relax.
+//!
+//! The file policy that is not confinement lives here too: the credential files
+//! every file tool refuses before confinement ([`refuse_credentials`], issue
+//! #142) and the model-facing texts that refusal and a failed read carry, so a
+//! component's capability service and the native tool refuse the same paths with
+//! the same wording.
 
 mod commit;
 mod gate;
 mod observe;
 mod path;
+mod policy;
 mod read;
 mod reads;
 mod text;
@@ -20,6 +27,9 @@ pub use commit::{Change, MutationError, MutationPolicy, OwnedMutation};
 pub use gate::{Mutation, WriteGate};
 pub use observe::{Observation, ObservedFiles, StreamingHash};
 pub use p1_contracts::tool::ToolFace;
+pub use policy::{
+    could_not_be_read, credential_refusal, refuse_credentials, refuses_credentials, xdg_credentials,
+};
 pub use read::{CheckedPath, DirEntry, FileKind, Snapshot, SnapshotMetadata, Stat};
 pub use reads::ReadRecord;
 pub use text::{bound_output, write_atomic};
