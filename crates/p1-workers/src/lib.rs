@@ -9,6 +9,17 @@
 //! Completion is retained state plus ONE parent notification: the status is stored
 //! first, then the parent is told. A missed or ignored notification loses nothing —
 //! the result stays retrievable by id for the service's lifetime.
+//!
+//! [`scope`] adds the scoped surface a component links (the WIT worker interfaces) over
+//! any [`WorkerService`], without changing the service. [`journal`] reads back which
+//! workers a journalled session started.
+
+pub mod journal;
+pub mod scope;
+
+pub use scope::{
+    ScopeKey, WorkerScope, WorkerScopes, WorkersControl, WorkersObserve, WorkersStart,
+};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -330,7 +341,8 @@ enum ChildCommand {
     Continue {
         message: String,
         token: CancellationToken,
-        reconfig: Option<Reconfiguration>,
+        // Boxed: the command queue should not size every `Shutdown` after it.
+        reconfig: Option<Box<Reconfiguration>>,
         reply: Option<oneshot::Sender<Result<(), String>>>,
     },
     Shutdown,
@@ -750,7 +762,7 @@ impl WorkerService for InProcessWorkers {
                             id.0
                         )));
                     };
-                    Some(regrant(&grant).map_err(WorkerError::Regrant)?)
+                    Some(Box::new(regrant(&grant).map_err(WorkerError::Regrant)?))
                 };
                 let (reply, reply_tx) = if reconfig.is_some() {
                     let (tx, rx) = oneshot::channel();
@@ -942,7 +954,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                 return;
             };
             if let Some(reconfig) = reconfig {
-                match agent.reconfigure(reconfig) {
+                match agent.reconfigure(*reconfig).await {
                     Ok(()) => {
                         if let Some(reply) = reply {
                             let _ = reply.send(Ok(()));
@@ -1239,6 +1251,7 @@ mod tests {
             system_prompt: "child".into(),
             options: ModelOptions::default(),
             context: Arc::new(PassthroughContext),
+            authorization: None,
         }
     }
 

@@ -1,23 +1,29 @@
 //! The `write` tool: atomic create-or-replace of one workspace file.
 //!
 //! Confinement, atomic replacement and observed-file tracking live in
-//! `p1-workspace`. This module owns the model-facing declaration, input
-//! validation and the read-before-mutate guard for an existing target.
+//! `p1-workspace`. The model-facing declaration, input validation, the call
+//! and result descriptions and every text the model sees live in
+//! `p1-tool-write-logic`, which the `p1/write` component calls too, so both run
+//! the same code. This module owns the native flow: the read-before-mutate
+//! guard for an existing target and the write, under the write gate.
+//!
+//! The `workspace-mutation` capability service a component is linked with is the
+//! HOST's (`p1_module_runtime::file_services`, S7.10-R1, ADR-0095); it is re-exported
+//! here for the tests that link the edit, write and patch components.
 
 use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
-use p1_workspace::{Observation, ObservedFiles, Workspace, bound_output, write_atomic};
-use serde::Deserialize;
+use p1_tool_write_logic::{self as logic, RawInput, WriteInput};
+use p1_workspace::{Observation, ObservedFiles, Workspace, write_atomic};
 
 pub use p1_workspace::ToolFace;
 
-const NAME: &str = "write";
-const DESCRIPTION: &str = "Create or replace a workspace file atomically, creating missing parent directories.\nOverwriting an existing file requires that you read its current contents first.\nPrefer `edit` for small changes: `write` replaces the whole file.";
-const MAX_OUTPUT_BYTES: usize = 50_000;
-const MAX_OUTPUT_LINES: usize = 2_000;
+pub use p1_module_runtime::file_services::{
+    MutationCapability, mutation_service, mutation_service_over,
+};
 
 /// The `write` tool. Holds one agent's workspace and observation store.
 pub struct WriteTool {
@@ -51,7 +57,7 @@ impl WriteTool {
 }
 
 fn default_face() -> ToolFace {
-    ToolFace::new(NAME, DESCRIPTION)
+    ToolFace::new(logic::NAME, logic::DESCRIPTION)
 }
 
 fn declaration(face: ToolFace) -> ToolDeclaration {
@@ -59,7 +65,7 @@ fn declaration(face: ToolFace) -> ToolDeclaration {
         name: face.name,
         description: face.description,
         kind: DeclarationKind::Function {
-            input_schema: input_schema(),
+            input_schema: logic::input_schema(),
         },
     }
 }
@@ -71,29 +77,12 @@ fn identity(variant: &str) -> ToolIdentity {
     }
 }
 
-fn input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "File path, relative to the workspace root or absolute inside it."
-            },
-            "content": {
-                "type": "string",
-                "description": "Complete file contents; replaces any existing file."
-            }
-        },
-        "required": ["file_path", "content"],
-        "additionalProperties": false
-    })
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WriteInput {
-    file_path: String,
-    content: String,
+/// The call's input as the logic crate reads it.
+fn raw_input(input: &ToolInput) -> RawInput<'_> {
+    match input {
+        ToolInput::Json(raw) => RawInput::Json(raw),
+        ToolInput::Text(raw) => RawInput::Text(raw),
+    }
 }
 
 impl Tool for WriteTool {
@@ -111,19 +100,20 @@ impl Tool for WriteTool {
 
     /// ADR-0057: the file this call writes, from the tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
-        let parsed = parse_input(&self.declaration.name, call).ok();
-        let destructive = parsed
-            .as_ref()
-            .is_some_and(|input| self.workspace.resolve(&input.file_path).is_err());
+        // Natively the workspace is at hand, so an escape is decided by resolving
+        // the path, symlinks included.
+        let described = logic::describe(raw_input(&call.input), |path| {
+            self.workspace.resolve(path).is_err()
+        });
         CallDescription {
-            verb: "edit",
-            target: parsed.as_ref().map(|input| input.file_path.clone()),
-            edit: parsed.map(|input| EditPreview {
-                path: input.file_path,
-                old: String::new(),
-                new: input.content,
+            verb: logic::VERB,
+            target: described.target,
+            edit: described.edit.map(|edit| EditPreview {
+                path: edit.path,
+                old: edit.old,
+                new: edit.new,
             }),
-            destructive,
+            destructive: described.destructive,
         }
     }
 
@@ -132,23 +122,17 @@ impl Tool for WriteTool {
         call: &ToolCall,
         result: &p1_contracts::ToolResultItem,
     ) -> ResultDescription {
-        if result.status != ToolStatus::Ok {
-            return plain_result(result);
-        }
-        let Ok(input) = parse_input(&self.declaration.name, call) else {
-            return plain_result(result);
-        };
-        let lines = input.content.lines().count();
-        let summary = parenthesized_count(&result.content, "bytes").map_or_else(
-            || format!("{lines} lines"),
-            |bytes| format!("{lines} lines · {:.1} kB", bytes as f64 / 1000.0),
+        let described = logic::describe_result(
+            raw_input(&call.input),
+            result.status == ToolStatus::Ok,
+            &result.content,
         );
         ResultDescription {
-            summary,
-            detail: Some(ResultDetail::Diff {
-                path: input.file_path,
-                before: String::new(),
-                after: input.content,
+            summary: described.summary,
+            detail: described.diff.map(|diff| ResultDetail::Diff {
+                path: diff.path,
+                before: diff.before,
+                after: diff.after,
             }),
         }
     }
@@ -166,7 +150,7 @@ impl Tool for WriteTool {
                     content: String::new(),
                 };
             }
-            let input = match parse_input(&self.declaration.name, call) {
+            let input = match logic::parse_input(&self.declaration.name, raw_input(&call.input)) {
                 Ok(input) => input,
                 Err(message) => return ToolOutcome::error(message),
             };
@@ -176,53 +160,12 @@ impl Tool for WriteTool {
             // All filesystem work runs on a blocking thread; the async thread
             // is never used for synchronous I/O.
             match tokio::task::spawn_blocking(move || run(&workspace, &observed, &input)).await {
-                Ok(Ok(content)) => {
-                    ToolOutcome::ok(bound_output(&content, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES))
-                }
+                Ok(Ok(content)) => ToolOutcome::ok(logic::bounded(&content)),
                 Ok(Err(message)) => ToolOutcome::error(message),
                 Err(error) => ToolOutcome::error(format!("{tool} failed: {error}")),
             }
         })
     }
-}
-
-fn plain_result(result: &p1_contracts::ToolResultItem) -> ResultDescription {
-    ResultDescription {
-        summary: result
-            .content
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        detail: None,
-    }
-}
-
-fn parenthesized_count(content: &str, unit: &str) -> Option<usize> {
-    let rest = &content[content.rfind('(')? + 1..];
-    let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
-    let count = rest[..digits_end].parse().ok()?;
-    rest[digits_end..]
-        .trim_start()
-        .starts_with(unit)
-        .then_some(count)
-}
-
-fn parse_input(tool: &str, call: &ToolCall) -> Result<WriteInput, String> {
-    let raw = match &call.input {
-        ToolInput::Json(raw) => raw,
-        ToolInput::Text(_) => {
-            return Err(invalid(
-                tool,
-                "expected a JSON object input, got freeform text",
-            ));
-        }
-    };
-    serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))
-}
-
-fn invalid(tool: &str, reason: &str) -> String {
-    format!("Invalid input for {tool}: {reason}")
 }
 
 fn run(
@@ -242,27 +185,25 @@ fn run(
     // a new file is a blind create, which is allowed.
     if resolved.exists() {
         let bytes = std::fs::read(&resolved)
-            .map_err(|error| format!("{display} could not be read: {error}"))?;
+            .map_err(|error| logic::could_not_be_read(&display, &error.to_string()))?;
         match observed.check_unchanged(&resolved, &bytes) {
             Observation::NeverObserved => {
-                return Err(format!("You must read {display} before changing it."));
+                return Err(logic::never_observed(&display));
             }
             Observation::ChangedSinceObserved => {
-                return Err(format!(
-                    "{display} changed on disk since you last read it; read it again."
-                ));
+                return Err(logic::changed_since_observed(&display));
             }
             Observation::Unchanged => {}
         }
     }
 
     write_atomic(&resolved, input.content.as_bytes())
-        .map_err(|error| format!("failed to write {display}: {error}"))?;
+        .map_err(|error| logic::failed_to_write(&display, &error.to_string()))?;
     // A successful mutation records the new contents, so a follow-up edit or
     // write needs no re-read.
     observed.record(&resolved, input.content.as_bytes());
 
-    Ok(format!("Wrote {display} ({} bytes).", input.content.len()))
+    Ok(logic::wrote(&display, input.content.len()))
 }
 
 #[cfg(test)]

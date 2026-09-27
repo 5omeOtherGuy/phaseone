@@ -1,0 +1,28 @@
+[package]
+name = "p1-module-policy-full-access"
+description = "The full-access authorization policy (ADR-0038, the shipped default): every call is permitted"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-authorization-policy = { path = "../p1-bindings-authorization-policy" }
+
+# The frozen package manifest (docs/design/modules/package.md). `scripts/build-modules.sh`
+# reads these fields, checks them and copies them into the built module's manifest. The
+# build refuses an empty capability list; `control` is the smallest grant of the class, and
+# the policy calls no import at all.
+[package.metadata.p1-module]
+name = "p1/policy/full-access"
+kind = "authorization-policy"
+world = "p1:module/authorization-policy@1.0.0"
+protocol = "1.0"
+capabilities = ["control"]
+variant = "default"

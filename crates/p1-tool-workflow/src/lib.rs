@@ -1,5 +1,6 @@
-//! The four model-facing workflow tools. They depend only on the workflow service
-//! trait; the host owns the implementation, background execution and notification.
+//! The four model-facing workflow tools. Each depends only on its own narrow operation
+//! trait (`StartRuns`, `ObserveRuns`, `CancelRuns`), which every `WorkflowService`
+//! satisfies; the host owns the implementation, background execution and notification.
 
 use std::sync::Arc;
 
@@ -9,8 +10,8 @@ use p1_contracts::{
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_workflow::{
-    RunId, RunOutcome, RunProgress, RunReport, RunStatus, StartRequest, StepLine, StepStatus,
-    WorkflowError, WorkflowService,
+    CancelRuns, ObserveRuns, RunId, RunProgress, RunStatus, StartRequest, StartRuns, WorkflowError,
+    WorkflowService, render_report, report_line,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -61,7 +62,8 @@ fn declaration(name: &str, description: &str, schema: Value) -> ToolDeclaration 
     }
 }
 
-/// The four tools, in start/status/result/cancel order.
+/// The four tools, in start/status/result/cancel order. A composition helper only: each
+/// member is built by its own constructor and holds only its own trait of `service`.
 pub fn all(service: Arc<dyn WorkflowService>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(WorkflowStartTool::new(Arc::clone(&service))),
@@ -84,17 +86,49 @@ fn empty_object() -> serde_json::Map<String, Value> {
     serde_json::Map::new()
 }
 
+/// A member's one trait over whatever `Arc` it was built from. Constructors take
+/// `Arc<S>` for any `S: ?Sized` implementing the trait, so both a test fake and the
+/// host's `Arc<dyn WorkflowService>` fit; an unsized `S` cannot coerce to a trait object
+/// directly, so this wrapper is the trait object instead.
+struct Runs<S: ?Sized>(Arc<S>);
+
+impl<S: StartRuns + ?Sized> StartRuns for Runs<S> {
+    fn start<'a>(&'a self, request: StartRequest) -> BoxFuture<'a, Result<RunId, WorkflowError>> {
+        self.0.start(request)
+    }
+}
+
+impl<S: ObserveRuns + ?Sized> ObserveRuns for Runs<S> {
+    fn status<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        self.0.status(id)
+    }
+
+    fn wait<'a>(
+        &'a self,
+        id: &'a RunId,
+        cancel: p1_contracts::CancellationToken,
+    ) -> BoxFuture<'a, Result<RunStatus, WorkflowError>> {
+        self.0.wait(id, cancel)
+    }
+}
+
+impl<S: CancelRuns + ?Sized> CancelRuns for Runs<S> {
+    fn cancel<'a>(&'a self, id: &'a RunId) -> BoxFuture<'a, Result<(), WorkflowError>> {
+        self.0.cancel(id)
+    }
+}
+
 /// Starts a script in the background; the host sends the completion notification.
 pub struct WorkflowStartTool {
-    service: Arc<dyn WorkflowService>,
+    service: Arc<dyn StartRuns>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkflowStartTool {
-    pub fn new(service: Arc<dyn WorkflowService>) -> Self {
+    pub fn new<S: StartRuns + ?Sized + 'static>(service: Arc<S>) -> Self {
         Self {
-            service,
+            service: Arc::new(Runs(service)),
             declaration: declaration(
                 "workflow_start",
                 START_DESCRIPTION,
@@ -196,15 +230,15 @@ struct IdInput {
 
 /// Nonblocking, compact status; ended runs share the result's first line.
 pub struct WorkflowStatusTool {
-    service: Arc<dyn WorkflowService>,
+    service: Arc<dyn ObserveRuns>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkflowStatusTool {
-    pub fn new(service: Arc<dyn WorkflowService>) -> Self {
+    pub fn new<S: ObserveRuns + ?Sized + 'static>(service: Arc<S>) -> Self {
         Self {
-            service,
+            service: Arc::new(Runs(service)),
             declaration: declaration("workflow_status", STATUS_DESCRIPTION, id_schema()),
             identity: identity("default"),
         }
@@ -276,15 +310,15 @@ struct ResultInput {
 
 /// Reads a retained report, or waits for it using the tool's cancellation token.
 pub struct WorkflowResultTool {
-    service: Arc<dyn WorkflowService>,
+    service: Arc<dyn ObserveRuns>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkflowResultTool {
-    pub fn new(service: Arc<dyn WorkflowService>) -> Self {
+    pub fn new<S: ObserveRuns + ?Sized + 'static>(service: Arc<S>) -> Self {
         Self {
-            service,
+            service: Arc::new(Runs(service)),
             declaration: declaration(
                 "workflow_result",
                 RESULT_DESCRIPTION,
@@ -365,15 +399,15 @@ impl Tool for WorkflowResultTool {
 
 /// Cancels a run; an already ended run is an idempotent success.
 pub struct WorkflowCancelTool {
-    service: Arc<dyn WorkflowService>,
+    service: Arc<dyn CancelRuns>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
 
 impl WorkflowCancelTool {
-    pub fn new(service: Arc<dyn WorkflowService>) -> Self {
+    pub fn new<S: CancelRuns + ?Sized + 'static>(service: Arc<S>) -> Self {
         Self {
-            service,
+            service: Arc::new(Runs(service)),
             declaration: declaration("workflow_cancel", CANCEL_DESCRIPTION, id_schema()),
             identity: identity("default"),
         }
@@ -496,98 +530,5 @@ fn render_progress(id: &str, progress: &RunProgress) -> String {
         text.push_str("\n  ");
         text.push_str(line);
     }
-    text
-}
-
-fn report_line(report: &RunReport) -> String {
-    let outcome = match report.outcome {
-        RunOutcome::Completed => "completed",
-        RunOutcome::CompletedWithIssues => "completed with issues",
-        RunOutcome::Failed => "failed",
-        RunOutcome::Cancelled => "cancelled",
-    };
-    let c = &report.counts;
-    format!(
-        "Workflow {}: {outcome} — {} steps ({} replayed): {} done, {} blocked, {} failed, {} cancelled; {} not verified; {} capped; {} invalid output; {} fell back",
-        report.id.0,
-        c.steps,
-        c.replayed,
-        c.done,
-        c.blocked,
-        c.failed,
-        c.cancelled,
-        c.not_verified,
-        c.capped,
-        c.invalid_output,
-        c.fell_back
-    )
-}
-
-fn render_step(step: &StepLine) -> String {
-    let status = match step.status {
-        StepStatus::Done => "done",
-        StepStatus::Blocked => "blocked",
-        StepStatus::Failed => "failed",
-        StepStatus::Cancelled => "cancelled",
-    };
-    // The model part is the chain the step walked (ADR-0054 item 4).
-    let mut line = format!(
-        "  {} {} → {}",
-        step.label.as_deref().unwrap_or(&step.call.0),
-        step.role,
-        step.model_chain()
-    );
-    if let Some(worker) = &step.worker {
-        line.push_str(&format!(" [{worker}]"));
-    }
-    line.push_str(&format!(" {status} — schema {}", step.schema));
-    if let Some(evidence) = &step.evidence {
-        line.push_str(&format!("; {evidence}"));
-    }
-    if step.replayed {
-        line.push_str("; replayed");
-    }
-    if step.attempts > 1 {
-        line.push_str(&format!("; attempts {}", step.attempts));
-    }
-    if let Some(error) = &step.error {
-        line.push_str(&format!("; {error}"));
-    }
-    line
-}
-
-fn render_report(report: &RunReport) -> String {
-    let mut text = report_line(report);
-    if let Some(error) = &report.error {
-        text.push_str(&format!("\nerror: {error}"));
-    }
-    text.push_str("\nsteps:");
-    for step in report.steps.iter().take(200) {
-        text.push('\n');
-        text.push_str(&render_step(step));
-    }
-    if report.steps.len() > 200 {
-        text.push_str(&format!(
-            "\n  … {} more in result.json",
-            report.steps.len() - 200
-        ));
-    }
-    let value =
-        serde_json::to_string_pretty(&report.value).expect("a serde_json::Value always serializes");
-    text.push_str("\nresult:\n");
-    if value.len() > 16 * 1024 {
-        let mut end = 16 * 1024;
-        while !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.push_str(&value[..end]);
-        text.push_str(&format!(
-            "… (truncated; full value in {}/result.json)",
-            report.run_dir.display()
-        ));
-    } else {
-        text.push_str(&value);
-    }
-    text.push_str(&format!("\nrun dir: {}", report.run_dir.display()));
     text
 }

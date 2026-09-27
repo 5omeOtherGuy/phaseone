@@ -1,6 +1,10 @@
 //! The rhai bridge (ADR-0053 item 3): a raw, limited engine; the workflow functions;
 //! `agent()` with caps, schema repair and replay; bounded thunk threads.
 //!
+//! This is the substrate: it owns the engine, its threads, the run's state, the caps, the
+//! journal, worktree holds, the runner and the observer. What a step does next is asked of
+//! the run's [`Decisions`] (`crate::decision`), which see a snapshot and answer a transition.
+//!
 //! rhai has no async VM, so the script runs on its own OS thread and `agent()` blocks that
 //! thread on the caller's tokio handle while the step runs. Concurrency comes from OS
 //! threads for `parallel` thunks and `pipeline` items, bounded per run.
@@ -25,11 +29,16 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::api::{
-    CallId, Counts, JournalRecord, ModelTry, MovedOn, ResolvedModel, RunId, RunOutcome,
-    RunProgress, RunReport, SchemaCheck, StepEnd, StepEnvelope, StepLine, StepRequest, StepRunner,
-    StepStatus, WorkerRef, WorkflowError, WorkflowObserver, WorktreeHold,
+    CallId, Counts, JournalRecord, MovedOn, ResolvedModel, RunId, RunOutcome, RunProgress,
+    RunReport, SchemaCheck, StepEnvelope, StepLine, StepRequest, StepRunner, StepStatus, WorkerRef,
+    WorkflowError, WorkflowObserver, WorktreeHold,
 };
 use crate::caps::CapCounter;
+use crate::check::{self, Ask};
+use crate::decision::{
+    Action, Attempt, AttemptOutcome, CONTRACT_VERSION, Decisions, PlanRequest, RepairTurn,
+    RoleView, Snapshot, StepCost, StepProgress,
+};
 use crate::error::{parse_error, runtime_message};
 use crate::journal::{JournalWriter, Replay, call_id, canonical_json};
 
@@ -73,6 +82,8 @@ pub(crate) struct RunState {
     pub(crate) run_dir: PathBuf,
     pub(crate) resumed_from: Option<RunId>,
     pub(crate) runner: Arc<dyn StepRunner>,
+    /// What each step does next and what its attempts' ends mean; the rest is this state's.
+    pub(crate) decisions: Arc<dyn Decisions>,
     pub(crate) observer: Arc<dyn WorkflowObserver>,
     pub(crate) roles: BTreeMap<String, Role>,
     pub(crate) caps: CapCounter,
@@ -182,6 +193,11 @@ impl RunState {
 
     /// One `agent()` call, in the order ADR-0053 fixes, walking the role's fallback chain
     /// on a route failure (ADR-0054). `Err` only for a cancelled run.
+    ///
+    /// The step's moves are its decisions' ([`crate::decision`]); this is the substrate that
+    /// asks them, checks each answer ([`check::transition`]) and applies it. Every decision
+    /// call returns before anything is dispatched, journalled or handed back to the script,
+    /// and no lock is held across it.
     fn step(
         &self,
         prompt: &str,
@@ -198,310 +214,246 @@ impl RunState {
             model: role.map(Role::head).unwrap_or_default(),
             ordinal: number,
         };
-        let refused = |error: String| StepEnvelope {
-            step: call.clone(),
-            label: opts.label.clone(),
-            status: StepStatus::Failed,
-            value: Value::Null,
-            schema: SchemaCheck::NotRequested,
-            evidence: None,
-            attempts: 0,
-            worker: None,
-            needs: None,
-            error: Some(error),
-            models: Vec::new(),
-            worktree: None,
-        };
-
-        if number > self.max_steps {
-            let envelope = refused(format!("max_steps: {} reached", self.max_steps));
-            return Ok(self.conclude(call, &line, envelope, false, &StepCost::default()));
-        }
-
-        let replayed = lock(&self.replay).take(call);
-        if let Some((envelope, from)) = replayed {
-            self.write(&JournalRecord::Replayed {
-                call: call.clone(),
-                from,
-            });
-            return Ok(self.conclude(call, &line, envelope, true, &StepCost::default()));
-        }
-
-        let Some(role) = role else {
-            let envelope = refused(format!("unknown_role: {}", opts.role));
-            return Ok(self.conclude(call, &line, envelope, false, &StepCost::default()));
-        };
-        let tools = opts.tools.clone().unwrap_or_else(|| role.tools.clone());
-        let phase = opts
-            .phase
-            .clone()
-            .or_else(|| lock(&self.record).phase.clone());
-        let request_for = |model: &ResolvedModel, workspace: Option<PathBuf>| StepRequest {
-            run: self.id.clone(),
+        let plan = PlanRequest {
+            version: CONTRACT_VERSION,
             call: call.clone(),
             label: opts.label.clone(),
-            phase: phase.clone(),
             role: opts.role.clone(),
-            model: model.clone(),
-            tools: tools.clone(),
-            prompt: prompt.to_string(),
-            schema: opts.schema.clone(),
-            workspace,
-            attempt: 1,
-            ordinal: number,
             worktree: opts.worktree.clone(),
-            base: self.base.clone(),
+            tools: opts.tools.clone(),
         };
-
-        // The step's own worktree (ADR-0073), held until the step ends: across every
-        // link of its chain and its repair turn. Refused before anything is dispatched.
-        let hold: Option<Box<dyn WorktreeHold>> = match (&opts.worktree, role.chain.first()) {
-            (Some(slug), Some(head)) => {
-                if self.base.is_none() {
-                    let envelope = refused(format!(
-                        "worktree: {slug}: the run has no base commit (its workspace is not a git repository)"
-                    ));
-                    return Ok(self.conclude(call, &line, envelope, false, &StepCost::default()));
-                }
-                let probe = request_for(head, self.workspace.clone());
-                match self.cancellable(self.runner.worktree(&probe)) {
-                    None => {
-                        let envelope = StepEnvelope {
-                            status: StepStatus::Cancelled,
-                            error: None,
-                            ..refused(String::new())
-                        };
-                        self.conclude(call, &line, envelope, false, &StepCost::default());
-                        return Err(cancelled_error());
-                    }
-                    Some(Err(error)) => {
-                        let envelope = refused(error);
-                        return Ok(self.conclude(
-                            call,
-                            &line,
-                            envelope,
-                            false,
-                            &StepCost::default(),
-                        ));
-                    }
-                    Some(Ok(hold)) => Some(hold),
-                }
-            }
-            _ => None,
-        };
-        let workspace = match &hold {
-            Some(hold) => Some(hold.info().path.clone()),
-            None => opts.workspace.clone().or_else(|| self.workspace.clone()),
-        };
-
-        // The chain, head first (ADR-0054 item 2). A link is left only for a route
-        // failure or a cap; every other end stops the step (ADR-0054 item 3).
-        let mut cost = StepCost::default();
-        let mut walked: Vec<ModelTry> = Vec::new();
-        let mut last_error = String::new();
-        let mut last_worker: Option<String> = None;
-        let mut route_failed = false;
-        let mut envelope: Option<StepEnvelope> = None;
-        for (index, model) in role.chain.iter().enumerate() {
-            if let Some(previous) = walked.last() {
-                // The hop is journalled BEFORE the next model is dispatched (ADR-0054
-                // item 4), so a journal always shows why a link was left.
-                self.write(&JournalRecord::Fallback {
-                    call: call.clone(),
-                    from: previous.model.clone(),
-                    to: model.reference.clone(),
-                    error: last_error.clone(),
-                });
-                cost.fell_back += 1;
-            }
-            let request = request_for(model, workspace.clone());
-            match self.link(&request, &opts.json, &mut cost) {
-                Link::Ended(end) => {
-                    walked.push(ModelTry {
-                        model: request.model.reference.clone(),
-                        moved_on: None,
-                    });
-                    envelope = Some(end);
-                    break;
-                }
-                Link::MovedOn(moved) => {
-                    route_failed |= moved.reason == MovedOn::RouteFailed;
-                    last_error = moved.error;
-                    last_worker = moved.worker;
-                    // A reason is recorded only when the step really moves on: the LAST
-                    // link of an exhausted chain stays bare, as the head of a role with
-                    // no fallback does.
-                    walked.push(ModelTry {
-                        model: moved.model,
-                        moved_on: (index + 1 < role.chain.len()).then_some(moved.reason),
-                    });
-                }
-                // Cancelled: the run is over, whatever the chain still held.
-                Link::Cancelled(end) => {
-                    walked.push(ModelTry {
-                        model: request.model.reference.clone(),
-                        moved_on: None,
-                    });
-                    envelope = Some(end);
-                    break;
-                }
-            }
-        }
-        let mut envelope = envelope.unwrap_or_else(|| StepEnvelope {
-            // Every link was skipped: nothing ended the step, so the chain is what
-            // failed (ADR-0054 item 4). The step names the worker of its LAST link.
-            worker: last_worker,
-            error: Some(if route_failed {
-                format!("route: {last_error}")
-            } else {
-                last_error.clone()
-            }),
-            attempts: cost.attempts,
-            ..refused(String::new())
+        let role_view = role.map(|role| RoleView {
+            chain: role.chain.clone(),
+            tools: role.tools.clone(),
         });
-        envelope.models = walked;
-        if let Some(hold) = hold {
-            // The head as the step left it; the hold is released right after, before the
-            // step concludes, so the script's next step finds the worktree free.
-            let settled = self.handle.block_on(hold.settle());
-            envelope.worktree = Some(match settled {
-                Ok(info) => info,
+        let mut progress = StepProgress {
+            ordinal: number,
+            ..StepProgress::default()
+        };
+        let mut work = StepWork::default();
+        let mut ask = Ask::Plan;
+        loop {
+            // The replay lock is released before the decision is called.
+            let replay = lock(&self.replay).view();
+            let snapshot = Snapshot {
+                version: CONTRACT_VERSION,
+                run: self.id.clone(),
+                max_steps: self.max_steps,
+                has_base: self.base.is_some(),
+                role: role_view.clone(),
+                replay,
+                step: progress.clone(),
+            };
+            let answer = match &ask {
+                Ask::Plan => self.decisions.plan_step(&snapshot, &plan),
+                Ask::Accept(attempt) => self.decisions.accept_step(
+                    &snapshot,
+                    &AttemptOutcome {
+                        version: CONTRACT_VERSION,
+                        call: call.clone(),
+                        label: opts.label.clone(),
+                        attempt: attempt.clone(),
+                    },
+                ),
+            };
+            let checked = answer
+                .map_err(|error| format!("the decision failed: {error}"))
+                .and_then(|transition| {
+                    check::transition(&snapshot, call, &ask, transition)
+                        .map_err(|error| format!("transition refused: {error}"))
+                });
+            let action = match checked {
+                Ok(action) => action,
                 Err(error) => {
-                    self.log_line(&format!("worktree: {error}"));
-                    hold.info().clone()
+                    return self.refuse_step(call, &line, opts, &progress, &mut work, error);
                 }
-            });
-            drop(hold);
+            };
+            ask = match action {
+                Action::Replay { entry } => {
+                    let taken = lock(&self.replay).take_entry(entry, call);
+                    let Some((envelope, from)) = taken else {
+                        // Another call took the entry, or missed the prefix, since the
+                        // snapshot: ask again with the prefix as it stands now.
+                        continue;
+                    };
+                    self.write(&JournalRecord::Replayed {
+                        call: call.clone(),
+                        from,
+                    });
+                    return Ok(self.conclude(call, &line, envelope, true, &StepCost::default()));
+                }
+                Action::Dispatch {
+                    link,
+                    tools,
+                    latch_replay,
+                    ..
+                } => {
+                    if latch_replay {
+                        lock(&self.replay).latch_off();
+                    }
+                    // The check found the link in this role's chain.
+                    let model = role.and_then(|role| {
+                        Some((role, role.chain.get(usize::try_from(link).ok()?)?))
+                    });
+                    let Some((role, model)) = model else {
+                        let error = format!("transition refused: no link {link} to dispatch");
+                        return self.refuse_step(call, &line, opts, &progress, &mut work, error);
+                    };
+                    let target = Target {
+                        prompt,
+                        opts,
+                        call,
+                        role,
+                        tools,
+                    };
+                    Ask::Accept(self.dispatch(&target, link, model, &mut progress, &mut work))
+                }
+                Action::Repair { message, rejected } => {
+                    let (Some(request), Some(worker)) = (work.request.clone(), work.worker.clone())
+                    else {
+                        let error = "transition refused: no worker to repair".to_string();
+                        return self.refuse_step(call, &line, opts, &progress, &mut work, error);
+                    };
+                    progress.repair = Some(RepairTurn {
+                        worker: worker.clone(),
+                        rejected,
+                    });
+                    Ask::Accept(self.repair(&request, &opts.json, &worker, message, &mut progress))
+                }
+                Action::MoveOn {
+                    reason,
+                    tried,
+                    error,
+                    worker,
+                } => {
+                    progress.route_failed |= reason == MovedOn::RouteFailed;
+                    progress.walked.push(tried);
+                    progress.last_error = error;
+                    progress.last_worker = worker;
+                    progress.moved_on = true;
+                    Ask::Plan
+                }
+                Action::End {
+                    envelope,
+                    latch_replay,
+                } => {
+                    if latch_replay {
+                        lock(&self.replay).latch_off();
+                    }
+                    return self.finish(call, &line, envelope, &progress.cost, work.hold.take());
+                }
+                Action::Cancelled { envelope } => {
+                    return self.finish(call, &line, envelope, &progress.cost, work.hold.take());
+                }
+            };
         }
-        if envelope.status == StepStatus::Cancelled {
-            self.conclude(call, &line, envelope, false, &cost);
-            return Err(cancelled_error());
-        }
-        Ok(self.conclude(call, &line, envelope, false, &cost))
     }
 
-    /// ONE link of a step's chain: the cap check, the dispatch and the turn, up to the
-    /// schema repair (which never leaves the worker that produced the invalid result).
-    fn link(&self, request: &StepRequest, opts: &Value, cost: &mut StepCost) -> Link {
-        let blank = |attempts: u32| StepEnvelope {
-            step: request.call.clone(),
-            label: request.label.clone(),
-            status: StepStatus::Failed,
-            value: Value::Null,
-            schema: SchemaCheck::NotRequested,
-            evidence: None,
-            attempts,
-            worker: None,
-            needs: None,
-            error: None,
-            models: Vec::new(),
-            worktree: None,
-        };
-        match self.spend(request, opts, 1, cost) {
-            // A cap is the one refusal a step walks past (ADR-0054 item 4).
-            Some(Refused::Capped(error)) => {
-                return Link::MovedOn(Moved {
-                    reason: MovedOn::Capped,
-                    model: request.model.reference.clone(),
-                    error,
-                    worker: None,
-                });
+    /// Dispatches the first attempt on `link` of the role's chain: the step's worktree on its
+    /// first link, the `Fallback` hop before any later one, then the cap check, the
+    /// `Dispatch` line and the turn. Returns how it ended, for `accept_step`.
+    fn dispatch(
+        &self,
+        target: &Target<'_>,
+        link: u32,
+        model: &ResolvedModel,
+        progress: &mut StepProgress,
+        work: &mut StepWork,
+    ) -> Attempt {
+        if progress.link.is_none() {
+            let opts = target.opts;
+            let phase = opts
+                .phase
+                .clone()
+                .or_else(|| lock(&self.record).phase.clone());
+            work.phase = phase;
+            // The step's own worktree (ADR-0073), held until the step ends: across every
+            // link of its chain and its repair turn. Prepared before anything is dispatched.
+            if let (Some(_), Some(head)) = (&opts.worktree, target.role.chain.first()) {
+                let probe = self.request_for(target, head, self.workspace.clone(), work, progress);
+                match self.cancellable(self.runner.worktree(&probe)) {
+                    None => return Attempt::WorktreeCancelled,
+                    Some(Err(error)) => return Attempt::WorktreeRefused { error },
+                    Some(Ok(hold)) => work.hold = Some(hold),
+                }
             }
-            // No `Dispatch` line: the attempt is unrecorded, so nothing runs.
-            Some(Refused::Journal(error)) => {
-                return Link::Ended(StepEnvelope {
-                    error: Some(error),
-                    ..blank(cost.attempts)
-                });
-            }
-            None => {}
+            work.workspace = match &work.hold {
+                Some(hold) => Some(hold.info().path.clone()),
+                None => opts.workspace.clone().or_else(|| self.workspace.clone()),
+            };
         }
-        let outcome = match self.cancellable(self.runner.run(request, self.token.clone())) {
-            None => {
-                cost.attempts += 1;
-                return Link::Cancelled(StepEnvelope {
-                    status: StepStatus::Cancelled,
-                    ..blank(cost.attempts)
-                });
+        if let Some(previous) = progress.walked.last() {
+            // The hop is journalled BEFORE the next model is dispatched (ADR-0054 item 4),
+            // so a journal always shows why a link was left.
+            self.write(&JournalRecord::Fallback {
+                call: target.call.clone(),
+                from: previous.model.clone(),
+                to: model.reference.clone(),
+                error: progress.last_error.clone(),
+            });
+            progress.cost.fell_back += 1;
+        }
+        progress.link = Some(link);
+        progress.moved_on = false;
+        let request = self.request_for(target, model, work.workspace.clone(), work, progress);
+        work.request = Some(request.clone());
+        work.worker = None;
+        if let Some(refused) = self.spend(&request, &target.opts.json, 1, &mut progress.cost) {
+            return refused;
+        }
+        let outcome = self.cancellable(self.runner.run(&request, self.token.clone()));
+        progress.cost.attempts += 1;
+        match outcome {
+            None => Attempt::Cancelled,
+            Some(Err(reason)) => Attempt::RunnerRefused { reason },
+            Some(Ok(outcome)) => {
+                self.observer
+                    .step_started(&self.id, &request, &outcome.worker);
+                work.worker = Some(outcome.worker.clone());
+                Attempt::Ended {
+                    worker: outcome.worker,
+                    end: outcome.end,
+                }
             }
-            Some(Err(reason)) => {
-                // The runner could not start the worker at all: the host's reason, never
-                // a hop (ADR-0054 item 3 — a route failure is a route's own report).
-                cost.attempts += 1;
-                return Link::Ended(StepEnvelope {
-                    error: Some(reason),
-                    ..blank(cost.attempts)
-                });
-            }
-            Some(Ok(outcome)) => outcome,
-        };
-        cost.attempts += 1;
-        self.observer
-            .step_started(&self.id, request, &outcome.worker);
-        let worker = outcome.worker;
-        let worker_line = format!("{} ({})", worker.id, worker.description);
-        let base = StepEnvelope {
-            worker: Some(worker_line.clone()),
-            ..blank(cost.attempts)
-        };
+        }
+    }
 
-        // A failed contract and a turn that ended without `finish` both get the ONE
-        // repair turn of the same worker (item 5, ADR-0072); every other end is the step's.
-        let (message, rejected) = match outcome.end {
-            StepEnd::RouteFailed { model, error } => {
-                return Link::MovedOn(Moved {
-                    reason: MovedOn::RouteFailed,
-                    // The host names the model it could not run; the engine's own answer
-                    // stands when a runner names none.
-                    model: if model.is_empty() {
-                        request.model.reference.clone()
-                    } else {
-                        model
-                    },
-                    error,
-                    worker: Some(worker_line),
-                });
-            }
-            StepEnd::Done {
-                evidence,
-                result,
-                schema: SchemaCheck::Failed(errors),
-                ..
-            } => (
-                repair_message(&errors),
-                StepEnvelope {
-                    value: result.unwrap_or(Value::Null),
-                    schema: SchemaCheck::Failed(errors),
-                    evidence: Some(evidence),
-                    error: None,
-                    ..base.clone()
-                },
-            ),
-            end @ StepEnd::EndedWithoutFinish { .. } => (
-                FINISH_NUDGE.to_string(),
-                envelope_from_end(end, cost.attempts, base.clone()),
-            ),
-            end => return Link::Ended(envelope_from_end(end, cost.attempts, base)),
-        };
-        match self.repair(request, opts, &worker, message, rejected, cost) {
-            Some(envelope) => Link::Ended(envelope),
-            None => Link::Cancelled(StepEnvelope {
-                status: StepStatus::Cancelled,
-                attempts: cost.attempts,
-                ..base
-            }),
+    fn request_for(
+        &self,
+        target: &Target<'_>,
+        model: &ResolvedModel,
+        workspace: Option<PathBuf>,
+        work: &StepWork,
+        progress: &StepProgress,
+    ) -> StepRequest {
+        StepRequest {
+            run: self.id.clone(),
+            call: target.call.clone(),
+            label: target.opts.label.clone(),
+            phase: work.phase.clone(),
+            role: target.opts.role.clone(),
+            model: model.clone(),
+            tools: target.tools.clone(),
+            prompt: target.prompt.to_string(),
+            schema: target.opts.schema.clone(),
+            workspace,
+            attempt: 1,
+            ordinal: progress.ordinal,
+            worktree: target.opts.worktree.clone(),
+            base: self.base.clone(),
         }
     }
 
     /// Cap check and `Dispatch` line for one attempt; `Some` when the attempt could not
-    /// be dispatched, which also charges the step's capped count (ADR-0054 item 4).
+    /// be dispatched, which also charges the step's capped count (ADR-0054 item 4). The cap
+    /// is the substrate's: a decision may ask to dispatch, a capped model is refused here.
     fn spend(
         &self,
         request: &StepRequest,
         opts: &Value,
         attempt: u32,
         cost: &mut StepCost,
-    ) -> Option<Refused> {
+    ) -> Option<Attempt> {
         let wire_model = &request.model.wire_model;
         if let Err((used, limit)) = self.caps.try_spend(wire_model) {
             self.write(&JournalRecord::Capped {
@@ -511,10 +463,11 @@ impl RunState {
                 limit,
             });
             cost.capped += 1;
-            let repair = if attempt > 1 { " (repair)" } else { "" };
-            return Some(Refused::Capped(format!(
-                "quota_exceeded: {wire_model} used={used} limit={limit}{repair}"
-            )));
+            return Some(Attempt::Capped {
+                wire_model: wire_model.clone(),
+                used,
+                limit,
+            });
         }
         // Written before the runner is called: a resumed run charges every dispatch, so
         // an attempt that crashed mid-step still counts against the cap.
@@ -529,64 +482,93 @@ impl RunState {
             opts: opts.clone(),
         };
         if let Err(error) = self.journal.append(&dispatch) {
-            return Some(Refused::Journal(format!("journal: {error}")));
+            return Some(Attempt::JournalFailed {
+                error: format!("journal: {error}"),
+            });
         }
         None
     }
 
     /// The one repair turn (item 5): another turn in the SAME worker that produced the
     /// invalid result — or ended its turn without `finish` (ADR-0072) — never a new model
-    /// (ADR-0054 item 3). `rejected` is the envelope if the repair cannot run. `None` when
-    /// the run is cancelled meanwhile.
+    /// (ADR-0054 item 3). Cap check and `Dispatch` line first, as for any attempt.
     fn repair(
         &self,
         request: &StepRequest,
         opts: &Value,
         worker: &WorkerRef,
         message: String,
-        rejected: StepEnvelope,
-        cost: &mut StepCost,
-    ) -> Option<StepEnvelope> {
-        if let Some(refused) = self.spend(request, opts, 2, cost) {
-            // A capped repair and an unwritable journal both keep the rejected value.
-            return Some(StepEnvelope {
-                error: Some(refused.error()),
-                ..rejected
-            });
+        progress: &mut StepProgress,
+    ) -> Attempt {
+        if let Some(refused) = self.spend(request, opts, 2, &mut progress.cost) {
+            return refused;
         }
-        cost.attempts += 1;
-        let end = self.cancellable(self.runner.repair(worker, message, self.token.clone()))?;
-        Some(match end {
-            Err(reason) => StepEnvelope {
-                attempts: cost.attempts,
-                error: Some(reason),
-                ..rejected
-            },
-            Ok(StepEnd::Done {
-                evidence,
-                result,
-                schema: SchemaCheck::Failed(errors),
-                ..
-            }) => StepEnvelope {
-                status: StepStatus::Failed,
-                value: result.unwrap_or(rejected.value),
-                error: Some(format!("invalid_output: {}", errors.join("; "))),
-                schema: SchemaCheck::Failed(errors),
-                evidence: Some(evidence),
-                attempts: cost.attempts,
-                ..rejected
-            },
-            Ok(end) => envelope_from_end(
-                end,
-                cost.attempts,
-                StepEnvelope {
-                    value: Value::Null,
-                    schema: SchemaCheck::NotRequested,
-                    evidence: None,
-                    ..rejected
-                },
-            ),
-        })
+        let end = self.cancellable(self.runner.repair(worker, message, self.token.clone()));
+        progress.cost.attempts += 1;
+        match end {
+            None => Attempt::Cancelled,
+            Some(Err(reason)) => Attempt::RunnerRefused { reason },
+            Some(Ok(end)) => Attempt::RepairEnded { end },
+        }
+    }
+
+    /// The step's end: its worktree settled and released, then [`Self::conclude`]. A
+    /// cancelled envelope ends the script too.
+    fn finish(
+        &self,
+        call: &CallId,
+        line: &LineContext,
+        mut envelope: StepEnvelope,
+        cost: &StepCost,
+        hold: Option<Box<dyn WorktreeHold>>,
+    ) -> Result<StepEnvelope, Box<EvalAltResult>> {
+        if let Some(hold) = hold {
+            // The head as the step left it; the hold is released right after, before the
+            // step concludes, so the script's next step finds the worktree free.
+            let settled = self.handle.block_on(hold.settle());
+            envelope.worktree = Some(match settled {
+                Ok(info) => info,
+                Err(error) => {
+                    self.log_line(&format!("worktree: {error}"));
+                    hold.info().clone()
+                }
+            });
+            drop(hold);
+        }
+        if envelope.status == StepStatus::Cancelled {
+            self.conclude(call, line, envelope, false, cost);
+            return Err(cancelled_error());
+        }
+        Ok(self.conclude(call, line, envelope, false, cost))
+    }
+
+    /// A decision that failed, or a transition the check refused: the step fails with the
+    /// reason, and the replay prefix is latched off as for any call it did not answer.
+    fn refuse_step(
+        &self,
+        call: &CallId,
+        line: &LineContext,
+        opts: &StepOptions,
+        progress: &StepProgress,
+        work: &mut StepWork,
+        error: String,
+    ) -> Result<StepEnvelope, Box<EvalAltResult>> {
+        lock(&self.replay).latch_off();
+        let envelope = StepEnvelope {
+            step: call.clone(),
+            label: opts.label.clone(),
+            status: StepStatus::Failed,
+            value: Value::Null,
+            schema: SchemaCheck::NotRequested,
+            evidence: None,
+            attempts: progress.cost.attempts,
+            worker: None,
+            needs: None,
+            error: Some(format!("workflow decision: {error}")),
+            models: progress.walked.clone(),
+            worktree: None,
+        };
+        self.finish(call, line, envelope, &progress.cost, work.hold.take())
     }
 
     /// Everything after a step: `Result` line, counts, the step line, the observer.
@@ -700,117 +682,24 @@ struct LineContext {
     ordinal: u32,
 }
 
-/// Why ONE attempt was not dispatched.
-enum Refused {
-    /// The cap refused it: the step may walk past this link (ADR-0054 item 4).
-    Capped(String),
-    /// The `Dispatch` line could not be written: nothing ran and nothing is charged.
-    Journal(String),
-}
-
-impl Refused {
-    fn error(self) -> String {
-        match self {
-            Refused::Capped(error) | Refused::Journal(error) => error,
-        }
-    }
-}
-
-/// What ONE step's chain spent (ADR-0054 item 4): dispatches (starts plus repairs), the
-/// links a cap refused, and the hops between links.
+/// What the substrate holds for one step that no snapshot carries: the worktree hold, the
+/// step's workspace and phase, the request of the link it is on and that link's worker.
 #[derive(Default)]
-struct StepCost {
-    attempts: u32,
-    capped: u32,
-    fell_back: u32,
+struct StepWork {
+    hold: Option<Box<dyn WorktreeHold>>,
+    workspace: Option<PathBuf>,
+    phase: Option<String>,
+    request: Option<StepRequest>,
+    worker: Option<WorkerRef>,
 }
 
-/// One link of a step's chain the step moves on from.
-struct Moved {
-    reason: MovedOn,
-    /// The model the link ran (or was refused for), as the runner reported it.
-    model: String,
-    /// Why the step moves on: the route error, or the cap refusal.
-    error: String,
-    /// The worker the link ran, as a step line names it; `None` for a capped link,
-    /// where nothing was built.
-    worker: Option<String>,
-}
-
-/// What one link of a step's chain decided (ADR-0054 item 4).
-enum Link {
-    /// The step ended on this link.
-    Ended(StepEnvelope),
-    /// The step moves to the next link.
-    MovedOn(Moved),
-    /// The run was cancelled while this link ran.
-    Cancelled(StepEnvelope),
-}
-
-fn envelope_from_end(end: StepEnd, attempts: u32, base: StepEnvelope) -> StepEnvelope {
-    let base = StepEnvelope { attempts, ..base };
-    match end {
-        StepEnd::Done {
-            summary,
-            evidence,
-            result,
-            schema,
-        } => StepEnvelope {
-            status: StepStatus::Done,
-            value: match (&schema, result) {
-                (SchemaCheck::Passed, Some(result)) => result,
-                _ => Value::String(summary),
-            },
-            schema,
-            evidence: Some(evidence),
-            error: None,
-            ..base
-        },
-        StepEnd::Blocked { needs, .. } => StepEnvelope {
-            status: StepStatus::Blocked,
-            needs: Some(needs),
-            error: None,
-            ..base
-        },
-        StepEnd::RouteFailed { error, .. } => StepEnvelope {
-            status: StepStatus::Failed,
-            value: Value::Null,
-            error: Some(format!("route: {error}")),
-            ..base
-        },
-        StepEnd::EndedWithoutFinish { text } => StepEnvelope {
-            status: StepStatus::Failed,
-            value: Value::String(text),
-            error: Some("ended without finish".to_string()),
-            ..base
-        },
-        StepEnd::Failed(message) => StepEnvelope {
-            status: StepStatus::Failed,
-            error: Some(message),
-            ..base
-        },
-        StepEnd::Cancelled => StepEnvelope {
-            status: StepStatus::Cancelled,
-            error: None,
-            ..base
-        },
-    }
-}
-
-/// The repair turn's message to a worker whose turn ended without `finish` (ADR-0072).
-const FINISH_NUDGE: &str = "You ended your turn without calling finish. Call finish now: status \"done\" with your result (and the evidence), or \"blocked\" with what you need.";
-
-fn repair_message(errors: &[String]) -> String {
-    let mut message = String::from("Your result did not match the required schema:\n");
-    for error in errors {
-        message.push_str("- ");
-        message.push_str(error);
-        message.push('\n');
-    }
-    message.push_str(
-        "Call finish again with a corrected \"result\" that matches the schema of the \"result\" parameter.",
-    );
-    message
+/// The call a step answers and the grant its decision chose, for building its requests.
+struct Target<'a> {
+    prompt: &'a str,
+    opts: &'a StepOptions,
+    call: &'a CallId,
+    role: &'a Role,
+    tools: Vec<String>,
 }
 
 /// `agent()`'s options. Every key is known: a typo is an error, never a silently

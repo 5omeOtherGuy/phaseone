@@ -11,11 +11,17 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
+# S7.10-R1 (ADR-0095): the `workspace` (`read`) and `snapshot` capability services this crate
+# once implemented are the host's now (`p1_module_runtime::file_services`); this crate
+# re-exports them for its own tests and keeps the native adapter.
+p1-module-runtime = { path = "../p1-module-runtime" }
+p1-read-guest = { path = "guest" }
+# The credential refusal policy, its texts and the read record the native adapter and the
+# capability service both run (issue #142).
 p1-workspace = { path = "../p1-workspace" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

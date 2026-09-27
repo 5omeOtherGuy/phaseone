@@ -1,0 +1,111 @@
+package p1:module@1.0.0;
+
+/// Naming the credential a lowered request needs. Owner: `p1-provider-http` with the
+/// `p1-auth` credential broker.
+///
+/// A module never receives a credential value. It names how the route's credential is
+/// attached, and the broker attaches it when it sends; it also refreshes the credential once
+/// after a 401 or 403, and attaches nothing on a route whose credential an egress proxy
+/// injects. No function here returns a value: the interface is the vocabulary the lowered
+/// request uses.
+interface credential-control {
+    enum credential-scheme {
+        /// `Authorization: Bearer <token>`.
+        bearer,
+    }
+
+    record credential-use {
+        scheme: credential-scheme,
+        /// The header that carries the credential's account id, for an account that needs
+        /// one (`chatgpt-account-id`). The broker fails the request as `authentication` when
+        /// the credential has no account id.
+        account-id-header: option<string>,
+    }
+}
+
+/// HTTP requests the transport broker sends. Owner: `p1-provider-http`.
+///
+/// Sending, retry, backoff, the one credential refresh, the first-byte and idle read bounds
+/// and cancellation are the broker's (freeze item 9); a provider module only lowers a request
+/// into these values and classifies what comes back. An HTTP request is also the fallback of
+/// a route that speaks WebSocket, which the provider component chooses.
+interface http {
+    use credential-control.{credential-use};
+
+    /// A header name and value.
+    type header = tuple<string, string>;
+
+    enum method {
+        /// Every provider route today sends one POST per response.
+        post,
+    }
+
+    record http-request {
+        method: method,
+        /// Path and query relative to the route's endpoint, starting with `/`.
+        path: string,
+        /// Headers without any credential. The broker refuses a request naming
+        /// `authorization`, `proxy-authorization`, `cookie`, `x-api-key` or `api-key`, and
+        /// attaches the credential as `credential` says, ahead of these headers.
+        headers: list<header>,
+        credential: credential-use,
+        body: list<u8>,
+    }
+
+    /// The status and headers of a response or of a refused WebSocket upgrade.
+    record response-head {
+        status: u16,
+        headers: list<header>,
+    }
+}
+
+/// WebSocket requests the transport broker sends. Owner: `p1-provider-http` (ADR-0047).
+///
+/// Who decides what. The provider component owns the Responses framing, the continuation
+/// decision and the fallback to HTTP/SSE: on every `lower` it reads the connection facts in
+/// `connection-state` and chooses an HTTP request, a full request frame or the shorter
+/// continuation frame (`docs/design/websocket.md` §6). The broker owns the connection — one
+/// per provider instance, reused across responses, dropped after a cancelled or failed
+/// response — and keeps TLS, the handshake, ping/pong, bounded writes, raw-frame activity,
+/// retry and backoff and the one credential refresh (freeze item 9). It decides nothing
+/// about continuation or fallback; it reports facts. A WebSocket failure before any output of
+/// a request is reported through `connection-state` on the next `lower` call of that request;
+/// a failure after output ends the response as a failure, with no retry and no fallback
+/// (ADR-0047's pre-output/post-output rule).
+interface websocket {
+    use http.{header};
+    use credential-control.{credential-use};
+
+    /// Facts the broker reports on each `lower` call, and nothing it decided.
+    record connection-state {
+        /// A WebSocket connection of this provider instance is open, so a frame without a
+        /// handshake goes out on it.
+        open: bool,
+        /// The response id (`decoding.decoder.response-id`) of the last response that open
+        /// connection completed cleanly; `none` when it completed none or no connection is open.
+        last-clean-response: option<string>,
+        /// The previous attempt of this same request failed over WebSocket before any output,
+        /// so this retry may fall back to HTTP.
+        failed-before-output: bool,
+    }
+
+    /// What opens a connection.
+    record websocket-request-head {
+        /// Path relative to the route's endpoint; the broker swaps the scheme to `wss`.
+        path: string,
+        /// Handshake headers, under the same credential rule as `http-request.headers`.
+        headers: list<header>,
+        credential: credential-use,
+    }
+
+    record websocket-send {
+        /// Present only when `connection-state.open` was false: the broker opens a connection
+        /// with it before sending. When the open connection a send without a head relies on
+        /// is gone before the frame went out, that is a failure before any output.
+        handshake: option<websocket-request-head>,
+        /// The one text frame to send: the full request frame or, on the open connection whose
+        /// last clean response it continues, the shorter continuation frame. The component
+        /// chooses.
+        frame: string,
+    }
+}

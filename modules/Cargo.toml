@@ -1,0 +1,40 @@
+# The module workspace: the guest-side crates that build to WebAssembly components.
+#
+# Separate from the root workspace because a component crate links wit-bindgen and is built
+# for the wasm target only; the host crates never depend on any of this. Members are globs
+# over package directories, so a package is a directory whose name says what it is
+# (p1-module-*) and bindings crates are not packages: modules/wit/ holds the WIT worlds and
+# is never a member.
+[workspace]
+resolver = "3"
+members = ["p1-module-*", "p1-bindings-*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Generated bindings keep the prohibition (see modules/p1-bindings-tool/): the bindings live
+# in their own crate so the `export!` macro that needs `unsafe` is not expanded inside a crate
+# that forbids it.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+# The smallest feature set that compiles a component here: `macros` for `generate!`,
+# `realloc` for the `cabi_realloc` the component model's lifting needs and `std` for the
+# `String`/`Vec` the WIT types map to. No world uses a WIT `async`, `future`, `stream` or
+# `flags` type, so `async`, `futures-stream`, `inter-task-wakeup` and `bitflags` are off,
+# and `macro-string` is not needed to render a string literal.
+wit-bindgen = { version = "=0.62.0", default-features = false, features = ["macros", "realloc", "std"] }
+
+# Shipped modules: the release profile the build script builds packages with. `panic = "abort"`
+# makes a guest panic the wasm `unreachable` trap (the host maps it through `ModuleFailure`),
+# and the size options keep a component small.
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

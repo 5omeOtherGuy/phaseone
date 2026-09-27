@@ -11,13 +11,21 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
+# S7.10-R1 (ADR-0095): the `workspace` capability service the `p1/search` component is linked
+# with and the walk behind it are the host's now (`p1_module_runtime::file_services`,
+# `p1_module_runtime::file_walk`), as p1-tool-read's read side is for `p1/read`; this crate
+# re-exports the service and runs the same walk for its native tool.
+p1-module-runtime = { path = "../p1-module-runtime" }
+p1-tool-search-logic = { path = "logic" }
 p1-workspace = { path = "../p1-workspace" }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }
-grep = "0.4"
-ignore = "0.4"
 
 [dev-dependencies]
+# tests/search_module.rs wraps the loaded component as the host does (`wasm_tool` redacts
+# through a mask counter).
+p1-redact = { path = "../p1-redact" }
 tempfile = "3"
-tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
+# `rt-multi-thread`: the component's executor and the host service's blocking work run
+# side by side, as in the host.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }

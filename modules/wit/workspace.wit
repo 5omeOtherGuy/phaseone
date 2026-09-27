@@ -1,0 +1,144 @@
+package p1:module@1.0.0;
+
+/// Reading the confined workspace. Owner: `p1-workspace`.
+///
+/// Confinement is always on and is the host's: every path is workspace-relative or absolute
+/// inside the root, and is resolved after symlinks, so a path that escapes (directly, by `..`
+/// or through a symlink) is `outside-workspace` whatever the module does. Paths the host
+/// returns are relative to the root with `/` separators, ready for model-facing text.
+interface workspace {
+    /// Why a workspace operation failed. Messages are the host's and safe to show the model.
+    variant fs-error {
+        /// The path resolves outside the workspace root.
+        outside-workspace,
+        not-found,
+        /// The path exists but is not the kind the operation needs (a file, or a directory).
+        wrong-kind,
+        already-exists,
+        /// A search pattern or glob that does not parse; the message names the problem.
+        invalid-pattern(string),
+        /// The call this module serves was cancelled while the host worked on the request.
+        cancelled,
+        /// Any other filesystem failure, as the host describes it.
+        io(string),
+    }
+
+    enum entry-kind {
+        file,
+        directory,
+        other,
+    }
+
+    record entry {
+        /// Relative to the workspace root.
+        path: string,
+        kind: entry-kind,
+        /// Size in bytes; zero for anything but a file.
+        size: u64,
+    }
+
+    /// Resolve `path` and describe what is there.
+    stat: func(path: string) -> result<entry, fs-error>;
+
+    /// Up to `length` bytes of the file at `path`, starting at byte `offset`; fewer, or none,
+    /// at the end of the file. A module reads a large file window by window.
+    read: func(path: string, offset: u64, length: u64) -> result<list<u8>, fs-error>;
+
+    /// The files under the directory `path`, sorted, relative to the root. The walk honours
+    /// `.gitignore`, skips hidden entries and never follows symlinks; `glob` keeps only
+    /// matching files (`*.rs`, `src/**/*.md`).
+    list-files: func(path: string, glob: option<string>) -> result<list<string>, fs-error>;
+
+    record search-query {
+        /// A regular expression in the host's (ripgrep) syntax.
+        pattern: string,
+        /// The file or directory to search; the root when absent.
+        path: option<string>,
+        glob: option<string>,
+        case-insensitive: bool,
+        /// Lines of context before and after each match.
+        context: u32,
+        /// The most lines (matches and context) the result carries; the search stops there.
+        max-lines: u32,
+    }
+
+    record search-line {
+        /// One-based.
+        line-number: u64,
+        text: string,
+        /// False for a context line.
+        is-match: bool,
+    }
+
+    record file-matches {
+        path: string,
+        lines: list<search-line>,
+    }
+
+    record search-result {
+        /// In walk order.
+        files: list<file-matches>,
+        /// Whether the search stopped at `max-lines` before the walk ended.
+        truncated: bool,
+        /// Files with matches after the one where it stopped, which the result leaves out.
+        omitted-files: u64,
+    }
+
+    /// Search file contents with the same walk as `list-files`; binary files are skipped.
+    search: func(query: search-query) -> result<search-result, fs-error>;
+}
+
+/// Which files this agent has seen, and in what state. Owner: `p1-workspace` (the observed
+/// file registry the native file tools share per agent).
+///
+/// Staleness is decided by content, not modification time: the host keeps a digest of what
+/// the module says it observed and compares contents the module read again.
+interface snapshot {
+    use workspace.{fs-error};
+
+    enum observation {
+        /// This agent never observed this path.
+        never-observed,
+        /// The contents match the last observation.
+        unchanged,
+        /// The contents changed since this agent last observed them.
+        changed-since-observed,
+    }
+
+    /// Record `contents` as this agent's observation of `path`, after reading or writing it.
+    observe: func(path: string, contents: list<u8>) -> result<_, fs-error>;
+
+    /// Compare `current`, the contents just read, with this agent's last observation.
+    check: func(path: string, current: list<u8>) -> result<observation, fs-error>;
+}
+
+/// Changing files in the workspace. Owner: `p1-workspace`.
+///
+/// Every write is the host's atomic replacement (a sibling temporary file, synced, then
+/// renamed over the target, permission bits kept), so a reader never sees a partial file and
+/// a failed write leaves the target as it was.
+interface workspace-mutation {
+    use workspace.{fs-error};
+
+    /// The workspace's write gate, held. Agents that share a workspace share one gate, so a
+    /// module holds a mutation from reading a file's current contents until its write is
+    /// observed, and the next writer checks against what this one wrote. Dropping it
+    /// releases the gate. A mutation does not outlive the export call that began it: the host
+    /// releases the gate when that call returns, and a later use traps. A shell command's
+    /// writes are not gated.
+    resource mutation {
+        /// Replace the file at `path` with `contents`, creating missing parent directories.
+        write: func(path: string, contents: list<u8>) -> result<_, fs-error>;
+        /// As `write`, but `already-exists` when anything is at `path`.
+        create: func(path: string, contents: list<u8>) -> result<_, fs-error>;
+        /// Remove the file at `path`.
+        remove: func(path: string) -> result<_, fs-error>;
+        /// Move the file at `old-path` to `new-path`; `already-exists` when anything is at
+        /// `new-path`.
+        rename: func(old-path: string, new-path: string) -> result<_, fs-error>;
+    }
+
+    /// Wait for the write gate. The critical sections behind it are a few file operations,
+    /// never a model or network wait.
+    begin: func() -> mutation;
+}

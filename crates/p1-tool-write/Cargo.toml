@@ -11,11 +11,17 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
+# S7.10-R1 (ADR-0095): the `workspace-mutation` capability service the edit, write and patch
+# components are linked with is the host's now (`p1_module_runtime::file_services`), so the one
+# edge left to the runtime is the re-export this crate's tests use (a path dependency inside the
+# workspace, no new package).
+p1-module-runtime = { path = "../p1-module-runtime" }
+# The logic the `p1/write` component ships (S0-R3), so native and component run the same code.
+p1-tool-write-logic = { path = "logic" }
 p1-workspace = { path = "../p1-workspace" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

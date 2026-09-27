@@ -1,13 +1,13 @@
 use crate::ChatDialect;
 use p1_contracts::{
     AssistantBlock, AssistantItem, CompletedResponse, Origin, Outcome, ProviderError,
-    ProviderErrorKind, ReplayData, StopReason, StreamEvent, ToolCall, ToolInput, Usage,
+    ProviderErrorKind, StopReason, StreamEvent, ToolCall, ToolInput, Usage,
 };
 use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status, reset_after};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub(crate) struct ChatParser {
+pub struct ChatParser {
     origin: Origin,
     blocks: Vec<AssistantBlock>,
     calls: BTreeMap<u64, usize>,
@@ -19,7 +19,7 @@ pub(crate) struct ChatParser {
     ended: bool,
 }
 impl ChatParser {
-    pub(crate) fn new(origin: Origin, _dialect: ChatDialect) -> Self {
+    pub fn new(origin: Origin, _dialect: ChatDialect) -> Self {
         Self {
             origin,
             blocks: Vec::new(),
@@ -138,11 +138,7 @@ impl ChatParser {
         }
         for block in &mut self.blocks {
             if let AssistantBlock::Reasoning { text, replay } = block {
-                *replay = Some(ReplayData {
-                    origin: self.origin.clone(),
-                    version: 1,
-                    payload: Value::String(text.clone()),
-                });
+                *replay = Some(crate::replay::encode(&self.origin, text));
             }
         }
         self.ended = true;

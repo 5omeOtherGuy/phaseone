@@ -1,0 +1,17 @@
+[package]
+name = "p1-read-guest"
+description = "The guest behaviour of the p1 `read` tool: input, declaration, description, line numbering, truncation and footers, shared by the component and the native adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Pure computation only (programme decision D-XO-8): serde and serde_json and nothing else, so
+# the same code builds for the native adapter and for the `wasm32-unknown-unknown` component
+# (docs/design/modules/package.md, "Shared guest logic", decision S0-R3).
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

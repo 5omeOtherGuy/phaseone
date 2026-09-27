@@ -1,0 +1,99 @@
+package p1:module@1.0.0;
+
+/// Values every world shares. This interface grants nothing: a world imports it only for its
+/// types, so it never appears in a module class's capability allocation.
+///
+/// Rich contract values cross the boundary as JSON text. Each alias below names the schema
+/// family of `p1-module-protocol` the text must conform to (`p1:protocol/<family>/1`, see
+/// `docs/design/modules/protocol.md`); the host parses and validates it and treats text that
+/// does not conform as the module's invalid output, never as a value. Small closed values the
+/// host must read without parsing JSON are WIT types.
+interface types {
+    /// JSON text that is not one of the protocol families: a JSON Schema, a module's own
+    /// settings, a workflow's arguments. Each use names what it holds.
+    type json = string;
+
+    /// One complete tool call: schema family `tool-call` (`p1:protocol/tool-call/1`).
+    type tool-call = string;
+    /// The result of executing a tool call: schema family `tool-outcome`.
+    type tool-outcome = string;
+    /// One model-visible history item: schema family `history-item`.
+    type history-item = string;
+    /// One provider stream event, the terminal `finished` included: schema family
+    /// `stream-event`.
+    type stream-event = string;
+    /// A provider error of one of the closed `ProviderErrorKind`s: schema family
+    /// `provider-error`.
+    type provider-error = string;
+    /// A tool's description of one call (ADR-0057): schema family `call-description`.
+    type call-description = string;
+    /// A tool's description of one result: schema family `result-description`.
+    type result-description = string;
+    /// Explicit model options: schema family `model-options`.
+    type model-options = string;
+    /// What a provider instance is: schema family `route-description`.
+    type route-description = string;
+    /// Token usage, unknown fields absent: schema family `usage`.
+    type usage = string;
+
+    /// What executing one call may do; the input to authorization. Mirrors
+    /// `p1_contracts::Effect`.
+    enum effect {
+        /// Reads inside the tool's confinement only.
+        read-only,
+        /// Changes files inside the tool's confinement.
+        writes-files,
+        /// Runs arbitrary processes; effects are not bounded by the tool.
+        executes,
+        /// Starts or controls other agents.
+        delegates,
+    }
+
+    /// An authorization policy's answer. Mirrors `p1_contracts::Decision`.
+    variant decision {
+        permit,
+        /// Nothing is executed; the reason is shown to the model.
+        deny(string),
+    }
+
+    /// The implementation and model-facing variant behind a tool name. Built by the loader
+    /// from the package identity, never reported by the module about itself.
+    record tool-identity {
+        implementation: string,
+        %variant: string,
+    }
+
+    /// A freeform tool's input grammar, e.g. syntax `lark`.
+    record grammar {
+        syntax: string,
+        definition: string,
+    }
+
+    /// How the model calls a tool. Mirrors `p1_contracts::DeclarationKind`.
+    variant declaration-kind {
+        /// A JSON-schema function tool; its calls carry JSON input. The payload is the input
+        /// JSON Schema as JSON text.
+        function(json),
+        /// A freeform tool; its calls carry text input, optionally constrained by a grammar.
+        freeform(option<grammar>),
+    }
+
+    /// What the model is told about a tool. Mirrors `p1_contracts::ToolDeclaration`; an
+    /// environment may still present the tool under another name and description.
+    record declaration {
+        name: string,
+        description: string,
+        kind: declaration-kind,
+    }
+
+    /// Why a model response stopped. Mirrors `p1_contracts::StopReason`.
+    enum stop-reason {
+        end-turn,
+        tool-use,
+        max-output-tokens,
+        context-window-exceeded,
+        refusal,
+        paused,
+        other,
+    }
+}
