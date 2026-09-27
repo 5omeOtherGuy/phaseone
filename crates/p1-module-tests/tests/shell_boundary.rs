@@ -629,6 +629,11 @@ fn expected_args(
             ]);
         }
     }
+    args.extend([
+        "--bind".into(),
+        workspace.display().to_string(),
+        workspace.display().to_string(),
+    ]);
     for name in ["credentials.toml", "credentials"] {
         let path = home.join(".cargo").join(name);
         if path.exists() {
@@ -640,9 +645,6 @@ fn expected_args(
         }
     }
     args.extend([
-        "--bind".into(),
-        workspace.display().to_string(),
-        workspace.display().to_string(),
         "--remount-ro".into(),
         home.display().to_string(),
         "--unshare-pid".into(),
@@ -653,7 +655,7 @@ fn expected_args(
     args
 }
 
-/// `bwrap_args` is pure: `OsString` there, plain `String` here, for comparison.
+/// `bwrap_args` returns validated `OsString` arguments; plain `String` here for comparison.
 fn os_args(args: &[OsString]) -> Vec<String> {
     args.iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -676,18 +678,17 @@ fn bwrap_args_order_for_a_workspace_under_tmp() {
     let missing = home.path().join("does-not-exist");
     let readable = home.path().join("shared");
     std::fs::create_dir_all(&readable).unwrap();
-    let missing_readable = home.path().join("no-shared");
 
     let mut sandbox = Sandbox::for_home(home.path());
     sandbox.writable = vec![extra.path().to_path_buf(), missing.clone()];
-    sandbox.readable = vec![readable.clone(), missing_readable.clone()];
+    sandbox.readable = vec![readable.clone()];
     sandbox.runtime_dir = Some(runtime_dir.path().to_path_buf());
-    let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
+    let args = bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap();
     let expected = expected_args(
         home.path(),
         &workspace,
         private_tmp.path(),
-        &[&readable, &missing_readable],
+        &[&readable],
         &[extra.path(), &missing],
         Some(runtime_dir.path()),
     );
@@ -695,8 +696,7 @@ fn bwrap_args_order_for_a_workspace_under_tmp() {
     assert_eq!(os_args(&args), expected);
 }
 
-/// A workspace under the home: the workspace bind must come after the home's `tmpfs` and
-/// before `--remount-ro`.
+/// A workspace under the home: token masks follow the workspace bind, before `--remount-ro`.
 #[test]
 fn bwrap_args_order_for_a_workspace_under_the_home() {
     require_bwrap!();
@@ -710,7 +710,7 @@ fn bwrap_args_order_for_a_workspace_under_the_home() {
 
     let mut sandbox = Sandbox::for_home(home.path());
     sandbox.readable = vec![readable.clone()];
-    let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
+    let args = bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap();
     let expected = expected_args(
         home.path(),
         &workspace,
