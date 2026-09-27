@@ -420,11 +420,11 @@ impl Workspace {
             };
             // Every check runs before the first replacement, so two changes to one
             // path would each be checked against bytes the other is about to replace.
-            // The key is the canonical path, not the resolved spelling: a directory
+            // The key is `Target::canonical`, not the resolved spelling: a directory
             // symlink inside the workspace makes `src/new.txt` and `link/new.txt` one
             // file that a not-yet-existing leaf would otherwise spell twice.
             for target in planned.targets() {
-                let key = self.canonical_key(target)?;
+                let key = target.canonical.clone();
                 if touched.contains(&key) {
                     return Err(MutationError::Io(format!(
                         "{} is changed more than once in one commit.",
@@ -459,9 +459,14 @@ impl Workspace {
             });
         }
         let display = self.display(&path);
+        // Resolved once, here, for everything downstream: the one-change-per-path key,
+        // the directory `plan_parent` opens, and the name a record of what this change
+        // writes is keyed by are one and the same file.
+        let canonical = self.canonical_path(&path, requested, &display)?;
         Ok(Target {
             requested: requested.to_string(),
             path,
+            canonical,
             display,
         })
     }
@@ -513,7 +518,10 @@ impl Workspace {
                             target.display
                         )),
                     })?;
-                    observed.record(&target.path, contents);
+                    // Keyed by the plan's destination, never by the spelling: a parent
+                    // symlink retargeted since the plan would otherwise record a file
+                    // the write never touched, leaving the real output unobserved.
+                    observed.record(&target.canonical, contents);
                 }
                 Staged::Remove { dir, leaf, target } => {
                     rustix::fs::unlinkat(&*dir, leaf.as_os_str(), AtFlags::empty()).map_err(
@@ -553,8 +561,10 @@ impl Workspace {
                     })?;
                     sync_directory(to_dir);
                     sync_directory(from_dir);
-                    // As patch's move: the destination now holds bytes this agent saw.
-                    observed.record(&to.path, bytes);
+                    // As patch's move: the destination now holds bytes this agent saw —
+                    // keyed by the file the plan's handle put them in, so a parent
+                    // symlink retargeted since the plan cannot name another file.
+                    observed.record(&to.canonical, bytes);
                 }
             }
         }
@@ -659,37 +669,46 @@ impl Workspace {
         }
     }
 
-    /// The canonical path two spellings of `target` share: its deepest existing
+    /// The canonical path two spellings of one file share: its deepest existing
     /// ancestor canonicalized, with the missing parent components and the leaf
-    /// re-joined. `plan` refuses a commit that names this path twice, so a directory
-    /// symlink inside the workspace (`link -> src`) cannot make `src/new.txt` and
-    /// `link/new.txt` slip through the one-change-per-path check as two files.
-    fn canonical_key(&self, target: &Target) -> Result<PathBuf, MutationError> {
-        let (mut key, missing) = self.ancestor_and_missing(target)?;
+    /// re-joined. `Target` keeps this as [`Target::canonical`] — `plan` refuses a
+    /// commit that names it twice, so a directory symlink inside the workspace
+    /// (`link -> src`) cannot make `src/new.txt` and `link/new.txt` slip through the
+    /// one-change-per-path check as two files, and it is the name an observation of
+    /// the change is keyed by.
+    fn canonical_path(
+        &self,
+        path: &Path,
+        requested: &str,
+        display: &str,
+    ) -> Result<PathBuf, MutationError> {
+        let (mut key, missing) = self.ancestor_and_missing(path, requested, display)?;
         for name in missing.into_iter().rev() {
             key.push(name);
         }
-        key.push(leaf_of(target));
+        key.push(path.file_name().unwrap_or_default());
         Ok(key)
     }
 
-    /// The deepest existing ancestor of `target`'s parent, canonicalized and checked
+    /// The deepest existing ancestor of `path`'s parent, canonicalized and checked
     /// beneath the root, with the names of the missing components below it (leaf-most
-    /// first). `canonical_key` rejoins them to name the file; `plan_parent` walks the
-    /// ancestor once and records the missing names for [`open_parent`] to create.
+    /// first). `Target::canonical` rejoins them to name the file; `plan_parent` walks
+    /// the ancestor once and records the missing names for [`open_parent`] to create.
     ///
     /// The canonical form has no symlink in it (a symlink that stays inside is fine,
     /// as for [`Workspace::resolve`]), so `plan_parent`'s `O_NOFOLLOW` walk succeeds
     /// unless a component was swapped since, and then the walk refuses instead of
     /// following.
-    fn ancestor_and_missing<'t>(
+    fn ancestor_and_missing<'p>(
         &self,
-        target: &'t Target,
-    ) -> Result<(PathBuf, Vec<&'t OsStr>), MutationError> {
+        path: &'p Path,
+        requested: &str,
+        display: &str,
+    ) -> Result<(PathBuf, Vec<&'p OsStr>), MutationError> {
         let outside = || MutationError::OutsideWorkspace {
-            requested: target.requested.clone(),
+            requested: requested.to_string(),
         };
-        let mut existing = target.path.parent().ok_or_else(outside)?;
+        let mut existing = path.parent().ok_or_else(outside)?;
         let mut missing: Vec<&OsStr> = Vec::new();
         loop {
             match std::fs::symlink_metadata(existing) {
@@ -700,14 +719,13 @@ impl Workspace {
                 }
                 Err(error) => {
                     return Err(MutationError::Io(format!(
-                        "{} could not be resolved: {error}",
-                        target.display
+                        "{display} could not be resolved: {error}"
                     )));
                 }
             }
         }
         let canonical = existing.canonicalize().map_err(|error| {
-            MutationError::Io(format!("{} could not be resolved: {error}", target.display))
+            MutationError::Io(format!("{display} could not be resolved: {error}"))
         })?;
         if !canonical.starts_with(&self.root) {
             return Err(outside());
@@ -727,7 +745,8 @@ impl Workspace {
         let outside = || MutationError::OutsideWorkspace {
             requested: target.requested.clone(),
         };
-        let (canonical, missing) = self.ancestor_and_missing(target)?;
+        let (canonical, missing) =
+            self.ancestor_and_missing(&target.path, &target.requested, &target.display)?;
         let relative = canonical.strip_prefix(&self.root).map_err(|_| outside())?;
 
         let mut dir = root.try_clone().map_err(|error| {
@@ -753,12 +772,22 @@ impl Workspace {
     }
 }
 
-/// A validated path: resolved beneath the root, with what the caller asked for and
-/// what the model is shown.
+/// A validated path: resolved beneath the root, with what the caller asked for, what the
+/// model is shown, and the file this change actually writes.
 #[derive(Debug)]
 struct Target {
     requested: String,
+    /// What [`Workspace::resolve`] returned: the canonical file for a leaf that exists,
+    /// the lexical spelling for one that does not — which, under a directory symlink
+    /// inside the workspace, still contains the link. Read identities compare against
+    /// this, so it stays the resolution and nothing else.
     path: PathBuf,
+    /// The destination this change writes: the deepest existing ancestor canonicalized
+    /// (no symlink in it) with the missing components and the leaf re-joined — the file
+    /// the directory handle `plan` opened names. Observations are keyed by this, never
+    /// by `path`: re-resolving a spelling after a parent symlink was retargeted would
+    /// record a file the write never touched, leaving the real output unobserved.
+    canonical: PathBuf,
     display: String,
 }
 
@@ -869,7 +898,10 @@ impl Recheck<'_> {
         if self.policy == MutationPolicy::PatchAuthorized {
             return Ok(());
         }
-        match self.observed.check_unchanged(&target.path, current) {
+        // The registry is keyed by the file itself, which is `target.canonical`: the
+        // spelling could resolve elsewhere than the handle this change writes through,
+        // and a lookup keyed by it would then answer for another file.
+        match self.observed.check_unchanged(&target.canonical, current) {
             Observation::Unchanged => Ok(()),
             Observation::NeverObserved => Err(MutationError::Io(format!(
                 "You must read {} before changing it.",
@@ -2044,11 +2076,24 @@ mod tests {
             retarget,
         );
         match written {
-            Ok(()) => assert_eq!(
-                fs::read_to_string(dir.path().join("planned/fresh.txt")).unwrap(),
-                "written\n",
-                "the write lands in the directory the plan opened"
-            ),
+            Ok(()) => {
+                assert_eq!(
+                    fs::read_to_string(dir.path().join("planned/fresh.txt")).unwrap(),
+                    "written\n",
+                    "the write lands in the directory the plan opened"
+                );
+                assert_eq!(
+                    observed
+                        .check_unchanged(&workspace.root().join("planned/fresh.txt"), b"written\n"),
+                    Observation::Unchanged,
+                    "the observation names the file the planned handle wrote"
+                );
+                assert_eq!(
+                    observed.check_unchanged(&workspace.root().join("new/fresh.txt"), b"written\n"),
+                    Observation::NeverObserved,
+                    "the directory the link was retargeted to is never observed"
+                );
+            }
             Err(error) => assert!(
                 !dir.path().join("planned/fresh.txt").exists(),
                 "a refused change writes nothing: {error:?}"
@@ -2076,6 +2121,17 @@ mod tests {
             Ok(()) => {
                 assert_eq!(text(&workspace, "planned/landed.txt"), "moving\n");
                 assert!(!dir.path().join("src/moving.txt").exists());
+                assert_eq!(
+                    observed
+                        .check_unchanged(&workspace.root().join("planned/landed.txt"), b"moving\n"),
+                    Observation::Unchanged,
+                    "the destination observation names the planned file"
+                );
+                assert_eq!(
+                    observed.check_unchanged(&workspace.root().join("new/landed.txt"), b"moving\n"),
+                    Observation::NeverObserved,
+                    "the directory the link was retargeted to is never observed"
+                );
             }
             Err(error) => {
                 assert_eq!(
