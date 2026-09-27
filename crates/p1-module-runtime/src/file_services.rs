@@ -953,27 +953,29 @@ mod tests {
     #[tokio::test]
     async fn search_capability_refuses_credentials_in_every_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let credential = dir.path().join("xdg-auth.json");
+        let relative_credential = ".config/p1/auth.json";
+        let credential = dir.path().join(relative_credential);
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
         std::fs::write(&credential, "credential-marker\n").unwrap();
         std::fs::write(dir.path().join("notes.txt"), "safe match\n").unwrap();
         let workspace = Workspace::new(dir.path()).unwrap();
-        // This is one of the policy's XDG-named credential paths, made visible to the walk.
+        // Empty XDG list proves refusal comes from the agent-home policy.
         let capability = SearchCapability {
             workspace,
             home: Some(dir.path().to_path_buf()),
-            xdg_credentials: vec![credential],
+            xdg_credentials: vec![],
         };
 
         assert_eq!(
-            capability.stat("xdg-auth.json".into()).await,
+            capability.stat(relative_credential.into()).await,
             Err(FsError::Io(p1_workspace::credential_refusal(
-                "xdg-auth.json"
+                relative_credential
             )))
         );
         assert_eq!(
-            capability.read("xdg-auth.json".into(), 0, 128).await,
+            capability.read(relative_credential.into(), 0, 128).await,
             Err(FsError::Io(p1_workspace::credential_refusal(
-                "xdg-auth.json"
+                relative_credential
             )))
         );
         assert_eq!(
