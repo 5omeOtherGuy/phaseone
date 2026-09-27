@@ -13,6 +13,9 @@
 //! never undoes a native effect.
 //!
 //! How a call is bounded (freeze item 4):
+//! - **Hostcall fuel.** What one import call may make the host allocate while lifting its
+//!   arguments is [`HOSTCALL_FUEL`]: a whole file of up to [`MAX_TRANSFER_BYTES`] and no
+//!   more (ADR-0092).
 //! - **Fuel.** Each call starts with [`ExecutionLimits::fuel`]; running out traps as
 //!   `FuelExhausted`. The guest also yields to the Tokio scheduler every
 //!   [`FUEL_YIELD_INTERVAL`] of fuel, so a busy guest never starves the caller's runtime,
@@ -58,6 +61,20 @@ pub const CANCEL_GRACE_FUEL: u64 = 50_000_000;
 /// How much fuel a guest consumes between two yields to the Tokio scheduler: small against
 /// every budget above, so the call's task looks at its deadline and cancellation often.
 pub const FUEL_YIELD_INTERVAL: u64 = 1_000_000;
+
+/// The largest byte list a guest may hand the host in one import call: a whole file a
+/// component passes `snapshot.check`, `snapshot.observe` or a `workspace-mutation` write
+/// (ADR-0092). The workspace sets no file size of its own, so this is the file size a
+/// component can edit, write or patch; the native tools have none.
+pub const MAX_TRANSFER_BYTES: usize = 16 << 20;
+
+/// The hostcall fuel of one call's Store: what wasmtime lets one import call allocate on the
+/// host while lifting its arguments. The imports are linked dynamically (`Val`, the typed
+/// forms need `unsafe impl`s), and a dynamic lift charges one `Val` per list element, so
+/// the default of 128 MiB stops a byte list at about three megabytes. Sized for
+/// [`MAX_TRANSFER_BYTES`] as `Val`s plus the default for the rest of the call's arguments,
+/// it still bounds what one import call can make the host allocate.
+pub const HOSTCALL_FUEL: usize = MAX_TRANSFER_BYTES * size_of::<Val>() + (128 << 20);
 
 /// The per-call limits of `execute`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +270,7 @@ async fn one_call(
     store
         .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
         .map_err(|error| failure(&error))?;
+    store.set_hostcall_fuel(HOSTCALL_FUEL);
     // Called at every epoch tick while guest code runs, and at once after a cancellation
     // interrupts the engine's epoch.
     let clock = setup.epochs.subscribe();
