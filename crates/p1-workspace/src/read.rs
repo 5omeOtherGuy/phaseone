@@ -176,7 +176,7 @@ impl Workspace {
         let mut directory = rustix::fs::openat(
             CWD,
             &self.root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|error| io_at(&path, error))?;
@@ -189,7 +189,7 @@ impl Workspace {
                 directory = rustix::fs::openat(
                     &directory,
                     name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Mode::empty(),
                 )
                 .map_err(|error| io_at(&path, error))?;
@@ -360,7 +360,7 @@ mod tests {
     use super::*;
     use crate::ObservedFiles;
     use rustix::fs::{CWD, Mode};
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -406,6 +406,24 @@ mod tests {
             workspace.read("external.md", &ObservedFiles::new()),
             Err(WorkspaceError::OutsideWorkspace { .. })
         ));
+    }
+
+    #[test]
+    fn reading_file_in_search_only_directory_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        if directory.path().metadata().unwrap().uid() == 0 {
+            return;
+        }
+        let subdirectory = directory.path().join("sub");
+        std::fs::create_dir(&subdirectory).unwrap();
+        std::fs::write(subdirectory.join("file"), b"readable\n").unwrap();
+        std::fs::set_permissions(&subdirectory, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+
+        let result = workspace.read("sub/file", &ObservedFiles::new());
+
+        std::fs::set_permissions(&subdirectory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap().read(0, 100), b"readable\n");
     }
 
     #[test]
