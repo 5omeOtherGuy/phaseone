@@ -62,7 +62,7 @@ pub fn search(
         .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
     let overrides = build_overrides(&search_path, query.glob.as_deref())?;
     let files = collect_files(workspace, &search_path, overrides, cancel)?;
-    search_content(&matcher, query, &files, cancel)
+    search_content(workspace, &matcher, query, &files, cancel)
 }
 
 /// The host side of `workspace.list-files`: the files under `path` (a directory, or one
@@ -92,7 +92,9 @@ pub fn read_window(
 ) -> Result<Vec<u8>, FsError> {
     let checked = workspace.check_path(path).map_err(workspace_error)?;
     let io = |error: io::Error| FsError::Io(error.to_string());
-    let mut file = std::fs::File::open(checked.path()).map_err(io)?;
+    let mut file = workspace
+        .open_file_at(checked.path())
+        .map_err(workspace_error)?;
     io::copy(&mut (&mut file).take(offset), &mut io::sink()).map_err(io)?;
     let mut window = Vec::new();
     file.take(length).read_to_end(&mut window).map_err(io)?;
@@ -163,6 +165,7 @@ fn collect_files(
 }
 
 fn search_content(
+    workspace: &Workspace,
     matcher: &RegexMatcher,
     query: &SearchQuery,
     files: &[(String, PathBuf)],
@@ -180,7 +183,10 @@ fn search_content(
             return Err(FsError::Cancelled);
         }
         let mut sink = MatchSink::with_room(room);
-        if searcher.search_path(matcher, path, &mut sink).is_err() {
+        let Ok(file) = workspace.open_file_at(path) else {
+            continue;
+        };
+        if searcher.search_file(matcher, &file, &mut sink).is_err() {
             continue;
         }
         if sink.binary || !sink.seen {
@@ -274,5 +280,80 @@ impl Sink for MatchSink {
     ) -> Result<bool, io::Error> {
         self.binary = true;
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_files, search_content};
+    use grep::regex::RegexMatcher;
+    use p1_contracts::CancellationToken;
+    use p1_workspace::Workspace;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    use crate::capabilities::SearchQuery;
+
+    #[test]
+    fn search_finds_file_with_invalid_utf8_name() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let name = OsStr::from_bytes(b"invalid-\xff.txt");
+        fs::write(
+            workspace_dir.path().join(name),
+            "needle in non-UTF-8 name\n",
+        )
+        .unwrap();
+        let workspace = Workspace::new(workspace_dir.path()).unwrap();
+        let cancel = CancellationToken::new();
+        let files = collect_files(&workspace, workspace.root(), None, &cancel).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 10,
+        };
+        let matcher = RegexMatcher::new("needle").unwrap();
+
+        let result = search_content(&workspace, &matcher, &query, &files, &cancel).unwrap();
+
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].lines[0].text, "needle in non-UTF-8 name");
+    }
+
+    #[test]
+    fn search_skips_file_swapped_for_outside_symlink_after_walk() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        fs::write(workspace_dir.path().join("needle.txt"), "inside\n").unwrap();
+        fs::write(outside_dir.path().join("secret.txt"), "needle outside\n").unwrap();
+        let workspace = Workspace::new(workspace_dir.path()).unwrap();
+        let cancel = CancellationToken::new();
+        let files = collect_files(&workspace, workspace.root(), None, &cancel).unwrap();
+
+        fs::remove_file(workspace_dir.path().join("needle.txt")).unwrap();
+        symlink(
+            outside_dir.path().join("secret.txt"),
+            workspace_dir.path().join("needle.txt"),
+        )
+        .unwrap();
+
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 10,
+        };
+        let matcher = RegexMatcher::new("needle").unwrap();
+        let result = search_content(&workspace, &matcher, &query, &files, &cancel).unwrap();
+        assert!(
+            result.files.is_empty(),
+            "outside symlink target was searched"
+        );
     }
 }
