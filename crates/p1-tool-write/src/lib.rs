@@ -6,6 +6,10 @@
 //! `p1-tool-write-logic`, which the `p1/write` component calls too, so both run
 //! the same code. This module owns the native flow: the read-before-mutate
 //! guard for an existing target and the write, under the write gate.
+//!
+//! The `workspace-mutation` capability service a component is linked with is the
+//! HOST's (`p1_module_runtime::file_services`, S7.10-R1, ADR-0091); it is re-exported
+//! here for the tests that link the edit, write and patch components.
 
 use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
@@ -17,8 +21,9 @@ use p1_workspace::{Observation, ObservedFiles, Workspace, write_atomic};
 
 pub use p1_workspace::ToolFace;
 
-pub mod capability;
-pub use capability::{MutationCapability, mutation_service, mutation_service_over};
+pub use p1_module_runtime::file_services::{
+    MutationCapability, mutation_service, mutation_service_over,
+};
 
 /// The `write` tool. Holds one agent's workspace and observation store.
 pub struct WriteTool {

@@ -3,33 +3,27 @@
 //!
 //! `ignore` provides the `.gitignore`-aware walk and the glob filter, and
 //! `grep` (regex + searcher) does the matching, so no `rg` binary is needed.
-//! Confinement lives in `p1-workspace`. The walk and the matching are this
-//! crate's [`search`] and [`list_files`], the host side of the `workspace`
-//! interface's `search` and `list-files`. The declaration, input validation,
-//! the grouped rendering with its own output bound and footers, and the
-//! descriptions live in `p1-tool-search-logic`, the one copy the `grep`
-//! component (`modules/p1-module-search/`) runs too: the native tool runs that
-//! crate's `execute` over these two functions, so native and component run the
-//! same code.
+//! Confinement lives in `p1-workspace`. The declaration, input validation, the
+//! grouped rendering with its own output bound and footers, and the descriptions
+//! live in `p1-tool-search-logic`, the one copy the `grep` component
+//! (`modules/p1-module-search/`) runs too: the native tool runs that crate's
+//! `execute` over the walk, so native and component run the same code.
+//!
+//! The walk and the `workspace` capability service that links it into the component
+//! are the HOST's (`p1_module_runtime::file_walk`, `p1_module_runtime::file_services`,
+//! S7.10-R1, ADR-0091): the native tool calls the same walk through the runtime's
+//! types, and re-exports the service for its own tests.
 
-mod capability;
-
-pub use capability::{SearchCapability, search_services};
+pub use p1_module_runtime::file_services::{SearchCapability, search_services};
 
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
 
-use grep::regex::{RegexMatcher, RegexMatcherBuilder};
-use grep::searcher::{
-    BinaryDetection, MmapChoice, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch,
-};
-use ignore::WalkBuilder;
-use ignore::overrides::{Override, OverrideBuilder};
 use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, CancellationToken, DeclarationKind, Effect, Tool, ToolCall,
     ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
+use p1_module_runtime::file_walk;
 use p1_tool_search_logic::exec::{
     CallInput, Capabilities, Entry, EntryKind, FileMatches, FsError, Outcome, SearchLine,
     SearchQuery, SearchResult,
@@ -239,6 +233,75 @@ impl Capabilities for NativeHost {
     }
 }
 
+/// The host walk's `workspace.list-files` ([`p1_module_runtime::file_walk`], the one copy the
+/// `p1/search` component's capability service also runs) as this crate's logic speaks it: the
+/// same files, one error variant per variant.
+pub fn list_files(
+    workspace: &Workspace,
+    path: &str,
+    glob: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>, FsError> {
+    file_walk::list_files(workspace, path, glob, cancel).map_err(from_walk)
+}
+
+/// The host walk's `workspace.search`, as [`list_files`] is the host walk's `list-files`: the
+/// query and the result are converted at this one boundary, and every failure keeps the text
+/// the walk worded it with.
+pub fn search(
+    workspace: &Workspace,
+    query: &SearchQuery,
+    cancel: &CancellationToken,
+) -> Result<SearchResult, FsError> {
+    let found = file_walk::search(workspace, &runtime_query(query), cancel).map_err(from_walk)?;
+    Ok(SearchResult {
+        files: found
+            .files
+            .into_iter()
+            .map(|file| FileMatches {
+                path: file.path,
+                lines: file
+                    .lines
+                    .into_iter()
+                    .map(|line| SearchLine {
+                        line_number: line.line_number,
+                        text: line.text,
+                        is_match: line.is_match,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        truncated: found.truncated,
+        omitted_files: found.omitted_files,
+    })
+}
+
+/// The logic crate's `search-query` as the runtime's, for the host's walk.
+fn runtime_query(query: &SearchQuery) -> p1_module_runtime::capabilities::SearchQuery {
+    p1_module_runtime::capabilities::SearchQuery {
+        pattern: query.pattern.clone(),
+        path: query.path.clone(),
+        glob: query.glob.clone(),
+        case_insensitive: query.case_insensitive,
+        context: query.context,
+        max_lines: query.max_lines,
+    }
+}
+
+/// The walk's failures as the frozen `fs-error` the logic crate speaks: one variant per
+/// variant, and the message of `invalid-pattern` and `io` exactly as the walk worded it.
+fn from_walk(error: p1_module_runtime::FsError) -> FsError {
+    match error {
+        p1_module_runtime::FsError::OutsideWorkspace => FsError::OutsideWorkspace,
+        p1_module_runtime::FsError::NotFound => FsError::NotFound,
+        p1_module_runtime::FsError::WrongKind => FsError::WrongKind,
+        p1_module_runtime::FsError::AlreadyExists => FsError::AlreadyExists,
+        p1_module_runtime::FsError::InvalidPattern(message) => FsError::InvalidPattern(message),
+        p1_module_runtime::FsError::Cancelled => FsError::Cancelled,
+        p1_module_runtime::FsError::Io(message) => FsError::Io(message),
+    }
+}
+
 /// The workspace service's failures as the frozen `fs-error`
 /// (docs/design/modules/workspace-mutation.md): `io` carries the io error's
 /// own text, never a host path.
@@ -248,231 +311,6 @@ fn fs_error(error: WorkspaceError) -> FsError {
         WorkspaceError::NotFound { .. } => FsError::NotFound,
         WorkspaceError::NotADirectory(_) => FsError::WrongKind,
         WorkspaceError::Io { source, .. } => FsError::Io(source.to_string()),
-    }
-}
-
-/// The host side of `workspace.search`: search file contents under
-/// `query.path` (the root when absent) with the walk of [`list_files`].
-///
-/// Matching files come in walk order, each with its match and context lines;
-/// binary files are skipped. At most `query.max_lines` lines are carried: when
-/// one more would not fit, the result is `truncated`, the rest of that file is
-/// dropped, and the walk goes on only to count the matching files after it
-/// (`omitted_files`, which also counts a file the cap left without a line).
-/// Every file is still searched whole, exactly as when nothing is cut, so a
-/// file is a match here exactly when it would be one in a complete result.
-///
-/// The failures are the frozen `fs-error`: `outside-workspace`, `not-found`
-/// for a missing path, `invalid-pattern` with the model-facing text for a
-/// regex or glob that does not parse (in that order), and `cancelled` when
-/// `cancel` is set during the walk or the search.
-pub fn search(
-    workspace: &Workspace,
-    query: &SearchQuery,
-    cancel: &CancellationToken,
-) -> Result<SearchResult, FsError> {
-    let search_path = scope(workspace, query.path.as_deref())?;
-    let matcher = RegexMatcherBuilder::new()
-        .case_insensitive(query.case_insensitive)
-        .build(&query.pattern)
-        .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
-    let overrides = build_overrides(&search_path, query.glob.as_deref())?;
-    let files = collect_files(workspace, &search_path, overrides, cancel)?;
-    search_content(&matcher, query, &files, cancel)
-}
-
-/// The host side of `workspace.list-files`: the files under `path` (a
-/// directory, or one file), sorted bytewise, relative to the root. The walk
-/// honours `.gitignore`, skips hidden entries and never follows symlinks;
-/// `glob` keeps only matching files.
-pub fn list_files(
-    workspace: &Workspace,
-    path: &str,
-    glob: Option<&str>,
-    cancel: &CancellationToken,
-) -> Result<Vec<String>, FsError> {
-    let search_path = scope(workspace, Some(path))?;
-    let overrides = build_overrides(&search_path, glob)?;
-    let files = collect_files(workspace, &search_path, overrides, cancel)?;
-    Ok(files.into_iter().map(|(display, _)| display).collect())
-}
-
-/// Resolve the path to search (the root when absent); it must exist.
-fn scope(workspace: &Workspace, requested: Option<&str>) -> Result<PathBuf, FsError> {
-    let search_path = match requested {
-        Some(requested) => workspace.resolve(requested).map_err(fs_error)?,
-        None => workspace.root().to_path_buf(),
-    };
-    if !search_path.exists() {
-        return Err(FsError::NotFound);
-    }
-    Ok(search_path)
-}
-
-fn build_overrides(search_path: &Path, glob: Option<&str>) -> Result<Option<Override>, FsError> {
-    match glob {
-        Some(glob) => {
-            let invalid = |error: ignore::Error| {
-                FsError::InvalidPattern(format!("invalid glob pattern: {error}"))
-            };
-            let mut builder = OverrideBuilder::new(search_path);
-            builder.add(glob).map_err(invalid)?;
-            let overrides = builder.build().map_err(invalid)?;
-            Ok(Some(overrides))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Walk the search path and return `(root-relative display, absolute path)`
-/// pairs, sorted bytewise by display path. Hidden entries are skipped by the
-/// walker, symlinks are never followed, and binary files are filtered by the
-/// callers that read content.
-fn collect_files(
-    workspace: &Workspace,
-    search_path: &Path,
-    overrides: Option<Override>,
-    cancel: &CancellationToken,
-) -> Result<Vec<(String, PathBuf)>, FsError> {
-    let mut walk = WalkBuilder::new(search_path);
-    // Keep the walker defaults for hidden files (skip them) and follow_links
-    // (never); only the gitignore handling is relaxed so a scratch directory
-    // without a `.git` still honours its `.gitignore`.
-    walk.require_git(false);
-    if let Some(overrides) = overrides {
-        walk.overrides(overrides);
-    }
-
-    let mut files = Vec::new();
-    for entry in walk.build() {
-        if cancel.is_cancelled() {
-            return Err(FsError::Cancelled);
-        }
-        let Ok(entry) = entry else { continue };
-        // `is_file` is false for symlinks, so links are never followed.
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let path = entry.into_path();
-        let display = workspace.display(&path);
-        files.push((display, path));
-    }
-    files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    Ok(files)
-}
-
-fn search_content(
-    matcher: &RegexMatcher,
-    query: &SearchQuery,
-    files: &[(String, PathBuf)],
-    cancel: &CancellationToken,
-) -> Result<SearchResult, FsError> {
-    let mut searcher = content_searcher(query.context as usize);
-    let mut result = SearchResult {
-        files: Vec::new(),
-        truncated: false,
-        omitted_files: 0,
-    };
-    let mut room = query.max_lines as usize;
-    for (display, path) in files {
-        if cancel.is_cancelled() {
-            return Err(FsError::Cancelled);
-        }
-        let mut sink = MatchSink::with_room(room);
-        if searcher.search_path(matcher, path, &mut sink).is_err() {
-            continue;
-        }
-        if sink.binary || !sink.seen {
-            continue;
-        }
-        if sink.overflowed {
-            result.truncated = true;
-        }
-        if sink.lines.is_empty() {
-            result.omitted_files += 1;
-            continue;
-        }
-        room -= sink.lines.len();
-        result.files.push(FileMatches {
-            path: display.clone(),
-            lines: sink.lines,
-        });
-    }
-    Ok(result)
-}
-
-fn content_searcher(context: usize) -> Searcher {
-    let mut builder = SearcherBuilder::new();
-    builder
-        .line_number(true)
-        .before_context(context)
-        .after_context(context)
-        .binary_detection(BinaryDetection::quit(b'\0'))
-        .memory_map(MmapChoice::never());
-    builder.build()
-}
-
-/// Collects match and context lines for a single file, up to `room` of them.
-/// Past that it keeps searching, carrying nothing, so a binary file is still
-/// recognised as one wherever its NUL is.
-struct MatchSink {
-    lines: Vec<SearchLine>,
-    room: usize,
-    /// Any match or context line was seen, carried or not.
-    seen: bool,
-    /// A line was seen with no room left for it.
-    overflowed: bool,
-    binary: bool,
-}
-
-impl MatchSink {
-    fn with_room(room: usize) -> Self {
-        Self {
-            lines: Vec::new(),
-            room,
-            seen: false,
-            overflowed: false,
-            binary: false,
-        }
-    }
-
-    fn push(&mut self, number: Option<u64>, is_match: bool, bytes: &[u8]) {
-        self.seen = true;
-        if self.lines.len() >= self.room {
-            self.overflowed = true;
-            return;
-        }
-        let text = String::from_utf8_lossy(bytes)
-            .trim_end_matches(['\n', '\r'])
-            .to_string();
-        self.lines.push(SearchLine {
-            line_number: number.unwrap_or(0),
-            text,
-            is_match,
-        });
-    }
-}
-
-impl Sink for MatchSink {
-    type Error = io::Error;
-
-    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
-        self.push(mat.line_number(), true, mat.bytes());
-        Ok(true)
-    }
-
-    fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, io::Error> {
-        self.push(ctx.line_number(), false, ctx.bytes());
-        Ok(true)
-    }
-
-    fn binary_data(
-        &mut self,
-        _searcher: &Searcher,
-        _binary_byte_offset: u64,
-    ) -> Result<bool, io::Error> {
-        self.binary = true;
-        Ok(false)
     }
 }
 

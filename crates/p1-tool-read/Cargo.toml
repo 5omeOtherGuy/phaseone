@@ -11,15 +11,13 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
-# The `workspace` and `snapshot` capability traits this crate's native services implement.
+# S7.10-R1 (ADR-0091): the `workspace` (`read`) and `snapshot` capability services this crate
+# once implemented are the host's now (`p1_module_runtime::file_services`); this crate
+# re-exports them for its own tests and keeps the native adapter.
 p1-module-runtime = { path = "../p1-module-runtime" }
 p1-read-guest = { path = "guest" }
-# The search tool's `workspace` service (`list-files`, `search`) beside this crate's read
-# side, so one builder links every tool component of the release (S2).
-p1-tool-search = { path = "../p1-tool-search" }
-# The owned mutation service (`workspace-mutation`) the edit, write and patch components
-# are linked with, over the same agent and the same read record (S2).
-p1-tool-write = { path = "../p1-tool-write" }
+# The credential refusal policy, its texts and the read record the native adapter and the
+# capability service both run (issue #142).
 p1-workspace = { path = "../p1-workspace" }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 

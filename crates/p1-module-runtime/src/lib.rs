@@ -5,6 +5,10 @@
 //! - [`manifest`]: the release manifest, the one source modules load from;
 //! - [`loader`]: verify-then-compile-same-bytes, the digest as identity (freeze item 6);
 //! - [`capabilities`]: the host imports linked per the manifest's grants;
+//! - [`file_services`]: the capability services of the file tools — the read side
+//!   (`workspace`, `snapshot`), the walk (`list-files`, `search`) and the owned mutation
+//!   (`workspace-mutation`) — a component is linked with, and [`file_walk`]: the walk itself,
+//!   over the ripgrep crates (S7.10-R1, ADR-0091);
 //! - [`completion`]: the `completion` import, linked to the host's completion hub;
 //! - [`executor`]: the one owner of a module's async Stores (ADR-0015);
 //! - [`restricted`]: the synchronous inspection path (freeze item 4);
@@ -17,6 +21,8 @@ pub mod completion;
 pub mod context_policy;
 pub mod delegation;
 pub mod executor;
+pub mod file_services;
+pub mod file_walk;
 pub mod loader;
 pub mod manifest;
 pub mod provider;

@@ -19,6 +19,16 @@ p1-redact = { path = "../p1-redact" }
 # crates' own traits, passed in by the host.
 p1-workers = { path = "../p1-workers" }
 p1-workflow = { path = "../p1-workflow" }
+# S7.10-R1 (ADR-0091): the file tools' capability services — the read side, the walk and the
+# owned mutation — and the credential-file policy they apply before confinement are the
+# HOST's now (`src/file_services.rs`, `src/file_walk.rs`), so a component is linked without
+# the host depending on a tool crate.
+p1-workspace = { path = "../p1-workspace" }
+# The walk behind `workspace.list-files` and `workspace.search`: `ignore` for the
+# `.gitignore`-aware walk and the glob filter, `grep` for the matching, exactly as the native
+# `grep` used them before its crate left the host's normal graph.
+grep = "0.4"
+ignore = "0.4"
 thiserror = "2"
 # The executor task, its request channel and the per-call tasks it owns.
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
@@ -26,3 +36,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync", "ma
 # verified bytes itself, so a compiled-code cache would be a second, unverified source of
 # code. No `wat` or WASI: modules arrive as binary components and get only p1's own imports.
 wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "async", "std"] }
+
+[dev-dependencies]
+# The moved file-service cases (`src/file_services.rs`) build scratch workspaces.
+tempfile = "3"
