@@ -15,9 +15,11 @@ use std::path::{Path, PathBuf};
 
 use crate::Workspace;
 
-/// Credential policy with fixed paths canonicalized once for repeated capability checks.
+/// Credential policy with fixed paths canonicalized once per request.
 #[derive(Clone, Debug)]
 pub struct CredentialPolicy {
+    lexical_exact_paths: Vec<PathBuf>,
+    lexical_keys_directory: Option<PathBuf>,
     exact_paths: Vec<PathBuf>,
     keys_directory: Option<PathBuf>,
 }
@@ -25,36 +27,60 @@ pub struct CredentialPolicy {
 impl CredentialPolicy {
     /// Builds the policy for an agent home and its XDG-named credential files.
     pub fn new(home: Option<&Path>, xdg_credentials: &[PathBuf]) -> Self {
+        let mut lexical_exact_paths = xdg_credentials
+            .iter()
+            .map(|path| lexical_absolute(path))
+            .collect::<Vec<_>>();
+        let lexical_keys_directory = home.map(|home| {
+            let home = lexical_absolute(home);
+            lexical_exact_paths.extend([
+                home.join(".config/p1/auth.json"),
+                home.join(".codex/auth.json"),
+                home.join(".claude/.credentials.json"),
+                home.join(".local/share/opencode/auth.json"),
+                home.join(".pi/agent/auth.json"),
+            ]);
+            home.join(".config").join("keys")
+        });
         let mut exact_paths = xdg_credentials
             .iter()
             .map(|path| canonical_best_effort(path))
             .collect::<Vec<_>>();
         let keys_directory = home.map(|home| {
             let home = canonical_best_effort(home);
+            let home_credentials = [
+                home.join(".config/p1/auth.json"),
+                home.join(".codex/auth.json"),
+                home.join(".claude/.credentials.json"),
+                home.join(".local/share/opencode/auth.json"),
+                home.join(".pi/agent/auth.json"),
+            ];
             exact_paths.extend(
-                [
-                    home.join(".config/p1/auth.json"),
-                    home.join(".codex/auth.json"),
-                    home.join(".claude/.credentials.json"),
-                    home.join(".local/share/opencode/auth.json"),
-                    home.join(".pi/agent/auth.json"),
-                ]
-                .iter()
-                .map(|path| canonical_best_effort(path)),
+                home_credentials
+                    .iter()
+                    .map(|path| canonical_best_effort(path)),
             );
             canonical_best_effort(&home.join(".config").join("keys"))
         });
         Self {
+            lexical_exact_paths,
+            lexical_keys_directory,
             exact_paths,
             keys_directory,
         }
     }
 
     /// Whether `candidate` is one of the fixed credential files or lies under the keys
-    /// directory. The candidate is canonicalized per request, so aliases cannot bypass policy.
+    /// directory. Both lexical spelling and canonical target are checked for each candidate.
     pub fn refuses(&self, candidate: &Path) -> bool {
+        let lexical_candidate = lexical_absolute(candidate);
+        let lexical_match = self.lexical_exact_paths.contains(&lexical_candidate)
+            || self.lexical_keys_directory.as_ref().is_some_and(|keys| {
+                lexical_candidate == *keys || lexical_candidate.starts_with(keys)
+            });
         let candidate = canonical_best_effort(candidate);
-        self.exact_paths.contains(&candidate)
+        lexical_match
+            || self.exact_paths.contains(&candidate)
             || self
                 .keys_directory
                 .as_ref()
@@ -130,6 +156,17 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// Make a path absolute without resolving symlinks, preserving the lexical policy spelling.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
 }
 
 /// The canonical form of `path`, or — when it does not exist yet — its canonical parent with

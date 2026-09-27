@@ -277,16 +277,17 @@ impl SnapshotService for ReadCapability {
 #[derive(Clone)]
 pub struct SearchCapability {
     workspace: Workspace,
-    credential_policy: Arc<CredentialPolicy>,
+    home: Option<PathBuf>,
+    xdg_credentials: Vec<PathBuf>,
 }
 
 impl SearchCapability {
     /// The capability over `workspace`, refusing credentials under the agent's home.
     pub fn new(workspace: Workspace, home: Option<PathBuf>) -> Self {
-        let xdg_credentials = xdg_credentials();
         Self {
             workspace,
-            credential_policy: Arc::new(CredentialPolicy::new(home.as_deref(), &xdg_credentials)),
+            home,
+            xdg_credentials: xdg_credentials(),
         }
     }
 
@@ -311,8 +312,10 @@ impl SearchCapability {
 
 impl WorkspaceService for SearchCapability {
     fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>> {
-        let credential_policy = self.credential_policy.clone();
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
         self.blocking(move |workspace, _| {
+            let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -346,8 +349,10 @@ impl WorkspaceService for SearchCapability {
     ) -> BoxFuture<'_, Result<Vec<u8>, FsError>> {
         // Only the requested window, as the native `grep` reads: file-list mode sniffs a
         // prefix of every listed file, which must not load a large file whole.
-        let credential_policy = self.credential_policy.clone();
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
         self.blocking(move |workspace, _| {
+            let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -360,8 +365,10 @@ impl WorkspaceService for SearchCapability {
         path: String,
         glob: Option<String>,
     ) -> BoxFuture<'_, Result<Vec<String>, FsError>> {
-        let credential_policy = self.credential_policy.clone();
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
         self.blocking(move |workspace, cancel| {
+            let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
             file_walk::list_files_excluding(
                 workspace,
                 &path,
@@ -373,8 +380,10 @@ impl WorkspaceService for SearchCapability {
     }
 
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<SearchResult, FsError>> {
-        let credential_policy = self.credential_policy.clone();
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
         self.blocking(move |workspace, cancel| {
+            let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
             file_walk::search_excluding(workspace, &query, cancel, |candidate| {
                 credential_policy.refuses(candidate)
             })
@@ -945,6 +954,55 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_capability_tracks_home_config_symlink_changes() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config");
+        let credential = config.join("p1/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "credential-marker\n").unwrap();
+        std::fs::write(home.path().join("notes.txt"), "ordinary file\n").unwrap();
+        let capability = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().to_path_buf()),
+        );
+
+        std::fs::rename(&config, home.path().join(".config-real")).unwrap();
+        symlink(".config-real", &config).unwrap();
+
+        assert_eq!(
+            capability.stat(".config/p1/auth.json".into()).await,
+            Err(FsError::Io(p1_workspace::credential_refusal(
+                ".config/p1/auth.json"
+            )))
+        );
+        assert_eq!(
+            capability.read(".config/p1/auth.json".into(), 0, 128).await,
+            Err(FsError::Io(p1_workspace::credential_refusal(
+                ".config/p1/auth.json"
+            )))
+        );
+        assert_eq!(
+            capability.list_files(".".into(), None).await,
+            Ok(vec!["notes.txt".to_owned()])
+        );
+        let result = capability
+            .search(SearchQuery {
+                pattern: "credential-marker".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap();
+        assert!(result.files.is_empty());
+    }
+
     #[test]
     fn cancellation_during_file_exclusion_returns_cancelled() {
         let dir = tempfile::tempdir().unwrap();
@@ -972,7 +1030,8 @@ mod tests {
         // Empty XDG list proves refusal comes from the agent-home policy.
         let capability = SearchCapability {
             workspace,
-            credential_policy: Arc::new(CredentialPolicy::new(Some(dir.path()), &[])),
+            home: Some(dir.path().to_path_buf()),
+            xdg_credentials: vec![],
         };
 
         assert_eq!(
