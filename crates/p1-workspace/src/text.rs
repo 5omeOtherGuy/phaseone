@@ -73,7 +73,7 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn temp_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
+pub(crate) fn temp_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
     // Built from OsString so a non-UTF-8 file name is preserved exactly.
     let mut name = std::ffi::OsString::from(".");
     name.push(file_name);
