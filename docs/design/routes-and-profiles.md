@@ -88,7 +88,11 @@ output_limit  = 32000                  # optional; same rule
   A header whose name is `authorization`, `x-api-key`, `cookie` or starts with `x-auth` is
   rejected in `[headers]`: a route file must not be able to hold a secret by accident.
 - `[adapter_settings]` is deserialized by the adapter's own typed struct with
-  `deny_unknown_fields`; the host passes it through as a `toml::Value` and never interprets it.
+  `deny_unknown_fields` — in the provider component that serves a request, and when a route file
+  loads, against the host's copy of that struct (S7.10-R4: the native adapters are not in the
+  host's dependency graph; same type names, fields, defaults and serde attributes, so a malformed
+  table fails at the same stage with the same message). The host hands the component the table as
+  a `toml::Value`, adding only its own reserved keys.
 - `[adapter_settings] client_identity` (optional, `openai-chat` only) makes a route present
   a vendor's own client identity to a gateway that gates a free tier on it. The only value is
   `opencode`: the request carries OpenCode's `user-agent` and `x-opencode-*` headers and a

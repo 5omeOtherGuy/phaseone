@@ -39,9 +39,11 @@ pub struct ModelBinding {
     pub output_limit: Option<u32>,
 }
 
-/// One parsed `routes/<id>.toml`, validated. The host never interprets these fields
-/// beyond routing: `[adapter_settings]` is handed to the adapter named by `adapter`
-/// as-is (`docs/design/routes-and-profiles.md` §1.2).
+/// One parsed `routes/<id>.toml`, validated. The host interprets these fields only to
+/// route: `[adapter_settings]` is checked when the file loads against the host's copy
+/// of the settings type of the adapter named by `adapter` ([`RouteFile::settings`]),
+/// and the table itself reaches the component that serves the route as-is
+/// (`docs/design/routes-and-profiles.md` §1.2).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteFile {
