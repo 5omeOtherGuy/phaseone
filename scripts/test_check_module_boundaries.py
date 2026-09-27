@@ -218,6 +218,24 @@ class Harness:
         lines += ["1serde v1.0.229", "2serde_core v1.0.229"]
         return "\n".join(lines) + "\n"
 
+    def withhold_shipping_packages(self, *crates: str) -> None:
+        """Drops the SHIPPING_PACKAGES rows of `crates` from this repository's copy of the script.
+
+        The rows are the fixture for a fallback whose implementing package the table cannot name;
+        only the SHIPPING_PACKAGES block is touched, so the crate stays classified.
+        """
+        script = self.repo / "scripts" / "check-module-boundaries.sh"
+        lines = script.read_text(encoding="utf-8").splitlines(keepends=True)
+        start = lines.index("SHIPPING_PACKAGES='\n") + 1
+        end = start
+        while lines[end] != "'\n":
+            end += 1
+        rows = lines[start:end]
+        kept = [line for line in rows if line.split("|")[0] not in crates]
+        if len(kept) == len(rows):
+            raise AssertionError("no SHIPPING_PACKAGES row of " + ", ".join(crates) + " to withhold")
+        write(script, "".join(lines[:start] + kept + lines[end:]))
+
     def run(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = {
             "PATH": os.pathsep.join([str(self.bin), os.path.dirname(sys.executable), "/usr/bin", "/bin"]),
@@ -436,9 +454,12 @@ class ShippingModeTests(unittest.TestCase):
         self.assertNotIn("no module package ships it yet", result.stdout)
 
     def test_a_fallback_crate_without_a_package_row_says_no_package_ships_it_yet(self) -> None:
-        # The four S2 crates (D083) have no module package: their fallback line stays honest
-        # about that instead of naming a package the release does not ship.
+        # Every extension crate of the frozen table names its implementing package now (S3.8 and
+        # #386 activated what the remaining fallbacks implement), so this case withholds the two
+        # rows from this repository's copy of the script: the fallback line stays honest about a
+        # package the table cannot name instead of naming one the release does not ship.
         h = self.harness("p1-tool-edit", "p1-tool-patch")
+        h.withhold_shipping_packages("p1-tool-edit", "p1-tool-patch")
         result = h.run("--shipping")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn(
