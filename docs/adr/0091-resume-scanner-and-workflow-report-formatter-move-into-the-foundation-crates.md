@@ -50,4 +50,7 @@ component: the CLI report would then depend on a loaded package for a pure rende
 `p1_workers::journal` tests; `p1_workflow::report` test pinned to the component's golden text;
 `crates/p1-module-tests/tests/delegation_activation.rs`
 `the_member_the_native_tool_and_the_formatter_render_one_report`;
+`crates/p1-host/tests/resume_worker_ids.rs`
+`a_resumed_session_journalled_under_the_native_identity_still_reserves_its_ids` (the pre-S6.11
+identity, end to end);
 `cargo tree --locked -p p1-host -e normal` (with and without `--all-features`).
