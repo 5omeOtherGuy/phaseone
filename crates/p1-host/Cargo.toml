@@ -17,11 +17,11 @@ workspace = true
 # Delegation tools and the in-process worker service. Off => the four
 # `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
 default = ["delegation", "workflows", "shadow-hook"]
-delegation = ["dep:p1-workers", "dep:p1-tool-delegate"]
+delegation = ["dep:p1-workers"]
 shadow-hook = ["dep:p1-hook-shadow"]
 # Workflows (ADR-0053): the engine and its four tools, composed over the worker
 # service. Off => the four `workflow_*` catalog keys are unknown modules.
-workflows = ["delegation", "dep:p1-workflow", "dep:p1-tool-workflow"]
+workflows = ["delegation", "dep:p1-workflow"]
 
 [dependencies]
 p1-assembly = { path = "../p1-assembly" }
@@ -37,7 +37,7 @@ p1-module-protocol = { path = "../p1-module-protocol" }
 p1-core = { path = "../p1-core" }
 p1-journal = { path = "../p1-journal" }
 p1-workspace = { path = "../p1-workspace" }
-# S7.10-R1 (ADR-0094): `read`, `edit`, `write`, `apply_patch` and `grep` are the release's
+# S7.10-R1 (ADR-0095): `read`, `edit`, `write`, `apply_patch` and `grep` are the release's
 # host entries now, so their crates are out of the host's NORMAL graph — the file-tool
 # capability services they used to carry are the runtime's (`module-runtime/file_services.rs`)
 # and the credential policy is `p1-workspace`'s. The five stay dev-dependencies below: the
@@ -54,9 +54,7 @@ p1-redact = { path = "../p1-redact" }
 p1-hook-shadow = { path = "../p1-hook-shadow", optional = true }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-workers = { path = "../p1-workers", optional = true }
-p1-tool-delegate = { path = "../p1-tool-delegate", optional = true }
 p1-workflow = { path = "../p1-workflow", optional = true }
-p1-tool-workflow = { path = "../p1-tool-workflow", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # S1.4: catalog/modules registers the packages modules.lock selects. The runtime crate
@@ -86,7 +84,7 @@ tokio = { version = "1", default-features = false, features = [
 
 [dev-dependencies]
 p1-testkit = { path = "../p1-testkit" }
-# S7.10-R1 (ADR-0094): the native file tools, built by the host's own cases and by
+# S7.10-R1 (ADR-0095): the native file tools, built by the host's own cases and by
 # tests/call_description.rs and tests/describe_results.rs to compare a component's
 # declaration, description and effect against the native tool's. The components themselves are
 # the release's host entries, so nothing in the host's normal graph names these crates.

@@ -6,7 +6,7 @@
 //! runs too. This crate is the native adapter over both, and re-exports the
 //! capability services a `p1/read`, `p1/edit`, `p1/write`, `p1/patch` or `p1/search`
 //! component is linked with — the host's now (`p1_module_runtime::file_services`,
-//! S7.10-R1, ADR-0094), re-used here by this crate's own tests.
+//! S7.10-R1, ADR-0095), re-used here by this crate's own tests.
 
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ use p1_contracts::{
 use p1_read_guest::{
     DESCRIPTION, NAME, RawInput, ReadInput, WindowedRender, input_schema, sniff_len,
 };
-// S7.10-R1 (ADR-0094): the credential refusal policy and its two model-facing texts are
+// S7.10-R1 (ADR-0095): the credential refusal policy and its two model-facing texts are
 // `p1-workspace`'s; this native adapter and the capability service a module is linked with run
 // that one copy. `the_moved_texts_are_the_guests` below pins it against the guest-side copy the
 // `p1/read` component words its own failures with.

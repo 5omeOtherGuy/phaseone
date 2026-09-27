@@ -1658,7 +1658,7 @@ mod tests {
         );
     }
 
-    /// S7.10-R1 (ADR-0094): the five file tools are release host entries — `edit`, `write`,
+    /// S7.10-R1 (ADR-0095): the five file tools are release host entries — `edit`, `write`,
     /// `apply_patch` and `grep` beside `read` — so a key no lock names runs the release's
     /// component, and a release that does not carry one fails the build naming the key and the
     /// package, exactly as a missing `read` does. No compiled-in registration answers for any of

@@ -10,9 +10,9 @@
 //! under its catalog key (`worker_start`, …, `workflow_cancel`) through the module path
 //! (`register_host_entry`), and each instance is linked through the member hook
 //! ([`worker_member_services`], `workflow::member_services`) against the parent's
-//! [`WorkerScope`]. No native member is registered any more; `p1-tool-delegate` stays for
-//! `workers_started_in` (`children.rs`) and `p1-tool-workflow` for the `p1 workflow run`
-//! report (`run.rs`).
+//! [`WorkerScope`]. No native member is registered any more, and neither native tool crate is
+//! a dependency: a resume reads its workers with `p1_workers::journal` (`children.rs`) and
+//! `p1 workflow run` prints `p1_workflow::render_report` (`run.rs`).
 //!
 //! An environment that names a member package by its `modules.lock` key still gets only the
 //! members of that family it names; every other main agent gets the whole family appended.

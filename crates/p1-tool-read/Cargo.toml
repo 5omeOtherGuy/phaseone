@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
-# S7.10-R1 (ADR-0094): the `workspace` (`read`) and `snapshot` capability services this crate
+# S7.10-R1 (ADR-0095): the `workspace` (`read`) and `snapshot` capability services this crate
 # once implemented are the host's now (`p1_module_runtime::file_services`); this crate
 # re-exports them for its own tests and keeps the native adapter.
 p1-module-runtime = { path = "../p1-module-runtime" }

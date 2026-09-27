@@ -19,7 +19,7 @@ p1-redact = { path = "../p1-redact" }
 # crates' own traits, passed in by the host.
 p1-workers = { path = "../p1-workers" }
 p1-workflow = { path = "../p1-workflow" }
-# S7.10-R1 (ADR-0094): the file tools' capability services — the read side, the walk and the
+# S7.10-R1 (ADR-0095): the file tools' capability services — the read side, the walk and the
 # owned mutation — and the credential-file policy they apply before confinement are the
 # HOST's now (`src/file_services.rs`, `src/file_walk.rs`), so a component is linked without
 # the host depending on a tool crate.

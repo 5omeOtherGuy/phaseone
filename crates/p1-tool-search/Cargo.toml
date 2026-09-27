@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
-# S7.10-R1 (ADR-0094): the `workspace` capability service the `p1/search` component is linked
+# S7.10-R1 (ADR-0095): the `workspace` capability service the `p1/search` component is linked
 # with and the walk behind it are the host's now (`p1_module_runtime::file_services`,
 # `p1_module_runtime::file_walk`), as p1-tool-read's read side is for `p1/read`; this crate
 # re-exports the service and runs the same walk for its native tool.

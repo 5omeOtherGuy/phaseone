@@ -1,5 +1,5 @@
 ---
-adr: 94
+adr: 95
 title: File-tool capability services live in the runtime; no native file-tool fallback
 status: proposed
 date: 2026-09-27
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: ["docs/design/modules/capabilities.md", "docs/design/modules/workspace-mutation.md"]
 ---
-# ADR-0094: File-tool capability services live in the runtime; no native file-tool fallback
+# ADR-0095: File-tool capability services live in the runtime; no native file-tool fallback
 
 ## Context
 
