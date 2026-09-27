@@ -19,6 +19,8 @@
 #[path = "../../p1-provider-anthropic/tests/fixtures/mod.rs"]
 mod messages_fixtures;
 
+mod common;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,8 +72,9 @@ fn borrowing_route(route_id: &str) -> RouteFile {
     p1_host::routes::load_route(&path).expect("the route file")
 }
 
-/// The provider the host's own catalog factory builds for this route: the shipped
-/// route file, its binding and the REAL credential source over a scratch home.
+/// The provider the host's own catalog factory builds for this route: the provider component
+/// the route's `adapter` names (D083b), the shipped route file, its binding and the REAL
+/// credential source over a scratch home.
 ///
 /// The connector is injected like the transport (ADR-0047 §1). The shipped Codex
 /// route asks for WebSocket, so this test must hand it one that REFUSES every
@@ -92,6 +95,8 @@ fn provider(
     let locations = p1_auth::Locations::none().with_home(Some(home.to_path_buf()));
     let credentials = credential_source_at(&route, transport.clone(), &locations);
     route_provider(
+        common::provider_components(),
+        &environment_dirs(),
         &route,
         &binding,
         profile(profile_id),
@@ -100,6 +105,12 @@ fn provider(
         credentials,
     )
     .expect("the shipped route and profile compose")
+}
+
+/// The environment search directories activation reads the effective `modules.lock` and the
+/// selected profile's text from. The routes here live in temp files, so nothing else uses them.
+fn environment_dirs() -> Vec<PathBuf> {
+    vec![repo("environments")]
 }
 
 fn request() -> ProviderRequest {

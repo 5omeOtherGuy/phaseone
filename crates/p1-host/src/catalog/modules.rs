@@ -140,8 +140,11 @@ pub enum ModulesError {
         /// The capability.
         capability: String,
     },
-    /// Only tool packages have an adapter to register.
-    #[error("module `{module}` is a {kind} package; only tool packages can be registered")]
+    /// A class this host cannot register: only tool packages have a catalog adapter, and
+    /// policy packages are accepted as the session's host entries.
+    #[error(
+        "module `{module}` is a {kind} package; only tool and policy packages can be registered"
+    )]
     NotATool {
         /// The module name.
         module: String,
@@ -373,6 +376,14 @@ fn allocation(kind: &str) -> Option<Vec<String>> {
 
 /// Registers each verified tool package under its module name. A name a registered tool
 /// already has is refused: a package never silently replaces a compiled-in tool.
+///
+/// A USER-selected provider package takes no catalog key at all: the lock keeps it under the
+/// module name it gave it (`provider-anthropic`, `provider-openai`, `provider-openai-chat`,
+/// the manifest name without the reserved `p1/` namespace, `docs/design/modules/package.md`)
+/// and provider activation resolves that name in the same lock, so the module a user selected
+/// serves the route in place of the release's host entry of that adapter — until #355's debug
+/// discovery is on main, the release's own host entries stay the delivered path for the three
+/// shipped providers (ANSWERS D083b).
 pub fn register_modules(
     catalog: &mut Catalog,
     packages: Vec<ModulePackage>,
@@ -381,13 +392,22 @@ pub fn register_modules(
     let existing = catalog.tool_keys();
     for package in packages {
         let kind = package.loaded.kind();
-        if kind != ModuleKind::Tool {
-            // Provider and policy packages need S4's and S5's adapters, which the runtime
-            // does not have yet; a lock that selects one is refused, never ignored.
-            return Err(ModulesError::NotATool {
-                module: package.module,
-                kind: kind.name(),
-            });
+        match kind {
+            ModuleKind::Tool => {}
+            // Kept by module name in the lock the selection came from; never a tool here.
+            ModuleKind::Provider => continue,
+            // A policy package is the session's, not a catalog tool: the shipped policies are
+            // official-release host entries the host loads by name (`policy.rs`,
+            // `summary.rs`; D083b 2), so a lock selecting one registers no tool.
+            ModuleKind::ContextPolicy | ModuleKind::AuthorizationPolicy => continue,
+            // A class with no adapter here yet: a lock that selects one is refused, never
+            // ignored.
+            _ => {
+                return Err(ModulesError::NotATool {
+                    module: package.module,
+                    kind: kind.name(),
+                });
+            }
         }
         if existing.contains(&package.module) {
             return Err(ModulesError::Collision {
@@ -396,21 +416,35 @@ pub fn register_modules(
             });
         }
         let key = package.module.clone();
-        let services = services.clone();
-        let package = Arc::new(package);
-        catalog.tool(
-            &key,
-            Box::new(move |spec: &ToolSpec, tool_services: &ToolServices| {
-                instantiate(&package, spec, &services, tool_services)
-            }),
-        );
+        register_host_entry(catalog, &key, Arc::new(package.loaded), services.clone());
     }
     Ok(())
 }
 
-/// Builds one agent's instance of a module tool.
+/// Registers the verified module `loaded` under the catalog key `module`, built only when an
+/// environment assembles the key, as [`register_modules`] registers a locked package. The
+/// official-release host entries (the worker and workflow members, S6.11, D083b) come through
+/// here with their fixed `worker_*`/`workflow_*` keys; they are verified against the release
+/// manifest once per process and shared, so they arrive already loaded.
+pub fn register_host_entry(
+    catalog: &mut Catalog,
+    module: &str,
+    loaded: Arc<LoadedModule>,
+    services: ModuleServices,
+) {
+    let key = module.to_owned();
+    catalog.tool(
+        module,
+        Box::new(move |spec: &ToolSpec, tool_services: &ToolServices| {
+            instantiate(&key, &loaded, spec, &services, tool_services)
+        }),
+    );
+}
+
+/// Builds one agent's instance of the module tool `loaded`, registered as `module`.
 fn instantiate(
-    package: &ModulePackage,
+    module: &str,
+    loaded: &LoadedModule,
     spec: &ToolSpec,
     services: &ModuleServices,
     tool_services: &ToolServices,
@@ -420,8 +454,7 @@ fn instantiate(
     // not ask for.
     if spec.name.is_some() || spec.description.is_some() || spec.variant.is_some() {
         return Err(format!(
-            "module `{}` cannot take a name, description or variant override",
-            package.module
+            "module `{module}` cannot take a name, description or variant override"
         ));
     }
     // The turn's own counter is the assembling agent's, carried on `ToolServices`
@@ -430,8 +463,8 @@ fn instantiate(
     // so a module tool's masking is what the turn's mask notice reports — never a
     // throwaway counter that always reads zero.
     wasm_tool(
-        &package.loaded,
-        services(package.loaded.name(), tool_services),
+        loaded,
+        services(loaded.name(), tool_services),
         ExecutionLimits::default(),
         &tool_services.mask,
     )

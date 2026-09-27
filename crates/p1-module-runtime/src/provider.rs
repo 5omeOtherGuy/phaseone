@@ -74,6 +74,12 @@ use crate::loader::{EPOCH_TICK, Epochs, LoadedModule, ModuleKind, interface_impo
 /// so a manifest granting one is refused at construction until a provider needs it.
 pub const PROVIDER_LINKED: [&str; 3] = ["http", "websocket", "credential-control"];
 
+/// The capabilities a provider component cannot work without: the transport it lowers for
+/// (`http`) and the credential placement it names (`credential-control`). A component granted
+/// neither would configure a provider that can never send, so activation refuses it before
+/// the first turn rather than building it (ADR-0086, S4.9).
+pub const PROVIDER_REQUIRED: [&str; 2] = ["http", "credential-control"];
+
 /// The export instance of the decoder resource.
 const DECODING: &str = "p1:module/decoding@1.0.0";
 
@@ -126,6 +132,16 @@ pub enum ProviderError {
         name: String,
         /// The capability as written.
         capability: String,
+    },
+    /// The manifest does not grant a capability every provider needs.
+    #[error(
+        "module {name}: capability {capability} is not granted, and a provider cannot work without it"
+    )]
+    MissingCapability {
+        /// The module.
+        name: String,
+        /// The capability.
+        capability: &'static str,
     },
     /// The route's endpoint is not one the broker sends to.
     #[error("module {name}: {source}")]
@@ -209,6 +225,9 @@ impl WasmProvider {
                 name,
                 capability: capability.clone(),
             });
+        }
+        if let Some(capability) = missing_required(module.capabilities()) {
+            return Err(ProviderError::MissingCapability { name, capability });
         }
         let authority =
             RouteAuthority::new(&settings.endpoint, credentials.clone()).map_err(|source| {
@@ -346,6 +365,15 @@ fn split_endpoint(endpoint: &str) -> Option<(&str, String)> {
         return None;
     }
     Some((base, format!("/{last}")))
+}
+
+/// The capability of [`PROVIDER_REQUIRED`] that `granted` does not have, or `None`: a
+/// component that cannot reach the transport, or cannot name where a credential goes, would
+/// configure a provider that can never send a request.
+fn missing_required(granted: &[String]) -> Option<&'static str> {
+    PROVIDER_REQUIRED
+        .into_iter()
+        .find(|required| !granted.iter().any(|granted| granted == required))
 }
 
 /// What a `result<_, provider-error>` export refused with, or how the call failed.
@@ -1163,6 +1191,30 @@ mod tests {
             failure(&wasmtime::Error::new(DeadlineStop)),
             ModuleFailure::DeadlineExceeded
         );
+    }
+
+    #[test]
+    fn a_provider_component_without_a_required_capability_is_refused() {
+        let granted = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            missing_required(&granted(&["http", "credential-control"])),
+            None
+        );
+        assert_eq!(
+            missing_required(&granted(&["http", "websocket", "credential-control"])),
+            None
+        );
+        assert_eq!(missing_required(&granted(&["websocket"])), Some("http"));
+        assert_eq!(
+            missing_required(&granted(&["http", "websocket"])),
+            Some("credential-control")
+        );
+        assert_eq!(missing_required(&granted(&[])), Some("http"));
     }
 
     #[test]

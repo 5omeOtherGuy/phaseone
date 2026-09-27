@@ -83,12 +83,15 @@ fn shipped_environment_dirs() -> Vec<PathBuf> {
 
 /// What the host resolves for one environment before it assembles (spec §2 steps 1–3):
 /// the route file the environment names, the profile it selects, and the wire model the
-/// binding gives that profile on that route.
+/// binding gives that profile on that route. `dirs` are the environment search directories the
+/// resolution read from; activation reads the effective lock and the profile's text from beside
+/// them, so the provider a test composes is the one the host would compose for that environment.
 #[derive(Debug)]
 struct Resolved {
     route: RouteFile,
     profile: Arc<ModelProfile>,
     wire_model: String,
+    dirs: Vec<PathBuf>,
 }
 
 fn resolve(environment_dirs: &[PathBuf], name: &str) -> Result<Resolved, String> {
@@ -103,6 +106,7 @@ fn resolve(environment_dirs: &[PathBuf], name: &str) -> Result<Resolved, String>
         route,
         profile,
         wire_model: loaded.model,
+        dirs: environment_dirs.to_vec(),
     })
 }
 
@@ -113,16 +117,22 @@ fn shipped(environment: &str) -> Resolved {
 /// Build the provider the catalog factory would build: `catalog::route_provider` with
 /// the route's binding for the resolved profile. No constructor argument is hand-made.
 ///
-/// The connector is injected next to the transport (ADR-0047 §1) and REFUSES every
-/// upgrade: a route that asks for WebSocket falls back to SSE at once (the shipped
-/// Codex route does — ADR-0047 §1 was revised to make WebSocket its default), an SSE
-/// route ignores it, and no test opens a socket.
+/// The provider components are the ones `scripts/build-modules.sh --all` published, read once
+/// per test binary through a release manifest in a temp directory (`common::provider_components`):
+/// a route whose adapter names one activates that component (D083b), and only the shipped
+/// Codex route's WebSocket transport still builds a native adapter — S5.5's branch, which this
+/// suite's SSE tests reach by making the injected connector refuse every upgrade.
+///
+/// The connector is injected next to the transport (ADR-0047 §1); an SSE route ignores it, and
+/// no test opens a socket.
 fn provider_of(resolved: &Resolved, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = resolved
         .route
         .binding(&resolved.profile.id)
         .expect("the route serves this profile");
     route_provider(
+        common::provider_components(),
+        &resolved.dirs,
         &resolved.route,
         binding,
         resolved.profile.clone(),
@@ -1842,6 +1852,8 @@ fn a_websocket_route_assembles_with_the_real_connector_and_an_unchanged_origin()
         .expect("the route serves this profile");
     let connector = Arc::new(RefusingWsConnector::default());
     let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
         &resolved.route,
         binding,
         resolved.profile.clone(),
@@ -1878,6 +1890,8 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
         .binding(&resolved.profile.id)
         .expect("the route serves this profile");
     let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
         &resolved.route,
         binding,
         resolved.profile.clone(),
@@ -1899,6 +1913,8 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
     let transport =
         ScriptedTransport::new(vec![ScriptedResponse::ok_sse(chat_fixtures::TEXT_TURN)]);
     let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
         &resolved.route,
         binding,
         resolved.profile.clone(),
