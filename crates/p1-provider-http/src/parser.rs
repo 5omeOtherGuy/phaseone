@@ -26,4 +26,20 @@ pub trait ResponseParser: Send {
         headers: &[(String, String)],
         body: &[u8],
     ) -> ProviderError;
+
+    /// The id of the response this parser saw, if the wire named one (WIT
+    /// `decoding.decoder.response-id`): the WebSocket broker hands a cleanly completed
+    /// response's id back to its session, where a continuation frame refers to it. A
+    /// parser that never feeds a WebSocket session keeps the default.
+    fn response_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Whether the component instance that decoded this response was dropped while it
+    /// was asked for the response id. The connection the response used belongs to that
+    /// instance and must not outlive it (ADR-0078 §3), so the broker drops it rather than
+    /// returning it to the session. A native parser has no instance to lose.
+    fn instance_lost(&self) -> bool {
+        false
+    }
 }

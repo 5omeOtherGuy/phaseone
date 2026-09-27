@@ -1,5 +1,5 @@
 ---
-adr: 93
+adr: 91
 title: Process service and finish outcome rehome to the host runtime
 status: proposed
 date: 2026-09-27
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [issue #391 (S7.10-R3), ~/.agents/xo/reports/cutover-fallbacks/PLAN.md rows "p1-tool-shell · S3" and "p1-tool-finish · S3", ADR-0071, ADR-0083, PR #382 (S3.8)]
 ---
-# ADR-0093: Process service and finish outcome rehome to the host runtime
+# ADR-0091: Process service and finish outcome rehome to the host runtime
 
 ## Context
 
