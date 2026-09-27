@@ -25,7 +25,11 @@ use p1_assembly::{
     Catalog, LockedModule, LockedProtocol, ModulesLock, ModulesLockError, ToolServices, ToolSpec,
     load_modules_lock,
 };
-use p1_contracts::Tool;
+use p1_contracts::tool::ResultDescription;
+use p1_contracts::{
+    BoxFuture, CallDescription, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
+    ToolOutcome, ToolResultItem,
+};
 use p1_module_runtime::{
     ComponentEntry, ExecutionLimits, LoadError, LoadedModule, Loader, ManifestError, ModuleKind,
     ReleaseManifest, Services, wasm_tool,
@@ -335,27 +339,53 @@ pub fn register_modules(
             });
         }
         let key = package.module.clone();
-        register_host_entry(catalog, &key, Arc::new(package.loaded), services.clone());
+        register_locked_entry(catalog, &key, Arc::new(package.loaded), services.clone());
     }
     Ok(())
 }
 
 /// Registers the verified module `loaded` under the catalog key `module`, built only when an
-/// environment assembles the key, as [`register_modules`] registers a locked package. The
-/// official-release host entries (the worker and workflow members, S6.11, D083b) come through
-/// here with their fixed `worker_*`/`workflow_*` keys; they are verified against the release
-/// manifest once per process and shared, so they arrive already loaded.
+/// environment assembles the key, as [`register_modules`] registers a locked package. This is
+/// the OFFICIAL-RELEASE HOST-ENTRY path (the worker and workflow members, S6.11, D083b): the
+/// entries arrive with their fixed `worker_*`/`workflow_*` keys, verified against the release
+/// manifest once per process and shared, so they arrive already loaded. An environment may give
+/// a host entry a face (`name`, `description`, `variant`), exactly as it could the native member
+/// the entry replaced.
 pub fn register_host_entry(
     catalog: &mut Catalog,
     module: &str,
     loaded: Arc<LoadedModule>,
     services: ModuleServices,
 ) {
+    register_entry(catalog, module, loaded, services, true);
+}
+
+/// Registers a package an installation selected through `modules.lock` ([`register_modules`]).
+/// A locked package takes no face override: an extra module must never present a name,
+/// description or variant other than its own, whatever `ToolSpec` an environment carries.
+pub fn register_locked_entry(
+    catalog: &mut Catalog,
+    module: &str,
+    loaded: Arc<LoadedModule>,
+    services: ModuleServices,
+) {
+    register_entry(catalog, module, loaded, services, false);
+}
+
+/// Registers `loaded` under `module` for an environment to build, accepting a face override
+/// only when `face` (a host entry) rather than refusing it (a locked package).
+fn register_entry(
+    catalog: &mut Catalog,
+    module: &str,
+    loaded: Arc<LoadedModule>,
+    services: ModuleServices,
+    face: bool,
+) {
     let key = module.to_owned();
     catalog.tool(
         module,
         Box::new(move |spec: &ToolSpec, tool_services: &ToolServices| {
-            instantiate(&key, &loaded, spec, &services, tool_services)
+            instantiate(&key, &loaded, spec, &services, tool_services, face)
         }),
     );
 }
@@ -367,11 +397,13 @@ fn instantiate(
     spec: &ToolSpec,
     services: &ModuleServices,
     tool_services: &ToolServices,
+    face: bool,
 ) -> Result<Arc<dyn Tool>, String> {
-    // `WasmTool` has no `ToolFace`; presenting a module under another face would need one,
-    // and silently dropping the override would show the model a tool the environment did
-    // not ask for.
-    if spec.name.is_some() || spec.description.is_some() || spec.variant.is_some() {
+    let overridden = spec.name.is_some() || spec.description.is_some() || spec.variant.is_some();
+    // `WasmTool` has no `ToolFace`; presenting a locked package under another face would need
+    // one, and silently dropping the override would show the model a tool the environment did
+    // not ask for. An official host entry is built by [`FacedEntry`] instead, below.
+    if overridden && !face {
         return Err(format!(
             "module `{module}` cannot take a name, description or variant override"
         ));
@@ -381,13 +413,80 @@ fn instantiate(
     // host's `assemble_with_cache_key` wraps the SAME counter around the assembled tools,
     // so a module tool's masking is what the turn's mask notice reports — never a
     // throwaway counter that always reads zero.
-    wasm_tool(
+    let tool = wasm_tool(
         loaded,
         services(loaded.name(), tool_services),
         ExecutionLimits::default(),
         &tool_services.mask,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if !overridden {
+        return Ok(tool);
+    }
+    let name = spec
+        .name
+        .clone()
+        .unwrap_or_else(|| tool.declaration().name.clone());
+    let description = spec
+        .description
+        .clone()
+        .unwrap_or_else(|| tool.declaration().description.clone());
+    let variant = spec
+        .variant
+        .clone()
+        .unwrap_or_else(|| tool.identity().variant.clone());
+    Ok(Arc::new(FacedEntry {
+        declaration: ToolDeclaration {
+            name,
+            description,
+            kind: tool.declaration().kind.clone(),
+        },
+        identity: ToolIdentity {
+            implementation: tool.identity().implementation.clone(),
+            variant,
+        },
+        inner: tool,
+    }))
+}
+
+/// A host entry under the face an environment gave it: the component, its schema and its
+/// semantics are unchanged, only the model-facing `name`, `description` and the identity
+/// `variant` differ — what `apply_face!` gives a native tool. The native member registrations
+/// this path replaced accepted those overrides, so a host entry must too (S6.11 review).
+struct FacedEntry {
+    inner: Arc<dyn Tool>,
+    declaration: ToolDeclaration,
+    identity: ToolIdentity,
+}
+
+impl Tool for FacedEntry {
+    fn declaration(&self) -> &ToolDeclaration {
+        &self.declaration
+    }
+
+    fn identity(&self) -> &ToolIdentity {
+        &self.identity
+    }
+
+    fn effect(&self, call: &ToolCall) -> Effect {
+        self.inner.effect(call)
+    }
+
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        self.inner.describe(call)
+    }
+
+    fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        self.inner.describe_result(call, result)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: ToolContext,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        self.inner.execute(call, context)
+    }
 }
 
 /// The catalog build path's step: resolve the lock files next to the environment
@@ -430,8 +529,17 @@ fn register_locked_modules_from(
         });
     }
     let packages = load_locked_modules(&lock, &release).map_err(|error| error.to_string())?;
-    register_modules(catalog, packages, locked_module_services(deps))
-        .map_err(|error| error.to_string())
+    // A member a lock selects is a member of its family all the same: it takes the host's
+    // lists and grant check, as a host entry does, not only the family's scopes
+    // (`catalog/delegation.rs`, D084).
+    #[cfg(feature = "delegation")]
+    let services = super::delegation::with_member_lists(
+        locked_module_services(deps),
+        super::delegation::worker_lists(catalog, deps)?,
+    );
+    #[cfg(not(feature = "delegation"))]
+    let services = locked_module_services(deps);
+    register_modules(catalog, packages, services).map_err(|error| error.to_string())
 }
 
 /// The hook every locked package is linked with. The base is the agent's own: the read

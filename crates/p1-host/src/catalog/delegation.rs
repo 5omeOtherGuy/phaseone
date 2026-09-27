@@ -346,18 +346,7 @@ pub(crate) fn register_delegation_tools(
     // a member: every tool module this catalog registers, minus `finish` (the
     // factory adds it to every worker), the `worker_*` modules (a worker never
     // delegates) and the `workflow_*` modules (a worker never orchestrates). The environments a worker may run are the host's environment dirs.
-    let grantable: Vec<String> = catalog
-        .tool_keys()
-        .into_iter()
-        .filter(|key| {
-            key != "finish" && !key.starts_with("worker_") && !key.starts_with("workflow_")
-        })
-        .collect();
-    let environments = crate::models::environment_names(&deps.environment_dirs)?;
-    let lists = WorkerLists {
-        grantable,
-        environments,
-    };
+    let lists = worker_lists(catalog, deps)?;
 
     let entries = official_member_entries()?;
     let hook = member_hook(deps, service, lists);
@@ -374,6 +363,40 @@ pub(crate) fn register_delegation_tools(
         }
     }
     Ok(())
+}
+
+/// The host's worker lists (D084): the tool modules a worker may be granted and the
+/// environment names a worker may run on, read off the assembled catalog. The official host
+/// entries and a member a lock selects are both linked with them, so a locked `worker-start`
+/// declares the same enums a host entry does.
+#[cfg(feature = "delegation")]
+pub(crate) fn worker_lists(catalog: &Catalog, deps: &HostDeps) -> Result<WorkerLists, String> {
+    let grantable: Vec<String> = catalog
+        .tool_keys()
+        .into_iter()
+        .filter(|key| {
+            key != "finish" && !key.starts_with("worker_") && !key.starts_with("workflow_")
+        })
+        .collect();
+    let environments = crate::models::environment_names(&deps.environment_dirs)?;
+    Ok(WorkerLists {
+        grantable,
+        environments,
+    })
+}
+
+/// A member-services hook with the host's lists and grant check added: every instance of a
+/// worker member — a host entry or a package a lock selects — is linked with `lists`, and a
+/// module outside the grantable list is refused before the scope is asked.
+#[cfg(feature = "delegation")]
+pub(crate) fn with_member_lists(family: ModuleServices, lists: WorkerLists) -> ModuleServices {
+    Arc::new(move |module: &str, services: &ToolServices| {
+        let mut linked = family(module, services);
+        if WORKER_MODULES.contains(&module) {
+            linked.workers = linked.workers.map(|workers| checked(workers, &lists));
+        }
+        linked
+    })
 }
 
 // ------------------------------------------------------------------ host entries
@@ -482,13 +505,7 @@ fn member_hook(
     } else {
         inspection_services(MemberScopes::new(service))
     };
-    Arc::new(move |module: &str, services: &ToolServices| {
-        let mut linked = family(module, services);
-        if WORKER_MODULES.contains(&module) {
-            linked.workers = linked.workers.map(|workers| checked(workers, &lists));
-        }
-        linked
-    })
+    with_member_lists(family, lists)
 }
 
 /// The member hook of a catalog no run composed: the worker members over `scopes`, keyed

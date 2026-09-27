@@ -148,7 +148,7 @@ pub fn build_catalog_with_workers(
     );
     register_delegation_tools(&mut catalog, deps, service)?;
     #[cfg(feature = "workflows")]
-    register_workflow_tools(&mut catalog, deps.workflow_service.clone());
+    register_workflow_tools(&mut catalog, deps.workflow_service.clone())?;
     // Module packages last among the built-ins, so a lock entry that collides with a
     // compiled-in tool is refused rather than replacing it.
     modules::register_locked_modules(&mut catalog, deps)?;
