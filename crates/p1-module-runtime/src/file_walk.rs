@@ -183,10 +183,10 @@ fn search_content(
             return Err(FsError::Cancelled);
         }
         let mut sink = MatchSink::with_room(room);
-        let Ok(mut file) = workspace.open_file(display) else {
+        let Ok(file) = workspace.open_file(display) else {
             continue;
         };
-        if searcher.search_file(matcher, &mut file, &mut sink).is_err() {
+        if searcher.search_file(matcher, &file, &mut sink).is_err() {
             continue;
         }
         if sink.binary || !sink.seen {
