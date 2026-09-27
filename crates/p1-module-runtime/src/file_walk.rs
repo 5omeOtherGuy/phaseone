@@ -93,7 +93,7 @@ pub fn read_window(
     let checked = workspace.check_path(path).map_err(workspace_error)?;
     let io = |error: io::Error| FsError::Io(error.to_string());
     let mut file = workspace
-        .open_file(checked.display())
+        .open_file_at(checked.path())
         .map_err(workspace_error)?;
     io::copy(&mut (&mut file).take(offset), &mut io::sink()).map_err(io)?;
     let mut window = Vec::new();
@@ -178,12 +178,12 @@ fn search_content(
         omitted_files: 0,
     };
     let mut room = query.max_lines as usize;
-    for (display, _path) in files {
+    for (display, path) in files {
         if cancel.is_cancelled() {
             return Err(FsError::Cancelled);
         }
         let mut sink = MatchSink::with_room(room);
-        let Ok(file) = workspace.open_file(display) else {
+        let Ok(file) = workspace.open_file_at(path) else {
             continue;
         };
         if searcher.search_file(matcher, &file, &mut sink).is_err() {
@@ -289,10 +289,40 @@ mod tests {
     use grep::regex::RegexMatcher;
     use p1_contracts::CancellationToken;
     use p1_workspace::Workspace;
+    use std::ffi::OsStr;
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
     use crate::capabilities::SearchQuery;
+
+    #[test]
+    fn search_finds_file_with_invalid_utf8_name() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let name = OsStr::from_bytes(b"invalid-\xff.txt");
+        fs::write(
+            workspace_dir.path().join(name),
+            "needle in non-UTF-8 name\n",
+        )
+        .unwrap();
+        let workspace = Workspace::new(workspace_dir.path()).unwrap();
+        let cancel = CancellationToken::new();
+        let files = collect_files(&workspace, workspace.root(), None, &cancel).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 10,
+        };
+        let matcher = RegexMatcher::new("needle").unwrap();
+
+        let result = search_content(&workspace, &matcher, &query, &files, &cancel).unwrap();
+
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].lines[0].text, "needle in non-UTF-8 name");
+    }
 
     #[test]
     fn search_skips_file_swapped_for_outside_symlink_after_walk() {

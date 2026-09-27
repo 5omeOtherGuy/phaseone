@@ -145,22 +145,33 @@ impl Workspace {
         Ok(CheckedPath { path, display })
     }
 
-    /// Open the regular file named by `requested` from the workspace root without
-    /// following links, then verify the opened handle's type. NONBLOCK ensures a
-    /// swapped FIFO cannot park a host thread between path validation and open.
+    /// Resolve `requested`, then open its regular file without following links.
     pub fn open_file(&self, requested: &str) -> Result<File, WorkspaceError> {
         let resolved = self.resolve(requested)?;
-        let path = std::fs::canonicalize(&resolved)
-            .map_err(|source| missing_or_io(requested, &resolved, source))?;
+        self.open_file_at(&resolved)
+    }
+
+    /// Open a resolved path beneath the workspace root without following links,
+    /// then verify the opened handle's type. NONBLOCK ensures a swapped FIFO
+    /// cannot park a host thread between path validation and open.
+    pub fn open_file_at(&self, requested: &Path) -> Result<File, WorkspaceError> {
+        self.open_file_at_with_path(requested)
+            .map(|(file, _path)| file)
+    }
+
+    fn open_file_at_with_path(&self, requested: &Path) -> Result<(File, PathBuf), WorkspaceError> {
+        let requested_display = requested.to_string_lossy();
+        let path = std::fs::canonicalize(requested)
+            .map_err(|source| missing_or_io(&requested_display, requested, source))?;
         if !path.starts_with(&self.root) {
             return Err(WorkspaceError::OutsideWorkspace {
-                requested: requested.to_string(),
+                requested: requested_display.into_owned(),
             });
         }
         let relative =
             path.strip_prefix(&self.root)
                 .map_err(|_| WorkspaceError::OutsideWorkspace {
-                    requested: requested.to_string(),
+                    requested: requested_display.to_string(),
                 })?;
         let mut directory = rustix::fs::openat(
             CWD,
@@ -204,7 +215,7 @@ impl Workspace {
                 {
                     return Err(WorkspaceError::NotADirectory(path));
                 }
-                return Ok(file);
+                return Ok((file, path));
             }
         }
         Err(WorkspaceError::NotADirectory(path))
@@ -283,20 +294,14 @@ impl Workspace {
         requested: &str,
         observed: &ObservedFiles,
     ) -> Result<Snapshot, WorkspaceError> {
-        let path = self.resolve(requested)?;
+        let resolved = self.resolve(requested)?;
+        let (mut file, path) =
+            self.open_file_at_with_path(&resolved)
+                .map_err(|error| match error {
+                    WorkspaceError::Io { path, source } => missing_or_io(requested, &path, source),
+                    other => other,
+                })?;
         let display = self.display(&path);
-        // Mirror `list`: decide the kind from metadata instead of leaving `read` of a
-        // directory to surface as an untyped `Io` ("Is a directory"). The host import
-        // needs the typed variant to map a wrong kind without parsing an io message.
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| missing_or_io(requested, &path, error))?;
-        if metadata.is_dir() {
-            return Err(WorkspaceError::NotADirectory(path));
-        }
-        let mut file = self.open_file(requested).map_err(|error| match error {
-            WorkspaceError::Io { path, source } => missing_or_io(requested, &path, source),
-            other => other,
-        })?;
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut bytes)
             .map_err(|error| missing_or_io(requested, &path, error))?;
