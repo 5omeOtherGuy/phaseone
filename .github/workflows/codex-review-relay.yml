@@ -1,0 +1,29 @@
+name: codex-review-relay
+
+# Codex submits a PR review only when it has findings. Routine GitHub triggers cannot subscribe to
+# pull_request_review, so this job turns each such review into a `pull_request.labeled` event:
+# it removes and re-adds `codex-reviewed`, which starts the Opus fix routine (ADR-0090). The
+# routine removes only that label when it is done.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  relay:
+    if: contains(github.event.review.user.login, 'codex') && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Re-add the codex-reviewed label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh api -X DELETE "repos/$REPO/issues/$PR/labels/codex-reviewed" >/dev/null 2>&1 || true
+          gh api -X POST "repos/$REPO/issues/$PR/labels" -f 'labels[]=codex-reviewed' --jq '.[].name'
