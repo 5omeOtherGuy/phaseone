@@ -1115,7 +1115,8 @@ async fn workflow_run(
             workflows.observer.settled(&id).await;
             match status {
                 Ok(p1_workflow::RunStatus::Ended(report)) => {
-                    write_stdout(deps, &(workflow_report(&workflows, &id).await + "\n"));
+                    // The report exactly as `workflow_result` renders it for a model.
+                    write_stdout(deps, &(p1_workflow::render_report(&report) + "\n"));
                     match report.outcome {
                         p1_workflow::RunOutcome::Completed => EXIT_OK,
                         p1_workflow::RunOutcome::CompletedWithIssues => EXIT_USAGE,
@@ -1162,25 +1163,6 @@ fn workflow_args(workflow: &cli::WorkflowRunOptions) -> Result<serde_json::Value
         args.insert(key.clone(), value);
     }
     Ok(serde_json::Value::Object(args))
-}
-
-/// The report exactly as the `workflow_result` tool renders it for a model.
-#[cfg(feature = "workflows")]
-async fn workflow_report(
-    workflows: &crate::workflow::Workflows,
-    id: &p1_workflow::RunId,
-) -> String {
-    use p1_contracts::{Tool, ToolCall, ToolContext, ToolInput};
-    let tool = p1_tool_workflow::WorkflowResultTool::new(workflows.service.clone());
-    let call = ToolCall {
-        call_id: "workflow-run".to_string(),
-        name: "workflow_result".to_string(),
-        input: ToolInput::Json(serde_json::json!({ "id": id.0 }).to_string()),
-    };
-    let context = ToolContext {
-        cancel: CancellationToken::new(),
-    };
-    tool.execute(&call, context).await.content
 }
 
 fn open_session(deps: &HostDeps, options: &Options) -> Result<OpenedSession, String> {

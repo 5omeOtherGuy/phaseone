@@ -48,6 +48,9 @@ p1-workers = { path = "../p1-workers" }
 p1-context = { path = "../p1-context" }
 # workflow_boundary.rs: the workflow substrate driven through its decision seam (S6.3).
 p1-workflow = { path = "../p1-workflow" }
+# delegation_activation.rs (S7.10-R6): the native `workflow_result`, which p1-host no longer
+# depends on, is checked for one report text with the member and `p1_workflow::render_report`.
+p1-tool-workflow = { path = "../p1-tool-workflow" }
 # workflow_scripts.rs (S6.9) compiles p1-workflow's own test support by path, which names
 # serde_json directly.
 serde_json = "1"
