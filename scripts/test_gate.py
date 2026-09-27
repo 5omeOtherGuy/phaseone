@@ -72,19 +72,19 @@ DU_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + 'printf \'1G\\t%s\\n\' "$2"\n
 DF_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + "printf 'Avail\\n 9G\\n'\nexit 0\n"
 
 # Like the real boundary check, a finding when a package imports an interface its manifest's
-# capability allocation does not name. Its `--shipping` mode prints the fallback set
-# STUB_SHIPPING_CRATES names (the four the gate allows by default) and, on request, a
-# `native twin:` or `FINDING:` line, then exits STUB_SHIPPING_STATUS (1, as the real audit does
-# while a fallback remains).
+# capability allocation does not name. Its `--shipping` mode prints the fallback crates
+# STUB_SHIPPING_CRATES names (none by default: the cutover allows no native fallback) and, on
+# request, a `native twin:` or `FINDING:` line, then exits STUB_SHIPPING_STATUS (0, as the real
+# audit does only for a graph without a fallback).
 BOUNDARY_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
     """\
     if [ "${1:-}" = --shipping ]; then
-      for crate in ${STUB_SHIPPING_CRATES-p1-tool-edit p1-tool-write p1-tool-search p1-tool-patch}; do
-        echo "check-module-boundaries: shipping: native fallback: $crate (extension) via p1-host > $crate; no module package ships it yet"
+      for crate in ${STUB_SHIPPING_CRATES:-}; do
+        echo "check-module-boundaries: shipping: native fallback: $crate (extension) via p1-host > $crate; implements p1-module-demo (not built)"
       done
-      [ -z "${STUB_SHIPPING_TWIN:-}" ] || echo "check-module-boundaries: shipping: native twin: p1-host (extension: the native authorization policies p1/policy/ask and p1/policy/full-access) via p1-host; implements p1-module-policy-ask (not built), p1-module-policy-full-access (not built)"
+      [ -z "${STUB_SHIPPING_TWIN:-}" ] || echo "check-module-boundaries: shipping: native twin: p1-host (extension: a native implementation of a tool that becomes a module) via p1-host; implements p1-module-demo (not built)"
       [ -z "${STUB_SHIPPING_FINDING:-}" ] || echo "check-module-boundaries: shipping: FINDING: p1-unknown (depth 1) is not in the frozen classification table"
-      exit "${STUB_SHIPPING_STATUS:-1}"
+      exit "${STUB_SHIPPING_STATUS:-0}"
     fi
     dir=modules/target/p1-modules
     [ "${1:-}" = --output-dir ] && dir="$2"
@@ -730,9 +730,12 @@ class GateTests(unittest.TestCase):
 
     # --- S7.10.1: the shipping audit step -----------------------------------------
 
-    # The four crates D083's sealed A/B arm keeps native, and the one line a green step prints.
-    ALLOWED_FALLBACKS = ("p1-tool-edit", "p1-tool-write", "p1-tool-search", "p1-tool-patch")
-    SHIPPING_GREEN = "shipping audit: 4 allowed native fallbacks (D083): edit, write, grep, apply_patch"
+    # The one line a green step prints: the owner order of 2026-09-27 ("zero native fallbacks")
+    # ends D083's sealed A/B arm, so the allowed set is empty and the audit must be clean.
+    SHIPPING_GREEN = (
+        "shipping audit: clean: no native fallback, no native twin, no finding "
+        "(owner order 2026-09-27: zero native fallbacks)"
+    )
 
     def shipping_red_line(self, result: subprocess.CompletedProcess[str], needle: str) -> str:
         """The one red line of the shipping audit that carries `needle`."""
@@ -747,50 +750,45 @@ class GateTests(unittest.TestCase):
         steps = h.steps()
         self.assertEqual(steps[steps.index("module boundary") + 1], "shipping audit")
 
-    def test_exactly_the_four_d083_fallbacks_are_green(self) -> None:
-        # The real audit exits 1 while a fallback remains, so the step judges the fallback set.
+    def test_a_clean_shipping_audit_is_green(self) -> None:
         h = self.harness()
         result = h.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(self.SHIPPING_GREEN, result.stdout.splitlines())
 
-    def test_another_native_fallback_is_red_and_named(self) -> None:
+    def test_any_single_native_fallback_is_red_and_named(self) -> None:
+        # The allowed set is empty: one fallback alone is red, whether D083's arm kept it
+        # (edit, write, grep, apply_patch) or its owning slice removes it (the rest).
+        for crate in (
+            "p1-tool-edit", "p1-tool-write", "p1-tool-search", "p1-tool-patch", "p1-tool-read",
+            "p1-tool-shell", "p1-tool-finish", "p1-tool-delegate", "p1-tool-workflow", "p1-context",
+            "p1-provider-openai",
+        ):
+            with self.subTest(crate=crate):
+                h = self.harness()
+                result = h.run(STUB_SHIPPING_CRATES=crate, STUB_SHIPPING_STATUS="1")
+                self.assert_red(result)
+                self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
+                self.assertEqual(h.steps()[-1], "shipping audit")
+                self.assertIn("native fallback:", self.shipping_red_line(result, crate))
+
+    def test_every_native_fallback_line_is_reported(self) -> None:
         h = self.harness()
-        result = h.run(STUB_SHIPPING_CRATES=" ".join(self.ALLOWED_FALLBACKS) + " p1-tool-shell")
+        result = h.run(STUB_SHIPPING_CRATES="p1-tool-edit p1-tool-shell", STUB_SHIPPING_STATUS="1")
         self.assert_red(result)
         self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
-        self.assertEqual(h.steps()[-1], "shipping audit")
-        line = self.shipping_red_line(result, "outside the D083 four")
-        self.assertIn("p1-tool-shell", line)
-        for allowed in self.ALLOWED_FALLBACKS:
-            self.assertNotIn(allowed, line)
+        self.assertIn("native fallback: p1-tool-edit", result.stderr)
+        self.assertIn("native fallback: p1-tool-shell", result.stderr)
 
-    def test_a_missing_allowed_native_fallback_is_red_and_named(self) -> None:
+    def test_a_clean_audit_that_exits_one_is_red(self) -> None:
+        # Exit 0 is part of the rule: the audit's own status decides too, not only its lines.
         h = self.harness()
-        result = h.run(STUB_SHIPPING_CRATES="p1-tool-edit p1-tool-write p1-tool-search")
+        result = h.run(STUB_SHIPPING_CRATES="", STUB_SHIPPING_STATUS="1")
         self.assert_red(result)
         self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
-        line = self.shipping_red_line(result, "missing from the graph")
-        self.assertIn("p1-tool-patch", line)
-        self.assertNotIn("p1-tool-edit", line)
+        self.assertIn("exited 1", result.stderr)
 
-    def test_a_clean_shipping_audit_is_red_because_the_four_are_missing(self) -> None:
-        # The allowed set must match exactly: a graph that reaches none of the four is red too.
-        h = self.harness()
-        result = h.run(STUB_SHIPPING_CRATES="", STUB_SHIPPING_STATUS="0")
-        self.assert_red(result)
-        self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
-        line = self.shipping_red_line(result, "missing from the graph")
-        for allowed in self.ALLOWED_FALLBACKS:
-            self.assertIn(allowed, line)
-
-    def test_exit_one_with_no_native_fallback_line_is_red(self) -> None:
-        h = self.harness()
-        result = h.run(STUB_SHIPPING_CRATES="")
-        self.assert_red(result)
-        self.assertIn("no native fallback line", result.stderr)
-
-    def test_a_native_twin_line_is_red(self) -> None:
+    def test_a_native_twin_line_is_red_even_when_the_audit_exits_0(self) -> None:
         h = self.harness()
         result = h.run(STUB_SHIPPING_TWIN="yes")
         self.assert_red(result)
@@ -798,7 +796,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(h.steps()[-1], "shipping audit")
         self.assertIn("native twin: p1-host", result.stderr)
 
-    def test_a_finding_line_is_red(self) -> None:
+    def test_a_finding_line_is_red_even_when_the_audit_exits_0(self) -> None:
         h = self.harness()
         result = h.run(STUB_SHIPPING_FINDING="yes")
         self.assert_red(result)
