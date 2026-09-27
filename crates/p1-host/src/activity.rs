@@ -650,9 +650,12 @@ fn parse_finish_call(raw: &str) -> Option<FinishReport> {
 }
 
 /// One agent's completion state: the activity it runs against and the cell its
-/// `finish` tool writes.
+/// `finish` tool writes. `id` names the AGENT this state belongs to: one hub serves the
+/// parent and every worker, so the grant state and the call window are keyed on it and a
+/// (re-)grant invalidates only the SAME agent's earlier grants (ADR-0083 rule 6).
 #[derive(Clone)]
 pub struct Completion {
+    pub id: u64,
     pub log: Arc<ActivityLog>,
     pub outcome: FinishOutcome,
 }
@@ -670,6 +673,13 @@ pub struct Completion {
 #[derive(Default)]
 pub struct CompletionHub {
     last: Mutex<Option<Completion>>,
+    /// The `p1/finish` component the finish entry assembled, so a worker's assembly
+    /// boundary can rebuild the tool under the policy the hub chose (rule 7) without
+    /// touching the catalog.
+    finish_module: Mutex<Option<Arc<LoadedModule>>>,
+    /// The next agent id; ids are never reused, so a retired agent's grant state cannot
+    /// be reached by a later one.
+    next_agent: AtomicU64,
     shared: Arc<HubShared>,
 }
 
@@ -678,9 +688,10 @@ impl CompletionHub {
         Self::default()
     }
 
-    /// Build the completion for the assembly that is starting.
+    /// Build the completion for the assembly that is starting, under a fresh agent id.
     pub fn issue(&self) -> Completion {
         let completion = Completion {
+            id: self.next_agent.fetch_add(1, Ordering::Relaxed) + 1,
             log: Arc::new(ActivityLog::default()),
             outcome: FinishOutcome::default(),
         };
@@ -694,14 +705,21 @@ impl CompletionHub {
         self.last.lock().unwrap().take()
     }
 
+    /// The `p1/finish` component the finish entry assembled, registered when it builds
+    /// it. [`CompletionHub::finish_for`] needs it to rebuild the tool at a worker's
+    /// assembly boundary.
+    pub fn register_finish(&self, module: &Arc<LoadedModule>) {
+        *self.finish_module.lock().unwrap() = Some(module.clone());
+    }
+
     /// An assembly boundary for the component path (ADR-0083 rules 6 and 7): the first
     /// assembly of an agent or a re-grant. `completion` is the agent's record and cell,
     /// kept across its re-grants; `tools` are the other tools assembled with the
     /// component, whose loader-built or native identities choose the policy; `contract`
     /// is the output contract the host set for this agent.
     ///
-    /// Every earlier grant becomes stale: its instances and the calls that started under
-    /// it can no longer commit.
+    /// Every earlier grant of the SAME agent becomes stale: its instances and the calls
+    /// that started under it can no longer commit. Another agent's grants are untouched.
     pub fn grant(
         &self,
         completion: Completion,
@@ -710,18 +728,51 @@ impl CompletionHub {
         contract: Option<OutputContract>,
     ) -> CompletionGrant {
         let policy = completion_policy(tools, role);
-        let mut state = self.shared.state.lock().unwrap();
-        state.generation += 1;
-        state.completion = Some(completion.clone());
-        state.policy = policy;
-        state.contract = contract.clone();
+        let agent = self.shared.agent(completion.id);
+        let generation = {
+            let mut state = agent.state.lock().unwrap();
+            state.generation += 1;
+            state.completion = Some(completion.clone());
+            state.policy = policy;
+            state.contract = contract.clone();
+            state.generation
+        };
         CompletionGrant {
-            shared: self.shared.clone(),
-            generation: state.generation,
+            agent,
+            generation,
             completion,
             policy,
             contract,
         }
+    }
+
+    /// A worker's assembly boundary for the `p1/finish` component (ADR-0083 rules 6 and
+    /// 7): re-choose the policy from `tools`, re-grant the agent's own `completion`, and
+    /// build the component the grant is linked with, presenting `current`'s model-facing
+    /// name and variant and the policy's and contract's declaration. `current` is the
+    /// tool the catalog assembled for this environment, so the face the environment chose
+    /// survives. Errors when no `p1/finish` component was assembled.
+    pub fn finish_for(
+        &self,
+        current: &Arc<dyn Tool>,
+        completion: &Completion,
+        tools: &[Arc<dyn Tool>],
+        role: AgentRole,
+        contract: Option<OutputContract>,
+        mask: &Arc<MaskCounter>,
+    ) -> Result<Arc<dyn Tool>, String> {
+        let module = self
+            .finish_module
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no finish component was assembled for this agent".to_string())?;
+        let grant = self.grant(completion.clone(), tools, role, contract);
+        let face = (
+            current.declaration().name.as_str(),
+            current.identity().variant.as_str(),
+        );
+        finish_component(&module, &grant, Some(face), mask).map_err(|error| error.to_string())
     }
 }
 
@@ -756,17 +807,33 @@ pub fn completion_policy(tools: &[Arc<dyn Tool>], role: AgentRole) -> Completion
     }
 }
 
-/// The state every grant of one hub shares.
+/// The grant state of ONE agent. One hub serves the parent and every concurrent worker,
+/// so each agent gets its own generation, record, policy, contract and call window: a
+/// worker's (re-)grant must never invalidate another live worker's (ADR-0083 rule 6).
 #[derive(Default)]
-struct HubShared {
-    state: Mutex<HubState>,
-    /// One `execute` of a component granted `completion` at a time: the frozen `accept`
-    /// carries no call identity, so a candidate belongs to the one open window.
+struct AgentShared {
+    state: Mutex<AgentState>,
+    /// One `execute` of THIS agent's component granted `completion` at a time: the frozen
+    /// `accept` carries no call identity, so a candidate belongs to the one open window.
     calls: tokio::sync::Mutex<()>,
 }
 
-struct HubState {
-    /// Increased at every [`CompletionHub::grant`]; 0 before the first.
+/// The state every grant of one hub shares.
+#[derive(Default)]
+struct HubShared {
+    agents: Mutex<HashMap<u64, Arc<AgentShared>>>,
+}
+
+impl HubShared {
+    /// The state of `id`, created on first use.
+    fn agent(&self, id: u64) -> Arc<AgentShared> {
+        let mut agents = self.agents.lock().unwrap();
+        agents.entry(id).or_default().clone()
+    }
+}
+
+struct AgentState {
+    /// Increased at every [`CompletionHub::grant`] for this agent; 0 before the first.
     generation: u64,
     completion: Option<Completion>,
     policy: CompletionPolicy,
@@ -775,7 +842,7 @@ struct HubState {
     window: Option<Window>,
 }
 
-impl Default for HubState {
+impl Default for AgentState {
     fn default() -> Self {
         Self {
             generation: 0,
@@ -862,7 +929,7 @@ impl Refusal {
 /// with and the gate its calls run through. Cheap to clone.
 #[derive(Clone)]
 pub struct CompletionGrant {
-    shared: Arc<HubShared>,
+    agent: Arc<AgentShared>,
     generation: u64,
     completion: Completion,
     policy: CompletionPolicy,
@@ -888,22 +955,22 @@ impl CompletionGrant {
     /// The `completion` service of this assembly, for [`Services::completion`].
     pub fn service(&self) -> Arc<dyn CompletionService> {
         Arc::new(HubService {
-            shared: self.shared.clone(),
+            agent: self.agent.clone(),
             generation: self.generation,
         })
     }
 
     /// Opens the window of one `execute` call under this grant: a candidate commits only
-    /// while it is open and only if no re-grant happened since. [`CompletionGate`] opens
-    /// one around every call; closing it returns the hub's refusal of the call's last
-    /// candidate, if it refused it.
+    /// while it is open and only if no re-grant of this agent happened since.
+    /// [`CompletionGate`] opens one around every call; closing it returns the hub's
+    /// refusal of the call's last candidate, if it refused it.
     pub fn open_window(&self) -> CallWindow {
-        self.shared.state.lock().unwrap().window = Some(Window {
+        self.agent.state.lock().unwrap().window = Some(Window {
             generation: self.generation,
             decision: None,
         });
         CallWindow {
-            shared: self.shared.clone(),
+            agent: self.agent.clone(),
         }
     }
 }
@@ -911,14 +978,14 @@ impl CompletionGrant {
 /// An open [`Window`]. Dropping it closes it, so an abandoned or cancelled call leaves no
 /// window a later candidate could commit into.
 pub struct CallWindow {
-    shared: Arc<HubShared>,
+    agent: Arc<AgentShared>,
 }
 
 impl CallWindow {
     /// Closes the window: the refusal of the call's last candidate, or `None` when the
     /// last candidate committed or none was submitted.
     pub fn close(self) -> Option<Refusal> {
-        let window = self.shared.state.lock().unwrap().window.take();
+        let window = self.agent.state.lock().unwrap().window.take();
         match window.and_then(|window| window.decision) {
             Some(Err(refusal)) => Some(refusal),
             _ => None,
@@ -928,19 +995,19 @@ impl CallWindow {
 
 impl Drop for CallWindow {
     fn drop(&mut self) {
-        self.shared.state.lock().unwrap().window = None;
+        self.agent.state.lock().unwrap().window = None;
     }
 }
 
-/// The hub as one assembly's `completion` service.
+/// The hub as one assembly's `completion` service, over its own agent's state.
 struct HubService {
-    shared: Arc<HubShared>,
+    agent: Arc<AgentShared>,
     generation: u64,
 }
 
 impl HubService {
     fn log(&self) -> Option<Arc<ActivityLog>> {
-        let state = self.shared.state.lock().unwrap();
+        let state = self.agent.state.lock().unwrap();
         state
             .completion
             .as_ref()
@@ -969,14 +1036,14 @@ impl CompletionService for HubService {
     }
 
     fn policy(&self) -> WirePolicy {
-        match self.shared.state.lock().unwrap().policy {
+        match self.agent.state.lock().unwrap().policy {
             CompletionPolicy::RecordedCommands => WirePolicy::RecordedCommands,
             CompletionPolicy::ReportToParent => WirePolicy::ReportToParent,
         }
     }
 
     fn output_contract(&self) -> Option<String> {
-        let state = self.shared.state.lock().unwrap();
+        let state = self.agent.state.lock().unwrap();
         state
             .contract
             .as_ref()
@@ -984,7 +1051,7 @@ impl CompletionService for HubService {
     }
 
     fn accept(&self, candidate: Candidate, structured: Option<WireStructured>) {
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.agent.state.lock().unwrap();
         let decision = decide(&state, self.generation, candidate, structured);
         let decision = decision.map(|(accepted, structured, completion)| {
             completion.outcome.set(accepted, structured);
@@ -1002,7 +1069,7 @@ type Commit = (Accepted, Option<StructuredResult>, Completion);
 /// Re-verify a candidate against the hub's own record (ADR-0083 §2, rules 1–6). `Ok` is
 /// what commits — the hub's evidence, reason and schema verdict, never the component's.
 fn decide(
-    state: &HubState,
+    state: &AgentState,
     generation: u64,
     candidate: Candidate,
     structured: Option<WireStructured>,
@@ -1063,7 +1130,7 @@ fn decide(
 
 /// Rules 1–3: the evidence the hub commits for a `done`.
 fn verify_evidence(
-    state: &HubState,
+    state: &AgentState,
     log: &ActivityLog,
     claimed: CandidateEvidence,
 ) -> Result<Evidence, Refusal> {
@@ -1152,6 +1219,9 @@ pub struct CompletionGate {
     inner: Arc<dyn Tool>,
     grant: CompletionGrant,
     declaration: ToolDeclaration,
+    /// The identity to present, when the host applies a face (a `+sandbox` variant or an
+    /// environment's own variant). `None` presents the component's loader-built identity.
+    identity: Option<ToolIdentity>,
 }
 
 impl CompletionGate {
@@ -1162,6 +1232,7 @@ impl CompletionGate {
             inner,
             grant,
             declaration,
+            identity: None,
         }
     }
 
@@ -1172,6 +1243,13 @@ impl CompletionGate {
         self.declaration = declaration;
         self
     }
+
+    /// Present `identity` instead of the component's: only the variant moves — the
+    /// implementation stays the loader's (ADR-0087).
+    pub fn identified(mut self, identity: ToolIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
 }
 
 impl Tool for CompletionGate {
@@ -1180,7 +1258,9 @@ impl Tool for CompletionGate {
     }
 
     fn identity(&self) -> &ToolIdentity {
-        self.inner.identity()
+        self.identity
+            .as_ref()
+            .unwrap_or_else(|| self.inner.identity())
     }
 
     fn effect(&self, call: &ToolCall) -> Effect {
@@ -1201,7 +1281,7 @@ impl Tool for CompletionGate {
         context: ToolContext,
     ) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
-            let _one_call_at_a_time = self.grant.shared.calls.lock().await;
+            let _one_call_at_a_time = self.grant.agent.calls.lock().await;
             let window = self.grant.open_window();
             let outcome = self.inner.execute(call, context).await;
             match window.close() {
@@ -1217,9 +1297,14 @@ impl Tool for CompletionGate {
 /// the declaration of the grant's policy and contract — byte-identical to the native
 /// tool's, because both come from `p1-finish-guest` — and masked as every assembled tool
 /// is, the refusal text included.
+///
+/// `face` is the model-facing `(name, variant)` the host presents INSTEAD of the
+/// component's own, for the environment's face a worker was assembled with; `None`
+/// presents the component's own name and its loader-built variant.
 pub fn finish_component(
     module: &LoadedModule,
     grant: &CompletionGrant,
+    face: Option<(&str, &str)>,
     mask: &Arc<MaskCounter>,
 ) -> Result<Arc<dyn Tool>, ToolError> {
     let services = Services {
@@ -1227,18 +1312,28 @@ pub fn finish_component(
         ..Services::default()
     };
     let component = wasm_tool(module, services, ExecutionLimits::default(), mask)?;
+    let (name, variant) = match face {
+        Some((name, variant)) => (name.to_owned(), variant.to_owned()),
+        None => (
+            component.declaration().name.clone(),
+            component.identity().variant.clone(),
+        ),
+    };
     let declaration = ToolDeclaration {
-        name: component.declaration().name.clone(),
+        name: name.clone(),
         description: p1_finish_guest::description(grant.policy(), grant.contract()),
         kind: DeclarationKind::Function {
             input_schema: p1_finish_guest::input_schema(grant.contract()),
         },
     };
-    grant
-        .completion()
-        .log
-        .set_finish_name(declaration.name.clone());
-    let gate = CompletionGate::new(component, grant.clone()).presenting(declaration);
+    grant.completion().log.set_finish_name(name.clone());
+    let identity = ToolIdentity {
+        implementation: component.identity().implementation.clone(),
+        variant,
+    };
+    let gate = CompletionGate::new(component, grant.clone())
+        .presenting(declaration)
+        .identified(identity);
     Ok(redacted(Arc::new(gate), mask))
 }
 
@@ -1250,14 +1345,18 @@ mod tests {
     };
     use p1_testkit::FakeTool;
 
-    /// The identity implementation the real `finish` tool builds: a fake that takes it
-    /// is found as the `finish` tool through that identity's declared capability.
+    /// The identity implementation the real `finish` tool builds (S3.8: the `p1/finish`
+    /// package, declared through its verified manifest): a fake that takes it is found as
+    /// the `finish` tool through that identity's declared capability.
     #[cfg(feature = "delegation")]
     fn finish_implementation() -> String {
-        p1_tool_finish::FinishTool::new(Arc::new(ActivityLog::default()), FinishOutcome::default())
-            .identity()
-            .implementation
-            .clone()
+        static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        NAME.get_or_init(|| {
+            let module = crate::catalog::capabilities::built_package("p1-module-finish");
+            crate::catalog::capabilities::declare_package(&module);
+            module.name().to_owned()
+        })
+        .clone()
     }
 
     fn result(call_id: &str, name: &str, status: ToolStatus, content: &str) -> ToolResultItem {

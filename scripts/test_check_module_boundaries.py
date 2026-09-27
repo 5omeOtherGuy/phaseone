@@ -360,6 +360,11 @@ class ShippingModeTests(unittest.TestCase):
         h = self.harness("p1-tool-shell", "p1-context")
         result = h.run("--shipping")
         self.assertEqual(result.returncode, 1, result.stdout)
+        # notice: scripts/test_check_module_boundaries.py (S7, D083): S3.8 makes the
+        # `p1/shell` component what implements the `shell` tool, so the table below names
+        # `p1-module-shell` for `p1-tool-shell` — the temporary repository builds no
+        # output for it, which is what "(not built)" says. Without that SHIPPING_PACKAGES
+        # line the audit would keep claiming no module package ships the tool.
         self.assertIn(
             "check-module-boundaries: shipping: native fallback: p1-tool-shell (extension) "
             "via p1-host > p1-tool-shell; implements p1-module-shell (not built)",

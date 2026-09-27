@@ -268,6 +268,37 @@ max_output_tokens = 32000
         );
     }
 
+    /// The endpoint scheme rule (D-XO-42) as the component's `configure` takes it: the module
+    /// composes its route through the shared `validate_composition`, so a cleartext endpoint is
+    /// accepted for a loopback host — the local provider a test runs — and every other host
+    /// keeps requiring `https` with the rule's own message.
+    #[test]
+    fn a_cleartext_endpoint_is_composed_on_a_loopback_host_alone() {
+        let chat = |endpoint: &str| {
+            compose(
+                "openai-chat/loopback",
+                endpoint,
+                "mimo-v2.6-flash-free",
+                &settings(serde_json::json!({}), serde_json::json!({})),
+            )
+        };
+        for endpoint in [
+            "https://opencode.ai/zen/v1/chat/completions",
+            "http://127.0.0.1:8080/v1/chat/completions",
+            "http://localhost/v1/chat/completions",
+            "http://[::1]:8080/v1/chat/completions",
+        ] {
+            chat(endpoint).unwrap_or_else(|error| panic!("{endpoint}: {error}"));
+        }
+        for endpoint in [
+            "http://opencode.ai/zen/v1/chat/completions",
+            "http://localhost.example.test/v1/chat/completions",
+        ] {
+            let error = chat(endpoint).expect_err("a non-loopback cleartext endpoint is refused");
+            assert_eq!(error.message, "chat endpoint requires HTTPS", "{endpoint}");
+        }
+    }
+
     #[test]
     fn the_http_target_is_the_endpoint_split_before_its_last_segment() {
         for endpoint in [

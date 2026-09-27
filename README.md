@@ -1,16 +1,77 @@
 # Phaseone (p1)
 
-A lean, modular Rust coding harness that adapts itself to the model it runs.
+p1 is a coding-agent harness for the terminal. You give it a prompt and an
+environment — a file that names a route, a model profile, the tools and the whole
+prompt — and the agent works in your workspace (`environments/`, `p1 --help`). One
+agent core runs the loop and depends only on the shared contracts; providers,
+tools, context policies, authorization policies, delegation and workflows are
+modules around it (AGENTS.md, Architecture).
 
-You type a prompt and the agent works. One small agent core (loop + API); everything
-else — providers, tools, sessions, frontends, delegation — is a module around it.
-Modules are migrating to WebAssembly artifacts the host loads by name (ADR-0071, 2026-09-25).
+## Why
 
-**Status: pre-alpha, first usable slice done (2026-09-20).** `p1 --env claude|gpt "prompt"`
-runs a real coding task on the Claude and Codex subscription routes, each with its own
-prompt and tools; sessions resume from a JSONL journal; an agent can delegate to a worker
-on the other route and is woken when it finishes. What was built, measured and what is
-weak: `docs/SLICE-REPORT.md`.
+- Each model gets its own environment: an agent sees only the prompt, the tool
+  declarations and the provider behaviour assembled for it, and an unassembled tool
+  cannot dispatch (AGENTS.md, Architecture).
+- The core stays the loop and the API; everything else is a unit of composition,
+  one module per tool (AGENTS.md, Architecture; ADR-0002).
+- Composition is explicit at one root: the host loads WebAssembly modules by name
+  from the environment file; there is no service locator, global registry or DI
+  framework (AGENTS.md, Architecture; ADR-0071).
+- A tool, provider or policy as a WebAssembly component can be added or removed
+  without rebuilding the host, a module that needs no host capability runs
+  sandboxed by construction, and modules may be written in other languages that
+  target WebAssembly (ADR-0071).
+- Providers only translate wire behaviour and hold no tools; tools hold no provider
+  wire formats and no UI types (AGENTS.md, Architecture).
+- Unknown token usage or cost is reported as unknown, never as zero (AGENTS.md,
+  Architecture; docs/SLICE-REPORT.md).
+
+## Use cases
+
+- Run a coding task headlessly on a subscription route:
+  `p1 --env claude --workspace <repo> --yes "<task>"` (docs/SLICE-REPORT.md).
+- Work interactively in the terminal UI: `p1 --tui` (`p1 --help`).
+- Resume a session from its JSONL journal, compacting once first if needed:
+  `p1 --session s.jsonl --resume --compact "<prompt>"` (docs/design/journal.md).
+- Hand a bounded sub-task to a worker on another route mid-run; the worker tools
+  are assembled on every main agent: `p1 --env claude --yes "…"`
+  (crates/p1-host/src/catalog/delegation.rs).
+- Orchestrate workers with a Rhai workflow whose steps can each run in their own
+  git worktree: `p1 workflow run FILE --arg K=V --yes` (docs/design/workflows.md;
+  ADR-0073).
+- Fan out a batch of briefs to worker models and get one JSON summary:
+  `scripts/fanout.py jobs.json` (AGENTS.md, Workers).
+- List and verify the module set of an installed release against its release
+  manifest: `p1 modules list`, `p1 modules verify` (crates/p1-host/src/cli.rs;
+  ADR-0079).
+- Select which official package a module name resolves to with a `modules.lock`
+  next to an environments directory, e.g. `read` to the `p1/read` package
+  (crates/p1-assembly/src/modules_lock.rs).
+
+## Status (2026-09-26)
+
+Pre-alpha. The first slice ran real coding tasks on the Claude and Codex
+subscription routes with session resume and delegation; the measured record is
+docs/SLICE-REPORT.md (2026-09-20). The migration to WebAssembly modules is in
+progress (ADR-0071): the module boundary is frozen (`wasm-boundary-v1`,
+docs/design/modules/README.md) and every tool, provider, policy, worker and
+workflow member has a component package under `modules/`. The shipped policies
+and the worker/workflow members load as official-release host entries
+(crates/p1-host/src/catalog/modules.rs, `register_host_entry`); a provider
+component is used only where a route's adapter key names one, and the shipped
+WebSocket route stays native (crates/p1-host/src/catalog/modules.rs, ADR-0086);
+the tools are still assembled native unless a `modules.lock` selects the
+component (crates/p1-host/src/catalog/tools.rs), and
+`scripts/check-module-boundaries.sh --shipping` lists the remaining native
+fallbacks. Native by design: the core, the journal, the worker service, the
+workflow interpreter, the provider transport, the sandbox boundary and the
+terminal UI (ADR-0081).
+
+## Where to read next
+
+- docs/SLICE-REPORT.md — what the first slice does, measured, and what is weak.
+- docs/design/README.md — the design notes and the module-boundary documents.
+- docs/adr/README.md — the settled decisions; ADR-0071 records the migration.
 
 ## Install and update
 

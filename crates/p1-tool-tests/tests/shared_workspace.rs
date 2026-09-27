@@ -17,7 +17,9 @@ use p1_tool_edit::EditTool;
 use p1_tool_patch::PatchTool;
 use p1_tool_read::ReadTool;
 use p1_tool_write::WriteTool;
-use p1_workspace::{ObservedFiles, Workspace, WriteGate};
+use p1_workspace::{
+    MutationError, MutationPolicy, Observation, ObservedFiles, Workspace, WriteGate,
+};
 
 /// One agent's file tools: its own observations, the shared gate.
 struct AgentTools {
@@ -210,4 +212,95 @@ async fn two_agents_creating_the_same_file_do_not_overwrite_each_other() {
         };
         assert_eq!(text, expected);
     }
+}
+
+/// A module's `workspace-mutation.begin` goes through the owned, async acquisition of the
+/// same gate the native tools wait on, and a parent and its worker still keep separate
+/// observations: what one writes is its own observation, never the other's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parent_and_a_worker_share_the_gate_through_the_owned_api_and_keep_separate_observations()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.txt");
+    fs::write(&file, "one\n").unwrap();
+    let gate = WriteGate::new();
+    let parent = Workspace::new(dir.path())
+        .unwrap()
+        .with_write_gate(gate.clone());
+    let worker = Workspace::new(dir.path())
+        .unwrap()
+        .with_write_gate(gate.clone());
+    let (parent_observed, worker_observed) = (ObservedFiles::new(), ObservedFiles::new());
+    let worker_edit = EditTool::new(worker.clone(), worker_observed.clone());
+    parent.read("notes.txt", &parent_observed).unwrap();
+    worker.read("notes.txt", &worker_observed).unwrap();
+
+    // The parent's module holds the gate…
+    let parent_mutation = parent
+        .begin_owned(&parent_observed, MutationPolicy::Observed)
+        .await;
+    // …so the worker's module queues behind it, and so does the worker's native edit.
+    let mut worker_begin = Box::pin(worker.begin_owned(&worker_observed, MutationPolicy::Observed));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        worker_begin.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    let mut edit = Box::pin(json(
+        &worker_edit,
+        serde_json::json!({"file_path": "notes.txt", "old_string": "one", "new_string": "ONE"}),
+    ));
+    assert!(matches!(edit.as_mut().poll(&mut context), Poll::Pending));
+
+    parent_mutation
+        .write("notes.txt", "one\ntwo (from the parent)\n")
+        .unwrap();
+    let written = b"one\ntwo (from the parent)\n";
+    assert_eq!(
+        parent_observed.check_unchanged(&file, written),
+        Observation::Unchanged
+    );
+    assert_eq!(
+        worker_observed.check_unchanged(&file, written),
+        Observation::ChangedSinceObserved
+    );
+    drop(parent_mutation);
+
+    let outcome = edit.await;
+    assert_eq!(outcome.status, ToolStatus::Error, "{outcome:?}");
+    assert_eq!(
+        outcome.content,
+        "notes.txt changed on disk since you last read it; read it again."
+    );
+    let worker_mutation = worker_begin.await;
+    assert_eq!(
+        worker_mutation.write("notes.txt", "lost update\n"),
+        Err(MutationError::Io(
+            "notes.txt changed on disk since you last read it; read it again.".into()
+        ))
+    );
+    worker_mutation
+        .create("from-worker.txt", "the worker's\n")
+        .unwrap();
+    drop(worker_mutation);
+
+    // The worker's file is the worker's observation; the parent must read it first.
+    let parent_mutation = parent
+        .begin_owned(&parent_observed, MutationPolicy::Observed)
+        .await;
+    assert_eq!(
+        parent_mutation.write("from-worker.txt", "overwritten\n"),
+        Err(MutationError::Io(
+            "You must read from-worker.txt before changing it.".into()
+        ))
+    );
+    drop(parent_mutation);
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "one\ntwo (from the parent)\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("from-worker.txt")).unwrap(),
+        "the worker's\n"
+    );
 }

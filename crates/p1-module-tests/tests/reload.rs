@@ -5,7 +5,9 @@
 //! Every generation's catalog is loaded again from a release through S1.4's loader
 //! (`load_locked_modules` and `register_modules`, the fixture package selected by a
 //! `modules.lock`), its assembly is built with `p1_assembly::assemble`, and its policy is
-//! the host's `AskBridge` over a built `p1/policy/*` component. The candidate is installed
+//! the host's `AskBridge` over a built `p1/policy/*` component, through the host's own
+//! adapter for its shipped policies (`ShippedPolicy`, S5.11), which keys a grant by the
+//! component's real digest. The candidate is installed
 //! through the host's `install_candidate`, which is `Agent::reconfigure` with the policy
 //! plus the generation swap. Busy sessions queue on the host's `ReloadQueue`.
 //!
@@ -40,16 +42,13 @@ use p1_contracts::{
 use p1_core::{Agent, AgentParts, ReconfigureError};
 use p1_host::catalog::modules::{ModuleServices, load_locked_modules, register_modules};
 use p1_host::policy::{
-    AskBridge, Asker, OperatorAnswer, PolicyId, USER_DENY, Verdict as HostVerdict, VerdictSource,
+    AskBridge, Asker, OperatorAnswer, PolicyId, ShippedPolicy, USER_DENY, VerdictSource,
 };
 use p1_host::run::{
     Candidate, CandidateParts, Generation, Generations, ReloadQueue, ReloadRequested,
     install_candidate,
 };
-use p1_module_runtime::{
-    ExecutionLimits, Loader, ProcessService, ReleaseManifest, Services, Verdict as WasmVerdict,
-    WasmAuthorizationPolicy,
-};
+use p1_module_runtime::{Loader, ProcessService, ReleaseManifest, Services};
 use p1_module_tests::{
     FIXTURE_NAME, FakeProcesses, Release, fake_processes, lock_text, within_deadline,
 };
@@ -105,28 +104,6 @@ fn entry(package: (&str, &str)) -> Value {
     })
 }
 
-/// The component's verdicts in the host's shape, keyed by its package name and digest.
-struct ComponentSource(WasmAuthorizationPolicy);
-
-impl VerdictSource for ComponentSource {
-    fn policy(&self) -> PolicyId {
-        PolicyId {
-            package: self.0.name().to_owned(),
-            digest: self.0.digest().to_string(),
-        }
-    }
-
-    fn verdict<'a>(&'a self, request: AuthorizationRequest<'a>) -> BoxFuture<'a, HostVerdict> {
-        Box::pin(async move {
-            match self.0.verdict(request).await {
-                WasmVerdict::Permit => HostVerdict::Permit,
-                WasmVerdict::Deny(reason) => HostVerdict::Deny(reason),
-                WasmVerdict::Ask => HostVerdict::Ask,
-            }
-        })
-    }
-}
-
 /// The operator: scripted answers in order, every question counted.
 #[derive(Default)]
 struct Operator {
@@ -162,10 +139,20 @@ fn policy(package: (&str, &str), operator: &Arc<Operator>) -> Arc<dyn Authorizat
     let release = ReleaseManifest::parse(&manifest.to_string()).expect("release manifest");
     let loader = Loader::new(release, built()).expect("loader");
     let module = loader.load(package.1).expect("the built policy loads");
-    let component = WasmAuthorizationPolicy::new(&module, ExecutionLimits::default())
-        .expect("the policy adapter builds");
+    let shipped = ShippedPolicy::from_module(Arc::new(module)).expect("the policy adapter builds");
+    // The grant key is the package and the digest the build pinned for these bytes.
+    assert_eq!(
+        shipped.policy(),
+        PolicyId {
+            package: package.1.to_owned(),
+            digest: manifest["components"][0]["digest"]
+                .as_str()
+                .expect("a digest")
+                .to_owned(),
+        }
+    );
     Arc::new(AskBridge::with_asker(
-        Arc::new(ComponentSource(component)),
+        shipped,
         false,
         operator.clone(),
         CancellationToken::new(),

@@ -37,7 +37,7 @@ use crate::HostDeps;
 use crate::activity::Completion;
 use crate::cli::Options;
 use crate::frontend::{FrontEnd, WorkerService};
-use crate::policy::{AskBridge, Asker, NativeAsk, NativeFullAccess, OperatorAnswer, VerdictSource};
+use crate::policy::{AskBridge, Asker, OperatorAnswer, ShippedPolicy};
 use crate::run::StallGuard;
 
 mod describer;
@@ -72,6 +72,8 @@ pub struct TuiFrontEnd {
     options: TuiOptions,
     sink: Arc<TuiSink>,
     policy: Arc<AskBridge>,
+    // notice: S5.11 (#357): the host entry the bridge asks, for `/modules reload`.
+    shipped: Arc<ShippedPolicy>,
     events: Mutex<Option<mpsc::UnboundedReceiver<UiEvent>>>,
     auth: Mutex<Option<mpsc::UnboundedReceiver<AuthRequest>>>,
     /// (route, model), announced by the host once assembly has happened.
@@ -93,13 +95,17 @@ pub struct TuiFrontEnd {
 }
 
 impl TuiFrontEnd {
-    pub fn new(options: TuiOptions, cancel: CancellationToken) -> Self {
+    // notice: S5.11 (#357): fallible, because its policy is the release's host entry (a
+    // release that lacks it or ships one that does not verify fails, naming it).
+    pub fn new(options: TuiOptions, cancel: CancellationToken) -> Result<Self, String> {
         let (sink, events) = TuiSink::new();
-        let (policy, auth) = tui_policy(options.ask, cancel.clone());
-        Self {
+        let shipped = ShippedPolicy::official(options.ask)?;
+        let (policy, auth) = tui_policy(shipped.clone(), cancel.clone());
+        Ok(Self {
             options,
             sink: Arc::new(sink),
             policy: Arc::new(policy),
+            shipped,
             events: Mutex::new(Some(events)),
             auth: Mutex::new(Some(auth)),
             labels: Mutex::new(None),
@@ -107,23 +113,20 @@ impl TuiFrontEnd {
             worker_windows: Arc::new(Mutex::new(HashMap::new())),
             route_label: Arc::new(Mutex::new(String::new())),
             tools: Mutex::new(Arc::new(Vec::new())),
-        }
+        })
     }
 }
 
 /// The TUI's authorization policy (issue #308): the host's [`AskBridge`] over the
-/// native verdict source of its mode (full access without `--ask`, ADR-0038; the
-/// restrictive policy with it), asking on the screen through [`TuiPolicy`]. Only
-/// `Permit` or `Deny` reaches the core (ADR-0024); `always` grants are the bridge's.
+/// shipped policy of its mode (the host entry `p1/policy/full-access` without
+/// `--ask`, ADR-0038; `p1/policy/ask` with it), asking on the screen through
+/// [`TuiPolicy`]. Only `Permit` or `Deny` reaches the core (ADR-0024); `always`
+/// grants are the bridge's.
+// notice: S5.11 (#357): takes the loaded host entry instead of building a native one.
 fn tui_policy(
-    ask: bool,
+    source: Arc<ShippedPolicy>,
     cancel: CancellationToken,
 ) -> (AskBridge, mpsc::UnboundedReceiver<AuthRequest>) {
-    let source: Arc<dyn VerdictSource> = if ask {
-        Arc::new(NativeAsk)
-    } else {
-        Arc::new(NativeFullAccess)
-    };
     let (asker, auth) = TuiPolicy::new(cancel.clone());
     (
         AskBridge::with_asker(source, false, Arc::new(TuiAsker(asker)), cancel),
@@ -234,6 +237,10 @@ impl FrontEnd for TuiFrontEnd {
 
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
         self.policy.clone()
+    }
+
+    fn shipped_policy(&self) -> Option<Arc<ShippedPolicy>> {
+        Some(self.shipped.clone())
     }
 
     fn parent_assembled(&self, route: &str, model: &str, _completion: Option<Completion>) {
@@ -2357,7 +2364,8 @@ mod worker_context_window_tests {
                 compact: false,
             },
             CancellationToken::new(),
-        );
+        )
+        .expect("the official release ships the policy");
 
         front_end.worker_context_configured("w1", Some(200_000));
         assert_eq!(
@@ -2390,7 +2398,8 @@ mod worker_end_tests {
                 compact: false,
             },
             CancellationToken::new(),
-        );
+        )
+        .expect("the official release ships the policy");
         let mut events = front_end
             .events
             .lock()
