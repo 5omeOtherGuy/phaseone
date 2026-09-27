@@ -103,6 +103,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0087 | [Module identity and verified loading](0087-module-identity-and-verified-loading.md) | proposed | 2026-09-26 | lead |
 | ADR-0088 | [Workspace capabilities across components](0088-workspace-capabilities-across-components.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0089 | [Cleartext chat endpoints on loopback hosts only](0089-cleartext-chat-endpoints-on-loopback-hosts-only.md) | proposed | 2026-09-26 | owner+lead |
+| ADR-0090 | [Call-scoped capability services and a hostcall budget sized for whole files](0090-call-scoped-capability-services-and-a-hostcall-budget-sized-for-whole-files.md) | proposed | 2026-09-27 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
