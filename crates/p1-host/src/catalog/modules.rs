@@ -1013,8 +1013,10 @@ fn announce_release(_deps: &HostDeps, _release: &Path) {}
 /// every module. The worker and workflow families install `deps.module_services` for their
 /// own members (`catalog/delegation.rs`, `catalog/workflow.rs`; B-S6-9, D068); their hooks
 /// give every module they do not serve `Services::default()`, so the base fills the
-/// `workspace` and `snapshot` a family hook left empty, and a module that is no member (the
-/// `p1/read` component) links exactly as without the families. No other native service
+/// `workspace`, `snapshot` and `workspace-mutation` a family hook left empty, with the call
+/// scope that builds them fresh per call (ADR-0090), and a module that is no member (the
+/// `p1/read`, `p1/edit`, `p1/write`, `p1/patch` or `p1/search` component) links exactly as
+/// without the families. No other native service
 /// backs a module capability in the host yet (the shell's process service is not bridged
 /// to the runtime's `ProcessService`), so a package granted one fails its assembly with the
 /// runtime's `MissingService` rather than running unlinked.
@@ -1029,6 +1031,8 @@ fn locked_module_services(deps: &HostDeps) -> ModuleServices {
             let base = base(module, services);
             linked.workspace = linked.workspace.or(base.workspace);
             linked.snapshot = linked.snapshot.or(base.snapshot);
+            linked.workspace_mutation = linked.workspace_mutation.or(base.workspace_mutation);
+            linked.call_scope = linked.call_scope.or(base.call_scope);
         }
         linked
     })
@@ -1088,6 +1092,43 @@ mod tests {
         let provider = allocation("provider").expect("provider class");
         assert!(!provider.iter().any(|c| c == "process"));
         assert!(allocation("plugin").is_none());
+    }
+
+    /// Under a family hook that serves only its members, a mutating component still gets its
+    /// row's mutation and the call scope that builds each call's read record (ADR-0090): with
+    /// only `workspace` and `snapshot` filled in, a locked `p1/edit` failed its assembly on
+    /// `MissingService("workspace-mutation")` in every run that installs the worker family.
+    #[test]
+    fn a_family_hook_keeps_the_mutation_and_the_call_scope_of_a_non_member() {
+        let root = tempfile::tempdir().unwrap();
+        let mut deps = quiet_deps(vec![root.path().join("environments")]);
+        let family: ModuleServices = Arc::new(|module: &str, _: &ToolServices| match module {
+            "p1/worker-start" => Services {
+                workers: Some(Default::default()),
+                ..Services::default()
+            },
+            _ => Services::default(),
+        });
+        deps.module_services = Some(family);
+        let hook = locked_module_services(&deps);
+        let services = ToolServices {
+            workspace: p1_workspace::Workspace::new(root.path()).unwrap(),
+            observed: p1_workspace::ObservedFiles::new(),
+            mask: Arc::new(p1_redact::MaskCounter::new()),
+            agent: None,
+        };
+
+        let edit = hook("p1/edit", &services);
+        assert!(edit.workspace.is_some() && edit.snapshot.is_some());
+        assert!(edit.workspace_mutation.is_some(), "edit keeps its mutation");
+        assert!(edit.call_scope.is_some(), "and its per-call read record");
+        let read = hook("p1/read", &services);
+        assert!(read.workspace_mutation.is_none(), "read's row grants none");
+        let member = hook("p1/worker-start", &services);
+        assert!(
+            member.workers.is_some(),
+            "a member keeps its family's services"
+        );
     }
 
     #[test]
