@@ -356,7 +356,9 @@ impl WorkspaceService for SearchCapability {
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
-            file_walk::read_window(workspace, &path, offset, length)
+            file_walk::read_window_excluding(workspace, &path, offset, length, |candidate| {
+                credential_policy.refuses(candidate)
+            })
         })
     }
 

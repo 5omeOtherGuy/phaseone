@@ -9,8 +9,12 @@
 //! The mutation side ([`crate::WriteGate`], [`crate::Mutation`],
 //! [`crate::write_atomic`]) stays where it is; nothing here writes.
 
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+
+use rustix::fs::{CWD, Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::observe::{ObservedFiles, hash_of};
 use crate::{Workspace, WorkspaceError};
@@ -141,6 +145,82 @@ impl Workspace {
         Ok(CheckedPath { path, display })
     }
 
+    /// Resolve `requested`, then open its regular file without following links.
+    pub fn open_file(&self, requested: &str) -> Result<File, WorkspaceError> {
+        let resolved = self.resolve(requested)?;
+        self.open_file_at(&resolved)
+    }
+
+    /// Open a resolved path beneath the workspace root without following links,
+    /// then verify the opened handle's type. NONBLOCK ensures a swapped FIFO
+    /// cannot park a host thread between path validation and open.
+    pub fn open_file_at(&self, requested: &Path) -> Result<File, WorkspaceError> {
+        self.open_file_at_with_path(requested)
+            .map(|(file, _path)| file)
+    }
+
+    fn open_file_at_with_path(&self, requested: &Path) -> Result<(File, PathBuf), WorkspaceError> {
+        let requested_display = requested.to_string_lossy();
+        let path = std::fs::canonicalize(requested)
+            .map_err(|source| missing_or_io(&requested_display, requested, source))?;
+        if !path.starts_with(&self.root) {
+            return Err(WorkspaceError::OutsideWorkspace {
+                requested: requested_display.into_owned(),
+            });
+        }
+        let relative =
+            path.strip_prefix(&self.root)
+                .map_err(|_| WorkspaceError::OutsideWorkspace {
+                    requested: requested_display.to_string(),
+                })?;
+        let mut directory = rustix::fs::openat(
+            CWD,
+            &self.root,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| io_at(&path, error))?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(WorkspaceError::NotADirectory(path));
+            };
+            if components.peek().is_some() {
+                directory = rustix::fs::openat(
+                    &directory,
+                    name,
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| io_at(&path, error))?;
+            } else {
+                let fd = rustix::fs::openat(
+                    &directory,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| match error {
+                    Errno::LOOP | Errno::NOTDIR => WorkspaceError::NotADirectory(path.clone()),
+                    other => io_at(&path, other),
+                })?;
+                let file = File::from(fd);
+                if !file
+                    .metadata()
+                    .map_err(|error| WorkspaceError::Io {
+                        path: path.clone(),
+                        source: error,
+                    })?
+                    .is_file()
+                {
+                    return Err(WorkspaceError::NotADirectory(path));
+                }
+                return Ok((file, path));
+            }
+        }
+        Err(WorkspaceError::NotADirectory(path))
+    }
+
     /// The kind and size in bytes of `requested`.
     ///
     /// The leaf is looked at as itself (not followed) — see [`FileKind::Symlink`].
@@ -214,17 +294,17 @@ impl Workspace {
         requested: &str,
         observed: &ObservedFiles,
     ) -> Result<Snapshot, WorkspaceError> {
-        let path = self.resolve(requested)?;
+        let resolved = self.resolve(requested)?;
+        let (mut file, path) =
+            self.open_file_at_with_path(&resolved)
+                .map_err(|error| match error {
+                    WorkspaceError::Io { path, source } => missing_or_io(requested, &path, source),
+                    other => other,
+                })?;
         let display = self.display(&path);
-        // Mirror `list`: decide the kind from metadata instead of leaving `read` of a
-        // directory to surface as an untyped `Io` ("Is a directory"). The host import
-        // needs the typed variant to map a wrong kind without parsing an io message.
-        let metadata = std::fs::symlink_metadata(&path)
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)
             .map_err(|error| missing_or_io(requested, &path, error))?;
-        if metadata.is_dir() {
-            return Err(WorkspaceError::NotADirectory(path));
-        }
-        let bytes = std::fs::read(&path).map_err(|error| missing_or_io(requested, &path, error))?;
 
         // `record` stores `hash_of(contents)`: computing the same value here with
         // the same function makes the snapshot's hash and the stored observation
@@ -255,6 +335,13 @@ fn kind_of(file_type: std::fs::FileType) -> FileKind {
 
 /// A filesystem failure on `requested`. A missing path is its own variant, so a
 /// host import can tell "absent" from "unreadable" without parsing a message.
+fn io_at(path: &Path, error: Errno) -> WorkspaceError {
+    WorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: error.into(),
+    }
+}
+
 fn missing_or_io(requested: &str, path: &Path, source: std::io::Error) -> WorkspaceError {
     if source.kind() == std::io::ErrorKind::NotFound {
         WorkspaceError::NotFound {
@@ -265,5 +352,97 @@ fn missing_or_io(requested: &str, path: &Path, source: std::io::Error) -> Worksp
             path: path.to_path_buf(),
             source,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ObservedFiles;
+    use rustix::fs::{CWD, Mode};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn in_workspace_symlinks_read_and_outside_symlink_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("documentation")).unwrap();
+        std::fs::write(directory.path().join("documentation/x.md"), b"inside\n").unwrap();
+        std::fs::write(outside.path().join("secret.md"), b"outside\n").unwrap();
+        symlink(
+            directory.path().join("documentation"),
+            directory.path().join("docs"),
+        )
+        .unwrap();
+        symlink(
+            directory.path().join("documentation/x.md"),
+            directory.path().join("shortcut.md"),
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("secret.md"),
+            directory.path().join("external.md"),
+        )
+        .unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+
+        assert_eq!(
+            workspace
+                .read("docs/x.md", &ObservedFiles::new())
+                .unwrap()
+                .read(0, 100),
+            b"inside\n"
+        );
+        assert_eq!(
+            workspace
+                .read("shortcut.md", &ObservedFiles::new())
+                .unwrap()
+                .read(0, 100),
+            b"inside\n"
+        );
+        assert!(matches!(
+            workspace.read("external.md", &ObservedFiles::new()),
+            Err(WorkspaceError::OutsideWorkspace { .. })
+        ));
+    }
+
+    #[test]
+    fn reading_file_in_search_only_directory_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        if directory.path().metadata().unwrap().uid() == 0 {
+            return;
+        }
+        let subdirectory = directory.path().join("sub");
+        std::fs::create_dir(&subdirectory).unwrap();
+        std::fs::write(subdirectory.join("file"), b"readable\n").unwrap();
+        std::fs::set_permissions(&subdirectory, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+
+        let result = workspace.read("sub/file", &ObservedFiles::new());
+
+        std::fs::set_permissions(&subdirectory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap().read(0, 100), b"readable\n");
+    }
+
+    #[test]
+    fn reading_fifo_returns_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("pipe");
+        rustix::fs::mkfifoat(CWD, &fifo, Mode::from_raw_mode(0o600)).unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = workspace.read("pipe", &ObservedFiles::new());
+            sender
+                .send(matches!(result, Err(WorkspaceError::NotADirectory(_))))
+                .unwrap();
+        });
+
+        assert!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "reading a FIFO should return the existing wrong-kind error"
+        );
     }
 }
