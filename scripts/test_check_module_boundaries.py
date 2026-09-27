@@ -218,6 +218,24 @@ class Harness:
         lines += ["1serde v1.0.229", "2serde_core v1.0.229"]
         return "\n".join(lines) + "\n"
 
+    def withhold_shipping_packages(self, *crates: str) -> None:
+        """Drops the SHIPPING_PACKAGES rows of `crates` from this repository's copy of the script.
+
+        The rows are the fixture for a fallback whose implementing package the table cannot name;
+        only the SHIPPING_PACKAGES block is touched, so the crate stays classified.
+        """
+        script = self.repo / "scripts" / "check-module-boundaries.sh"
+        lines = script.read_text(encoding="utf-8").splitlines(keepends=True)
+        start = lines.index("SHIPPING_PACKAGES='\n") + 1
+        end = start
+        while lines[end] != "'\n":
+            end += 1
+        rows = lines[start:end]
+        kept = [line for line in rows if line.split("|")[0] not in crates]
+        if len(kept) == len(rows):
+            raise AssertionError("no SHIPPING_PACKAGES row of " + ", ".join(crates) + " to withhold")
+        write(script, "".join(lines[:start] + kept + lines[end:]))
+
     def run(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = {
             "PATH": os.pathsep.join([str(self.bin), os.path.dirname(sys.executable), "/usr/bin", "/bin"]),
@@ -251,6 +269,9 @@ class DefaultModeTests(unittest.TestCase):
         result = h.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout, GOLDEN)
+        # The --shipping data (the package rows and the now empty twin list) is not read by this
+        # mode: the golden above is the whole of its output.
+        self.assertNotIn("shipping", result.stdout)
 
     def test_default_mode_reports_a_finding_and_exits_1(self) -> None:
         h = self.harness()
@@ -408,17 +429,76 @@ class ShippingModeTests(unittest.TestCase):
         result = h.run("--shipping")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("native fallback:", result.stdout)
-        # The native authorization policies p1-host still answers are named, but they are not a
-        # crate of the graph: they do not count as a crate fallback.
-        self.assertIn(
-            "check-module-boundaries: shipping: native twin: p1-host (extension: the native authorization policies "
-            "p1/policy/ask and p1/policy/full-access (crates/p1-host/src/policy.rs))",
-            result.stdout,
-        )
+        # The native authorization policies p1-host answered were the one entry of the twin list;
+        # S5.11 removed them, so no `native twin:` line is left to print.
+        self.assertNotIn("native twin:", result.stdout)
         self.assertEqual(
             result.stdout.splitlines()[-1],
             "check-module-boundaries: shipping: clean (5 crates, 2 packages, 0 native fallbacks)",
         )
+
+    def test_a_fallback_crate_with_a_package_row_names_the_package(self) -> None:
+        h = self.harness("p1-tool-read", "p1-provider-openai")
+        result = h.run("--shipping")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            "check-module-boundaries: shipping: native fallback: p1-tool-read (extension) "
+            "via p1-host > p1-tool-read; implements p1-module-read (not built)",
+            result.stdout,
+        )
+        self.assertIn(
+            "check-module-boundaries: shipping: native fallback: p1-provider-openai (extension) "
+            "via p1-host > p1-provider-openai; implements p1-module-provider-openai (not built)",
+            result.stdout,
+        )
+        self.assertNotIn("no module package ships it yet", result.stdout)
+
+    def test_a_fallback_crate_without_a_package_row_says_no_package_ships_it_yet(self) -> None:
+        # Every extension crate of the frozen table names its implementing package now (S3.8 and
+        # #386 activated what the remaining fallbacks implement), so this case withholds the two
+        # rows from this repository's copy of the script: the fallback line stays honest about a
+        # package the table cannot name instead of naming one the release does not ship.
+        h = self.harness("p1-tool-edit", "p1-tool-patch")
+        h.withhold_shipping_packages("p1-tool-edit", "p1-tool-patch")
+        result = h.run("--shipping")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            "check-module-boundaries: shipping: native fallback: p1-tool-edit (extension) "
+            "via p1-host > p1-tool-edit; no module package ships it yet",
+            result.stdout,
+        )
+        self.assertIn(
+            "check-module-boundaries: shipping: native fallback: p1-tool-patch (extension) "
+            "via p1-host > p1-tool-patch; no module package ships it yet",
+            result.stdout,
+        )
+        self.assertEqual(result.stdout.splitlines()[-1], "check-module-boundaries: shipping: 2 native fallback(s)")
+
+    def test_no_native_twin_line_is_printed_for_p1_host(self) -> None:
+        h = self.harness("p1-core", "p1-context")
+        result = h.run("--shipping")
+        self.assertNotIn("native twin:", result.stdout)
+        # p1-host is still the foundation crate of the frozen table, so it is not a fallback of
+        # its own graph either.
+        self.assertRegex(
+            result.stdout,
+            r"(?m)^check-module-boundaries: shipping: graph: \d+ p1-host \(foundation: \S",
+        )
+
+    def test_the_workflow_row_names_only_the_four_tool_members(self) -> None:
+        # p1-module-workflow-decision is not a member of p1-tool-workflow: the decision
+        # component's native substrate is p1-workflow (ADR-0085 item 5), so the workflow row
+        # names the four tool members and nothing else.
+        h = self.harness("p1-tool-workflow")
+        result = h.run("--shipping")
+        self.assertIn(
+            "check-module-boundaries: shipping: native fallback: p1-tool-workflow (extension) "
+            "via p1-host > p1-tool-workflow; implements p1-module-workflow-start (not built), "
+            "p1-module-workflow-status (not built), p1-module-workflow-result (not built), "
+            "p1-module-workflow-cancel (not built)",
+            result.stdout,
+        )
+        self.assertNotIn("p1-module-workflow-decision", result.stdout)
 
     def test_the_import_inventory_names_every_shipped_package_and_its_imports(self) -> None:
         h = self.harness("p1-contracts", "p1-core")

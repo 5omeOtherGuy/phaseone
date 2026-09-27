@@ -20,8 +20,10 @@
 # fallback, listed rather than hidden. It builds nothing, reads no component and needs no
 # module toolchain. Its last line is
 #   check-module-boundaries: shipping: clean (<n> crates, <k> packages, 0 native fallbacks)
-# or `check-module-boundaries: shipping: <f> native fallback(s)`; before the cutover it is red
-# by design and the gate does not run it.
+# or `check-module-boundaries: shipping: <f> native fallback(s)`; it is red by design until the
+# owning streams cut their crates over, and the gate's shipping-audit step (S7.10.1) judges the
+# lines it prints: under the owner order of 2026-09-27 (zero native fallbacks) any `native
+# fallback:`, `native twin:` or `FINDING:` line is red.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 root="$(pwd -P)"
@@ -620,7 +622,7 @@ p1-context|extension|holds the summarizing context policy (src/engine.rs); it be
 p1-core|core|the core runs one loop and depends only on contracts (ADR-0002)
 p1-finish-guest|contracts|the shared guest crate of the `finish` package (S3.7): the world bindings, the declaration text the native tool and the host hub present per policy and output contract, and the wire values both sides convert (ADR-0081, D083)
 p1-hook-shadow|foundation|the brain shadow hook is spawned detached by the host and fails open (ADR-0058)
-p1-host|foundation|the composition root: the OS services it owns (the terminal driver, the worker service, the detached hook shadow) stay native (ADR-0081); its native authorization policies are named as a native twin
+p1-host|foundation|the composition root: the OS services it owns (the terminal driver, the worker service, the detached hook shadow) stay native (ADR-0081)
 p1-journal|foundation|the session record is native and the single truth, including the version and assembly identity (ADR-0021, ADR-0080)
 p1-model-profile|foundation|model policy is host data read at assembly, not an extension (ADR-0004, ADR-0081)
 p1-module-protocol|runtime|the value protocol a module speaks; it is a runtime crate (ADR-0081)
@@ -629,6 +631,7 @@ p1-provider-anthropic|extension|the Anthropic Messages implementation, a provide
 p1-provider-http|foundation|sending, retry, backoff, the one credential refresh after a 401 or 403 and the read bounds stay native (ADR-0081)
 p1-provider-openai|extension|the OpenAI Responses implementation, a provider that becomes a module (ADR-0081)
 p1-provider-openai-chat|extension|the Chat Completions implementation, a provider that becomes a module (ADR-0081)
+p1-read-guest|contracts|the shared guest logic of `read` (S0-R3): pure computation the p1/read component ships; natively it is reached only through p1-tool-read, listed as extension
 p1-redact|foundation|credential-shape masking runs over the output of every assembled tool (issue #142)
 p1-shell-guest|contracts|the shared guest crate of the `shell` package (S3.2), classified for the reason in the notice above: the world bindings, the input validation, the declaration and the sandbox paragraph the native adapter and the component both present (ADR-0081, D083)
 p1-tool-delegate|extension|the worker_start, worker_result, worker_continue and worker_cancel tool members (ADR-0081)
@@ -658,21 +661,33 @@ p1-workspace|foundation|confinement resolves paths after symlinks and every writ
 # official-release HOST ENTRIES over the `p1/shell` and `p1/finish` components (D083b: no
 # modules.lock entries), so the fallback lines of `p1-tool-shell` and `p1-tool-finish` name the
 # packages that now implement the tool, exactly as the worker, workflow and context rows do.
+# notice: scripts/check-module-boundaries.sh (S7.10.2, #386, owner order 2026-09-27): S2
+# activation makes `read`, `edit`, `write`, `apply_patch` and `grep` host entries over the
+# `p1/read`, `p1/edit`, `p1/write`, `p1/patch` and `p1/search` components, so each fallback
+# line of this table names the package that implements the same tool.
 SHIPPING_PACKAGES='
 p1-context|p1-module-context
-p1-tool-finish|p1-module-finish
-p1-tool-shell|p1-module-shell
+p1-provider-anthropic|p1-module-provider-anthropic
+p1-provider-openai|p1-module-provider-openai
+p1-provider-openai-chat|p1-module-provider-openai-chat
 p1-tool-delegate|p1-module-worker-start p1-module-worker-continue p1-module-worker-result p1-module-worker-cancel
+p1-tool-edit|p1-module-edit
+p1-tool-finish|p1-module-finish
+p1-tool-patch|p1-module-patch
+p1-tool-read|p1-module-read
+p1-tool-search|p1-module-search
+p1-tool-shell|p1-module-shell
 p1-tool-workflow|p1-module-workflow-start p1-module-workflow-status p1-module-workflow-result p1-module-workflow-cancel
+p1-tool-write|p1-module-write
 '
 
 # The extension implementations a *foundation* crate still answers natively, as
 # `<crate>|<what>|<package directory> [...]`, one line each. The audit names them (a `native
 # twin:` line) rather than leaving them inside a class that would hide them; the class of the
-# crate they live in does not decide whether the audit may hide them.
-SHIPPING_TWINS='
-p1-host|the native authorization policies p1/policy/ask and p1/policy/full-access (crates/p1-host/src/policy.rs)|p1-module-policy-ask p1-module-policy-full-access
-'
+# crate they live in does not decide whether the audit may hide them. The list is empty: S5.11
+# removed the native authorization policies, the one extension implementation a foundation crate
+# (p1-host) still answered natively.
+SHIPPING_TWINS=''
 
 # The class the frozen table gives crate $1, or nothing when the table does not list the crate.
 shipping_class() {
