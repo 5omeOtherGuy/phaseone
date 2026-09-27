@@ -15,39 +15,74 @@ use std::path::{Path, PathBuf};
 
 use crate::Workspace;
 
-/// Whether `candidate` is one of the credential files a file tool always refuses: the p1
-/// auth store, anything under `~/.config/keys/`, and the other tools' auth files. Compared
-/// on the canonicalised form, so a symlink or a relative path cannot slip past. An empty
-/// `home` refuses only the XDG-named stores.
+/// Credential policy with fixed paths canonicalized once for repeated capability checks.
+#[derive(Clone, Debug)]
+pub struct CredentialPolicy {
+    exact_paths: Vec<PathBuf>,
+    keys_directory: Option<PathBuf>,
+}
+
+impl CredentialPolicy {
+    /// Builds the policy for an agent home and its XDG-named credential files.
+    pub fn new(home: Option<&Path>, xdg_credentials: &[PathBuf]) -> Self {
+        let mut exact_paths = xdg_credentials
+            .iter()
+            .map(|path| canonical_best_effort(path))
+            .collect::<Vec<_>>();
+        let keys_directory = home.map(|home| {
+            let home = canonical_best_effort(home);
+            exact_paths.extend(
+                [
+                    home.join(".config/p1/auth.json"),
+                    home.join(".codex/auth.json"),
+                    home.join(".claude/.credentials.json"),
+                    home.join(".local/share/opencode/auth.json"),
+                    home.join(".pi/agent/auth.json"),
+                ]
+                .iter()
+                .map(|path| canonical_best_effort(path)),
+            );
+            canonical_best_effort(&home.join(".config").join("keys"))
+        });
+        Self {
+            exact_paths,
+            keys_directory,
+        }
+    }
+
+    /// Whether `candidate` is one of the fixed credential files or lies under the keys
+    /// directory. The candidate is canonicalized per request, so aliases cannot bypass policy.
+    pub fn refuses(&self, candidate: &Path) -> bool {
+        let candidate = canonical_best_effort(candidate);
+        self.exact_paths.contains(&candidate)
+            || self
+                .keys_directory
+                .as_ref()
+                .is_some_and(|keys| candidate == *keys || candidate.starts_with(keys))
+    }
+
+    /// The credential refusal for a request, before workspace confinement.
+    pub fn refuse(&self, workspace: &Workspace, requested: &str) -> Result<(), String> {
+        let candidate = if Path::new(requested).is_absolute() {
+            PathBuf::from(requested)
+        } else {
+            workspace.root().join(requested)
+        };
+        if self.refuses(&candidate) {
+            return Err(credential_refusal(&workspace.display(&candidate)));
+        }
+        Ok(())
+    }
+}
+
+/// Whether `candidate` is one of the credential files refused by this file policy.
+/// An empty `home` refuses only the XDG-named stores.
 pub fn refuses_credentials(
     candidate: &Path,
     home: Option<&Path>,
     xdg_credentials: &[PathBuf],
 ) -> bool {
-    let candidate = canonical_best_effort(candidate);
-    if xdg_credentials
-        .iter()
-        .any(|path| canonical_best_effort(path) == candidate)
-    {
-        return true;
-    }
-    let Some(home) = home else {
-        return false;
-    };
-    let home = canonical_best_effort(home);
-    let keys = canonical_best_effort(&home.join(".config").join("keys"));
-    if candidate == keys || candidate.starts_with(&keys) {
-        return true;
-    }
-    [
-        home.join(".config/p1/auth.json"),
-        home.join(".codex/auth.json"),
-        home.join(".claude/.credentials.json"),
-        home.join(".local/share/opencode/auth.json"),
-        home.join(".pi/agent/auth.json"),
-    ]
-    .iter()
-    .any(|path| canonical_best_effort(path) == candidate)
+    CredentialPolicy::new(home, xdg_credentials).refuses(candidate)
 }
 
 /// The refusal of a credential file, before confinement, as the model is told it: the path
@@ -74,15 +109,7 @@ pub fn refuse_credentials(
     home: Option<&Path>,
     xdg_credentials: &[PathBuf],
 ) -> Result<(), String> {
-    let candidate = if Path::new(requested).is_absolute() {
-        PathBuf::from(requested)
-    } else {
-        workspace.root().join(requested)
-    };
-    if refuses_credentials(&candidate, home, xdg_credentials) {
-        return Err(credential_refusal(&workspace.display(&candidate)));
-    }
-    Ok(())
+    CredentialPolicy::new(home, xdg_credentials).refuse(workspace, requested)
 }
 
 /// The p1 and OpenCode stores move with their XDG override (p1-auth); a home-based path

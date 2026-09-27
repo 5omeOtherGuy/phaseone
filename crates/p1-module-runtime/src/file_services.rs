@@ -26,9 +26,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use p1_contracts::{BoxFuture, CancellationToken};
 use p1_workspace::{
-    CheckedPath, FileKind, MutationError, MutationPolicy, Observation, ObservedFiles,
-    OwnedMutation, ReadRecord, Snapshot, Workspace, WorkspaceError, refuse_credentials,
-    xdg_credentials,
+    CheckedPath, CredentialPolicy, FileKind, MutationError, MutationPolicy, Observation,
+    ObservedFiles, OwnedMutation, ReadRecord, Snapshot, Workspace, WorkspaceError,
+    refuse_credentials, xdg_credentials,
 };
 
 use crate::capabilities::{
@@ -277,17 +277,16 @@ impl SnapshotService for ReadCapability {
 #[derive(Clone)]
 pub struct SearchCapability {
     workspace: Workspace,
-    home: Option<PathBuf>,
-    xdg_credentials: Vec<PathBuf>,
+    credential_policy: Arc<CredentialPolicy>,
 }
 
 impl SearchCapability {
     /// The capability over `workspace`, refusing credentials under the agent's home.
     pub fn new(workspace: Workspace, home: Option<PathBuf>) -> Self {
+        let xdg_credentials = xdg_credentials();
         Self {
             workspace,
-            home,
-            xdg_credentials: xdg_credentials(),
+            credential_policy: Arc::new(CredentialPolicy::new(home.as_deref(), &xdg_credentials)),
         }
     }
 
@@ -312,10 +311,10 @@ impl SearchCapability {
 
 impl WorkspaceService for SearchCapability {
     fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>> {
-        let home = self.home.clone();
-        let xdg_credentials = self.xdg_credentials.clone();
+        let credential_policy = self.credential_policy.clone();
         self.blocking(move |workspace, _| {
-            refuse_credentials(workspace, &path, home.as_deref(), &xdg_credentials)
+            credential_policy
+                .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
             let checked = workspace
                 .check_path(&path)
@@ -347,10 +346,10 @@ impl WorkspaceService for SearchCapability {
     ) -> BoxFuture<'_, Result<Vec<u8>, FsError>> {
         // Only the requested window, as the native `grep` reads: file-list mode sniffs a
         // prefix of every listed file, which must not load a large file whole.
-        let home = self.home.clone();
-        let xdg_credentials = self.xdg_credentials.clone();
+        let credential_policy = self.credential_policy.clone();
         self.blocking(move |workspace, _| {
-            refuse_credentials(workspace, &path, home.as_deref(), &xdg_credentials)
+            credential_policy
+                .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
             file_walk::read_window(workspace, &path, offset, length)
         })
@@ -361,27 +360,23 @@ impl WorkspaceService for SearchCapability {
         path: String,
         glob: Option<String>,
     ) -> BoxFuture<'_, Result<Vec<String>, FsError>> {
-        let home = self.home.clone();
-        let xdg_credentials = self.xdg_credentials.clone();
+        let credential_policy = self.credential_policy.clone();
         self.blocking(move |workspace, cancel| {
             file_walk::list_files_excluding(
                 workspace,
                 &path,
                 glob.as_deref(),
                 cancel,
-                |candidate| {
-                    p1_workspace::refuses_credentials(candidate, home.as_deref(), &xdg_credentials)
-                },
+                |candidate| credential_policy.refuses(candidate),
             )
         })
     }
 
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<SearchResult, FsError>> {
-        let home = self.home.clone();
-        let xdg_credentials = self.xdg_credentials.clone();
+        let credential_policy = self.credential_policy.clone();
         self.blocking(move |workspace, cancel| {
             file_walk::search_excluding(workspace, &query, cancel, |candidate| {
-                p1_workspace::refuses_credentials(candidate, home.as_deref(), &xdg_credentials)
+                credential_policy.refuses(candidate)
             })
         })
     }
@@ -950,6 +945,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cancellation_during_file_exclusion_returns_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let cancel = CancellationToken::new();
+
+        let result = file_walk::list_files_excluding(&workspace, ".", None, &cancel, |_| {
+            cancel.cancel();
+            false
+        });
+
+        assert_eq!(result, Err(FsError::Cancelled));
+    }
+
     #[tokio::test]
     async fn search_capability_refuses_credentials_in_every_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -962,8 +972,7 @@ mod tests {
         // Empty XDG list proves refusal comes from the agent-home policy.
         let capability = SearchCapability {
             workspace,
-            home: Some(dir.path().to_path_buf()),
-            xdg_credentials: vec![],
+            credential_policy: Arc::new(CredentialPolicy::new(Some(dir.path()), &[])),
         };
 
         assert_eq!(

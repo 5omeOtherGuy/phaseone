@@ -71,8 +71,8 @@ pub(crate) fn search_excluding(
         .build(&query.pattern)
         .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
     let overrides = build_overrides(&search_path, query.glob.as_deref())?;
-    let mut files = collect_files(workspace, &search_path, overrides, cancel)?;
-    files.retain(|(_, path)| !excluded(path));
+    let files = collect_files(workspace, &search_path, overrides, cancel)?;
+    let files = exclude_files(files, cancel, excluded)?;
     search_content(&matcher, query, &files, cancel)
 }
 
@@ -98,9 +98,31 @@ pub(crate) fn list_files_excluding(
 ) -> Result<Vec<String>, FsError> {
     let search_path = scope(workspace, Some(path))?;
     let overrides = build_overrides(&search_path, glob)?;
-    let mut files = collect_files(workspace, &search_path, overrides, cancel)?;
-    files.retain(|(_, path)| !excluded(path));
+    let files = collect_files(workspace, &search_path, overrides, cancel)?;
+    let files = exclude_files(files, cancel, excluded)?;
     Ok(files.into_iter().map(|(display, _)| display).collect())
+}
+
+/// Remove paths selected by the policy, stopping promptly if the request is cancelled.
+fn exclude_files(
+    files: Vec<(String, PathBuf)>,
+    cancel: &CancellationToken,
+    excluded: impl Fn(&Path) -> bool,
+) -> Result<Vec<(String, PathBuf)>, FsError> {
+    let mut included = Vec::with_capacity(files.len());
+    for file in files {
+        if cancel.is_cancelled() {
+            return Err(FsError::Cancelled);
+        }
+        let exclude = excluded(&file.1);
+        if cancel.is_cancelled() {
+            return Err(FsError::Cancelled);
+        }
+        if !exclude {
+            included.push(file);
+        }
+    }
+    Ok(included)
 }
 
 /// One window of the file, read directly: the guest reads only the prefix it sniffs for
