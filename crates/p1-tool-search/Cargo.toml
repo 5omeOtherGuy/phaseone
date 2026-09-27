@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
+# The `workspace` capability trait the `p1/search` component's host service implements
+# (U-search.3), as p1-tool-read's does for `p1/read`.
+p1-module-runtime = { path = "../p1-module-runtime" }
 p1-tool-search-logic = { path = "logic" }
 p1-workspace = { path = "../p1-workspace" }
 serde_json = "1"
@@ -19,5 +22,10 @@ grep = "0.4"
 ignore = "0.4"
 
 [dev-dependencies]
+# tests/search_module.rs wraps the loaded component as the host does (`wasm_tool` redacts
+# through a mask counter).
+p1-redact = { path = "../p1-redact" }
 tempfile = "3"
-tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
+# `rt-multi-thread`: the component's executor and the host service's blocking work run
+# side by side, as in the host.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }

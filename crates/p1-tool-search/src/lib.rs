@@ -12,6 +12,10 @@
 //! crate's `execute` over these two functions, so native and component run the
 //! same code.
 
+mod capability;
+
+pub use capability::{SearchCapability, search_services};
+
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -866,7 +870,9 @@ mod tests {
         for bytes in [MAX_OUTPUT_BYTES - 1, MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES + 1] {
             texts.push("x".repeat(bytes));
         }
-        texts.push("x\n".repeat(MAX_OUTPUT_LINES - 1) + &"x".repeat(MAX_OUTPUT_BYTES));
+        // `.as_str()`: a crate in the dependency graph adds another `Add` impl for `String`,
+        // so `+ &String` no longer coerces to `&str` by inference.
+        texts.push("x\n".repeat(MAX_OUTPUT_LINES - 1) + "x".repeat(MAX_OUTPUT_BYTES).as_str());
 
         for text in &texts {
             assert_eq!(

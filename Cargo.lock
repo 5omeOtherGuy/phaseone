@@ -2088,6 +2088,8 @@ dependencies = [
  "p1-contracts",
  "p1-module-runtime",
  "p1-read-guest",
+ "p1-tool-search",
+ "p1-tool-write",
  "p1-workspace",
  "serde_json",
  "tempfile",
@@ -2101,6 +2103,8 @@ dependencies = [
  "grep",
  "ignore",
  "p1-contracts",
+ "p1-module-runtime",
+ "p1-redact",
  "p1-tool-search-logic",
  "p1-workspace",
  "serde_json",
@@ -2163,6 +2167,7 @@ name = "p1-tool-write"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
+ "p1-module-runtime",
  "p1-tool-write-logic",
  "p1-workspace",
  "serde_json",
