@@ -678,11 +678,14 @@ fn bwrap_args_order_for_a_workspace_under_tmp() {
     let missing = home.path().join("does-not-exist");
     let readable = home.path().join("shared");
     std::fs::create_dir_all(&readable).unwrap();
+    let missing_readable = home.path().join("no-shared");
 
     let mut sandbox = Sandbox::for_home(home.path());
     sandbox.writable = vec![extra.path().to_path_buf(), missing.clone()];
-    sandbox.readable = vec![readable.clone()];
+    sandbox.readable = vec![readable.clone(), missing_readable];
     sandbox.runtime_dir = Some(runtime_dir.path().to_path_buf());
+    assert!(bwrap_args(&sandbox, &workspace, private_tmp.path()).is_err());
+    sandbox.readable = vec![readable.clone()];
     let args = bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap();
     let expected = expected_args(
         home.path(),
