@@ -25,12 +25,15 @@
 //! parent directories are created while staging (the temporary lives beside its
 //! target), so they can remain after a refusal; no file is left behind.
 //!
-//! Every file operation under the gate is directory-relative: the canonical parent is
-//! opened once by walking down from the root without following any symlink, and the
-//! temporary file, the rename and the unlink all happen relative to that directory
-//! handle, never following a symlink at the leaf. A parent directory swapped for a
+//! Every file operation under the gate is directory-relative: `plan` opens each
+//! target's parent directory once, walking down from the root without following any
+//! symlink, and keeps that directory handle in the planned change. The gate re-proves
+//! that the names the walk used still lead to that handle, and the temporary file, the
+//! rename and the unlink all happen relative to it, never following a symlink at the
+//! leaf and never resolving the target's path again. A parent directory swapped for a
 //! symlink between validation and replacement therefore cannot make a mutation land
-//! outside the root. A create-only replacement and a rename destination are refused
+//! outside the root, and one retargeted in between cannot move it to a directory the
+//! plan never checked. A create-only replacement and a rename destination are refused
 //! atomically with `RENAME_NOREPLACE`, so an ungated writer that fills the path after
 //! the staged `exists` check is not silently overwritten; a filesystem without
 //! `renameat2` refuses those changes rather than degrade to an overwrite, and the root
@@ -371,27 +374,49 @@ impl Workspace {
         self.read(requested, &ObservedFiles::new())
     }
 
-    /// Validate every path of `changes` beneath the workspace, before the gate.
+    /// Validate every path of `changes` beneath the workspace and open every target's
+    /// parent directory once, before the gate. The handle each walk returns travels in
+    /// the planned change, so staging and the replacement work in the directory the plan
+    /// resolved instead of resolving the target's path again (issue #401).
     fn plan<'c>(&self, changes: &'c [Change]) -> Result<Vec<Planned<'c>>, MutationError> {
+        let root = open_root(&self.root)?;
         let mut plan = Vec::with_capacity(changes.len());
         let mut touched: Vec<PathBuf> = Vec::new();
         for change in changes {
             let planned = match &change.op {
-                Op::Write { path, contents } | Op::Create { path, contents } => Planned::Write {
-                    target: self.target(path)?,
-                    contents,
-                    create_only: matches!(change.op, Op::Create { .. }),
-                    computed_from: change.computed_from,
-                },
-                Op::Remove { path } => Planned::Remove {
-                    target: self.target(path)?,
-                    computed_from: change.computed_from,
-                },
-                Op::Rename { from, to } => Planned::Rename {
-                    from: self.target(from)?,
-                    to: self.target(to)?,
-                    computed_from: change.computed_from,
-                },
+                Op::Write { path, contents } | Op::Create { path, contents } => {
+                    let target = self.target(path)?;
+                    let parent = self.plan_parent(&root, &target)?;
+                    Planned::Write {
+                        target,
+                        contents,
+                        create_only: matches!(change.op, Op::Create { .. }),
+                        computed_from: change.computed_from,
+                        parent,
+                    }
+                }
+                Op::Remove { path } => {
+                    let target = self.target(path)?;
+                    let parent = self.plan_parent(&root, &target)?;
+                    Planned::Remove {
+                        target,
+                        computed_from: change.computed_from,
+                        parent,
+                    }
+                }
+                Op::Rename { from, to } => {
+                    let from = self.target(from)?;
+                    let to = self.target(to)?;
+                    let from_parent = self.plan_parent(&root, &from)?;
+                    let to_parent = self.plan_parent(&root, &to)?;
+                    Planned::Rename {
+                        from,
+                        to,
+                        from_parent,
+                        to_parent,
+                        computed_from: change.computed_from,
+                    }
+                }
             };
             // Every check runs before the first replacement, so two changes to one
             // path would each be checked against bytes the other is about to replace.
@@ -451,11 +476,21 @@ impl Workspace {
         let root = open_root(&self.root)?;
         let recheck = Recheck { observed, policy };
 
+        // Under the gate every handle the plan opened must still be the directory the
+        // workspace path names: the names the plan's walk used are re-walked from this
+        // fresh root without following a symlink and must land on the handle it kept. A
+        // parent swapped for a symlink since the plan, or one now leading to a different
+        // directory, refuses here — this proves, it does not resolve: nothing below
+        // touches the target's path.
+        for planned in plan {
+            planned.still_planned(&root)?;
+        }
+
         // Stage everything first: a refusal or failure here drops the staged files,
         // which removes their temporaries, and no target has been touched.
         let mut staged = Vec::with_capacity(plan.len());
         for planned in plan {
-            staged.push(self.stage(&root, planned, &recheck)?);
+            staged.push(self.stage(planned, &recheck)?);
         }
 
         for step in &mut staged {
@@ -526,9 +561,11 @@ impl Workspace {
         Ok(())
     }
 
+    /// One change checked and staged, entirely relative to the parent directory handles
+    /// `plan` opened: `stage` resolves no path, so a parent retargeted after the plan
+    /// cannot move the write to a directory the plan never checked.
     fn stage<'p>(
         &self,
-        root: &OwnedFd,
         planned: &'p Planned<'_>,
         recheck: &Recheck<'_>,
     ) -> Result<Staged<'p>, MutationError> {
@@ -538,8 +575,9 @@ impl Workspace {
                 contents,
                 create_only,
                 computed_from,
+                parent,
             } => {
-                let dir = self.open_parent(root, target, true)?;
+                let dir = open_parent(parent, target, true)?;
                 let leaf = leaf_of(target);
                 if *create_only && exists(&dir, leaf, target)? {
                     return Err(MutationError::AlreadyExists {
@@ -570,8 +608,9 @@ impl Workspace {
             Planned::Remove {
                 target,
                 computed_from,
+                parent,
             } => {
-                let dir = self.open_parent(root, target, false)?;
+                let dir = open_parent(parent, target, false)?;
                 let leaf = leaf_of(target);
                 let Some(existing) = inspect(&dir, leaf, target)? else {
                     return Err(MutationError::NotFound {
@@ -589,8 +628,10 @@ impl Workspace {
                 from,
                 to,
                 computed_from,
+                from_parent,
+                to_parent,
             } => {
-                let from_dir = self.open_parent(root, from, false)?;
+                let from_dir = open_parent(from_parent, from, false)?;
                 let from_leaf = leaf_of(from);
                 let Some(existing) = inspect(&from_dir, from_leaf, from)? else {
                     return Err(MutationError::NotFound {
@@ -598,7 +639,7 @@ impl Workspace {
                     });
                 };
                 recheck.check(from, &existing.bytes, *computed_from)?;
-                let to_dir = self.open_parent(root, to, true)?;
+                let to_dir = open_parent(to_parent, to, true)?;
                 let to_leaf = leaf_of(to);
                 if exists(&to_dir, to_leaf, to)? {
                     return Err(MutationError::AlreadyExists {
@@ -634,11 +675,11 @@ impl Workspace {
 
     /// The deepest existing ancestor of `target`'s parent, canonicalized and checked
     /// beneath the root, with the names of the missing components below it (leaf-most
-    /// first). `canonical_key` rejoins them to name the file; `open_parent` creates
-    /// them and walks the canonical ancestor.
+    /// first). `canonical_key` rejoins them to name the file; `plan_parent` walks the
+    /// ancestor once and records the missing names for [`open_parent`] to create.
     ///
     /// The canonical form has no symlink in it (a symlink that stays inside is fine,
-    /// as for [`Workspace::resolve`]), so `open_parent`'s `O_NOFOLLOW` walk succeeds
+    /// as for [`Workspace::resolve`]), so `plan_parent`'s `O_NOFOLLOW` walk succeeds
     /// unless a component was swapped since, and then the walk refuses instead of
     /// following.
     fn ancestor_and_missing<'t>(
@@ -674,14 +715,15 @@ impl Workspace {
         Ok((canonical, missing))
     }
 
-    /// Open `target`'s parent directory relative to the open `root`, without following
-    /// a symlink on the way, creating missing directories when `create` is set.
-    fn open_parent(
-        &self,
-        root: &OwnedFd,
-        target: &Target,
-        create: bool,
-    ) -> Result<OwnedFd, MutationError> {
+    /// Open the deepest existing part of `target`'s parent directory relative to the
+    /// open `root`, without following a symlink on the way, and record how to reach it:
+    /// the names the walk used, for [`Planned::still_planned`] to re-walk under the gate,
+    /// and the names still missing below it, for [`open_parent`] to create at staging.
+    ///
+    /// This runs once, in [`Workspace::plan`], and opens nothing that does not exist
+    /// yet: a parent directory that is not there is created only while staging, where it
+    /// has always been created.
+    fn plan_parent(&self, root: &OwnedFd, target: &Target) -> Result<Parent, MutationError> {
         let outside = || MutationError::OutsideWorkspace {
             requested: target.requested.clone(),
         };
@@ -691,31 +733,23 @@ impl Workspace {
         let mut dir = root.try_clone().map_err(|error| {
             MutationError::Io(format!("the workspace could not be opened: {error}"))
         })?;
+        let mut names = Vec::new();
         for component in relative.components() {
             let Component::Normal(name) = component else {
                 return Err(outside());
             };
             dir = open_directory(&dir, name, target)?;
+            names.push(name.to_os_string());
         }
-
-        if !missing.is_empty() && !create {
-            return Err(MutationError::NotFound {
-                requested: target.requested.clone(),
-            });
-        }
-        for name in missing.into_iter().rev() {
-            match rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777)) {
-                Ok(()) | Err(Errno::EXIST) => {}
-                Err(error) => {
-                    return Err(MutationError::Io(format!(
-                        "failed to create the parent directories of {}: {error}",
-                        target.display
-                    )));
-                }
-            }
-            dir = open_directory(&dir, name, target)?;
-        }
-        Ok(dir)
+        Ok(Parent {
+            dir,
+            names,
+            missing: missing
+                .into_iter()
+                .rev()
+                .map(|name| name.to_os_string())
+                .collect(),
+        })
     }
 }
 
@@ -728,21 +762,35 @@ struct Target {
     display: String,
 }
 
-/// One validated change.
+/// What [`Workspace::plan_parent`] opened for one target's parent directory: the handle
+/// of its deepest existing part, the names it walked from the root to reach it, and the
+/// names still missing below it. Staging works inside this handle, creating the missing
+/// names when the change may, and never resolves the target's path again.
+struct Parent {
+    dir: OwnedFd,
+    names: Vec<OsString>,
+    missing: Vec<OsString>,
+}
+
+/// One validated change, with the parent directory handles `plan` opened for it.
 enum Planned<'c> {
     Write {
         target: Target,
         contents: &'c [u8],
         create_only: bool,
         computed_from: Option<u64>,
+        parent: Parent,
     },
     Remove {
         target: Target,
         computed_from: Option<u64>,
+        parent: Parent,
     },
     Rename {
         from: Target,
         to: Target,
+        from_parent: Parent,
+        to_parent: Parent,
         computed_from: Option<u64>,
     },
 }
@@ -752,6 +800,28 @@ impl Planned<'_> {
         match self {
             Planned::Write { target, .. } | Planned::Remove { target, .. } => vec![target],
             Planned::Rename { from, to, .. } => vec![from, to],
+        }
+    }
+
+    /// Under the gate: prove that every directory handle this change carries is still
+    /// the directory its workspace path opens, before anything is staged. A parent
+    /// swapped for a symlink since the plan, or one that now leads elsewhere, refuses
+    /// ([`MutationError::OutsideWorkspace`]) instead of letting the write follow it.
+    fn still_planned(&self, root: &OwnedFd) -> Result<(), MutationError> {
+        match self {
+            Planned::Write { target, parent, .. } | Planned::Remove { target, parent, .. } => {
+                parent_still_planned(root, parent, target)
+            }
+            Planned::Rename {
+                from,
+                from_parent,
+                to,
+                to_parent,
+                ..
+            } => {
+                parent_still_planned(root, from_parent, from)?;
+                parent_still_planned(root, to_parent, to)
+            }
         }
     }
 }
@@ -972,9 +1042,9 @@ fn rename_noreplace_on(
 }
 
 /// The workspace root's directory handle, never following a symlink at its final
-/// component. The root is re-opened by path under the gate, so a root swapped for a
-/// symlink after the workspace was resolved must refuse instead of re-opening wherever
-/// the link points; `O_DIRECTORY` alone would follow it.
+/// component. `plan` walks down from this handle, and it is re-opened by path under the
+/// gate, so a root swapped for a symlink after the workspace was resolved must refuse
+/// instead of re-opening wherever the link points; `O_DIRECTORY` alone would follow it.
 fn open_root(root: &std::path::Path) -> Result<OwnedFd, MutationError> {
     rustix::fs::openat(
         CWD,
@@ -1029,6 +1099,70 @@ fn open_directory(dir: &OwnedFd, name: &OsStr, target: &Target) -> Result<OwnedF
         },
         other => MutationError::Io(format!("{} could not be resolved: {other}", target.display)),
     })
+}
+
+/// The parent directory staging works in: the handle `plan` opened, with the names it
+/// recorded missing below it created now. `create` decides whether a parent still
+/// missing is a refusal (`NotFound`, as a removal or a rename source needs) or is made,
+/// as a write's or a rename's destination's is. Directories are created here and
+/// nowhere else, inside the plan's handle — no path of `target` is resolved again.
+fn open_parent(parent: &Parent, target: &Target, create: bool) -> Result<OwnedFd, MutationError> {
+    if !parent.missing.is_empty() && !create {
+        return Err(MutationError::NotFound {
+            requested: target.requested.clone(),
+        });
+    }
+    let mut dir = parent.dir.try_clone().map_err(|error| {
+        MutationError::Io(format!("the workspace could not be opened: {error}"))
+    })?;
+    for name in &parent.missing {
+        match rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o777)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(error) => {
+                return Err(MutationError::Io(format!(
+                    "failed to create the parent directories of {}: {error}",
+                    target.display
+                )));
+            }
+        }
+        dir = open_directory(&dir, name, target)?;
+    }
+    Ok(dir)
+}
+
+/// Prove, with the gate held, that `parent` is still the directory its workspace path
+/// opens: the names `plan` walked are re-walked from the freshly opened root without
+/// following a symlink, and must land on the handle the plan kept. A component swapped
+/// for a symlink refuses in the walk itself (`open_directory` never follows one), and a
+/// component that now leads to another directory refuses here. This checks the plan's
+/// handle; it is not how staging finds the directory — staging works in the handle.
+fn parent_still_planned(
+    root: &OwnedFd,
+    parent: &Parent,
+    target: &Target,
+) -> Result<(), MutationError> {
+    let mut walked = root.try_clone().map_err(|error| {
+        MutationError::Io(format!("the workspace could not be opened: {error}"))
+    })?;
+    for name in &parent.names {
+        walked = open_directory(&walked, name, target)?;
+    }
+    let same = same_directory(&walked, &parent.dir).map_err(|error| {
+        MutationError::Io(format!("{} could not be resolved: {error}", target.display))
+    })?;
+    if same {
+        return Ok(());
+    }
+    Err(MutationError::OutsideWorkspace {
+        requested: target.requested.clone(),
+    })
+}
+
+/// Whether two handles are one directory: what the gate re-walked must be the directory
+/// the plan opened, not a directory that took its place while the gate was being taken.
+fn same_directory(one: &OwnedFd, other: &OwnedFd) -> Result<bool, Errno> {
+    let (one, other) = (rustix::fs::fstat(one)?, rustix::fs::fstat(other)?);
+    Ok(one.st_dev == other.st_dev && one.st_ino == other.st_ino)
 }
 
 /// Whether anything at all (a dangling symlink included) is at `leaf` in `dir`.
@@ -1880,6 +2014,83 @@ mod tests {
         drop(owned);
         assert_eq!(text(&workspace, "a.txt"), "same\n");
         assert_eq!(text(&workspace, "b.txt"), "same\n");
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn a_parent_symlink_retargeted_between_the_plan_and_the_stage_never_moves_the_change() {
+        // The parent is a directory symlink inside the workspace. `plan` resolves it to
+        // the directory it points at and opens that directory, so an ungated writer that
+        // retargets the link after the plan can neither move the change into a
+        // directory the plan never checked nor out of the workspace.
+        let (dir, workspace) = workspace(&[
+            ("planned/keep.txt", "planned\n"),
+            ("new/keep.txt", "new\n"),
+            ("src/moving.txt", "moving\n"),
+        ]);
+        symlink(dir.path().join("planned"), dir.path().join("link")).unwrap();
+        let observed = ObservedFiles::new();
+        let retarget = || {
+            fs::remove_file(dir.path().join("link")).unwrap();
+            symlink(dir.path().join("new"), dir.path().join("link")).unwrap();
+        };
+
+        // A new file written through the link: the change may land in the directory the
+        // plan opened or be refused, never in the directory `link` was retargeted to.
+        let written = commit_in_two_steps(
+            &workspace,
+            std::slice::from_ref(&Change::write("link/fresh.txt", "written\n")),
+            &observed,
+            retarget,
+        );
+        match written {
+            Ok(()) => assert_eq!(
+                fs::read_to_string(dir.path().join("planned/fresh.txt")).unwrap(),
+                "written\n",
+                "the write lands in the directory the plan opened"
+            ),
+            Err(error) => assert!(
+                !dir.path().join("planned/fresh.txt").exists(),
+                "a refused change writes nothing: {error:?}"
+            ),
+        }
+        assert!(
+            !dir.path().join("new/fresh.txt").exists(),
+            "the retargeted directory must never receive the write"
+        );
+        assert_eq!(text(&workspace, "planned/keep.txt"), "planned\n");
+        assert_eq!(text(&workspace, "new/keep.txt"), "new\n");
+
+        // The same through a rename's destination, which the plan resolves and opens
+        // the same way: the final rename runs between the two handles the plan holds.
+        fs::remove_file(dir.path().join("link")).unwrap();
+        symlink(dir.path().join("planned"), dir.path().join("link")).unwrap();
+        workspace.read("src/moving.txt", &observed).unwrap();
+        let moved = commit_in_two_steps(
+            &workspace,
+            std::slice::from_ref(&Change::rename("src/moving.txt", "link/landed.txt")),
+            &observed,
+            retarget,
+        );
+        match moved {
+            Ok(()) => {
+                assert_eq!(text(&workspace, "planned/landed.txt"), "moving\n");
+                assert!(!dir.path().join("src/moving.txt").exists());
+            }
+            Err(error) => {
+                assert_eq!(
+                    text(&workspace, "src/moving.txt"),
+                    "moving\n",
+                    "a refused change moves nothing: {error:?}"
+                );
+                assert!(!dir.path().join("planned/landed.txt").exists());
+            }
+        }
+        assert!(
+            !dir.path().join("new/landed.txt").exists(),
+            "the rename must never follow the retargeted parent"
+        );
+        assert_eq!(text(&workspace, "new/keep.txt"), "new\n");
         no_temporaries(dir.path());
     }
 
