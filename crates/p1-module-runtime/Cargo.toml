@@ -19,7 +19,7 @@ p1-redact = { path = "../p1-redact" }
 # crates' own traits, passed in by the host.
 p1-workers = { path = "../p1-workers" }
 p1-workflow = { path = "../p1-workflow" }
-# S7.10-R1 (ADR-0091): the file tools' capability services — the read side, the walk and the
+# S7.10-R1 (ADR-0093): the file tools' capability services — the read side, the walk and the
 # owned mutation — and the credential-file policy they apply before confinement are the
 # HOST's now (`src/file_services.rs`, `src/file_walk.rs`), so a component is linked without
 # the host depending on a tool crate.
@@ -30,8 +30,12 @@ p1-workspace = { path = "../p1-workspace" }
 grep = "0.4"
 ignore = "0.4"
 thiserror = "2"
+# The native process service (`process`): process-group signals, the sandbox's private /tmp,
+# and the child's pipes and timers.
+nix = { version = "0.29", default-features = false, features = ["signal"] }
+tempfile = "3"
 # The executor task, its request channel and the per-call tasks it owns.
-tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "process", "io-util", "time"] }
 # The bounded set of ORCHESTRATION-PLAN §2 (owner, Q7). No `cache`: the loader compiles the
 # verified bytes itself, so a compiled-code cache would be a second, unverified source of
 # code. No `wat` or WASI: modules arrive as binary components and get only p1's own imports.

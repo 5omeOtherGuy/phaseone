@@ -8,9 +8,15 @@
 //! credential, retries and frames the SSE body, and feeds the events to the `decoder`
 //! (freeze item 9).
 //!
-//! Every request lowers to HTTP, whatever the route's `transport` and the connection
-//! state: the WebSocket branch of `lower` is S5's (ADR-0078), and HTTP is the fallback the
-//! world allows a WebSocket route.
+//! A route whose `transport` is `sse` lowers every request to HTTP. A `websocket` route
+//! lowers through the portable decisions of `p1_provider_openai::websocket_lower`, the ones
+//! the native adapter ran (ADR-0078 §1): from the broker's `connection-state` it chooses a
+//! handshake with the full frame, a full frame or the shorter continuation frame on the open
+//! connection (`docs/design/websocket.md` §6), or — once an attempt failed before any output —
+//! the HTTP request, after which this instance speaks HTTP for good (§5). The decoder records
+//! what §6 needs of every response, and a response it completes becomes what the next request
+//! may continue; the broker's `last-clean-response` decides whether that connection completed
+//! it.
 //!
 //! One instance holds one composition, stored by `configure`. Every export before
 //! `configure` answers a `Protocol` error rather than trapping. A decoder fed after its
@@ -29,8 +35,9 @@ use p1_bindings_provider::generated::p1::module::credential_control::{
 };
 use p1_bindings_provider::generated::p1::module::http::{HttpRequest, Method, ResponseHead};
 use p1_bindings_provider::generated::p1::module::types::{Declaration, DeclarationKind};
+use p1_bindings_provider::generated::p1::module::websocket::WebsocketRequestHead;
 use p1_bindings_provider::generated::{
-    ConnectionState, Guest, LoweredRequest, ProviderRequest, ProviderSettings,
+    ConnectionState, Guest, LoweredRequest, ProviderRequest, ProviderSettings, WebsocketSend,
 };
 use p1_contracts::tool::{Grammar, ToolDeclaration};
 use p1_contracts::{
@@ -41,7 +48,14 @@ use p1_module_protocol::{
     WireItem, WireModelOptions, WireProviderError, WireRouteDescription, WireStreamEvent,
 };
 use p1_provider_http::{ResponseParser, SseEvent};
-use p1_provider_openai::{CodexResponseParser, lower_request, validate_history, validate_request};
+use p1_provider_openai::websocket_lower::{
+    self, Lowered, ResponseFacts, WebSocketDecisions, WebSocketHead,
+};
+use p1_provider_openai::{
+    CodexResponseParser, ResponsesTransport, build_ws_headers_without_credential,
+    clamped_cache_key, lower_request, validate_history, validate_request, ws_frame,
+};
+use serde_json::Value;
 
 use settings::Composition;
 
@@ -49,6 +63,13 @@ thread_local! {
     /// The instance's one composition. The component model runs an instance on one thread
     /// and calls it once at a time, so a thread-local cell is the whole instance's state.
     static COMPOSITION: OnceCell<Composition> = const { OnceCell::new() };
+    /// The WebSocket decisions of this instance: whether it fell back, and §6's memory of
+    /// the last response it completed.
+    static DECISIONS: RefCell<WebSocketDecisions> = RefCell::new(WebSocketDecisions::new(ws_frame));
+    /// The full body of the request lowered last, which the response a decoder completes
+    /// answered: the broker holds the connection for one request at a time, and lowers
+    /// its retries again, so the body lowered last is the one on the wire.
+    static LOWERED_BODY: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 const NOT_CONFIGURED: &str = "the provider module was used before configure";
@@ -56,6 +77,7 @@ const CONFIGURED_TWICE: &str = "the provider module was configured twice";
 const BAD_HISTORY: &str = "the request carries a history item that is not protocol JSON";
 const BAD_OPTIONS: &str = "the request carries model options that are not protocol JSON";
 const BAD_SCHEMA: &str = "the request carries a tool input schema that is not JSON";
+const BAD_BODY: &str = "the lowered request body is not a JSON object";
 /// The panic message of a decoder used after its terminal event: the trap it causes is
 /// what the host reports, and the message never leaves the guest.
 const USED_AFTER_TERMINAL: &str = "decoder used after its terminal event";
@@ -179,7 +201,7 @@ impl Guest for Component {
 
     fn lower(
         request: ProviderRequest,
-        _connection: ConnectionState,
+        connection: ConnectionState,
     ) -> Result<LoweredRequest, String> {
         with_composition(|composition| {
             let request = decode_request(request)?;
@@ -196,22 +218,56 @@ impl Guest for Component {
             } else {
                 lowered.path.to_owned()
             };
-            Ok(LoweredRequest::Http(HttpRequest {
-                method: Method::Post,
+            // An OAuth bearer, and the header the broker fills with the credential's
+            // ChatGPT account id, as the native header builder does.
+            let account_id_header = composition
+                .route
+                .account
+                .account_id_header()
+                .map(str::to_owned);
+            let http = websocket_lower::LoweredHttpRequest {
                 path,
                 headers: lowered.headers,
-                // An OAuth bearer, and the header the broker fills with the credential's
-                // ChatGPT account id, as the native header builder does.
-                credential: CredentialUse {
-                    scheme: CredentialScheme::Bearer,
-                    account_id_header: composition
-                        .route
-                        .account
-                        .account_id_header()
-                        .map(str::to_owned),
-                },
+                account_id_header,
                 body: lowered.body,
-            }))
+            };
+            if composition.route.transport == ResponsesTransport::Sse {
+                return Ok(http_request(http));
+            }
+            let body: Value = serde_json::from_slice(&http.body)
+                .ok()
+                .filter(Value::is_object)
+                .ok_or_else(|| protocol(BAD_BODY))?;
+            // The handshake opens the same URL the HTTP request posts to, with the header
+            // set §3 names; the broker attaches the credential ahead of it.
+            let cache_key = clamped_cache_key(&request.options);
+            let head = WebSocketHead {
+                path: http.path.clone(),
+                headers: build_ws_headers_without_credential(
+                    composition.route.account,
+                    cache_key.as_deref(),
+                )?,
+                account_id_header: http.account_id_header.clone(),
+            };
+            let state = websocket_lower::ConnectionState {
+                open: connection.open,
+                last_clean_response: connection.last_clean_response,
+                failed_before_output: connection.failed_before_output,
+            };
+            let lowered = DECISIONS
+                .with(|decisions| decisions.borrow_mut().lower(&body, head, &http, &state));
+            LOWERED_BODY.with(|lowered| *lowered.borrow_mut() = Some(body));
+            Ok(match lowered {
+                Lowered::Http(http) => http_request(http),
+                Lowered::WebSocket(send) => LoweredRequest::Websocket(WebsocketSend {
+                    handshake: send.handshake.map(|head| WebsocketRequestHead {
+                        path: head.path,
+                        headers: head.headers,
+                        credential: bearer(head.account_id_header),
+                    }),
+                    frame: send.frame,
+                }),
+            })
         })
         .map_err(error_json)
     }
@@ -225,11 +281,31 @@ impl Guest for Component {
     }
 }
 
+/// Where the broker attaches the route's credential: always an OAuth bearer, plus the
+/// account-id header an account needs.
+fn bearer(account_id_header: Option<String>) -> CredentialUse {
+    CredentialUse {
+        scheme: CredentialScheme::Bearer,
+        account_id_header,
+    }
+}
+
+fn http_request(http: websocket_lower::LoweredHttpRequest) -> LoweredRequest {
+    LoweredRequest::Http(HttpRequest {
+        method: Method::Post,
+        path: http.path,
+        headers: http.headers,
+        credential: bearer(http.account_id_header),
+        body: http.body,
+    })
+}
+
 impl DecodingGuest for Component {
     type Decoder = Decoder;
 }
 
-/// One response attempt: a fresh parser, and whether its terminal event was returned.
+/// One response attempt: a fresh parser, what §6 needs of the response, and whether its
+/// terminal event was returned.
 struct Decoder {
     state: RefCell<DecoderState>,
 }
@@ -237,6 +313,8 @@ struct Decoder {
 struct DecoderState {
     /// `None` when the decoder was created before `configure`.
     parser: Option<CodexResponseParser>,
+    /// The response id and re-encodable output items this attempt's events reported.
+    facts: ResponseFacts,
     terminated: bool,
 }
 
@@ -246,6 +324,7 @@ impl GuestDecoder for Decoder {
         Self {
             state: RefCell::new(DecoderState {
                 parser,
+                facts: ResponseFacts::default(),
                 terminated: false,
             }),
         }
@@ -253,6 +332,8 @@ impl GuestDecoder for Decoder {
 
     fn feed(&self, event: WireEvent) -> Vec<String> {
         let mut state = self.state.borrow_mut();
+        // One plain borrow, so the parser and the facts are borrowed apart.
+        let state = &mut *state;
         if state.terminated {
             panic!("{USED_AFTER_TERMINAL}");
         }
@@ -261,21 +342,31 @@ impl GuestDecoder for Decoder {
             let failure = Outcome::Failed(protocol(NOT_CONFIGURED));
             return vec![event_json(StreamEvent::Finished(failure))];
         };
+        state.facts.record(&event.data);
         let mut events = Vec::new();
-        let mut terminated = false;
+        let mut completed = false;
         for event in parser.on_event(SseEvent {
             event: event.name,
             data: event.data,
         }) {
-            terminated = matches!(event, StreamEvent::Finished(_));
+            let terminal = match &event {
+                StreamEvent::Finished(outcome) => {
+                    completed = matches!(outcome, Outcome::Completed(_));
+                    true
+                }
+                _ => false,
+            };
             events.push(event_json(event));
             // Exactly one `Finished` per decoder: whatever a parser returns after its own
             // terminal event is dropped, as the native drive loop drops it.
-            if terminated {
+            if terminal {
+                state.terminated = true;
                 break;
             }
         }
-        state.terminated = terminated;
+        if completed {
+            remember(&state.facts);
+        }
         events
     }
 
@@ -289,6 +380,9 @@ impl GuestDecoder for Decoder {
             Some(parser) => parser.on_end(),
             None => Outcome::Failed(protocol(NOT_CONFIGURED)),
         };
+        if matches!(outcome, Outcome::Completed(_)) {
+            remember(&state.facts);
+        }
         event_json(StreamEvent::Finished(outcome))
     }
 
@@ -299,6 +393,17 @@ impl GuestDecoder for Decoder {
             .as_ref()
             .and_then(|parser| parser.response_id().map(str::to_owned))
     }
+}
+
+/// §6: a response completed, so the next request may continue it. Whether it may is decided
+/// at that request's `lower`: only on the open connection whose last clean response is this
+/// one, which also makes a response that came over HTTP never continued.
+fn remember(facts: &ResponseFacts) {
+    LOWERED_BODY.with(|body| {
+        if let Some(body) = body.borrow().as_ref() {
+            DECISIONS.with(|decisions| decisions.borrow_mut().completed(body, facts));
+        }
+    });
 }
 
 p1_bindings_provider::generated::export!(Component);
@@ -320,9 +425,13 @@ efforts  = ["low", "medium", "high", "extra_high", "max"]
 "#;
 
     fn configure(endpoint: &str) {
+        configure_for(endpoint, "sse");
+    }
+
+    fn configure_for(endpoint: &str, transport: &str) {
         let adapter_settings = serde_json::json!({
             "account": "codex-subscription",
-            "transport": "websocket",
+            "transport": transport,
             "model_profile": {"stem": "gpt-6-sol", "toml": PROFILE},
         });
         Component::configure(ProviderSettings {
@@ -356,6 +465,14 @@ efforts  = ["low", "medium", "high", "extra_high", "max"]
         }
     }
 
+    fn closed_connection() -> ConnectionState {
+        ConnectionState {
+            open: false,
+            last_clean_response: None,
+            failed_before_output: false,
+        }
+    }
+
     fn error(text: &str) -> WireProviderError {
         serde_json::from_str(text).expect("a provider-error")
     }
@@ -376,9 +493,131 @@ efforts  = ["low", "medium", "high", "extra_high", "max"]
         let user = r#"{"item":"user","text":"hello"}"#.to_owned();
         match Component::lower(request(vec![user]), open_connection()) {
             Ok(LoweredRequest::Http(http)) => http,
-            Ok(LoweredRequest::Websocket(_)) => panic!("the WebSocket branch is S5's"),
+            Ok(LoweredRequest::Websocket(_)) => panic!("an SSE route lowers to HTTP"),
             Err(refused) => panic!("the request lowers: {refused}"),
         }
+    }
+
+    fn user(text: &str) -> String {
+        serde_json::to_string(&WireItem::from(Item::User { text: text.into() }))
+            .expect("a history item encodes")
+    }
+
+    fn lower_websocket(history: Vec<String>, connection: ConnectionState) -> WebsocketSend {
+        match Component::lower(request(history), connection) {
+            Ok(LoweredRequest::Websocket(send)) => send,
+            Ok(LoweredRequest::Http(_)) => panic!("expected a WebSocket send"),
+            Err(refused) => panic!("the request lowers: {refused}"),
+        }
+    }
+
+    fn frame(send: &WebsocketSend) -> serde_json::Value {
+        serde_json::from_str(&send.frame).expect("a JSON frame")
+    }
+
+    /// Feeds one completed response, `resp_1` with the assistant message "ok", to a fresh
+    /// decoder, as the broker feeds a WebSocket response's frames.
+    fn complete_a_response() {
+        let decoder = Decoder::new();
+        let wire = [
+            r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1"}}"#,
+        ];
+        for data in wire {
+            decoder.feed(sse(data));
+        }
+        assert_eq!(decoder.response_id().as_deref(), Some("resp_1"));
+    }
+
+    fn open_after(response: &str) -> ConnectionState {
+        ConnectionState {
+            open: true,
+            last_clean_response: Some(response.into()),
+            failed_before_output: false,
+        }
+    }
+
+    fn second_turn() -> Vec<String> {
+        let assistant = Item::Assistant(AssistantItem {
+            origin: Origin {
+                route: "openai-responses/codex-subscription".into(),
+                model: "gpt-6-sol".into(),
+            },
+            blocks: vec![AssistantBlock::Text { text: "ok".into() }],
+        });
+        vec![
+            user("hello"),
+            serde_json::to_string(&WireItem::from(assistant)).expect("a history item encodes"),
+            user("again"),
+        ]
+    }
+
+    #[test]
+    fn a_websocket_route_opens_a_connection_with_the_full_frame() {
+        configure_for("https://chatgpt.com/backend-api", "websocket");
+        let send = lower_websocket(vec![user("hello")], closed_connection());
+        let head = send
+            .handshake
+            .as_ref()
+            .expect("a handshake when nothing is open");
+        assert_eq!(head.path, "/codex/responses");
+        assert!(
+            head.headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+        );
+        assert!(head.headers.contains(&(
+            "OpenAI-Beta".to_owned(),
+            "responses_websockets=2026-02-06".to_owned()
+        )));
+        assert_eq!(
+            head.credential.account_id_header.as_deref(),
+            Some("chatgpt-account-id")
+        );
+        let frame = frame(&send);
+        assert_eq!(frame["type"], "response.create");
+        assert!(frame.get("stream").is_none(), "{frame}");
+        assert!(frame.get("previous_response_id").is_none(), "{frame}");
+    }
+
+    #[test]
+    fn a_completed_response_is_continued_only_on_the_connection_that_completed_it() {
+        configure_for("https://chatgpt.com/backend-api", "websocket");
+        lower_websocket(vec![user("hello")], closed_connection());
+        complete_a_response();
+
+        let other = lower_websocket(second_turn(), open_after("resp_other"));
+        assert!(other.handshake.is_none());
+        assert!(frame(&other).get("previous_response_id").is_none());
+
+        let continued = lower_websocket(second_turn(), open_after("resp_1"));
+        assert!(continued.handshake.is_none());
+        let frame = frame(&continued);
+        assert_eq!(frame["previous_response_id"], "resp_1");
+        assert_eq!(frame["input"].as_array().map(Vec::len), Some(1), "{frame}");
+    }
+
+    #[test]
+    fn a_failure_before_output_falls_back_to_http_for_good() {
+        configure_for("https://chatgpt.com/backend-api", "websocket");
+        let failed = ConnectionState {
+            open: false,
+            last_clean_response: None,
+            failed_before_output: true,
+        };
+        let Ok(LoweredRequest::Http(fallback)) =
+            Component::lower(request(vec![user("hello")]), failed)
+        else {
+            panic!("the fallback is the HTTP request");
+        };
+        assert_eq!(fallback.path, "/codex/responses");
+        let body: serde_json::Value = serde_json::from_slice(&fallback.body).unwrap();
+        assert_eq!(body["stream"], true);
+        assert!(matches!(
+            Component::lower(request(vec![user("hello")]), closed_connection()),
+            Ok(LoweredRequest::Http(_))
+        ));
     }
 
     #[test]

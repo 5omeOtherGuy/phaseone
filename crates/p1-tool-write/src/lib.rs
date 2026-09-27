@@ -8,7 +8,7 @@
 //! guard for an existing target and the write, under the write gate.
 //!
 //! The `workspace-mutation` capability service a component is linked with is the
-//! HOST's (`p1_module_runtime::file_services`, S7.10-R1, ADR-0091); it is re-exported
+//! HOST's (`p1_module_runtime::file_services`, S7.10-R1, ADR-0093); it is re-exported
 //! here for the tests that link the edit, write and patch components.
 
 use p1_contracts::tool::{ResultDescription, ResultDetail};

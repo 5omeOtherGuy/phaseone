@@ -5,7 +5,7 @@
 //!
 //! They lived in the tool crates (`p1-tool-read`, `p1-tool-search`, `p1-tool-write`) while
 //! those crates were the host's file tools; since read, edit, write, apply_patch and grep are
-//! served by their components alone (S7.10-R1, ADR-0091), the host cannot depend on them any
+//! served by their components alone (S7.10-R1, ADR-0093), the host cannot depend on them any
 //! more: a service that links a component is the host's, so it lives where the capability
 //! traits do, and the tool crates re-use it for their own native tools and tests.
 //!
@@ -15,7 +15,7 @@
 //! a module receives is complete and safe to show the model, so the component passes `io` text
 //! through unchanged.
 //!
-//! The services are call-scoped (ADR-0090): [`tool_services`] and [`capability_services`]
+//! The services are call-scoped (ADR-0092): [`tool_services`] and [`capability_services`]
 //! build each export call's own read side and mutation service over one fresh
 //! [`ReadRecord`], so the gated write of a call refuses a target another agent changed after
 //! THIS call's read, and no read of an earlier or a concurrent call of the same tool
@@ -183,9 +183,13 @@ impl Inner {
         // What this read returned is this tool's read identity of the file, whatever window
         // was asked for: the whole-file digest of the snapshot the bytes come from. The latest
         // read of a path wins, and a mutation assembled with the same record refuses any other
-        // bytes at that path under the gate.
-        self.reads
-            .record_hash(&key, snapshot.metadata().content_hash);
+        // bytes at that path under the gate. The spelling is recorded too, so the mutation
+        // refuses a source path that now resolves elsewhere (a retargeted symlink).
+        self.reads.record_read(
+            &self.workspace.spelling(requested),
+            &key,
+            snapshot.metadata().content_hash,
+        );
         if (offset as u64).saturating_add(window.len() as u64) < size {
             self.keep_open(key, snapshot);
         }
@@ -331,14 +335,9 @@ impl WorkspaceService for SearchCapability {
         offset: u64,
         length: u64,
     ) -> BoxFuture<'_, Result<Vec<u8>, FsError>> {
-        self.blocking(move |workspace, _| {
-            let snapshot = workspace
-                .read_unobserved(&path)
-                .map_err(file_walk::workspace_error)?;
-            let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-            let length = usize::try_from(length).unwrap_or(usize::MAX);
-            Ok(snapshot.read(offset, length).to_vec())
-        })
+        // Only the requested window, as the native `grep` reads: file-list mode sniffs a
+        // prefix of every listed file, which must not load a large file whole.
+        self.blocking(move |workspace, _| file_walk::read_window(workspace, &path, offset, length))
     }
 
     fn list_files(
@@ -473,7 +472,7 @@ fn fs_error(error: MutationError) -> FsError {
 /// rows, `Some(PatchAuthorized)` for the patch row, `None` for a tool that does not mutate
 /// (its manifest does not grant `workspace-mutation` either way).
 ///
-/// The services are call-scoped (ADR-0090): every export call gets its own read side and
+/// The services are call-scoped (ADR-0092): every export call gets its own read side and
 /// mutation service over one fresh [`ReadRecord`], so the gated write of a call refuses a
 /// target another agent changed after THIS call's read, and no read of an earlier or a
 /// concurrent call of the same tool satisfies or blocks it.
@@ -916,6 +915,28 @@ mod tests {
         assert_eq!(
             file_walk::search(&workspace, &query, &cancel),
             Err(FsError::Cancelled)
+        );
+    }
+
+    /// The search capability's `read` returns only the requested window and records no
+    /// observation (`p1/search` is granted no `snapshot`), so file-list mode's binary sniff
+    /// cannot load a large file whole or give a search the permission an edit needs.
+    #[tokio::test]
+    async fn a_search_read_returns_only_the_requested_window() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "0123456789").unwrap();
+        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap());
+        assert_eq!(
+            capability.read("a.txt".into(), 2, 3).await,
+            Ok(b"234".to_vec())
+        );
+        assert_eq!(
+            capability.read("a.txt".into(), 8, 100).await,
+            Ok(b"89".to_vec())
+        );
+        assert_eq!(
+            capability.read("../outside".into(), 0, 1).await,
+            Err(FsError::OutsideWorkspace)
         );
     }
 }

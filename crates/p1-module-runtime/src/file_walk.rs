@@ -10,7 +10,7 @@
 //! [`crate::file_services::SearchCapability`] links it into a module, so native and component
 //! walk the same way and word every failure the same way (the frozen `fs-error`).
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
@@ -78,6 +78,25 @@ pub fn list_files(
     let overrides = build_overrides(&search_path, glob)?;
     let files = collect_files(workspace, &search_path, overrides, cancel)?;
     Ok(files.into_iter().map(|(display, _)| display).collect())
+}
+
+/// One window of the file, read directly: the guest reads only the prefix it sniffs for
+/// binary content, so the whole file is never loaded. The native `grep` and the search
+/// component's capability service (a window of `workspace.read`) share it, so both read the
+/// same bytes for the same request.
+pub fn read_window(
+    workspace: &Workspace,
+    path: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, FsError> {
+    let checked = workspace.check_path(path).map_err(workspace_error)?;
+    let io = |error: io::Error| FsError::Io(error.to_string());
+    let mut file = std::fs::File::open(checked.path()).map_err(io)?;
+    io::copy(&mut (&mut file).take(offset), &mut io::sink()).map_err(io)?;
+    let mut window = Vec::new();
+    file.take(length).read_to_end(&mut window).map_err(io)?;
+    Ok(window)
 }
 
 /// Resolve the path to search (the root when absent); it must exist.

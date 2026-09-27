@@ -5,7 +5,7 @@
 //! published, and links it as the host's catalog links its row
 //! (`p1_host::catalog::capability_services_for`): the agent's read side and search walk, the
 //! mutation mode the row grants, and a read record shared by the read side and the
-//! mutation, fresh for every call (ADR-0090).
+//! mutation, fresh for every call (ADR-0092).
 //!
 //! A parity case then runs the SAME call through the component and through the native tool
 //! the catalog registers while no lock selects the key, each over its own workspace seeded
@@ -424,7 +424,7 @@ fn key() -> String {
 
 /// A component linked with its row's services, with each call's mutation service wrapped so
 /// a case learns when a call asks for the write gate — no sleep, no polling. The row's
-/// services are call-scoped (ADR-0090), so the wrapping is too: every call's own mutation
+/// services are call-scoped (ADR-0092), so the wrapping is too: every call's own mutation
 /// service, over that call's read record, is the one that announces.
 fn announcing(
     row: Row,
@@ -989,7 +989,7 @@ async fn a_change_between_the_components_read_and_its_gated_write_is_refused() {
     .await;
 }
 
-/// The read record is the call's own (ADR-0090): a later call of the same assembled tool does
+/// The read record is the call's own (ADR-0092): a later call of the same assembled tool does
 /// not inherit an earlier call's read. One patch moves `a.txt` away — it read `a.txt` to do so
 /// — and the next patch creates `a.txt` afresh, which a record shared across calls refused as
 /// "changed on disk" (the file its digest names is gone).
@@ -1035,7 +1035,7 @@ async fn a_later_call_does_not_inherit_an_earlier_calls_read() {
     .await;
 }
 
-/// Two concurrent calls of one assembled tool never share a read record (ADR-0090): call A
+/// Two concurrent calls of one assembled tool never share a read record (ADR-0092): call A
 /// reads `a.txt`, another agent changes it, call B reads the new contents, and only then do
 /// both reach the gate. A's change was computed from the old contents and is refused whichever
 /// call writes first; with one record per assembly B's read overwrote A's digest, so A's
@@ -1089,7 +1089,7 @@ async fn a_component_replacement_is_never_observed_partially() {
     within_deadline("atomicity", async {
         // Four megabytes, the oracle's size: big enough that an in-place write is caught
         // mid-write, and above the three megabytes wasmtime's default hostcall budget let a
-        // component hand the host (ADR-0090, `p1_module_runtime::executor::HOSTCALL_FUEL`).
+        // component hand the host (ADR-0092, `p1_module_runtime::executor::HOSTCALL_FUEL`).
         let before = "a".repeat(4 * 1024 * 1024);
         let after = "b".repeat(4 * 1024 * 1024);
         let pair = Pair::of(Row::Write, &[("big.txt", &before)]);

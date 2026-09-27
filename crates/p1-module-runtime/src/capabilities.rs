@@ -59,7 +59,8 @@ pub enum ProcessEvent {
 }
 
 /// The native process service a module's `process` capability is linked to. The real one
-/// is the service extracted from `p1-tool-shell`; the runtime only adapts it.
+/// is [`process::ProcessCapability`](crate::process::ProcessCapability) over this crate's
+/// native process service.
 pub trait ProcessService: Send + Sync {
     /// Starts `command` for a call whose cancellation is `cancel`. The future settles the
     /// start even when `cancel` fires while it runs: a service that started the command
@@ -297,7 +298,7 @@ pub struct Services {
     /// The `workflows` capability ([`crate::delegation`], S6).
     pub workflows: Option<WorkflowServices>,
     /// The services whose state belongs to ONE export call (the read record a mutation
-    /// rechecks against, ADR-0090): called once at the start of every call, before its
+    /// rechecks against, ADR-0092): called once at the start of every call, before its
     /// Store, and each service it returns serves that call in place of the field above.
     /// The fields above are what the linker checks against the manifest, so a scope
     /// returns a service only where the field above holds one.
@@ -1317,7 +1318,7 @@ mod tests {
     }
 
     /// A call-scoped part is built at the start of every call and serves that call alone
-    /// (ADR-0090); what the scope does not return is the assembly's, shared as before.
+    /// (ADR-0092); what the scope does not return is the assembly's, shared as before.
     #[test]
     fn every_call_gets_its_own_call_scoped_services() {
         struct NoGate;

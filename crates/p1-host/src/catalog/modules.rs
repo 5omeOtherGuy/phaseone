@@ -1021,7 +1021,7 @@ fn announce_release(_deps: &HostDeps, _release: &Path) {}
 /// own members (`catalog/delegation.rs`, `catalog/workflow.rs`; B-S6-9, D068); their hooks
 /// give every module they do not serve `Services::default()`, so the base fills the
 /// `workspace`, `snapshot` and `workspace-mutation` a family hook left empty, with the call
-/// scope that builds them fresh per call (ADR-0090), and a module that is no member (the
+/// scope that builds them fresh per call (ADR-0092), and a module that is no member (the
 /// `p1/read`, `p1/edit`, `p1/write`, `p1/patch` or `p1/search` component) links exactly as
 /// without the families. No other native service
 /// backs a module capability in the host yet (the shell's process service is not bridged
@@ -1079,10 +1079,10 @@ pub(crate) fn quiet_deps(environment_dirs: Vec<PathBuf>) -> HostDeps {
 mod tests {
     use p1_assembly::{EnvironmentFile, ProviderSpec, Substitutions, assemble};
     use p1_contracts::{ModelOptions, Provider, ToolIdentity};
+    use p1_finish_guest::CompletionPolicy;
     use p1_module_runtime::ProcessService;
     use p1_module_tests::{FIXTURE_NAME, FakeProcesses, Release, fake_processes, lock_text};
     use p1_testkit::{FakeTool, ScriptedProvider};
-    use p1_tool_finish::CompletionPolicy;
 
     use crate::catalog::capabilities::{Capabilities, SemanticCapability, carries, declared};
 
@@ -1102,7 +1102,7 @@ mod tests {
     }
 
     /// Under a family hook that serves only its members, a mutating component still gets its
-    /// row's mutation and the call scope that builds each call's read record (ADR-0090): with
+    /// row's mutation and the call scope that builds each call's read record (ADR-0092): with
     /// only `workspace` and `snapshot` filled in, a locked `p1/edit` failed its assembly on
     /// `MissingService("workspace-mutation")` in every run that installs the worker family.
     #[test]
@@ -1658,7 +1658,7 @@ mod tests {
         );
     }
 
-    /// S7.10-R1 (ADR-0091): the five file tools are release host entries — `edit`, `write`,
+    /// S7.10-R1 (ADR-0093): the five file tools are release host entries — `edit`, `write`,
     /// `apply_patch` and `grep` beside `read` — so a key no lock names runs the release's
     /// component, and a release that does not carry one fails the build naming the key and the
     /// package, exactly as a missing `read` does. No compiled-in registration answers for any of

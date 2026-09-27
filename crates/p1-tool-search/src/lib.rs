@@ -11,12 +11,10 @@
 //!
 //! The walk and the `workspace` capability service that links it into the component
 //! are the HOST's (`p1_module_runtime::file_walk`, `p1_module_runtime::file_services`,
-//! S7.10-R1, ADR-0091): the native tool calls the same walk through the runtime's
+//! S7.10-R1, ADR-0093): the native tool calls the same walk through the runtime's
 //! types, and re-exports the service for its own tests.
 
 pub use p1_module_runtime::file_services::{SearchCapability, search_services};
-
-use std::io::{self, Read};
 
 use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
@@ -212,16 +210,8 @@ impl Capabilities for NativeHost {
         })
     }
 
-    /// One window of the file, read directly: the guest reads only the prefix
-    /// it sniffs for binary content, so the whole file is never loaded.
     fn read(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>, FsError> {
-        let checked = self.workspace.check_path(path).map_err(fs_error)?;
-        let io = |error: io::Error| FsError::Io(error.to_string());
-        let mut file = std::fs::File::open(checked.path()).map_err(io)?;
-        io::copy(&mut (&mut file).take(offset), &mut io::sink()).map_err(io)?;
-        let mut window = Vec::new();
-        file.take(length).read_to_end(&mut window).map_err(io)?;
-        Ok(window)
+        read_window(&self.workspace, path, offset, length)
     }
 
     fn list_files(&self, path: &str, glob: Option<&str>) -> Result<Vec<String>, FsError> {
@@ -231,6 +221,20 @@ impl Capabilities for NativeHost {
     fn search(&self, query: &SearchQuery) -> Result<SearchResult, FsError> {
         search(&self.workspace, query, &self.cancel)
     }
+}
+
+/// One window of the file, read directly: the guest reads only the prefix
+/// it sniffs for binary content, so the whole file is never loaded. This is the
+/// host walk's read ([`p1_module_runtime::file_walk::read_window`], the copy the
+/// `p1/search` component's capability service reads through), so native and component
+/// read the same bytes for the same request.
+pub(crate) fn read_window(
+    workspace: &Workspace,
+    path: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, FsError> {
+    file_walk::read_window(workspace, path, offset, length).map_err(from_walk)
 }
 
 /// The host walk's `workspace.list-files` ([`p1_module_runtime::file_walk`], the one copy the

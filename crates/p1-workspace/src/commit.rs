@@ -228,7 +228,7 @@ impl OwnedMutation {
     }
 
     fn single(&self, change: Change) -> Result<(), MutationError> {
-        let change = self.read_identity(change);
+        let change = self.read_identity(change)?;
         let plan = self.workspace.plan(std::slice::from_ref(&change))?;
         self.workspace.apply(&plan, &self.observed, self.policy)
     }
@@ -238,16 +238,31 @@ impl OwnedMutation {
     /// other bytes there, whatever the policy. A target this tool did not read has no
     /// identity and is checked by the policy alone. The path is resolved exactly as the
     /// change's own validation resolves it, so both name one file.
-    fn read_identity(&self, change: Change) -> Change {
-        match self
-            .workspace
-            .resolve(change.source_path())
-            .ok()
-            .and_then(|path| self.reads.recorded(&path))
+    ///
+    /// A path this tool read that now resolves to another file (a symlink retargeted
+    /// since the read) is refused as stale: the change was computed from a file that is
+    /// not the one it would replace, and treating the new target as unread would skip
+    /// the recheck entirely.
+    fn read_identity(&self, change: Change) -> Result<Change, MutationError> {
+        let requested = change.source_path();
+        let Ok(path) = self.workspace.resolve(requested) else {
+            return Ok(change);
+        };
+        let spelling = self.workspace.spelling(requested);
+        if self
+            .reads
+            .read_as(&spelling)
+            .is_some_and(|read| read != crate::observe::key(&path))
         {
+            return Err(MutationError::Io(format!(
+                "{} changed on disk since you last read it; read it again.",
+                self.workspace.display(&spelling)
+            )));
+        }
+        Ok(match self.reads.recorded(&path) {
             Some(hash) => change.computed_from_hash(hash),
             None => change,
-        }
+        })
     }
 }
 
@@ -1757,6 +1772,47 @@ mod tests {
             observed.check_unchanged(&workspace.root().join("a.txt"), b"mine\n"),
             Observation::Unchanged
         );
+        drop(owned);
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn a_symlink_retargeted_between_the_read_and_the_gated_write_is_refused() {
+        let (dir, workspace) = workspace(&[("a.txt", "read\n"), ("b.txt", "never read\n")]);
+        std::os::unix::fs::symlink("a.txt", dir.path().join("link.txt")).unwrap();
+        let observed = ObservedFiles::new();
+        let reads = ReadRecord::new();
+        // The call reads through the symlink, as the read side records it.
+        let snapshot = workspace.read("link.txt", &ObservedFiles::new()).unwrap();
+        reads.record_read(
+            &workspace.spelling("link.txt"),
+            &workspace.resolve("link.txt").unwrap(),
+            snapshot.metadata().content_hash,
+        );
+        let owned = ready(workspace.begin_owned(&observed, &reads, PATCH));
+
+        // Another writer retargets the link to a file the call never read.
+        fs::remove_file(dir.path().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("b.txt", dir.path().join("link.txt")).unwrap();
+        assert_eq!(
+            owned.write("link.txt", "pwned\n"),
+            Err(io(
+                "link.txt changed on disk since you last read it; read it again."
+            ))
+        );
+        assert_eq!(text(&workspace, "b.txt"), "never read\n");
+        assert_eq!(text(&workspace, "a.txt"), "read\n");
+
+        // Retargeted to a path with nothing behind it, the change is refused too.
+        fs::remove_file(dir.path().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("gone.txt", dir.path().join("link.txt")).unwrap();
+        assert_eq!(
+            owned.write("link.txt", "pwned\n"),
+            Err(io(
+                "link.txt changed on disk since you last read it; read it again."
+            ))
+        );
+        assert!(!dir.path().join("gone.txt").exists());
         drop(owned);
         no_temporaries(dir.path());
     }

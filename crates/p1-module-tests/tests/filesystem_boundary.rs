@@ -18,7 +18,7 @@
 //! name through the production loader over the artifacts `scripts/build-modules.sh`
 //! published, linked with the services the host links their catalog rows with
 //! (`p1_host::catalog::capability_services_for`): the read side and the mutation of one
-//! call share that call's read record (S2, ADR-0090).
+//! call share that call's read record (S2, ADR-0092).
 
 use std::fs;
 use std::future::Future;
@@ -1225,7 +1225,7 @@ async fn a_call_waiting_for_a_held_gate_returns_promptly_when_cancelled() {
         let release = Release::of(&["p1-module-write"]);
         let observed = ObservedFiles::new();
         let (waiting, mut waits) = tokio::sync::mpsc::unbounded_channel();
-        // The services are call-scoped (ADR-0090), so each call's mutation is the one wrapped.
+        // The services are call-scoped (ADR-0092), so each call's mutation is the one wrapped.
         let scope = services_with(&ws, &observed, MutationPolicy::Observed)
             .call_scope
             .expect("the row's services are call-scoped");

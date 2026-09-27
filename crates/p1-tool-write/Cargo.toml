@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
-# S7.10-R1 (ADR-0091): the `workspace-mutation` capability service the edit, write and patch
+# S7.10-R1 (ADR-0093): the `workspace-mutation` capability service the edit, write and patch
 # components are linked with is the host's now (`p1_module_runtime::file_services`), so the one
 # edge left to the runtime is the re-export this crate's tests use (a path dependency inside the
 # workspace, no new package).

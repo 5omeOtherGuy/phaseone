@@ -1,5 +1,5 @@
 ---
-adr: 91
+adr: 93
 title: File-tool capability services live in the runtime; no native file-tool fallback
 status: proposed
 date: 2026-09-27
@@ -8,11 +8,11 @@ supersedes: []
 superseded_by: []
 sources: ["docs/design/modules/capabilities.md", "docs/design/modules/workspace-mutation.md"]
 ---
-# ADR-0091: File-tool capability services live in the runtime; no native file-tool fallback
+# ADR-0093: File-tool capability services live in the runtime; no native file-tool fallback
 
 ## Context
 
-S2 activation (PR #386, ADR-0090) made `modules.lock` entries named `edit`, `write`,
+S2 activation (PR #386, ADR-0092) made `modules.lock` entries named `edit`, `write`,
 `apply_patch` and `grep` resolve to the `p1/edit`, `p1/write`, `p1/patch` and `p1/search`
 components, exactly as S1.8 did for `read`, and kept the native tools registered as the
 fallback for a key no lock selects. The host also needed HOST-side code to link those
