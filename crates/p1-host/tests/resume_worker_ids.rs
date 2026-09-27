@@ -2,8 +2,10 @@
 //! (issue #98).
 //!
 //! Workers of the earlier process are declared gone and their ids are reserved, so a
-//! new worker cannot answer to an old name. The ids come from the delegation tool's
-//! own results — but a WORKFLOW step is a worker too, and it leaves only its
+//! new worker cannot answer to an old name. The ids come from the `worker_start`
+//! results the session journalled, under whichever identity wrote them: the native
+//! `p1-tool-delegate` member's before S6.11, the `p1/worker-start` package's since.
+//! A WORKFLOW step is a worker too, and it leaves only its
 //! `FILE.w<N>.jsonl` beside the session, with no record naming it. Reserving solely
 //! from the journal therefore offered an id whose file was already there, and every
 //! new worker (and every workflow child) failed with "journal file already exists"
@@ -215,6 +217,123 @@ async fn a_resumed_session_reserves_the_ids_of_worker_journals_a_workflow_left()
             .as_deref()
             .is_some_and(|content| content.starts_with("Started worker w11 ")),
         "the model is told which worker it got: {started:?}"
+    );
+}
+
+/// S7.10-R6 (#392): a session written before S6.11 journalled `worker_start` under the
+/// native tool's identity, not the member package's. The host reads those records
+/// directly now — no rewrite — so that journal must still declare its worker gone and
+/// keep its id reserved.
+#[tokio::test]
+async fn a_resumed_session_journalled_under_the_native_identity_still_reserves_its_ids() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    declared_environments(environments.path());
+    let session = workspace.path().join("session.jsonl");
+    let session_arg = session.to_str().unwrap();
+    let workspace_arg = workspace.path().to_str().unwrap();
+
+    let (code, harness) = run(
+        environments.path(),
+        ScriptedProvider::new(vec![
+            tool_call_response(vec![start_call("c1")]),
+            text_response("done"),
+            text_response("spare"),
+            text_response("spare"),
+        ]),
+        ScriptedProvider::new(vec![text_response("child done")]),
+        &[
+            "--yes",
+            "--env",
+            "a",
+            "--workspace",
+            workspace_arg,
+            "--session",
+            session_arg,
+            "go",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert!(
+        worker_journal(&session, 1).exists(),
+        "w1 must be journalled: {}",
+        harness.stderr.text()
+    );
+
+    // Rewrite ONLY the identity of each `ToolStarted`, the record the scanner reads,
+    // into the one a pre-S6.11 binary wrote: the journal is otherwise the one the run
+    // above just wrote, so the resume sees a session it must read as before.
+    let mut rewritten = 0;
+    let older = std::fs::read_to_string(&session)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+            if record["record"] == "tool_started" {
+                assert_eq!(
+                    record["identity"]["implementation"], "p1/worker-start",
+                    "the run journalled the member package's identity: {line}"
+                );
+                record["identity"]["implementation"] = "p1-tool-delegate".into();
+                rewritten += 1;
+            }
+            serde_json::to_string(&record).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rewritten > 0, "the run journalled its `worker_start`");
+    std::fs::write(&session, older + "\n").unwrap();
+
+    let parent = ScriptedProvider::new(vec![
+        tool_call_response(vec![start_call("c2")]),
+        text_response("started"),
+        text_response("waiting"),
+        text_response("spare"),
+    ]);
+    let (code, harness) = run(
+        environments.path(),
+        parent.clone(),
+        ScriptedProvider::new(vec![text_response("done again")]),
+        &[
+            "--yes",
+            "--env",
+            "a",
+            "--workspace",
+            workspace_arg,
+            "--session",
+            session_arg,
+            "--resume",
+            "again",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+
+    assert!(
+        harness
+            .stderr
+            .text()
+            .contains("resume: worker(s) w1 belonged to the earlier process and are not restored"),
+        "stderr: {}",
+        harness.stderr.text()
+    );
+    let started = parent.requests()[1]
+        .history
+        .iter()
+        .find_map(|item| match item {
+            Item::ToolResult(result) if result.call_id == "c2" => Some(result.content.clone()),
+            _ => None,
+        });
+    assert!(
+        started
+            .as_deref()
+            .is_some_and(|content| content.starts_with("Started worker w2 ")),
+        "the worker past the journalled w1 gets w2: {started:?}"
+    );
+    assert!(
+        worker_journal(&session, 2).exists(),
+        "w2 is the worker that was started"
     );
 }
 
