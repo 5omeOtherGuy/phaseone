@@ -118,6 +118,16 @@ impl SandboxRuntime {
             return Err(SandboxError::WorkspaceContainsHome { workspace, home });
         }
         let sandbox = Sandbox { home, ..sandbox };
+        // Refuse unsafe operator configuration at assembly; bwrap_args repeats
+        // this check after resolving each path for every command.
+        for readable in &sandbox.readable {
+            if let Some(directory) = credential_directory(&sandbox.home, readable) {
+                return Err(SandboxError::ReadableCredential {
+                    path: readable.clone(),
+                    directory,
+                });
+            }
+        }
         let bwrap_path = resolve_bwrap(std::env::var_os("PATH").as_deref(), &workspace)
             .ok_or(SandboxError::NotInstalled)?;
         let private_tmp = tempfile::Builder::new()

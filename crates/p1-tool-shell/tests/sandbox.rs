@@ -394,6 +394,11 @@ fn expected_args(
             ]);
         }
     }
+    args.extend([
+        "--bind".into(),
+        workspace.display().to_string(),
+        workspace.display().to_string(),
+    ]);
     for name in ["credentials.toml", "credentials"] {
         let path = home.join(".cargo").join(name);
         if path.exists() {
@@ -405,9 +410,6 @@ fn expected_args(
         }
     }
     args.extend([
-        "--bind".into(),
-        workspace.display().to_string(),
-        workspace.display().to_string(),
         "--remount-ro".into(),
         home.display().to_string(),
         "--unshare-pid".into(),
@@ -439,7 +441,9 @@ fn i_bwrap_args_order_for_a_workspace_under_tmp() {
     sandbox.writable = vec![extra.path().to_path_buf(), missing.clone()];
     sandbox.readable = vec![readable.clone(), missing_readable.clone()];
     sandbox.runtime_dir = Some(runtime_dir.path().to_path_buf());
-    let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
+    assert!(bwrap_args(&sandbox, &workspace, private_tmp.path()).is_err());
+    sandbox.readable = vec![readable.clone()];
+    let args = bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap();
     let expected = expected_args(
         home.path(),
         &workspace,
@@ -466,7 +470,7 @@ fn i_bwrap_args_order_for_a_workspace_under_the_home() {
 
     let mut sandbox = Sandbox::for_home(home.path());
     sandbox.readable = vec![readable.clone()];
-    let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
+    let args = bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap();
     let expected = expected_args(
         home.path(),
         &workspace,
@@ -479,8 +483,7 @@ fn i_bwrap_args_order_for_a_workspace_under_the_home() {
     assert_eq!(os_args(&args), expected);
 }
 
-/// The masks must come AFTER the writable binds: a `--sandbox-write ~/.cargo`
-/// must not cover the `/dev/null` mask and expose the token.
+/// The masks follow writable and workspace binds, so neither can expose the token.
 #[test]
 fn i_token_masks_come_after_the_writable_binds() {
     let home = tempfile::tempdir().unwrap();
@@ -493,7 +496,7 @@ fn i_token_masks_come_after_the_writable_binds() {
 
     let mut sandbox = Sandbox::for_home(home.path());
     sandbox.writable = vec![cargo.clone()];
-    let args = os_args(&bwrap_args(&sandbox, &workspace, private_tmp.path()));
+    let args = os_args(&bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap());
 
     let writable = args
         .windows(3)
@@ -516,14 +519,12 @@ fn i_token_masks_come_after_the_writable_binds() {
         .position(|window| window[0] == "--bind" && window[1] == workspace.display().to_string())
         .expect("the workspace bind must be present");
     assert!(
-        mask < workspace_bind,
-        "the mask must come before the workspace bind"
+        mask > workspace_bind,
+        "the mask must come after the workspace bind"
     );
 }
 
-/// The mount ORDER alone (`bwrap_args` is pure and does not validate) keeps the
-/// token masked: even a readable `~/.cargo` — or the home, which `sandboxed`
-/// refuses — is mounted before the mask.
+/// A readable `~/.cargo` remains masked after its bind; the broader home is refused.
 #[test]
 fn i_a_readable_path_cannot_uncover_the_cargo_token_mask() {
     let home = tempfile::tempdir().unwrap();
@@ -534,10 +535,21 @@ fn i_a_readable_path_cannot_uncover_the_cargo_token_mask() {
     std::fs::create_dir_all(&workspace).unwrap();
     let private_tmp = tempfile::tempdir().unwrap();
 
-    for readable in [home.path().to_path_buf(), cargo.clone()] {
+    assert!(
+        bwrap_args(
+            &Sandbox {
+                readable: vec![home.path().to_path_buf()],
+                ..Sandbox::for_home(home.path())
+            },
+            &workspace,
+            private_tmp.path(),
+        )
+        .is_err()
+    );
+    for readable in [cargo.clone()] {
         let mut sandbox = Sandbox::for_home(home.path());
         sandbox.readable = vec![readable.clone()];
-        let args = os_args(&bwrap_args(&sandbox, &workspace, private_tmp.path()));
+        let args = os_args(&bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap());
         let readable_bind = args
             .windows(3)
             .position(|window| {
