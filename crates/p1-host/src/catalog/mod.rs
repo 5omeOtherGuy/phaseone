@@ -74,6 +74,10 @@ pub use providers::{
     provider_component, reject_profile, route_provider,
 };
 use tools::register_standard_tools;
+// The mutation mode of a tool's row and the capability services that row's link assembles
+// (`tools.rs`): re-exported so the module acceptance suite can link a component exactly as
+// the host links it.
+pub use tools::{capability_services_for, mutation_mode};
 // Re-exported so `crate::catalog::register_workflow_tools` stays the path its callers use.
 #[cfg(feature = "workflows")]
 pub(crate) use workflow::register_workflow_tools;

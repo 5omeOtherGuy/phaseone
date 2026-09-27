@@ -67,7 +67,7 @@ impl ObservedFiles {
     }
 }
 
-fn key(path: &Path) -> PathBuf {
+pub(crate) fn key(path: &Path) -> PathBuf {
     // Canonicalize so a read and a later mutation agree on the key even when
     // one arrived through a symlink; fall back for a path that does not exist.
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
