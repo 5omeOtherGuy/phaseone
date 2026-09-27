@@ -32,7 +32,8 @@ pub const CREDENTIAL_DIRECTORIES: &[&str] = &[
 ];
 
 /// What the sandbox hides, keeps visible and keeps writable. The host chooses
-/// this; [`crate::ShellTool::sandboxed`] turns it into a `bwrap` invocation.
+/// this; [`ProcessService::sandboxed`](super::ProcessService::sandboxed) turns it
+/// into a `bwrap` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sandbox {
     /// The home directory to hide behind a `tmpfs` (canonical once sandboxed).
@@ -42,9 +43,9 @@ pub struct Sandbox {
     /// Extra absolute paths that stay visible READ-ONLY if they exist. A git
     /// worktree keeps its metadata outside the workspace, in the main checkout's
     /// git directory, so a job there needs this to run `git status`/`git diff`.
-    /// [`crate::ShellTool::sandboxed`] refuses a path equal to, inside or
-    /// containing a [`CREDENTIAL_DIRECTORIES`] entry of the home, and a path
-    /// containing the home itself.
+    /// [`ProcessService::sandboxed`](super::ProcessService::sandboxed) refuses a
+    /// path equal to, inside or containing a [`CREDENTIAL_DIRECTORIES`] entry of
+    /// the home, and a path containing the home itself.
     pub readable: Vec<PathBuf>,
     /// Extra absolute paths that stay writable if they exist.
     pub writable: Vec<PathBuf>,
@@ -182,7 +183,7 @@ pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) 
     //    directory (agent sockets and keyrings). The readable binds come BEFORE
     //    the writable binds and the token masks below, so no readable path can
     //    uncover `~/.cargo/credentials*`. The runtime `tmpfs` comes last, so a
-    //    readable path can never re-expose an agent socket. (`ShellTool::sandboxed`
+    //    readable path can never re-expose an agent socket. (`ProcessService::sandboxed`
     //    also refuses a readable path that would contain a credential directory.)
     args.push("--tmpfs".into());
     args.push(home.into());

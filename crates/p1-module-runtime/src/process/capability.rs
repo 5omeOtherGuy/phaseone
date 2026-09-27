@@ -1,6 +1,6 @@
 //! The native side of a WebAssembly guest's `process` capability
 //! (`modules/wit/process.wit`): [`ProcessCapability`] implements the runtime's
-//! [`ProcessService`](p1_module_runtime::ProcessService) over this crate's
+//! [`ProcessService`](crate::ProcessService) trait over the native
 //! [`ProcessService`], so a guest's `process.spawn` runs exactly what the native
 //! shell tool runs.
 //!
@@ -11,8 +11,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::{ExitStatus, ProcessCommand, ProcessEvent, RunningProcess};
 use p1_contracts::{BoxFuture, CancellationToken};
-use p1_module_runtime::{ExitStatus, ProcessCommand, ProcessEvent, RunningProcess};
 
 use super::{ProcessEnd, ProcessRequest, ProcessService, ProcessStream, StreamEvent};
 
@@ -33,7 +33,7 @@ impl ProcessCapability {
     }
 }
 
-impl p1_module_runtime::ProcessService for ProcessCapability {
+impl crate::ProcessService for ProcessCapability {
     /// `Err` is [`ProcessFailure`](super::ProcessFailure)'s text, the one the native
     /// shell tool shows the model. A call already cancelled starts nothing, as the
     /// native tool starts nothing then.

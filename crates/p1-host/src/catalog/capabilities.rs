@@ -259,9 +259,22 @@ mod tests {
         p1_tool_shell::ShellTool::new(p1_workspace::Workspace::new(dir).expect("workspace"))
     }
 
+    /// The native tool reads no record here: only its identity is checked.
+    struct NoActivity;
+
+    impl p1_tool_finish::SessionActivity for NoActivity {
+        fn last_file_change(&self) -> Option<u64> {
+            None
+        }
+
+        fn shell_runs(&self) -> Vec<p1_finish_guest::ShellRun> {
+            Vec::new()
+        }
+    }
+
     fn finish() -> p1_tool_finish::FinishTool {
         p1_tool_finish::FinishTool::new(
-            Arc::new(crate::activity::ActivityLog::default()),
+            Arc::new(NoActivity),
             p1_tool_finish::FinishOutcome::default(),
         )
     }

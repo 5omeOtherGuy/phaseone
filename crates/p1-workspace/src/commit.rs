@@ -10,6 +10,13 @@
 //! A module reads and computes outside the gate; the host rechecks the agent's
 //! observation of every target under the gate, at the moment it writes.
 //!
+//! A component's read is not an observation, so the gate also rechecks the target's
+//! contents against the change's read identity: a [`ReadRecord`] names the whole file
+//! as the reading tool saw it, and an [`OwnedMutation`] carries that identity into
+//! every change of the file it read ([`Recheck::check`]). That is what refuses a
+//! second writer for patch-authorized mode, which has no observation to check, and it
+//! is why the read record is one tool's own state rather than the agent's.
+//!
 //! Atomicity is per file. Each new content is staged as a synced sibling temporary
 //! file before anything is replaced, so a failure while checking or staging leaves
 //! every target untouched and removes the temporaries. The replacements themselves
@@ -25,7 +32,9 @@
 //! symlink between validation and replacement therefore cannot make a mutation land
 //! outside the root. A create-only replacement and a rename destination are refused
 //! atomically with `RENAME_NOREPLACE`, so an ungated writer that fills the path after
-//! the staged `exists` check is not silently overwritten.
+//! the staged `exists` check is not silently overwritten; a filesystem without
+//! `renameat2` refuses those changes rather than degrade to an overwrite, and the root
+//! itself is opened without following a symlink.
 //!
 //! [`WriteGate`]: crate::WriteGate
 
@@ -35,7 +44,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
@@ -43,6 +52,7 @@ use rustix::io::Errno;
 use crate::gate::Held;
 use crate::observe::{Observation, ObservedFiles, hash_of};
 use crate::read::{Snapshot, SnapshotMetadata};
+use crate::reads::ReadRecord;
 use crate::text::temp_name;
 use crate::{Workspace, WorkspaceError};
 
@@ -136,6 +146,21 @@ impl Change {
         self
     }
 
+    /// The same identity, when the caller holds the whole file's content digest instead
+    /// of a [`SnapshotMetadata`] of it (the [`ReadRecord`] an [`OwnedMutation`] carries).
+    fn computed_from_hash(mut self, hash: u64) -> Self {
+        self.computed_from = Some(hash);
+        self
+    }
+
+    /// The path the change was computed from: its target, or a rename's source.
+    fn source_path(&self) -> &str {
+        match &self.op {
+            Op::Write { path, .. } | Op::Create { path, .. } | Op::Remove { path } => path,
+            Op::Rename { from, .. } => from,
+        }
+    }
+
     fn new(op: Op) -> Self {
         Self {
             op,
@@ -163,16 +188,19 @@ impl std::fmt::Debug for Change {
     }
 }
 
-/// The write gate held for one module export call, with the agent and policy it
-/// mutates for: the native side of the WIT `mutation` resource.
+/// The write gate held for one module export call, with the agent, the read identity it
+/// mutates for and the policy: the native side of the WIT `mutation` resource.
 ///
 /// `'static + Send`, so the host can keep it in its resource table across import
 /// calls. Each method is a single-target [`Workspace::commit`] under the gate this
-/// value already holds, with the same checks and policy. Dropping it releases the gate.
-/// The methods do blocking file I/O, a few operations each, like the native tools.
+/// value already holds, with the same checks and policy, and with the [`ReadRecord`]
+/// entry of the change's target, when this tool read it, as the change's read identity.
+/// Dropping it releases the gate. The methods do blocking file I/O, a few operations
+/// each, like the native tools.
 pub struct OwnedMutation {
     workspace: Workspace,
     observed: ObservedFiles,
+    reads: ReadRecord,
     policy: MutationPolicy,
     _held: Held,
 }
@@ -200,8 +228,71 @@ impl OwnedMutation {
     }
 
     fn single(&self, change: Change) -> Result<(), MutationError> {
+        let (change, read) = self.read_identity(change)?;
         let plan = self.workspace.plan(std::slice::from_ref(&change))?;
+        self.plans_the_file_read(&plan, read.as_deref(), &change)?;
         self.workspace.apply(&plan, &self.observed, self.policy)
+    }
+
+    /// Refuse a plan whose source resolved to another file than the one the read
+    /// identity was checked against: `plan` resolves the path again, and a symlink
+    /// retargeted in between would otherwise carry the read file's digest to a file
+    /// with the same bytes that this tool never read.
+    fn plans_the_file_read(
+        &self,
+        plan: &[Planned<'_>],
+        read: Option<&Path>,
+        change: &Change,
+    ) -> Result<(), MutationError> {
+        let (Some(read), Some(planned)) = (read, plan.first()) else {
+            return Ok(());
+        };
+        let source = match planned {
+            Planned::Write { target, .. } | Planned::Remove { target, .. } => target,
+            Planned::Rename { from, .. } => from,
+        };
+        if source.path == read {
+            return Ok(());
+        }
+        Err(self.changed_since_read(change.source_path()))
+    }
+
+    fn changed_since_read(&self, requested: &str) -> MutationError {
+        MutationError::Io(format!(
+            "{} changed on disk since you last read it; read it again.",
+            self.workspace.display(&self.workspace.spelling(requested))
+        ))
+    }
+
+    /// The change with the read identity of what this tool read of its target, if
+    /// anything: the gated recheck (the caller already holds the gate) then refuses any
+    /// other bytes there, whatever the policy. A target this tool did not read has no
+    /// identity and is checked by the policy alone. The path is resolved exactly as the
+    /// change's own validation resolves it, so both name one file.
+    ///
+    /// A path this tool read that now resolves to another file (a symlink retargeted
+    /// since the read) is refused as stale: the change was computed from a file that is
+    /// not the one it would replace, and treating the new target as unread would skip
+    /// the recheck entirely. With the identity comes the file it was checked against,
+    /// which the plan must resolve to as well ([`Self::plans_the_file_read`]).
+    fn read_identity(&self, change: Change) -> Result<(Change, Option<PathBuf>), MutationError> {
+        let requested = change.source_path();
+        let Ok(path) = self.workspace.resolve(requested) else {
+            return Ok((change, None));
+        };
+        let spelling = self.workspace.spelling(requested);
+        let read_as = self.reads.read_as(&spelling);
+        if read_as
+            .as_ref()
+            .is_some_and(|read| *read != crate::observe::key(&path))
+        {
+            return Err(self.changed_since_read(requested));
+        }
+        Ok(match self.reads.recorded(&path) {
+            Some(hash) => (change.computed_from_hash(hash), Some(path)),
+            None if read_as.is_some() => (change, Some(path)),
+            None => (change, None),
+        })
     }
 }
 
@@ -247,19 +338,24 @@ impl Workspace {
     /// Wait for the write gate without blocking the calling thread, for the host
     /// function behind `workspace-mutation.begin`. The future and the
     /// [`OwnedMutation`] it resolves to are `'static + Send`; the mutation shares this
-    /// workspace's gate with the native tools' [`Workspace::begin_mutation`].
+    /// workspace's gate with the native tools' [`Workspace::begin_mutation`], and it
+    /// carries `reads`, the read record the changing tool filled from the read side, so
+    /// every change it makes is rechecked against what that tool read.
     pub fn begin_owned(
         &self,
         observed: &ObservedFiles,
+        reads: &ReadRecord,
         policy: MutationPolicy,
     ) -> impl Future<Output = OwnedMutation> + Send + 'static {
         let workspace = self.clone();
         let observed = observed.clone();
+        let reads = reads.clone();
         async move {
             let held = workspace.writes.acquire_owned().await;
             OwnedMutation {
                 workspace,
                 observed,
+                reads,
                 policy,
                 _held: held,
             }
@@ -352,15 +448,7 @@ impl Workspace {
         observed: &ObservedFiles,
         policy: MutationPolicy,
     ) -> Result<(), MutationError> {
-        let root = rustix::fs::openat(
-            CWD,
-            &self.root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| {
-            MutationError::Io(format!("the workspace could not be opened: {error}"))
-        })?;
+        let root = open_root(&self.root)?;
         let recheck = Recheck { observed, policy };
 
         // Stage everything first: a refusal or failure here drops the staged files,
@@ -828,8 +916,9 @@ fn sync_directory(dir: &OwnedFd) {
 /// `AlreadyExists` refusal atomic with the rename itself: an ungated writer that
 /// fills the path after the staged `exists` check is refused with `EEXIST` instead
 /// of being silently overwritten. A kernel or filesystem without `renameat2`
-/// support (`EINVAL`/`ENOSYS`) cannot give that guarantee, so there the plain rename
-/// is the documented fallback and the check-to-rename window reopens.
+/// support (`EINVAL`/`ENOSYS`) cannot give that guarantee, so there the no-replace
+/// rename is refused with `EEXIST` too — the callers' `AlreadyExists` — rather than
+/// degraded to a plain rename that would overwrite the path.
 fn rename_noreplace(
     from_dir: &OwnedFd,
     from: &OsStr,
@@ -837,14 +926,73 @@ fn rename_noreplace(
     to: &OsStr,
     noreplace: bool,
 ) -> Result<(), Errno> {
+    rename_noreplace_on(from_dir, from, to_dir, to, noreplace, Renameat2::Kernel)
+}
+
+/// Which renameat2 the no-replace rename is attempted with. Production is
+/// [`Renameat2::Kernel`]; a test passes [`Renameat2::Absent`] to stand in for a
+/// filesystem without it, whose refusal the decision below must treat exactly like
+/// the `EINVAL`/`ENOSYS` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Renameat2 {
+    /// The kernel's `renameat2(RENAME_NOREPLACE)`.
+    Kernel,
+    /// As if the kernel or filesystem lacked it.
+    #[cfg(test)]
+    Absent,
+}
+
+/// [`rename_noreplace`] with the renameat2 the caller decides.
+fn rename_noreplace_on(
+    from_dir: &OwnedFd,
+    from: &OsStr,
+    to_dir: &OwnedFd,
+    to: &OsStr,
+    noreplace: bool,
+    renameat2: Renameat2,
+) -> Result<(), Errno> {
     if !noreplace {
         return rustix::fs::renameat(from_dir, from, to_dir, to);
     }
-    match rustix::fs::renameat_with(from_dir, from, to_dir, to, RenameFlags::NOREPLACE) {
+    let attempt = match renameat2 {
+        Renameat2::Kernel => {
+            rustix::fs::renameat_with(from_dir, from, to_dir, to, RenameFlags::NOREPLACE)
+        }
+        // A filesystem without it answers EINVAL/ENOSYS, which is what deciding sees.
+        #[cfg(test)]
+        Renameat2::Absent => Err(Errno::NOSYS),
+    };
+    match attempt {
         Ok(()) => Ok(()),
-        Err(Errno::INVAL | Errno::NOSYS) => rustix::fs::renameat(from_dir, from, to_dir, to),
+        // Fail closed: with no atomic no-replace rename there is no refusal to make, so
+        // the rename is refused as `AlreadyExists` and the destination is never touched.
+        Err(Errno::INVAL | Errno::NOSYS) => Err(Errno::EXIST),
         Err(error) => Err(error),
     }
+}
+
+/// The workspace root's directory handle, never following a symlink at its final
+/// component. The root is re-opened by path under the gate, so a root swapped for a
+/// symlink after the workspace was resolved must refuse instead of re-opening wherever
+/// the link points; `O_DIRECTORY` alone would follow it.
+fn open_root(root: &std::path::Path) -> Result<OwnedFd, MutationError> {
+    rustix::fs::openat(
+        CWD,
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        // `O_DIRECTORY` may report a symlink as "not a directory" before `O_NOFOLLOW`'s
+        // ELOOP; only a look at the entry itself tells a swapped link from a file.
+        if matches!(error, Errno::LOOP | Errno::NOTDIR)
+            && rustix::fs::statat(CWD, root, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Symlink)
+        {
+            return MutationError::Io("the workspace root is a symlink".to_owned());
+        }
+        MutationError::Io(format!("the workspace could not be opened: {error}"))
+    })
 }
 
 fn leaf_of(target: &Target) -> &OsStr {
@@ -945,7 +1093,7 @@ fn inspect(
 #[cfg(test)]
 mod tests {
     use super::{Change, MutationError, MutationPolicy, OwnedMutation};
-    use crate::{Observation, ObservedFiles, Workspace};
+    use crate::{Observation, ObservedFiles, ReadRecord, Workspace};
     use std::ffi::OsStr;
     use std::fs;
     use std::future::Future;
@@ -1438,11 +1586,12 @@ mod tests {
         let (_dir, workspace) = workspace(&[("a.txt", "a\n")]);
         let other_agent = workspace.clone();
         let observed = ObservedFiles::new();
+        let reads = ReadRecord::new();
         let mut context = Context::from_waker(Waker::noop());
 
         // A native tool holds the gate: the owned acquisition waits.
         let native = other_agent.begin_mutation();
-        let mut begin = pin!(workspace.begin_owned(&observed, PATCH));
+        let mut begin = pin!(workspace.begin_owned(&observed, &reads, PATCH));
         assert!(begin.as_mut().poll(&mut context).is_pending());
         drop(native);
         let Poll::Ready(owned) = begin.as_mut().poll(&mut context) else {
@@ -1481,7 +1630,8 @@ mod tests {
         fn assert_static_send<T: Send + 'static>(_: &T) {}
         let (dir, workspace) = workspace(&[("a.txt", "a\n"), ("b.txt", "b\n")]);
         let observed = ObservedFiles::new();
-        let begin = workspace.begin_owned(&observed, OBSERVED);
+        let reads = ReadRecord::new();
+        let begin = workspace.begin_owned(&observed, &reads, OBSERVED);
         assert_static_send(&begin);
         let owned: OwnedMutation = ready(begin);
         assert_static_send(&owned);
@@ -1613,6 +1763,193 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("from.txt")).unwrap(),
             "from\n"
+        );
+    }
+
+    #[test]
+    fn a_second_writer_between_the_read_and_the_gated_write_is_refused() {
+        let (dir, workspace) = workspace(&[("a.txt", "one\n")]);
+        let observed = ObservedFiles::new();
+        let reads = ReadRecord::new();
+        // The call reads the file through the read side, which is what the change it
+        // computes is computed from, and takes the gate afterwards.
+        let snapshot = workspace.read("a.txt", &ObservedFiles::new()).unwrap();
+        reads.record_hash(
+            &workspace.resolve("a.txt").unwrap(),
+            snapshot.metadata().content_hash,
+        );
+        let owned = ready(workspace.begin_owned(&observed, &reads, PATCH));
+
+        // A second writer changes the file between the read and the gated write.
+        fs::write(dir.path().join("a.txt"), "changed by another agent\n").unwrap();
+        assert_eq!(
+            owned.write("a.txt", "pwned\n"),
+            Err(io(
+                "a.txt changed on disk since you last read it; read it again."
+            ))
+        );
+        assert_eq!(text(&workspace, "a.txt"), "changed by another agent\n");
+
+        // The other agent's contents read again are the identity the write then may
+        // replace, and the written contents become this agent's observation.
+        reads.record(
+            &workspace.root().join("a.txt"),
+            b"changed by another agent\n",
+        );
+        owned.write("a.txt", "mine\n").unwrap();
+        assert_eq!(text(&workspace, "a.txt"), "mine\n");
+        assert_eq!(
+            observed.check_unchanged(&workspace.root().join("a.txt"), b"mine\n"),
+            Observation::Unchanged
+        );
+        drop(owned);
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn a_symlink_retargeted_between_the_read_and_the_gated_write_is_refused() {
+        let (dir, workspace) = workspace(&[("a.txt", "read\n"), ("b.txt", "never read\n")]);
+        std::os::unix::fs::symlink("a.txt", dir.path().join("link.txt")).unwrap();
+        let observed = ObservedFiles::new();
+        let reads = ReadRecord::new();
+        // The call reads through the symlink, as the read side records it.
+        let snapshot = workspace.read("link.txt", &ObservedFiles::new()).unwrap();
+        reads.record_read(
+            &workspace.spelling("link.txt"),
+            &workspace.resolve("link.txt").unwrap(),
+            snapshot.metadata().content_hash,
+        );
+        let owned = ready(workspace.begin_owned(&observed, &reads, PATCH));
+
+        // Another writer retargets the link to a file the call never read.
+        fs::remove_file(dir.path().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("b.txt", dir.path().join("link.txt")).unwrap();
+        assert_eq!(
+            owned.write("link.txt", "pwned\n"),
+            Err(io(
+                "link.txt changed on disk since you last read it; read it again."
+            ))
+        );
+        assert_eq!(text(&workspace, "b.txt"), "never read\n");
+        assert_eq!(text(&workspace, "a.txt"), "read\n");
+
+        // Retargeted to a path with nothing behind it, the change is refused too.
+        fs::remove_file(dir.path().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("gone.txt", dir.path().join("link.txt")).unwrap();
+        assert_eq!(
+            owned.write("link.txt", "pwned\n"),
+            Err(io(
+                "link.txt changed on disk since you last read it; read it again."
+            ))
+        );
+        assert!(!dir.path().join("gone.txt").exists());
+        drop(owned);
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn a_symlink_retargeted_between_the_identity_check_and_the_plan_is_refused() {
+        // Both targets hold the same bytes, so the read digest alone would accept either.
+        let (dir, workspace) = workspace(&[("a.txt", "same\n"), ("b.txt", "same\n")]);
+        std::os::unix::fs::symlink("a.txt", dir.path().join("link.txt")).unwrap();
+        let observed = ObservedFiles::new();
+        let reads = ReadRecord::new();
+        let snapshot = workspace.read("link.txt", &ObservedFiles::new()).unwrap();
+        reads.record_read(
+            &workspace.spelling("link.txt"),
+            &workspace.resolve("link.txt").unwrap(),
+            snapshot.metadata().content_hash,
+        );
+        let owned = ready(workspace.begin_owned(&observed, &reads, PATCH));
+
+        // `single`'s steps, with another writer retargeting the link between the
+        // identity check and the plan's own resolution.
+        let (change, read) = owned
+            .read_identity(Change::write("link.txt", "pwned\n"))
+            .unwrap();
+        fs::remove_file(dir.path().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("b.txt", dir.path().join("link.txt")).unwrap();
+        let plan = workspace.plan(std::slice::from_ref(&change)).unwrap();
+        assert_eq!(
+            owned.plans_the_file_read(&plan, read.as_deref(), &change),
+            Err(io(
+                "link.txt changed on disk since you last read it; read it again."
+            ))
+        );
+        drop(plan);
+        drop(owned);
+        assert_eq!(text(&workspace, "a.txt"), "same\n");
+        assert_eq!(text(&workspace, "b.txt"), "same\n");
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn a_no_replace_rename_without_renameat2_refuses_instead_of_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("from.txt"), "from\n").unwrap();
+        // The destination is already there, or appears after the staged `exists` check;
+        // either way a kernel without `renameat2` can make no atomic refusal.
+        fs::write(dir.path().join("to.txt"), "ungated\n").unwrap();
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            dir.path(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::rename_noreplace_on(
+                &fd,
+                OsStr::new("from.txt"),
+                &fd,
+                OsStr::new("to.txt"),
+                true,
+                super::Renameat2::Absent,
+            ),
+            Err(rustix::io::Errno::EXIST),
+            "no renameat2 must refuse, never fall back to a plain rename"
+        );
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("to.txt")).unwrap(),
+            "ungated\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("from.txt")).unwrap(),
+            "from\n"
+        );
+    }
+
+    #[test]
+    fn a_root_swapped_for_a_symlink_is_refused_and_writes_nothing_outside() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("a.txt"), "outside\n").unwrap();
+        let (dir, workspace) = workspace(&[("a.txt", "one\n")]);
+        let observed = ObservedFiles::new();
+        workspace.read("a.txt", &observed).unwrap();
+        let changes = [Change::write("a.txt", "pwned\n")];
+        let plan = workspace.plan(&changes).unwrap();
+
+        // The root itself is swapped for a symlink to another directory after the
+        // change was validated: the gate must re-open a directory, not the link.
+        fs::rename(dir.path(), dir.path().with_extension("real")).unwrap();
+        symlink(outside.path(), dir.path()).unwrap();
+        let _mutation = workspace.begin_mutation();
+        let result = workspace.apply(&plan, &observed, OBSERVED);
+
+        assert_eq!(
+            result,
+            Err(io("the workspace root is a symlink")),
+            "a root that is no longer the resolved directory must refuse"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("a.txt")).unwrap(),
+            "outside\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().with_extension("real").join("a.txt")).unwrap(),
+            "one\n"
         );
     }
 }

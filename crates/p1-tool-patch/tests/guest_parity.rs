@@ -18,8 +18,8 @@ use p1_tool_patch_logic::{
     Entry, EntryKind, FsError, Host as Capabilities, Mutation, Outcome, RawInput, Status, execute,
 };
 use p1_workspace::{
-    MutationError, MutationPolicy, Observation, ObservedFiles, OwnedMutation, Workspace,
-    WorkspaceError,
+    MutationError, MutationPolicy, Observation, ObservedFiles, OwnedMutation, ReadRecord,
+    Workspace, WorkspaceError,
 };
 
 /// The call read record of `docs/design/modules/workspace-mutation.md` ("Per-agent state the
@@ -154,12 +154,15 @@ impl Capabilities for Host {
 
     fn begin(&mut self) -> HeldMutation {
         // The patch exemption: the host assembles the patch component's mutation
-        // patch-authorized, so no prior observation is required.
+        // patch-authorized, so no prior observation is required. The read record is
+        // empty: [`HeldMutation`] models step 3's recheck over its own [`CallReads`], and
+        // the native tool this compares against carries no record either.
         HeldMutation {
-            mutation: self.runtime.block_on(
-                self.workspace
-                    .begin_owned(&self.observed, MutationPolicy::PatchAuthorized),
-            ),
+            mutation: self.runtime.block_on(self.workspace.begin_owned(
+                &self.observed,
+                &ReadRecord::new(),
+                MutationPolicy::PatchAuthorized,
+            )),
             workspace: self.workspace.clone(),
             reads: Rc::clone(&self.reads),
             changes: Rc::clone(&self.changes),

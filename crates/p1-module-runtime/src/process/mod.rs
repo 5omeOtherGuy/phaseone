@@ -7,20 +7,14 @@
 //! tool, or a WebAssembly guest through [`ProcessCapability`]) cannot widen them.
 //! A run is available whole ([`ProcessService::run`]) or as a stream of events
 //! ([`ProcessService::spawn`]); the first is the second drained.
+//!
+//! It lives with the runtime because the host serves the `process` capability with it;
+//! the native `shell` tool (`p1-tool-shell`) re-exports it. The sandbox's presentation
+//! (paragraph and variant suffix) is the shell's contract, in `p1-shell-guest`.
 
 mod capability;
 mod sandbox;
 mod stream;
-
-/// The paragraph the model reads when the host turned the sandbox on (ADR-0035: the
-/// description says what the boundary is). It belongs to the side that assembled the
-/// sandbox: a tool running over this service cannot know whether it is sandboxed, so
-/// whoever presents the tool appends this to the face's description.
-pub const SANDBOX_PARAGRAPH: &str = "Commands run in a sandbox: only the workspace and /tmp are writable, the rest of the filesystem is read-only, and most of the home directory is not visible. Do not try to install software outside the workspace.";
-
-/// Appended to a tool's identity variant when its commands run in the sandbox, for the
-/// same reason as [`SANDBOX_PARAGRAPH`].
-pub const SANDBOX_VARIANT_SUFFIX: &str = "+sandbox";
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -113,7 +107,7 @@ pub struct ProcessService {
 ///
 /// ```
 /// use std::time::Duration;
-/// let request = p1_tool_shell::ProcessRequest {
+/// let request = p1_module_runtime::process::ProcessRequest {
 ///     command: "echo hi",
 ///     timeout: Duration::from_secs(1),
 /// };
@@ -122,7 +116,7 @@ pub struct ProcessService {
 ///
 /// ```compile_fail,E0560
 /// use std::time::Duration;
-/// let request = p1_tool_shell::ProcessRequest {
+/// let request = p1_module_runtime::process::ProcessRequest {
 ///     command: "echo hi",
 ///     timeout: Duration::from_secs(1),
 ///     sandbox: None,
@@ -242,11 +236,12 @@ impl ProcessService {
     }
 
     /// `expiry` is the timeout as a future, so a test can fire it on an observed
-    /// condition instead of racing the shell's start-up against a wall clock.
+    /// condition instead of racing the shell's start-up against a wall clock. Public
+    /// for that test, which formats the run with the shell tool's own footer.
     ///
     /// A run is its stream drained: there is one capture implementation, so what a
     /// streaming caller receives is byte for byte what `run` returns.
-    pub(crate) async fn run_until(
+    pub async fn run_until(
         &self,
         command: &str,
         expiry: impl Future<Output = ()> + Send + 'static,

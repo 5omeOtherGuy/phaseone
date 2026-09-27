@@ -26,6 +26,14 @@ use serde::Deserialize;
 pub const NAME: &str = "shell";
 /// The model-facing description of the default face.
 pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test) is summarised unless `raw: true` is passed.";
+/// The paragraph the model reads when the host turned the sandbox on (ADR-0035: the
+/// description says what the boundary is). It belongs to the side that assembled the
+/// sandbox: a tool running over the process service cannot know whether it is sandboxed, so
+/// whoever presents the tool appends this to the face's description.
+pub const SANDBOX_PARAGRAPH: &str = "Commands run in a sandbox: only the workspace and /tmp are writable, the rest of the filesystem is read-only, and most of the home directory is not visible. Do not try to install software outside the workspace.";
+/// Appended to a tool's identity variant when its commands run in the sandbox, for the
+/// same reason as [`SANDBOX_PARAGRAPH`].
+pub const SANDBOX_VARIANT_SUFFIX: &str = "+sandbox";
 const DEFAULT_TIMEOUT_SECONDS: i64 = 120;
 const MIN_TIMEOUT_SECONDS: i64 = 1;
 const MAX_TIMEOUT_SECONDS: i64 = 3_600;

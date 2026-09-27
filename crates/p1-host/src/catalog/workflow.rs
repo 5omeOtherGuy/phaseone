@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use p1_assembly::{Catalog, ToolServices};
 use p1_contracts::{BoxFuture, CancellationToken, InboxKind};
 use p1_core::Inbox;
+use p1_finish_guest::OutputContract;
 use p1_module_runtime::Services;
 use p1_module_runtime::delegation::WorkflowServices;
-use p1_tool_finish::{FinishOutcome, OutputContract};
 use p1_workers::{
     ChildId, ChildStatus, InProcessWorkers, PreparedStart, WorkerError, WorkerService,
 };
@@ -24,6 +24,7 @@ use p1_workflow::{
 };
 
 use crate::HostDeps;
+use crate::activity::FinishOutcome;
 use crate::catalog::modules::{ModuleServices, register_host_entry};
 use crate::frontend::{
     FrontEnd, WorkflowRunEnded, WorkflowRunStarted, WorkflowStepEnded, WorkflowStepStarted,
@@ -171,7 +172,7 @@ impl HostStepRunner {
     fn worker_state(
         &self,
         id: &ChildId,
-    ) -> (Option<p1_tool_finish::StructuredResult>, String, bool) {
+    ) -> (Option<p1_finish_guest::StructuredResult>, String, bool) {
         let workers = self.workers.lock().unwrap();
         let Some(worker) = workers.get(&id.0) else {
             return (None, String::new(), false);
@@ -210,11 +211,11 @@ impl HostStepRunner {
                         .unwrap_or_else(|| NOT_VERIFIED.to_string()),
                     result: structured.as_ref().and_then(|s| s.value.clone()),
                     schema: match structured.map(|s| s.schema) {
-                        None | Some(p1_tool_finish::SchemaCheck::NotRequested) => {
+                        None | Some(p1_finish_guest::SchemaCheck::NotRequested) => {
                             SchemaCheck::NotRequested
                         }
-                        Some(p1_tool_finish::SchemaCheck::Passed) => SchemaCheck::Passed,
-                        Some(p1_tool_finish::SchemaCheck::Failed(errors)) => {
+                        Some(p1_finish_guest::SchemaCheck::Passed) => SchemaCheck::Passed,
+                        Some(p1_finish_guest::SchemaCheck::Failed(errors)) => {
                             SchemaCheck::Failed(errors)
                         }
                     },

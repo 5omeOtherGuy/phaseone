@@ -23,6 +23,19 @@ use p1_contracts::Tool;
 use p1_testkit::{ScriptedProvider, text_response};
 use tempfile::tempdir;
 
+/// The native `finish` tool's session record, empty: only its declaration is compared.
+struct NoActivity;
+
+impl p1_tool_finish::SessionActivity for NoActivity {
+    fn last_file_change(&self) -> Option<u64> {
+        None
+    }
+
+    fn shell_runs(&self) -> Vec<p1_finish_guest::ShellRun> {
+        Vec::new()
+    }
+}
+
 /// The two packages S3.8 activates, with the variant their manifests declare (the
 /// environment below names no variant, so the loader's own stands).
 const PACKAGES: [(&str, &str); 2] = [("shell", "p1/shell"), ("finish", "p1/finish")];
@@ -88,7 +101,7 @@ async fn the_shell_and_finish_assemble_as_their_packages() {
         (
             "finish",
             p1_tool_finish::FinishTool::new(
-                Arc::new(p1_host::activity::ActivityLog::default()),
+                Arc::new(NoActivity),
                 p1_tool_finish::FinishOutcome::default(),
             )
             .declaration()
