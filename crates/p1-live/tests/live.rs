@@ -423,7 +423,9 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
 /// `route_provider` activates the provider COMPONENT the route's adapter names (D083b),
 /// from the module set the host itself would read: a live check needs the built modules
 /// (`scripts/build-modules.sh --all`; a debug build finds them through S3.8.0's discovery once
-/// it is on main). Only a `transport = "websocket"` route still builds a native adapter (S5.5).
+/// it is on main). Since S7.10-R5 no route builds a native adapter, a
+/// `transport = "websocket"` one included: the component lowers that transport and connects
+/// through the injected connector (ADR-0078).
 ///
 /// The connector is injected next to the transport (ADR-0047 §1); a live check gets
 /// the REAL one, because the shipped Codex route asks for WebSocket.

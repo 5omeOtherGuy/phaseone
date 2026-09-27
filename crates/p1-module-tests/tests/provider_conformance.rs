@@ -238,8 +238,9 @@ impl Case {
     /// The native adapter the host composed from the same route file and profile until S4.9's
     /// D083b repair dropped the native arms from `catalog::route_provider`: the reference the
     /// component's wire form is compared with. The three adapter crates still ship, and the
-    /// WebSocket branch (the shipped Responses route's transport, S5.5) is attached exactly as
-    /// the host attached it.
+    /// connector the shipped Responses route's `transport = "websocket"` needs is attached here
+    /// as the host used to attach it (S5.5; since S7.10-R5 the component itself lowers that
+    /// transport, and no production path builds a native adapter for these routes).
     fn native(&self, transport: ScriptedTransport) -> Arc<dyn Provider> {
         let binding = self.route.binding(&self.profile).expect("a bound profile");
         let profile = Arc::new(
