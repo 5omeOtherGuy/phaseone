@@ -11,8 +11,10 @@
 //! the result stays retrievable by id for the service's lifetime.
 //!
 //! [`scope`] adds the scoped surface a component links (the WIT worker interfaces) over
-//! any [`WorkerService`], without changing the service.
+//! any [`WorkerService`], without changing the service. [`journal`] reads back which
+//! workers a journalled session started.
 
+pub mod journal;
 pub mod scope;
 
 pub use scope::{

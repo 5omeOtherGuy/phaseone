@@ -1,13 +1,12 @@
 //! The `read` tool: line-numbered reads of one workspace file.
 //!
-//! Confinement, atomic writes and observed-file tracking live in `p1-workspace`.
-//! The model-facing declaration, input validation and rendering live in
-//! `p1-read-guest`, which the component (`p1/read`) runs too. This crate is the
-//! native adapter over both, owns the credential refusal (issue #142), and
-//! provides the capability services the release's tool components read and mutate
-//! through ([`capability`]).
-
-pub mod capability;
+//! Confinement, atomic writes, observed-file tracking and the credential refusal
+//! policy live in `p1-workspace` (issue #142); the model-facing declaration, input
+//! validation and rendering live in `p1-read-guest`, which the component (`p1/read`)
+//! runs too. This crate is the native adapter over both, and re-exports the
+//! capability services a `p1/read`, `p1/edit`, `p1/write`, `p1/patch` or `p1/search`
+//! component is linked with — the host's now (`p1_module_runtime::file_services`,
+//! S7.10-R1, ADR-0095), re-used here by this crate's own tests.
 
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -20,9 +19,15 @@ use p1_contracts::{
 use p1_read_guest::{
     DESCRIPTION, NAME, RawInput, ReadInput, WindowedRender, input_schema, sniff_len,
 };
-use p1_workspace::{ObservedFiles, StreamingHash, Workspace};
+// S7.10-R1 (ADR-0095): the credential refusal policy and its two model-facing texts are
+// `p1-workspace`'s; this native adapter and the capability service a module is linked with run
+// that one copy. `the_moved_texts_are_the_guests` below pins it against the guest-side copy the
+// `p1/read` component words its own failures with.
+use p1_workspace::{
+    ObservedFiles, StreamingHash, Workspace, could_not_be_read, refuse_credentials, xdg_credentials,
+};
 
-pub use capability::{ReadCapability, capability_services, tool_services};
+pub use p1_module_runtime::file_services::{ReadCapability, capability_services, tool_services};
 pub use p1_workspace::ToolFace;
 
 /// The internal read buffer: fixed and small, however large the file is.
@@ -79,72 +84,11 @@ impl ReadTool {
     }
 }
 
-/// Whether `candidate` is one of the credential files `read` always refuses: the p1
-/// auth store, anything under `~/.config/keys/`, and the other tools' auth files.
-/// Compared on the canonicalised form, so a symlink or a relative path cannot slip
-/// past. An empty `home` refuses only the XDG-named stores.
-pub(crate) fn refuses_credentials(
-    candidate: &Path,
-    home: Option<&Path>,
-    xdg_credentials: &[PathBuf],
-) -> bool {
-    let candidate = canonical_best_effort(candidate);
-    if xdg_credentials
-        .iter()
-        .any(|path| canonical_best_effort(path) == candidate)
-    {
-        return true;
-    }
-    let Some(home) = home else {
-        return false;
-    };
-    let home = canonical_best_effort(home);
-    let keys = canonical_best_effort(&home.join(".config").join("keys"));
-    if candidate == keys || candidate.starts_with(&keys) {
-        return true;
-    }
-    [
-        home.join(".config/p1/auth.json"),
-        home.join(".codex/auth.json"),
-        home.join(".claude/.credentials.json"),
-        home.join(".local/share/opencode/auth.json"),
-        home.join(".pi/agent/auth.json"),
-    ]
-    .iter()
-    .any(|path| canonical_best_effort(path) == candidate)
-}
-
 /// A non-empty environment variable as a path, or `None`.
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-}
-
-/// The p1 and OpenCode stores move with their XDG override (p1-auth); a home-based
-/// path below covers the default. `None` when the variable is unset.
-pub(crate) fn xdg_credentials() -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Some(config) = env_path("XDG_CONFIG_HOME") {
-        files.push(config.join("p1/auth.json"));
-    }
-    if let Some(data) = env_path("XDG_DATA_HOME") {
-        files.push(data.join("opencode/auth.json"));
-    }
-    files
-}
-
-/// The canonical form of `path`, or — when it does not exist yet — its canonical
-/// parent with the file name appended, so a refusal never falls back to a lexical
-/// comparison against the whole path.
-fn canonical_best_effort(path: &Path) -> PathBuf {
-    match path.canonicalize() {
-        Ok(canonical) => canonical,
-        Err(_) => match path.parent().and_then(|parent| parent.canonicalize().ok()) {
-            Some(parent) => parent.join(path.file_name().unwrap_or_default()),
-            None => path.to_path_buf(),
-        },
-    }
 }
 
 fn default_face() -> ToolFace {
@@ -280,10 +224,7 @@ fn run(
             return Err(p1_read_guest::missing(&display));
         }
         Err(error) => {
-            return Err(p1_read_guest::could_not_be_read(
-                &display,
-                &error.to_string(),
-            ));
+            return Err(could_not_be_read(&display, &error.to_string()));
         }
     };
     if !metadata.is_file() {
@@ -297,33 +238,11 @@ fn run(
     }
 
     let file = std::fs::File::open(&resolved)
-        .map_err(|error| p1_read_guest::could_not_be_read(&display, &error.to_string()))?;
+        .map_err(|error| could_not_be_read(&display, &error.to_string()))?;
 
     // Only the requested window (plus small fixed buffers) is ever held in
     // memory: the file is streamed line by line, never loaded whole.
     read_windowed(file, metadata.len(), &resolved, &display, input, observed)
-}
-
-/// Issue #142: a credential file is refused even with full access, BEFORE any
-/// confinement error, so the model is told why and never sees the file's bytes.
-/// The component's `workspace` capability applies the same rule ([`capability`]).
-pub(crate) fn refuse_credentials(
-    workspace: &Workspace,
-    requested: &str,
-    home: Option<&Path>,
-    xdg_credentials: &[PathBuf],
-) -> Result<(), String> {
-    let candidate = if Path::new(requested).is_absolute() {
-        PathBuf::from(requested)
-    } else {
-        workspace.root().join(requested)
-    };
-    if refuses_credentials(&candidate, home, xdg_credentials) {
-        return Err(p1_read_guest::credential_refusal(
-            &workspace.display(&candidate),
-        ));
-    }
-    Ok(())
 }
 
 struct WindowedRead {
@@ -361,7 +280,7 @@ fn read_windowed_impl<R: Read>(
     let mut sniff = vec![0u8; sniff_len(total_len)];
     reader
         .read_exact(&mut sniff)
-        .map_err(|error| p1_read_guest::could_not_be_read(display, &error.to_string()))?;
+        .map_err(|error| could_not_be_read(display, &error.to_string()))?;
     let mut render = WindowedRender::start(&sniff, display, input)?;
     let mut hash = StreamingHash::new();
     hash.update(&sniff);
@@ -371,7 +290,7 @@ fn read_windowed_impl<R: Read>(
     loop {
         let bytes_read = reader
             .read(&mut buffer)
-            .map_err(|error| p1_read_guest::could_not_be_read(display, &error.to_string()))?;
+            .map_err(|error| could_not_be_read(display, &error.to_string()))?;
         if bytes_read == 0 {
             break;
         }
@@ -1090,5 +1009,25 @@ mod tests {
 
         assert_eq!(outcome.status, ToolStatus::Ok);
         assert_eq!(outcome.content, "     1\talpha\n     2\tbeta");
+    }
+
+    /// S7.10-R1: the refusal policy and its two model-facing texts moved to `p1-workspace`,
+    /// which cannot see the guest crate (it builds for the component too). The guest keeps the
+    /// copy the `p1/read` component words its own failures with, so the two must stay
+    /// byte-identical: this crate is the one place both are visible.
+    #[test]
+    fn the_moved_texts_are_the_guests() {
+        for display in ["a.txt", ".codex/auth.json", "../outside"] {
+            assert_eq!(
+                p1_workspace::credential_refusal(display),
+                p1_read_guest::credential_refusal(display),
+                "the credential refusal text: {display}"
+            );
+            assert_eq!(
+                p1_workspace::could_not_be_read(display, "Is a directory (os error 21)"),
+                p1_read_guest::could_not_be_read(display, "Is a directory (os error 21)"),
+                "the read failure text: {display}"
+            );
+        }
     }
 }
