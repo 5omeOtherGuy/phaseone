@@ -259,7 +259,13 @@ fn resolve_bwrap(path: Option<&OsStr>, workspace: &Path) -> Option<PathBuf> {
         if !directory.is_absolute() {
             continue;
         }
-        let candidate = directory.join("bwrap");
+        let Ok(resolved_directory) = std::fs::canonicalize(&directory) else {
+            continue;
+        };
+        if resolved_directory.starts_with(workspace) {
+            continue;
+        }
+        let candidate = resolved_directory.join("bwrap");
         let Ok(resolved) = std::fs::canonicalize(candidate) else {
             continue;
         };
