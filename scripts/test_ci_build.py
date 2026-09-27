@@ -645,6 +645,23 @@ class CiBuildTests(unittest.TestCase):
         self.assertEqual((h.artifact() / "a/same.wasm").read_text(encoding="utf-8"), "a/same.wasm\n")
         self.assertEqual((h.artifact() / "b/same.wasm").read_text(encoding="utf-8"), "b/same.wasm\n")
 
+    def test_nested_candidate_tree_downloads_intact(self) -> None:
+        # The gate stages the release candidate beside p1; the artifact carries it as
+        # candidate/, and the same-basename candidate/p1.sha256 must not collide with
+        # the root p1.sha256 (S7.5.2, build.yml's "Stage binary and sha256").
+        assets = [
+            "candidate/p1-linux-x86_64",
+            "candidate/p1-linux-x86_64.sha256",
+            "candidate/p1-share.tar.gz",
+            "candidate/p1-share.tar.gz.sha256",
+        ]
+        h = self.harness(**{"STUB_DOWNLOAD_FILES": ",".join(assets)})
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for rel in assets:
+            self.assertEqual((h.artifact() / rel).read_text(encoding="utf-8"), rel + "\n", rel)
+        self.assertEqual((h.artifact() / "p1.sha256").read_text(encoding="utf-8").split()[-1], "p1")
+
     def test_artifact_named_subdirectory_form_is_accepted(self) -> None:
         # The other layout `gh run download --name X --dir D` can leave: D holds only
         # the directory named after the artifact.

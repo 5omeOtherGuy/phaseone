@@ -159,7 +159,16 @@ async fn resuming_on_another_route_that_accepts_the_history_continues_the_sessio
         "the session is only appended to"
     );
     let appended = String::from_utf8(after[before.len()..].to_vec()).unwrap();
-    let first_new = appended.lines().next().unwrap();
+    let mut appended = appended.lines();
+    // The host names the assembly that will execute the records it is about to commit
+    // (ADR-0080), so the new assembly line comes first and the environment is the first
+    // RECORD the new assembly commits.
+    let assembly = appended.next().unwrap();
+    assert!(
+        assembly.contains("\"assembly\":") && assembly.contains("\"environment\":\"moved\""),
+        "the new assembly is named first: {assembly}"
+    );
+    let first_new = appended.next().unwrap();
     assert!(
         first_new.contains("\"record\":\"environment\"")
             && first_new.contains("another-route")

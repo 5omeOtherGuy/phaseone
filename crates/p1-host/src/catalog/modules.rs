@@ -11,12 +11,29 @@
 //!   other bytes or another ABI than it names;
 //! - the granted capabilities must lie inside the class allocation of
 //!   `modules/capabilities.toml` (freeze item 13);
+//! - the registration declares each accepted tool package's semantic capabilities under the
+//!   loader-built identity (S1.5's `capabilities::declare_package`), so a package tool is
+//!   visible to the host's capability checks exactly as its native twin is (ADR-0083 rule 7);
 //! - registration builds no instance: [`p1_module_runtime::wasm_tool`] runs only in the
 //!   catalog factory, i.e. only when an environment assembles the key, so an installed but
 //!   unselected package and an invented name both never dispatch (the assembly rule).
 //!
 //! Two components claiming one name or one digest are refused when the release manifest is
 //! read ([`ManifestError::DuplicateIdentity`]).
+//!
+//! An official-release HOST ENTRY ([`HOST_ENTRIES`], [`register_host_entries`], D083b 2) is a
+//! package of the same release that a compiled-in registration once carried: its catalog key is
+//! fixed by the host, not by an environment or a lock, and it is loaded from the release
+//! manifest and verified against it exactly as a lock-selected package is. A release that does
+//! not hold it, or does not verify it, fails the catalog build naming the package — never a
+//! silent fallback to a native tool.
+//!
+//! `notice: crates/p1-host/src/catalog/modules.rs (S1): S3.8 (D083b, D-XO-49) lists `p1/shell` and
+//! `p1/finish` in [`HOST_ENTRIES`] beside `p1/read` and loads them through the one shared step —
+//! every entry's package is loaded by [`register_host_entries`], verified against the release
+//! manifest and handed to the registration that owns the key ([`HostEntryRegistration`]; the
+//! shell's sandbox face and the finish's gate stay in `catalog/tools.rs`, ADR-0083 §1 and §2), so
+//! the PR's own `load_release_module` is gone. The lock path is unchanged.`
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +42,11 @@ use p1_assembly::{
     Catalog, LockedModule, LockedProtocol, ModulesLock, ModulesLockError, ToolServices, ToolSpec,
     load_modules_lock,
 };
-use p1_contracts::Tool;
+use p1_contracts::tool::ResultDescription;
+use p1_contracts::{
+    BoxFuture, CallDescription, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
+    ToolOutcome, ToolResultItem,
+};
 use p1_module_runtime::{
     ComponentEntry, ExecutionLimits, LoadError, LoadedModule, Loader, ManifestError, ModuleKind,
     ReleaseManifest, Services, wasm_tool,
@@ -33,9 +54,51 @@ use p1_module_runtime::{
 use thiserror::Error;
 
 use crate::HostDeps;
+#[cfg(debug_assertions)]
+use crate::run::write_stderr;
 
 /// The release manifest's file name inside the module set (ADR-0079).
 pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
+
+/// The official-release host entries this host registers (D083b 2), as `(catalog key, package)`.
+///
+/// The key is what an environment selects the entry by and what an assembly identity names as
+/// the module's `package`; the package name is what the release must ship. `read` is a tool
+/// entry whose native registration is gone (S1.8.1) and whose component the shared registration
+/// builds; `shell` and `finish` are S3.8's entries ([`HOST_COMPOSED_ENTRIES`]), whose catalog
+/// tool the host composes around the loaded package. A user lock that names a key here still
+/// wins ([`lock_selects`]), and S5.11's policy entries are one more list passed to the same step.
+pub const HOST_ENTRIES: [(&str, &str); 3] = [
+    ("read", "p1/read"),
+    ("shell", "p1/shell"),
+    ("finish", "p1/finish"),
+];
+
+/// The [`HOST_ENTRIES`] keys whose catalog tool the HOST composes around the package the release
+/// ships instead of the shared registration (S3.8, D-XO-49): the shell, over the sandboxed
+/// process service and under the sandbox paragraph and the `+sandbox` variant (ADR-0083 §1), and
+/// the finish, under the completion hub's gate and the declaration its policy and output contract
+/// choose (§2) — both in `catalog/tools.rs`, where the native registrations stood.
+///
+/// The shared step loads their packages exactly as it loads every entry's — the release must hold
+/// them, and a missing or unverified one fails the catalog build naming the key and the package —
+/// and hands each to the [`HostEntryRegistration`] the caller gives for the key
+/// ([`register_composed_host_entries`]). A caller that gives none (an entry list of its own)
+/// registers nothing for them here: the host step that owns the key is the one that registers it.
+const HOST_COMPOSED_ENTRIES: [&str; 2] = ["shell", "finish"];
+
+/// How the host registers one of its own host entries (a [`HOST_COMPOSED_ENTRIES`] key): the
+/// loaded, verified package of the key goes in, whatever the host builds around it comes out.
+/// `catalog/tools.rs` supplies the shell's and the finish's.
+pub type HostEntryRegistration =
+    Box<dyn Fn(&mut Catalog, Arc<LoadedModule>) -> Result<(), String> + Send + Sync>;
+
+/// Whether a `modules.lock` beside `environment_dirs` names `key`. A lock that cannot be read
+/// selects nothing here; the locked-module registration reports its error.
+pub(super) fn lock_selects(environment_dirs: &[PathBuf], key: &str) -> bool {
+    load_modules_lock(environment_dirs)
+        .is_ok_and(|lock| lock.iter().any(|(module, _)| module == key))
+}
 
 /// The frozen per-class capability allocation (freeze item 13). Compiled in, so the host
 /// checks against the table the boundary was frozen with, not a file an installation could
@@ -44,8 +107,11 @@ const ALLOCATION: &str = include_str!("../../../../modules/capabilities.toml");
 
 /// Builds the capability services one instance of a module tool is linked with, from the
 /// agent's own services. Called once per instantiation, so only when an environment
-/// assembles the module.
-pub type ModuleServices = Arc<dyn Fn(&ToolServices) -> Services + Send + Sync>;
+/// assembles the module. The first argument is the package's verified manifest name (its
+/// module id, e.g. `p1/worker-start`), never the lock key an installation chose: a hook
+/// that serves some members differently (the worker and workflow families, B-S6-9, D068)
+/// must key on the identity the loader checked.
+pub type ModuleServices = Arc<dyn Fn(&str, &ToolServices) -> Services + Send + Sync>;
 
 /// Why the locked modules could not be loaded or registered. Each refusal has its own
 /// variant; the runtime's refusals keep theirs inside [`ModulesError::Load`] and
@@ -112,8 +178,11 @@ pub enum ModulesError {
         /// The capability.
         capability: String,
     },
-    /// Only tool packages have an adapter to register.
-    #[error("module `{module}` is a {kind} package; only tool packages can be registered")]
+    /// A class this host cannot register: only tool packages have a catalog adapter, and
+    /// policy packages are accepted as the session's host entries.
+    #[error(
+        "module `{module}` is a {kind} package; only tool and policy packages can be registered"
+    )]
     NotATool {
         /// The module name.
         module: String,
@@ -131,28 +200,111 @@ pub enum ModulesError {
         /// The lock file.
         lock: PathBuf,
     },
+    /// A host entry's release manifest could not be read, or claims one identity twice.
+    ///
+    /// A host entry is not selectable: a release that cannot be read, does not hold the package,
+    /// or does not verify it must fail the catalog build, and the message always names both the
+    /// catalog key and the release package, so the refusal is never read as a missing native
+    /// tool.
+    #[error("host entry `{module}` (release package `{package}`) from {}: {source}", path.display())]
+    HostEntryRelease {
+        /// The catalog key the entry registers under.
+        module: String,
+        /// The package the release must hold.
+        package: String,
+        /// The release manifest.
+        path: PathBuf,
+        /// Why the manifest could not be used.
+        source: Box<ManifestError>,
+    },
+    /// The release refuses the package a host entry names: it is not there, its bytes are not
+    /// the ones the manifest pins, or the runtime cannot speak it.
+    #[error("host entry `{module}` (release package `{package}`) from {}: {source}", path.display())]
+    HostEntryLoad {
+        /// The catalog key the entry registers under.
+        module: String,
+        /// The package the release must hold.
+        package: String,
+        /// The release manifest.
+        path: PathBuf,
+        /// The loader's refusal.
+        source: Box<LoadError>,
+    },
+    /// No release module set could be located for the host entries at all (the executable path
+    /// is unknown), so the packages they need can be loaded from nowhere.
+    #[error(
+        "host entry `{module}` (release package `{package}`): cannot locate p1's release module set"
+    )]
+    HostEntryNoRelease {
+        /// The catalog key the entry registers under.
+        module: String,
+        /// The package the release must hold.
+        package: String,
+    },
 }
 
 /// One verified, compiled package and the module name the lock gave it.
 pub struct ModulePackage {
     /// The catalog key.
     pub module: String,
-    /// The lock file that selected it.
+    /// What selected the package: the lock file, or the release manifest for a host entry.
     pub lock: PathBuf,
     /// The runtime's verified module.
     pub loaded: LoadedModule,
 }
 
+/// What an assembly identity needs of one package it names (ADR-0080): the manifest name, the
+/// version the release pins, the digest the loader verified in the manifest's `sha256:` spelling
+/// and the `<world>+<protocol>` ABI. A `modules.lock` resolution and a release host entry both
+/// resolve to this, so the identity builder never reads either source itself.
+#[derive(Clone)]
+pub struct PackageIdentity {
+    /// The package's manifest name, `<namespace>/<name>`.
+    pub name: String,
+    /// The release version the package runs at.
+    pub version: String,
+    /// `sha256:<64 lowercase hex>`, the digest of the package's `.wasm`.
+    pub digest: String,
+    /// `<world>+<protocol>`, the ABI the package speaks.
+    pub abi: String,
+}
+
 /// Where p1's own release keeps its module set: `<exe dir>/../share/p1/modules/manifest.json`
 /// (ADR-0079), next to the shipped `environments/`. Never a configuration directory, so an
-/// override lock can only select among what the release ships.
+/// override lock can only select among what the release ships. A debug build has no install
+/// to read, so when the share tree carries no manifest it falls back to the manifest
+/// `scripts/build-modules.sh` writes beside the built packages (BLOCKERS S3-B6, D080), the
+/// mirror of `main.rs`'s debug-only source-tree `environments/` fallback; a release binary
+/// never does, because `cfg(debug_assertions)` is false there, so the official-source rule of
+/// ADR-0079/ADR-0087 is unchanged. The choice is not logged here: this function holds no
+/// [`HostDeps`], so [`register_locked_modules`] and [`register_host_entries`] write the one-line
+/// notice on the host's own stderr channel, where the TUI's alternate screen and a test's
+/// captured stderr both see it.
 pub fn official_release_manifest() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    Some(
-        exe.parent()?
-            .join("../share/p1/modules")
-            .join(RELEASE_MANIFEST_FILE),
-    )
+    let share = exe
+        .parent()?
+        .join("../share/p1/modules")
+        .join(RELEASE_MANIFEST_FILE);
+    // Compiled in, so the fallback is the checkout's own path, never a place an installation
+    // could edit.
+    let built = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../modules/target/p1-modules")
+        .join(RELEASE_MANIFEST_FILE);
+    Some(choose_release_manifest(share, built))
+}
+
+/// The manifest to load modules from: the share tree's when it is there, else — in a debug
+/// build only — the built set's when the share tree has none, else the share path, so the
+/// loader's error names the release it looked for.
+fn choose_release_manifest(share: PathBuf, built: PathBuf) -> PathBuf {
+    if share.is_file() {
+        return share;
+    }
+    if cfg!(debug_assertions) && built.is_file() {
+        return built;
+    }
+    share
 }
 
 /// Verifies and compiles every package `lock` resolves, from the release whose manifest is
@@ -160,6 +312,16 @@ pub fn official_release_manifest() -> Option<PathBuf> {
 pub fn load_locked_modules(
     lock: &ModulesLock,
     release_manifest: &Path,
+) -> Result<Vec<ModulePackage>, ModulesError> {
+    load_locked_modules_except(lock, release_manifest, &[])
+}
+
+/// [`load_locked_modules`] without the keys in `skip`: the [`HOST_COMPOSED_ENTRIES`] a lock
+/// names are loaded by the host-entry step, which hands them to the host's own registration.
+fn load_locked_modules_except(
+    lock: &ModulesLock,
+    release_manifest: &Path,
+    skip: &[&str],
 ) -> Result<Vec<ModulePackage>, ModulesError> {
     let release_error = |source| ModulesError::Release {
         path: release_manifest.to_owned(),
@@ -169,32 +331,45 @@ pub fn load_locked_modules(
     manifest.check_unique_digests().map_err(release_error)?;
     let mut packages = Vec::new();
     // The loader starts an epoch thread; a release nothing selects needs none.
-    if lock.is_empty() {
+    if lock.iter().all(|(module, _)| skip.contains(&module)) {
         return Ok(packages);
     }
     let root = release_manifest.parent().unwrap_or(Path::new("."));
     let loader = Loader::new(manifest.clone(), root)
         .map_err(|error| ModulesError::Runtime(Box::new(error)))?;
     for (module, locked) in lock.iter() {
-        if let Some(entry) = manifest.entry(&locked.package) {
-            check_lock(module, locked, entry)?;
-            check_allocation(module, entry)?;
+        if skip.contains(&module) {
+            continue;
         }
-        // A package the manifest lacks is the loader's refusal to report: official source.
-        let loaded = loader
-            .load(&locked.package)
-            .map_err(|source| ModulesError::Load {
-                module: module.to_owned(),
-                lock: locked.source.clone(),
-                source: Box::new(source),
-            })?;
-        packages.push(ModulePackage {
-            module: module.to_owned(),
-            lock: locked.source.clone(),
-            loaded,
-        });
+        packages.push(load_locked_entry(&loader, &manifest, module, locked)?);
     }
     Ok(packages)
+}
+
+/// Verifies the lock's pin and the class allocation of `module`'s package, then compiles it.
+fn load_locked_entry(
+    loader: &Loader,
+    manifest: &ReleaseManifest,
+    module: &str,
+    locked: &LockedModule,
+) -> Result<ModulePackage, ModulesError> {
+    if let Some(entry) = manifest.entry(&locked.package) {
+        check_lock(module, locked, entry)?;
+        check_allocation(module, entry)?;
+    }
+    // A package the manifest lacks is the loader's refusal to report: official source.
+    let loaded = loader
+        .load(&locked.package)
+        .map_err(|source| ModulesError::Load {
+            module: module.to_owned(),
+            lock: locked.source.clone(),
+            source: Box::new(source),
+        })?;
+    Ok(ModulePackage {
+        module: module.to_owned(),
+        lock: locked.source.clone(),
+        loaded,
+    })
 }
 
 /// The lock pins the release's digest, world and protocol, or the selection is refused.
@@ -260,8 +435,18 @@ fn allocation(kind: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Registers each verified tool package under its module name. A name a registered tool
-/// already has is refused: a package never silently replaces a compiled-in tool.
+/// Registers each verified tool package under its module name and declares its semantic
+/// capabilities under the loader-built identity (S1.5), so a package tool is visible to the
+/// host's capability checks exactly as a native one is. A name a registered tool already has
+/// is refused: a package never silently replaces a compiled-in tool.
+///
+/// A USER-selected provider package takes no catalog key at all: the lock keeps it under the
+/// module name it gave it (`provider-anthropic`, `provider-openai`, `provider-openai-chat`,
+/// the manifest name without the reserved `p1/` namespace, `docs/design/modules/package.md`)
+/// and provider activation resolves that name in the same lock, so the module a user selected
+/// serves the route in place of the release's host entry of that adapter — until #355's debug
+/// discovery is on main, the release's own host entries stay the delivered path for the three
+/// shipped providers (ANSWERS D083b).
 pub fn register_modules(
     catalog: &mut Catalog,
     packages: Vec<ModulePackage>,
@@ -270,13 +455,22 @@ pub fn register_modules(
     let existing = catalog.tool_keys();
     for package in packages {
         let kind = package.loaded.kind();
-        if kind != ModuleKind::Tool {
-            // Provider and policy packages need S4's and S5's adapters, which the runtime
-            // does not have yet; a lock that selects one is refused, never ignored.
-            return Err(ModulesError::NotATool {
-                module: package.module,
-                kind: kind.name(),
-            });
+        match kind {
+            ModuleKind::Tool => {}
+            // Kept by module name in the lock the selection came from; never a tool here.
+            ModuleKind::Provider => continue,
+            // A policy package is the session's, not a catalog tool: the shipped policies are
+            // official-release host entries the host loads by name (`policy.rs`,
+            // `summary.rs`; D083b 2), so a lock selecting one registers no tool.
+            ModuleKind::ContextPolicy | ModuleKind::AuthorizationPolicy => continue,
+            // A class with no adapter here yet: a lock that selects one is refused, never
+            // ignored.
+            _ => {
+                return Err(ModulesError::NotATool {
+                    module: package.module,
+                    kind: kind.name(),
+                });
+            }
         }
         if existing.contains(&package.module) {
             return Err(ModulesError::Collision {
@@ -284,33 +478,81 @@ pub fn register_modules(
                 lock: package.lock,
             });
         }
+        // S1.5's carrier, filled here: the registration that accepts a verified tool
+        // package declares its semantic capabilities under the identity the loader built,
+        // exactly as a native registration lists its `NativeDeclaration`. The call sits after
+        // the refusals, so a package that is not registered declares nothing; a package
+        // reaches `completion_policy` and `WorkerReportTap::retool` only through it
+        // (ADR-0083 rule 7).
+        super::capabilities::declare_package(&package.loaded);
         let key = package.module.clone();
-        let services = services.clone();
-        let package = Arc::new(package);
-        catalog.tool(
-            &key,
-            Box::new(move |spec: &ToolSpec, tool_services: &ToolServices| {
-                instantiate(&package, spec, &services, tool_services)
-            }),
-        );
+        register_locked_entry(catalog, &key, Arc::new(package.loaded), services.clone());
     }
     Ok(())
 }
 
-/// Builds one agent's instance of a module tool.
+/// Registers the verified module `loaded` under the catalog key `module`, built only when an
+/// environment assembles the key, as [`register_modules`] registers a locked package. This is
+/// the OFFICIAL-RELEASE HOST-ENTRY path (the worker and workflow members, S6.11, D083b): the
+/// entries arrive with their fixed `worker_*`/`workflow_*` keys, verified against the release
+/// manifest once per process and shared, so they arrive already loaded. An environment may give
+/// a host entry a face (`name`, `description`, `variant`), exactly as it could the native member
+/// the entry replaced.
+pub fn register_host_entry(
+    catalog: &mut Catalog,
+    module: &str,
+    loaded: Arc<LoadedModule>,
+    services: ModuleServices,
+) {
+    register_entry(catalog, module, loaded, services, true);
+}
+
+/// Registers a package an installation selected through `modules.lock` ([`register_modules`]).
+/// A locked package takes no face override: an extra module must never present a name,
+/// description or variant other than its own, whatever `ToolSpec` an environment carries.
+pub fn register_locked_entry(
+    catalog: &mut Catalog,
+    module: &str,
+    loaded: Arc<LoadedModule>,
+    services: ModuleServices,
+) {
+    register_entry(catalog, module, loaded, services, false);
+}
+
+/// Registers `loaded` under `module` for an environment to build, accepting a face override
+/// only when `face` (a host entry) rather than refusing it (a locked package).
+fn register_entry(
+    catalog: &mut Catalog,
+    module: &str,
+    loaded: Arc<LoadedModule>,
+    services: ModuleServices,
+    face: bool,
+) {
+    let key = module.to_owned();
+    catalog.tool(
+        module,
+        Box::new(move |spec: &ToolSpec, tool_services: &ToolServices| {
+            instantiate(&key, &loaded, spec, &services, tool_services, face)
+        }),
+    );
+}
+
+/// Builds one agent's instance of the module tool `loaded`, registered as `module`.
 fn instantiate(
-    package: &ModulePackage,
+    module: &str,
+    loaded: &LoadedModule,
     spec: &ToolSpec,
     services: &ModuleServices,
     tool_services: &ToolServices,
+    face: bool,
 ) -> Result<Arc<dyn Tool>, String> {
-    // `WasmTool` has no `ToolFace`; presenting a module under another face would need one,
-    // and silently dropping the override would show the model a tool the environment did
-    // not ask for.
-    if spec.name.is_some() || spec.description.is_some() || spec.variant.is_some() {
+    let overridden = spec.name.is_some() || spec.description.is_some() || spec.variant.is_some();
+    // `WasmTool` has no `ToolFace`; presenting a locked package under another face would need
+    // one, and silently dropping the override would show the model a tool the environment did
+    // not ask for. An official host entry is built by [`FacedEntry`] instead, below.
+    if overridden && !face {
         return Err(format!(
-            "module `{}` cannot take a name, description or variant override",
-            package.module
+            "module `{module}` cannot take a name, description or variant override"
         ));
     }
     // The turn's own counter is the assembling agent's, carried on `ToolServices`
@@ -318,13 +560,134 @@ fn instantiate(
     // host's `assemble_with_cache_key` wraps the SAME counter around the assembled tools,
     // so a module tool's masking is what the turn's mask notice reports — never a
     // throwaway counter that always reads zero.
-    wasm_tool(
-        &package.loaded,
-        services(tool_services),
+    let tool = wasm_tool(
+        loaded,
+        services(loaded.name(), tool_services),
         ExecutionLimits::default(),
         &tool_services.mask,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if !overridden {
+        return Ok(tool);
+    }
+    let name = spec
+        .name
+        .clone()
+        .unwrap_or_else(|| tool.declaration().name.clone());
+    let description = spec
+        .description
+        .clone()
+        .unwrap_or_else(|| tool.declaration().description.clone());
+    let variant = spec
+        .variant
+        .clone()
+        .unwrap_or_else(|| tool.identity().variant.clone());
+    Ok(Arc::new(FacedEntry {
+        declaration: ToolDeclaration {
+            name,
+            description,
+            kind: tool.declaration().kind.clone(),
+        },
+        identity: ToolIdentity {
+            implementation: tool.identity().implementation.clone(),
+            variant,
+        },
+        inner: tool,
+    }))
+}
+
+/// A host entry under the face an environment gave it: the component, its schema and its
+/// semantics are unchanged, only the model-facing `name`, `description` and the identity
+/// `variant` differ — what `apply_face!` gives a native tool. The native member registrations
+/// this path replaced accepted those overrides, so a host entry must too (S6.11 review).
+struct FacedEntry {
+    inner: Arc<dyn Tool>,
+    declaration: ToolDeclaration,
+    identity: ToolIdentity,
+}
+
+impl Tool for FacedEntry {
+    fn declaration(&self) -> &ToolDeclaration {
+        &self.declaration
+    }
+
+    fn identity(&self) -> &ToolIdentity {
+        &self.identity
+    }
+
+    fn effect(&self, call: &ToolCall) -> Effect {
+        self.inner.effect(call)
+    }
+
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        self.inner.describe(call)
+    }
+
+    fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        self.inner.describe_result(call, result)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: ToolContext,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        self.inner.execute(call, context)
+    }
+}
+
+/// Loads and verifies the release's `package` for the catalog key `module`, with the steps
+/// [`load_locked_modules`] takes: read the manifest, refuse duplicate identities, parse the
+/// ABI, check the class allocation, start the loader and load the package by name. The ONE
+/// loading step of every host entry, whichever registration takes the package
+/// ([`register_entries_from`]): the class allocation check is applied to every entry here, so an
+/// entry the host composes itself is checked exactly as a shared one.
+fn load_host_entry(
+    module: &str,
+    package: &str,
+    release: &Path,
+) -> Result<ModulePackage, ModulesError> {
+    let manifest = read_release(module, package, release)?;
+    if let Some(entry) = manifest.entry(package) {
+        check_allocation(module, entry)?;
+    }
+    // A package the manifest lacks is the loader's refusal to report: official source.
+    let root = release.parent().unwrap_or(Path::new("."));
+    let loader =
+        Loader::new(manifest, root).map_err(|error| ModulesError::Runtime(Box::new(error)))?;
+    let loaded = loader
+        .load(package)
+        .map_err(|source| ModulesError::HostEntryLoad {
+            module: module.to_owned(),
+            package: package.to_owned(),
+            path: release.to_owned(),
+            source: Box::new(source),
+        })?;
+    // The registration refuses a class with no catalog adapter (`register_modules`), so a
+    // release that ships something other than a tool under this name fails naming the key.
+    Ok(ModulePackage {
+        module: module.to_owned(),
+        lock: release.to_owned(),
+        loaded,
+    })
+}
+
+/// Reads the release manifest at `release` and refuses one that claims an identity twice: the
+/// step both the host-entry registration and an assembly identity's package rows take.
+fn read_release(
+    module: &str,
+    package: &str,
+    release: &Path,
+) -> Result<ReleaseManifest, ModulesError> {
+    let release_error = |source| ModulesError::HostEntryRelease {
+        module: module.to_owned(),
+        package: package.to_owned(),
+        path: release.to_owned(),
+        source: Box::new(source),
+    };
+    let manifest = ReleaseManifest::read(release).map_err(release_error)?;
+    manifest.check_unique_digests().map_err(release_error)?;
+    Ok(manifest)
 }
 
 /// The catalog build path's step: resolve the lock files next to the environment
@@ -334,21 +697,384 @@ pub(super) fn register_locked_modules(
     catalog: &mut Catalog,
     deps: &HostDeps,
 ) -> Result<(), String> {
+    register_locked_modules_from(catalog, deps, official_release_manifest())
+}
+
+/// [`register_locked_modules`] over the release whose manifest is `release`.
+fn register_locked_modules_from(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    release: Option<PathBuf>,
+) -> Result<(), String> {
     let lock = load_modules_lock(&deps.environment_dirs).map_err(|error| error.to_string())?;
     if lock.is_empty() {
         return Ok(());
     }
-    let release = official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())?;
-    let packages = load_locked_modules(&lock, &release).map_err(|error| error.to_string())?;
-    // No native service backs a module capability in the host yet (the shell's process
-    // service is not bridged to the runtime's `ProcessService`), so a package granted one
-    // fails its assembly with the runtime's `MissingService` rather than running unlinked.
-    let services: ModuleServices = Arc::new(|_: &ToolServices| Services::default());
+    let release = release.ok_or_else(|| ModulesError::NoRelease.to_string())?;
+    announce_release(deps, &release);
+    // A lock-selected shell or finish still needs the host's process service or completion hub,
+    // so the host-entry step hands it to the host's registration instead
+    // ([`register_composed_host_entries`]).
+    let packages = load_locked_modules_except(&lock, &release, &HOST_COMPOSED_ENTRIES)
+        .map_err(|error| error.to_string())?;
+    // A member a lock selects is a member of its family all the same: it takes the host's
+    // lists and grant check, as a host entry does, not only the family's scopes
+    // (`catalog/delegation.rs`, D084).
+    #[cfg(feature = "delegation")]
+    let services = super::delegation::with_member_lists(
+        locked_module_services(deps),
+        super::delegation::worker_lists(catalog, deps)?,
+    );
+    #[cfg(not(feature = "delegation"))]
+    let services = locked_module_services(deps);
     register_modules(catalog, packages, services).map_err(|error| error.to_string())
+}
+
+/// The catalog build path's step for the official-release host entries (D083b 2,
+/// [`HOST_ENTRIES`]): each entry no user lock selects is loaded from the release, verified and
+/// registered through the same path a lock-selected package takes. A refusal is an error naming
+/// the package and the release — never a native fallback. The entries the host composes its own
+/// tool for are the host's step's ([`register_composed_host_entries`], S3.8), loaded through this
+/// same path.
+pub(super) fn register_host_entries(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
+    register_host_entries_from(catalog, deps, &HOST_ENTRIES, official_release_manifest())
+}
+
+/// [`register_host_entries`] over `entries`, loaded from the release whose manifest is
+/// `release`. A slice that adds host entries (S5.11's policy packages) calls this with its own
+/// list.
+///
+/// The entries of [`HOST_COMPOSED_ENTRIES`] are not registered here: the host builds their
+/// catalog tools itself ([`register_composed_host_entries`], `catalog/tools.rs`), so this list's
+/// entries are the shared registration's alone.
+pub(crate) fn register_host_entries_from(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    entries: &[(&str, &str)],
+    release: Option<PathBuf>,
+) -> Result<(), String> {
+    register_entries_from(catalog, deps, entries, release, &[])
+}
+
+/// Registers the host entries the HOST composes itself — the `(key, registration)` pairs of
+/// [`HOST_COMPOSED_ENTRIES`], S3.8's shell and finish — through the one shared step: for each
+/// key, its package is loaded from the official release, verified against it and handed to the
+/// registration, which builds the catalog tool around it. A user lock that names the key leaves
+/// the release's package unloaded, exactly as it does for `read`, and the lock's package is
+/// handed to the same registration, so it is linked with the host's services
+/// ([`register_locked_modules`] leaves these keys alone).
+pub(crate) fn register_composed_host_entries(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    composed: &[(&str, HostEntryRegistration)],
+) -> Result<(), String> {
+    let entries: Vec<(&str, &str)> = HOST_ENTRIES
+        .iter()
+        .copied()
+        .filter(|(key, _)| composed.iter().any(|(registered, _)| registered == key))
+        .collect();
+    register_entries_from(
+        catalog,
+        deps,
+        &entries,
+        official_release_manifest(),
+        composed,
+    )
+}
+
+/// The step every host-entry registration takes: each of `entries` that no user lock selects is
+/// loaded from `release` and verified against it — the manifest read, the duplicate-identity and
+/// class-allocation checks, then compiles the package by name ([`load_host_entry`]) — and
+/// registered under its catalog key, through the registration `composed` gives for the key when
+/// the host owns its tool, through the shared [`register_host_entry`] otherwise. A
+/// [`HOST_COMPOSED_ENTRIES`] key with no registration is the host's own: the step that owns it
+/// registers it, so nothing is loaded or registered for it here.
+fn register_entries_from(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    entries: &[(&str, &str)],
+    release: Option<PathBuf>,
+    composed: &[(&str, HostEntryRegistration)],
+) -> Result<(), String> {
+    let mut packages = Vec::new();
+    for (key, package) in entries {
+        let registration = composed
+            .iter()
+            .find(|(registered, _)| registered == key)
+            .map(|(_, registration)| registration);
+        if lock_selects(&deps.environment_dirs, key) {
+            // A user lock names this key: its package is what runs, never the release entry's,
+            // or the two would collide. A key the host composes takes the lock's package
+            // through the host's registration, which links the services the shared one lacks;
+            // any other key is the locked-module registration's.
+            if let Some(registration) = registration {
+                let locked = load_locked_host_entry(deps, key, release.as_deref())?;
+                registration(catalog, Arc::new(locked.loaded))?;
+            }
+            continue;
+        }
+        if registration.is_none() && HOST_COMPOSED_ENTRIES.contains(key) {
+            // The host's own entry: it is loaded and registered by the step that owns its tool
+            // key ([`register_composed_host_entries`]), never by the shared registration.
+            continue;
+        }
+        let release = release.as_deref().ok_or_else(|| {
+            ModulesError::HostEntryNoRelease {
+                module: (*key).to_owned(),
+                package: (*package).to_owned(),
+            }
+            .to_string()
+        })?;
+        // The release is loaded, so a debug build says so exactly as the locked path does.
+        announce_release(deps, release);
+        let loaded = load_host_entry(key, package, release).map_err(|error| error.to_string())?;
+        match registration {
+            Some(registration) => registration(catalog, Arc::new(loaded.loaded))?,
+            None => packages.push(loaded),
+        }
+    }
+    if packages.is_empty() {
+        return Ok(());
+    }
+    register_modules(catalog, packages, locked_module_services(deps))
+        .map_err(|error| error.to_string())
+}
+
+/// The package a user lock selects for the host-composed key `key`, verified against `release`
+/// exactly as [`load_locked_modules`] verifies it.
+fn load_locked_host_entry(
+    deps: &HostDeps,
+    key: &str,
+    release: Option<&Path>,
+) -> Result<ModulePackage, String> {
+    let lock = load_modules_lock(&deps.environment_dirs).map_err(|error| error.to_string())?;
+    let locked = lock
+        .resolve(key)
+        .ok_or_else(|| format!("modules.lock no longer names `{key}`"))?;
+    let release = release.ok_or_else(|| ModulesError::NoRelease.to_string())?;
+    announce_release(deps, release);
+    let release_error = |source| {
+        ModulesError::Release {
+            path: release.to_owned(),
+            source: Box::new(source),
+        }
+        .to_string()
+    };
+    let manifest = ReleaseManifest::read(release).map_err(release_error)?;
+    manifest.check_unique_digests().map_err(release_error)?;
+    let root = release.parent().unwrap_or(Path::new("."));
+    let loader = Loader::new(manifest.clone(), root)
+        .map_err(|error| ModulesError::Runtime(Box::new(error)).to_string())?;
+    load_locked_entry(&loader, &manifest, key, locked).map_err(|error| error.to_string())
+}
+
+/// The package sources an assembly identity names (ADR-0080): the `modules.lock` the catalog's
+/// module registration read, and the official-release host entries it registered (D083b 2). A
+/// key is resolved by the lock first — a user lock's package is what runs — then by a host
+/// entry; a key neither names is a native module.
+#[derive(Clone)]
+pub struct ModuleSources {
+    lock: ModulesLock,
+    host: Vec<(String, PackageIdentity)>,
+}
+
+impl ModuleSources {
+    /// Only the lock's resolutions: an assembly of a release without host entries, and the
+    /// journal-identity cases that drive the identity builder over a fixture lock.
+    pub fn of_lock(lock: ModulesLock) -> Self {
+        Self {
+            lock,
+            host: Vec::new(),
+        }
+    }
+
+    /// What `key` resolves to, or `None` for a native module.
+    pub fn resolve(&self, key: &str) -> Option<PackageIdentity> {
+        if let Some(locked) = self.lock.resolve(key) {
+            return Some(PackageIdentity {
+                name: locked.package.clone(),
+                version: locked.version.clone(),
+                digest: locked.digest.clone(),
+                abi: format!("{}+{}", locked.world, locked.protocol),
+            });
+        }
+        self.host
+            .iter()
+            .find(|(entry, _)| entry == key)
+            .map(|(_, package)| PackageIdentity {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                digest: package.digest.clone(),
+                abi: package.abi.clone(),
+            })
+    }
+}
+
+/// The lock the catalog read and the host entries it registered, for the assembly identity the
+/// host writes (ADR-0080). The release is read again here, never cached: ADR-0084 §3 has every
+/// catalog build, a `/modules reload` included, load the release of that build, so the identity
+/// names what that build registered.
+pub fn module_sources(deps: &HostDeps) -> Result<ModuleSources, String> {
+    module_sources_from(deps, &HOST_ENTRIES, official_release_manifest())
+}
+
+/// [`module_sources`] over `entries`, resolved against the release whose manifest is `release`.
+///
+/// An entry the release carries no package for is not one of ITS packages: the key is not a
+/// package row here (the lock's package, or a native module). The catalog build is where a
+/// release missing an entry it must hold is refused ([`register_entries_from`] names the key and
+/// the package), so an identity asked for after a successful build always finds the entries that
+/// build registered; this step answers for the caller's list, not for the release's completeness.
+fn module_sources_from(
+    deps: &HostDeps,
+    entries: &[(&str, &str)],
+    release: Option<PathBuf>,
+) -> Result<ModuleSources, String> {
+    let lock = load_modules_lock(&deps.environment_dirs).map_err(|error| error.to_string())?;
+    let mut host = Vec::new();
+    for (key, package) in entries {
+        // The same choice the registration makes: a key a user lock names is the lock's
+        // package, and the release's entry for it is not what runs.
+        if lock.resolve(key).is_some() {
+            continue;
+        }
+        let release = release.as_deref().ok_or_else(|| {
+            ModulesError::HostEntryNoRelease {
+                module: (*key).to_owned(),
+                package: (*package).to_owned(),
+            }
+            .to_string()
+        })?;
+        if let Some(identity) =
+            host_entry_identity(key, package, release).map_err(|error| error.to_string())?
+        {
+            host.push(((*key).to_owned(), identity));
+        }
+    }
+    Ok(ModuleSources { lock, host })
+}
+
+/// What the release states of the package `package`, for the identity of the catalog key
+/// `module`: the manifest name, the digest the loader verified, the ABI, and the versions the
+/// release pins. `None` when the release carries no such package: the key is not one of the
+/// release's packages, and the catalog build is where a missing one is refused
+/// ([`register_entries_from`]).
+///
+/// The digest is the manifest's own, not a second digest of the bytes: the loader verified the
+/// component against that entry when the catalog registered it, so it is the loader-verified
+/// digest, exactly as the lock's digest is for a lock-selected package. The version is the
+/// host's own, because the release manifest is built with the binary in one pass (D083b 2) and a
+/// package manifest carries no version of its own; the digest is what pins the bytes.
+fn host_entry_identity(
+    module: &str,
+    package: &str,
+    release: &Path,
+) -> Result<Option<PackageIdentity>, ModulesError> {
+    let manifest = read_release(module, package, release)?;
+    let Some(entry) = manifest.entry(package) else {
+        return Ok(None);
+    };
+    check_allocation(module, entry)?;
+    Ok(Some(PackageIdentity {
+        name: entry.name.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        digest: entry.digest.to_string(),
+        abi: format!("{}+{}", entry.world, entry.protocol),
+    }))
+}
+
+/// The one line a debug build writes when it loads a module set from `release`, once per
+/// process, so an operator can see which module set a development binary loaded without a line
+/// per catalog assembly. It goes through `write_stderr` (the injected channel), never
+/// `eprintln!`: a line on the process's real stderr would land on the TUI's drawn screen, and a
+/// host test that captures stderr would never see it. Both paths that load the release — the
+/// locked modules and the host entries — call it, and the first of the process to load anything
+/// prints it.
+#[cfg(debug_assertions)]
+fn announce_release(deps: &HostDeps, release: &Path) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        write_stderr(
+            deps,
+            &format!(
+                "p1: debug build: loading modules from {}\n",
+                release.display()
+            ),
+        );
+    });
+}
+
+/// A release build writes no such notice.
+#[cfg(not(debug_assertions))]
+fn announce_release(_deps: &HostDeps, _release: &Path) {}
+
+/// The hook every locked package is linked with. The base is the agent's own: the read
+/// side of its workspace and its observations (`super::tools::module_services`, S1.8), for
+/// every module. The worker and workflow families install `deps.module_services` for their
+/// own members (`catalog/delegation.rs`, `catalog/workflow.rs`; B-S6-9, D068); their hooks
+/// give every module they do not serve `Services::default()`, so the base fills the
+/// `workspace` and `snapshot` a family hook left empty, and a module that is no member (the
+/// `p1/read` component) links exactly as without the families. No other native service
+/// backs a module capability in the host yet (the shell's process service is not bridged
+/// to the runtime's `ProcessService`), so a package granted one fails its assembly with the
+/// runtime's `MissingService` rather than running unlinked.
+fn locked_module_services(deps: &HostDeps) -> ModuleServices {
+    let base = super::tools::module_services(deps);
+    let Some(family) = deps.module_services.clone() else {
+        return base;
+    };
+    Arc::new(move |module: &str, services: &ToolServices| {
+        let mut linked = family(module, services);
+        if linked.workspace.is_none() || linked.snapshot.is_none() {
+            let base = base(module, services);
+            linked.workspace = linked.workspace.or(base.workspace);
+            linked.snapshot = linked.snapshot.or(base.snapshot);
+        }
+        linked
+    })
+}
+
+/// Host dependencies over `environment_dirs` that touch no terminal, network or home: what the
+/// catalog cases build, and what a sibling file's cases drive this step over.
+#[cfg(test)]
+pub(crate) fn quiet_deps(environment_dirs: Vec<PathBuf>) -> HostDeps {
+    /// Nothing interrupts the catalog cases.
+    struct NoInterrupt;
+    impl crate::InterruptSource for NoInterrupt {
+        fn recv<'a>(
+            &'a self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    let sink =
+        || -> crate::SharedWriter { Arc::new(std::sync::Mutex::new(Box::new(std::io::sink()))) };
+    let mut deps = HostDeps::new(
+        sink(),
+        sink(),
+        Arc::new(crate::ReaderLines::from_reader(tokio::io::empty())),
+        Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+        "2026-01-02".to_string(),
+        Arc::new(NoInterrupt),
+        environment_dirs,
+        false,
+    );
+    deps.home = None;
+    deps
 }
 
 #[cfg(test)]
 mod tests {
+    use p1_assembly::{EnvironmentFile, ProviderSpec, Substitutions, assemble};
+    use p1_contracts::{ModelOptions, Provider, ToolIdentity};
+    use p1_module_runtime::ProcessService;
+    use p1_module_tests::{FIXTURE_NAME, FakeProcesses, Release, fake_processes, lock_text};
+    use p1_testkit::{FakeTool, ScriptedProvider};
+    use p1_tool_finish::CompletionPolicy;
+
+    use crate::catalog::capabilities::{Capabilities, SemanticCapability, carries, declared};
+
     use super::*;
 
     #[test]
@@ -362,5 +1088,701 @@ mod tests {
         let provider = allocation("provider").expect("provider class");
         assert!(!provider.iter().any(|c| c == "process"));
         assert!(allocation("plugin").is_none());
+    }
+
+    #[test]
+    fn the_debug_fallback_is_taken_only_when_the_share_tree_has_no_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let share = dir.path().join("share/p1/modules/manifest.json");
+        let built = dir.path().join("modules/target/p1-modules/manifest.json");
+        std::fs::create_dir_all(share.parent().expect("share parent")).expect("share dir");
+        std::fs::create_dir_all(built.parent().expect("built parent")).expect("built dir");
+        std::fs::write(&built, "{}\n").expect("write built manifest");
+
+        // Only the built set exists: a debug build takes it, and a release build does not.
+        #[cfg(debug_assertions)]
+        assert_eq!(choose_release_manifest(share.clone(), built.clone()), built);
+        #[cfg(not(debug_assertions))]
+        assert_eq!(choose_release_manifest(share.clone(), built.clone()), share);
+
+        // The share tree's manifest always wins, whichever else exists.
+        std::fs::write(&share, "{}\n").expect("write share manifest");
+        assert_eq!(choose_release_manifest(share.clone(), built.clone()), share);
+
+        // Neither exists: the share path is returned, so the loader's error names the release.
+        std::fs::remove_file(&share).expect("remove share manifest");
+        std::fs::remove_file(&built).expect("remove built manifest");
+        assert_eq!(choose_release_manifest(share.clone(), built), share);
+    }
+
+    /// The child completion policy (ADR-0051 item 1) exactly as `catalog/children.rs`
+    /// computes it over assembled tools: `RecordedCommands` iff one of them carries
+    /// `records-command-evidence`. That function is private to the delegation module, so its
+    /// one-line rule is restated here; the cases below are about the registration's
+    /// declaration, which is what the rule reads.
+    fn child_policy(tools: &[Arc<dyn Tool>]) -> CompletionPolicy {
+        let can_run_commands = tools
+            .iter()
+            .any(|tool| carries(tool.as_ref(), SemanticCapability::RecordsCommandEvidence));
+        if can_run_commands {
+            CompletionPolicy::RecordedCommands
+        } else {
+            CompletionPolicy::ReportToParent
+        }
+    }
+
+    /// A `modules.lock` resolving `module` to the fixture package of `release`.
+    fn fixture_lock(release: &Release, module: &str) -> ModulesLock {
+        let entry = release.fixture_entry(FIXTURE_NAME);
+        ModulesLock::parse(
+            &release.root().join("modules.lock"),
+            &lock_text(module, &entry),
+        )
+        .expect("fixture lock")
+    }
+
+    /// A catalog built the host's way: a scripted provider, and every package `lock` selects
+    /// registered through [`register_modules`] with a fake `process` service (the fixture
+    /// imports `process`). The fake's receiving end comes back with the catalog so the caller
+    /// keeps it alive for the assembled tool's life.
+    fn registered_catalog(release: &Release, lock: &ModulesLock) -> (Catalog, FakeProcesses) {
+        let mut catalog = Catalog::new();
+        let provider = ScriptedProvider::new(Vec::new());
+        catalog.provider(
+            "scripted",
+            Box::new(move |_spec: &ProviderSpec| {
+                Ok(Arc::new(provider.clone()) as Arc<dyn Provider>)
+            }),
+        );
+        let (process, processes) = fake_processes();
+        let process: Arc<dyn ProcessService> = process;
+        let services: ModuleServices = Arc::new(move |_: &str, _: &ToolServices| Services {
+            process: Some(process.clone()),
+            ..Services::default()
+        });
+        let packages =
+            load_locked_modules(lock, &release.manifest_file()).expect("the package loads");
+        register_modules(&mut catalog, packages, services).expect("registration");
+        (catalog, processes)
+    }
+
+    /// An environment naming `modules`, assembled in a scratch workspace.
+    fn assemble_modules(
+        catalog: &Catalog,
+        modules: &[&str],
+    ) -> Result<p1_assembly::Assembled, p1_assembly::AssemblyError> {
+        let environment = EnvironmentFile {
+            name: "package-capabilities-test".into(),
+            family: "test".into(),
+            provider: "scripted".into(),
+            model: "test-model".into(),
+            profile: None,
+            options: ModelOptions::default(),
+            tools: modules
+                .iter()
+                .map(|module| ToolSpec {
+                    module: (*module).into(),
+                    name: None,
+                    description: None,
+                    variant: None,
+                })
+                .collect(),
+            prompt_template: "tools: {{tool_names}}".into(),
+            context: None,
+            summarize_prompt: None,
+        };
+        let workspace = tempfile::tempdir().expect("scratch workspace");
+        assemble(
+            catalog,
+            &environment,
+            workspace.path(),
+            &Substitutions {
+                workspace: "/work".into(),
+                date: "2026-01-01".into(),
+                os: "linux".into(),
+            },
+        )
+    }
+
+    /// The built tool package in `dir` (manifest name `name`) as a release entry and its
+    /// bytes, laid out as `scripts/build-modules.sh` publishes it.
+    fn built_package(dir: &str, name: &str) -> (serde_json::Value, Vec<u8>) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/target/p1-modules")
+            .join(dir);
+        let wasm_path = root.join(format!("{dir}.wasm"));
+        let wasm = std::fs::read(&wasm_path).unwrap_or_else(|error| {
+            panic!(
+                "the built package {} is missing ({error}): run scripts/build-modules.sh",
+                wasm_path.display()
+            )
+        });
+        let manifest_path = root.join(format!("{dir}.manifest.json"));
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", manifest_path.display())),
+        )
+        .expect("the built manifest is JSON");
+        let entry = serde_json::json!({
+            "name": name,
+            "digest": manifest["digest"],
+            "path": format!("packages/{dir}/{dir}.wasm"),
+            "kind": manifest["kind"],
+            "world": manifest["world"],
+            "protocol": manifest["protocol"],
+            "capabilities": manifest["capabilities"],
+            "variant": manifest["variant"],
+        });
+        (entry, wasm)
+    }
+
+    /// S1.5.1: the real registration declares a tool package's verified grants under the
+    /// identity the loader built, so a child assembled with the package is treated exactly as
+    /// one assembled with its native twin. The fixture package grants `process`, so its
+    /// assembled tool carries `records-command-evidence` and a child's completion policy is
+    /// the strict `CompletionPolicy::RecordedCommands` (ADR-0051 item 1, ADR-0083 rule 7).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registering_a_process_package_makes_it_a_command_tool_for_a_child() {
+        let release = Release::with_fixture();
+        let (catalog, _processes) =
+            registered_catalog(&release, &fixture_lock(&release, "fixture"));
+        let assembled = assemble_modules(&catalog, &["fixture"]).expect("the package assembles");
+
+        assert_eq!(
+            assembled.tools.len(),
+            1,
+            "the granted package, and nothing else"
+        );
+        let module_tool = assembled.tools[0].clone();
+        assert_eq!(module_tool.identity().implementation, FIXTURE_NAME);
+        assert!(
+            carries(
+                module_tool.as_ref(),
+                SemanticCapability::RecordsCommandEvidence
+            ),
+            "the registration declared the package's verified `process` grant"
+        );
+        assert_eq!(
+            child_policy(&assembled.tools),
+            CompletionPolicy::RecordedCommands
+        );
+    }
+
+    /// S1.5.1: a tool package WITHOUT the `process` grant gets no capability, so a child
+    /// assembled with it stays on `CompletionPolicy::ReportToParent`. The package is a real
+    /// built tool component (`p1/worker-result`, granted `control` and `workers-observe`)
+    /// registered through the same host entry point, so the case is the registration's
+    /// declaration and not a hand-written one.
+    #[test]
+    fn registering_a_package_without_process_is_not_a_command_tool() {
+        let mut release = Release::empty();
+        let (entry, bytes) = built_package("p1-module-worker-result", "p1/worker-result");
+        release.add(entry.clone(), &bytes);
+        let lock = ModulesLock::parse(
+            &release.root().join("modules.lock"),
+            &lock_text("worker_result", &entry),
+        )
+        .expect("lock");
+        let mut catalog = Catalog::new();
+        let packages =
+            load_locked_modules(&lock, &release.manifest_file()).expect("the package loads");
+        let services: ModuleServices = Arc::new(|_: &str, _: &ToolServices| Services::default());
+        register_modules(&mut catalog, packages, services).expect("registration");
+
+        let identity = ToolIdentity {
+            implementation: "p1/worker-result".into(),
+            variant: "default".into(),
+        };
+        assert_eq!(
+            declared(&identity),
+            Capabilities::NONE,
+            "no `process` grant, so no `records-command-evidence`"
+        );
+        let tool: Arc<dyn Tool> = Arc::new(
+            FakeTool::new("worker_result")
+                .with_identity(&identity.implementation, &identity.variant),
+        );
+        assert_eq!(child_policy(&[tool]), CompletionPolicy::ReportToParent);
+    }
+
+    /// The built `p1-module-read` component's bytes, or a panic naming the build script.
+    fn built_read_wasm() -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/target/p1-modules/p1-module-read/p1-module-read.wasm");
+        std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "the p1-module-read artifact {} is missing ({error}): run scripts/build-modules.sh --all first",
+                path.display()
+            )
+        })
+    }
+
+    /// The release entry of the built `p1/read` component: the manifest name, the digest of the
+    /// bytes `scripts/build-modules.sh` published, and the class, world, protocol, grants and
+    /// variant of the package manifest the build wrote.
+    fn read_entry() -> p1_contracts::serde_json::Value {
+        built_entry("p1-module-read")
+    }
+
+    /// The release entry of the built package `dir` (`p1-module-read`, `p1-module-shell`, …): the
+    /// name, digest, class, world, protocol, grants and variant of the package manifest
+    /// `scripts/build-modules.sh` wrote beside its component.
+    fn built_entry(dir: &str) -> p1_contracts::serde_json::Value {
+        use p1_contracts::serde_json::{Value, json};
+
+        let manifest: Value = p1_contracts::serde_json::from_slice(
+            &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "../../modules/target/p1-modules/{dir}/{dir}.manifest.json"
+            )))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the built {dir} package manifest is missing ({error}): run \
+                     scripts/build-modules.sh --all first"
+                )
+            }),
+        )
+        .expect("the package manifest is JSON");
+        json!({
+            "name": manifest["name"],
+            "digest": manifest["digest"],
+            "path": format!("packages/{dir}/{dir}.wasm"),
+            "kind": manifest["kind"],
+            "world": manifest["world"],
+            "protocol": manifest["protocol"],
+            "capabilities": manifest["capabilities"],
+            "variant": manifest["variant"],
+        })
+    }
+
+    /// Writes a release under `dir` holding `entries` and the built `p1/read` bytes at each
+    /// entry's path; returns its manifest path. A case that hands an entry another digest gets a
+    /// release whose package the loader must refuse.
+    fn write_read_release(dir: &Path, entries: &[p1_contracts::serde_json::Value]) -> PathBuf {
+        let wasm = built_read_wasm();
+        for entry in entries {
+            let component = dir.join(entry["path"].as_str().expect("entry path"));
+            std::fs::create_dir_all(component.parent().expect("package dir")).expect("package dir");
+            std::fs::write(&component, &wasm).expect("component");
+        }
+        write_release_manifest(dir, entries)
+    }
+
+    /// Writes a release manifest under `dir` holding `entries`: enough for the cases that read
+    /// the release's IDENTITIES (`module_sources_from`) and compile no package.
+    fn write_release_manifest(dir: &Path, entries: &[p1_contracts::serde_json::Value]) -> PathBuf {
+        use p1_contracts::serde_json::json;
+
+        let manifest = dir.join(RELEASE_MANIFEST_FILE);
+        std::fs::write(
+            &manifest,
+            json!({ "format": "p1-release-manifest/1", "components": entries }).to_string(),
+        )
+        .expect("release manifest");
+        manifest
+    }
+
+    /// S3.8 (D083b, D-XO-49): a release that does not carry the package a host entry names fails
+    /// the build with the loader's own refusal, naming the key, the package and the manifest it
+    /// looked in — never a silent native fallback. The shell and the finish are loaded by this
+    /// same step (`load_host_entry`), so their refusals name them exactly as `read`'s does.
+    #[test]
+    fn a_package_the_release_does_not_carry_fails_naming_the_key() {
+        let release = tempfile::tempdir().expect("release dir");
+        let manifest = write_release_manifest(release.path(), &[]);
+        let error = match load_host_entry("shell", "p1/shell", &manifest) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a release that does not carry p1/shell must refuse"),
+        };
+        assert!(error.contains("shell"), "{error}");
+        assert!(error.contains("p1/shell"), "{error}");
+        assert!(error.contains(&manifest.display().to_string()), "{error}");
+    }
+
+    /// A config tree whose environments directory carries no lock: the shipped shape, where a
+    /// host entry is what a build registers.
+    fn config_without_lock() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let config = tempfile::tempdir().expect("config dir");
+        let environments = config.path().join("environments");
+        std::fs::create_dir_all(&environments).expect("environments dir");
+        (config, vec![environments])
+    }
+
+    /// The key a lock file names, over `dirs`, kept from the native-registration case this file
+    /// inherited: a lock selects a key only when it names it.
+    #[test]
+    fn the_lock_selects_only_the_key_it_names() {
+        let root = tempfile::tempdir().unwrap();
+        let environments = root.path().join("environments");
+        std::fs::create_dir_all(&environments).unwrap();
+        let dirs = [environments];
+        assert!(!lock_selects(&dirs, "read"), "no lock selects nothing");
+
+        std::fs::write(
+            root.path().join("modules.lock"),
+            "format = \"p1-modules-lock/1\"\n\n[modules]\n",
+        )
+        .unwrap();
+        assert!(!lock_selects(&dirs, "read"), "the shipped empty lock");
+
+        let entry = read_entry();
+        std::fs::write(
+            root.path().join("modules.lock"),
+            p1_module_tests::lock_text("read", &entry),
+        )
+        .unwrap();
+        assert!(lock_selects(&dirs, "read"));
+        assert!(!lock_selects(&dirs, "grep"));
+    }
+
+    /// S1.8.1: a release that holds no `p1/read` refuses the catalog build, naming the package and
+    /// the manifest it looked in — never a silent native fallback.
+    #[test]
+    fn a_release_without_the_read_package_is_refused_by_name() {
+        let release = tempfile::tempdir().expect("release dir");
+        let manifest = write_read_release(release.path(), &[]);
+        let (_config, dirs) = config_without_lock();
+        let deps = quiet_deps(dirs);
+
+        let mut catalog = Catalog::new();
+        let error =
+            register_host_entries_from(&mut catalog, &deps, &HOST_ENTRIES, Some(manifest.clone()))
+                .expect_err("a release without p1/read is refused");
+        assert!(error.contains("p1/read"), "{error}");
+        assert!(error.contains(&manifest.display().to_string()), "{error}");
+        assert!(
+            catalog.tool_keys().is_empty(),
+            "nothing is registered: {error}"
+        );
+    }
+
+    /// S1.8.1: a `p1/read` whose bytes are not the ones its manifest pins refuses the catalog
+    /// build, naming the package and the manifest.
+    #[test]
+    fn a_read_package_whose_bytes_do_not_verify_is_refused_by_name() {
+        let release = tempfile::tempdir().expect("release dir");
+        let mut entry = read_entry();
+        entry["digest"] = p1_contracts::serde_json::json!(format!("sha256:{}", "0".repeat(64)));
+        let manifest = write_read_release(release.path(), &[entry]);
+        let (_config, dirs) = config_without_lock();
+        let deps = quiet_deps(dirs);
+
+        let mut catalog = Catalog::new();
+        let error =
+            register_host_entries_from(&mut catalog, &deps, &HOST_ENTRIES, Some(manifest.clone()))
+                .expect_err("bytes that do not verify are refused");
+        assert!(error.contains("p1/read"), "{error}");
+        assert!(error.contains(&manifest.display().to_string()), "{error}");
+        assert!(
+            catalog.tool_keys().is_empty(),
+            "nothing is registered: {error}"
+        );
+    }
+
+    /// S1.8.1: a user lock that names `read` still wins. The host entry is not loaded at all (the
+    /// release it is offered holds no `p1/read`, and nothing is refused), the locked-module
+    /// registration registers the LOCK's package under the key with no collision, and the
+    /// identity resolves the key through the lock.
+    #[test]
+    fn a_user_lock_naming_read_wins_over_the_host_entry() {
+        let fixture = p1_module_tests::Release::with_fixture();
+        let entry = fixture.fixture_entry(p1_module_tests::FIXTURE_NAME);
+        let (config, dirs) = config_without_lock();
+        std::fs::write(
+            config.path().join("modules.lock"),
+            p1_module_tests::lock_text("read", &entry),
+        )
+        .expect("lock");
+        let deps = quiet_deps(dirs);
+
+        // An empty release: had the host entry been loaded, this build would have failed naming
+        // p1/read.
+        let empty = tempfile::tempdir().expect("empty release dir");
+        let empty_manifest = write_read_release(empty.path(), &[]);
+        let mut catalog = Catalog::new();
+        register_host_entries_from(
+            &mut catalog,
+            &deps,
+            &HOST_ENTRIES,
+            Some(empty_manifest.clone()),
+        )
+        .expect("a lock-selected key leaves the host entry alone");
+        assert!(
+            catalog.tool_keys().is_empty(),
+            "the host entry registers nothing"
+        );
+
+        // The lock's package registers under the key, with no collision.
+        register_locked_modules_from(&mut catalog, &deps, Some(fixture.manifest_file()))
+            .expect("the lock's package registers");
+        assert_eq!(catalog.tool_keys(), ["read"]);
+
+        // And the identity names the lock's package, not the release's.
+        let sources = module_sources_from(&deps, &HOST_ENTRIES, Some(empty_manifest))
+            .expect("a lock-selected key needs no release");
+        let resolved = sources.resolve("read").expect("the lock resolves the key");
+        assert_eq!(resolved.name, p1_module_tests::FIXTURE_NAME);
+        assert_eq!(resolved.digest, entry["digest"].as_str().expect("digest"));
+    }
+
+    /// A user lock that names `shell` hands the LOCK's package to the host's own registration,
+    /// which links the process service the shared locked-module services lack; the locked-module
+    /// registration leaves the key alone, so the two never collide.
+    #[test]
+    fn a_lock_selected_shell_reaches_the_host_registration() {
+        let entry = built_entry("p1-module-shell");
+        let release = tempfile::tempdir().expect("release dir");
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/target/p1-modules/p1-module-shell/p1-module-shell.wasm");
+        let component = release
+            .path()
+            .join(entry["path"].as_str().expect("entry path"));
+        std::fs::create_dir_all(component.parent().expect("package dir")).expect("package dir");
+        std::fs::copy(&wasm, &component).expect("the built p1-module-shell component");
+        let manifest = write_release_manifest(release.path(), std::slice::from_ref(&entry));
+        let (config, dirs) = config_without_lock();
+        std::fs::write(
+            config.path().join("modules.lock"),
+            p1_module_tests::lock_text("shell", &entry),
+        )
+        .expect("lock");
+        let deps = quiet_deps(dirs);
+
+        let handed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = handed.clone();
+        let registration: HostEntryRegistration =
+            Box::new(move |_catalog: &mut Catalog, module: Arc<LoadedModule>| {
+                recorded.lock().unwrap().push(module);
+                Ok(())
+            });
+        let mut catalog = Catalog::new();
+        register_entries_from(
+            &mut catalog,
+            &deps,
+            &[("shell", "p1/shell")],
+            Some(manifest.clone()),
+            &[("shell", registration)],
+        )
+        .expect("the lock's p1/shell loads");
+        let handed = handed.lock().unwrap();
+        assert_eq!(handed.len(), 1, "the lock's package is handed over once");
+        assert_eq!(handed[0].identity().implementation, "p1/shell");
+
+        register_locked_modules_from(&mut catalog, &deps, Some(manifest))
+            .expect("the locked-module registration leaves the key alone");
+        assert!(catalog.tool_keys().is_empty(), "no shared registration");
+    }
+
+    /// S1.8.1: with no lock, the host entry registers the release's package under the key, its
+    /// catalog key is the one an environment selects, and the identity names it as a PACKAGE row
+    /// (manifest name, loader-verified digest, ABI) — never as a native module.
+    #[test]
+    fn the_host_entry_registers_the_release_package_and_the_identity_names_it() {
+        let entry = read_entry();
+        let release = tempfile::tempdir().expect("release dir");
+        let manifest = write_read_release(release.path(), std::slice::from_ref(&entry));
+        let (_config, dirs) = config_without_lock();
+        let deps = quiet_deps(dirs);
+
+        let mut catalog = Catalog::new();
+        register_host_entries_from(&mut catalog, &deps, &HOST_ENTRIES, Some(manifest.clone()))
+            .expect("the release's p1/read registers");
+        assert_eq!(catalog.tool_keys(), ["read"]);
+
+        let sources =
+            module_sources_from(&deps, &HOST_ENTRIES, Some(manifest)).expect("the release reads");
+        let resolved = sources
+            .resolve("read")
+            .expect("the host entry resolves the key");
+        assert_eq!(resolved.name, "p1/read");
+        assert_eq!(resolved.digest, entry["digest"].as_str().expect("digest"));
+        assert_eq!(
+            resolved.abi,
+            format!(
+                "{}+{}",
+                entry["world"].as_str().expect("world"),
+                entry["protocol"].as_str().expect("protocol")
+            )
+        );
+    }
+
+    /// S3.8 (D083b, D-XO-49): `shell` and `finish` are HOST ENTRIES beside `read`, so the identity
+    /// builder names the release package that ran for each key — the manifest name, the digest the
+    /// release pins and the version the host runs at — exactly as it does for `read`. Before this
+    /// slice both keys were journaled as native modules with a null digest although the release's
+    /// `p1/shell` and `p1/finish` components were what executed.
+    #[test]
+    fn the_shell_and_finish_host_entries_name_their_release_packages() {
+        let package = |key: &str| {
+            HOST_ENTRIES
+                .iter()
+                .find(|(entry, _)| *entry == key)
+                .unwrap_or_else(|| panic!("`{key}` is a host entry"))
+                .1
+        };
+        let mut entries = Vec::new();
+        for (key, dir) in [("shell", "p1-module-shell"), ("finish", "p1-module-finish")] {
+            let entry = built_entry(dir);
+            assert_eq!(entry["name"], package(key), "the key's release package");
+            entries.push(entry);
+        }
+        let release = tempfile::tempdir().expect("release dir");
+        let manifest = write_release_manifest(release.path(), &entries);
+        let (_config, dirs) = config_without_lock();
+        let deps = quiet_deps(dirs);
+
+        let sources =
+            module_sources_from(&deps, &HOST_ENTRIES, Some(manifest)).expect("the release reads");
+        for (key, entry) in [("shell", &entries[0]), ("finish", &entries[1])] {
+            let resolved = sources
+                .resolve(key)
+                .expect("the host entry resolves its key");
+            assert_eq!(
+                resolved.name,
+                entry["name"].as_str().expect("name"),
+                "{key}"
+            );
+            assert_eq!(
+                resolved.digest,
+                entry["digest"].as_str().expect("digest"),
+                "{key}"
+            );
+            assert_eq!(resolved.version, env!("CARGO_PKG_VERSION"), "{key}");
+            assert_eq!(
+                resolved.abi,
+                format!(
+                    "{}+{}",
+                    entry["world"].as_str().expect("world"),
+                    entry["protocol"].as_str().expect("protocol")
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    /// S1-N12: with a family hook installed that serves only a worker member and gives every
+    /// other module `Services::default()` (as `catalog/delegation.rs` installs it), a lock
+    /// that selects `p1/read` still builds the component with `workspace` and `snapshot`
+    /// linked through `register_locked_modules`, and a read returns the file. The same hook
+    /// alone, without the base, is the `MissingService` this merge must not reintroduce.
+    #[tokio::test]
+    async fn the_read_component_resolves_with_a_delegation_hook_installed() {
+        use p1_assembly::{EnvironmentFile, ProviderSpec, Substitutions, assemble};
+        use p1_contracts::serde_json::json;
+        use p1_contracts::{
+            CancellationToken, ModelOptions, Provider, ToolCall, ToolContext, ToolInput,
+        };
+
+        let entry = read_entry();
+
+        // The release, and a lock next to the environments directory selecting `p1/read`
+        // under the key `read`.
+        let release = tempfile::tempdir().expect("release dir");
+        let release_manifest = write_read_release(release.path(), std::slice::from_ref(&entry));
+        let config = tempfile::tempdir().expect("config dir");
+        let environments = config.path().join("environments");
+        std::fs::create_dir_all(&environments).expect("environments dir");
+        std::fs::write(
+            config.path().join("modules.lock"),
+            p1_module_tests::lock_text("read", &entry),
+        )
+        .expect("lock");
+
+        // The family hook: a worker member gets its services, every other module none.
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = asked.clone();
+        let family: ModuleServices = Arc::new(move |module: &str, _: &ToolServices| {
+            recorded.lock().unwrap().push(module.to_owned());
+            match module {
+                "p1/worker-start" => Services {
+                    workers: Some(Default::default()),
+                    ..Services::default()
+                },
+                _ => Services::default(),
+            }
+        });
+        let mut deps = quiet_deps(vec![environments]);
+        deps.module_services = Some(family.clone());
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("notes.txt"), "alpha\nbeta\n").expect("file");
+        let environment = EnvironmentFile {
+            name: "read-module".into(),
+            family: "test".into(),
+            provider: "scripted".into(),
+            model: "test-model".into(),
+            profile: None,
+            options: ModelOptions::default(),
+            tools: vec![ToolSpec {
+                module: "read".into(),
+                name: None,
+                description: None,
+                variant: None,
+            }],
+            prompt_template: "tools: {{tool_names}}".into(),
+            context: None,
+            summarize_prompt: None,
+        };
+        let substitutions = Substitutions {
+            workspace: "/work".into(),
+            date: "2026-01-01".into(),
+            os: "linux".into(),
+        };
+        let catalog_with = |register: &dyn Fn(&mut Catalog) -> Result<(), String>| {
+            let mut catalog = Catalog::new();
+            let provider = p1_testkit::ScriptedProvider::new(Vec::new());
+            catalog.provider(
+                "scripted",
+                Box::new(move |_spec: &ProviderSpec| {
+                    Ok(Arc::new(provider.clone()) as Arc<dyn Provider>)
+                }),
+            );
+            register(&mut catalog).expect("registration");
+            catalog
+        };
+
+        let catalog = catalog_with(&|catalog| {
+            register_locked_modules_from(catalog, &deps, Some(release_manifest.clone()))
+        });
+        let assembled = assemble(&catalog, &environment, workspace.path(), &substitutions)
+            .unwrap_or_else(|error| panic!("p1/read assembles under the family hook: {error}"));
+        assert_eq!(asked.lock().unwrap().as_slice(), ["p1/read"]);
+        let tool = &assembled.tools[0];
+        assert_eq!(
+            assembled.resolved.tools[0].identity.implementation,
+            "p1/read"
+        );
+        let outcome = p1_module_tests::within_deadline(
+            "read under a family hook",
+            tool.execute(
+                &ToolCall {
+                    call_id: "c1".into(),
+                    name: "read".into(),
+                    input: ToolInput::Json(json!({ "file_path": "notes.txt" }).to_string()),
+                },
+                ToolContext {
+                    cancel: CancellationToken::new(),
+                },
+            ),
+        )
+        .await;
+        let text = format!("{:?}", outcome.content);
+        assert!(
+            text.contains("alpha") && text.contains("beta"),
+            "{:?}: {text}",
+            outcome.status
+        );
+
+        // The family hook alone leaves `workspace` and `snapshot` unlinked.
+        let bare = catalog_with(&|catalog| {
+            let packages = load_locked_modules(
+                &load_modules_lock(&deps.environment_dirs).expect("lock"),
+                &release_manifest,
+            )
+            .expect("p1/read loads");
+            register_modules(catalog, packages, family.clone()).map_err(|error| error.to_string())
+        });
+        let refused = assemble(&bare, &environment, workspace.path(), &substitutions)
+            .expect_err("the family hook alone cannot link p1/read");
+        assert!(refused.to_string().contains("workspace"), "{refused}");
     }
 }

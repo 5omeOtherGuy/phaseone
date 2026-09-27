@@ -1,7 +1,7 @@
 use crate::ChatDialect;
 use p1_contracts::{
     AssistantBlock, AssistantItem, CompletedResponse, Origin, Outcome, ProviderError,
-    ProviderErrorKind, ReplayData, StopReason, StreamEvent, ToolCall, ToolInput, Usage,
+    ProviderErrorKind, StopReason, StreamEvent, ToolCall, ToolInput, Usage,
 };
 use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status, reset_after};
 use serde_json::Value;
@@ -138,11 +138,7 @@ impl ChatParser {
         }
         for block in &mut self.blocks {
             if let AssistantBlock::Reasoning { text, replay } = block {
-                *replay = Some(ReplayData {
-                    origin: self.origin.clone(),
-                    version: 1,
-                    payload: Value::String(text.clone()),
-                });
+                *replay = Some(crate::replay::encode(&self.origin, text));
             }
         }
         self.ended = true;

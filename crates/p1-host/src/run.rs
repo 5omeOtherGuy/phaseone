@@ -5,6 +5,12 @@
 //! Interactive prompts on stderr and drains inbox turns without waiting on
 //! children. First Ctrl-C cancels the run (and, at exit, the children); second
 //! Ctrl-C returns 130 immediately.
+//!
+//! notice: S1's file; S6.8 adds only the passage of the `[capabilities]`
+//! run-time switch — the three main-agent assembly sites (a run's start,
+//! `env show` and a model switch), the `p1 workflow run` refusal and the one
+//! `ModelSwitch` field that pins the switch for the generation (D065/D068
+//! pattern, ADR-0085 item 6).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,11 +22,16 @@ use std::time::Duration;
 use p1_assembly::Catalog;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
-    AgentEvent, BoxFuture, CacheKeySupport, CancellationToken, CommitSink, Compaction,
-    ContextError, ContextInput, ContextPolicy, Effort, EventSink, JournalRecord, Prepared,
-    ProviderErrorKind, Tool, TurnEnd,
+    AgentEvent, AuthorizationPolicy, BoxFuture, CacheKeySupport, CancellationToken, CommitSink,
+    Compaction, ContextError, ContextInput, ContextPolicy, Effort, EventSink, JournalRecord,
+    ModelOptions, Prepared, Provider, ProviderErrorKind, Tool, TurnEnd,
 };
-use p1_core::{Agent, AgentParts, Reconfiguration, ResumeReport};
+use p1_core::{Agent, AgentParts, Reconfiguration, ReconfigureError, ResumeReport};
+/// The assembly-identity types the host writes and compares (ADR-0080), plus the format
+/// version a created file carries, re-exported so a front end — and the module tests — can
+/// name what [`assembly_identity`] returns and what [`AssemblyLines`] is given.
+pub use p1_journal::{AssemblyEntry, AssemblyIdentity, JOURNAL_VERSION};
+use p1_journal::{HostIdentity, JsonlJournal, MemoryJournal, ModuleIdentity, ModuleKind};
 use p1_model_profile::ModelProfile;
 use p1_redact::{MaskCounter, redacted};
 
@@ -29,10 +40,12 @@ use crate::catalog::build_catalog;
 #[cfg(feature = "delegation")]
 use crate::catalog::children::{announce_lost_workers, compose_children, running_children};
 use crate::catalog::delegation::with_worker_tools;
+use crate::catalog::modules::{ModuleSources, module_sources};
 use crate::cli::{self, Command, Options};
 use crate::frontend::{FrontEnd, LineFrontEnd};
 use crate::render::Renderer;
 use crate::session;
+use crate::summary::ContextTable;
 use crate::{HostDeps, InterruptSource};
 use p1_tool_finish::Accepted;
 
@@ -153,13 +166,14 @@ impl ContextPolicy for DefaultContext {
     }
 }
 
-/// The context policy for an assembled agent (context.md §3): a
-/// `SummarizingContext` when the environment opts in with `[context]`,
-/// passthrough otherwise. The host is the composition root: `p1-assembly` only
-/// carries the plain settings and the prompt override. `profile` is the model
-/// profile the environment selected (the whole-provider form has none): its own
-/// capacity narrows the environment's table, and its effort floor is what the
-/// summarization request runs at (#125).
+/// The context policy for an assembled agent (context.md §3): the summarizing
+/// context component (the host entry `p1/context/summarizing`, `summary.rs`) when the
+/// environment opts in with `[context]`, passthrough otherwise. The host is the
+/// composition root: `p1-assembly` only carries the plain settings and the prompt
+/// override. `profile` is the model profile the environment selected (the
+/// whole-provider form has none): its own capacity narrows the environment's table,
+/// and its effort floor is what the summarization request runs at (#125).
+// notice: S5.11 (#357): the component replaces the native `SummarizingContext`.
 pub(crate) fn agent_context(
     assembled: &Assembled,
     profile: Option<&ModelProfile>,
@@ -172,15 +186,15 @@ pub(crate) fn agent_context(
         .resolved
         .summarize_prompt
         .clone()
-        .unwrap_or_else(|| p1_context::DEFAULT_SUMMARIZER_PROMPT.to_string());
-    let policy = p1_context::SummarizingContext::new(
+        .unwrap_or_else(|| crate::summary::DEFAULT_SUMMARIZER_PROMPT.to_string());
+    let policy = crate::summary::summarizing_context(
         assembled.provider.clone(),
         assembled.options.clone(),
-        config,
+        &config,
+        summary_output_tokens,
         prompt,
-    )?
-    .with_summary_output_tokens(summary_output_tokens)?
-    .with_summary_effort(summary_effort(profile));
+        summary_effort(profile),
+    )?;
     Ok(Arc::new(policy))
 }
 
@@ -200,7 +214,7 @@ const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 1_000;
 fn effective_context(
     settings: &p1_assembly::ContextSettings,
     profile: Option<&ModelProfile>,
-) -> Result<(p1_context::ContextConfig, u64), String> {
+) -> Result<(ContextTable, u64), String> {
     let config = config_for_route(settings, profile);
     let wall = config.window_tokens - config.output_headroom_tokens;
     let cap = settings.summary_output_tokens.min(wall / 2);
@@ -229,7 +243,7 @@ fn effective_context(
 pub(crate) fn config_for_route(
     settings: &p1_assembly::ContextSettings,
     profile: Option<&ModelProfile>,
-) -> p1_context::ContextConfig {
+) -> ContextTable {
     let window = profile
         .and_then(|profile| profile.context_tokens)
         .map_or(settings.window_tokens, |model_window| {
@@ -264,7 +278,7 @@ pub(crate) fn config_for_route(
     // a share of the kept tail, so it can never exceed it).
     let keep_recent = settings.keep_recent_tokens.min(wall.saturating_sub(1));
     let user_verbatim = settings.user_verbatim_tokens.min(keep_recent);
-    p1_context::ContextConfig {
+    ContextTable {
         window_tokens: window,
         output_headroom_tokens: headroom,
         summarize_at_tokens: useful,
@@ -286,8 +300,19 @@ fn summary_effort(profile: Option<&ModelProfile>) -> Option<Effort> {
     }
 }
 
-/// A session store plus the records to resume from (when resuming).
-type OpenedSession = (Arc<dyn CommitSink>, Option<Vec<JournalRecord>>);
+/// The session the host opened: the concrete store the core commits through — with the
+/// session's assembly identity lines written ahead of the records (ADR-0080) — and what the
+/// file already holds.
+struct OpenedSession {
+    /// The concrete store the session's records and assembly identity lines go through.
+    store: AssemblyStore,
+    /// The file's format version: only version 2 carries assembly lines.
+    version: u64,
+    /// The records to resume from, when the session has a history.
+    records: Option<Vec<JournalRecord>>,
+    /// Every assembly identity line the file already holds, in order.
+    assemblies: Vec<AssemblyEntry>,
+}
 
 /// Run one parsed command line.
 pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
@@ -474,14 +499,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     };
     // The same for the workflow tools: they assemble, and no run can start.
     #[cfg(feature = "workflows")]
-    let catalog = catalog.map(|mut catalog| {
+    let catalog = catalog.and_then(|mut catalog| {
         if deps.workflow_service.is_none() {
             crate::catalog::register_workflow_tools(
                 &mut catalog,
                 Some(Arc::new(crate::workflow::RefusingWorkflows)),
-            );
+            )?;
         }
-        catalog
+        Ok(catalog)
     });
     #[cfg(not(feature = "delegation"))]
     let catalog = build_catalog(
@@ -508,7 +533,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             return EXIT_FAILURE;
         }
     };
-    with_worker_tools(&mut environment);
+    // ADR-0085 item 6 (S6): `env show` assembles as a run's start would, so a disabled
+    // family is left out here too, and naming one of its members is the same error.
+    if let Err(message) = crate::catalog::delegation::enabled_capabilities(deps)
+        .and_then(|capabilities| with_worker_tools(&mut environment, capabilities))
+    {
+        write_stderr(deps, &format!("{message}\n"));
+        return EXIT_FAILURE;
+    }
     // Resolve the route binding before assembling: the wire model and the route's
     // own output ceiling come from the route file (spec §2).
     if let Err(message) =
@@ -603,9 +635,9 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
                 compact: options.compact,
             },
             cancel.clone(),
-        ))
+        )?)
     } else {
-        Arc::new(LineFrontEnd::new(deps, options, cancel.clone()))
+        Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?)
     };
     run_with_front_end(deps, options, cancel, front_end).await
 }
@@ -621,6 +653,11 @@ pub async fn run_with_front_end(
     cancel: CancellationToken,
     front_end: Arc<dyn FrontEnd>,
 ) -> Result<i32, RunError> {
+    // A previous run of this `HostDeps` left its model-switch context behind, and that
+    // context holds the session store of THAT run open (an assembly identity line goes
+    // through the concrete journal, ADR-0080). Drop it before this run opens a session of
+    // its own: a stale handle would hold the file's writer lock.
+    deps.model_switch = None;
     let workspace = resolve_workspace(options)?;
     // Standing instructions and the skill index belong to the top-level agent only
     // (issue #129): a child's brief carries what it needs.
@@ -630,6 +667,10 @@ pub async fn run_with_front_end(
     // front end decides what "headless" means (the line front end uses the CLI
     // rule, a terminal UI is interactive by definition).
     let headless = front_end.is_headless(options);
+    // ADR-0085 item 6 (S6): this assembly generation's worker and workflow switch, read
+    // once and kept by a model switch, as the generation's worker scopes are.
+    let capabilities =
+        crate::catalog::delegation::enabled_capabilities(deps).map_err(RunError::usage)?;
 
     // The delegation service must exist before the catalog so the `worker_*`
     // tools can be registered; the child factory reaches the catalog lazily,
@@ -638,8 +679,14 @@ pub async fn run_with_front_end(
     // must happen before workflows are composed, since a step worker is built by the
     // same service and receives the same id namespace.
     #[cfg(feature = "delegation")]
-    let (completion_hub, catalog_slot, child_builder, service, child_counter) =
-        compose_children(deps, &workspace, front_end.clone(), options, 2)?;
+    let (completion_hub, generations, child_builder, service, child_counter) = compose_children(
+        deps,
+        &workspace,
+        front_end.clone(),
+        options,
+        2,
+        capabilities,
+    )?;
     #[cfg(feature = "delegation")]
     let service = Some(service);
     #[cfg(not(feature = "delegation"))]
@@ -654,6 +701,7 @@ pub async fn run_with_front_end(
                 child_builder.clone(),
                 service.clone(),
                 crate::workflow::run_root(deps, options.session.as_deref()),
+                capabilities,
             )
             .map_err(RunError::usage)?,
         ),
@@ -670,8 +718,15 @@ pub async fn run_with_front_end(
     )?);
     #[cfg(feature = "delegation")]
     {
-        let _ = catalog_slot.set(catalog.clone());
+        // Generation 0: the start's catalog and policy. The child builder already
+        // shares `generations`, so a child started from now on pins this one until
+        // a reload replaces it (ADR-0084 §3).
+        generations.install(catalog.clone(), front_end.authorization());
     }
+    // Without delegation nothing else reads the generations; the session still has
+    // generation 0 so a `/modules reload` has a current one to replace.
+    #[cfg(not(feature = "delegation"))]
+    let generations = Arc::new(Generations::new(catalog.clone(), front_end.authorization()));
 
     // The chosen model (ADR-0049 stage 1): the environment the reference or
     // `default_model` named, with the selected profile applied on top of it. The
@@ -680,7 +735,7 @@ pub async fn run_with_front_end(
     let choice = selection(deps, options).map_err(RunError::usage)?;
     let mut environment = load_environment(&choice.environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment);
+    with_worker_tools(&mut environment, capabilities)?;
     crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
         .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
@@ -706,6 +761,7 @@ pub async fn run_with_front_end(
     // runs, the profile it selected and the `finish` tool it keeps.
     let session_environment = assembled.resolved.environment.clone();
     let session_finish = finish_tool(&assembled);
+    let session_effort = environment.options.reasoning_effort;
 
     // Announce the assembled parent before the agent is built: the front end
     // builds its parent renderer from this.
@@ -729,7 +785,28 @@ pub async fn run_with_front_end(
             .map(|config| config.summarize_at_tokens),
     );
 
-    let (journal, records): OpenedSession = open_session(deps, options)?;
+    let opened = open_session(deps, options)?;
+    let records = opened.records.clone();
+    // ADR-0080: the execution manifest of THIS assembly, written before the `Environment`
+    // record the first turn commits, and compared with the identity the journal already names
+    // when the session is resumed. The package sources the catalog's module registration read
+    // resolve a package key to the identity the loader verified — the `modules.lock`, and the
+    // official-release host entries (D083b 2); a changed artifact never blocks the resume, it is
+    // reported.
+    let sources = module_sources(deps)?;
+    let identity = assembly_identity(&assembled, &environment.provider, options.ask, &sources);
+    let lines = Arc::new(AssemblyLines::new(opened.store, opened.version));
+    let changed = arm_assembly(&lines, &opened.assemblies, &identity);
+    if !changed.is_empty() {
+        write_stderr(
+            deps,
+            "resume: assembly changed since this journal was written\n",
+        );
+        for line in &changed {
+            write_stderr(deps, &format!("{line}\n"));
+        }
+    }
+    let journal: Arc<dyn CommitSink> = lines.sink();
     #[cfg(feature = "shadow-hook")]
     let journal: Arc<dyn CommitSink> = match &deps.shadow {
         Some(hook) => Arc::new(ShadowJournal {
@@ -869,8 +946,21 @@ pub async fn run_with_front_end(
     // The model-switch context (ADR-0049 stage 3): the SAME catalog, cache-key
     // policy and completion plumbing the start path used, plus the session's own
     // `finish` tool. The line mode uses it between turns; the TUI's run loop will.
+    // ADR-0084 §3: the start's catalog and policy are generation 0; a
+    // `/modules reload` rebuilds both from a copy of the catalog's dependencies.
+    let reload_deps = catalog_deps(deps);
+    let reload_policy = front_end.clone();
     deps.model_switch = Some(Arc::new(ModelSwitch {
-        catalog: catalog.clone(),
+        generations: generations.clone(),
+        reload: ReloadInputs {
+            deps: reload_deps,
+            sandbox: options.sandbox,
+            sandbox_write: options.sandbox_write.clone(),
+            sandbox_read: options.sandbox_read.clone(),
+            env_pass: options.env_pass.clone(),
+            policy: Box::new(move || reload_policy_of(reload_policy.as_ref())),
+            queue: ReloadQueue::default(),
+        },
         completion: completion_hub.clone(),
         activity: activity.clone(),
         environment_dirs: deps.environment_dirs.clone(),
@@ -881,9 +971,14 @@ pub async fn run_with_front_end(
         route_label: front_end.route_label(),
         instructions,
         mask: mask.clone(),
+        lines: lines.clone(),
+        sources: Mutex::new(sources),
+        ask: options.ask,
+        capabilities,
         session: Mutex::new(SessionModel {
             environment: session_environment,
             profile: choice.profile.clone(),
+            effort: session_effort,
             finish: session_finish,
         }),
     }));
@@ -902,6 +997,19 @@ pub async fn run_with_front_end(
         );
     }
 
+    // B-S6-9, D068: the main agent's assembly is dropped here, at teardown, so its
+    // generation of worker-member scopes is retired: every child id those scopes held
+    // becomes `unknown-child` through them. Retiring forgets ids only, so a running child
+    // still completes and still notifies. A model switch or a re-grant keeps the
+    // generation; this is the one place it ends.
+    #[cfg(feature = "delegation")]
+    if let Some(scopes) = &deps.member_scopes {
+        scopes
+            .registry()
+            .retire_generation(scopes.generation())
+            .await;
+    }
+
     // Runs first: a run cancelled here cancels its step workers through the worker
     // service, which must still be up to do it and to let the journal get `Ended`.
     #[cfg(feature = "workflows")]
@@ -914,6 +1022,10 @@ pub async fn run_with_front_end(
     }
 
     front_end.finish();
+    // The switch context belongs to THIS run and holds its session store open (the assembly
+    // line goes through the concrete journal, ADR-0080). Drop it with the run: the caller's
+    // `HostDeps` outlives the session, and a stale handle would hold the file's writer lock.
+    deps.model_switch = None;
     Ok(code)
 }
 
@@ -935,25 +1047,33 @@ async fn workflow_run(
         ))
     })?;
     let args = workflow_args(workflow).map_err(RunError::usage)?;
+    // ADR-0085 item 6 (S6): a disabled workflow capability refuses the run explicitly.
+    let capabilities =
+        crate::catalog::delegation::enabled_capabilities(deps).map_err(RunError::usage)?;
+    if !capabilities.workflows {
+        return Err(crate::catalog::delegation::disabled("workflows").into());
+    }
     let workspace = resolve_workspace(options)?;
     let cancel = CancellationToken::new();
-    let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone()));
+    let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?);
 
     // The same child composition as an interactive run, including the sibling
     // reservation. A standalone workflow can be invoked repeatedly with one session.
-    let (completion_hub, catalog_slot, child_builder, service, _child_counter) = compose_children(
+    let (completion_hub, generations, child_builder, service, _child_counter) = compose_children(
         deps,
         &workspace,
         front_end.clone(),
         options,
         workflow.max_workers,
+        capabilities,
     )?;
     let run_root = match &workflow.out {
         Some(out) => out.clone(),
         None => crate::workflow::run_root(deps, options.session.as_deref()),
     };
-    let workflows = crate::workflow::compose(deps, child_builder, service.clone(), run_root)
-        .map_err(RunError::usage)?;
+    let workflows =
+        crate::workflow::compose(deps, child_builder, service.clone(), run_root, capabilities)
+            .map_err(RunError::usage)?;
     let catalog = Arc::new(build_catalog(
         deps,
         options.sandbox,
@@ -962,7 +1082,9 @@ async fn workflow_run(
         &options.env_pass,
         &completion_hub,
     )?);
-    let _ = catalog_slot.set(catalog);
+    // Generation 0 of this standalone run: the child builder shares it, so every
+    // step worker pins the catalog the run loaded (ADR-0084 §3).
+    generations.install(catalog, front_end.authorization());
 
     // The run's base commit (ADR-0073): what its steps' new worktrees branch from.
     let base = crate::worktree::run_base_async(workspace.clone()).await;
@@ -1063,7 +1185,17 @@ async fn workflow_report(
 
 fn open_session(deps: &HostDeps, options: &Options) -> Result<OpenedSession, String> {
     match &options.session {
-        None => Ok((session::memory(), None)),
+        None => {
+            // An in-memory session carries assembly lines exactly as a file store does, and
+            // the sink the core commits through is the same store the lines go through.
+            let store = session::memory();
+            Ok(OpenedSession {
+                store: AssemblyStore::Memory(store),
+                version: JOURNAL_VERSION,
+                records: None,
+                assemblies: Vec::new(),
+            })
+        }
         Some(path) => {
             if options.resume {
                 let (store, resumed) = session::resume(path).map_err(|e| e.to_string())?;
@@ -1076,13 +1208,402 @@ fn open_session(deps: &HostDeps, options: &Options) -> Result<OpenedSession, Str
                         ),
                     );
                 }
-                Ok((session::sink(&store), Some(resumed.records)))
+                Ok(OpenedSession {
+                    store: AssemblyStore::File(store),
+                    version: resumed.version,
+                    records: Some(resumed.records),
+                    assemblies: resumed.assemblies,
+                })
             } else {
                 let store = session::create(path).map_err(|e| e.to_string())?;
-                Ok((session::sink(&store), None))
+                Ok(OpenedSession {
+                    store: AssemblyStore::File(store),
+                    version: JOURNAL_VERSION,
+                    records: None,
+                    assemblies: Vec::new(),
+                })
             }
         }
     }
+}
+
+// ------------------------------------------------------- assembly identity (ADR-0080)
+
+/// The concrete journal a session commits through (ADR-0080).
+///
+/// `record_assembly` is a method of `JsonlJournal` and `MemoryJournal`, never of the erased
+/// [`CommitSink`] the core commits records through, so the host keeps the concrete store: it
+/// is both the sink the records go through and the object an assembly identity line goes to.
+#[derive(Clone)]
+pub enum AssemblyStore {
+    File(Arc<JsonlJournal>),
+    Memory(Arc<MemoryJournal>),
+}
+
+impl AssemblyStore {
+    /// The store as the erased sink the core commits records through.
+    fn sink(&self) -> Arc<dyn CommitSink> {
+        match self {
+            Self::File(store) => store.clone(),
+            Self::Memory(store) => store.clone(),
+        }
+    }
+}
+
+/// The session's assembly identity line (ADR-0080): the store it goes through, the file's
+/// format version, and the identity the file still owes.
+///
+/// The line is not written when the session is opened but when the host is about to commit
+/// the run's first record: a resume whose first request the provider refuses commits nothing
+/// at all (issue #2, ADR-0049) and must leave its session byte-identical. The core commits
+/// the `Environment` record first in a turn, so the line still precedes it.
+pub struct AssemblyLines {
+    store: AssemblyStore,
+    version: u64,
+    /// The assembly the file still has to name before the record being committed now.
+    owed: Mutex<Option<AssemblyIdentity>>,
+}
+
+impl AssemblyLines {
+    /// The session's assembly lines: the concrete `store` beside the format `version` the
+    /// loaded or created file carries.
+    pub fn new(store: AssemblyStore, version: u64) -> Self {
+        Self {
+            store,
+            version,
+            owed: Mutex::new(None),
+        }
+    }
+
+    /// The sink a session commits through: this store, with the assembly identity line the
+    /// file owes written immediately before the record that follows it (ADR-0080).
+    pub fn sink(self: &Arc<Self>) -> Arc<dyn CommitSink> {
+        Arc::new(NamingJournal {
+            inner: self.store.sink(),
+            lines: self.clone(),
+        })
+    }
+
+    /// The file must name this assembly before its next record. A version-1 file carries no
+    /// assembly line and never gets one: its header is never rewritten (`AssemblyNeedsVersion2`).
+    fn owe(&self, identity: AssemblyIdentity) {
+        if self.version == JOURNAL_VERSION {
+            *self.slot() = Some(identity);
+        }
+    }
+
+    /// Write the line the file owes, if any. Called before every record the core commits,
+    /// so it is a no-op after the first.
+    fn settle(&self) -> Result<(), String> {
+        let owed = self.slot().take();
+        match owed {
+            Some(identity) => self.write_line(&identity),
+            None => Ok(()),
+        }
+    }
+
+    /// A model switch changed the assembly. Name it now — before the records of the first
+    /// turn after the switch — and report a store that refuses the line where the switch
+    /// happened, rather than at the commit of an unrelated record.
+    fn switched(&self, identity: &AssemblyIdentity) -> Result<(), String> {
+        self.settle()?;
+        self.write_line(identity)
+    }
+
+    fn write_line(&self, identity: &AssemblyIdentity) -> Result<(), String> {
+        match &self.store {
+            AssemblyStore::File(store) => store.record_assembly(identity),
+            AssemblyStore::Memory(store) => store.record_assembly(identity),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    /// The owed slot. A poisoned lock only means an earlier write panicked; the line is
+    /// still owed in that case, so the poison is ignored rather than propagated.
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<AssemblyIdentity>> {
+        self.owed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// The sink the core commits through, with the session's assembly identity line written
+/// first (ADR-0080). Every commit of this run goes through it, whichever front end drives
+/// the turn, so no record can be written ahead of the manifest that says what ran.
+struct NamingJournal {
+    inner: Arc<dyn CommitSink>,
+    lines: Arc<AssemblyLines>,
+}
+
+impl CommitSink for NamingJournal {
+    fn commit<'a>(
+        &'a self,
+        record: &'a JournalRecord,
+    ) -> BoxFuture<'a, Result<(), p1_contracts::CommitError>> {
+        Box::pin(async move {
+            self.lines.settle().map_err(p1_contracts::CommitError)?;
+            self.inner.commit(record).await
+        })
+    }
+}
+
+/// The host's execution manifest for the assembly running now (ADR-0080): the environment
+/// it runs, the p1 binary that built it, and one entry per assembled tool, the provider
+/// and the host's two policies.
+///
+/// A module key `sources` resolves to a package is a package entry: `name` is the manifest
+/// name, `package` the key the environment selects the module by, `version` the release version
+/// the package runs at, `digest` the loader-verified sha256 hex and `abi` the package's
+/// `<world>+<protocol>`. `sources` is the `modules.lock` the catalog's module registration read,
+/// plus the official-release host entries it registered (D083b 2), so a host entry such as
+/// `read`'s `p1/read` is a package entry exactly as a lock-selected one is. The digest comes
+/// from the release manifest rather than from a second load: the loader verified the bytes
+/// against that entry when the catalog registered the package, so it is the loader-verified
+/// digest. Every other key is native: `name` is the crate or
+/// policy name the host can state for it, `package` the key it is selected by, `version` the
+/// p1 version, and `digest` is `None` — the host's `commit` identifies that code.
+///
+/// `provider_key` is the environment's provider key (a route id, or a whole-provider key);
+/// `ask` is the run's `--ask`, which is what selects the restrictive authorization policy.
+pub fn assembly_identity(
+    assembled: &Assembled,
+    provider_key: &str,
+    ask: bool,
+    sources: &ModuleSources,
+) -> AssemblyIdentity {
+    let mut modules = Vec::new();
+    for tool in &assembled.resolved.tools {
+        // One entry per module: an environment may assemble the same package twice under two
+        // faces, and the line names what executed the call, not how it was presented.
+        if modules
+            .iter()
+            .any(|module: &ModuleIdentity| module.package == tool.module)
+        {
+            continue;
+        }
+        modules.push(module_identity(
+            ModuleKind::Tool,
+            &tool.module,
+            &tool.identity.implementation,
+            sources,
+        ));
+    }
+    modules.push(module_identity(
+        ModuleKind::Provider,
+        provider_key,
+        provider_key,
+        sources,
+    ));
+    // The two host policies are native today, with the names their component twins carry
+    // (`crate::policy` uses the same names for the authorization pair). The context policy
+    // exists only when the environment opts in with `[context]`: without it the core sends
+    // the history unchanged and no module is assembled.
+    if assembled.resolved.context.is_some() {
+        modules.push(native_module(
+            ModuleKind::ContextPolicy,
+            SUMMARIZING_POLICY,
+            SUMMARIZING_POLICY,
+        ));
+    }
+    let authorization = if ask {
+        crate::policy::ASK_POLICY
+    } else {
+        crate::policy::FULL_ACCESS_POLICY
+    };
+    modules.push(native_module(
+        ModuleKind::AuthorizationPolicy,
+        authorization,
+        authorization,
+    ));
+    AssemblyIdentity {
+        environment: assembled.resolved.environment.clone(),
+        host: host_identity(),
+        modules,
+    }
+}
+
+/// The manifest name of the summarizing context policy (`p1/context/summarizing`): the
+/// component twin of `p1-context`'s policy, whose rules the host's native policy carries
+/// until the host loads the package.
+const SUMMARIZING_POLICY: &str = "p1/context/summarizing";
+
+/// The p1 binary that assembled the session: the version and commit `p1 --version` prints.
+pub fn host_identity() -> HostIdentity {
+    HostIdentity {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        commit: env!("P1_GIT_SHA").to_string(),
+    }
+}
+
+/// The identity of the module an environment selects by `key`: a package entry when `sources`
+/// resolves the key — the `modules.lock` the catalog read, or an official-release host entry it
+/// registered (D083b 2) — and a native entry otherwise.
+fn module_identity(
+    kind: ModuleKind,
+    key: &str,
+    implementation: &str,
+    sources: &ModuleSources,
+) -> ModuleIdentity {
+    match sources.resolve(key) {
+        Some(package) => ModuleIdentity {
+            name: package.name,
+            kind,
+            package: key.to_string(),
+            version: package.version,
+            digest: Some(bare_digest(&package.digest)),
+            abi: Some(package.abi),
+        },
+        None => native_module(kind, implementation, key),
+    }
+}
+
+/// A module the host itself carries (ADR-0081). It has no package bytes, so `digest` is
+/// `None`: the host's `commit` identifies that code.
+fn native_module(kind: ModuleKind, name: &str, key: &str) -> ModuleIdentity {
+    ModuleIdentity {
+        name: name.to_string(),
+        kind,
+        package: key.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        digest: None,
+        abi: None,
+    }
+}
+
+/// The bare hex of a lock digest (`sha256:<hex>`, the package manifest's spelling).
+fn bare_digest(digest: &str) -> String {
+    digest.strip_prefix("sha256:").unwrap_or(digest).to_string()
+}
+
+/// The host's assembly-identity step for a session it just opened (ADR-0080).
+///
+/// Arms the session's next commit with the identity of the assembly running now when the
+/// journal does not already name it — a session resumed on another assembly, and a version-2
+/// file that names none at all, both get a line before the records that follow — and returns
+/// the changed-artifact report to print, empty when there is nothing to say. A version-1 file
+/// carries no assembly line and never gets one: its header is never rewritten, so its records
+/// have no execution manifest here to compare. The journal's claim is never taken silently:
+/// every difference the report can name is reported.
+pub fn arm_assembly(
+    lines: &AssemblyLines,
+    entries: &[AssemblyEntry],
+    current: &AssemblyIdentity,
+) -> Vec<String> {
+    match entries.last() {
+        // The file already names the assembly running now: nothing to write, nothing to say.
+        Some(last) if last.identity == *current => Vec::new(),
+        Some(last) => {
+            lines.owe(current.clone());
+            changed_artifacts(&last.identity, current)
+        }
+        None => {
+            lines.owe(current.clone());
+            Vec::new()
+        }
+    }
+}
+
+/// The changed-artifact report (ADR-0080): every module whose digest, package or version
+/// changed since the journal's last assembly identity, plus every module added or removed.
+/// The host binary is reported too — it is what a native module's code is identified by.
+pub fn changed_artifacts(previous: &AssemblyIdentity, current: &AssemblyIdentity) -> Vec<String> {
+    let mut lines = Vec::new();
+    if previous.host != current.host {
+        lines.push(format!(
+            "resume: assembly: host {} {} -> {} {}",
+            previous.host.version, previous.host.commit, current.host.version, current.host.commit
+        ));
+    }
+    if previous.environment != current.environment {
+        lines.push(format!(
+            "resume: assembly: environment `{}` -> `{}`",
+            previous.environment, current.environment
+        ));
+    }
+    for module in &previous.modules {
+        match current.modules.iter().find(|now| same_module(module, now)) {
+            Some(now) => {
+                let mut changed = Vec::new();
+                if now.package != module.package {
+                    changed.push(format!("package `{}` -> `{}`", module.package, now.package));
+                }
+                if now.digest != module.digest {
+                    changed.push(format!(
+                        "digest {} -> {}",
+                        digest_label(module.digest.as_deref()),
+                        digest_label(now.digest.as_deref())
+                    ));
+                }
+                if now.version != module.version {
+                    changed.push(format!("version {} -> {}", module.version, now.version));
+                }
+                if now.abi != module.abi {
+                    changed.push(format!(
+                        "abi {} -> {}",
+                        abi_label(module.abi.as_deref()),
+                        abi_label(now.abi.as_deref())
+                    ));
+                }
+                if !changed.is_empty() {
+                    lines.push(format!(
+                        "resume: assembly: {}: {}",
+                        describe_module(module),
+                        changed.join("; ")
+                    ));
+                }
+            }
+            None => lines.push(format!(
+                "resume: assembly: {}: removed",
+                describe_module(module)
+            )),
+        }
+    }
+    for module in &current.modules {
+        if !previous.modules.iter().any(|was| same_module(was, module)) {
+            lines.push(format!(
+                "resume: assembly: {}: added",
+                describe_module(module)
+            ));
+        }
+    }
+    lines
+}
+
+/// Whether `a` and `b` are the same module: the same class and the same artifact name. The
+/// key the environment selects a module by is a field of the entry (so a module re-keyed to
+/// another package key is reported as a change), not its identity.
+fn same_module(a: &ModuleIdentity, b: &ModuleIdentity) -> bool {
+    a.kind == b.kind && a.name == b.name
+}
+
+/// A module's entry in a report line: its class, its artifact name and the key the
+/// environment selected it by.
+fn describe_module(module: &ModuleIdentity) -> String {
+    format!(
+        "{} `{}` (module `{}`)",
+        kind_label(module.kind),
+        module.name,
+        module.package
+    )
+}
+
+fn kind_label(kind: ModuleKind) -> &'static str {
+    match kind {
+        ModuleKind::Tool => "tool",
+        ModuleKind::Provider => "provider",
+        ModuleKind::ContextPolicy => "context policy",
+        ModuleKind::AuthorizationPolicy => "authorization policy",
+    }
+}
+
+/// A digest as a report line writes it: the bare hex, or `native` for a module without
+/// package bytes.
+fn digest_label(digest: Option<&str>) -> &str {
+    digest.unwrap_or("native")
+}
+
+fn abi_label(abi: Option<&str>) -> &str {
+    abi.unwrap_or("none")
 }
 
 pub(crate) async fn run_headless(
@@ -1361,7 +1882,7 @@ pub(crate) async fn run_interactive(
             } else {
                 report_model(
                     deps,
-                    switch_model(switch, agent, SwitchRequest::Model(reference)),
+                    switch_model(switch, agent, SwitchRequest::Model(reference)).await,
                 );
             }
             continue;
@@ -1371,8 +1892,17 @@ pub(crate) async fn run_interactive(
         {
             report_model(
                 deps,
-                switch_model(switch, agent, SwitchRequest::Effort(level)),
+                switch_model(switch, agent, SwitchRequest::Effort(level)).await,
             );
+            continue;
+        }
+        // ADR-0084 §3: this loop reads a line only between complete turns, so a
+        // `/modules reload` is never pending here; it applies at once.
+        if let Some(switch) = &deps.model_switch
+            && argument(text, "/modules").and_then(p1_tui::input::modules_command)
+                == Some(p1_tui::input::ModulesCommand::Reload)
+        {
+            report_reload(deps, reload_modules(switch, agent).await);
             continue;
         }
         let end = match race_turn(agent.run_turn(text.to_string(), cancel.clone()), &second).await {
@@ -1451,6 +1981,8 @@ struct SessionModel {
     environment: String,
     /// The profile the session selected (`None` keeps the environment's own).
     profile: Option<String>,
+    /// The effort the session runs at, so a module reload assembles the same model.
+    effort: Option<Effort>,
     /// The `finish` tool the session keeps, when its environment assembles one.
     finish: Option<Arc<dyn Tool>>,
 }
@@ -1460,8 +1992,13 @@ struct SessionModel {
 /// on [`HostDeps`], so the line mode switches now and the TUI's run loop can call
 /// [`switch_model`] with it.
 pub(crate) struct ModelSwitch {
-    /// The session's catalog: a switch assembles exactly as the start path did.
-    catalog: Arc<Catalog>,
+    /// The session's assembly generations (ADR-0084 §3): a switch assembles on the
+    /// current generation's catalog exactly as the start path did, and a
+    /// `/modules reload` installs the next one. The child builder shares THIS cell,
+    /// so a child or workflow step pinning it pins what the reload replaced.
+    generations: Arc<Generations>,
+    /// What a `/modules reload` builds its candidate from.
+    reload: ReloadInputs,
     /// The hub the catalog's `finish` factory issues into.
     completion: Arc<CompletionHub>,
     /// The parent's activity plumbing, re-pointed when the switched `finish` is not
@@ -1485,6 +2022,19 @@ pub(crate) struct ModelSwitch {
     /// Issue #142: the top-level agent's mask counter. A switched assembly's tools
     /// feed the SAME counter the parent's notice sink reads.
     mask: Arc<MaskCounter>,
+    /// The session's assembly identity lines (ADR-0080): a switch that commits a new
+    /// `Environment` names the assembly that will execute the records after it.
+    lines: Arc<AssemblyLines>,
+    /// The package sources resolving a module key to the identity the loader verified: the
+    /// current generation's `modules.lock` and its official-release host entries (D083b 2),
+    /// replaced when a `/modules reload` installs.
+    sources: Mutex<ModuleSources>,
+    /// Whether `--ask` selected the restrictive authorization policy: part of the
+    /// switched assembly's identity.
+    ask: bool,
+    /// The worker and workflow switch the session's assembly generation started with
+    /// (ADR-0085 item 6, S6): a switch keeps the generation, so it keeps these too.
+    capabilities: crate::catalog::delegation::Capabilities,
     session: Mutex<SessionModel>,
 }
 
@@ -1492,6 +2042,245 @@ impl ModelSwitch {
     /// The `--models` value this run was given, if any.
     fn scope_flag(&self) -> Option<&str> {
         self.scope.as_deref()
+    }
+
+    /// The session's `/modules reload` queue: a front end asks it whether a request
+    /// waits for the next boundary.
+    pub(crate) fn reload_queue(&self) -> &ReloadQueue {
+        &self.reload.queue
+    }
+
+    /// A snapshot of the session's model rather than the guard: a std guard must not
+    /// live across the commit's await, and `&mut Agent` already serializes changes.
+    fn session_snapshot(&self) -> SessionSnapshot {
+        let session = self.session.lock().unwrap();
+        SessionSnapshot {
+            environment: session.environment.clone(),
+            profile: session.profile.clone(),
+            effort: session.effort,
+            finish: session.finish.clone(),
+        }
+    }
+}
+
+/// A WORKING [`ModelSwitch`] for the driver's tests (S5.7, issue #331): the session
+/// runs `environment` from `deps.environment_dirs`, generation 0 is a catalog built
+/// exactly as a run builds one, and the front end's own policy answers. The TUI's
+/// `request_reload` and `apply_reload` are driven through it, so the pending note and
+/// the boundary application are tested through the front end the way a run wires them.
+#[cfg(all(test, feature = "delegation"))]
+pub(crate) fn model_switch_for_test(
+    deps: &mut HostDeps,
+    front_end: Arc<dyn FrontEnd>,
+    environment: &str,
+    workspace: PathBuf,
+) -> Result<ModelSwitch, String> {
+    // The session's MAIN environment carries the `worker_*` tools (and, with
+    // workflows, `workflow_*`); a run's service registers them, so a stub stands in.
+    let stub: p1_workers::AgentFactory = Arc::new(|_spec| Err("no workers in this test".into()));
+    deps.worker_service = Some(p1_workers::InProcessWorkers::new(stub, 1));
+    // The workflow tools are only registered by a run's `workflow_service`, and the
+    // native members are the ones `with_worker_tools` appends to a main environment
+    // (`WORKFLOW_TOOLS`; `WORKFLOW_MODULES` are the packages a member environment
+    // names instead). A driver test has no service, so stand-ins go in through the
+    // same catalog hook `reload_modules` builds ITS catalog with — both the session's
+    // and the reload's catalogs must have them, or the main environment will not
+    // assemble.
+    #[cfg(feature = "workflows")]
+    {
+        let inner = deps.catalog_hook.take();
+        deps.catalog_hook = Some(Box::new(move |catalog: &mut Catalog| {
+            for key in crate::catalog::workflow::WORKFLOW_TOOLS {
+                if !catalog
+                    .tool_keys()
+                    .iter()
+                    .any(|registered| registered == key)
+                {
+                    catalog.tool(
+                        key,
+                        Box::new(
+                            |spec: &p1_assembly::ToolSpec, _: &p1_assembly::ToolServices| {
+                                Ok(Arc::new(p1_testkit::FakeTool::new(&spec.module))
+                                    as Arc<dyn Tool>)
+                            },
+                        ),
+                    );
+                }
+            }
+            if let Some(inner) = &inner {
+                inner(catalog);
+            }
+        }));
+    }
+    let reload_deps = catalog_deps(deps);
+    let completion = Arc::new(CompletionHub::new());
+    let catalog = build_catalog(
+        &reload_deps,
+        cli::SandboxMode::Off,
+        &[],
+        &[],
+        &[],
+        &completion,
+    )?;
+    let catalog = Arc::new(catalog);
+    let generations = Arc::new(Generations::new(catalog, front_end.authorization()));
+    // A stand-in sink: a driver test's session environment has no `finish`, so the
+    // activity plumbing is never re-pointed, and the front end's renderer is only
+    // built once a turn announces itself.
+    let activity = Arc::new(ParentActivity::new(
+        Arc::new(p1_testkit::RecordingEvents::new()),
+        Arc::new(ActivityLog::default()),
+        &[],
+    ));
+    let substitutions = substitutions(&reload_deps, &workspace);
+    // The package sources the catalog above registered its modules from, read as the start
+    // path's `module_sources` reads them.
+    let sources = module_sources(&reload_deps)?;
+    Ok(ModelSwitch {
+        generations,
+        reload: ReloadInputs {
+            deps: reload_deps,
+            sandbox: cli::SandboxMode::Off,
+            sandbox_write: Vec::new(),
+            sandbox_read: Vec::new(),
+            env_pass: Vec::new(),
+            policy: {
+                let front_end = front_end.clone();
+                Box::new(move || reload_policy_of(front_end.as_ref()))
+            },
+            queue: ReloadQueue::default(),
+        },
+        completion,
+        activity,
+        environment_dirs: deps.environment_dirs.clone(),
+        workspace,
+        substitutions,
+        ignored: session_journals(None),
+        scope: None,
+        capabilities: crate::catalog::delegation::Capabilities::default(),
+        route_label: front_end.route_label(),
+        instructions: String::new(),
+        mask: Arc::new(MaskCounter::new()),
+        // A fresh in-memory journal, as the start path opens one when there is no
+        // `--session`: the switch and the reload still name their assembly.
+        lines: Arc::new(AssemblyLines::new(
+            AssemblyStore::Memory(session::memory()),
+            JOURNAL_VERSION,
+        )),
+        sources: Mutex::new(sources),
+        // No `--ask`: the default policy the start path uses without the flag.
+        ask: false,
+        session: Mutex::new(SessionModel {
+            environment: environment.to_string(),
+            profile: None,
+            effort: None,
+            finish: None,
+        }),
+    })
+}
+
+/// [`SessionModel`] read out of its lock.
+struct SessionSnapshot {
+    environment: String,
+    profile: Option<String>,
+    effort: Option<Effort>,
+    finish: Option<Arc<dyn Tool>>,
+}
+
+#[cfg(test)]
+impl ModelSwitch {
+    /// Every assembly identity line the session's in-memory journal holds, in order.
+    pub(crate) fn assemblies_for_test(&self) -> Vec<AssemblyEntry> {
+        match &self.lines.store {
+            AssemblyStore::Memory(store) => store.assemblies(),
+            AssemblyStore::File(_) => panic!("a test switch journals in memory"),
+        }
+    }
+
+    /// A real switch over a test's own catalog and scratch environment tree, for the
+    /// TUI's idle `/model` case (`tui::tests`): it runs the production
+    /// [`switch_model`] + `Agent::reconfigure` path through `drive_loop`.
+    ///
+    /// ADR-0084 §3 (S5.7) moved the switch's catalog into a generation, so `catalog`
+    /// becomes generation 0 and the reload inputs — which a `/model` never reads —
+    /// are a minimal stand-in over the same environment tree.
+    pub(crate) fn new_for_test(
+        catalog: Arc<Catalog>,
+        front: Arc<dyn EventSink>,
+        environment_dirs: Vec<PathBuf>,
+        workspace: PathBuf,
+        environment: String,
+        profile: Option<String>,
+    ) -> Self {
+        let substitutions = Substitutions {
+            workspace: workspace.display().to_string(),
+            date: "2026-01-02".to_string(),
+            os: std::env::consts::OS.to_string(),
+        };
+        let lock = p1_assembly::load_modules_lock(&environment_dirs)
+            .expect("the test's modules.lock reads");
+        // `/model` keeps the agent's policy (`authorization: None`), so the
+        // generation only carries one; a permissive stand-in is enough.
+        let authorization: Arc<dyn AuthorizationPolicy> =
+            Arc::new(p1_testkit::ScriptedAuthorization::permit_all());
+        let policy = authorization.clone();
+        let writer = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
+        let reload_deps = HostDeps::new(
+            writer(),
+            writer(),
+            Arc::new(crate::StdinLines::new()),
+            Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            "2026-01-02".to_string(),
+            Arc::new(crate::SignalInterrupt),
+            environment_dirs.clone(),
+            false,
+        );
+        Self {
+            generations: Arc::new(Generations::new(catalog, authorization)),
+            reload: ReloadInputs {
+                deps: reload_deps,
+                sandbox: cli::SandboxMode::Off,
+                sandbox_write: Vec::new(),
+                sandbox_read: Vec::new(),
+                env_pass: Vec::new(),
+                policy: Box::new(move || Ok((policy.clone(), None))),
+                queue: ReloadQueue::default(),
+            },
+            completion: Arc::new(CompletionHub::new()),
+            activity: Arc::new(ParentActivity::new(
+                front,
+                Arc::new(ActivityLog::default()),
+                &[],
+            )),
+            environment_dirs,
+            workspace,
+            substitutions,
+            ignored: Vec::new(),
+            scope: None,
+            capabilities: crate::catalog::delegation::Capabilities::default(),
+            route_label: None,
+            instructions: String::new(),
+            mask: Arc::new(MaskCounter::new()),
+            // A fresh in-memory journal, as the start path opens one when there is no
+            // `--session`: the switch still names its assembly, into a store no one reads.
+            lines: Arc::new(AssemblyLines::new(
+                AssemblyStore::Memory(session::memory()),
+                JOURNAL_VERSION,
+            )),
+            // The lock of the test's own environment tree, read as `module_sources` reads it;
+            // a tree without `modules.lock` gives the empty set. This switch case reads no
+            // release: its tree is a fixture, and a build's host entries are the catalog's own
+            // step (the start and reload paths call `module_sources`).
+            sources: Mutex::new(ModuleSources::of_lock(lock)),
+            // No `--ask`: the default policy the start path uses without the flag.
+            ask: false,
+            session: Mutex::new(SessionModel {
+                environment,
+                profile,
+                effort: None,
+                finish: None,
+            }),
+        }
     }
 }
 
@@ -1513,16 +2302,16 @@ pub(crate) enum SwitchRequest<'a> {
 /// On success the new `E/P[:effort]` is returned and the session's model state is
 /// updated. On any failure the reason is returned and NOTHING changes: the agent
 /// keeps its model.
-pub(crate) fn switch_model(
+pub(crate) async fn switch_model(
     switch: &ModelSwitch,
     agent: &mut Agent,
     request: SwitchRequest<'_>,
 ) -> Result<String, String> {
-    let mut session = switch.session.lock().unwrap();
+    let current = switch.session_snapshot();
     let choice = match request {
         SwitchRequest::Model(reference) => {
             let models = crate::models::enumerate(&switch.environment_dirs)?;
-            let resolved = crate::models::resolve(reference, &session.environment, &models)?;
+            let resolved = crate::models::resolve(reference, &current.environment, &models)?;
             crate::models::Choice {
                 environment: resolved.environment,
                 profile: Some(resolved.profile),
@@ -1531,18 +2320,79 @@ pub(crate) fn switch_model(
         }
         // `/effort LEVEL` keeps the model and replaces only the effort.
         SwitchRequest::Effort(level) => crate::models::Choice {
-            environment: session.environment.clone(),
-            profile: session.profile.clone(),
+            environment: current.environment,
+            profile: current.profile,
             effort: Some(crate::models::parse_effort(level)?),
         },
     };
+    let generation = switch.generations.current();
+    let sources = switch.sources.lock().unwrap().clone();
+    let candidate = session_candidate(
+        switch,
+        generation.catalog(),
+        &sources,
+        &choice,
+        &current.finish,
+    )?;
+    // `reconfigure` validates against the CURRENT history and commits the new
+    // `Environment` before it installs; on either failure it changes nothing at all,
+    // so the session state below is only updated once it is `Ok`.
+    agent
+        .reconfigure(Reconfiguration {
+            provider: candidate.parts.provider.clone(),
+            tools: candidate.parts.tools.clone(),
+            system_prompt: candidate.parts.system_prompt.clone(),
+            options: candidate.parts.options.clone(),
+            context: candidate.parts.context.clone(),
+            authorization: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    // The journal names the assembly that executes the records after this point. A store
+    // that refuses the line has already accepted the switch, so the message says so: the
+    // run cannot hide that its journal no longer says what will run. The session state
+    // follows the installed candidate first, so a refused line never leaves it behind.
+    let identity = candidate.identity.clone();
+    let model = adopt_candidate(switch, candidate);
+    switch.lines.switched(&identity).map_err(|error| {
+        format!("the model switched, but the journal could not name the new assembly: {error}")
+    })?;
+    Ok(model)
+}
+
+/// The session's assembly as the start path builds it: its parts, plus what the
+/// session state takes over once the agent installed them.
+struct SessionCandidate {
+    parts: CandidateParts,
+    environment: p1_assembly::EnvironmentFile,
+    route: String,
+    /// The completion the switched `finish` writes, when the session adopts it.
+    adopted: Option<Completion>,
+    finish_at: Option<usize>,
+    /// ADR-0080: the candidate's execution manifest, built before `reconfigure`
+    /// consumes the assembly and written only once the agent installed it.
+    identity: AssemblyIdentity,
+}
+
+/// Load `choice`, apply the selection, resolve the route binding and assemble on
+/// `catalog` EXACTLY as the start path does — the same cache-key policy with the
+/// parent's ordinal, the same standing instructions. `sources` is the `modules.lock`
+/// the catalog's module registration read plus the host entries it registered, for the
+/// candidate's assembly identity (ADR-0080). Nothing is installed.
+fn session_candidate(
+    switch: &ModelSwitch,
+    catalog: &Catalog,
+    sources: &ModuleSources,
+    choice: &crate::models::Choice,
+    current_finish: &Option<Arc<dyn Tool>>,
+) -> Result<SessionCandidate, String> {
     let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment);
-    crate::models::apply(&mut environment, &choice, &switch.environment_dirs)?;
+    with_worker_tools(&mut environment, switch.capabilities)?;
+    crate::models::apply(&mut environment, choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
     let assembled = assemble_with_cache_key(
-        &switch.catalog,
+        catalog,
         &environment,
         &switch.workspace,
         &switch.substitutions,
@@ -1558,6 +2408,11 @@ pub(crate) fn switch_model(
     // named it (`Origin.route`, `<adapter>/<account>`).
     let route = assembled.resolved.route.origin.route.clone();
     let context = agent_context(&assembled, environment.profile.as_deref())?;
+    // ADR-0080: the candidate's execution manifest, built before `reconfigure` consumes
+    // the assembly. It is written only once the agent installed the candidate, and then
+    // before the next turn: the `Environment` the install committed, and every record
+    // after it, are executed by THIS assembly.
+    let identity = assembly_identity(&assembled, &environment.provider, switch.ask, sources);
     let mut tools = assembled.tools;
     // The switched tool set's `finish` must reach the completion the run reads. The
     // session keeps ITS `finish` — the whole session's activity is in that tool's
@@ -1565,7 +2420,7 @@ pub(crate) fn switch_model(
     // otherwise the switched tool set's own is the session's from now on, and the
     // plumbing follows the completion the catalog just issued it (which the `finish`
     // factory always does).
-    let adopted = match (&session.finish, finish_at) {
+    let adopted = match (current_finish, finish_at) {
         (Some(kept), Some(index)) if kept.declaration().name == tools[index].declaration().name => {
             tools[index] = kept.clone();
             None
@@ -1573,17 +2428,36 @@ pub(crate) fn switch_model(
         (_, Some(_)) => issued,
         _ => None,
     };
-    // `reconfigure` validates against the CURRENT history and, on failure, changes
-    // nothing at all — so the session state below is only updated once it is `Ok`.
-    agent
-        .reconfigure(Reconfiguration {
+    Ok(SessionCandidate {
+        parts: CandidateParts {
             provider: assembled.provider,
-            tools: tools.clone(),
+            tools,
             system_prompt: assembled.system_prompt + switch.instructions.as_str(),
             options: assembled.options,
             context,
-        })
-        .map_err(|error| error.to_string())?;
+        },
+        environment,
+        route,
+        adopted,
+        finish_at,
+        identity,
+    })
+}
+
+/// The session state follows an installed candidate: its `finish` plumbing, its
+/// model and the route label. Called only once the agent installed it, so a failed
+/// switch or reload changed nothing. Returns the new `E/P[:effort]`.
+fn adopt_candidate(switch: &ModelSwitch, candidate: SessionCandidate) -> String {
+    let SessionCandidate {
+        parts,
+        environment,
+        route,
+        adopted,
+        finish_at,
+        identity: _,
+    } = candidate;
+    let tools = parts.tools;
+    let mut session = switch.session.lock().unwrap();
     if let Some(completion) = adopted {
         // The switched `finish` writes the completion the catalog issued: point the
         // parent's activity plumbing (and the §3c guard, which reads it) at it, so
@@ -1600,11 +2474,360 @@ pub(crate) fn switch_model(
         .profile
         .as_ref()
         .map(|profile| profile.id.clone());
+    session.effort = environment.options.reasoning_effort;
     // The session's route label moves only now: a failed switch changed nothing.
     if let Some(label) = &switch.route_label {
         *label.lock().unwrap() = route;
     }
-    Ok(model_name(&environment))
+    model_name(&environment)
+}
+
+// ------------------------------------------ the module reload (ADR-0084 §3)
+//
+// `/modules reload` is a model switch to the model the session runs now, on a
+// catalog loaded again from the release (S1.4's loader through `build_catalog`)
+// and with the policy the session selects, installed through the same
+// `Agent::reconfigure`. It happens only between complete turns: `&mut Agent` is
+// free only once the turn and its tool calls settled, and a front end that is busy
+// queues the request on [`ReloadQueue`] and applies it at its next boundary.
+
+/// One assembly generation of the session: the catalog a start or a reload loaded
+/// from the release, and the authorization policy that decides with it.
+pub struct Generation {
+    number: u64,
+    catalog: Arc<Catalog>,
+    authorization: Arc<dyn AuthorizationPolicy>,
+}
+
+impl std::fmt::Debug for Generation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Generation")
+            .field("number", &self.number)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Generation {
+    /// 0 for the start's generation, one more for every installed reload.
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    /// The catalog every assembly of this generation is built on.
+    pub fn catalog(&self) -> &Arc<Catalog> {
+        &self.catalog
+    }
+
+    /// The policy that decides this generation's calls.
+    pub fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
+        self.authorization.clone()
+    }
+}
+
+/// The session's current generation. Whatever starts an assembly — the parent's
+/// switch, a child, a workflow step — pins [`Generations::current`] when it starts
+/// and keeps it until it ends: an installed reload replaces the current generation
+/// and never a pinned one, and a generation is dropped with its last pin.
+pub struct Generations {
+    /// `None` until the start's catalog exists: the composition reads the
+    /// configuration that names the delegation service before the catalog is
+    /// built, and the child builder is created in between.
+    current: Mutex<Option<Arc<Generation>>>,
+}
+
+impl Generations {
+    /// No generation yet. The child builder is created before the catalog (the
+    /// catalog registers the `worker_*` tools, so the service must exist first);
+    /// [`Generations::install`] installs generation 0 once the catalog is built.
+    pub fn empty() -> Self {
+        Self {
+            current: Mutex::new(None),
+        }
+    }
+
+    /// Generation 0: what the session started with.
+    pub fn new(catalog: Arc<Catalog>, authorization: Arc<dyn AuthorizationPolicy>) -> Self {
+        let generations = Self::empty();
+        generations.install(catalog, authorization);
+        generations
+    }
+
+    /// Install the NEXT generation: the start path's catalog and policy once the
+    /// catalog exists, and a `/modules reload`'s candidate after its agent took it
+    /// ([`install_candidate`]). The swap is here — one lock, no await — so a child or
+    /// workflow step starting after it pins the new generation, and one already
+    /// running keeps the old.
+    pub fn install(
+        &self,
+        catalog: Arc<Catalog>,
+        authorization: Arc<dyn AuthorizationPolicy>,
+    ) -> Arc<Generation> {
+        let mut current = self.current.lock().unwrap();
+        let generation = Arc::new(Generation {
+            number: current
+                .as_ref()
+                .map_or(0, |generation| generation.number + 1),
+            catalog,
+            authorization,
+        });
+        *current = Some(generation.clone());
+        generation
+    }
+
+    /// The generation a new assembly pins.
+    pub fn current(&self) -> Arc<Generation> {
+        self.try_current()
+            .expect("the session's assembly generation is installed")
+    }
+
+    /// The generation a new assembly pins, when the start has installed one: a
+    /// child build asked for before the catalog exists is refused, not a panic.
+    pub fn try_current(&self) -> Option<Arc<Generation>> {
+        self.current.lock().unwrap().clone()
+    }
+}
+
+/// The agent-facing parts of a candidate assembly.
+pub struct CandidateParts {
+    pub provider: Arc<dyn Provider>,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub system_prompt: String,
+    pub options: ModelOptions,
+    pub context: Arc<dyn ContextPolicy>,
+}
+
+/// A complete reload candidate: the catalog loaded again, the policy, and the
+/// session's assembly built on that catalog.
+pub struct Candidate {
+    pub catalog: Arc<Catalog>,
+    pub authorization: Arc<dyn AuthorizationPolicy>,
+    pub parts: CandidateParts,
+}
+
+/// Validate `candidate` against the agent's current history, commit it as ONE
+/// `Environment` record and install it — policy included — through
+/// `Agent::reconfigure`, then make it the current generation. Nothing awaits
+/// between the commit and either installation: the agent's is inside
+/// `reconfigure`, and the generation is swapped in the same poll `reconfigure`
+/// returns in. On any failure nothing changes: the agent keeps its assembly and
+/// its policy, and the current generation stays.
+pub async fn install_candidate(
+    generations: &Generations,
+    agent: &mut Agent,
+    candidate: Candidate,
+) -> Result<Arc<Generation>, ReconfigureError> {
+    let Candidate {
+        catalog,
+        authorization,
+        parts,
+    } = candidate;
+    agent
+        .reconfigure(Reconfiguration {
+            provider: parts.provider,
+            tools: parts.tools,
+            system_prompt: parts.system_prompt,
+            options: parts.options,
+            context: parts.context,
+            authorization: Some(authorization.clone()),
+        })
+        .await?;
+    Ok(generations.install(catalog, authorization))
+}
+
+/// What a `/modules reload` request did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadRequested {
+    /// The session is idle: the front end applies it now.
+    Now,
+    /// The session is busy: it waits for the next boundary between complete turns.
+    Pending,
+}
+
+/// The session's queued `/modules reload`: requested from a key handler or a line,
+/// applied by the loop that owns the agent, at a boundary.
+#[derive(Default)]
+pub struct ReloadQueue {
+    pending: AtomicBool,
+}
+
+impl ReloadQueue {
+    /// Queue a reload. `busy` is whether a turn (and so its tool calls) is still
+    /// running; the answer says whether it waits for that turn's end.
+    pub fn request(&self, busy: bool) -> ReloadRequested {
+        self.pending.store(true, Ordering::SeqCst);
+        if busy {
+            ReloadRequested::Pending
+        } else {
+            ReloadRequested::Now
+        }
+    }
+
+    /// Take the queued request, at a boundary: `true` once per request.
+    pub fn take(&self) -> bool {
+        self.pending.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// What the host's reload rebuilds a candidate from: its own copy of the
+/// dependencies the catalog is built from, the run's sandbox selection, and the
+/// session's policy.
+pub(crate) struct ReloadInputs {
+    deps: HostDeps,
+    sandbox: cli::SandboxMode,
+    sandbox_write: Vec<PathBuf>,
+    sandbox_read: Vec<PathBuf>,
+    env_pass: Vec<String>,
+    /// The policy the session selects: the front end's, which asks through it, and
+    /// the shipped policy package it asks loaded again from the release
+    /// ([`reload_policy_of`]).
+    // notice: S5.11 (#357): fallible, and the reloaded package answers once installed.
+    policy: Box<dyn Fn() -> Result<ReloadedPolicy, String> + Send + Sync>,
+    queue: ReloadQueue,
+}
+
+/// A reload candidate's policy: the front end's bridge, and the shipped package it asks
+/// loaded again from the release, which answers once the candidate is installed.
+type ReloadedPolicy = (
+    Arc<dyn AuthorizationPolicy>,
+    Option<crate::policy::PolicyReload>,
+);
+
+// notice: S5.11 (#357): the reload policy closure over the loaded components.
+/// The policy of a reload candidate for `front_end`: its own policy, which keeps its
+/// asker, its turn and its grants, and — when it asks a shipped policy
+/// (`p1/policy/full-access` or `p1/policy/ask`) — that package loaded and verified again
+/// from the official release. A package that is gone or does not verify fails the
+/// reload, naming it, and the current policy keeps answering.
+fn reload_policy_of(front_end: &dyn FrontEnd) -> Result<ReloadedPolicy, String> {
+    let reloaded = front_end
+        .shipped_policy()
+        .map(|shipped| shipped.reload())
+        .transpose()?;
+    Ok((front_end.authorization(), reloaded))
+}
+
+/// A copy of what [`build_catalog`] reads of `deps`, for a reload that runs where
+/// `deps` is not reachable (the TUI's loop). The test catalog hook moves behind an
+/// `Arc` both copies call.
+fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
+    let hook: Option<Arc<crate::catalog::CatalogHook>> = deps.catalog_hook.take().map(Arc::new);
+    let forward = |hook: Arc<crate::catalog::CatalogHook>| -> crate::catalog::CatalogHook {
+        Box::new(move |catalog: &mut Catalog| hook(catalog))
+    };
+    deps.catalog_hook = hook.clone().map(forward);
+    HostDeps {
+        stdout: deps.stdout.clone(),
+        stderr: deps.stderr.clone(),
+        lines: deps.lines.clone(),
+        transport: deps.transport.clone(),
+        date: deps.date.clone(),
+        interrupt: deps.interrupt.clone(),
+        environment_dirs: deps.environment_dirs.clone(),
+        stdout_is_tty: deps.stdout_is_tty,
+        home: deps.home.clone(),
+        runtime_dir: deps.runtime_dir.clone(),
+        shell_env: deps.shell_env.clone(),
+        #[cfg(feature = "shadow-hook")]
+        shadow: deps.shadow.clone(),
+        catalog_hook: hook.map(forward),
+        wait: deps.wait.clone(),
+        // The reload rebuilds the same catalog, so it links the module packages through
+        // the same hook and stays inside the member-scope generation the run holds.
+        module_services: deps.module_services.clone(),
+        #[cfg(feature = "delegation")]
+        member_scopes: deps.member_scopes.clone(),
+        #[cfg(feature = "delegation")]
+        worker_service: deps.worker_service.clone(),
+        #[cfg(feature = "workflows")]
+        workflow_service: deps.workflow_service.clone(),
+        #[cfg(feature = "workflows")]
+        workflow_observer: deps.workflow_observer.clone(),
+        model_switch: None,
+    }
+}
+
+/// The ONE `/modules reload` entry point: load the release again through the
+/// catalog build (S1.4's `load_locked_modules` and `register_modules`), assemble the
+/// model the session runs now on it exactly as the start path does, take the
+/// session's policy, and install the whole candidate with [`install_candidate`].
+/// Callable only between turns (`&mut Agent`).
+///
+/// On success the new generation and model are returned; on any failure (load,
+/// verification, assembly, validation or commit) the reason is returned and the
+/// current assembly keeps answering.
+pub(crate) async fn reload_modules(
+    switch: &ModelSwitch,
+    agent: &mut Agent,
+) -> Result<String, String> {
+    let inputs = &switch.reload;
+    // The package sources of the reloaded catalog's module registration — its lock and its
+    // release host entries (D083b 2): the reloaded modules' identities, which the assembly line
+    // after the install names (ADR-0080).
+    let sources = module_sources(&inputs.deps)?;
+    let catalog = Arc::new(build_catalog(
+        &inputs.deps,
+        inputs.sandbox,
+        &inputs.sandbox_write,
+        &inputs.sandbox_read,
+        &inputs.env_pass,
+        &switch.completion,
+    )?);
+    let current = switch.session_snapshot();
+    let choice = crate::models::Choice {
+        environment: current.environment,
+        // An effort belongs to a profile; without one the environment keeps its own.
+        effort: current.profile.as_ref().and(current.effort),
+        profile: current.profile,
+    };
+    // The reloaded assembly's identity is what the package sources name (the lock and the
+    // release host entries, `module_sources`), and the session's policy comes from the front
+    // end's reload bridge, which loads the shipped policy package again (S5.11): a reload
+    // keeps both behaviours.
+    let candidate = session_candidate(switch, &catalog, &sources, &choice, &current.finish)?;
+    let (authorization, reloaded) = (inputs.policy)()?;
+    let generation = install_candidate(
+        &switch.generations,
+        agent,
+        Candidate {
+            catalog,
+            authorization,
+            parts: CandidateParts {
+                provider: candidate.parts.provider.clone(),
+                tools: candidate.parts.tools.clone(),
+                system_prompt: candidate.parts.system_prompt.clone(),
+                options: candidate.parts.options.clone(),
+                context: candidate.parts.context.clone(),
+            },
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    // The reloaded component answers from the installed generation on, never before.
+    if let Some(reloaded) = reloaded {
+        reloaded.install();
+    }
+    // The install committed a new `Environment` with the reloaded modules: the journal
+    // names that assembly before the next turn, and later switches resolve module keys
+    // against the reloaded sources. A store that refuses the line has already accepted the
+    // reload, so the message says so; the session state follows the install first.
+    *switch.sources.lock().unwrap() = sources;
+    let identity = candidate.identity.clone();
+    let model = adopt_candidate(switch, candidate);
+    switch.lines.switched(&identity).map_err(|error| {
+        format!(
+            "the modules reloaded (generation {}), but the journal could not name the new assembly: {error}",
+            generation.number()
+        )
+    })?;
+    Ok(format!("generation {} · {model}", generation.number()))
+}
+
+/// What a `/modules reload` did, on the host's own channel.
+fn report_reload(deps: &HostDeps, outcome: Result<String, String>) {
+    match outcome {
+        Ok(reloaded) => write_stderr(deps, &format!("· modules reloaded: {reloaded}\n")),
+        Err(reason) => write_stderr(deps, &format!("· modules not reloaded: {reason}\n")),
+    }
 }
 
 /// The model a loaded environment runs, as the operator writes it: `E/P`, with the
@@ -2142,12 +3365,18 @@ pub(crate) fn assemble_with_cache_key(
 ) -> Result<p1_assembly::Assembled, String> {
     let name = environment.name.clone();
     let configured = environment.options.clone();
-    let mut assembled = p1_assembly::assemble_with_route_options(
+    // B-S6-9, D068: a MAIN agent's tools learn which parent they serve, so the worker and
+    // workflow members' scopes are per parent. The parent's ordinal names it: each main
+    // agent has its own catalog, worker service and scope generation, so the ordinal is
+    // unique among the agents that share one scope registry. Workers get none.
+    let agent = (agent_ordinal == PARENT_ORDINAL).then(|| agent_ordinal.to_string());
+    let mut assembled = p1_assembly::assemble_for_agent(
         catalog,
         environment,
         workspace,
         substitutions,
         mask,
+        agent.as_deref(),
         |route| {
             let mut options = configured.clone();
             if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {
@@ -2318,8 +3547,22 @@ mod tests {
     }
 
     /// The reserve the effective table leaves for the next response.
-    fn wall_of(config: &p1_context::ContextConfig) -> u64 {
+    fn wall_of(config: &ContextTable) -> u64 {
         config.window_tokens - config.output_headroom_tokens
+    }
+
+    // notice: S5.11 (#357): the table is the host's own type now; the component's source
+    // crate still validates it, as the component's `configure` does.
+    /// The effective table as the context engine's own config, to validate it.
+    fn native_table(table: &ContextTable) -> p1_context::ContextConfig {
+        p1_context::ContextConfig {
+            window_tokens: table.window_tokens,
+            output_headroom_tokens: table.output_headroom_tokens,
+            summarize_at_tokens: table.summarize_at_tokens,
+            keep_recent_tokens: table.keep_recent_tokens,
+            user_verbatim_tokens: table.user_verbatim_tokens,
+            tool_result_excerpt_chars: table.tool_result_excerpt_chars,
+        }
     }
 
     /// A profile that is not a shipped file: the folding rule must hold for any capacity a
@@ -2372,7 +3615,9 @@ mod tests {
             wall_of(&config)
         );
         // The effective table must be one the policy accepts.
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     /// A profile that states MORE than the environment cannot widen it: the environment's table
@@ -2397,7 +3642,9 @@ mod tests {
             config_for_route(&settings, None),
             "a roomier profile changes nothing"
         );
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     /// A profile far narrower than the environment (40,000 tokens on `zen`) clamps the copied
@@ -2433,7 +3680,9 @@ mod tests {
             config.user_verbatim_tokens,
             config.keep_recent_tokens
         );
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
 
         // A profile whose own output ceiling exceeds its own window: the reserve is clamped
         // below the window, so the table still describes a sendable request. What is left is too
@@ -2449,7 +3698,9 @@ mod tests {
             config.window_tokens
         );
         assert!(config.keep_recent_tokens < wall_of(&config));
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
 
         let (assembled, _) = assembled_for_test(Some(settings.clone()), Effort::High);
         let error = match agent_context(&assembled, Some(&odd)) {
@@ -2529,7 +3780,9 @@ mod tests {
             "the profile's output ceiling bounds the reserve"
         );
         assert_eq!(config.summarize_at_tokens, 500_000);
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     /// A profile that states no capacity at all (the one the `deepseek` environment binds) leaves
@@ -2581,7 +3834,9 @@ mod tests {
             config.summarize_at_tokens > settings.window_tokens * 60 / 100,
             "the decided threshold is above 60% of the window, so the rule must not apply"
         );
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     // ---------------------------- #125 review: the summary's own effort

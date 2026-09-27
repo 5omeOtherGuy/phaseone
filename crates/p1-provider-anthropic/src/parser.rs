@@ -13,20 +13,22 @@
 
 use std::collections::HashMap;
 
-use p1_contracts::history::{
-    AssistantBlock, AssistantItem, Origin, ReplayData, ToolCall, ToolInput,
-};
+use p1_contracts::history::{AssistantBlock, AssistantItem, Origin, ToolCall, ToolInput};
 use p1_contracts::{
     CompletedResponse, Outcome, ProviderError, ProviderErrorKind, StopReason, StreamEvent, Usage,
 };
 use p1_provider_http::{ResponseParser, SseEvent, kind_for_status};
-use serde_json::{Value, json};
+use serde_json::Value;
+
+use crate::replay;
 
 /// Parse one streaming Messages response into contract events.
 pub struct AnthropicParser {
     origin_route: String,
-    /// Starts as the requested model and is re-keyed by `message_start` to the
-    /// RESPONSE model, so replay data carries the model that actually produced it.
+    /// The CONFIGURED wire model, kept for the whole stream: `message_start` reports a
+    /// dated alias of the model that was asked for, and replay is gated on origin
+    /// equality, so keying on the echoed name would make a session's own thinking
+    /// foreign to itself (ADR-0018, routes.md §A "Replay").
     origin_model: String,
     blocks: Vec<AssistantBlock>,
     open: HashMap<usize, OpenBlock>,
@@ -44,7 +46,11 @@ struct OpenBlock {
 
 enum OpenKind {
     Text,
-    Thinking,
+    Thinking {
+        /// The signature parts received so far, in arrival order. The payload is
+        /// re-encoded from it, so the codec stays the only writer of a payload.
+        signature: String,
+    },
     Redacted,
     Tool {
         call_id: String,
@@ -55,7 +61,7 @@ enum OpenKind {
 
 impl AnthropicParser {
     /// `origin_route` is the composed route's `Origin.route`; the model is the
-    /// configured wire model that `message_start` re-keys to the RESPONSE model.
+    /// configured wire model, which every replay payload is tagged with.
     pub fn new(origin_route: &str, model: &str) -> Self {
         Self {
             origin_route: origin_route.to_string(),
@@ -145,11 +151,10 @@ impl AnthropicParser {
             }
             Some("thinking") => {
                 let text = str_field(block, "thinking");
-                let replay = ReplayData {
-                    origin: self.origin(),
-                    version: 1,
-                    payload: json!({ "type": "thinking", "signature": "" }),
-                };
+                let replay = replay::encode(
+                    &self.origin(),
+                    replay::WireBlock::Thinking { signature: "" },
+                );
                 self.blocks.push(AssistantBlock::Reasoning {
                     text,
                     replay: Some(replay),
@@ -158,17 +163,16 @@ impl AnthropicParser {
                     index,
                     OpenBlock {
                         final_index,
-                        kind: OpenKind::Thinking,
+                        kind: OpenKind::Thinking {
+                            signature: String::new(),
+                        },
                     },
                 );
             }
             Some("redacted_thinking") => {
                 let data = str_field(block, "data");
-                let replay = ReplayData {
-                    origin: self.origin(),
-                    version: 1,
-                    payload: json!({ "type": "redacted_thinking", "data": data }),
-                };
+                let replay =
+                    replay::encode(&self.origin(), replay::WireBlock::Redacted { data: &data });
                 self.blocks.push(AssistantBlock::Reasoning {
                     text: String::new(),
                     replay: Some(replay),
@@ -263,7 +267,7 @@ impl AnthropicParser {
                 };
                 // Redacted thinking is never streamed as a delta: only a visible
                 // thinking block can produce ReasoningDelta.
-                if !matches!(open.kind, OpenKind::Thinking) {
+                if !matches!(open.kind, OpenKind::Thinking { .. }) {
                     return;
                 }
                 if let AssistantBlock::Reasoning { text, .. } = &mut self.blocks[open.final_index] {
@@ -280,23 +284,24 @@ impl AnthropicParser {
                 let Some(signature) = delta.get("signature").and_then(Value::as_str) else {
                     return;
                 };
-                let Some(open) = self.open.get(&index) else {
+                let origin = self.origin();
+                let Some(open) = self.open.get_mut(&index) else {
                     return;
                 };
-                if !matches!(open.kind, OpenKind::Thinking) {
+                let OpenBlock { final_index, kind } = open;
+                // The signature arrives in parts and only a visible thinking block
+                // carries one.
+                let OpenKind::Thinking { signature: parts } = kind else {
                     return;
-                }
+                };
+                parts.push_str(signature);
                 if let AssistantBlock::Reasoning {
                     replay: Some(replay),
                     ..
-                } = &mut self.blocks[open.final_index]
+                } = &mut self.blocks[*final_index]
                 {
-                    let existing = replay
-                        .payload
-                        .get("signature")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    replay.payload["signature"] = json!(format!("{existing}{signature}"));
+                    *replay =
+                        replay::encode(&origin, replay::WireBlock::Thinking { signature: parts });
                 }
             }
             _ => {}

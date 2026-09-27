@@ -6,12 +6,15 @@
 //! `docs/design/routes.md` §A, the policy split is `docs/design/routes-and-profiles.md`
 //! §7.
 
-use p1_contracts::history::{AssistantBlock, Item, ReplayData, ToolCall, ToolInput, ToolStatus};
+use p1_contracts::history::{
+    AssistantBlock, Item, Origin, ReplayData, ToolCall, ToolInput, ToolStatus,
+};
 use p1_contracts::tool::{DeclarationKind, ToolDeclaration};
 use p1_contracts::{ModelOptions, ProviderError, ProviderErrorKind, ProviderRequest};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use serde_json::{Value, json};
 
+use crate::replay::{self, Replay, WireBlock};
 use crate::{MessagesAccount, MessagesRoute};
 
 /// `native` keys in this namespace are route-specific. None are known in this
@@ -404,6 +407,12 @@ pub(crate) fn build_messages(
     history: &[Item],
 ) -> Result<Vec<Value>, ProviderError> {
     let mut messages: Vec<Value> = Vec::new();
+    // The configured origin every replay is classified against (ADR-0018): the
+    // route's own route id and wire model, never a name a response echoed.
+    let origin = Origin {
+        route: origin_route.to_string(),
+        model: wire_model.to_string(),
+    };
 
     for item in history {
         match item {
@@ -438,9 +447,7 @@ pub(crate) fn build_messages(
                         }
                         AssistantBlock::ToolCall(call) => blocks.push(tool_use_block(call)),
                         AssistantBlock::Reasoning { text, replay } => {
-                            if let Some(replay) =
-                                replay_block(origin_route, wire_model, text, replay.as_ref())
-                            {
+                            if let Some(replay) = replay_block(&origin, text, replay.as_ref())? {
                                 blocks.push(replay);
                             }
                         }
@@ -490,36 +497,41 @@ fn tool_use_block(call: &ToolCall) -> Value {
     })
 }
 
-/// A reasoning block replays only when the origin is this exact route + model
-/// and the payload version is current. A foreign or stale-version block is
-/// dropped entirely — never downgraded to assistant text.
+/// The ONE replay rule for one reasoning block, so `validate` and `build_request`
+/// cannot disagree: a block of the configured origin that this build reads goes back
+/// byte-exact, one another origin wrote is dropped entirely — never downgraded to
+/// assistant text (ADR-0018) — and one of OUR origin that this build does not read is
+/// refused, naming the item and both versions (ADR-0049).
 fn replay_block(
-    origin_route: &str,
-    wire_model: &str,
+    origin: &Origin,
     text: &str,
     replay: Option<&ReplayData>,
-) -> Option<Value> {
-    let replay = replay?;
-    if replay.version != 1 {
-        return None;
-    }
-    if replay.origin.route != origin_route || replay.origin.model != wire_model {
-        return None;
-    }
-    match replay.payload.get("type").and_then(Value::as_str) {
-        Some("thinking") => {
-            let signature = replay.payload.get("signature").and_then(Value::as_str)?;
-            Some(json!({
-                "type": "thinking",
-                "thinking": text,
-                "signature": signature,
-            }))
+) -> Result<Option<Value>, ProviderError> {
+    let Some(data) = replay else {
+        return Ok(None);
+    };
+    match replay::decode(data, origin) {
+        Replay::Foreign => Ok(None),
+        Replay::Carried(WireBlock::Thinking { signature }) => Ok(Some(json!({
+            "type": "thinking",
+            "thinking": text,
+            "signature": signature,
+        }))),
+        Replay::Carried(WireBlock::Redacted { data }) => {
+            Ok(Some(json!({ "type": "redacted_thinking", "data": data })))
         }
-        Some("redacted_thinking") => {
-            let data = replay.payload.get("data").and_then(Value::as_str)?;
-            Some(json!({ "type": "redacted_thinking", "data": data }))
-        }
-        _ => None,
+        Replay::UnsupportedVersion { version } => Err(invalid(&format!(
+            "cannot replay the reasoning block of the assistant item from {}/{}: its replay \
+             data is version {version}, this route reads version {}",
+            data.origin.route,
+            data.origin.model,
+            replay::REPLAY_VERSION
+        ))),
+        Replay::UnsupportedPayload => Err(invalid(&format!(
+            "cannot replay the reasoning block of the assistant item from {}/{}: its replay \
+             payload is not a thinking block",
+            data.origin.route, data.origin.model
+        ))),
     }
 }
 

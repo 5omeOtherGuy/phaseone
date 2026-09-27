@@ -78,9 +78,43 @@ files to their sha256.
   grants, never one.
 - **The loader builds `ToolIdentity`** from the release manifest entry: implementation
   from `name`, variant from `variant`; a package does not name its own identity. Host
-  behaviour that depended on which tool ran keys on semantic capabilities the manifest
-  declares and the loader verifies (for example `records-command-evidence` replaces the
-  literal `SHELL_IMPLEMENTATION` match; a later slice).
+  behaviour that depends on which tool ran keys on a semantic capability of that identity
+  (below), never on an implementation or model-facing name.
+- **Semantic capabilities.** Host behaviour that depends on which tool ran keys on a
+  semantic capability of the tool's loader-built identity. There are two, and neither is a
+  `p1:module` interface of the frozen allocation, so no manifest grants one directly; both
+  are host facts:
+  - `records-command-evidence`: the tool's outcomes record the commands it ran, so its runs
+    are evidence a `finish` verification may name. It selects the `recorded-commands`
+    completion policy for a child (ADR-0051 item 1) and, with ADR-0083 rule 2, decides whose
+    runs count as evidence.
+  - `reports-completion`: a successful call ends the turn with a completion report
+    (`status`, `needs`, `summary`). The worker report reads that tool's call.
+
+  A capability is declared in one of two ways:
+
+  1. **A package** derives them from its verified manifest (`LoadedModule::kind()` and
+     `capabilities()`), whose grants the loader has already checked against the component's
+     imports. A `tool` granted `process` carries `records-command-evidence`: `process` is the
+     only way a component runs a command, the host's process service runs it, and the host
+     records every run from the event stream, never from the component, so the command is
+     known without trusting the module. A `tool` granted `completion` carries
+     `reports-completion` (ADR-0083 rule 6: only a tool's `execute` commits a completion).
+     Other classes carry none: they run no tool calls, and a context policy's `completion`
+     grant reads the record only. The host's registration records the derived set under the
+     loader-built identity (`declare_package`, called by `register_modules` in
+     `catalog/modules.rs`), which is what the host's checks read; a module cannot write it,
+     and the identity is the loader's. The frozen manifest has no semantic-capability field,
+     and none is needed; a dedicated field would be an S0 freeze amendment.
+  2. **A still-native tool** gets them from its catalog registration
+     (`catalog/tools.rs`, `NATIVE_CAPABILITIES`), keyed on the identity implementation its
+     constructor builds: `shell` declares `records-command-evidence`, `finish` declares
+     `reports-completion`. A declaration goes with its registration when the tool becomes a
+     package.
+
+  An environment's face changes the model-facing name, description and variant, never the
+  identity implementation, so it can neither grant nor hide a capability. Capabilities are
+  never journalled; on resume they come from the packages loaded now.
 - **Registration and the assembly rule.** The catalog build path
   (`catalog/mod.rs` → `catalog/modules.rs`) loads what the effective lock resolves and
   registers each verified tool package under its module name, after the compiled-in

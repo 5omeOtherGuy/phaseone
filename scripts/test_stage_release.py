@@ -225,6 +225,33 @@ class StageReleaseTest(unittest.TestCase):
 
     # ---- refusals ----------------------------------------------------------------
 
+    def test_a_development_manifest_at_the_top_is_not_a_package(self) -> None:
+        # scripts/build-modules.sh writes the development manifest at the top of the same
+        # build-outputs directory this script stages from (BLOCKERS S3-B6, D080): it sits
+        # beside the packages and must be skipped, never packed as one.
+        data = self.fixture()
+        write_file(os.path.join(self.modules, "manifest.json"),
+                   b'{"format": "p1-release-manifest/1", "components": []}\n')
+
+        done = self.stage()
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        files = self.members()
+        self.assertEqual(files["modules/packages/p1-fixture/p1-fixture.wasm"], data)
+        # The only manifest.json in the archive is the release manifest this script writes.
+        self.assertEqual(
+            sorted(name for name in files if name.rsplit("/", 1)[-1] == "manifest.json"),
+            ["modules/manifest.json"],
+        )
+
+    def test_any_other_top_level_regular_file_is_not_a_package_directory(self) -> None:
+        # The skip is by name, for the development manifest only; every other top-level entry
+        # keeps the package-directory check.
+        self.fixture()
+        write_file(os.path.join(self.modules, "stray.txt"), b"stray\n")
+
+        self.assert_no_out(self.stage(), "not a package directory")
+
     def test_a_compiled_cache_blob_is_refused_and_leaves_no_out(self) -> None:
         self.fixture()
         write_file(os.path.join(self.modules, "p1-module-fixture",

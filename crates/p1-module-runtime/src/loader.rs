@@ -40,12 +40,42 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// The capabilities this runtime can link, by the interface name the manifest uses. The
 /// other capability interfaces belong to other native crates and streams; a manifest that
 /// grants one of them is refused until the runtime can provide it. `summary` is linked to
-/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7).
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 5] =
-    ["control", "clock", "random", "process", "summary"];
+/// the caller's [`SummaryService`](crate::context_policy::SummaryService) (S5, GO S5-B7);
+/// `completion` to the caller's [`CompletionService`](crate::completion::CompletionService)
+/// (S3.7, D067); `http`, `websocket` and `credential-control` to the broker and credential
+/// services a provider component's `stream` uses (S4.7); the worker and workflow interfaces
+/// to the caller's services in [`crate::delegation`] (S6, B-S6-8); `workspace` (its read side)
+/// and `snapshot` to the caller's [`WorkspaceService`](crate::capabilities::WorkspaceService)
+/// and [`SnapshotService`](crate::capabilities::SnapshotService) (S1). `workspace-mutation` is
+/// S2's and stays refused.
+///
+/// Public, and re-exported from the crate root, because it is the ONE list of what this
+/// runtime links: the host's `p1 modules verify` checks a manifest against it instead of
+/// keeping a copy that could drift (S1.5.1). A new capability is added here alone.
+pub const LINKABLE_CAPABILITIES: [&str; 15] = [
+    "control",
+    "clock",
+    "random",
+    "process",
+    "summary",
+    "completion",
+    "http",
+    "websocket",
+    "credential-control",
+    "workers-start",
+    "workers-observe",
+    "workers-control",
+    "workflows",
+    "workspace",
+    "snapshot",
+];
 
 /// The interface every world imports for its types; it grants nothing.
 const TYPES_INTERFACE: &str = "types";
+/// The type-only interface the worker capabilities take their records from
+/// (`modules/capabilities.toml`, `type-only`): it grants nothing, so a manifest need not
+/// declare it.
+const WORKER_TYPES_INTERFACE: &str = crate::delegation::WORKER_TYPES_INTERFACE;
 
 /// Why a module could not be loaded. Every refusal names the module.
 #[derive(Debug, Error)]
@@ -161,15 +191,21 @@ pub enum ModuleKind {
     AuthorizationPolicy,
     /// A workflow implemented as a module.
     WorkflowImplementation,
+    /// A workflow's step decisions (`p1_workflow::Decisions`), its state kept native.
+    WorkflowDecision,
 }
 
 impl ModuleKind {
-    const ALL: [Self; 5] = [
+    /// Every class this runtime speaks, in the order a manifest may name them. Public
+    /// because the host's `p1 modules verify` reads a manifest's `kind` without the loader
+    /// (it may not compile) and must accept exactly the classes the loader does (S1.5.1).
+    pub const ALL: [Self; 6] = [
         Self::Tool,
         Self::Provider,
         Self::ContextPolicy,
         Self::AuthorizationPolicy,
         Self::WorkflowImplementation,
+        Self::WorkflowDecision,
     ];
 
     /// The manifest name of the class.
@@ -180,6 +216,7 @@ impl ModuleKind {
             Self::ContextPolicy => "context-policy",
             Self::AuthorizationPolicy => "authorization-policy",
             Self::WorkflowImplementation => "workflow-implementation",
+            Self::WorkflowDecision => "workflow-decision",
         }
     }
 
@@ -397,7 +434,10 @@ impl Loader {
             .capabilities
             .iter()
             .map(|capability| interface_import(capability))
-            .chain([interface_import(TYPES_INTERFACE)])
+            .chain([
+                interface_import(TYPES_INTERFACE),
+                interface_import(WORKER_TYPES_INTERFACE),
+            ])
             .collect();
         let component_type = component.component_type();
         if let Some((import, _)) = component_type
@@ -501,12 +541,28 @@ mod tests {
     }
 
     #[test]
-    fn the_linkable_capabilities_are_the_old_four_plus_summary() {
+    fn the_linkable_capabilities_are_the_old_four_plus_every_linked_service() {
         assert_eq!(
             LINKABLE_CAPABILITIES,
-            ["control", "clock", "random", "process", "summary"]
+            [
+                "control",
+                "clock",
+                "random",
+                "process",
+                "summary",
+                "completion",
+                "http",
+                "websocket",
+                "credential-control",
+                "workers-start",
+                "workers-observe",
+                "workers-control",
+                "workflows",
+                "workspace",
+                "snapshot",
+            ]
         );
-        for refused in ["notices", "completion", "http", "filesystem"] {
+        for refused in ["notices", "filesystem", "workspace-mutation"] {
             assert!(!LINKABLE_CAPABILITIES.contains(&refused), "{refused}");
         }
     }

@@ -37,6 +37,7 @@
 mod parser;
 #[cfg(feature = "native")]
 mod provider;
+mod replay;
 mod request;
 #[cfg(feature = "native")]
 mod websocket;
@@ -45,11 +46,12 @@ pub mod websocket_lower;
 pub use parser::CodexResponseParser;
 #[cfg(feature = "native")]
 pub use provider::{Clock, OpenAiCodexProvider, OpenAiCodexProviderBuilder};
+pub use replay::{REPLAY_VERSION, Replay, decode, encode};
 #[cfg(feature = "native")]
 pub use request::build_headers;
 pub use request::{
     LoweredRequest, build_headers_without_credential, build_request, lower_request, request_path,
-    resolve_base_url, validate_composition, validate_request,
+    resolve_base_url, validate_composition, validate_history, validate_request,
 };
 
 /// The `origin_route` of the shipped `routes/openai-codex-subscription.toml`, byte for

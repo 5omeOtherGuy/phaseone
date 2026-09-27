@@ -1,7 +1,9 @@
 //! Driver tests: no TTY, no terminal — the driver over plain method calls.
 
 use super::*;
+use crate::policy::{PolicyId, Verdict};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use p1_contracts::Decision;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -25,13 +27,16 @@ fn agent_with(provider: Arc<p1_testkit::ScriptedProvider>) -> Agent {
         system_prompt: String::new(),
         options: p1_contracts::ModelOptions::default(),
         context: Arc::new(crate::run::DefaultContext),
-        authorization: Arc::new(crate::policy::HostPolicy::new(
-            false,
-            false,
-            Arc::new(crate::StdinLines::new()),
-            Arc::new(std::sync::Mutex::new(Box::new(std::io::sink()))),
-            CancellationToken::new(),
-        )),
+        authorization: Arc::new(
+            crate::policy::HostPolicy::new(
+                false,
+                false,
+                Arc::new(crate::StdinLines::new()),
+                Arc::new(std::sync::Mutex::new(Box::new(std::io::sink()))),
+                CancellationToken::new(),
+            )
+            .expect("the official release ships the policy"),
+        ),
         journal: Arc::new(p1_journal::MemoryJournal::new()),
         events: Arc::new(p1_tui::runtime::TuiSink::new().0),
     })
@@ -50,10 +55,16 @@ fn driver() -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
     driver_with(false)
 }
 
+// notice: S5.11 (#357): the TUI's policy is the release's host entry (D080's built set here).
+/// The shipped policy of the mode, loaded from the official release as the TUI loads it.
+fn shipped(ask: bool) -> Arc<crate::policy::ShippedPolicy> {
+    crate::policy::ShippedPolicy::official(ask).expect("the official release ships the policy")
+}
+
 /// A driver whose policy is `--ask` (`true`) or full access: the idle-loop tests
 /// park a real authorization on the ask one (handoff §7.5).
 fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
-    let (policy, auth) = TuiPolicy::new(ask, CancellationToken::new());
+    let (policy, auth) = tui_policy(shipped(ask), CancellationToken::new());
     // A minimal real agent, for its inbox handle.
     let agent = test_agent();
     (
@@ -434,6 +445,194 @@ fn report_switch_err_keeps_state_and_names_what_stayed() {
     );
 }
 
+/// A real `ModelSwitch` over a scratch tree (`environments/`, `routes/`,
+/// `profiles/`). The whole production path runs behind the `/model` key —
+/// `switch_model`, the catalog assembly and `Agent::reconfigure`'s commit — so the
+/// drive-loop tests below exercise the wiring this slice added at idle, not a stub.
+struct SwitchFixture {
+    _root: tempfile::TempDir,
+    environments: Vec<std::path::PathBuf>,
+    switch: Arc<crate::run::ModelSwitch>,
+}
+
+/// `e-one` runs `r-one`'s `p-one`; nothing else is selectable.
+const SWITCH_ENVIRONMENT: &str = "route   = \"r-one\"\nprofile = \"p-one\"\n";
+
+const SWITCH_ROUTE: &str = r#"
+id           = "r-one"
+origin_route = "openai-chat/one"
+adapter      = "openai-chat"
+endpoint     = "https://example.invalid/v1/chat/completions"
+
+[credential]
+kind = "api-key"
+env  = "ONE_API_KEY"
+
+[adapter_settings]
+dialect = "thinking-with-reasoning-alias"
+
+[models."p-one"]
+wire_model = "wire-one"
+"#;
+
+const SWITCH_PROFILE: &str = r#"
+id             = "p-one"
+revision       = 1
+model_id       = "p-one-model"
+family         = "temp"
+thinking       = "enabled"
+efforts        = ["low", "high"]
+default_effort = "high"
+"#;
+
+/// Every tool module a main assembly gets in this build (ADR-0050's `worker_*` set
+/// plus the `workflow_*` set when workflows are compiled). The fixture registers a
+/// fake for each, so the switched assembly resolves them exactly as a real run's
+/// catalog would.
+const SWITCH_TOOL_MODULES: [&str; 8] = [
+    "worker_start",
+    "worker_result",
+    "worker_continue",
+    "worker_cancel",
+    "workflow_start",
+    "workflow_status",
+    "workflow_result",
+    "workflow_cancel",
+];
+
+impl SwitchFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let environments = root.path().join("environments");
+        std::fs::create_dir_all(environments.join("e-one")).unwrap();
+        std::fs::write(
+            environments.join("e-one/environment.toml"),
+            SWITCH_ENVIRONMENT,
+        )
+        .unwrap();
+        std::fs::write(environments.join("e-one/prompt.md"), "one\n").unwrap();
+        std::fs::create_dir_all(root.path().join("routes")).unwrap();
+        std::fs::write(root.path().join("routes/r-one.toml"), SWITCH_ROUTE).unwrap();
+        std::fs::create_dir_all(root.path().join("profiles")).unwrap();
+        std::fs::write(root.path().join("profiles/p-one.toml"), SWITCH_PROFILE).unwrap();
+
+        let mut catalog = p1_assembly::Catalog::new();
+        catalog.provider(
+            "r-one",
+            Box::new(|_spec: &p1_assembly::ProviderSpec| {
+                Ok(Arc::new(p1_testkit::ScriptedProvider::new(vec![]))
+                    as Arc<dyn p1_contracts::Provider>)
+            }),
+        );
+        for module in SWITCH_TOOL_MODULES {
+            catalog.tool(
+                module,
+                Box::new(
+                    move |_spec: &p1_assembly::ToolSpec, _services: &p1_assembly::ToolServices| {
+                        Ok(Arc::new(p1_testkit::FakeTool::new(module))
+                            as Arc<dyn p1_contracts::Tool>)
+                    },
+                ),
+            );
+        }
+        let dirs = vec![environments.clone()];
+        let switch = Arc::new(crate::run::ModelSwitch::new_for_test(
+            Arc::new(catalog),
+            Arc::new(p1_testkit::RecordingEvents::new()),
+            dirs.clone(),
+            root.path().to_path_buf(),
+            "e-one".into(),
+            Some("p-one".into()),
+        ));
+        Self {
+            _root: root,
+            environments: dirs,
+            switch,
+        }
+    }
+}
+
+/// The idle `/model` path end to end: the key queues the switch and the drive loop
+/// applies it right after the key, awaiting the commit. Without the take/apply in
+/// the idle key arm `pending_switch` would sit until the next key, and a refusal
+/// there while a switch exists would leave `/model` dead at idle; both wire
+/// mistakes leave every other test green.
+#[tokio::test(start_paused = true)]
+async fn a_model_typed_at_idle_applies_through_the_drive_loop() {
+    let fixture = SwitchFixture::new();
+    let journal = Arc::new(p1_testkit::RecordingJournal::new());
+    let agent = Agent::new(p1_core::AgentParts {
+        provider: Arc::new(p1_testkit::ScriptedProvider::new(vec![])),
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+        journal: journal.clone(),
+        events: Arc::new(p1_testkit::RecordingEvents::new()),
+    })
+    .unwrap();
+    let mut harness =
+        IdleLoop::with_agent(ratatui::backend::TestBackend::new(96, 24), false, agent);
+    harness.driver.model_switch = Some(fixture.switch.clone());
+    harness.driver.environment_dirs = fixture.environments.clone();
+    let keys = harness.wires.keys.clone();
+    for c in "/model e-one/p-one".chars() {
+        keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+    }
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    drop(keys);
+
+    let (code, driver, _agent) = run_with_own_wires(harness, async {}).await;
+
+    assert_eq!(code, 0);
+    assert!(
+        meta_rows(&driver).contains(&"· model sonnet-4.5 → e-one/p-one · from the next turn"),
+        "{:?}",
+        meta_rows(&driver)
+    );
+    assert_eq!(driver.model, "e-one/p-one");
+    assert_eq!(driver.env, "e-one");
+    // The switch committed before it installed: the candidate's `Environment` is in
+    // the agent's journal when the loop returns, and nothing else was written.
+    let records = journal.records();
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert!(matches!(
+        &records[0].body,
+        p1_contracts::RecordBody::Environment { .. }
+    ));
+}
+
+/// With a switch seam present, an idle `/model` that does not resolve is refused at
+/// once through the loop — reported, not queued — and the session keeps its model.
+#[tokio::test(start_paused = true)]
+async fn a_model_typed_at_idle_that_does_not_resolve_is_refused_not_queued() {
+    let fixture = SwitchFixture::new();
+    let mut harness = IdleLoop::new();
+    harness.driver.model_switch = Some(fixture.switch.clone());
+    let keys = harness.wires.keys.clone();
+    for c in "/model nope/p-one".chars() {
+        keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+    }
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    drop(keys);
+
+    let (code, driver, _agent) = run_with_own_wires(harness, async {}).await;
+
+    assert_eq!(code, 0);
+    assert_eq!(driver.model, "sonnet-4.5", "the old model stays");
+    let rows = meta_rows(&driver);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("✗ switch refused · ")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("queued")),
+        "an idle refusal is not queued: {rows:?}"
+    );
+}
+
 // ------------------------------------------------------------------- context
 
 #[test]
@@ -477,7 +676,7 @@ fn driver_with_agent() -> (Driver, Agent) {
 
 #[tokio::test]
 async fn a_cancelled_turn_denies_its_parked_approval() {
-    let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
+    let (policy, mut auth_rx) = tui_policy(shipped(true), CancellationToken::new());
     let turn = CancellationToken::new();
     policy.set_turn(Some(turn.clone()));
     let call = p1_contracts::ToolCall {
@@ -533,7 +732,7 @@ fn cancel_clears_the_follow_up_queue() {
 
 #[tokio::test]
 async fn an_auth_request_becomes_the_approval_view_and_answers() {
-    let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
+    let (policy, mut auth_rx) = tui_policy(shipped(true), CancellationToken::new());
     let (mut d, _auth) = driver();
     d.policy = Arc::new(policy);
     let call = p1_contracts::ToolCall {
@@ -570,6 +769,188 @@ async fn an_auth_request_becomes_the_approval_view_and_answers() {
     assert_eq!(pending.await.unwrap(), Decision::Permit);
     assert!(d.screen.approval.is_none());
     assert!(!d.screen.pinned);
+}
+
+/// One `Executes` call on `policy` (issue #308's cases): the task resolves with the
+/// decision the bridge hands the core.
+fn authorize_call(policy: &Arc<AskBridge>, effect: Effect) -> tokio::task::JoinHandle<Decision> {
+    let policy = policy.clone();
+    tokio::spawn(async move {
+        let call = p1_contracts::ToolCall {
+            call_id: "c1".into(),
+            name: "shell".into(),
+            input: p1_contracts::ToolInput::Json("{\"command\":\"cargo test\"}".into()),
+        };
+        let identity = p1_contracts::ToolIdentity {
+            implementation: "shell".into(),
+            variant: String::new(),
+        };
+        policy
+            .authorize(p1_contracts::AuthorizationRequest {
+                call: &call,
+                identity: &identity,
+                effect,
+            })
+            .await
+    })
+}
+
+/// Park one call, show it, and answer it with `key` on the driver.
+async fn answer_parked(
+    d: &mut Driver,
+    auth_rx: &mut mpsc::UnboundedReceiver<AuthRequest>,
+    answer: char,
+) -> Decision {
+    let pending = authorize_call(&d.policy, Effect::Executes);
+    let request = auth_rx.recv().await.expect("the call parked");
+    d.on_auth(request);
+    assert!(d.screen.approval.is_some());
+    d.on_key(key(KeyCode::Char(answer)), None);
+    assert!(d.screen.approval.is_none());
+    pending.await.unwrap()
+}
+
+/// Issue #308: under `--ask` the TUI resolves the bridge's `Ask`: `y` permits, `n`
+/// is USER_DENY, `a` permits and the bridge remembers it, so the next identical
+/// call never reaches the screen.
+#[tokio::test]
+async fn ask_resolves_through_the_screen_and_always_is_remembered() {
+    let (mut d, mut auth_rx) = driver_with(true);
+
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'y').await,
+        Decision::Permit
+    );
+    assert!(auth_rx.try_recv().is_err(), "one call parks one request");
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'n').await,
+        Decision::Deny {
+            reason: p1_tui::runtime::USER_DENY.into()
+        }
+    );
+    // Neither `y` nor `n` is remembered: the call parks again.
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'a').await,
+        Decision::Permit
+    );
+    assert_eq!(
+        authorize_call(&d.policy, Effect::Executes).await.unwrap(),
+        Decision::Permit
+    );
+    assert!(
+        auth_rx.try_recv().is_err(),
+        "the `always` grant is not asked again"
+    );
+    // ReadOnly is the policy's own permit: never parked.
+    assert_eq!(
+        authorize_call(&d.policy, Effect::ReadOnly).await.unwrap(),
+        Decision::Permit
+    );
+    assert!(auth_rx.try_recv().is_err());
+}
+
+/// A verdict source that always asks, under a policy id the test changes as a
+/// reload would.
+struct ReloadingSource(Mutex<PolicyId>);
+
+impl crate::policy::VerdictSource for ReloadingSource {
+    fn policy(&self) -> PolicyId {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn verdict<'a>(
+        &'a self,
+        _request: p1_contracts::AuthorizationRequest<'a>,
+    ) -> p1_contracts::BoxFuture<'a, Verdict> {
+        Box::pin(async { Verdict::Ask })
+    }
+}
+
+/// Issue #308: an `always` grant is keyed by the deciding policy's package and
+/// digest too, so another policy id asks on the screen again.
+#[tokio::test]
+async fn an_always_grant_is_keyed_by_the_deciding_policy() {
+    let source = Arc::new(ReloadingSource(Mutex::new(PolicyId {
+        package: crate::policy::ASK_POLICY.into(),
+        digest: "sha256:one".into(),
+    })));
+    let cancel = CancellationToken::new();
+    let (asker, mut auth_rx) = TuiPolicy::new(cancel.clone());
+    let (mut d, _auth) = driver_with(true);
+    d.policy = Arc::new(AskBridge::with_asker(
+        source.clone(),
+        false,
+        Arc::new(TuiAsker(asker)),
+        cancel,
+    ));
+
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'a').await,
+        Decision::Permit
+    );
+    assert_eq!(
+        authorize_call(&d.policy, Effect::Executes).await.unwrap(),
+        Decision::Permit
+    );
+    assert!(
+        auth_rx.try_recv().is_err(),
+        "the same policy id reuses the grant"
+    );
+
+    source.0.lock().unwrap().digest = "sha256:two".into();
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'n').await,
+        Decision::Deny {
+            reason: p1_tui::runtime::USER_DENY.into()
+        }
+    );
+}
+
+/// Issue #308: the driver's `set_turn` reaches the bridge and the screen's asker;
+/// a turn cancelled while its call is parked is CANCEL_DENY, and the operator's
+/// late `a` on the abandoned request grants nothing.
+#[tokio::test]
+async fn a_turn_cancelled_while_parked_is_cancel_deny_and_grants_nothing() {
+    let (mut d, mut auth_rx) = driver_with(true);
+    let turn = CancellationToken::new();
+    d.policy.set_turn(Some(turn.clone()));
+
+    let pending = authorize_call(&d.policy, Effect::Executes);
+    let request = auth_rx.recv().await.expect("the call parked");
+    d.on_auth(request);
+    turn.cancel();
+    assert_eq!(
+        pending.await.unwrap(),
+        Decision::Deny {
+            reason: p1_tui::runtime::CANCEL_DENY.into()
+        }
+    );
+    d.on_key(key(KeyCode::Char('a')), None);
+    d.policy.set_turn(None);
+
+    assert_eq!(
+        answer_parked(&mut d, &mut auth_rx, 'y').await,
+        Decision::Permit
+    );
+}
+
+/// Issue #308 (ADR-0038): without `--ask` the bridge's full access permits every
+/// effect and nothing is ever parked on the screen.
+#[tokio::test]
+async fn full_access_never_parks_on_the_screen() {
+    let (d, mut auth_rx) = driver_with(false);
+    for effect in [
+        Effect::ReadOnly,
+        Effect::WritesFiles,
+        Effect::Executes,
+        Effect::Delegates,
+    ] {
+        assert_eq!(
+            authorize_call(&d.policy, effect).await.unwrap(),
+            Decision::Permit
+        );
+    }
+    assert!(auth_rx.try_recv().is_err(), "no request reached the screen");
 }
 
 #[cfg(feature = "delegation")]
@@ -853,12 +1234,19 @@ fn worker_test_row(id: &str) -> p1_tui::render::workers::WorkerBlock {
 
 /// A key stream over a channel, so a script can deliver an input at a chosen
 /// simulated instant — the shape `run` builds from crossterm's events.
+// notice: S5.11 (#357): fused, as crossterm's never-ending stream effectively is: the
+// summarizing component answers a `/compact` on a later poll, so the pump can see the
+// end of the keys before the idle loop polls them again.
 fn key_stream(
     rx: mpsc::UnboundedReceiver<Input>,
 ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Input>>> {
-    Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|input| (input, rx))
-    }))
+    use futures_util::StreamExt;
+    Box::pin(
+        futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|input| (input, rx))
+        })
+        .fuse(),
+    )
 }
 
 /// The handles a test script uses to poke the running loop.
@@ -870,7 +1258,7 @@ struct Wires {
     rows: Arc<Mutex<Vec<p1_tui::render::workers::WorkerBlock>>>,
     /// The driver's policy: an `authorize` call on it parks a request on the
     /// screen when the driver is under `--ask`.
-    policy: Arc<TuiPolicy>,
+    policy: Arc<AskBridge>,
     cancel: CancellationToken,
     draws: DrawCounter,
 }
@@ -1438,7 +1826,7 @@ async fn an_attached_workers_event_draws_immediately() {
 
 /// Park one authorization on the screen (handoff §7.5): the task resolves when
 /// the operator answers, exactly as the running turn's own call would.
-fn park_authorization(policy: &Arc<TuiPolicy>) -> tokio::task::JoinHandle<Decision> {
+fn park_authorization(policy: &Arc<AskBridge>) -> tokio::task::JoinHandle<Decision> {
     let call = p1_contracts::ToolCall {
         call_id: "c1".into(),
         name: "shell".into(),
@@ -1789,7 +2177,7 @@ fn a_worker_stream_is_buffered_for_attach_and_stays_out_of_the_parent() {
 async fn an_approval_while_attached_detaches_the_worker() {
     use p1_tui::state::PaneMode;
 
-    let (policy, mut auth_rx) = TuiPolicy::new(true, CancellationToken::new());
+    let (policy, mut auth_rx) = tui_policy(shipped(true), CancellationToken::new());
     let (mut d, _auth) = driver();
     d.policy = Arc::new(policy);
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
@@ -2060,7 +2448,8 @@ fn workflow_calls_build_the_tree_and_a_run_header_cancels_through_the_run_channe
             compact: false,
         },
         CancellationToken::new(),
-    );
+    )
+    .expect("the official release ships the policy");
     let mut events = front_end.events.lock().unwrap().take().unwrap();
     front_end.workflow_run_started(&crate::frontend::WorkflowRunStarted {
         id: "wf1".into(),
@@ -2272,10 +2661,11 @@ fn compacting_agent(
     journal: Arc<p1_testkit::RecordingJournal>,
     records: &[p1_contracts::JournalRecord],
 ) -> Agent {
-    let context = p1_context::SummarizingContext::new(
+    // notice: S5.11 (#357): the summarizer is the host entry p1/context/summarizing.
+    let context = crate::summary::summarizing_context(
         provider.clone(),
         p1_contracts::ModelOptions::default(),
-        p1_context::ContextConfig {
+        &crate::summary::ContextTable {
             window_tokens: 20_000,
             output_headroom_tokens: 1_000,
             summarize_at_tokens: 10_000,
@@ -2283,7 +2673,9 @@ fn compacting_agent(
             user_verbatim_tokens: 100,
             tool_result_excerpt_chars: 2_000,
         },
+        p1_context::DEFAULT_SUMMARY_OUTPUT_TOKENS,
         "summary prompt".into(),
+        None,
     )
     .expect("the summarizer builds");
     Agent::resume(
@@ -2532,4 +2924,346 @@ fn slash_compact_is_listed_in_help_and_is_a_command_while_working() {
     assert!(is_slash_command("/model gpt/x"));
     assert!(!is_slash_command("/usr/bin is where it lives"));
     assert!(!is_slash_command("compact"));
+}
+
+// ------------------------------------------------------ /modules reload (ADR-0084 §3)
+
+/// A scratch session environment: provider `reload-fake` (registered by the catalog
+/// hook [`driver_with_reload`] sets), no profile and no tools of its own.
+fn reload_environment() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join("reload-session");
+    std::fs::create_dir_all(&env).unwrap();
+    std::fs::write(
+        env.join("environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n",
+    )
+    .unwrap();
+    std::fs::write(env.join("prompt.md"), "hi").unwrap();
+    dir
+}
+
+/// A driver wired to the host's REAL model switch over [`reload_environment`], so a
+/// `/modules reload` really installs the next generation and leaves the run's own
+/// note. The scratch directory comes back with it: the caller keeps it alive.
+fn driver_with_reload() -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::TempDir) {
+    let dir = reload_environment();
+    let writer = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
+    let mut deps = HostDeps::new(
+        writer(),
+        writer(),
+        Arc::new(crate::StdinLines::new()),
+        Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+        "2026-01-01".to_string(),
+        Arc::new(crate::SignalInterrupt),
+        vec![dir.path().to_path_buf()],
+        false,
+    );
+    // No test reads the process environment.
+    deps.shell_env = Some(Vec::new());
+    let provider = Arc::new(p1_testkit::ScriptedProvider::new(Vec::new()));
+    deps.catalog_hook = Some(Box::new(move |catalog: &mut p1_assembly::Catalog| {
+        let provider = provider.clone();
+        catalog.provider(
+            "reload-fake",
+            Box::new(move |_spec| Ok(provider.clone() as Arc<dyn p1_contracts::Provider>)),
+        );
+    }));
+    let options = crate::cli::parse(&[
+        "--env".to_string(),
+        "reload-session".to_string(),
+        "--workspace".to_string(),
+        dir.path().display().to_string(),
+        "go".to_string(),
+    ])
+    .expect("the test args parse");
+    let front_end: Arc<dyn FrontEnd> = Arc::new(
+        crate::frontend::LineFrontEnd::new(&deps, &options, CancellationToken::new())
+            .expect("the official release ships the policy"),
+    );
+    let switch = Arc::new(
+        crate::run::model_switch_for_test(
+            &mut deps,
+            front_end,
+            "reload-session",
+            dir.path().to_path_buf(),
+        )
+        .expect("the test's model switch builds"),
+    );
+    let (mut d, _auth) = driver();
+    d.model_switch = Some(switch.clone());
+    (d, switch, dir)
+}
+
+#[test]
+fn modules_takes_only_reload() {
+    let (mut d, _auth) = driver();
+    d.slash("modules list", None);
+    assert_eq!(meta_rows(&d), ["· /modules takes reload"]);
+}
+
+#[test]
+fn modules_reload_with_no_switch_refuses_cleanly() {
+    let (mut d, mut agent) = driver_with_agent();
+    d.slash("modules reload", Some(&mut agent));
+    assert_eq!(
+        meta_rows(&d),
+        ["· switch refused · no model switch is available this run"]
+    );
+}
+
+#[test]
+fn a_modules_reload_typed_mid_turn_is_reported_pending() {
+    let (mut d, switch, _dir) = driver_with_reload();
+    // `agent` is `None` exactly while a turn borrows it: the session is busy.
+    d.slash("modules reload", None);
+    assert_eq!(meta_rows(&d), [p1_tui::input::RELOAD_PENDING_NOTE]);
+    assert!(
+        switch.reload_queue().take(),
+        "the busy request waits on the session's reload queue"
+    );
+    assert!(d.pending_switch.is_none(), "a reload is not a model switch");
+}
+
+/// ADR-0080 (S1.9): a `/modules reload` commits a new `Environment` with the reloaded
+/// modules, so the journal names that assembly — the reloaded set, not the one the
+/// session started with — once the install is `Ok`, before the next turn.
+#[tokio::test]
+async fn a_modules_reload_writes_an_assembly_line_naming_the_reloaded_set() {
+    let (mut d, switch, dir) = driver_with_reload();
+    let mut agent = test_agent();
+    assert!(
+        switch.assemblies_for_test().is_empty(),
+        "nothing is named before the reload"
+    );
+    // The release changes under the session: the reloaded environment assembles a
+    // module the started one did not.
+    std::fs::write(
+        dir.path().join("reload-session").join("environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n\n\
+         [[tools]]\nmodule = \"read\"\n",
+    )
+    .unwrap();
+    d.slash("modules reload", Some(&mut agent));
+    d.apply_reload(&mut agent).await;
+    let rows = meta_rows(&d);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("· modules reloaded · generation 1 ·")),
+        "{rows:?}"
+    );
+    let entries = switch.assemblies_for_test();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one line per installed reload: {entries:?}"
+    );
+    let identity = &entries[0].identity;
+    assert_eq!(identity.environment, "reload-session");
+    let named: Vec<(p1_journal::ModuleKind, &str)> = identity
+        .modules
+        .iter()
+        .map(|module| (module.kind, module.package.as_str()))
+        .collect();
+    // The main environment also carries the `worker_*` (and `workflow_*`) tools the
+    // host appends by feature; the reloaded module, the provider and the policy are
+    // what this reload is about.
+    assert_eq!(
+        named.first(),
+        Some(&(p1_journal::ModuleKind::Tool, "read")),
+        "the line names the reloaded module first: {identity:?}"
+    );
+    assert_eq!(
+        named[named.len() - 2..],
+        [
+            (p1_journal::ModuleKind::Provider, "reload-fake"),
+            (
+                p1_journal::ModuleKind::AuthorizationPolicy,
+                crate::policy::FULL_ACCESS_POLICY
+            ),
+        ],
+        "the line names the reloaded set: {identity:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_modules_reload_at_idle_applies_at_the_following_boundary() {
+    let (mut d, switch, _dir) = driver_with_reload();
+    let mut agent = test_agent();
+    // Idle: `agent` is `Some`, so nothing is queued as pending — the loop applies
+    // the request right after the key.
+    d.slash("modules reload", Some(&mut agent));
+    assert!(meta_rows(&d).is_empty(), "{:?}", meta_rows(&d));
+    d.apply_reload(&mut agent).await;
+    let rows = meta_rows(&d);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].starts_with("· modules reloaded · generation 1 ·"),
+        "{rows:?}"
+    );
+    assert!(!switch.reload_queue().take(), "one request applies once");
+}
+
+#[tokio::test]
+async fn apply_reload_with_nothing_queued_changes_nothing() {
+    let (mut d, _switch, _dir) = driver_with_reload();
+    let mut agent = test_agent();
+    d.apply_reload(&mut agent).await;
+    assert!(meta_rows(&d).is_empty(), "{:?}", meta_rows(&d));
+}
+
+/// ADR-0084 §3: a `/modules reload` typed while a turn runs queues on the session and
+/// applies at the turn's end — the same boundary a pending `/model` uses — through the
+/// real `drive_loop`, so the routing is exercised, not just the pieces of it.
+#[tokio::test(start_paused = true)]
+async fn a_modules_reload_typed_mid_turn_applies_at_the_turns_end() {
+    let (_d, switch, _dir) = driver_with_reload();
+    let scripted = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        p1_testkit::text_response("answer"),
+    ]));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(HeldProvider {
+        inner: scripted,
+        started: started.clone(),
+        release: release.clone(),
+        held: std::sync::atomic::AtomicBool::new(false),
+    });
+    let agent = Agent::new(p1_core::AgentParts {
+        provider,
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+        journal: Arc::new(p1_journal::MemoryJournal::new()),
+        events: Arc::new(p1_testkit::RecordingEvents::new()),
+    })
+    .expect("the turn's agent builds");
+    let mut harness =
+        IdleLoop::with_agent(ratatui::backend::TestBackend::new(96, 24), false, agent);
+    harness.driver.model_switch = Some(switch);
+    harness.driver.screen.composer.insert('g');
+    let keys = harness.wires.keys.clone();
+    let events = harness.wires.events.clone();
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    let script = async move {
+        // The turn's request is in flight and held: the session is busy.
+        started.notified().await;
+        events
+            .send(UiEvent::Agent(p1_tui::runtime::Stamped {
+                worker: None,
+                at_ms: 0,
+                event: p1_contracts::AgentEvent::TurnStarted,
+            }))
+            .unwrap();
+        for c in "/modules reload".chars() {
+            keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+        }
+        keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+        // Let the loop take every key (explicit scheduling, no clock).
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_one();
+        drop(keys);
+        drop(events);
+    };
+
+    let (code, driver, _agent) = run_with_own_wires(harness, script).await;
+
+    assert_eq!(code, 0);
+    let rows = meta_rows(&driver);
+    assert!(
+        rows.contains(&p1_tui::input::RELOAD_PENDING_NOTE),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("· modules reloaded · generation 1 ·")),
+        "the queued reload applied at the turn's end: {rows:?}"
+    );
+}
+
+/// §11 / ADR-0084 §3: a `/modules reload` typed AT IDLE applies right after that key —
+/// the loop's second boundary, where `agent` is free.
+#[tokio::test(start_paused = true)]
+async fn a_modules_reload_typed_at_idle_applies_right_after_the_key() {
+    let (_d, switch, _dir) = driver_with_reload();
+    let mut harness = IdleLoop::with_agent(
+        ratatui::backend::TestBackend::new(96, 24),
+        false,
+        test_agent(),
+    );
+    harness.driver.model_switch = Some(switch);
+    let keys = harness.wires.keys.clone();
+    for c in "/modules reload".chars() {
+        keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+    }
+    keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+    drop(keys);
+
+    let (code, driver, _agent) = run_with_own_wires(harness, async {}).await;
+
+    assert_eq!(code, 0);
+    let rows = meta_rows(&driver);
+    assert!(
+        !rows.contains(&p1_tui::input::RELOAD_PENDING_NOTE),
+        "at idle nothing is queued as pending: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("· modules reloaded · generation 1 ·")),
+        "the reload applied at once: {rows:?}"
+    );
+}
+
+/// ADR-0084 §3: the loop's third boundary — an inbox turn drains a worker's
+/// completion and the queued reload applies when that turn ends.
+#[tokio::test(start_paused = true)]
+async fn a_modules_reload_applies_after_an_inbox_turn() {
+    let (_d, switch, _dir) = driver_with_reload();
+    let scripted = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        p1_testkit::text_response("noted"),
+    ]));
+    let agent = Agent::new(p1_core::AgentParts {
+        provider: scripted,
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+        journal: Arc::new(p1_journal::MemoryJournal::new()),
+        events: Arc::new(p1_testkit::RecordingEvents::new()),
+    })
+    .expect("the inbox turn's agent builds");
+    let inbox = agent.inbox();
+    let mut harness =
+        IdleLoop::with_agent(ratatui::backend::TestBackend::new(96, 24), false, agent);
+    harness.driver.model_switch = Some(switch.clone());
+    // A reload requested while busy, and the worker's completion that drives the
+    // inbox turn the loop drains next.
+    switch.reload_queue().request(true);
+    inbox.send(p1_contracts::InboxKind::Notification, "w1 finished");
+    let keys = harness.wires.keys.clone();
+    let events = harness.wires.events.clone();
+    let script = async move {
+        // Let the inbox turn run and the boundary take the queued request; the
+        // senders stay open until then, so the loop cannot end early.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        drop(keys);
+        drop(events);
+    };
+
+    let (code, driver, _agent) = run_with_own_wires(harness, script).await;
+
+    assert_eq!(code, 0);
+    let rows = meta_rows(&driver);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("· modules reloaded · generation 1 ·")),
+        "the reload applied at the inbox boundary: {rows:?}"
+    );
 }

@@ -11,11 +11,13 @@ workspace = true
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
+# The `workspace` and `snapshot` capability traits this crate's native services implement.
+p1-module-runtime = { path = "../p1-module-runtime" }
+p1-read-guest = { path = "guest" }
 p1-workspace = { path = "../p1-workspace" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

@@ -1,6 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "crates/p1-hook-shadow", "crates/p1-tool-shell/guest"]
+members = [
+    "crates/*",
+    "crates/p1-hook-shadow",
+    "crates/p1-tool-read/guest",
+    "crates/p1-tool-shell/guest",
+    "crates/p1-tool-finish/guest",
+    "crates/p1-tool-edit/logic",
+    "crates/p1-tool-patch/logic",
+    "crates/p1-tool-search/logic",
+    "crates/p1-tool-write/logic",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -20,3 +30,21 @@ panic = "abort"
 
 [profile.dev]
 debug = "line-tables-only"
+
+# Test builds compile every loaded component from its bytes (no compiled cache,
+# p1-module-runtime loader.rs), so an unoptimised Cranelift makes each p1 process
+# start slowly. Optimising the compiler crates keeps debug builds usable.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+[profile.dev.package.wasmparser]
+opt-level = 3

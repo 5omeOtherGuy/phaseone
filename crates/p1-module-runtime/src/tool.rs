@@ -28,6 +28,7 @@ use thiserror::Error;
 use wasmtime::component::Val;
 
 use crate::capabilities::{LinkError, Services, capability_linker};
+use crate::delegation::link_worker_lists;
 use crate::executor::{ExecutionLimits, Executor};
 use crate::loader::{Epochs, LoadedModule, ModuleKind};
 use crate::restricted::Restricted;
@@ -118,16 +119,27 @@ impl WasmTool {
             name: name.clone(),
             reason: format!("{error:#}"),
         };
-        let linker = capability_linker(&module.engine, module.capabilities(), &services).map_err(
-            |source| ToolError::Link {
+        let mut linker = capability_linker(&module.engine, module.capabilities(), &services)
+            .map_err(|source| ToolError::Link {
                 name: name.clone(),
                 source,
-            },
-        )?;
+            })?;
+        // D084/D085: a module granted `workers-observe` also gets the two lists of its worker
+        // services, on both paths; `capability_linker` has already refused that grant when the
+        // worker services are missing.
+        let lists = services
+            .workers
+            .as_ref()
+            .filter(|_| module.capabilities().iter().any(|c| c == "workers-observe"))
+            .map(|workers| &workers.lists);
+        if let Some(lists) = lists {
+            link_worker_lists(&mut linker, lists).map_err(instantiate)?;
+        }
         let pre = linker
             .instantiate_pre(&module.component)
             .map_err(instantiate)?;
-        let restricted = Restricted::new(&module.engine, &module.component).map_err(instantiate)?;
+        let restricted = Restricted::with_worker_lists(&module.engine, &module.component, lists)
+            .map_err(instantiate)?;
 
         let declaration = restricted
             .call("declaration", &[])

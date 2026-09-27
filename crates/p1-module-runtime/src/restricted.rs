@@ -6,7 +6,8 @@
 //! runtime. They run here instead: on a second instance of the module that this adapter
 //! owns behind a `Mutex`, called on the caller's own thread, with no capability linked —
 //! every import is defined by [`Linker::define_unknown_imports_as_traps`], so an import
-//! called on this path traps — and with a tight fuel budget.
+//! called on this path traps — and with a tight fuel budget. The one exception (D085) is a
+//! tool's two read-only `workers-observe` lists, see [`Restricted::with_worker_lists`].
 //!
 //! The choice between the two ways of calling synchronously: this path uses a Store that
 //! never sees an asynchronous definition, and calls it with wasmtime's synchronous
@@ -28,6 +29,8 @@ use std::sync::Mutex;
 
 use wasmtime::component::{Component, Func, Instance, InstancePre, Linker, Val};
 use wasmtime::{Engine, Store};
+
+use crate::delegation::{WorkerLists, link_worker_lists};
 
 /// The fuel of one restricted call: enough for a module to parse its input and write a
 /// description, far too little to hide real work behind "inspection".
@@ -51,7 +54,23 @@ struct Live {
 
 impl Restricted {
     pub(crate) fn new(engine: &Engine, component: &Component) -> wasmtime::Result<Self> {
+        Self::with_worker_lists(engine, component, None)
+    }
+
+    /// As [`Restricted::new`], with the one exception D085 allows: a tool granted
+    /// `workers-observe` gets that interface's `grantable` and `environments` answered from
+    /// `lists`, the data fixed for its assembly, because its `declaration` builds its schema
+    /// from them. Both are synchronous, take no argument and have no effect; every other
+    /// import, the rest of `workers-observe` included, is still a trap.
+    pub(crate) fn with_worker_lists(
+        engine: &Engine,
+        component: &Component,
+        lists: Option<&WorkerLists>,
+    ) -> wasmtime::Result<Self> {
         let mut linker: Linker<()> = Linker::new(engine);
+        if let Some(lists) = lists {
+            link_worker_lists(&mut linker, lists)?;
+        }
         linker.define_unknown_imports_as_traps(component)?;
         let pre = linker.instantiate_pre(component)?;
         Ok(Self {

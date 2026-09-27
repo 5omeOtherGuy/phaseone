@@ -104,6 +104,10 @@ jobs:
             ( cd dist && sha256sum p1 > p1.sha256 )
             cat dist/p1.sha256
           fi
+          target_dir="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+          if [ -d "$target_dir/p1-candidate" ]; then
+            cp -a "$target_dir/p1-candidate" dist/candidate
+          fi
 
       - name: Upload artifact
         if: always()
@@ -130,7 +134,7 @@ jobs:
             echo "| scripts/gate.sh | ${{ steps.gate.outcome }} | $((build_start - gate_start)) |"
             echo "| cargo build -p p1-host | ${{ steps.build.outcome }} | $((now - build_start)) |"
             echo
-            echo "Artifact \`p1-build\`: p1, p1.sha256, gate.log."
+            echo "Artifact \`p1-build\`: p1, p1.sha256, gate.log, candidate/."
             echo
             echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } | tee -a "$GITHUB_STEP_SUMMARY"

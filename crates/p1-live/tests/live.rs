@@ -405,6 +405,11 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
 /// data, so a live check runs exactly what the host runs. `wire_model` is the live
 /// knob's model, which overrides the file's binding for the run.
 ///
+/// `route_provider` activates the provider COMPONENT the route's adapter names (D083b),
+/// from the module set the host itself would read: a live check needs the built modules
+/// (`scripts/build-modules.sh --all`; a debug build finds them through S3.8.0's discovery once
+/// it is on main). Only a `transport = "websocket"` route still builds a native adapter (S5.5).
+///
 /// The connector is injected next to the transport (ADR-0047 §1); a live check gets
 /// the REAL one, because the shipped Codex route asks for WebSocket.
 fn live_route(route_id: &str, profile_id: &str, wire_model: &str) -> Arc<dyn Provider> {
@@ -417,7 +422,11 @@ fn live_route(route_id: &str, profile_id: &str, wire_model: &str) -> Arc<dyn Pro
         .clone();
     binding.wire_model = wire_model.to_string();
     let credentials = p1_host::auth::credential_source(&route, Arc::new(ReqwestTransport::new()));
+    let components = p1_host::catalog::ProviderComponents::installed()
+        .expect("the module set a live check needs");
     p1_host::catalog::route_provider(
+        &components,
+        &dirs,
         &route,
         &binding,
         profile,

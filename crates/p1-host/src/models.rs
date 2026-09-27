@@ -114,6 +114,13 @@ pub struct Settings {
     pub workflows: Option<p1_workflow::WorkflowSettings>,
     #[serde(default)]
     pub shadow: Option<ShadowSettings>,
+    /// `[capabilities]` (ADR-0085 item 6): the worker and workflow families' run-time
+    /// switch, both enabled when absent. S6's type, read by `catalog/delegation.rs`.
+    ///
+    /// notice: S1's file; S6.8 adds this one `Settings` field and nothing else here
+    /// (D065/D068 pattern, ADR-0085 item 6).
+    #[serde(default)]
+    pub capabilities: crate::catalog::delegation::Capabilities,
 }
 
 /// The optional brain shadow binary in `[shadow]`.
