@@ -11,9 +11,10 @@ wasmtime runtime, the loader and the per-contract adapters (ADR-0081). Every too
 provider, context policy and authorization policy has a WebAssembly component
 package under `modules/`; the host instantiates a component only when the
 environment file or the release's host entries name it (ADR-0071). Today the
-policies and the worker/workflow members load as host entries, while the tools
-run native unless a `modules.lock` selects a component
-(crates/p1-host/src/catalog/tools.rs).
+policies, the worker/workflow members and the five file tools (`read`, `edit`,
+`write`, `apply_patch`, `grep` — S7.10-R1, ADR-0095) load as host entries, while
+the providers and the remaining keys run native unless a `modules.lock` selects a
+component (crates/p1-host/src/catalog/tools.rs).
 Enforcement, transport, interpreters and OS services stay native: the sandbox
 boundary, the provider transport broker, the workflow interpreter, workspace
 confinement, credentials, the journal and the terminal UI (ADR-0081). The boundary

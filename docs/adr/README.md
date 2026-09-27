@@ -108,6 +108,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0092 | [Call-scoped capability services and a hostcall budget sized for whole files](0092-call-scoped-capability-services-and-a-hostcall-budget-sized-for-whole-files.md) | proposed | 2026-09-27 | lead |
 | ADR-0093 | [Route settings validation is host-owned and the native route constructors leave p1-host](0093-route-settings-validation-is-host-owned-and-the-native-route-constructors-leave-p1-host.md) | proposed | 2026-09-27 | lead |
 | ADR-0094 | [Resume scanner and workflow report formatter move into the foundation crates](0094-resume-scanner-and-workflow-report-formatter-move-into-the-foundation-crates.md) | proposed | 2026-09-27 | lead |
+| ADR-0095 | [File-tool capability services live in the runtime; no native file-tool fallback](0095-file-tool-capability-services-live-in-the-runtime-no-native-file-tool-fallback.md) | proposed | 2026-09-27 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
