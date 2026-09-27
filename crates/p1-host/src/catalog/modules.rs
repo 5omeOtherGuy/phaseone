@@ -310,6 +310,16 @@ pub fn load_locked_modules(
     lock: &ModulesLock,
     release_manifest: &Path,
 ) -> Result<Vec<ModulePackage>, ModulesError> {
+    load_locked_modules_except(lock, release_manifest, &[])
+}
+
+/// [`load_locked_modules`] without the keys in `skip`: the [`HOST_COMPOSED_ENTRIES`] a lock
+/// names are loaded by the host-entry step, which hands them to the host's own registration.
+fn load_locked_modules_except(
+    lock: &ModulesLock,
+    release_manifest: &Path,
+    skip: &[&str],
+) -> Result<Vec<ModulePackage>, ModulesError> {
     let release_error = |source| ModulesError::Release {
         path: release_manifest.to_owned(),
         source: Box::new(source),
@@ -318,32 +328,45 @@ pub fn load_locked_modules(
     manifest.check_unique_digests().map_err(release_error)?;
     let mut packages = Vec::new();
     // The loader starts an epoch thread; a release nothing selects needs none.
-    if lock.is_empty() {
+    if lock.iter().all(|(module, _)| skip.contains(&module)) {
         return Ok(packages);
     }
     let root = release_manifest.parent().unwrap_or(Path::new("."));
     let loader = Loader::new(manifest.clone(), root)
         .map_err(|error| ModulesError::Runtime(Box::new(error)))?;
     for (module, locked) in lock.iter() {
-        if let Some(entry) = manifest.entry(&locked.package) {
-            check_lock(module, locked, entry)?;
-            check_allocation(module, entry)?;
+        if skip.contains(&module) {
+            continue;
         }
-        // A package the manifest lacks is the loader's refusal to report: official source.
-        let loaded = loader
-            .load(&locked.package)
-            .map_err(|source| ModulesError::Load {
-                module: module.to_owned(),
-                lock: locked.source.clone(),
-                source: Box::new(source),
-            })?;
-        packages.push(ModulePackage {
-            module: module.to_owned(),
-            lock: locked.source.clone(),
-            loaded,
-        });
+        packages.push(load_locked_entry(&loader, &manifest, module, locked)?);
     }
     Ok(packages)
+}
+
+/// Verifies the lock's pin and the class allocation of `module`'s package, then compiles it.
+fn load_locked_entry(
+    loader: &Loader,
+    manifest: &ReleaseManifest,
+    module: &str,
+    locked: &LockedModule,
+) -> Result<ModulePackage, ModulesError> {
+    if let Some(entry) = manifest.entry(&locked.package) {
+        check_lock(module, locked, entry)?;
+        check_allocation(module, entry)?;
+    }
+    // A package the manifest lacks is the loader's refusal to report: official source.
+    let loaded = loader
+        .load(&locked.package)
+        .map_err(|source| ModulesError::Load {
+            module: module.to_owned(),
+            lock: locked.source.clone(),
+            source: Box::new(source),
+        })?;
+    Ok(ModulePackage {
+        module: module.to_owned(),
+        lock: locked.source.clone(),
+        loaded,
+    })
 }
 
 /// The lock pins the release's digest, world and protocol, or the selection is refused.
@@ -677,7 +700,11 @@ fn register_locked_modules_from(
     }
     let release = release.ok_or_else(|| ModulesError::NoRelease.to_string())?;
     announce_release(deps, &release);
-    let packages = load_locked_modules(&lock, &release).map_err(|error| error.to_string())?;
+    // A lock-selected shell or finish still needs the host's process service or completion hub,
+    // so the host-entry step hands it to the host's registration instead
+    // ([`register_composed_host_entries`]).
+    let packages = load_locked_modules_except(&lock, &release, &HOST_COMPOSED_ENTRIES)
+        .map_err(|error| error.to_string())?;
     // A member a lock selects is a member of its family all the same: it takes the host's
     // lists and grant check, as a host entry does, not only the family's scopes
     // (`catalog/delegation.rs`, D084).
@@ -721,8 +748,9 @@ pub(crate) fn register_host_entries_from(
 /// [`HOST_COMPOSED_ENTRIES`], S3.8's shell and finish — through the one shared step: for each
 /// key, its package is loaded from the official release, verified against it and handed to the
 /// registration, which builds the catalog tool around it. A user lock that names the key leaves
-/// the release's package unloaded, exactly as it does for `read`
-/// ([`register_locked_modules`] registers the lock's package instead).
+/// the release's package unloaded, exactly as it does for `read`, and the lock's package is
+/// handed to the same registration, so it is linked with the host's services
+/// ([`register_locked_modules`] leaves these keys alone).
 pub(crate) fn register_composed_host_entries(
     catalog: &mut Catalog,
     deps: &HostDeps,
@@ -758,16 +786,21 @@ fn register_entries_from(
 ) -> Result<(), String> {
     let mut packages = Vec::new();
     for (key, package) in entries {
-        if lock_selects(&deps.environment_dirs, key) {
-            // A user lock names this key: its package is what the locked-module registration
-            // registers. The release entry must not be registered as well, or the two would
-            // collide.
-            continue;
-        }
         let registration = composed
             .iter()
             .find(|(registered, _)| registered == key)
             .map(|(_, registration)| registration);
+        if lock_selects(&deps.environment_dirs, key) {
+            // A user lock names this key: its package is what runs, never the release entry's,
+            // or the two would collide. A key the host composes takes the lock's package
+            // through the host's registration, which links the services the shared one lacks;
+            // any other key is the locked-module registration's.
+            if let Some(registration) = registration {
+                let locked = load_locked_host_entry(deps, key, release.as_deref())?;
+                registration(catalog, Arc::new(locked.loaded))?;
+            }
+            continue;
+        }
         if registration.is_none() && HOST_COMPOSED_ENTRIES.contains(key) {
             // The host's own entry: it is loaded and registered by the step that owns its tool
             // key ([`register_composed_host_entries`]), never by the shared registration.
@@ -793,6 +826,34 @@ fn register_entries_from(
     }
     register_modules(catalog, packages, locked_module_services(deps))
         .map_err(|error| error.to_string())
+}
+
+/// The package a user lock selects for the host-composed key `key`, verified against `release`
+/// exactly as [`load_locked_modules`] verifies it.
+fn load_locked_host_entry(
+    deps: &HostDeps,
+    key: &str,
+    release: Option<&Path>,
+) -> Result<ModulePackage, String> {
+    let lock = load_modules_lock(&deps.environment_dirs).map_err(|error| error.to_string())?;
+    let locked = lock
+        .resolve(key)
+        .ok_or_else(|| format!("modules.lock no longer names `{key}`"))?;
+    let release = release.ok_or_else(|| ModulesError::NoRelease.to_string())?;
+    announce_release(deps, release);
+    let release_error = |source| {
+        ModulesError::Release {
+            path: release.to_owned(),
+            source: Box::new(source),
+        }
+        .to_string()
+    };
+    let manifest = ReleaseManifest::read(release).map_err(release_error)?;
+    manifest.check_unique_digests().map_err(release_error)?;
+    let root = release.parent().unwrap_or(Path::new("."));
+    let loader = Loader::new(manifest.clone(), root)
+        .map_err(|error| ModulesError::Runtime(Box::new(error)).to_string())?;
+    load_locked_entry(&loader, &manifest, key, locked).map_err(|error| error.to_string())
 }
 
 /// The package sources an assembly identity names (ADR-0080): the `modules.lock` the catalog's
@@ -1250,6 +1311,54 @@ mod tests {
         let resolved = sources.resolve("read").expect("the lock resolves the key");
         assert_eq!(resolved.name, p1_module_tests::FIXTURE_NAME);
         assert_eq!(resolved.digest, entry["digest"].as_str().expect("digest"));
+    }
+
+    /// A user lock that names `shell` hands the LOCK's package to the host's own registration,
+    /// which links the process service the shared locked-module services lack; the locked-module
+    /// registration leaves the key alone, so the two never collide.
+    #[test]
+    fn a_lock_selected_shell_reaches_the_host_registration() {
+        let entry = built_entry("p1-module-shell");
+        let release = tempfile::tempdir().expect("release dir");
+        let wasm = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/target/p1-modules/p1-module-shell/p1-module-shell.wasm");
+        let component = release
+            .path()
+            .join(entry["path"].as_str().expect("entry path"));
+        std::fs::create_dir_all(component.parent().expect("package dir")).expect("package dir");
+        std::fs::copy(&wasm, &component).expect("the built p1-module-shell component");
+        let manifest = write_release_manifest(release.path(), std::slice::from_ref(&entry));
+        let (config, dirs) = config_without_lock();
+        std::fs::write(
+            config.path().join("modules.lock"),
+            p1_module_tests::lock_text("shell", &entry),
+        )
+        .expect("lock");
+        let deps = quiet_deps(dirs);
+
+        let handed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = handed.clone();
+        let registration: HostEntryRegistration =
+            Box::new(move |_catalog: &mut Catalog, module: Arc<LoadedModule>| {
+                recorded.lock().unwrap().push(module);
+                Ok(())
+            });
+        let mut catalog = Catalog::new();
+        register_entries_from(
+            &mut catalog,
+            &deps,
+            &HOST_ENTRIES,
+            Some(manifest.clone()),
+            &[("shell", registration)],
+        )
+        .expect("the lock's p1/shell loads");
+        let handed = handed.lock().unwrap();
+        assert_eq!(handed.len(), 1, "the lock's package is handed over once");
+        assert_eq!(handed[0].identity().implementation, "p1/shell");
+
+        register_locked_modules_from(&mut catalog, &deps, Some(manifest))
+            .expect("the locked-module registration leaves the key alone");
+        assert!(catalog.tool_keys().is_empty(), "no shared registration");
     }
 
     /// S1.8.1: with no lock, the host entry registers the release's package under the key, its

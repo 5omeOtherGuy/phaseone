@@ -350,8 +350,9 @@ pub(super) fn register_standard_tools(
     // entries (ADR-0083, D083b, D-XO-49). They are listed in `HOST_ENTRIES` beside `read`'s, and
     // the one shared host-entry step loads each package from the release manifest, verifies it
     // against that same manifest — its class allocation included — and hands it to the
-    // registration built here, so `load_release_module` is gone and a key a user lock names is
-    // left to the locked-module registration exactly as `read` is.
+    // registration built here, so `load_release_module` is gone. A key a user lock names takes
+    // the lock's package instead, through the same registration, so it keeps the host's
+    // process service and completion hub.
     register_composed_host_entries(
         catalog,
         deps,
