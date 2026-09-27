@@ -297,7 +297,7 @@ pub struct Services {
     /// The `workflows` capability ([`crate::delegation`], S6).
     pub workflows: Option<WorkflowServices>,
     /// The services whose state belongs to ONE export call (the read record a mutation
-    /// rechecks against, ADR-0090): called once at the start of every call, before its
+    /// rechecks against, ADR-0091): called once at the start of every call, before its
     /// Store, and each service it returns serves that call in place of the field above.
     /// The fields above are what the linker checks against the manifest, so a scope
     /// returns a service only where the field above holds one.
@@ -1317,7 +1317,7 @@ mod tests {
     }
 
     /// A call-scoped part is built at the start of every call and serves that call alone
-    /// (ADR-0090); what the scope does not return is the assembly's, shared as before.
+    /// (ADR-0091); what the scope does not return is the assembly's, shared as before.
     #[test]
     fn every_call_gets_its_own_call_scoped_services() {
         struct NoGate;

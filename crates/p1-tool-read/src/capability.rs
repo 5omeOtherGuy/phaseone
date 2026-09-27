@@ -14,7 +14,7 @@
 //! owned mutation (`p1-tool-write`, U-mut), so `p1/read`, `p1/edit`, `p1/write`, `p1/patch`
 //! and `p1/search` are all linked from one place. A read through this capability is not an
 //! observation; it is recorded in the call's [`ReadRecord`] instead, which the mutation
-//! rechecks under the gate (docs/design/modules/workspace-mutation.md, step 3; ADR-0090).
+//! rechecks under the gate (docs/design/modules/workspace-mutation.md, step 3; ADR-0091).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -106,7 +106,7 @@ impl ReadCapability {
 /// for the edit and write rows, `Some(PatchAuthorized)` for the patch row, `None` for a
 /// tool that does not mutate (its manifest does not grant `workspace-mutation` either way).
 ///
-/// The services are call-scoped (ADR-0090): every export call gets its own read side and
+/// The services are call-scoped (ADR-0091): every export call gets its own read side and
 /// mutation service over one fresh [`ReadRecord`], so the gated write of a call refuses a
 /// target another agent changed after THIS call's read, and no read of an earlier or a
 /// concurrent call of the same tool satisfies or blocks it.

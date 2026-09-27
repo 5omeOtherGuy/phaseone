@@ -15,7 +15,7 @@
 //! How a call is bounded (freeze item 4):
 //! - **Hostcall fuel.** What one import call may make the host allocate while lifting its
 //!   arguments is [`HOSTCALL_FUEL`]: a whole file of up to [`MAX_TRANSFER_BYTES`] and no
-//!   more (ADR-0090).
+//!   more (ADR-0091).
 //! - **Fuel.** Each call starts with [`ExecutionLimits::fuel`]; running out traps as
 //!   `FuelExhausted`. The guest also yields to the Tokio scheduler every
 //!   [`FUEL_YIELD_INTERVAL`] of fuel, so a busy guest never starves the caller's runtime,
@@ -64,7 +64,7 @@ pub const FUEL_YIELD_INTERVAL: u64 = 1_000_000;
 
 /// The largest byte list a guest may hand the host in one import call: a whole file a
 /// component passes `snapshot.check`, `snapshot.observe` or a `workspace-mutation` write
-/// (ADR-0090). The workspace sets no file size of its own, so this is the file size a
+/// (ADR-0091). The workspace sets no file size of its own, so this is the file size a
 /// component can edit, write or patch; the native tools have none.
 pub const MAX_TRANSFER_BYTES: usize = 16 << 20;
 

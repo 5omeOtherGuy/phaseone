@@ -20,7 +20,10 @@
 //! knowledge: an adapter supplies a request builder and a [`ResponseParser`].
 //! The transport broker ([`broker_drive`]) sends a provider component's
 //! [`LoweredHttpRequest`] through the same [`drive`], after its [`RouteAuthority`]
-//! has kept the request on the route's endpoint and attached the credential itself.
+//! has kept the request on the route's endpoint and attached the credential itself;
+//! a component's WebSocket lowering goes through [`ws_drive`] and the host session of
+//! [`ws_session`], with the same credential rule and the HTTP fallback through
+//! [`broker_drive`].
 //!
 //! The authoritative spec is `docs/design/providers.md`. The five stream rules
 //! the returned stream obeys are at the top of `p1-contracts/src/provider.rs`.
@@ -43,6 +46,8 @@ mod sse;
 mod status;
 #[cfg(feature = "native")]
 pub mod ws;
+#[cfg(feature = "native")]
+mod ws_drive;
 #[cfg(feature = "native")]
 pub mod ws_session;
 
@@ -68,6 +73,8 @@ pub use parser::ResponseParser;
 pub use retry::RetryPolicy;
 pub use sse::{SseDecoder, SseEvent};
 pub use status::{HttpClass, classify_status, reset_after, retry_after};
+#[cfg(feature = "native")]
+pub use ws_drive::{WsDriveRequest, WsLower, WsLowered, ws_drive, ws_lease};
 
 /// Test doubles for the transport seam. Enabled by the `testing` feature, and
 /// always available to this crate's own tests.

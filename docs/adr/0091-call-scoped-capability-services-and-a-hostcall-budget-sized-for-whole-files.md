@@ -1,5 +1,5 @@
 ---
-adr: 90
+adr: 91
 title: Call-scoped capability services and a hostcall budget sized for whole files
 status: proposed
 date: 2026-09-27
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [PR #386 Codex review (crates/p1-tool-read/src/capability.rs, crates/p1-module-runtime/src/capabilities.rs), PR #386 comments (XO 2026-09-27 01:44, review-fix 02:25), docs/adr/0082-component-abi-and-execution-ownership.md, docs/adr/0088-workspace-capabilities-across-components.md, docs/design/modules/workspace-mutation.md, docs/design/modules/cancellation.md]
 ---
-# ADR-0090: Call-scoped capability services and a hostcall budget sized for whole files
+# ADR-0091: Call-scoped capability services and a hostcall budget sized for whole files
 
 ## Context
 
