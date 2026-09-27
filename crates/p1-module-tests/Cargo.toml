@@ -63,6 +63,9 @@ p1-workspace = { path = "../p1-workspace" }
 # S3.7: the finish boundary suite compares the component's committed state and declaration
 # with the native tool's types and texts.
 p1-tool-finish = { path = "../p1-tool-finish" }
+# delegation_activation.rs (S7.10-R6): the native `workflow_result`, which p1-host no longer
+# depends on, is checked for one report text with the member and `p1_workflow::render_report`.
+p1-tool-workflow = { path = "../p1-tool-workflow" }
 # provider_wire.rs (S4.4): the provider adapters' portable halves, their wire forms and
 # the model policy they are composed with. `default-features = false` because a provider
 # component reaches no transport, runtime or credential code.
