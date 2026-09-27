@@ -14,12 +14,13 @@
 //! proves), so no live network is possible and no credential is read. `HOME`,
 //! `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `P1_CONFIG_DIR` all live inside the scratch tree.
 //!
-//! Every negative case is EXPECTED RED on main today: none of these packages is a host entry
-//! yet, so the host never looks for it and the native code answers — the silent native answer
-//! D083b item 4 forbids. Each case turns green when its owner slice lands; each case's `owner`
-//! names that slice, and every failure message repeats it. A case matches the package name in
-//! stderr plus a non-zero exit, never the owners' exact wording, and asserts that no request
-//! reached the endpoint before that failure.
+//! Every case's owner slice has landed on main (S1.8.1, S3.8, S4.9, S5.11, S6.11), so the
+//! host composes each of these packages itself and a release missing one fails naming it
+//! instead of answering natively — the silent native answer D083b item 4 forbids. A case whose
+//! package the host does not compose yet is red until its owner slice lands; each case's
+//! `owner` names that slice, and every failure message repeats it. A case matches the package
+//! name in stderr plus a non-zero exit, never the owners' exact wording, and asserts that no
+//! request reached the endpoint before that failure.
 //!
 //! The control case runs the same way over the complete release: it must get past assembly to
 //! the refusing endpoint, and it must fail there with the provider's transport error. That is
@@ -267,7 +268,7 @@ fn missing_host_entry(class: &Class) {
     assert!(
         stderr.contains(class.package),
         "the {} class: a release without {} must fail startup naming it instead of answering \
-         natively (expected red until {} lands); stderr was: {stderr}",
+         natively (the slice that composes it is {}); stderr was: {stderr}",
         class.name,
         class.package,
         class.owner
