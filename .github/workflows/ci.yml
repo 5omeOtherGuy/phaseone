@@ -117,6 +117,10 @@ jobs:
 
       - name: Build the modules the tests load (scripts/gate.sh's modules step)
         run: scripts/build-modules.sh --all
+      - name: Build the p1 binary the release tests copy (fresh from this tree; P1_BIN, no nested cargo)
+        run: |
+          cargo build --locked -p p1-host --bin p1
+          echo "P1_BIN=$(cargo metadata --no-deps --format-version 1 --locked | jq -r .target_directory)/debug/p1" >> "$GITHUB_ENV"
       - name: cargo test -p p1-module-tests (its heaviest test binaries)
         run: timeout --foreground 3600 cargo test --locked -p p1-module-tests --test installed_release --test provider_conformance
 
@@ -174,6 +178,10 @@ jobs:
       # here by default: the lib and bin unit tests, every integration test not in
       # test-modules-a, and the doctests. Together with test-modules-a this is exactly
       # `cargo test -p p1-module-tests`.
+      - name: Build the p1 binary the release tests copy (fresh from this tree; P1_BIN, no nested cargo)
+        run: |
+          cargo build --locked -p p1-host --bin p1
+          echo "P1_BIN=$(cargo metadata --no-deps --format-version 1 --locked | jq -r .target_directory)/debug/p1" >> "$GITHUB_ENV"
       - name: cargo test -p p1-module-tests (every other target)
         shell: bash
         run: |
