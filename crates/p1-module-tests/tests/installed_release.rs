@@ -656,13 +656,12 @@ fn verify_installed_components(modules_root: &Path, manifest: &Value) {
 async fn load_every_installed_component(modules_root: &Path) {
     let manifest_path = modules_root.join("manifest.json");
     let manifest = ReleaseManifest::read(&manifest_path).expect("read the installed manifest");
-    // Every interface an installed component imports is linked but one: the provider
-    // interfaces (http, websocket, credential-control) by S4.7, the worker and workflow
-    // interfaces (workers-start, workers-observe, workers-control, workflows) by S6.7 (D057),
-    // and `workspace` and `snapshot` by S1. S2's mutating file tools (edit, write, patch) also
-    // import `workspace-mutation`, which the runtime links only once p1-workspace's mutation
-    // service is wired, so their refusal is expected until then; `p1/search` must load.
-    const UNLINKED: [&str; 1] = ["workspace-mutation"];
+    // Every interface an installed component imports is linked: the provider interfaces
+    // (http, websocket, credential-control) by S4.7, the worker and workflow interfaces
+    // (workers-start, workers-observe, workers-control, workflows) by S6.7 (D057), `workspace`
+    // and `snapshot` by S1, and `workspace-mutation` (edit, write, patch) by S2 (U-mut.2). So
+    // every installed component must load; the list stays for the next family to arrive.
+    const UNLINKED: [&str; 0] = [];
 
     let entries: Vec<(String, Vec<String>)> = manifest
         .components()

@@ -46,9 +46,9 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// services a provider component's `stream` uses (S4.7); the worker and workflow interfaces
 /// to the caller's services in [`crate::delegation`] (S6, B-S6-8); `workspace` (its read side)
 /// and `snapshot` to the caller's [`WorkspaceService`](crate::capabilities::WorkspaceService)
-/// and [`SnapshotService`](crate::capabilities::SnapshotService) (S1). `workspace-mutation` is
-/// S2's and stays refused.
-pub(crate) const LINKABLE_CAPABILITIES: [&str; 15] = [
+/// and [`SnapshotService`](crate::capabilities::SnapshotService) (S1); `workspace-mutation` to
+/// the caller's [`MutationService`](crate::capabilities::MutationService) (S2, beside S1's).
+pub(crate) const LINKABLE_CAPABILITIES: [&str; 16] = [
     "control",
     "clock",
     "random",
@@ -64,6 +64,7 @@ pub(crate) const LINKABLE_CAPABILITIES: [&str; 15] = [
     "workflows",
     "workspace",
     "snapshot",
+    "workspace-mutation",
 ];
 
 /// The interface every world imports for its types; it grants nothing.
@@ -553,9 +554,10 @@ mod tests {
                 "workflows",
                 "workspace",
                 "snapshot",
+                "workspace-mutation",
             ]
         );
-        for refused in ["notices", "filesystem", "workspace-mutation"] {
+        for refused in ["notices", "filesystem"] {
             assert!(!LINKABLE_CAPABILITIES.contains(&refused), "{refused}");
         }
     }

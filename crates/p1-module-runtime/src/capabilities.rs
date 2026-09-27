@@ -1,7 +1,7 @@
 //! The capabilities this runtime links into a module's per-call instance, and only those the
 //! manifest grants (freeze item 3): `control`, `clock` and `random` are the runtime's own,
-//! `process`, `summary`, `completion`, `workspace` and `snapshot` are services the caller
-//! passes in explicitly — there is no registry.
+//! `process`, `summary`, `completion`, `workspace`, `snapshot` and `workspace-mutation` are
+//! services the caller passes in explicitly — there is no registry.
 //!
 //! Every import is an asynchronous host function (`func_wrap_async` / `func_new_async`):
 //! the guest sees a plain call, the host awaits without blocking a thread. The dynamic
@@ -128,11 +128,59 @@ pub struct WorkspaceEntry {
     pub size: u64,
 }
 
+/// A content search as a module asks for it (`workspace.search-query`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchQuery {
+    /// A regular expression in the host's (ripgrep) syntax.
+    pub pattern: String,
+    /// The file or directory to search; the root when absent.
+    pub path: Option<String>,
+    /// Keeps only matching files.
+    pub glob: Option<String>,
+    /// Match regardless of case.
+    pub case_insensitive: bool,
+    /// Lines of context before and after each match.
+    pub context: u32,
+    /// The most lines (matches and context) the result carries.
+    pub max_lines: u32,
+}
+
+/// One match or context line (`workspace.search-line`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchLine {
+    /// One-based.
+    pub line_number: u64,
+    /// The line without its terminator.
+    pub text: String,
+    /// False for a context line.
+    pub is_match: bool,
+}
+
+/// The lines one file contributed (`workspace.file-matches`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMatches {
+    /// Relative to the workspace root, `/`-separated.
+    pub path: String,
+    /// In file order.
+    pub lines: Vec<SearchLine>,
+}
+
+/// What a search found (`workspace.search-result`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchResult {
+    /// In walk order.
+    pub files: Vec<FileMatches>,
+    /// The search stopped at `max_lines` before the walk ended.
+    pub truncated: bool,
+    /// Files with matches after the one where it stopped.
+    pub omitted_files: u64,
+}
+
 /// The read side of the confined workspace a module's `workspace` capability is linked to
-/// (`p1-workspace`, S1). Confinement is the service's: every path it is given is the
-/// module's, unchecked. Only `stat` and `read` are linked; `list-files` and `search` belong
-/// to the slice that moves a tool needing them, and a module importing them fails to
-/// instantiate until then.
+/// (`p1-workspace`). Confinement is the service's: every path it is given is the module's,
+/// unchecked. `stat` and `read` are S1's; `list-files` and `search` were added beside them by
+/// S2 for the search tool (U-search.3), with default bodies that refuse, so a service for a
+/// tool that is not granted the walk (S1's read capability) needs no code for them.
 pub trait WorkspaceService: Send + Sync {
     /// Resolves `path` and describes what is there.
     fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>>;
@@ -145,7 +193,30 @@ pub trait WorkspaceService: Send + Sync {
         offset: u64,
         length: u64,
     ) -> BoxFuture<'_, Result<Vec<u8>, FsError>>;
+
+    /// The files under the directory `path`, sorted, relative to the root; `glob` keeps only
+    /// matching files. The default refuses: only a search service walks the workspace.
+    fn list_files(
+        &self,
+        path: String,
+        glob: Option<String>,
+    ) -> BoxFuture<'_, Result<Vec<String>, FsError>> {
+        let _ = (path, glob);
+        Box::pin(async { Err(FsError::Io(LIST_FILES_NOT_GRANTED.to_owned())) })
+    }
+
+    /// Searches file contents with the walk of `list_files`. The default refuses, as
+    /// `list_files` does.
+    fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<SearchResult, FsError>> {
+        let _ = query;
+        Box::pin(async { Err(FsError::Io(SEARCH_NOT_GRANTED.to_owned())) })
+    }
 }
+
+/// The refusal of a workspace service that does not walk the workspace.
+pub const LIST_FILES_NOT_GRANTED: &str = "list-files is not granted to this tool";
+/// The refusal of a workspace service that does not search the workspace.
+pub const SEARCH_NOT_GRANTED: &str = "search is not granted to this tool";
 
 /// What an agent's last observation of a path says about contents it read again
 /// (`snapshot.observation`).
@@ -173,6 +244,35 @@ pub trait SnapshotService: Send + Sync {
     ) -> BoxFuture<'_, Result<SnapshotObservation, FsError>>;
 }
 
+/// The write side of the confined workspace a module's `workspace-mutation` capability is
+/// linked to (`p1-workspace`'s owned mutation, S2). The host builds one per agent, over the
+/// agent's observations and with the mutation policy of the assembly (observed for edit and
+/// write, patch-authorized for patch): the module never chooses it.
+pub trait MutationService: Send + Sync {
+    /// Waits for the workspace's write gate without blocking a thread and returns it held.
+    /// The runtime drops this future when the call is cancelled while it waits, so waiting
+    /// must hold nothing.
+    fn begin(&self) -> BoxFuture<'_, Box<dyn HeldMutation>>;
+}
+
+/// The write gate held for one export call (`workspace-mutation.mutation`). Dropping it
+/// releases the gate: the runtime drops it when the module drops the resource and, at the
+/// latest, when the call ends (however it ends).
+pub trait HeldMutation: Send {
+    /// Replaces the file at `path` with `contents`, creating missing parent directories.
+    fn write(&self, path: String, contents: Vec<u8>) -> BoxFuture<'_, Result<(), FsError>>;
+
+    /// As `write`, but `AlreadyExists` when anything is at `path`.
+    fn create(&self, path: String, contents: Vec<u8>) -> BoxFuture<'_, Result<(), FsError>>;
+
+    /// Removes the file at `path`.
+    fn remove(&self, path: String) -> BoxFuture<'_, Result<(), FsError>>;
+
+    /// Moves the file at `old_path` to `new_path`; `AlreadyExists` when anything is at
+    /// `new_path`.
+    fn rename(&self, old_path: String, new_path: String) -> BoxFuture<'_, Result<(), FsError>>;
+}
+
 /// The services a caller grants a module; each is linked only when the manifest grants the
 /// capability too.
 #[derive(Clone, Default)]
@@ -189,6 +289,8 @@ pub struct Services {
     pub workspace: Option<Arc<dyn WorkspaceService>>,
     /// The `snapshot` capability (S1).
     pub snapshot: Option<Arc<dyn SnapshotService>>,
+    /// The `workspace-mutation` capability (S2).
+    pub workspace_mutation: Option<Arc<dyn MutationService>>,
     /// The `workers-start`, `workers-observe` and `workers-control` capabilities, one
     /// optional service each ([`crate::delegation`], S6).
     pub workers: Option<WorkerServices>,
@@ -287,6 +389,10 @@ pub(crate) struct CallState {
     pub(crate) completion: Option<Arc<dyn CompletionService>>,
     workspace: Option<Arc<dyn WorkspaceService>>,
     snapshot: Option<Arc<dyn SnapshotService>>,
+    workspace_mutation: Option<Arc<dyn MutationService>>,
+    /// How many `workspace-mutation.mutation` resources this call holds in its table: the
+    /// gate is not re-entrant, so a `begin` while one is held would wait on itself.
+    mutations_held: usize,
     /// The origin of `clock.monotonic-now`, fixed per instance.
     origin: Instant,
     /// The call was cancelled and its fuel cut to the grace it gets to return.
@@ -303,6 +409,8 @@ impl CallState {
             completion: services.completion.clone(),
             workspace: services.workspace.clone(),
             snapshot: services.snapshot.clone(),
+            workspace_mutation: services.workspace_mutation.clone(),
+            mutations_held: 0,
             origin: Instant::now(),
             cancel_grace: false,
         }
@@ -376,6 +484,12 @@ pub(crate) fn capability_linker(
                     return Err(LinkError::MissingService(capability.clone()));
                 }
                 link_snapshot(&mut linker)
+            }
+            "workspace-mutation" => {
+                if services.workspace_mutation.is_none() {
+                    return Err(LinkError::MissingService(capability.clone()));
+                }
+                link_workspace_mutation(&mut linker)
             }
             "workers-start" => match services.workers.as_ref().and_then(|w| w.start.clone()) {
                 Some(start) => link_workers_start(&mut linker, start),
@@ -619,7 +733,128 @@ fn link_workspace(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
             );
             Ok(())
         })
+    })?;
+    workspace.func_new_async("list-files", |store, _ty, params, results| {
+        Box::new(async move {
+            let path = string_param(params, 0, "workspace.list-files")?;
+            let glob = option_string(params.get(1), "workspace.list-files", "glob")?;
+            let Some(service) = store.data().workspace.clone() else {
+                bail!("workspace.list-files called without a workspace service");
+            };
+            let cancel = store.data().cancel.clone();
+            results[0] = fs_result(
+                unless_cancelled(&cancel, service.list_files(path, glob))
+                    .await
+                    .map(|paths| Some(Val::List(paths.into_iter().map(Val::String).collect()))),
+            );
+            Ok(())
+        })
+    })?;
+    workspace.func_new_async("search", |store, _ty, params, results| {
+        Box::new(async move {
+            let Some(query) = params.first() else {
+                bail!("workspace.search called without its query");
+            };
+            let query = search_query(query)?;
+            let Some(service) = store.data().workspace.clone() else {
+                bail!("workspace.search called without a workspace service");
+            };
+            let cancel = store.data().cancel.clone();
+            results[0] = fs_result(
+                unless_cancelled(&cancel, service.search(query))
+                    .await
+                    .map(search_result_val),
+            );
+            Ok(())
+        })
     })
+}
+
+/// An `option<string>` field or parameter.
+fn option_string(
+    value: Option<&Val>,
+    function: &str,
+    name: &str,
+) -> wasmtime::Result<Option<String>> {
+    match value {
+        Some(Val::Option(None)) => Ok(None),
+        Some(Val::Option(Some(inner))) => match inner.as_ref() {
+            Val::String(text) => Ok(Some(text.clone())),
+            _ => bail!("{function}: {name} is not an optional string"),
+        },
+        _ => bail!("{function}: {name} is not an optional string"),
+    }
+}
+
+fn search_query(value: &Val) -> wasmtime::Result<SearchQuery> {
+    const FUNCTION: &str = "workspace.search";
+    let Val::Record(fields) = value else {
+        bail!("{FUNCTION}: query is not a record");
+    };
+    let mut pattern = None;
+    let mut path = None;
+    let mut glob = None;
+    let mut case_insensitive = None;
+    let mut context = None;
+    let mut max_lines = None;
+    for (name, value) in fields {
+        match (name.as_str(), value) {
+            ("pattern", Val::String(text)) => pattern = Some(text.clone()),
+            ("path", value) => path = Some(option_string(Some(value), FUNCTION, name)?),
+            ("glob", value) => glob = Some(option_string(Some(value), FUNCTION, name)?),
+            ("case-insensitive", Val::Bool(flag)) => case_insensitive = Some(*flag),
+            ("context", Val::U32(lines)) => context = Some(*lines),
+            ("max-lines", Val::U32(lines)) => max_lines = Some(*lines),
+            _ => bail!("{FUNCTION}: unexpected query field {name}"),
+        }
+    }
+    match (pattern, path, glob, case_insensitive, context, max_lines) {
+        (
+            Some(pattern),
+            Some(path),
+            Some(glob),
+            Some(case_insensitive),
+            Some(context),
+            Some(max_lines),
+        ) => Ok(SearchQuery {
+            pattern,
+            path,
+            glob,
+            case_insensitive,
+            context,
+            max_lines,
+        }),
+        _ => bail!("{FUNCTION}: query is missing a field"),
+    }
+}
+
+fn search_result_val(result: SearchResult) -> Option<Val> {
+    let files = result
+        .files
+        .into_iter()
+        .map(|file| {
+            let lines = file
+                .lines
+                .into_iter()
+                .map(|line| {
+                    Val::Record(vec![
+                        ("line-number".to_owned(), Val::U64(line.line_number)),
+                        ("text".to_owned(), Val::String(line.text)),
+                        ("is-match".to_owned(), Val::Bool(line.is_match)),
+                    ])
+                })
+                .collect();
+            Val::Record(vec![
+                ("path".to_owned(), Val::String(file.path)),
+                ("lines".to_owned(), Val::List(lines)),
+            ])
+        })
+        .collect();
+    Some(Val::Record(vec![
+        ("files".to_owned(), Val::List(files)),
+        ("truncated".to_owned(), Val::Bool(result.truncated)),
+        ("omitted-files".to_owned(), Val::U64(result.omitted_files)),
+    ]))
 }
 
 fn link_snapshot(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
@@ -656,6 +891,163 @@ fn link_snapshot(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
             Ok(())
         })
     })
+}
+
+/// A `workspace-mutation.mutation` as the host holds it: the service's held gate, in the
+/// call's resource table.
+pub(crate) struct HostMutation(Box<dyn HeldMutation>);
+
+/// The `mutation` a call cancelled while `begin` waited gets: `begin` has no error result, so
+/// the cancellation reaches the guest where `workspace.wit` puts it for every file operation —
+/// each use answers `cancelled`. It holds no gate, so nothing else waits on it.
+struct CancelledBegin;
+
+fn cancelled_begin() -> Box<dyn HeldMutation> {
+    Box::new(CancelledBegin)
+}
+
+impl HeldMutation for CancelledBegin {
+    fn write(&self, _path: String, _contents: Vec<u8>) -> BoxFuture<'_, Result<(), FsError>> {
+        Box::pin(async { Err(FsError::Cancelled) })
+    }
+
+    fn create(&self, _path: String, _contents: Vec<u8>) -> BoxFuture<'_, Result<(), FsError>> {
+        Box::pin(async { Err(FsError::Cancelled) })
+    }
+
+    fn remove(&self, _path: String) -> BoxFuture<'_, Result<(), FsError>> {
+        Box::pin(async { Err(FsError::Cancelled) })
+    }
+
+    fn rename(&self, _old_path: String, _new_path: String) -> BoxFuture<'_, Result<(), FsError>> {
+        Box::pin(async { Err(FsError::Cancelled) })
+    }
+}
+
+fn link_workspace_mutation(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
+    let mut mutation = linker.instance(&interface_import("workspace-mutation"))?;
+    mutation.resource(
+        "mutation",
+        ResourceType::host::<HostMutation>(),
+        |mut store, rep| {
+            // Dropping the entry drops the service's held gate, which releases it. What the
+            // call still holds when it returns goes with its Store the same way.
+            store
+                .data_mut()
+                .table
+                .delete(Resource::<HostMutation>::new_own(rep))?;
+            let state = store.data_mut();
+            state.mutations_held = state.mutations_held.saturating_sub(1);
+            Ok(())
+        },
+    )?;
+    mutation.func_new_async("begin", |mut store, _ty, _params, results| {
+        Box::new(async move {
+            let Some(service) = store.data().workspace_mutation.clone() else {
+                bail!("workspace-mutation.begin called without a workspace-mutation service");
+            };
+            // The gate is not re-entrant and `begin` has no error to answer with: waiting
+            // would park this call on the gate it holds, keeping it from every other agent
+            // until the deadline, so the call traps instead and its Store releases the gate.
+            if store.data().mutations_held > 0 {
+                bail!("workspace-mutation.begin called while this call already holds a mutation");
+            }
+            let cancel = store.data().cancel.clone();
+            // Raced against the cancellation so a cancelled call does not wait out another
+            // writer: it gets a mutation whose every use answers `cancelled`.
+            let held = tokio::select! {
+                biased;
+                () = cancel.cancelled() => cancelled_begin(),
+                held = service.begin() => held,
+            };
+            let entry = store.data_mut().table.push(HostMutation(held))?;
+            store.data_mut().mutations_held += 1;
+            let handle = ResourceAny::try_from_resource(entry, &mut store)?;
+            results[0] = Val::Resource(handle);
+            Ok(())
+        })
+    })?;
+    mutation.func_new_async(
+        "[method]mutation.write",
+        |mut store, _ty, params, results| {
+            Box::new(async move {
+                let path = string_param(params, 1, "workspace-mutation.mutation.write")?;
+                let contents = bytes_param(params, 2, "workspace-mutation.mutation.write")?;
+                let cancel = store.data().cancel.clone();
+                let entry = mutation_entry(&mut store, params, "write")?;
+                results[0] = fs_result(
+                    unless_cancelled(&cancel, entry.0.write(path, contents))
+                        .await
+                        .map(|()| None),
+                );
+                Ok(())
+            })
+        },
+    )?;
+    mutation.func_new_async(
+        "[method]mutation.create",
+        |mut store, _ty, params, results| {
+            Box::new(async move {
+                let path = string_param(params, 1, "workspace-mutation.mutation.create")?;
+                let contents = bytes_param(params, 2, "workspace-mutation.mutation.create")?;
+                let cancel = store.data().cancel.clone();
+                let entry = mutation_entry(&mut store, params, "create")?;
+                results[0] = fs_result(
+                    unless_cancelled(&cancel, entry.0.create(path, contents))
+                        .await
+                        .map(|()| None),
+                );
+                Ok(())
+            })
+        },
+    )?;
+    mutation.func_new_async(
+        "[method]mutation.remove",
+        |mut store, _ty, params, results| {
+            Box::new(async move {
+                let path = string_param(params, 1, "workspace-mutation.mutation.remove")?;
+                let cancel = store.data().cancel.clone();
+                let entry = mutation_entry(&mut store, params, "remove")?;
+                results[0] = fs_result(
+                    unless_cancelled(&cancel, entry.0.remove(path))
+                        .await
+                        .map(|()| None),
+                );
+                Ok(())
+            })
+        },
+    )?;
+    mutation.func_new_async(
+        "[method]mutation.rename",
+        |mut store, _ty, params, results| {
+            Box::new(async move {
+                let old_path = string_param(params, 1, "workspace-mutation.mutation.rename")?;
+                let new_path = string_param(params, 2, "workspace-mutation.mutation.rename")?;
+                let cancel = store.data().cancel.clone();
+                let entry = mutation_entry(&mut store, params, "rename")?;
+                results[0] = fs_result(
+                    unless_cancelled(&cancel, entry.0.rename(old_path, new_path))
+                        .await
+                        .map(|()| None),
+                );
+                Ok(())
+            })
+        },
+    )
+}
+
+/// The held mutation a method call names. A handle the module dropped, or one the call no
+/// longer holds, fails here: a later use traps.
+fn mutation_entry<'s>(
+    store: &'s mut wasmtime::StoreContextMut<'_, CallState>,
+    params: &[Val],
+    method: &str,
+) -> wasmtime::Result<&'s HostMutation> {
+    let Some(Val::Resource(handle)) = params.first() else {
+        bail!("workspace-mutation.mutation.{method} called without its resource");
+    };
+    let mutation: Resource<HostMutation> = handle.try_into_resource(&mut *store)?;
+    Ok(store.data().table.get(&mutation)?)
 }
 
 fn string_param(params: &[Val], index: usize, function: &str) -> wasmtime::Result<String> {
@@ -844,6 +1236,40 @@ mod tests {
     }
 
     #[test]
+    fn workspace_mutation_links_only_with_its_service() {
+        struct NoGate;
+
+        impl MutationService for NoGate {
+            fn begin(&self) -> BoxFuture<'_, Box<dyn HeldMutation>> {
+                Box::pin(async { cancelled_begin() })
+            }
+        }
+
+        let engine = crate::engine().expect("engine");
+        match capability_linker(
+            &engine,
+            &granted(&["workspace-mutation"]),
+            &Services::default(),
+        ) {
+            Err(LinkError::MissingService(missing)) => assert_eq!(missing, "workspace-mutation"),
+            Err(other) => panic!("wrong link error: {other}"),
+            Ok(_) => panic!("workspace-mutation must not link without its service"),
+        }
+        let services = Services {
+            workspace_mutation: Some(Arc::new(NoGate)),
+            ..Services::default()
+        };
+        assert!(
+            capability_linker(
+                &engine,
+                &granted(&["control", "workspace-mutation"]),
+                &services
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn fs_errors_are_the_wit_variant_cases() {
         assert_eq!(
             fs_error_val(FsError::Io("disk".to_owned())),
@@ -861,6 +1287,87 @@ mod tests {
             vec![1, 2]
         );
         assert!(bytes_param(&[Val::List(vec![Val::U32(1)])], 0, "f").is_err());
+    }
+
+    #[test]
+    fn a_search_query_is_read_by_field_name_and_its_result_is_the_wit_record() {
+        let some = |text: &str| Val::Option(Some(Box::new(Val::String(text.to_owned()))));
+        let record = Val::Record(vec![
+            ("pattern".to_owned(), Val::String("beta".to_owned())),
+            ("path".to_owned(), some("src")),
+            ("glob".to_owned(), Val::Option(None)),
+            ("case-insensitive".to_owned(), Val::Bool(true)),
+            ("context".to_owned(), Val::U32(1)),
+            ("max-lines".to_owned(), Val::U32(10)),
+        ]);
+        assert_eq!(
+            search_query(&record).unwrap(),
+            SearchQuery {
+                pattern: "beta".to_owned(),
+                path: Some("src".to_owned()),
+                glob: None,
+                case_insensitive: true,
+                context: 1,
+                max_lines: 10,
+            }
+        );
+        assert!(search_query(&Val::Record(vec![])).is_err());
+        assert!(option_string(Some(&Val::U32(1)), "f", "glob").is_err());
+
+        let result = SearchResult {
+            files: vec![FileMatches {
+                path: "a.rs".to_owned(),
+                lines: vec![SearchLine {
+                    line_number: 2,
+                    text: "fn beta() {}".to_owned(),
+                    is_match: true,
+                }],
+            }],
+            truncated: false,
+            omitted_files: 3,
+        };
+        assert_eq!(
+            search_result_val(result),
+            Some(Val::Record(vec![
+                (
+                    "files".to_owned(),
+                    Val::List(vec![Val::Record(vec![
+                        ("path".to_owned(), Val::String("a.rs".to_owned())),
+                        (
+                            "lines".to_owned(),
+                            Val::List(vec![Val::Record(vec![
+                                ("line-number".to_owned(), Val::U64(2)),
+                                ("text".to_owned(), Val::String("fn beta() {}".to_owned())),
+                                ("is-match".to_owned(), Val::Bool(true)),
+                            ])])
+                        ),
+                    ])])
+                ),
+                ("truncated".to_owned(), Val::Bool(false)),
+                ("omitted-files".to_owned(), Val::U64(3)),
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_service_without_the_walk_refuses_list_files_and_search() {
+        let files = NoFiles;
+        assert_eq!(
+            files.list_files(".".to_owned(), None).await,
+            Err(FsError::Io(LIST_FILES_NOT_GRANTED.to_owned()))
+        );
+        let query = SearchQuery {
+            pattern: "x".to_owned(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 1,
+        };
+        assert_eq!(
+            files.search(query).await,
+            Err(FsError::Io(SEARCH_NOT_GRANTED.to_owned()))
+        );
     }
 
     #[test]
