@@ -178,7 +178,7 @@ pub fn route_provider(
         // connector here, at composition. The provider refuses a WebSocket route without one,
         // so the two cannot drift apart. This is the native adapter's one remaining caller.
         AdapterSettings::OpenAiResponses(settings)
-            if settings.transport == p1_provider_openai::ResponsesTransport::Websocket =>
+            if settings.transport == crate::routes::ResponsesTransport::Websocket =>
         {
             let composition = p1_provider_openai::OpenAiCodexProvider::builder(
                 responses_route_from(route, settings),
@@ -406,119 +406,25 @@ fn profile_text(environment_dirs: &[PathBuf], id: &str) -> Result<String, String
     ))
 }
 
-/// The chat adapter's view of one route file: the file's endpoint and static headers,
-/// the settings the adapter parses for itself, and the profile's output ceiling
-/// lowered by the binding's.
-pub fn chat_route(
-    route: &crate::routes::RouteFile,
-    binding: &crate::routes::ModelBinding,
-    profile: &p1_model_profile::ModelProfile,
-) -> Result<p1_provider_openai_chat::ChatRoute, String> {
-    // A chat route file names `openai-chat`; any other adapter key is the wrong
-    // function, not a silent fallback.
-    let crate::routes::AdapterSettings::OpenAiChat(settings) = route.settings()? else {
-        return Err(format!(
-            "route \"{}\" names adapter \"{}\", not openai-chat",
-            route.id, route.adapter
-        ));
-    };
-    chat_route_from(route, binding, profile, settings)
-}
-
-fn chat_route_from(
-    route: &crate::routes::RouteFile,
-    binding: &crate::routes::ModelBinding,
-    profile: &p1_model_profile::ModelProfile,
-    settings: p1_provider_openai_chat::ChatAdapterSettings,
-) -> Result<p1_provider_openai_chat::ChatRoute, String> {
-    use p1_provider_openai_chat::{ChatLimits, ChatRoute};
-    // `user-agent` stays compiled: it carries this crate's version, so a route file
-    // cannot stale it. The file's own headers follow, sorted by name (a `BTreeMap`,
-    // so the order is stable), and a file cannot name a secret-looking one.
-    let mut headers = vec![(
-        "user-agent".to_string(),
-        concat!("p1/", env!("CARGO_PKG_VERSION")).to_string(),
-    )];
-    headers.extend(
-        route
-            .headers
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone())),
-    );
-    Ok(ChatRoute {
-        origin_route: route.origin_route.clone(),
-        endpoint: route.endpoint.clone(),
-        headers,
-        session_header: settings.session_header,
-        dialect: settings.dialect,
-        client_identity: settings.client_identity,
-        limits: ChatLimits {
-            max_output_tokens: lower_ceiling(profile.max_output_tokens, binding.output_limit),
-        },
-    })
-}
-
-/// The Messages adapter's view of one route file: the recorded origin route, the
-/// endpoint, the account behaviour the file names (spec §7.2) and whether it requests
-/// the 1M context window (`long_context`, ADR-0063). It carries no static headers
-/// today, so a `[headers]` table on such a route is empty in every shipped file.
-pub fn messages_route(
-    route: &crate::routes::RouteFile,
-) -> Result<p1_provider_anthropic::MessagesRoute, String> {
-    let crate::routes::AdapterSettings::AnthropicMessages(settings) = route.settings()? else {
-        return Err(format!(
-            "route \"{}\" names adapter \"{}\", not anthropic-messages",
-            route.id, route.adapter
-        ));
-    };
-    Ok(messages_route_from(route, settings))
-}
-
-fn messages_route_from(
-    route: &crate::routes::RouteFile,
-    settings: p1_provider_anthropic::MessagesAdapterSettings,
-) -> p1_provider_anthropic::MessagesRoute {
-    p1_provider_anthropic::MessagesRoute {
-        origin_route: route.origin_route.clone(),
-        endpoint: route.endpoint.clone(),
-        account: settings.account,
-        long_context: settings.long_context,
-    }
-}
-
-/// The Responses adapter's view of one route file: the recorded origin route, the
-/// endpoint and the account behaviour the file names (spec §7.2). Like a Messages
-/// route it carries no static headers today, so a `[headers]` table on such a route
-/// is empty in every shipped file; nothing else about a Responses route is data.
-pub fn responses_route(
-    route: &crate::routes::RouteFile,
-) -> Result<p1_provider_openai::ResponsesRoute, String> {
-    let crate::routes::AdapterSettings::OpenAiResponses(settings) = route.settings()? else {
-        return Err(format!(
-            "route \"{}\" names adapter \"{}\", not openai-responses",
-            route.id, route.adapter
-        ));
-    };
-    Ok(responses_route_from(route, settings))
-}
-
+/// The native Responses adapter's view of one route file, for the WebSocket arm of
+/// [`route_provider`] only: the recorded origin route, the endpoint and the settings the route
+/// file names (spec §7.2), in the adapter's own types.
 fn responses_route_from(
     route: &crate::routes::RouteFile,
-    settings: p1_provider_openai::ResponsesAdapterSettings,
+    settings: crate::routes::ResponsesAdapterSettings,
 ) -> p1_provider_openai::ResponsesRoute {
+    use crate::routes::{ResponsesAccount, ResponsesTransport};
     p1_provider_openai::ResponsesRoute {
         origin_route: route.origin_route.clone(),
         endpoint: route.endpoint.clone(),
-        account: settings.account,
-        transport: settings.transport,
-    }
-}
-
-/// A route may restrict a profile's ceiling, never enlarge it. Unknown on one side
-/// keeps the known one; unknown on both stays unknown.
-fn lower_ceiling(profile: Option<u32>, route: Option<u32>) -> Option<u32> {
-    match (profile, route) {
-        (Some(profile), Some(route)) => Some(profile.min(route)),
-        (profile, route) => profile.or(route),
+        account: match settings.account {
+            ResponsesAccount::CodexSubscription => {
+                p1_provider_openai::ResponsesAccount::CodexSubscription
+            }
+        },
+        transport: match settings.transport {
+            ResponsesTransport::Sse => p1_provider_openai::ResponsesTransport::Sse,
+            ResponsesTransport::Websocket => p1_provider_openai::ResponsesTransport::Websocket,
+        },
     }
 }

@@ -20,6 +20,11 @@
 //! sent for it, so the replay payload goes out of the component's decoder and back into
 //! its lowering.
 
+// The native adapters' route values, composed from a route file exactly as the host's tests
+// compose them (S7.10-R4 took them out of `p1_host::catalog`).
+#[path = "../../p1-host/tests/native_routes/mod.rs"]
+mod native_routes;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -244,7 +249,7 @@ impl Case {
         let provider: Arc<dyn Provider> = match self.route.settings().expect("route settings") {
             AdapterSettings::OpenAiChat(_) => Arc::new(
                 p1_provider_openai_chat::ChatProvider::new(
-                    p1_host::catalog::chat_route(&self.route, binding, &profile)
+                    native_routes::chat_route(&self.route, binding, &profile)
                         .expect("the chat route value"),
                     &binding.wire_model,
                     profile,
@@ -255,8 +260,7 @@ impl Case {
             ),
             AdapterSettings::AnthropicMessages(_) => Arc::new(
                 p1_provider_anthropic::AnthropicProvider::new(
-                    p1_host::catalog::messages_route(&self.route)
-                        .expect("the messages route value"),
+                    native_routes::messages_route(&self.route).expect("the messages route value"),
                     &binding.wire_model,
                     profile,
                     Arc::new(transport),
@@ -266,15 +270,14 @@ impl Case {
             ),
             AdapterSettings::OpenAiResponses(settings) => {
                 let composition = p1_provider_openai::OpenAiCodexProvider::builder(
-                    p1_host::catalog::responses_route(&self.route)
-                        .expect("the responses route value"),
+                    native_routes::responses_route(&self.route).expect("the responses route value"),
                     &binding.wire_model,
                     profile,
                     Arc::new(transport),
                     Arc::new(FixedCredentials),
                 );
                 let composition = if settings.transport
-                    == p1_provider_openai::ResponsesTransport::Websocket
+                    == p1_host::routes::ResponsesTransport::Websocket
                 {
                     composition.with_ws_connector(Arc::new(ScriptedWsConnector::new(Vec::new())))
                 } else {

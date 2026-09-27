@@ -5,6 +5,7 @@
 //! SHIPPED routes built from the shipped files through this same loading path.
 
 mod common;
+mod native_routes;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 use common::Harness;
 use futures_util::StreamExt;
+use native_routes::{chat_route, responses_route};
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_auth::CredentialKind;
 use p1_contracts::{
@@ -20,19 +22,21 @@ use p1_contracts::{
 };
 use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
-use p1_host::catalog::{
-    build_catalog, chat_route, resolve_environment, responses_route, route_provider,
-};
+use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
-use p1_host::routes::{AdapterSettings, RouteFile, load_all_routes, load_route, load_route_by_id};
+use p1_host::routes::{
+    AdapterSettings, ChatAdapterSettings, ChatDialect, ClientIdentity, ResponsesAccount,
+    ResponsesAdapterSettings, ResponsesTransport, RouteFile, load_all_routes, load_route,
+    load_route_by_id,
+};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, fixtures::chat as chat_fixtures, run_all,
 };
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
-use p1_provider_openai::{ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport};
-use p1_provider_openai_chat::{ChatAdapterSettings, ChatDialect, ClientIdentity, build_request};
+use p1_provider_openai::ResponsesTransport as NativeTransport;
+use p1_provider_openai_chat::build_request;
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
 
@@ -1763,7 +1767,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
         responses_route(&route)
             .expect("the route composes")
             .transport,
-        ResponsesTransport::Websocket
+        NativeTransport::Websocket
     );
 
     // Absent means `sse`: the adapter's own default for a route file that says
@@ -1777,9 +1781,13 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
         })
     );
 
-    for (value, expected) in [
-        ("sse", ResponsesTransport::Sse),
-        ("websocket", ResponsesTransport::Websocket),
+    for (value, expected, native) in [
+        ("sse", ResponsesTransport::Sse, NativeTransport::Sse),
+        (
+            "websocket",
+            ResponsesTransport::Websocket,
+            NativeTransport::Websocket,
+        ),
     ] {
         codex_route_with(&scratch, &format!("transport = \"{value}\""));
         assert_eq!(
@@ -1797,7 +1805,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
             responses_route(&route)
                 .expect("the route composes")
                 .transport,
-            expected,
+            native,
             "{value}"
         );
     }

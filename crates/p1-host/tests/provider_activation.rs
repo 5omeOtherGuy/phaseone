@@ -17,20 +17,21 @@
 //! credential source is a fixture.
 
 mod common;
+mod native_routes;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{built_provider_packages, provider_release};
+use native_routes::{chat_route, messages_route, responses_route};
 use p1_assembly::{Catalog, ModulesLock, ToolServices};
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{BoxFuture, Provider, ProviderError};
 use p1_host::catalog::modules::{load_locked_modules, register_modules};
-use p1_host::catalog::{
-    ProviderComponents, chat_route, messages_route, provider_component, responses_route,
-    route_provider,
+use p1_host::catalog::{ProviderComponents, provider_component, route_provider};
+use p1_host::routes::{
+    AdapterSettings, ModelBinding, ResponsesTransport, RouteFile, load_route, load_route_by_id,
 };
-use p1_host::routes::{AdapterSettings, ModelBinding, RouteFile, load_route, load_route_by_id};
 use p1_model_profile::ModelProfile;
 use p1_module_runtime::Services;
 use p1_module_tests::Release;
@@ -152,12 +153,11 @@ fn native(
                 transport,
                 credentials,
             );
-            let composition =
-                if settings.transport == p1_provider_openai::ResponsesTransport::Websocket {
-                    composition.with_ws_connector(ws)
-                } else {
-                    composition
-                };
+            let composition = if settings.transport == ResponsesTransport::Websocket {
+                composition.with_ws_connector(ws)
+            } else {
+                composition
+            };
             Ok(Arc::new(
                 composition.build().map_err(|error| error.to_string())?,
             ))
@@ -443,7 +443,7 @@ fn is_websocket_route(route: &RouteFile) -> bool {
     matches!(
         route.settings().expect("the shipped settings parse"),
         AdapterSettings::OpenAiResponses(settings)
-            if settings.transport == p1_provider_openai::ResponsesTransport::Websocket
+            if settings.transport == ResponsesTransport::Websocket
     )
 }
 
