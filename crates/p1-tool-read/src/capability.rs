@@ -291,8 +291,11 @@ impl Inner {
         // was asked for: the whole-file digest of the snapshot the bytes come from. The
         // latest read of a path wins, and a mutation assembled with the same record refuses
         // any other bytes at that path under the gate.
-        self.reads
-            .record_hash(&key, snapshot.metadata().content_hash);
+        self.reads.record_read(
+            &self.workspace.spelling(requested),
+            &key,
+            snapshot.metadata().content_hash,
+        );
         if (offset as u64).saturating_add(window.len() as u64) < size {
             self.keep_open(key, snapshot);
         }

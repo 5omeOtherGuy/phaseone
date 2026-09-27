@@ -104,7 +104,7 @@ impl Workspace {
     /// ancestor is canonicalized and must be inside the root — that ancestor is
     /// the one the eventual read/write would resolve through.
     pub fn resolve(&self, requested: &str) -> Result<PathBuf, WorkspaceError> {
-        let candidate = path::lexical_normalize(&path::join_request(&self.root, requested));
+        let candidate = self.spelling(requested);
         if !candidate.starts_with(&self.root) {
             return Err(WorkspaceError::OutsideWorkspace {
                 requested: requested.to_string(),
@@ -146,6 +146,13 @@ impl Workspace {
                 });
         }
         Ok(candidate)
+    }
+
+    /// `requested` joined to the root and normalized lexically, before any symlink is
+    /// resolved: the one name every spelling of a request shares, so a read record can
+    /// tell a path that now resolves to another file than the one it read.
+    pub fn spelling(&self, requested: &str) -> PathBuf {
+        path::lexical_normalize(&path::join_request(&self.root, requested))
     }
 
     /// Render `path` relative to the root with `/` separators, for model-facing

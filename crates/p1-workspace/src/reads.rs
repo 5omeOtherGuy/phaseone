@@ -24,7 +24,15 @@ use crate::observe::{hash_of, key};
 /// A clonable, `Send + Sync` registry of what one tool read.
 #[derive(Clone, Default)]
 pub struct ReadRecord {
-    reads: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    reads: Arc<Mutex<Reads>>,
+}
+
+#[derive(Default)]
+struct Reads {
+    digests: HashMap<PathBuf, u64>,
+    /// The file each requested spelling resolved to when it was read, so a mutation of
+    /// the same spelling can refuse a symlink retargeted since (see [`ReadRecord::read_as`]).
+    resolved: HashMap<PathBuf, PathBuf>,
 }
 
 impl ReadRecord {
@@ -42,17 +50,32 @@ impl ReadRecord {
     /// the whole file (a snapshot's `content_hash`), so the record names the very same
     /// value the read returned instead of a second hash of the same bytes.
     pub fn record_hash(&self, path: &Path, hash: u64) {
-        self.lock().insert(key(path), hash);
+        self.lock().digests.insert(key(path), hash);
+    }
+
+    /// Like [`Self::record_hash`], and remember that `spelling` (a request's
+    /// [`Workspace::spelling`](crate::Workspace::spelling)) resolved to `path`.
+    pub fn record_read(&self, spelling: &Path, path: &Path, hash: u64) {
+        let mut reads = self.lock();
+        let path = key(path);
+        reads.resolved.insert(spelling.to_path_buf(), path.clone());
+        reads.digests.insert(path, hash);
     }
 
     /// The digest recorded for `path`, `None` when this tool has not read it.
     pub fn recorded(&self, path: &Path) -> Option<u64> {
-        self.lock().get(&key(path)).copied()
+        self.lock().digests.get(&key(path)).copied()
+    }
+
+    /// The file `spelling` resolved to when this tool last read it, `None` when it has
+    /// not read that spelling.
+    pub fn read_as(&self, spelling: &Path) -> Option<PathBuf> {
+        self.lock().resolved.get(spelling).cloned()
     }
 
     /// Recover from a poisoned lock: a panic elsewhere must not turn a read identity
     /// into a process abort.
-    fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, u64>> {
+    fn lock(&self) -> MutexGuard<'_, Reads> {
         self.reads
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
