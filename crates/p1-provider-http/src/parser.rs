@@ -26,4 +26,12 @@ pub trait ResponseParser: Send {
         headers: &[(String, String)],
         body: &[u8],
     ) -> ProviderError;
+
+    /// The id of the response this parser saw, if the wire named one (WIT
+    /// `decoding.decoder.response-id`): the WebSocket broker hands a cleanly completed
+    /// response's id back to its session, where a continuation frame refers to it. A
+    /// parser that never feeds a WebSocket session keeps the default.
+    fn response_id(&self) -> Option<String> {
+        None
+    }
 }

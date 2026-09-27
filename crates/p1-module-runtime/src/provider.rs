@@ -24,11 +24,20 @@
 //! - Construction calls `configure` then `describe` once and caches the description; either
 //!   failing is a construction error ([`ProviderError`]).
 //! - `stream` runs `validate` then `lower` in the component before anything is sent; a
-//!   refusal is the setup error a native adapter returns. The lowered request goes through
+//!   refusal is the setup error a native adapter returns. A lowered HTTP request goes through
 //!   [`broker_drive`], which keeps retry, backoff, the one refresh after 401/403, the read
 //!   bounds and cancellation; each framed SSE event goes to a fresh decoder per attempt, and
 //!   a non-2xx response to `classify`. The broker applies its own status policy to the kind
 //!   `classify` returns, as it does for a native parser (ADR-0046, ADR-0062).
+//! - WebSocket (ADR-0078 §1–§2): a provider given a session ([`WasmProvider::with_websocket`])
+//!   leases it for each request — waiting while another request's response holds it, since the
+//!   frozen `connection-state` has no fact for a busy session and a second socket is never
+//!   opened — and passes the session's facts to `lower`. A lowered `websocket-send` goes
+//!   through [`ws_drive`], which keeps the connection, the handshake with the credential, the
+//!   read bounds, §5's retry and refresh, and feeds every text frame to a fresh decoder per
+//!   attempt as an event with no name; for each retry before any output it calls `lower`
+//!   again, and an HTTP answer then is the fallback it sends through [`broker_drive`]. A
+//!   decoder's `response-id` goes back to the session with a cleanly completed response.
 //! - Exactly one `Finished` per stream holds host side too: whatever a decoder returns after
 //!   its terminal event is dropped, and the decoder with it.
 //! - A module failure maps as `ModuleFailure::into_provider_outcome` fixes it: a trap, fuel
@@ -55,9 +64,12 @@ use p1_module_protocol::{
     ModuleFailure, WireItem, WireModelOptions, WireProviderError, WireRouteDescription,
     WireStreamEvent,
 };
+use p1_provider_http::ws::WsConnector;
+use p1_provider_http::ws_session::{Clock, ConnectionState, WsHead, WsLease, WsSend, WsSession};
 use p1_provider_http::{
     CredentialScheme, CredentialSource, CredentialUse, LoweredHttpRequest, ResponseParser,
-    RetryPolicy, RouteAuthority, SseEvent, Transport, broker_drive,
+    RetryPolicy, RouteAuthority, SseEvent, Transport, WsDriveRequest, WsLowered, broker_drive,
+    ws_drive, ws_lease,
 };
 use thiserror::Error;
 use wasmtime::component::{
@@ -88,9 +100,9 @@ const DECODING: &str = "p1:module/decoding@1.0.0";
 const BAD_EVENT: &str = "a decoded stream event is not protocol stream-event JSON";
 const BAD_ERROR: &str = "a provider error is not protocol provider-error JSON";
 const BAD_DESCRIPTION: &str = "describe did not return a protocol route description";
-const BAD_LOWERED: &str = "lower did not return an http request of the transport interface";
+const BAD_LOWERED: &str = "lower did not return a request of the transport interfaces";
 const WEBSOCKET_LOWERED: &str =
-    "lower chose WebSocket, which this broker does not send yet; nothing was sent";
+    "lower chose WebSocket, but this provider has no WebSocket session; nothing was sent";
 const BAD_RESULT: &str = "an export returned a value of the wrong shape";
 const NOT_TERMINAL: &str = "the decoder's finish returned an event that is not finished";
 const DECODER_LOST: &str = "the decoder was lost with its instance after an earlier failure";
@@ -195,6 +207,8 @@ pub struct WasmProvider {
     /// The endpoint's last path segment as a path, and the authority without it.
     split: Option<(String, RouteAuthority)>,
     transport: Arc<dyn Transport>,
+    /// This instance's one WebSocket connection, when the host gave it one.
+    websocket: Option<WsSession>,
 }
 
 impl WasmProvider {
@@ -307,7 +321,36 @@ impl WasmProvider {
             authority,
             split,
             transport,
+            websocket: None,
         })
+    }
+
+    /// Gives the provider its WebSocket session: the one route-bound connection its component
+    /// may lower a request onto (ADR-0078 §1), opened through `connector` and reused under the
+    /// bounds of `docs/design/websocket.md` §4 on `clock`. Composing it opens no socket; only a
+    /// request the component lowers to WebSocket connects. Without a session a WebSocket
+    /// lowering is refused and nothing is sent.
+    pub fn with_websocket(mut self, connector: Arc<dyn WsConnector>, clock: Clock) -> Self {
+        self.websocket = Some(WsSession::new(connector, clock));
+        self
+    }
+
+    /// The route authority a lowered `path` goes to (ADR-0086).
+    fn authority_for(&self, path: &str) -> &RouteAuthority {
+        authority_for(&self.authority, self.split.as_ref(), path)
+    }
+}
+
+/// `authority`, or the split one when `path` is the endpoint's own last segment: the request
+/// URL is then the endpoint unchanged.
+fn authority_for<'a>(
+    authority: &'a RouteAuthority,
+    split: Option<&'a (String, RouteAuthority)>,
+    path: &str,
+) -> &'a RouteAuthority {
+    match split {
+        Some((split_path, split_authority)) if split_path == path => split_authority,
+        _ => authority,
     }
 }
 
@@ -332,25 +375,68 @@ impl Provider for WasmProvider {
     ) -> BoxFuture<'a, Result<ProviderStream, ContractError>> {
         Box::pin(async move {
             let request = request_val(&request).map_err(module_error)?;
+            let mut lease = match &self.websocket {
+                Some(session) => match ws_lease(session, &cancel).await {
+                    Ok(lease) => Some(lease),
+                    Err(cancelled) => return Ok(cancelled),
+                },
+                None => None,
+            };
+            let connection = lease.as_mut().map(WsLease::state).unwrap_or_default();
             let lowered = self
                 .executor
-                .ask(|reply| Command::Prepare { request, reply })
+                .ask(|reply| Command::Prepare {
+                    request: request.clone(),
+                    connection,
+                    reply,
+                })
                 .map_err(Refusal::from)
                 .and_then(|answer| answer)
                 .map_err(Refusal::into_error)?;
-            let authority = match &self.split {
-                Some((path, authority)) if *path == lowered.path => authority,
-                _ => &self.authority,
+            let send = match lowered {
+                WsLowered::Http(lowered) => {
+                    // No connection is needed: the session is free for another request.
+                    drop(lease);
+                    let executor = self.executor.clone();
+                    return broker_drive(
+                        self.authority_for(&lowered.path),
+                        self.transport.clone(),
+                        &lowered,
+                        Box::new(move || Box::new(ComponentParser::new(executor.clone()))),
+                        RetryPolicy::default(),
+                        cancel,
+                    );
+                }
+                WsLowered::WebSocket(send) => send,
             };
-            let executor = self.executor.clone();
-            broker_drive(
-                authority,
-                self.transport.clone(),
-                &lowered,
-                Box::new(move || Box::new(ComponentParser::new(executor.clone()))),
-                RetryPolicy::default(),
+            let Some(lease) = lease else {
+                return Err(module_error(invalid(WEBSOCKET_LOWERED)));
+            };
+            let lower = self.executor.clone();
+            let parsers = self.executor.clone();
+            let (authority, split) = (self.authority.clone(), self.split.clone());
+            Ok(ws_drive(WsDriveRequest {
+                lease,
+                send,
+                lower: Box::new(move |connection| {
+                    lower
+                        .ask(|reply| Command::Lower {
+                            request: request.clone(),
+                            connection,
+                            reply,
+                        })
+                        .map_err(Refusal::from)
+                        .and_then(|answer| answer)
+                        .map_err(Refusal::into_error)
+                }),
+                authority: Box::new(move |path| {
+                    authority_for(&authority, split.as_ref(), path).clone()
+                }),
+                transport: self.transport.clone(),
+                new_parser: Arc::new(move || Box::new(ComponentParser::new(parsers.clone()))),
+                retry: RetryPolicy::default(),
                 cancel,
-            )
+            }))
         })
     }
 }
@@ -429,7 +515,14 @@ enum Command {
     /// `validate`, then `lower` when it passed.
     Prepare {
         request: Val,
-        reply: Reply<Result<LoweredHttpRequest, Refusal>>,
+        connection: ConnectionState,
+        reply: Reply<Result<WsLowered, Refusal>>,
+    },
+    /// `lower` again, for a retry after a WebSocket failure before any output.
+    Lower {
+        request: Val,
+        connection: ConnectionState,
+        reply: Reply<Result<WsLowered, Refusal>>,
     },
     Classify {
         status: u16,
@@ -437,17 +530,18 @@ enum Command {
         body: Vec<u8>,
         reply: Reply<Result<ContractError, ModuleFailure>>,
     },
-    /// Feed one event to decoder `key`, constructing it first when `create`.
+    /// Feed one event to decoder `key`, constructing it first when `create`. A completed
+    /// response comes back with the decoder's response id.
     Feed {
         key: u64,
         create: bool,
         event: SseEvent,
-        reply: Reply<Result<Vec<StreamEvent>, ModuleFailure>>,
+        reply: Reply<Result<(Vec<StreamEvent>, Option<String>), ModuleFailure>>,
     },
     Finish {
         key: u64,
         create: bool,
-        reply: Reply<Result<Outcome, ModuleFailure>>,
+        reply: Reply<Result<(Outcome, Option<String>), ModuleFailure>>,
     },
     Drop {
         key: u64,
@@ -489,6 +583,8 @@ struct ComponentParser {
     created: bool,
     /// The terminal outcome was returned: nothing more is decoded.
     terminated: bool,
+    /// The response id of a response the decoder completed (`decoder.response-id`).
+    response_id: Option<String>,
 }
 
 impl ComponentParser {
@@ -499,6 +595,7 @@ impl ComponentParser {
             key,
             created: false,
             terminated: false,
+            response_id: None,
         }
     }
 
@@ -539,7 +636,8 @@ impl ResponseParser for ComponentParser {
             })
             .and_then(|answer| answer);
         match answer {
-            Ok(events) => {
+            Ok((events, response_id)) => {
+                self.response_id = response_id;
                 let (events, finished) = through_terminal(events);
                 if finished {
                     self.terminate();
@@ -563,7 +661,13 @@ impl ResponseParser for ComponentParser {
             .ask(|reply| Command::Finish { key, create, reply })
             .and_then(|answer| answer);
         self.terminate();
-        answer.unwrap_or_else(ModuleFailure::into_provider_outcome)
+        match answer {
+            Ok((outcome, response_id)) => {
+                self.response_id = response_id;
+                outcome
+            }
+            Err(failure) => failure.into_provider_outcome(),
+        }
     }
 
     fn on_http_error(
@@ -582,6 +686,10 @@ impl ResponseParser for ComponentParser {
             })
             .and_then(|answer| answer)
             .unwrap_or_else(module_error)
+    }
+
+    fn response_id(&self) -> Option<String> {
+        self.response_id.clone()
     }
 }
 
@@ -610,6 +718,7 @@ struct Exports {
     new_decoder: ComponentExportIndex,
     feed: ComponentExportIndex,
     finish: ComponentExportIndex,
+    response_id: ComponentExportIndex,
 }
 
 impl Exports {
@@ -634,6 +743,7 @@ impl Exports {
             new_decoder: decoder("[constructor]decoder")?,
             feed: decoder("[method]decoder.feed")?,
             finish: decoder("[method]decoder.finish")?,
+            response_id: decoder("[method]decoder.response-id")?,
         })
     }
 }
@@ -700,12 +810,21 @@ impl Machine {
     fn handle(&mut self, command: Command) {
         match command {
             Command::Validate { request, reply } => reply.send(self.validate(request)),
-            Command::Prepare { request, reply } => {
+            Command::Prepare {
+                request,
+                connection,
+                reply,
+            } => {
                 let answer = self
                     .validate(request.clone())
-                    .and_then(|()| self.lower(request));
+                    .and_then(|()| self.lower(request, &connection));
                 reply.send(answer);
             }
+            Command::Lower {
+                request,
+                connection,
+                reply,
+            } => reply.send(self.lower(request, &connection)),
             Command::Classify {
                 status,
                 headers,
@@ -738,8 +857,11 @@ impl Machine {
         }
     }
 
-    fn lower(&mut self, request: Val) -> Result<LoweredHttpRequest, Refusal> {
-        let results = self.call(|exports| &exports.lower, &[request, connection_state()])?;
+    fn lower(&mut self, request: Val, connection: &ConnectionState) -> Result<WsLowered, Refusal> {
+        let results = self.call(
+            |exports| &exports.lower,
+            &[request, connection_state(connection)],
+        )?;
         match results.into_iter().next() {
             Some(Val::Result(Ok(Some(lowered)))) => Ok(lowered_request(*lowered)?),
             Some(Val::Result(Err(Some(error)))) => Err(Refusal::Refused(provider_error(*error)?)),
@@ -770,7 +892,7 @@ impl Machine {
         key: u64,
         create: bool,
         event: SseEvent,
-    ) -> Result<Vec<StreamEvent>, ModuleFailure> {
+    ) -> Result<(Vec<StreamEvent>, Option<String>), ModuleFailure> {
         let decoder = self.decoder(key, create)?;
         let event = Val::Record(vec![
             (
@@ -780,20 +902,58 @@ impl Machine {
             ("data".to_owned(), Val::String(event.data)),
         ]);
         let results = self.call(|exports| &exports.feed, &[Val::Resource(decoder), event])?;
-        match results.into_iter().next() {
-            Some(Val::List(events)) => events.into_iter().map(stream_event).collect(),
-            _ => Err(invalid(BAD_RESULT)),
-        }
+        let events = match results.into_iter().next() {
+            Some(Val::List(events)) => events
+                .into_iter()
+                .map(stream_event)
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err(invalid(BAD_RESULT)),
+        };
+        let completed = events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Finished(Outcome::Completed(_))));
+        let response_id = if completed {
+            self.response_id(decoder)
+        } else {
+            None
+        };
+        Ok((events, response_id))
     }
 
-    fn finish(&mut self, key: u64, create: bool) -> Result<Outcome, ModuleFailure> {
+    fn finish(
+        &mut self,
+        key: u64,
+        create: bool,
+    ) -> Result<(Outcome, Option<String>), ModuleFailure> {
         let decoder = self.decoder(key, create)?;
         let results = self.call(|exports| &exports.finish, &[Val::Resource(decoder)])?;
-        match results.into_iter().next().map(stream_event) {
-            Some(Ok(StreamEvent::Finished(outcome))) => Ok(outcome),
-            Some(Ok(_)) => Err(invalid(NOT_TERMINAL)),
-            Some(Err(failure)) => Err(failure),
-            None => Err(invalid(BAD_RESULT)),
+        let outcome = match results.into_iter().next().map(stream_event) {
+            Some(Ok(StreamEvent::Finished(outcome))) => outcome,
+            Some(Ok(_)) => return Err(invalid(NOT_TERMINAL)),
+            Some(Err(failure)) => return Err(failure),
+            None => return Err(invalid(BAD_RESULT)),
+        };
+        let response_id = if matches!(outcome, Outcome::Completed(_)) {
+            self.response_id(decoder)
+        } else {
+            None
+        };
+        Ok((outcome, response_id))
+    }
+
+    /// The response id `decoder` saw. It only lets the next request continue this response on
+    /// its connection, so a call that fails leaves it unknown rather than failing a response
+    /// that completed.
+    fn response_id(&mut self, decoder: ResourceAny) -> Option<String> {
+        let results = self
+            .call(|exports| &exports.response_id, &[Val::Resource(decoder)])
+            .ok()?;
+        match results.into_iter().next() {
+            Some(Val::Option(Some(id))) => match *id {
+                Val::String(id) => Some(id),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -965,55 +1125,23 @@ fn field<'v>(fields: &'v [(String, Val)], key: &str) -> Option<&'v Val> {
         .map(|(_, value)| value)
 }
 
-/// A `lowered-request`: only its `http` case is sent here.
-fn lowered_request(value: Val) -> Result<LoweredHttpRequest, ModuleFailure> {
-    let fields = match value {
+/// A `lowered-request`: an `http-request` or a `websocket-send`.
+fn lowered_request(value: Val) -> Result<WsLowered, ModuleFailure> {
+    match value {
         Val::Variant(case, Some(request)) if case == "http" => match *request {
-            Val::Record(fields) => fields,
-            _ => return Err(invalid(BAD_LOWERED)),
+            Val::Record(fields) => http_request(&fields).map(WsLowered::Http),
+            _ => Err(invalid(BAD_LOWERED)),
         },
-        Val::Variant(case, _) if case == "websocket" => return Err(invalid(WEBSOCKET_LOWERED)),
-        _ => return Err(invalid(BAD_LOWERED)),
-    };
-    let path = match field(&fields, "path") {
-        Some(Val::String(path)) => path.clone(),
-        _ => return Err(invalid(BAD_LOWERED)),
-    };
-    let headers = match field(&fields, "headers") {
-        Some(Val::List(headers)) => headers
-            .iter()
-            .map(|header| match header {
-                Val::Tuple(pair) => match pair.as_slice() {
-                    [Val::String(name), Val::String(value)] => Ok((name.clone(), value.clone())),
-                    _ => Err(invalid(BAD_LOWERED)),
-                },
-                _ => Err(invalid(BAD_LOWERED)),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => return Err(invalid(BAD_LOWERED)),
-    };
-    let credential = match field(&fields, "credential") {
-        Some(Val::Record(credential)) => {
-            let scheme = match field(credential, "scheme") {
-                Some(Val::Enum(scheme)) if scheme == "bearer" => CredentialScheme::Bearer,
-                _ => return Err(invalid(BAD_LOWERED)),
-            };
-            let account_id_header = match field(credential, "account-id-header") {
-                Some(Val::Option(None)) => None,
-                Some(Val::Option(Some(name))) => match name.as_ref() {
-                    Val::String(name) => Some(name.clone()),
-                    _ => return Err(invalid(BAD_LOWERED)),
-                },
-                _ => return Err(invalid(BAD_LOWERED)),
-            };
-            CredentialUse {
-                scheme,
-                account_id_header,
-            }
-        }
-        _ => return Err(invalid(BAD_LOWERED)),
-    };
-    let body = match field(&fields, "body") {
+        Val::Variant(case, Some(send)) if case == "websocket" => match *send {
+            Val::Record(fields) => websocket_send(&fields).map(WsLowered::WebSocket),
+            _ => Err(invalid(BAD_LOWERED)),
+        },
+        _ => Err(invalid(BAD_LOWERED)),
+    }
+}
+
+fn http_request(fields: &[(String, Val)]) -> Result<LoweredHttpRequest, ModuleFailure> {
+    let body = match field(fields, "body") {
         Some(Val::List(bytes)) => bytes
             .iter()
             .map(|byte| match byte {
@@ -1024,10 +1152,74 @@ fn lowered_request(value: Val) -> Result<LoweredHttpRequest, ModuleFailure> {
         _ => return Err(invalid(BAD_LOWERED)),
     };
     Ok(LoweredHttpRequest {
-        path,
-        headers,
-        credential,
+        path: string(field(fields, "path"))?,
+        headers: headers(field(fields, "headers"))?,
+        credential: credential_use(field(fields, "credential"))?,
         body,
+    })
+}
+
+fn websocket_send(fields: &[(String, Val)]) -> Result<WsSend, ModuleFailure> {
+    let handshake = match field(fields, "handshake") {
+        Some(Val::Option(None)) => None,
+        Some(Val::Option(Some(head))) => match head.as_ref() {
+            Val::Record(head) => Some(WsHead {
+                path: string(field(head, "path"))?,
+                headers: headers(field(head, "headers"))?,
+                credential: credential_use(field(head, "credential"))?,
+            }),
+            _ => return Err(invalid(BAD_LOWERED)),
+        },
+        _ => return Err(invalid(BAD_LOWERED)),
+    };
+    Ok(WsSend {
+        handshake,
+        frame: string(field(fields, "frame"))?,
+    })
+}
+
+fn string(value: Option<&Val>) -> Result<String, ModuleFailure> {
+    match value {
+        Some(Val::String(text)) => Ok(text.clone()),
+        _ => Err(invalid(BAD_LOWERED)),
+    }
+}
+
+fn headers(value: Option<&Val>) -> Result<Vec<(String, String)>, ModuleFailure> {
+    match value {
+        Some(Val::List(headers)) => headers
+            .iter()
+            .map(|header| match header {
+                Val::Tuple(pair) => match pair.as_slice() {
+                    [Val::String(name), Val::String(value)] => Ok((name.clone(), value.clone())),
+                    _ => Err(invalid(BAD_LOWERED)),
+                },
+                _ => Err(invalid(BAD_LOWERED)),
+            })
+            .collect(),
+        _ => Err(invalid(BAD_LOWERED)),
+    }
+}
+
+fn credential_use(value: Option<&Val>) -> Result<CredentialUse, ModuleFailure> {
+    let Some(Val::Record(credential)) = value else {
+        return Err(invalid(BAD_LOWERED));
+    };
+    let scheme = match field(credential, "scheme") {
+        Some(Val::Enum(scheme)) if scheme == "bearer" => CredentialScheme::Bearer,
+        _ => return Err(invalid(BAD_LOWERED)),
+    };
+    let account_id_header = match field(credential, "account-id-header") {
+        Some(Val::Option(None)) => None,
+        Some(Val::Option(Some(name))) => match name.as_ref() {
+            Val::String(name) => Some(name.clone()),
+            _ => return Err(invalid(BAD_LOWERED)),
+        },
+        _ => return Err(invalid(BAD_LOWERED)),
+    };
+    Ok(CredentialUse {
+        scheme,
+        account_id_header,
     })
 }
 
@@ -1104,13 +1296,24 @@ fn declaration_val(declaration: &ToolDeclaration) -> Result<Val, serde_json::Err
     ]))
 }
 
-/// The broker's report on `lower`: this broker keeps no WebSocket connection (S5's), so
-/// none is open and no attempt failed over one.
-fn connection_state() -> Val {
+/// The broker's report on `lower`: the session's facts, or nothing open and nothing failed
+/// for a provider without a session.
+fn connection_state(state: &ConnectionState) -> Val {
     Val::Record(vec![
-        ("open".to_owned(), Val::Bool(false)),
-        ("last-clean-response".to_owned(), Val::Option(None)),
-        ("failed-before-output".to_owned(), Val::Bool(false)),
+        ("open".to_owned(), Val::Bool(state.open)),
+        (
+            "last-clean-response".to_owned(),
+            Val::Option(
+                state
+                    .last_clean_response
+                    .clone()
+                    .map(|id| Box::new(Val::String(id))),
+            ),
+        ),
+        (
+            "failed-before-output".to_owned(),
+            Val::Bool(state.failed_before_output),
+        ),
     ])
 }
 
@@ -1241,8 +1444,18 @@ mod tests {
         }
     }
 
+    fn credential_val(account_id_header: Option<&str>) -> Val {
+        Val::Record(vec![
+            ("scheme".to_owned(), Val::Enum("bearer".to_owned())),
+            (
+                "account-id-header".to_owned(),
+                Val::Option(account_id_header.map(|name| Box::new(Val::String(name.to_owned())))),
+            ),
+        ])
+    }
+
     #[test]
-    fn a_lowered_websocket_request_is_refused_and_http_is_read() {
+    fn a_lowered_request_of_either_transport_is_read() {
         let http = Val::Variant(
             "http".to_owned(),
             Some(Box::new(Val::Record(vec![
@@ -1252,28 +1465,92 @@ mod tests {
                     "headers".to_owned(),
                     headers_val(vec![("x-a".to_owned(), "1".to_owned())]),
                 ),
-                (
-                    "credential".to_owned(),
-                    Val::Record(vec![
-                        ("scheme".to_owned(), Val::Enum("bearer".to_owned())),
-                        ("account-id-header".to_owned(), Val::Option(None)),
-                    ]),
-                ),
+                ("credential".to_owned(), credential_val(None)),
                 (
                     "body".to_owned(),
                     Val::List(vec![Val::U8(b'{'), Val::U8(b'}')]),
                 ),
             ]))),
         );
-        let lowered = lowered_request(http).unwrap();
+        let Ok(WsLowered::Http(lowered)) = lowered_request(http) else {
+            panic!("an http request");
+        };
         assert_eq!(lowered.path, "/v1/messages");
         assert_eq!(lowered.headers, vec![("x-a".to_owned(), "1".to_owned())]);
         assert_eq!(lowered.body, b"{}".to_vec());
         assert_eq!(lowered.credential.account_id_header, None);
-        let websocket = Val::Variant("websocket".to_owned(), None);
+
+        let send = |handshake: Option<Val>| {
+            Val::Variant(
+                "websocket".to_owned(),
+                Some(Box::new(Val::Record(vec![
+                    ("handshake".to_owned(), Val::Option(handshake.map(Box::new))),
+                    ("frame".to_owned(), Val::String("{}".to_owned())),
+                ]))),
+            )
+        };
+        let head = Val::Record(vec![
+            (
+                "path".to_owned(),
+                Val::String("/codex/responses".to_owned()),
+            ),
+            (
+                "headers".to_owned(),
+                headers_val(vec![("originator".to_owned(), "p1".to_owned())]),
+            ),
+            (
+                "credential".to_owned(),
+                credential_val(Some("chatgpt-account-id")),
+            ),
+        ]);
+        let Ok(WsLowered::WebSocket(opened)) = lowered_request(send(Some(head))) else {
+            panic!("a websocket send");
+        };
+        let head = opened.handshake.expect("a handshake head");
+        assert_eq!(head.path, "/codex/responses");
         assert_eq!(
-            lowered_request(websocket).unwrap_err(),
-            invalid(WEBSOCKET_LOWERED)
+            head.headers,
+            vec![("originator".to_owned(), "p1".to_owned())]
+        );
+        assert_eq!(
+            head.credential.account_id_header.as_deref(),
+            Some("chatgpt-account-id")
+        );
+        assert_eq!(opened.frame, "{}");
+        let Ok(WsLowered::WebSocket(continued)) = lowered_request(send(None)) else {
+            panic!("a websocket send on the open connection");
+        };
+        assert_eq!(continued.handshake, None);
+
+        for malformed in [
+            Val::Variant("websocket".to_owned(), None),
+            Val::Variant("http".to_owned(), Some(Box::new(Val::Bool(true)))),
+            Val::Variant("smtp".to_owned(), None),
+        ] {
+            assert_eq!(
+                lowered_request(malformed).unwrap_err(),
+                invalid(BAD_LOWERED)
+            );
+        }
+    }
+
+    #[test]
+    fn the_connection_state_carries_the_sessions_facts() {
+        let state = ConnectionState {
+            open: true,
+            last_clean_response: Some("resp_1".to_owned()),
+            failed_before_output: true,
+        };
+        assert_eq!(
+            connection_state(&state),
+            Val::Record(vec![
+                ("open".to_owned(), Val::Bool(true)),
+                (
+                    "last-clean-response".to_owned(),
+                    Val::Option(Some(Box::new(Val::String("resp_1".to_owned())))),
+                ),
+                ("failed-before-output".to_owned(), Val::Bool(true)),
+            ])
         );
     }
 }

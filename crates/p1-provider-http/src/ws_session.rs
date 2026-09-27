@@ -209,6 +209,21 @@ impl WsSession {
         }
     }
 
+    /// Lease the session for one request, waiting while another request holds it. The
+    /// provider-component broker waits here: the frozen `connection-state` has no fact for
+    /// "busy", and a lease is released as soon as its response's terminal event is queued.
+    pub async fn lease(&self) -> WsLease {
+        let slot = Arc::clone(&self.slot).lock_owned().await;
+        WsLease {
+            connector: Arc::clone(&self.connector),
+            clock: Arc::clone(&self.clock),
+            slot,
+            live: None,
+            reused: false,
+            failed_before_output: false,
+        }
+    }
+
     /// Lease the session for one request WITHOUT waiting. `None` means another
     /// request holds it, and §4 sends such a request over HTTP.
     pub fn try_lease(&self) -> Option<WsLease> {
