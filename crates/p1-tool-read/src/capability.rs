@@ -13,8 +13,8 @@
 //! `snapshot`, the search tool's walk beside them (`p1-tool-search`, U-search.3) and the
 //! owned mutation (`p1-tool-write`, U-mut), so `p1/read`, `p1/edit`, `p1/write`, `p1/patch`
 //! and `p1/search` are all linked from one place. A read through this capability is not an
-//! observation; it is recorded in the assembly's [`ReadRecord`] instead, which the mutation
-//! rechecks under the gate (docs/design/modules/workspace-mutation.md, step 3).
+//! observation; it is recorded in the call's [`ReadRecord`] instead, which the mutation
+//! rechecks under the gate (docs/design/modules/workspace-mutation.md, step 3; ADR-0090).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -106,12 +106,23 @@ impl ReadCapability {
 /// for the edit and write rows, `Some(PatchAuthorized)` for the patch row, `None` for a
 /// tool that does not mutate (its manifest does not grant `workspace-mutation` either way).
 ///
-/// The read side and the mutation service share one [`ReadRecord`]: every read of this
-/// assembly is recorded, and the gated write refuses a target another agent changed after
-/// the read that computed the change.
+/// The services are call-scoped (ADR-0090): every export call gets its own read side and
+/// mutation service over one fresh [`ReadRecord`], so the gated write of a call refuses a
+/// target another agent changed after THIS call's read, and no read of an earlier or a
+/// concurrent call of the same tool satisfies or blocks it.
 pub fn tool_services(
     workspace: Workspace,
     observed: ObservedFiles,
+    home: Option<PathBuf>,
+    mutation: Option<MutationPolicy>,
+) -> Services {
+    Services::call_scoped(move || call_services(&workspace, &observed, home.clone(), mutation))
+}
+
+/// The services of one call: the read side and the mutation over the call's own record.
+fn call_services(
+    workspace: &Workspace,
+    observed: &ObservedFiles,
     home: Option<PathBuf>,
     mutation: Option<MutationPolicy>,
 ) -> Services {
@@ -125,8 +136,9 @@ pub fn tool_services(
     Services {
         workspace: Some(read.clone()),
         snapshot: Some(read),
-        workspace_mutation: mutation
-            .map(|policy| p1_tool_write::mutation_service_over(workspace, observed, reads, policy)),
+        workspace_mutation: mutation.map(|policy| {
+            p1_tool_write::mutation_service_over(workspace.clone(), observed.clone(), reads, policy)
+        }),
         ..Services::default()
     }
 }
@@ -139,28 +151,31 @@ pub fn tool_services(
 /// patch component must never be held to an agent's observation (ADR-0025's exemption), and
 /// the edit and write components check the observation themselves before they begin
 /// (ADR-0088 point 4). What the host enforces for all three, whatever the mode, is the read
-/// record. A caller that knows the module's row uses [`tool_services`] with its mode (the
-/// catalog does; a row that grants no mutation passes `None`).
+/// record, call-scoped as in [`tool_services`]. A caller that knows the module's row uses
+/// [`tool_services`] with its mode (the catalog does; a row that grants no mutation passes
+/// `None`).
 pub fn capability_services(
     workspace: Workspace,
     observed: ObservedFiles,
     home: Option<PathBuf>,
 ) -> Services {
-    let mut services = tool_services(
-        workspace.clone(),
-        observed,
-        home,
-        Some(MutationPolicy::PatchAuthorized),
-    );
-    let read = services
-        .workspace
-        .take()
-        .expect("tool_services links the read side");
-    services.workspace = Some(Arc::new(ToolWorkspace {
-        read,
-        search: Arc::new(SearchCapability::new(workspace)),
-    }));
-    services
+    Services::call_scoped(move || {
+        let mut services = call_services(
+            &workspace,
+            &observed,
+            home.clone(),
+            Some(MutationPolicy::PatchAuthorized),
+        );
+        let read = services
+            .workspace
+            .take()
+            .expect("call_services links the read side");
+        services.workspace = Some(Arc::new(ToolWorkspace {
+            read,
+            search: Arc::new(SearchCapability::new(workspace.clone())),
+        }));
+        services
+    })
 }
 
 /// The workspace service of every tool component whose assembly carries the walk: the read
