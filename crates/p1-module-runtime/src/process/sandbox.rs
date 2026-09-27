@@ -2,7 +2,8 @@
 //! argument vector, and the one-time probe that makes an unusable sandbox fail
 //! assembly instead of the first command.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
@@ -85,6 +86,11 @@ pub enum SandboxError {
     )]
     WorkspaceContainsHome { workspace: PathBuf, home: PathBuf },
     #[error(
+        "the sandbox readable path {} does not resolve: choose an existing path, or pass --sandbox off",
+        .path.display()
+    )]
+    ReadableUnresolved { path: PathBuf },
+    #[error(
         "the sandbox readable path {} would uncover the credential directory {}: choose another path, or pass --sandbox off",
         .path.display(),
         .directory.display()
@@ -96,13 +102,15 @@ pub enum SandboxError {
 pub(super) struct SandboxRuntime {
     pub(super) sandbox: Sandbox,
     pub(super) private_tmp: tempfile::TempDir,
+    pub(super) bwrap_path: PathBuf,
 }
 
 impl SandboxRuntime {
     /// Check `sandbox` against `workspace` and probe ONCE (`bwrap <args> true`),
     /// so an unusable sandbox fails assembly, not the first command.
     pub(super) fn assemble(sandbox: Sandbox, workspace: &Path) -> Result<Self, SandboxError> {
-        let workspace = workspace.to_path_buf();
+        let workspace =
+            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
         // One canonical home for BOTH the containment check and the mounts: a home
         // reached through a symlink must be hidden at the path bwrap is told about.
         let home = std::fs::canonicalize(&sandbox.home).unwrap_or_else(|_| sandbox.home.clone());
@@ -110,25 +118,16 @@ impl SandboxRuntime {
             return Err(SandboxError::WorkspaceContainsHome { workspace, home });
         }
         let sandbox = Sandbox { home, ..sandbox };
-        // A readable path must never uncover a credential directory, whatever the
-        // caller asks for. The check is here, before the probe, so it costs nothing
-        // and fails assembly with a message naming the path.
-        for readable in &sandbox.readable {
-            if let Some(directory) = credential_directory(&sandbox.home, readable) {
-                return Err(SandboxError::ReadableCredential {
-                    path: readable.clone(),
-                    directory,
-                });
-            }
-        }
+        let bwrap_path = resolve_bwrap(std::env::var_os("PATH").as_deref(), &workspace)
+            .ok_or(SandboxError::NotInstalled)?;
         let private_tmp = tempfile::Builder::new()
             .prefix("p1-shell-sandbox-")
             .tempdir()
             .map_err(|error| {
                 SandboxError::Unavailable(format!("could not create a private /tmp: {error}"))
             })?;
-        let args = bwrap_args(&sandbox, &workspace, private_tmp.path());
-        let mut probe = std::process::Command::new("bwrap");
+        let args = bwrap_args(&sandbox, &workspace, private_tmp.path())?;
+        let mut probe = std::process::Command::new(&bwrap_path);
         probe
             .args(&args)
             .arg("true")
@@ -150,20 +149,21 @@ impl SandboxRuntime {
         Ok(Self {
             sandbox,
             private_tmp,
+            bwrap_path,
         })
     }
 }
 
 /// The argument vector passed to `bwrap` before `bash -lc <command>`.
 ///
-/// Pure, and the ORDER is part of the contract: a later mount covers an earlier
-/// one, so the private `/tmp` is mounted before the home and the workspace (a
-/// workspace may itself live under `/tmp` or under the home), the read-only
-/// `readable` paths are mounted BEFORE every writable bind, and the token masks
-/// are emitted AFTER every writable bind so no writable directory can uncover
-/// them. The workspace bind comes after the home's `tmpfs` but before
-/// `--remount-ro`. `bwrap` creates missing mount points itself.
-pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Vec<OsString> {
+/// The order is part of the contract: later mounts cover earlier ones. Readable
+/// paths are resolved and credential-checked at each command start; token masks
+/// follow the workspace bind and writable binds. `bwrap` creates mount points.
+pub fn bwrap_args(
+    sandbox: &Sandbox,
+    workspace_root: &Path,
+    private_tmp: &Path,
+) -> Result<Vec<OsString>, SandboxError> {
     let home = &sandbox.home;
     let mut args: Vec<OsString> = Vec::new();
     // 1. The host filesystem, read-only, with fresh /dev and /proc.
@@ -194,9 +194,22 @@ pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) 
         }
     }
     for readable in &sandbox.readable {
-        if readable.exists() {
-            push_ro_bind(&mut args, readable);
+        if !readable.is_absolute() {
+            return Err(SandboxError::ReadableUnresolved {
+                path: readable.clone(),
+            });
         }
+        let resolved =
+            std::fs::canonicalize(readable).map_err(|_| SandboxError::ReadableUnresolved {
+                path: readable.clone(),
+            })?;
+        if let Some(directory) = credential_directory(home, &resolved) {
+            return Err(SandboxError::ReadableCredential {
+                path: readable.clone(),
+                directory,
+            });
+        }
+        push_ro_bind(&mut args, &resolved);
     }
     if let Some(runtime_dir) = &sandbox.runtime_dir
         && runtime_dir.exists()
@@ -204,8 +217,7 @@ pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) 
         args.push("--tmpfs".into());
         args.push(runtime_dir.into());
     }
-    // 4. Extra writable paths, if they exist; THEN the token masks, so a writable
-    //    bind (e.g. `--sandbox-write ~/.cargo`) cannot uncover a credential file.
+    // 4. Extra writable paths, if they exist.
     for writable in &sandbox.writable {
         if writable.exists() {
             args.push("--bind".into());
@@ -213,6 +225,11 @@ pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) 
             args.push(writable.into());
         }
     }
+    // 5. The workspace follows mounts that could cover it; masks then follow
+    //    the workspace and writable binds, so neither can uncover credentials.
+    args.push("--bind".into());
+    args.push(workspace_root.into());
+    args.push(workspace_root.into());
     for name in ["credentials.toml", "credentials"] {
         let path = home.join(".cargo").join(name);
         if path.exists() {
@@ -221,10 +238,6 @@ pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) 
             args.push(path.into());
         }
     }
-    // 5. The workspace, after the mounts that could cover it.
-    args.push("--bind".into());
-    args.push(workspace_root.into());
-    args.push(workspace_root.into());
     // 6. Only now make the home read-only: writes fail loudly instead of
     //    vanishing into the tmpfs. Child mounts (the workspace) stay writable.
     args.push("--remount-ro".into());
@@ -234,7 +247,33 @@ pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) 
         args.push(arg.into());
     }
     args.push(workspace_root.into());
-    args
+    Ok(args)
+}
+
+/// Resolve bubblewrap using only absolute PATH entries outside the workspace.
+/// The resolved executable is retained by the runtime so no later command can
+/// re-resolve it against a model-controlled working directory or PATH.
+fn resolve_bwrap(path: Option<&OsStr>, workspace: &Path) -> Option<PathBuf> {
+    let path = path?;
+    for directory in std::env::split_paths(path) {
+        if !directory.is_absolute() {
+            continue;
+        }
+        let candidate = directory.join("bwrap");
+        let Ok(resolved) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        if resolved.starts_with(workspace) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(&resolved) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return Some(resolved);
+        }
+    }
+    None
 }
 
 fn push_ro_bind(args: &mut Vec<OsString>, path: &Path) {
@@ -318,4 +357,134 @@ fn lexical_normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Sandbox, SandboxError, bwrap_args, resolve_bwrap};
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn executable(path: &Path) {
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn resolver_skips_relative_and_workspace_path_entries() {
+        let workspace = tempfile::tempdir().unwrap();
+        executable(&workspace.path().join("bwrap"));
+        let path = std::env::join_paths([OsStr::new("."), workspace.path().as_os_str()]).unwrap();
+
+        assert_eq!(resolve_bwrap(Some(&path), workspace.path()), None);
+    }
+
+    #[test]
+    fn resolver_returns_an_absolute_executable_for_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let trusted = temp.path().join("trusted");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&trusted).unwrap();
+        executable(&trusted.join("bwrap"));
+        let path = std::env::join_paths([trusted.as_os_str()]).unwrap();
+
+        let program = resolve_bwrap(Some(&path), &workspace).unwrap();
+        assert!(
+            program.is_absolute(),
+            "spawn must use an absolute program path"
+        );
+        assert_eq!(
+            program,
+            std::fs::canonicalize(trusted.join("bwrap")).unwrap()
+        );
+    }
+
+    #[test]
+    fn command_time_readable_path_into_credentials_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let credential = home.join(".ssh");
+        std::fs::create_dir_all(&credential).unwrap();
+        std::fs::write(credential.join("known_hosts"), "not a credential").unwrap();
+        let readable = credential.join("known_hosts");
+        let sandbox = Sandbox {
+            home: home.clone(),
+            home_visible: Vec::new(),
+            readable: vec![readable],
+            writable: Vec::new(),
+            runtime_dir: None,
+        };
+
+        let result = bwrap_args(&sandbox, temp.path(), &temp.path().join("private-tmp"));
+        assert!(matches!(
+            result,
+            Err(SandboxError::ReadableCredential { .. })
+        ));
+    }
+
+    #[test]
+    fn unresolved_readable_path_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox {
+            home: temp.path().join("home"),
+            home_visible: Vec::new(),
+            readable: vec![temp.path().join("does-not-exist")],
+            writable: Vec::new(),
+            runtime_dir: None,
+        };
+
+        let result = bwrap_args(&sandbox, temp.path(), &temp.path().join("private-tmp"));
+        assert!(matches!(
+            result,
+            Err(SandboxError::ReadableUnresolved { .. })
+        ));
+    }
+
+    #[test]
+    fn token_masks_follow_workspace_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cargo = home.join(".cargo");
+        std::fs::create_dir_all(&cargo).unwrap();
+        std::fs::write(cargo.join("credentials"), "not a credential").unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sandbox = Sandbox {
+            home,
+            home_visible: Vec::new(),
+            readable: Vec::new(),
+            writable: Vec::new(),
+            runtime_dir: None,
+        };
+
+        let args = bwrap_args(&sandbox, &workspace, &temp.path().join("private-tmp")).unwrap();
+        let args: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let workspace_bind = args
+            .windows(3)
+            .position(|window| {
+                window[0] == "--bind"
+                    && window[1] == workspace.display().to_string()
+                    && window[2] == workspace.display().to_string()
+            })
+            .unwrap();
+        let mask = args
+            .windows(3)
+            .position(|window| {
+                window[0] == "--ro-bind"
+                    && window[1] == "/dev/null"
+                    && window[2] == cargo.join("credentials").display().to_string()
+            })
+            .unwrap();
+        assert!(
+            mask > workspace_bind,
+            "credential mask must follow workspace bind"
+        );
+    }
 }

@@ -277,13 +277,16 @@ impl ProcessService {
         // process group, stdin, capture, timeout and kill are shared.
         let mut builder = match &self.sandbox {
             Some(runtime) => {
-                let mut bwrap = Command::new("bwrap");
+                let mut bwrap = Command::new(&runtime.bwrap_path);
                 bwrap
-                    .args(bwrap_args(
-                        &runtime.sandbox,
-                        root,
-                        runtime.private_tmp.path(),
-                    ))
+                    .args(
+                        bwrap_args(&runtime.sandbox, root, runtime.private_tmp.path()).map_err(
+                            |error| ProcessFailure::Start {
+                                program: "bwrap",
+                                error: error.to_string(),
+                            },
+                        )?,
+                    )
                     .arg("bash")
                     .arg("-lc")
                     .arg(command);
