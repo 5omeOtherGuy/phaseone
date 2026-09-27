@@ -3,7 +3,7 @@
 //! assembly instead of the first command.
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
@@ -267,8 +267,7 @@ pub fn bwrap_args(
     Ok(args)
 }
 
-/// Resolve bubblewrap using absolute PATH entries outside every sandbox-writable
-/// root. The result is retained so later commands never re-resolve model-controlled PATH.
+/// Resolve absolute PATH candidates with safe link counts; hard links cannot cross the sandbox's read-only/bind mount boundary.
 fn resolve_bwrap(
     path: Option<&OsStr>,
     workspace: &Path,
@@ -308,7 +307,11 @@ fn resolve_bwrap(
         let Ok(metadata) = std::fs::metadata(&resolved) else {
             continue;
         };
-        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+        let trusted_root_owned = metadata.uid() == 0 && metadata.mode() & 0o022 == 0;
+        if metadata.is_file()
+            && metadata.permissions().mode() & 0o111 != 0
+            && (metadata.nlink() == 1 || trusted_root_owned)
+        {
             return Some(resolved);
         }
     }
@@ -402,7 +405,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 mod tests {
     use super::{Sandbox, SandboxError, bwrap_args, resolve_bwrap};
     use std::ffi::OsStr;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
     fn executable(path: &Path) {
@@ -442,9 +445,37 @@ mod tests {
             program.is_absolute(),
             "spawn must use an absolute program path"
         );
+        let metadata = std::fs::metadata(trusted.join("bwrap")).unwrap();
+        assert_eq!(metadata.nlink(), 1);
         assert_eq!(
             program,
             std::fs::canonicalize(trusted.join("bwrap")).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolver_skips_user_owned_launcher_with_workspace_hard_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let trusted = temp.path().join("trusted");
+        let private_tmp = temp.path().join("private-tmp");
+        for directory in [&workspace, &trusted, &private_tmp] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let launcher = trusted.join("bwrap");
+        executable(&launcher);
+        std::fs::hard_link(&launcher, workspace.join("bwrap")).unwrap();
+        let metadata = std::fs::metadata(&launcher).unwrap();
+        if metadata.uid() == 0 {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o775);
+            std::fs::set_permissions(&launcher, permissions).unwrap();
+        }
+        let path = std::env::join_paths([trusted.as_os_str()]).unwrap();
+
+        assert_eq!(
+            resolve_bwrap(Some(&path), &workspace, &[], &private_tmp),
+            None
         );
     }
 
