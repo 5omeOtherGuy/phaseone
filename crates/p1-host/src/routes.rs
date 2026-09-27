@@ -39,9 +39,11 @@ pub struct ModelBinding {
     pub output_limit: Option<u32>,
 }
 
-/// One parsed `routes/<id>.toml`, validated. The host never interprets these fields
-/// beyond routing: `[adapter_settings]` is handed to the adapter named by `adapter`
-/// as-is (`docs/design/routes-and-profiles.md` §1.2).
+/// One parsed `routes/<id>.toml`, validated. The host interprets these fields only to
+/// route: `[adapter_settings]` is checked when the file loads against the host's copy
+/// of the settings type of the adapter named by `adapter` ([`RouteFile::settings`]),
+/// and the table itself reaches the component that serves the route as-is
+/// (`docs/design/routes-and-profiles.md` §1.2).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteFile {
@@ -76,25 +78,101 @@ pub const MODEL_BINDING_KEY: &str = "model_binding";
 /// The `[adapter_settings]` table of one route, typed by the adapter that named it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdapterSettings {
-    OpenAiChat(p1_provider_openai_chat::ChatAdapterSettings),
-    AnthropicMessages(p1_provider_anthropic::MessagesAdapterSettings),
-    OpenAiResponses(p1_provider_openai::ResponsesAdapterSettings),
+    OpenAiChat(ChatAdapterSettings),
+    AnthropicMessages(MessagesAdapterSettings),
+    OpenAiResponses(ResponsesAdapterSettings),
+}
+
+// The settings types below are the host's copies of the adapters' own `[adapter_settings]`
+// types, field for field and spelling for spelling, so that a route file is checked when it
+// loads without the host linking the native adapters (S7.10-R4): the provider COMPONENT is
+// what parses them for a request (ADR-0086). The type names are the adapters' too, because
+// serde names a type in some errors, and a malformed file must read the same either way; the
+// unit tests hold both sides against every shipped route and every malformed case.
+
+/// `openai-chat`'s message encodings (`p1_provider_openai_chat::ChatDialect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChatDialect {
+    #[default]
+    ThinkingWithReasoningAlias,
+    RetainedThinking,
+}
+
+/// `openai-chat`'s non-secret client identities (`p1_provider_openai_chat::ClientIdentity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientIdentity {
+    Opencode,
+}
+
+/// `openai-chat`'s `[adapter_settings]` (`p1_provider_openai_chat::ChatAdapterSettings`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatAdapterSettings {
+    pub dialect: ChatDialect,
+    #[serde(default)]
+    pub session_header: Option<String>,
+    #[serde(default)]
+    pub client_identity: Option<ClientIdentity>,
+}
+
+/// `anthropic-messages`' account behaviours (`p1_provider_anthropic::MessagesAccount`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MessagesAccount {
+    ClaudeCodeSubscription,
+}
+
+/// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessagesAdapterSettings {
+    pub account: MessagesAccount,
+    #[serde(default)]
+    pub long_context: bool,
+}
+
+/// `openai-responses`' account behaviours (`p1_provider_openai::ResponsesAccount`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResponsesAccount {
+    CodexSubscription,
+}
+
+/// `openai-responses`' `[adapter_settings]` (`p1_provider_openai::ResponsesAdapterSettings`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsesAdapterSettings {
+    pub account: ResponsesAccount,
+    /// Absent means [`ResponsesTransport::Sse`] (ADR-0047 §1).
+    #[serde(default)]
+    pub transport: ResponsesTransport,
+}
+
+/// How a Responses route reaches the model (`p1_provider_openai::ResponsesTransport`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponsesTransport {
+    #[default]
+    Sse,
+    Websocket,
 }
 
 impl RouteFile {
-    /// The settings the adapter named by `adapter` parses for itself. The host knows
-    /// only which type an adapter key selects; the fields belong to the adapter, so
-    /// an unknown key fails there, next to the code that would consume it.
+    /// The settings the adapter named by `adapter` takes, checked against the adapter's
+    /// own fields: an unknown key or value fails when the route loads, before any
+    /// provider component parses the same table for a request.
     pub fn settings(&self) -> Result<AdapterSettings, String> {
         match self.adapter.as_str() {
             "openai-chat" => self
-                .typed_settings::<p1_provider_openai_chat::ChatAdapterSettings>()
+                .typed_settings::<ChatAdapterSettings>()
                 .map(AdapterSettings::OpenAiChat),
             "anthropic-messages" => self
-                .typed_settings::<p1_provider_anthropic::MessagesAdapterSettings>()
+                .typed_settings::<MessagesAdapterSettings>()
                 .map(AdapterSettings::AnthropicMessages),
             "openai-responses" => self
-                .typed_settings::<p1_provider_openai::ResponsesAdapterSettings>()
+                .typed_settings::<ResponsesAdapterSettings>()
                 .map(AdapterSettings::OpenAiResponses),
             other => Err(format!(
                 "unknown adapter \"{other}\"; the known adapters are {}",
@@ -483,6 +561,199 @@ mod tests {
                     "{adapter}/{key}: {error}"
                 );
             }
+        }
+    }
+
+    /// The settings as the adapter crates parse them: the validation `load_route` ran before
+    /// S7.10-R4 moved it into this module. `Debug` is the comparison because the host's copies
+    /// carry the adapters' type, field and variant names.
+    fn adapter_crate_settings(route: &RouteFile) -> Result<String, String> {
+        match route.adapter.as_str() {
+            "openai-chat" => route
+                .typed_settings::<p1_provider_openai_chat::ChatAdapterSettings>()
+                .map(|settings| format!("{settings:?}")),
+            "anthropic-messages" => route
+                .typed_settings::<p1_provider_anthropic::MessagesAdapterSettings>()
+                .map(|settings| format!("{settings:?}")),
+            "openai-responses" => route
+                .typed_settings::<p1_provider_openai::ResponsesAdapterSettings>()
+                .map(|settings| format!("{settings:?}")),
+            other => panic!("no adapter crate for {other}"),
+        }
+    }
+
+    fn host_settings(route: &RouteFile) -> Result<String, String> {
+        route.settings().map(|settings| match settings {
+            AdapterSettings::OpenAiChat(settings) => format!("{settings:?}"),
+            AdapterSettings::AnthropicMessages(settings) => format!("{settings:?}"),
+            AdapterSettings::OpenAiResponses(settings) => format!("{settings:?}"),
+        })
+    }
+
+    #[test]
+    fn the_host_settings_agree_with_the_adapter_crates_on_every_shipped_route() {
+        let routes = load_routes(&repo("routes")).expect("the shipped routes load");
+        assert!(!routes.is_empty());
+        for route in &routes {
+            let old = adapter_crate_settings(route);
+            assert!(old.is_ok(), "{}: {old:?}", route.id);
+            assert_eq!(host_settings(route), old, "{}", route.id);
+        }
+    }
+
+    /// `adapter_settings` values, one per adapter key, that the adapter crates accept or
+    /// refuse: every field's wrong value, a wrong type, a missing required field, an unknown
+    /// and a reserved key, a value that is no table and an absent table. `None` omits the key.
+    const SETTINGS_CASES: &[(&str, Option<&str>)] = &[
+        ("openai-chat", Some(r#"{ dialect = "retained-thinking" }"#)),
+        (
+            "openai-chat",
+            Some(
+                r#"{ dialect = "thinking-with-reasoning-alias", session_header = "x-session-affinity", client_identity = "opencode" }"#,
+            ),
+        ),
+        ("openai-chat", Some(r#"{ dialect = "plain" }"#)),
+        ("openai-chat", Some(r#"{ dialect = 1 }"#)),
+        ("openai-chat", Some("{}")),
+        ("openai-chat", None),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", client_identity = "claude-code" }"#),
+        ),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", client_identity = 3 }"#),
+        ),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", session_header = 5 }"#),
+        ),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", max_tokens = 10 }"#),
+        ),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", route_headers = {} }"#),
+        ),
+        ("openai-chat", Some(r#""retained-thinking""#)),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription", long_context = true }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription" }"#),
+        ),
+        ("anthropic-messages", Some(r#"{ account = "api-key" }"#)),
+        ("anthropic-messages", Some(r#"{ account = ["x"] }"#)),
+        ("anthropic-messages", Some("{}")),
+        ("anthropic-messages", None),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription", long_context = "yes" }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription", headers = {} }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription", model_profile = {} }"#),
+        ),
+        ("anthropic-messages", Some("7")),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = "websocket" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = "sse" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription" }"#),
+        ),
+        ("openai-responses", Some(r#"{ account = "plus" }"#)),
+        ("openai-responses", Some("{}")),
+        ("openai-responses", None),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = "http" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = "WebSocket" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = true }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", store = false }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", model_binding = {} }"#),
+        ),
+        ("openai-responses", Some("[]")),
+    ];
+
+    fn case_route_text(adapter: &str, settings: Option<&str>) -> String {
+        let settings = settings
+            .map(|value| format!("adapter_settings = {value}\n"))
+            .unwrap_or_default();
+        format!(
+            r#"id = "case"
+origin_route = "{adapter}/case"
+adapter = "{adapter}"
+endpoint = "https://example.invalid/v1"
+{settings}
+[credential]
+kind = "api-key"
+env = "EXAMPLE_API_KEY"
+borrow = []
+store_only = true
+
+[models."m"]
+wire_model = "m"
+"#
+        )
+    }
+
+    #[test]
+    fn the_host_settings_agree_with_the_adapter_crates_on_every_case() {
+        let mut refused = 0;
+        for (adapter, settings) in SETTINGS_CASES {
+            let route: RouteFile = toml::from_str(&case_route_text(adapter, *settings))
+                .unwrap_or_else(|error| panic!("{adapter} {settings:?}: {error}"));
+            let old = adapter_crate_settings(&route);
+            assert_eq!(host_settings(&route), old, "{adapter} {settings:?}");
+            refused += usize::from(old.is_err());
+        }
+        assert!(refused >= 20, "the cases refuse: {refused}");
+    }
+
+    /// A malformed `[adapter_settings]` still fails when the route file LOADS, with the
+    /// adapter crate's own words behind the file's name: the same stage and message as when
+    /// `load_route` parsed the table with the adapter crate's type.
+    #[test]
+    fn a_malformed_route_fails_at_load_with_the_adapter_crates_error() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let path = scratch.path().join("case.toml");
+        for (adapter, settings) in SETTINGS_CASES {
+            let text = case_route_text(adapter, *settings);
+            std::fs::write(&path, &text).expect("the case file is written");
+            let route: RouteFile = toml::from_str(&text).expect("the case parses");
+            let expected = adapter_crate_settings(&route)
+                .map(|_| ())
+                .map_err(|error| format!("{}: {error}", path.display()));
+            assert_eq!(
+                load_route(&path).map(|_| ()),
+                expected,
+                "{adapter} {settings:?}"
+            );
         }
     }
 

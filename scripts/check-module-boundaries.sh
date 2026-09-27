@@ -633,13 +633,17 @@ p1-redact|foundation|credential-shape masking runs over the output of every asse
 p1-shell-guest|contracts|the shared guest crate of the `shell` package (S3.2), classified for the reason in the notice above: the world bindings, the input validation, the declaration and the sandbox paragraph the native adapter and the component both present (ADR-0081, D083)
 p1-tool-delegate|extension|the worker_start, worker_result, worker_continue and worker_cancel tool members (ADR-0081)
 p1-tool-edit|extension|the `edit` tool implementation, which becomes a tool module (ADR-0081)
+p1-tool-edit-logic|contracts|the shared guest logic of `edit` (S0-R3): pure computation the p1/edit component ships; natively it is reached only through p1-tool-edit, listed as extension
 p1-tool-finish|extension|the `finish` tool and the output contract it checks, which become a tool module (ADR-0081)
 p1-tool-patch|extension|the `apply_patch` tool implementation, which becomes a tool module (ADR-0081)
+p1-tool-patch-logic|contracts|the shared guest logic of `apply_patch` (S0-R3): pure computation the p1/patch component ships; natively it is reached only through p1-tool-patch, listed as extension
 p1-tool-read|extension|the `read` tool implementation, which becomes a tool module (ADR-0081)
 p1-tool-search|extension|the `grep` tool implementation, which becomes a tool module (ADR-0081)
+p1-tool-search-logic|contracts|the shared guest logic of `grep` (S0-R3): pure computation the p1/search component ships; natively it is reached only through p1-tool-search, listed as extension
 p1-tool-shell|extension|the `shell` tool logic is extension; the crate also holds the bubblewrap boundary and the native process service (S3.1), so it stays extension until that service leaves it (ADR-0081)
 p1-tool-workflow|extension|the workflow_start, workflow_status, workflow_result and workflow_cancel tool members (ADR-0081)
 p1-tool-write|extension|the `write` tool implementation, which becomes a tool module (ADR-0081)
+p1-tool-write-logic|contracts|the shared guest logic of `write` (S0-R3): pure computation the p1/write component ships; natively it is reached only through p1-tool-write, listed as extension
 p1-tui|foundation|the terminal driver is native; the state machine it renders is not a module (ADR-0043)
 p1-usage|foundation|usage and cost accounting is native (ADR-0019)
 p1-workers|foundation|the in-process worker service is native; the worker packages answer the tool members over the module interfaces (ADR-0027, ADR-0081)

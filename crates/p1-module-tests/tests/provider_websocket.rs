@@ -14,18 +14,23 @@
 //! Fake time (`start_paused`), `ScriptedWsConnector` and `ScriptedTransport` only: no socket,
 //! no network, no sleep.
 
+// The native adapters' route values, composed from a route file exactly as the host's tests
+// compose them (S7.10-R4 took them out of `p1_host::catalog`).
+#[path = "../../p1-host/tests/native_routes/mod.rs"]
+mod native_routes;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use native_routes::responses_route;
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{
     AssistantBlock, AssistantItem, BoxFuture, CancellationToken, Item, ModelOptions, Origin,
     Outcome, Provider, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
     StreamEvent,
 };
-use p1_host::catalog::responses_route;
 use p1_host::routes::{RouteFile, load_route};
 use p1_model_profile::ModelProfile;
 use p1_module_runtime::{ExecutionLimits, LoadedModule, ProviderSettings, WasmProvider};
