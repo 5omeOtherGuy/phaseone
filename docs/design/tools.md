@@ -256,7 +256,7 @@ impl ShellTool {
     pub fn sandboxed(self, sandbox: Sandbox) -> Result<Self, SandboxError>;
 }
 /// Pure, unit-tested: the argument vector before `bash -lc <command>`.
-pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Vec<OsString>;
+pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Result<Vec<OsString>, SandboxError>;
 ```
 
 The command becomes `bwrap <args> bash -lc <command>`; process group, timeout, cancellation,
@@ -267,19 +267,19 @@ itself live under `/tmp` or under the home:
 2. `--bind <private_tmp> /tmp` — a fresh directory per `ShellTool`, created under
    `std::env::temp_dir()` and removed when the tool is dropped; `--setenv TMPDIR /tmp`;
 3. `--tmpfs <home>` (`<home>` CANONICAL — the same path the containment check used), then
-   `--ro-bind <home>/<entry> <home>/<entry>` for every existing `home_visible` entry, then
-   `--ro-bind <path> <path>` for every existing `readable` path (e.g. a git worktree's
-   common directory, from `--sandbox-read`); `--tmpfs $XDG_RUNTIME_DIR` when that variable
-   names an existing directory — agent sockets and keyrings live there;
-4. `--bind <path> <path>` for every existing `writable` path; THEN the masks, so that no
-   writable bind can uncover them: `--ro-bind /dev/null <home>/.cargo/credentials.toml` (and
-   `…/credentials`) if that file exists — a visible or writable directory must not leak a token.
-   The `readable` binds come BEFORE this step, so no readable path can uncover
-   `~/.cargo/credentials*`;
+   `--ro-bind <home>/<entry> <home>/<entry>` for every existing `home_visible` entry, then for
+   each existing `readable` path use `--ro-bind <canonical-source> <configured-path>` (e.g. a
+   git worktree's common directory from `--sandbox-read`; preserving the configured destination
+   keeps a symlink inside the hidden home reachable); `--tmpfs $XDG_RUNTIME_DIR` when that
+   variable names an existing directory — agent sockets and keyrings live there;
+4. `--bind <path> <path>` for every existing `writable` path;
 5. `--bind <workspace root> <workspace root>`;
-6. `--remount-ro <home>` — writes to the hidden home fail loudly (`Read-only file system`)
+6. AFTER readable, writable and workspace binds, mask existing cargo credentials with
+   `--ro-bind /dev/null <home>/.cargo/credentials.toml` (and `…/credentials`), so no later
+   bind can uncover a token;
+7. `--remount-ro <home>` — writes to the hidden home fail loudly (`Read-only file system`)
    instead of vanishing into a tmpfs;
-7. `--unshare-pid --die-with-parent --chdir <workspace root>`.
+8. `--unshare-pid --die-with-parent --chdir <workspace root>`.
 The network stays shared (fetching dependencies is normal work). The PID namespace closes the
 hole the unsandboxed tool has: a process that leaves the process group (`setsid`, double
 fork) still dies with the sandbox when the command is cancelled or times out.

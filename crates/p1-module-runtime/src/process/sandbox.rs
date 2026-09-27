@@ -190,11 +190,9 @@ pub fn bwrap_args(
     // 3. Hide the home behind a tmpfs, then put back only what stays visible —
     //    the allow-list entries, then the caller's read-only `readable` paths
     //    (e.g. a git worktree's common directory) — and replace the runtime
-    //    directory (agent sockets and keyrings). The readable binds come BEFORE
-    //    the writable binds and the token masks below, so no readable path can
-    //    uncover `~/.cargo/credentials*`. The runtime `tmpfs` comes last, so a
-    //    readable path can never re-expose an agent socket. (`ProcessService::sandboxed`
-    //    also refuses a readable path that would contain a credential directory.)
+    //    directory (agent sockets and keyrings). For a symlinked readable path,
+    //    mount its canonical source at the configured destination, which remains
+    //    reachable after the home tmpfs hides the original symlink.
     args.push("--tmpfs".into());
     args.push(home.into());
     for entry in &sandbox.home_visible {
@@ -213,13 +211,17 @@ pub fn bwrap_args(
             std::fs::canonicalize(readable).map_err(|_| SandboxError::ReadableUnresolved {
                 path: readable.clone(),
             })?;
-        if let Some(directory) = credential_directory(home, &resolved) {
-            return Err(SandboxError::ReadableCredential {
-                path: readable.clone(),
-                directory,
-            });
+        for candidate in [readable.as_path(), resolved.as_path()] {
+            if let Some(directory) = credential_directory(home, candidate) {
+                return Err(SandboxError::ReadableCredential {
+                    path: readable.clone(),
+                    directory,
+                });
+            }
         }
-        push_ro_bind(&mut args, &resolved);
+        args.push("--ro-bind".into());
+        args.push(resolved.into());
+        args.push(readable.as_os_str().into());
     }
     if let Some(runtime_dir) = &sandbox.runtime_dir
         && runtime_dir.exists()
@@ -458,6 +460,43 @@ mod tests {
             result,
             Err(SandboxError::ReadableUnresolved { .. })
         ));
+    }
+
+    #[test]
+    fn readable_symlink_inside_hidden_home_keeps_its_configured_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let source = temp.path().join("shared");
+        std::fs::create_dir_all(&source).unwrap();
+        let configured = home.join("shared-link");
+        symlink(&source, &configured).unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sandbox = Sandbox {
+            home,
+            home_visible: Vec::new(),
+            readable: vec![configured.clone()],
+            writable: Vec::new(),
+            runtime_dir: None,
+        };
+
+        let args = bwrap_args(&sandbox, &workspace, &temp.path().join("private-tmp")).unwrap();
+        let args: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(3).any(|window| {
+            window[0] == "--ro-bind"
+                && window[1]
+                    == std::fs::canonicalize(&source)
+                        .unwrap()
+                        .display()
+                        .to_string()
+                && window[2] == configured.display().to_string()
+        }));
     }
 
     #[test]

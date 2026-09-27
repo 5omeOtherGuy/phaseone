@@ -48,7 +48,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0032 | [Agents sharing a directory serialize their file mutations](0032-agents-sharing-a-directory-serialize-their-file-mutations.md) | accepted | 2026-09-20 | lead |
 | ADR-0033 | [A session resumes only on the route and model that recorded it](0033-a-session-resumes-only-on-the-route-and-model-that-recorded-it.md) | superseded by ADR-0049 | 2026-09-20 | lead |
 | ADR-0034 | [Workers are not restored when their parent session resumes](0034-workers-are-not-restored-when-their-parent-session-resumes.md) | accepted | 2026-09-20 | lead |
-| ADR-0035 | [The shell tool can run inside a bubblewrap execution boundary](0035-the-shell-tool-can-run-inside-a-bubblewrap-execution-boundary.md) | accepted | 2026-09-20 | lead |
+| ADR-0035 | [The shell tool can run inside a bubblewrap execution boundary](0035-the-shell-tool-can-run-inside-a-bubblewrap-execution-boundary.md) | superseded by ADR-0096 | 2026-09-20 | lead |
 | ADR-0036 | [Context control is a summarizing policy module with a durable, validated replacement](0036-context-control-is-a-summarizing-policy-module-with-a-durable-validated-replacement.md) | accepted | 2026-09-20 | lead |
 | ADR-0037 | [Unattended runs end by an observable finish call, with bounded continuation](0037-unattended-runs-end-by-an-observable-finish-call-with-bounded-continuation.md) | accepted | 2026-09-20 | lead |
 | ADR-0038 | [Full access is the default; asking is opt-in](0038-full-access-is-the-default-asking-is-opt-in.md) | accepted | 2026-09-20 | owner |
@@ -109,6 +109,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0093 | [Route settings validation is host-owned and the native route constructors leave p1-host](0093-route-settings-validation-is-host-owned-and-the-native-route-constructors-leave-p1-host.md) | proposed | 2026-09-27 | lead |
 | ADR-0094 | [Resume scanner and workflow report formatter move into the foundation crates](0094-resume-scanner-and-workflow-report-formatter-move-into-the-foundation-crates.md) | proposed | 2026-09-27 | lead |
 | ADR-0095 | [File-tool capability services live in the runtime; no native file-tool fallback](0095-file-tool-capability-services-live-in-the-runtime-no-native-file-tool-fallback.md) | proposed | 2026-09-27 | lead |
+| ADR-0096 | [Bubblewrap credential masks follow workspace mounts](0096-bubblewrap-credential-masks-follow-workspace-mounts.md) | proposed | 2026-09-27 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
