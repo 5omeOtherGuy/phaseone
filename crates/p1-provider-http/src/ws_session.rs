@@ -390,6 +390,14 @@ impl WsLease {
         self.live = None;
     }
 
+    /// Drop every connection, the idle one in the session included: the
+    /// component instance that opened it is gone, and a connection must not
+    /// outlive it.
+    pub fn drop_session_connection(&mut self) {
+        self.live = None;
+        self.slot.live = None;
+    }
+
     /// The attempt failed before any output and the caller allows it no further
     /// WebSocket attempt: drop the connection and report
     /// [`ConnectionState::failed_before_output`] from now on.
@@ -578,6 +586,38 @@ mod tests {
             assert_eq!(error.message, PATH_REFUSED, "{path}");
         }
         assert!(handshake_for(authority, &head("/sub/path", Vec::new())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_session_connection_also_drops_the_idle_one() {
+        let connector = crate::testing::ScriptedWsConnector::new(vec![
+            crate::testing::ScriptedConnection::Accept(Vec::new()),
+        ]);
+        let session = WsSession::new(Arc::new(connector), Arc::new(Instant::now));
+        let credential = credential();
+        let authority = WsAuthority {
+            endpoint: "https://host.test/codex/responses",
+            credential: Some(&credential),
+        };
+        let cancel = CancellationToken::new();
+        let mut lease = session.lease().await;
+        let send = WsSend {
+            handshake: Some(head("", Vec::new())),
+            frame: "{}".to_string(),
+        };
+        lease.send(authority, send, &cancel).await.unwrap();
+        lease.completed(None);
+        drop(lease);
+
+        let mut lease = session.lease().await;
+        assert!(
+            lease.state().open,
+            "a completed response keeps the connection"
+        );
+        // The instance failed before this lease took the idle connection.
+        lease.drop_session_connection();
+        drop(lease);
+        assert!(!session.lease().await.state().open);
     }
 
     #[test]

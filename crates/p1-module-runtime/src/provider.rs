@@ -383,7 +383,7 @@ impl Provider for WasmProvider {
                 None => None,
             };
             let connection = lease.as_mut().map(WsLease::state).unwrap_or_default();
-            let lowered = self
+            let lowered = match self
                 .executor
                 .ask(|reply| Command::Prepare {
                     request: request.clone(),
@@ -392,7 +392,17 @@ impl Provider for WasmProvider {
                 })
                 .map_err(Refusal::from)
                 .and_then(|answer| answer)
-                .map_err(Refusal::into_error)?;
+            {
+                Ok(lowered) => lowered,
+                Err(refusal) => {
+                    // A failed call poisoned the instance; the next request rebuilds it and
+                    // must not reuse a connection opened for this one (ADR-0078 §3).
+                    if let (Refusal::Failed(_), Some(lease)) = (&refusal, lease.as_mut()) {
+                        lease.drop_session_connection();
+                    }
+                    return Err(refusal.into_error());
+                }
+            };
             let send = match lowered {
                 WsLowered::Http(lowered) => {
                     // No connection is needed: the session is free for another request.
