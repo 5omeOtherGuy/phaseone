@@ -250,6 +250,10 @@ pub fn load_release_module(package: &str) -> Result<LoadedModule, String> {
     let at = |error: ManifestError| format!("module `{package}`: {}: {error}", release.display());
     let manifest = ReleaseManifest::read(&release).map_err(at)?;
     manifest.check_unique_digests().map_err(at)?;
+    // The loader checks only what is linkable at all; the class allocation is the host's.
+    if let Some(entry) = manifest.entry(package) {
+        check_allocation(package, entry).map_err(|error| error.to_string())?;
+    }
     let root = release.parent().unwrap_or(Path::new("."));
     let loader = Loader::new(manifest, root)
         .map_err(|error| format!("module `{package}`: cannot start the module runtime: {error}"))?;
