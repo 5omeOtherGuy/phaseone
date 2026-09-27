@@ -330,6 +330,19 @@ fn io_at(path: &Path, error: Errno) -> WorkspaceError {
     }
 }
 
+fn missing_or_io(requested: &str, path: &Path, source: std::io::Error) -> WorkspaceError {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        WorkspaceError::NotFound {
+            requested: requested.to_string(),
+        }
+    } else {
+        WorkspaceError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,18 +369,5 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
             "reading a FIFO should return the existing wrong-kind error"
         );
-    }
-}
-
-fn missing_or_io(requested: &str, path: &Path, source: std::io::Error) -> WorkspaceError {
-    if source.kind() == std::io::ErrorKind::NotFound {
-        WorkspaceError::NotFound {
-            requested: requested.to_string(),
-        }
-    } else {
-        WorkspaceError::Io {
-            path: path.to_path_buf(),
-            source,
-        }
     }
 }
