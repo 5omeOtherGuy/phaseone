@@ -42,8 +42,6 @@ p1-tool-edit = { path = "../p1-tool-edit" }
 p1-tool-write = { path = "../p1-tool-write" }
 p1-tool-search = { path = "../p1-tool-search" }
 p1-tool-patch = { path = "../p1-tool-patch" }
-p1-tool-shell = { path = "../p1-tool-shell" }
-p1-tool-finish = { path = "../p1-tool-finish" }
 # S3.7: the completion hub re-verifies a `finish` component's candidates with the same
 # command rules and contract check the component ships (ADR-0083 §2).
 p1-finish-guest = { path = "../p1-tool-finish/guest" }
@@ -100,6 +98,10 @@ p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 p1-provider-conformance = { path = "../p1-provider-conformance" }
 # S1.5: the package-capability cases load the built fixture through S0's release harness.
 p1-module-tests = { path = "../p1-module-tests" }
+# S7.10-R3: the native shell and finish tools stay only as the references the host's tests
+# compare the components against (declarations, identities, the describer).
+p1-tool-shell = { path = "../p1-tool-shell" }
+p1-tool-finish = { path = "../p1-tool-finish" }
 futures-util = "0.3"
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = [

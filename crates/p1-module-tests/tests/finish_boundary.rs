@@ -18,8 +18,8 @@ use p1_contracts::{
     ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_host::activity::{
-    ActivityLog, ActivityTee, AgentRole, Completion, CompletionGate, CompletionGrant,
-    CompletionHub, CompletionRule, completion_policy, finish_component,
+    ActivityTee, AgentRole, Completion, CompletionGate, CompletionGrant, CompletionHub,
+    CompletionRule, FinishOutcome, completion_policy, finish_component,
 };
 use p1_host::catalog::modules::{ModulesError, load_locked_modules};
 use p1_module_runtime::completion::{
@@ -33,9 +33,22 @@ use p1_module_tests::{Release, lock_text, within_deadline};
 use p1_redact::MaskCounter;
 use p1_testkit::{FakeTool, RecordingEvents};
 use p1_tool_finish::{
-    Accepted, CompletionPolicy, Evidence, FinishOutcome, FinishTool, OutputContract, SchemaCheck,
+    Accepted, CompletionPolicy, Evidence, FinishTool, OutputContract, SchemaCheck, ShellRun,
     StructuredResult,
 };
+
+/// The native `finish` tool's session record, empty: only its declaration is compared.
+struct NoActivity;
+
+impl p1_tool_finish::SessionActivity for NoActivity {
+    fn last_file_change(&self) -> Option<u64> {
+        None
+    }
+
+    fn shell_runs(&self) -> Vec<ShellRun> {
+        Vec::new()
+    }
+}
 
 /// The package directory and manifest name of the component under test.
 const PACKAGE: &str = "p1-module-finish";
@@ -918,13 +931,19 @@ async fn the_policy_is_the_hosts_and_the_declaration_follows_it() {
             for (grant, native) in [
                 (
                     reporting.grant(AgentRole::Worker, Some(id_contract())),
-                    FinishTool::new(Arc::new(ActivityLog::default()), FinishOutcome::default())
-                        .with_policy(CompletionPolicy::ReportToParent)
-                        .with_output_contract(id_contract()),
+                    FinishTool::new(
+                        Arc::new(NoActivity),
+                        p1_tool_finish::FinishOutcome::default(),
+                    )
+                    .with_policy(CompletionPolicy::ReportToParent)
+                    .with_output_contract(id_contract()),
                 ),
                 (
                     reporting.grant(AgentRole::Main, None),
-                    FinishTool::new(Arc::new(ActivityLog::default()), FinishOutcome::default()),
+                    FinishTool::new(
+                        Arc::new(NoActivity),
+                        p1_tool_finish::FinishOutcome::default(),
+                    ),
                 ),
             ] {
                 let presented = component(&module, &grant);

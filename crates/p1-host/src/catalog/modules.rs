@@ -1068,10 +1068,10 @@ pub(crate) fn quiet_deps(environment_dirs: Vec<PathBuf>) -> HostDeps {
 mod tests {
     use p1_assembly::{EnvironmentFile, ProviderSpec, Substitutions, assemble};
     use p1_contracts::{ModelOptions, Provider, ToolIdentity};
+    use p1_finish_guest::CompletionPolicy;
     use p1_module_runtime::ProcessService;
     use p1_module_tests::{FIXTURE_NAME, FakeProcesses, Release, fake_processes, lock_text};
     use p1_testkit::{FakeTool, ScriptedProvider};
-    use p1_tool_finish::CompletionPolicy;
 
     use crate::catalog::capabilities::{Capabilities, SemanticCapability, carries, declared};
 

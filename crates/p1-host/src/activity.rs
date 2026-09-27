@@ -1,6 +1,6 @@
-//! The host's session-completion state: the `SessionActivity` implementation fed
+//! The host's session-completion state: the session record ([`ActivityLog`]) fed
 //! from the event stream, the tee that feeds it, and the per-agent handoff of the
-//! `finish` tool's outcome.
+//! `finish` tool's outcome ([`FinishOutcome`], the cell only the hub writes).
 //!
 //! The tee forwards EVERY event to the renderer unchanged (the renderer keeps its
 //! exact behaviour) and records finished calls into an [`ActivityLog`]: the order
@@ -33,6 +33,9 @@ use p1_contracts::{
     RecordBody, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome,
     ToolResultItem, ToolStatus,
 };
+use p1_finish_guest::{
+    Accepted, CompletionPolicy, Evidence, OutputContract, ShellRun, StructuredResult,
+};
 use p1_module_runtime::completion::{
     Candidate, CompletionPolicy as WirePolicy, Evidence as CandidateEvidence, ShellRun as WireRun,
     StructuredResult as WireStructured,
@@ -41,10 +44,6 @@ use p1_module_runtime::{
     CompletionService, ExecutionLimits, LoadedModule, Services, ToolError, wasm_tool,
 };
 use p1_redact::{MaskCounter, redacted};
-use p1_tool_finish::{
-    Accepted, CompletionPolicy, Evidence, FinishOutcome, OutputContract, SessionActivity, ShellRun,
-    StructuredResult,
-};
 
 use crate::fingerprint::{self, Fingerprint, FingerprintError};
 
@@ -90,7 +89,8 @@ struct Watch {
     last: Option<Fingerprint>,
 }
 
-/// The host's [`SessionActivity`]. One per agent; fed only through [`ActivityTee`].
+/// The host's session record, what a `finish` call is checked against. One per agent;
+/// fed only through [`ActivityTee`].
 #[derive(Default)]
 pub struct ActivityLog {
     next_order: AtomicU64,
@@ -325,7 +325,7 @@ impl ActivityLog {
 
     /// The runs the completion hub counts as evidence (ADR-0083 rule 2): the finished
     /// `Executes` calls of a tool that records command evidence, ordered as
-    /// [`SessionActivity::shell_runs`] orders every run.
+    /// [`ActivityLog::shell_runs`] orders every run.
     pub fn evidence_runs(&self) -> Vec<ShellRun> {
         self.runs(true)
     }
@@ -361,8 +361,10 @@ impl ActivityLog {
     }
 }
 
-impl SessionActivity for ActivityLog {
-    fn last_file_change(&self) -> Option<u64> {
+impl ActivityLog {
+    /// `order` of the last successful call that changed a file: a `WritesFiles` call, or
+    /// an `Executes` call that changed the workspace (ADR-0055).
+    pub fn last_file_change(&self) -> Option<u64> {
         self.finished
             .lock()
             .unwrap()
@@ -377,7 +379,7 @@ impl SessionActivity for ActivityLog {
 
     /// Every successful `Executes` run, whatever tool ran it, as `completion.shell-runs`
     /// reports them; the hub counts only [`ActivityLog::evidence_runs`].
-    fn shell_runs(&self) -> Vec<ShellRun> {
+    pub fn shell_runs(&self) -> Vec<ShellRun> {
         self.runs(false)
     }
 }
@@ -647,6 +649,50 @@ fn parse_finish_call(raw: &str) -> Option<FinishReport> {
         summary,
         evidence: None,
     })
+}
+
+/// Both values an accepted call writes, under ONE lock, so the host can never read a
+/// `get` and a `structured` that belong to different calls.
+#[derive(Default)]
+struct OutcomeCell {
+    accepted: Option<Accepted>,
+    structured: Option<StructuredResult>,
+}
+
+/// One agent's accepted `finish` outcome, which the host reads after a turn. Cheap to
+/// clone; all clones share one value. Only the completion hub writes it, after it
+/// re-verified a component's candidate against its own record (ADR-0083 §2); the host
+/// reads and clears it.
+#[derive(Clone, Default)]
+pub struct FinishOutcome {
+    inner: Arc<Mutex<OutcomeCell>>,
+}
+
+impl FinishOutcome {
+    /// The last accepted outcome, if any.
+    pub fn get(&self) -> Option<Accepted> {
+        self.inner.lock().unwrap().accepted.clone()
+    }
+
+    /// The `result` of the last accepted `done` with its check; `None` after an
+    /// accepted `blocked`, after [`FinishOutcome::clear`], or before any call.
+    pub fn structured(&self) -> Option<StructuredResult> {
+        self.inner.lock().unwrap().structured.clone()
+    }
+
+    /// Drop both values, so an earlier turn cannot end a later one.
+    pub fn clear(&self) {
+        let mut cell = self.inner.lock().unwrap();
+        cell.accepted = None;
+        cell.structured = None;
+    }
+
+    /// Store an accepted call; the last one wins.
+    pub fn set(&self, accepted: Accepted, structured: Option<StructuredResult>) {
+        let mut cell = self.inner.lock().unwrap();
+        cell.accepted = Some(accepted);
+        cell.structured = structured;
+    }
 }
 
 /// One agent's completion state: the activity it runs against and the cell its
@@ -2039,7 +2085,7 @@ mod tests {
             runs: Vec<ShellRun>,
         }
 
-        impl SessionActivity for Fixed {
+        impl p1_tool_finish::SessionActivity for Fixed {
             fn last_file_change(&self) -> Option<u64> {
                 self.change
             }
@@ -2075,7 +2121,10 @@ mod tests {
         ];
         for (verification, activity, expected) in cases {
             let outcome = FinishOutcome::default();
-            let finish = p1_tool_finish::FinishTool::new(Arc::new(activity), outcome.clone());
+            // The native tool accepts into its own cell; what it accepted is committed to
+            // the host's cell, as the hub commits a verified candidate (ADR-0083 §2).
+            let written = p1_tool_finish::FinishOutcome::default();
+            let finish = p1_tool_finish::FinishTool::new(Arc::new(activity), written.clone());
             let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
                 FakeTool::new("finish").with_identity(&finish_implementation(), "claude"),
             )];
@@ -2104,6 +2153,7 @@ mod tests {
                 )
                 .await;
             assert_eq!(accepted.status, ToolStatus::Ok, "{}", accepted.content);
+            outcome.set(written.get().expect("accepted"), written.structured());
             // The tap sees the same call through the child's events.
             tap.emit(AgentEvent::ToolStarted {
                 call: call("f1", "finish", &raw),
