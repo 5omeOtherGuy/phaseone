@@ -6,29 +6,37 @@
 //! and asks on the terminal for anything else, racing the turn's cancellation.
 //!
 //! "Ask" lives HERE, inside the policy, so the core never sees UI (D18). A policy
-//! (a `p1/policy/*` component, or its native twin below) answers a [`Verdict`]:
-//! `Permit`, `Deny` or `Ask`. The [`AskBridge`] resolves `Ask` through the front
-//! end's [`Asker`] (the line prompt, or the TUI's approval view), so only `Permit`
-//! or `Deny` reaches the core (ADR-0024).
+//! (a `p1/policy/*` component) answers a [`Verdict`]: `Permit`, `Deny` or `Ask`. The
+//! [`AskBridge`] resolves `Ask` through the front end's [`Asker`] (the line prompt,
+//! or the TUI's approval view), so only `Permit` or `Deny` reaches the core
+//! (ADR-0024).
 //!
-//! The verdict sources are native for now: the host has no module loader yet, so
-//! [`NativeFullAccess`] and [`NativeAsk`] carry exactly the rules the packages
-//! `p1/policy/full-access` and `p1/policy/ask` implement. The loaded components
-//! (`p1_module_runtime::WasmAuthorizationPolicy`, whose `name`, `digest` and
-//! `verdict` match [`VerdictSource`]) replace them when the host loads modules.
+//! The verdict source is the loaded component ([`ShippedPolicy`], over
+//! `p1_module_runtime::WasmAuthorizationPolicy`): the packages `p1/policy/full-access`
+//! and `p1/policy/ask` are official-release HOST ENTRIES (D083b 2), loaded by package
+//! name from the release manifest and verified against that same manifest, never
+//! selected by `modules.lock`. With the summarizing context (`summary.rs`) they are
+//! the three [`HOST_ENTRIES`]: a release missing one of them, or shipping one that
+//! does not verify, fails startup naming it; there is no native default.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use p1_contracts::{
-    AuthorizationPolicy, AuthorizationRequest, BoxFuture, CancellationToken, Decision, Effect,
-    ToolIdentity,
+    AuthorizationPolicy, AuthorizationRequest, BoxFuture, CancellationToken, Decision, ToolIdentity,
+};
+use p1_module_runtime::{
+    ExecutionLimits, LoadedModule, Loader, ModuleKind, ReleaseManifest,
+    Verdict as ComponentVerdict, WasmAuthorizationPolicy,
 };
 
 use crate::LineSource;
 use crate::SharedWriter;
+use crate::catalog::modules::{ModulesError, official_release_manifest};
 use crate::render::summarize_input;
+use crate::summary::CONTEXT_POLICY;
 
 /// The exact headless refusal.
 pub const HEADLESS_DENY: &str = "Not permitted in headless mode with --ask.";
@@ -41,8 +49,10 @@ pub const CANCEL_DENY: &str = "Cancelled while awaiting authorization.";
 pub const FULL_ACCESS_POLICY: &str = "p1/policy/full-access";
 /// The manifest name of the restrictive policy `--ask` selects.
 pub const ASK_POLICY: &str = "p1/policy/ask";
-/// The digest a native verdict source reports: it has no component bytes.
-pub const NATIVE_DIGEST: &str = "native";
+
+/// The official-release host entries every session loads (D083b 2): the two shipped
+/// authorization policies and the summarizing context policy.
+pub const HOST_ENTRIES: [&str; 3] = [FULL_ACCESS_POLICY, ASK_POLICY, CONTEXT_POLICY];
 
 /// A policy's answer, before the host resolves `Ask`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,12 +70,11 @@ pub enum Verdict {
 pub struct PolicyId {
     /// The manifest name, e.g. `p1/policy/ask`.
     pub package: String,
-    /// The component digest (`sha256:…`), or [`NATIVE_DIGEST`].
+    /// The digest of the component's verified bytes (`sha256:…`).
     pub digest: String,
 }
 
-/// What answers the verdicts the bridge resolves: a loaded policy component, or a
-/// native one with the same rules.
+/// What answers the verdicts the bridge resolves: a loaded policy component.
 pub trait VerdictSource: Send + Sync {
     /// The policy that answers now; part of every remembered grant's key.
     fn policy(&self) -> PolicyId;
@@ -73,41 +82,236 @@ pub trait VerdictSource: Send + Sync {
     fn verdict<'a>(&'a self, request: AuthorizationRequest<'a>) -> BoxFuture<'a, Verdict>;
 }
 
-/// `p1/policy/full-access`, natively: every call is permitted.
-pub struct NativeFullAccess;
+// ------------------------------------------------------------------ the host entries
 
-impl VerdictSource for NativeFullAccess {
-    fn policy(&self) -> PolicyId {
-        PolicyId {
-            package: FULL_ACCESS_POLICY.to_string(),
-            digest: NATIVE_DIGEST.to_string(),
+/// The verified host entries of one release, by package name.
+pub type HostEntries = HashMap<&'static str, Arc<LoadedModule>>;
+
+/// Loads every [`HOST_ENTRIES`] package from the release manifest `release_manifest`,
+/// verifying each against that same manifest (official source, class, world, protocol,
+/// digest, grants: `p1_module_runtime::Loader`). The first package that is missing or does
+/// not verify is the error, and the error names it.
+pub fn load_host_entries(release_manifest: &Path) -> Result<HostEntries, String> {
+    let loader = host_entry_loader(release_manifest)?;
+    let mut entries = HashMap::new();
+    for package in HOST_ENTRIES {
+        let module = load_with(&loader, release_manifest, package)?;
+        entries.insert(package, Arc::new(module));
+    }
+    Ok(entries)
+}
+
+/// A loader over the release manifest `release_manifest` and the directory it describes.
+fn host_entry_loader(release_manifest: &Path) -> Result<Loader, String> {
+    let unreadable = |error: String| {
+        format!(
+            "cannot load the host entries {}: {}: {error}",
+            HOST_ENTRIES.join(", "),
+            release_manifest.display()
+        )
+    };
+    let manifest =
+        ReleaseManifest::read(release_manifest).map_err(|error| unreadable(error.to_string()))?;
+    manifest
+        .check_unique_digests()
+        .map_err(|error| unreadable(error.to_string()))?;
+    let root = release_manifest.parent().unwrap_or(Path::new("."));
+    Loader::new(manifest, root).map_err(|error| unreadable(error.to_string()))
+}
+
+/// The host entry `package` through `loader`, its refusal naming the package.
+fn load_with(
+    loader: &Loader,
+    release_manifest: &Path,
+    package: &str,
+) -> Result<LoadedModule, String> {
+    loader.load(package).map_err(|error| {
+        format!(
+            "host entry {package} from {}: {error}",
+            release_manifest.display()
+        )
+    })
+}
+
+/// The host entries of the official release, loaded once per process (and again only when
+/// the official manifest's path changes).
+static OFFICIAL_ENTRIES: Mutex<Option<(PathBuf, HostEntries)>> = Mutex::new(None);
+
+/// The official release's manifest: the share tree's, or in a debug build the built set's
+/// (D080, `official_release_manifest`).
+fn official_manifest() -> Result<PathBuf, String> {
+    official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())
+}
+
+/// The host entry `package` of the official release. The first call loads and verifies all
+/// three [`HOST_ENTRIES`], so a session's start fails naming whichever one is missing or
+/// unverifiable, whichever it asked for.
+pub fn host_entry(package: &str) -> Result<Arc<LoadedModule>, String> {
+    let release = official_manifest()?;
+    let mut cached = OFFICIAL_ENTRIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if !matches!(&*cached, Some((path, _)) if *path == release) {
+        *cached = Some((release.clone(), load_host_entries(&release)?));
+    }
+    cached
+        .as_ref()
+        .and_then(|(_, entries)| entries.get(package).cloned())
+        .ok_or_else(|| format!("{package} is not one of p1's host entries"))
+}
+
+/// The package the session's mode selects: full access by default (ADR-0038), the
+/// restrictive policy with `--ask`.
+pub fn shipped_package(ask: bool) -> &'static str {
+    if ask { ASK_POLICY } else { FULL_ACCESS_POLICY }
+}
+
+// ------------------------------------------------------------------ the shipped policy
+
+/// One loaded authorization-policy component and the id grants are keyed by.
+struct PolicyComponent {
+    id: PolicyId,
+    module: Arc<LoadedModule>,
+    limits: ExecutionLimits,
+    /// Built on first use when the component was loaded outside a Tokio runtime, whose
+    /// executor it needs; inside one it is built at once.
+    adapter: OnceLock<Result<WasmAuthorizationPolicy, String>>,
+}
+
+impl PolicyComponent {
+    fn new(module: Arc<LoadedModule>, limits: ExecutionLimits) -> Result<Self, String> {
+        if module.kind() != ModuleKind::AuthorizationPolicy {
+            return Err(format!(
+                "host entry {} is a {} package, not an authorization policy",
+                module.name(),
+                module.kind().name()
+            ));
         }
+        let component = Self {
+            id: PolicyId {
+                package: module.name().to_owned(),
+                digest: module.digest().to_string(),
+            },
+            module,
+            limits,
+            adapter: OnceLock::new(),
+        };
+        // A policy that cannot be built fails where it is loaded, when a runtime is there
+        // to build it on.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            component.adapter().map_err(Clone::clone)?;
+        }
+        Ok(component)
     }
 
-    fn verdict<'a>(&'a self, _request: AuthorizationRequest<'a>) -> BoxFuture<'a, Verdict> {
-        Box::pin(async { Verdict::Permit })
+    fn adapter(&self) -> Result<&WasmAuthorizationPolicy, &String> {
+        self.adapter
+            .get_or_init(|| {
+                WasmAuthorizationPolicy::new(&self.module, self.limits)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
     }
 }
 
-/// `p1/policy/ask`, natively: `ReadOnly` is permitted, every other effect asks.
-pub struct NativeAsk;
+/// A shipped authorization policy as the bridge's [`VerdictSource`]: the host entry
+/// `p1/policy/full-access` or `p1/policy/ask`, answering through its component. Its
+/// [`PolicyId`] is the package name and the digest of the verified component bytes, so a
+/// grant remembered under one artifact never answers for another (F8). A trap, a fuel or
+/// deadline stop, or a component that could not be built answers a `Deny` naming the
+/// policy, never a `Permit`. A `/modules reload` loads the package again from the release
+/// ([`ShippedPolicy::reload`]); the component is swapped only once the reload installed.
+pub struct ShippedPolicy {
+    current: Mutex<Arc<PolicyComponent>>,
+}
 
-impl VerdictSource for NativeAsk {
+impl ShippedPolicy {
+    /// The official release's host entry for the session's mode: full access, or `ask`
+    /// with `--ask`.
+    pub fn official(ask: bool) -> Result<Arc<Self>, String> {
+        Self::from_module(host_entry(shipped_package(ask))?)
+    }
+
+    /// The policy over an already verified authorization-policy `module`.
+    pub fn from_module(module: Arc<LoadedModule>) -> Result<Arc<Self>, String> {
+        Self::with_limits(module, ExecutionLimits::default())
+    }
+
+    /// As [`ShippedPolicy::from_module`], each call bounded by `limits` instead of the
+    /// executor's defaults.
+    pub fn with_limits(
+        module: Arc<LoadedModule>,
+        limits: ExecutionLimits,
+    ) -> Result<Arc<Self>, String> {
+        Ok(Arc::new(Self {
+            current: Mutex::new(Arc::new(PolicyComponent::new(module, limits)?)),
+        }))
+    }
+
+    fn current(&self) -> Arc<PolicyComponent> {
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Loads this policy's package again from the official release and verifies it. Nothing
+    /// changes until [`PolicyReload::install`]; a failure leaves the current component
+    /// answering.
+    pub fn reload(self: &Arc<Self>) -> Result<PolicyReload, String> {
+        let release = official_manifest()?;
+        let current = self.current();
+        let loader = host_entry_loader(&release)?;
+        let module = load_with(&loader, &release, &current.id.package)?;
+        Ok(PolicyReload {
+            policy: self.clone(),
+            component: Arc::new(PolicyComponent::new(Arc::new(module), current.limits)?),
+        })
+    }
+}
+
+impl VerdictSource for ShippedPolicy {
     fn policy(&self) -> PolicyId {
-        PolicyId {
-            package: ASK_POLICY.to_string(),
-            digest: NATIVE_DIGEST.to_string(),
-        }
+        self.current().id.clone()
     }
 
     fn verdict<'a>(&'a self, request: AuthorizationRequest<'a>) -> BoxFuture<'a, Verdict> {
+        let component = self.current();
         Box::pin(async move {
-            if request.effect == Effect::ReadOnly {
-                Verdict::Permit
-            } else {
-                Verdict::Ask
+            match component.adapter() {
+                Ok(adapter) => match adapter.verdict(request).await {
+                    ComponentVerdict::Permit => Verdict::Permit,
+                    ComponentVerdict::Deny(reason) => Verdict::Deny(reason),
+                    ComponentVerdict::Ask => Verdict::Ask,
+                },
+                Err(reason) => Verdict::Deny(format!(
+                    "authorization policy {} failed: {reason}",
+                    component.id.package
+                )),
             }
         })
+    }
+}
+
+/// A shipped policy's package loaded again, not yet answering.
+pub struct PolicyReload {
+    policy: Arc<ShippedPolicy>,
+    component: Arc<PolicyComponent>,
+}
+
+impl PolicyReload {
+    /// The id the policy answers under once installed.
+    pub fn policy(&self) -> PolicyId {
+        self.component.id.clone()
+    }
+
+    /// The reloaded component answers from now on.
+    pub fn install(self) {
+        *self
+            .policy
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = self.component;
     }
 }
 
@@ -307,29 +511,34 @@ impl AuthorizationPolicy for AskBridge {
     }
 }
 
-/// The line front end's authorization policy: the [`AskBridge`] over the native
-/// verdict source of its mode, full access without `--ask` and the restrictive
-/// policy with it.
+/// The line front end's authorization policy: the [`AskBridge`] over the shipped
+/// policy of its mode ([`ShippedPolicy::official`]), full access without `--ask` and
+/// the restrictive policy with it.
 pub struct HostPolicy {
     bridge: AskBridge,
+    shipped: Arc<ShippedPolicy>,
 }
 
 impl HostPolicy {
+    /// Fails, naming the package, when the official release lacks a host entry or ships
+    /// one that does not verify.
     pub fn new(
         ask: bool,
         headless: bool,
         lines: Arc<dyn LineSource>,
         stderr: SharedWriter,
         cancel: CancellationToken,
-    ) -> Self {
-        let source: Arc<dyn VerdictSource> = if ask {
-            Arc::new(NativeAsk)
-        } else {
-            Arc::new(NativeFullAccess)
-        };
-        Self {
-            bridge: AskBridge::new(source, headless, lines, stderr, cancel),
-        }
+    ) -> Result<Self, String> {
+        let shipped = ShippedPolicy::official(ask)?;
+        Ok(Self {
+            bridge: AskBridge::new(shipped.clone(), headless, lines, stderr, cancel),
+            shipped,
+        })
+    }
+
+    /// The shipped policy the bridge asks: what a `/modules reload` loads again.
+    pub fn shipped(&self) -> &Arc<ShippedPolicy> {
+        &self.shipped
     }
 
     /// Marks the live turn's token, as [`AskBridge::set_turn`].
@@ -350,7 +559,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use p1_contracts::{ToolCall, ToolInput};
+    use p1_contracts::{Effect, ToolCall, ToolInput};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -741,6 +950,7 @@ mod tests {
                 Arc::new(Mutex::new(Box::new(std::io::sink()))),
                 CancellationToken::new(),
             )
+            .expect("the official release ships both policies")
         };
         let (call, identity) = (call(), identity());
         let request = |effect| AuthorizationRequest {
@@ -752,6 +962,16 @@ mod tests {
         assert_eq!(full.bridge.source.policy().package, FULL_ACCESS_POLICY);
         let ask = policy(true);
         assert_eq!(ask.bridge.source.policy().package, ASK_POLICY);
+        // The grant key carries the digest of the component the release pins, never a
+        // placeholder.
+        for (host, package) in [(&full, FULL_ACCESS_POLICY), (&ask, ASK_POLICY)] {
+            let module = host_entry(package).expect("the host entry loads");
+            assert_eq!(
+                host.bridge.source.policy().digest,
+                module.digest().to_string()
+            );
+            assert_eq!(host.shipped().policy(), host.bridge.source.policy());
+        }
         for effect in [
             Effect::ReadOnly,
             Effect::WritesFiles,

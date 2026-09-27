@@ -70,8 +70,8 @@ use delegation::register_delegation_tools;
 // Re-exported so the `crate::catalog::…` paths other crates and the tests use stay valid.
 use providers::register_providers;
 pub use providers::{
-    WHOLE_PROVIDERS, chat_route, credential_line, credential_line_for_route, messages_route,
-    reject_profile, responses_route, route_provider,
+    ProviderComponents, WHOLE_PROVIDERS, chat_route, credential_line, credential_line_for_route,
+    messages_route, provider_component, reject_profile, responses_route, route_provider,
 };
 use tools::register_standard_tools;
 // Re-exported so `crate::catalog::register_workflow_tools` stays the path its callers use.
@@ -83,9 +83,9 @@ pub(crate) use workflow::register_workflow_tools;
 /// Provider keys: one key per route file found in `<environments dir>/../routes`
 /// (`docs/design/routes-and-profiles.md` §2) — the Messages adapter's
 /// `anthropic-subscription` and the Responses adapter's `openai-codex-subscription`
-/// routes among them. Tool keys: `read`, `edit`, `write`, `grep`, `shell`,
-/// `apply_patch`, and — with the `delegation` feature and a worker service present —
-/// the four `worker_*` tools.
+/// routes among them. Tool keys: `read` (the release's `p1/read` host entry, S1.8.1),
+/// `edit`, `write`, `grep`, `shell`, `apply_patch`, and — with the `delegation` feature
+/// and a worker service present — the four `worker_*` tools.
 ///
 /// A routed key is selected with `route` + `profile` and refuses the whole-provider
 /// form; a whole provider refuses a profile. A route file whose id collides with a
@@ -145,12 +145,19 @@ pub fn build_catalog_with_workers(
         sandbox_read,
         env_pass,
         completion,
-    );
+    )?;
+    // The official-release host entries (S1.8.1, D083b 2) stand where the compiled-in
+    // registrations they replace stood: before the delegation family, whose grantable list is
+    // the catalog's own tool keys, so `read` is grantable to a worker exactly as the native
+    // registration made it. `shell` and `finish` registered with the standard tools (S3.8),
+    // through the same host-entry step.
+    modules::register_host_entries(&mut catalog, deps)?;
     register_delegation_tools(&mut catalog, deps, service)?;
     #[cfg(feature = "workflows")]
-    register_workflow_tools(&mut catalog, deps.workflow_service.clone());
+    register_workflow_tools(&mut catalog, deps.workflow_service.clone())?;
     // Module packages last among the built-ins, so a lock entry that collides with a
-    // compiled-in tool is refused rather than replacing it.
+    // compiled-in tool is refused rather than replacing it. A lock that selects a host entry's
+    // key already kept the host entry out (`register_host_entries`).
     modules::register_locked_modules(&mut catalog, deps)?;
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
@@ -178,7 +185,11 @@ fn build_catalog_inner(
         sandbox_read,
         env_pass,
         completion,
-    );
+    )?;
+    // The official-release host entries and then the locked modules (S1.8.1, D083b 2): a
+    // lock that selects a host entry's key already kept the host entry out. `shell` and
+    // `finish` registered with the standard tools (S3.8), through the same host-entry step.
+    modules::register_host_entries(&mut catalog, deps)?;
     modules::register_locked_modules(&mut catalog, deps)?;
 
     if let Some(hook) = &deps.catalog_hook {

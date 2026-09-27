@@ -87,7 +87,11 @@ import sys
 
 EXIT_CODE = re.compile(r"\[exit code: (-?\d+)\]\s*$")
 WORKER_FILE = re.compile(r"\.w(\d+)\.jsonl$")
-SHELL_IMPLEMENTATION = "p1-tool-shell"
+# notice: scripts/run-report.py (lead): S3.8 (D083b) makes `shell` the component `p1/shell`,
+# so from then on a journal records the PACKAGE name as the shell call's
+# `ToolStarted.identity.implementation`, not the crate's. Both are accepted, so the record
+# of a session recorded either way keeps counting its shell exits.
+SHELL_IMPLEMENTATIONS = frozenset(("p1-tool-shell", "p1/shell"))
 # The host's ONE retry message after a transient provider failure (completion.md
 # §3b). A `user_input` with exactly this text is a provider retry.
 PROVIDER_RETRY_MESSAGE = ("The connection to the model failed and the last response was lost; "
@@ -210,7 +214,7 @@ def analyze(path, max_idle_summaries=DEFAULT_MAX_IDLE_SUMMARIES):
             max_idle_run = max(max_idle_run, idle_run)
         elif kind == "tool_started":
             started.add(record["call_id"])
-            if record["identity"]["implementation"] == SHELL_IMPLEMENTATION:
+            if record["identity"]["implementation"] in SHELL_IMPLEMENTATIONS:
                 shell_calls.add(record["call_id"])
             if record["identity"]["implementation"] == DELEGATION_IMPLEMENTATION:
                 delegate_calls.add(record["call_id"])

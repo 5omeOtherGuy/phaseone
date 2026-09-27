@@ -27,7 +27,6 @@ workflows = ["delegation", "dep:p1-workflow", "dep:p1-tool-workflow"]
 p1-assembly = { path = "../p1-assembly" }
 p1-auth = { path = "../p1-auth" }
 p1-usage = { path = "../p1-usage" }
-p1-context = { path = "../p1-context" }
 p1-contracts = { path = "../p1-contracts" }
 p1-model-profile = { path = "../p1-model-profile" }
 # `p1 modules` (ADR-0079, S1.6): the release manifest's format, a package's digest and the
@@ -88,6 +87,10 @@ tokio = { version = "1", default-features = false, features = [
 
 [dev-dependencies]
 p1-testkit = { path = "../p1-testkit" }
+# S5.11: the host runs the summarizing context as the host entry p1/context/summarizing
+# (src/summary.rs); its source crate stays the reference the host's tests check the table,
+# the prompt and the summaries against.
+p1-context = { path = "../p1-context" }
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 # The shared provider conformance suite, run over the SHIPPED composed routes in
 # `tests/route_files.rs` through the same host loading path the binary uses.

@@ -8,8 +8,8 @@
 //! runs through the same generic gate, because the shipped component refuses those calls
 //! itself: either way the hub re-verifies, and only what passes its own rules commits.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use p1_assembly::ModulesLock;
 use p1_contracts::serde_json::{self, Value, json};
@@ -46,10 +46,15 @@ const MODULE: &str = "finish";
 /// The built component and the manifest `scripts/build-modules.sh` wrote for it. A missing
 /// artifact fails the case with the instruction; it never skips.
 fn artifact() -> (Vec<u8>, Value) {
+    artifact_of(PACKAGE)
+}
+
+/// The same for the package in `dir`, whose build manifest names it.
+fn artifact_of(dir: &str) -> (Vec<u8>, Value) {
     let dir = p1_module_tests::fixture_dir()
         .parent()
         .expect("the publish directory")
-        .join(PACKAGE);
+        .join(dir);
     let read = |file: &str| {
         let path = dir.join(file);
         std::fs::read(&path).unwrap_or_else(|error| {
@@ -59,10 +64,52 @@ fn artifact() -> (Vec<u8>, Value) {
             )
         })
     };
-    let wasm = read(&format!("{PACKAGE}.wasm"));
-    let manifest = serde_json::from_slice(&read(&format!("{PACKAGE}.manifest.json")))
-        .expect("the package manifest is JSON");
+    let wasm = read(&format!(
+        "{}.wasm",
+        dir.file_name().expect("a directory name").to_string_lossy()
+    ));
+    let manifest = serde_json::from_slice(&read(&format!(
+        "{}.manifest.json",
+        dir.file_name().expect("a directory name").to_string_lossy()
+    )))
+    .expect("the package manifest is JSON");
     (wasm, manifest)
+}
+
+/// The built `p1/shell` component's loader-built identity, declared through the host's own
+/// catalog exactly as the host declares the package it ships (S3.8, D083b). The shell
+/// carries `records-command-evidence` because its verified manifest grants the `process`
+/// service — not because a native `p1-tool-shell` registration declared it — so the
+/// evidence tool below takes THIS identity rather than the old implementation name. Loaded
+/// once: every case needs the identity, not a second compilation of the component.
+fn declared_shell() -> ToolIdentity {
+    static IDENTITY: OnceLock<ToolIdentity> = OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            let (wasm, manifest) = artifact_of("p1-module-shell");
+            let mut release = Release::empty();
+            release.add(
+                json!({
+                    "name": manifest["name"],
+                    "digest": manifest["digest"],
+                    "path": "packages/p1-shell/p1-shell.wasm",
+                    "kind": manifest["kind"],
+                    "world": manifest["world"],
+                    "protocol": manifest["protocol"],
+                    "capabilities": manifest["capabilities"],
+                    "variant": manifest["variant"],
+                }),
+                &wasm,
+            );
+            let name = manifest["name"].as_str().expect("the manifest name");
+            let module = release
+                .loader()
+                .load(name)
+                .expect("the shell component loads");
+            p1_host::catalog::capabilities::declare_package(&module);
+            module.identity().clone()
+        })
+        .clone()
 }
 
 /// The release entry of the component: the package manifest's frozen fields, with
@@ -128,7 +175,8 @@ fn done(commands: &[&str]) -> ToolCall {
     finish_call(json!({"status": "done", "summary": "did it", "verification": commands}))
 }
 
-/// The native shell's identity under another face: a tool that records command evidence.
+/// The evidence tool: a tool under the `p1/shell` package's loader-built identity, so the
+/// hub reads its capability from the manifest's `process` grant.
 const EVIDENCE_TOOL: &str = "exec";
 /// A tool merely NAMED `shell`, with an identity that records nothing.
 const IMPOSTOR_TOOL: &str = "shell";
@@ -136,7 +184,9 @@ const IMPOSTOR_TOOL: &str = "shell";
 /// One agent's session: the hub, the agent's record and cell, and the tee the host feeds
 /// the record through.
 struct Session {
-    hub: CompletionHub,
+    /// The hub is SHARED with every other agent of the run (ADR-0083 rule 6), so it is an
+    /// `Arc` a case can hand to two sessions.
+    hub: Arc<CompletionHub>,
     completion: Completion,
     tee: ActivityTee,
     tools: Vec<Arc<dyn Tool>>,
@@ -144,13 +194,19 @@ struct Session {
 }
 
 impl Session {
-    /// A session whose assembled tools are the evidence shell (the native shell's
-    /// implementation under the face `exec`), a shell impostor and a writer.
+    /// A session whose assembled tools are the evidence shell (the `p1/shell` package's
+    /// identity under the face `exec`), a shell impostor and a writer.
     fn new() -> Self {
-        Self::with_tools(vec![
+        Self::on(Arc::new(CompletionHub::new()), Self::tools())
+    }
+
+    /// The tools every default session assembles.
+    fn tools() -> Vec<Arc<dyn Tool>> {
+        let shell = declared_shell();
+        vec![
             Arc::new(
                 FakeTool::new(EVIDENCE_TOOL)
-                    .with_identity("p1-tool-shell", "gpt")
+                    .with_identity(&shell.implementation, &shell.variant)
                     .with_effect(Effect::Executes),
             ),
             Arc::new(
@@ -159,11 +215,15 @@ impl Session {
                     .with_effect(Effect::Executes),
             ),
             Arc::new(FakeTool::new("write").with_effect(Effect::WritesFiles)),
-        ])
+        ]
     }
 
     fn with_tools(tools: Vec<Arc<dyn Tool>>) -> Self {
-        let hub = CompletionHub::new();
+        Self::on(Arc::new(CompletionHub::new()), tools)
+    }
+
+    /// Another agent of the same run: its own record, cell and tools on the SHARED hub.
+    fn on(hub: Arc<CompletionHub>, tools: Vec<Arc<dyn Tool>>) -> Self {
         let completion = hub.issue();
         let tee = ActivityTee::new(
             Arc::new(RecordingEvents::new()),
@@ -227,9 +287,11 @@ impl Session {
     }
 }
 
-/// The shipped component assembled by the finish entry under `grant`.
+/// The shipped component assembled by the finish entry under `grant`, presenting the
+/// component's own model-facing name and loader-built variant.
 fn component(module: &LoadedModule, grant: &CompletionGrant) -> Arc<dyn Tool> {
-    finish_component(module, grant, &Arc::new(MaskCounter::new())).expect("the component builds")
+    finish_component(module, grant, None, &Arc::new(MaskCounter::new()))
+        .expect("the component builds")
 }
 
 /// A component that ignores the record and submits whatever it is told to, through its
@@ -800,9 +862,10 @@ async fn the_policy_is_the_hosts_and_the_declaration_follows_it() {
     within_deadline(
         "the_policy_is_the_hosts_and_the_declaration_follows_it",
         async {
+            let shell = declared_shell();
             let evidence: Arc<dyn Tool> = Arc::new(
                 FakeTool::new("run")
-                    .with_identity("p1-tool-shell", "claude")
+                    .with_identity(&shell.implementation, &shell.variant)
                     .with_effect(Effect::Executes),
             );
             let impostor: Arc<dyn Tool> = Arc::new(
@@ -912,4 +975,82 @@ fn an_import_the_manifest_does_not_grant_is_refused() {
         Err(other) => panic!("wrong error: {other}"),
         Ok(_) => panic!("a component importing an ungranted completion must not load"),
     }
+}
+
+// --- (h) one hub, two live agents --------------------------------------------------------------
+
+/// The host shares ONE [`CompletionHub`] across the parent and every concurrent worker
+/// (ADR-0083 rule 6), so the grant state must be per AGENT: a worker's (re-)grant — a
+/// `worker_continue` re-assembly — invalidates only that worker's earlier grants, never
+/// another live worker's. Two agents granted on one hub both commit, and after the first
+/// re-grants, the first agent's earlier grant is stale while the second still commits.
+#[tokio::test(flavor = "current_thread")]
+async fn a_regrant_of_one_agent_leaves_another_agents_grant_live() {
+    within_deadline(
+        "a_regrant_of_one_agent_leaves_another_agents_grant_live",
+        async {
+            let module = loaded();
+            let hub = Arc::new(CompletionHub::new());
+            // Two workers of one parent, each with its own record: a command newer than the
+            // turn's last file change, which is what rule 1 accepts.
+            let first = Session::on(hub.clone(), Session::tools());
+            first.write();
+            first.run(EVIDENCE_TOOL, "cargo test", 0);
+            let second = Session::on(hub.clone(), Session::tools());
+            second.write();
+            second.run(EVIDENCE_TOOL, "cargo test", 0);
+
+            let first_before = first.grant(AgentRole::Worker, None);
+            let second_grant = second.grant(AgentRole::Worker, None);
+            // The first worker is continued: its OWN earlier grant goes stale (rule 6)…
+            let _first_after = first.grant(AgentRole::Worker, None);
+
+            // …while the second worker, granted before that re-grant, still commits.
+            let finish = component(&module, &second_grant);
+            let outcome = finish.execute(&done(&["cargo test"]), context()).await;
+            assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.content);
+            assert_eq!(second.outcome().get(), Some(done_with(&["cargo test"])));
+
+            // The first worker's earlier grant is the stale one: its component is refused,
+            // and nothing reaches its cell.
+            let stale = component(&module, &first_before);
+            let outcome = stale.execute(&done(&["cargo test"]), context()).await;
+            assert_refused(&outcome, CompletionRule::Freshness);
+            assert_eq!(first.outcome().get(), None);
+        },
+    )
+    .await;
+}
+
+/// The same rule from the other side: a window belongs to its own agent. While one worker's
+/// call is open, another worker's component commits to ITS cell and its candidate never
+/// enters the first worker's window — so the shared hub never lets one worker's call decide
+/// another's completion.
+#[tokio::test(flavor = "current_thread")]
+async fn a_window_belongs_to_its_own_agent() {
+    within_deadline("a_window_belongs_to_its_own_agent", async {
+        let module = loaded();
+        let hub = Arc::new(CompletionHub::new());
+        let first = Session::on(hub.clone(), Session::tools());
+        first.write();
+        first.run(EVIDENCE_TOOL, "cargo test", 0);
+        let second = Session::on(hub.clone(), Session::tools());
+        second.write();
+        second.run(EVIDENCE_TOOL, "cargo test", 0);
+
+        let first_grant = first.grant(AgentRole::Worker, None);
+        let second_grant = second.grant(AgentRole::Worker, None);
+        // The first worker has a call open…
+        let window = first_grant.open_window();
+        // …and the second worker's own call commits in its own cell.
+        let finish = component(&module, &second_grant);
+        let outcome = finish.execute(&done(&["cargo test"]), context()).await;
+        assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.content);
+        assert_eq!(second.outcome().get(), Some(done_with(&["cargo test"])));
+        assert_eq!(first.outcome().get(), None);
+        // The open window is the first worker's and saw no candidate at all.
+        assert_eq!(window.close(), None);
+        assert_eq!(first.outcome().get(), None);
+    })
+    .await;
 }

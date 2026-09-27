@@ -6,6 +6,7 @@
 //! root *after* symlink resolution (see [`Workspace::resolve`]). This is an
 //! invariant of the tools, not a policy the host may relax.
 
+mod commit;
 mod gate;
 mod observe;
 mod path;
@@ -14,6 +15,7 @@ mod text;
 
 use std::path::{Path, PathBuf};
 
+pub use commit::{Change, MutationError, MutationPolicy, OwnedMutation};
 pub use gate::{Mutation, WriteGate};
 pub use observe::{Observation, ObservedFiles, StreamingHash};
 pub use p1_contracts::tool::ToolFace;

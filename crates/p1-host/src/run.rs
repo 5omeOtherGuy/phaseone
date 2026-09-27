@@ -20,9 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use p1_assembly::Catalog;
-use p1_assembly::{
-    Assembled, ModulesLock, Substitutions, assemble, load_environment, load_modules_lock,
-};
+use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
     AgentEvent, AuthorizationPolicy, BoxFuture, CacheKeySupport, CancellationToken, CommitSink,
     Compaction, ContextError, ContextInput, ContextPolicy, Effort, EventSink, JournalRecord,
@@ -42,10 +40,12 @@ use crate::catalog::build_catalog;
 #[cfg(feature = "delegation")]
 use crate::catalog::children::{announce_lost_workers, compose_children, running_children};
 use crate::catalog::delegation::with_worker_tools;
+use crate::catalog::modules::{ModuleSources, module_sources};
 use crate::cli::{self, Command, Options};
 use crate::frontend::{FrontEnd, LineFrontEnd};
 use crate::render::Renderer;
 use crate::session;
+use crate::summary::ContextTable;
 use crate::{HostDeps, InterruptSource};
 use p1_tool_finish::Accepted;
 
@@ -166,13 +166,14 @@ impl ContextPolicy for DefaultContext {
     }
 }
 
-/// The context policy for an assembled agent (context.md §3): a
-/// `SummarizingContext` when the environment opts in with `[context]`,
-/// passthrough otherwise. The host is the composition root: `p1-assembly` only
-/// carries the plain settings and the prompt override. `profile` is the model
-/// profile the environment selected (the whole-provider form has none): its own
-/// capacity narrows the environment's table, and its effort floor is what the
-/// summarization request runs at (#125).
+/// The context policy for an assembled agent (context.md §3): the summarizing
+/// context component (the host entry `p1/context/summarizing`, `summary.rs`) when the
+/// environment opts in with `[context]`, passthrough otherwise. The host is the
+/// composition root: `p1-assembly` only carries the plain settings and the prompt
+/// override. `profile` is the model profile the environment selected (the
+/// whole-provider form has none): its own capacity narrows the environment's table,
+/// and its effort floor is what the summarization request runs at (#125).
+// notice: S5.11 (#357): the component replaces the native `SummarizingContext`.
 pub(crate) fn agent_context(
     assembled: &Assembled,
     profile: Option<&ModelProfile>,
@@ -185,15 +186,15 @@ pub(crate) fn agent_context(
         .resolved
         .summarize_prompt
         .clone()
-        .unwrap_or_else(|| p1_context::DEFAULT_SUMMARIZER_PROMPT.to_string());
-    let policy = p1_context::SummarizingContext::new(
+        .unwrap_or_else(|| crate::summary::DEFAULT_SUMMARIZER_PROMPT.to_string());
+    let policy = crate::summary::summarizing_context(
         assembled.provider.clone(),
         assembled.options.clone(),
-        config,
+        &config,
+        summary_output_tokens,
         prompt,
-    )?
-    .with_summary_output_tokens(summary_output_tokens)?
-    .with_summary_effort(summary_effort(profile));
+        summary_effort(profile),
+    )?;
     Ok(Arc::new(policy))
 }
 
@@ -213,7 +214,7 @@ const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 1_000;
 fn effective_context(
     settings: &p1_assembly::ContextSettings,
     profile: Option<&ModelProfile>,
-) -> Result<(p1_context::ContextConfig, u64), String> {
+) -> Result<(ContextTable, u64), String> {
     let config = config_for_route(settings, profile);
     let wall = config.window_tokens - config.output_headroom_tokens;
     let cap = settings.summary_output_tokens.min(wall / 2);
@@ -242,7 +243,7 @@ fn effective_context(
 pub(crate) fn config_for_route(
     settings: &p1_assembly::ContextSettings,
     profile: Option<&ModelProfile>,
-) -> p1_context::ContextConfig {
+) -> ContextTable {
     let window = profile
         .and_then(|profile| profile.context_tokens)
         .map_or(settings.window_tokens, |model_window| {
@@ -277,7 +278,7 @@ pub(crate) fn config_for_route(
     // a share of the kept tail, so it can never exceed it).
     let keep_recent = settings.keep_recent_tokens.min(wall.saturating_sub(1));
     let user_verbatim = settings.user_verbatim_tokens.min(keep_recent);
-    p1_context::ContextConfig {
+    ContextTable {
         window_tokens: window,
         output_headroom_tokens: headroom,
         summarize_at_tokens: useful,
@@ -498,14 +499,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     };
     // The same for the workflow tools: they assemble, and no run can start.
     #[cfg(feature = "workflows")]
-    let catalog = catalog.map(|mut catalog| {
+    let catalog = catalog.and_then(|mut catalog| {
         if deps.workflow_service.is_none() {
             crate::catalog::register_workflow_tools(
                 &mut catalog,
                 Some(Arc::new(crate::workflow::RefusingWorkflows)),
-            );
+            )?;
         }
-        catalog
+        Ok(catalog)
     });
     #[cfg(not(feature = "delegation"))]
     let catalog = build_catalog(
@@ -634,9 +635,9 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
                 compact: options.compact,
             },
             cancel.clone(),
-        ))
+        )?)
     } else {
-        Arc::new(LineFrontEnd::new(deps, options, cancel.clone()))
+        Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?)
     };
     run_with_front_end(deps, options, cancel, front_end).await
 }
@@ -788,11 +789,12 @@ pub async fn run_with_front_end(
     let records = opened.records.clone();
     // ADR-0080: the execution manifest of THIS assembly, written before the `Environment`
     // record the first turn commits, and compared with the identity the journal already names
-    // when the session is resumed. The lock the catalog's module registration read resolves a
-    // package key to the identity the loader verified; a changed artifact never blocks the
-    // resume, it is reported.
-    let lock = module_lock(deps)?;
-    let identity = assembly_identity(&assembled, &environment.provider, options.ask, &lock);
+    // when the session is resumed. The package sources the catalog's module registration read
+    // resolve a package key to the identity the loader verified — the `modules.lock`, and the
+    // official-release host entries (D083b 2); a changed artifact never blocks the resume, it is
+    // reported.
+    let sources = module_sources(deps)?;
+    let identity = assembly_identity(&assembled, &environment.provider, options.ask, &sources);
     let lines = Arc::new(AssemblyLines::new(opened.store, opened.version));
     let changed = arm_assembly(&lines, &opened.assemblies, &identity);
     if !changed.is_empty() {
@@ -956,7 +958,7 @@ pub async fn run_with_front_end(
             sandbox_write: options.sandbox_write.clone(),
             sandbox_read: options.sandbox_read.clone(),
             env_pass: options.env_pass.clone(),
-            policy: Box::new(move || reload_policy.authorization()),
+            policy: Box::new(move || reload_policy_of(reload_policy.as_ref())),
             queue: ReloadQueue::default(),
         },
         completion: completion_hub.clone(),
@@ -970,7 +972,7 @@ pub async fn run_with_front_end(
         instructions,
         mask: mask.clone(),
         lines: lines.clone(),
-        lock: Mutex::new(lock),
+        sources: Mutex::new(sources),
         ask: options.ask,
         capabilities,
         session: Mutex::new(SessionModel {
@@ -1053,7 +1055,7 @@ async fn workflow_run(
     }
     let workspace = resolve_workspace(options)?;
     let cancel = CancellationToken::new();
-    let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone()));
+    let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?);
 
     // The same child composition as an interactive run, including the sibling
     // reservation. A standalone workflow can be invoked repeatedly with one session.
@@ -1349,13 +1351,15 @@ impl CommitSink for NamingJournal {
 /// it runs, the p1 binary that built it, and one entry per assembled tool, the provider
 /// and the host's two policies.
 ///
-/// A module key the lock resolves is a package entry: `name` is the manifest name,
-/// `package` the key the environment selects the module by (the lock key), `version` the
-/// release version the lock pins, `digest` the bare sha256 hex and `abi` the package's
-/// `<world>+<protocol>`. The digest comes from the lock rather than from a second load: the
-/// lock is checked against the release manifest ([`load_locked_modules`]'s `check_lock`) and
-/// the loader verifies the compiled bytes against that same manifest digest, so the lock's
-/// digest is the loader-verified one. Every other key is native: `name` is the crate or
+/// A module key `sources` resolves to a package is a package entry: `name` is the manifest
+/// name, `package` the key the environment selects the module by, `version` the release version
+/// the package runs at, `digest` the loader-verified sha256 hex and `abi` the package's
+/// `<world>+<protocol>`. `sources` is the `modules.lock` the catalog's module registration read,
+/// plus the official-release host entries it registered (D083b 2), so a host entry such as
+/// `read`'s `p1/read` is a package entry exactly as a lock-selected one is. The digest comes
+/// from the release manifest rather than from a second load: the loader verified the bytes
+/// against that entry when the catalog registered the package, so it is the loader-verified
+/// digest. Every other key is native: `name` is the crate or
 /// policy name the host can state for it, `package` the key it is selected by, `version` the
 /// p1 version, and `digest` is `None` — the host's `commit` identifies that code.
 ///
@@ -1365,7 +1369,7 @@ pub fn assembly_identity(
     assembled: &Assembled,
     provider_key: &str,
     ask: bool,
-    lock: &ModulesLock,
+    sources: &ModuleSources,
 ) -> AssemblyIdentity {
     let mut modules = Vec::new();
     for tool in &assembled.resolved.tools {
@@ -1381,14 +1385,14 @@ pub fn assembly_identity(
             ModuleKind::Tool,
             &tool.module,
             &tool.identity.implementation,
-            lock,
+            sources,
         ));
     }
     modules.push(module_identity(
         ModuleKind::Provider,
         provider_key,
         provider_key,
-        lock,
+        sources,
     ));
     // The two host policies are native today, with the names their component twins carry
     // (`crate::policy` uses the same names for the authorization pair). The context policy
@@ -1431,22 +1435,23 @@ pub fn host_identity() -> HostIdentity {
     }
 }
 
-/// The identity of the module an environment selects by `key`: a package entry when `lock`
-/// resolves the key, a native entry otherwise.
+/// The identity of the module an environment selects by `key`: a package entry when `sources`
+/// resolves the key — the `modules.lock` the catalog read, or an official-release host entry it
+/// registered (D083b 2) — and a native entry otherwise.
 fn module_identity(
     kind: ModuleKind,
     key: &str,
     implementation: &str,
-    lock: &ModulesLock,
+    sources: &ModuleSources,
 ) -> ModuleIdentity {
-    match lock.resolve(key) {
-        Some(locked) => ModuleIdentity {
-            name: locked.package.clone(),
+    match sources.resolve(key) {
+        Some(package) => ModuleIdentity {
+            name: package.name,
             kind,
             package: key.to_string(),
-            version: locked.version.clone(),
-            digest: Some(bare_digest(&locked.digest)),
-            abi: Some(format!("{}+{}", locked.world, locked.protocol)),
+            version: package.version,
+            digest: Some(bare_digest(&package.digest)),
+            abi: Some(package.abi),
         },
         None => native_module(kind, implementation, key),
     }
@@ -1599,14 +1604,6 @@ fn digest_label(digest: Option<&str>) -> &str {
 
 fn abi_label(abi: Option<&str>) -> &str {
     abi.unwrap_or("none")
-}
-
-/// The `modules.lock` the catalog's own module registration read (ADR-0087): the key, the
-/// manifest name, the release version, the digest and the ABI of every package an environment
-/// can select. Read again here because the identity names what the loader verified, and the
-/// catalog keeps no list of what it registered.
-fn module_lock(deps: &HostDeps) -> Result<ModulesLock, String> {
-    load_modules_lock(&deps.environment_dirs).map_err(|error| error.to_string())
 }
 
 pub(crate) async fn run_headless(
@@ -2028,9 +2025,10 @@ pub(crate) struct ModelSwitch {
     /// The session's assembly identity lines (ADR-0080): a switch that commits a new
     /// `Environment` names the assembly that will execute the records after it.
     lines: Arc<AssemblyLines>,
-    /// The lock resolving a module key to the identity the loader verified: the
-    /// current generation's, replaced when a `/modules reload` installs.
-    lock: Mutex<ModulesLock>,
+    /// The package sources resolving a module key to the identity the loader verified: the
+    /// current generation's `modules.lock` and its official-release host entries (D083b 2),
+    /// replaced when a `/modules reload` installs.
+    sources: Mutex<ModuleSources>,
     /// Whether `--ask` selected the restrictive authorization policy: part of the
     /// switched assembly's identity.
     ask: bool,
@@ -2135,9 +2133,9 @@ pub(crate) fn model_switch_for_test(
         &[],
     ));
     let substitutions = substitutions(&reload_deps, &workspace);
-    // The lock the catalog above registered its modules from, read as the start path's
-    // `module_lock` reads it.
-    let lock = module_lock(&reload_deps)?;
+    // The package sources the catalog above registered its modules from, read as the start
+    // path's `module_sources` reads them.
+    let sources = module_sources(&reload_deps)?;
     Ok(ModelSwitch {
         generations,
         reload: ReloadInputs {
@@ -2148,7 +2146,7 @@ pub(crate) fn model_switch_for_test(
             env_pass: Vec::new(),
             policy: {
                 let front_end = front_end.clone();
-                Box::new(move || front_end.authorization())
+                Box::new(move || reload_policy_of(front_end.as_ref()))
             },
             queue: ReloadQueue::default(),
         },
@@ -2169,7 +2167,7 @@ pub(crate) fn model_switch_for_test(
             AssemblyStore::Memory(session::memory()),
             JOURNAL_VERSION,
         )),
-        lock: Mutex::new(lock),
+        sources: Mutex::new(sources),
         // No `--ask`: the default policy the start path uses without the flag.
         ask: false,
         session: Mutex::new(SessionModel {
@@ -2219,7 +2217,8 @@ impl ModelSwitch {
             date: "2026-01-02".to_string(),
             os: std::env::consts::OS.to_string(),
         };
-        let lock = load_modules_lock(&environment_dirs).expect("the test's modules.lock reads");
+        let lock = p1_assembly::load_modules_lock(&environment_dirs)
+            .expect("the test's modules.lock reads");
         // `/model` keeps the agent's policy (`authorization: None`), so the
         // generation only carries one; a permissive stand-in is enough.
         let authorization: Arc<dyn AuthorizationPolicy> =
@@ -2244,7 +2243,7 @@ impl ModelSwitch {
                 sandbox_write: Vec::new(),
                 sandbox_read: Vec::new(),
                 env_pass: Vec::new(),
-                policy: Box::new(move || policy.clone()),
+                policy: Box::new(move || Ok((policy.clone(), None))),
                 queue: ReloadQueue::default(),
             },
             completion: Arc::new(CompletionHub::new()),
@@ -2268,9 +2267,11 @@ impl ModelSwitch {
                 AssemblyStore::Memory(session::memory()),
                 JOURNAL_VERSION,
             )),
-            // The lock of the test's own environment tree, read as `module_lock` reads it;
-            // a tree without `modules.lock` gives the empty lock.
-            lock: Mutex::new(lock),
+            // The lock of the test's own environment tree, read as `module_sources` reads it;
+            // a tree without `modules.lock` gives the empty set. This switch case reads no
+            // release: its tree is a fixture, and a build's host entries are the catalog's own
+            // step (the start and reload paths call `module_sources`).
+            sources: Mutex::new(ModuleSources::of_lock(lock)),
             // No `--ask`: the default policy the start path uses without the flag.
             ask: false,
             session: Mutex::new(SessionModel {
@@ -2325,11 +2326,11 @@ pub(crate) async fn switch_model(
         },
     };
     let generation = switch.generations.current();
-    let lock = switch.lock.lock().unwrap().clone();
+    let sources = switch.sources.lock().unwrap().clone();
     let candidate = session_candidate(
         switch,
         generation.catalog(),
-        &lock,
+        &sources,
         &choice,
         &current.finish,
     )?;
@@ -2375,13 +2376,13 @@ struct SessionCandidate {
 
 /// Load `choice`, apply the selection, resolve the route binding and assemble on
 /// `catalog` EXACTLY as the start path does — the same cache-key policy with the
-/// parent's ordinal, the same standing instructions. `lock` is the `modules.lock`
-/// the catalog's module registration read, for the candidate's assembly identity
-/// (ADR-0080). Nothing is installed.
+/// parent's ordinal, the same standing instructions. `sources` is the `modules.lock`
+/// the catalog's module registration read plus the host entries it registered, for the
+/// candidate's assembly identity (ADR-0080). Nothing is installed.
 fn session_candidate(
     switch: &ModelSwitch,
     catalog: &Catalog,
-    lock: &ModulesLock,
+    sources: &ModuleSources,
     choice: &crate::models::Choice,
     current_finish: &Option<Arc<dyn Tool>>,
 ) -> Result<SessionCandidate, String> {
@@ -2411,7 +2412,7 @@ fn session_candidate(
     // the assembly. It is written only once the agent installed the candidate, and then
     // before the next turn: the `Environment` the install committed, and every record
     // after it, are executed by THIS assembly.
-    let identity = assembly_identity(&assembled, &environment.provider, switch.ask, lock);
+    let identity = assembly_identity(&assembled, &environment.provider, switch.ask, sources);
     let mut tools = assembled.tools;
     // The switched tool set's `finish` must reach the completion the run reads. The
     // session keeps ITS `finish` — the whole session's activity is in that tool's
@@ -2676,12 +2677,33 @@ pub(crate) struct ReloadInputs {
     sandbox_write: Vec<PathBuf>,
     sandbox_read: Vec<PathBuf>,
     env_pass: Vec<String>,
-    /// The policy the session selects. The host's policies are still the native
-    /// twins of `p1/policy/*` (`policy.rs`), owned by the front end that asks
-    /// through them, so this hands back the front end's; a loaded policy package
-    /// is built here once the host loads them.
-    policy: Box<dyn Fn() -> Arc<dyn AuthorizationPolicy> + Send + Sync>,
+    /// The policy the session selects: the front end's, which asks through it, and
+    /// the shipped policy package it asks loaded again from the release
+    /// ([`reload_policy_of`]).
+    // notice: S5.11 (#357): fallible, and the reloaded package answers once installed.
+    policy: Box<dyn Fn() -> Result<ReloadedPolicy, String> + Send + Sync>,
     queue: ReloadQueue,
+}
+
+/// A reload candidate's policy: the front end's bridge, and the shipped package it asks
+/// loaded again from the release, which answers once the candidate is installed.
+type ReloadedPolicy = (
+    Arc<dyn AuthorizationPolicy>,
+    Option<crate::policy::PolicyReload>,
+);
+
+// notice: S5.11 (#357): the reload policy closure over the loaded components.
+/// The policy of a reload candidate for `front_end`: its own policy, which keeps its
+/// asker, its turn and its grants, and — when it asks a shipped policy
+/// (`p1/policy/full-access` or `p1/policy/ask`) — that package loaded and verified again
+/// from the official release. A package that is gone or does not verify fails the
+/// reload, naming it, and the current policy keeps answering.
+fn reload_policy_of(front_end: &dyn FrontEnd) -> Result<ReloadedPolicy, String> {
+    let reloaded = front_end
+        .shipped_policy()
+        .map(|shipped| shipped.reload())
+        .transpose()?;
+    Ok((front_end.authorization(), reloaded))
 }
 
 /// A copy of what [`build_catalog`] reads of `deps`, for a reload that runs where
@@ -2738,9 +2760,10 @@ pub(crate) async fn reload_modules(
     agent: &mut Agent,
 ) -> Result<String, String> {
     let inputs = &switch.reload;
-    // The lock the reloaded catalog's module registration reads: the reloaded modules'
-    // identities, which the assembly line after the install names (ADR-0080).
-    let lock = module_lock(&inputs.deps)?;
+    // The package sources of the reloaded catalog's module registration — its lock and its
+    // release host entries (D083b 2): the reloaded modules' identities, which the assembly line
+    // after the install names (ADR-0080).
+    let sources = module_sources(&inputs.deps)?;
     let catalog = Arc::new(build_catalog(
         &inputs.deps,
         inputs.sandbox,
@@ -2756,13 +2779,18 @@ pub(crate) async fn reload_modules(
         effort: current.profile.as_ref().and(current.effort),
         profile: current.profile,
     };
-    let candidate = session_candidate(switch, &catalog, &lock, &choice, &current.finish)?;
+    // The reloaded assembly's identity is what the package sources name (the lock and the
+    // release host entries, `module_sources`), and the session's policy comes from the front
+    // end's reload bridge, which loads the shipped policy package again (S5.11): a reload
+    // keeps both behaviours.
+    let candidate = session_candidate(switch, &catalog, &sources, &choice, &current.finish)?;
+    let (authorization, reloaded) = (inputs.policy)()?;
     let generation = install_candidate(
         &switch.generations,
         agent,
         Candidate {
             catalog,
-            authorization: (inputs.policy)(),
+            authorization,
             parts: CandidateParts {
                 provider: candidate.parts.provider.clone(),
                 tools: candidate.parts.tools.clone(),
@@ -2774,11 +2802,15 @@ pub(crate) async fn reload_modules(
     )
     .await
     .map_err(|error| error.to_string())?;
+    // The reloaded component answers from the installed generation on, never before.
+    if let Some(reloaded) = reloaded {
+        reloaded.install();
+    }
     // The install committed a new `Environment` with the reloaded modules: the journal
     // names that assembly before the next turn, and later switches resolve module keys
-    // against the reloaded lock. A store that refuses the line has already accepted the
+    // against the reloaded sources. A store that refuses the line has already accepted the
     // reload, so the message says so; the session state follows the install first.
-    *switch.lock.lock().unwrap() = lock;
+    *switch.sources.lock().unwrap() = sources;
     let identity = candidate.identity.clone();
     let model = adopt_candidate(switch, candidate);
     switch.lines.switched(&identity).map_err(|error| {
@@ -3515,8 +3547,22 @@ mod tests {
     }
 
     /// The reserve the effective table leaves for the next response.
-    fn wall_of(config: &p1_context::ContextConfig) -> u64 {
+    fn wall_of(config: &ContextTable) -> u64 {
         config.window_tokens - config.output_headroom_tokens
+    }
+
+    // notice: S5.11 (#357): the table is the host's own type now; the component's source
+    // crate still validates it, as the component's `configure` does.
+    /// The effective table as the context engine's own config, to validate it.
+    fn native_table(table: &ContextTable) -> p1_context::ContextConfig {
+        p1_context::ContextConfig {
+            window_tokens: table.window_tokens,
+            output_headroom_tokens: table.output_headroom_tokens,
+            summarize_at_tokens: table.summarize_at_tokens,
+            keep_recent_tokens: table.keep_recent_tokens,
+            user_verbatim_tokens: table.user_verbatim_tokens,
+            tool_result_excerpt_chars: table.tool_result_excerpt_chars,
+        }
     }
 
     /// A profile that is not a shipped file: the folding rule must hold for any capacity a
@@ -3569,7 +3615,9 @@ mod tests {
             wall_of(&config)
         );
         // The effective table must be one the policy accepts.
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     /// A profile that states MORE than the environment cannot widen it: the environment's table
@@ -3594,7 +3642,9 @@ mod tests {
             config_for_route(&settings, None),
             "a roomier profile changes nothing"
         );
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     /// A profile far narrower than the environment (40,000 tokens on `zen`) clamps the copied
@@ -3630,7 +3680,9 @@ mod tests {
             config.user_verbatim_tokens,
             config.keep_recent_tokens
         );
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
 
         // A profile whose own output ceiling exceeds its own window: the reserve is clamped
         // below the window, so the table still describes a sendable request. What is left is too
@@ -3646,7 +3698,9 @@ mod tests {
             config.window_tokens
         );
         assert!(config.keep_recent_tokens < wall_of(&config));
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
 
         let (assembled, _) = assembled_for_test(Some(settings.clone()), Effort::High);
         let error = match agent_context(&assembled, Some(&odd)) {
@@ -3726,7 +3780,9 @@ mod tests {
             "the profile's output ceiling bounds the reserve"
         );
         assert_eq!(config.summarize_at_tokens, 500_000);
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     /// A profile that states no capacity at all (the one the `deepseek` environment binds) leaves
@@ -3778,7 +3834,9 @@ mod tests {
             config.summarize_at_tokens > settings.window_tokens * 60 / 100,
             "the decided threshold is above 60% of the window, so the rule must not apply"
         );
-        p1_context::ContextConfig::validate(&config).expect("the effective table validates");
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
     }
 
     // ---------------------------- #125 review: the summary's own effort

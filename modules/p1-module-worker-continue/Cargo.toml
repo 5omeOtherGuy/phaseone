@@ -26,5 +26,5 @@ name = "p1/worker-continue"
 kind = "tool"
 world = "p1:module/tool@1.0.0"
 protocol = "1.0"
-capabilities = ["control", "workers-control"]
+capabilities = ["control", "workers-control", "workers-observe"]
 variant = "default"

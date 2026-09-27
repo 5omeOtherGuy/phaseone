@@ -37,7 +37,9 @@ pub use context_policy::{
     WasmContextPolicy,
 };
 pub use executor::ExecutionLimits;
-pub use loader::{LoadError, LoadedModule, Loader, ManualEpochs, ModuleKind};
+pub use loader::{
+    LINKABLE_CAPABILITIES, LoadError, LoadedModule, Loader, ManualEpochs, ModuleKind,
+};
 pub use manifest::{ComponentEntry, Digest, ManifestError, ReleaseManifest};
 pub use provider::{ProviderError, ProviderSettings, WasmProvider};
 pub use tool::{ToolError, WasmTool, wasm_tool};
