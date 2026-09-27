@@ -131,6 +131,26 @@ fn a_release_missing_read_fails_startup_naming_it() {
 }
 
 #[test]
+fn a_release_missing_edit_fails_startup_naming_it() {
+    missing_host_entry(&class("edit", "p1/edit", CLAUDE_RUN, "S7.10-R1 (#390)"));
+}
+
+#[test]
+fn a_release_missing_write_fails_startup_naming_it() {
+    missing_host_entry(&class("write", "p1/write", CLAUDE_RUN, "S7.10-R1 (#390)"));
+}
+
+#[test]
+fn a_release_missing_search_fails_startup_naming_it() {
+    missing_host_entry(&class("search", "p1/search", CLAUDE_RUN, "S7.10-R1 (#390)"));
+}
+
+#[test]
+fn a_release_missing_patch_fails_startup_naming_it() {
+    missing_host_entry(&class("patch", "p1/patch", OPENAI_RUN, "S7.10-R1 (#390)"));
+}
+
+#[test]
 fn a_release_missing_shell_fails_startup_naming_it() {
     missing_host_entry(&class("shell", "p1/shell", CLAUDE_RUN, "S3.8 (#330)"));
 }
