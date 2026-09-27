@@ -277,12 +277,18 @@ impl SnapshotService for ReadCapability {
 #[derive(Clone)]
 pub struct SearchCapability {
     workspace: Workspace,
+    home: Option<PathBuf>,
+    xdg_credentials: Vec<PathBuf>,
 }
 
 impl SearchCapability {
-    /// The capability over `workspace`.
-    pub fn new(workspace: Workspace) -> Self {
-        Self { workspace }
+    /// The capability over `workspace`, refusing credentials under the agent's home.
+    pub fn new(workspace: Workspace, home: Option<PathBuf>) -> Self {
+        Self {
+            workspace,
+            home,
+            xdg_credentials: xdg_credentials(),
+        }
     }
 
     /// Runs `work` on a blocking thread: the walk and the reads are synchronous and must never
@@ -306,7 +312,11 @@ impl SearchCapability {
 
 impl WorkspaceService for SearchCapability {
     fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>> {
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
         self.blocking(move |workspace, _| {
+            refuse_credentials(workspace, &path, home.as_deref(), &xdg_credentials)
+                .map_err(FsError::Io)?;
             let checked = workspace
                 .check_path(&path)
                 .map_err(file_walk::workspace_error)?;
@@ -337,7 +347,13 @@ impl WorkspaceService for SearchCapability {
     ) -> BoxFuture<'_, Result<Vec<u8>, FsError>> {
         // Only the requested window, as the native `grep` reads: file-list mode sniffs a
         // prefix of every listed file, which must not load a large file whole.
-        self.blocking(move |workspace, _| file_walk::read_window(workspace, &path, offset, length))
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
+        self.blocking(move |workspace, _| {
+            refuse_credentials(workspace, &path, home.as_deref(), &xdg_credentials)
+                .map_err(FsError::Io)?;
+            file_walk::read_window(workspace, &path, offset, length)
+        })
     }
 
     fn list_files(
@@ -345,13 +361,29 @@ impl WorkspaceService for SearchCapability {
         path: String,
         glob: Option<String>,
     ) -> BoxFuture<'_, Result<Vec<String>, FsError>> {
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
         self.blocking(move |workspace, cancel| {
-            file_walk::list_files(workspace, &path, glob.as_deref(), cancel)
+            file_walk::list_files_excluding(
+                workspace,
+                &path,
+                glob.as_deref(),
+                cancel,
+                |candidate| {
+                    p1_workspace::refuses_credentials(candidate, home.as_deref(), &xdg_credentials)
+                },
+            )
         })
     }
 
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<SearchResult, FsError>> {
-        self.blocking(move |workspace, cancel| file_walk::search(workspace, &query, cancel))
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
+        self.blocking(move |workspace, cancel| {
+            file_walk::search_excluding(workspace, &query, cancel, |candidate| {
+                p1_workspace::refuses_credentials(candidate, home.as_deref(), &xdg_credentials)
+            })
+        })
     }
 }
 
@@ -538,7 +570,7 @@ pub fn capability_services(
             .expect("call_services links the read side");
         services.workspace = Some(Arc::new(ToolWorkspace {
             read,
-            search: Arc::new(SearchCapability::new(workspace.clone())),
+            search: Arc::new(SearchCapability::new(workspace.clone(), home.clone())),
         }));
         services
     })
@@ -605,9 +637,9 @@ pub fn mutation_service_over(
 }
 
 /// The services of the `p1/search` component over one agent's workspace: the walk alone.
-pub fn search_services(workspace: Workspace) -> Services {
+pub fn search_services(workspace: Workspace, home: Option<PathBuf>) -> Services {
     Services {
-        workspace: Some(Arc::new(SearchCapability::new(workspace))),
+        workspace: Some(Arc::new(SearchCapability::new(workspace, home))),
         ..Services::default()
     }
 }
@@ -764,7 +796,7 @@ mod tests {
     async fn a_dropped_request_cancels_its_walk() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "beta\n").unwrap();
-        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap());
+        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap(), None);
         // The work starts, the request is dropped while it runs (as the runtime drops it on
         // a cancellation), and the work then sees its token cancelled.
         let (started, work_started) = std::sync::mpsc::channel();
@@ -918,6 +950,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn search_capability_refuses_credentials_in_every_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential = dir.path().join("xdg-auth.json");
+        std::fs::write(&credential, "credential-marker\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "safe match\n").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        // This is one of the policy's XDG-named credential paths, made visible to the walk.
+        let capability = SearchCapability {
+            workspace,
+            home: Some(dir.path().to_path_buf()),
+            xdg_credentials: vec![credential],
+        };
+
+        assert_eq!(
+            capability.stat("xdg-auth.json".into()).await,
+            Err(FsError::Io(p1_workspace::credential_refusal(
+                "xdg-auth.json"
+            )))
+        );
+        assert_eq!(
+            capability.read("xdg-auth.json".into(), 0, 128).await,
+            Err(FsError::Io(p1_workspace::credential_refusal(
+                "xdg-auth.json"
+            )))
+        );
+        assert_eq!(
+            capability.list_files(".".into(), None).await,
+            Ok(vec!["notes.txt".to_owned()])
+        );
+
+        let result = capability
+            .search(SearchQuery {
+                pattern: "credential-marker|safe match".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["notes.txt"],
+            "content search must neither match nor list credential files"
+        );
+    }
+
     /// The search capability's `read` returns only the requested window and records no
     /// observation (`p1/search` is granted no `snapshot`), so file-list mode's binary sniff
     /// cannot load a large file whole or give a search the permission an edit needs.
@@ -925,7 +1010,7 @@ mod tests {
     async fn a_search_read_returns_only_the_requested_window() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "0123456789").unwrap();
-        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap());
+        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap(), None);
         assert_eq!(
             capability.read("a.txt".into(), 2, 3).await,
             Ok(b"234".to_vec())

@@ -55,13 +55,24 @@ pub fn search(
     query: &SearchQuery,
     cancel: &CancellationToken,
 ) -> Result<SearchResult, FsError> {
+    search_excluding(workspace, query, cancel, |_| false)
+}
+
+/// Search like [`search`], omitting paths selected by the caller before reading their contents.
+pub(crate) fn search_excluding(
+    workspace: &Workspace,
+    query: &SearchQuery,
+    cancel: &CancellationToken,
+    excluded: impl Fn(&Path) -> bool,
+) -> Result<SearchResult, FsError> {
     let search_path = scope(workspace, query.path.as_deref())?;
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(query.case_insensitive)
         .build(&query.pattern)
         .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
     let overrides = build_overrides(&search_path, query.glob.as_deref())?;
-    let files = collect_files(workspace, &search_path, overrides, cancel)?;
+    let mut files = collect_files(workspace, &search_path, overrides, cancel)?;
+    files.retain(|(_, path)| !excluded(path));
     search_content(&matcher, query, &files, cancel)
 }
 
@@ -74,9 +85,21 @@ pub fn list_files(
     glob: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<Vec<String>, FsError> {
+    list_files_excluding(workspace, path, glob, cancel, |_| false)
+}
+
+/// List like [`list_files`], omitting paths selected by the caller.
+pub(crate) fn list_files_excluding(
+    workspace: &Workspace,
+    path: &str,
+    glob: Option<&str>,
+    cancel: &CancellationToken,
+    excluded: impl Fn(&Path) -> bool,
+) -> Result<Vec<String>, FsError> {
     let search_path = scope(workspace, Some(path))?;
     let overrides = build_overrides(&search_path, glob)?;
-    let files = collect_files(workspace, &search_path, overrides, cancel)?;
+    let mut files = collect_files(workspace, &search_path, overrides, cancel)?;
+    files.retain(|(_, path)| !excluded(path));
     Ok(files.into_iter().map(|(display, _)| display).collect())
 }
 

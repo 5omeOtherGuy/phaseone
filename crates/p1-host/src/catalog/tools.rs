@@ -99,7 +99,7 @@ pub fn capability_services_for(
     home: Option<PathBuf>,
 ) -> Services {
     if module == SEARCH_MODULE {
-        return p1_module_runtime::file_services::search_services(workspace);
+        return p1_module_runtime::file_services::search_services(workspace, home);
     }
     p1_module_runtime::file_services::tool_services(
         workspace,
