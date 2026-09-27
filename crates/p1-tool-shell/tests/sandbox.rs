@@ -546,44 +546,39 @@ fn i_a_readable_path_cannot_uncover_the_cargo_token_mask() {
         )
         .is_err()
     );
-    for readable in [cargo.clone()] {
-        let mut sandbox = Sandbox::for_home(home.path());
-        sandbox.readable = vec![readable.clone()];
-        let args = os_args(&bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap());
-        let readable_bind = args
-            .windows(3)
-            .position(|window| {
-                window[0] == "--ro-bind" && window[1] == readable.display().to_string()
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "the readable bind for {} must be present",
-                    readable.display()
-                )
-            });
-        let home_tmpfs = args
-            .windows(2)
-            .position(|window| {
-                window[0] == "--tmpfs" && window[1] == home.path().display().to_string()
-            })
-            .expect("the home tmpfs must be present");
-        let mask = args
-            .windows(3)
-            .position(|window| {
-                window[0] == "--ro-bind"
-                    && window[1] == "/dev/null"
-                    && window[2] == cargo.join("credentials.toml").display().to_string()
-            })
-            .expect("the credentials mask must be present");
-        assert!(
-            readable_bind > home_tmpfs,
-            "the readable bind must come after the home tmpfs: {readable:?}"
-        );
-        assert!(
-            mask > readable_bind,
-            "the token mask must come after the readable bind: {readable:?}"
-        );
-    }
+    let readable = cargo.clone();
+    let mut sandbox = Sandbox::for_home(home.path());
+    sandbox.readable = vec![readable.clone()];
+    let args = os_args(&bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap());
+    let readable_bind = args
+        .windows(3)
+        .position(|window| window[0] == "--ro-bind" && window[1] == readable.display().to_string())
+        .unwrap_or_else(|| {
+            panic!(
+                "the readable bind for {} must be present",
+                readable.display()
+            )
+        });
+    let home_tmpfs = args
+        .windows(2)
+        .position(|window| window[0] == "--tmpfs" && window[1] == home.path().display().to_string())
+        .expect("the home tmpfs must be present");
+    let mask = args
+        .windows(3)
+        .position(|window| {
+            window[0] == "--ro-bind"
+                && window[1] == "/dev/null"
+                && window[2] == cargo.join("credentials.toml").display().to_string()
+        })
+        .expect("the credentials mask must be present");
+    assert!(
+        readable_bind > home_tmpfs,
+        "the readable bind must come after the home tmpfs: {readable:?}"
+    );
+    assert!(
+        mask > readable_bind,
+        "the token mask must come after the readable bind: {readable:?}"
+    );
 }
 
 /// A readable path equal to or inside a credential directory is refused before
