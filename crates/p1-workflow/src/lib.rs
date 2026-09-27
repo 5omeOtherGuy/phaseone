@@ -14,6 +14,8 @@
 //! The engine is split (S6.3): [`decision`] holds the step decisions behind the
 //! [`Decisions`] seam and their JSON contract; the engine is the native substrate that owns
 //! every piece of state and applies the checked transitions.
+//!
+//! [`report`] renders an ended run's report as the text its readers print.
 
 pub mod api;
 mod caps;
@@ -22,6 +24,7 @@ pub mod decision;
 mod engine;
 mod error;
 mod journal;
+pub mod report;
 mod service;
 
 pub use api::*;
@@ -29,4 +32,5 @@ pub use decision::{Decisions, NativeDecisions};
 // The one piece of the journal module the host needs: it reads a run's journal to
 // reserve worker ids on resume (issue #98), with this crate's exact parse semantics.
 pub use journal::read_journal;
+pub use report::{render_report, report_line};
 pub use service::InProcessWorkflows;

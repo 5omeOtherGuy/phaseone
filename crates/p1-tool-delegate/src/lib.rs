@@ -17,9 +17,10 @@ use std::sync::Arc;
 pub use p1_contracts::tool::ToolFace;
 use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
-    BoxFuture, CallDescription, DeclarationKind, Effect, JournalRecord, RecordBody, Tool, ToolCall,
+    BoxFuture, CallDescription, DeclarationKind, Effect, JournalRecord, Tool, ToolCall,
     ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
+use p1_workers::journal::STARTED_PREFIX;
 use p1_workers::scope::UnscopedWorkers;
 use p1_workers::{
     ChildId, ChildSpec, ChildStatus, WorkerError, WorkerReport, WorkerService, WorkersControl,
@@ -41,9 +42,6 @@ const CANCEL_NAME: &str = "worker_cancel";
 const CANCEL_DESCRIPTION: &str =
     "Cancel a running worker's current turn. The worker's session is kept.";
 
-/// How a successful `worker_start` result begins; [`workers_started_in`] reads it back.
-const STARTED_PREFIX: &str = "Started worker ";
-
 fn plain_result(result: &ToolResultItem) -> ResultDescription {
     ResultDescription {
         summary: result.content.lines().next().unwrap_or_default().to_owned(),
@@ -51,35 +49,11 @@ fn plain_result(result: &ToolResultItem) -> ResultDescription {
     }
 }
 
-/// The ids of every worker a journalled session started, in order. Workers live in
-/// the process that started them, so after a resume these ids name nothing — the
-/// host uses this to say so and to keep new ids from colliding with them.
+/// The ids of every worker a session journalled by these tools started, in order. Workers
+/// live in the process that started them, so after a resume these ids name nothing; the
+/// scanner is `p1-workers`' own, read under this crate's identity.
 pub fn workers_started_in(records: &[JournalRecord]) -> Vec<String> {
-    let mut delegate_calls = std::collections::HashSet::new();
-    let mut ids = Vec::new();
-    for record in records {
-        match &record.body {
-            RecordBody::ToolStarted { call_id, identity }
-                if identity.implementation == env!("CARGO_PKG_NAME") =>
-            {
-                delegate_calls.insert(call_id.as_str());
-            }
-            RecordBody::ToolFinished { result }
-                if result.status == ToolStatus::Ok
-                    && delegate_calls.contains(result.call_id.as_str()) =>
-            {
-                let id = result
-                    .content
-                    .strip_prefix(STARTED_PREFIX)
-                    .and_then(|rest| rest.split(' ').next());
-                if let Some(id) = id {
-                    ids.push(id.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    ids
+    p1_workers::journal::workers_started_in(records, &[env!("CARGO_PKG_NAME")])
 }
 
 fn identity(variant: &str) -> ToolIdentity {

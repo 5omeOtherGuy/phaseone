@@ -632,6 +632,78 @@ async fn each_member_loads_and_runs_one_call_against_its_scoped_service() {
     .await;
 }
 
+/// S7.10-R6: `p1 workflow run` prints `p1_workflow::render_report`, no longer the native
+/// `WorkflowResultTool`. For the same ended runs the `p1/workflow-result` member, the native
+/// tool and the formatter give one text: a report with a fallback chain, a replayed step and
+/// an error, and one past the 200-step and 16 KiB value cuts.
+#[tokio::test]
+async fn the_member_the_native_tool_and_the_formatter_render_one_report() {
+    within_deadline("one report text", async {
+        let rich: RunStatus = serde_json::from_value(json!({"Ended": {
+            "id": "wf1", "outcome": "failed", "value": {"b": 1, "a": [true]},
+            "counts": {"steps": 2, "replayed": 1, "done": 1, "blocked": 0, "failed": 1,
+                "cancelled": 0, "not_verified": 1, "capped": 0, "invalid_output": 0,
+                "fell_back": 1},
+            "steps": [
+                {"call": "c-1", "ordinal": 1, "label": "plan", "role": "worker", "model": "e/p",
+                 "worker": "w1", "status": "done", "schema": "ok", "evidence": "not verified",
+                 "attempts": 2, "replayed": false, "error": null,
+                 "models": [{"model": "e/a", "moved_on": "route_failed"},
+                            {"model": "e/b", "moved_on": null}]},
+                {"call": "c-2", "ordinal": 2, "label": null, "role": "judge", "model": "e/j",
+                 "worker": null, "status": "failed", "schema": "none", "evidence": null,
+                 "attempts": 1, "replayed": true, "error": "route: down", "models": []}],
+            "error": "script failed [line 3, column 1]", "run_dir": "/runs/wf1"}}))
+        .expect("a run status");
+        let steps: Vec<Value> = (1..=201)
+            .map(|n| {
+                json!({"call": format!("c-{n}"), "label": null, "role": "worker",
+                "model": "e/p", "worker": format!("w{n}"), "status": "blocked", "schema": "ok",
+                "evidence": null, "attempts": 1, "replayed": false, "error": null, "models": []})
+            })
+            .collect();
+        let large: RunStatus = serde_json::from_value(json!({"Ended": {
+            "id": "wf2", "outcome": "completed_with_issues", "value": "é".repeat(9000),
+            "counts": {"steps": 201, "blocked": 201, "replayed": 0, "done": 0, "failed": 0,
+                "cancelled": 0, "not_verified": 0, "capped": 0, "invalid_output": 0,
+                "fell_back": 0},
+            "steps": steps, "error": null, "run_dir": "/runs/wf2"}}))
+        .expect("a run status");
+
+        let runs = Arc::new(FakeRuns::default());
+        runs.runs.lock().unwrap().extend([
+            (RunId("wf1".to_owned()), rich),
+            (RunId("wf2".to_owned()), large),
+        ]);
+        let member = tool(
+            &load(&loader(), "p1/workflow-result"),
+            workflows(WorkflowServices::of(runs.clone())),
+        );
+        let native: Arc<dyn Tool> =
+            Arc::new(p1_tool_workflow::WorkflowResultTool::new(runs.clone()));
+        for id in ["wf1", "wf2"] {
+            let Ok(RunStatus::Ended(report)) = runs.known(&RunId(id.to_owned())) else {
+                panic!("{id} is ended");
+            };
+            let formatted = p1_workflow::render_report(&report);
+            let from_member = run(&member, "workflow_result", json!({"id": id})).await;
+            assert_ok(&from_member, "workflow_result");
+            assert_eq!(from_member.content, formatted, "member, {id}");
+            let from_native = run(&native, "workflow_result", json!({"id": id})).await;
+            assert_ok(&from_native, "native workflow_result");
+            assert_eq!(from_native.content, formatted, "native, {id}");
+            if id == "wf2" {
+                assert!(
+                    formatted.contains("\n  … 1 more in result.json")
+                        && formatted.contains("… (truncated; full value in /runs/wf2/result.json)"),
+                    "the large report is cut: {formatted}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
 /// `worker_result` declares and imports only `workers-observe` of the worker interfaces, and
 /// its instance links with that one service alone; `worker_start` given the same services is
 /// refused for the start it would need.
