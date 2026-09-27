@@ -6,7 +6,7 @@
 //! reserved keys the host adds (the settings contract of S4.6): `model_profile`
 //! (`{stem, toml}`, the selected profile file), `route_headers` (the route's `[headers]`
 //! table) and `model_binding` (the binding's `context_limit` and `output_limit`). The chat
-//! route is built from them exactly as `chat_route_from` in p1-host's catalog builds it.
+//! route is built from them exactly as `chat_route` in p1-host's tests/native_routes builds it.
 
 use std::collections::BTreeMap;
 
@@ -176,7 +176,7 @@ max_output_tokens = 32000
     #[test]
     fn the_shipped_route_composes_as_the_native_host_builds_it() {
         let composition = zen(serde_json::json!({}), serde_json::json!({})).unwrap();
-        // `chat_route_from` in p1-host's catalog, over the same route file and binding.
+        // `chat_route` in p1-host's tests/native_routes, over the same route file and binding.
         assert_eq!(
             composition.route,
             ChatRoute {

@@ -318,8 +318,23 @@ async fn codex_subscription_route_over_websocket() {
     let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
     let route_file = p1_host::routes::load_route_by_id(&dirs, "openai-codex-subscription")
         .expect("the shipped route file");
-    let mut route = p1_host::catalog::responses_route(&route_file).expect("a responses route");
-    route.transport = p1_provider_openai::ResponsesTransport::Websocket;
+    // The native adapter's route value from the file, as the host composed it before S7.10-R4
+    // took the adapter crates out of its normal dependencies; this check asks for WebSocket.
+    let p1_host::routes::AdapterSettings::OpenAiResponses(settings) =
+        route_file.settings().expect("the route settings")
+    else {
+        panic!("a responses route");
+    };
+    let route = p1_provider_openai::ResponsesRoute {
+        origin_route: route_file.origin_route.clone(),
+        endpoint: route_file.endpoint.clone(),
+        account: match settings.account {
+            p1_host::routes::ResponsesAccount::CodexSubscription => {
+                p1_provider_openai::ResponsesAccount::CodexSubscription
+            }
+        },
+        transport: p1_provider_openai::ResponsesTransport::Websocket,
+    };
     let credentials =
         p1_host::auth::credential_source(&route_file, Arc::new(ReqwestTransport::new()));
     let connected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -408,7 +423,9 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
 /// `route_provider` activates the provider COMPONENT the route's adapter names (D083b),
 /// from the module set the host itself would read: a live check needs the built modules
 /// (`scripts/build-modules.sh --all`; a debug build finds them through S3.8.0's discovery once
-/// it is on main). Only a `transport = "websocket"` route still builds a native adapter (S5.5).
+/// it is on main). Since S7.10-R5 no route builds a native adapter, a
+/// `transport = "websocket"` one included: the component lowers that transport and connects
+/// through the injected connector (ADR-0078).
 ///
 /// The connector is injected next to the transport (ADR-0047 §1); a live check gets
 /// the REAL one, because the shipped Codex route asks for WebSocket.

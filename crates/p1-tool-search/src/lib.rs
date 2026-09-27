@@ -12,6 +12,10 @@
 //! crate's `execute` over these two functions, so native and component run the
 //! same code.
 
+mod capability;
+
+pub use capability::{SearchCapability, search_services};
+
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -214,16 +218,8 @@ impl Capabilities for NativeHost {
         })
     }
 
-    /// One window of the file, read directly: the guest reads only the prefix
-    /// it sniffs for binary content, so the whole file is never loaded.
     fn read(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>, FsError> {
-        let checked = self.workspace.check_path(path).map_err(fs_error)?;
-        let io = |error: io::Error| FsError::Io(error.to_string());
-        let mut file = std::fs::File::open(checked.path()).map_err(io)?;
-        io::copy(&mut (&mut file).take(offset), &mut io::sink()).map_err(io)?;
-        let mut window = Vec::new();
-        file.take(length).read_to_end(&mut window).map_err(io)?;
-        Ok(window)
+        read_window(&self.workspace, path, offset, length)
     }
 
     fn list_files(&self, path: &str, glob: Option<&str>) -> Result<Vec<String>, FsError> {
@@ -233,6 +229,23 @@ impl Capabilities for NativeHost {
     fn search(&self, query: &SearchQuery) -> Result<SearchResult, FsError> {
         search(&self.workspace, query, &self.cancel)
     }
+}
+
+/// One window of the file, read directly: the guest reads only the prefix
+/// it sniffs for binary content, so the whole file is never loaded.
+pub(crate) fn read_window(
+    workspace: &Workspace,
+    path: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, FsError> {
+    let checked = workspace.check_path(path).map_err(fs_error)?;
+    let io = |error: io::Error| FsError::Io(error.to_string());
+    let mut file = std::fs::File::open(checked.path()).map_err(io)?;
+    io::copy(&mut (&mut file).take(offset), &mut io::sink()).map_err(io)?;
+    let mut window = Vec::new();
+    file.take(length).read_to_end(&mut window).map_err(io)?;
+    Ok(window)
 }
 
 /// The workspace service's failures as the frozen `fs-error`
@@ -866,7 +879,9 @@ mod tests {
         for bytes in [MAX_OUTPUT_BYTES - 1, MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES + 1] {
             texts.push("x".repeat(bytes));
         }
-        texts.push("x\n".repeat(MAX_OUTPUT_LINES - 1) + &"x".repeat(MAX_OUTPUT_BYTES));
+        // `.as_str()`: a crate in the dependency graph adds another `Add` impl for `String`,
+        // so `+ &String` no longer coerces to `&str` by inference.
+        texts.push("x\n".repeat(MAX_OUTPUT_LINES - 1) + "x".repeat(MAX_OUTPUT_BYTES).as_str());
 
         for text in &texts {
             assert_eq!(

@@ -4,7 +4,7 @@
 //! The model-facing declaration, input validation and rendering live in
 //! `p1-read-guest`, which the component (`p1/read`) runs too. This crate is the
 //! native adapter over both, owns the credential refusal (issue #142), and
-//! provides the `workspace` and `snapshot` capabilities the component reads
+//! provides the capability services the release's tool components read and mutate
 //! through ([`capability`]).
 
 pub mod capability;
@@ -22,7 +22,7 @@ use p1_read_guest::{
 };
 use p1_workspace::{ObservedFiles, StreamingHash, Workspace};
 
-pub use capability::{ReadCapability, capability_services};
+pub use capability::{ReadCapability, capability_services, tool_services};
 pub use p1_workspace::ToolFace;
 
 /// The internal read buffer: fixed and small, however large the file is.
