@@ -44,6 +44,36 @@ pub trait ContextPolicy: Send + Sync {
         &'a self,
         input: ContextInput<'a>,
     ) -> BoxFuture<'a, Result<Option<Prepared>, ContextError>>;
+
+    /// Manual compaction (ADR-0076): summarize the history NOW, whatever the
+    /// threshold, through the same summary `prepare` makes at the threshold. A
+    /// replacement is installed and journalled exactly like one from `prepare`
+    /// (`ContextReplaced`). `Unchanged` when there is nothing to summarize. The
+    /// default is a policy that never summarizes: it refuses.
+    fn compact_now<'a>(
+        &'a self,
+        input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Compaction, ContextError>> {
+        let _ = input;
+        Box::pin(async {
+            Err(ContextError::Failed(
+                "this context policy has no summarizer (no [context] section)".to_string(),
+            ))
+        })
+    }
+}
+
+/// What one manual compaction did (ADR-0076). Token counts are the policy's
+/// estimates of the history before and after.
+pub enum Compaction {
+    /// One summary replaces the history from now on.
+    Replaced {
+        prepared: Prepared,
+        tokens_before: u64,
+        tokens_after: u64,
+    },
+    /// Nothing older than the kept tail to summarize: the history stays as it is.
+    Unchanged { tokens: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]

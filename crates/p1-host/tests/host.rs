@@ -1203,6 +1203,7 @@ async fn usage_errors_exit_2() {
         workspace: Some(workspace.path().to_path_buf()),
         session: None,
         resume: true,
+        compact: false,
         ask: false,
         tui: false,
         sandbox: p1_host::cli::SandboxMode::Off,

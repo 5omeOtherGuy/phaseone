@@ -1,0 +1,7 @@
+{
+  "item": "tool_result",
+  "call_id": "call_1",
+  "name": "read",
+  "status": "ok",
+  "content": "1\tfn main() {}\n"
+}

@@ -1,0 +1,46 @@
+[package]
+name = "p1-module-runtime"
+description = "The host side of p1's WebAssembly modules: the wasmtime engine that compiles and runs module components"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-module-protocol = { path = "../p1-module-protocol" }
+# The transport broker a provider component's lowered request is sent through (S4.7).
+p1-provider-http = { path = "../p1-provider-http" }
+p1-redact = { path = "../p1-redact" }
+# S6 (B-S6-8, D065): `delegation.rs` links the worker and workflow interfaces over these
+# crates' own traits, passed in by the host.
+p1-workers = { path = "../p1-workers" }
+p1-workflow = { path = "../p1-workflow" }
+# S7.10-R1 (ADR-0095): the file tools' capability services — the read side, the walk and the
+# owned mutation — and the credential-file policy they apply before confinement are the
+# HOST's now (`src/file_services.rs`, `src/file_walk.rs`), so a component is linked without
+# the host depending on a tool crate.
+p1-workspace = { path = "../p1-workspace" }
+# The walk behind `workspace.list-files` and `workspace.search`: `ignore` for the
+# `.gitignore`-aware walk and the glob filter, `grep` for the matching, exactly as the native
+# `grep` used them before its crate left the host's normal graph.
+grep = "0.4"
+ignore = "0.4"
+thiserror = "2"
+# The native process service (`process`): process-group signals, the sandbox's private /tmp,
+# and the child's pipes and timers.
+nix = { version = "0.29", default-features = false, features = ["signal"] }
+tempfile = "3"
+# The executor task, its request channel and the per-call tasks it owns.
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "process", "io-util", "time"] }
+# The bounded set of ORCHESTRATION-PLAN §2 (owner, Q7). No `cache`: the loader compiles the
+# verified bytes itself, so a compiled-code cache would be a second, unverified source of
+# code. No `wat` or WASI: modules arrive as binary components and get only p1's own imports.
+wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "async", "std"] }
+
+[dev-dependencies]
+# The moved file-service cases (`src/file_services.rs`) build scratch workspaces.
+tempfile = "3"

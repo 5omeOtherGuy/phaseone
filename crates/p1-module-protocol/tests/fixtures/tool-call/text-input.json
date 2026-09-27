@@ -1,0 +1,8 @@
+{
+  "call_id": "call_2",
+  "name": "apply_patch",
+  "input": {
+    "kind": "text",
+    "raw": "*** Begin Patch\n*** End Patch\n"
+  }
+}

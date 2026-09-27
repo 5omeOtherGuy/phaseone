@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/route-description/1",
+  "title": "Route description",
+  "description": "What a provider instance actually is. Never carries credentials.",
+  "type": "object",
+  "properties": {
+    "origin": { "$ref": "p1:protocol/replay-data/1#/$defs/origin" },
+    "supports_freeform_tools": { "type": "boolean" },
+    "mandatory_prompt_prefix": { "type": "string" },
+    "reports_cost": { "type": "boolean" },
+    "cache_key": { "enum": ["unsupported", "optional"] }
+  },
+  "required": ["origin", "supports_freeform_tools", "reports_cost", "cache_key"],
+  "additionalProperties": false
+}

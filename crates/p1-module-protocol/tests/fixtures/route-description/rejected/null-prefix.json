@@ -1,0 +1,10 @@
+{
+  "origin": {
+    "route": "openai-responses/api",
+    "model": "gpt-test"
+  },
+  "supports_freeform_tools": true,
+  "mandatory_prompt_prefix": null,
+  "reports_cost": true,
+  "cache_key": "optional"
+}

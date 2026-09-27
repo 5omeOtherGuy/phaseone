@@ -1,0 +1,8 @@
+{
+  "call_id": "call_1",
+  "name": "read",
+  "input": {
+    "kind": "json",
+    "raw": "{\"path\":\"src/lib.rs\"}"
+  }
+}

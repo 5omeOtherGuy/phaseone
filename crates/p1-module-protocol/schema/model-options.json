@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/model-options/1",
+  "title": "Model options",
+  "description": "Explicit model options. An absent field means the route's default; native holds route-namespaced options the adapter interprets.",
+  "type": "object",
+  "properties": {
+    "reasoning_effort": { "enum": ["low", "medium", "high", "extra_high", "max"] },
+    "max_output_tokens": { "type": "integer" },
+    "cache_key": { "type": "string" },
+    "native": { "type": "object" }
+  },
+  "additionalProperties": false
+}

@@ -180,6 +180,8 @@ struct ScriptedWsState {
     handshakes: Vec<WsHandshake>,
     /// Texts sent, one entry per ACCEPTED connection in connect order.
     sent_texts: Vec<Vec<String>>,
+    /// Pongs written, one count per ACCEPTED connection in connect order.
+    pongs: Vec<usize>,
 }
 
 impl ScriptedWsConnector {
@@ -190,6 +192,7 @@ impl ScriptedWsConnector {
                 connections: connections.into(),
                 handshakes: Vec::new(),
                 sent_texts: Vec::new(),
+                pongs: Vec::new(),
             })),
         }
     }
@@ -204,6 +207,12 @@ impl ScriptedWsConnector {
     /// failed connections never produced a connection, so they have no entry.
     pub fn sent_texts(&self) -> Vec<Vec<String>> {
         self.lock().sent_texts.clone()
+    }
+
+    /// The pongs written on each accepted connection, in connect order: every one
+    /// answers a scripted ping, and one that stalled was never written.
+    pub fn pongs(&self) -> Vec<usize> {
+        self.lock().pongs.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ScriptedWsState> {
@@ -231,6 +240,7 @@ impl WsConnector for ScriptedWsConnector {
             let connection = match scripted {
                 ScriptedConnection::Accept(_) => {
                     state.sent_texts.push(Vec::new());
+                    state.pongs.push(0);
                     Some(state.sent_texts.len() - 1)
                 }
                 ScriptedConnection::Refuse { .. } | ScriptedConnection::Fail(_) => None,
@@ -244,15 +254,20 @@ impl WsConnector for ScriptedWsConnector {
                     Err(WsConnectError::Status { status, body })
                 }
                 ScriptedConnection::Fail(message) => Err(WsConnectError::Failed(message)),
-                ScriptedConnection::Accept(frames) => Ok(Box::new(ScriptedWsConnection {
-                    channel: ScriptedChannel {
-                        frames: frames.into(),
-                    },
-                    awaiting_first_frame: false,
-                    inner,
-                    connection: connection.expect("an accepted connection is recorded"),
-                })
-                    as Box<dyn WsConnection>),
+                ScriptedConnection::Accept(frames) => {
+                    let connection = connection.expect("an accepted connection is recorded");
+                    Ok(Box::new(ScriptedWsConnection {
+                        channel: ScriptedChannel {
+                            frames: frames.into(),
+                            inner: Arc::clone(&inner),
+                            connection,
+                            stall_pong: false,
+                        },
+                        awaiting_first_frame: false,
+                        inner,
+                        connection,
+                    }) as Box<dyn WsConnection>)
+                }
             }
         })
     }
@@ -351,6 +366,9 @@ impl ScriptedConnection {
 pub enum ScriptedFrame {
     Text(String),
     Ping,
+    /// A ping whose pong write never completes, the way a peer that stopped
+    /// reading its socket fills the write buffer.
+    PingWithStalledPong,
     Pong,
     Wait(Duration),
     Error(String),
@@ -364,6 +382,11 @@ impl ScriptedFrame {
 
     pub fn ping() -> Self {
         Self::Ping
+    }
+
+    /// A ping whose pong write never completes: the write bound must end it.
+    pub fn ping_with_stalled_pong() -> Self {
+        Self::PingWithStalledPong
     }
 
     pub fn pong() -> Self {
@@ -427,6 +450,10 @@ impl WsConnection for ScriptedWsConnection {
 /// crate's real bounded read, so a test exercises the production idle clock.
 struct ScriptedChannel {
     frames: VecDeque<ScriptedFrame>,
+    inner: Arc<Mutex<ScriptedWsState>>,
+    connection: usize,
+    /// Whether the ping just delivered was a [`ScriptedFrame::PingWithStalledPong`].
+    stall_pong: bool,
 }
 
 impl MessageChannel for ScriptedChannel {
@@ -436,6 +463,10 @@ impl MessageChannel for ScriptedChannel {
                 match self.frames.pop_front() {
                     Some(ScriptedFrame::Text(text)) => return Ok(Some(RawMessage::Text(text))),
                     Some(ScriptedFrame::Ping) => return Ok(Some(RawMessage::Ping(Vec::new()))),
+                    Some(ScriptedFrame::PingWithStalledPong) => {
+                        self.stall_pong = true;
+                        return Ok(Some(RawMessage::Ping(Vec::new())));
+                    }
                     Some(ScriptedFrame::Pong) => return Ok(Some(RawMessage::Pong)),
                     Some(ScriptedFrame::Wait(delay)) => tokio::time::sleep(delay).await,
                     Some(ScriptedFrame::Error(message)) => return Err(WsError(message)),
@@ -447,7 +478,18 @@ impl MessageChannel for ScriptedChannel {
     }
 
     fn pong(&mut self, _payload: Vec<u8>) -> BoxFuture<'_, Result<(), WsError>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            if std::mem::take(&mut self.stall_pong) {
+                // Never written: only the connection's write bound ends this wait.
+                std::future::pending::<()>().await;
+            }
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.pongs[self.connection] += 1;
+            Ok(())
+        })
     }
 }
 

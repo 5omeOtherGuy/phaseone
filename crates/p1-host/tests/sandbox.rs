@@ -36,6 +36,21 @@ fn bwrap_usable() -> bool {
         .unwrap_or(false)
 }
 
+/// The one probe every sandboxed case starts at. Without a usable bubblewrap a CI runner skips
+/// the case loudly (ADR-0077); `P1_REQUIRE_BWRAP=1` makes a stream box fail it instead, so a
+/// boundary that silently stopped being proved cannot pass there.
+macro_rules! require_bwrap {
+    () => {
+        if !bwrap_usable() {
+            if std::env::var_os("P1_REQUIRE_BWRAP").is_some_and(|value| value == "1") {
+                panic!("SKIP: bwrap unusable here");
+            }
+            eprintln!("SKIP: bwrap unusable here");
+            return;
+        }
+    };
+}
+
 fn tool_results(history: &[Item]) -> Vec<&str> {
     history
         .iter()
@@ -50,10 +65,7 @@ fn tool_results(history: &[Item]) -> Vec<&str> {
 /// and one inside it works.
 #[tokio::test]
 async fn workspace_sandbox_blocks_an_escape_and_allows_an_inside_write() {
-    if !bwrap_usable() {
-        eprintln!("SKIP: bwrap unusable here");
-        return;
-    }
+    require_bwrap!();
     let home = tempdir().unwrap();
     let workspace = home.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -130,10 +142,7 @@ async fn workspace_sandbox_blocks_an_escape_and_allows_an_inside_write() {
 /// reaches the tool's `Sandbox::writable`.
 #[tokio::test]
 async fn sandbox_write_keeps_a_path_writable_end_to_end() {
-    if !bwrap_usable() {
-        eprintln!("SKIP: bwrap unusable here");
-        return;
-    }
+    require_bwrap!();
     let home = tempdir().unwrap();
     let workspace = home.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -189,10 +198,7 @@ async fn sandbox_write_keeps_a_path_writable_end_to_end() {
 /// CLI flag reaches the tool's `Sandbox::readable`.
 #[tokio::test]
 async fn sandbox_read_keeps_a_path_readable_end_to_end() {
-    if !bwrap_usable() {
-        eprintln!("SKIP: bwrap unusable here");
-        return;
-    }
+    require_bwrap!();
     let home = tempdir().unwrap();
     let workspace = home.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -377,10 +383,7 @@ async fn sandbox_read_of_the_home_fails_assembly_before_any_provider_request() {
 async fn env_show_with_sandbox_workspace_shows_the_sandbox_face() {
     // Assembly probes bwrap, so without it this exits 1 by design (covered by
     // `a_sandbox_error_fails_assembly_before_any_provider_request`).
-    if !bwrap_usable() {
-        eprintln!("SKIP: bwrap unusable here");
-        return;
-    }
+    require_bwrap!();
     let home = tempdir().unwrap();
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     harness.deps.home = Some(home.path().to_path_buf());
@@ -458,10 +461,7 @@ fn sandbox_usage_errors_exit_2_and_help_lists_the_flags() {
 /// the real runtime directory is not visible inside the sandbox.
 #[tokio::test]
 async fn the_host_replaces_the_runtime_dir_inside_the_sandbox() {
-    if !bwrap_usable() {
-        eprintln!("SKIP: bwrap unusable here");
-        return;
-    }
+    require_bwrap!();
     let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else {
         eprintln!("SKIP: no usable XDG_RUNTIME_DIR here");
         return;
@@ -599,10 +599,7 @@ async fn sandbox_off_keeps_the_plain_shell_description() {
 #[cfg(feature = "delegation")]
 #[tokio::test]
 async fn a_workers_shell_runs_in_the_sandbox_too() {
-    if !bwrap_usable() {
-        eprintln!("SKIP: bwrap unusable here");
-        return;
-    }
+    require_bwrap!();
     let home = tempdir().unwrap();
     let workspace = home.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();

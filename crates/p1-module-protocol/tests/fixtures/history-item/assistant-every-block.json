@@ -1,0 +1,61 @@
+{
+  "item": "assistant",
+  "origin": {
+    "route": "anthropic-messages/claude-subscription",
+    "model": "claude-test"
+  },
+  "blocks": [
+    {
+      "block": "reasoning",
+      "text": "",
+      "replay": {
+        "origin": {
+          "route": "anthropic-messages/claude-subscription",
+          "model": "claude-test"
+        },
+        "version": 2,
+        "payload": {
+          "signature": "c2lnbmF0dXJl",
+          "nested": [
+            1,
+            {
+              "deep": [
+                true,
+                null,
+                2.5,
+                "x"
+              ]
+            }
+          ],
+          "empty": {}
+        }
+      }
+    },
+    {
+      "block": "reasoning",
+      "text": "thinking shown"
+    },
+    {
+      "block": "text",
+      "text": "I will read it."
+    },
+    {
+      "block": "tool_call",
+      "call_id": "call_1",
+      "name": "read",
+      "input": {
+        "kind": "json",
+        "raw": "{}"
+      }
+    },
+    {
+      "block": "tool_call",
+      "call_id": "call_2",
+      "name": "apply_patch",
+      "input": {
+        "kind": "text",
+        "raw": "patch"
+      }
+    }
+  ]
+}

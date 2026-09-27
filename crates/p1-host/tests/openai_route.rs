@@ -3,13 +3,21 @@
 //! `profiles/gpt-*.toml`, through the host's own loading path. Nothing here is
 //! hand-made except the scripted transport and the fake credential source, and no
 //! test touches a credential file or the network.
+//!
+//! notice: crates/p1-host/tests/openai_route.rs (S1): S3.8 makes `shell` and `finish` the
+//! components `p1/shell` and `p1/finish`, and `environments/gpt` names both, so assembling
+//! it now happens inside a Tokio runtime (a component executor runs there — the whole host
+//! always is). The case that assembled it in a plain `#[test]` runs inside one now; every
+//! assertion is unchanged.
 
 mod common;
+mod native_routes;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{Harness, shipped_environments};
+use native_routes::responses_route;
 use p1_assembly::{Assembled, AssemblyError, Substitutions, assemble, load_environment};
 use p1_contracts::{
     BoxFuture, DeclarationKind, Effort, Item, ModelOptions, Origin, Provider, ProviderError,
@@ -17,18 +25,19 @@ use p1_contracts::{
 };
 use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
-use p1_host::catalog::{build_catalog, resolve_environment, responses_route, route_provider};
+use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
-use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
+use p1_host::routes::{
+    AdapterSettings, ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport, RouteFile,
+    load_route_by_id,
+};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, fixtures::responses as responses_fixtures, run_all,
 };
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
-use p1_provider_openai::{
-    ROUTE, ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport, build_request,
-};
+use p1_provider_openai::{ROUTE, build_request};
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
 
@@ -91,11 +100,14 @@ fn environment_dirs() -> Vec<PathBuf> {
 }
 
 /// The shipped route and profile one environment selects, resolved exactly as the host
-/// resolves them before it assembles (spec §2 steps 1–3).
+/// resolves them before it assembles (spec §2 steps 1–3). `dirs` are the search directories the
+/// resolution read from: activation reads the effective lock and the profile's text from beside
+/// them.
 struct Composed {
     route: RouteFile,
     profile: Arc<ModelProfile>,
     wire_model: String,
+    dirs: Vec<PathBuf>,
 }
 
 fn composed(environment: &str) -> Composed {
@@ -111,19 +123,22 @@ fn composed(environment: &str) -> Composed {
         route,
         profile,
         wire_model: loaded.model,
+        dirs,
     }
 }
 
 /// The provider the catalog factory would build for this composition. The connector
 /// is injected next to the transport (ADR-0047 §1): it REFUSES every upgrade, so the
-/// shipped route — which asks for WebSocket — falls back to SSE at once and this
-/// scripted transport serves every request. No test opens a socket.
+/// shipped route — which asks for WebSocket — has its component fall back to HTTP (SSE) at
+/// once, and this scripted transport serves every request. No test opens a socket.
 fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = composed
         .route
         .binding(&composed.profile.id)
         .expect("the route serves this profile");
     route_provider(
+        common::provider_components(),
+        &composed.dirs,
         &composed.route,
         binding,
         composed.profile.clone(),
@@ -297,19 +312,16 @@ fn the_shipped_responses_route_passes_the_conformance_suite() {
 // ------------------------------------------------------------- the shipped environment
 
 /// `p1 env show NAME` through the real CLI and catalog.
-fn show_env(name: &str) -> (i32, String, String) {
+async fn show_env(name: &str) -> (i32, String, String) {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     common::isolated_environment(&mut harness);
-    let code = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(common::run_args(&mut harness, &["env", "show", name]));
+    let code = common::run_args(&mut harness, &["env", "show", name]).await;
     (code, harness.stdout.text(), harness.stderr.text())
 }
 
-#[test]
-fn the_shipped_gpt_environment_assembles_through_the_catalog_unchanged() {
-    let (code, stdout, stderr) = show_env("gpt");
+#[tokio::test]
+async fn the_shipped_gpt_environment_assembles_through_the_catalog_unchanged() {
+    let (code, stdout, stderr) = show_env("gpt").await;
     assert_eq!(code, 0, "{stderr}");
     let resolved: serde_json::Value = common::env_show_json(&stdout);
     assert_eq!(resolved["environment"], "gpt");

@@ -4,8 +4,10 @@
 //!
 //! This crate names no concrete provider or tool. Everything it can build comes
 //! from a [`Catalog`] of closures supplied by the composition root (`p1-host`);
-//! an environment file can therefore never select a module that was not compiled
-//! into the binary. `assemble` never runs a model and never touches the network.
+//! an environment file can therefore never select a module the host did not register
+//! (compiled into the binary, or an official package the host resolved through
+//! [`ModulesLock`] and loaded). `assemble` never runs a model and never touches the
+//! network.
 //!
 //! # Prompt substitution
 //!
@@ -60,8 +62,15 @@ use p1_contracts::{
     ToolDeclaration, ToolIdentity,
 };
 use p1_model_profile::ModelProfile;
+use p1_redact::MaskCounter;
 use p1_workspace::{ObservedFiles, Workspace, WriteGate};
 use serde::{Deserialize, Serialize};
+
+mod modules_lock;
+pub use modules_lock::{
+    LockedModule, LockedProtocol, MODULES_LOCK_FORMAT, ModulesLock, ModulesLockError,
+    load_modules_lock,
+};
 
 /// File name of an environment definition inside `<dir>/<name>/`.
 const ENVIRONMENT_FILE: &str = "environment.toml";
@@ -197,6 +206,16 @@ pub struct ProviderSpec {
 pub struct ToolServices {
     pub workspace: Workspace,
     pub observed: ObservedFiles,
+    /// Issue #142: the assembling agent's ONE [`MaskCounter`], shared with the notice
+    /// sink the turn reports through. A factory that wraps its tool in `p1-redact`'s
+    /// decorator binds THIS counter — the module catalog factory does, so a module
+    /// tool's masking is counted in the turn's own notice rather than a throwaway.
+    pub mask: Arc<MaskCounter>,
+    /// The main agent this assembly is for, as the host names it; `None` for every other
+    /// assembly (a worker, `p1 env show`, a plain [`assemble`]). A factory that hands out
+    /// per-parent state (the worker and workflow members' scopes, B-S6-9, D068) keys on it,
+    /// so two main agents never share children.
+    pub agent: Option<String>,
 }
 
 /// Builds one provider instance. `Err` is a human-readable reason.
@@ -677,6 +696,11 @@ struct ToolToml {
 /// root that must decide options FROM the resolved route (the host's cache-key
 /// policy) uses [`assemble_with_route_options`] instead, which still builds the
 /// provider and the tools exactly once.
+///
+/// The [`MaskCounter`] in the shared [`ToolServices`] is a fresh one no caller
+/// can read: a caller that reports masking (the host's notice sink) assembles
+/// through [`assemble_with_route_options`] with the agent's own counter, so the
+/// count and the report share ONE counter (issue #142).
 pub fn assemble(
     catalog: &Catalog,
     environment: &EnvironmentFile,
@@ -684,9 +708,15 @@ pub fn assemble(
     substitutions: &Substitutions,
 ) -> Result<Assembled, AssemblyError> {
     let options = environment.options.clone();
-    assemble_with_route_options(catalog, environment, workspace, substitutions, move |_| {
-        options
-    })
+    let mask = Arc::new(MaskCounter::new());
+    assemble_with_route_options(
+        catalog,
+        environment,
+        workspace,
+        substitutions,
+        &mask,
+        move |_| options,
+    )
 }
 
 /// As [`assemble`], with the final options supplied by `route_options` once the
@@ -695,11 +725,40 @@ pub fn assemble(
 /// constructed, so a caller can finalise options (e.g. generate a cache key)
 /// without a second assembly attempt. `p1-assembly` knows nothing about what the
 /// caller does with the description.
+///
+/// `mask` is the assembling agent's ONE [`MaskCounter`] (issue #142): it is put in
+/// the shared [`ToolServices`], so a factory that wraps its tool for masking binds
+/// the counter the turn reports through, and the caller can wrap the assembled
+/// tools with the same counter.
 pub fn assemble_with_route_options(
     catalog: &Catalog,
     environment: &EnvironmentFile,
     workspace: &Path,
     substitutions: &Substitutions,
+    mask: &Arc<MaskCounter>,
+    route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
+) -> Result<Assembled, AssemblyError> {
+    assemble_for_agent(
+        catalog,
+        environment,
+        workspace,
+        substitutions,
+        mask,
+        None,
+        route_options,
+    )
+}
+
+/// As [`assemble_with_route_options`], for the main agent `agent`: the name is put in the
+/// shared [`ToolServices`] ([`ToolServices::agent`]), so a factory can key per-parent
+/// state on it. `None` is exactly [`assemble_with_route_options`].
+pub fn assemble_for_agent(
+    catalog: &Catalog,
+    environment: &EnvironmentFile,
+    workspace: &Path,
+    substitutions: &Substitutions,
+    mask: &Arc<MaskCounter>,
+    agent: Option<&str>,
     route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
 ) -> Result<Assembled, AssemblyError> {
     let workspace = Workspace::new(workspace)
@@ -710,6 +769,8 @@ pub fn assemble_with_route_options(
     let services = ToolServices {
         workspace,
         observed: ObservedFiles::new(),
+        mask: mask.clone(),
+        agent: agent.map(str::to_owned),
     };
 
     let provider_key = environment.provider.as_str();

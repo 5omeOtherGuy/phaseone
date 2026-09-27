@@ -39,9 +39,11 @@ pub struct ModelBinding {
     pub output_limit: Option<u32>,
 }
 
-/// One parsed `routes/<id>.toml`, validated. The host never interprets these fields
-/// beyond routing: `[adapter_settings]` is handed to the adapter named by `adapter`
-/// as-is (`docs/design/routes-and-profiles.md` §1.2).
+/// One parsed `routes/<id>.toml`, validated. The host interprets these fields only to
+/// route: `[adapter_settings]` is checked when the file loads against the host's copy
+/// of the settings type of the adapter named by `adapter` ([`RouteFile::settings`]),
+/// and the table itself reaches the component that serves the route as-is
+/// (`docs/design/routes-and-profiles.md` §1.2).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteFile {
@@ -65,28 +67,112 @@ pub struct RouteFile {
     pub models: BTreeMap<String, ModelBinding>,
 }
 
+/// The keys the host adds to a provider component's `adapter-settings` object, next to
+/// the route file's own `[adapter_settings]` keys (ADR-0086). The
+/// component removes them before it parses its settings type, which denies unknown
+/// fields, so no adapter may ever name a settings field like one of these.
+pub const MODEL_PROFILE_KEY: &str = "model_profile";
+pub const ROUTE_HEADERS_KEY: &str = "route_headers";
+pub const MODEL_BINDING_KEY: &str = "model_binding";
+
 /// The `[adapter_settings]` table of one route, typed by the adapter that named it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdapterSettings {
-    OpenAiChat(p1_provider_openai_chat::ChatAdapterSettings),
-    AnthropicMessages(p1_provider_anthropic::MessagesAdapterSettings),
-    OpenAiResponses(p1_provider_openai::ResponsesAdapterSettings),
+    OpenAiChat(ChatAdapterSettings),
+    AnthropicMessages(MessagesAdapterSettings),
+    OpenAiResponses(ResponsesAdapterSettings),
+}
+
+// The settings types below are the host's copies of the adapters' own `[adapter_settings]`
+// types, field for field and spelling for spelling, so that a route file is checked when it
+// loads without the host linking the native adapters (S7.10-R4): the provider COMPONENT is
+// what parses them for a request (ADR-0086). The type names are the adapters' too, because
+// serde names a type in some errors, and a malformed file must read the same either way; the
+// unit tests hold both sides against every shipped route and every malformed case.
+
+/// `openai-chat`'s message encodings (`p1_provider_openai_chat::ChatDialect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChatDialect {
+    #[default]
+    ThinkingWithReasoningAlias,
+    RetainedThinking,
+}
+
+/// `openai-chat`'s non-secret client identities (`p1_provider_openai_chat::ClientIdentity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientIdentity {
+    Opencode,
+}
+
+/// `openai-chat`'s `[adapter_settings]` (`p1_provider_openai_chat::ChatAdapterSettings`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatAdapterSettings {
+    pub dialect: ChatDialect,
+    #[serde(default)]
+    pub session_header: Option<String>,
+    #[serde(default)]
+    pub client_identity: Option<ClientIdentity>,
+}
+
+/// `anthropic-messages`' account behaviours (`p1_provider_anthropic::MessagesAccount`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MessagesAccount {
+    ClaudeCodeSubscription,
+}
+
+/// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessagesAdapterSettings {
+    pub account: MessagesAccount,
+    #[serde(default)]
+    pub long_context: bool,
+}
+
+/// `openai-responses`' account behaviours (`p1_provider_openai::ResponsesAccount`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResponsesAccount {
+    CodexSubscription,
+}
+
+/// `openai-responses`' `[adapter_settings]` (`p1_provider_openai::ResponsesAdapterSettings`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsesAdapterSettings {
+    pub account: ResponsesAccount,
+    /// Absent means [`ResponsesTransport::Sse`] (ADR-0047 §1).
+    #[serde(default)]
+    pub transport: ResponsesTransport,
+}
+
+/// How a Responses route reaches the model (`p1_provider_openai::ResponsesTransport`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponsesTransport {
+    #[default]
+    Sse,
+    Websocket,
 }
 
 impl RouteFile {
-    /// The settings the adapter named by `adapter` parses for itself. The host knows
-    /// only which type an adapter key selects; the fields belong to the adapter, so
-    /// an unknown key fails there, next to the code that would consume it.
+    /// The settings the adapter named by `adapter` takes, checked against the adapter's
+    /// own fields: an unknown key or value fails when the route loads, before any
+    /// provider component parses the same table for a request.
     pub fn settings(&self) -> Result<AdapterSettings, String> {
         match self.adapter.as_str() {
             "openai-chat" => self
-                .typed_settings::<p1_provider_openai_chat::ChatAdapterSettings>()
+                .typed_settings::<ChatAdapterSettings>()
                 .map(AdapterSettings::OpenAiChat),
             "anthropic-messages" => self
-                .typed_settings::<p1_provider_anthropic::MessagesAdapterSettings>()
+                .typed_settings::<MessagesAdapterSettings>()
                 .map(AdapterSettings::AnthropicMessages),
             "openai-responses" => self
-                .typed_settings::<p1_provider_openai::ResponsesAdapterSettings>()
+                .typed_settings::<ResponsesAdapterSettings>()
                 .map(AdapterSettings::OpenAiResponses),
             other => Err(format!(
                 "unknown adapter \"{other}\"; the known adapters are {}",
@@ -103,6 +189,46 @@ impl RouteFile {
         table
             .try_into::<T>()
             .map_err(|error| format!("invalid `[adapter_settings]`: {error}"))
+    }
+
+    /// The `provider-settings.adapter-settings` object a provider component is
+    /// configured with for one model this route binds: the `[adapter_settings]` table
+    /// unchanged, plus the three reserved keys. The component cannot read files, so
+    /// the profile travels as its file stem and text; `route_headers` and
+    /// `model_binding` carry the route data the native host folds into the adapter's
+    /// route value itself. An absent limit stays absent: unknown is never zero.
+    pub fn component_adapter_settings(
+        &self,
+        binding: &ModelBinding,
+        profile_stem: &str,
+        profile_toml: &str,
+    ) -> serde_json::Value {
+        let mut settings = match self.adapter_settings.as_ref().map(serde_json::to_value) {
+            Some(Ok(serde_json::Value::Object(table))) => table,
+            // `load_route` refuses settings that are not a table the adapter parses, so
+            // only a hand-built, unvalidated route lands here, and the component's own
+            // parse then names the fields that are missing.
+            _ => serde_json::Map::new(),
+        };
+        let headers: serde_json::Map<String, serde_json::Value> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), serde_json::Value::from(value.as_str())))
+            .collect();
+        let mut limits = serde_json::Map::new();
+        if let Some(context_limit) = binding.context_limit {
+            limits.insert("context_limit".into(), context_limit.into());
+        }
+        if let Some(output_limit) = binding.output_limit {
+            limits.insert("output_limit".into(), output_limit.into());
+        }
+        settings.insert(
+            MODEL_PROFILE_KEY.into(),
+            serde_json::json!({ "stem": profile_stem, "toml": profile_toml }),
+        );
+        settings.insert(ROUTE_HEADERS_KEY.into(), headers.into());
+        settings.insert(MODEL_BINDING_KEY.into(), limits.into());
+        settings.into()
     }
 
     /// The binding for one profile, or the spec §2 error naming what this route does
@@ -304,4 +430,409 @@ fn is_header_name(name: &str) -> bool {
             name.to_ascii_lowercase().as_str(),
             "content-type" | "accept" | "host" | "content-length" | "transfer-encoding"
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RESERVED: [&str; 3] = [MODEL_PROFILE_KEY, ROUTE_HEADERS_KEY, MODEL_BINDING_KEY];
+
+    fn repo(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative)
+    }
+
+    /// What a component does with the object: drop the reserved keys, then parse the
+    /// rest as the settings type its adapter key selects.
+    fn component_settings(
+        adapter: &str,
+        mut object: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<AdapterSettings, String> {
+        for key in RESERVED {
+            object.remove(key);
+        }
+        typed_from_json(adapter, serde_json::Value::Object(object))
+    }
+
+    fn typed_from_json(adapter: &str, value: serde_json::Value) -> Result<AdapterSettings, String> {
+        let text = |error: serde_json::Error| error.to_string();
+        match adapter {
+            "openai-chat" => serde_json::from_value(value)
+                .map(AdapterSettings::OpenAiChat)
+                .map_err(text),
+            "anthropic-messages" => serde_json::from_value(value)
+                .map(AdapterSettings::AnthropicMessages)
+                .map_err(text),
+            "openai-responses" => serde_json::from_value(value)
+                .map(AdapterSettings::OpenAiResponses)
+                .map_err(text),
+            other => Err(format!("unknown adapter {other}")),
+        }
+    }
+
+    #[test]
+    fn every_shipped_route_and_binding_yields_the_component_settings_object() {
+        let routes = load_routes(&repo("routes")).expect("the shipped routes load");
+        let mut adapters_seen: Vec<&str> = Vec::new();
+        let mut bindings_seen = 0;
+        for route in &routes {
+            let native = route.settings().expect("a shipped route's settings parse");
+            for (profile_id, binding) in &route.models {
+                let profile_toml =
+                    std::fs::read_to_string(repo(&format!("profiles/{profile_id}.toml")))
+                        .unwrap_or_else(|error| {
+                            panic!("{}: profile {profile_id}: {error}", route.id)
+                        });
+                let value = route.component_adapter_settings(binding, profile_id, &profile_toml);
+                let serde_json::Value::Object(object) = value else {
+                    panic!("{}: the settings are not a JSON object", route.id);
+                };
+
+                let profile = &object[MODEL_PROFILE_KEY];
+                assert_eq!(
+                    profile,
+                    &serde_json::json!({ "stem": profile_id, "toml": profile_toml }),
+                    "{}",
+                    route.id
+                );
+                p1_model_profile::ModelProfile::from_toml(profile_id, &profile_toml)
+                    .unwrap_or_else(|error| panic!("{}: {error}", route.id));
+
+                let headers: BTreeMap<String, String> =
+                    serde_json::from_value(object[ROUTE_HEADERS_KEY].clone())
+                        .expect("route_headers is an object of strings");
+                assert_eq!(headers, route.headers, "{}", route.id);
+
+                let limits = object[MODEL_BINDING_KEY]
+                    .as_object()
+                    .expect("model_binding is an object");
+                assert_eq!(
+                    limits
+                        .get("context_limit")
+                        .and_then(serde_json::Value::as_u64),
+                    binding.context_limit,
+                    "{}",
+                    route.id
+                );
+                assert_eq!(
+                    limits
+                        .get("output_limit")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|limit| u32::try_from(limit).expect("an output limit fits u32")),
+                    binding.output_limit,
+                    "{}",
+                    route.id
+                );
+                assert!(
+                    limits
+                        .keys()
+                        .all(|key| key == "context_limit" || key == "output_limit"),
+                    "{}: {limits:?}",
+                    route.id
+                );
+
+                let parsed = component_settings(&route.adapter, object)
+                    .unwrap_or_else(|error| panic!("{}: {error}", route.id));
+                assert_eq!(parsed, native, "{}", route.id);
+                bindings_seen += 1;
+            }
+            if !adapters_seen.contains(&route.adapter.as_str()) {
+                adapters_seen.push(route.adapter.as_str());
+            }
+        }
+        adapters_seen.sort_unstable();
+        let mut expected = ADAPTER_KEYS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(adapters_seen, expected, "every adapter has a shipped route");
+        assert!(bindings_seen > 0, "the shipped routes bind models");
+    }
+
+    #[test]
+    fn no_adapter_settings_type_accepts_a_reserved_key() {
+        for adapter in ADAPTER_KEYS {
+            for key in RESERVED {
+                let object = serde_json::json!({ key: {} });
+                let error = typed_from_json(adapter, object)
+                    .expect_err("a reserved key is not a settings field");
+                assert!(
+                    error.contains("unknown field") && error.contains(key),
+                    "{adapter}/{key}: {error}"
+                );
+            }
+        }
+    }
+
+    /// The settings as the adapter crates parse them: the validation `load_route` ran before
+    /// S7.10-R4 moved it into this module. `Debug` is the comparison because the host's copies
+    /// carry the adapters' type, field and variant names.
+    fn adapter_crate_settings(route: &RouteFile) -> Result<String, String> {
+        match route.adapter.as_str() {
+            "openai-chat" => route
+                .typed_settings::<p1_provider_openai_chat::ChatAdapterSettings>()
+                .map(|settings| format!("{settings:?}")),
+            "anthropic-messages" => route
+                .typed_settings::<p1_provider_anthropic::MessagesAdapterSettings>()
+                .map(|settings| format!("{settings:?}")),
+            "openai-responses" => route
+                .typed_settings::<p1_provider_openai::ResponsesAdapterSettings>()
+                .map(|settings| format!("{settings:?}")),
+            other => panic!("no adapter crate for {other}"),
+        }
+    }
+
+    fn host_settings(route: &RouteFile) -> Result<String, String> {
+        route.settings().map(|settings| match settings {
+            AdapterSettings::OpenAiChat(settings) => format!("{settings:?}"),
+            AdapterSettings::AnthropicMessages(settings) => format!("{settings:?}"),
+            AdapterSettings::OpenAiResponses(settings) => format!("{settings:?}"),
+        })
+    }
+
+    #[test]
+    fn the_host_settings_agree_with_the_adapter_crates_on_every_shipped_route() {
+        let routes = load_routes(&repo("routes")).expect("the shipped routes load");
+        assert!(!routes.is_empty());
+        for route in &routes {
+            let old = adapter_crate_settings(route);
+            assert!(old.is_ok(), "{}: {old:?}", route.id);
+            assert_eq!(host_settings(route), old, "{}", route.id);
+        }
+    }
+
+    /// `adapter_settings` values, one per adapter key, that the adapter crates accept or
+    /// refuse: every field's wrong value, a wrong type, a missing required field, an unknown
+    /// and a reserved key, a value that is no table and an absent table. `None` omits the key.
+    const SETTINGS_CASES: &[(&str, Option<&str>)] = &[
+        ("openai-chat", Some(r#"{ dialect = "retained-thinking" }"#)),
+        (
+            "openai-chat",
+            Some(
+                r#"{ dialect = "thinking-with-reasoning-alias", session_header = "x-session-affinity", client_identity = "opencode" }"#,
+            ),
+        ),
+        ("openai-chat", Some(r#"{ dialect = "plain" }"#)),
+        ("openai-chat", Some(r#"{ dialect = 1 }"#)),
+        ("openai-chat", Some("{}")),
+        ("openai-chat", None),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", client_identity = "claude-code" }"#),
+        ),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", client_identity = 3 }"#),
+        ),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", session_header = 5 }"#),
+        ),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", max_tokens = 10 }"#),
+        ),
+        (
+            "openai-chat",
+            Some(r#"{ dialect = "retained-thinking", route_headers = {} }"#),
+        ),
+        ("openai-chat", Some(r#""retained-thinking""#)),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription", long_context = true }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription" }"#),
+        ),
+        ("anthropic-messages", Some(r#"{ account = "api-key" }"#)),
+        ("anthropic-messages", Some(r#"{ account = ["x"] }"#)),
+        ("anthropic-messages", Some("{}")),
+        ("anthropic-messages", None),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription", long_context = "yes" }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription", headers = {} }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ account = "claude-code-subscription", model_profile = {} }"#),
+        ),
+        ("anthropic-messages", Some("7")),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = "websocket" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = "sse" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription" }"#),
+        ),
+        ("openai-responses", Some(r#"{ account = "plus" }"#)),
+        ("openai-responses", Some("{}")),
+        ("openai-responses", None),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = "http" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = "WebSocket" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", transport = true }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", store = false }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ account = "codex-subscription", model_binding = {} }"#),
+        ),
+        ("openai-responses", Some("[]")),
+    ];
+
+    fn case_route_text(adapter: &str, settings: Option<&str>) -> String {
+        let settings = settings
+            .map(|value| format!("adapter_settings = {value}\n"))
+            .unwrap_or_default();
+        format!(
+            r#"id = "case"
+origin_route = "{adapter}/case"
+adapter = "{adapter}"
+endpoint = "https://example.invalid/v1"
+{settings}
+[credential]
+kind = "api-key"
+env = "EXAMPLE_API_KEY"
+borrow = []
+store_only = true
+
+[models."m"]
+wire_model = "m"
+"#
+        )
+    }
+
+    #[test]
+    fn the_host_settings_agree_with_the_adapter_crates_on_every_case() {
+        let mut refused = 0;
+        for (adapter, settings) in SETTINGS_CASES {
+            let route: RouteFile = toml::from_str(&case_route_text(adapter, *settings))
+                .unwrap_or_else(|error| panic!("{adapter} {settings:?}: {error}"));
+            let old = adapter_crate_settings(&route);
+            assert_eq!(host_settings(&route), old, "{adapter} {settings:?}");
+            refused += usize::from(old.is_err());
+        }
+        assert!(refused >= 20, "the cases refuse: {refused}");
+    }
+
+    /// A malformed `[adapter_settings]` still fails when the route file LOADS, with the
+    /// adapter crate's own words behind the file's name: the same stage and message as when
+    /// `load_route` parsed the table with the adapter crate's type.
+    #[test]
+    fn a_malformed_route_fails_at_load_with_the_adapter_crates_error() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let path = scratch.path().join("case.toml");
+        for (adapter, settings) in SETTINGS_CASES {
+            let text = case_route_text(adapter, *settings);
+            std::fs::write(&path, &text).expect("the case file is written");
+            let route: RouteFile = toml::from_str(&text).expect("the case parses");
+            let expected = adapter_crate_settings(&route)
+                .map(|_| ())
+                .map_err(|error| format!("{}: {error}", path.display()));
+            assert_eq!(
+                load_route(&path).map(|_| ()),
+                expected,
+                "{adapter} {settings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_headers_and_known_limits_travel_and_unknown_limits_stay_absent() {
+        let route: RouteFile = toml::from_str(
+            r#"
+            id = "example"
+            origin_route = "openai-chat/example"
+            adapter = "openai-chat"
+            endpoint = "https://example.invalid/v1/chat/completions"
+
+            [credential]
+            kind = "api-key"
+            env = "EXAMPLE_API_KEY"
+            borrow = []
+            store_only = true
+
+            [headers]
+            x-title = "p1"
+
+            [adapter_settings]
+            dialect = "retained-thinking"
+
+            [models."known"]
+            wire_model = "known-wire"
+            context_limit = 200000
+            output_limit = 32000
+
+            [models."unknown"]
+            wire_model = "unknown-wire"
+            "#,
+        )
+        .expect("the example route parses");
+        route
+            .validate("example")
+            .expect("the example route is valid");
+
+        let known = route.component_adapter_settings(&route.models["known"], "known", "");
+        assert_eq!(
+            known[ROUTE_HEADERS_KEY],
+            serde_json::json!({ "x-title": "p1" })
+        );
+        assert_eq!(
+            known[MODEL_BINDING_KEY],
+            serde_json::json!({ "context_limit": 200000, "output_limit": 32000 })
+        );
+        assert_eq!(known["dialect"], serde_json::json!("retained-thinking"));
+
+        let unknown = route.component_adapter_settings(&route.models["unknown"], "unknown", "");
+        assert_eq!(unknown[MODEL_BINDING_KEY], serde_json::json!({}));
+    }
+
+    #[test]
+    fn a_route_without_adapter_settings_or_headers_still_carries_the_reserved_keys() {
+        let mut route: RouteFile = toml::from_str(
+            r#"
+            id = "bare"
+            origin_route = "openai-chat/bare"
+            adapter = "openai-chat"
+            endpoint = "https://example.invalid/v1/chat/completions"
+
+            [credential]
+            kind = "api-key"
+            env = "EXAMPLE_API_KEY"
+            borrow = []
+            store_only = true
+
+            [models."m"]
+            wire_model = "m"
+            "#,
+        )
+        .expect("the bare route parses");
+        route.adapter_settings = None;
+        let value = route.component_adapter_settings(&route.models["m"], "m", "id = \"m\"");
+        let object = value.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["model_binding", "model_profile", "route_headers"]);
+        assert_eq!(object[ROUTE_HEADERS_KEY], serde_json::json!({}));
+    }
 }

@@ -1,0 +1,7 @@
+{
+  "item": "tool_result",
+  "call_id": "call_2",
+  "name": "shell",
+  "status": "denied",
+  "content": "the authorization policy refused this call"
+}

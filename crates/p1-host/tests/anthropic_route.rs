@@ -5,11 +5,13 @@
 //! test touches a credential file or the network.
 
 mod common;
+mod native_routes;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{Harness, shipped_environments};
+use native_routes::messages_route;
 use p1_assembly::{Assembled, AssemblyError, Substitutions, assemble, load_environment};
 use p1_contracts::{
     BoxFuture, DeclarationKind, Effort, Item, ModelOptions, Origin, Provider, ProviderError,
@@ -17,11 +19,13 @@ use p1_contracts::{
 };
 use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
-use p1_host::catalog::{build_catalog, messages_route, resolve_environment, route_provider};
+use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
-use p1_host::routes::{AdapterSettings, RouteFile, load_route_by_id};
+use p1_host::routes::{
+    AdapterSettings, MessagesAccount, MessagesAdapterSettings, RouteFile, load_route_by_id,
+};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
-use p1_provider_anthropic::{MessagesAccount, MessagesAdapterSettings, ROUTE, build_request};
+use p1_provider_anthropic::{ROUTE, build_request};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, fixtures::anthropic as messages_fixtures, run_all,
 };
@@ -88,11 +92,14 @@ fn environment_dirs() -> Vec<PathBuf> {
 }
 
 /// The shipped route and profile one environment selects, resolved exactly as the host
-/// resolves them before it assembles (spec §2 steps 1–3).
+/// resolves them before it assembles (spec §2 steps 1–3). `dirs` are the search directories the
+/// resolution read from: activation reads the effective lock and the profile's text from beside
+/// them.
 struct Composed {
     route: RouteFile,
     profile: Arc<ModelProfile>,
     wire_model: String,
+    dirs: Vec<PathBuf>,
 }
 
 fn composed(environment: &str) -> Composed {
@@ -108,18 +115,22 @@ fn composed(environment: &str) -> Composed {
         route,
         profile,
         wire_model: loaded.model,
+        dirs,
     }
 }
 
-/// The provider the catalog factory would build for this composition. The connector
-/// is injected next to the transport (ADR-0047 §1); a Messages route never asks for
-/// WebSocket, so it ignores it.
+/// The provider the catalog factory would build for this composition: the provider component
+/// the route's `adapter` names (D083b), activated from the route file the build published as
+/// `common::provider_components` reads them. The connector is injected next to the transport
+/// (ADR-0047 §1); a Messages route never asks for WebSocket, so it ignores it.
 fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = composed
         .route
         .binding(&composed.profile.id)
         .expect("the route serves this profile");
     route_provider(
+        common::provider_components(),
+        &composed.dirs,
         &composed.route,
         binding,
         composed.profile.clone(),
@@ -146,16 +157,20 @@ fn assemble_shipped(name: &str) -> Assembled {
     resolve_environment(&mut environment, &harness.deps.environment_dirs)
         .expect("the shipped route serves its profile");
     let workspace = tempdir().unwrap();
-    assemble(
-        &catalog,
-        &environment,
-        workspace.path(),
-        &Substitutions {
-            workspace: workspace.path().display().to_string(),
-            date: "2026-09-20".into(),
-            os: "linux".into(),
-        },
-    )
+    // The `read` key is the release's `p1/read` host entry (S1.8.1), and a module tool is built
+    // inside a Tokio runtime, which runs its executor.
+    common::on_runtime(|| {
+        assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &Substitutions {
+                workspace: workspace.path().display().to_string(),
+                date: "2026-09-20".into(),
+                os: "linux".into(),
+            },
+        )
+    })
     .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
 }
 

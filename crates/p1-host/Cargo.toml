@@ -17,42 +17,52 @@ workspace = true
 # Delegation tools and the in-process worker service. Off => the four
 # `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
 default = ["delegation", "workflows", "shadow-hook"]
-delegation = ["dep:p1-workers", "dep:p1-tool-delegate"]
+delegation = ["dep:p1-workers"]
 shadow-hook = ["dep:p1-hook-shadow"]
 # Workflows (ADR-0053): the engine and its four tools, composed over the worker
 # service. Off => the four `workflow_*` catalog keys are unknown modules.
-workflows = ["delegation", "dep:p1-workflow", "dep:p1-tool-workflow"]
+workflows = ["delegation", "dep:p1-workflow"]
 
 [dependencies]
 p1-assembly = { path = "../p1-assembly" }
 p1-auth = { path = "../p1-auth" }
 p1-usage = { path = "../p1-usage" }
-p1-context = { path = "../p1-context" }
 p1-contracts = { path = "../p1-contracts" }
 p1-model-profile = { path = "../p1-model-profile" }
+# `p1 modules` (ADR-0079, S1.6): the release manifest's format, a package's digest and the
+# loader's checks are the runtime's (freeze item 6), so the host reads a module set with the
+# runtime instead of parsing the format a second time; the protocol major it prints and
+# verifies is the protocol crate's.
+p1-module-protocol = { path = "../p1-module-protocol" }
 p1-core = { path = "../p1-core" }
 p1-journal = { path = "../p1-journal" }
 p1-workspace = { path = "../p1-workspace" }
-p1-tool-read = { path = "../p1-tool-read" }
-p1-tool-edit = { path = "../p1-tool-edit" }
-p1-tool-write = { path = "../p1-tool-write" }
-p1-tool-search = { path = "../p1-tool-search" }
-p1-tool-shell = { path = "../p1-tool-shell" }
-p1-tool-patch = { path = "../p1-tool-patch" }
-p1-tool-finish = { path = "../p1-tool-finish" }
+# S7.10-R1 (ADR-0095): `read`, `edit`, `write`, `apply_patch` and `grep` are the release's
+# host entries now, so their crates are out of the host's NORMAL graph — the file-tool
+# capability services they used to carry are the runtime's (`module-runtime/file_services.rs`)
+# and the credential policy is `p1-workspace`'s. The five stay dev-dependencies below: the
+# host's own cases build the native tools to compare a component against them. S7.10-R3
+# (ADR-0091) took `p1-tool-shell` and `p1-tool-finish` out the same way.
+# S3.7: the completion hub re-verifies a `finish` component's candidates with the same
+# command rules and contract check the component ships (ADR-0083 §2).
+p1-finish-guest = { path = "../p1-tool-finish/guest" }
+# S7.10-R3: the sandbox paragraph and variant suffix the host presents over the `p1/shell`
+# component; the process service behind its `process` capability is p1-module-runtime's.
+p1-shell-guest = { path = "../p1-tool-shell/guest" }
 # Issue #142: credential-shape masking for every assembled tool and its per-turn count.
 p1-redact = { path = "../p1-redact" }
 p1-hook-shadow = { path = "../p1-hook-shadow", optional = true }
-p1-provider-anthropic = { path = "../p1-provider-anthropic" }
-p1-provider-openai = { path = "../p1-provider-openai" }
-p1-provider-openai-chat = { path = "../p1-provider-openai-chat" }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-workers = { path = "../p1-workers", optional = true }
-p1-tool-delegate = { path = "../p1-tool-delegate", optional = true }
 p1-workflow = { path = "../p1-workflow", optional = true }
-p1-tool-workflow = { path = "../p1-tool-workflow", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# S1.4: catalog/modules registers the packages modules.lock selects. The runtime crate
+# verifies, compiles and adapts them, so the host needs no wasmtime of its own.
+# S1.5: a package's semantic capabilities are derived from the same verified `LoadedModule`
+# (catalog/capabilities.rs).
+p1-module-runtime = { path = "../p1-module-runtime" }
+thiserror = "2"
 # Route files are TOML data; `parse` is all this crate needs, exactly like the profile
 # and environment loaders in `p1-model-profile`/`p1-assembly`.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
@@ -74,10 +84,36 @@ tokio = { version = "1", default-features = false, features = [
 
 [dev-dependencies]
 p1-testkit = { path = "../p1-testkit" }
+# S7.10-R1 (ADR-0095): the native file tools, built by the host's own cases and by
+# tests/call_description.rs and tests/describe_results.rs to compare a component's
+# declaration, description and effect against the native tool's. The components themselves are
+# the release's host entries, so nothing in the host's normal graph names these crates.
+p1-tool-read = { path = "../p1-tool-read" }
+p1-tool-edit = { path = "../p1-tool-edit" }
+p1-tool-write = { path = "../p1-tool-write" }
+p1-tool-search = { path = "../p1-tool-search" }
+p1-tool-patch = { path = "../p1-tool-patch" }
+# S5.11: the host runs the summarizing context as the host entry p1/context/summarizing
+# (src/summary.rs); its source crate stays the reference the host's tests check the table,
+# the prompt and the summaries against.
+p1-context = { path = "../p1-context" }
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 # The shared provider conformance suite, run over the SHIPPED composed routes in
 # `tests/route_files.rs` through the same host loading path the binary uses.
 p1-provider-conformance = { path = "../p1-provider-conformance" }
+# S7.10-R4: the native adapters are the reference the tests compose from a route file
+# (tests/native_routes) and the other side of the route settings' parity tests (src/routes.rs).
+# S7.10-R5 took the last production caller — the Responses route's WebSocket transport, which
+# `route_provider` used to build natively — so every one of the three is test-only.
+p1-provider-anthropic = { path = "../p1-provider-anthropic" }
+p1-provider-openai-chat = { path = "../p1-provider-openai-chat" }
+p1-provider-openai = { path = "../p1-provider-openai" }
+# S1.5: the package-capability cases load the built fixture through S0's release harness.
+p1-module-tests = { path = "../p1-module-tests" }
+# S7.10-R3: the native shell and finish tools stay only as the references the host's tests
+# compare the components against (declarations, identities, the describer).
+p1-tool-shell = { path = "../p1-tool-shell" }
+p1-tool-finish = { path = "../p1-tool-finish" }
 futures-util = "0.3"
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = [

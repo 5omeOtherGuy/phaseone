@@ -1,0 +1,14 @@
+{
+  "event": "finished",
+  "outcome": {
+    "status": "completed",
+    "item": {
+      "origin": {
+        "route": "anthropic-messages/claude-subscription",
+        "model": "claude-test"
+      },
+      "blocks": []
+    },
+    "stop": "refusal"
+  }
+}

@@ -27,31 +27,10 @@ use crate::http::{
     ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, HttpResponse, STREAM_IDLE_TIMEOUT, Transport,
     TransportError, first_byte_timeout_message, stream_idle_timeout_message,
 };
-use crate::retry::{HttpClass, RetryPolicy, classify_status, retry_after};
+use crate::parser::ResponseParser;
+use crate::retry::RetryPolicy;
 use crate::sse::{SseDecoder, SseEvent};
-
-/// Turns route-native SSE events into contract stream events. Pure and
-/// synchronous, so it can be unit-tested without a transport.
-pub trait ResponseParser: Send {
-    /// Feed one SSE event. Returned events are forwarded in order. A returned
-    /// `StreamEvent::Finished` ends the stream.
-    fn on_event(&mut self, event: SseEvent) -> Vec<StreamEvent>;
-
-    /// The body ended. Return the terminal outcome (normally a Transport failure
-    /// "stream ended without a terminal event" unless the parser already
-    /// finished).
-    fn on_end(&mut self) -> Outcome;
-
-    /// Map a non-2xx response to an error. `body` is for CLASSIFICATION ONLY
-    /// (e.g. spotting a context-window error type) and must never be copied into
-    /// the message.
-    fn on_http_error(
-        &self,
-        status: u16,
-        headers: &[(String, String)],
-        body: &[u8],
-    ) -> ProviderError;
-}
+use crate::status::{HttpClass, classify_status, retry_after};
 
 /// Everything [`drive`] needs for one request, including how to rebuild it for a
 /// refreshed credential.

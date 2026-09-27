@@ -10,10 +10,11 @@ use std::sync::{Arc, Mutex, Weak};
 use futures_util::StreamExt;
 use p1_contracts::{
     AgentEvent, AuthorizationPolicy, AuthorizationRequest, CancellationToken, CommitError,
-    CommitSink, CompletedResponse, ContextError, ContextInput, ContextPolicy, Decision, EventSink,
-    InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Prepared, Provider,
-    ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody, StopReason,
-    StreamEvent, Tool, ToolCall, ToolContext, ToolResultItem, ToolStatus, TurnEnd, Usage,
+    CommitSink, Compaction, CompletedResponse, ContextError, ContextInput, ContextPolicy, Decision,
+    EventSink, InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Prepared,
+    Provider, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody,
+    StopReason, StreamEvent, Tool, ToolCall, ToolContext, ToolResultItem, ToolStatus, TurnEnd,
+    Usage,
 };
 use tokio::sync::Notify;
 
@@ -38,14 +39,18 @@ pub struct AgentParts {
 }
 
 /// The parts of [`AgentParts`] a running agent can be switched to between turns
-/// (ADR-0049). Journal, events and authorization belong to the session, not to the
-/// model it talks to, so a switch never replaces them.
+/// (ADR-0049, ADR-0084). Journal and events belong to the session, not to the
+/// assembly, so a switch never replaces them.
 pub struct Reconfiguration {
     pub provider: Arc<dyn Provider>,
     pub tools: Vec<Arc<dyn Tool>>,
     pub system_prompt: String,
     pub options: ModelOptions,
     pub context: Arc<dyn ContextPolicy>,
+    /// `None` keeps the policy the agent holds. An `Option` rather than a required
+    /// `Arc`: a model switch does not own the session's policy and the core hands
+    /// none of its parts out, so "keep" must be expressible without holding it.
+    pub authorization: Option<Arc<dyn AuthorizationPolicy>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -54,6 +59,19 @@ pub enum BuildError {
     DuplicateToolName(String),
     #[error("the provider rejected this environment: {0}")]
     ProviderRejected(ProviderError),
+}
+
+/// Why [`Agent::reconfigure`] left the current assembly in place.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReconfigureError {
+    /// The candidate failed validation against the current history; nothing was
+    /// written.
+    #[error(transparent)]
+    Rejected(BuildError),
+    /// The candidate's `Environment` record could not be committed; nothing was
+    /// installed and no sequence number was used.
+    #[error("the new environment could not be committed: {0}")]
+    CommitFailed(String),
 }
 
 /// State shared between the `Agent` and every `Inbox` handle.
@@ -127,31 +145,48 @@ impl Agent {
         Self::assemble(parts, Vec::new(), 0, false, HashSet::new(), None)
     }
 
-    /// Switch this agent to another environment/profile pair between turns
-    /// (ADR-0049, model-selection.md §3). Callable only between turns (`&mut self`),
-    /// never inside a tool loop: a boundary has no thinking blocks pending.
+    /// Switch this agent to another assembly between turns (ADR-0049, ADR-0084,
+    /// model-selection.md §3). Callable only between turns (`&mut self`), never
+    /// inside a tool loop: a boundary has no thinking blocks pending.
     ///
     /// Runs exactly [`Agent::new`]'s checks, but `provider.validate` gets the
     /// CURRENT history, so a route that cannot carry this transcript is refused
-    /// before anything is sent or committed. On success the parts are replaced —
-    /// journal, events and authorization stay — and `environment_committed` is
-    /// cleared, so the next turn commits the new `Environment` before its input.
-    /// On failure nothing changes at all.
-    pub fn reconfigure(&mut self, next: Reconfiguration) -> Result<(), BuildError> {
+    /// before anything is sent or committed. The candidate's `Environment` record
+    /// is then committed, and only once that commit returned are the parts
+    /// installed, with no await in between: a caller that drops this future, or a
+    /// journal that fails, leaves the old assembly answering. A dropped future
+    /// leaves the commit's outcome unknown, though — a store whose commit is a
+    /// blocking write its runtime does not cancel may still have written the record
+    /// and advanced its own sequence — so such a caller must resume, not retry (ADR
+    /// draft, item 2.3). Journal and events are never replaced. A candidate equal to
+    /// the current environment still commits its record: the call is an explicit
+    /// change and the journal says so.
+    pub async fn reconfigure(&mut self, next: Reconfiguration) -> Result<(), ReconfigureError> {
         let Reconfiguration {
             provider,
             tools,
             system_prompt,
             options,
             context,
+            authorization,
         } = next;
-        check_environment(&provider, &tools, &system_prompt, &options, &self.history)?;
+        check_environment(&provider, &tools, &system_prompt, &options, &self.history)
+            .map_err(ReconfigureError::Rejected)?;
+        let body = environment_record(&provider, &tools, &system_prompt, &options);
+        self.commit(body)
+            .await
+            .map_err(|error| ReconfigureError::CommitFailed(error.0))?;
+        // Nothing below awaits: once the record is durable the candidate is the
+        // agent's, whole, before any other code can observe the agent.
         self.parts.provider = provider;
         self.parts.tools = tools;
         self.parts.system_prompt = system_prompt;
         self.parts.options = options;
         self.parts.context = context;
-        self.environment_committed = false;
+        if let Some(authorization) = authorization {
+            self.parts.authorization = authorization;
+        }
+        self.environment_committed = true;
         Ok(())
     }
 
@@ -273,17 +308,12 @@ impl Agent {
         if self.environment_committed {
             return Ok(());
         }
-        let body = RecordBody::Environment {
-            route: self.parts.provider.describe(),
-            system_prompt: self.parts.system_prompt.clone(),
-            tools: self
-                .parts
-                .tools
-                .iter()
-                .map(|tool| (tool.declaration().clone(), tool.identity().clone()))
-                .collect(),
-            options: self.parts.options.clone(),
-        };
+        let body = environment_record(
+            &self.parts.provider,
+            &self.parts.tools,
+            &self.parts.system_prompt,
+            &self.parts.options,
+        );
         self.commit(body).await.map_err(|error| error.0)?;
         self.environment_committed = true;
         Ok(())
@@ -332,26 +362,10 @@ impl Agent {
                 return Flow::End(end);
             }
             Some(Ok(None)) => {}
-            Some(Ok(Some(Prepared { items, usage }))) => {
-                // A policy bug must not become a provider 400 three requests later.
-                if let Err(message) = validate_replacement(&items) {
-                    return Flow::End(TurnEnd::ContextFailed { message });
+            Some(Ok(Some(prepared))) => {
+                if let Err(end) = self.install_replacement(prepared, items_before).await {
+                    return Flow::End(end);
                 }
-                let items_after = items.len();
-                let body = RecordBody::ContextReplaced {
-                    items: items.clone(),
-                    usage,
-                };
-                if let Err(error) = self.commit(body).await {
-                    return Flow::End(TurnEnd::CommitFailed { message: error.0 });
-                }
-                self.history = items;
-                // R6: the event announces the committed record, so it comes after.
-                self.parts.events.emit(AgentEvent::ContextReplaced {
-                    items_before,
-                    items_after,
-                    usage,
-                });
             }
             // The policy itself gave up, with or without the turn's token firing.
             Some(Err(ContextError::Cancelled)) => {
@@ -461,6 +475,98 @@ impl Agent {
             return Flow::End(TurnEnd::Cancelled);
         }
         Flow::Continue
+    }
+
+    /// §3b: install a policy's replacement — validated, journalled as
+    /// `ContextReplaced`, then the history, then the event (R6). The ONE install,
+    /// shared by the threshold path and [`Agent::compact_now`] (ADR-0076), so both
+    /// write the same record.
+    async fn install_replacement(
+        &mut self,
+        prepared: Prepared,
+        items_before: usize,
+    ) -> Result<(), TurnEnd> {
+        let Prepared { items, usage } = prepared;
+        // A policy bug must not become a provider 400 three requests later.
+        if let Err(message) = validate_replacement(&items) {
+            return Err(TurnEnd::ContextFailed { message });
+        }
+        let items_after = items.len();
+        let body = RecordBody::ContextReplaced {
+            items: items.clone(),
+            usage,
+        };
+        if let Err(error) = self.commit(body).await {
+            return Err(TurnEnd::CommitFailed { message: error.0 });
+        }
+        self.history = items;
+        // R6: the event announces the committed record, so it comes after.
+        self.parts.events.emit(AgentEvent::ContextReplaced {
+            items_before,
+            items_after,
+            usage,
+        });
+        Ok(())
+    }
+
+    /// Manual compaction (ADR-0076): ask the context policy for one summary of the
+    /// current history NOW ([`ContextPolicy::compact_now`]) and install it exactly
+    /// as a threshold replacement is installed — the same `ContextReplaced` record
+    /// and event. Callable only between turns (`&mut self`), like
+    /// [`Agent::reconfigure`]. A pending `Environment` is committed first, as a
+    /// turn would before its own records.
+    ///
+    /// On a replacement the last usage is forgotten: it measured the history that
+    /// was just replaced, so the next preparation estimates the new one instead of
+    /// adding to a number that no longer applies. `Unchanged` changes nothing. On
+    /// an error nothing is installed; the error names why.
+    pub async fn compact_now(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Compaction, ContextError> {
+        let context = self.parts.context.clone();
+        let input = ContextInput {
+            history: &self.history,
+            last_usage: self.last_usage.as_ref(),
+            cancel,
+        };
+        let compaction = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ContextError::Cancelled),
+            result = context.compact_now(input) => result?,
+        };
+        let Compaction::Replaced {
+            prepared,
+            tokens_before,
+            tokens_after,
+        } = compaction
+        else {
+            return Ok(compaction);
+        };
+        self.commit_environment_if_needed()
+            .await
+            .map_err(ContextError::Failed)?;
+        let kept = Prepared {
+            items: prepared.items.clone(),
+            usage: prepared.usage,
+        };
+        let items_before = self.history.len();
+        self.install_replacement(prepared, items_before)
+            .await
+            .map_err(|end| {
+                ContextError::Failed(match end {
+                    TurnEnd::ContextFailed { message } | TurnEnd::CommitFailed { message } => {
+                        message
+                    }
+                    other => format!("{other:?}"),
+                })
+            })?;
+        self.last_usage = None;
+        Ok(Compaction::Replaced {
+            prepared: kept,
+            tokens_before,
+            tokens_after,
+        })
     }
 
     /// §3d: consume one provider stream, racing every wait on `cancel`.
@@ -818,6 +924,25 @@ impl Agent {
                 .collect(),
             options: self.parts.options.clone(),
         }
+    }
+}
+
+/// The ONE `Environment` record, shared by the lazy first commit and
+/// [`Agent::reconfigure`], so a switched and a constructed assembly journal alike.
+fn environment_record(
+    provider: &Arc<dyn Provider>,
+    tools: &[Arc<dyn Tool>],
+    system_prompt: &str,
+    options: &ModelOptions,
+) -> RecordBody {
+    RecordBody::Environment {
+        route: provider.describe(),
+        system_prompt: system_prompt.to_string(),
+        tools: tools
+            .iter()
+            .map(|tool| (tool.declaration().clone(), tool.identity().clone()))
+            .collect(),
+        options: options.clone(),
     }
 }
 

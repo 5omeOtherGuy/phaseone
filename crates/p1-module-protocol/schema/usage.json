@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/usage/1",
+  "title": "Usage",
+  "description": "Token usage with provider fields kept apart. Unknown usage is absent, never zero.",
+  "type": "object",
+  "properties": {
+    "input_uncached": { "type": "integer" },
+    "cache_read": { "type": "integer" },
+    "cache_write": { "type": "integer" },
+    "output": { "type": "integer" },
+    "reasoning_output": { "type": "integer" },
+    "cost_micro_usd": { "type": "integer" }
+  },
+  "additionalProperties": false
+}

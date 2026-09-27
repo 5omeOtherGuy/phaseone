@@ -1,0 +1,8 @@
+{
+  "call_id": "c",
+  "name": "n",
+  "input": {
+    "kind": "binary",
+    "raw": "x"
+  }
+}

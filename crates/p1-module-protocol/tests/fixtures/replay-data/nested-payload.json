@@ -1,0 +1,22 @@
+{
+  "origin": {
+    "route": "anthropic-messages/claude-subscription",
+    "model": "claude-test"
+  },
+  "version": 2,
+  "payload": {
+    "signature": "c2lnbmF0dXJl",
+    "nested": [
+      1,
+      {
+        "deep": [
+          true,
+          null,
+          2.5,
+          "x"
+        ]
+      }
+    ],
+    "empty": {}
+  }
+}

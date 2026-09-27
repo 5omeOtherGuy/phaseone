@@ -1,0 +1,12 @@
+{
+  "summary": "exit 0",
+  "detail": {
+    "kind": "command",
+    "exit_code": -1,
+    "elapsed_ms": 1200,
+    "tail": [
+      "ok",
+      "done"
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "call_id": "call_3",
+  "name": "read",
+  "input": {
+    "kind": "json",
+    "raw": "{\"path\":"
+  }
+}

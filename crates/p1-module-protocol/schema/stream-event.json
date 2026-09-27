@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/stream-event/1",
+  "title": "Stream event",
+  "description": "One event of a provider stream. Deltas are display only; finished is the single terminal event and the only one carrying tool calls.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "event": { "const": "text_delta" },
+        "block": { "type": "integer" },
+        "text": { "type": "string" }
+      },
+      "required": ["event", "block", "text"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "event": { "const": "reasoning_delta" },
+        "block": { "type": "integer" },
+        "text": { "type": "string" }
+      },
+      "required": ["event", "block", "text"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "event": { "const": "tool_input_delta" },
+        "call_id": { "type": "string" },
+        "name": { "type": "string" },
+        "text": { "type": "string" }
+      },
+      "required": ["event", "call_id", "name", "text"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "event": { "const": "notice" },
+        "text": { "type": "string" }
+      },
+      "required": ["event", "text"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "event": { "const": "activity" }
+      },
+      "required": ["event"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "event": { "const": "finished" },
+        "outcome": { "$ref": "#/$defs/outcome" }
+      },
+      "required": ["event", "outcome"],
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "stop_reason": {
+      "enum": [
+        "end_turn",
+        "tool_use",
+        "max_output_tokens",
+        "context_window_exceeded",
+        "refusal",
+        "paused",
+        "other"
+      ]
+    },
+    "outcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": { "const": "completed" },
+            "item": { "$ref": "p1:protocol/history-item/1#/$defs/assistant_item" },
+            "stop": { "$ref": "#/$defs/stop_reason" },
+            "usage": { "$ref": "p1:protocol/usage/1" }
+          },
+          "required": ["status", "item", "stop"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": { "const": "failed" },
+            "error": { "$ref": "p1:protocol/provider-error/1" }
+          },
+          "required": ["status", "error"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": { "const": "cancelled" }
+          },
+          "required": ["status"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

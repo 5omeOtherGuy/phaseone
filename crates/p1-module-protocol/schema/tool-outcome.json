@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/tool-outcome/1",
+  "title": "Tool outcome",
+  "description": "The result of one tool execution. The content is exactly what the model sees.",
+  "type": "object",
+  "properties": {
+    "status": { "$ref": "#/$defs/tool_status" },
+    "content": { "type": "string" }
+  },
+  "required": ["status", "content"],
+  "additionalProperties": false,
+  "$defs": {
+    "tool_status": {
+      "enum": ["ok", "error", "unavailable", "denied", "cancelled", "unknown"]
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "verb": "edit",
+  "target": "src/lib.rs",
+  "edit": {
+    "path": "src/lib.rs",
+    "old": "a",
+    "new": "b"
+  },
+  "destructive": true
+}

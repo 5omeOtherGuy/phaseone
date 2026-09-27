@@ -120,7 +120,9 @@ fn help_version_and_unknown_flag() {
 #[test]
 fn a_subcommand_typo_exits_two_without_running() {
     // `envs` (the reported typo) and the two the owner named, `modles` and `loginn`.
-    for (typo, meant) in [("envs", "env"), ("modles", "models"), ("loginn", "login")] {
+    // `modles` is one edit from `modules` and two from `models`, and the suggestion is
+    // the nearest command, so it now means `modules` (S1.6 added the subcommand).
+    for (typo, meant) in [("envs", "env"), ("modles", "modules"), ("loginn", "login")] {
         let home = tempfile::tempdir().unwrap();
         let output = isolated(home.path()).arg(typo).output().unwrap();
         assert_eq!(

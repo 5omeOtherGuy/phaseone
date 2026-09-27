@@ -4,6 +4,8 @@
 //! `p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]
 //! [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
 //! `p1 models [SEARCH]`
+//! `p1 modules list` / `p1 modules inspect NAME` /
+//! `p1 modules verify [--root DIR] [--integrity-only]`
 //! `p1 env show NAME`
 //! `p1 workflow run FILE [--arg k=v]… [--args FILE] [--role r=E/P[:effort]]…`
 //! `p1 login <route>` / `p1 login --list` / `p1 logout <route>`
@@ -55,6 +57,8 @@ pub enum Command {
     Models {
         search: Option<String>,
     },
+    /// The installed module set (ADR-0079, freeze item 6): `p1 modules`.
+    Modules(ModulesOptions),
     /// Read one API key from stdin and store it for this route (ADR-0044, spec §6).
     Login {
         route: String,
@@ -110,6 +114,34 @@ pub struct UsageOptions {
     pub search: Option<String>,
 }
 
+/// Parsed arguments for `p1 modules` (ADR-0079).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModulesOptions {
+    pub action: ModulesAction,
+    /// `--root DIR`: the module set to read — the directory that holds its
+    /// `manifest.json`, or the share directory above the `modules/` one. `None` means
+    /// the installed `<binary>/../share/p1`.
+    pub root: Option<PathBuf>,
+    /// `--integrity-only` for `verify`: report a grant this runtime cannot link as
+    /// `UNLINKED` and pass it, instead of failing the verification. The parser refuses
+    /// the flag on `list` and `inspect`, which have nothing to narrow (S1.6.1).
+    pub integrity_only: bool,
+}
+
+/// What `p1 modules` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModulesAction {
+    /// Every installed package, its digest and the environments that name it.
+    List,
+    /// One package: its frozen manifest fields, its imports and its effective grants.
+    Inspect {
+        /// The package's manifest name, `<namespace>/<name>`.
+        name: String,
+    },
+    /// The metadata-only check an installer runs on a staged module set.
+    Verify,
+}
+
 /// Parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -127,6 +159,9 @@ pub struct Options {
     pub workspace: Option<PathBuf>,
     pub session: Option<PathBuf>,
     pub resume: bool,
+    /// `--compact` (ADR-0076): with `--resume`, summarize the resumed history once
+    /// before the first turn, exactly as the TUI's `/compact` does.
+    pub compact: bool,
     /// Ask before permitting a call: the restrictive policy (ADR-0038). The
     /// default is full access; `--yes` is accepted and means the default.
     pub ask: bool,
@@ -192,9 +227,12 @@ pub fn usage() -> String {
     out.push_str("p1 — a lean, model-shaped coding harness\n\n");
     out.push_str("usage:\n");
     out.push_str(
-        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]\n     [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]\n",
+        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]\n     [--workspace DIR] [--session FILE] [--resume [--compact]] [--ask]\n     [PROMPT…]\n",
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
+    out.push_str(
+        "  p1 modules list      every installed module package: kind, protocol, digest, selection\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR] [--integrity-only]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1. --integrity-only\n                       reports a grant this runtime cannot link as UNLINKED, failing none\n",
+    );
     out.push_str("  p1 env show NAME\n");
     out.push_str(
         "  p1 workflow run FILE [--arg K=V]… [--args FILE] [--role R=E/P[:effort]]…\n     [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]\n     [--max-workers N] [--yes]\n                       run a workflow script without a parent agent; `--arg`\n                       values that parse as JSON are passed as JSON, and lie over\n                       the JSON object in `--args FILE`; exit 0 completed,\n                       2 completed with issues, 1 failed, 130 cancelled\n",
@@ -224,6 +262,9 @@ pub fn usage() -> String {
     out.push_str("  --instructions FILE  append FILE to the agent's system prompt (repeatable; e.g.\n                    the global and the repository AGENTS.md)\n");
     out.push_str("  --skills DIR      list DIR/*/SKILL.md by name and description in the system\n                    prompt; the agent reads one when a task calls for it (repeatable)\n");
     out.push_str("  --resume          continue an existing --session file\n");
+    out.push_str(
+        "  --compact         with --resume: summarize the resumed session once before the\n                    first turn (the TUI's /compact)\n",
+    );
     out.push_str(
         "  --ask             ask before permitting a tool call; headless permits only\n                    read-only calls (default: full access, no questions)\n",
     );
@@ -285,6 +326,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         if first == "models" {
             return parse_models(args);
         }
+        if first == "modules" {
+            return parse_modules(args);
+        }
         if first == "usage" {
             return parse_usage(args);
         }
@@ -306,6 +350,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut workspace: Option<PathBuf> = None;
     let mut session: Option<PathBuf> = None;
     let mut resume = false;
+    let mut compact = false;
     let mut ask = false;
     let mut tui = false;
     let mut yes = false;
@@ -345,6 +390,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
                 session = Some(PathBuf::from(value));
             }
             "--resume" => resume = true,
+            "--compact" => compact = true,
             "--instructions" => {
                 instructions.push(PathBuf::from(take_value(args, &mut index, arg)?));
             }
@@ -404,6 +450,12 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     if resume && session.is_none() {
         return Err(CliError {
             message: "--resume requires --session".to_string(),
+        });
+    }
+    if compact && !resume {
+        return Err(CliError {
+            message: "--compact needs --resume (a fresh session has nothing to compact)"
+                .to_string(),
         });
     }
     // `--yes` is the default, so combining it with `--ask` names two policies at once.
@@ -470,6 +522,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         workspace,
         session,
         resume,
+        compact,
         ask,
         tui,
         sandbox,
@@ -486,7 +539,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
 
 /// The subcommands a first positional token can name. Kept in one place so a
 /// near miss suggests from the same list the parser dispatches on.
-const SUBCOMMANDS: [&str; 6] = ["models", "env", "workflow", "usage", "login", "logout"];
+const SUBCOMMANDS: [&str; 7] = [
+    "models", "env", "workflow", "usage", "login", "logout", "modules",
+];
 
 /// The subcommand a lone positional `token` most likely meant, or `None` when it
 /// is not a typo (issue #83). A typo is shaped like a command (`^[a-z][a-z-]*$`),
@@ -583,6 +638,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         workspace: None,
         session: None,
         resume: false,
+        compact: false,
         ask: false,
         tui: false,
         sandbox,
@@ -628,6 +684,92 @@ fn parse_models(args: &[String]) -> Result<Options, CliError> {
     let mut options = defaults(Command::Models { search });
     options.models = models;
     Ok(options)
+}
+
+/// `p1 modules list | inspect NAME | verify` (ADR-0079): one module set, read only.
+/// An action is required — as `p1 workflow` requires one — so a bare `p1 modules` is
+/// a usage error rather than a listing nobody asked for.
+fn parse_modules(args: &[String]) -> Result<Options, CliError> {
+    const USAGE: &str = "usage: p1 modules list | p1 modules inspect NAME | \
+                         p1 modules verify [--root DIR] [--integrity-only]";
+    let mut action: Option<String> = None;
+    let mut operand: Option<String> = None;
+    let mut root: Option<PathBuf> = None;
+    let mut integrity_only = false;
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--root" => root = Some(PathBuf::from(take_value(args, &mut index, "--root")?)),
+            "--integrity-only" => integrity_only = true,
+            other if other.starts_with('-') && other != "-" => {
+                return Err(CliError {
+                    message: format!("unknown flag `{other}`"),
+                });
+            }
+            other => {
+                if action.is_none() {
+                    if !matches!(other, "list" | "inspect" | "verify") {
+                        return Err(CliError {
+                            message: format!("unknown modules subcommand `{other}`"),
+                        });
+                    }
+                    action = Some(other.to_string());
+                } else if operand.is_none() {
+                    operand = Some(other.to_string());
+                } else {
+                    return Err(CliError {
+                        message: format!("unexpected argument `{other}`"),
+                    });
+                }
+            }
+        }
+        index += 1;
+    }
+    let unexpected = |operand: Option<String>| -> Result<(), CliError> {
+        match operand {
+            Some(extra) => Err(CliError {
+                message: format!("unexpected argument `{extra}`"),
+            }),
+            None => Ok(()),
+        }
+    };
+    let subcommand = action.as_deref().unwrap_or_default().to_string();
+    let action = match subcommand.as_str() {
+        "list" => {
+            unexpected(operand)?;
+            ModulesAction::List
+        }
+        "verify" => {
+            unexpected(operand)?;
+            ModulesAction::Verify
+        }
+        "inspect" => ModulesAction::Inspect {
+            name: operand.ok_or_else(|| CliError {
+                message: USAGE.to_string(),
+            })?,
+        },
+        _ => {
+            return Err(CliError {
+                message: USAGE.to_string(),
+            });
+        }
+    };
+    // `--integrity-only` narrows a verification and nothing else: taking it on `list` or
+    // `inspect` would silently ignore what the caller asked for, so the parser refuses it
+    // rather than accepting a flag that changes nothing (S1.6.1).
+    if integrity_only && subcommand != "verify" {
+        return Err(CliError {
+            message: format!(
+                "--integrity-only is only for `p1 modules verify`, not `p1 modules {subcommand}`"
+            ),
+        });
+    }
+    Ok(defaults(Command::Modules(ModulesOptions {
+        action,
+        root,
+        integrity_only,
+    })))
 }
 
 fn parse_usage(args: &[String]) -> Result<Options, CliError> {
@@ -1048,6 +1190,7 @@ fn defaults(command: Command) -> Options {
         workspace: None,
         session: None,
         resume: false,
+        compact: false,
         ask: false,
         tui: false,
         sandbox: SandboxMode::Off,
@@ -1162,6 +1305,26 @@ mod tests {
         assert!(usage().contains("p1 login <route>"));
         assert!(usage().contains("p1 login --list"));
         assert!(usage().contains("p1 logout <route>"));
+    }
+
+    #[test]
+    fn parses_compact_only_with_resume() {
+        let options = parse(&args(&["--session", "s.jsonl", "--resume", "--compact"])).unwrap();
+        assert!(options.resume);
+        assert!(options.compact);
+        assert!(
+            !parse(&args(&["--session", "s.jsonl", "--resume"]))
+                .unwrap()
+                .compact
+        );
+        let error = parse(&args(&["--session", "s.jsonl", "--compact"])).unwrap_err();
+        assert_eq!(
+            error.message,
+            "--compact needs --resume (a fresh session has nothing to compact)"
+        );
+        assert!(parse(&args(&["--compact"])).is_err());
+        assert!(usage().contains("--resume [--compact]"));
+        assert!(usage().contains("  --compact         with --resume"));
     }
 
     #[test]
@@ -1509,14 +1672,116 @@ mod tests {
         assert!(usage().contains("p1 models [SEARCH]"));
     }
 
+    #[test]
+    fn parses_the_modules_subcommand() {
+        assert_eq!(
+            parse(&args(&["modules", "list"])).unwrap().command,
+            Command::Modules(ModulesOptions {
+                action: ModulesAction::List,
+                root: None,
+                integrity_only: false,
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "modules",
+                "inspect",
+                "p1/fixture",
+                "--root",
+                "/share"
+            ]))
+            .unwrap()
+            .command,
+            Command::Modules(ModulesOptions {
+                action: ModulesAction::Inspect {
+                    name: "p1/fixture".to_string(),
+                },
+                root: Some(PathBuf::from("/share")),
+                integrity_only: false,
+            })
+        );
+        assert_eq!(
+            parse(&args(&["modules", "verify", "--root", "/share/modules"]))
+                .unwrap()
+                .command,
+            Command::Modules(ModulesOptions {
+                action: ModulesAction::Verify,
+                root: Some(PathBuf::from("/share/modules")),
+                integrity_only: false,
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "modules",
+                "verify",
+                "--integrity-only",
+                "--root",
+                "/share/modules"
+            ]))
+            .unwrap()
+            .command,
+            Command::Modules(ModulesOptions {
+                action: ModulesAction::Verify,
+                root: Some(PathBuf::from("/share/modules")),
+                integrity_only: true,
+            })
+        );
+        assert!(
+            !parse(&args(&["modules", "list"])).unwrap().is_headless(),
+            "reading a module set runs no agent"
+        );
+
+        // An action is required, `inspect` needs its name, and a word that names no
+        // action is refused with the one that does.
+        assert!(parse(&args(&["modules"])).is_err());
+        assert!(parse(&args(&["modules", "inspect"])).is_err());
+        assert!(parse(&args(&["modules", "list", "extra"])).is_err());
+        assert!(parse(&args(&["modules", "verify", "extra"])).is_err());
+        assert!(parse(&args(&["modules", "--bogus"])).is_err());
+        assert!(parse(&args(&["modules", "--root"])).is_err());
+        // `--integrity-only` narrows `verify` only; the other two actions have nothing to
+        // narrow, so the parser refuses it instead of taking a flag that changes nothing.
+        assert!(parse(&args(&["modules", "list", "--integrity-only"])).is_err());
+        assert!(
+            parse(&args(&[
+                "modules",
+                "inspect",
+                "p1/fixture",
+                "--integrity-only"
+            ]))
+            .is_err()
+        );
+        assert!(parse(&args(&["modules", "--integrity-only"])).is_err());
+        let error = parse(&args(&["modules", "list", "--integrity-only"])).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("--integrity-only is only for `p1 modules verify`"),
+            "{}",
+            error.message
+        );
+        let error = parse(&args(&["modules", "listt"])).unwrap_err();
+        assert!(
+            error.message.contains("unknown modules subcommand `listt`"),
+            "{}",
+            error.message
+        );
+        assert!(usage().contains("p1 modules list"));
+        assert!(usage().contains("p1 modules inspect NAME"));
+        assert!(usage().contains("p1 modules verify [--root DIR]"));
+        assert!(usage().contains("--integrity-only"));
+    }
+
     /// A lone word that is a near miss for a subcommand is a usage error naming the
-    /// command meant, never a prompt (issue #83).
+    /// command meant, never a prompt (issue #83). `modles` is one edit from `modules`
+    /// and two from `models`, so the nearer command is the one suggested.
     #[test]
     fn a_lone_near_miss_for_a_subcommand_is_a_usage_error() {
         for (typo, meant) in [
             ("envs", "env"),
-            ("modles", "models"),
+            ("modles", "modules"),
             ("model", "models"),
+            ("module", "modules"),
             ("usge", "usage"),
             ("workfow", "workflow"),
             ("loginn", "login"),

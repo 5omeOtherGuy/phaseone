@@ -11,6 +11,8 @@
 //! fail before a request existed, so "a request was sent" is itself the negative
 //! proof. Every value is an obvious fake and no test opens a socket.
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -131,7 +133,14 @@ impl Home {
     }
 }
 
-/// The provider the host's catalog factory builds for one route and one bound profile.
+/// The environment search directories activation reads the effective `modules.lock` and the
+/// selected profile's text from. The routes here live in temp files, so nothing else uses them.
+fn environment_dirs() -> Vec<PathBuf> {
+    vec![repo("environments")]
+}
+
+/// The provider the host's catalog factory builds for one route and one bound profile: the
+/// provider component the route's `adapter` names (D083b), the WebSocket Codex route included.
 fn provider(
     route: &RouteFile,
     profile_id: &str,
@@ -146,6 +155,8 @@ fn provider(
     let locations = Locations::none().with_home(Some(home.to_path_buf()));
     let credentials = credential_source_at(route, Arc::new(transport.clone()), &locations);
     route_provider(
+        common::provider_components(),
+        &environment_dirs(),
         route,
         &binding,
         profile(profile_id),

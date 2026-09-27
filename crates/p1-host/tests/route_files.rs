@@ -5,6 +5,7 @@
 //! SHIPPED routes built from the shipped files through this same loading path.
 
 mod common;
+mod native_routes;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 use common::Harness;
 use futures_util::StreamExt;
+use native_routes::{chat_route, responses_route};
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_auth::CredentialKind;
 use p1_contracts::{
@@ -20,19 +22,21 @@ use p1_contracts::{
 };
 use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
-use p1_host::catalog::{
-    build_catalog, chat_route, resolve_environment, responses_route, route_provider,
-};
+use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
-use p1_host::routes::{AdapterSettings, RouteFile, load_all_routes, load_route, load_route_by_id};
+use p1_host::routes::{
+    AdapterSettings, ChatAdapterSettings, ChatDialect, ClientIdentity, ResponsesAccount,
+    ResponsesAdapterSettings, ResponsesTransport, RouteFile, load_all_routes, load_route,
+    load_route_by_id,
+};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, fixtures::chat as chat_fixtures, run_all,
 };
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
-use p1_provider_openai::{ResponsesAccount, ResponsesAdapterSettings, ResponsesTransport};
-use p1_provider_openai_chat::{ChatAdapterSettings, ChatDialect, ClientIdentity, build_request};
+use p1_provider_openai::ResponsesTransport as NativeTransport;
+use p1_provider_openai_chat::build_request;
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
 
@@ -83,12 +87,15 @@ fn shipped_environment_dirs() -> Vec<PathBuf> {
 
 /// What the host resolves for one environment before it assembles (spec §2 steps 1–3):
 /// the route file the environment names, the profile it selects, and the wire model the
-/// binding gives that profile on that route.
+/// binding gives that profile on that route. `dirs` are the environment search directories the
+/// resolution read from; activation reads the effective lock and the profile's text from beside
+/// them, so the provider a test composes is the one the host would compose for that environment.
 #[derive(Debug)]
 struct Resolved {
     route: RouteFile,
     profile: Arc<ModelProfile>,
     wire_model: String,
+    dirs: Vec<PathBuf>,
 }
 
 fn resolve(environment_dirs: &[PathBuf], name: &str) -> Result<Resolved, String> {
@@ -103,6 +110,7 @@ fn resolve(environment_dirs: &[PathBuf], name: &str) -> Result<Resolved, String>
         route,
         profile,
         wire_model: loaded.model,
+        dirs: environment_dirs.to_vec(),
     })
 }
 
@@ -113,16 +121,22 @@ fn shipped(environment: &str) -> Resolved {
 /// Build the provider the catalog factory would build: `catalog::route_provider` with
 /// the route's binding for the resolved profile. No constructor argument is hand-made.
 ///
-/// The connector is injected next to the transport (ADR-0047 §1) and REFUSES every
-/// upgrade: a route that asks for WebSocket falls back to SSE at once (the shipped
-/// Codex route does — ADR-0047 §1 was revised to make WebSocket its default), an SSE
-/// route ignores it, and no test opens a socket.
+/// The provider components are the ones `scripts/build-modules.sh --all` published, read once
+/// per test binary through a release manifest in a temp directory (`common::provider_components`):
+/// a route whose adapter names one activates that component (D083b). The shipped Codex route
+/// asks for WebSocket, which this suite's SSE tests turn into the HTTP fallback by making the
+/// injected connector refuse every upgrade.
+///
+/// The connector is injected next to the transport (ADR-0047 §1); an SSE route ignores it, and
+/// no test opens a socket.
 fn provider_of(resolved: &Resolved, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = resolved
         .route
         .binding(&resolved.profile.id)
         .expect("the route serves this profile");
     route_provider(
+        common::provider_components(),
+        &resolved.dirs,
         &resolved.route,
         binding,
         resolved.profile.clone(),
@@ -458,12 +472,16 @@ fn assemble_shipped(name: &str) -> Assembled {
     let mut environment = load_environment(name, &dirs).expect("the shipped environment loads");
     resolve_environment(&mut environment, &dirs).expect("the shipped route serves its profile");
     let workspace = tempdir().unwrap();
-    assemble(
-        &catalog,
-        &environment,
-        workspace.path(),
-        &substitutions(workspace.path()),
-    )
+    // The `read` key is the release's `p1/read` host entry (S1.8.1), and a module tool is built
+    // inside a Tokio runtime, which runs its executor.
+    common::on_runtime(|| {
+        assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &substitutions(workspace.path()),
+        )
+    })
     .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
 }
 
@@ -880,7 +898,15 @@ fn the_two_shipped_routes_have_no_compiled_literals() {
         "glm-5.3",
         "chat/completions",
     ];
-    for file in ["src/catalog.rs", "src/run.rs", "src/cli.rs", "src/auth.rs"] {
+    for file in [
+        "src/catalog/mod.rs",
+        "src/catalog/providers.rs",
+        "src/catalog/tools.rs",
+        "src/catalog/modules.rs",
+        "src/run.rs",
+        "src/cli.rs",
+        "src/auth.rs",
+    ] {
         let path = repo("crates/p1-host").join(file);
         let text = std::fs::read_to_string(&path).expect("the host source is readable");
         for literal in literals {
@@ -1741,7 +1767,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
         responses_route(&route)
             .expect("the route composes")
             .transport,
-        ResponsesTransport::Websocket
+        NativeTransport::Websocket
     );
 
     // Absent means `sse`: the adapter's own default for a route file that says
@@ -1755,9 +1781,13 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
         })
     );
 
-    for (value, expected) in [
-        ("sse", ResponsesTransport::Sse),
-        ("websocket", ResponsesTransport::Websocket),
+    for (value, expected, native) in [
+        ("sse", ResponsesTransport::Sse, NativeTransport::Sse),
+        (
+            "websocket",
+            ResponsesTransport::Websocket,
+            NativeTransport::Websocket,
+        ),
     ] {
         codex_route_with(&scratch, &format!("transport = \"{value}\""));
         assert_eq!(
@@ -1775,7 +1805,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
             responses_route(&route)
                 .expect("the route composes")
                 .transport,
-            expected,
+            native,
             "{value}"
         );
     }
@@ -1830,6 +1860,8 @@ fn a_websocket_route_assembles_with_the_real_connector_and_an_unchanged_origin()
         .expect("the route serves this profile");
     let connector = Arc::new(RefusingWsConnector::default());
     let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
         &resolved.route,
         binding,
         resolved.profile.clone(),
@@ -1866,6 +1898,8 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
         .binding(&resolved.profile.id)
         .expect("the route serves this profile");
     let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
         &resolved.route,
         binding,
         resolved.profile.clone(),
@@ -1887,6 +1921,8 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
     let transport =
         ScriptedTransport::new(vec![ScriptedResponse::ok_sse(chat_fixtures::TEXT_TURN)]);
     let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
         &resolved.route,
         binding,
         resolved.profile.clone(),

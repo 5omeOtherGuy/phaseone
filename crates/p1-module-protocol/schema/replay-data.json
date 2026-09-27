@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/replay-data/1",
+  "title": "Replay data",
+  "description": "Provider-native continuation data. The payload is opaque and carried verbatim; only the originating adapter interprets it, under its own layout version.",
+  "type": "object",
+  "properties": {
+    "origin": { "$ref": "#/$defs/origin" },
+    "version": { "type": "integer" },
+    "payload": {}
+  },
+  "required": ["origin", "version", "payload"],
+  "additionalProperties": false,
+  "$defs": {
+    "origin": {
+      "type": "object",
+      "properties": {
+        "route": { "type": "string" },
+        "model": { "type": "string" }
+      },
+      "required": ["route", "model"],
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "verb": "worker",
+  "target": "w1",
+  "destructive": false
+}

@@ -1,0 +1,11 @@
+{
+  "summary": "3 matches",
+  "detail": {
+    "kind": "matches",
+    "count": 3,
+    "files": [
+      "a.rs",
+      "b.rs"
+    ]
+  }
+}

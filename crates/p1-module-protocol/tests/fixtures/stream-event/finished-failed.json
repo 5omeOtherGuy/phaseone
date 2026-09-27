@@ -1,0 +1,10 @@
+{
+  "event": "finished",
+  "outcome": {
+    "status": "failed",
+    "error": {
+      "kind": "transport",
+      "message": "stream ended before the terminal event"
+    }
+  }
+}

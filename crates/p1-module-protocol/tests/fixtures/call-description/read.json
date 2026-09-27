@@ -1,0 +1,5 @@
+{
+  "verb": "read",
+  "target": "src/lib.rs",
+  "destructive": false
+}

@@ -1,0 +1,9 @@
+{
+  "call_id": "c",
+  "name": "n",
+  "input": {
+    "kind": "json",
+    "raw": "{}"
+  },
+  "extra": 1
+}

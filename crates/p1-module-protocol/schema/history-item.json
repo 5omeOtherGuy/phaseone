@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p1:protocol/history-item/1",
+  "title": "History item",
+  "description": "One item of the flat, ordered, model-visible history.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "item": { "const": "user" },
+        "text": { "type": "string" }
+      },
+      "required": ["item", "text"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "item": { "const": "inbox" },
+        "kind": { "$ref": "#/$defs/inbox_kind" },
+        "text": { "type": "string" }
+      },
+      "required": ["item", "kind", "text"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "item": { "const": "assistant" },
+        "origin": { "$ref": "p1:protocol/replay-data/1#/$defs/origin" },
+        "blocks": { "type": "array", "items": { "$ref": "#/$defs/assistant_block" } }
+      },
+      "required": ["item", "origin", "blocks"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "item": { "const": "tool_result" },
+        "call_id": { "type": "string" },
+        "name": { "type": "string" },
+        "status": { "$ref": "p1:protocol/tool-outcome/1#/$defs/tool_status" },
+        "content": { "type": "string" }
+      },
+      "required": ["item", "call_id", "name", "status", "content"],
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "inbox_kind": { "enum": ["steering", "notification"] },
+    "assistant_block": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "block": { "const": "text" },
+            "text": { "type": "string" }
+          },
+          "required": ["block", "text"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "block": { "const": "reasoning" },
+            "text": { "type": "string" },
+            "replay": { "$ref": "p1:protocol/replay-data/1" }
+          },
+          "required": ["block", "text"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "block": { "const": "tool_call" },
+            "call_id": { "type": "string" },
+            "name": { "type": "string" },
+            "input": { "$ref": "p1:protocol/tool-call/1#/$defs/tool_input" }
+          },
+          "required": ["block", "call_id", "name", "input"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "assistant_item": {
+      "type": "object",
+      "properties": {
+        "origin": { "$ref": "p1:protocol/replay-data/1#/$defs/origin" },
+        "blocks": { "type": "array", "items": { "$ref": "#/$defs/assistant_block" } }
+      },
+      "required": ["origin", "blocks"],
+      "additionalProperties": false
+    }
+  }
+}

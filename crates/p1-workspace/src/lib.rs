@@ -5,31 +5,51 @@
 //! variable: every path a file tool touches must resolve inside the workspace
 //! root *after* symlink resolution (see [`Workspace::resolve`]). This is an
 //! invariant of the tools, not a policy the host may relax.
+//!
+//! The file policy that is not confinement lives here too: the credential files
+//! every file tool refuses before confinement ([`refuse_credentials`], issue
+//! #142) and the model-facing texts that refusal and a failed read carry, so a
+//! component's capability service and the native tool refuse the same paths with
+//! the same wording.
 
+mod commit;
 mod gate;
 mod observe;
 mod path;
+mod policy;
+mod read;
+mod reads;
 mod text;
 
 use std::path::{Path, PathBuf};
 
+pub use commit::{Change, MutationError, MutationPolicy, OwnedMutation};
 pub use gate::{Mutation, WriteGate};
 pub use observe::{Observation, ObservedFiles, StreamingHash};
 pub use p1_contracts::tool::ToolFace;
+pub use policy::{
+    could_not_be_read, credential_refusal, refuse_credentials, refuses_credentials, xdg_credentials,
+};
+pub use read::{CheckedPath, DirEntry, FileKind, Snapshot, SnapshotMetadata, Stat};
+pub use reads::ReadRecord;
 pub use text::{bound_output, write_atomic};
 
 /// Why a workspace path could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
-    /// The configured root is not a directory.
-    #[error("workspace root is not a directory: {}", .0.display())]
+    /// The workspace root, or a path a caller asked to list, is not a directory.
+    #[error("not a directory: {}", .0.display())]
     NotADirectory(PathBuf),
+    /// The requested path resolves inside the workspace but does not exist.
+    #[error("no such path in the workspace: {requested}")]
+    NotFound { requested: String },
     /// The requested path resolves outside the workspace root, directly, by
     /// `..`, or through a symlink.
     #[error("path escapes workspace: {requested}")]
     OutsideWorkspace { requested: String },
-    /// A filesystem operation failed while resolving the path.
-    #[error("failed to resolve {}: {source}", path.display())]
+    /// A filesystem operation on the path failed while resolving, reading or
+    /// listing it.
+    #[error("workspace I/O failed for {}: {source}", path.display())]
     Io {
         path: PathBuf,
         #[source]
@@ -94,7 +114,7 @@ impl Workspace {
     /// ancestor is canonicalized and must be inside the root — that ancestor is
     /// the one the eventual read/write would resolve through.
     pub fn resolve(&self, requested: &str) -> Result<PathBuf, WorkspaceError> {
-        let candidate = path::lexical_normalize(&path::join_request(&self.root, requested));
+        let candidate = self.spelling(requested);
         if !candidate.starts_with(&self.root) {
             return Err(WorkspaceError::OutsideWorkspace {
                 requested: requested.to_string(),
@@ -136,6 +156,13 @@ impl Workspace {
                 });
         }
         Ok(candidate)
+    }
+
+    /// `requested` joined to the root and normalized lexically, before any symlink is
+    /// resolved: the one name every spelling of a request shares, so a read record can
+    /// tell a path that now resolves to another file than the one it read.
+    pub fn spelling(&self, requested: &str) -> PathBuf {
+        path::lexical_normalize(&path::join_request(&self.root, requested))
     }
 
     /// Render `path` relative to the root with `/` separators, for model-facing
