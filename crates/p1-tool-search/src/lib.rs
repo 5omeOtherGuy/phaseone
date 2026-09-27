@@ -218,16 +218,8 @@ impl Capabilities for NativeHost {
         })
     }
 
-    /// One window of the file, read directly: the guest reads only the prefix
-    /// it sniffs for binary content, so the whole file is never loaded.
     fn read(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>, FsError> {
-        let checked = self.workspace.check_path(path).map_err(fs_error)?;
-        let io = |error: io::Error| FsError::Io(error.to_string());
-        let mut file = std::fs::File::open(checked.path()).map_err(io)?;
-        io::copy(&mut (&mut file).take(offset), &mut io::sink()).map_err(io)?;
-        let mut window = Vec::new();
-        file.take(length).read_to_end(&mut window).map_err(io)?;
-        Ok(window)
+        read_window(&self.workspace, path, offset, length)
     }
 
     fn list_files(&self, path: &str, glob: Option<&str>) -> Result<Vec<String>, FsError> {
@@ -237,6 +229,23 @@ impl Capabilities for NativeHost {
     fn search(&self, query: &SearchQuery) -> Result<SearchResult, FsError> {
         search(&self.workspace, query, &self.cancel)
     }
+}
+
+/// One window of the file, read directly: the guest reads only the prefix
+/// it sniffs for binary content, so the whole file is never loaded.
+pub(crate) fn read_window(
+    workspace: &Workspace,
+    path: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, FsError> {
+    let checked = workspace.check_path(path).map_err(fs_error)?;
+    let io = |error: io::Error| FsError::Io(error.to_string());
+    let mut file = std::fs::File::open(checked.path()).map_err(io)?;
+    io::copy(&mut (&mut file).take(offset), &mut io::sink()).map_err(io)?;
+    let mut window = Vec::new();
+    file.take(length).read_to_end(&mut window).map_err(io)?;
+    Ok(window)
 }
 
 /// The workspace service's failures as the frozen `fs-error`

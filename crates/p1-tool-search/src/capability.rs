@@ -2,9 +2,9 @@
 //! this crate's native serial walk ([`crate::list_files`], [`crate::search`]), and `stat` and
 //! `read` over `p1-workspace` as the native `grep` reads.
 //!
-//! Search is granted no `snapshot` (its package manifest), and this service reads with
-//! `Workspace::read_unobserved`: nothing a search reads is recorded as an observation, so a
-//! search can never give an agent the permission an edit needs.
+//! Search is granted no `snapshot` (its package manifest), and this service reads a window
+//! of the file directly, never through `Workspace::read`: nothing a search reads is recorded
+//! as an observation, so a search can never give an agent the permission an edit needs.
 
 use std::sync::Arc;
 
@@ -85,11 +85,10 @@ impl WorkspaceService for SearchCapability {
         offset: u64,
         length: u64,
     ) -> BoxFuture<'_, Result<Vec<u8>, FsError>> {
+        // Only the requested window, as the native `grep` reads: file-list mode sniffs a
+        // prefix of every listed file, which must not load a large file whole.
         self.blocking(move |workspace, _| {
-            let snapshot = workspace.read_unobserved(&path).map_err(workspace_error)?;
-            let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-            let length = usize::try_from(length).unwrap_or(usize::MAX);
-            Ok(snapshot.read(offset, length).to_vec())
+            crate::read_window(workspace, &path, offset, length).map_err(from_logic)
         })
     }
 
@@ -190,6 +189,25 @@ mod tests {
         assert_eq!(
             capability.list_files(".".into(), None).await,
             Ok(vec!["a.txt".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_returns_only_the_requested_window() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "0123456789").unwrap();
+        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap());
+        assert_eq!(
+            capability.read("a.txt".into(), 2, 3).await,
+            Ok(b"234".to_vec())
+        );
+        assert_eq!(
+            capability.read("a.txt".into(), 8, 100).await,
+            Ok(b"89".to_vec())
+        );
+        assert_eq!(
+            capability.read("../outside".into(), 0, 1).await,
+            Err(FsError::OutsideWorkspace)
         );
     }
 }
