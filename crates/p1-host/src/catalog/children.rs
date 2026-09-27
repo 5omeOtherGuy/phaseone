@@ -268,10 +268,10 @@ pub(crate) fn announce_lost_workers(
     records: &[p1_contracts::JournalRecord],
 ) -> Result<(), String> {
     let earlier = p1_workers::journal::workers_started_in(records, &worker_identities());
-    // `workers_started_in` reads only the delegate tool's own results, so workers a
-    // WORKFLOW started are missing from it. Their run journals name them, and the
-    // step's own `<session>.w<N>.jsonl` file may be gone or still there; every source
-    // is bound below BEFORE the message can return early (issue #98).
+    // `workers_started_in` reads only the `worker_start` results journalled under those
+    // identities, so workers a WORKFLOW started are missing from it. Their run journals
+    // name them, and the step's own `<session>.w<N>.jsonl` file may be gone or still
+    // there; every source is bound below BEFORE the message can return early (issue #98).
     let reserved = reserved_worker_ids(session_file)?;
     let used = earlier
         .iter()
