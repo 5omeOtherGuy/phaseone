@@ -149,7 +149,14 @@ impl Workspace {
     /// following links, then verify the opened handle's type. NONBLOCK ensures a
     /// swapped FIFO cannot park a host thread between path validation and open.
     pub fn open_file(&self, requested: &str) -> Result<File, WorkspaceError> {
-        let path = self.resolve(requested)?;
+        let resolved = self.resolve(requested)?;
+        let path = std::fs::canonicalize(&resolved)
+            .map_err(|source| missing_or_io(requested, &resolved, source))?;
+        if !path.starts_with(&self.root) {
+            return Err(WorkspaceError::OutsideWorkspace {
+                requested: requested.to_string(),
+            });
+        }
         let relative =
             path.strip_prefix(&self.root)
                 .map_err(|_| WorkspaceError::OutsideWorkspace {
@@ -348,8 +355,53 @@ mod tests {
     use super::*;
     use crate::ObservedFiles;
     use rustix::fs::{CWD, Mode};
+    use std::os::unix::fs::symlink;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn in_workspace_symlinks_read_and_outside_symlink_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("documentation")).unwrap();
+        std::fs::write(directory.path().join("documentation/x.md"), b"inside\n").unwrap();
+        std::fs::write(outside.path().join("secret.md"), b"outside\n").unwrap();
+        symlink(
+            directory.path().join("documentation"),
+            directory.path().join("docs"),
+        )
+        .unwrap();
+        symlink(
+            directory.path().join("documentation/x.md"),
+            directory.path().join("shortcut.md"),
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("secret.md"),
+            directory.path().join("external.md"),
+        )
+        .unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+
+        assert_eq!(
+            workspace
+                .read("docs/x.md", &ObservedFiles::new())
+                .unwrap()
+                .read(0, 100),
+            b"inside\n"
+        );
+        assert_eq!(
+            workspace
+                .read("shortcut.md", &ObservedFiles::new())
+                .unwrap()
+                .read(0, 100),
+            b"inside\n"
+        );
+        assert!(matches!(
+            workspace.read("external.md", &ObservedFiles::new()),
+            Err(WorkspaceError::OutsideWorkspace { .. })
+        ));
+    }
 
     #[test]
     fn reading_fifo_returns_without_blocking() {
