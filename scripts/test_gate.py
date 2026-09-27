@@ -72,9 +72,20 @@ DU_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + 'printf \'1G\\t%s\\n\' "$2"\n
 DF_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + "printf 'Avail\\n 9G\\n'\nexit 0\n"
 
 # Like the real boundary check, a finding when a package imports an interface its manifest's
-# capability allocation does not name.
+# capability allocation does not name. Its `--shipping` mode prints the fallback crates
+# STUB_SHIPPING_CRATES names (none by default: the cutover allows no native fallback) and, on
+# request, a `native twin:` or `FINDING:` line, then exits STUB_SHIPPING_STATUS (0, as the real
+# audit does only for a graph without a fallback).
 BOUNDARY_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
     """\
+    if [ "${1:-}" = --shipping ]; then
+      for crate in ${STUB_SHIPPING_CRATES:-}; do
+        echo "check-module-boundaries: shipping: native fallback: $crate (extension) via p1-host > $crate; implements p1-module-demo (not built)"
+      done
+      [ -z "${STUB_SHIPPING_TWIN:-}" ] || echo "check-module-boundaries: shipping: native twin: p1-host (extension: a native implementation of a tool that becomes a module) via p1-host; implements p1-module-demo (not built)"
+      [ -z "${STUB_SHIPPING_FINDING:-}" ] || echo "check-module-boundaries: shipping: FINDING: p1-unknown (depth 1) is not in the frozen classification table"
+      exit "${STUB_SHIPPING_STATUS:-0}"
+    fi
     dir=modules/target/p1-modules
     [ "${1:-}" = --output-dir ] && dir="$2"
     status=0
@@ -320,6 +331,7 @@ ORDER = [
     ("tests", r"^cargo test --workspace --locked$"),
     ("core isolation", r"^check-core-isolation\.sh$"),
     ("module boundary", r"^check-module-boundaries\.sh$"),
+    ("shipping audit", r"^check-module-boundaries\.sh --shipping$"),
     ("secret scan", r"^secret-scan\.sh$"),
     ("adr", r"^adr\.py check$"),
 ] + [(name, "^" + re.escape(name) + " -q$") for name in PY_TESTS] + [
@@ -493,6 +505,7 @@ class GateTests(unittest.TestCase):
             "== gate: test",
             "== gate: core isolation",
             "== gate: module boundary",
+            "== gate: shipping audit",
             "== gate: secret scan",
             "== gate: adr",
             "== gate: installer and CI helpers",
@@ -714,6 +727,90 @@ class GateTests(unittest.TestCase):
         result = h.run(STUB_SMOKE_DAMAGE="version")
         self.assert_red(result)
         self.assert_tempdirs_removed(h)
+
+    # --- S7.10.1: the shipping audit step -----------------------------------------
+
+    # The one line a green step prints: the owner order of 2026-09-27 ("zero native fallbacks")
+    # ends D083's sealed A/B arm, so the allowed set is empty and the audit must be clean.
+    SHIPPING_GREEN = (
+        "shipping audit: clean: no native fallback, no native twin, no finding "
+        "(owner order 2026-09-27: zero native fallbacks)"
+    )
+
+    def shipping_red_line(self, result: subprocess.CompletedProcess[str], needle: str) -> str:
+        """The one red line of the shipping audit that carries `needle`."""
+        lines = [line for line in result.stderr.splitlines() if needle in line]
+        self.assertEqual(len(lines), 1, result.stderr)
+        return lines[0]
+
+    def test_the_shipping_audit_runs_right_after_the_module_boundary_check(self) -> None:
+        h = self.harness()
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        steps = h.steps()
+        self.assertEqual(steps[steps.index("module boundary") + 1], "shipping audit")
+
+    def test_a_clean_shipping_audit_is_green(self) -> None:
+        h = self.harness()
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(self.SHIPPING_GREEN, result.stdout.splitlines())
+
+    def test_any_single_native_fallback_is_red_and_named(self) -> None:
+        # The allowed set is empty: one fallback alone is red, whether D083's arm kept it
+        # (edit, write, grep, apply_patch) or its owning slice removes it (the rest).
+        for crate in (
+            "p1-tool-edit", "p1-tool-write", "p1-tool-search", "p1-tool-patch", "p1-tool-read",
+            "p1-tool-shell", "p1-tool-finish", "p1-tool-delegate", "p1-tool-workflow", "p1-context",
+            "p1-provider-openai",
+        ):
+            with self.subTest(crate=crate):
+                h = self.harness()
+                result = h.run(STUB_SHIPPING_CRATES=crate, STUB_SHIPPING_STATUS="1")
+                self.assert_red(result)
+                self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
+                self.assertEqual(h.steps()[-1], "shipping audit")
+                self.assertIn("native fallback:", self.shipping_red_line(result, crate))
+
+    def test_every_native_fallback_line_is_reported(self) -> None:
+        h = self.harness()
+        result = h.run(STUB_SHIPPING_CRATES="p1-tool-edit p1-tool-shell", STUB_SHIPPING_STATUS="1")
+        self.assert_red(result)
+        self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
+        self.assertIn("native fallback: p1-tool-edit", result.stderr)
+        self.assertIn("native fallback: p1-tool-shell", result.stderr)
+
+    def test_a_clean_audit_that_exits_one_is_red(self) -> None:
+        # Exit 0 is part of the rule: the audit's own status decides too, not only its lines.
+        h = self.harness()
+        result = h.run(STUB_SHIPPING_CRATES="", STUB_SHIPPING_STATUS="1")
+        self.assert_red(result)
+        self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
+        self.assertIn("exited 1", result.stderr)
+
+    def test_a_native_twin_line_is_red_even_when_the_audit_exits_0(self) -> None:
+        h = self.harness()
+        result = h.run(STUB_SHIPPING_TWIN="yes")
+        self.assert_red(result)
+        self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
+        self.assertEqual(h.steps()[-1], "shipping audit")
+        self.assertIn("native twin: p1-host", result.stderr)
+
+    def test_a_finding_line_is_red_even_when_the_audit_exits_0(self) -> None:
+        h = self.harness()
+        result = h.run(STUB_SHIPPING_FINDING="yes")
+        self.assert_red(result)
+        self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
+        self.assertIn("FINDING: p1-unknown", result.stderr)
+
+    def test_a_usage_or_tool_error_is_red(self) -> None:
+        for status in ("2", "3"):
+            with self.subTest(status=status):
+                h = self.harness()
+                result = h.run(STUB_SHIPPING_STATUS=status)
+                self.assert_red(result)
+                self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
+                self.assertIn(f"exited {status}", result.stderr)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,9 @@
 #   core isolation      scripts/check-core-isolation.sh
 #   module boundary     imports against the frozen capability allocation, and the unsafe policy
 #                       (scripts/check-module-boundaries.sh, freeze items 11 and 13)
+#   shipping audit      the shipping binary's production graph reaches no native fallback, no
+#                       native twin and no unclassified crate, and the audit exits 0
+#                       (scripts/check-module-boundaries.sh --shipping)
 #   secret scan, adr, installer and CI helpers
 #   release candidate   the p1 binary relinked and staged for exactly this commit
 #                       (scripts/stage-release.sh, no tag, a null manifest tag)
@@ -94,6 +97,46 @@ validate_modules() {
   echo "module validation: ${#expected[@]} package(s) valid"
 }
 
+# The shipping audit as a gate step (S7.10.1): scripts/check-module-boundaries.sh --shipping
+# prints the production graph of the shipping binary and every extension crate it still
+# reaches. The owner order of 2026-09-27 ("zero native fallbacks") ends D083's sealed A/B arm,
+# so the step allows no fallback at all: it is green only when the audit exits 0 and prints no
+# `native fallback:` line, no extension implementation hidden in a foundation crate (`native
+# twin:`) and no crate outside the frozen classification table (`FINDING:`). A status but 0 or 1
+# is a usage or tool error, never a pass, and the step is red by design until #395 (delegate,
+# workflow) and #390 (the five file tools) land: the red lines name the crates still in the
+# graph.
+shipping_audit() {
+  local status=0 output="" line=""
+  local -a red=() problems=()
+
+  output="$(scripts/check-module-boundaries.sh --shipping)" || status=$?
+  case "$status" in
+    0 | 1) ;;
+    *)
+      echo "shipping audit: scripts/check-module-boundaries.sh --shipping exited $status; a usage or tool error is red" >&2
+      return 1
+      ;;
+  esac
+
+  while IFS= read -r line; do
+    case "$line" in
+      *"native fallback:"* | *"native twin:"* | *"FINDING:"*) red+=("$line") ;;
+    esac
+  done <<<"$output"
+
+  problems=("${red[@]}")
+  if [ "$status" != 0 ]; then
+    problems+=("shipping audit: scripts/check-module-boundaries.sh --shipping exited $status; the cutover allows no native fallback")
+  fi
+  if [ "${#problems[@]}" -gt 0 ]; then
+    printf '%s\n' "${problems[@]}" >&2
+    return 1
+  fi
+
+  echo "shipping audit: clean: no native fallback, no native twin, no finding (owner order 2026-09-27: zero native fallbacks)"
+}
+
 echo "== gate: fmt"
 cargo fmt --all -- --check
 cargo fmt --manifest-path modules/Cargo.toml --all -- --check
@@ -133,6 +176,10 @@ echo "== gate: module boundary"
 # The tag's standing boundary check, next to core isolation: imports and the unsafe policy of
 # every package and crate, over the outputs the tests ran against.
 scripts/check-module-boundaries.sh
+echo "== gate: shipping audit"
+# The shipping graph's own inventory of native fallbacks, run right after the boundary check it
+# shares its script with: S7.10.1.
+shipping_audit
 echo "== gate: secret scan"
 scripts/secret-scan.sh
 echo "== gate: adr"
