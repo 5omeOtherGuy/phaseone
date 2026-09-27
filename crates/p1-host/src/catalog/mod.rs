@@ -145,11 +145,12 @@ pub fn build_catalog_with_workers(
         sandbox_read,
         env_pass,
         completion,
-    );
+    )?;
     // The official-release host entries (S1.8.1, D083b 2) stand where the compiled-in
     // registrations they replace stood: before the delegation family, whose grantable list is
     // the catalog's own tool keys, so `read` is grantable to a worker exactly as the native
-    // registration made it.
+    // registration made it. `shell` and `finish` registered with the standard tools (S3.8),
+    // through the same host-entry step.
     modules::register_host_entries(&mut catalog, deps)?;
     register_delegation_tools(&mut catalog, deps, service)?;
     #[cfg(feature = "workflows")]
@@ -184,9 +185,10 @@ fn build_catalog_inner(
         sandbox_read,
         env_pass,
         completion,
-    );
+    )?;
     // The official-release host entries and then the locked modules (S1.8.1, D083b 2): a
-    // lock that selects a host entry's key already kept the host entry out.
+    // lock that selects a host entry's key already kept the host entry out. `shell` and
+    // `finish` registered with the standard tools (S3.8), through the same host-entry step.
     modules::register_host_entries(&mut catalog, deps)?;
     modules::register_locked_modules(&mut catalog, deps)?;
 

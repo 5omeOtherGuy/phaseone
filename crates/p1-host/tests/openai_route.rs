@@ -3,6 +3,12 @@
 //! `profiles/gpt-*.toml`, through the host's own loading path. Nothing here is
 //! hand-made except the scripted transport and the fake credential source, and no
 //! test touches a credential file or the network.
+//!
+//! notice: crates/p1-host/tests/openai_route.rs (S1): S3.8 makes `shell` and `finish` the
+//! components `p1/shell` and `p1/finish`, and `environments/gpt` names both, so assembling
+//! it now happens inside a Tokio runtime (a component executor runs there — the whole host
+//! always is). The case that assembled it in a plain `#[test]` runs inside one now; every
+//! assertion is unchanged.
 
 mod common;
 
@@ -304,19 +310,16 @@ fn the_shipped_responses_route_passes_the_conformance_suite() {
 // ------------------------------------------------------------- the shipped environment
 
 /// `p1 env show NAME` through the real CLI and catalog.
-fn show_env(name: &str) -> (i32, String, String) {
+async fn show_env(name: &str) -> (i32, String, String) {
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
     common::isolated_environment(&mut harness);
-    let code = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(common::run_args(&mut harness, &["env", "show", name]));
+    let code = common::run_args(&mut harness, &["env", "show", name]).await;
     (code, harness.stdout.text(), harness.stderr.text())
 }
 
-#[test]
-fn the_shipped_gpt_environment_assembles_through_the_catalog_unchanged() {
-    let (code, stdout, stderr) = show_env("gpt");
+#[tokio::test]
+async fn the_shipped_gpt_environment_assembles_through_the_catalog_unchanged() {
+    let (code, stdout, stderr) = show_env("gpt").await;
     assert_eq!(code, 0, "{stderr}");
     let resolved: serde_json::Value = common::env_show_json(&stdout);
     assert_eq!(resolved["environment"], "gpt");
