@@ -24,8 +24,10 @@ p1-core = { path = "../p1-core" }
 # transport and the one real transport's redirect policy over a loopback socket.
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 # The WebSocket boundary suite (tests/websocket_boundary.rs, S5): the host session with
-# its scripted connector, the provider's portable decisions, and the paused clock.
-p1-provider-openai = { path = "../p1-provider-openai", default-features = false }
+# its scripted connector, the provider's portable decisions, and the paused clock. The
+# component WebSocket suite (tests/provider_websocket.rs, S7.10-R5) holds the component
+# against the native adapter it replaced, so it needs the `native` half too.
+p1-provider-openai = { path = "../p1-provider-openai", default-features = false, features = ["native"] }
 futures-util = "0.3"
 tokio = { version = "1", default-features = false, features = [
     "macros",

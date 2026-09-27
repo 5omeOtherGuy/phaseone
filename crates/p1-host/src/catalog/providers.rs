@@ -4,15 +4,16 @@
 //! Since S4.9 a route's `adapter` key names a provider COMPONENT (ADR-0086): the factory
 //! activates the component the installed release ships — or the one a user's lock selects for
 //! that adapter's module (ANSWERS D083b) — configured from the route's own data
-//! and the selected profile's text, and the native transport broker sends every request. The
-//! native adapter a route used to build stays reachable in exactly one case, stated in
-//! [`route_provider`]: the Responses route's WebSocket transport (S5.5). A host with no release
-//! module set installed has no component to activate, so activation REFUSES — naming the route
-//! and the module — instead of falling back to a native adapter.
+//! and the selected profile's text, and the native transport broker sends every request, over
+//! HTTP or, when the component lowers one to WebSocket, over the provider's one route-bound
+//! connection (ADR-0078). A host with no release module set installed has no component to
+//! activate, so activation REFUSES — naming the route and the module — instead of falling back
+//! to a native adapter.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use p1_assembly::{Catalog, ProviderSpec, load_modules_lock};
 use p1_contracts::Provider;
@@ -148,55 +149,30 @@ pub fn reject_profile(spec: &ProviderSpec) -> Result<(), String> {
 /// The composition of one route file with one profile binding: the one construction path
 /// (spec §2 step 4). The adapter key the file names selects a provider COMPONENT (ADR-0086),
 /// which [`ProviderComponents::activate`] configures from the route's own data and the selected
-/// profile's text; the native transport broker then sends every request.
-///
-/// The ONE route that still builds a native adapter is the Responses route's WebSocket
-/// transport (`environments/gpt` → `routes/openai-codex-subscription.toml`): this broker sends
-/// the HTTP lowering only, and the WebSocket branch is S5.5's. `components` and
-/// `environment_dirs` are unused for it, because a WebSocket route reaches no component.
+/// profile's text; the native transport broker then sends every request. Activation resolves
+/// the same binding from the route and the profile, so `_binding` only names what the caller
+/// already resolved.
 ///
 /// `environment_dirs` are the directories the host resolves an environment from: activation
 /// reads the effective lock (`modules.lock`) and the selected profile's text from beside them.
 /// `ws` is the WebSocket connector, next to the HTTP transport (ADR-0047 §1): the production
 /// factory passes the real one and a test or live check injects its own, so a test that
-/// composes a shipped WebSocket route never opens a socket. A route that does not ask for
-/// WebSocket ignores it.
+/// composes a shipped WebSocket route never opens a socket. Only a request the component lowers
+/// to WebSocket — on a route that asks for `transport = "websocket"` — connects through it.
 #[allow(clippy::too_many_arguments)]
 pub fn route_provider(
     components: &ProviderComponents,
     environment_dirs: &[PathBuf],
     route: &crate::routes::RouteFile,
-    binding: &crate::routes::ModelBinding,
+    _binding: &crate::routes::ModelBinding,
     profile: Arc<p1_model_profile::ModelProfile>,
     transport: Arc<dyn p1_provider_http::Transport>,
     ws: Arc<dyn WsConnector>,
     credentials: Arc<dyn p1_provider_http::CredentialSource>,
 ) -> Result<Arc<dyn Provider>, String> {
-    use crate::routes::AdapterSettings;
-    match route.settings()? {
-        // ADR-0047 §1: a route that asks for `transport = "websocket"` gets the injected
-        // connector here, at composition. The provider refuses a WebSocket route without one,
-        // so the two cannot drift apart. This is the native adapter's one remaining caller.
-        AdapterSettings::OpenAiResponses(settings)
-            if settings.transport == crate::routes::ResponsesTransport::Websocket =>
-        {
-            let composition = p1_provider_openai::OpenAiCodexProvider::builder(
-                responses_route_from(route, settings),
-                &binding.wire_model,
-                profile,
-                transport,
-                credentials,
-            )
-            .with_ws_connector(ws);
-            composition
-                .build()
-                .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
-                .map_err(|error| error.to_string())
-        }
-        // Every other route activates the provider COMPONENT its adapter names: the release's
-        // host entry of that component, or the package a user's lock selects for it (D083b).
-        _ => components.activate(environment_dirs, route, profile, transport, credentials),
-    }
+    // A route whose own `[adapter_settings]` do not parse never activates.
+    route.settings()?;
+    components.activate(environment_dirs, route, profile, transport, ws, credentials)
 }
 
 /// The provider component each adapter key names (ADR-0086). One `match` at the root: a route
@@ -288,8 +264,8 @@ impl ProviderComponents {
     /// reported like a route-file load error; nothing is sent.
     ///
     /// There is NO native fallback: a host with no release module set installed, or a release
-    /// that does not ship the component, refuses here. The one route the native adapter still
-    /// serves is [`route_provider`]'s: the Responses route's WebSocket transport (S5.5).
+    /// that does not ship the component, refuses here. `ws` is the connector of the provider's
+    /// one WebSocket connection, which only a request the component lowers to WebSocket opens.
     ///
     /// A USER's lock may select another package for the route's adapter module; the module the
     /// lock names is then what activation uses ([`locked_package`], ANSWERS D083b).
@@ -299,6 +275,7 @@ impl ProviderComponents {
         route: &RouteFile,
         profile: Arc<p1_model_profile::ModelProfile>,
         transport: Arc<dyn Transport>,
+        ws: Arc<dyn WsConnector>,
         credentials: Arc<dyn CredentialSource>,
     ) -> Result<Arc<dyn Provider>, String> {
         let binding = route.binding(&profile.id)?;
@@ -328,7 +305,9 @@ impl ProviderComponents {
             transport,
             ExecutionLimits::default(),
         )
-        .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
+        .map(|provider| {
+            Arc::new(provider.with_websocket(ws, Arc::new(Instant::now))) as Arc<dyn Provider>
+        })
         .map_err(|error| activation_refusal(route, module.name(), error.to_string()))
     }
 }
@@ -404,27 +383,4 @@ fn profile_text(environment_dirs: &[PathBuf], id: &str) -> Result<String, String
         "profile `{id}` was not found in {}",
         searched.join(", ")
     ))
-}
-
-/// The native Responses adapter's view of one route file, for the WebSocket arm of
-/// [`route_provider`] only: the recorded origin route, the endpoint and the settings the route
-/// file names (spec §7.2), in the adapter's own types.
-fn responses_route_from(
-    route: &crate::routes::RouteFile,
-    settings: crate::routes::ResponsesAdapterSettings,
-) -> p1_provider_openai::ResponsesRoute {
-    use crate::routes::{ResponsesAccount, ResponsesTransport};
-    p1_provider_openai::ResponsesRoute {
-        origin_route: route.origin_route.clone(),
-        endpoint: route.endpoint.clone(),
-        account: match settings.account {
-            ResponsesAccount::CodexSubscription => {
-                p1_provider_openai::ResponsesAccount::CodexSubscription
-            }
-        },
-        transport: match settings.transport {
-            ResponsesTransport::Sse => p1_provider_openai::ResponsesTransport::Sse,
-            ResponsesTransport::Websocket => p1_provider_openai::ResponsesTransport::Websocket,
-        },
-    }
 }

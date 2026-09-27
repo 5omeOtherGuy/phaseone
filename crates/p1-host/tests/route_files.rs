@@ -123,9 +123,9 @@ fn shipped(environment: &str) -> Resolved {
 ///
 /// The provider components are the ones `scripts/build-modules.sh --all` published, read once
 /// per test binary through a release manifest in a temp directory (`common::provider_components`):
-/// a route whose adapter names one activates that component (D083b), and only the shipped
-/// Codex route's WebSocket transport still builds a native adapter — S5.5's branch, which this
-/// suite's SSE tests reach by making the injected connector refuse every upgrade.
+/// a route whose adapter names one activates that component (D083b). The shipped Codex route
+/// asks for WebSocket, which this suite's SSE tests turn into the HTTP fallback by making the
+/// injected connector refuse every upgrade.
 ///
 /// The connector is injected next to the transport (ADR-0047 §1); an SSE route ignores it, and
 /// no test opens a socket.

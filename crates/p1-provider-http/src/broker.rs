@@ -158,7 +158,7 @@ pub struct RouteAuthority {
     endpoint: Url,
     /// The endpoint's path without a trailing `/`; every request path extends it.
     prefix: String,
-    credentials: Arc<dyn CredentialSource>,
+    pub(crate) credentials: Arc<dyn CredentialSource>,
 }
 
 impl std::fmt::Debug for RouteAuthority {
@@ -194,6 +194,11 @@ impl RouteAuthority {
             prefix,
             credentials,
         })
+    }
+
+    /// The endpoint without a trailing `/`: the base a WebSocket head's path extends.
+    pub(crate) fn endpoint_base(&self) -> &str {
+        self.endpoint.as_str().trim_end_matches('/')
     }
 
     /// Check a lowered request against the route before anything is read or sent.

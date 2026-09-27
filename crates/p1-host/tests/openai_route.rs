@@ -129,9 +129,8 @@ fn composed(environment: &str) -> Composed {
 
 /// The provider the catalog factory would build for this composition. The connector
 /// is injected next to the transport (ADR-0047 §1): it REFUSES every upgrade, so the
-/// shipped route — which asks for WebSocket — takes S5.5's one remaining native branch and
-/// falls back to SSE at once, and this scripted transport serves every request. No test opens a
-/// socket.
+/// shipped route — which asks for WebSocket — has its component fall back to HTTP (SSE) at
+/// once, and this scripted transport serves every request. No test opens a socket.
 fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
     let binding = composed
         .route
