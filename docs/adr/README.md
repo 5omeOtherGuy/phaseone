@@ -104,7 +104,8 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0088 | [Workspace capabilities across components](0088-workspace-capabilities-across-components.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0089 | [Cleartext chat endpoints on loopback hosts only](0089-cleartext-chat-endpoints-on-loopback-hosts-only.md) | proposed | 2026-09-26 | owner+lead |
 | ADR-0090 | [A busy WebSocket session is waited for through the provider component](0090-a-busy-websocket-session-is-waited-for-through-the-provider-component.md) | proposed | 2026-09-27 | lead |
-| ADR-0091 | [Call-scoped capability services and a hostcall budget sized for whole files](0091-call-scoped-capability-services-and-a-hostcall-budget-sized-for-whole-files.md) | proposed | 2026-09-27 | lead |
+| ADR-0091 | [Process service and finish outcome rehome to the host runtime](0091-process-service-and-finish-outcome-rehome-to-the-host-runtime.md) | proposed | 2026-09-27 | lead |
+| ADR-0092 | [Call-scoped capability services and a hostcall budget sized for whole files](0092-call-scoped-capability-services-and-a-hostcall-budget-sized-for-whole-files.md) | proposed | 2026-09-27 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

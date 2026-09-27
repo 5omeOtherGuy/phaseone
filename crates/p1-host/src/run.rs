@@ -47,7 +47,7 @@ use crate::render::Renderer;
 use crate::session;
 use crate::summary::ContextTable;
 use crate::{HostDeps, InterruptSource};
-use p1_tool_finish::Accepted;
+use p1_finish_guest::Accepted;
 
 /// Observe the record only after the underlying journal has accepted it. The
 /// wrapper also covers TUI prompts, which bypass the line-mode turn driver.

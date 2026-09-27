@@ -7,6 +7,7 @@
 //! - [`capabilities`]: the host imports linked per the manifest's grants;
 //! - [`completion`]: the `completion` import, linked to the host's completion hub;
 //! - [`executor`]: the one owner of a module's async Stores (ADR-0015);
+//! - [`process`]: the native process service and sandbox behind the `process` capability;
 //! - [`restricted`]: the synchronous inspection path (freeze item 4);
 //! - [`tool`]: `WasmTool`, the generic tool adapter (freeze item 12);
 //! - [`workflow_decision`]: `WasmWorkflowDecisions`, a workflow's decisions as a component.
@@ -19,6 +20,7 @@ pub mod delegation;
 pub mod executor;
 pub mod loader;
 pub mod manifest;
+pub mod process;
 pub mod provider;
 pub mod restricted;
 mod sha256;

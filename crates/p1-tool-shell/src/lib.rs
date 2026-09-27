@@ -12,7 +12,8 @@
 //! with [`ShellTool::with_env_pass`], sandboxed or not.
 //!
 //! The tool is split along the WebAssembly boundary (ADR-0071). [`ProcessService`]
-//! (`process`) is the native part and stays native: sandbox, spawn, environment
+//! (`p1_module_runtime::process`, re-exported here) is the native part and stays native,
+//! with the host runtime that serves it to the component: sandbox, spawn, environment
 //! policy, bounded capture, timeout and group kill, all fixed at assembly so a
 //! request carries only a command and a timeout. The guest behaviour — input
 //! parsing, declaration, destructiveness, output filters and result formatting —
@@ -21,8 +22,6 @@
 //! the native `Tool` contract, so the frozen tests of this crate prove it.
 //! [`ProcessCapability`] links the same service to the component's `process`
 //! import (the runtime's `ProcessService` and `RunningProcess` traits).
-
-mod process;
 
 use std::ffi::OsString;
 use std::time::Duration;
@@ -35,11 +34,12 @@ use p1_contracts::{
 use p1_shell_guest::{End, Outcome, RawInput, ShellInput, Status};
 use p1_workspace::{ToolFace, Workspace};
 
-pub use process::{
+pub use p1_module_runtime::process::{
     CREDENTIAL_DIRECTORIES, DEFAULT_HOME_VISIBLE, ENV_ALLOW, ENV_ALLOW_PREFIXES, ProcessCapability,
     ProcessEnd, ProcessFailure, ProcessOutcome, ProcessRequest, ProcessService, ProcessStream,
-    SANDBOX_PARAGRAPH, SANDBOX_VARIANT_SUFFIX, Sandbox, SandboxError, StreamEvent, bwrap_args,
+    Sandbox, SandboxError, StreamEvent, bwrap_args,
 };
+pub use p1_shell_guest::{SANDBOX_PARAGRAPH, SANDBOX_VARIANT_SUFFIX};
 
 /// The `shell` tool. Holds one agent's workspace and the process service that
 /// runs its commands, sandboxed when the host chose it.
