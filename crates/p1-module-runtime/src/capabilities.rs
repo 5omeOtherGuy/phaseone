@@ -296,6 +296,50 @@ pub struct Services {
     pub workers: Option<WorkerServices>,
     /// The `workflows` capability ([`crate::delegation`], S6).
     pub workflows: Option<WorkflowServices>,
+    /// The services whose state belongs to ONE export call (the read record a mutation
+    /// rechecks against, ADR-0090): called once at the start of every call, before its
+    /// Store, and each service it returns serves that call in place of the field above.
+    /// The fields above are what the linker checks against the manifest, so a scope
+    /// returns a service only where the field above holds one.
+    pub call_scope: Option<CallScope>,
+}
+
+/// Builds the call-scoped services of one export call ([`Services::call_scope`]).
+pub type CallScope = Arc<dyn Fn() -> Services + Send + Sync>;
+
+impl Services {
+    /// Services whose state is fresh for every call: `build` is called once here, for the
+    /// capabilities an assembly links, and again at the start of every call, whose services
+    /// they then are. What one call records is never seen by another, and two concurrent
+    /// calls never share it.
+    pub fn call_scoped(build: impl Fn() -> Services + Send + Sync + 'static) -> Self {
+        let build: CallScope = Arc::new(build);
+        Self {
+            call_scope: Some(build.clone()),
+            ..build()
+        }
+    }
+
+    /// The services one call is served with: the scope's, where it returns one, else these.
+    fn for_call(&self) -> Services {
+        let Some(scope) = &self.call_scope else {
+            return self.clone();
+        };
+        let call = scope();
+        Services {
+            process: call.process.or_else(|| self.process.clone()),
+            summary: call.summary.or_else(|| self.summary.clone()),
+            completion: call.completion.or_else(|| self.completion.clone()),
+            workspace: call.workspace.or_else(|| self.workspace.clone()),
+            snapshot: call.snapshot.or_else(|| self.snapshot.clone()),
+            workspace_mutation: call
+                .workspace_mutation
+                .or_else(|| self.workspace_mutation.clone()),
+            workers: call.workers.or_else(|| self.workers.clone()),
+            workflows: call.workflows.or_else(|| self.workflows.clone()),
+            call_scope: None,
+        }
+    }
 }
 
 /// A `process.running` as the host holds it, and where it is in the stream `process.wit`
@@ -400,7 +444,10 @@ pub(crate) struct CallState {
 }
 
 impl CallState {
+    /// The state of one call over `services`: a call-scoped part is built here, once per
+    /// call, so it never outlives the call or reaches another.
     pub(crate) fn new(cancel: CancellationToken, services: &Services) -> Self {
+        let services = &services.for_call();
         Self {
             cancel,
             table: ResourceTable::new(),
@@ -1267,6 +1314,52 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A call-scoped part is built at the start of every call and serves that call alone
+    /// (ADR-0090); what the scope does not return is the assembly's, shared as before.
+    #[test]
+    fn every_call_gets_its_own_call_scoped_services() {
+        struct NoGate;
+
+        impl MutationService for NoGate {
+            fn begin(&self) -> BoxFuture<'_, Box<dyn HeldMutation>> {
+                Box::pin(async { cancelled_begin() })
+            }
+        }
+
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = built.clone();
+        let mut services = Services::call_scoped(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Services {
+                workspace_mutation: Some(Arc::new(NoGate)),
+                ..Services::default()
+            }
+        });
+        let shared: Arc<dyn WorkspaceService> = Arc::new(NoFiles);
+        services.workspace = Some(shared.clone());
+        assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let one = CallState::new(CancellationToken::new(), &services);
+        let two = CallState::new(CancellationToken::new(), &services);
+        assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let (Some(one_gate), Some(two_gate), Some(assembly_gate)) = (
+            &one.workspace_mutation,
+            &two.workspace_mutation,
+            &services.workspace_mutation,
+        ) else {
+            panic!("every call is served a mutation");
+        };
+        assert!(!Arc::ptr_eq(one_gate, two_gate), "one per call");
+        assert!(
+            !Arc::ptr_eq(one_gate, assembly_gate),
+            "never the assembly's"
+        );
+        let (Some(one_files), Some(two_files)) = (&one.workspace, &two.workspace) else {
+            panic!("the assembly's workspace serves every call");
+        };
+        assert!(Arc::ptr_eq(one_files, &shared) && Arc::ptr_eq(two_files, &shared));
     }
 
     #[test]

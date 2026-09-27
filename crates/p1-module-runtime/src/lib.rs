@@ -27,8 +27,8 @@ pub mod workflow_decision;
 
 pub use authorization_policy::{AuthorizationPolicyError, Verdict, WasmAuthorizationPolicy};
 pub use capabilities::{
-    EntryKind, ExitStatus, FsError, LinkError, ProcessCommand, ProcessEvent, ProcessService,
-    RunningProcess, Services, SnapshotObservation, SnapshotService, WorkspaceEntry,
+    CallScope, EntryKind, ExitStatus, FsError, LinkError, ProcessCommand, ProcessEvent,
+    ProcessService, RunningProcess, Services, SnapshotObservation, SnapshotService, WorkspaceEntry,
     WorkspaceService,
 };
 pub use completion::CompletionService;
