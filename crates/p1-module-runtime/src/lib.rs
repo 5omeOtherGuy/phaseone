@@ -8,7 +8,7 @@
 //! - [`file_services`]: the capability services of the file tools — the read side
 //!   (`workspace`, `snapshot`), the walk (`list-files`, `search`) and the owned mutation
 //!   (`workspace-mutation`) — a component is linked with, and [`file_walk`]: the walk itself,
-//!   over the ripgrep crates (S7.10-R1, ADR-0093);
+//!   over the ripgrep crates (S7.10-R1, ADR-0094);
 //! - [`completion`]: the `completion` import, linked to the host's completion hub;
 //! - [`executor`]: the one owner of a module's async Stores (ADR-0015);
 //! - [`process`]: the native process service and sandbox behind the `process` capability;

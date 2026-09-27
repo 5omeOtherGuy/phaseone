@@ -14,7 +14,7 @@
 //! the host and not on the component — the sandbox paragraph and variant, the face, and
 //! `finish`'s policy/contract declaration — the host presents here (ADR-0083 §1 and §2).
 //!
-//! Since S7.10-R1 (ADR-0093) the five file tools are release host entries as well — `read`
+//! Since S7.10-R1 (ADR-0094) the five file tools are release host entries as well — `read`
 //! since S1.8.1, and `edit`, `write`, `apply_patch` and `grep` since their crates left the
 //! host's normal graph — so this file registers NO native file tool: those keys are served by
 //! the release's `p1/read`, `p1/edit`, `p1/write`, `p1/patch` and `p1/search` components,
@@ -454,7 +454,7 @@ mod tests {
         )
     }
 
-    /// S7.10-R1 (ADR-0093): the five file-tool keys are the release's host entries, and this
+    /// S7.10-R1 (ADR-0094): the five file-tool keys are the release's host entries, and this
     /// file registers NO native tool for any of them. Building the standard entries over a
     /// catalog with no lock leaves exactly the two entries the HOST composes its own tool around
     /// (`shell`, `finish`): `read`, `edit`, `write`, `apply_patch` and `grep` come from the

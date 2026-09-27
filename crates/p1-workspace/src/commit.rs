@@ -44,7 +44,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
@@ -228,9 +228,40 @@ impl OwnedMutation {
     }
 
     fn single(&self, change: Change) -> Result<(), MutationError> {
-        let change = self.read_identity(change)?;
+        let (change, read) = self.read_identity(change)?;
         let plan = self.workspace.plan(std::slice::from_ref(&change))?;
+        self.plans_the_file_read(&plan, read.as_deref(), &change)?;
         self.workspace.apply(&plan, &self.observed, self.policy)
+    }
+
+    /// Refuse a plan whose source resolved to another file than the one the read
+    /// identity was checked against: `plan` resolves the path again, and a symlink
+    /// retargeted in between would otherwise carry the read file's digest to a file
+    /// with the same bytes that this tool never read.
+    fn plans_the_file_read(
+        &self,
+        plan: &[Planned<'_>],
+        read: Option<&Path>,
+        change: &Change,
+    ) -> Result<(), MutationError> {
+        let (Some(read), Some(planned)) = (read, plan.first()) else {
+            return Ok(());
+        };
+        let source = match planned {
+            Planned::Write { target, .. } | Planned::Remove { target, .. } => target,
+            Planned::Rename { from, .. } => from,
+        };
+        if source.path == read {
+            return Ok(());
+        }
+        Err(self.changed_since_read(change.source_path()))
+    }
+
+    fn changed_since_read(&self, requested: &str) -> MutationError {
+        MutationError::Io(format!(
+            "{} changed on disk since you last read it; read it again.",
+            self.workspace.display(&self.workspace.spelling(requested))
+        ))
     }
 
     /// The change with the read identity of what this tool read of its target, if
@@ -242,26 +273,25 @@ impl OwnedMutation {
     /// A path this tool read that now resolves to another file (a symlink retargeted
     /// since the read) is refused as stale: the change was computed from a file that is
     /// not the one it would replace, and treating the new target as unread would skip
-    /// the recheck entirely.
-    fn read_identity(&self, change: Change) -> Result<Change, MutationError> {
+    /// the recheck entirely. With the identity comes the file it was checked against,
+    /// which the plan must resolve to as well ([`Self::plans_the_file_read`]).
+    fn read_identity(&self, change: Change) -> Result<(Change, Option<PathBuf>), MutationError> {
         let requested = change.source_path();
         let Ok(path) = self.workspace.resolve(requested) else {
-            return Ok(change);
+            return Ok((change, None));
         };
         let spelling = self.workspace.spelling(requested);
-        if self
-            .reads
-            .read_as(&spelling)
-            .is_some_and(|read| read != crate::observe::key(&path))
+        let read_as = self.reads.read_as(&spelling);
+        if read_as
+            .as_ref()
+            .is_some_and(|read| *read != crate::observe::key(&path))
         {
-            return Err(MutationError::Io(format!(
-                "{} changed on disk since you last read it; read it again.",
-                self.workspace.display(&spelling)
-            )));
+            return Err(self.changed_since_read(requested));
         }
         Ok(match self.reads.recorded(&path) {
-            Some(hash) => change.computed_from_hash(hash),
-            None => change,
+            Some(hash) => (change.computed_from_hash(hash), Some(path)),
+            None if read_as.is_some() => (change, Some(path)),
+            None => (change, None),
         })
     }
 }
@@ -1814,6 +1844,42 @@ mod tests {
         );
         assert!(!dir.path().join("gone.txt").exists());
         drop(owned);
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn a_symlink_retargeted_between_the_identity_check_and_the_plan_is_refused() {
+        // Both targets hold the same bytes, so the read digest alone would accept either.
+        let (dir, workspace) = workspace(&[("a.txt", "same\n"), ("b.txt", "same\n")]);
+        std::os::unix::fs::symlink("a.txt", dir.path().join("link.txt")).unwrap();
+        let observed = ObservedFiles::new();
+        let reads = ReadRecord::new();
+        let snapshot = workspace.read("link.txt", &ObservedFiles::new()).unwrap();
+        reads.record_read(
+            &workspace.spelling("link.txt"),
+            &workspace.resolve("link.txt").unwrap(),
+            snapshot.metadata().content_hash,
+        );
+        let owned = ready(workspace.begin_owned(&observed, &reads, PATCH));
+
+        // `single`'s steps, with another writer retargeting the link between the
+        // identity check and the plan's own resolution.
+        let (change, read) = owned
+            .read_identity(Change::write("link.txt", "pwned\n"))
+            .unwrap();
+        fs::remove_file(dir.path().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("b.txt", dir.path().join("link.txt")).unwrap();
+        let plan = workspace.plan(std::slice::from_ref(&change)).unwrap();
+        assert_eq!(
+            owned.plans_the_file_read(&plan, read.as_deref(), &change),
+            Err(io(
+                "link.txt changed on disk since you last read it; read it again."
+            ))
+        );
+        drop(plan);
+        drop(owned);
+        assert_eq!(text(&workspace, "a.txt"), "same\n");
+        assert_eq!(text(&workspace, "b.txt"), "same\n");
         no_temporaries(dir.path());
     }
 

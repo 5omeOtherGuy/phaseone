@@ -11,7 +11,7 @@
 //!
 //! The walk and the `workspace` capability service that links it into the component
 //! are the HOST's (`p1_module_runtime::file_walk`, `p1_module_runtime::file_services`,
-//! S7.10-R1, ADR-0093): the native tool calls the same walk through the runtime's
+//! S7.10-R1, ADR-0094): the native tool calls the same walk through the runtime's
 //! types, and re-exports the service for its own tests.
 
 pub use p1_module_runtime::file_services::{SearchCapability, search_services};

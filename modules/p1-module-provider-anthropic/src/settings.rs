@@ -110,7 +110,7 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
     #[test]
     fn the_shipped_route_composes_as_the_native_host_builds_it() {
         let composition = shipped().expect("the shipped route composes");
-        // `messages_route_from` in p1-host's catalog, over the same route file.
+        // `messages_route` in p1-host's tests/native_routes, over the same route file.
         assert_eq!(
             composition.route,
             MessagesRoute {

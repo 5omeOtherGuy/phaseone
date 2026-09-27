@@ -5,7 +5,7 @@
 //!
 //! They lived in the tool crates (`p1-tool-read`, `p1-tool-search`, `p1-tool-write`) while
 //! those crates were the host's file tools; since read, edit, write, apply_patch and grep are
-//! served by their components alone (S7.10-R1, ADR-0093), the host cannot depend on them any
+//! served by their components alone (S7.10-R1, ADR-0094), the host cannot depend on them any
 //! more: a service that links a component is the host's, so it lives where the capability
 //! traits do, and the tool crates re-use it for their own native tools and tests.
 //!
