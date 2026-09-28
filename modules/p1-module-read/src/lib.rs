@@ -103,7 +103,11 @@ fn run(call: &str) -> Result<String, Failure> {
     // Until the observation capability supports streaming, refuse oversized files before
     // allocating a guest copy. The host snapshot may also hold a copy of this file.
     if exceeds_guest_read_budget(entry.size) {
-        return Err(p1_read_guest::could_not_be_read(&entry.path, "file exceeds the component read budget").into());
+        return Err(p1_read_guest::could_not_be_read(
+            &entry.path,
+            "file exceeds the component read budget",
+        )
+        .into());
     }
     read_whole(&entry.path, entry.size, &input)
 }
@@ -113,8 +117,12 @@ fn run(call: &str) -> Result<String, Failure> {
 /// invalid byte stops the read at the window that shows it.
 fn read_whole(display: &str, size: u64, input: &ReadInput) -> Result<String, Failure> {
     read_whole_with(
-        display, size, input,
-        |offset, length| workspace::read(display, offset, length).map_err(|error| fs_failure(display, error)),
+        display,
+        size,
+        input,
+        |offset, length| {
+            workspace::read(display, offset, length).map_err(|error| fs_failure(display, error))
+        },
         |bytes| snapshot::observe(display, bytes).map_err(|error| fs_failure(display, error)),
         control::cancelled,
     )
@@ -141,7 +149,11 @@ fn read_whole_with(
             break;
         }
         if exceeds_guest_read_budget(contents.len().saturating_add(chunk.len()) as u64) {
-            return Err(p1_read_guest::could_not_be_read(display, "file exceeds the component read budget").into());
+            return Err(p1_read_guest::could_not_be_read(
+                display,
+                "file exceeds the component read budget",
+            )
+            .into());
         }
         contents.extend_from_slice(&chunk);
         match &mut render {
@@ -155,7 +167,9 @@ fn read_whole_with(
         }
     }
     if contents.is_empty() {
-        if cancelled() { return Err(Failure::Cancelled); }
+        if cancelled() {
+            return Err(Failure::Cancelled);
+        }
         observe(&[])?;
         return Ok(p1_read_guest::empty(display));
     }
@@ -169,7 +183,9 @@ fn read_whole_with(
     let output = render.finish()?;
     // A read always observes the FULL file, even when offset/limit windows the returned
     // lines: a later edit compares against the whole file.
-    if cancelled() { return Err(Failure::Cancelled); }
+    if cancelled() {
+        return Err(Failure::Cancelled);
+    }
     observe(&contents)?;
     Ok(output)
 }
@@ -180,18 +196,32 @@ fn exceeds_guest_read_budget(size: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use super::{Failure, ReadInput, read_whole_with};
+    use std::cell::Cell;
 
     #[test]
     fn cancellation_after_first_guest_chunk_stops_without_observation() {
         let cancelled = Cell::new(false);
         let reads = Cell::new(0);
         let observed = Cell::new(false);
-        let input = ReadInput { file_path: "a".into(), offset: None, limit: None };
-        let result = read_whole_with("a", 4, &input,
-            |_, _| { reads.set(reads.get() + 1); cancelled.set(true); Ok(b"abc\n".to_vec()) },
-            |_| { observed.set(true); Ok(()) },
+        let input = ReadInput {
+            file_path: "a".into(),
+            offset: None,
+            limit: None,
+        };
+        let result = read_whole_with(
+            "a",
+            4,
+            &input,
+            |_, _| {
+                reads.set(reads.get() + 1);
+                cancelled.set(true);
+                Ok(b"abc\n".to_vec())
+            },
+            |_| {
+                observed.set(true);
+                Ok(())
+            },
             || cancelled.get(),
         );
         assert!(matches!(result, Err(Failure::Cancelled)));
@@ -201,11 +231,27 @@ mod tests {
 
     #[test]
     fn zero_size_stat_does_not_observe_empty_when_bytes_arrive() {
-        let input = ReadInput { file_path: "a".into(), offset: None, limit: None };
+        let input = ReadInput {
+            file_path: "a".into(),
+            offset: None,
+            limit: None,
+        };
         let contents = Cell::new(Vec::new());
-        let result = read_whole_with("a", 0, &input,
-            |offset, _| if offset == 0 { Ok(b"later\n".to_vec()) } else { Ok(Vec::new()) },
-            |bytes| { contents.set(bytes.to_vec()); Ok(()) },
+        let result = read_whole_with(
+            "a",
+            0,
+            &input,
+            |offset, _| {
+                if offset == 0 {
+                    Ok(b"later\n".to_vec())
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+            |bytes| {
+                contents.set(bytes.to_vec());
+                Ok(())
+            },
             || false,
         );
         assert!(result.is_ok());
@@ -214,21 +260,35 @@ mod tests {
 
     #[test]
     fn oversized_guest_chunk_refuses_without_observation() {
-        let input = ReadInput { file_path: "large".into(), offset: None, limit: Some(1) };
+        let input = ReadInput {
+            file_path: "large".into(),
+            offset: None,
+            limit: Some(1),
+        };
         let observed = Cell::new(false);
-        let outcome = read_whole_with("large", 1, &input,
+        let outcome = read_whole_with(
+            "large",
+            1,
+            &input,
             |_, _| Ok(vec![b'a'; super::MAX_GUEST_READ_BYTES as usize + 1]),
-            |_| { observed.set(true); Ok(()) },
+            |_| {
+                observed.set(true);
+                Ok(())
+            },
             || false,
         );
-        assert!(matches!(outcome, Err(Failure::Message(message)) if message.contains("read budget")));
+        assert!(
+            matches!(outcome, Err(Failure::Message(message)) if message.contains("read budget"))
+        );
         assert!(!observed.get());
     }
 
     #[test]
     fn refuses_oversized_stat_before_guest_buffering() {
         assert!(super::exceeds_guest_read_budget(u64::MAX));
-        assert!(!super::exceeds_guest_read_budget(super::MAX_GUEST_READ_BYTES));
+        assert!(!super::exceeds_guest_read_budget(
+            super::MAX_GUEST_READ_BYTES
+        ));
     }
 }
 
