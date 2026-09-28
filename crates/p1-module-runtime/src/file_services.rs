@@ -320,13 +320,12 @@ fn cached_index(
     let mut guard = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(index) = guard.as_ref() {
-        if index
+    if let Some(index) = guard.as_ref()
+        && index
             .still_current(cancel)
             .map_err(|IndexCancelled| FsError::Cancelled)?
-        {
-            return Ok(index.clone());
-        }
+    {
+        return Ok(index.clone());
     }
     let index = Arc::new(
         ProtectedIndex::build(policy, cancel).map_err(|IndexCancelled| FsError::Cancelled)?,
