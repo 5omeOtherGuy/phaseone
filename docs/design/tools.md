@@ -244,18 +244,22 @@ impl Sandbox {
 }
 pub const CREDENTIAL_DIRECTORIES: &[&str]; // `.ssh`, `.claude`, `.codex`, `.gnupg`,
                                           // `.local/share/opencode`, `.pi`, `.config/gh`, `.config/p1`
-pub enum SandboxError { NotInstalled, Unavailable(String), WorkspaceContainsHome, ReadableUnresolved { path: PathBuf }, ReadableUnderWritable { path: PathBuf, root: PathBuf }, ReadableCredential { path: PathBuf, directory: PathBuf } }
+pub enum SandboxError { NotInstalled, UnsafeLauncher, Unavailable(String), WorkspaceContainsHome, WritableOverlap { path: PathBuf, root: PathBuf }, ReadableUnresolved { path: PathBuf }, ReadableUnderWritable { path: PathBuf, root: PathBuf }, ReadableCredential { path: PathBuf, directory: PathBuf } }
 impl ShellTool {
     /// Probes ONCE (`bwrap <args> true`), so an unusable sandbox fails assembly, not the
     /// first command. `NotInstalled`: no `bwrap` on PATH. `Unavailable(stderr)`: it cannot
     /// run here (user namespaces disabled). `WorkspaceContainsHome`: the workspace root is
     /// the home directory or an ancestor of it — hiding the home would hide the workspace.
+    /// `WritableOverlap`: a writable path may not be equal to or nested below the workspace,
+    /// private `/tmp`, or another writable path (including missing inner paths).
     /// `ReadableUnresolved`: a `readable` path must exist and resolve. `ReadableUnderWritable`:
     /// its canonical target cannot be equal to or below the workspace, any writable path, or the
     /// private `/tmp`. `ReadableCredential`: a path equal to, inside or an ANCESTOR of a
     /// `CREDENTIAL_DIRECTORIES` entry is refused before the probe, whether it exists or not.
     pub fn sandboxed(self, sandbox: Sandbox) -> Result<Self, SandboxError>;
 }
+// `UnsafeLauncher` is raised at command start as `ProcessFailure::Start`; other
+// SandboxError variants arise during assembly or argument building.
 /// Pure, unit-tested: the argument vector before `bash -lc <command>`.
 pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Result<Vec<OsString>, SandboxError>;
 ```

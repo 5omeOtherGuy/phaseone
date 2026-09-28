@@ -90,6 +90,12 @@ pub enum SandboxError {
     )]
     WorkspaceContainsHome { workspace: PathBuf, home: PathBuf },
     #[error(
+        "the sandbox writable path {} overlaps writable root {}: choose disjoint writable paths, or pass --sandbox off",
+        .path.display(),
+        .root.display()
+    )]
+    WritableOverlap { path: PathBuf, root: PathBuf },
+    #[error(
         "the sandbox readable path {} does not resolve: choose an existing path, or pass --sandbox off",
         .path.display()
     )]
@@ -134,6 +140,7 @@ impl SandboxRuntime {
             .map_err(|error| {
                 SandboxError::Unavailable(format!("could not create a private /tmp: {error}"))
             })?;
+        validate_writable_layout(&workspace, &sandbox.writable, private_tmp.path())?;
         let writable_roots =
             sandbox_writable_roots(&workspace, &sandbox.writable, private_tmp.path());
         for readable in &sandbox.readable {
@@ -317,6 +324,37 @@ fn launcher_is_safe(path: &Path, forbidden: &[PathBuf]) -> bool {
         && (metadata.nlink() == 1 || trusted_root_owned)
 }
 
+/// Nested writable mounts let a command retarget the inner bind source after
+/// launcher validation. Refuse lexical nesting even when the inner path is absent.
+fn validate_writable_layout(
+    workspace: &Path,
+    writable: &[PathBuf],
+    private_tmp: &Path,
+) -> Result<(), SandboxError> {
+    let mut roots = vec![workspace.to_path_buf(), private_tmp.to_path_buf()];
+    roots.extend(writable.iter().cloned());
+    for (index, path) in writable.iter().enumerate() {
+        let lexical = lexical_normalize(path);
+        let canonical = std::fs::canonicalize(path).ok();
+        for (root_index, root) in roots.iter().enumerate() {
+            if root_index == index + 2 {
+                continue;
+            }
+            if lexical.starts_with(lexical_normalize(root))
+                || canonical.as_ref().is_some_and(|path| {
+                    std::fs::canonicalize(root).is_ok_and(|root| path.starts_with(root))
+                })
+            {
+                return Err(SandboxError::WritableOverlap {
+                    path: path.clone(),
+                    root: root.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Canonical destinations outside these roots cannot be redirected by sandboxed writes.
 fn sandbox_writable_roots(
     workspace: &Path,
@@ -340,6 +378,12 @@ fn canonical_readable_source(
     home: &Path,
     writable_roots: &[PathBuf],
 ) -> Result<PathBuf, SandboxError> {
+    if let Some(directory) = credential_directory(home, readable) {
+        return Err(SandboxError::ReadableCredential {
+            path: readable.to_path_buf(),
+            directory,
+        });
+    }
     if !readable.is_absolute() {
         return Err(SandboxError::ReadableUnresolved {
             path: readable.to_path_buf(),
@@ -349,13 +393,11 @@ fn canonical_readable_source(
         std::fs::canonicalize(readable).map_err(|_| SandboxError::ReadableUnresolved {
             path: readable.to_path_buf(),
         })?;
-    for candidate in [readable, resolved.as_path()] {
-        if let Some(directory) = credential_directory(home, candidate) {
-            return Err(SandboxError::ReadableCredential {
-                path: readable.to_path_buf(),
-                directory,
-            });
-        }
+    if let Some(directory) = credential_directory(home, &resolved) {
+        return Err(SandboxError::ReadableCredential {
+            path: readable.to_path_buf(),
+            directory,
+        });
     }
     if let Some(root) = writable_roots
         .iter()
@@ -505,44 +547,63 @@ mod tests {
     }
 
     #[test]
-    fn cached_launcher_refuses_retargeted_writable_bind() {
+    fn overlapping_writable_entries_are_refused_before_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let scratch = temp.path().join("scratch");
+        let nested = scratch.join("tool");
+        for directory in [&workspace, &scratch] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let make_sandbox = |writable| Sandbox {
+            home: temp.path().join("home"),
+            home_visible: Vec::new(),
+            readable: Vec::new(),
+            writable,
+            runtime_dir: None,
+        };
+        for writable in [
+            vec![scratch.clone(), nested.clone()], // inner does not exist yet
+            vec![nested.clone(), scratch.clone()], // order must not matter
+            vec![workspace.join("tool")],
+        ] {
+            assert!(matches!(
+                SandboxRuntime::assemble(make_sandbox(writable), &workspace),
+                Err(SandboxError::WritableOverlap { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn canonical_writable_overlap_is_refused() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let scratch = temp.path().join("scratch");
-        let nested = scratch.join("tool");
-        let trusted = temp.path().join("trusted");
-        for directory in [&workspace, &scratch, &trusted] {
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&scratch, &alias).unwrap();
+        let private_tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            super::validate_writable_layout(&workspace, &[scratch, alias], private_tmp.path()),
+            Err(SandboxError::WritableOverlap { .. })
+        ));
+    }
+
+    #[test]
+    fn disjoint_writable_entries_pass_layout_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        for directory in [&workspace, &left, &right] {
             std::fs::create_dir_all(directory).unwrap();
         }
-        let launcher = trusted.join("bwrap");
-        executable(&launcher);
-        std::fs::create_dir(&nested).unwrap();
-        let runtime = SandboxRuntime {
-            sandbox: Sandbox {
-                home: temp.path().join("home"),
-                home_visible: Vec::new(),
-                readable: Vec::new(),
-                writable: vec![scratch.clone(), nested.clone()],
-                runtime_dir: None,
-            },
-            private_tmp: tempfile::tempdir().unwrap(),
-            bwrap_path: std::fs::canonicalize(&launcher).unwrap(),
-        };
-
+        let private_tmp = tempfile::tempdir().unwrap();
         assert!(
-            runtime.validate_launcher(&workspace).is_ok(),
-            "safe launcher must start"
-        );
-        std::fs::remove_dir(&nested).unwrap();
-        symlink(&trusted, &nested).unwrap();
-        assert!(
-            matches!(
-                runtime.validate_launcher(&workspace),
-                Err(SandboxError::UnsafeLauncher)
-            ),
-            "retargeted writable bind must refuse start"
+            super::validate_writable_layout(&workspace, &[left, right], private_tmp.path()).is_ok()
         );
     }
 
