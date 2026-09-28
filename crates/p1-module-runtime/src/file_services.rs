@@ -1125,7 +1125,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn search_refuses_hard_links_into_credential_directories() {
-        for credential_path in [".config/keys/a.key", ".ssh/id_test"] {
+        for credential_path in [".config/keys/a.key", ".config/keys/nested/b.key"] {
             let home = tempfile::tempdir().unwrap();
             let credential = home.path().join(credential_path);
             std::fs::create_dir_all(credential.parent().unwrap()).unwrap();

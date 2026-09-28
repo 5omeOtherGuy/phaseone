@@ -40,11 +40,7 @@ impl CredentialPolicy {
                 home.join(".local/share/opencode/auth.json"),
                 home.join(".pi/agent/auth.json"),
             ]);
-            vec![
-                home.join(".config/keys"),
-                home.join(".ssh"),
-                home.join(".gnupg"),
-            ]
+            vec![home.join(".config/keys")]
         });
         let mut exact_paths = xdg_credentials
             .iter()
@@ -64,7 +60,7 @@ impl CredentialPolicy {
                     .iter()
                     .map(|path| canonical_best_effort(path)),
             );
-            [".config/keys", ".ssh", ".gnupg"]
+            [".config/keys"]
                 .iter()
                 .map(|relative| canonical_best_effort(&home.join(relative)))
                 .collect()
