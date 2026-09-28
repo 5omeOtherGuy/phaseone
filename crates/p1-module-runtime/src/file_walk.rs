@@ -169,12 +169,15 @@ pub(crate) fn read_window_excluding(
     read_window_inner(workspace, path, offset, length, Some(excluded))
 }
 
+/// A check of an opened file: its real path and the open handle.
+type OpenedCheck<'a> = &'a dyn Fn(&Path, &std::fs::File) -> bool;
+
 fn read_window_inner(
     workspace: &Workspace,
     path: &str,
     offset: u64,
     length: u64,
-    excluded: Option<&dyn Fn(&Path, &std::fs::File) -> bool>,
+    excluded: Option<OpenedCheck<'_>>,
 ) -> Result<Vec<u8>, FsError> {
     let checked = workspace.check_path(path).map_err(workspace_error)?;
     let io = |error: io::Error| FsError::Io(error.to_string());
