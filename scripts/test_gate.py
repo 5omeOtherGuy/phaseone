@@ -659,6 +659,41 @@ class GateTests(unittest.TestCase):
         self.assertEqual(len(install), 1, h.calls())
         self.assertIn(f"--from-release candidate-{SHORT_SHA}", install[0])
 
+    def test_cached_candidate_without_owner_record_is_replaced_by_gate(self) -> None:
+        h = self.harness()
+        candidate = h.repo / 'target' / 'p1-candidate'
+        candidate.mkdir(parents=True)
+        for asset in ('p1-linux-x86_64', 'p1-linux-x86_64.sha256',
+                      'p1-share.tar.gz', 'p1-share.tar.gz.sha256'):
+            (candidate / asset).write_text('cached before ownership records')
+        stage = h.repo / 'scripts' / 'stage-release.sh'
+        source = stage.read_text(encoding='utf-8')
+        stage.write_text(source.replace(
+            '#!/usr/bin/env bash\n',
+            '#!/usr/bin/env bash\n'
+            'for arg in "$@"; do\n'
+            '  if [ "$arg" = "' + str(candidate) + '" ] && [ -d "$arg" ]; then\n'
+            '    echo "stage-release: no matching prior stage ownership record" >&2\n'
+            '    exit 85\n'
+            '  fi\n'
+            'done\n', 1), encoding='utf-8')
+        done = h.run()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotEqual((candidate / 'p1-share.tar.gz').read_bytes(),
+                            b'cached before ownership records')
+
+    def test_smoke_installer_path_contains_transaction_commands(self) -> None:
+        h = self.harness()
+        installer = h.repo / 'scripts' / 'install.sh'
+        original = installer.read_text(encoding='utf-8')
+        installer.write_text(original.replace(
+            '#!/usr/bin/env bash\n',
+            '#!/usr/bin/env bash\n'
+            'command -v stat >/dev/null || exit 88\n'
+            'command -v flock >/dev/null || exit 89\n', 1), encoding='utf-8')
+        done = h.run()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
     def test_a_stale_candidate_is_replaced(self) -> None:
         h = self.harness()
         candidate = h.repo / "target" / "p1-candidate"
