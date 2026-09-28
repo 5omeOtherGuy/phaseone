@@ -233,7 +233,7 @@ bubblewrap (`bwrap`, unprivileged user namespaces); nothing is installed or run 
 pub struct Sandbox {
     pub home: PathBuf,               // the home directory to hide
     pub home_visible: Vec<PathBuf>,  // RELATIVE to `home`; visible read-only if they exist
-    pub readable: Vec<PathBuf>,      // extra absolute paths visible READ-ONLY if they exist
+    pub readable: Vec<PathBuf>,      // existing absolute paths; bound READ-ONLY unless already under a writable root
     pub writable: Vec<PathBuf>,      // extra absolute paths that stay writable if they exist
     pub runtime_dir: Option<PathBuf>, // e.g. $XDG_RUNTIME_DIR: hidden behind a tmpfs (agent sockets, keyrings)
 }
@@ -244,19 +244,24 @@ impl Sandbox {
 }
 pub const CREDENTIAL_DIRECTORIES: &[&str]; // `.ssh`, `.claude`, `.codex`, `.gnupg`,
                                           // `.local/share/opencode`, `.pi`, `.config/gh`, `.config/p1`
-pub enum SandboxError { NotInstalled, Unavailable(String), WorkspaceContainsHome, ReadableCredential { path: PathBuf, directory: PathBuf } }
+pub enum SandboxError { NotInstalled, UnsafeLauncher, Unavailable(String), WorkspaceContainsHome, WritableAncestor { path: PathBuf, root: PathBuf }, ReadableUnresolved { path: PathBuf }, ReadableCredential { path: PathBuf, directory: PathBuf } }
 impl ShellTool {
     /// Probes ONCE (`bwrap <args> true`), so an unusable sandbox fails assembly, not the
     /// first command. `NotInstalled`: no `bwrap` on PATH. `Unavailable(stderr)`: it cannot
     /// run here (user namespaces disabled). `WorkspaceContainsHome`: the workspace root is
     /// the home directory or an ancestor of it — hiding the home would hide the workspace.
-    /// `ReadableCredential`: a `readable` path is equal to, inside or an ANCESTOR of a
-    /// `CREDENTIAL_DIRECTORIES` entry of the home (or of the home itself) — refused before
-    /// the probe, whether or not that directory exists yet.
+    /// `WritableAncestor`: a writable path may not contain the hidden home, workspace,
+    /// or private `/tmp` (lexically or canonically).
+    /// `ReadableUnresolved`: a `readable` path must exist and resolve. A source already
+    /// under a writable root needs no extra bind. `ReadableCredential`: any bind source
+    /// equal to, inside or an ancestor of a credential directory is refused, both lexically
+    /// and canonically, even when it does not exist.
     pub fn sandboxed(self, sandbox: Sandbox) -> Result<Self, SandboxError>;
 }
+// `UnsafeLauncher` is raised at assembly when PATH has executable candidates but
+// all are unsafe, or at command start as `ProcessFailure::Start` if the cached launcher changes.
 /// Pure, unit-tested: the argument vector before `bash -lc <command>`.
-pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Vec<OsString>;
+pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Result<Vec<OsString>, SandboxError>;
 ```
 
 The command becomes `bwrap <args> bash -lc <command>`; process group, timeout, cancellation,
@@ -267,19 +272,21 @@ itself live under `/tmp` or under the home:
 2. `--bind <private_tmp> /tmp` — a fresh directory per `ShellTool`, created under
    `std::env::temp_dir()` and removed when the tool is dropped; `--setenv TMPDIR /tmp`;
 3. `--tmpfs <home>` (`<home>` CANONICAL — the same path the containment check used), then
-   `--ro-bind <home>/<entry> <home>/<entry>` for every existing `home_visible` entry, then
-   `--ro-bind <path> <path>` for every existing `readable` path (e.g. a git worktree's
-   common directory, from `--sandbox-read`); `--tmpfs $XDG_RUNTIME_DIR` when that variable
-   names an existing directory — agent sockets and keyrings live there;
-4. `--bind <path> <path>` for every existing `writable` path; THEN the masks, so that no
-   writable bind can uncover them: `--ro-bind /dev/null <home>/.cargo/credentials.toml` (and
-   `…/credentials`) if that file exists — a visible or writable directory must not leak a token.
-   The `readable` binds come BEFORE this step, so no readable path can uncover
-   `~/.cargo/credentials*`;
+   bind each safe existing `home_visible` entry and configured `readable` path read-only.
+   Skip sources already under the workspace, a writable path, or private `/tmp`; when the
+   configured path is an alias, recreate it with `--symlink <canonical> <configured-path>`.
+   Other sources use `--ro-bind <canonical-source> <configured-path>`;
+   `--tmpfs $XDG_RUNTIME_DIR` when that
+   variable names an existing directory — agent sockets and keyrings live there;
+4. `--bind <canonical-source> <path>` for nonredundant existing `writable` paths; nested,
+   duplicate or missing entries under writable roots get no bind; aliases get `--symlink`;
 5. `--bind <workspace root> <workspace root>`;
-6. `--remount-ro <home>` — writes to the hidden home fail loudly (`Read-only file system`)
+6. AFTER readable, writable and workspace binds, mask existing cargo credentials with
+   `--ro-bind /dev/null <home>/.cargo/credentials.toml` (and `…/credentials`), so no later
+   bind can uncover a token;
+7. `--remount-ro <home>` — writes to the hidden home fail loudly (`Read-only file system`)
    instead of vanishing into a tmpfs;
-7. `--unshare-pid --die-with-parent --chdir <workspace root>`.
+8. `--unshare-pid --die-with-parent --chdir <workspace root>`.
 The network stays shared (fetching dependencies is normal work). The PID namespace closes the
 hole the unsandboxed tool has: a process that leaves the process group (`setsid`, double
 fork) still dies with the sandbox when the command is cancelled or times out.
@@ -294,9 +301,9 @@ after dogfooding), repeatable `--sandbox-write PATH` and repeatable `--sandbox-r
 (each a usage error without `--sandbox workspace`). The sandbox applies to the parent's AND
 every worker's `shell`. `scripts/fanout.py` and `scripts/dogfood.sh` pass the git common
 directory as `--sandbox-read` when the job dir is a git WORKTREE, so the agent can inspect
-(never commit) the metadata that lives in the main checkout. A `SandboxError` fails assembly
-— exit 1 before any model call — with a message that names the remedy (`install bubblewrap,
-or pass --sandbox off`).
+(never commit) the metadata that lives in the main checkout. Assembly-time `SandboxError`
+returns exit 1 before any model call; `UnsafeLauncher` instead refuses a command start as
+`ProcessFailure::Start`. Each error names a remedy.
 
 Must-pass (real `bwrap`; a test returns early with a printed `SKIP: bwrap unusable here` when
 the probe fails — CI runners may forbid user namespaces): fake home `H` containing

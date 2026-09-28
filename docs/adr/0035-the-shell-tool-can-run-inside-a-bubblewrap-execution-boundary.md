@@ -1,11 +1,11 @@
 ---
 adr: 35
 title: The shell tool can run inside a bubblewrap execution boundary
-status: accepted
+status: superseded
 date: 2026-09-20
 deciders: lead
 supersedes: []
-superseded_by: []
+superseded_by: [96]
 sources: [docs/design/tools.md, docs/review-2026-09-20-dispositions.md, crates/p1-tool-shell/src/lib.rs, crates/p1-tool-shell/tests/sandbox.rs, crates/p1-host/tests/sandbox.rs]
 ---
 # ADR-0035: The shell tool can run inside a bubblewrap execution boundary
