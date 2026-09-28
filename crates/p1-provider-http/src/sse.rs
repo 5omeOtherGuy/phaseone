@@ -39,11 +39,36 @@ pub struct SseDecoder {
     event: Option<String>,
     /// The `data:` field values of the event under construction, in order.
     data: Vec<String>,
+    frame_bytes: usize,
 }
 
 impl SseDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reject an oversized unfinished frame before allocating it. Use at transport
+    /// boundaries; `push` remains available for pure decoder fixtures.
+    pub fn try_push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, &'static str> {
+        const MAX_EVENT: usize = 1_048_576;
+        let mut events = Vec::new();
+        let mut start = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if matches!(*byte, b'\n' | b'\r') {
+                events.extend(self.push_bounded(&bytes[start..=index], MAX_EVENT)?);
+                start = index + 1;
+            }
+        }
+        events.extend(self.push_bounded(&bytes[start..], MAX_EVENT)?);
+        Ok(events)
+    }
+
+    fn push_bounded(&mut self, bytes: &[u8], limit: usize) -> Result<Vec<SseEvent>, &'static str> {
+        if self.frame_bytes.saturating_add(bytes.len()) > limit {
+            return Err("provider SSE event exceeds byte limit");
+        }
+        self.frame_bytes += bytes.len();
+        Ok(self.push(bytes))
     }
 
     /// Decode everything `bytes` completes. A returned event is complete; an
@@ -108,7 +133,9 @@ impl SseDecoder {
             None => (line, ""),
         };
         match field {
-            "data" => self.data.push(value.to_string()),
+            "data" => {
+                self.data.push(value.to_string());
+            }
             "event" => self.event = Some(value.to_string()),
             _ => {}
         }
@@ -118,6 +145,7 @@ impl SseDecoder {
     /// Close the event under construction. An event with no data (only comments,
     /// or only an `event:` field) is not dispatched.
     fn take_event(&mut self) -> Option<SseEvent> {
+        self.frame_bytes = 0;
         let data = std::mem::take(&mut self.data).join("\n");
         let event = self.event.take();
         if data.is_empty() {
@@ -141,6 +169,37 @@ impl std::fmt::Debug for SseDecoder {
 mod tests {
     use super::*;
 
+    #[test]
+    fn keepalive_chunks_cannot_grow_an_unterminated_line() {
+        let mut decoder = SseDecoder::new();
+        let chunk = vec![b'x'; 128 * 1024];
+        for _ in 0..8 {
+            assert!(decoder.try_push(&chunk).unwrap().is_empty());
+        }
+        assert!(decoder.try_push(b"x").is_err());
+    }
+    #[test]
+    fn batched_small_frames_do_not_hit_the_frame_limit() {
+        let mut decoder = SseDecoder::new();
+        let frame = format!("data: {}\n\n", "a".repeat(600_000));
+        let events = decoder
+            .try_push(format!("{frame}{frame}").as_bytes())
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data.len(), 600_000);
+        let mut decoder = SseDecoder::new();
+        assert!(
+            decoder
+                .try_push(format!("data: {}\n", "b".repeat(600_000)).as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            decoder
+                .try_push(format!("data: {}\n\n", "c".repeat(600_000)).as_bytes())
+                .is_err()
+        );
+    }
     #[test]
     fn splits_events_on_a_blank_line_and_joins_data_lines() {
         let mut decoder = SseDecoder::new();

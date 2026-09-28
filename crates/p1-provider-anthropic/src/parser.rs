@@ -11,7 +11,7 @@
 //! event contributes only its enumerated `error.type`, and the free-text
 //! `message` is used for classification alone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use p1_contracts::history::{AssistantBlock, AssistantItem, Origin, ToolCall, ToolInput};
 use p1_contracts::{
@@ -36,6 +36,10 @@ pub struct AnthropicParser {
     usage: Option<Usage>,
     usage_seen: bool,
     message_stopped: bool,
+    message_started: bool,
+    pre_start_content: bool,
+    closed: HashSet<usize>,
+    decoded_bytes: usize,
     terminal: Option<Outcome>,
 }
 
@@ -72,6 +76,10 @@ impl AnthropicParser {
             usage: None,
             usage_seen: false,
             message_stopped: false,
+            message_started: false,
+            pre_start_content: false,
+            closed: HashSet::new(),
+            decoded_bytes: 0,
             terminal: None,
         }
     }
@@ -95,12 +103,36 @@ impl AnthropicParser {
         if self.terminal.is_some() {
             return;
         }
+        let mut ids = HashSet::new();
+        if self.blocks.iter().any(|block| matches!(block, AssistantBlock::ToolCall(call) if call.call_id.is_empty() || call.name.is_empty() || !ids.insert(call.call_id.clone()))) {
+            self.fail(ProviderErrorKind::Protocol, "incomplete or duplicate tool identity");
+            return;
+        }
+        let stop = self.stop.expect("checked at message_stop");
+        if matches!(
+            stop,
+            StopReason::MaxOutputTokens | StopReason::Refusal | StopReason::ContextWindowExceeded
+        ) {
+            self.blocks
+                .retain(|block| !matches!(block, AssistantBlock::ToolCall(_)));
+        } else if self
+            .blocks
+            .iter()
+            .any(|block| matches!(block, AssistantBlock::ToolCall(_)))
+            && stop != StopReason::ToolUse
+        {
+            self.fail(
+                ProviderErrorKind::Protocol,
+                "tool calls without tool finish reason",
+            );
+            return;
+        }
         let completed = CompletedResponse {
             item: AssistantItem {
                 origin: self.origin(),
                 blocks: std::mem::take(&mut self.blocks),
             },
-            stop: self.stop.unwrap_or(StopReason::Other),
+            stop,
             usage: if self.usage_seen { self.usage } else { None },
         };
         self.terminal = Some(Outcome::Completed(completed));
@@ -131,7 +163,14 @@ impl AnthropicParser {
     }
 
     fn on_content_block_start(&mut self, value: &Value) {
-        let index = block_index(value);
+        let Some(index) = block_index(value) else {
+            self.fail(ProviderErrorKind::Protocol, "invalid block index");
+            return;
+        };
+        if self.open.contains_key(&index) || self.closed.contains(&index) {
+            self.fail(ProviderErrorKind::Protocol, "duplicate block start");
+            return;
+        }
         let block = value.get("content_block");
         let final_index = self.blocks.len();
         match block
@@ -208,16 +247,43 @@ impl AnthropicParser {
                     },
                 );
             }
-            // An unknown block type ends up in no item, so it owns no index.
-            _ => {}
+            _ => self.fail(ProviderErrorKind::Protocol, "unknown content block type"),
         }
     }
 
     fn on_content_block_delta(&mut self, value: &Value, events: &mut Vec<StreamEvent>) {
-        let index = block_index(value);
-        let Some(delta) = value.get("delta") else {
+        let Some(index) = block_index(value) else {
+            self.fail(ProviderErrorKind::Protocol, "invalid block index");
             return;
         };
+        let Some(delta) = value.get("delta") else {
+            self.fail(ProviderErrorKind::Protocol, "missing block delta");
+            return;
+        };
+        let valid = matches!(
+            (
+                self.open.get(&index).map(|b| &b.kind),
+                delta.get("type").and_then(Value::as_str)
+            ),
+            (Some(OpenKind::Text), Some("text_delta"))
+                | (Some(OpenKind::Tool { .. }), Some("input_json_delta"))
+                | (
+                    Some(OpenKind::Thinking { .. }),
+                    Some("thinking_delta" | "signature_delta")
+                )
+        );
+        if !valid
+            || !match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") => delta.get("text").is_some_and(Value::is_string),
+                Some("input_json_delta") => delta.get("partial_json").is_some_and(Value::is_string),
+                Some("thinking_delta") => delta.get("thinking").is_some_and(Value::is_string),
+                Some("signature_delta") => delta.get("signature").is_some_and(Value::is_string),
+                _ => false,
+            }
+        {
+            self.fail(ProviderErrorKind::Protocol, "unmatched block delta");
+            return;
+        }
         match delta.get("type").and_then(Value::as_str) {
             Some("text_delta") => {
                 let Some(text) = delta.get("text").and_then(Value::as_str) else {
@@ -309,10 +375,15 @@ impl AnthropicParser {
     }
 
     fn on_content_block_stop(&mut self, value: &Value) {
-        let index = block_index(value);
-        let Some(open) = self.open.remove(&index) else {
+        let Some(index) = block_index(value) else {
+            self.fail(ProviderErrorKind::Protocol, "invalid block index");
             return;
         };
+        let Some(open) = self.open.remove(&index) else {
+            self.fail(ProviderErrorKind::Protocol, "unmatched block stop");
+            return;
+        };
+        self.closed.insert(index);
         if let OpenKind::Tool {
             call_id,
             name,
@@ -352,6 +423,18 @@ impl ResponseParser for AnthropicParser {
         if self.terminal.is_some() {
             return Vec::new();
         }
+        self.decoded_bytes = self.decoded_bytes.saturating_add(event.data.len());
+        if event.data.len() > 1_048_576
+            || self.decoded_bytes > 16_777_216
+            || self.blocks.len() > 4096
+            || self.open.len() > 4096
+        {
+            self.fail(
+                ProviderErrorKind::Protocol,
+                "provider response exceeds size limit",
+            );
+            return vec![StreamEvent::Finished(self.terminal.clone().unwrap())];
+        }
         let mut events = Vec::new();
 
         // A `[DONE]` sentinel is not part of this route's protocol; tolerate it
@@ -374,10 +457,34 @@ impl ResponseParser for AnthropicParser {
 
         match value.get("type").and_then(Value::as_str) {
             Some("ping") => events.push(StreamEvent::Activity),
-            Some("message_start") => self.on_message_start(&value),
-            Some("content_block_start") => self.on_content_block_start(&value),
-            Some("content_block_delta") => self.on_content_block_delta(&value, &mut events),
-            Some("content_block_stop") => self.on_content_block_stop(&value),
+            Some("message_start") => {
+                if self.pre_start_content {
+                    self.fail(ProviderErrorKind::Protocol, "content before message start");
+                } else if self.message_started {
+                    self.fail(ProviderErrorKind::Protocol, "duplicate message start");
+                } else {
+                    self.message_started = true;
+                    self.on_message_start(&value);
+                }
+            }
+            // A broken stream can start with content and then disconnect. Keep its
+            // visible delta so the frozen no-retry-after-output contract still
+            // reports Transport on EOF; message_stop still cannot complete it.
+            Some("message_delta" | "message_stop") if !self.message_started => {
+                self.fail(ProviderErrorKind::Protocol, "event before message start");
+            }
+            Some("content_block_start") => {
+                self.pre_start_content |= !self.message_started;
+                self.on_content_block_start(&value);
+            }
+            Some("content_block_delta") => {
+                self.pre_start_content |= !self.message_started;
+                self.on_content_block_delta(&value, &mut events);
+            }
+            Some("content_block_stop") => {
+                self.pre_start_content |= !self.message_started;
+                self.on_content_block_stop(&value);
+            }
             Some("message_delta") => {
                 if let Some(reason) = value
                     .get("delta")
@@ -392,7 +499,9 @@ impl ResponseParser for AnthropicParser {
             }
             Some("message_stop") => {
                 self.message_stopped = true;
-                if self.open.is_empty() {
+                if self.stop.is_none() {
+                    self.fail(ProviderErrorKind::Protocol, "message has no stop reason");
+                } else if self.open.is_empty() {
                     self.complete();
                 } else {
                     // routes.md: a stop with a block still open is a broken
@@ -416,7 +525,8 @@ impl ResponseParser for AnthropicParser {
                 let kind = classify_error(error_type, message);
                 // Only the enumerated type is surfaced; the free-text message is
                 // classification input and is never copied.
-                self.fail(kind, format!("provider error: {error_type}"));
+                let label = displayed_error_type(error_type);
+                self.fail(kind, format!("provider error: {label}"));
             }
             // Unknown event types are ignored for forward compatibility.
             _ => {}
@@ -461,14 +571,14 @@ impl ResponseParser for AnthropicParser {
         let mut message = format!("http {status}");
         if let Some(error_type) = &error_type {
             message.push(' ');
-            message.push_str(error_type);
+            message.push_str(displayed_error_type(error_type));
         }
-        if let Some(request_id) = headers
+        if let Some(id) = headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("request-id"))
-            .map(|(_, value)| value)
+            .and_then(|(_, value)| safe_request_id(value))
         {
-            message.push_str(&format!(" request-id={request_id}"));
+            message.push_str(&format!(" request-id={id}"));
         }
         ProviderError::new(kind, message)
     }
@@ -486,6 +596,32 @@ fn map_stop_reason(reason: &str) -> StopReason {
         // the contract's `Other`.
         _ => StopReason::Other,
     }
+}
+
+/// Only vendor-defined error labels, never arbitrary response text.
+fn displayed_error_type(value: &str) -> &'static str {
+    match value {
+        "overloaded_error" => "overloaded_error",
+        "api_error" => "api_error",
+        "rate_limit_error" => "rate_limit_error",
+        "authentication_error" => "authentication_error",
+        "permission_error" => "permission_error",
+        "invalid_request_error" => "invalid_request_error",
+        "context_window_exceeded" => "context_window_exceeded",
+        _ => "unknown",
+    }
+}
+
+/// The frozen HTTP-error contract exposes `req_*` request IDs. Refuse arbitrary
+/// token-shaped header values and malformed IDs; never expose other headers.
+fn safe_request_id(value: &str) -> Option<&str> {
+    let suffix = value.strip_prefix("req_")?;
+    (value.len() <= 64
+        && !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then_some(value)
 }
 
 fn classify_error(error_type: &str, message: &str) -> ProviderErrorKind {
@@ -532,8 +668,11 @@ fn extract_error_message(body: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
-fn block_index(value: &Value) -> usize {
-    value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize
+fn block_index(value: &Value) -> Option<usize> {
+    value
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
 }
 
 fn str_field(value: Option<&Value>, field: &str) -> String {
@@ -542,4 +681,181 @@ fn str_field(value: Option<&Value>, field: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn send(parser: &mut AnthropicParser, value: Value) -> Vec<StreamEvent> {
+        parser.on_event(SseEvent {
+            event: None,
+            data: value.to_string(),
+        })
+    }
+    fn parser() -> AnthropicParser {
+        AnthropicParser::new("anthropic", "model")
+    }
+    fn failed(events: &[StreamEvent]) {
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Finished(Outcome::Failed(error))) if error.kind == ProviderErrorKind::Protocol),
+            "{events:?}"
+        );
+    }
+    fn start(p: &mut AnthropicParser) {
+        send(p, json!({"type":"message_start","message":{}}));
+    }
+    fn block(p: &mut AnthropicParser, index: usize, id: &str, name: &str) {
+        send(
+            p,
+            json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name}}),
+        );
+        send(p, json!({"type":"content_block_stop","index":index}));
+    }
+    #[test]
+    fn malformed_lifecycle_and_blocks_fail() {
+        for event in [
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"content_block_stop","index":0}),
+        ] {
+            failed(&send(&mut parser(), event));
+        }
+        let mut p = parser();
+        start(&mut p);
+        failed(&send(&mut p, json!({"type":"message_start"})));
+        for bad in [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"unknown"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","content_block":{"type":"text"}}),
+        ] {
+            let mut p = parser();
+            start(&mut p);
+            failed(&send(&mut p, bad));
+        }
+        let mut p = parser();
+        start(&mut p);
+        send(
+            &mut p,
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        );
+        failed(&send(
+            &mut p,
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text"}}),
+        ));
+    }
+    #[test]
+    fn pre_start_content_cannot_become_a_completed_message() {
+        for block in [
+            json!({"type":"text","text":""}),
+            json!({"type":"tool_use","id":"c","name":"read"}),
+        ] {
+            let mut p = parser();
+            send(
+                &mut p,
+                json!({"type":"content_block_start","index":0,"content_block":block}),
+            );
+            let delta = if block["type"] == "text" {
+                json!({"type":"text_delta","text":"visible"})
+            } else {
+                json!({"type":"input_json_delta","partial_json":"{}"})
+            };
+            let visible = send(
+                &mut p,
+                json!({"type":"content_block_delta","index":0,"delta":delta}),
+            );
+            assert!(!visible.is_empty());
+            send(&mut p, json!({"type":"content_block_stop","index":0}));
+            failed(&send(&mut p, json!({"type":"message_start","message":{}})));
+            assert!(send(&mut p, json!({"type":"message_stop"})).is_empty());
+        }
+        let mut p = parser();
+        send(
+            &mut p,
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text"}}),
+        );
+        assert!(
+            matches!(p.on_end(), Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport)
+        );
+    }
+    #[test]
+    fn stop_reason_and_tool_identity_are_required() {
+        let mut p = parser();
+        start(&mut p);
+        failed(&send(&mut p, json!({"type":"message_stop"})));
+        let mut p = parser();
+        start(&mut p);
+        send(
+            &mut p,
+            json!({"type":"message_delta","delta":{"stop_reason":"future_reason"}}),
+        );
+        assert!(
+            matches!(send(&mut p, json!({"type":"message_stop"})).last(), Some(StreamEvent::Finished(Outcome::Completed(c))) if c.stop == StopReason::Other)
+        );
+        for (id, name) in [("", "read"), ("c", "")] {
+            let mut p = parser();
+            start(&mut p);
+            block(&mut p, 0, id, name);
+            send(
+                &mut p,
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            );
+            failed(&send(&mut p, json!({"type":"message_stop"})));
+        }
+        let mut p = parser();
+        start(&mut p);
+        block(&mut p, 0, "c", "read");
+        block(&mut p, 1, "c", "read");
+        send(
+            &mut p,
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+        );
+        failed(&send(&mut p, json!({"type":"message_stop"})));
+    }
+    #[test]
+    fn truncated_or_refused_calls_are_not_executable() {
+        for reason in ["max_tokens", "refusal", "model_context_window_exceeded"] {
+            let mut p = parser();
+            start(&mut p);
+            block(&mut p, 0, "c", "read");
+            send(
+                &mut p,
+                json!({"type":"message_delta","delta":{"stop_reason":reason}}),
+            );
+            assert!(
+                matches!(send(&mut p, json!({"type":"message_stop"})).last(), Some(StreamEvent::Finished(Outcome::Completed(c))) if c.item.tool_calls().next().is_none())
+            );
+        }
+    }
+    #[test]
+    fn hostile_error_labels_and_header_are_not_reflected() {
+        let credential_shaped = "AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+        let mut p = parser();
+        let events = send(
+            &mut p,
+            json!({"type":"error","error":{"type":credential_shaped}}),
+        );
+        assert!(!format!("{events:?}").contains(credential_shaped));
+        let error = parser().on_http_error(
+            400,
+            &[("request-id".into(), credential_shaped.into())],
+            json!({"error":{"type":credential_shaped}})
+                .to_string()
+                .as_bytes(),
+        );
+        assert!(!error.message.contains(credential_shaped));
+        let mut p = parser();
+        let events = send(
+            &mut p,
+            json!({"type":"error","error":{"type":"sentinel secret\nvalue"}}),
+        );
+        assert!(!format!("{events:?}").contains("sentinel"));
+        let error = parser().on_http_error(
+            400,
+            &[("request-id".into(), "sentinel secret".into())],
+            br#"{"error":{"type":"sentinel secret"}}"#,
+        );
+        assert!(!error.message.contains("sentinel"));
+    }
 }

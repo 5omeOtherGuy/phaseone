@@ -4,6 +4,8 @@
 //! shared [`ResponseParser`] contract means the retrying driver owns retries,
 //! cancellation and terminal-event bookkeeping. Wire facts: `routes.md` §B.
 
+use std::collections::{HashMap, HashSet};
+
 use p1_contracts::history::{AssistantBlock, AssistantItem, Origin, ToolCall, ToolInput};
 use p1_contracts::{
     CompletedResponse, Outcome, ProviderError, ProviderErrorKind, StopReason, StreamEvent, Usage,
@@ -26,7 +28,10 @@ pub struct CodexResponseParser {
     /// [`CodexResponseParser::response_id`] reads it (a component's decoder).
     response_id: Option<String>,
     /// Model-facing names observed when function-call output items are announced.
-    call_names: std::collections::HashMap<String, String>,
+    call_names: HashMap<String, String>,
+    open_items: HashMap<String, (String, Option<String>, Option<String>)>,
+    done_items: HashSet<String>,
+    decoded_bytes: usize,
     /// Whether a reasoning summary delta has been emitted for the item currently
     /// being produced, used to insert a section break on a later summary part.
     reasoning_emitted_in_item: bool,
@@ -42,7 +47,10 @@ impl CodexResponseParser {
             blocks: Vec::new(),
             terminal: None,
             response_id: None,
-            call_names: std::collections::HashMap::new(),
+            call_names: HashMap::new(),
+            open_items: HashMap::new(),
+            done_items: HashSet::new(),
+            decoded_bytes: 0,
             reasoning_emitted_in_item: false,
         }
     }
@@ -76,6 +84,24 @@ impl CodexResponseParser {
     /// terminal envelope. `stop` is computed from the blocks for `completed` and
     /// supplied for `incomplete`.
     fn completed(&mut self, response: Option<&Value>, stop: StopReason) -> Vec<StreamEvent> {
+        if self.response_id.is_some()
+            && response
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| Some(id) != self.response_id.as_deref())
+        {
+            return self.fail(ProviderErrorKind::Protocol, "conflicting response id");
+        }
+        if !self.open_items.is_empty() {
+            return self.fail(ProviderErrorKind::Protocol, "unfinished output items");
+        }
+        let mut ids = HashSet::new();
+        if self.blocks.iter().any(|block| matches!(block, AssistantBlock::ToolCall(call) if call.call_id.is_empty() || call.name.is_empty() || !ids.insert(call.call_id.clone()))) {
+            return self.fail(ProviderErrorKind::Protocol, "incomplete or duplicate tool identity");
+        }
+        if stop != StopReason::EndTurn {
+            self.blocks.retain(|block| !is_tool_call(block));
+        }
         let usage = response.and_then(parse_usage);
         let stop = match stop {
             StopReason::EndTurn if self.blocks.iter().any(is_tool_call) => StopReason::ToolUse,
@@ -188,8 +214,8 @@ fn reasoning_summary_text(item: &Value) -> String {
 /// missing usage object yields `None` rather than zeros. `input_tokens` is the
 /// TOTAL input, so the cached and cache-written parts are subtracted out of it
 /// to get `input_uncached`: an absent part counts as 0 in that subtraction
-/// only, never in the reported value, and the subtraction saturates so that
-/// uncached + read + write still adds up to the vendor's `input_tokens`.
+/// only, never in the reported value. The established contract saturates
+/// contradictory totals to zero (see the frozen regression test).
 fn parse_usage(response: &Value) -> Option<Usage> {
     let usage = response.get("usage")?;
     let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
@@ -277,6 +303,18 @@ impl ResponseParser for CodexResponseParser {
         if self.terminal.is_some() {
             return Vec::new();
         }
+        self.decoded_bytes = self.decoded_bytes.saturating_add(event.data.len());
+        if event.data.len() > 1_048_576
+            || self.decoded_bytes > 16_777_216
+            || self.blocks.len() > 4096
+            || self.open_items.len() > 4096
+            || self.done_items.len() > 4096
+        {
+            return self.fail(
+                ProviderErrorKind::Protocol,
+                "provider response exceeds size limit",
+            );
+        }
         let data = event.data.trim();
         if data.is_empty() || data == "[DONE]" {
             return Vec::new();
@@ -287,11 +325,11 @@ impl ResponseParser for CodexResponseParser {
         };
         match value.get("type").and_then(Value::as_str) {
             Some("response.created") => {
-                self.response_id = value
-                    .get("response")
-                    .and_then(|response| response.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                let id = value.pointer("/response/id").and_then(Value::as_str);
+                if self.response_id.is_some() && self.response_id.as_deref() != id {
+                    return self.fail(ProviderErrorKind::Protocol, "conflicting response id");
+                }
+                self.response_id = id.map(str::to_string);
                 Vec::new()
             }
             Some("response.output_text.delta") => match delta_text(&value) {
@@ -347,6 +385,32 @@ impl ResponseParser for CodexResponseParser {
             }
             Some("response.output_item.added") => {
                 if let Some(item) = value.get("item")
+                    && let Some(id) = item.get("id").and_then(Value::as_str)
+                {
+                    let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                    if kind.is_empty()
+                        || self.done_items.contains(id)
+                        || self
+                            .open_items
+                            .insert(
+                                id.to_string(),
+                                (
+                                    kind.to_string(),
+                                    item.get("call_id")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string),
+                                    item.get("name").and_then(Value::as_str).map(str::to_string),
+                                ),
+                            )
+                            .is_some()
+                    {
+                        return self.fail(
+                            ProviderErrorKind::Protocol,
+                            "duplicate or invalid output item",
+                        );
+                    }
+                }
+                if let Some(item) = value.get("item")
                     && matches!(
                         item.get("type").and_then(Value::as_str),
                         Some("function_call" | "custom_tool_call")
@@ -366,6 +430,24 @@ impl ResponseParser for CodexResponseParser {
             }
             Some("response.output_item.done") => {
                 if let Some(item) = value.get("item") {
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        if !self.done_items.insert(id.to_string()) {
+                            return self
+                                .fail(ProviderErrorKind::Protocol, "duplicate output item done");
+                        }
+                        if let Some((kind, call_id, name)) = self.open_items.remove(id)
+                            && (item.get("type").and_then(Value::as_str) != Some(kind.as_str())
+                                || call_id.as_deref().is_some_and(|expected| {
+                                    item.get("call_id").and_then(Value::as_str) != Some(expected)
+                                })
+                                || name.as_deref().is_some_and(|expected| {
+                                    item.get("name").and_then(Value::as_str) != Some(expected)
+                                }))
+                        {
+                            return self
+                                .fail(ProviderErrorKind::Protocol, "output item identity changed");
+                        }
+                    }
                     self.handle_item_done(item);
                 }
                 Vec::new()
@@ -477,6 +559,115 @@ mod tests {
         }
     }
 
+    #[test]
+    fn excessive_provider_events_have_one_bounded_terminal() {
+        let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+        let huge = format!(
+            r#"{{"type":"response.output_item.added","item":{{"id":"{}"}}}}"#,
+            "a".repeat(1_048_576)
+        );
+        assert!(
+            matches!(terminal(&feed(&mut p, &huge)), Outcome::Failed(e) if e.kind == ProviderErrorKind::Protocol)
+        );
+        assert!(feed(&mut p, r#"{"type":"response.completed"}"#).is_empty());
+    }
+    #[test]
+    fn unfinished_items_and_conflicting_ids_fail() {
+        let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+        feed(
+            &mut p,
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","name":"read"}}"#,
+        );
+        assert!(
+            matches!(terminal(&feed(&mut p, r#"{"type":"response.completed","response":{}}"#)), Outcome::Failed(e) if e.kind == ProviderErrorKind::Protocol)
+        );
+        let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+        feed(
+            &mut p,
+            r#"{"type":"response.created","response":{"id":"a"}}"#,
+        );
+        assert!(
+            matches!(terminal(&feed(&mut p, r#"{"type":"response.completed","response":{"id":"b"}}"#)), Outcome::Failed(e) if e.kind == ProviderErrorKind::Protocol)
+        );
+    }
+    #[test]
+    fn announced_items_cannot_be_replaced_or_completed_twice() {
+        for done in [
+            r#"{"type":"message","id":"x","content":[{"type":"output_text","text":"wrong"}]}"#,
+            r#"{"id":"x"}"#,
+            r#"{"type":"function_call","id":"x","call_id":"different","name":"read"}"#,
+        ] {
+            let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+            feed(
+                &mut p,
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"x","call_id":"c","name":"read"}}"#,
+            );
+            assert!(
+                matches!(terminal(&feed(&mut p, &format!(r#"{{"type":"response.output_item.done","item":{done}}}"#))), Outcome::Failed(error) if error.kind == ProviderErrorKind::Protocol)
+            );
+        }
+        let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+        feed(
+            &mut p,
+            r#"{"type":"response.output_item.added","item":{"type":"message","id":"x"}}"#,
+        );
+        let done = r#"{"type":"response.output_item.done","item":{"type":"message","id":"x","content":[]}}"#;
+        feed(&mut p, done);
+        assert!(
+            matches!(terminal(&feed(&mut p, done)), Outcome::Failed(error) if error.kind == ProviderErrorKind::Protocol)
+        );
+    }
+    #[test]
+    fn incomplete_envelope_cannot_change_response_id() {
+        let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+        feed(
+            &mut p,
+            r#"{"type":"response.created","response":{"id":"a"}}"#,
+        );
+        assert!(
+            matches!(terminal(&feed(&mut p, r#"{"type":"response.incomplete","response":{"id":"b","incomplete_details":{"reason":"max_output_tokens"}}}"#)), Outcome::Failed(error) if error.kind == ProviderErrorKind::Protocol)
+        );
+        let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+        feed(
+            &mut p,
+            r#"{"type":"response.created","response":{"id":"a"}}"#,
+        );
+        assert_eq!(completed(&feed(&mut p, r#"{"type":"response.incomplete","response":{"id":"a","incomplete_details":{"reason":"max_output_tokens"}}}"#)).stop, StopReason::MaxOutputTokens);
+    }
+    #[test]
+    fn incomplete_calls_are_removed_and_identities_checked() {
+        for item in [
+            r#"{"type":"function_call","name":"read","arguments":"{}"}"#,
+            r#"{"type":"custom_tool_call","call_id":"c","input":"x"}"#,
+        ] {
+            let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+            feed(
+                &mut p,
+                &format!(r#"{{"type":"response.output_item.done","item":{item}}}"#),
+            );
+            assert!(
+                matches!(terminal(&feed(&mut p, r#"{"type":"response.completed","response":{}}"#)), Outcome::Failed(e) if e.kind == ProviderErrorKind::Protocol)
+            );
+        }
+        let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+        for kind in ["function_call", "custom_tool_call"] {
+            feed(
+                &mut p,
+                &format!(
+                    r#"{{"type":"response.output_item.done","item":{{"type":"{kind}","call_id":"c","name":"read","arguments":"{{}}"}}}}"#
+                ),
+            );
+        }
+        assert!(
+            matches!(terminal(&feed(&mut p, r#"{"type":"response.completed","response":{}}"#)), Outcome::Failed(e) if e.kind == ProviderErrorKind::Protocol)
+        );
+        let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+        feed(
+            &mut p,
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c","name":"read","arguments":"{}"}}"#,
+        );
+        assert!(completed(&feed(&mut p, r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#)).item.tool_calls().next().is_none());
+    }
     #[test]
     fn output_text_deltas_use_the_item_block_index() {
         let mut parser = CodexResponseParser::new(crate::ROUTE, "gpt-test");

@@ -120,7 +120,24 @@ fn lower_item(origin: &Origin, item: &AssistantItem) -> Result<LoweredItem, Prov
         has_reasoning: false,
         calls: Vec::new(),
     };
+    let mut last_group = 0;
     for block in &item.blocks {
+        let group = match block {
+            AssistantBlock::Reasoning {
+                replay: Some(data), ..
+            } if &data.origin == origin => 1,
+            AssistantBlock::Text { text } if !text.is_empty() => 2,
+            AssistantBlock::ToolCall(_) => 3,
+            _ => 0,
+        };
+        if group != 0 {
+            if group < last_group {
+                return Err(invalid(
+                    "interleaved assistant blocks cannot be replayed by chat wire",
+                ));
+            }
+            last_group = group;
+        }
         match block {
             AssistantBlock::Text { text } => lowered.text.push_str(text),
             AssistantBlock::Reasoning {
@@ -261,6 +278,30 @@ mod tests {
             tools: vec![],
             options: ModelOptions::default(),
         }
+    }
+    #[test]
+    fn interleaved_blocks_are_refused_before_lowering() {
+        let route = crate::test_config::route(true);
+        let mut r = request();
+        r.history.push(Item::Assistant(AssistantItem {
+            origin: route.origin("model"),
+            blocks: vec![
+                AssistantBlock::Text {
+                    text: "before".into(),
+                },
+                AssistantBlock::ToolCall(ToolCall {
+                    call_id: "c".into(),
+                    name: "read".into(),
+                    input: ToolInput::Json("{}".into()),
+                }),
+                AssistantBlock::Text {
+                    text: "after".into(),
+                },
+            ],
+        }));
+        assert!(
+            matches!(build_request(&route, "model", &crate::test_config::profile(true), &r), Err(e) if e.kind == ProviderErrorKind::InvalidRequest)
+        );
     }
     #[test]
     fn golden_tool_round_trip_and_subscription_options() {

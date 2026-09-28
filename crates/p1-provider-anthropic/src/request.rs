@@ -138,6 +138,17 @@ pub(crate) fn lower(
                     profile.id
                 ))
             })?;
+            let minimum_cap = budget
+                .checked_add(1)
+                .ok_or_else(|| invalid("thinking budget exceeds representable output cap"))?;
+            let derived_cap = if options.max_output_tokens.is_some() || budget < DEFAULT_MAX_TOKENS
+            {
+                DEFAULT_MAX_TOKENS
+            } else {
+                budget
+                    .checked_add(MANUAL_OUTPUT_MARGIN)
+                    .ok_or_else(|| invalid("thinking budget exceeds representable output cap"))?
+            };
             // The API requires `budget_tokens < max_tokens`. An EXPLICIT cap the
             // budget meets or exceeds cannot be honoured: reject it with the
             // smallest cap that would work, never raise it silently (ADR-0039).
@@ -148,16 +159,12 @@ pub(crate) fn lower(
                     "max_output_tokens {cap} leaves no room for the thinking budget {budget}: the \
                      Messages API requires budget_tokens < max_tokens, so the smallest cap that \
                      works is {} (or omit max_output_tokens and one is derived)",
-                    budget + 1
+                    minimum_cap
                 )));
             }
             Ok(Lowered {
                 // The derived cap makes room for the budget rather than reducing it.
-                max_tokens: if budget >= DEFAULT_MAX_TOKENS {
-                    budget + MANUAL_OUTPUT_MARGIN
-                } else {
-                    DEFAULT_MAX_TOKENS
-                },
+                max_tokens: derived_cap,
                 thinking: Some(json!({ "type": "enabled", "budget_tokens": budget })),
                 output_config: None,
             })
@@ -180,6 +187,14 @@ pub fn validate_composition(
 ) -> Result<(), ProviderError> {
     route.validate()?;
     profile.validate()?;
+    if profile.thinking == ThinkingPolicy::Budget
+        && profile
+            .thinking_budgets
+            .values()
+            .any(|&budget| budget.checked_add(1).is_none())
+    {
+        return Err(invalid("thinking budget exceeds representable output cap"));
+    }
     if wire_model.is_empty() {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
@@ -200,6 +215,7 @@ pub fn validate_request(
     profile: &ModelProfile,
     request: &ProviderRequest,
 ) -> Result<(), ProviderError> {
+    validate_composition(route, wire_model, profile)?;
     for tool in &request.tools {
         if matches!(tool.kind, DeclarationKind::Freeform { .. }) {
             return Err(ProviderError::new(

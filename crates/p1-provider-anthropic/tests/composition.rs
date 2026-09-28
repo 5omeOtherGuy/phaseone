@@ -77,6 +77,54 @@ fn request(options: ModelOptions) -> ProviderRequest {
     }
 }
 
+#[test]
+fn explicit_cap_can_rescue_an_unrepresentable_implicit_margin() {
+    let mut profile = budget_profile();
+    profile.thinking_budgets.insert(Effort::High, u32::MAX - 1);
+    p1_provider_anthropic::validate_composition(&route(), "claude-opus-4-6", &profile).unwrap();
+    let options = ModelOptions {
+        reasoning_effort: Some(Effort::High),
+        max_output_tokens: Some(u32::MAX),
+        ..ModelOptions::default()
+    };
+    let lowered = p1_provider_anthropic::lower_request(
+        &route(),
+        "claude-opus-4-6",
+        &profile,
+        &request(options.clone()),
+    )
+    .unwrap();
+    let body: p1_contracts::serde_json::Value =
+        p1_contracts::serde_json::from_slice(&lowered.body).unwrap();
+    assert_eq!(body["max_tokens"], u32::MAX);
+    let implicit = ModelOptions {
+        max_output_tokens: None,
+        ..options
+    };
+    assert!(
+        matches!(p1_provider_anthropic::lower_request(&route(), "claude-opus-4-6", &profile, &request(implicit)), Err(error) if error.kind == ProviderErrorKind::InvalidRequest)
+    );
+}
+
+#[test]
+fn unrepresentable_thinking_budget_is_an_invalid_request_not_a_panic() {
+    let mut profile = budget_profile();
+    profile.thinking_budgets.insert(Effort::High, u32::MAX);
+    assert!(
+        matches!(p1_provider_anthropic::validate_composition(&route(), "claude-opus-4-6", &profile), Err(e) if e.kind == ProviderErrorKind::InvalidRequest)
+    );
+    for cap in [None, Some(32_000)] {
+        let options = ModelOptions {
+            reasoning_effort: Some(Effort::High),
+            max_output_tokens: cap,
+            ..ModelOptions::default()
+        };
+        assert!(
+            matches!(p1_provider_anthropic::lower_request(&route(), "claude-opus-4-6", &profile, &request(options)), Err(e) if e.kind == ProviderErrorKind::InvalidRequest)
+        );
+    }
+}
+
 fn provider(profile: ModelProfile) -> Result<AnthropicProvider, ProviderError> {
     AnthropicProvider::new(
         route(),

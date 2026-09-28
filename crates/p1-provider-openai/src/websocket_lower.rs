@@ -237,16 +237,11 @@ impl std::fmt::Debug for Memory {
 /// request's `input` re-encodes of it (§6 rule 3).
 #[derive(Clone)]
 pub(crate) struct EchoedItem {
-    /// The `type` the next request writes for this item.
+    /// Exact value re-encoded by the request builder.
+    pub(crate) value: Value,
     pub(crate) kind: &'static str,
-    /// The `role` it writes, for a message: what tells the echoed assistant message
-    /// from the user message that follows it.
     pub(crate) role: Option<&'static str>,
-    /// The item's wire `id`. The encoding does not carry one, so it is only
-    /// compared when a new item happens to have one.
     pub(crate) id: Option<String>,
-    /// The call id the next request writes — `call_id`, or the `id` the wire put it
-    /// there instead (the parser's own rule, so the two cannot disagree).
     pub(crate) call_id: Option<String>,
 }
 
@@ -256,14 +251,13 @@ impl EchoedItem {
     /// under either of the wire's two spellings (the parser's rule). A plain item
     /// `id` is NOT re-encoded: one is compared only when a new item has one.
     pub(crate) fn answers(&self, item: &Value) -> bool {
-        if item.get("type").and_then(Value::as_str) != Some(self.kind) {
+        let Some(candidate) = echoed_item(item) else {
             return false;
-        }
-        item.get("role").and_then(Value::as_str) == self.role
-            && self
-                .call_id
-                .as_deref()
-                .is_none_or(|call_id| item_call_id(item) == call_id)
+        };
+        candidate.kind == self.kind
+            && candidate.role == self.role
+            && candidate.call_id == self.call_id
+            && candidate.value == self.value
             && item
                 .get("id")
                 .and_then(Value::as_str)
@@ -279,54 +273,48 @@ impl EchoedItem {
 /// echo rule 3 looks for.
 pub(crate) fn echoed_item(item: &Value) -> Option<EchoedItem> {
     let kind = item.get("type").and_then(Value::as_str)?;
-    let id = item.get("id").and_then(Value::as_str).map(str::to_string);
-    match kind {
-        "message" => has_output_text(item).then_some(EchoedItem {
-            kind: "message",
-            role: Some("assistant"),
-            id,
-            call_id: None,
-        }),
-        "reasoning" => item
-            .get("encrypted_content")
-            .and_then(Value::as_str)
-            .is_some_and(|encrypted| !encrypted.is_empty())
-            .then_some(EchoedItem {
-                kind: "reasoning",
-                role: None,
-                id,
-                call_id: None,
-            }),
-        "function_call" => Some(EchoedItem {
-            kind: "function_call",
-            role: None,
-            id,
-            call_id: Some(item_call_id(item)),
-        }),
-        "custom_tool_call" => Some(EchoedItem {
-            kind: "custom_tool_call",
-            role: None,
-            id,
-            call_id: Some(item_call_id(item)),
-        }),
-        _ => None,
-    }
-}
-
-/// Whether a message item carries any `output_text` (the only part kind that
-/// becomes a text block, and therefore the next request's assistant message).
-fn has_output_text(item: &Value) -> bool {
-    item.get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|content| {
-            content.iter().any(|part| {
-                part.get("type").and_then(Value::as_str) == Some("output_text")
-                    && part
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| !text.is_empty())
-            })
-        })
+    let value = match kind {
+        "message" => {
+            let text: String = item
+                .get("content")?
+                .as_array()?
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect();
+            if text.is_empty() {
+                return None;
+            }
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]})
+        }
+        "reasoning" => {
+            let encrypted = item.get("encrypted_content")?.as_str()?;
+            if encrypted.is_empty() {
+                return None;
+            }
+            json!({"type":"reasoning","encrypted_content":encrypted,"summary":[]})
+        }
+        "function_call" => json!({"type":"function_call","call_id":item_call_id(item),
+            "name":item.get("name")?.as_str()?,"arguments":item.get("arguments").and_then(Value::as_str).unwrap_or("{}")}),
+        "custom_tool_call" => json!({"type":"custom_tool_call","call_id":item_call_id(item),
+            "name":item.get("name")?.as_str()?,"input":item.get("input").and_then(Value::as_str).unwrap_or_default()}),
+        _ => return None,
+    };
+    let (kind, role) = match kind {
+        "message" => ("message", Some("assistant")),
+        "reasoning" => ("reasoning", None),
+        "function_call" => ("function_call", None),
+        "custom_tool_call" => ("custom_tool_call", None),
+        _ => unreachable!(),
+    };
+    let call_id = matches!(kind, "function_call" | "custom_tool_call").then(|| item_call_id(item));
+    Some(EchoedItem {
+        value,
+        kind,
+        role,
+        id: item.get("id").and_then(Value::as_str).map(str::to_string),
+        call_id,
+    })
 }
 
 /// The call id the parser would take from this item, so the fingerprint and the
@@ -345,6 +333,7 @@ fn item_call_id(item: &Value) -> String {
 pub struct ResponseFacts {
     id: Option<String>,
     items: Vec<EchoedItem>,
+    conflicting_id: bool,
 }
 
 impl ResponseFacts {
@@ -361,12 +350,13 @@ impl ResponseFacts {
             | Some("response.completed")
             | Some("response.done")
             | Some("response.incomplete") => {
-                if let Some(id) = value
-                    .get("response")
-                    .and_then(|response| response.get("id"))
-                    .and_then(Value::as_str)
-                {
-                    self.id = Some(id.to_string());
+                if let Some(id) = value.pointer("/response/id").and_then(Value::as_str) {
+                    if self.id.as_deref().is_some_and(|old| old != id) {
+                        self.id = None;
+                        self.conflicting_id = true;
+                    } else if !self.conflicting_id {
+                        self.id = Some(id.to_string());
+                    }
                 }
             }
             Some("response.output_item.done") => {
@@ -388,6 +378,9 @@ impl ResponseFacts {
 
 /// §6: what to remember now that the response ended cleanly.
 fn remember(body: &Value, facts: &ResponseFacts) -> Option<Memory> {
+    if facts.conflicting_id {
+        return None;
+    }
     let response_id = facts.id.clone()?;
     body.get("input")?.as_array()?;
     Some(Memory {

@@ -410,7 +410,15 @@ async fn read_body(
             }
         }
         Raced::Done(Ok(Some(Ok(chunk)))) => {
-            let events = decoder.push(&chunk);
+            let events = match decoder.try_push(&chunk) {
+                Ok(events) => events,
+                Err(message) => {
+                    return state.finish(Outcome::Failed(ProviderError::new(
+                        ProviderErrorKind::Protocol,
+                        message,
+                    )));
+                }
+            };
             if let Some(outcome) = feed(&mut state, parser.as_mut(), events) {
                 state.pending.push_back(StreamEvent::Finished(outcome));
                 state.phase = Phase::Done;

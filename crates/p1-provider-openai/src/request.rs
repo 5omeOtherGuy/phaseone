@@ -427,10 +427,12 @@ pub fn validate_request(
             ));
         }
     }
-    if request.options.cache_key.as_deref() == Some("") {
+    if let Some(key) = request.options.cache_key.as_deref()
+        && (key.is_empty() || key.chars().any(|ch| ch.is_control() || ch == ' '))
+    {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
-            "cache_key must not be empty: set a stable nonempty key or leave it unset",
+            "cache_key must be nonempty without controls or spaces",
         ));
     }
     // The model policy: the same lowering the request builder runs, so
@@ -503,7 +505,7 @@ pub fn build_request(
     validate_composition(route, wire_model, profile)?;
     // The same pure validation the provider's `validate` runs, so the builder can
     // never emit a request the provider would refuse.
-    validate(route.account, profile, &request.options)?;
+    validate_request(route, profile, request)?;
     let lowered = lower(profile, &request.options)?;
     let origin = route.origin(wire_model);
     let input = input_items(request, &origin)?;
@@ -861,6 +863,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cache_key_header_injection_is_rejected_before_lowering() {
+        for key in ["bad\nkey", "bad\rkey", "bad\0key", "bad\u{7f}key"] {
+            let mut request = request_with(vec![], vec![]);
+            request.options.cache_key = Some(key.into());
+            assert!(
+                matches!(validate_request(&route(), &profile(), &request), Err(e) if e.kind == ProviderErrorKind::InvalidRequest)
+            );
+            assert!(
+                matches!(lower_request(&route(), "gpt-test", &profile(), &request), Err(e) if e.kind == ProviderErrorKind::InvalidRequest)
+            );
+        }
+        let mut request = request_with(vec![], vec![]);
+        request.options.cache_key = Some("valid-123".into());
+        assert!(lower_request(&route(), "gpt-test", &profile(), &request).is_ok());
+    }
     #[test]
     fn websocket_session_headers_need_a_cache_key() {
         let mut request = request_with(vec![user("hi")], Vec::new());
