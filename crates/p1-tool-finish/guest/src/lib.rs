@@ -559,8 +559,17 @@ pub struct FinishInput {
     tried: Option<Vec<String>>,
     /// The structured answer a contract asks for (ADR-0053 item 5); unknown without
     /// one, and ignored by `blocked`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_result")]
     result: Option<serde_json::Value>,
+}
+
+fn deserialize_present_result<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 impl FinishInput {
@@ -767,7 +776,16 @@ fn counting_commands(record: &Record) -> Vec<String> {
     let last_change = record.last_file_change;
     let mut last: HashMap<String, &ShellRun> = HashMap::new();
     for run in &record.runs {
-        last.insert(normalise_command(&run.command), run);
+        last.insert(
+            run.command.split_whitespace().collect::<Vec<_>>().join(" "),
+            run,
+        );
+    }
+    let mut spelling_counts: HashMap<String, usize> = HashMap::new();
+    for command in last.keys() {
+        *spelling_counts
+            .entry(normalise_command(command))
+            .or_default() += 1;
     }
     let mut counting: Vec<(u64, String)> = last
         .into_iter()
@@ -775,9 +793,18 @@ fn counting_commands(record: &Record) -> Vec<String> {
             run.exit_code == Some(0)
                 && !is_piped(&run.command)
                 && !is_masked(&run.command)
+                && !is_unprovable(&run.command)
                 && last_change.is_none_or(|change| run.order > change)
         })
-        .map(|(command, run)| (run.order, command))
+        .map(|(command, run)| {
+            let short = normalise_command(&command);
+            let display = if spelling_counts[&short] == 1 {
+                short
+            } else {
+                command
+            };
+            (run.order, display)
+        })
         .collect();
     counting.sort();
     let keep_from = counting.len().saturating_sub(5);
@@ -812,11 +839,22 @@ fn masked_error(named: &str) -> String {
 /// success.
 pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>) -> Option<String> {
     let wanted = normalise_command(named);
-    let Some(run) = runs
+    // A shorthand may omit a leading cd only when it identifies a unique actual
+    // command. Different directories must never substitute for each other.
+    let candidates: Vec<&ShellRun> = runs
         .iter()
-        .rev()
-        .find(|run| normalise_command(&run.command) == wanted)
-    else {
+        .filter(|run| normalise_command(&run.command) == wanted)
+        .collect();
+    let distinct: std::collections::HashSet<&str> =
+        candidates.iter().map(|run| run.command.as_str()).collect();
+    let run = if let Some(exact) = runs.iter().rev().find(|run| {
+        run.command.split_whitespace().collect::<Vec<_>>().join(" ")
+            == named.split_whitespace().collect::<Vec<_>>().join(" ")
+    }) {
+        exact
+    } else if distinct.len() == 1 {
+        *candidates.last().expect("one distinct command has a run")
+    } else {
         return Some(no_successful_run(named));
     };
     // A pipe hides the check's exit code behind its last stage's, so the recorded
@@ -826,20 +864,48 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
     }
     // `;`, `||`, a newline or a single `&` lets something else run last, with the
     // same effect.
-    if is_masked(&run.command) {
+    if is_masked(&run.command) || is_unprovable(&run.command) {
         return Some(masked_error(named));
     }
     if run.exit_code != Some(0) {
         return Some(no_successful_run(named));
     }
     if let Some(change) = last_change
-        && run.order < change
+        && run.order <= change
     {
         return Some(format!(
             "You changed files after running `{named}`. Run it again, then finish."
         ));
     }
     None
+}
+
+/// Shell constructs whose outer zero status cannot prove the check succeeded.
+/// An opaque interpreter/expansion is refused rather than trying to parse shell syntax.
+pub fn is_unprovable(command: &str) -> bool {
+    let trimmed = command.trim_start();
+    trimmed.starts_with('!')
+        || command
+            .split("&&")
+            .any(|segment| segment.trim_start().starts_with('!'))
+        || command.contains("$(")
+        || command.contains('`')
+        || command.contains("${")
+        || command.split_whitespace().any(|word| {
+            matches!(
+                word.rsplit('/').next().unwrap_or_default(),
+                "eval"
+                    | "source"
+                    | "."
+                    | "bash"
+                    | "sh"
+                    | "zsh"
+                    | "dash"
+                    | "python"
+                    | "python3"
+                    | "node"
+            )
+        })
 }
 
 /// Normalise a command for comparison: trim, collapse every run of whitespace to
@@ -949,6 +1015,17 @@ pub fn describe_result(
         Ok(input) => match input.status {
             Status::Done => {
                 let commands = input.verification.unwrap_or_default();
+                let invalid_result = content.contains("result does not match the schema");
+                if commands.len() == 1 && commands[0].trim() == "none" {
+                    return plain(if invalid_result {
+                        "invalid structured result · unchecked".into()
+                    } else {
+                        "unchecked · no command run".into()
+                    });
+                }
+                if invalid_result {
+                    return plain("invalid structured result · unchecked".into());
+                }
                 ResultSummary {
                     summary: format!("verified · {}", commands.join(", ")),
                     detail: Some(format!(
@@ -1043,6 +1120,122 @@ mod tests {
         assert_eq!(command_failure("cargo test", &runs, None), None);
         assert!(command_failure("cargo test", &runs, Some(2)).is_some());
         assert!(command_failure("cargo build", &runs, None).is_some());
+    }
+
+    #[test]
+    fn null_result_is_present_and_valid() {
+        let contract = OutputContract::new(serde_json::json!({"type":"null"})).unwrap();
+        let input = parse_input(
+            NAME,
+            RawInput::Json(
+                r#"{"status":"done","summary":"ok","verification":["none"],"result":null}"#,
+            ),
+        )
+        .unwrap();
+        let verdict = evaluate(
+            NAME,
+            input,
+            CompletionPolicy::RecordedCommands,
+            Some(&contract),
+            &Record::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            verdict.structured.unwrap().value,
+            Some(serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn verification_rejects_inverted_nested_and_same_event_runs() {
+        for command in [
+            "! cargo test",
+            "bash -c 'cargo test; true'",
+            "echo $(cargo test)",
+        ] {
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], Some(7)).is_some(),
+                "{command}"
+            );
+        }
+        assert!(command_failure("cargo test", &[run("cargo test", 0, 7)], Some(7)).is_some());
+        assert!(command_failure("cargo test", &[run("cargo test", 0, 8)], Some(7)).is_none());
+    }
+
+    #[test]
+    fn trailer_shortens_only_unambiguous_directory_spelling() {
+        let single = Record {
+            last_file_change: None,
+            runs: vec![run("cd a && cd b && x", 0, 1)],
+        };
+        assert!(trailer(&single).contains("- cd b && x"));
+        let distinct = Record {
+            last_file_change: None,
+            runs: vec![
+                run("cd broken && cargo test", 0, 1),
+                run("cd clean && cargo test", 0, 2),
+            ],
+        };
+        let text = trailer(&distinct);
+        assert!(text.contains("- cd broken && cargo test"));
+        assert!(text.contains("- cd clean && cargo test"));
+    }
+
+    #[test]
+    fn nested_status_inversion_and_path_qualified_interpreters_never_count() {
+        for command in [
+            "cd project && ! cargo test",
+            "/bin/bash -c 'cargo test; true'",
+            "python3 -c 'import subprocess; subprocess.run(\"cargo test\", shell=True)'",
+        ] {
+            let record = Record {
+                last_file_change: Some(1),
+                runs: vec![run(command, 0, 2)],
+            };
+            assert!(command_failure(command, &record.runs, record.last_file_change).is_some());
+            assert!(counting_commands(&record).is_empty());
+        }
+    }
+
+    #[test]
+    fn none_and_invalid_schema_both_show_in_result_description() {
+        let raw = RawInput::Json(r#"{"status":"done","summary":"x","verification":["none"]}"#);
+        let result = describe_result(
+            NAME,
+            raw,
+            ResultStatus::Ok,
+            "Finished. The result does not match the schema:",
+        );
+        assert!(result.summary.contains("invalid structured result"));
+        assert!(result.summary.contains("unchecked"));
+        assert!(result.detail.is_none());
+    }
+
+    #[test]
+    fn verification_does_not_swap_directories() {
+        let runs = [
+            run("cd broken && cargo test", 1, 7),
+            run("cd clean && cargo test", 0, 8),
+        ];
+        assert!(command_failure("cd broken && cargo test", &runs, Some(6)).is_some());
+        assert!(command_failure("cargo test", &runs, Some(6)).is_some());
+    }
+
+    #[test]
+    fn unverified_and_invalid_result_descriptions_have_no_checkmark() {
+        let none = r#"{"status":"done","summary":"ok","verification":["none"]}"#;
+        let summary = describe_result(NAME, RawInput::Json(none), ResultStatus::Ok, "Finished.");
+        assert!(!summary.summary.contains("verified"));
+        assert!(summary.detail.is_none());
+        let invalid = r#"{"status":"done","summary":"ok","verification":["cargo test"]}"#;
+        let summary = describe_result(
+            NAME,
+            RawInput::Json(invalid),
+            ResultStatus::Ok,
+            "Finished. The result does not match the schema:",
+        );
+        assert!(summary.detail.is_none());
+        assert!(!summary.summary.starts_with("verified"));
     }
 
     #[test]

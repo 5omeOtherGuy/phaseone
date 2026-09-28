@@ -70,12 +70,15 @@ pub(crate) fn search_excluding(
         .case_insensitive(query.case_insensitive)
         .build(&query.pattern)
         .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
-    let overrides = build_overrides(&search_path, query.glob.as_deref())?;
-    let files = collect_files(workspace, &search_path, overrides, cancel)?;
-    let files = exclude_files(files, cancel, &excluded)?;
-    search_content(workspace, &matcher, query, &files, cancel, |path, _| {
-        excluded(path)
-    })
+    search_streaming(
+        workspace,
+        &search_path,
+        &matcher,
+        query,
+        cancel,
+        &excluded,
+        &|path, _| excluded(path),
+    )
 }
 
 /// Like [`search_excluding`], with a fresh check on each opened file.
@@ -91,10 +94,15 @@ pub(crate) fn search_excluding_opened(
         .case_insensitive(query.case_insensitive)
         .build(&query.pattern)
         .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
-    let overrides = build_overrides(&search_path, query.glob.as_deref())?;
-    let files = collect_files(workspace, &search_path, overrides, cancel)?;
-    let files = exclude_files(files, cancel, &excluded)?;
-    search_content(workspace, &matcher, query, &files, cancel, opened_excluded)
+    search_streaming(
+        workspace,
+        &search_path,
+        &matcher,
+        query,
+        cancel,
+        &excluded,
+        &opened_excluded,
+    )
 }
 
 /// The host side of `workspace.list-files`: the files under `path` (a directory, or one
@@ -249,6 +257,11 @@ fn build_overrides(search_path: &Path, glob: Option<&str>) -> Result<Option<Over
     }
 }
 
+/// Until the workspace interface offers paginated walking, refuse exceptionally large
+/// listings rather than accumulating unbounded path data in host and guest memory.
+const MAX_WALK_FILES: usize = 4_096;
+const MAX_WALK_PATH_BYTES: usize = 512 * 1024;
+
 /// Walk the search path and return `(root-relative display, absolute path)` pairs, sorted
 /// bytewise by display path. Hidden entries are skipped by the walker, symlinks are never
 /// followed, and binary files are filtered by the callers that read content.
@@ -268,6 +281,7 @@ fn collect_files(
     }
 
     let mut files = Vec::new();
+    let mut path_bytes = 0usize;
     for entry in walk.build() {
         if cancel.is_cancelled() {
             return Err(FsError::Cancelled);
@@ -279,12 +293,89 @@ fn collect_files(
         }
         let path = entry.into_path();
         let display = workspace.display(&path);
+        path_bytes = path_bytes
+            .saturating_add(display.len())
+            .saturating_add(path.as_os_str().len());
+        if files.len() >= MAX_WALK_FILES || path_bytes > MAX_WALK_PATH_BYTES {
+            return Err(FsError::Io(
+                "workspace listing exceeds the bounded search budget; narrow with path or glob"
+                    .into(),
+            ));
+        }
         files.push((display, path));
     }
     files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     Ok(files)
 }
 
+/// Search in a sorted streaming walk, keeping only the bounded match lines and
+/// counting omitted matching files without retaining the complete path listing.
+fn search_streaming(
+    workspace: &Workspace,
+    search_path: &Path,
+    matcher: &RegexMatcher,
+    query: &SearchQuery,
+    cancel: &CancellationToken,
+    excluded: &impl Fn(&Path) -> Result<bool, FsError>,
+    opened_excluded: &impl Fn(&Path, &std::fs::File) -> Result<bool, FsError>,
+) -> Result<SearchResult, FsError> {
+    let overrides = build_overrides(search_path, query.glob.as_deref())?;
+    let mut walk = WalkBuilder::new(search_path);
+    walk.require_git(false);
+    if let Some(overrides) = overrides {
+        walk.overrides(overrides);
+    }
+    walk.sort_by_file_path(|left, right| left.as_os_str().cmp(right.as_os_str()));
+    let mut searcher = content_searcher(query.context as usize);
+    let mut result = SearchResult {
+        files: Vec::new(),
+        truncated: false,
+        omitted_files: 0,
+    };
+    let mut room = query.max_lines as usize;
+    for entry in walk.build() {
+        if cancel.is_cancelled() {
+            return Err(FsError::Cancelled);
+        }
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if excluded(path)? {
+            continue;
+        }
+        let Ok(file) = workspace.open_file_at(path) else {
+            continue;
+        };
+        let Ok(opened_path) = opened_object_path(&file, path) else {
+            continue;
+        };
+        if opened_excluded(&opened_path, &file)? {
+            continue;
+        }
+        let mut sink = MatchSink::with_room(room);
+        if searcher.search_file(matcher, &file, &mut sink).is_err() || sink.binary || !sink.seen {
+            continue;
+        }
+        if sink.overflowed {
+            result.truncated = true;
+        }
+        if sink.lines.is_empty() {
+            result.omitted_files = result.omitted_files.saturating_add(1);
+            result.truncated = true;
+            continue;
+        }
+        room -= sink.lines.len();
+        result.files.push(FileMatches {
+            path: workspace.display(path),
+            lines: sink.lines,
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
 fn search_content(
     workspace: &Workspace,
     matcher: &RegexMatcher,
@@ -423,6 +514,47 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use crate::capabilities::SearchQuery;
+
+    #[test]
+    fn listing_refuses_before_collecting_unbounded_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..=super::MAX_WALK_FILES {
+            fs::write(dir.path().join(format!("f{i:05}")), b"text").unwrap();
+        }
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let cancel = CancellationToken::new();
+        let error = super::list_files(&workspace, ".", None, &cancel).unwrap_err();
+        assert!(
+            matches!(error, crate::capabilities::FsError::Io(message) if message.contains("bounded search budget"))
+        );
+    }
+
+    #[test]
+    fn broad_content_search_streams_past_listing_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..=super::MAX_WALK_FILES {
+            fs::write(
+                dir.path().join(format!("f{i:05}")),
+                if i == 0 { "needle" } else { "other" },
+            )
+            .unwrap();
+        }
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 2,
+        };
+        let result = super::search(&workspace, &query, &CancellationToken::new()).unwrap();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "f00000");
+        // Files mode starts with this same capped host search; no full listing is
+        // needed when its one matching path already fits in the carried prefix.
+        assert_eq!(result.omitted_files, 0);
+    }
 
     #[test]
     fn search_finds_file_with_invalid_utf8_name() {

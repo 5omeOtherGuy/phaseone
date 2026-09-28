@@ -42,6 +42,20 @@ use crate::file_walk;
 /// a read the module abandons (a binary file, say) is dropped when newer ones push it out,
 /// which bounds what abandoned reads keep in memory.
 const MAX_OPEN_SNAPSHOTS: usize = 4;
+/// Matches the component's per-read budget; host allocation is bounded independently.
+const MAX_COMPONENT_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+fn protected_index_current(index: &ProtectedIndex, cancel: &CancellationToken) -> bool {
+    #[cfg(unix)]
+    {
+        index.still_current(cancel).unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (index, cancel);
+        true
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // The read side: the `workspace` and `snapshot` capabilities of one agent.
@@ -138,7 +152,35 @@ impl Inner {
         }
     }
 
+    fn opened_file(
+        &self,
+        checked: &CheckedPath,
+        index: &ProtectedIndex,
+        policy: &CredentialPolicy,
+        cancel: &CancellationToken,
+    ) -> Result<std::fs::File, FsError> {
+        let refused = || FsError::Io(p1_workspace::credential_refusal(checked.display()));
+        let file = self
+            .workspace
+            .open_file_at(checked.path())
+            .map_err(|error| self.fs_error(error))?;
+        let opened_path =
+            file_walk::opened_object_path(&file, checked.path()).map_err(|_| refused())?;
+        let metadata = file.metadata().map_err(|_| refused())?;
+        if policy.refuses(&opened_path)
+            || index.refuses_current_exact(policy, &metadata)
+            || !protected_index_current(index, cancel)
+        {
+            return Err(refused());
+        }
+        Ok(file)
+    }
+
     fn stat(&self, requested: &str) -> Result<WorkspaceEntry, FsError> {
+        let policy = CredentialPolicy::new(self.home.as_deref(), &self.xdg_credentials);
+        let cancel = CancellationToken::new();
+        let index =
+            ProtectedIndex::build(&policy, &cancel).map_err(|IndexCancelled| FsError::Cancelled)?;
         let checked = self.check(requested)?;
         let stat = self
             .workspace
@@ -152,18 +194,36 @@ impl Inner {
             FileKind::Symlink => return Err(FsError::NotFound),
             FileKind::Other => EntryKind::Other,
         };
+        let size = if kind == EntryKind::File {
+            self.opened_file(&checked, &index, &policy, &cancel)?
+                .metadata()
+                .map_err(|error| FsError::Io(error.to_string()))?
+                .len()
+        } else {
+            0
+        };
         Ok(WorkspaceEntry {
             path: checked.display().to_owned(),
             kind,
-            size: if kind == EntryKind::File {
-                stat.size
-            } else {
-                0
-            },
+            size,
         })
     }
 
     fn read(&self, requested: &str, offset: u64, length: u64) -> Result<Vec<u8>, FsError> {
+        self.read_with_before_open(requested, offset, length, || {})
+    }
+
+    fn read_with_before_open(
+        &self,
+        requested: &str,
+        offset: u64,
+        length: u64,
+        before_open: impl FnOnce(),
+    ) -> Result<Vec<u8>, FsError> {
+        let policy = CredentialPolicy::new(self.home.as_deref(), &self.xdg_credentials);
+        let cancel = CancellationToken::new();
+        let index =
+            ProtectedIndex::build(&policy, &cancel).map_err(|IndexCancelled| FsError::Cancelled)?;
         let checked = self.check(requested)?;
         let key = checked.path().to_path_buf();
         // A read from the start takes a fresh snapshot; later windows come from the same one,
@@ -173,10 +233,13 @@ impl Inner {
         // records only a successful read.
         let snapshot = match self.take_open(&key).filter(|_| offset > 0) {
             Some(snapshot) => snapshot,
-            None => self
-                .workspace
-                .read(requested, &ObservedFiles::new())
-                .map_err(|error| self.fs_error(error))?,
+            None => {
+                before_open();
+                let file = self.opened_file(&checked, &index, &policy, &cancel)?;
+                self.workspace
+                    .snapshot_from_open_file(&key, file, MAX_COMPONENT_READ_BYTES)
+                    .map_err(|error| self.fs_error(error))?
+            }
         };
         let offset = usize::try_from(offset).unwrap_or(usize::MAX);
         let length = usize::try_from(length).unwrap_or(usize::MAX);
@@ -967,6 +1030,99 @@ mod tests {
             Err(FsError::NotFound)
         );
         assert_eq!(reads.recorded(&dir.path().join("missing.txt")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_capability_refuses_credential_hardlinks_even_after_check_open_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = dir.path().join(".config/keys/token.key");
+        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        std::fs::write(&protected, b"synthetic private fixture").unwrap();
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, b"public").unwrap();
+        let observed = ObservedFiles::new();
+        let capability = ReadCapability::new(
+            Workspace::new(dir.path()).unwrap(),
+            observed.clone(),
+            Some(dir.path().to_path_buf()),
+        );
+        let outcome = capability
+            .inner
+            .read_with_before_open("notes.txt", 0, 64, || {
+                std::fs::remove_file(&notes).unwrap();
+                std::fs::hard_link(&protected, &notes).unwrap();
+            });
+        assert!(matches!(outcome, Err(FsError::Io(_))));
+        assert_eq!(
+            observed.check_unchanged(&notes, b"synthetic private fixture"),
+            Observation::NeverObserved
+        );
+        assert!(matches!(
+            capability.inner.stat("notes.txt"),
+            Err(FsError::Io(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_capability_refuses_new_protected_directory_inodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, b"public").unwrap();
+        let cap = ReadCapability::new(
+            Workspace::new(dir.path()).unwrap(),
+            ObservedFiles::new(),
+            Some(dir.path().to_path_buf()),
+        );
+        let result = cap.inner.read_with_before_open("notes.txt", 0, 64, || {
+            let protected = dir.path().join(".config/keys/new.key");
+            std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+            std::fs::write(&protected, b"private fixture").unwrap();
+            std::fs::remove_file(&notes).unwrap();
+            std::fs::hard_link(&protected, &notes).unwrap();
+        });
+        assert!(matches!(result, Err(FsError::Io(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_index_detects_protected_directory_added_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CredentialPolicy::new(Some(dir.path()), &[]);
+        let cancel = CancellationToken::new();
+        let index = ProtectedIndex::build(&policy, &cancel).unwrap();
+        let protected = dir.path().join(".config/keys/new.key");
+        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        std::fs::write(&protected, b"synthetic fixture").unwrap();
+        let alias = dir.path().join("notes.txt");
+        std::fs::hard_link(&protected, &alias).unwrap();
+        let file = std::fs::File::open(alias).unwrap();
+        assert!(!index.still_current(&cancel).unwrap());
+        assert!(!index.refuses_current_exact(&policy, &file.metadata().unwrap()));
+        // SearchCapability's opened-file callbacks now fail closed on this staleness.
+    }
+
+    #[test]
+    fn bounded_host_snapshot_refuses_growth_after_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.txt");
+        std::fs::write(&path, b"ok").unwrap();
+        let cap = ReadCapability::new(
+            Workspace::new(dir.path()).unwrap(),
+            ObservedFiles::new(),
+            None,
+        );
+        assert_eq!(cap.inner.stat("growing.txt").unwrap().size, 2);
+        let result = cap.inner.read_with_before_open("growing.txt", 0, 16, || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(super::MAX_COMPONENT_READ_BYTES + 1)
+                .unwrap();
+        });
+        assert!(matches!(result, Err(FsError::Io(message)) if message.contains("read budget")));
     }
 
     #[tokio::test]

@@ -61,7 +61,8 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
     }
 
     if exit_ok && !has_failure_signal(&text) {
-        // Pass: summary block only.
+        // Only remove known progress. An unknown line may be a warning; leave the
+        // entire output raw instead of silently dropping a diagnostic.
         let mut kept: Vec<String> = Vec::new();
         for line in &lines {
             if jest && is_jest_summary(line) {
@@ -74,8 +75,11 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
                         kept.push(t.split(" (").next().unwrap_or(t).to_string());
                     }
                     Some(_) => kept.push(line.trim().to_string()),
+                    None if !is_noise(line) => return None,
                     None => {}
                 }
+            } else if !is_noise(line) {
+                return None;
             }
         }
         if kept.is_empty() {
@@ -205,6 +209,14 @@ AssertionError: expected -5 to be -6 // Object.is equality
         }
         assert!(!out.contains("RUN  v4.1.9"), "{out}");
         assert!(!out.contains("Start at"), "{out}");
+    }
+
+    #[test]
+    fn successful_test_warning_is_not_discarded() {
+        let raw = "PASS a.test.js\nwarning: a deprecated API\nTest Suites: 1 passed, 1 total\nTests: 1 passed, 1 total\n";
+        assert_eq!(apply(raw, true), None);
+        let vitest = " RUN v1\nwarning: API deprecated\n Test Files  1 passed\n Tests  1 passed\n";
+        assert_eq!(apply(vitest, true), None);
     }
 
     #[test]

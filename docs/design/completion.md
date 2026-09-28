@@ -14,7 +14,9 @@ the model ends its work by calling a tool. No text is ever pattern-matched.
 - **Verified completion** — the model calls `finish` with `status: "done"` and names the
   verification commands it ran; and the session's own record shows that each of them really
   ran, succeeded, and ran AFTER the last file change. The tool checks this; the model's word
-  is not enough.
+  is not enough. Status-inverting (including after `&&`), nested-interpreter (including
+  path-qualified executables) and command-substitution runs cannot establish verification
+  evidence.
 - **Real blocker** — the model calls `finish` with `status: "blocked"`: what it needs, and what
   it tried. The run stops and reports it. A blocker is never answered with "continue".
 - **Premature stop** — a turn that ends (`TurnEnd::Completed`) in an unattended run while no
@@ -63,7 +65,8 @@ Rules, each with its exact model-visible text:
    (the LAST run of that command counts: a failing re-run invalidates an earlier success).
 3. That run must be newer than the last file change → otherwise
    Error `You changed files after running \`<command>\`. Run it again, then finish.`
-   A shell command was once not counted as a file change (it could not be known); ADR-0055
+   A run sharing its order with the last file change does not count as newer.
+  A shell command was once not counted as a file change (it could not be known); ADR-0055
    removes that stated limit — a successful command that changes the workspace IS a file change
    (§3c), and the run that caused the change shares its record with it.
 4. `blocked` requires non-empty `needs` → otherwise Error `Say what you need in "needs".`
@@ -133,8 +136,9 @@ on `TurnStarted` stays the host's job.
 omitted `verification` although the error asked for it, two named a command in a different
 spelling than it had run (`cargo fmt --check` vs `cd <dir> && cargo fmt --check`). And the
 journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fail. Therefore:
-- **Matching is normalised**, on both sides: trim, collapse runs of whitespace, and drop ONE
-  leading `cd <path> &&` segment. Equality after that.
+- **Matching is normalised** by whitespace. A leading `cd <path> &&` may be omitted only
+  when it unambiguously names one distinct recorded command; different directories are
+  different verification identities.
 - **A pipeline is not a verification.** A recorded command containing an unquoted `|` that is
   not part of `||` never counts (its exit code is the last command's). Naming such a run →
   Error `\`<command>\` was run through a pipe, so its exit code says nothing about it. Run it without a pipe, then finish.`

@@ -413,6 +413,26 @@ async fn the_host_passes_the_credential_refusal_into_the_workspace_service() {
     .await;
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn built_component_refuses_protected_hardlink_without_observation() {
+    let home = tempfile::tempdir().unwrap();
+    let protected = home.path().join(".config/keys/synthetic.key");
+    std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+    std::fs::write(&protected, b"synthetic fixture").unwrap();
+    let alias = home.path().join("notes.txt");
+    std::fs::hard_link(&protected, &alias).unwrap();
+    let pair = both_tools(home.path(), Some(home.path()));
+    let outcome = execute(pair.module.as_ref(), &call(&file_call("notes.txt"))).await;
+    assert_eq!(outcome.status, ToolStatus::Error);
+    assert!(!outcome.content.contains("synthetic fixture"));
+    assert_eq!(
+        pair.module_observed
+            .check_unchanged(&alias, b"synthetic fixture"),
+        Observation::NeverObserved
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_successful_read_is_observed_and_a_failed_one_is_not() {
     within_deadline("observation", async {

@@ -402,13 +402,23 @@ fn describe_matches(content: &str, files_mode: bool) -> (usize, Vec<String>) {
         return (0, Vec::new());
     }
     if files_mode {
-        let files = content.lines().map(str::to_string).collect::<Vec<_>>();
+        let mut lines: Vec<&str> = content.lines().collect();
+        if lines.len() > 1 && lines.last().is_some_and(|line| is_truncation_footer(line)) {
+            lines.pop();
+        }
+        let files = lines.into_iter().map(str::to_string).collect::<Vec<_>>();
         return (files.len(), files);
     }
     let blocks = content.split("\n\n").collect::<Vec<_>>();
     let count = blocks
         .iter()
-        .map(|block| block.lines().count().saturating_sub(1))
+        .map(|block| {
+            let mut lines: Vec<&str> = block.lines().skip(1).collect();
+            if lines.last().is_some_and(|line| is_truncation_footer(line)) {
+                lines.pop();
+            }
+            lines.len()
+        })
         .sum();
     let files = blocks
         .iter()
@@ -416,6 +426,20 @@ fn describe_matches(content: &str, files_mode: bool) -> (usize, Vec<String>) {
         .map(str::to_string)
         .collect();
     (count, files)
+}
+
+fn is_truncation_footer(line: &str) -> bool {
+    let rest = line
+        .strip_prefix("[truncated after ")
+        .or_else(|| line.strip_prefix("[truncated inside "));
+    let Some((_, tail)) = rest.and_then(|rest| rest.rsplit_once("; ")) else {
+        return false;
+    };
+    // A footer is a complete renderer sentinel, not an arbitrary filename with
+    // the same prefix. Only the final line of a block can be a control line.
+    let suffix = tail == "narrow with path or glob]"
+        || tail == "narrow with path, glob or a stricter pattern]";
+    suffix && line.contains(" more matching files not shown; ")
 }
 
 /// `requested` with `.` and `..` collapsed and empty components dropped, `/`-separated; for a
@@ -459,6 +483,57 @@ mod tests {
             truncated,
             omitted_files,
         }
+    }
+
+    #[test]
+    fn footer_like_filenames_and_hit_lines_are_preserved() {
+        let filename = "[truncated after notes]";
+        let files = describe_result(true, true, &render_files(&[filename.into()], 1));
+        assert_eq!(files.matches.unwrap().files, vec![filename]);
+        let content = render_content(&result(
+            vec![file("notes", vec![line(1, "[truncated after notes]")])],
+            false,
+            0,
+        ));
+        let matches = describe_result(false, true, &content).matches.unwrap();
+        assert_eq!(matches.count, 1);
+        assert_eq!(matches.files, vec!["notes"]);
+    }
+
+    #[test]
+    fn descriptions_exclude_truncation_footer() {
+        let paths: Vec<String> = (0..MAX_OUTPUT_LINES + 5)
+            .map(|i| format!("file-{i}"))
+            .collect();
+        let description = describe_result(true, true, &render_files(&paths, paths.len()));
+        let matches = description.matches.unwrap();
+        assert!(
+            !matches
+                .files
+                .iter()
+                .any(|path| path.starts_with("[truncated"))
+        );
+        assert_eq!(matches.count, matches.files.len());
+        let hits = result(
+            vec![file(
+                "a",
+                (1..=MAX_OUTPUT_LINES as u64 + 10)
+                    .map(|i| line(i, "hit"))
+                    .collect(),
+            )],
+            true,
+            0,
+        );
+        let text = render_content(&hits);
+        let description = describe_result(false, true, &text);
+        assert!(
+            !description
+                .matches
+                .unwrap()
+                .files
+                .iter()
+                .any(|path| path.starts_with("[truncated"))
+        );
     }
 
     #[test]

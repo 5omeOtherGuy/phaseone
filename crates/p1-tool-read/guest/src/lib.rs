@@ -113,11 +113,29 @@ pub fn describe_target(tool: &str, raw: RawInput<'_>) -> Option<String> {
         let mut target = input.file_path;
         if input.offset.is_some() || input.limit.is_some() {
             let start = input.offset.unwrap_or(DEFAULT_OFFSET);
-            let end = start + input.limit.unwrap_or(DEFAULT_LIMIT) - 1;
+            let end = start.saturating_add(input.limit.unwrap_or(DEFAULT_LIMIT).saturating_sub(1));
             target = format!("{target}:{start}-{end}");
         }
         target
     })
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    #[test]
+    fn huge_read_window_does_not_overflow() {
+        let raw = format!(
+            r#"{{"file_path":"a", "offset":{}, "limit":{}}}"#,
+            i64::MAX,
+            i64::MAX
+        );
+        assert!(
+            describe_target(NAME, RawInput::Json(&raw))
+                .unwrap()
+                .contains(&i64::MAX.to_string())
+        );
+    }
 }
 
 /// The one-line summary of a result the model was shown: its size for a successful read,

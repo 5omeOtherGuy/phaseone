@@ -494,7 +494,7 @@ impl Capture {
         let dropped = self.dropped();
         let mut out = Vec::new();
         if dropped > 0 {
-            out.extend_from_slice(format!("\n[… {dropped} bytes omitted …]\n").as_bytes());
+            out.extend_from_slice(format!("\n[… {dropped} bytes omitted; diagnostics may be missing, including in raw output …]\n").as_bytes());
         }
         out.extend(std::mem::take(&mut self.tail));
         self.tail_newlines = 0;
@@ -508,6 +508,14 @@ impl Capture {
 mod tests {
     use super::{ENV_ALLOW, ENV_ALLOW_PREFIXES, ProcessService};
     use std::ffi::OsString;
+
+    #[test]
+    fn truncated_middle_warns_that_raw_cannot_restore_diagnostics() {
+        let mut capture = super::Capture::default();
+        capture.push(&vec![b'a'; super::HEAD_BYTES + super::TAIL_BYTES + 100]);
+        let rest = String::from_utf8(capture.take_rest()).unwrap();
+        assert!(rest.contains("diagnostics may be missing, including in raw output"));
+    }
 
     /// The allow-list is exactly the spec's list; a later change has to update
     /// this test rather than widen the boundary silently.
