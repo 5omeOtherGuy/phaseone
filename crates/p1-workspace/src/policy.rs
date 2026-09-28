@@ -443,7 +443,7 @@ mod tests {
         std::fs::hard_link(&credential, &alias).unwrap();
         let policy = CredentialPolicy::new(Some(home.path()), &[]);
         let original_permissions = std::fs::metadata(parent).unwrap().permissions();
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::metadata(&credential).is_ok() {
             // Root can still search mode-000 directories, so this refusal cannot be exercised.
             std::fs::set_permissions(parent, original_permissions).unwrap();
