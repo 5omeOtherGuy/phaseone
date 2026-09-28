@@ -19,9 +19,9 @@ use crate::Workspace;
 #[derive(Clone, Debug)]
 pub struct CredentialPolicy {
     lexical_exact_paths: Vec<PathBuf>,
-    lexical_keys_directory: Option<PathBuf>,
+    lexical_directories: Vec<PathBuf>,
     exact_paths: Vec<PathBuf>,
-    keys_directory: Option<PathBuf>,
+    directories: Vec<PathBuf>,
 }
 
 impl CredentialPolicy {
@@ -31,7 +31,7 @@ impl CredentialPolicy {
             .iter()
             .map(|path| lexical_absolute(path))
             .collect::<Vec<_>>();
-        let lexical_keys_directory = home.map(|home| {
+        let lexical_directories = home.map_or_else(Vec::new, |home| {
             let home = lexical_absolute(home);
             lexical_exact_paths.extend([
                 home.join(".config/p1/auth.json"),
@@ -40,13 +40,17 @@ impl CredentialPolicy {
                 home.join(".local/share/opencode/auth.json"),
                 home.join(".pi/agent/auth.json"),
             ]);
-            home.join(".config").join("keys")
+            vec![
+                home.join(".config/keys"),
+                home.join(".ssh"),
+                home.join(".gnupg"),
+            ]
         });
         let mut exact_paths = xdg_credentials
             .iter()
             .map(|path| canonical_best_effort(path))
             .collect::<Vec<_>>();
-        let keys_directory = home.map(|home| {
+        let directories = home.map_or_else(Vec::new, |home| {
             let home = canonical_best_effort(home);
             let home_credentials = [
                 home.join(".config/p1/auth.json"),
@@ -60,36 +64,38 @@ impl CredentialPolicy {
                     .iter()
                     .map(|path| canonical_best_effort(path)),
             );
-            canonical_best_effort(&home.join(".config").join("keys"))
+            [".config/keys", ".ssh", ".gnupg"]
+                .iter()
+                .map(|relative| canonical_best_effort(&home.join(relative)))
+                .collect()
         });
         Self {
             lexical_exact_paths,
-            lexical_keys_directory,
+            lexical_directories,
             exact_paths,
-            keys_directory,
+            directories,
         }
     }
 
-    /// Whether `candidate` is one of the fixed credential files or lies under the keys
+    /// Whether `candidate` is one of the fixed credential files or lies under a credential
     /// directory. Both lexical spelling and canonical target are checked for each candidate.
     pub fn refuses(&self, candidate: &Path) -> bool {
         let lexical_candidate = lexical_absolute(candidate);
         let lexical_match = self.lexical_exact_paths.contains(&lexical_candidate)
-            || self.lexical_keys_directory.as_ref().is_some_and(|keys| {
-                lexical_candidate == *keys || lexical_candidate.starts_with(keys)
+            || self.lexical_directories.iter().any(|directory| {
+                lexical_candidate == *directory || lexical_candidate.starts_with(directory)
             });
         let candidate = canonical_best_effort(candidate);
         lexical_match
             || self.exact_paths.contains(&candidate)
             || self
-                .keys_directory
-                .as_ref()
-                .is_some_and(|keys| candidate == *keys || candidate.starts_with(keys))
+                .directories
+                .iter()
+                .any(|directory| candidate == *directory || candidate.starts_with(directory))
     }
 
-    /// Check the object already opened, including hard links to exact credential files.
-    /// Directory targets remain path-prefix checks; file identities are checked from the
-    /// opened descriptor rather than a second lookup of the candidate spelling.
+    /// Check the object already opened, including hard links to credential files.
+    /// File identities come from the descriptor, not a second lookup of the candidate.
     pub fn refuses_opened(&self, candidate: &Path, file: &std::fs::File) -> bool {
         if self.refuses(candidate) {
             return true;
@@ -100,11 +106,36 @@ impl CredentialPolicy {
             let Ok(opened) = file.metadata() else {
                 return true;
             };
-            self.exact_paths.iter().any(|target| {
+            if opened.nlink() == 1 {
+                return false;
+            }
+            let same_file = |target: &Path| {
                 std::fs::metadata(target).is_ok_and(|credential| {
-                    credential.dev() == opened.dev() && credential.ino() == opened.ino()
+                    credential.is_file()
+                        && credential.dev() == opened.dev()
+                        && credential.ino() == opened.ino()
                 })
-            })
+            };
+            if self.exact_paths.iter().any(|target| same_file(target)) {
+                return true;
+            }
+            let mut pending = self.directories.clone();
+            while let Some(directory) = pending.pop() {
+                let Ok(entries) = std::fs::read_dir(directory) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let Ok(kind) = entry.file_type() else {
+                        continue;
+                    };
+                    if kind.is_dir() {
+                        pending.push(entry.path());
+                    } else if kind.is_file() && same_file(&entry.path()) {
+                        return true;
+                    }
+                }
+            }
+            false
         }
         #[cfg(not(unix))]
         {

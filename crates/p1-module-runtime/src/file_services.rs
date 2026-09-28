@@ -1122,6 +1122,75 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_refuses_hard_links_into_credential_directories() {
+        for credential_path in [".config/keys/a.key", ".ssh/id_test"] {
+            let home = tempfile::tempdir().unwrap();
+            let credential = home.path().join(credential_path);
+            std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+            std::fs::write(&credential, "directory-secret-marker").unwrap();
+            std::fs::hard_link(&credential, home.path().join("notes.txt")).unwrap();
+            let capability = SearchCapability::new(
+                Workspace::new(home.path()).unwrap(),
+                Some(home.path().to_path_buf()),
+            );
+            assert_eq!(
+                capability.read("notes.txt".into(), 0, 64).await,
+                Err(FsError::Io(p1_workspace::credential_refusal("notes.txt"))),
+                "hard link to {credential_path} must be refused"
+            );
+            assert!(
+                capability
+                    .search(SearchQuery {
+                        pattern: "directory-secret-marker".into(),
+                        path: None,
+                        glob: None,
+                        case_insensitive: false,
+                        context: 0,
+                        max_lines: 10,
+                    })
+                    .await
+                    .unwrap()
+                    .files
+                    .is_empty(),
+                "hard link to {credential_path} must not match"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_hard_link_remains_searchable() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("original.txt"), "ordinary-linked-marker").unwrap();
+        std::fs::hard_link(
+            home.path().join("original.txt"),
+            home.path().join("notes.txt"),
+        )
+        .unwrap();
+        let capability = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().to_path_buf()),
+        );
+        assert_eq!(
+            capability.read("notes.txt".into(), 0, 64).await,
+            Ok(b"ordinary-linked-marker".to_vec())
+        );
+        let found = capability
+            .search(SearchQuery {
+                pattern: "ordinary-linked-marker".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap();
+        assert!(found.files.iter().any(|file| file.path == "notes.txt"));
+    }
+
     /// The search capability's `read` returns only the requested window and records no
     /// observation (`p1/search` is granted no `snapshot`), so file-list mode's binary sniff
     /// cannot load a large file whole or give a search the permission an edit needs.
