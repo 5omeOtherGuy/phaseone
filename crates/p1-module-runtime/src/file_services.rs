@@ -279,6 +279,7 @@ pub struct SearchCapability {
     workspace: Workspace,
     home: Option<PathBuf>,
     xdg_credentials: Vec<PathBuf>,
+    index: Arc<Mutex<Option<Arc<ProtectedIndex>>>>,
 }
 
 impl SearchCapability {
@@ -288,6 +289,7 @@ impl SearchCapability {
             workspace,
             home,
             xdg_credentials: xdg_credentials(),
+            index: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -310,14 +312,37 @@ impl SearchCapability {
     }
 }
 
+fn cached_index(
+    cache: &Mutex<Option<Arc<ProtectedIndex>>>,
+    policy: &CredentialPolicy,
+    cancel: &CancellationToken,
+) -> Result<Arc<ProtectedIndex>, FsError> {
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(index) = guard.as_ref() {
+        if index
+            .still_current(cancel)
+            .map_err(|IndexCancelled| FsError::Cancelled)?
+        {
+            return Ok(index.clone());
+        }
+    }
+    let index = Arc::new(
+        ProtectedIndex::build(policy, cancel).map_err(|IndexCancelled| FsError::Cancelled)?,
+    );
+    *guard = Some(index.clone());
+    Ok(index)
+}
+
 impl WorkspaceService for SearchCapability {
     fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>> {
         let home = self.home.clone();
         let xdg_credentials = self.xdg_credentials.clone();
+        let cache = self.index.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            let index = ProtectedIndex::build(&credential_policy, cancel)
-                .map_err(|IndexCancelled| FsError::Cancelled)?;
+            let index = cached_index(&cache, &credential_policy, cancel)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -335,7 +360,9 @@ impl WorkspaceService for SearchCapability {
                 let refused = || FsError::Io(p1_workspace::credential_refusal(checked.display()));
                 let opened_path =
                     file_walk::opened_object_path(&file, checked.path()).map_err(|_| refused())?;
-                if credential_policy.refuses(&opened_path) || index.refuses_metadata(&metadata) {
+                if credential_policy.refuses(&opened_path)
+                    || index.refuses_current_exact(&credential_policy, &metadata)
+                {
                     return Err(refused());
                 }
                 (EntryKind::File, metadata.len())
@@ -367,10 +394,10 @@ impl WorkspaceService for SearchCapability {
         // prefix of every listed file, which must not load a large file whole.
         let home = self.home.clone();
         let xdg_credentials = self.xdg_credentials.clone();
+        let cache = self.index.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            let index = ProtectedIndex::build(&credential_policy, cancel)
-                .map_err(|IndexCancelled| FsError::Cancelled)?;
+            let index = cached_index(&cache, &credential_policy, cancel)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -381,9 +408,9 @@ impl WorkspaceService for SearchCapability {
                 length,
                 &|candidate, file| {
                     credential_policy.refuses(candidate)
-                        || file
-                            .metadata()
-                            .map_or(true, |metadata| index.refuses_metadata(&metadata))
+                        || file.metadata().map_or(true, |metadata| {
+                            index.refuses_current_exact(&credential_policy, &metadata)
+                        })
                 },
             )
         })
@@ -396,10 +423,10 @@ impl WorkspaceService for SearchCapability {
     ) -> BoxFuture<'_, Result<Vec<String>, FsError>> {
         let home = self.home.clone();
         let xdg_credentials = self.xdg_credentials.clone();
+        let cache = self.index.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            let index = ProtectedIndex::build(&credential_policy, cancel)
-                .map_err(|IndexCancelled| FsError::Cancelled)?;
+            let index = cached_index(&cache, &credential_policy, cancel)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -408,7 +435,12 @@ impl WorkspaceService for SearchCapability {
                 &path,
                 glob.as_deref(),
                 cancel,
-                |candidate| credential_policy.refuses(candidate) || index.refuses_path(candidate),
+                |candidate| {
+                    credential_policy.refuses(candidate)
+                        || std::fs::metadata(candidate).is_ok_and(|metadata| {
+                            index.refuses_current_exact(&credential_policy, &metadata)
+                        })
+                },
             )
         })
     }
@@ -416,10 +448,10 @@ impl WorkspaceService for SearchCapability {
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<SearchResult, FsError>> {
         let home = self.home.clone();
         let xdg_credentials = self.xdg_credentials.clone();
+        let cache = self.index.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            let index = ProtectedIndex::build(&credential_policy, cancel)
-                .map_err(|IndexCancelled| FsError::Cancelled)?;
+            let index = cached_index(&cache, &credential_policy, cancel)?;
             if let Some(path) = query.path.as_deref() {
                 credential_policy
                     .refuse(workspace, path)
@@ -429,12 +461,17 @@ impl WorkspaceService for SearchCapability {
                 workspace,
                 &query,
                 cancel,
-                |candidate| credential_policy.refuses(candidate) || index.refuses_path(candidate),
+                |candidate| {
+                    credential_policy.refuses(candidate)
+                        || std::fs::metadata(candidate).is_ok_and(|metadata| {
+                            index.refuses_current_exact(&credential_policy, &metadata)
+                        })
+                },
                 |candidate, file| {
                     credential_policy.refuses(candidate)
-                        || file
-                            .metadata()
-                            .map_or(true, |metadata| index.refuses_metadata(&metadata))
+                        || file.metadata().map_or(true, |metadata| {
+                            index.refuses_current_exact(&credential_policy, &metadata)
+                        })
                 },
             )
         })
@@ -1082,6 +1119,7 @@ mod tests {
             workspace,
             home: Some(dir.path().to_path_buf()),
             xdg_credentials: vec![],
+            index: Arc::new(Mutex::new(None)),
         };
 
         assert_eq!(
@@ -1260,6 +1298,67 @@ mod tests {
             cap.read(".config/keys/../public.txt".into(), 0, 32).await,
             Ok(b"public".to_vec())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn renamed_exact_credential_is_refused_after_index_was_cached() {
+        let home = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "old").unwrap();
+        std::fs::write(home.path().join("safe.txt"), "safe").unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert_eq!(
+            cap.read("safe.txt".into(), 0, 10).await,
+            Ok(b"safe".to_vec())
+        );
+        std::fs::rename(&credential, home.path().join("old.txt")).unwrap();
+        std::fs::write(&credential, "new-marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("alias.txt")).unwrap();
+        assert_eq!(
+            cap.read("alias.txt".into(), 0, 20).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("alias.txt")))
+        );
+        assert!(
+            cap.search(SearchQuery {
+                pattern: "new-marker".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap()
+            .files
+            .iter()
+            .all(|file| file.path != "alias.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_index_cache_reuses_and_rebuilds_on_change() {
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join(".config/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        let policy = CredentialPolicy::new(Some(home.path()), &cap.xdg_credentials);
+        let cancel = CancellationToken::new();
+        let first = cached_index(&cap.index, &policy, &cancel).unwrap();
+        let reused = cached_index(&cap.index, &policy, &cancel).unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        std::fs::write(keys.join("new.key"), "fixture").unwrap();
+        let rebuilt = cached_index(&cap.index, &policy, &cancel).unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert!(rebuilt.refuses_path(&keys.join("new.key")));
     }
 
     #[cfg(unix)]

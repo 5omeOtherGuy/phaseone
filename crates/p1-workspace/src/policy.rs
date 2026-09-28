@@ -34,6 +34,30 @@ pub struct ProtectedIndex {
     #[cfg(unix)]
     files: HashSet<(u64, u64)>,
     incomplete: bool,
+    #[cfg(unix)]
+    directories_seen: Vec<(PathBuf, Option<DirectoryStamp>)>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct DirectoryStamp {
+    dev: u64,
+    ino: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+impl DirectoryStamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
 }
 
 /// Index construction stopped by the request's cancellation token.
@@ -51,6 +75,8 @@ impl ProtectedIndex {
             #[cfg(unix)]
             files: HashSet::new(),
             incomplete: false,
+            #[cfg(unix)]
+            directories_seen: Vec::new(),
         };
         for path in &policy.exact_paths {
             if cancel.is_cancelled() {
@@ -78,8 +104,10 @@ impl ProtectedIndex {
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound
-                        && std::fs::symlink_metadata(&directory).is_err() =>
+                        && cleanly_missing(&directory) =>
                 {
+                    #[cfg(unix)]
+                    index.directories_seen.push((directory, None));
                     continue;
                 }
                 Err(_) => {
@@ -89,8 +117,12 @@ impl ProtectedIndex {
             };
             #[cfg(unix)]
             {
-                use std::os::unix::fs::MetadataExt;
-                if !visited.insert((metadata.dev(), metadata.ino())) {
+                let stamp = DirectoryStamp::of(&metadata);
+                let identity = (stamp.dev, stamp.ino);
+                index
+                    .directories_seen
+                    .push((directory.clone(), Some(stamp)));
+                if !visited.insert(identity) {
                     continue;
                 }
             }
@@ -127,6 +159,44 @@ impl ProtectedIndex {
         Ok(index)
     }
 
+    /// A cached directory index is safe only while every traversed directory is unchanged.
+    /// Incomplete walks are rebuilt; cancellations never reuse a stale snapshot.
+    pub fn still_current(&self, cancel: &CancellationToken) -> Result<bool, IndexCancelled> {
+        #[cfg(unix)]
+        {
+            if self.incomplete {
+                return Ok(false);
+            }
+            for (path, stamp) in &self.directories_seen {
+                if cancel.is_cancelled() {
+                    return Err(IndexCancelled);
+                }
+                let current = std::fs::metadata(path).ok();
+                let matches = match (stamp, current) {
+                    (Some(expected), Some(metadata)) if metadata.is_dir() => {
+                        *expected == DirectoryStamp::of(&metadata)
+                    }
+                    (None, None) => cleanly_missing(path),
+                    _ => false,
+                };
+                if !matches {
+                    return Ok(false);
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(IndexCancelled);
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+        #[cfg(unix)]
+        {
+            Ok(true)
+        }
+    }
+
     fn insert(&mut self, metadata: &std::fs::Metadata) {
         #[cfg(unix)]
         if metadata.is_file() {
@@ -152,9 +222,55 @@ impl ProtectedIndex {
         }
     }
 
+    /// Recheck exact credential paths at the time of opening: an atomic rename may have
+    /// replaced one after this index was captured.
+    pub fn refuses_current_exact(
+        &self,
+        policy: &CredentialPolicy,
+        metadata: &std::fs::Metadata,
+    ) -> bool {
+        if self.refuses_metadata(metadata) {
+            return true;
+        }
+        for path in &policy.exact_paths {
+            match std::fs::metadata(path) {
+                Ok(credential) if credential.is_file() && same_identity(&credential, metadata) => {
+                    return true;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && cleanly_missing(path) => {}
+                Err(_) => return multiple_links(metadata),
+                _ => {}
+            }
+        }
+        false
+    }
+
     pub fn refuses_path(&self, path: &Path) -> bool {
         std::fs::metadata(path).is_ok_and(|metadata| self.refuses_metadata(&metadata))
     }
+}
+
+#[cfg(unix)]
+fn same_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_identity(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn multiple_links(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn multiple_links(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// A missing exact store is harmless only when every ancestor lookup succeeds up to
