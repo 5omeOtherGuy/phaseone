@@ -427,13 +427,19 @@ pub fn validate_request(
             ));
         }
     }
-    if let Some(key) = request.options.cache_key.as_deref()
-        && (key.is_empty() || key.chars().any(|ch| ch.is_control() || ch == ' '))
-    {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "cache_key must be nonempty without controls or spaces",
-        ));
+    if let Some(key) = request.options.cache_key.as_deref() {
+        if key.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "cache_key must not be empty: set a stable nonempty key or leave it unset",
+            ));
+        }
+        if key.chars().any(|ch| ch.is_control() || ch == ' ') {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "cache_key must not contain controls or spaces",
+            ));
+        }
     }
     // The model policy: the same lowering the request builder runs, so
     // `validate` can never accept a request the builder would reject.
