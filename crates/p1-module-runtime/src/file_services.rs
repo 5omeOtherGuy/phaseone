@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use p1_contracts::{BoxFuture, CancellationToken};
 use p1_workspace::{
     CheckedPath, CredentialPolicy, FileKind, MutationError, MutationPolicy, Observation,
-    ObservedFiles, OwnedMutation, ReadRecord, Snapshot, Workspace, WorkspaceError,
+    ObservedFiles, OwnedMutation, ProtectedIndex, ReadRecord, Snapshot, Workspace, WorkspaceError,
     refuse_credentials, xdg_credentials,
 };
 
@@ -314,8 +314,10 @@ impl WorkspaceService for SearchCapability {
     fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>> {
         let home = self.home.clone();
         let xdg_credentials = self.xdg_credentials.clone();
-        self.blocking(move |workspace, _| {
+        self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+            let index = ProtectedIndex::build(&credential_policy, cancel)
+                .map_err(|()| FsError::Cancelled)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -323,20 +325,34 @@ impl WorkspaceService for SearchCapability {
                 .check_path(&path)
                 .map_err(file_walk::workspace_error)?;
             let stat = workspace.stat(&path).map_err(file_walk::workspace_error)?;
-            // The kinds the native `grep` gives its logic, so both render the same text.
-            let kind = match stat.kind {
-                FileKind::File => EntryKind::File,
-                FileKind::Directory => EntryKind::Directory,
-                _ => EntryKind::Other,
+            let (kind, size) = if stat.kind == FileKind::File {
+                let file = workspace
+                    .open_file_at(checked.path())
+                    .map_err(file_walk::workspace_error)?;
+                let metadata = file
+                    .metadata()
+                    .map_err(|error| FsError::Io(error.to_string()))?;
+                let refused = || FsError::Io(p1_workspace::credential_refusal(checked.display()));
+                let opened_path =
+                    file_walk::opened_object_path(&file, checked.path()).map_err(|_| refused())?;
+                if credential_policy.refuses(&opened_path) || index.refuses_metadata(&metadata) {
+                    return Err(refused());
+                }
+                (EntryKind::File, metadata.len())
+            } else {
+                (
+                    if stat.kind == FileKind::Directory {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::Other
+                    },
+                    0,
+                )
             };
             Ok(WorkspaceEntry {
                 path: checked.display().to_owned(),
                 kind,
-                size: if kind == EntryKind::File {
-                    stat.size
-                } else {
-                    0
-                },
+                size,
             })
         })
     }
@@ -351,8 +367,10 @@ impl WorkspaceService for SearchCapability {
         // prefix of every listed file, which must not load a large file whole.
         let home = self.home.clone();
         let xdg_credentials = self.xdg_credentials.clone();
-        self.blocking(move |workspace, _| {
+        self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+            let index = ProtectedIndex::build(&credential_policy, cancel)
+                .map_err(|()| FsError::Cancelled)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -362,8 +380,10 @@ impl WorkspaceService for SearchCapability {
                 offset,
                 length,
                 &|candidate, file| {
-                    CredentialPolicy::new(home.as_deref(), &xdg_credentials)
-                        .refuses_opened(candidate, file)
+                    credential_policy.refuses(candidate)
+                        || file
+                            .metadata()
+                            .map_or(true, |metadata| index.refuses_metadata(&metadata))
                 },
             )
         })
@@ -378,12 +398,17 @@ impl WorkspaceService for SearchCapability {
         let xdg_credentials = self.xdg_credentials.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+            let index = ProtectedIndex::build(&credential_policy, cancel)
+                .map_err(|()| FsError::Cancelled)?;
+            credential_policy
+                .refuse(workspace, &path)
+                .map_err(FsError::Io)?;
             file_walk::list_files_excluding(
                 workspace,
                 &path,
                 glob.as_deref(),
                 cancel,
-                |candidate| credential_policy.refuses(candidate),
+                |candidate| credential_policy.refuses(candidate) || index.refuses_path(candidate),
             )
         })
     }
@@ -393,14 +418,23 @@ impl WorkspaceService for SearchCapability {
         let xdg_credentials = self.xdg_credentials.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+            let index = ProtectedIndex::build(&credential_policy, cancel)
+                .map_err(|()| FsError::Cancelled)?;
+            if let Some(path) = query.path.as_deref() {
+                credential_policy
+                    .refuse(workspace, path)
+                    .map_err(FsError::Io)?;
+            }
             file_walk::search_excluding_opened(
                 workspace,
                 &query,
                 cancel,
-                |candidate| credential_policy.refuses(candidate),
+                |candidate| credential_policy.refuses(candidate) || index.refuses_path(candidate),
                 |candidate, file| {
-                    CredentialPolicy::new(home.as_deref(), &xdg_credentials)
-                        .refuses_opened(candidate, file)
+                    credential_policy.refuses(candidate)
+                        || file
+                            .metadata()
+                            .map_or(true, |metadata| index.refuses_metadata(&metadata))
                 },
             )
         })
@@ -1157,6 +1191,75 @@ mod tests {
                 "hard link to {credential_path} must not match"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aliases_are_absent_from_list_files_and_empty_pattern_files_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("alias.txt")).unwrap();
+        std::fs::write(home.path().join("safe.txt"), "safe").unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert_eq!(
+            cap.list_files(".".into(), None).await.unwrap(),
+            vec!["safe.txt"]
+        );
+        assert!(
+            cap.search(SearchQuery {
+                pattern: String::new(),
+                path: Some("alias.txt".into()),
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap()
+            .files
+            .is_empty()
+        );
+        assert_eq!(
+            cap.stat("alias.txt".into()).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("alias.txt")))
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_credential_scope_is_refused_before_confinement() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "marker").unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(workspace_dir.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert!(matches!(cap.search(SearchQuery {
+            pattern: "marker".into(), path: Some(credential.display().to_string()), glob: None,
+            case_insensitive: false, context: 0, max_lines: 10,
+        }).await, Err(FsError::Io(message)) if message.contains("read refuses credential files")));
+    }
+
+    #[tokio::test]
+    async fn parent_component_out_of_keys_is_allowed() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/keys")).unwrap();
+        std::fs::write(home.path().join(".config/public.txt"), "public").unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert_eq!(
+            cap.read(".config/keys/../public.txt".into(), 0, 32).await,
+            Ok(b"public".to_vec())
+        );
     }
 
     #[cfg(unix)]

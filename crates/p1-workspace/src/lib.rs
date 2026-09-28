@@ -28,7 +28,7 @@ pub use gate::{Mutation, WriteGate};
 pub use observe::{Observation, ObservedFiles, StreamingHash};
 pub use p1_contracts::tool::ToolFace;
 pub use policy::{
-    CredentialPolicy, could_not_be_read, credential_refusal, refuse_credentials,
+    CredentialPolicy, ProtectedIndex, could_not_be_read, credential_refusal, refuse_credentials,
     refuses_credentials, xdg_credentials,
 };
 pub use read::{CheckedPath, DirEntry, FileKind, Snapshot, SnapshotMetadata, Stat};

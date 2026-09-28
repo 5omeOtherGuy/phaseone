@@ -11,7 +11,11 @@
 //! crates that see both sides pin them equal
 //! (`crates/p1-tool-read/src/lib.rs`, `the_native_texts_are_the_guests`).
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
+
+use p1_contracts::CancellationToken;
 
 use crate::Workspace;
 
@@ -22,6 +26,125 @@ pub struct CredentialPolicy {
     lexical_directories: Vec<PathBuf>,
     exact_paths: Vec<PathBuf>,
     directories: Vec<PathBuf>,
+}
+
+/// Descriptor identities of protected regular files, captured once for a request.
+#[derive(Debug)]
+pub struct ProtectedIndex {
+    #[cfg(unix)]
+    files: HashSet<(u64, u64)>,
+    incomplete: bool,
+}
+
+impl ProtectedIndex {
+    /// Follow symlinked subdirectories while preventing directory cycles. An unreadable
+    /// protected directory forces conservative treatment of every multiply linked file.
+    pub fn build(policy: &CredentialPolicy, cancel: &CancellationToken) -> Result<Self, ()> {
+        let mut index = Self {
+            #[cfg(unix)]
+            files: HashSet::new(),
+            incomplete: false,
+        };
+        for path in &policy.exact_paths {
+            if cancel.is_cancelled() {
+                return Err(());
+            }
+            if let Ok(metadata) = std::fs::metadata(path) {
+                index.insert(&metadata);
+            }
+        }
+        let mut pending = policy.directories.clone();
+        #[cfg(unix)]
+        let mut visited = HashSet::new();
+        while let Some(directory) = pending.pop() {
+            if cancel.is_cancelled() {
+                return Err(());
+            }
+            let metadata = match std::fs::metadata(&directory) {
+                Ok(metadata) if metadata.is_dir() => metadata,
+                Ok(_) => {
+                    index.incomplete = true;
+                    continue;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && std::fs::symlink_metadata(&directory).is_err() =>
+                {
+                    continue;
+                }
+                Err(_) => {
+                    index.incomplete = true;
+                    continue;
+                }
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if !visited.insert((metadata.dev(), metadata.ino())) {
+                    continue;
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = metadata;
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    index.incomplete = true;
+                    continue;
+                }
+            };
+            for entry in entries {
+                if cancel.is_cancelled() {
+                    return Err(());
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        index.incomplete = true;
+                        continue;
+                    }
+                };
+                match entry.metadata() {
+                    Ok(metadata) if metadata.is_dir() => pending.push(entry.path()),
+                    Ok(metadata) => index.insert(&metadata),
+                    Err(_) => index.incomplete = true,
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(());
+        }
+        Ok(index)
+    }
+
+    fn insert(&mut self, metadata: &std::fs::Metadata) {
+        #[cfg(unix)]
+        if metadata.is_file() {
+            use std::os::unix::fs::MetadataExt;
+            self.files.insert((metadata.dev(), metadata.ino()));
+        }
+        #[cfg(not(unix))]
+        let _ = metadata;
+    }
+
+    /// Metadata must come from the opened handle for reads and stat.
+    pub fn refuses_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            self.files.contains(&(metadata.dev(), metadata.ino()))
+                || (self.incomplete && metadata.nlink() > 1)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            self.incomplete
+        }
+    }
+
+    pub fn refuses_path(&self, path: &Path) -> bool {
+        std::fs::metadata(path).is_ok_and(|metadata| self.refuses_metadata(&metadata))
+    }
 }
 
 impl CredentialPolicy {
@@ -213,13 +336,24 @@ fn env_path(name: &str) -> Option<PathBuf> {
 
 /// Make a path absolute without resolving symlinks, preserving the lexical policy spelling.
 fn lexical_absolute(path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .map(|current_dir| current_dir.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut normalized = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
     }
+    normalized
 }
 
 /// The canonical form of `path`, or — when it does not exist yet — its canonical parent with
@@ -241,6 +375,110 @@ fn canonical_best_effort(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn index_remembers_opened_identity_after_alias_is_unlinked() {
+        use std::os::unix::fs::MetadataExt;
+        let home = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "marker").unwrap();
+        let alias = home.path().join("alias.txt");
+        std::fs::hard_link(&credential, &alias).unwrap();
+        let opened = std::fs::File::open(&alias).unwrap();
+        let index = ProtectedIndex::build(
+            &CredentialPolicy::new(Some(home.path()), &[]),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        assert_eq!(opened.metadata().unwrap().nlink(), 1);
+        assert!(index.refuses_metadata(&opened.metadata().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_metadata_is_not_second_path_resolution() {
+        let home = tempfile::tempdir().unwrap();
+        let secret = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret, "secret").unwrap();
+        let alias = home.path().join("alias.txt");
+        std::fs::hard_link(&secret, &alias).unwrap();
+        let opened = std::fs::File::open(&alias).unwrap();
+        let index = ProtectedIndex::build(
+            &CredentialPolicy::new(Some(home.path()), &[]),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::write(&alias, "new ordinary file").unwrap();
+        assert!(!index.refuses_path(&alias));
+        assert!(index.refuses_metadata(&opened.metadata().unwrap()));
+        assert_eq!(opened.metadata().unwrap().len(), 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_follows_symlinked_keys_directories_and_survives_cycles() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join(".config/keys");
+        let sub = home.path().join("store");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("secret.key"), "marker").unwrap();
+        symlink(&sub, keys.join("linked")).unwrap();
+        symlink(&keys, sub.join("back")).unwrap();
+        let alias = home.path().join("alias.txt");
+        std::fs::hard_link(sub.join("secret.key"), &alias).unwrap();
+        let index = ProtectedIndex::build(
+            &CredentialPolicy::new(Some(home.path()), &[]),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(index.refuses_path(&alias));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_index_refuses_multilink_but_not_single_link() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join(".config/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        symlink("missing", keys.join("unreadable")).unwrap();
+        let alias = home.path().join("alias.txt");
+        std::fs::write(&alias, "safe").unwrap();
+        let other = home.path().join("other.txt");
+        std::fs::hard_link(&alias, &other).unwrap();
+        let index = ProtectedIndex::build(
+            &CredentialPolicy::new(Some(home.path()), &[]),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(index.refuses_path(&alias));
+        std::fs::remove_file(&other).unwrap();
+        assert!(!index.refuses_path(&alias));
+    }
+
+    #[test]
+    fn cancelled_index_build_stops_before_reading_directories() {
+        let home = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            ProtectedIndex::build(&CredentialPolicy::new(Some(home.path()), &[]), &cancel).is_err()
+        );
+    }
+
+    #[test]
+    fn parent_components_do_not_turn_public_files_into_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let policy = CredentialPolicy::new(Some(home.path()), &[]);
+        assert!(!policy.refuses(&home.path().join(".config/keys/../public.txt")));
+    }
 
     /// The credential files a tool refuses, relative to the home it was given.
     const CREDENTIAL_PATHS: [&str; 7] = [

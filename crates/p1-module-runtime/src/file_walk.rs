@@ -202,7 +202,7 @@ fn read_window_inner(
 }
 
 /// The real path of the object `file` refers to, so policy checks see what was opened.
-fn opened_object_path(file: &std::fs::File, opened_path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn opened_object_path(file: &std::fs::File, opened_path: &Path) -> io::Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
