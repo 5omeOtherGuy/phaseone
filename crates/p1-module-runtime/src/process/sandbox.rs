@@ -194,13 +194,11 @@ pub fn bwrap_args(
     private_tmp: &Path,
 ) -> Result<Vec<OsString>, SandboxError> {
     let home = &sandbox.home;
-    if home == workspace_root || home.starts_with(workspace_root) {
-        return Err(SandboxError::WorkspaceContainsHome {
-            workspace: workspace_root.to_path_buf(),
-            home: home.to_path_buf(),
-        });
+    // Assembly rejects workspaces containing home. Keep this pure argument builder
+    // focused on individual bind sources so it can report their errors independently.
+    if !home.starts_with(workspace_root) {
+        validate_credential_source(workspace_root, home)?;
     }
-    validate_credential_source(workspace_root, home)?;
     for writable in &sandbox.writable {
         validate_credential_source(writable, home)?;
     }
@@ -391,11 +389,10 @@ fn sandbox_writable_roots(
         std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf()),
         std::fs::canonicalize(private_tmp).unwrap_or_else(|_| private_tmp.to_path_buf()),
     ];
-    roots.extend(
-        writable
-            .iter()
-            .filter_map(|path| std::fs::canonicalize(path).ok()),
-    );
+    // Keep one root per configured entry, including absent paths. The writable
+    // loop excludes its own root by index; dropping absent entries shifts those
+    // indexes and can incorrectly suppress a disjoint bind.
+    roots.extend(writable.iter().map(|path| existing_source(path)));
     roots
 }
 
