@@ -34,6 +34,8 @@ pub struct ProtectedIndex {
     #[cfg(unix)]
     files: HashSet<(u64, u64)>,
     incomplete: bool,
+    protected_directories: Vec<PathBuf>,
+    protected_exact_paths: Vec<PathBuf>,
     #[cfg(unix)]
     directories_seen: Vec<(PathBuf, Option<DirectoryStamp>)>,
 }
@@ -75,6 +77,8 @@ impl ProtectedIndex {
             #[cfg(unix)]
             files: HashSet::new(),
             incomplete: false,
+            protected_directories: policy.directories.clone(),
+            protected_exact_paths: policy.exact_paths.clone(),
             #[cfg(unix)]
             directories_seen: Vec::new(),
         };
@@ -157,6 +161,12 @@ impl ProtectedIndex {
             return Err(IndexCancelled);
         }
         Ok(index)
+    }
+
+    /// A cached index belongs to the canonical roots and exact stores used to build it.
+    pub fn matches_policy(&self, policy: &CredentialPolicy) -> bool {
+        self.protected_directories == policy.directories
+            && self.protected_exact_paths == policy.exact_paths
     }
 
     /// A cached directory index is safe only while every traversed directory is unchanged.

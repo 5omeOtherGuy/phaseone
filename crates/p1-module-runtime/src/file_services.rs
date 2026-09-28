@@ -321,6 +321,7 @@ fn cached_index(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(index) = guard.as_ref()
+        && index.matches_policy(policy)
         && index
             .still_current(cancel)
             .map_err(|IndexCancelled| FsError::Cancelled)?
@@ -359,8 +360,8 @@ impl WorkspaceService for SearchCapability {
                 let refused = || FsError::Io(p1_workspace::credential_refusal(checked.display()));
                 let opened_path =
                     file_walk::opened_object_path(&file, checked.path()).map_err(|_| refused())?;
-                if credential_policy.refuses(&opened_path)
-                    || index.refuses_current_exact(&credential_policy, &metadata)
+                let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                if current.refuses(&opened_path) || index.refuses_current_exact(&current, &metadata)
                 {
                     return Err(refused());
                 }
@@ -406,9 +407,10 @@ impl WorkspaceService for SearchCapability {
                 offset,
                 length,
                 &|candidate, file| {
-                    credential_policy.refuses(candidate)
+                    let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                    current.refuses(candidate)
                         || file.metadata().map_or(true, |metadata| {
-                            index.refuses_current_exact(&credential_policy, &metadata)
+                            index.refuses_current_exact(&current, &metadata)
                         })
                 },
             )
@@ -435,10 +437,10 @@ impl WorkspaceService for SearchCapability {
                 glob.as_deref(),
                 cancel,
                 |candidate| {
-                    credential_policy.refuses(candidate)
-                        || std::fs::metadata(candidate).is_ok_and(|metadata| {
-                            index.refuses_current_exact(&credential_policy, &metadata)
-                        })
+                    let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                    current.refuses(candidate)
+                        || std::fs::metadata(candidate)
+                            .is_ok_and(|metadata| index.refuses_current_exact(&current, &metadata))
                 },
             )
         })
@@ -461,15 +463,16 @@ impl WorkspaceService for SearchCapability {
                 &query,
                 cancel,
                 |candidate| {
-                    credential_policy.refuses(candidate)
-                        || std::fs::metadata(candidate).is_ok_and(|metadata| {
-                            index.refuses_current_exact(&credential_policy, &metadata)
-                        })
+                    let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                    current.refuses(candidate)
+                        || std::fs::metadata(candidate)
+                            .is_ok_and(|metadata| index.refuses_current_exact(&current, &metadata))
                 },
                 |candidate, file| {
-                    credential_policy.refuses(candidate)
+                    let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                    current.refuses(candidate)
                         || file.metadata().map_or(true, |metadata| {
-                            index.refuses_current_exact(&credential_policy, &metadata)
+                            index.refuses_current_exact(&current, &metadata)
                         })
                 },
             )
@@ -1337,6 +1340,76 @@ mod tests {
             .iter()
             .all(|file| file.path != "alias.txt")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retargeted_config_keys_rebuild_the_cached_index() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let old = home.path().join("old/keys");
+        let new = home.path().join("new/keys");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let credential = new.join("new.key");
+        std::fs::write(&credential, "new-key-marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("alias.txt")).unwrap();
+        let config = home.path().join(".config");
+        symlink(home.path().join("old"), &config).unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert_eq!(
+            cap.read("alias.txt".into(), 0, 32).await,
+            Ok(b"new-key-marker".to_vec())
+        );
+        std::fs::remove_file(&config).unwrap();
+        symlink(home.path().join("new"), &config).unwrap();
+        assert_eq!(
+            cap.read("alias.txt".into(), 0, 32).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("alias.txt")))
+        );
+        assert!(
+            cap.search(SearchQuery {
+                pattern: "new-key-marker".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap()
+            .files
+            .iter()
+            .all(|file| file.path != "alias.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeted_exact_parent_requires_a_fresh_open_time_policy() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        for name in ["old", "new"] {
+            std::fs::create_dir_all(home.path().join(name)).unwrap();
+        }
+        let credential = home.path().join("new/auth.json");
+        std::fs::write(&credential, "marker").unwrap();
+        let alias = home.path().join("alias.txt");
+        std::fs::hard_link(&credential, &alias).unwrap();
+        let link = home.path().join(".codex");
+        symlink(home.path().join("old"), &link).unwrap();
+        let old_policy = CredentialPolicy::new(Some(home.path()), &[]);
+        let index = ProtectedIndex::build(&old_policy, &CancellationToken::new()).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(home.path().join("new"), &link).unwrap();
+        let opened = std::fs::File::open(&alias).unwrap();
+        let metadata = opened.metadata().unwrap();
+        assert!(!index.refuses_current_exact(&old_policy, &metadata));
+        let current = CredentialPolicy::new(Some(home.path()), &[]);
+        assert!(index.refuses_current_exact(&current, &metadata));
     }
 
     #[cfg(unix)]
