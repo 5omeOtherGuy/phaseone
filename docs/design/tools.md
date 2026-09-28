@@ -244,22 +244,22 @@ impl Sandbox {
 }
 pub const CREDENTIAL_DIRECTORIES: &[&str]; // `.ssh`, `.claude`, `.codex`, `.gnupg`,
                                           // `.local/share/opencode`, `.pi`, `.config/gh`, `.config/p1`
-pub enum SandboxError { NotInstalled, UnsafeLauncher, Unavailable(String), WorkspaceContainsHome, WritableOverlap { path: PathBuf, root: PathBuf }, ReadableUnresolved { path: PathBuf }, ReadableCredential { path: PathBuf, directory: PathBuf } }
+pub enum SandboxError { NotInstalled, UnsafeLauncher, Unavailable(String), WorkspaceContainsHome, WritableAncestor { path: PathBuf, root: PathBuf }, ReadableUnresolved { path: PathBuf }, ReadableCredential { path: PathBuf, directory: PathBuf } }
 impl ShellTool {
     /// Probes ONCE (`bwrap <args> true`), so an unusable sandbox fails assembly, not the
     /// first command. `NotInstalled`: no `bwrap` on PATH. `Unavailable(stderr)`: it cannot
     /// run here (user namespaces disabled). `WorkspaceContainsHome`: the workspace root is
     /// the home directory or an ancestor of it — hiding the home would hide the workspace.
-    /// `WritableOverlap`: a writable path may not be equal to or nested below the workspace,
-    /// private `/tmp`, or another writable path (including missing inner paths).
-    /// `ReadableUnresolved`: a `readable` path must exist and resolve. A readable whose
-    /// canonical source is under the workspace, any writable path, or private `/tmp` needs
-    /// no extra bind and is skipped. `ReadableCredential`: a path equal to, inside or an ANCESTOR of a
-    /// `CREDENTIAL_DIRECTORIES` entry is refused before the probe, whether it exists or not.
+    /// `WritableAncestor`: a writable path may not contain the hidden home, workspace,
+    /// or private `/tmp` (lexically or canonically).
+    /// `ReadableUnresolved`: a `readable` path must exist and resolve. A source already
+    /// under a writable root needs no extra bind. `ReadableCredential`: any bind source
+    /// equal to, inside or an ancestor of a credential directory is refused, both lexically
+    /// and canonically, even when it does not exist.
     pub fn sandboxed(self, sandbox: Sandbox) -> Result<Self, SandboxError>;
 }
-// `UnsafeLauncher` is raised at command start as `ProcessFailure::Start`; other
-// SandboxError variants arise during assembly or argument building.
+// `UnsafeLauncher` is raised at assembly when PATH has executable candidates but
+// all are unsafe, or at command start as `ProcessFailure::Start` if the cached launcher changes.
 /// Pure, unit-tested: the argument vector before `bash -lc <command>`.
 pub fn bwrap_args(sandbox: &Sandbox, workspace_root: &Path, private_tmp: &Path) -> Result<Vec<OsString>, SandboxError>;
 ```
@@ -272,14 +272,14 @@ itself live under `/tmp` or under the home:
 2. `--bind <private_tmp> /tmp` — a fresh directory per `ShellTool`, created under
    `std::env::temp_dir()` and removed when the tool is dropped; `--setenv TMPDIR /tmp`;
 3. `--tmpfs <home>` (`<home>` CANONICAL — the same path the containment check used), then
-   `--ro-bind <home>/<entry> <home>/<entry>` for every existing `home_visible` entry, then for
-   each configured `readable` path must exist and resolve; skip paths already under the
-   workspace, a writable path, or private `/tmp` (no redundant read-only bind). Bind the others with
-   `--ro-bind <canonical-source> <configured-path>` (e.g. a git worktree's common directory from
-   `--sandbox-read`; preserving the configured destination keeps a symlink inside hidden home
-   reachable); `--tmpfs $XDG_RUNTIME_DIR` when that
+   bind each safe existing `home_visible` entry and configured `readable` path read-only.
+   Skip sources already under the workspace, a writable path, or private `/tmp`; when the
+   configured path is an alias, recreate it with `--symlink <canonical> <configured-path>`.
+   Other sources use `--ro-bind <canonical-source> <configured-path>`;
+   `--tmpfs $XDG_RUNTIME_DIR` when that
    variable names an existing directory — agent sockets and keyrings live there;
-4. `--bind <path> <path>` for every existing `writable` path;
+4. `--bind <canonical-source> <path>` for nonredundant existing `writable` paths; nested,
+   duplicate or missing entries under writable roots get no bind; aliases get `--symlink`;
 5. `--bind <workspace root> <workspace root>`;
 6. AFTER readable, writable and workspace binds, mask existing cargo credentials with
    `--ro-bind /dev/null <home>/.cargo/credentials.toml` (and `…/credentials`), so no later

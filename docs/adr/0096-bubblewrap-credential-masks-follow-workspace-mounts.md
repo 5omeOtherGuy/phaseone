@@ -19,12 +19,11 @@ order and declared `bwrap_args` infallible. A later bind can cover an earlier cr
 ## Decision
 
 Place credential masks after readable, writable and workspace binds. Make `bwrap_args` return
-`Result<Vec<OsString>, SandboxError>` so unresolved or credential-exposing readable paths fail closed. Canonical readable sources under workspace, writable mounts, or private `/tmp` are already visible and are skipped rather than rebound, avoiding symlink races. Overlapping writable binds are refused at assembly; a cached launcher that becomes unsafe raises `UnsafeLauncher` at command start as `ProcessFailure::Start`. This supersedes ADR-0035's mount-order contract only; its sandbox boundary remains.
+`Result<Vec<OsString>, SandboxError>`. One bind-source check at assembly and command start rejects lexical and canonical credential exposure for workspace, readable, writable and home-visible entries. Writable ancestors of hidden home, workspace and private tmp are refused. Canonical sources already under writable roots (including missing descendants) are not rebound; aliases are restored with `--symlink` so hidden-home aliases stay reachable. Duplicate writable binds are redundant. An executable-only unsafe PATH fails assembly with `UnsafeLauncher`; a cached launcher that becomes unsafe fails command start as `ProcessFailure::Start`. This supersedes ADR-0035's mount-order contract only; its sandbox boundary remains.
 
 ## Consequences
 
-No later configured mount can expose a masked cargo credential. Callers must handle argument
-construction errors; the design contract now matches runtime behavior.
+No later configured mount can expose a masked cargo credential or rebind mutable sources through aliases. Callers handle argument-construction errors; redundant entries retain configured alias paths without mutable rebinds.
 
 ## Alternatives considered
 

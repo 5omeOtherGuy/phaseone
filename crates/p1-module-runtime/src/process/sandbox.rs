@@ -92,11 +92,11 @@ pub enum SandboxError {
     )]
     WorkspaceContainsHome { workspace: PathBuf, home: PathBuf },
     #[error(
-        "the sandbox writable path {} overlaps writable root {}: choose disjoint writable paths, or pass --sandbox off",
+        "the sandbox writable path {} contains hidden or writable root {}: choose a narrower writable path, or pass --sandbox off",
         .path.display(),
         .root.display()
     )]
-    WritableOverlap { path: PathBuf, root: PathBuf },
+    WritableAncestor { path: PathBuf, root: PathBuf },
     #[error(
         "the sandbox readable path {} does not resolve: choose an existing path, or pass --sandbox off",
         .path.display()
@@ -129,6 +129,7 @@ impl SandboxRuntime {
         if home == workspace || home.starts_with(&workspace) {
             return Err(SandboxError::WorkspaceContainsHome { workspace, home });
         }
+        validate_credential_source(&workspace, &home)?;
         let sandbox = Sandbox { home, ..sandbox };
         let private_tmp = tempfile::Builder::new()
             .prefix("p1-shell-sandbox-")
@@ -136,19 +137,14 @@ impl SandboxRuntime {
             .map_err(|error| {
                 SandboxError::Unavailable(format!("could not create a private /tmp: {error}"))
             })?;
-        validate_writable_layout(&workspace, &sandbox.writable, private_tmp.path())?;
-        let writable_roots =
-            sandbox_writable_roots(&workspace, &sandbox.writable, private_tmp.path());
-        for readable in &sandbox.readable {
-            canonical_readable_source(readable, &sandbox.home, &writable_roots)?;
-        }
+        // Use exactly the same checks at assembly and command start.
+        bwrap_args(&sandbox, &workspace, private_tmp.path())?;
         let bwrap_path = resolve_bwrap(
             std::env::var_os("PATH").as_deref(),
             &workspace,
             &sandbox.writable,
             private_tmp.path(),
-        )
-        .ok_or(SandboxError::NotInstalled)?;
+        )?;
         let args = bwrap_args(&sandbox, &workspace, private_tmp.path())?;
         let mut probe = std::process::Command::new(&bwrap_path);
         probe
@@ -198,6 +194,17 @@ pub fn bwrap_args(
     private_tmp: &Path,
 ) -> Result<Vec<OsString>, SandboxError> {
     let home = &sandbox.home;
+    if home == workspace_root || home.starts_with(workspace_root) {
+        return Err(SandboxError::WorkspaceContainsHome {
+            workspace: workspace_root.to_path_buf(),
+            home: home.to_path_buf(),
+        });
+    }
+    validate_credential_source(workspace_root, home)?;
+    for writable in &sandbox.writable {
+        validate_credential_source(writable, home)?;
+    }
+    validate_writable_layout(workspace_root, home, &sandbox.writable, private_tmp)?;
     let writable_roots = sandbox_writable_roots(workspace_root, &sandbox.writable, private_tmp);
     let mut args: Vec<OsString> = Vec::new();
     // 1. The host filesystem, read-only, with fresh /dev and /proc.
@@ -221,15 +228,21 @@ pub fn bwrap_args(
     args.push(home.into());
     for entry in &sandbox.home_visible {
         let path = home.join(entry);
-        if path.exists() {
-            push_ro_bind(&mut args, &path);
+        if let Some(source) = bind_source(&path, home, &writable_roots, false)? {
+            args.push("--ro-bind".into());
+            args.push(source.into());
+            args.push(path.into());
+        } else if path.exists() {
+            push_alias(&mut args, &path)?;
         }
     }
     for readable in &sandbox.readable {
-        if let Some(resolved) = canonical_readable_source(readable, home, &writable_roots)? {
+        if let Some(resolved) = bind_source(readable, home, &writable_roots, true)? {
             args.push("--ro-bind".into());
             args.push(resolved.into());
             args.push(readable.as_os_str().into());
+        } else {
+            push_alias(&mut args, readable)?;
         }
     }
     if let Some(runtime_dir) = &sandbox.runtime_dir
@@ -239,11 +252,22 @@ pub fn bwrap_args(
         args.push(runtime_dir.into());
     }
     // 4. Extra writable paths, if they exist.
-    for writable in &sandbox.writable {
-        if writable.exists() {
+    for (index, writable) in sandbox.writable.iter().enumerate() {
+        let other_roots: Vec<_> = writable_roots
+            .iter()
+            .enumerate()
+            .filter(|(root_index, root)| {
+                *root_index != index + 2
+                    && !(*root_index > index + 2 && **root == existing_source(writable))
+            })
+            .map(|(_, root)| root.clone())
+            .collect();
+        if let Some(source) = bind_source(writable, home, &other_roots, false)? {
             args.push("--bind".into());
+            args.push(source.into());
             args.push(writable.into());
-            args.push(writable.into());
+        } else {
+            push_alias(&mut args, writable)?;
         }
     }
     // 5. The workspace follows mounts that could cover it; masks then follow
@@ -277,8 +301,9 @@ fn resolve_bwrap(
     workspace: &Path,
     writable: &[PathBuf],
     private_tmp: &Path,
-) -> Option<PathBuf> {
-    let path = path?;
+) -> Result<PathBuf, SandboxError> {
+    let path = path.ok_or(SandboxError::NotInstalled)?;
+    let mut found = false;
     let forbidden = sandbox_writable_roots(workspace, writable, private_tmp);
     for directory in std::env::split_paths(path) {
         if !directory.is_absolute() {
@@ -287,21 +312,31 @@ fn resolve_bwrap(
         let Ok(resolved_directory) = std::fs::canonicalize(&directory) else {
             continue;
         };
+        let candidate = resolved_directory.join("bwrap");
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            continue;
+        }
+        found = true;
         if forbidden
             .iter()
             .any(|root| resolved_directory.starts_with(root))
         {
             continue;
         }
-        let candidate = resolved_directory.join("bwrap");
-        let Ok(resolved) = std::fs::canonicalize(candidate) else {
-            continue;
-        };
-        if launcher_is_safe(&resolved, &forbidden) {
-            return Some(resolved);
+        if let Ok(resolved) = std::fs::canonicalize(candidate)
+            && launcher_is_safe(&resolved, &forbidden)
+        {
+            return Ok(resolved);
         }
     }
-    None
+    Err(if found {
+        SandboxError::UnsafeLauncher
+    } else {
+        SandboxError::NotInstalled
+    })
 }
 
 /// Re-canonicalize even a cached path: writable bind aliases may change after assembly.
@@ -321,30 +356,24 @@ fn launcher_is_safe(path: &Path, forbidden: &[PathBuf]) -> bool {
         && (metadata.nlink() == 1 || trusted_root_owned)
 }
 
-/// Nested writable mounts let a command retarget the inner bind source after
-/// launcher validation. Refuse lexical nesting even when the inner path is absent.
+/// No writable mount may cover the hidden home or a root it could retarget.
 fn validate_writable_layout(
     workspace: &Path,
+    home: &Path,
     writable: &[PathBuf],
     private_tmp: &Path,
 ) -> Result<(), SandboxError> {
-    let mut roots = vec![workspace.to_path_buf(), private_tmp.to_path_buf()];
-    roots.extend(writable.iter().cloned());
-    for (index, path) in writable.iter().enumerate() {
-        let lexical = lexical_normalize(path);
-        let canonical = std::fs::canonicalize(path).ok();
-        for (root_index, root) in roots.iter().enumerate() {
-            if root_index == index + 2 {
-                continue;
-            }
-            if lexical.starts_with(lexical_normalize(root))
-                || canonical.as_ref().is_some_and(|path| {
-                    std::fs::canonicalize(root).is_ok_and(|root| path.starts_with(root))
-                })
+    for path in writable {
+        for root in [home, workspace, private_tmp] {
+            let lexical = lexical_normalize(path);
+            let resolved = existing_source(path);
+            let canonical_root = existing_source(root);
+            if (lexical != lexical_normalize(root) && lexical_normalize(root).starts_with(&lexical))
+                || (resolved != canonical_root && canonical_root.starts_with(&resolved))
             {
-                return Err(SandboxError::WritableOverlap {
+                return Err(SandboxError::WritableAncestor {
                     path: path.clone(),
-                    root: root.clone(),
+                    root: root.to_path_buf(),
                 });
             }
         }
@@ -370,44 +399,73 @@ fn sandbox_writable_roots(
     roots
 }
 
-fn canonical_readable_source(
-    readable: &Path,
+fn validate_credential_source(source: &Path, home: &Path) -> Result<(), SandboxError> {
+    if let Some(directory) = credential_directory(home, source) {
+        return Err(SandboxError::ReadableCredential {
+            path: source.to_path_buf(),
+            directory,
+        });
+    }
+    Ok(())
+}
+
+/// Resolve the longest existing prefix so an absent nested path cannot gain a
+/// second mutable bind after it is created under an already-writable root.
+fn existing_source(path: &Path) -> PathBuf {
+    let mut prefix = path;
+    let mut suffix = Vec::new();
+    while !prefix.exists() {
+        if let Some(name) = prefix.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        prefix = match prefix.parent() {
+            Some(parent) if parent != prefix => parent,
+            _ => return lexical_normalize(path),
+        };
+    }
+    let mut resolved = std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
+    for name in suffix.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
+}
+
+fn bind_source(
+    source: &Path,
     home: &Path,
     writable_roots: &[PathBuf],
+    required: bool,
 ) -> Result<Option<PathBuf>, SandboxError> {
-    if let Some(directory) = credential_directory(home, readable) {
-        return Err(SandboxError::ReadableCredential {
-            path: readable.to_path_buf(),
-            directory,
-        });
-    }
-    if !readable.is_absolute() {
+    validate_credential_source(source, home)?;
+    if !source.is_absolute() {
         return Err(SandboxError::ReadableUnresolved {
-            path: readable.to_path_buf(),
+            path: source.to_path_buf(),
         });
     }
-    let resolved =
-        std::fs::canonicalize(readable).map_err(|_| SandboxError::ReadableUnresolved {
-            path: readable.to_path_buf(),
-        })?;
-    if let Some(directory) = credential_directory(home, &resolved) {
-        return Err(SandboxError::ReadableCredential {
-            path: readable.to_path_buf(),
-            directory,
+    let resolved = existing_source(source);
+    validate_credential_source(&resolved, home)?;
+    if required && !source.exists() {
+        return Err(SandboxError::ReadableUnresolved {
+            path: source.to_path_buf(),
         });
     }
-    // Already exposed by a writable bind. Rebinding its mutable source under
-    // an alias would permit a symlink swap before bubblewrap applies the mount.
     if writable_roots.iter().any(|root| resolved.starts_with(root)) {
+        return Ok(None);
+    }
+    if !source.exists() {
         return Ok(None);
     }
     Ok(Some(resolved))
 }
 
-fn push_ro_bind(args: &mut Vec<OsString>, path: &Path) {
-    args.push("--ro-bind".into());
-    args.push(path.into());
-    args.push(path.into());
+fn push_alias(args: &mut Vec<OsString>, source: &Path) -> Result<(), SandboxError> {
+    let resolved = existing_source(source);
+    if resolved != lexical_normalize(source) {
+        args.push("--symlink".into());
+        args.push(resolved.into());
+        args.push(source.into());
+    }
+    Ok(())
 }
 
 /// The credential directory of `home` that `readable` would uncover, if any.
@@ -508,10 +566,10 @@ mod tests {
         let private_tmp = tempfile::tempdir().unwrap();
         let path = std::env::join_paths([OsStr::new("."), workspace.path().as_os_str()]).unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             resolve_bwrap(Some(&path), workspace.path(), &[], private_tmp.path()),
-            None
-        );
+            Err(SandboxError::UnsafeLauncher)
+        ));
     }
 
     #[test]
@@ -540,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_writable_entries_are_refused_before_probe() {
+    fn overlapping_writable_entries_are_redundant() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let scratch = temp.path().join("scratch");
@@ -560,15 +618,24 @@ mod tests {
             vec![nested.clone(), scratch.clone()], // order must not matter
             vec![workspace.join("tool")],
         ] {
-            assert!(matches!(
-                SandboxRuntime::assemble(make_sandbox(writable), &workspace),
-                Err(SandboxError::WritableOverlap { .. })
-            ));
+            let sandbox = make_sandbox(writable.clone());
+            let args = bwrap_args(&sandbox, &workspace, temp.path()).unwrap();
+            for nested in &writable {
+                if nested.starts_with(&workspace)
+                    || nested.starts_with(&scratch) && nested != &scratch
+                {
+                    assert!(
+                        !args
+                            .windows(3)
+                            .any(|w| w[0] == "--bind" && w[2] == nested.as_os_str())
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn canonical_writable_overlap_is_refused() {
+    fn canonical_writable_overlap_is_skipped() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -579,10 +646,22 @@ mod tests {
         let alias = temp.path().join("alias");
         symlink(&scratch, &alias).unwrap();
         let private_tmp = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            super::validate_writable_layout(&workspace, &[scratch, alias], private_tmp.path()),
-            Err(SandboxError::WritableOverlap { .. })
-        ));
+        let sandbox = Sandbox {
+            home: temp.path().join("home"),
+            home_visible: vec![],
+            readable: vec![],
+            writable: vec![scratch.clone(), alias.clone()],
+            runtime_dir: None,
+        };
+        let args = bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap();
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[2] == alias.as_os_str())
+        );
+        assert!(args.windows(3).any(|w| w[0] == "--symlink"
+            && w[1] == scratch.as_os_str()
+            && w[2] == alias.as_os_str()));
     }
 
     #[test]
@@ -596,7 +675,13 @@ mod tests {
         }
         let private_tmp = tempfile::tempdir().unwrap();
         assert!(
-            super::validate_writable_layout(&workspace, &[left, right], private_tmp.path()).is_ok()
+            super::validate_writable_layout(
+                &workspace,
+                &temp.path().join("home"),
+                &[left, right],
+                private_tmp.path()
+            )
+            .is_ok()
         );
     }
 
@@ -620,10 +705,10 @@ mod tests {
         }
         let path = std::env::join_paths([trusted.as_os_str()]).unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             resolve_bwrap(Some(&path), &workspace, &[], &private_tmp),
-            None
-        );
+            Err(SandboxError::UnsafeLauncher)
+        ));
     }
 
     #[test]
@@ -866,6 +951,134 @@ mod tests {
                         .to_string()
                 && window[2] == configured.display().to_string()
         }));
+    }
+
+    #[test]
+    fn writable_ancestors_of_hidden_roots_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        let private_tmp = temp.path().join("private");
+        for path in [&home, &workspace, &private_tmp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let sandbox = Sandbox {
+            home,
+            home_visible: vec![],
+            readable: vec![],
+            writable: vec![temp.path().to_path_buf()],
+            runtime_dir: None,
+        };
+        assert!(matches!(
+            bwrap_args(&sandbox, &workspace, &private_tmp),
+            Err(SandboxError::ReadableCredential { .. })
+        ));
+        for root in [&workspace, &private_tmp] {
+            let parent = temp.path().join(format!(
+                "{}-parent",
+                root.file_name().unwrap().to_string_lossy()
+            ));
+            let child = parent.join("child");
+            std::fs::create_dir_all(&child).unwrap();
+            let mut sandbox = sandbox.clone();
+            sandbox.writable = vec![parent];
+            let result = if root == &workspace {
+                bwrap_args(&sandbox, &child, &private_tmp)
+            } else {
+                bwrap_args(&sandbox, &workspace, &child)
+            };
+            assert!(matches!(result, Err(SandboxError::WritableAncestor { .. })));
+        }
+    }
+
+    #[test]
+    fn every_bind_kind_rejects_credentials() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let ssh = home.join(".ssh");
+        let config = home.join(".config");
+        let workspace = temp.path().join("workspace");
+        for path in [&ssh, &config, &workspace] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        symlink(&ssh, config.join("git")).unwrap();
+        let private_tmp = temp.path().join("private");
+        let mut sandbox = Sandbox::for_home(&home);
+        sandbox.home_visible = vec![".config/git".into()];
+        assert!(matches!(
+            bwrap_args(&sandbox, &workspace, &private_tmp),
+            Err(SandboxError::ReadableCredential { .. })
+        ));
+        sandbox.home_visible.clear();
+        sandbox.writable.push(ssh.clone());
+        assert!(matches!(
+            bwrap_args(&sandbox, &workspace, &private_tmp),
+            Err(SandboxError::ReadableCredential { .. })
+        ));
+        sandbox.writable.clear();
+        assert!(matches!(
+            bwrap_args(&sandbox, &ssh, &private_tmp),
+            Err(SandboxError::ReadableCredential { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_and_duplicate_writable_entries_do_not_rebind() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let writable = temp.path().join("writable");
+        let disjoint = temp.path().join("disjoint");
+        for path in [&workspace, &writable, &disjoint] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let nested = writable.join("not-yet-created");
+        let sandbox = Sandbox {
+            home: temp.path().join("home"),
+            home_visible: vec![],
+            readable: vec![],
+            writable: vec![
+                writable.clone(),
+                nested.clone(),
+                writable.clone(),
+                disjoint.clone(),
+            ],
+            runtime_dir: None,
+        };
+        let args = bwrap_args(&sandbox, &workspace, &temp.path().join("private")).unwrap();
+        let binds: Vec<_> = args.windows(3).filter(|w| w[0] == "--bind").collect();
+        assert_eq!(
+            binds
+                .iter()
+                .filter(|w| w[2] == writable.as_os_str())
+                .count(),
+            1
+        );
+        assert!(!binds.iter().any(|w| w[2] == nested.as_os_str()));
+        assert!(binds.iter().any(|w| w[2] == disjoint.as_os_str()));
+    }
+
+    #[test]
+    fn readable_alias_under_writable_root_is_recreated() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let alias = home.join("alias");
+        symlink(&workspace, &alias).unwrap();
+        let sandbox = Sandbox {
+            home,
+            home_visible: vec![],
+            readable: vec![alias.clone()],
+            writable: vec![],
+            runtime_dir: None,
+        };
+        let args = bwrap_args(&sandbox, &workspace, &temp.path().join("private")).unwrap();
+        assert!(args.windows(3).any(|w| w[0] == "--symlink"
+            && w[1] == workspace.as_os_str()
+            && w[2] == alias.as_os_str()));
     }
 
     #[test]
