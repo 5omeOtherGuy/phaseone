@@ -41,7 +41,9 @@ pub struct Sandbox {
     pub home: PathBuf,
     /// Paths relative to `home` that stay visible (read-only) if they exist.
     pub home_visible: Vec<PathBuf>,
-    /// Extra absolute paths that stay visible READ-ONLY if they exist. A git
+    /// Extra absolute paths that must exist and resolve. Paths under a writable
+    /// root are already visible there and are not bound again; other paths stay
+    /// visible READ-ONLY. A git
     /// worktree keeps its metadata outside the workspace, in the main checkout's
     /// git directory, so a job there needs this to run `git status`/`git diff`.
     /// [`ProcessService::sandboxed`](super::ProcessService::sandboxed) refuses a
@@ -100,12 +102,6 @@ pub enum SandboxError {
         .path.display()
     )]
     ReadableUnresolved { path: PathBuf },
-    #[error(
-        "the sandbox readable path {} resolves under writable root {}: choose another path, or pass --sandbox off",
-        .path.display(),
-        .root.display()
-    )]
-    ReadableUnderWritable { path: PathBuf, root: PathBuf },
     #[error(
         "the sandbox readable path {} would uncover the credential directory {}: choose another path, or pass --sandbox off",
         .path.display(),
@@ -230,10 +226,11 @@ pub fn bwrap_args(
         }
     }
     for readable in &sandbox.readable {
-        let resolved = canonical_readable_source(readable, home, &writable_roots)?;
-        args.push("--ro-bind".into());
-        args.push(resolved.into());
-        args.push(readable.as_os_str().into());
+        if let Some(resolved) = canonical_readable_source(readable, home, &writable_roots)? {
+            args.push("--ro-bind".into());
+            args.push(resolved.into());
+            args.push(readable.as_os_str().into());
+        }
     }
     if let Some(runtime_dir) = &sandbox.runtime_dir
         && runtime_dir.exists()
@@ -377,7 +374,7 @@ fn canonical_readable_source(
     readable: &Path,
     home: &Path,
     writable_roots: &[PathBuf],
-) -> Result<PathBuf, SandboxError> {
+) -> Result<Option<PathBuf>, SandboxError> {
     if let Some(directory) = credential_directory(home, readable) {
         return Err(SandboxError::ReadableCredential {
             path: readable.to_path_buf(),
@@ -399,16 +396,12 @@ fn canonical_readable_source(
             directory,
         });
     }
-    if let Some(root) = writable_roots
-        .iter()
-        .find(|root| resolved.starts_with(root))
-    {
-        return Err(SandboxError::ReadableUnderWritable {
-            path: readable.to_path_buf(),
-            root: root.clone(),
-        });
+    // Already exposed by a writable bind. Rebinding its mutable source under
+    // an alias would permit a symlink swap before bubblewrap applies the mount.
+    if writable_roots.iter().any(|root| resolved.starts_with(root)) {
+        return Ok(None);
     }
-    Ok(resolved)
+    Ok(Some(resolved))
 }
 
 fn push_ro_bind(args: &mut Vec<OsString>, path: &Path) {
@@ -703,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn assembly_rejects_readable_source_under_workspace_before_probe() {
+    fn assembly_accepts_readable_source_under_workspace_without_rebinding() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -723,14 +716,31 @@ mod tests {
             runtime_dir: None,
         };
 
-        assert!(matches!(
-            SandboxRuntime::assemble(sandbox, &workspace),
-            Err(SandboxError::ReadableUnderWritable { .. })
-        ));
+        let args = bwrap_args(&sandbox, &workspace, temp.path()).unwrap();
+        assert_no_ro_bind_source_under(&args, &workspace);
+        assert_assembly_accepts(sandbox, &workspace);
+    }
+
+    fn assert_assembly_accepts(sandbox: Sandbox, workspace: &Path) {
+        match SandboxRuntime::assemble(sandbox, workspace) {
+            Ok(_) => {}
+            Err(SandboxError::NotInstalled | SandboxError::Unavailable(_)) => {
+                eprintln!("SKIP: bwrap unusable here");
+            }
+            Err(error) => panic!("readable under writable root must be accepted: {error:?}"),
+        }
+    }
+
+    fn assert_no_ro_bind_source_under(args: &[std::ffi::OsString], root: &Path) {
+        assert!(
+            !args.windows(2).any(|window| {
+                window[0] == "--ro-bind" && Path::new(&window[1]).starts_with(root)
+            })
+        );
     }
 
     #[test]
-    fn readable_symlink_into_workspace_is_refused() {
+    fn readable_symlink_into_workspace_is_skipped() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -752,14 +762,13 @@ mod tests {
             runtime_dir: None,
         };
 
-        assert!(matches!(
-            bwrap_args(&sandbox, &workspace, &private_tmp),
-            Err(SandboxError::ReadableUnderWritable { .. })
-        ));
+        let args = bwrap_args(&sandbox, &workspace, &private_tmp).unwrap();
+        assert_no_ro_bind_source_under(&args, &workspace);
+        assert_assembly_accepts(sandbox, &workspace);
     }
 
     #[test]
-    fn readable_symlink_into_writable_root_is_refused() {
+    fn readable_symlink_into_writable_root_is_skipped() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -782,10 +791,9 @@ mod tests {
             runtime_dir: None,
         };
 
-        assert!(matches!(
-            bwrap_args(&sandbox, &workspace, &private_tmp),
-            Err(SandboxError::ReadableUnderWritable { .. })
-        ));
+        let args = bwrap_args(&sandbox, &workspace, &private_tmp).unwrap();
+        assert_no_ro_bind_source_under(&args, target.parent().unwrap());
+        assert_assembly_accepts(sandbox, &workspace);
     }
 
     #[test]

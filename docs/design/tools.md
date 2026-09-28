@@ -233,7 +233,7 @@ bubblewrap (`bwrap`, unprivileged user namespaces); nothing is installed or run 
 pub struct Sandbox {
     pub home: PathBuf,               // the home directory to hide
     pub home_visible: Vec<PathBuf>,  // RELATIVE to `home`; visible read-only if they exist
-    pub readable: Vec<PathBuf>,      // existing absolute paths bound READ-ONLY after safety validation
+    pub readable: Vec<PathBuf>,      // existing absolute paths; bound READ-ONLY unless already under a writable root
     pub writable: Vec<PathBuf>,      // extra absolute paths that stay writable if they exist
     pub runtime_dir: Option<PathBuf>, // e.g. $XDG_RUNTIME_DIR: hidden behind a tmpfs (agent sockets, keyrings)
 }
@@ -244,7 +244,7 @@ impl Sandbox {
 }
 pub const CREDENTIAL_DIRECTORIES: &[&str]; // `.ssh`, `.claude`, `.codex`, `.gnupg`,
                                           // `.local/share/opencode`, `.pi`, `.config/gh`, `.config/p1`
-pub enum SandboxError { NotInstalled, UnsafeLauncher, Unavailable(String), WorkspaceContainsHome, WritableOverlap { path: PathBuf, root: PathBuf }, ReadableUnresolved { path: PathBuf }, ReadableUnderWritable { path: PathBuf, root: PathBuf }, ReadableCredential { path: PathBuf, directory: PathBuf } }
+pub enum SandboxError { NotInstalled, UnsafeLauncher, Unavailable(String), WorkspaceContainsHome, WritableOverlap { path: PathBuf, root: PathBuf }, ReadableUnresolved { path: PathBuf }, ReadableCredential { path: PathBuf, directory: PathBuf } }
 impl ShellTool {
     /// Probes ONCE (`bwrap <args> true`), so an unusable sandbox fails assembly, not the
     /// first command. `NotInstalled`: no `bwrap` on PATH. `Unavailable(stderr)`: it cannot
@@ -252,9 +252,9 @@ impl ShellTool {
     /// the home directory or an ancestor of it — hiding the home would hide the workspace.
     /// `WritableOverlap`: a writable path may not be equal to or nested below the workspace,
     /// private `/tmp`, or another writable path (including missing inner paths).
-    /// `ReadableUnresolved`: a `readable` path must exist and resolve. `ReadableUnderWritable`:
-    /// its canonical target cannot be equal to or below the workspace, any writable path, or the
-    /// private `/tmp`. `ReadableCredential`: a path equal to, inside or an ANCESTOR of a
+    /// `ReadableUnresolved`: a `readable` path must exist and resolve. A readable whose
+    /// canonical source is under the workspace, any writable path, or private `/tmp` needs
+    /// no extra bind and is skipped. `ReadableCredential`: a path equal to, inside or an ANCESTOR of a
     /// `CREDENTIAL_DIRECTORIES` entry is refused before the probe, whether it exists or not.
     pub fn sandboxed(self, sandbox: Sandbox) -> Result<Self, SandboxError>;
 }
@@ -273,8 +273,8 @@ itself live under `/tmp` or under the home:
    `std::env::temp_dir()` and removed when the tool is dropped; `--setenv TMPDIR /tmp`;
 3. `--tmpfs <home>` (`<home>` CANONICAL — the same path the containment check used), then
    `--ro-bind <home>/<entry> <home>/<entry>` for every existing `home_visible` entry, then for
-   each configured `readable` path must exist and canonicalize outside the workspace, every
-   writable path, and private `/tmp`; otherwise argument construction fails. Bind safe paths with
+   each configured `readable` path must exist and resolve; skip paths already under the
+   workspace, a writable path, or private `/tmp` (no redundant read-only bind). Bind the others with
    `--ro-bind <canonical-source> <configured-path>` (e.g. a git worktree's common directory from
    `--sandbox-read`; preserving the configured destination keeps a symlink inside hidden home
    reachable); `--tmpfs $XDG_RUNTIME_DIR` when that

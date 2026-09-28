@@ -1088,7 +1088,9 @@ fn parse_env_pass(args: &[String]) -> Result<Vec<String>, CliError> {
 
 /// A `--sandbox-write`/`--sandbox-read` value: absolute, or relative to the
 /// current directory; canonicalised when the path exists. A path that does not
-/// exist is kept as an absolute path and simply not bound (see `bwrap_args`).
+/// exist is kept as an absolute path: `--sandbox-read` then fails assembly,
+/// while `--sandbox-write` is not bound if missing. Readable paths under a
+/// writable root are already exposed by it and are not bound again.
 fn resolve_sandbox_path(value: &str, flag: &str) -> Result<PathBuf, CliError> {
     let path = Path::new(value);
     let absolute = if path.is_absolute() {
