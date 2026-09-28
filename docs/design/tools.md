@@ -301,9 +301,9 @@ after dogfooding), repeatable `--sandbox-write PATH` and repeatable `--sandbox-r
 (each a usage error without `--sandbox workspace`). The sandbox applies to the parent's AND
 every worker's `shell`. `scripts/fanout.py` and `scripts/dogfood.sh` pass the git common
 directory as `--sandbox-read` when the job dir is a git WORKTREE, so the agent can inspect
-(never commit) the metadata that lives in the main checkout. A `SandboxError` fails assembly
-— exit 1 before any model call — with a message that names the remedy (`install bubblewrap,
-or pass --sandbox off`).
+(never commit) the metadata that lives in the main checkout. Assembly-time `SandboxError`
+returns exit 1 before any model call; `UnsafeLauncher` instead refuses a command start as
+`ProcessFailure::Start`. Each error names a remedy.
 
 Must-pass (real `bwrap`; a test returns early with a printed `SKIP: bwrap unusable here` when
 the probe fails — CI runners may forbid user namespaces): fake home `H` containing
