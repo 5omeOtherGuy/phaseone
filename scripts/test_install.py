@@ -15,6 +15,7 @@ build limits, filesystem, and free-space checks hermetic without touching a real
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import io
 import json
@@ -44,7 +45,7 @@ SYSTEM_PATH = "/usr/bin:/bin"
 # the farm carries no `gh`, which is how the curl fallback is reached deterministically.
 FARM_TOOLS = ("mktemp", "sha256sum", "cut", "awk", "tar", "gzip", "cp", "mv", "mkdir",
               "rm", "chmod", "basename", "dirname", "env", "cat", "python3",
-              "findmnt", "df", "realpath")
+              "findmnt", "df", "realpath", "flock", "stat")
 
 VERSION_LINE = "p1 0.0.1 (deadbeef0000 2026-09-24)"
 
@@ -844,6 +845,58 @@ class InstallTest(unittest.TestCase):
                 done = self.run_install("--prefix", self.prefix, "--force")
                 self.assert_refused_untouched(done, fragment, before)
 
+    def test_missing_required_module_set_is_not_a_noop(self) -> None:
+        files = {'tools/tool.wasm': b'original'}
+        entries = [self.package_entry('tools/tool.wasm', files['tools/tool.wasm'])]
+        self.publish(modules=self.module_spec(entries, files, tag='v9.9.9'))
+        installed = self.run_install('--from-release', 'v9.9.9', '--prefix', self.prefix)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        modules = os.path.join(self.prefix, 'share', 'p1', 'modules')
+        shutil.rmtree(modules)
+        before = len(self.gh_downloads())
+        again = self.run_install('--from-release', 'v9.9.9', '--prefix', self.prefix)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertGreater(len(self.gh_downloads()), before)
+        self.assertTrue(os.path.isfile(os.path.join(modules, 'manifest.json')))
+        shutil.rmtree(modules)
+        os.symlink('missing', modules)
+        before = len(self.gh_downloads())
+        again = self.run_install('--from-release', 'v9.9.9', '--prefix', self.prefix)
+        self.assertNotIn('already installed', again.stdout)
+        self.assertGreater(len(self.gh_downloads()), before)
+
+    def test_main_version_fallback_cannot_hide_corrupt_modules(self) -> None:
+        files = {'tools/tool.wasm': b'original'}
+        entries = [self.package_entry('tools/tool.wasm', files['tools/tool.wasm'])]
+        tag = 'main-deadbeef0000'
+        self.publish(modules=self.module_spec(entries, files, tag=tag,
+                                               commit='deadbeef0000' + '0' * 28))
+        installed = self.run_install('--from-release', tag, '--prefix', self.prefix)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        os.remove(os.path.join(self.prefix, 'share', 'p1', '.p1-release'))
+        with open(os.path.join(self.prefix, 'share', 'p1', 'modules', 'packages',
+                               'tools', 'tool.wasm'), 'wb') as output:
+            output.write(b'corrupted')
+        before = len(self.gh_downloads())
+        again = self.run_install('--from-release', tag, '--prefix', self.prefix)
+        self.assertNotIn('already installed', again.stdout)
+        self.assertGreater(len(self.gh_downloads()), before)
+
+    def test_corrupt_installed_module_cannot_short_circuit_release(self) -> None:
+        files = {'tools/tool.wasm': b'original'}
+        entries = [self.package_entry('tools/tool.wasm', files['tools/tool.wasm'])]
+        self.publish(modules=self.module_spec(entries, files, tag='v9.9.9'))
+        self.assertEqual(self.run_install('--from-release', 'v9.9.9', '--prefix', self.prefix).returncode, 0)
+        path = os.path.join(self.prefix, 'share', 'p1', 'modules', 'packages', 'tools', 'tool.wasm')
+        with open(path, 'wb') as output:
+            output.write(b'corrupted')
+        # A nonzero verifier must trigger a download/reinstall, not a successful no-op.
+        before = len(self.gh_downloads())
+        done = self.run_install('--from-release', 'v9.9.9',
+                                '--prefix', self.prefix, P1_VERIFY_MODE='fail')
+        self.assertNotEqual(done.returncode, 0)
+        self.assertGreater(len(self.gh_downloads()), before)
+
     def test_a_manifest_tag_that_disagrees_with_from_release_is_refused(self) -> None:
         def modules(binary_sha: str) -> dict:
             return {"manifest": self.manifest([], binary_sha=binary_sha,
@@ -852,6 +905,50 @@ class InstallTest(unittest.TestCase):
         self.publish(modules=modules)
         done = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
         self.assert_refused_untouched(done, "does not match the requested release 'v9.9.9'")
+
+    def test_main_release_requires_matching_manifest_tag_and_commit(self) -> None:
+        for overrides in ({'tag': None}, {'tag': 'main-deadbeef0000'}):
+            with self.subTest(overrides=overrides):
+                def modules(binary_sha: str) -> dict:
+                    return {'manifest': self.manifest([], binary_sha=binary_sha, **overrides),
+                            'files': {}}
+                self.publish(modules=modules)
+                done = self.run_install('--from-release', 'main-deadbeef0000', '--prefix', self.prefix)
+                self.assertNotEqual(done.returncode, 0)
+                self.assert_nothing_installed(self.prefix)
+
+    def test_duplicate_archive_member_is_refused(self) -> None:
+        self.publish()
+        path = os.path.join(self.release, 'p1-share.tar.gz')
+        # Repack with duplicate route entry while retaining valid outer checksum.
+        with tarfile.open(path, 'w:gz') as archive:
+            for root in ('environments', 'routes', 'profiles'):
+                info = tarfile.TarInfo(root + '/')
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+            for text in (b'original', b'replacement'):
+                info = tarfile.TarInfo('routes/default.toml')
+                info.size = len(text)
+                archive.addfile(info, io.BytesIO(text))
+        self.write_sum('p1-share.tar.gz')
+        done = self.run_install('--prefix', self.prefix)
+        self.assertNotEqual(done.returncode, 0)
+        self.assert_nothing_installed(self.prefix)
+
+    def test_excessive_archive_member_count_is_refused(self) -> None:
+        self.publish()
+        path = os.path.join(self.release, 'p1-share.tar.gz')
+        with tarfile.open(path, 'w:gz') as archive:
+            for root in ('environments', 'routes', 'profiles'):
+                info = tarfile.TarInfo(root + '/')
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+            for index in range(10001):
+                archive.addfile(tarfile.TarInfo(f'routes/item{index}'))
+        self.write_sum('p1-share.tar.gz')
+        done = self.run_install('--prefix', self.prefix)
+        self.assertNotEqual(done.returncode, 0)
+        self.assert_nothing_installed(self.prefix)
 
     def test_a_manifest_tag_matching_from_release_installs(self) -> None:
         def modules(binary_sha: str) -> dict:
@@ -1195,6 +1292,147 @@ exit 99
 
     # --- updates -----------------------------------------------------------
 
+    def test_planted_pid_staging_symlinks_do_not_overwrite_private_files(self) -> None:
+        protected = self.mkdir('private-staging')
+        sentinel = os.path.join(protected, 'keep')
+        with open(sentinel, 'wb') as output:
+            output.write(b'untouched')
+        tools = self.mkdir('plant-staging')
+        mkdir = shutil.which('mkdir')
+        self.stub('mkdir', f'''#!/bin/sh
+"{mkdir}" "$@" || exit
+if [ "${{2:-}}" = "{self.prefix}/bin" ] && [ "${{3:-}}" = "{self.prefix}/share" ]; then
+  ln -s "{sentinel}" "{self.prefix}/bin/.p1.new.$PPID"
+  ln -s "{sentinel}" "{self.prefix}/bin/.p1-update.new.$PPID"
+fi
+''', directory=tools)
+        done = self.run_install('--prefix', self.prefix,
+                                PATH=tools + ':' + self.stub_dir + ':' + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0)
+        with open(sentinel, 'rb') as source:
+            self.assertEqual(source.read(), b'untouched')
+
+    def test_protected_config_parent_alias_is_refused(self) -> None:
+        protected = os.path.join(self.config, 'p1')
+        os.makedirs(protected)
+        sentinel = os.path.join(protected, 'credential')
+        with open(sentinel, 'w', encoding='utf-8') as output:
+            output.write('untouched')
+        os.makedirs(os.path.join(self.prefix, 'bin'))
+        os.symlink(self.config, os.path.join(self.prefix, 'share'))
+        done = self.run_install('--prefix', self.prefix)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.read(sentinel), 'untouched')
+        self.assertFalse(os.path.exists(os.path.join(protected, '.p1.previous')))
+
+    def test_substituted_share_parent_cannot_enter_private_tree(self) -> None:
+        protected = os.path.join(self.config, 'p1')
+        os.makedirs(protected)
+        sentinel = os.path.join(protected, 'keep')
+        with open(sentinel, 'w', encoding='utf-8') as output:
+            output.write('untouched')
+        tools = self.mkdir('swap-share-parent')
+        real_mkdir = shutil.which('mkdir')
+        self.stub('mkdir', f'''#!/bin/sh
+"{real_mkdir}" "$@" || exit
+if [ "${{2:-}}" = "{self.prefix}/bin" ] && [ "${{3:-}}" = "{self.prefix}/share" ]; then
+  rmdir "{self.prefix}/share"
+  ln -s "{protected}" "{self.prefix}/share"
+fi
+''', directory=tools)
+        done = self.run_install('--prefix', self.prefix,
+                                PATH=tools + ':' + self.stub_dir + ':' + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.read(sentinel), 'untouched')
+        self.assertFalse(os.path.exists(os.path.join(protected, 'p1')))
+
+    def test_backup_disposal_failure_does_not_erase_new_install(self) -> None:
+        self.assertEqual(self.run_install('--prefix', self.prefix).returncode, 0)
+        self.publish(marker='two', binary=NEW_RELEASE)
+        tools = self.mkdir('fail-backup-disposal')
+        real_rm = shutil.which('rm')
+        self.stub('rm', f'''#!/bin/sh
+case "$*" in
+  *"/share/.p1.previous"*) exit 72 ;;
+esac
+exec "{real_rm}" "$@"
+''', directory=tools)
+        done = self.run_install('--prefix', self.prefix,
+                                PATH=tools + ':' + self.stub_dir + ':' + SYSTEM_PATH)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.read(os.path.join(self.prefix, 'share', 'p1',
+                                                 'environments', 'marker.txt')),
+                         'environments two\n')
+        self.assertEqual(self.read(os.path.join(self.prefix, 'bin', 'p1')), NEW_RELEASE)
+
+    def test_installed_release_test_farm_exposes_transaction_commands(self) -> None:
+        fixture = os.path.join(os.path.dirname(SCRIPTS), 'crates', 'p1-module-tests',
+                               'tests', 'installed_release.rs')
+        with open(fixture, encoding='utf-8') as source:
+            farm = source.read().split('const FARM_TOOLS:', 1)[1].split('];', 1)[0]
+        for command in ('stat', 'flock'):
+            with self.subTest(command=command):
+                self.assertIn(f'"{command}"', farm)
+
+    def test_second_installer_cannot_enter_locked_transaction(self) -> None:
+        self.assertEqual(self.run_install('--prefix', self.prefix).returncode, 0)
+        self.publish(marker='two', binary=NEW_RELEASE)
+        fd = os.open(self.prefix, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            done = self.run_install('--prefix', self.prefix)
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn('another install', done.stderr)
+            self.assertEqual(self.read(os.path.join(self.prefix, 'share', 'p1',
+                                                     'environments', 'marker.txt')),
+                             'environments one\n')
+        finally:
+            os.close(fd)
+
+    def test_parent_substitution_mid_commit_refuses_private_tree(self) -> None:
+        self.assertEqual(self.run_install('--prefix', self.prefix).returncode, 0)
+        protected = os.path.join(self.config, 'p1')
+        os.makedirs(protected)
+        sentinel = os.path.join(protected, 'keep')
+        with open(sentinel, 'w', encoding='utf-8') as output:
+            output.write('untouched')
+        self.publish(marker='two', binary=NEW_RELEASE)
+        tools = self.mkdir('swap-share-mid-commit')
+        real_mv = shutil.which('mv')
+        self.stub('mv', f'''#!/bin/sh
+"{real_mv}" "$@" || exit
+if [ "$2" = "{self.prefix}/bin/.p1.previous" ]; then
+  "{real_mv}" "{self.prefix}/share" "{self.prefix}/share.saved"
+  ln -s "{protected}" "{self.prefix}/share"
+fi
+''', directory=tools)
+        done = self.run_install('--prefix', self.prefix,
+                                PATH=tools + ':' + self.stub_dir + ':' + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.read(sentinel), 'untouched')
+        self.assertEqual(os.listdir(protected), ['keep'])
+
+    def test_replaced_destination_is_not_deleted_by_rollback(self) -> None:
+        self.assertEqual(self.run_install('--prefix', self.prefix).returncode, 0)
+        self.publish(marker='two', binary=NEW_RELEASE)
+        tools = self.mkdir('replace-during-commit')
+        real_mv = shutil.which('mv')
+        target = os.path.join(self.prefix, 'share', 'p1')
+        self.stub('mv', f'''#!/bin/sh
+case "$1:$2" in
+  *".p1.new."*":{target}")
+    mkdir -p "{target}"
+    printf sentinel > "{target}/someone-else"
+    exit 71 ;;
+esac
+exec "{real_mv}" "$@"
+''', directory=tools)
+        done = self.run_install('--prefix', self.prefix,
+                                PATH=tools + ':' + self.stub_dir + ':' + SYSTEM_PATH)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.read(os.path.join(target, 'someone-else')), 'sentinel')
+        self.assertTrue(os.path.exists(os.path.join(self.prefix, 'share', '.p1.previous')))
+
     def test_commit_failure_rolls_back_binary_share_and_updater(self) -> None:
         first = self.run_install("--prefix", self.prefix)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -1446,6 +1684,16 @@ exec '{real_mv}' \"$@\"
                          "environments two\n")
         self.assertIn("fake p1 v2", self.read(os.path.join(self.prefix, "bin", "p1")))
         self.assertEqual(len(self.gh_downloads()), 8)
+
+    def test_updater_quotes_literal_command_substitution_in_prefix(self) -> None:
+        prefix = os.path.join(self.dir, '$(touch${IFS}marker)')
+        installed = self.run_install('--prefix', prefix)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        update = subprocess.run([BASH, os.path.join(prefix, 'bin', 'p1-update')],
+                                env=self.env(), cwd=self.dir, capture_output=True, text=True)
+        self.assertEqual(update.returncode, 0, update.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'marker')))
+        self.assertTrue(os.path.exists(os.path.join(prefix, 'bin', 'p1')))
 
     def test_same_release_is_a_noop_and_force_reinstalls(self) -> None:
         first = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)

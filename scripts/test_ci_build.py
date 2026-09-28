@@ -578,6 +578,54 @@ class CiBuildTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("no failed-step log", result.stderr)
 
+    def test_interrupt_before_publish_restores_verified_artifact(self) -> None:
+        h = self.harness()
+        dest = h.artifact()
+        dest.mkdir(parents=True)
+        (dest / 'p1').write_bytes(b'old verified binary')
+        (dest / 'p1.sha256').write_bytes(b'old checksum')
+        before = {p.name: p.read_bytes() for p in dest.iterdir()}
+        h._stub('mv', f'''#!/bin/sh
+case "$3:$4" in
+  *'.staging.'*':{dest.parent.name}/{SHA}) kill -TERM "$PPID"; exit 143 ;;
+esac
+exec {REAL_TOOLS['mv']} "$@"
+''')
+        done = h.run()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual({p.name: p.read_bytes() for p in dest.iterdir()}, before)
+
+    def test_partial_removal_error_restores_verified_artifact(self) -> None:
+        h = self.harness()
+        dest = h.artifact()
+        dest.mkdir(parents=True)
+        (dest / 'p1').write_bytes(b'old verified binary')
+        (dest / 'p1.sha256').write_bytes(b'old checksum')
+        before = {p.name: p.read_bytes() for p in dest.iterdir()}
+        h._stub('rm', f'''#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "{dest.parent.name}/{SHA}" ]; then
+    if [ -d "$arg" ]; then {REAL_TOOLS['rm']} -f "$arg/p1"; fi
+    exit 72
+  fi
+done
+exec {REAL_TOOLS['rm']} "$@"
+''')
+        done = h.run()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual({p.name: p.read_bytes() for p in dest.iterdir()}, before)
+
+    def test_bad_download_does_not_replace_prior_verified_artifact(self) -> None:
+        h = self.harness(**{'STUB_UPLOADED_SHA': '0' * 64})
+        dest = h.artifact()
+        dest.mkdir(parents=True)
+        (dest / 'p1').write_bytes(b'previous verified binary')
+        (dest / 'p1.sha256').write_text('previous checksum')
+        before = {p.name: p.read_bytes() for p in dest.iterdir()}
+        done = h.run()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual({p.name: p.read_bytes() for p in dest.iterdir()}, before)
+
     def test_sha_mismatch_exits_one(self) -> None:
         h = self.harness(**{"STUB_UPLOADED_SHA": "0" * 64})
         result = h.run()

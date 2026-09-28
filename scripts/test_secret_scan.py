@@ -59,6 +59,53 @@ class SecretScanTest(unittest.TestCase):
         self.assertNotIn(key, done.stdout)
         self.assertNotIn(key, done.stderr)
 
+    def test_failed_git_enumeration_is_not_clean(self) -> None:
+        repo = self.make_repo('clean.txt', 'ordinary text')
+        tools = os.path.join(self.dir, 'git-failure')
+        os.mkdir(tools)
+        stub = os.path.join(tools, 'git')
+        with open(stub, 'w', encoding='utf-8') as output:
+            output.write('#!/bin/sh\nexit 9\n')
+        os.chmod(stub, 0o755)
+        done = subprocess.run([BASH, SECRET_SCAN], cwd=repo,
+                              env=dict(os.environ, PATH=tools + ':' + os.environ['PATH']),
+                              capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn('secret-scan: clean', done.stdout)
+
+    def test_grep_failure_is_not_a_clean_scan(self) -> None:
+        repo = self.make_repo('clean.txt', 'ordinary text')
+        tools = os.path.join(self.dir, 'bin')
+        os.mkdir(tools)
+        grep = os.path.join(tools, 'grep')
+        with open(grep, 'w', encoding='utf-8') as output:
+            output.write('#!/bin/sh\nexit 2\n')
+        os.chmod(grep, 0o755)
+        done = subprocess.run([BASH, SECRET_SCAN], cwd=repo,
+                              env=dict(os.environ, PATH=tools + ':' + os.environ['PATH']),
+                              capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn('clean', done.stdout)
+
+    def test_tracked_symlink_refused_without_reading_outside_checkout(self) -> None:
+        repo = self.make_repo('clean.txt', 'normal\n')
+        outside = os.path.join(self.dir, 'outside')
+        with open(outside, 'w', encoding='utf-8') as handle:
+            handle.write('outside sentinel')
+        os.symlink(outside, os.path.join(repo, 'link'))
+        subprocess.run(['git', 'add', 'link'], cwd=repo, check=True, capture_output=True)
+        done = self.scan(repo)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn('outside sentinel', done.stdout + done.stderr)
+
+    def test_tracked_binary_refused_without_printing_contents(self) -> None:
+        repo = self.make_repo('binary', 'normal\n')
+        with open(os.path.join(repo, 'binary'), 'wb') as handle:
+            handle.write(b'fixture\\x00value'.replace(b'\\x00', b'\x00'))
+        done = self.scan(repo)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn('fixture', done.stdout + done.stderr)
+
     def test_a_clean_tree_passes(self) -> None:
         clean = "a" * 24
         repo = self.make_repo("clean.txt", "this is a normal sentence.\n" + clean + "\n")

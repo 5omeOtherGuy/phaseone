@@ -407,7 +407,7 @@ def main():
         else:
             case = source[len("case "):]
             value = reported.get(row_id)
-            if value is None:
+            if value is None or case in failed_cases:
                 why = "failed" if case in failed_cases else "printed no measurement"
                 result.update(verdict="ERROR", reason=f"case {case} {why}")
             else:

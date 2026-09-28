@@ -190,11 +190,16 @@ python3 scripts/test_bench_modules.py -q
 python3 scripts/test_build_modules.py -q
 python3 scripts/test_check_module_boundaries.py -q
 python3 scripts/test_ci_build.py -q
+python3 scripts/test_ci_bwrap.py -q
+python3 scripts/test_dogfood_privacy.py -q
 python3 scripts/test_fanout.py -q
 python3 scripts/test_gate.py -q
 python3 scripts/test_install.py -q
 python3 scripts/test_local_cargo_config.py -q
+python3 scripts/test_module_toolchain_hash.py -q
+python3 scripts/test_push_main.py -q
 python3 scripts/test_release_manifest.py -q
+python3 scripts/test_release_publication.py -q
 python3 scripts/test_run_report.py -q
 python3 scripts/test_rustc_serial.py -q
 python3 scripts/test_secret_scan.py -q

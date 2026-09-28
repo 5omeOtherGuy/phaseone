@@ -246,6 +246,47 @@ class RemapTests(unittest.TestCase):
         # Cargo ignores RUSTFLAGS when the encoded form is set, so the build must not carry one.
         self.assertEqual(h.build_env()["RUSTFLAGS"], "<unset>")
 
+    def test_failed_all_build_invalidates_old_whole_set_manifest(self) -> None:
+        h = self.harness()
+        self.assertEqual(h.run('--all').returncode, 0)
+        manifest = h.repo / 'modules' / 'target' / 'p1-modules' / 'manifest.json'
+        manifest.write_text('attestation from prior commit', encoding='utf-8')
+        second = 'p1-module-zfixture'
+        (h.repo / 'modules' / second).mkdir()
+        (h.repo / 'modules' / second / 'Cargo.toml').write_text(
+            PACKAGE_MANIFEST.replace(PACKAGE, second).replace('p1/fixture', 'p1/zfixture'),
+            encoding='utf-8')
+        write_exec(h.bin / 'wasm-tools', WASM_TOOLS_STUB.replace(
+            'elif [ "${1:-}" = component ] && [ "${2:-}" = wit ]; then',
+            'elif [ "${1:-}" = validate ] && [[ "$2" == *p1-module-zfixture* ]]; then\n'
+            '  exit 1\n'
+            'elif [ "${1:-}" = component ] && [ "${2:-}" = wit ]; then'))
+        failed = h.run('--all')
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertFalse(manifest.exists())
+
+    def test_partial_build_does_not_keep_whole_set_manifest(self) -> None:
+        h = self.harness()
+        manifest = h.repo / 'modules' / 'target' / 'p1-modules' / 'manifest.json'
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('stale manifest', encoding='utf-8')
+        done = h.run('--package', PACKAGE)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(manifest.exists())
+
+    def test_failed_component_validation_keeps_last_complete_package(self) -> None:
+        h = self.harness()
+        self.assertEqual(h.run('--package', PACKAGE).returncode, 0)
+        out = h.repo / 'modules' / 'target' / 'p1-modules' / PACKAGE
+        before = {p.name: p.read_bytes() for p in out.iterdir()}
+        write_exec(h.bin / 'wasm-tools', WASM_TOOLS_STUB.replace(
+            'elif [ "${1:-}" = component ] && [ "${2:-}" = wit ]; then',
+            'elif [ "${1:-}" = validate ]; then\n  exit 1\n'
+            'elif [ "${1:-}" = component ] && [ "${2:-}" = wit ]; then'))
+        failed = h.run('--package', PACKAGE)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual({p.name: p.read_bytes() for p in out.iterdir()}, before)
+
     def test_the_fixture_package_builds_and_publishes_its_outputs(self) -> None:
         h = self.harness()
         result = h.run("--package", PACKAGE)

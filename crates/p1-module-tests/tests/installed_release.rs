@@ -77,6 +77,8 @@ const FARM_TOOLS: &[&str] = &[
     "cat",
     "python3",
     "curl",
+    "stat",
+    "flock",
 ];
 
 /// The user environment the module case writes into the run's `$P1_CONFIG_DIR` (D083b): a

@@ -219,7 +219,11 @@ if [ "${#wit_files[@]}" -eq 0 ]; then
   echo "wit: none yet"
 else
   for f in "${wit_files[@]}"; do
-    echo "wit: $(sha256sum "$f" | awk '{print $1}') $f"
+    if digest=$(sha256sum "$f"); then
+      echo "wit: ${digest%% *} $f"
+    else
+      fail "cannot hash WIT file $f"
+    fi
   done
 fi
 

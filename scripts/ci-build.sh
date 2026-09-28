@@ -306,9 +306,23 @@ if ! tmpdir=$(mktemp -d); then
   echo "ci-build: mktemp -d failed" >&2
   exit 2
 fi
-# A failure must leave neither a half-written ci-artifacts/<sha> (only the rename at
-# the end writes it) nor the scratch directories behind.
-trap 'rm -rf -- "$tmpdir" "$staging" || echo "ci-build: could not remove the temporary directories" >&2' EXIT
+# A displaced verified artifact survives every failure, including a signal between renames.
+backup=""
+cleanup_artifact() {
+  if [ -n "$backup" ] && [ -e "$backup" ]; then
+    if [ ! -e "$dest" ]; then
+      mv -T -- "$backup" "$dest" ||
+        echo "ci-build: recovery backup retained at $backup" >&2
+    else
+      echo "ci-build: recovery backup retained at $backup" >&2
+    fi
+  fi
+  rm -rf -- "$tmpdir" "$staging" ||
+    echo "ci-build: could not remove the temporary directories" >&2
+}
+trap cleanup_artifact EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if ! gh run download "$run_id" --name "$artifact" --dir "$tmpdir"; then
   echo "ci-build: could not download the $artifact artifact of run $run_id" >&2
   exit 2
@@ -377,11 +391,39 @@ if ! cp -a "$root/." "$staging/"; then
   echo "ci-build: cannot stage the $artifact artifact into $staging" >&2
   exit 2
 fi
+# Refuse an invalid download while the previous verified destination is untouched.
+if ! staged_sha=$(sha256sum "$staging/p1"); then
+  echo "ci-build: sha256sum failed on staged $sha/p1" >&2
+  exit 2
+fi
+staged_sha=${staged_sha%% *}
+if ! uploaded_sha=$(cut -d' ' -f1 "$staging/p1.sha256"); then
+  echo "ci-build: cannot read staged p1.sha256" >&2
+  exit 2
+fi
+echo "sha256 (downloaded) $staged_sha"
+echo "sha256 (uploaded)   $uploaded_sha"
+manifest_name=""
+read -r _ manifest_name <"$staging/p1.sha256" || true
+if [ "$manifest_name" != p1 ] || [ "$staged_sha" != "$uploaded_sha" ]; then
+  echo "ci-build: sha256 verification failed for staged $sha/p1" >&2
+  exit 1
+fi
 # The rename is the only write to ci-artifacts/<sha>: an earlier download of the same
 # commit is replaced cleanly, or nothing is written at all. -T renames the staging
 # directory onto $dest itself, so a concurrent invocation for the same commit
 # (ADR-0066) that recreated $dest between the rm and this mv fails loudly (exit 2)
 # instead of silently nesting the staging directory inside a fresh destination.
+if [ -e "$dest" ]; then
+  backup="$artifacts/.$sha.previous.$$"
+  if ! mv -T -- "$dest" "$backup"; then
+    backup=""
+    echo "ci-build: cannot preserve $dest" >&2
+    exit 2
+  fi
+fi
+# The old verified directory is in backup now. A foreign recreation must still
+# fail, not absorb staging as a nested directory.
 if ! rm -rf -- "$dest"; then
   echo "ci-build: cannot replace $dest" >&2
   exit 2
@@ -399,11 +441,13 @@ if ! uploaded_sha=$(cut -d' ' -f1 "$dest/p1.sha256"); then
   echo "ci-build: cannot read $dest/p1.sha256" >&2
   exit 2
 fi
-echo "sha256 (downloaded) $local_sha"
-echo "sha256 (uploaded)   $uploaded_sha"
 if ! ( cd "$dest" && sha256sum -c p1.sha256 ); then
   echo "ci-build: sha256 verification failed for $dest/p1" >&2
   exit 1
+fi
+if [ -n "$backup" ] && [ -e "$backup" ]; then
+  rm -rf -- "$backup" || echo "ci-build: prior artifact retained at $backup" >&2
+  backup=""
 fi
 echo "ci-build: $branch ${sha:0:7} green; $dest/p1 verified with sha256sum -c"
 exit 0

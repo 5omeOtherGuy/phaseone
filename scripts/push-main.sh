@@ -9,7 +9,7 @@ git push -q origin main
 sha=$(git rev-parse HEAD)
 echo "pushed ${sha:0:7}; waiting for CI…"
 for _ in $(seq 1 90); do
-  run=$(gh run list --branch main --limit 10 --json status,conclusion,headSha \
+  run=$(gh run list --workflow gate --event push --branch main --limit 10 --json status,conclusion,headSha \
         -q ".[] | select(.headSha==\"$sha\") | [.status, .conclusion] | @tsv" | head -1)
   case "$run" in
     completed*success*) echo "CI green on ${sha:0:7}"; exit 0 ;;

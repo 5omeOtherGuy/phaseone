@@ -21,6 +21,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "stage-release.sh")
@@ -142,6 +143,18 @@ class StageReleaseTest(unittest.TestCase):
 
     # ---- the four assets ---------------------------------------------------------
 
+    def test_two_independent_stages_of_one_commit_are_byte_identical(self) -> None:
+        self.fixture()
+        first = self.stage()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        other = os.path.join(self.tmp, 'other-dist')
+        second = self.stage(out=other)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        for asset in ASSETS:
+            with self.subTest(asset=asset):
+                self.assertEqual(self.read(os.path.join(self.out, asset)),
+                                 self.read(os.path.join(other, asset)))
+
     def test_writes_exactly_the_four_assets_with_their_checksums(self) -> None:
         self.fixture()
 
@@ -155,6 +168,93 @@ class StageReleaseTest(unittest.TestCase):
         self.assertEqual(self.sha_line("p1-linux-x86_64"), sha256(self.binary_bytes))
         self.assertEqual(self.sha_line("p1-share.tar.gz"),
                          sha256(self.read(os.path.join(self.out, "p1-share.tar.gz"))))
+
+    def test_packed_bytes_are_reconciled_against_manifest(self) -> None:
+        self.fixture()
+        stub = os.path.join(self.tmp, 'bin')
+        os.mkdir(stub)
+        tar_path = os.path.join(stub, 'tar')
+        with open(tar_path, 'w', encoding='utf-8') as output:
+            output.write('''#!/bin/sh
+/usr/bin/tar "$@" || exit
+python3 - "$2" <<'PY'
+import io, os, sys, tarfile
+path = sys.argv[1]
+with tarfile.open(path, 'r:gz') as source:
+    entries = [(member, source.extractfile(member).read() if member.isfile() else None)
+               for member in source]
+with tarfile.open(path + '.changed', 'w:gz') as dest:
+    for member, data in entries:
+        if member.name.endswith('.wasm'):
+            data = b'X' * len(data)
+        dest.addfile(member, io.BytesIO(data) if data is not None else None)
+os.replace(path + '.changed', path)
+PY
+''')
+        os.chmod(tar_path, 0o755)
+        with unittest.mock.patch.dict(os.environ, {'PATH': stub + ':' + os.environ['PATH']}):
+            done = self.stage()
+        self.assertNotEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_symlink_output_does_not_delete_sentinel(self) -> None:
+        self.fixture()
+        sentinel = os.path.join(self.tmp, 'valued')
+        os.mkdir(sentinel)
+        write_file(os.path.join(sentinel, 'keep'), b'untouched')
+        os.symlink(sentinel, self.out)
+        done = self.stage()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.read(os.path.join(sentinel, 'keep')), b'untouched')
+
+    def test_four_public_asset_names_do_not_prove_output_ownership(self) -> None:
+        self.fixture()
+        os.mkdir(self.out)
+        before = {}
+        for asset in ASSETS:
+            value = ('unrelated ' + asset).encode()
+            write_file(os.path.join(self.out, asset), value)
+            before[asset] = value
+        done = self.stage()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual({asset: self.read(os.path.join(self.out, asset))
+                          for asset in ASSETS}, before)
+
+    def test_unowned_output_does_not_delete_sentinel(self) -> None:
+        self.fixture()
+        os.mkdir(self.out)
+        write_file(os.path.join(self.out, 'keep'), b'untouched')
+        done = self.stage()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.read(os.path.join(self.out, 'keep')), b'untouched')
+
+    def test_failed_replacement_restores_prior_complete_stage(self) -> None:
+        self.fixture()
+        first = self.stage()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = {asset: self.read(os.path.join(self.out, asset)) for asset in ASSETS}
+        tools = os.path.join(self.tmp, 'bin')
+        os.mkdir(tools)
+        stub = os.path.join(tools, 'mv')
+        with open(stub, 'w', encoding='utf-8') as output:
+            output.write('''#!/bin/sh
+case "$4" in
+  */dist) case "$3" in *release-backup*) ;; *) exit 72 ;; esac ;;
+esac
+exec /usr/bin/mv "$@"
+''')
+        os.chmod(stub, 0o755)
+        with unittest.mock.patch.dict(os.environ, {'PATH': tools + ':' + os.environ['PATH']}):
+            failed = self.stage()
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual({asset: self.read(os.path.join(self.out, asset)) for asset in ASSETS}, before)
+
+    def test_bad_tmpdir_leaves_no_release_scratch(self) -> None:
+        self.fixture()
+        with unittest.mock.patch.dict(os.environ, {'TMPDIR': os.path.join(self.tmp, 'missing')}):
+            done = self.stage()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(any(n.startswith('.p1-release.') for n in os.listdir(self.tmp)))
 
     def test_the_share_archive_carries_the_shipped_roots_and_the_module_set(self) -> None:
         data = self.fixture()

@@ -114,6 +114,7 @@ CARGO_STUB = textwrap.dedent(
         name="${@: -1}"
         if [ -f "$STUB_CASES/$name.json" ]; then
           printf 'test %s ... %s\\n' "$name" "$(cat "$STUB_CASES/$name.json")"
+          if [ "$name" = "${STUB_FAIL_AFTER_MEASURE:-}" ]; then exit 101; fi
           echo "test result: ok. 1 passed; 0 failed"
           exit 0
         fi
@@ -354,6 +355,16 @@ class BenchModulesTests(unittest.TestCase):
         self.assertEqual(header.count("Facts, not a check"), 1)
 
     # ---- the whole suite ------------------------------------------------------------
+
+    def test_case_that_panics_after_a_passing_measurement_is_error(self) -> None:
+        h = self.harness()
+        h.reading('history-1m')
+        for checked in ([], ['--check']):
+            with self.subTest(checked=checked):
+                result = h.run('--suite', 'acceptance', '--row', 'history-1m',
+                               *checked, STUB_FAIL_AFTER_MEASURE='history_1m')
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(verdicts(result.stdout)['history-1m'], 'ERROR')
 
     def test_the_whole_suite_reports_every_row_in_plan_order(self) -> None:
         h = self.harness()

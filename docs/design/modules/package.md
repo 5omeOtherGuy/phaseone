@@ -108,6 +108,25 @@ The cases are tested in
 | `<package>.imports` | every imported interface, one per line, sorted (this is what the capability check compares against) |
 | `<package>.manifest.json` | the manifest fields above, plus `digest` and `size` |
 
+The release installer records `.p1-modules-required` independently of `modules/`, so
+missing module directories cannot pass a matching-release no-op. A missing release
+marker forces reinstallation instead of trusting the binary version alone.
+
+The release installer rechecks the protected config path and the identities of `bin/` and
+`share/` before pathname operations; an advisory lock on the prefix directory inode
+serializes cooperating installers without creating a redirectable lock file.
+Rollback refuses to delete a public destination whose identity no longer matches the
+transaction's installed entry. These checks detect many concurrent mutations but are
+not directory-handle-anchored: an uncooperative same-user actor can still race a check
+and a write.
+
+Each package is built in a sibling scratch directory and published only after all five
+outputs validate. A failed rebuild retains the last complete package. A partial `--package`
+build removes the whole-set development manifest: only `--all` can attest the complete
+set as originating from the current commit. `--all` invalidates its prior whole-set
+manifest before publishing the first package, so a failed batch cannot retain a stale
+attestation beside partially updated packages.
+
 The build compiles the package with the target named by `WASM_TARGET` in
 [`modules/toolchain.pins`](../../../modules/toolchain.pins) — the pin alone decides, so a target
 that produces a core module rather than a component is componentized with

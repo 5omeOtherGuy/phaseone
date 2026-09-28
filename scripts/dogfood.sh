@@ -7,10 +7,9 @@
 #   is outside it, a clone's is not), so the shell sandbox can confine the agent to it.
 # - The agent runs with --yes inside the workspace sandbox; cargo's registry and the rustc
 #   semaphore directory stay writable so builds work and stay serialized machine-wide.
-# - Afterwards: the session journal, the agent's output, the diff and one evidence record
-#   (scripts/run-report.py) are in ../phaseone-dogfood/<label>.run/. NOTHING is merged and
-#   acceptance is NOT decided here: verify independently, then append the record with
-#   --accepted yes|no to docs/dogfood/runs.jsonl.
+# - Afterwards: only a derived evidence record is retained. Prompt-bearing journal,
+#   outputs and diff remain in private scratch for this invocation and are removed.
+#   NOTHING is merged; acceptance is NOT decided here.
 set -euo pipefail
 label=$1 env=$2 repo=$(realpath "$3") task_file=$(realpath "$4") base=${5:-HEAD}
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -40,18 +39,22 @@ read_args=()
 if [ "$common" != "$clone" ] && [[ "$common" != "$clone"/* ]]; then
   read_args=(--sandbox-read "$common")
 fi
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/p1-dogfood.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
 start=$(date +%s)
 set +e
-"$p1" --env "$env" --workspace "$clone" --session "$run/session.jsonl" --yes \
+"$p1" --env "$env" --workspace "$clone" --session "$scratch/session.jsonl" --yes \
   --sandbox workspace --sandbox-write "$HOME/.cargo/registry" --sandbox-write "$HOME/.cargo/git" \
-  --sandbox-write "$locks" "${read_args[@]}" "$(cat "$task_file")" >"$run/stdout.txt" 2>"$run/stderr.txt"
+  --sandbox-write "$locks" "${read_args[@]}" "$(cat "$task_file")" >"$scratch/stdout.txt" 2>"$scratch/stderr.txt"
 code=$?
 set -e
 elapsed=$(( $(date +%s) - start ))
 git -C "$clone" add -A -N . >/dev/null 2>&1 || true
-git -C "$clone" diff >"$run/changes.diff" || true
-cp "$task_file" "$run/task.txt"
-"$here/scripts/run-report.py" "$run/session.jsonl" --label "$label" --elapsed "$elapsed" \
+git -C "$clone" diff --numstat -z >"$scratch/diff.numstat" || true
+"$here/scripts/run-report.py" "$scratch/session.jsonl" --label "$label" --elapsed "$elapsed" \
   --exit-code "$code" >"$run/report.json"
+python3 "$here/scripts/dogfood-review.py" "$run/report.json" \
+  "$scratch/stdout.txt" "$scratch/stderr.txt" "$scratch/session.jsonl" \
+  "$scratch/diff.numstat" "$run/review-evidence.json"
 echo "exit=$code elapsed=${elapsed}s clone=$clone run=$run"
-tail -n 3 "$run/stderr.txt" || true
+echo "dogfood: raw output and journal not retained"

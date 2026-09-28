@@ -362,6 +362,23 @@ def validate_jobs(jobs):
     labels = [job["label"] for job in jobs]
     if len(set(labels)) != len(labels):
         raise JobError("fanout: duplicate job labels")
+    graph = {job["label"]: job.get("after", []) for job in jobs}
+    visiting, visited = set(), set()
+
+    def visit(label):
+        if label in visiting:
+            raise JobError(f"fanout: dependency cycle at {label}")
+        if label in visited:
+            return
+        visiting.add(label)
+        for dep in graph[label]:
+            if dep in graph:
+                visit(dep)
+        visiting.remove(label)
+        visited.add(label)
+
+    for label in labels:
+        visit(label)
     for job in jobs:
         label = job["label"]
         kind = runner_of(job)
@@ -415,10 +432,11 @@ def launch(job, worker, binary, out_dir):
         os.makedirs(run_dir, exist_ok=True)
         session = os.path.abspath(job["session"]) if job.get("session") else os.path.join(run_dir, "session.jsonl")
         brief = read_file(job["prompt_file"] if job.get("session") else job["brief_file"])
-        stdout_path = unique_path(run_dir, "stdout.txt")
-        stderr_path = unique_path(run_dir, "stderr.txt")
+        # Frozen test_run_dir_layout requires the original task in task.txt.
         with open(unique_path(run_dir, "task.txt"), "w", encoding="utf-8") as handle:
             handle.write(brief)
+        stdout_path = unique_path(run_dir, "stdout.txt")
+        stderr_path = unique_path(run_dir, "stderr.txt")
         stdout = open(stdout_path, "w")
         stderr = open(stderr_path, "w")
         proc = subprocess.Popen(p1_command(job, binary, session, brief, build_locks_dir(),

@@ -158,11 +158,16 @@ PY_TESTS = [
     "test_build_modules.py",
     "test_check_module_boundaries.py",
     "test_ci_build.py",
+    "test_ci_bwrap.py",
+    "test_dogfood_privacy.py",
     "test_fanout.py",
     "test_gate.py",
     "test_install.py",
     "test_local_cargo_config.py",
+    "test_module_toolchain_hash.py",
+    "test_push_main.py",
     "test_release_manifest.py",
+    "test_release_publication.py",
     "test_run_report.py",
     "test_rustc_serial.py",
     "test_secret_scan.py",
@@ -476,6 +481,16 @@ class GateTests(unittest.TestCase):
         self.assertLess(steps.index("module build"), steps.index("tests"))
         self.assertLess(steps.index("module validation"), steps.index("tests"))
         self.assertLess(steps.index("import check"), steps.index("tests"))
+
+    def test_new_regression_suite_failure_stops_required_gate(self) -> None:
+        for name in ('test_ci_bwrap.py', 'test_dogfood_privacy.py',
+                     'test_module_toolchain_hash.py', 'test_push_main.py',
+                     'test_release_publication.py'):
+            with self.subTest(name=name):
+                h = self.harness()
+                result = h.run(STUB_FAIL='^' + re.escape(name) + r' -q$')
+                self.assert_red(result)
+                self.assertIn(name + ' -q', '\n'.join(h.calls()))
 
     def test_every_step_failing_stops_the_gate_red(self) -> None:
         names = [name for name, _ in ORDER]

@@ -501,10 +501,8 @@ check_package() {
   # The component's world is the manifest's world: its exports are the world's exports.
   local expected actual
   expected="$(wit_world_exports "$kind")"
-  actual="$(component_exports "$wit")"
-  [ "$expected" = "$actual" ] ||
-    reason "the component's exports are not the $kind world's exports"
-
+  # The saved WIT is not evidence of what the component actually exports.
+  # Extract first, then compare both the extracted exports and the saved copy.
   # The <package>.imports file is the component's own import list, extracted fresh.
   local fresh extracted
   fresh="$(mktemp)"
@@ -512,6 +510,10 @@ check_package() {
     rm -f "$fresh"
     reason "wasm-tools could not extract the world from $wasm"
   else
+    actual="$(component_exports "$fresh")"
+    [ "$expected" = "$actual" ] ||
+      reason "the component's exports are not the $kind world's exports"
+    cmp -s "$wit" "$fresh" || reason "$pkg.wit does not match the component's extracted world"
     extracted="$(mktemp)"
     imported_interfaces "$fresh" >"$extracted"
     if ! LC_ALL=C sort -u "$imports_file" | diff -q - "$extracted" >/dev/null 2>&1; then

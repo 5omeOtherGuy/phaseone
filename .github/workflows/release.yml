@@ -118,7 +118,18 @@ jobs:
               grep -Fxq "$asset" <<<"$assets" || complete=0
             done
             if [ "$complete" -eq 1 ]; then
-              echo "release $tag is complete — nothing to publish"
+              compare="$(mktemp -d)"
+              trap 'rm -rf -- "$compare"' EXIT
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$compare" \
+                --pattern 'p1-linux-x86_64*' --pattern 'p1-share.tar.gz*'
+              for asset in "${required[@]}"; do
+                [ -f "$compare/$asset" ] || { echo "missing published $asset" >&2; exit 1; }
+                cmp -s "dist/$asset" "$compare/$asset" || {
+                  echo "published $asset differs from staged build; refusing no-op" >&2
+                  exit 1
+                }
+              done
+              echo "release $tag is complete and byte-identical — nothing to publish"
               exit 0
             fi
             # Repair a partial publication. --clobber also repairs an asset left from an

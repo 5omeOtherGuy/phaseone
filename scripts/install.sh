@@ -163,7 +163,8 @@ import sys
 protected = os.path.realpath(sys.argv[1])
 for candidate in sys.argv[2:]:
     resolved = os.path.realpath(candidate)
-    if resolved == protected or resolved.startswith(protected + os.sep):
+    if (resolved == protected or resolved.startswith(protected + os.sep)
+            or protected.startswith(resolved.rstrip(os.sep) + os.sep)):
         raise SystemExit(1)
 PY
 
@@ -187,17 +188,75 @@ update_prev="$prefix/bin/.p1-update.previous"
 share_prev="$prefix/share/.p1.previous"
 transaction=0
 new_started=0
+bin_identity=""
+share_identity=""
+lock_fd=""
+installed_identity=("" "" "")
+
+# Recheck both the private-tree exclusion and directory identities immediately before
+# pathname-based operations. This detects substituted parents; it is not a substitute
+# for fd-relative writes against an uncooperative same-user attacker.
+check_install_paths() {
+  python3 - "$config_root/p1" "$prefix/bin" "$prefix/share" <<'PY'
+import os
+import sys
+protected = os.path.realpath(sys.argv[1])
+for candidate in sys.argv[2:]:
+    resolved = os.path.realpath(candidate)
+    if (resolved == protected or resolved.startswith(protected + os.sep)
+            or protected.startswith(resolved.rstrip(os.sep) + os.sep)):
+        raise SystemExit(1)
+PY
+  [ "$?" -eq 0 ] || return 1
+  if [ -n "$bin_identity" ]; then
+    [ "$(stat -Lc '%d:%i' -- "$prefix/bin")" = "$bin_identity" ] || return 1
+    [ "$(stat -Lc '%d:%i' -- "$prefix/share")" = "$share_identity" ] || return 1
+  fi
+}
 
 rollback_install() {
   local restore_error=0 restore_from restore_to index
   [ "$transaction" -eq 1 ] || return 0
-  if [ "$new_started" -eq 1 ]; then
-    rm -rf "$prefix/bin/p1" "$prefix/bin/p1-update" "$prefix/share/p1"
+  if ! check_install_paths; then
+    printf 'p1 install: install directories changed; backups retained for manual recovery\n' >&2
+    transaction=0
+    return 1
   fi
   restore_from=("$bin_prev" "$update_prev" "$share_prev")
   restore_to=("$prefix/bin/p1" "$prefix/bin/p1-update" "$prefix/share/p1")
+  if [ "$new_started" -eq 1 ]; then
+    # Do not delete an entry another actor installed while this transaction ran.
+    for index in "${!restore_to[@]}"; do
+      if [ -e "${restore_to[$index]}" ] || [ -L "${restore_to[$index]}" ]; then
+        if [ -z "${installed_identity[$index]}" ] ||
+           [ "$(stat -c '%d:%i' -- "${restore_to[$index]}")" != "${installed_identity[$index]}" ]; then
+          printf 'p1 install: destination replaced during transaction: %s; backups retained\n' "${restore_to[$index]}" >&2
+          transaction=0
+          return 1
+        fi
+      fi
+    done
+    for index in "${!restore_to[@]}"; do
+      if ! check_install_paths; then
+        printf 'p1 install: install directories changed during rollback; backups retained\n' >&2
+        transaction=0
+        return 1
+      fi
+      [ -z "${installed_identity[$index]}" ] || rm -rf -- "${restore_to[$index]}"
+    done
+  fi
   for index in "${!restore_from[@]}"; do
+    if ! check_install_paths; then
+      printf 'p1 install: install directories changed during restore; backups retained\n' >&2
+      transaction=0
+      return 1
+    fi
     if [ -e "${restore_from[$index]}" ] || [ -L "${restore_from[$index]}" ]; then
+      if [ -e "${restore_to[$index]}" ] || [ -L "${restore_to[$index]}" ]; then
+        printf 'p1 install: destination occupied during restore: %s; backup retained\n' "${restore_to[$index]}" >&2
+        restore_error=1
+        continue
+      fi
       mv "${restore_from[$index]}" "${restore_to[$index]}" || restore_error=1
     fi
   done
@@ -210,9 +269,13 @@ cleanup() {
     rollback_install || printf 'p1 install: rollback could not restore the previous install\n' >&2
   fi
   rm -rf "$stage"
-  [ -z "$bin_new" ] || rm -f "$bin_new"
-  [ -z "$update_new" ] || rm -f "$update_new"
-  [ -z "$share_new" ] || rm -rf "$share_new"
+  if check_install_paths; then
+    [ -z "$bin_new" ] || rm -f "$bin_new"
+    [ -z "$update_new" ] || rm -f "$update_new"
+    [ -z "$share_new" ] || rm -rf "$share_new"
+  else
+    printf 'p1 install: paths changed; staged entries retained for manual recovery\n' >&2
+  fi
 }
 # A signal must end the script after the rollback, not let it resume a half-swapped
 # install: the INT/TERM handler runs cleanup and then exits.
@@ -461,17 +524,24 @@ if set(packaged) != set(listed):
     raise SystemExit("modules/manifest.json does not match the packaged files: " + "; ".join(detail))
 
 for entry in manifest["packages"]:
-    data = packaged[entry["path"]].read_bytes()
-    if len(data) != entry["size"]:
-        raise SystemExit(f"modules/{entry['path']}: size is {len(data)} bytes, the manifest says {entry['size']}")
-    got = hashlib.sha256(data).hexdigest()
+    digest = hashlib.sha256()
+    size = 0
+    with packaged[entry["path"]].open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    if size != entry["size"]:
+        raise SystemExit(f"modules/{entry['path']}: size is {size} bytes, the manifest says {entry['size']}")
+    got = digest.hexdigest()
     if got != entry["sha256"]:
         raise SystemExit(f"modules/{entry['path']}: sha256 is {got}, the manifest says {entry['sha256']}")
 
 if binary_sha and native["sha256"] != binary_sha:
     raise SystemExit(f"modules/manifest.json: native.sha256 {native['sha256']!r} does not match the verified binary {binary_sha}")
-if tag and manifest["tag"] is not None and manifest["tag"] != tag:
-    raise SystemExit(f"modules/manifest.json: tag {manifest['tag']!r} does not match the requested release {tag!r}")
+if tag and ((manifest["tag"] is not None and manifest["tag"] != tag) or
+            (tag.startswith("main-") and
+             (manifest["tag"] != tag or not commit.startswith(tag[5:])))):
+    raise SystemExit(f"modules/manifest.json: tag/commit does not match the requested release {tag!r}")
 PY
 }
 
@@ -492,13 +562,28 @@ import tarfile
 archive_path, destination = sys.argv[1:]
 allowed = {"environments", "routes", "profiles", "modules"}
 with tarfile.open(archive_path, "r:gz") as archive:
-    members = archive.getmembers()
-    for member in members:
+    seen = set()
+    seen_files = set()
+    members = []
+    total = 0
+    # Bound metadata and extraction before writing any member to disk.
+    for member in archive:
         path = pathlib.PurePosixPath(member.name)
+        normalized = path.as_posix()
+        total += member.size
         if (not path.parts or path.is_absolute() or ".." in path.parts
                 or path.parts[0] not in allowed
-                or not (member.isdir() or member.isfile())):
+                or not (member.isdir() or member.isfile())
+                or len(members) >= 10000 or member.size > 1024 * 1024 * 1024
+                or total > 2 * 1024 * 1024 * 1024
+                or normalized in seen
+                or (member.isfile() and any(name.startswith(normalized + '/') for name in seen))
+                or any('/'.join(path.parts[:n]) in seen_files for n in range(1, len(path.parts)))):
             raise SystemExit(f"unsafe archive member: {member.name!r}")
+        seen.add(normalized)
+        if member.isfile():
+            seen_files.add(normalized)
+        members.append(member)
     archive.extractall(destination, members=members, filter="data")
 PY
   for dir in environments routes profiles; do
@@ -553,11 +638,21 @@ stage_self_and_updater() {
   cp -f "$stage_script" "$staged_share/install.sh"
   chmod 0755 "$staged_share/install.sh"
   staged_update="$stage/p1-update"
+  # Keep the documented wrapper spelling for simple pathnames. For all others,
+  # %q emits one shell word, including command substitutions as data.
+  local quoted_prefix quoted_script
+  if [[ "$prefix" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+    quoted_prefix="\"$prefix\""
+    quoted_script="\"$prefix/share/p1/install.sh\""
+  else
+    printf -v quoted_prefix '%q' "$prefix"
+    printf -v quoted_script '%q' "$prefix/share/p1/install.sh"
+  fi
   cat >"$staged_update" <<EOF
 #!/usr/bin/env bash
 # Written by p1's install.sh (ADR-0065): update p1 to the latest release.
 set -euo pipefail
-exec "$prefix/share/p1/install.sh" --latest --prefix "$prefix" "\$@"
+exec $quoted_script --latest --prefix $quoted_prefix "\$@"
 EOF
   chmod 0755 "$staged_update"
 }
@@ -566,17 +661,41 @@ EOF
 # .new copies in their destination directories, so the commit stays a set of same-filesystem
 # renames and every earlier refusal leaves the prefix exactly as it was.
 publish_staged() {
+  check_install_paths || die "install paths changed before publication"
   mkdir -p "$prefix/bin" "$prefix/share"
+  check_install_paths || die "install paths changed during publication"
+  bin_identity="$(stat -Lc '%d:%i' -- "$prefix/bin")"
+  share_identity="$(stat -Lc '%d:%i' -- "$prefix/share")"
+  # Lock the prefix directory inode, not a writable lock filename that could be
+  # replaced with a symlink into the user's private configuration tree.
+  check_install_paths || die "install paths changed before locking"
+  exec {lock_fd}<"$prefix"
+  flock -n "$lock_fd" || die "another install is updating this prefix"
+  check_install_paths || die "install paths changed after locking"
   share_new="$prefix/share/.p1.new.$$"
+  check_install_paths || die "install paths changed before staging share"
   rm -rf "$share_new"
+  check_install_paths || die "install paths changed while staging share"
   mkdir -p "$share_new"
+  check_install_paths || die "install paths changed while staging share"
   cp -a "$staged_share/." "$share_new/"
-  bin_new="$prefix/bin/.p1.new.$$"
+  check_install_paths || die "install paths changed after staging share"
+  check_install_paths || die "install paths changed before staging binary"
+  [ ! -e "$prefix/bin/.p1.new.$$" ] && [ ! -L "$prefix/bin/.p1.new.$$" ] ||
+    die "pre-existing binary staging entry; refusing to follow it"
+  bin_new="$(mktemp "$prefix/bin/.p1.new.XXXXXX")" || die "cannot allocate binary staging file"
+  check_install_paths || die "install paths changed before copying binary"
   cp -f "$staged_bin" "$bin_new"
+  check_install_paths || die "install paths changed after staging binary"
   chmod 0755 "$bin_new"
   if [ -n "$staged_update" ]; then
-    update_new="$prefix/bin/.p1-update.new.$$"
+    check_install_paths || die "install paths changed before staging updater"
+    [ ! -e "$prefix/bin/.p1-update.new.$$" ] && [ ! -L "$prefix/bin/.p1-update.new.$$" ] ||
+      die "pre-existing updater staging entry; refusing to follow it"
+    update_new="$(mktemp "$prefix/bin/.p1-update.new.XXXXXX")" || die "cannot allocate updater staging file"
+    check_install_paths || die "install paths changed before copying updater"
     cp -f "$staged_update" "$update_new"
+    check_install_paths || die "install paths changed after staging updater"
     chmod 0755 "$update_new"
   fi
 }
@@ -690,6 +809,7 @@ install_release() {
 }
 
 commit_install() {
+  check_install_paths || die "install paths changed before commit"
   local had_binary=0 had_updater=0 had_share=0
   [ ! -e "$prefix/bin/p1" ] || had_binary=1
   [ ! -e "$prefix/bin/p1-update" ] || had_updater=1
@@ -700,62 +820,85 @@ commit_install() {
   # it aside rather than deleting it, and discard both it and this install's retained
   # previous files only after every new-file rename has succeeded.
   if [ "$had_binary" -eq 1 ]; then
+    check_install_paths || die "install paths changed during binary backup"
     if [ -e "$bin_prev" ] || [ -L "$bin_prev" ]; then
       mv "$bin_prev" "$bin_prev.stale" || {
         restore_previous_install
         die "could not preserve the previous binary backup"
       }
     fi
+    check_install_paths || die "install paths changed before retaining binary"
     if ! mv "$prefix/bin/p1" "$bin_prev"; then
       restore_previous_install
       die "could not retain the previous binary"
     fi
   fi
   if [ "$had_updater" -eq 1 ]; then
+    check_install_paths || die "install paths changed during updater backup"
     if [ -e "$update_prev" ] || [ -L "$update_prev" ]; then
       mv "$update_prev" "$update_prev.stale" || {
         restore_previous_install
         die "could not preserve the previous updater backup"
       }
     fi
+    check_install_paths || die "install paths changed before retaining updater"
     if ! mv "$prefix/bin/p1-update" "$update_prev"; then
       restore_previous_install
       die "could not retain the previous updater"
     fi
   fi
   if [ "$had_share" -eq 1 ]; then
+    check_install_paths || die "install paths changed during share backup"
     if [ -e "$share_prev" ] || [ -L "$share_prev" ]; then
       mv "$share_prev" "$share_prev.stale" || {
         restore_previous_install
         die "could not preserve the previous share data backup"
       }
     fi
+    check_install_paths || die "install paths changed before retaining share"
     if ! mv "$prefix/share/p1" "$share_prev"; then
       restore_previous_install
       die "could not retain the previous share data"
     fi
   fi
 
+  check_install_paths || die "install paths changed during commit"
   new_started=1
-  if ! mv "$share_new" "$prefix/share/p1" || ! mv "$bin_new" "$prefix/bin/p1"; then
+  if ! mv "$share_new" "$prefix/share/p1"; then
     restore_previous_install
     die "could not commit the new share data and binary"
   fi
+  installed_identity[2]="$(stat -c '%d:%i' -- "$prefix/share/p1")"
+  check_install_paths || die "install paths changed after share commit"
+  if ! mv "$bin_new" "$prefix/bin/p1"; then
+    restore_previous_install
+    die "could not commit the new share data and binary"
+  fi
+  installed_identity[0]="$(stat -c '%d:%i' -- "$prefix/bin/p1")"
   share_new=""
   bin_new=""
   if [ -n "$update_new" ]; then
+    check_install_paths || die "install paths changed before updater commit"
     if ! mv "$update_new" "$prefix/bin/p1-update"; then
       restore_previous_install
       die "could not commit the new updater"
     fi
+    installed_identity[1]="$(stat -c '%d:%i' -- "$prefix/bin/p1-update")"
     update_new=""
   fi
 
-  rm -f "$bin_prev" "$update_prev"
-  rm -rf "$share_prev"
-  rm -f "$bin_prev.stale" "$update_prev.stale"
-  rm -rf "$share_prev.stale"
+  # Once any backup is discarded rollback cannot restore the old set. Commit first;
+  # leftover backups are recoverable and must not remove the new installation.
+  check_install_paths || die "install paths changed after commit"
   transaction=0
+  if check_install_paths; then
+    rm -f "$bin_prev" "$update_prev" || printf 'p1 install: retained binary/updater backup\n' >&2
+  fi
+  if check_install_paths; then
+    rm -rf "$share_prev" || printf 'p1 install: retained share backup\n' >&2
+  fi
+  if check_install_paths; then rm -f "$bin_prev.stale" "$update_prev.stale" || true; fi
+  if check_install_paths; then rm -rf "$share_prev.stale" || true; fi
 }
 
 # The running script may live inside the share directory the swap replaces, so copy it
@@ -797,6 +940,21 @@ latest_tag() {
   esac
 }
 
+installed_set_valid() {
+  local root="$prefix/share/p1" required
+  [ -f "$root/.p1-modules-required" ] && [ ! -L "$root/.p1-modules-required" ] || return 1
+  required="$(cat "$root/.p1-modules-required")" || return 1
+  case "$required" in
+    yes)
+      [ -d "$root/modules" ] && [ ! -L "$root/modules" ] &&
+        [ -f "$root/modules/manifest.json" ] &&
+        "$prefix/bin/p1" modules verify --integrity-only --root "$root" >/dev/null 2>&1
+      ;;
+    no) [ ! -e "$root/modules" ] && [ ! -L "$root/modules" ] ;;
+    *) return 1 ;;
+  esac
+}
+
 already_installed() {
   local want_tag want_sha installed_sha
   [ -z "$force" ] || return 1
@@ -809,6 +967,7 @@ already_installed() {
   fi
   if [ -f "$prefix/share/p1/.p1-release" ] &&
      [ "$(cat "$prefix/share/p1/.p1-release")" = "$want_tag" ]; then
+    installed_set_valid || return 1
     return 0
   fi
   case "$want_tag" in
@@ -817,7 +976,11 @@ already_installed() {
   esac
   want_sha="${want_tag#main-}"
   installed_sha="$(release_sha "$prefix/bin/p1")" || return 1
-  [ "$installed_sha" = "$want_sha" ]
+  [ "$installed_sha" = "$want_sha" ] || return 1
+  # A missing marker cannot bind the installed share to this binary version.
+  [ -f "$prefix/share/p1/.p1-release" ] || return 1
+  [ "$(cat "$prefix/share/p1/.p1-release")" = latest ] || return 1
+  installed_set_valid
 }
 
 local_bin=""
@@ -836,7 +999,9 @@ case "$mode" in
       installed_release_sha="$(release_sha "$prefix/bin/p1" || true)"
       downloaded_release_sha="$(release_sha "$release_bin" || true)"
       if [ -n "$installed_release_sha" ] &&
-         [ "$installed_release_sha" = "$downloaded_release_sha" ]; then
+         [ "$installed_release_sha" = "$downloaded_release_sha" ] &&
+         [ -f "$prefix/share/p1/.p1-release" ] &&
+         installed_set_valid; then
         printf 'p1 install: this release is already installed at %s (use --force to reinstall)\n' \
           "$prefix"
         exit 0
@@ -844,6 +1009,11 @@ case "$mode" in
     fi
     stage_share "$stage/$SHARE_ASSET"
     printf '%s\n' "${tag:-latest}" >"$staged_share/.p1-release"
+    if [ -d "$staged_share/modules" ]; then
+      printf 'yes\n' >"$staged_share/.p1-modules-required"
+    else
+      printf 'no\n' >"$staged_share/.p1-modules-required"
+    fi
     stage_binary "$release_bin"
     stage_self_and_updater
     ;;
@@ -851,6 +1021,7 @@ case "$mode" in
     install_local
     stage_share "$stage/$SHARE_ASSET"
     printf 'local\n' >"$staged_share/.p1-release"
+    printf 'no\n' >"$staged_share/.p1-modules-required"
     stage_binary "$local_bin"
     stage_self_and_updater
     ;;

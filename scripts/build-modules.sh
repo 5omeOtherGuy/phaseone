@@ -284,8 +284,12 @@ build_package() {
   cargo build --manifest-path modules/Cargo.toml --locked --release --target "$wasm_target" -p "$pkg"
   [ -f "$core" ] || fail "$pkg: cargo built no module at $core"
 
-  rm -rf "$out"
-  mkdir -p "$out"
+  local published="$out" previous
+  mkdir -p "${published%/*}"
+  out="$(mktemp -d "${published}.new.XXXXXX")"
+  wasm="$out/$pkg.wasm"
+  # A failed conversion must leave the published component untouched.
+  trap 'if [ -n "${out:-}" ] && [[ "$out" == *.new.* ]]; then rm -rf -- "$out"; fi' EXIT
   case "$(wasm_layer "$core")" in
     component) cp "$core" "$wasm" ;;
     core)
@@ -304,7 +308,6 @@ build_package() {
   local wasi
   wasi="$(grep '^wasi:' "$out/$pkg.imports" | paste -sd' ' - || true)"
   if [ -n "$wasi" ]; then
-    rm -rf "$out"
     fail "$pkg imports wasi: $wasi (no WASI surface, D-XO-4)"
   fi
   local digest size
@@ -330,6 +333,15 @@ build_package() {
 }
 EOF
 
+  previous="${published}.previous.$$"
+  if [ -d "$published" ]; then mv -T -- "$published" "$previous"; fi
+  if ! mv -T -- "$out" "$published"; then
+    [ ! -d "$previous" ] || mv -T -- "$previous" "$published"
+    fail "$pkg: cannot publish complete build output"
+  fi
+  out="$published"
+  trap - EXIT
+  [ ! -d "$previous" ] || rm -rf -- "$previous"
   echo "build-modules: $pkg ok sha256:$digest ($size bytes)"
 }
 
@@ -360,6 +372,9 @@ else
   export RUSTFLAGS
 fi
 
+# Any failure during an --all build leaves mixed generations on disk. Invalidate
+# the whole-set attestation before the first package can be published.
+rm -f modules/target/p1-modules/manifest.json
 built=0
 for p in "${packages[@]}"; do
   build_package "$p"
@@ -371,10 +386,15 @@ done
 # mode, so a release binary still reads only its own share tree. Every run rewrites it over
 # every package currently built, so a per-package run leaves a manifest naming them all, never
 # only the one just built (release-manifest.py walks the whole build outputs directory).
-python3 scripts/release-manifest.py --development \
-  --root . \
-  --modules-dir modules/target/p1-modules \
-  --build-modules-dir modules/target/p1-modules
+if [ -z "$package" ]; then
+  python3 scripts/release-manifest.py --development \
+    --root . \
+    --modules-dir modules/target/p1-modules \
+    --build-modules-dir modules/target/p1-modules
+else
+  # A partial build cannot attest the source revision of untouched packages.
+  rm -f modules/target/p1-modules/manifest.json
+fi
 
 # `--all` reports the batch; one named package reports only itself.
 [ -n "$package" ] || echo "build-modules: $built package(s) built"
