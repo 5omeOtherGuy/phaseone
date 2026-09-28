@@ -26,9 +26,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use p1_contracts::{BoxFuture, CancellationToken};
 use p1_workspace::{
-    CheckedPath, CredentialPolicy, FileKind, MutationError, MutationPolicy, Observation,
-    ObservedFiles, OwnedMutation, ProtectedIndex, ReadRecord, Snapshot, Workspace, WorkspaceError,
-    refuse_credentials, xdg_credentials,
+    CheckedPath, CredentialPolicy, FileKind, IndexCancelled, MutationError, MutationPolicy,
+    Observation, ObservedFiles, OwnedMutation, ProtectedIndex, ReadRecord, Snapshot, Workspace,
+    WorkspaceError, refuse_credentials, xdg_credentials,
 };
 
 use crate::capabilities::{
@@ -317,7 +317,7 @@ impl WorkspaceService for SearchCapability {
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
             let index = ProtectedIndex::build(&credential_policy, cancel)
-                .map_err(|()| FsError::Cancelled)?;
+                .map_err(|IndexCancelled| FsError::Cancelled)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -370,7 +370,7 @@ impl WorkspaceService for SearchCapability {
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
             let index = ProtectedIndex::build(&credential_policy, cancel)
-                .map_err(|()| FsError::Cancelled)?;
+                .map_err(|IndexCancelled| FsError::Cancelled)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -399,7 +399,7 @@ impl WorkspaceService for SearchCapability {
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
             let index = ProtectedIndex::build(&credential_policy, cancel)
-                .map_err(|()| FsError::Cancelled)?;
+                .map_err(|IndexCancelled| FsError::Cancelled)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -419,7 +419,7 @@ impl WorkspaceService for SearchCapability {
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
             let index = ProtectedIndex::build(&credential_policy, cancel)
-                .map_err(|()| FsError::Cancelled)?;
+                .map_err(|IndexCancelled| FsError::Cancelled)?;
             if let Some(path) = query.path.as_deref() {
                 credential_policy
                     .refuse(workspace, path)

@@ -36,10 +36,17 @@ pub struct ProtectedIndex {
     incomplete: bool,
 }
 
+/// Index construction stopped by the request's cancellation token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexCancelled;
+
 impl ProtectedIndex {
     /// Follow symlinked subdirectories while preventing directory cycles. An unreadable
     /// protected directory forces conservative treatment of every multiply linked file.
-    pub fn build(policy: &CredentialPolicy, cancel: &CancellationToken) -> Result<Self, ()> {
+    pub fn build(
+        policy: &CredentialPolicy,
+        cancel: &CancellationToken,
+    ) -> Result<Self, IndexCancelled> {
         let mut index = Self {
             #[cfg(unix)]
             files: HashSet::new(),
@@ -47,7 +54,7 @@ impl ProtectedIndex {
         };
         for path in &policy.exact_paths {
             if cancel.is_cancelled() {
-                return Err(());
+                return Err(IndexCancelled);
             }
             if let Ok(metadata) = std::fs::metadata(path) {
                 index.insert(&metadata);
@@ -58,7 +65,7 @@ impl ProtectedIndex {
         let mut visited = HashSet::new();
         while let Some(directory) = pending.pop() {
             if cancel.is_cancelled() {
-                return Err(());
+                return Err(IndexCancelled);
             }
             let metadata = match std::fs::metadata(&directory) {
                 Ok(metadata) if metadata.is_dir() => metadata,
@@ -95,7 +102,7 @@ impl ProtectedIndex {
             };
             for entry in entries {
                 if cancel.is_cancelled() {
-                    return Err(());
+                    return Err(IndexCancelled);
                 }
                 let entry = match entry {
                     Ok(entry) => entry,
@@ -104,7 +111,7 @@ impl ProtectedIndex {
                         continue;
                     }
                 };
-                match entry.metadata() {
+                match std::fs::metadata(entry.path()) {
                     Ok(metadata) if metadata.is_dir() => pending.push(entry.path()),
                     Ok(metadata) => index.insert(&metadata),
                     Err(_) => index.incomplete = true,
@@ -112,7 +119,7 @@ impl ProtectedIndex {
             }
         }
         if cancel.is_cancelled() {
-            return Err(());
+            return Err(IndexCancelled);
         }
         Ok(index)
     }
@@ -363,12 +370,13 @@ fn canonical_best_effort(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
         return canonical;
     }
-    match (path.parent(), path.file_name()) {
+    let normalized = lexical_absolute(path);
+    match (normalized.parent(), normalized.file_name()) {
         (Some(parent), Some(name)) => match parent.canonicalize() {
             Ok(parent) => parent.join(name),
-            Err(_) => path.to_path_buf(),
+            Err(_) => normalized,
         },
-        _ => path.to_path_buf(),
+        _ => normalized,
     }
 }
 
