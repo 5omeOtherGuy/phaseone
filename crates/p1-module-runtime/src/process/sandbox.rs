@@ -76,6 +76,10 @@ pub enum SandboxError {
     #[error("bubblewrap (`bwrap`) is not installed: install bubblewrap, or pass --sandbox off")]
     NotInstalled,
     #[error(
+        "the cached bubblewrap launcher is no longer safe: pass --sandbox off or restore its protected path"
+    )]
+    UnsafeLauncher,
+    #[error(
         "bubblewrap cannot run here ({0}): enable unprivileged user namespaces, or pass --sandbox off"
     )]
     Unavailable(String),
@@ -124,16 +128,6 @@ impl SandboxRuntime {
             return Err(SandboxError::WorkspaceContainsHome { workspace, home });
         }
         let sandbox = Sandbox { home, ..sandbox };
-        // Refuse unsafe operator configuration at assembly; bwrap_args repeats
-        // this check after resolving each path for every command.
-        for readable in &sandbox.readable {
-            if let Some(directory) = credential_directory(&sandbox.home, readable) {
-                return Err(SandboxError::ReadableCredential {
-                    path: readable.clone(),
-                    directory,
-                });
-            }
-        }
         let private_tmp = tempfile::Builder::new()
             .prefix("p1-shell-sandbox-")
             .tempdir()
@@ -143,7 +137,7 @@ impl SandboxRuntime {
         let writable_roots =
             sandbox_writable_roots(&workspace, &sandbox.writable, private_tmp.path());
         for readable in &sandbox.readable {
-            canonical_readable_source(readable, &writable_roots)?;
+            canonical_readable_source(readable, &sandbox.home, &writable_roots)?;
         }
         let bwrap_path = resolve_bwrap(
             std::env::var_os("PATH").as_deref(),
@@ -177,6 +171,16 @@ impl SandboxRuntime {
             private_tmp,
             bwrap_path,
         })
+    }
+
+    /// Writable bind destinations can be retargeted between commands; never
+    /// launch a cached binary after one gains an alias through such a bind.
+    pub(super) fn validate_launcher(&self, workspace: &Path) -> Result<(), SandboxError> {
+        let roots =
+            sandbox_writable_roots(workspace, &self.sandbox.writable, self.private_tmp.path());
+        launcher_is_safe(&self.bwrap_path, &roots)
+            .then_some(())
+            .ok_or(SandboxError::UnsafeLauncher)
     }
 }
 
@@ -219,15 +223,7 @@ pub fn bwrap_args(
         }
     }
     for readable in &sandbox.readable {
-        let resolved = canonical_readable_source(readable, &writable_roots)?;
-        for candidate in [readable.as_path(), resolved.as_path()] {
-            if let Some(directory) = credential_directory(home, candidate) {
-                return Err(SandboxError::ReadableCredential {
-                    path: readable.clone(),
-                    directory,
-                });
-            }
-        }
+        let resolved = canonical_readable_source(readable, home, &writable_roots)?;
         args.push("--ro-bind".into());
         args.push(resolved.into());
         args.push(readable.as_os_str().into());
@@ -297,21 +293,28 @@ fn resolve_bwrap(
         let Ok(resolved) = std::fs::canonicalize(candidate) else {
             continue;
         };
-        if forbidden.iter().any(|root| resolved.starts_with(root)) {
-            continue;
-        }
-        let Ok(metadata) = std::fs::metadata(&resolved) else {
-            continue;
-        };
-        let trusted_root_owned = metadata.uid() == 0 && metadata.mode() & 0o022 == 0;
-        if metadata.is_file()
-            && metadata.permissions().mode() & 0o111 != 0
-            && (metadata.nlink() == 1 || trusted_root_owned)
-        {
+        if launcher_is_safe(&resolved, &forbidden) {
             return Some(resolved);
         }
     }
     None
+}
+
+/// Re-canonicalize even a cached path: writable bind aliases may change after assembly.
+fn launcher_is_safe(path: &Path, forbidden: &[PathBuf]) -> bool {
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    if forbidden.iter().any(|root| resolved.starts_with(root)) {
+        return false;
+    }
+    let Ok(metadata) = std::fs::metadata(&resolved) else {
+        return false;
+    };
+    let trusted_root_owned = metadata.uid() == 0 && metadata.mode() & 0o022 == 0;
+    metadata.is_file()
+        && metadata.permissions().mode() & 0o111 != 0
+        && (metadata.nlink() == 1 || trusted_root_owned)
 }
 
 /// Canonical destinations outside these roots cannot be redirected by sandboxed writes.
@@ -334,6 +337,7 @@ fn sandbox_writable_roots(
 
 fn canonical_readable_source(
     readable: &Path,
+    home: &Path,
     writable_roots: &[PathBuf],
 ) -> Result<PathBuf, SandboxError> {
     if !readable.is_absolute() {
@@ -345,6 +349,14 @@ fn canonical_readable_source(
         std::fs::canonicalize(readable).map_err(|_| SandboxError::ReadableUnresolved {
             path: readable.to_path_buf(),
         })?;
+    for candidate in [readable, resolved.as_path()] {
+        if let Some(directory) = credential_directory(home, candidate) {
+            return Err(SandboxError::ReadableCredential {
+                path: readable.to_path_buf(),
+                directory,
+            });
+        }
+    }
     if let Some(root) = writable_roots
         .iter()
         .find(|root| resolved.starts_with(root))
@@ -489,6 +501,48 @@ mod tests {
         assert_eq!(
             program,
             std::fs::canonicalize(trusted.join("bwrap")).unwrap()
+        );
+    }
+
+    #[test]
+    fn cached_launcher_refuses_retargeted_writable_bind() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let scratch = temp.path().join("scratch");
+        let nested = scratch.join("tool");
+        let trusted = temp.path().join("trusted");
+        for directory in [&workspace, &scratch, &trusted] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let launcher = trusted.join("bwrap");
+        executable(&launcher);
+        std::fs::create_dir(&nested).unwrap();
+        let runtime = SandboxRuntime {
+            sandbox: Sandbox {
+                home: temp.path().join("home"),
+                home_visible: Vec::new(),
+                readable: Vec::new(),
+                writable: vec![scratch.clone(), nested.clone()],
+                runtime_dir: None,
+            },
+            private_tmp: tempfile::tempdir().unwrap(),
+            bwrap_path: std::fs::canonicalize(&launcher).unwrap(),
+        };
+
+        assert!(
+            runtime.validate_launcher(&workspace).is_ok(),
+            "safe launcher must start"
+        );
+        std::fs::remove_dir(&nested).unwrap();
+        symlink(&trusted, &nested).unwrap();
+        assert!(
+            matches!(
+                runtime.validate_launcher(&workspace),
+                Err(SandboxError::UnsafeLauncher)
+            ),
+            "retargeted writable bind must refuse start"
         );
     }
 

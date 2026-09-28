@@ -277,6 +277,12 @@ impl ProcessService {
         // process group, stdin, capture, timeout and kill are shared.
         let mut builder = match &self.sandbox {
             Some(runtime) => {
+                runtime
+                    .validate_launcher(root)
+                    .map_err(|error| ProcessFailure::Start {
+                        program: "bwrap",
+                        error: error.to_string(),
+                    })?;
                 let mut bwrap = Command::new(&runtime.bwrap_path);
                 bwrap
                     .args(
