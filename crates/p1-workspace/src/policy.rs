@@ -56,8 +56,11 @@ impl ProtectedIndex {
             if cancel.is_cancelled() {
                 return Err(IndexCancelled);
             }
-            if let Ok(metadata) = std::fs::metadata(path) {
-                index.insert(&metadata);
+            match std::fs::metadata(path) {
+                Ok(metadata) => index.insert(&metadata),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && cleanly_missing(path) => {}
+                Err(_) => index.incomplete = true,
             }
         }
         let mut pending = policy.directories.clone();
@@ -151,6 +154,28 @@ impl ProtectedIndex {
 
     pub fn refuses_path(&self, path: &Path) -> bool {
         std::fs::metadata(path).is_ok_and(|metadata| self.refuses_metadata(&metadata))
+    }
+}
+
+/// A missing exact store is harmless only when every ancestor lookup succeeds up to
+/// an existing directory. Permission failures and dangling symlinks are not absence.
+fn cleanly_missing(path: &Path) -> bool {
+    let mut candidate = path;
+    loop {
+        match std::fs::symlink_metadata(candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = candidate.parent() else {
+                    return false;
+                };
+                candidate = parent;
+            }
+            Ok(metadata) => {
+                return candidate != path
+                    && (metadata.is_dir()
+                        || std::fs::metadata(candidate).is_ok_and(|metadata| metadata.is_dir()));
+            }
+            Err(_) => return false,
+        }
     }
 }
 
@@ -403,6 +428,34 @@ mod tests {
         std::fs::remove_file(&alias).unwrap();
         assert_eq!(opened.metadata().unwrap().nlink(), 1);
         assert!(index.refuses_metadata(&opened.metadata().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_exact_credential_parent_refuses_hard_link_alias() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        let parent = credential.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(&credential, "marker").unwrap();
+        let alias = home.path().join("alias.txt");
+        std::fs::hard_link(&credential, &alias).unwrap();
+        let policy = CredentialPolicy::new(Some(home.path()), &[]);
+        let original_permissions = std::fs::metadata(parent).unwrap().permissions();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0)).unwrap();
+        if std::fs::metadata(&credential).is_ok() {
+            // Root can still search mode-000 directories, so this refusal cannot be exercised.
+            std::fs::set_permissions(parent, original_permissions).unwrap();
+            return;
+        }
+        let index = ProtectedIndex::build(&policy, &CancellationToken::new()).unwrap();
+        let refused = index.refuses_path(&alias);
+        std::fs::set_permissions(parent, original_permissions).unwrap();
+        assert!(
+            refused,
+            "unreadable exact credential must fail closed for multi-link aliases"
+        );
     }
 
     #[cfg(unix)]
