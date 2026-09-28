@@ -55,6 +55,16 @@ pub fn search(
     query: &SearchQuery,
     cancel: &CancellationToken,
 ) -> Result<SearchResult, FsError> {
+    search_excluding(workspace, query, cancel, |_| false)
+}
+
+/// Search like [`search`], omitting paths selected by the caller before reading their contents.
+pub(crate) fn search_excluding(
+    workspace: &Workspace,
+    query: &SearchQuery,
+    cancel: &CancellationToken,
+    excluded: impl Fn(&Path) -> bool,
+) -> Result<SearchResult, FsError> {
     let search_path = scope(workspace, query.path.as_deref())?;
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(query.case_insensitive)
@@ -62,7 +72,29 @@ pub fn search(
         .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
     let overrides = build_overrides(&search_path, query.glob.as_deref())?;
     let files = collect_files(workspace, &search_path, overrides, cancel)?;
-    search_content(workspace, &matcher, query, &files, cancel)
+    let files = exclude_files(files, cancel, &excluded)?;
+    search_content(workspace, &matcher, query, &files, cancel, |path, _| {
+        excluded(path)
+    })
+}
+
+/// Like [`search_excluding`], with a fresh check on each opened file.
+pub(crate) fn search_excluding_opened(
+    workspace: &Workspace,
+    query: &SearchQuery,
+    cancel: &CancellationToken,
+    excluded: impl Fn(&Path) -> bool,
+    opened_excluded: impl Fn(&Path, &std::fs::File) -> bool,
+) -> Result<SearchResult, FsError> {
+    let search_path = scope(workspace, query.path.as_deref())?;
+    let matcher = RegexMatcherBuilder::new()
+        .case_insensitive(query.case_insensitive)
+        .build(&query.pattern)
+        .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
+    let overrides = build_overrides(&search_path, query.glob.as_deref())?;
+    let files = collect_files(workspace, &search_path, overrides, cancel)?;
+    let files = exclude_files(files, cancel, &excluded)?;
+    search_content(workspace, &matcher, query, &files, cancel, opened_excluded)
 }
 
 /// The host side of `workspace.list-files`: the files under `path` (a directory, or one
@@ -74,10 +106,44 @@ pub fn list_files(
     glob: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<Vec<String>, FsError> {
+    list_files_excluding(workspace, path, glob, cancel, |_| false)
+}
+
+/// List like [`list_files`], omitting paths selected by the caller.
+pub(crate) fn list_files_excluding(
+    workspace: &Workspace,
+    path: &str,
+    glob: Option<&str>,
+    cancel: &CancellationToken,
+    excluded: impl Fn(&Path) -> bool,
+) -> Result<Vec<String>, FsError> {
     let search_path = scope(workspace, Some(path))?;
     let overrides = build_overrides(&search_path, glob)?;
     let files = collect_files(workspace, &search_path, overrides, cancel)?;
+    let files = exclude_files(files, cancel, &excluded)?;
     Ok(files.into_iter().map(|(display, _)| display).collect())
+}
+
+/// Remove paths selected by the policy, stopping promptly if the request is cancelled.
+fn exclude_files(
+    files: Vec<(String, PathBuf)>,
+    cancel: &CancellationToken,
+    excluded: &impl Fn(&Path) -> bool,
+) -> Result<Vec<(String, PathBuf)>, FsError> {
+    let mut included = Vec::with_capacity(files.len());
+    for file in files {
+        if cancel.is_cancelled() {
+            return Err(FsError::Cancelled);
+        }
+        let exclude = excluded(&file.1);
+        if cancel.is_cancelled() {
+            return Err(FsError::Cancelled);
+        }
+        if !exclude {
+            included.push(file);
+        }
+    }
+    Ok(included)
 }
 
 /// One window of the file, read directly: the guest reads only the prefix it sniffs for
@@ -90,15 +156,70 @@ pub fn read_window(
     offset: u64,
     length: u64,
 ) -> Result<Vec<u8>, FsError> {
+    read_window_inner(workspace, path, offset, length, None)
+}
+
+pub(crate) fn read_window_excluding(
+    workspace: &Workspace,
+    path: &str,
+    offset: u64,
+    length: u64,
+    excluded: &impl Fn(&Path, &std::fs::File) -> bool,
+) -> Result<Vec<u8>, FsError> {
+    read_window_inner(workspace, path, offset, length, Some(excluded))
+}
+
+/// A check of an opened file: its real path and the open handle.
+type OpenedCheck<'a> = &'a dyn Fn(&Path, &std::fs::File) -> bool;
+
+fn read_window_inner(
+    workspace: &Workspace,
+    path: &str,
+    offset: u64,
+    length: u64,
+    excluded: Option<OpenedCheck<'_>>,
+) -> Result<Vec<u8>, FsError> {
     let checked = workspace.check_path(path).map_err(workspace_error)?;
     let io = |error: io::Error| FsError::Io(error.to_string());
     let mut file = workspace
         .open_file_at(checked.path())
         .map_err(workspace_error)?;
+    if let Some(excluded) = excluded {
+        let refusal = || {
+            FsError::Io(p1_workspace::credential_refusal(
+                &workspace.display(checked.path()),
+            ))
+        };
+        let opened_path = opened_object_path(&file, checked.path()).map_err(|_| refusal())?;
+        if excluded(&opened_path, &file) {
+            return Err(refusal());
+        }
+    }
     io::copy(&mut (&mut file).take(offset), &mut io::sink()).map_err(io)?;
     let mut window = Vec::new();
     file.take(length).read_to_end(&mut window).map_err(io)?;
     Ok(window)
+}
+
+/// The real path of the object `file` refers to, so policy checks see what was opened.
+pub(crate) fn opened_object_path(file: &std::fs::File, opened_path: &Path) -> io::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let _ = opened_path;
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        canonicalize_opened_path(opened_path)
+    }
+}
+
+/// Fallback for systems without /proc: resolve the spelling only after the open.
+#[cfg(any(test, not(target_os = "linux")))]
+fn canonicalize_opened_path(opened_path: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(opened_path)
 }
 
 /// Resolve the path to search (the root when absent); it must exist.
@@ -170,6 +291,7 @@ fn search_content(
     query: &SearchQuery,
     files: &[(String, PathBuf)],
     cancel: &CancellationToken,
+    excluded: impl Fn(&Path, &std::fs::File) -> bool,
 ) -> Result<SearchResult, FsError> {
     let mut searcher = content_searcher(query.context as usize);
     let mut result = SearchResult {
@@ -186,6 +308,12 @@ fn search_content(
         let Ok(file) = workspace.open_file_at(path) else {
             continue;
         };
+        let Ok(opened_path) = opened_object_path(&file, path) else {
+            continue;
+        };
+        if excluded(&opened_path, &file) {
+            continue;
+        }
         if searcher.search_file(matcher, &file, &mut sink).is_err() {
             continue;
         }
@@ -285,10 +413,10 @@ impl Sink for MatchSink {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_files, search_content};
+    use super::{canonicalize_opened_path, collect_files, search_content, search_excluding_opened};
     use grep::regex::RegexMatcher;
     use p1_contracts::CancellationToken;
-    use p1_workspace::Workspace;
+    use p1_workspace::{CredentialPolicy, Workspace};
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
@@ -318,10 +446,109 @@ mod tests {
         };
         let matcher = RegexMatcher::new("needle").unwrap();
 
-        let result = search_content(&workspace, &matcher, &query, &files, &cancel).unwrap();
+        let result =
+            search_content(&workspace, &matcher, &query, &files, &cancel, |_, _| false).unwrap();
 
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].lines[0].text, "needle in non-UTF-8 name");
+    }
+
+    #[test]
+    fn search_rechecks_credentials_after_opening_swapped_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let credential_path = home.path().join(".codex/auth.json");
+        fs::create_dir_all(credential_path.parent().unwrap()).unwrap();
+        fs::write(&credential_path, "needle in credential\n").unwrap();
+        let workspace = Workspace::new(home.path()).unwrap();
+        let policy = CredentialPolicy::new(Some(home.path()), &[]);
+        let notes_path = home.path().join("notes.txt");
+        fs::write(&notes_path, "needle in notes\n").unwrap();
+        let cancel = CancellationToken::new();
+        let files = collect_files(&workspace, workspace.root(), None, &cancel).unwrap();
+
+        fs::remove_file(&notes_path).unwrap();
+        symlink(&credential_path, &notes_path).unwrap();
+
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 10,
+        };
+        let matcher = RegexMatcher::new("needle").unwrap();
+        let result = search_content(
+            &workspace,
+            &matcher,
+            &query,
+            &files,
+            &cancel,
+            |candidate, _| policy.refuses(candidate),
+        )
+        .unwrap();
+
+        assert!(
+            result.files.is_empty(),
+            "opened credential symlink was searched"
+        );
+    }
+
+    #[test]
+    fn canonical_fallback_checks_credential_and_ordinary_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        fs::write(&credential, "fixture").unwrap();
+        let ordinary = home.path().join("notes.txt");
+        fs::write(&ordinary, "ordinary").unwrap();
+        let policy = CredentialPolicy::new(Some(home.path()), &[]);
+        assert!(policy.refuses(&canonicalize_opened_path(&credential).unwrap()));
+        assert!(!policy.refuses(&canonicalize_opened_path(&ordinary).unwrap()));
+    }
+
+    #[test]
+    fn search_refreshes_policy_after_config_retarget() {
+        let home = tempfile::tempdir().unwrap();
+        let old = home.path().join("old");
+        let new = home.path().join("new");
+        fs::create_dir_all(old.join("p1")).unwrap();
+        fs::create_dir_all(new.join("p1")).unwrap();
+        fs::write(old.join("p1/auth.json"), "old").unwrap();
+        fs::write(new.join("p1/auth.json"), "needle secret").unwrap();
+        symlink(&old, home.path().join(".config")).unwrap();
+        fs::hard_link(new.join("p1/auth.json"), home.path().join("notes.txt")).unwrap();
+        let workspace = Workspace::new(home.path()).unwrap();
+        let old_policy = CredentialPolicy::new(Some(home.path()), &[]);
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 10,
+        };
+        let changed = std::cell::Cell::new(false);
+        let result = search_excluding_opened(
+            &workspace,
+            &query,
+            &CancellationToken::new(),
+            |candidate| {
+                if !changed.replace(true) {
+                    fs::remove_file(home.path().join(".config")).unwrap();
+                    symlink(&new, home.path().join(".config")).unwrap();
+                }
+                old_policy.refuses(candidate)
+            },
+            |candidate, file| {
+                CredentialPolicy::new(Some(home.path()), &[]).refuses_opened(candidate, file)
+            },
+        )
+        .unwrap();
+        assert!(
+            result.files.is_empty(),
+            "retargeted credential content leaked"
+        );
     }
 
     #[test]
@@ -350,7 +577,8 @@ mod tests {
             max_lines: 10,
         };
         let matcher = RegexMatcher::new("needle").unwrap();
-        let result = search_content(&workspace, &matcher, &query, &files, &cancel).unwrap();
+        let result =
+            search_content(&workspace, &matcher, &query, &files, &cancel, |_, _| false).unwrap();
         assert!(
             result.files.is_empty(),
             "outside symlink target was searched"

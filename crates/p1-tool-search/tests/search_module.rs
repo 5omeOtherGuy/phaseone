@@ -112,7 +112,7 @@ fn both_tools(workspace: &Workspace) -> Pair {
     assert_eq!(loaded.identity().implementation, NAME);
     let module = wasm_tool(
         &loaded,
-        search_services(workspace.clone()),
+        search_services(workspace.clone(), None),
         ExecutionLimits::default(),
         &Arc::new(MaskCounter::new()),
     )

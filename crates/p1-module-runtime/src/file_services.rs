@@ -26,9 +26,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use p1_contracts::{BoxFuture, CancellationToken};
 use p1_workspace::{
-    CheckedPath, FileKind, MutationError, MutationPolicy, Observation, ObservedFiles,
-    OwnedMutation, ReadRecord, Snapshot, Workspace, WorkspaceError, refuse_credentials,
-    xdg_credentials,
+    CheckedPath, CredentialPolicy, FileKind, IndexCancelled, MutationError, MutationPolicy,
+    Observation, ObservedFiles, OwnedMutation, ProtectedIndex, ReadRecord, Snapshot, Workspace,
+    WorkspaceError, refuse_credentials, xdg_credentials,
 };
 
 use crate::capabilities::{
@@ -277,12 +277,20 @@ impl SnapshotService for ReadCapability {
 #[derive(Clone)]
 pub struct SearchCapability {
     workspace: Workspace,
+    home: Option<PathBuf>,
+    xdg_credentials: Vec<PathBuf>,
+    index: Arc<Mutex<Option<Arc<ProtectedIndex>>>>,
 }
 
 impl SearchCapability {
-    /// The capability over `workspace`.
-    pub fn new(workspace: Workspace) -> Self {
-        Self { workspace }
+    /// The capability over `workspace`, refusing credentials under the agent's home.
+    pub fn new(workspace: Workspace, home: Option<PathBuf>) -> Self {
+        Self {
+            workspace,
+            home,
+            xdg_credentials: xdg_credentials(),
+            index: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Runs `work` on a blocking thread: the walk and the reads are synchronous and must never
@@ -304,27 +312,74 @@ impl SearchCapability {
     }
 }
 
+fn cached_index(
+    cache: &Mutex<Option<Arc<ProtectedIndex>>>,
+    policy: &CredentialPolicy,
+    cancel: &CancellationToken,
+) -> Result<Arc<ProtectedIndex>, FsError> {
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(index) = guard.as_ref()
+        && index.matches_policy(policy)
+        && index
+            .still_current(cancel)
+            .map_err(|IndexCancelled| FsError::Cancelled)?
+    {
+        return Ok(index.clone());
+    }
+    let index = Arc::new(
+        ProtectedIndex::build(policy, cancel).map_err(|IndexCancelled| FsError::Cancelled)?,
+    );
+    *guard = Some(index.clone());
+    Ok(index)
+}
+
 impl WorkspaceService for SearchCapability {
     fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>> {
-        self.blocking(move |workspace, _| {
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
+        let cache = self.index.clone();
+        self.blocking(move |workspace, cancel| {
+            let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+            let index = cached_index(&cache, &credential_policy, cancel)?;
+            credential_policy
+                .refuse(workspace, &path)
+                .map_err(FsError::Io)?;
             let checked = workspace
                 .check_path(&path)
                 .map_err(file_walk::workspace_error)?;
             let stat = workspace.stat(&path).map_err(file_walk::workspace_error)?;
-            // The kinds the native `grep` gives its logic, so both render the same text.
-            let kind = match stat.kind {
-                FileKind::File => EntryKind::File,
-                FileKind::Directory => EntryKind::Directory,
-                _ => EntryKind::Other,
+            let (kind, size) = if stat.kind == FileKind::File {
+                let file = workspace
+                    .open_file_at(checked.path())
+                    .map_err(file_walk::workspace_error)?;
+                let metadata = file
+                    .metadata()
+                    .map_err(|error| FsError::Io(error.to_string()))?;
+                let refused = || FsError::Io(p1_workspace::credential_refusal(checked.display()));
+                let opened_path =
+                    file_walk::opened_object_path(&file, checked.path()).map_err(|_| refused())?;
+                let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                if current.refuses(&opened_path) || index.refuses_current_exact(&current, &metadata)
+                {
+                    return Err(refused());
+                }
+                (EntryKind::File, metadata.len())
+            } else {
+                (
+                    if stat.kind == FileKind::Directory {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::Other
+                    },
+                    0,
+                )
             };
             Ok(WorkspaceEntry {
                 path: checked.display().to_owned(),
                 kind,
-                size: if kind == EntryKind::File {
-                    stat.size
-                } else {
-                    0
-                },
+                size,
             })
         })
     }
@@ -337,7 +392,29 @@ impl WorkspaceService for SearchCapability {
     ) -> BoxFuture<'_, Result<Vec<u8>, FsError>> {
         // Only the requested window, as the native `grep` reads: file-list mode sniffs a
         // prefix of every listed file, which must not load a large file whole.
-        self.blocking(move |workspace, _| file_walk::read_window(workspace, &path, offset, length))
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
+        let cache = self.index.clone();
+        self.blocking(move |workspace, cancel| {
+            let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+            let index = cached_index(&cache, &credential_policy, cancel)?;
+            credential_policy
+                .refuse(workspace, &path)
+                .map_err(FsError::Io)?;
+            file_walk::read_window_excluding(
+                workspace,
+                &path,
+                offset,
+                length,
+                &|candidate, file| {
+                    let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                    current.refuses(candidate)
+                        || file.metadata().map_or(true, |metadata| {
+                            index.refuses_current_exact(&current, &metadata)
+                        })
+                },
+            )
+        })
     }
 
     fn list_files(
@@ -345,13 +422,61 @@ impl WorkspaceService for SearchCapability {
         path: String,
         glob: Option<String>,
     ) -> BoxFuture<'_, Result<Vec<String>, FsError>> {
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
+        let cache = self.index.clone();
         self.blocking(move |workspace, cancel| {
-            file_walk::list_files(workspace, &path, glob.as_deref(), cancel)
+            let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+            let index = cached_index(&cache, &credential_policy, cancel)?;
+            credential_policy
+                .refuse(workspace, &path)
+                .map_err(FsError::Io)?;
+            file_walk::list_files_excluding(
+                workspace,
+                &path,
+                glob.as_deref(),
+                cancel,
+                |candidate| {
+                    let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                    current.refuses(candidate)
+                        || std::fs::metadata(candidate)
+                            .is_ok_and(|metadata| index.refuses_current_exact(&current, &metadata))
+                },
+            )
         })
     }
 
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<SearchResult, FsError>> {
-        self.blocking(move |workspace, cancel| file_walk::search(workspace, &query, cancel))
+        let home = self.home.clone();
+        let xdg_credentials = self.xdg_credentials.clone();
+        let cache = self.index.clone();
+        self.blocking(move |workspace, cancel| {
+            let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+            let index = cached_index(&cache, &credential_policy, cancel)?;
+            if let Some(path) = query.path.as_deref() {
+                credential_policy
+                    .refuse(workspace, path)
+                    .map_err(FsError::Io)?;
+            }
+            file_walk::search_excluding_opened(
+                workspace,
+                &query,
+                cancel,
+                |candidate| {
+                    let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                    current.refuses(candidate)
+                        || std::fs::metadata(candidate)
+                            .is_ok_and(|metadata| index.refuses_current_exact(&current, &metadata))
+                },
+                |candidate, file| {
+                    let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
+                    current.refuses(candidate)
+                        || file.metadata().map_or(true, |metadata| {
+                            index.refuses_current_exact(&current, &metadata)
+                        })
+                },
+            )
+        })
     }
 }
 
@@ -538,7 +663,7 @@ pub fn capability_services(
             .expect("call_services links the read side");
         services.workspace = Some(Arc::new(ToolWorkspace {
             read,
-            search: Arc::new(SearchCapability::new(workspace.clone())),
+            search: Arc::new(SearchCapability::new(workspace.clone(), home.clone())),
         }));
         services
     })
@@ -605,9 +730,9 @@ pub fn mutation_service_over(
 }
 
 /// The services of the `p1/search` component over one agent's workspace: the walk alone.
-pub fn search_services(workspace: Workspace) -> Services {
+pub fn search_services(workspace: Workspace, home: Option<PathBuf>) -> Services {
     Services {
-        workspace: Some(Arc::new(SearchCapability::new(workspace))),
+        workspace: Some(Arc::new(SearchCapability::new(workspace, home))),
         ..Services::default()
     }
 }
@@ -764,7 +889,7 @@ mod tests {
     async fn a_dropped_request_cancels_its_walk() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "beta\n").unwrap();
-        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap());
+        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap(), None);
         // The work starts, the request is dropped while it runs (as the runtime drops it on
         // a cancellation), and the work then sees its token cancelled.
         let (started, work_started) = std::sync::mpsc::channel();
@@ -918,6 +1043,428 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_capability_tracks_home_config_symlink_changes() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config");
+        let credential = config.join("p1/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "credential-marker\n").unwrap();
+        std::fs::write(home.path().join("notes.txt"), "ordinary file\n").unwrap();
+        let capability = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().to_path_buf()),
+        );
+
+        std::fs::rename(&config, home.path().join(".config-real")).unwrap();
+        symlink(".config-real", &config).unwrap();
+
+        assert_eq!(
+            capability.stat(".config/p1/auth.json".into()).await,
+            Err(FsError::Io(p1_workspace::credential_refusal(
+                ".config/p1/auth.json"
+            )))
+        );
+        assert_eq!(
+            capability.read(".config/p1/auth.json".into(), 0, 128).await,
+            Err(FsError::Io(p1_workspace::credential_refusal(
+                ".config/p1/auth.json"
+            )))
+        );
+        assert_eq!(
+            capability.list_files(".".into(), None).await,
+            Ok(vec!["notes.txt".to_owned()])
+        );
+        let result = capability
+            .search(SearchQuery {
+                pattern: "credential-marker".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap();
+        assert!(result.files.is_empty());
+    }
+
+    #[test]
+    fn cancellation_during_file_exclusion_returns_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let cancel = CancellationToken::new();
+
+        let result = file_walk::list_files_excluding(&workspace, ".", None, &cancel, |_| {
+            cancel.cancel();
+            false
+        });
+
+        assert_eq!(result, Err(FsError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn search_capability_refuses_credentials_in_every_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let relative_credential = ".config/p1/auth.json";
+        let credential = dir.path().join(relative_credential);
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "credential-marker\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "safe match\n").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        // Empty XDG list proves refusal comes from the agent-home policy.
+        let capability = SearchCapability {
+            workspace,
+            home: Some(dir.path().to_path_buf()),
+            xdg_credentials: vec![],
+            index: Arc::new(Mutex::new(None)),
+        };
+
+        assert_eq!(
+            capability.stat(relative_credential.into()).await,
+            Err(FsError::Io(p1_workspace::credential_refusal(
+                relative_credential
+            )))
+        );
+        assert_eq!(
+            capability.read(relative_credential.into(), 0, 128).await,
+            Err(FsError::Io(p1_workspace::credential_refusal(
+                relative_credential
+            )))
+        );
+        assert_eq!(
+            capability.list_files(".".into(), None).await,
+            Ok(vec!["notes.txt".to_owned()])
+        );
+
+        let result = capability
+            .search(SearchQuery {
+                pattern: "credential-marker|safe match".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["notes.txt"],
+            "content search must neither match nor list credential files"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_refuses_hard_link_to_credential() {
+        let home = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "hard-link-marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("notes.txt")).unwrap();
+        let capability = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().to_path_buf()),
+        );
+        assert_eq!(
+            capability.read("notes.txt".into(), 0, 64).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("notes.txt")))
+        );
+        assert!(
+            capability
+                .search(SearchQuery {
+                    pattern: "hard-link-marker".into(),
+                    path: None,
+                    glob: None,
+                    case_insensitive: false,
+                    context: 0,
+                    max_lines: 10,
+                })
+                .await
+                .unwrap()
+                .files
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_refuses_hard_links_into_credential_directories() {
+        for credential_path in [".config/keys/a.key", ".config/keys/nested/b.key"] {
+            let home = tempfile::tempdir().unwrap();
+            let credential = home.path().join(credential_path);
+            std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+            std::fs::write(&credential, "directory-secret-marker").unwrap();
+            std::fs::hard_link(&credential, home.path().join("notes.txt")).unwrap();
+            let capability = SearchCapability::new(
+                Workspace::new(home.path()).unwrap(),
+                Some(home.path().to_path_buf()),
+            );
+            assert_eq!(
+                capability.read("notes.txt".into(), 0, 64).await,
+                Err(FsError::Io(p1_workspace::credential_refusal("notes.txt"))),
+                "hard link to {credential_path} must be refused"
+            );
+            assert!(
+                capability
+                    .search(SearchQuery {
+                        pattern: "directory-secret-marker".into(),
+                        path: None,
+                        glob: None,
+                        case_insensitive: false,
+                        context: 0,
+                        max_lines: 10,
+                    })
+                    .await
+                    .unwrap()
+                    .files
+                    .is_empty(),
+                "hard link to {credential_path} must not match"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aliases_are_absent_from_list_files_and_empty_pattern_files_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("alias.txt")).unwrap();
+        std::fs::write(home.path().join("safe.txt"), "safe").unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert_eq!(
+            cap.list_files(".".into(), None).await.unwrap(),
+            vec!["safe.txt"]
+        );
+        assert!(
+            cap.search(SearchQuery {
+                pattern: String::new(),
+                path: Some("alias.txt".into()),
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap()
+            .files
+            .is_empty()
+        );
+        assert_eq!(
+            cap.stat("alias.txt".into()).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("alias.txt")))
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_credential_scope_is_refused_before_confinement() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "marker").unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(workspace_dir.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert!(matches!(cap.search(SearchQuery {
+            pattern: "marker".into(), path: Some(credential.display().to_string()), glob: None,
+            case_insensitive: false, context: 0, max_lines: 10,
+        }).await, Err(FsError::Io(message)) if message.contains("read refuses credential files")));
+    }
+
+    #[tokio::test]
+    async fn parent_component_out_of_keys_is_allowed() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/keys")).unwrap();
+        std::fs::write(home.path().join(".config/public.txt"), "public").unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert_eq!(
+            cap.read(".config/keys/../public.txt".into(), 0, 32).await,
+            Ok(b"public".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn renamed_exact_credential_is_refused_after_index_was_cached() {
+        let home = tempfile::tempdir().unwrap();
+        let credential = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "old").unwrap();
+        std::fs::write(home.path().join("safe.txt"), "safe").unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert_eq!(
+            cap.read("safe.txt".into(), 0, 10).await,
+            Ok(b"safe".to_vec())
+        );
+        std::fs::rename(&credential, home.path().join("old.txt")).unwrap();
+        std::fs::write(&credential, "new-marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("alias.txt")).unwrap();
+        assert_eq!(
+            cap.read("alias.txt".into(), 0, 20).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("alias.txt")))
+        );
+        assert!(
+            cap.search(SearchQuery {
+                pattern: "new-marker".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap()
+            .files
+            .iter()
+            .all(|file| file.path != "alias.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retargeted_config_keys_rebuild_the_cached_index() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let old = home.path().join("old/keys");
+        let new = home.path().join("new/keys");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let credential = new.join("new.key");
+        std::fs::write(&credential, "new-key-marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("alias.txt")).unwrap();
+        let config = home.path().join(".config");
+        symlink(home.path().join("old"), &config).unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        assert_eq!(
+            cap.read("alias.txt".into(), 0, 32).await,
+            Ok(b"new-key-marker".to_vec())
+        );
+        std::fs::remove_file(&config).unwrap();
+        symlink(home.path().join("new"), &config).unwrap();
+        assert_eq!(
+            cap.read("alias.txt".into(), 0, 32).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("alias.txt")))
+        );
+        assert!(
+            cap.search(SearchQuery {
+                pattern: "new-key-marker".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap()
+            .files
+            .iter()
+            .all(|file| file.path != "alias.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeted_exact_parent_requires_a_fresh_open_time_policy() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        for name in ["old", "new"] {
+            std::fs::create_dir_all(home.path().join(name)).unwrap();
+        }
+        let credential = home.path().join("new/auth.json");
+        std::fs::write(&credential, "marker").unwrap();
+        let alias = home.path().join("alias.txt");
+        std::fs::hard_link(&credential, &alias).unwrap();
+        let link = home.path().join(".codex");
+        symlink(home.path().join("old"), &link).unwrap();
+        let old_policy = CredentialPolicy::new(Some(home.path()), &[]);
+        let index = ProtectedIndex::build(&old_policy, &CancellationToken::new()).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(home.path().join("new"), &link).unwrap();
+        let opened = std::fs::File::open(&alias).unwrap();
+        let metadata = opened.metadata().unwrap();
+        assert!(!index.refuses_current_exact(&old_policy, &metadata));
+        let current = CredentialPolicy::new(Some(home.path()), &[]);
+        assert!(index.refuses_current_exact(&current, &metadata));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_index_cache_reuses_and_rebuilds_on_change() {
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join(".config/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        let policy = CredentialPolicy::new(Some(home.path()), &cap.xdg_credentials);
+        let cancel = CancellationToken::new();
+        let first = cached_index(&cap.index, &policy, &cancel).unwrap();
+        let reused = cached_index(&cap.index, &policy, &cancel).unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        std::fs::write(keys.join("new.key"), "fixture").unwrap();
+        let rebuilt = cached_index(&cap.index, &policy, &cancel).unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert!(rebuilt.refuses_path(&keys.join("new.key")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_hard_link_remains_searchable() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("original.txt"), "ordinary-linked-marker").unwrap();
+        std::fs::hard_link(
+            home.path().join("original.txt"),
+            home.path().join("notes.txt"),
+        )
+        .unwrap();
+        let capability = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().to_path_buf()),
+        );
+        assert_eq!(
+            capability.read("notes.txt".into(), 0, 64).await,
+            Ok(b"ordinary-linked-marker".to_vec())
+        );
+        let found = capability
+            .search(SearchQuery {
+                pattern: "ordinary-linked-marker".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap();
+        assert!(found.files.iter().any(|file| file.path == "notes.txt"));
+    }
+
     /// The search capability's `read` returns only the requested window and records no
     /// observation (`p1/search` is granted no `snapshot`), so file-list mode's binary sniff
     /// cannot load a large file whole or give a search the permission an edit needs.
@@ -925,7 +1472,7 @@ mod tests {
     async fn a_search_read_returns_only_the_requested_window() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "0123456789").unwrap();
-        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap());
+        let capability = SearchCapability::new(Workspace::new(dir.path()).unwrap(), None);
         assert_eq!(
             capability.read("a.txt".into(), 2, 3).await,
             Ok(b"234".to_vec())
