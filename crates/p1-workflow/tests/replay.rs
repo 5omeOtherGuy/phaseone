@@ -108,6 +108,65 @@ async fn caps_are_rebuilt_from_every_old_dispatch_on_resume() {
     assert_eq!(harness.runner.requests().len(), 3);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn live_predecessor_cannot_be_resumed() {
+    use p1_workflow::WorkflowService;
+    let harness = Harness::new();
+    let hold = harness.runner.hold("blocked");
+    let first = harness.start("agent(\"blocked\")").await;
+    let error = harness
+        .service
+        .start(StartRequest {
+            resume_from: Some(first.clone()),
+            ..request("agent(\"blocked\")")
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("predecessor") || error.to_string().contains("ended"));
+    assert!(!harness.root.path().join("wf2").exists());
+    harness.service.cancel(&first).await.unwrap();
+    hold.release.notify_waiters();
+    assert!(
+        harness
+            .service
+            .start(StartRequest {
+                resume_from: Some(first),
+                ..request("agent(\"changed\")")
+            })
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chained_replay_keeps_original_model_charges() {
+    let harness = Harness::new();
+    let script = r#"[agent("j1", #{ role: "judge" }), agent("j2", #{ role: "judge" }), agent("j3", #{ role: "judge" })]"#;
+    let first = harness.run(script).await;
+    let second = run(
+        &harness,
+        StartRequest {
+            resume_from: Some(first.id),
+            ..request(script)
+        },
+    )
+    .await;
+    assert_eq!(second.counts.replayed, 3);
+    let third = run(
+        &harness,
+        StartRequest {
+            resume_from: Some(second.id),
+            ..request(r#"agent("different", #{ role: "judge" })"#)
+        },
+    )
+    .await;
+    assert_eq!(
+        third.value["error"],
+        "quota_exceeded: claude-fable-5 used=3 limit=3"
+    );
+    assert_eq!(harness.runner.requests().len(), 3);
+}
+
 // (10)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_step_is_not_replayed() {

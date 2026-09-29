@@ -194,6 +194,112 @@ async fn two_calls_with_one_id_carry_their_own_ordinals_replayed_too() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_runner_errors_and_journal_mask_credential_shaped_values() {
+    let harness = Harness::new();
+    let secret = "sk-fakeexample123456789";
+    harness
+        .runner
+        .queue("failed", StepEnd::Failed(format!("error {secret}")));
+    let report = harness.run(&format!(
+        "phase(\"{secret}\"); log(\"{secret}\"); print(\"{secret}\"); debug(\"{secret}\"); agent(\"failed\")"
+    )).await;
+    assert!(!serde_json::to_string(&report).unwrap().contains(secret));
+    assert!(
+        !serde_json::to_string(&harness.journal(&report.id))
+            .unwrap()
+            .contains(secret)
+    );
+    assert!(
+        !harness
+            .recorder
+            .logs
+            .lock()
+            .unwrap()
+            .join(" ")
+            .contains(secret)
+    );
+    assert!(
+        !std::fs::read_to_string(report.run_dir.join("script.rhai"))
+            .unwrap()
+            .contains(secret)
+    );
+    assert!(
+        !std::fs::read_to_string(report.run_dir.join("result.json"))
+            .unwrap()
+            .contains(secret)
+    );
+    assert!(
+        !std::fs::read_to_string(report.run_dir.join("journal.jsonl"))
+            .unwrap()
+            .contains(secret)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn credential_shaped_argument_is_masked_in_artifacts() {
+    let harness = Harness::new();
+    let secret = "fakeexample123456789";
+    let id = harness
+        .start_request(StartRequest {
+            args: json!({"api_key": secret}),
+            ..request("1")
+        })
+        .await;
+    let second = harness.wait(&id).await;
+    assert_eq!(second.outcome, RunOutcome::Completed);
+    assert!(
+        !std::fs::read_to_string(second.run_dir.join("args.json"))
+            .unwrap()
+            .contains(secret)
+    );
+    assert!(
+        !std::fs::read_to_string(second.run_dir.join("journal.jsonl"))
+            .unwrap()
+            .contains(secret)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn result_artifact_write_failure_never_reports_completed() {
+    let harness = Harness::new();
+    let hold = harness.runner.hold("held");
+    let id = harness.start("agent(\"held\")").await;
+    std::fs::write(
+        harness.root.path().join(&id.0).join("result.json"),
+        b"occupied",
+    )
+    .unwrap();
+    hold.release.notify_one();
+    let report = harness.wait(&id).await;
+    assert_eq!(report.outcome, RunOutcome::Failed);
+    assert!(report.error.unwrap().contains("result.json"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn active_run_admission_refuses_before_creating_directory() {
+    let harness = Harness::new();
+    let hold = harness.runner.hold("blocked");
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(harness.start("agent(\"blocked\")").await);
+    }
+    let error = harness
+        .service
+        .start(support::request("agent(\"blocked\")"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("too many active workflow runs"),
+        "{error}"
+    );
+    assert!(!harness.root.path().join("wf3").exists());
+    hold.release.notify_waiters();
+    for id in ids {
+        harness.service.cancel(&id).await.unwrap();
+    }
+}
+
 // (3)
 #[tokio::test(flavor = "multi_thread")]
 async fn nested_parallel_in_a_stage_is_bounded_and_never_deadlocks() {

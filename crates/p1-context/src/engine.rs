@@ -169,6 +169,9 @@ pub struct Summarization<'h, G: Goal> {
     segments: plan::Segments,
     keep_recent_tokens: u64,
     user_verbatim_tokens: u64,
+    wall: u64,
+    excerpt_chars: usize,
+    tail_start: usize,
     summarize_at_tokens: u64,
     request: SummaryRequest,
     /// The cap the engine starts from, and doubles once.
@@ -197,8 +200,18 @@ fn summarize<'h, G: Goal>(
     // "Nothing to summarize": when everything outside the kept tail units is a previous
     // summary, a request could only buy the same summary back (context.md "Nothing to
     // summarize"). Unit-less histories (a lone user message) still count as material.
+    let kept = plan::kept_user_indices(history, tail_start, config.user_verbatim_tokens);
+    // The tail's units are kept verbatim, so they are not material; of the items
+    // outside them, a plain user the replacement keeps anyway is not material
+    // either. A history with no units has no tail units to speak of, so any
+    // non-summary item in it is still material (a lone user message is summarized,
+    // not treated as a no-op). Trailing user/inbox items after the last unit are
+    // outside every unit and so count as material too.
     let has_material = history.iter().enumerate().any(|(index, item)| {
-        !plan::in_tail_unit(index, tail_start, &segments) && !plan::is_summary_item(item)
+        if plan::is_summary_item(item) || plan::in_tail_unit(index, tail_start, &segments) {
+            return false;
+        }
+        segments.units.is_empty() || kept.binary_search(&index).is_err()
     });
     if !has_material {
         return Step::Done(goal.finish(Summarized::NothingToSummarize));
@@ -210,17 +223,23 @@ fn summarize<'h, G: Goal>(
     let cap = caps.summary_output_tokens;
     let limit = u32::try_from(cap).unwrap_or(u32::MAX);
     let render_budget = wall.saturating_sub(cap);
-    let transcript = render::transcript(
+    let transcript = match render::checked_transcript(
         &history[..tail_start],
         config.tool_result_excerpt_chars,
         render_budget,
-    );
+    ) {
+        Ok(transcript) => transcript,
+        Err(reason) => return Step::Done(goal.finish(Summarized::Failed(reason))),
+    };
     Step::Summarize(Box::new(Summarization {
         goal,
         history,
         segments,
         keep_recent_tokens: config.keep_recent_tokens,
         user_verbatim_tokens: config.user_verbatim_tokens,
+        wall,
+        excerpt_chars: config.tool_result_excerpt_chars,
+        tail_start,
         summarize_at_tokens: config.summarize_at_tokens,
         request: SummaryRequest {
             transcript,
@@ -285,7 +304,22 @@ impl<'h, G: Goal> Summarization<'h, G> {
             // be sent again unchanged.
             StopReason::MaxOutputTokens if self.attempts == 1 && self.capped => {
                 let sent = self.request.max_output_tokens.unwrap_or(self.limit);
-                self.request.max_output_tokens = Some(sent.saturating_mul(2));
+                let doubled = sent.saturating_mul(2);
+                // The doubled cap leaves the transcript less room, so it is rendered
+                // against the smaller budget before the retry. When the cap alone
+                // reaches the wall no transcript can fit; the retry keeps the
+                // transcript the first attempt sent, and the route's verdict decides.
+                if let Some(budget) = self.wall.checked_sub(u64::from(doubled)) {
+                    match render::checked_transcript(
+                        &self.history[..self.tail_start],
+                        self.excerpt_chars,
+                        budget,
+                    ) {
+                        Ok(transcript) => self.request.transcript = transcript,
+                        Err(reason) => return self.fail(reason),
+                    }
+                }
+                self.request.max_output_tokens = Some(doubled);
                 Step::Summarize(Box::new(self))
             }
             StopReason::MaxOutputTokens if !self.capped => self.fail(
