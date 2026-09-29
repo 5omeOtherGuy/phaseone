@@ -82,7 +82,7 @@ impl ProtectedIndex {
             #[cfg(unix)]
             directories_seen: Vec::new(),
         };
-        for path in &policy.exact_paths {
+        for path in policy.exact_paths.iter().chain(&policy.family_members()) {
             if cancel.is_cancelled() {
                 return Err(IndexCancelled);
             }
@@ -304,7 +304,9 @@ impl ProtectedIndex {
         if self.refuses_metadata(metadata) {
             return true;
         }
-        for path in &policy.exact_paths {
+        // A staging, lock or recovery sibling of a credential file (its family) is rechecked
+        // live too: one created after this index was captured holds the same tokens.
+        for path in policy.exact_paths.iter().chain(&policy.family_members()) {
             match std::fs::metadata(path) {
                 Ok(credential) if credential.is_file() && same_identity(&credential, metadata) => {
                     return true;
@@ -387,45 +389,46 @@ fn cleanly_missing(path: &Path) -> bool {
 
 impl CredentialPolicy {
     /// Builds the policy for an agent home and its XDG-named credential files.
+    ///
+    /// Each entry of `xdg_credentials` names a credential FILE, except one whose last
+    /// component is `keys`: that names a keys DIRECTORY (`$XDG_CONFIG_HOME/keys`), refused
+    /// with everything below it like `~/.config/keys` (see [`xdg_credentials`]).
     pub fn new(home: Option<&Path>, xdg_credentials: &[PathBuf]) -> Self {
-        let mut lexical_exact_paths = xdg_credentials
+        let (xdg_directories, xdg_files): (Vec<&PathBuf>, Vec<&PathBuf>) = xdg_credentials
+            .iter()
+            .partition(|path| path.file_name().is_some_and(|name| name == KEYS_DIRECTORY));
+        let mut lexical_exact_paths = xdg_files
             .iter()
             .map(|path| lexical_absolute(path))
             .collect::<Vec<_>>();
-        let lexical_directories = home.map_or_else(Vec::new, |home| {
-            let home = lexical_absolute(home);
-            lexical_exact_paths.extend([
-                home.join(".config/p1/auth.json"),
-                home.join(".codex/auth.json"),
-                home.join(".claude/.credentials.json"),
-                home.join(".local/share/opencode/auth.json"),
-                home.join(".pi/agent/auth.json"),
-            ]);
-            vec![home.join(".config/keys")]
-        });
-        let mut exact_paths = xdg_credentials
+        let mut lexical_directories = xdg_directories
+            .iter()
+            .map(|path| lexical_absolute(path))
+            .collect::<Vec<_>>();
+        let mut exact_paths = xdg_files
             .iter()
             .map(|path| canonical_best_effort(path))
             .collect::<Vec<_>>();
-        let directories = home.map_or_else(Vec::new, |home| {
-            let home = canonical_best_effort(home);
-            let home_credentials = [
-                home.join(".config/p1/auth.json"),
-                home.join(".codex/auth.json"),
-                home.join(".claude/.credentials.json"),
-                home.join(".local/share/opencode/auth.json"),
-                home.join(".pi/agent/auth.json"),
-            ];
-            exact_paths.extend(
-                home_credentials
+        let mut directories = xdg_directories
+            .iter()
+            .map(|path| canonical_best_effort(path))
+            .collect::<Vec<_>>();
+        if let Some(home) = home {
+            let lexical_home = lexical_absolute(home);
+            lexical_exact_paths.extend(
+                HOME_CREDENTIALS
                     .iter()
-                    .map(|path| canonical_best_effort(path)),
+                    .map(|relative| lexical_home.join(relative)),
             );
-            [".config/keys"]
-                .iter()
-                .map(|relative| canonical_best_effort(&home.join(relative)))
-                .collect()
-        });
+            lexical_directories.push(lexical_home.join(".config/keys"));
+            let home = canonical_best_effort(home);
+            exact_paths.extend(
+                HOME_CREDENTIALS
+                    .iter()
+                    .map(|relative| canonical_best_effort(&home.join(relative))),
+            );
+            directories.push(canonical_best_effort(&home.join(".config/keys")));
+        }
         Self {
             lexical_exact_paths,
             lexical_directories,
@@ -434,11 +437,18 @@ impl CredentialPolicy {
         }
     }
 
-    /// Whether `candidate` is one of the fixed credential files or lies under a credential
+    /// Whether `candidate` is one of the fixed credential files, a member of one's family (its
+    /// lock, staging and recovery siblings, see [`in_family`]), a Claude Code credential file
+    /// anywhere (a route's named `login_dir`, `$CLAUDE_CONFIG_DIR`), or lies under a credential
     /// directory. Both lexical spelling and canonical target are checked for each candidate.
     pub fn refuses(&self, candidate: &Path) -> bool {
         let lexical_candidate = lexical_absolute(candidate);
         let lexical_match = self.lexical_exact_paths.contains(&lexical_candidate)
+            || self
+                .lexical_exact_paths
+                .iter()
+                .any(|credential| in_family(&lexical_candidate, credential))
+            || claude_credential_name(&lexical_candidate)
             || self.lexical_directories.iter().any(|directory| {
                 lexical_candidate == *directory || lexical_candidate.starts_with(directory)
             });
@@ -446,9 +456,46 @@ impl CredentialPolicy {
         lexical_match
             || self.exact_paths.contains(&candidate)
             || self
+                .exact_paths
+                .iter()
+                .any(|credential| in_family(&candidate, credential))
+            || claude_credential_name(&candidate)
+            || self
                 .directories
                 .iter()
                 .any(|directory| candidate == *directory || candidate.starts_with(directory))
+    }
+
+    /// The family members of the fixed credential files that exist right now: the regular
+    /// files beside each one whose name belongs to its family, the file itself excluded. A
+    /// hard link to one of them is refused like a link to the credential file.
+    fn family_members(&self) -> Vec<PathBuf> {
+        let mut members = Vec::new();
+        let mut parents: Vec<&Path> = Vec::new();
+        for credential in &self.exact_paths {
+            let Some(parent) = credential.parent() else {
+                continue;
+            };
+            if parents.contains(&parent) {
+                continue;
+            }
+            parents.push(parent);
+            let Ok(entries) = std::fs::read_dir(parent) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = parent.join(entry.file_name());
+                if !self.exact_paths.contains(&path)
+                    && self
+                        .exact_paths
+                        .iter()
+                        .any(|credential| in_family(&path, credential))
+                {
+                    members.push(path);
+                }
+            }
+        }
+        members
     }
 
     /// Check the object already opened, including hard links to credential files.
@@ -473,7 +520,12 @@ impl CredentialPolicy {
                         && credential.ino() == opened.ino()
                 })
             };
-            if self.exact_paths.iter().any(|target| same_file(target)) {
+            if self
+                .exact_paths
+                .iter()
+                .chain(&self.family_members())
+                .any(|target| same_file(target))
+            {
                 return true;
             }
             let mut pending = self.directories.clone();
@@ -552,17 +604,97 @@ pub fn refuse_credentials(
     CredentialPolicy::new(home, xdg_credentials).refuse(workspace, requested)
 }
 
-/// The p1 and OpenCode stores move with their XDG override (p1-auth); a home-based path
-/// below covers the default. `None` when the variable is unset.
+/// The credential files (and the XDG keys directory) whose location an environment variable
+/// moves, as p1-auth's `Locations` resolves them: the p1 store and OpenCode's login under
+/// their XDG overrides, `$CODEX_HOME/auth.json`, `$CLAUDE_CONFIG_DIR/.credentials.json`,
+/// `$PI_CODING_AGENT_DIR/auth.json` and the `$XDG_CONFIG_HOME/keys` directory. A home-based
+/// path in [`CredentialPolicy::new`] covers each default. Unset or empty variables add nothing.
 pub fn xdg_credentials() -> Vec<PathBuf> {
+    xdg_credentials_from(|name| env_path(name))
+}
+
+/// [`xdg_credentials`] over an explicit lookup, so the rule is testable without the process
+/// environment.
+fn xdg_credentials_from(lookup: impl Fn(&str) -> Option<PathBuf>) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if let Some(config) = env_path("XDG_CONFIG_HOME") {
+    if let Some(config) = lookup("XDG_CONFIG_HOME") {
         files.push(config.join("p1/auth.json"));
+        files.push(config.join(KEYS_DIRECTORY));
     }
-    if let Some(data) = env_path("XDG_DATA_HOME") {
+    if let Some(data) = lookup("XDG_DATA_HOME") {
         files.push(data.join("opencode/auth.json"));
     }
+    if let Some(codex) = lookup("CODEX_HOME") {
+        files.push(codex.join("auth.json"));
+    }
+    if let Some(claude) = lookup("CLAUDE_CONFIG_DIR") {
+        files.push(claude.join(CLAUDE_CREDENTIALS));
+    }
+    if let Some(pi) = lookup("PI_CODING_AGENT_DIR") {
+        files.push(pi.join("auth.json"));
+    }
     files
+}
+
+/// The credential files below a home, one per credential source p1-auth knows.
+const HOME_CREDENTIALS: [&str; 5] = [
+    ".config/p1/auth.json",
+    ".codex/auth.json",
+    ".claude/.credentials.json",
+    ".local/share/opencode/auth.json",
+    ".pi/agent/auth.json",
+];
+
+/// The last component of an `xdg_credentials` entry that names a keys directory.
+const KEYS_DIRECTORY: &str = "keys";
+
+/// Claude Code's credential file name, refused wherever it is (a named `login_dir`).
+const CLAUDE_CREDENTIALS: &str = ".credentials.json";
+
+/// Whether `candidate` belongs to the family of the credential file `credential`: it sits in
+/// the same directory and is the file itself, or a sibling the credential writers create
+/// beside it — `N.*` (a `.lock`), `.N.*` (p1-auth's staging and recovery files
+/// `.N.p1-<pid>-<nanos>-<counter>.tmp`, `.N.p1-unsaved`, an older Codex `.N.<pid>.tmp`) and
+/// `S.*` where `S` is `N` without its extension (`auth.lock`, `auth.tmp-*` from
+/// `with_extension`). Every such sibling may hold the same tokens as the file.
+fn in_family(candidate: &Path, credential: &Path) -> bool {
+    let (Some(parent), Some(name)) = (candidate.parent(), candidate.file_name()) else {
+        return false;
+    };
+    let (Some(credential_parent), Some(credential_name)) =
+        (credential.parent(), credential.file_name())
+    else {
+        return false;
+    };
+    if parent != credential_parent {
+        return false;
+    }
+    let (Some(name), Some(credential_name)) = (name.to_str(), credential_name.to_str()) else {
+        return name == credential_name;
+    };
+    let stem = Path::new(credential_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(credential_name);
+    name == credential_name
+        || name.starts_with(&format!("{credential_name}."))
+        || name.starts_with(&format!(".{credential_name}."))
+        || name.starts_with(&format!("{stem}."))
+}
+
+/// Whether `candidate` is a Claude Code credential file or one of its siblings, in any
+/// directory: `.credentials.json`, `.credentials.json.*` (its lock), `..credentials.json.*`
+/// (staging and recovery) and `.credentials.tmp-*` (older staging). A route's `login_dir`
+/// (ADR-0074) can name any directory, so the name is the rule; other `.credentials.*` names
+/// (`.credentials.yaml`) stay ordinary files.
+fn claude_credential_name(candidate: &Path) -> bool {
+    let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == CLAUDE_CREDENTIALS
+        || name.starts_with(".credentials.json.")
+        || name.starts_with("..credentials.json.")
+        || name.starts_with(".credentials.tmp-")
 }
 
 /// A non-empty environment variable as a path, or `None`.
@@ -924,6 +1056,183 @@ mod tests {
             !refusal.contains("escapes workspace"),
             "the credential rule comes first: {refusal}"
         );
+    }
+
+    /// Every sibling a credential writer creates beside a credential file holds the same
+    /// tokens (review #484, finding 24): lock, staging, recovery and older temp names.
+    #[test]
+    fn the_family_of_every_credential_file_is_refused() {
+        let home = home_with_credentials();
+        let home_path = home.path();
+        let refused = [
+            ".config/p1/auth.json.lock",
+            ".config/p1/.auth.json.p1-123-000000042-0.tmp",
+            ".config/p1/.auth.json.p1-unsaved",
+            ".config/p1/auth.tmp-123-000000042-0",
+            ".codex/auth.lock",
+            ".codex/.auth.json.4242.tmp",
+            ".codex/.auth.json.p1-9-000000001-3.tmp",
+            ".codex/auth.tmp-9-1-0",
+            ".claude/.credentials.json.lock",
+            ".claude/..credentials.json.p1-9-000000001-3.tmp",
+            ".claude/.credentials.tmp-9-000000001-3",
+            ".local/share/opencode/auth.json.lock",
+            ".pi/agent/.auth.json.p1-unsaved",
+        ];
+        for relative in refused {
+            let candidate = home_path.join(relative);
+            std::fs::write(&candidate, "{}\n").unwrap();
+            assert!(
+                refuses_credentials(&candidate, Some(home_path), &[]),
+                "{relative}"
+            );
+        }
+        // The rest of those directories stays readable: p1's settings and environments,
+        // Claude Code's and Codex's other files, and a workspace file that only shares a
+        // word with a credential name.
+        for relative in [
+            ".config/p1/settings.toml",
+            ".config/p1/environments/default.toml",
+            ".codex/config.toml",
+            ".codex/other.json",
+            ".claude/settings.json",
+            "src/auth.json.rs",
+            "src/.credentials.yaml",
+        ] {
+            assert!(
+                !refuses_credentials(&home_path.join(relative), Some(home_path), &[]),
+                "{relative}"
+            );
+        }
+    }
+
+    /// A route's named Claude Code login directory (ADR-0074, e.g. `~/.claude-2`) and any
+    /// `$CLAUDE_CONFIG_DIR` hold `.credentials.json`: the name is refused wherever it is
+    /// (review #484, finding 25), with its lock and staging siblings.
+    #[test]
+    fn a_claude_code_credential_file_is_refused_in_any_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path();
+        let second = home_path.join(".claude-2");
+        std::fs::create_dir_all(&second).unwrap();
+        for name in [
+            ".credentials.json",
+            ".credentials.json.lock",
+            "..credentials.json.p1-1-2-3.tmp",
+            ".credentials.tmp-1-2-3",
+        ] {
+            let candidate = second.join(name);
+            std::fs::write(&candidate, "{}\n").unwrap();
+            assert!(
+                refuses_credentials(&candidate, Some(home_path), &[]),
+                "{name}"
+            );
+        }
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(refuses_credentials(
+            &elsewhere.path().join("logins/work/.credentials.json"),
+            None,
+            &[]
+        ));
+        assert!(!refuses_credentials(
+            &second.join("settings.json"),
+            Some(home_path),
+            &[]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_or_a_parent_spelling_cannot_reach_a_staging_file() {
+        use std::os::unix::fs::symlink;
+        let home = home_with_credentials();
+        let home_path = home.path();
+        let staging = home_path.join(".codex/.auth.json.p1-1-2-3.tmp");
+        std::fs::write(&staging, "{}\n").unwrap();
+        let link = home_path.join("notes-link.txt");
+        symlink(&staging, &link).unwrap();
+        assert!(refuses_credentials(&link, Some(home_path), &[]));
+        assert!(refuses_credentials(
+            &home_path.join(".config/../.codex/.auth.json.p1-1-2-3.tmp"),
+            Some(home_path),
+            &[]
+        ));
+        assert!(refuses_credentials(
+            &home_path.join(".claude/../.claude-9/.credentials.json"),
+            Some(home_path),
+            &[]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_to_a_staging_file_is_refused_by_the_index() {
+        let home = home_with_credentials();
+        let staging = home.path().join(".codex/.auth.json.p1-1-2-3.tmp");
+        std::fs::write(&staging, "tokens").unwrap();
+        let alias = home.path().join("alias.txt");
+        std::fs::hard_link(&staging, &alias).unwrap();
+        let policy = CredentialPolicy::new(Some(home.path()), &[]);
+        let index = ProtectedIndex::build(&policy, &CancellationToken::new()).unwrap();
+        assert!(index.refuses_path(&alias));
+        let opened = std::fs::File::open(&alias).unwrap();
+        assert!(policy.refuses_opened(&alias, &opened));
+
+        // A staging file created AFTER the index was captured is caught by the live recheck.
+        let late = home.path().join(".claude/..credentials.json.p1-1-2-4.tmp");
+        std::fs::write(&late, "tokens").unwrap();
+        let late_alias = home.path().join("late.txt");
+        std::fs::hard_link(&late, &late_alias).unwrap();
+        let metadata = std::fs::metadata(&late_alias).unwrap();
+        assert!(index.refuses_current_exact(&policy, &metadata));
+    }
+
+    /// The environment overrides p1-auth honours move the credential files; the policy
+    /// follows them (review #484, known #160 item 2).
+    #[test]
+    fn environment_overrides_name_the_moved_credential_files() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
+        let lookup = |name: &str| match name {
+            "XDG_CONFIG_HOME" => Some(root.join("xdg-config")),
+            "XDG_DATA_HOME" => Some(root.join("xdg-data")),
+            "CODEX_HOME" => Some(root.join("codex-home")),
+            "CLAUDE_CONFIG_DIR" => Some(root.join("claude-dir")),
+            "PI_CODING_AGENT_DIR" => Some(root.join("pi-dir")),
+            _ => None,
+        };
+        let listed = xdg_credentials_from(lookup);
+        assert_eq!(
+            listed,
+            vec![
+                root.join("xdg-config/p1/auth.json"),
+                root.join("xdg-config/keys"),
+                root.join("xdg-data/opencode/auth.json"),
+                root.join("codex-home/auth.json"),
+                root.join("claude-dir/.credentials.json"),
+                root.join("pi-dir/auth.json"),
+            ]
+        );
+        assert!(xdg_credentials_from(|_| None).is_empty());
+
+        let policy = CredentialPolicy::new(None, &listed);
+        for relative in [
+            "xdg-config/p1/auth.json",
+            "xdg-config/p1/.auth.json.p1-1-2-3.tmp",
+            "xdg-config/keys/provider.key",
+            "xdg-config/keys/nested/deeper.key",
+            "xdg-config/keys",
+            "xdg-data/opencode/auth.json",
+            "codex-home/auth.json",
+            "codex-home/auth.lock",
+            "claude-dir/.credentials.json",
+            "pi-dir/auth.json",
+        ] {
+            assert!(policy.refuses(&root.join(relative)), "{relative}");
+        }
+        for relative in ["xdg-config/p1/settings.toml", "codex-home/config.toml"] {
+            assert!(!policy.refuses(&root.join(relative)), "{relative}");
+        }
     }
 
     #[test]
