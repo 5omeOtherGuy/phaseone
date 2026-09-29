@@ -933,7 +933,7 @@ fn unquoted_text(command: &str) -> String {
 /// that segment is checked.
 fn command_has_interpreter(masked: &str) -> bool {
     masked
-        .split(|character| matches!(character, ';' | '\n' | '|' | '&' | '(' | ')' | '{' | '}'))
+        .split([';', '\n', '|', '&', '(', ')', '{', '}'])
         .any(segment_has_interpreter)
 }
 
