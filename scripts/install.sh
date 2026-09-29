@@ -47,7 +47,7 @@
 #   P1_REPO             the GitHub repository (default 5omeOtherGuy/phaseone)
 #   P1_RELEASE_BASE_URL base for the curl fallback (default the repo's releases page)
 #   CARGO_TARGET_DIR    --local's absolute target directory when set
-#   CARGO_BUILD_JOBS    --local's requested job count (must not exceed 2)
+#   CARGO_BUILD_JOBS    --local's requested job count (must not exceed 3)
 set -euo pipefail
 
 BINARY_ASSET="p1-linux-x86_64"
@@ -767,18 +767,18 @@ install_local() {
   local target jobs wrapper
   [ -f "$repo_root/crates/p1-host/Cargo.toml" ] ||
     die "--local needs a checkout: run scripts/install.sh from the repository"
-  jobs=${CARGO_BUILD_JOBS:-2}
+  jobs=${CARGO_BUILD_JOBS:-3}
   case "$jobs" in
-    '' | *[!0-9]*) local_refuse "--local CARGO_BUILD_JOBS must be an integer no greater than 2: $jobs" ;;
+    '' | *[!0-9]*) local_refuse "--local CARGO_BUILD_JOBS must be an integer no greater than 3: $jobs" ;;
   esac
-  [ "$jobs" -le 2 ] ||
-    local_refuse "--local CARGO_BUILD_JOBS must not exceed 2: $jobs"
+  [ "$jobs" -le 3 ] ||
+    local_refuse "--local CARGO_BUILD_JOBS must not exceed 3: $jobs"
   wrapper="$repo_root/scripts/rustc-serial"
   [ -x "$wrapper" ] || local_refuse "--local rustc wrapper is not executable: $wrapper"
   target="$(local_target_dir)"
   target="$(check_local_target "$target")"
   export CARGO_TARGET_DIR="$target"
-  export CARGO_BUILD_JOBS=2
+  export CARGO_BUILD_JOBS=3
   export RUSTC_WRAPPER="$wrapper"
   printf 'p1 install: cargo build --release --locked -p p1-host (target %s, jobs %s)\n' \
     "$target" "$CARGO_BUILD_JOBS"

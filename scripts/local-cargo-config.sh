@@ -177,7 +177,7 @@ emit_config() {
     '# An explicit CARGO_TARGET_DIR is caller-owned and must not be shared by worktrees.' \
     '[build]' \
     "target-dir = \"$target_toml\"" \
-    'jobs = 2' \
+    'jobs = 3' \
     'incremental = false' \
     "rustc-wrapper = \"$wrapper_toml\"" \
     '' \
