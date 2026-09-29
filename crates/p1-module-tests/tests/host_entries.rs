@@ -802,9 +802,10 @@ fn profile_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Reject a binary older than any input the `p1` binary is built from: the workspace manifests,
-/// the runtime data trees and `p1-host`'s dependency closure (`p1_binary_inputs`), not every
-/// workspace crate. A test-only or unrelated crate is not linked into the binary, so editing it
+/// Reject a binary older than any input the `p1` binary is built from: the workspace manifests
+/// and `p1-host`'s dependency closure (`p1_binary_inputs`), not every workspace crate and not
+/// the runtime config trees. A test-only or unrelated crate is not linked into the binary, and
+/// neither are `routes/` and `profiles/` (staged separately at run time), so editing either
 /// must not reject a binary that is newer than every real input.
 fn fresh(candidate: &Path, root: &Path) -> bool {
     let Ok(built) = fs::metadata(candidate).and_then(|meta| meta.modified()) else {
@@ -877,6 +878,25 @@ fn binary_freshness_ignores_crates_outside_the_binarys_dependency_closure() {
     assert!(
         !fresh(&candidate, dir.path()),
         "a crate the binary links is an input"
+    );
+}
+
+#[test]
+fn binary_freshness_ignores_runtime_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let candidate = dir.path().join("p1");
+    fs::write(&candidate, b"binary").unwrap();
+    let built = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    set_mtime(&candidate, built);
+    for relative in ["routes/loopback.toml", "profiles/loopback.toml"] {
+        let path = dir.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"runtime config").unwrap();
+        set_mtime(&path, built + Duration::from_secs(200));
+    }
+    assert!(
+        fresh(&candidate, dir.path()),
+        "routes and profiles are staged at run time, not compiled into the binary"
     );
 }
 

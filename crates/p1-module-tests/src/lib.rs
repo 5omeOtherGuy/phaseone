@@ -658,9 +658,13 @@ fn a_module_manifest_names_only_a_full_lowercase_commit() {
 
 // ---------------------------------------------------------------- binary inputs
 
-/// The files and directories the `p1` binary is built from: the workspace manifests, the
-/// runtime data trees, and each crate in `p1-host`'s normal dependency closure — its
-/// `Cargo.toml`, `build.rs` and `src/`.
+/// The files and directories the `p1` binary is built from: the workspace manifests and each
+/// crate in `p1-host`'s normal dependency closure — its `Cargo.toml`, `build.rs` and `src/`.
+///
+/// The runtime data trees (`routes/`, `profiles/`, `environments/`) are not listed: cargo
+/// neither embeds them nor relinks the binary when they change, so a caller that insists on
+/// freshness would reject a usable artefact after a route or profile edit. The suites stage
+/// those files separately at run time.
 ///
 /// Scanning every crate, or a whole crate directory, treats a test or a test-only crate as an
 /// input to the executable: editing one leaves it newer than the binary, while `cargo build -p
@@ -669,7 +673,7 @@ fn a_module_manifest_names_only_a_full_lowercase_commit() {
 /// reason. A tree that names no `p1-host` manifest is read conservatively, as every crate
 /// directory.
 pub fn p1_binary_inputs(root: &Path) -> Vec<PathBuf> {
-    let mut inputs: Vec<PathBuf> = ["Cargo.toml", "Cargo.lock", "build.rs", "routes", "profiles"]
+    let mut inputs: Vec<PathBuf> = ["Cargo.toml", "Cargo.lock", "build.rs"]
         .iter()
         .map(|part| root.join(part))
         .collect();
