@@ -122,8 +122,8 @@ const SHAPES: &str = concat!(
     r"(?m)(?P<marker><redacted:[A-Za-z0-9_.-]+:[0-9]+ chars>)",
     r"|(?P<sk>sk-(?:[A-Za-z0-9]{20,}|(?:ant|proj|or|svcacct|admin)-[A-Za-z0-9_-]{20,})",
     r"|\bsk-[A-Za-z0-9_-]{20,})",
-    r"|(?P<bearer>(?i:\bbearer)[ \t]*(?:\r?\n)?[ \t]*)",
-    r"|(?P<authz>(?i:\bauthorization)[ \t]*:[ \t]*(?:\r?\n[ \t]*)?)",
+    r"|(?P<bearer>(?:\\[nrt]|\b)(?i:bearer)[ \t]*(?:\r?\n)?[ \t]*)",
+    r"|(?P<authz>(?:\\[nrt]|\b)(?i:authorization)[ \t]*:[ \t]*(?:\r?\n[ \t]*)?)",
     r#"|[?&#;](?P<uname>(?i:access_token|refresh_token|id_token|client_secret|api_key|apikey|token|key))=(?P<uvalue>[^&#\s"'<>]+)"#,
     r#"|(?:^|[\s"'])(?P<pname>(?i:access_token|refresh_token|id_token|client_secret|api_key|apikey))=(?P<pvalue>[^&#\s"'<>]+)"#,
     r#"|(?:^|[\s"'])(?P<ename>[A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD))=(?P<evalue>[^\s"']+)"#,
@@ -384,28 +384,33 @@ fn find_spans(text: &str, secrets: &SecretSet, mode: Mode) -> Vec<Span> {
                 family: family.to_owned(),
             });
         } else if let Some(found) = captures.name("bearer") {
+            // An escaped line break before the scheme (`\nBearer` in a JSON string) is
+            // where the header starts, not part of it.
+            let start = found.start() + escape_prefix(found.as_str());
+            let scheme = &text[start..found.end()];
             // `bearer` glued to the next word (`bearerToken`) is not the scheme.
-            if found.as_str().len() == "bearer".len() {
+            if scheme.len() == "bearer".len() {
                 continue;
             }
             let value_start = found.end();
             let end = bearer_token_end(text, value_start);
             let token = &text[value_start..end];
             // Lowercase `bearer` before a lowercase word is prose ("the bearer of").
-            let prose = found.as_str().starts_with("bearer")
-                && token.bytes().all(|byte| byte.is_ascii_lowercase());
+            let prose =
+                scheme.starts_with("bearer") && token.bytes().all(|byte| byte.is_ascii_lowercase());
             if token.is_empty() || is_placeholder(token) || prose || !long_enough(token) {
                 continue;
             }
             spans.push(Span {
-                start: found.start(),
+                start,
                 end,
                 value_start,
                 family: "Bearer".to_owned(),
             });
         } else if let Some(found) = captures.name("authz") {
+            let start = found.start() + escape_prefix(found.as_str());
             let value_start = found.end();
-            let Some(end) = authorization_value_end(text, found.start(), value_start) else {
+            let Some(end) = authorization_value_end(text, start, value_start) else {
                 continue;
             };
             let value = &text[value_start..end];
@@ -416,7 +421,7 @@ fn find_spans(text: &str, secrets: &SecretSet, mode: Mode) -> Vec<Span> {
                 continue;
             }
             spans.push(Span {
-                start: found.start(),
+                start,
                 end,
                 value_start,
                 family: "Authorization".to_owned(),
@@ -547,6 +552,12 @@ fn is_placeholder(token: &str) -> bool {
         && rest
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':'))
+}
+
+/// The length of an escaped line break or tab (`\n`, `\r`, `\t`) a header match starts
+/// with: it precedes the header and is kept.
+fn escape_prefix(found: &str) -> usize {
+    if found.starts_with('\\') { 2 } else { 0 }
 }
 
 /// A declaration's example header value (`Bearer YOUR_API_TOKEN`, `Bearer ${TOKEN}`):
@@ -1307,6 +1318,12 @@ mod tests {
                 redaction.text
             );
         }
+        // A scheme right after an escaped line break is still found.
+        let redaction = redact(r#"{"raw":"x\nBearer abc123\nnext"}"#);
+        assert_eq!(
+            redaction.text,
+            r#"{"raw":"x\n<redacted:Bearer:6 chars>\nnext"}"#
+        );
         // A header inside an escaped JSON string ends at the escaped line break, so the
         // rest of the string survives and the JSON stays valid.
         let text = r#"{"raw":"GET / HTTP/1.1\r\nAuthorization: Bearer abc123\r\nHost: x"}"#;
