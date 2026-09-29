@@ -339,6 +339,7 @@ fn environment(provider: &str, modules: &[&str]) -> EnvironmentFile {
         provider: provider.into(),
         model: "test-model".into(),
         profile: None,
+        profile_text: None,
         options: ModelOptions::default(),
         tools: modules
             .iter()

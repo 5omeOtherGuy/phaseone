@@ -482,8 +482,10 @@ whatever the script returns.
   workflows on one machine a slug names one tree — one slug per tree, never two runs
   on it. Nothing is ever deleted, reset, cleaned, pruned or forced: a finished tree is
   removed with `git worktree remove`, by the rule for every worktree, and a registered
-  tree whose directory is gone is named for `git worktree prune`. git runs without an
-  inherited `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` or `GIT_COMMON_DIR`.
+  tree whose directory is gone is named for `git worktree prune`. A reused tree must
+  remain a real directory in the run repository at the registered branch: a symlink,
+  swapped `.git` pointer or ordinary checkout from another repository is refused.
+  Git children scrub inherited repository, object, ref and config redirect variables.
 - **Thread cost**: one OS thread per in-flight thunk, bounded by `max_threads`
   (default 64, inline fallback), plus one thread per running script.
 - **Runs do not survive the process, journals do.** A run lives in its service; its

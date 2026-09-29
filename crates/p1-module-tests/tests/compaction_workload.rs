@@ -520,6 +520,7 @@ impl Stack {
                 provider: PARENT.into(),
                 model: "test-model".into(),
                 profile: None,
+                profile_text: None,
                 options: ModelOptions::default(),
                 tools: Vec::new(),
                 prompt_template: "tools: {{tool_names}}".into(),

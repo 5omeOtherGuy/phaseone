@@ -1673,6 +1673,9 @@ where
                 Err(error) => return terminal_gave_up(&error),
             };
             driver.report_compaction(result);
+            // Keys handled by the compaction pump may have queued a switch or reload.
+            // Commit them before any prompt submitted during the pump starts its turn.
+            apply_queued_reconfiguration(driver, agent).await;
             // The pump's last frame predates the line just written: a failed or
             // no-op compaction touches nothing else the frame test compares.
             redraws.dirty = true;
@@ -1860,6 +1863,14 @@ where
             }
         }
     }
+}
+
+/// Apply reconfiguration queued while the agent was borrowed by a pump.
+async fn apply_queued_reconfiguration(driver: &mut Driver, agent: &mut Agent) {
+    if let Some(pending) = driver.pending_switch.take() {
+        driver.apply_switch(pending, agent).await;
+    }
+    driver.apply_reload(agent).await;
 }
 
 /// Poll one turn-shaped future to completion while the UI stays live: keys,
@@ -2294,6 +2305,7 @@ fn help_command_output() -> p1_tui::transcript::CommandOutput {
     use p1_tui::transcript::{CommandOutput, CommandRow};
     const COMMANDS: &[(&str, &str)] = &[
         ("/model [REF]", "switch model or effort · alias /env"),
+        ("/env [REF]", "switch model or effort · alias /model"),
         ("/compact", "summarize the session now"),
         ("/effort LEVEL", "low medium high max"),
         (
@@ -2304,7 +2316,11 @@ fn help_command_output() -> p1_tui::transcript::CommandOutput {
         ("/status", "session facts"),
         ("/access", "access and sandbox · fixed per process"),
         ("/models [SEARCH]", "every model p1 can run"),
-        ("/exit", "quit"),
+        (
+            "/modules reload",
+            "reload installed modules at turn boundary",
+        ),
+        ("/exit", "quit · alias /quit (same command)"),
     ];
     let mut body = vec![CommandRow::Head("COMMANDS".into())];
     body.extend(COMMANDS.iter().map(|(key, text)| CommandRow::Entry {
@@ -2317,6 +2333,36 @@ fn help_command_output() -> p1_tui::transcript::CommandOutput {
         // `/help` itself is the one command not listed as a row.
         facts: format!("{} commands", COMMANDS.len() + 1),
         body,
+    }
+}
+
+#[cfg(test)]
+mod command_regression_tests {
+    use super::*;
+    use p1_tui::transcript::CommandRow;
+
+    #[test]
+    fn help_covers_every_live_command_and_alias() {
+        let output = help_command_output();
+        let entries: Vec<String> = output
+            .body
+            .iter()
+            .filter_map(|row| match row {
+                CommandRow::Entry { key, text } => Some(format!("{key} {text}")),
+                _ => None,
+            })
+            .collect();
+        for name in SLASH_COMMANDS {
+            if *name == "help" {
+                continue;
+            }
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.contains(&format!("/{name} "))),
+                "/{name} missing from /help: {entries:?}"
+            );
+        }
     }
 }
 

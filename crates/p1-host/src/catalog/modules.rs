@@ -1225,6 +1225,7 @@ mod tests {
             provider: "scripted".into(),
             model: "test-model".into(),
             profile: None,
+            profile_text: None,
             options: ModelOptions::default(),
             tools: modules
                 .iter()
@@ -1795,6 +1796,7 @@ mod tests {
             provider: "scripted".into(),
             model: "test-model".into(),
             profile: None,
+            profile_text: None,
             options: ModelOptions::default(),
             tools: vec![ToolSpec {
                 module: "read".into(),

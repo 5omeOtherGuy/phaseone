@@ -1261,6 +1261,7 @@ async fn each_key_assembles_its_component_through_the_catalog() {
                 provider: "scripted".into(),
                 model: "test-model".into(),
                 profile: None,
+                profile_text: None,
                 options: ModelOptions::default(),
                 tools: vec![ToolSpec {
                     module: row.key().into(),

@@ -38,18 +38,23 @@ pub(super) fn register_providers(catalog: &mut Catalog, deps: &HostDeps) -> Resu
     register_routes(catalog, deps)
 }
 
-/// Register one factory per route file, under the route id. The closure owns that
-/// route's data and calls the compiled constructor for its adapter key; nothing about
-/// a route is compiled into this crate (spec §2).
+/// Register one factory per route file, under the route id. Its adapter selects a
+/// release component; the route and selected environment supply its configuration.
 fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
-    // Composed once per catalog: the credential chain reads no file until a source
-    // is accessed, so this stays cheap and touches no login.
-    let locations = crate::auth::locations(deps);
     // The provider components the installed release ships, discovered once per catalog
     // through the one manifest path modules are read from (ADR-0079). A host with no module
     // set installed has none, and every route then REFUSES activation instead of building a
     // native adapter.
     let components = Arc::new(ProviderComponents::installed()?);
+    register_routes_with_components(catalog, deps, components)
+}
+
+fn register_routes_with_components(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    components: Arc<ProviderComponents>,
+) -> Result<(), String> {
+    let locations = crate::auth::locations(deps);
     for route in crate::routes::load_all_routes(&deps.environment_dirs)? {
         if WHOLE_PROVIDERS.contains(&route.id.as_str()) {
             return Err(format!(
@@ -73,14 +78,16 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
             &route.id,
             Box::new(move |spec: &ProviderSpec| {
                 let profile = require_profile(spec)?;
-                let binding = data.binding(&profile.id)?;
+                data.binding(&profile.id)?;
                 let credentials =
                     crate::auth::credential_source_at(&data, transport.clone(), &locations);
-                route_provider(
-                    &components,
+                data.settings()?;
+                components.activate_for_environment(
                     &environment_dirs,
+                    spec.profile_text
+                        .as_deref()
+                        .ok_or_else(|| format!("route `{}` has no parsed profile text", data.id))?,
                     &data,
-                    binding,
                     profile,
                     transport.clone(),
                     ws.clone(),
@@ -153,8 +160,9 @@ pub fn reject_profile(spec: &ProviderSpec) -> Result<(), String> {
 /// the same binding from the route and the profile, so `_binding` only names what the caller
 /// already resolved.
 ///
-/// `environment_dirs` are the directories the host resolves an environment from: activation
-/// reads the effective lock (`modules.lock`) and the selected profile's text from beside them.
+/// `environment_dirs` resolve the effective lock (`modules.lock`). Direct callers of this
+/// compatibility entry point resolve profile text from the first matching directory; production
+/// assembly passes the exact text parsed by `load_environment`.
 /// `ws` is the WebSocket connector, next to the HTTP transport (ADR-0047 §1): the production
 /// factory passes the real one and a test or live check injects its own, so a test that
 /// composes a shipped WebSocket route never opens a socket. Only a request the component lowers
@@ -278,6 +286,55 @@ impl ProviderComponents {
         ws: Arc<dyn WsConnector>,
         credentials: Arc<dyn CredentialSource>,
     ) -> Result<Arc<dyn Provider>, String> {
+        self.activate_with_profile_dirs(
+            environment_dirs,
+            environment_dirs,
+            None,
+            route,
+            profile,
+            transport,
+            ws,
+            credentials,
+        )
+    }
+
+    /// Production assembly passes the exact profile text it parsed, while lock resolution
+    /// still uses the complete configuration search path.
+    #[allow(clippy::too_many_arguments)]
+    fn activate_for_environment(
+        &self,
+        environment_dirs: &[PathBuf],
+        parsed_profile_text: &str,
+        route: &RouteFile,
+        profile: Arc<p1_model_profile::ModelProfile>,
+        transport: Arc<dyn Transport>,
+        ws: Arc<dyn WsConnector>,
+        credentials: Arc<dyn CredentialSource>,
+    ) -> Result<Arc<dyn Provider>, String> {
+        self.activate_with_profile_dirs(
+            environment_dirs,
+            environment_dirs,
+            Some(parsed_profile_text),
+            route,
+            profile,
+            transport,
+            ws,
+            credentials,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn activate_with_profile_dirs(
+        &self,
+        environment_dirs: &[PathBuf],
+        profile_dirs: &[PathBuf],
+        parsed_profile_text: Option<&str>,
+        route: &RouteFile,
+        profile: Arc<p1_model_profile::ModelProfile>,
+        transport: Arc<dyn Transport>,
+        ws: Arc<dyn WsConnector>,
+        credentials: Arc<dyn CredentialSource>,
+    ) -> Result<Arc<dyn Provider>, String> {
         let binding = route.binding(&profile.id)?;
         let name = provider_component(&route.adapter)
             .map_err(|reason| selection_refusal(route, reason))?;
@@ -294,7 +351,7 @@ impl ProviderComponents {
             adapter_settings: route.component_adapter_settings(
                 binding,
                 &profile.id,
-                &profile_text(environment_dirs, &profile.id)
+                &component_profile_text(profile_dirs, &profile.id, parsed_profile_text)
                     .map_err(|reason| activation_refusal(route, name, reason))?,
             ),
         };
@@ -362,9 +419,20 @@ fn activation_refusal(
     )
 }
 
-/// The text of `profiles/<id>.toml` next to the environment directories, highest priority
-/// first: the same file `p1-assembly` parsed for this environment. A component reads no file,
-/// so the profile crosses the boundary as its text (ADR-0086).
+/// Production uses the bytes assembly parsed; direct callers preserve file lookup.
+fn component_profile_text(
+    dirs: &[PathBuf],
+    id: &str,
+    parsed_profile_text: Option<&str>,
+) -> Result<String, String> {
+    match parsed_profile_text {
+        Some(text) => Ok(text.to_owned()),
+        None => profile_text(dirs, id),
+    }
+}
+
+/// Direct-call compatibility lookup from the supplied directories; production uses the
+/// exact text from the environment instead. A component reads no file (ADR-0086).
 fn profile_text(environment_dirs: &[PathBuf], id: &str) -> Result<String, String> {
     let mut searched: Vec<PathBuf> = Vec::new();
     for dir in environment_dirs {
@@ -383,4 +451,155 @@ fn profile_text(environment_dirs: &[PathBuf], id: &str) -> Result<String, String
         "profile `{id}` was not found in {}",
         searched.join(", ")
     ))
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn provider_uses_exact_parsed_profile_text_even_after_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first/environments");
+        let second = dir.path().join("second/environments");
+        for base in [&first, &second] {
+            std::fs::create_dir_all(base.join("../profiles")).unwrap();
+        }
+        std::fs::create_dir_all(second.join("chosen")).unwrap();
+        std::fs::write(
+            second.join("chosen/environment.toml"),
+            "route = \"fake\"\nprofile = \"model\"\n",
+        )
+        .unwrap();
+        std::fs::write(second.join("chosen/prompt.md"), "test").unwrap();
+        let original = "id = \"model\"\nrevision = 1\nmodel_id = \"model\"\nfamily = \"test\"\nthinking = \"enabled\"\nefforts = [\"high\"]\n";
+        std::fs::write(first.join("../profiles/model.toml"), "wrong").unwrap();
+        let path = second.join("../profiles/model.toml");
+        std::fs::write(&path, original).unwrap();
+        let dirs = [first, second];
+        let environment = p1_assembly::load_environment("chosen", &dirs).unwrap();
+        std::fs::write(&path, "changed").unwrap();
+        assert_eq!(
+            component_profile_text(&dirs, "model", environment.profile_text.as_deref()).unwrap(),
+            original
+        );
+    }
+
+    /// The shipped route whose adapter has the provider component this case builds into a
+    /// release, and a profile it binds that the checkout ships. The case needs those ids
+    /// without compiling them: the frozen `the_two_shipped_routes_have_no_compiled_literals`
+    /// case scans this file for exactly those route and model literals, so they are read from
+    /// the shipped route files instead.
+    fn shipped_route_binding(source: &Path) -> Option<(String, String)> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(source.join("routes"))
+            .expect("the checkout ships route files")
+            .map(|entry| entry.expect("a route directory entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext.to_str() == Some("toml"))
+            })
+            .collect();
+        files.sort();
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("a route file is readable");
+            let Ok(route) = toml::from_str::<RouteFile>(&text) else {
+                continue;
+            };
+            if route.adapter != "openai-chat" {
+                continue;
+            }
+            if let Some(profile) = route.models.keys().find(|candidate| {
+                source
+                    .join("profiles")
+                    .join(format!("{candidate}.toml"))
+                    .is_file()
+            }) {
+                return Some((route.id.clone(), profile.clone()));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn registered_provider_activates_with_selected_profile_not_conflicting_higher_priority_file() {
+        use p1_contracts::serde_json::{self, json};
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first/environments");
+        let second = root.path().join("second/environments");
+        std::fs::create_dir_all(first.join("../profiles")).unwrap();
+        std::fs::create_dir_all(second.join("../profiles")).unwrap();
+        std::fs::create_dir_all(second.join("../routes")).unwrap();
+        std::fs::create_dir_all(second.join("chosen")).unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (route, profile) =
+            shipped_route_binding(&source).expect("a shipped route binds a shipped profile");
+        std::fs::copy(
+            source.join(format!("profiles/{profile}.toml")),
+            second.join(format!("../profiles/{profile}.toml")),
+        )
+        .unwrap();
+        std::fs::copy(
+            source.join(format!("routes/{route}.toml")),
+            second.join(format!("../routes/{route}.toml")),
+        )
+        .unwrap();
+        std::fs::write(
+            first.join(format!("../profiles/{profile}.toml")),
+            "not a profile",
+        )
+        .unwrap();
+        std::fs::write(
+            second.join("chosen/environment.toml"),
+            format!("route = \"{route}\"\nprofile = \"{profile}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(second.join("chosen/prompt.md"), "hello").unwrap();
+        let dirs = vec![first, second];
+        let environment = p1_assembly::load_environment("chosen", &dirs).unwrap();
+        std::fs::write(
+            dirs[1].join(format!("../profiles/{profile}.toml")),
+            "changed after load",
+        )
+        .unwrap();
+
+        let package = "p1-module-provider-openai-chat";
+        let built = source.join(format!("modules/target/p1-modules/{package}"));
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(built.join(format!("{package}.manifest.json"))).unwrap(),
+        )
+        .unwrap();
+        let bytes = std::fs::read(built.join(format!("{package}.wasm"))).unwrap();
+        let mut release = p1_module_tests::Release::empty();
+        release.add(
+            json!({
+                "name": "p1/provider-openai-chat",
+                "digest": manifest["digest"], "path": "packages/provider.wasm",
+                "kind": manifest["kind"], "world": manifest["world"],
+                "protocol": manifest["protocol"], "capabilities": manifest["capabilities"],
+                "variant": manifest["variant"],
+            }),
+            &bytes,
+        );
+        let components = Arc::new(ProviderComponents::read(&release.manifest_file()).unwrap());
+        let output = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
+        let deps = HostDeps::new(
+            output(),
+            output(),
+            Arc::new(crate::StdinLines::new()),
+            Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            "2026-01-01".into(),
+            Arc::new(crate::SignalInterrupt),
+            dirs,
+            false,
+        );
+        let mut catalog = Catalog::new();
+        register_routes_with_components(&mut catalog, &deps, components).unwrap();
+        let substitutions = p1_assembly::Substitutions {
+            workspace: root.path().display().to_string(),
+            date: "2026-01-01".into(),
+            os: "test".into(),
+        };
+        p1_assembly::assemble(&catalog, &environment, root.path(), &substitutions)
+            .expect("production route factory must use the selected parsed profile text");
+    }
 }

@@ -498,6 +498,7 @@ async fn the_read_key_assembles_the_component_through_the_catalog() {
             provider: "scripted".into(),
             model: "test-model".into(),
             profile: None,
+            profile_text: None,
             options: ModelOptions::default(),
             tools: vec![ToolSpec {
                 module: "read".into(),

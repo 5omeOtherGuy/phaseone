@@ -360,11 +360,7 @@ impl Loader {
 
     /// Verifies and compiles the package `name` of the release manifest.
     pub fn load(&self, name: &str) -> Result<LoadedModule, LoadError> {
-        if name.split_once('/').map(|(namespace, _)| namespace) != Some(OFFICIAL_NAMESPACE) {
-            return Err(LoadError::NotOfficial {
-                name: name.to_owned(),
-            });
-        }
+        check_official_name(name)?;
         let entry = self
             .manifest
             .entry(name)
@@ -372,25 +368,7 @@ impl Loader {
                 name: name.to_owned(),
             })?;
 
-        let kind = ModuleKind::parse(&entry.kind).ok_or_else(|| LoadError::UnknownKind {
-            name: name.to_owned(),
-            kind: entry.kind.clone(),
-        })?;
-        if entry.world != kind.world() {
-            return Err(LoadError::WorldMismatch {
-                name: name.to_owned(),
-                kind: entry.kind.clone(),
-                world: entry.world.clone(),
-                expected: kind.world(),
-            });
-        }
-        if protocol_major(&entry.protocol) != Some(PROTOCOL_VERSION.major) {
-            return Err(LoadError::ProtocolMismatch {
-                name: name.to_owned(),
-                protocol: entry.protocol.clone(),
-                major: PROTOCOL_VERSION.major,
-            });
-        }
+        let kind = check_manifest_fields(entry)?;
         if let Some(capability) = entry
             .capabilities
             .iter()
@@ -424,6 +402,10 @@ impl Loader {
                 actual,
             });
         }
+        check_component_header(&bytes).map_err(|reason| LoadError::Compile {
+            name: name.to_owned(),
+            reason,
+        })?;
         // The verified bytes, not the file: see the module documentation.
         let component =
             Component::from_binary(&self.engine, &bytes).map_err(|error| LoadError::Compile {
@@ -465,6 +447,79 @@ impl Loader {
             epochs: self.epochs.clone(),
         })
     }
+}
+
+/// Check the loader's reserved package namespace without reading a component.
+pub fn check_official_name(name: &str) -> Result<(), LoadError> {
+    if name.split_once('/').map(|(namespace, _)| namespace) != Some(OFFICIAL_NAMESPACE) {
+        return Err(LoadError::NotOfficial {
+            name: name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Check the manifest fields that do not require reading or compiling a component.
+pub fn check_manifest_fields(
+    entry: &crate::manifest::ComponentEntry,
+) -> Result<ModuleKind, LoadError> {
+    if let Some(error) = manifest_field_errors(entry).into_iter().next() {
+        return Err(error);
+    }
+    Ok(ModuleKind::parse(&entry.kind).expect("a valid manifest has a known kind"))
+}
+
+/// All metadata-only field errors, in loader refusal order. The loader takes the first;
+/// installer verification reports every independent problem in a staged entry.
+pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<LoadError> {
+    let mut errors = Vec::new();
+    if let Err(error) = check_official_name(&entry.name) {
+        errors.push(error);
+    }
+    let Some(kind) = ModuleKind::parse(&entry.kind) else {
+        errors.push(LoadError::UnknownKind {
+            name: entry.name.clone(),
+            kind: entry.kind.clone(),
+        });
+        return errors;
+    };
+    if entry.world != kind.world() {
+        errors.push(LoadError::WorldMismatch {
+            name: entry.name.clone(),
+            kind: entry.kind.clone(),
+            world: entry.world.clone(),
+            expected: kind.world(),
+        });
+    }
+    if protocol_major(&entry.protocol) != Some(PROTOCOL_VERSION.major) {
+        errors.push(LoadError::ProtocolMismatch {
+            name: entry.name.clone(),
+            protocol: entry.protocol.clone(),
+            major: PROTOCOL_VERSION.major,
+        });
+    }
+    errors
+}
+
+/// Reject headers that the component compiler cannot accept, without compiling bytes.
+/// Wasm components have the magic, component version 13 and layer 1.
+pub fn check_component_header(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
+        return Err("the file is not a WebAssembly module: it has no wasm header".into());
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version != 13 {
+        return Err(format!(
+            "the file is not a component: its wasm version is {version}, the component version is 13"
+        ));
+    }
+    let layer = u16::from_le_bytes([bytes[6], bytes[7]]);
+    if layer != 1 {
+        return Err(format!(
+            "the file is not a component: its wasm layer is {layer}, the component layer is 1"
+        ));
+    }
+    Ok(())
 }
 
 /// The major of a `major.minor` protocol version, or `None` when it is not one.

@@ -102,6 +102,8 @@ pub struct EnvironmentFile {
     pub model: String,
     /// `Some` exactly when the environment names `route` + `profile`.
     pub profile: Option<Arc<ModelProfile>>,
+    /// The exact profile text parsed for this environment; no later file read may replace it.
+    pub profile_text: Option<String>,
     pub options: ModelOptions,
     pub tools: Vec<ToolSpec>,
     pub prompt_template: String,
@@ -198,6 +200,8 @@ pub struct ProviderSpec {
     pub key: String,
     pub model: String,
     pub profile: Option<Arc<ModelProfile>>,
+    /// The exact text parsed with `profile`, passed to provider components unchanged.
+    pub profile_text: Option<String>,
 }
 
 /// What tools of ONE agent share. Created fresh per [`assemble`] call, so two
@@ -427,21 +431,22 @@ pub fn load_environment(
     // Which provider the environment names, and — in the new form — the profile
     // that carries the model policy. `family` and the model come from the profile;
     // route bindings (wire model, limits) arrive with route files.
-    let (provider, model, family, profile) = match provider_form(&parsed, &path)? {
+    let (provider, model, family, profile, profile_text) = match provider_form(&parsed, &path)? {
         ProviderForm::Routed { route, profile } => {
-            let profile = load_profile(base, &profile)?;
+            let (profile, text) = load_profile(base, &profile)?;
             (
                 route,
                 profile.model_id.clone(),
                 profile.family.clone(),
                 Some(profile),
+                Some(text),
             )
         }
         ProviderForm::Whole {
             provider,
             model,
             family,
-        } => (provider, model, family, None),
+        } => (provider, model, family, None, None),
     };
 
     let prompt_path = dir.join(PROMPT_FILE);
@@ -521,6 +526,7 @@ pub fn load_environment(
         provider,
         model,
         profile,
+        profile_text,
         options: parsed.options.into(),
         tools,
         prompt_template,
@@ -532,7 +538,10 @@ pub fn load_environment(
 /// Load `profiles/<id>.toml` next to the environments directory that was selected
 /// (`docs/design/routes-and-profiles.md` §1: shipped files live in the repository
 /// root, next to `environments/`). A missing file names the profiles that exist.
-fn load_profile(environments_base: &Path, id: &str) -> Result<Arc<ModelProfile>, AssemblyError> {
+fn load_profile(
+    environments_base: &Path,
+    id: &str,
+) -> Result<(Arc<ModelProfile>, String), AssemblyError> {
     let dir = environments_base.join(PROFILES_DIR);
     let path = dir.join(format!("{id}.toml"));
     let text = std::fs::read_to_string(&path).map_err(|error| {
@@ -549,9 +558,10 @@ fn load_profile(environments_base: &Path, id: &str) -> Result<Arc<ModelProfile>,
             }
         }
     })?;
-    ModelProfile::from_toml(id, &text)
+    let profile = ModelProfile::from_toml(id, &text)
         .map(Arc::new)
-        .map_err(|message| AssemblyError::InvalidProfileFile { path, message })
+        .map_err(|message| AssemblyError::InvalidProfileFile { path, message })?;
+    Ok((profile, text))
 }
 
 /// The profile ids a directory holds, sorted. A directory that does not exist or
@@ -786,6 +796,7 @@ pub fn assemble_for_agent(
         key: environment.provider.clone(),
         model: environment.model.clone(),
         profile: environment.profile.clone(),
+        profile_text: environment.profile_text.clone(),
     };
     let provider =
         make_provider(&provider_spec).map_err(|message| AssemblyError::FactoryFailed {
