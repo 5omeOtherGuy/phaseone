@@ -446,8 +446,10 @@ mod tests {
         };
         let matcher = RegexMatcher::new("needle").unwrap();
 
-        let result =
-            search_content(&workspace, &matcher, &query, &files, &cancel, |_, _| false).unwrap();
+        let result = search_content(&workspace, &matcher, &query, &files, &cancel, |_, _| {
+            Ok(false)
+        })
+        .unwrap();
 
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].lines[0].text, "needle in non-UTF-8 name");
@@ -484,7 +486,7 @@ mod tests {
             &query,
             &files,
             &cancel,
-            |candidate, _| policy.refuses(candidate),
+            |candidate, _| Ok(policy.refuses(candidate)),
         )
         .unwrap();
 
@@ -577,8 +579,10 @@ mod tests {
             max_lines: 10,
         };
         let matcher = RegexMatcher::new("needle").unwrap();
-        let result =
-            search_content(&workspace, &matcher, &query, &files, &cancel, |_, _| false).unwrap();
+        let result = search_content(&workspace, &matcher, &query, &files, &cancel, |_, _| {
+            Ok(false)
+        })
+        .unwrap();
         assert!(
             result.files.is_empty(),
             "outside symlink target was searched"
