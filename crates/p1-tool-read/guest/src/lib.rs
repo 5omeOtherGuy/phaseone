@@ -392,6 +392,11 @@ impl SkimFilter {
                     // Code after the closing delimiter: keep the line.
                     !trimmed[pos + end.len()..].trim().is_empty() || !complete
                 }
+                // The closer may lie past a truncated prefix: keep the line, resume as code.
+                None if !complete => {
+                    self.state = SkimState::Code;
+                    true
+                }
                 None => false,
             },
             SkimState::Docstring(delim) => match trimmed.find(delim) {
@@ -399,11 +404,16 @@ impl SkimFilter {
                     self.state = SkimState::Code;
                     !trimmed[pos + delim.len()..].trim().is_empty() || !complete
                 }
+                None if !complete => {
+                    self.state = SkimState::Code;
+                    true
+                }
                 None => false,
             },
             SkimState::Code => {
                 if trimmed.is_empty() {
-                    false
+                    // A blank-looking truncated prefix may hide code past it (review H1).
+                    !complete
                 }
                 // Shebangs carry meaning; never strip line 1's `#!`.
                 else if index == 0 && trimmed.starts_with("#!") {
@@ -414,6 +424,7 @@ impl SkimFilter {
                     match rest.find(end) {
                         // Closes on the same line: keep only if code follows the delimiter.
                         Some(pos) => !rest[pos + end.len()..].trim().is_empty() || !complete,
+                        None if !complete => true,
                         None => {
                             self.state = SkimState::Block(end);
                             false
@@ -427,6 +438,7 @@ impl SkimFilter {
                 {
                     match rest.find(delim) {
                         Some(pos) => !rest[pos + delim.len()..].trim().is_empty() || !complete,
+                        None if !complete => true,
                         None => {
                             self.state = SkimState::Docstring(delim);
                             false
@@ -655,14 +667,11 @@ impl WindowedRender {
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT) as usize;
         let start = offset - 1;
         let skim = if input.skim {
-            match skim_filter(&input.file_path) {
-                Some(filter) => Some(SkimWindow {
-                    filter,
-                    line: LineBuffer::new(),
-                    window: Window::new(start, limit),
-                }),
-                None => None,
-            }
+            skim_filter(&input.file_path).map(|filter| SkimWindow {
+                filter,
+                line: LineBuffer::new(),
+                window: Window::new(start, limit),
+            })
         } else {
             None
         };
@@ -986,6 +995,29 @@ mod tests {
             out.ends_with("\n[skim: 60 lines hidden; read the file in full before editing it]"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn a_truncated_line_whose_retained_prefix_looks_blank_or_unclosed_is_kept() {
+        // Review H1: code past the retained prefix must never be hidden unseen.
+        for head in [
+            " ".repeat(MAX_OUTPUT_BYTES),
+            format!("/* {}", "c".repeat(MAX_OUTPUT_BYTES)),
+        ] {
+            let src = format!("{head}fn hidden() {{}}\nfn visible() {{}}\n");
+            let out = render(src.as_bytes(), "a.rs", &skim_input("a.rs", None, None)).unwrap();
+            assert!(
+                out.starts_with("     1\t"),
+                "line 1 must be shown: {out:.80}"
+            );
+            assert!(out.contains("[output truncated: "), "{out:.80}");
+            // A truncated line ends the window, as in a full read.
+            assert!(out.contains("continue with offset=2]"), "{out:.80}");
+        }
+        let mut filter = skim_filter("a.rs").unwrap();
+        assert!(!filter.keep("/* open", true));
+        assert!(filter.keep("still comment, cut short", false));
+        assert!(filter.keep("fn after() {}", true), "resumes as code");
     }
 
     #[test]
