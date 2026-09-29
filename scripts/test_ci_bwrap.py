@@ -63,8 +63,11 @@ class CiBwrapTest(unittest.TestCase):
             if 'supersedes: [77]' in text:
                 superseding.append(path)
                 self.assertIn('status: proposed', text)
-        self.assertEqual(len(superseding), 1, [path.name for path in superseding])
-        self.assertIn(f'superseded_by: [{int(superseding[0].name[:4])}]', old)
+        # A later ADR may supersede ADR-0077 too (ADR-0105 reverses its build placement); the
+        # sandbox reversal stays pinned to ADR-0097 and ADR-0077 lists every superseding ADR.
+        numbers = [int(path.name[:4]) for path in superseding]
+        self.assertIn(97, numbers)
+        self.assertIn(f'superseded_by: [{", ".join(str(n) for n in numbers)}]', old)
 
     def test_root_rule_matches_the_ci_sandbox_reversal(self):
         # Codex finding ci.yml:66: after ADR-0097 provisions bubblewrap on GitHub-hosted
