@@ -218,7 +218,7 @@ an 11 GiB-RAM machine).
 Release builds are normally CI's: `.github/workflows/release.yml` builds in release profile
 on a GitHub runner after a green `main` and publishes the release that `install.sh` consumes.
 The one local exception is the documented `--local` fallback under the SSD admission and
-two-`rustc` rules. Do not run another `cargo build --release` or `cargo install` on a
+three-`rustc` rules. Do not run another `cargo build --release` or `cargo install` on a
 workstation (AGENTS.md).
 
 ## Working here
