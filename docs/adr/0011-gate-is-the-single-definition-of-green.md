@@ -1,11 +1,11 @@
 ---
 adr: 11
 title: The gate is the single definition of green
-status: accepted
+status: superseded
 date: 2026-09-19
 deciders: lead
 supersedes: []
-superseded_by: []
+superseded_by: [102]
 sources: [D7, D19, scripts/gate.sh, .github/workflows/ci.yml]
 ---
 # ADR-0011: The gate is the single definition of green

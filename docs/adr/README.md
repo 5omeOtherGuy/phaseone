@@ -24,7 +24,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0008 | [rustfmt and clippy installed for the gate](0008-rustfmt-and-clippy-for-the-gate.md) | accepted | 2026-09-19 | lead |
 | ADR-0009 | [New repository on a task branch with no remotes](0009-new-repo-task-branch-no-remotes.md) | superseded by ADR-0010 | 2026-09-19 | lead |
 | ADR-0010 | [Public repository, trunk-based, pushes and merges authorised](0010-public-repo-trunk-based-with-pushes-authorised.md) | accepted | 2026-09-19 | owner |
-| ADR-0011 | [The gate is the single definition of green](0011-gate-is-the-single-definition-of-green.md) | accepted | 2026-09-19 | lead |
+| ADR-0011 | [The gate is the single definition of green](0011-gate-is-the-single-definition-of-green.md) | superseded by ADR-0102 | 2026-09-19 | lead |
 | ADR-0012 | [Live provider checks are lead-only](0012-live-provider-checks-are-lead-only.md) | accepted | 2026-09-19 | lead |
 | ADR-0013 | [One shared cargo target directory across worktrees](0013-shared-cargo-target-dir.md) | superseded by ADR-0014 | 2026-09-19 | owner+lead |
 | ADR-0014 | [Per-worktree cargo targets seeded by hardlinks and a global rustc semaphore](0014-per-worktree-targets-and-rustc-semaphore.md) | accepted | 2026-09-20 | lead |
