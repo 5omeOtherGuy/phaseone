@@ -702,10 +702,6 @@ impl WindowedRender {
             remaining = &remaining[newline + 1..];
         }
         self.push_segment(remaining);
-        self.peak_line_bytes = self
-            .peak_line_bytes
-            .max(self.line.shown.len())
-            .max(self.skim.as_ref().map_or(0, |skim| skim.line.shown.len()));
         Ok(())
     }
 
@@ -716,6 +712,11 @@ impl WindowedRender {
         if let Some(skim) = &mut self.skim {
             skim.line.push(bytes, true);
         }
+        // Measured after every push, before `finish_line` resets the buffers (review M1).
+        self.peak_line_bytes = self
+            .peak_line_bytes
+            .max(self.line.shown.len())
+            .max(self.skim.as_ref().map_or(0, |skim| skim.line.shown.len()));
     }
 
     /// Count the finished line in both windows, rendering it in each that wants it.
@@ -1018,6 +1019,17 @@ mod tests {
         assert!(!filter.keep("/* open", true));
         assert!(filter.keep("still comment, cut short", false));
         assert!(filter.keep("fn after() {}", true), "resumes as code");
+    }
+
+    #[test]
+    fn the_peak_line_bytes_count_lines_finished_within_a_chunk() {
+        let mut render = WindowedRender::start(b"", "a.rs", &input(None, None)).unwrap();
+        render.feed(b"abcdef\n").unwrap();
+        assert_eq!(render.peak_line_bytes(), 6);
+        let mut render =
+            WindowedRender::start(b"", "a.rs", &skim_input("a.rs", None, None)).unwrap();
+        render.feed(b"// abcdefgh\n").unwrap();
+        assert_eq!(render.peak_line_bytes(), 11);
     }
 
     #[test]
