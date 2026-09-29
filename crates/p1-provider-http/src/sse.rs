@@ -282,9 +282,10 @@ mod tests {
         // The same bytes split between the separator's two bare `\r` decode
         // to the same events: the verdict no longer depends on the chunk.
         let at = "data: ".len() + 600_000 + 1;
+        let bytes = chunk.as_bytes();
         let mut split = SseDecoder::new();
-        let mut split_events = split.try_push(&chunk[..at]).unwrap();
-        split_events.extend(split.try_push(&chunk[at..]).unwrap());
+        let mut split_events = split.try_push(&bytes[..at]).unwrap();
+        split_events.extend(split.try_push(&bytes[at..]).unwrap());
         if let Some(event) = split.finish() {
             split_events.push(event);
         }
