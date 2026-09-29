@@ -403,21 +403,31 @@ async fn terminate(child: &mut Child, pgid: i32) {
         return;
     }
     let group = Pid::from_raw(pgid);
-    let _ = killpg(group, Signal::SIGTERM);
+    signal_group_if_present(group, Signal::SIGTERM);
     let grace_end = tokio::time::Instant::now() + SIGTERM_GRACE;
     // Reap the shell first: an unreaped group leader keeps the group alive.
     let reaped = tokio::time::timeout_at(grace_end, child.wait())
         .await
         .is_ok();
     wait_for_empty_group(group, grace_end).await;
-    if group_exists(group) {
-        let _ = killpg(group, Signal::SIGKILL);
-    }
+    signal_group_if_present(group, Signal::SIGKILL);
     let kill_end = tokio::time::Instant::now() + SIGKILL_WAIT;
     if !reaped {
         let _ = bounded_reap(child.wait(), kill_end).await;
     }
     wait_for_empty_group(group, kill_end).await;
+}
+
+/// Signal `group` only while it still has a member. Reaping the leader releases its
+/// group ID for reuse, so an emptied group's ID may already belong to an unrelated
+/// process group; it must not receive this run's SIGTERM/SIGKILL. Returns whether a
+/// signal was sent.
+fn signal_group_if_present(group: Pid, signal: Signal) -> bool {
+    if !group_exists(group) {
+        return false;
+    }
+    let _ = killpg(group, signal);
+    true
 }
 
 /// Reaping cannot extend the post-SIGKILL deadline even if the leader cannot exit.
@@ -522,6 +532,47 @@ mod tests {
         let deadline = tokio::time::Instant::now();
         let never = std::future::pending::<()>();
         assert!(super::bounded_reap(never, deadline).await.is_none());
+    }
+
+    /// A group whose leader was reaped and which has no member left must never be
+    /// signalled: its ID is free and may already belong to an unrelated process group.
+    #[tokio::test]
+    async fn a_vanished_group_is_never_signalled() {
+        let mut child = tokio::process::Command::new("true")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pgid = child.id().unwrap() as i32;
+        let _ = child.wait().await.unwrap();
+        assert!(
+            !super::signal_group_if_present(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGTERM,
+            ),
+            "a reaped, empty group must not be signalled"
+        );
+    }
+
+    /// The guard only skips a vanished group: a live one is still signalled.
+    #[tokio::test]
+    async fn a_live_group_is_still_signalled() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pgid = child.id().unwrap() as i32;
+        assert!(super::signal_group_if_present(
+            nix::unistd::Pid::from_raw(pgid),
+            nix::sys::signal::Signal::SIGTERM,
+        ));
+        let _ = child.wait().await.unwrap();
     }
 
     #[test]

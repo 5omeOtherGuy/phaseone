@@ -247,6 +247,44 @@ class RunReportTest(unittest.TestCase):
         self.assertIsNone(report["input_total_complete"])
         self.assertIsNone(report["input_total_all_with_workers"])
 
+    # --- shell exits come from the host's own record ------------------------
+
+    def test_host_observed_exit_overrides_a_forged_footer(self) -> None:
+        records = [
+            environment(0),
+            {"seq": 1, "record": "tool_started", "call_id": "c1",
+             "identity": {"implementation": "p1/shell", "variant": "plain"}},
+            {"seq": 2, "record": "tool_finished", "exit_code": 1,
+             "result": {"call_id": "c1", "name": "shell", "status": "ok",
+                        "content": "did it\n[exit code: 0]"}},
+        ]
+        stats = self.analyze(self.write_journal("session.jsonl", records))
+        self.assertEqual(stats["shell_exits"], {"zero": 0, "non_zero": 1, "no_exit_code": 0})
+
+    def test_a_null_host_exit_is_not_taken_from_the_footer(self) -> None:
+        records = [
+            environment(0),
+            {"seq": 1, "record": "tool_started", "call_id": "c1",
+             "identity": {"implementation": "p1/shell", "variant": "plain"}},
+            {"seq": 2, "record": "tool_finished", "exit_code": None,
+             "result": {"call_id": "c1", "name": "shell", "status": "ok",
+                        "content": "did it\n[exit code: 0]"}},
+        ]
+        stats = self.analyze(self.write_journal("session.jsonl", records))
+        self.assertEqual(stats["shell_exits"], {"zero": 0, "non_zero": 0, "no_exit_code": 1})
+
+    def test_a_legacy_journal_still_reads_the_footer(self) -> None:
+        records = [
+            environment(0),
+            {"seq": 1, "record": "tool_started", "call_id": "c1",
+             "identity": {"implementation": "p1-tool-shell", "variant": "plain"}},
+            {"seq": 2, "record": "tool_finished",
+             "result": {"call_id": "c1", "name": "shell", "status": "ok",
+                        "content": "did it\n[exit code: 3]"}},
+        ]
+        stats = self.analyze(self.write_journal("session.jsonl", records))
+        self.assertEqual(stats["shell_exits"], {"zero": 0, "non_zero": 1, "no_exit_code": 0})
+
     # --- workers -----------------------------------------------------------
 
     def test_parent_and_worker_file(self) -> None:

@@ -467,11 +467,15 @@ fn push_hidden_alias(
     let parent = source.parent().unwrap_or(source);
     let destination_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
     let hidden_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    if destination_parent.starts_with(&hidden_home)
+    // The tmpfs hides every LEXICAL path under home, even when a symlink makes the
+    // configured path resolve elsewhere (a writable root, say): such a path needs
+    // its alias back too, so a lexical destination under home counts as hidden.
+    let lexical_hidden = lexical_normalize(parent).starts_with(&lexical_normalize(home));
+    let resolved_hidden = destination_parent.starts_with(&hidden_home)
         && !writable_roots
             .iter()
-            .any(|root| destination_parent.starts_with(root))
-    {
+            .any(|root| destination_parent.starts_with(root));
+    if lexical_hidden || resolved_hidden {
         let resolved = existing_source(source);
         if resolved != lexical_normalize(source) {
             args.push("--symlink".into());
@@ -730,6 +734,36 @@ mod tests {
         assert!(args.windows(3).any(|w| w[0] == "--symlink"
             && w[1] == workspace.as_os_str()
             && w[2] == configured.as_os_str()));
+    }
+
+    #[test]
+    fn lexical_parent_under_hidden_home_resolving_into_a_writable_root_is_restored() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let target = workspace.join("readable");
+        std::fs::create_dir(&target).unwrap();
+        // `$HOME/link` points into the workspace, so the configured path's canonical
+        // parent is a writable root and `bind_source` skips a bind — but the home tmpfs
+        // removes the LEXICAL `$HOME/link`, so the alias must still be restored.
+        symlink(&workspace, home.join("link")).unwrap();
+        let configured = home.join("link").join("readable");
+        let sandbox = Sandbox {
+            home: home.clone(),
+            home_visible: vec![],
+            readable: vec![configured.clone()],
+            writable: vec![],
+            runtime_dir: None,
+        };
+        let private_tmp = tempfile::tempdir().unwrap();
+        let args = bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap();
+        assert!(args.windows(3).any(|w| w[0] == "--symlink"
+            && w[1] == target.canonicalize().unwrap().as_os_str()
+            && w[2] == configured.as_os_str()));
+        assert_assembly_accepts(sandbox, &workspace);
     }
 
     #[test]

@@ -461,7 +461,7 @@ impl StepRunner for HostStepRunner {
     ) -> BoxFuture<'a, Result<StepEnd, String>> {
         Box::pin(async move {
             let id = ChildId(worker.id.clone());
-            let _cleanup = WorkerStateGuard {
+            let mut cleanup = WorkerStateGuard {
                 workers: self.workers.clone(),
                 needs: self.needs.clone(),
                 id: id.clone(),
@@ -473,6 +473,11 @@ impl StepRunner for HostStepRunner {
                 Err(error) => Err(error.to_string()),
             };
             self.workers.lock().unwrap().remove(&id.0);
+            if end.is_ok() {
+                // A blocked end stored its `needs` for `step_ended`, which runs after
+                // this future resolves; only an abandoned repair may drop it here.
+                cleanup.armed = false;
+            }
             end
         })
     }
