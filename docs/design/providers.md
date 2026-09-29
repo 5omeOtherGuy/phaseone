@@ -51,7 +51,10 @@ stripped; `:` comment lines ignored; a chunk may end anywhere — in the middle 
 multi-byte UTF-8 character, or between `\r` and `\n`; `finish()` flushes a final event that
 lacks the trailing blank line. The host uses fallible `try_push`: one chunk/event is limited
  to 1 MiB and an unfinished line to 256 KiB; exceeding either ends the attempt as Protocol
- without replay, and `try_finish` applies the same cumulative event bound to the EOF flush.
+ without replay. Events that completed before the violating line in the same chunk are still
+ delivered first (`try_push_partial`), so a terminal event that precedes an over-limit tail
+ still finishes the stream; `try_finish` applies the same cumulative event bound to the EOF
+ flush. The bounds are public (`SSE_LINE_LIMIT`, `SSE_EVENT_LIMIT`, `SseLimitExceeded`).
  `Debug` shows lengths, never peer event names or data.
 
 Status classification: `401|403` → `Reauth`; `408|425|429|500..=599` → `Retry`; any other

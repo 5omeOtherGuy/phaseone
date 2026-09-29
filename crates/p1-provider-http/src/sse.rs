@@ -79,15 +79,33 @@ impl SseDecoder {
     }
 
     /// Decode with bounded retained memory, including a single oversized chunk.
-    /// On overflow the caller must terminate this stream, not retry its payload.
+    /// On overflow the caller must terminate this stream, not retry its payload;
+    /// use [`try_push_partial`](SseDecoder::try_push_partial) to keep the events
+    /// that completed before the violation.
     pub fn try_push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, SseLimitExceeded> {
+        let (events, result) = self.try_push_partial(bytes);
+        result.map(|()| events)
+    }
+
+    /// [`try_push`](SseDecoder::try_push) that never discards decoded events: on
+    /// overflow it returns the events that completed before the violation together
+    /// with the error. That keeps a chunk boundary invisible — a terminal event
+    /// that ended the stream before an over-limit tail in the same chunk must still
+    /// finish the stream instead of failing the whole attempt. On the error the
+    /// caller must terminate this stream, not retry its payload.
+    pub fn try_push_partial(
+        &mut self,
+        bytes: &[u8],
+    ) -> (Vec<SseEvent>, Result<(), SseLimitExceeded>) {
         if bytes.len() > SSE_EVENT_LIMIT {
-            return Err(SseLimitExceeded);
+            return (Vec::new(), Err(SseLimitExceeded));
         }
         let mut events = Vec::new();
         for piece in bytes.split_inclusive(|byte| *byte == b'\n' || *byte == b'\r') {
             self.pending.extend_from_slice(piece);
-            self.consume_lines(&mut events)?;
+            if let Err(error) = self.consume_lines(&mut events) {
+                return (events, Err(error));
+            }
             // Bound the line still under construction by its CONTENT, not the raw
             // buffer: a lone trailing `\r` is a possible CRLF half and does not
             // count, so a line of exactly `SSE_LINE_LIMIT` bytes is legal however
@@ -95,10 +113,10 @@ impl SseDecoder {
             if self.pending.len() - usize::from(self.pending.last() == Some(&b'\r'))
                 > SSE_LINE_LIMIT
             {
-                return Err(SseLimitExceeded);
+                return (events, Err(SseLimitExceeded));
             }
         }
-        Ok(events)
+        (events, Ok(()))
     }
 
     fn consume_lines(&mut self, events: &mut Vec<SseEvent>) -> Result<(), SseLimitExceeded> {
@@ -395,6 +413,27 @@ mod tests {
             assert!(decoder.try_push(b"\n").is_ok());
         }
         assert_eq!(decoder.try_push(b"data: more\n"), Err(SseLimitExceeded));
+    }
+
+    /// Events completed before a later over-limit line in the SAME chunk are not
+    /// lost: the frozen `try_push` still reports the error, but the partial form
+    /// returns them, so a caller can honor a terminal event that already ended the
+    /// stream instead of failing the whole attempt. Splitting the bytes just after
+    /// the terminal event already succeeds, so one chunk must behave the same.
+    #[test]
+    fn events_completed_before_a_later_overflow_are_returned() {
+        let mut chunk = b"data: terminal\n\n".to_vec();
+        chunk.extend_from_slice(&vec![b'x'; SSE_LINE_LIMIT + 2]);
+
+        let (events, result) = SseDecoder::new().try_push_partial(&chunk);
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: None,
+                data: "terminal".to_string()
+            }]
+        );
+        assert_eq!(result, Err(SseLimitExceeded));
     }
 
     /// A line whose content is exactly `SSE_LINE_LIMIT` bytes is legal with any

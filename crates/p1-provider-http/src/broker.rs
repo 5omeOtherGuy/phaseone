@@ -28,10 +28,11 @@ use crate::retry::RetryPolicy;
 
 /// Headers a component may never set. Most carry a credential, and the broker is
 /// the only party that attaches one; the rest fix the request's authority or
-/// framing. `forwarded` and the `x-forwarded-*` / `x-original-host` family are the
-/// proxy headers a front end may trust to choose the authority a credentialed
-/// request reaches, so a component may never place one either.
-const FORBIDDEN_HEADERS: [&str; 22] = [
+/// framing. `forwarded` and `x-original-host` are the proxy headers a front end
+/// may trust to choose the authority a credentialed request reaches, and the whole
+/// `x-forwarded-` family is refused by prefix in `allowed_name`, so a component may
+/// never place one either.
+const FORBIDDEN_HEADERS: [&str; 18] = [
     "authorization",
     "proxy-authorization",
     "cookie",
@@ -49,10 +50,6 @@ const FORBIDDEN_HEADERS: [&str; 22] = [
     "expect",
     "via",
     "forwarded",
-    "x-forwarded-host",
-    "x-forwarded-server",
-    "x-forwarded-proto",
-    "x-forwarded-port",
     "x-original-host",
 ];
 
@@ -322,6 +319,21 @@ fn allowed_name(name: &str) -> bool {
         && !FORBIDDEN_HEADERS
             .iter()
             .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+        && !has_ignored_prefix(name, FORWARDED_PREFIX)
+}
+
+/// The proxy headers a front end may honor to choose the target a credentialed
+/// request reaches. A reverse proxy can read any `X-Forwarded-*` field (Prefix,
+/// Uri, ...), so the family is reserved by prefix rather than by an enumeration
+/// that a new member would slip past.
+const FORWARDED_PREFIX: &str = "x-forwarded-";
+
+/// Case-insensitive prefix test for the header families the broker reserves by
+/// family: the proxy `x-forwarded-` fields and the connector's own
+/// `sec-websocket-` fields.
+fn has_ignored_prefix(name: &str, prefix: &str) -> bool {
+    name.len() >= prefix.len()
+        && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 /// The WebSocket connector's own handshake fields. `into_client_request` generates
@@ -331,8 +343,7 @@ fn allowed_name(name: &str) -> bool {
 const WS_HANDSHAKE_PREFIX: &str = "sec-websocket-";
 
 fn connector_owned_ws_name(name: &str) -> bool {
-    let prefix = WS_HANDSHAKE_PREFIX.as_bytes();
-    name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix)
+    has_ignored_prefix(name, WS_HANDSHAKE_PREFIX)
 }
 
 /// [`check_lowered_headers`] for a WebSocket head: the shared rule plus the
@@ -704,6 +715,31 @@ mod tests {
             "x-forwarded-proto",
             "x-forwarded-port",
             "x-original-host",
+        ] {
+            let mut request = lowered("/responses");
+            request
+                .headers
+                .push((name.to_string(), "attacker.example".to_string()));
+            assert_refused(&request, "attacker.example");
+
+            let mut named = with_account_header(lowered("/responses"));
+            named.credential.account_id_header = Some(name.to_string());
+            assert_refused(&named, name);
+        }
+    }
+
+    /// The proxy rule is a family, not the enumeration it grew from: a reverse proxy
+    /// may honor any `X-Forwarded-*` field to choose the target the credentialed
+    /// request reaches, so the whole `x-forwarded-` prefix is refused, in any case,
+    /// as a header and as the account-id placement.
+    #[test]
+    fn every_x_forwarded_field_is_refused_as_a_header_and_as_account_id_placement() {
+        for name in [
+            "x-forwarded-prefix",
+            "x-forwarded-uri",
+            "x-forwarded-for",
+            "X-Forwarded-Anything",
+            "X-FORWARDED-HOST",
         ] {
             let mut request = lowered("/responses");
             request

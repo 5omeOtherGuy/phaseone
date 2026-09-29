@@ -76,7 +76,9 @@ pub struct WsError(pub String);
   [donor, upstream], and — when the request has a cache key — `session-id: <key>` and
   `x-client-request-id: p1-<key>`. No `Content-Type`, no `Accept`. A head may not name any
   `Sec-WebSocket-*` field: the connector generates the key, version and extension fields
-  itself, so a guest value is refused as `Protocol` before the credential is read.
+  itself, so a guest value is refused as `Protocol` before the credential is read. The same
+  shared rule refuses every `X-Forwarded-*` proxy field (any case), which a front end may
+  trust to choose the credentialed target, as a head field or as the account-id placement.
 - A request is ONE text frame: the JSON body the SSE path would send, minus `stream` and
   `background`, plus `"type": "response.create"` at top level [donor; vendor: those fields are
   not used].

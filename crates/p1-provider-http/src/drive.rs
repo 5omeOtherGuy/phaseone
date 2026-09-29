@@ -418,19 +418,21 @@ async fn read_body(
             }
         }
         Raced::Done(Ok(Some(Ok(chunk)))) => {
-            let events = match decoder.try_push(&chunk) {
-                Ok(events) => events,
-                Err(_) => {
-                    return state.finish(Outcome::Failed(ProviderError::new(
-                        ProviderErrorKind::Protocol,
-                        "SSE payload exceeds decoder limit",
-                    )));
-                }
-            };
+            // A terminal event that completed before a limit violation in the same
+            // chunk still ends the stream; only an eventless over-limit tail is the
+            // failure. Splitting the bytes before the violation already succeeds, so
+            // one chunk must not behave differently.
+            let (events, limit) = decoder.try_push_partial(&chunk);
             if let Some(outcome) = feed(&mut state, parser.as_mut(), events) {
                 state.pending.push_back(StreamEvent::Finished(outcome));
                 state.phase = Phase::Done;
                 return state;
+            }
+            if limit.is_err() {
+                return state.finish(Outcome::Failed(ProviderError::new(
+                    ProviderErrorKind::Protocol,
+                    "SSE payload exceeds decoder limit",
+                )));
             }
             state.phase = Phase::Read {
                 parser,
@@ -1003,6 +1005,29 @@ mod tests {
                 matches!(terminal(&events), Outcome::Failed(error) if error.kind == ProviderErrorKind::Protocol)
             );
         }
+    }
+
+    /// A terminal event that completes before an over-limit line in the SAME chunk
+    /// must still finish the stream: splitting the bytes immediately after the
+    /// terminal event already succeeds and never reads the tail, so one chunk must
+    /// behave identically instead of failing the whole attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_event_before_an_over_limit_line_still_finishes() {
+        let mut chunk = b"data: done\n\n".to_vec();
+        chunk.extend_from_slice(&vec![b'x'; crate::sse::SSE_LINE_LIMIT + 2]);
+        let harness = Harness::new(vec![ScriptedResponse {
+            status: 200,
+            headers: vec![],
+            chunks: vec![chunk],
+            end: BodyEnd::Eof,
+        }]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        assert!(
+            matches!(terminal(&events), Outcome::Completed(_)),
+            "{events:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
