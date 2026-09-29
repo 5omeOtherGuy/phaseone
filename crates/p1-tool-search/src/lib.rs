@@ -162,7 +162,8 @@ impl Tool for GrepTool {
                     workspace
                         .credential_home()
                         .map(std::path::Path::to_path_buf),
-                );
+                )
+                .with_cancel(cancel.clone());
                 let host = NativeHost {
                     service,
                     runtime,

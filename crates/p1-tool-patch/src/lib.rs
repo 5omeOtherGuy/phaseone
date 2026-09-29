@@ -216,6 +216,19 @@ fn run(
     cancel: &CancellationToken,
 ) -> Result<String, PatchFailure> {
     let hunks = logic::parse_patch(text)?;
+    // Hold the shared write gate across planning and applying: the hunks are located by
+    // reading the files' current contents, so another agent's write must not land between
+    // that read and the write it produced (ADR-0032). The component reads outside the gate
+    // and is refused as stale instead, and the native tool's re-match is kept by planning
+    // under the gate. A call cancelled while it waits here mutates nothing.
+    let held = tokio::runtime::Handle::current().block_on(workspace.begin_owned(
+        observed,
+        &p1_workspace::ReadRecord::new(),
+        MutationPolicy::PatchAuthorized,
+    ));
+    if cancel.is_cancelled() {
+        return Err(PatchFailure::Cancelled);
+    }
     let mut read_snapshots = HashMap::new();
     let ops = logic::plan(
         &mut NativeFiles {
@@ -247,13 +260,8 @@ fn run(
         && canonical_missing_key(first)
             .is_some_and(|key| Some(key) == canonical_missing_key(second))
     {
-        // Keep the shared gate across both writes, so another participating
-        // writer cannot interleave between the frozen native operations.
-        let held = tokio::runtime::Handle::current().block_on(workspace.begin_owned(
-            observed,
-            &p1_workspace::ReadRecord::new(),
-            MutationPolicy::PatchAuthorized,
-        ));
+        // The shared gate is already held above, so another participating writer cannot
+        // interleave between the frozen native operations.
         for (path, contents, create) in [(first, one, true), (second, two, false)] {
             let requested = path.to_string_lossy();
             let result = if create {
@@ -287,8 +295,7 @@ fn run(
                 .map_or(change.clone(), |snapshot| change.computed_from(snapshot))
         })
         .collect::<Vec<_>>();
-    workspace
-        .commit(&changes, observed, MutationPolicy::PatchAuthorized)
+    held.apply_all_cancellable(&changes, cancel)
         .map_err(|error| PatchFailure::Message(native_commit_error(&ops, error)))?;
     Ok(logic::success_output(&ops))
 }
@@ -388,8 +395,10 @@ mod tests {
         CancellationToken, DeclarationKind, Effect, Grammar, Tool, ToolCall, ToolContext,
         ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
     };
-    use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace};
+    use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace, WriteGate};
+    use std::future::Future;
     use std::path::Path;
+    use std::task::{Context, Poll, Waker};
 
     fn tool(root: &Path) -> (PatchTool, ObservedFiles) {
         let observed = ObservedFiles::new();
@@ -1045,5 +1054,41 @@ mod tests {
 
         assert_eq!(outcome.status, ToolStatus::Cancelled);
         assert!(!dir.path().join("new.txt").exists());
+    }
+
+    /// A patch whose call is cancelled while it waits for the shared write gate must not
+    /// mutate: the native patch checks the token as soon as it holds the gate, before it
+    /// plans or writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_patch_cancelled_while_queued_on_the_gate_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "log.txt", "one\n");
+        let gate = WriteGate::new();
+        let workspace = Workspace::new(dir.path())
+            .unwrap()
+            .with_write_gate(gate.clone());
+        let tool = PatchTool::new(workspace, ObservedFiles::new());
+        let held = gate.begin_mutation();
+        let cancel = CancellationToken::new();
+        let call =
+            text_call("*** Begin Patch\n*** Update File: log.txt\n@@\n-one\n+two\n*** End Patch\n");
+        let mut future = tool.execute(
+            &call,
+            ToolContext {
+                cancel: cancel.clone(),
+            },
+        );
+        // Let the call pass its pre-work cancellation check and queue on the gate.
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        while gate.waiting_writers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+        drop(held);
+
+        let outcome = future.await;
+        assert_eq!(outcome.status, ToolStatus::Cancelled, "{outcome:?}");
+        assert_eq!(read(dir.path(), "log.txt"), "one\n");
     }
 }

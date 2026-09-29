@@ -180,7 +180,10 @@ the native tool (which plans under the gate) would re-match its context lines ag
 contents, whereas the component's change is refused as stale and the model applies the patch
 again. The frozen WIT also allows a component to `begin` before it reads, holding the gate
 across its reads as the native tools do; a tool that needs the native re-match may do that,
-at the cost of holding the gate while it computes.
+at the cost of holding the gate while it computes. The native `apply_patch` does exactly
+this: it takes the gate as an owned guard before planning, rechecks the call's cancellation
+token as soon as it holds the gate and again before applying, and applies its coalesced
+changes as one batch under that guard.
 
 ### Directory-relative operations
 

@@ -17,7 +17,7 @@ use p1_contracts::{
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_tool_write_logic::{self as logic, RawInput, WriteInput};
-use p1_workspace::{Change, MutationPolicy, ObservedFiles, Workspace};
+use p1_workspace::{Change, MutationError, MutationPolicy, ObservedFiles, Workspace};
 
 pub use p1_workspace::ToolFace;
 
@@ -199,9 +199,32 @@ fn run(
             MutationPolicy::Observed,
             cancel,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| native_mutation_error(workspace, &display, input, &error))?;
 
     Ok(logic::wrote(&display, input.content.len()))
+}
+
+/// The text for a mutation refusal, matching the component's read classification: an
+/// existing target that is not a regular file is reported as a failed read of that target
+/// (a directory as `Is a directory (os error 21)`, any other object as the typed
+/// `not a file` text), while a path whose parent is not a directory keeps the mutation's
+/// own text, `not a file: <request>`.
+fn native_mutation_error(
+    workspace: &Workspace,
+    display: &str,
+    input: &WriteInput,
+    error: &MutationError,
+) -> String {
+    match error {
+        MutationError::WrongKind { .. } => match workspace.stat(&input.file_path) {
+            Ok(stat) if stat.kind == p1_workspace::FileKind::Directory => {
+                logic::could_not_be_read(display, "Is a directory (os error 21)")
+            }
+            Ok(_) => logic::could_not_be_read(display, &format!("not a file: {}", input.file_path)),
+            Err(_) => error.to_string(),
+        },
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +283,38 @@ mod tests {
         assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.content);
         assert_eq!(std::fs::read(dir.path().join("link.txt")).unwrap(), b"new");
         assert!(!dir.path().join("missing.txt").exists());
+    }
+
+    /// The component reads an existing target before it mutates, so a directory target is a
+    /// failed read, not the mutation's `not a file` text. The native write classifies the same
+    /// way, so native and component keep the same model-visible message.
+    #[tokio::test]
+    async fn native_write_reports_a_directory_target_as_the_component_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"file_path":"sub","content":"x"}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert_eq!(
+            outcome.content,
+            "sub could not be read: Is a directory (os error 21)"
+        );
+    }
+
+    /// A path whose parent is a file is not a wrong-kind target the component read: it keeps
+    /// the typed `not a file` text.
+    #[tokio::test]
+    async fn native_write_keeps_the_not_a_file_text_for_a_file_used_as_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("d.txt"), "one\n").unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"file_path":"d.txt/x","content":"x"}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert_eq!(outcome.content, "not a file: d.txt/x");
     }
 
     #[test]

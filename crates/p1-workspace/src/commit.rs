@@ -234,6 +234,22 @@ impl OwnedMutation {
         self.single(Change::rename(old_path, new_path))
     }
 
+    /// Apply `changes` as one batch under the gate this mutation already holds, staging
+    /// every replacement before any rename, exactly as [`Workspace::commit`] does. The
+    /// caller is a native tool that plans its changes while the gate is held (the native
+    /// patch, whose hunks are located by reading the current files), so no second
+    /// acquisition of the gate is possible here; `cancel` is rechecked after staging and
+    /// before the first rename, so a call cancelled while staging mutates nothing.
+    pub fn apply_all_cancellable(
+        &self,
+        changes: &[Change],
+        cancel: &CancellationToken,
+    ) -> Result<(), MutationError> {
+        let plan = self.workspace.plan(changes)?;
+        self.workspace
+            .apply_with_cancel(&plan, &self.observed, self.policy, Some(cancel))
+    }
+
     fn single(&self, change: Change) -> Result<(), MutationError> {
         let (change, read) = self.read_identity(change)?;
         let plan = self.workspace.plan(std::slice::from_ref(&change))?;
@@ -1694,13 +1710,26 @@ mod tests {
                 )
             })
         };
-        while workspace.write_gate().sync_waiters() == 0 {
+        while workspace.write_gate().waiting_writers() == 0 {
             std::thread::yield_now();
         }
         cancel.cancel();
         drop(held);
         assert_eq!(worker.join().unwrap(), Err(io("cancelled")));
         assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_cancelled_batch_under_a_held_gate_mutates_nothing() {
+        let (dir, workspace) = workspace(&[("a", "old")]);
+        let observed = ObservedFiles::new();
+        let cancel = p1_contracts::CancellationToken::new();
+        cancel.cancel();
+        let held = ready(workspace.begin_owned(&observed, &ReadRecord::new(), PATCH));
+        let result = held.apply_all_cancellable(&[Change::write("a", b"new")], &cancel);
+        assert_eq!(result, Err(io("cancelled")));
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"old");
+        no_temporaries(dir.path());
     }
 
     #[test]
@@ -2411,7 +2440,7 @@ mod tests {
                 committed.store(true, Ordering::SeqCst);
             })
         };
-        while workspace.write_gate().sync_waiters() == 0 {
+        while workspace.write_gate().waiting_writers() == 0 {
             std::thread::yield_now();
         }
         assert!(!committed.load(Ordering::SeqCst));

@@ -157,6 +157,8 @@ Regex search honouring `.gitignore` (ripgrep library crates, as the donor). `mod
 for a match and `<line>-<text>` for a context line, blocks separated by a blank line, files in
 bytewise path order. `mode:"files"`: matching file paths only; with `pattern:""` and a `glob`
 it lists files by glob. No matches → Ok, `No matches.` Invalid regex → error.
+Native calls cancel a running walk when the call's cancellation token is cancelled, not only
+when the returned future is dropped.
 **Bounding (research #36).** A result over the shared output bound is cut by `grep` itself, never
 mid-block: whole file blocks (in `files` mode: whole paths) are kept while they fit, and the
 footer says what is missing and how to get it:

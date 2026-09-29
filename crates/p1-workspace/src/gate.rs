@@ -114,10 +114,12 @@ impl WriteGate {
         }
     }
 
-    /// How many synchronous callers are parked waiting for the gate right now.
-    #[cfg(test)]
-    pub(crate) fn sync_waiters(&self) -> usize {
-        self.gate.lock().sync_waiters
+    /// How many callers are parked waiting for the gate right now, synchronous and
+    /// owned. Read-only observability, chiefly for tests that need to know a waiter is
+    /// queued without sleeping.
+    pub fn waiting_writers(&self) -> usize {
+        let state = self.gate.lock();
+        state.sync_waiters + state.wakers.len()
     }
 }
 
@@ -222,7 +224,7 @@ mod tests {
         };
         // Explicit synchronization instead of a sleep: the waiter counts itself under
         // the state lock before it parks, and sets `entered` only once it holds the gate.
-        while gate.sync_waiters() == 0 {
+        while gate.waiting_writers() == 0 {
             std::thread::yield_now();
         }
         assert!(!entered.load(Ordering::SeqCst));

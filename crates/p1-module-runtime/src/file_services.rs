@@ -292,8 +292,14 @@ pub struct SearchCapability {
     home: Option<PathBuf>,
     xdg_credentials: Vec<PathBuf>,
     index: IndexCache,
+    /// The calling tool's cancellation token, when a native caller wired one in. The
+    /// blocking operations make a child token of it, so cancelling the call stops a walk
+    /// that is already running, not only dropping its future.
+    cancel: Option<CancellationToken>,
     #[cfg(test)]
     after_index: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    before_search: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// The protected-index cache of one search capability. A call captures a request-scoped index;
@@ -324,22 +330,38 @@ impl SearchCapability {
             home,
             xdg_credentials: xdg_credentials(),
             index: IndexCache::new(),
+            cancel: None,
             #[cfg(test)]
             after_index: None,
+            #[cfg(test)]
+            before_search: None,
         }
+    }
+
+    /// Wire the calling tool's cancellation token in: every blocking operation's own token
+    /// becomes its child, so cancelling the call stops the work (the native `grep` passes the
+    /// context token here). The component's service keeps its drop-token only.
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// Runs `work` on a blocking thread: the walk and the reads are synchronous and must never
     /// hold the async thread, as in the native tool. `work` gets a token that is cancelled when
     /// the returned future is dropped — the runtime drops it as soon as the call is cancelled —
-    /// so the walk stops at the next file instead of running on unobserved.
+    /// and that is also a child of the caller's token when one was wired in, so the walk stops
+    /// at the next file instead of running on unobserved.
     fn blocking<T: Send + 'static>(
         &self,
         work: impl FnOnce(&Workspace, &CancellationToken) -> Result<T, FsError> + Send + 'static,
     ) -> BoxFuture<'_, Result<T, FsError>> {
         let workspace = self.workspace.clone();
+        let parent = self.cancel.clone();
         Box::pin(async move {
-            let cancel = CancellationToken::new();
+            let cancel = match parent {
+                Some(parent) => parent.child_token(),
+                None => CancellationToken::new(),
+            };
             let _stop_on_drop = cancel.clone().drop_guard();
             tokio::task::spawn_blocking(move || work(&workspace, &cancel))
                 .await
@@ -553,9 +575,15 @@ impl WorkspaceService for SearchCapability {
         let home = self.home.clone();
         let xdg_credentials = self.xdg_credentials.clone();
         let cache = self.index.clone();
+        #[cfg(test)]
+        let before_search = self.before_search.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
             cached_index(&cache, &credential_policy, cancel)?;
+            #[cfg(test)]
+            if let Some(before_search) = before_search {
+                before_search();
+            }
             if let Some(path) = query.path.as_deref() {
                 credential_policy
                     .refuse(workspace, path)
@@ -1331,6 +1359,33 @@ mod tests {
         assert_eq!(result, Err(FsError::Cancelled));
     }
 
+    /// The native `grep` wires its call's cancellation token into the capability: cancelling
+    /// the call while a walk is running stops it, rather than only dropping a future the
+    /// native `block_on` keeps alive.
+    #[tokio::test]
+    async fn cancelling_the_calling_tool_stops_a_capability_search() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let mut capability = SearchCapability::new(Workspace::new(dir.path()).unwrap(), None);
+        capability.before_search = Some(Arc::new(move || trigger.cancel()));
+        let capability = capability.with_cancel(cancel.clone());
+
+        let result = capability
+            .search(SearchQuery {
+                pattern: "needle".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await;
+
+        assert_eq!(result, Err(FsError::Cancelled));
+    }
+
     #[tokio::test]
     async fn search_capability_refuses_credentials_in_every_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -1346,7 +1401,9 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
             xdg_credentials: vec![],
             index: super::IndexCache::new(),
+            cancel: None,
             after_index: None,
+            before_search: None,
         };
 
         assert_eq!(
