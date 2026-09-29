@@ -45,15 +45,20 @@ const MAX_OPEN_SNAPSHOTS: usize = 4;
 /// Matches the component's per-read budget; host allocation is bounded independently.
 const MAX_COMPONENT_READ_BYTES: u64 = 8 * 1024 * 1024;
 
-fn protected_index_current(index: &ProtectedIndex, cancel: &CancellationToken) -> bool {
+fn protected_index_current(
+    index: &ProtectedIndex,
+    cancel: &CancellationToken,
+) -> Result<bool, FsError> {
     #[cfg(unix)]
     {
-        index.still_current(cancel).unwrap_or(false)
+        index
+            .still_current(cancel)
+            .map_err(|IndexCancelled| FsError::Cancelled)
     }
     #[cfg(not(unix))]
     {
         let _ = (index, cancel);
-        true
+        Ok(true)
     }
 }
 
@@ -75,7 +80,7 @@ fn search_opened_excluded(
     candidate: &Path,
     file: &std::fs::File,
 ) -> Result<bool, FsError> {
-    if !protected_index_current(index, cancel) {
+    if !protected_index_current(index, cancel)? {
         return Err(stale_index_error());
     }
     let current = CredentialPolicy::new(home, xdg_credentials);
@@ -201,7 +206,7 @@ impl Inner {
         let metadata = file.metadata().map_err(|_| refused())?;
         if policy.refuses(&opened_path)
             || index.refuses_current_exact(policy, &metadata)
-            || !protected_index_current(index, cancel)
+            || !protected_index_current(index, cancel)?
         {
             return Err(refused());
         }
@@ -1155,6 +1160,25 @@ mod tests {
         assert!(
             matches!(outcome, Err(FsError::Io(message)) if message.contains("changed during the search"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_index_freshness_check_reports_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CredentialPolicy::new(Some(dir.path()), &[]);
+        let build_cancel = CancellationToken::new();
+        let index = ProtectedIndex::build(&policy, &build_cancel).unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "public").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // A cancelled call must surface as `Cancelled`, not as the stale-index I/O error: the
+        // walk stops instead of reporting a directory change that did not happen.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome =
+            super::search_opened_excluded(&index, Some(dir.path()), &[], &cancel, &path, &file);
+        assert!(matches!(outcome, Err(FsError::Cancelled)));
     }
 
     #[tokio::test]

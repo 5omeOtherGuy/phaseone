@@ -918,9 +918,13 @@ fn unquoted_text(command: &str) -> String {
         if escaped {
             // The shell removes the backslash and the character loses its special meaning.
             // Emit it when it is outside quotes, so an escaped name (`b\ash`) is still read
-            // as the word the shell looks up; inside quotes the whole word stays blanked.
+            // as the word the shell looks up; inside quotes the whole word stays blanked. A
+            // backslash-newline is a line continuation: the shell removes both and joins the
+            // words, so dropping the newline keeps `b\<newline>ash` the word `bash`.
             if quote.is_none() {
-                out.push(character);
+                if character != '\n' {
+                    out.push(character);
+                }
             } else {
                 out.push(' ');
             }
@@ -946,8 +950,10 @@ fn unquoted_text(command: &str) -> String {
                     out.push(' ');
                 }
                 '\\' => {
+                    // The escaped character is emitted by the branch above; the backslash
+                    // itself emits nothing, so `b\ash` stays one word (`bash`) and is not
+                    // split by the word scan.
                     escaped = true;
-                    out.push(' ');
                 }
                 _ => out.push(character),
             },
@@ -1094,7 +1100,9 @@ fn is_interpreter(word: &str) -> bool {
 }
 
 /// Commands that run another command named later in the same segment, so that later word is
-/// still a command position: `sudo`, `env`, `timeout`, `xargs` and their kin.
+/// still a command position: `sudo`, `env`, `timeout`, `xargs` and their kin. `builtin`
+/// belongs here too: `builtin eval '…'` and `builtin source …` run the named builtin, which
+/// can execute the quoted body and mask the check's status.
 fn is_wrapper(word: &str) -> bool {
     matches!(
         word.rsplit('/').next().unwrap_or_default(),
@@ -1103,6 +1111,7 @@ fn is_wrapper(word: &str) -> bool {
             | "env"
             | "exec"
             | "command"
+            | "builtin"
             | "nohup"
             | "nice"
             | "ionice"
@@ -1495,6 +1504,8 @@ mod tests {
         // does not open a span either, so the interpreter after it is still seen.
         for command in [
             "b\\ash -c 'cargo test; true'",
+            // A backslash-newline joins the words, so the shell still runs `bash`.
+            "b\\\nash -c 'cargo test; true'",
             "ba\\sh -c 'cargo test; true'",
             "\\bash -c 'cargo test; true'",
             "sud\\o b\\ash -c 'cargo test; true'",
@@ -1514,6 +1525,27 @@ mod tests {
         }
         // The escaped quote is a literal, so the `;` after it still masks the status.
         assert!(is_masked("cargo test \\' ; echo done"));
+    }
+
+    #[test]
+    fn builtin_dispatched_interpreters_are_unprovable() {
+        // `builtin` runs a shell builtin named by its next word; `builtin eval '…'` (and
+        // `builtin source …`) runs a quoted body and returns its status, so a failing check
+        // can still record zero. The dispatcher must be treated as a wrapper.
+        for command in [
+            "builtin eval 'cargo test; true'",
+            "cd w && builtin eval 'cargo test; true'",
+            "sudo builtin eval 'cargo test; true'",
+            "builtin source script.sh",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+        // A builtin that runs the check itself keeps the check's own status.
+        assert!(!is_unprovable("builtin cd work"));
     }
 
     #[test]
