@@ -18,14 +18,15 @@ sources it, so a stray command in it cannot run.
 | `RUST_MIN` | `1.96.0` | the oldest Rust that builds the host runtime and the guests: the `rust-version` of wasmtime 49 | `rustc -V`: an older compiler fails the check |
 | `WASM_TARGET` | `wasm32-unknown-unknown` | the guest target (D-XO-4 on S0-Q9, below) | the target's std in the rustc sysroot |
 | `WASMTIME` | `49.0.1` | the host runtime | the root `Cargo.lock` |
-| `WASMTIME_FEATURES` | `runtime,cranelift,component-model,async,std` | wasmtime's features, as a set, with default features off | the `wasmtime` dependency of [`crates/p1-module-runtime/Cargo.toml`](../../../crates/p1-module-runtime/Cargo.toml) |
+| `WASMTIME_FEATURES` | `runtime,cranelift,component-model,async,std,parallel-compilation` | wasmtime's features, as a set, with default features off | the `wasmtime` dependency of [`crates/p1-module-runtime/Cargo.toml`](../../../crates/p1-module-runtime/Cargo.toml) |
 | `WIT_BINDGEN` | `0.62.0` | the guest-side bindings generator | [`modules/Cargo.lock`](../../../modules/Cargo.lock) |
 | `WASM_TOOLS` | `1.259.0` | the build tool that componentizes, extracts worlds and validates | `wasm-tools --version` on `PATH` |
 
 The wasmtime feature set is the bounded dependency set of the owner's answer Q7. It leaves out
 `cache`, so no compiled component is ever read back from a cache the loader did not verify, and
 `wat` and WASI, so modules arrive as binary components and get only p1's own imports
-([`package.md`](package.md#the-loader-freeze-item-6)). `wit-bindgen` is built with `macros`,
+([`package.md`](package.md#the-loader-freeze-item-6)). `parallel-compilation` compiles a component's functions on several
+threads (rayon); it changes neither what is compiled nor what is trusted. `wit-bindgen` is built with `macros`,
 `realloc` and `std` only ([`modules/Cargo.toml`](../../../modules/Cargo.toml) says why each).
 
 `scripts/module-toolchain.sh --check` prints one `key: value` line per pin with its result, a
