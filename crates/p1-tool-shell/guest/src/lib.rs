@@ -9,8 +9,8 @@
 //! process service's, and reaches this crate only as bytes and an [`End`].
 //!
 //! Pure computation (programme decision D-XO-8): no filesystem, process, clock or
-//! environment access, and no dependency beyond `serde`, `serde_json`, `regex` and `toml`
-//! (the vendored declarative filters are embedded at compile time), so the
+//! environment access, and no dependency beyond `serde`, `serde_json` and `regex` (the
+//! vendored declarative filters are JSON embedded at compile time), so the
 //! same source builds for the host and for `wasm32-unknown-unknown`. Contract values are this
 //! crate's own small types; each host converts them to its wire or `p1_contracts` form.
 #![forbid(unsafe_code)]
@@ -26,7 +26,7 @@ use serde::Deserialize;
 /// The model-facing name of the default face.
 pub const NAME: &str = "shell";
 /// The model-facing description of the default face.
-pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test, and the tool classes of the built-in TOML filters such as `shellcheck`, `npm install`, `make` and `terraform plan`) is summarised unless `raw: true` is passed.";
+pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test, and the tool classes of the built-in declarative filters such as `make`, `helm`, `terraform plan` and `uv sync`) is summarised unless `raw: true` is passed.";
 /// The paragraph the model reads when the host turned the sandbox on (ADR-0035: the
 /// description says what the boundary is). It belongs to the side that assembled the
 /// sandbox: a tool running over the process service cannot know whether it is sandboxed, so

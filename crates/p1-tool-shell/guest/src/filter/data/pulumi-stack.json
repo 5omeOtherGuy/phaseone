@@ -1,0 +1,39 @@
+{
+  "filters": {
+    "pulumi-stack": {
+      "description": "Compact Pulumi stack (ls/output) output",
+      "match_command": "^pulumi\\s+stack(\\s+(ls|output|history|select|init|rm|rename|tag|unselect|change-secrets-provider)\\b|\\s*$)",
+      "strip_ansi": true,
+      "match_output": [
+        {
+          "pattern": "No stacks found",
+          "message": "pulumi stack: empty",
+          "unless": "(?i)\\berror\\b|\\bfail(ed|ure)?\\b|fatal|panic"
+        }
+      ],
+      "strip_lines_matching": [
+        "^\\s*$",
+        "^Please choose a stack",
+        "^More information at:",
+        "^Use `pulumi ",
+        "^Current stack outputs \\(0\\):",
+        "^\\s+No output values currently"
+      ],
+      "on_empty": "pulumi stack: ok"
+    }
+  },
+  "tests": {
+    "pulumi-stack": [
+      {
+        "name": "no stacks short-circuits",
+        "input": "No stacks found in the current workspace.\n",
+        "expected": "pulumi stack: empty"
+      },
+      {
+        "name": "keeps stack identity, strips prompt noise",
+        "input": "Please choose a stack, or create a new one:\nCurrent stack is dev:\n    Managed by my-user\n    Owner: my-org\n    Last updated: 2 hours ago\n    Pulumi version used: v3.120.0\n\nCurrent stack resources (3):\n    TYPE                          NAME\n    pulumi:pulumi:Stack           my-proj-dev\n    aws:s3:Bucket                 my-bucket\n    aws:iam:Role                  my-role\n",
+        "expected": "Current stack is dev:\n    Managed by my-user\n    Owner: my-org\n    Last updated: 2 hours ago\n    Pulumi version used: v3.120.0\nCurrent stack resources (3):\n    TYPE                          NAME\n    pulumi:pulumi:Stack           my-proj-dev\n    aws:s3:Bucket                 my-bucket\n    aws:iam:Role                  my-role"
+      }
+    ]
+  }
+}

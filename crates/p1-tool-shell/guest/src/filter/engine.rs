@@ -1,8 +1,10 @@
 //! Data-driven output-filter pipeline, ported from the donor `iris-agent`
 //! `src/tools/bash/filter/engine.rs` (design and schema from RTK,
-//! rtk-ai/rtk, Apache-2.0 -- see `data/NOTICE.md`).
+//! rtk-ai/rtk, Apache-2.0 -- see `data/NOTICE.md`). The donor's TOML files
+//! are carried as one-off JSON conversions so the guest keeps its three
+//! dependencies (ADR-0081, D-XO-8).
 //!
-//! A filter is a TOML-defined pipeline of eight ordered stages:
+//! A filter is a data-defined pipeline of eight ordered stages:
 //!
 //!   1. `strip_ansi`         -- remove ANSI escape codes
 //!   2. `replace`            -- regex substitutions, line-by-line, chainable
@@ -24,7 +26,7 @@
 //!   message (8) are disabled on non-zero exit, so a failed command's
 //!   diagnostics survive verbatim;
 //! - a filter that fails to compile is dropped (never a panic), and a file that
-//!   fails to parse disables TOML filtering entirely.
+//!   fails to parse costs only its own filters.
 
 use std::collections::BTreeMap;
 
@@ -37,9 +39,11 @@ use super::strip_ansi;
 /// filter file asks for. Precise on purpose: it targets error/failure
 /// *signals* (compiler `error:`/`error[`, test `FAILED`, panics, `fatal:`,
 /// tracebacks), not any line containing the word "error", so summary chatter
-/// like "1 error generated." stays strippable.
+/// like "1 error generated." stays strippable. `: *** ` is make's fatal-error
+/// mark (`make[1]: *** [all] Error 2`), which a recursive-make strip of
+/// `^make\[\d+\]:` would otherwise drop.
 const ERROR_GUARD_PATTERN: &str = concat!(
-    r"error(:|\[)|Error:|\bERROR\b|\bFAILED\b|\bFAIL\b|\bfailures?:",
+    r"error(:|\[)|Error:|\bERROR\b|\bFAILED\b|\bFAIL\b|\bfailures?:|: \*\*\* ",
     r"|panicked at|panic:|\bfatal(:| error)|Traceback \(most recent call",
     r"|Segmentation fault|assertion .*failed|✗|✕"
 );
@@ -50,7 +54,7 @@ fn error_guard() -> &'static Regex {
 }
 
 // ---------------------------------------------------------------------------
-// TOML schema (deserialization types)
+// Data-file schema (deserialization types)
 // ---------------------------------------------------------------------------
 
 /// Short-circuit rule: if `pattern` matches the whole output blob, return
@@ -73,7 +77,7 @@ struct ReplaceRule {
     replacement: String,
 }
 
-/// Inline test case attached to a filter (`[[tests.<name>]]`), run by the unit
+/// Inline test case attached to a filter (`tests.<name>[]`), run by the unit
 /// tests in `data.rs`; a release build parses and ignores these sections.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,8 +102,8 @@ impl FilterFile {
 #[derive(Deserialize)]
 pub(super) struct FilterFile {
     /// The donor's build script prepended this to the concatenated blob; the
-    /// per-file embedding here defaults to the same value and still rejects a
-    /// file that states a different one.
+    /// per-file data here defaults to the same value and still rejects a file
+    /// that states a different one.
     #[serde(default = "schema_version_1")]
     schema_version: u32,
     #[serde(default)]
@@ -187,7 +191,7 @@ impl CompiledFilter {
     }
 }
 
-/// Parse a TOML blob and compile every filter in it. A filter that fails to
+/// Parse a JSON filter file and compile every filter in it. A filter that fails to
 /// compile is dropped (fail-safe: the command passes through unfiltered); a
 /// blob that fails to parse is an error for the caller.
 pub(super) fn parse_and_compile(
@@ -195,7 +199,7 @@ pub(super) fn parse_and_compile(
     source: &str,
 ) -> Result<Vec<CompiledFilter>, String> {
     let file: FilterFile =
-        toml::from_str(content).map_err(|e| format!("TOML parse error in {source}: {e}"))?;
+        serde_json::from_str(content).map_err(|e| format!("parse error in {source}: {e}"))?;
     if file.schema_version != 1 {
         return Err(format!(
             "unsupported schema_version {} in {source} (expected 1)",
@@ -214,10 +218,10 @@ pub(super) fn parse_and_compile(
     Ok(compiled)
 }
 
-/// Parse a TOML blob without compiling (for the inline-test runner).
+/// Parse a JSON filter file without compiling (for the inline-test runner).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn parse_file(content: &str) -> Result<FilterFile, String> {
-    let file: FilterFile = toml::from_str(content).map_err(|e| e.to_string())?;
+    let file: FilterFile = serde_json::from_str(content).map_err(|e| e.to_string())?;
     if file.schema_version != 1 {
         return Err(format!(
             "unsupported schema_version {}",
@@ -413,27 +417,38 @@ pub(super) fn apply_filter(filter: &CompiledFilter, output: &str, exit_ok: bool)
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
 
-    fn make_filters(toml: &str) -> Vec<CompiledFilter> {
-        parse_and_compile(toml, "test").expect("test TOML should be valid")
+    /// A one-filter file named `f`, matching `^cmd`, with `keys` added.
+    fn file(keys: Value) -> String {
+        let mut def = json!({ "match_command": "^cmd" });
+        def.as_object_mut()
+            .unwrap()
+            .extend(keys.as_object().unwrap().clone());
+        json!({ "schema_version": 1, "filters": { "f": def } }).to_string()
     }
 
-    fn first_filter(toml: &str) -> CompiledFilter {
-        make_filters(toml)
+    fn make_filters(content: &str) -> Vec<CompiledFilter> {
+        parse_and_compile(content, "test").expect("test file should be valid")
+    }
+
+    fn first_filter(keys: Value) -> CompiledFilter {
+        make_filters(&file(keys))
             .into_iter()
             .next()
             .expect("expected at least one filter")
     }
 
-    fn apply(toml: &str, input: &str) -> String {
-        apply_filter(&first_filter(toml), input, true)
+    fn apply(keys: Value, input: &str) -> String {
+        apply_filter(&first_filter(keys), input, true)
     }
 
     #[test]
     fn strip_ansi_removes_codes() {
         let out = apply(
-            "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nstrip_ansi = true\n",
+            json!({ "strip_ansi": true }),
             "\x1b[31mError\x1b[0m\nnormal",
         );
         assert_eq!(out, "Error\nnormal");
@@ -441,53 +456,33 @@ mod tests {
 
     #[test]
     fn replace_rules_chain_sequentially() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-replace = [
-  { pattern = "foo", replacement = "bar" },
-  { pattern = "bar", replacement = "baz" },
-]
-"#;
-        assert_eq!(apply(toml, "foo"), "baz");
+        let keys = json!({ "replace": [
+            { "pattern": "foo", "replacement": "bar" },
+            { "pattern": "bar", "replacement": "baz" },
+        ] });
+        assert_eq!(apply(keys, "foo"), "baz");
     }
 
     #[test]
     fn strip_lines_matching_basic() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-strip_lines_matching = ["^noise", "^verbose"]
-"#;
+        let keys = json!({ "strip_lines_matching": ["^noise", "^verbose"] });
         assert_eq!(
-            apply(toml, "noise line\nkeep this\nverbose stuff\nalso keep"),
+            apply(keys, "noise line\nkeep this\nverbose stuff\nalso keep"),
             "keep this\nalso keep"
         );
     }
 
     #[test]
     fn keep_lines_matching_basic() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-keep_lines_matching = ["^PASS"]
-"#;
-        assert_eq!(apply(toml, "PASS a\nnoise\nPASS b"), "PASS a\nPASS b");
+        let keys = json!({ "keep_lines_matching": ["^PASS"] });
+        assert_eq!(apply(keys, "PASS a\nnoise\nPASS b"), "PASS a\nPASS b");
     }
 
     #[test]
     fn strip_never_removes_error_lines() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-strip_lines_matching = [".*"]
-"#;
+        let keys = json!({ "strip_lines_matching": [".*"] });
         let input = "chatter\nerror[E0308]: mismatched types\nsrc/x.rs:3:5: error: boom\ntest foo ... FAILED\nthread 'x' panicked at src/lib.rs:9:5\nmore chatter";
-        let out = apply(toml, input);
+        let out = apply(keys, input);
         assert!(out.contains("error[E0308]: mismatched types"), "{out}");
         assert!(out.contains("error: boom"), "{out}");
         assert!(out.contains("test foo ... FAILED"), "{out}");
@@ -496,67 +491,56 @@ strip_lines_matching = [".*"]
     }
 
     #[test]
+    fn strip_never_removes_recursive_make_errors() {
+        // The vendored make filter strips `^make\[\d+\]:` directory chatter;
+        // a failing sub-make's `*** ... Error 2` line must survive it.
+        let keys = json!({ "strip_lines_matching": ["^make\\[\\d+\\]:", "^\\s*$"] });
+        let input = "make[1]: Entering directory '/w/sub'\ngcc foo.c\nmake[1]: *** [Makefile:10: all] Error 2\nmake[1]: Leaving directory '/w/sub'\nmake: *** [Makefile:5: subdir] Error 2";
+        let f = first_filter(keys);
+        let expected = "gcc foo.c\nmake[1]: *** [Makefile:10: all] Error 2\nmake: *** [Makefile:5: subdir] Error 2";
+        assert_eq!(apply_filter(&f, input, false), expected);
+        assert_eq!(apply_filter(&f, input, true), expected);
+    }
+
+    #[test]
     fn keep_always_retains_error_lines() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-keep_lines_matching = ["^PASS"]
-"#;
-        let out = apply(toml, "PASS a\nfatal: repository not found\nnoise");
+        let keys = json!({ "keep_lines_matching": ["^PASS"] });
+        let out = apply(keys, "PASS a\nfatal: repository not found\nnoise");
         assert_eq!(out, "PASS a\nfatal: repository not found");
     }
 
     #[test]
     fn error_guard_does_not_shield_redundant_count_lines() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-strip_lines_matching = ["^\\d+ errors? generated"]
-"#;
-        let out = apply(toml, "main.c:1:1: error: boom\n1 error generated.");
+        let keys = json!({ "strip_lines_matching": ["^\\d+ errors? generated"] });
+        let out = apply(keys, "main.c:1:1: error: boom\n1 error generated.");
         assert_eq!(out, "main.c:1:1: error: boom");
+    }
+
+    fn build_complete_rule() -> Value {
+        json!({ "match_output": [
+            { "pattern": "Build complete", "message": "ok", "unless": "error:" },
+        ] })
     }
 
     #[test]
     fn match_output_short_circuits_on_success() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-match_output = [
-  { pattern = "Build complete", message = "ok", unless = "error:" },
-]
-"#;
-        assert_eq!(apply(toml, "stuff\nBuild complete!\n"), "ok");
+        assert_eq!(
+            apply(build_complete_rule(), "stuff\nBuild complete!\n"),
+            "ok"
+        );
     }
 
     #[test]
     fn match_output_unless_guard_blocks_short_circuit() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-match_output = [
-  { pattern = "Build complete", message = "ok", unless = "error:" },
-]
-"#;
         let input = "warning stuff\nerror: bad thing\nBuild complete!";
-        assert_eq!(apply(toml, input), input);
+        assert_eq!(apply(build_complete_rule(), input), input);
     }
 
     #[test]
     fn match_output_skipped_on_nonzero_exit() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-match_output = [
-  { pattern = "done", message = "ok", unless = "error:" },
-]
-"#;
-        let f = first_filter(toml);
+        let f = first_filter(json!({ "match_output": [
+            { "pattern": "done", "message": "ok", "unless": "error:" },
+        ] }));
         assert_eq!(
             apply_filter(&f, "done (but exit 1)", false),
             "done (but exit 1)"
@@ -566,45 +550,39 @@ match_output = [
 
     #[test]
     fn match_output_first_rule_wins() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-match_output = [
-  { pattern = "alpha", message = "first", unless = "error:" },
-  { pattern = "beta", message = "second", unless = "error:" },
-]
-"#;
-        assert_eq!(apply(toml, "alpha beta"), "first");
+        let keys = json!({ "match_output": [
+            { "pattern": "alpha", "message": "first", "unless": "error:" },
+            { "pattern": "beta", "message": "second", "unless": "error:" },
+        ] });
+        assert_eq!(apply(keys, "alpha beta"), "first");
     }
 
     #[test]
     fn truncate_lines_at_is_unicode_safe() {
-        let toml =
-            "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\ntruncate_lines_at = 5\n";
-        assert_eq!(apply(toml, "hello\n日本語xyz"), "hello\n日本...");
+        let keys = json!({ "truncate_lines_at": 5 });
+        assert_eq!(apply(keys, "hello\n日本語xyz"), "hello\n日本...");
     }
 
     #[test]
     fn head_lines_keeps_prefix_with_marker() {
-        let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nhead_lines = 2\n";
-        let out = apply(toml, "a\nb\nc\nd\ne");
+        let out = apply(json!({ "head_lines": 2 }), "a\nb\nc\nd\ne");
         assert!(out.starts_with("a\nb\n"));
         assert!(out.contains("3 lines omitted"));
     }
 
     #[test]
     fn tail_lines_keeps_suffix_with_marker() {
-        let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\ntail_lines = 2\n";
-        let out = apply(toml, "a\nb\nc\nd\ne");
+        let out = apply(json!({ "tail_lines": 2 }), "a\nb\nc\nd\ne");
         assert!(out.contains("3 lines omitted"));
         assert!(out.ends_with("d\ne"));
     }
 
     #[test]
     fn head_and_tail_combined() {
-        let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nhead_lines = 2\ntail_lines = 2\n";
-        let out = apply(toml, "a\nb\nc\nd\ne\nf");
+        let out = apply(
+            json!({ "head_lines": 2, "tail_lines": 2 }),
+            "a\nb\nc\nd\ne\nf",
+        );
         assert!(out.starts_with("a\nb\n"));
         assert!(out.contains("2 lines omitted"));
         assert!(out.ends_with("e\nf"));
@@ -612,60 +590,33 @@ match_output = [
 
     #[test]
     fn max_lines_caps_with_marker() {
-        let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nmax_lines = 3\n";
-        let out = apply(toml, "a\nb\nc\nd\ne");
+        let out = apply(json!({ "max_lines": 3 }), "a\nb\nc\nd\ne");
         assert_eq!(out.lines().count(), 4); // 3 kept + marker
         assert!(out.contains("lines truncated"));
     }
 
     #[test]
     fn on_empty_fires_when_everything_stripped() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-strip_lines_matching = ["^noise"]
-on_empty = "nothing left"
-"#;
-        assert_eq!(apply(toml, "noise a\nnoise b"), "nothing left");
+        let keys = json!({ "strip_lines_matching": ["^noise"], "on_empty": "nothing left" });
+        assert_eq!(apply(keys, "noise a\nnoise b"), "nothing left");
     }
 
     #[test]
     fn on_empty_not_triggered_when_output_remains() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-keep_lines_matching = ["keep"]
-on_empty = "nothing left"
-"#;
-        assert_eq!(apply(toml, "keep this\nnoise"), "keep this");
+        let keys = json!({ "keep_lines_matching": ["keep"], "on_empty": "nothing left" });
+        assert_eq!(apply(keys, "keep this\nnoise"), "keep this");
     }
 
     #[test]
     fn size_caps_skip_lossy_stages_on_failure() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-truncate_lines_at = 4
-max_lines = 2
-"#;
-        let f = first_filter(toml);
+        let f = first_filter(json!({ "truncate_lines_at": 4, "max_lines": 2 }));
         let input = "aaaaaaaa\nbbbbbbbb\ncccccccc\nerror: boom past the cap";
         assert_eq!(apply_filter(&f, input, false), input);
     }
 
     #[test]
     fn size_caps_apply_on_success() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-truncate_lines_at = 4
-max_lines = 2
-"#;
-        let f = first_filter(toml);
+        let f = first_filter(json!({ "truncate_lines_at": 4, "max_lines": 2 }));
         let input = "aaaaaaaa\nbbbbbbbb\ncccccccc\ndddddddd";
         assert_eq!(
             apply_filter(&f, input, true),
@@ -675,14 +626,10 @@ max_lines = 2
 
     #[test]
     fn on_empty_skipped_on_failure() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-strip_lines_matching = ["^noise"]
-on_empty = "ok (nothing left)"
-"#;
-        let f = first_filter(toml);
+        let f = first_filter(json!({
+            "strip_lines_matching": ["^noise"],
+            "on_empty": "ok (nothing left)",
+        }));
         assert_eq!(apply_filter(&f, "noise a\nnoise b", false), "");
         assert_eq!(
             apply_filter(&f, "noise a\nnoise b", true),
@@ -692,20 +639,17 @@ on_empty = "ok (nothing left)"
 
     #[test]
     fn full_pipeline_order() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-strip_ansi = true
-strip_lines_matching = ["^noise"]
-truncate_lines_at = 10
-head_lines = 3
-max_lines = 4
-on_empty = "empty"
-"#;
+        let keys = json!({
+            "strip_ansi": true,
+            "strip_lines_matching": ["^noise"],
+            "truncate_lines_at": 10,
+            "head_lines": 3,
+            "max_lines": 4,
+            "on_empty": "empty",
+        });
         let input =
             "\x1b[31mred line\x1b[0m\nnoise skip\nkeep one\nkeep two\nkeep three\nkeep four";
-        let out = apply(toml, input);
+        let out = apply(keys, input);
         assert!(out.contains("red line"));
         assert!(!out.contains("noise skip"));
         assert!(out.contains("lines omitted") || out.contains("lines truncated"));
@@ -713,84 +657,57 @@ on_empty = "empty"
 
     #[test]
     fn empty_filter_is_passthrough() {
-        let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\n";
-        assert_eq!(apply(toml, "line1\nline2"), "line1\nline2");
+        assert_eq!(apply(json!({}), "line1\nline2"), "line1\nline2");
     }
 
     #[test]
     fn strip_and_keep_are_mutually_exclusive() {
-        let filters = make_filters(
-            r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-strip_lines_matching = ["a"]
-keep_lines_matching = ["b"]
-"#,
-        );
+        let filters = make_filters(&file(json!({
+            "strip_lines_matching": ["a"],
+            "keep_lines_matching": ["b"],
+        })));
         assert!(filters.is_empty(), "conflicting filter must be dropped");
     }
 
     #[test]
     fn invalid_regex_drops_filter_not_process() {
-        let filters = make_filters("schema_version = 1\n[filters.f]\nmatch_command = \"[\"\n");
+        let filters = make_filters(&file(json!({ "match_command": "[" })));
         assert!(filters.is_empty());
     }
 
     #[test]
     fn match_output_without_unless_is_rejected() {
-        let result = parse_and_compile(
-            r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-match_output = [
-  { pattern = "done", message = "ok" },
-]
-"#,
-            "test",
+        let content = file(json!({ "match_output": [{ "pattern": "done", "message": "ok" }] }));
+        assert!(
+            parse_and_compile(&content, "test").is_err(),
+            "missing unless must be a parse error"
         );
-        assert!(result.is_err(), "missing unless must be a parse error");
     }
 
     #[test]
     fn schema_version_mismatch_is_error() {
-        assert!(
-            parse_and_compile(
-                "schema_version = 99\n[filters.f]\nmatch_command = \"^c\"\n",
-                "t"
-            )
-            .is_err()
-        );
+        let content =
+            json!({ "schema_version": 99, "filters": { "f": { "match_command": "^c" } } });
+        assert!(parse_and_compile(&content.to_string(), "t").is_err());
     }
 
     #[test]
     fn schema_version_defaults_to_one_like_the_donors_blob() {
-        let filters = make_filters("[filters.f]\nmatch_command = \"^c\"\n");
-        assert_eq!(filters.len(), 1);
+        let content = json!({ "filters": { "f": { "match_command": "^c" } } });
+        assert_eq!(make_filters(&content.to_string()).len(), 1);
     }
 
     #[test]
     fn unknown_field_is_error() {
-        assert!(
-            parse_and_compile(
-                "schema_version = 1\n[filters.f]\nmatch_command = \"^c\"\nstrip_ansi_typo = true\n",
-                "t"
-            )
-            .is_err()
-        );
+        let content = file(json!({ "strip_ansi_typo": true }));
+        assert!(parse_and_compile(&content, "t").is_err());
     }
 
     #[test]
     fn unicode_content_preserved() {
-        let toml = r#"
-schema_version = 1
-[filters.f]
-match_command = "^cmd"
-strip_lines_matching = ["^noise"]
-"#;
+        let keys = json!({ "strip_lines_matching": ["^noise"] });
         assert_eq!(
-            apply(toml, "日本語テスト\nnoise\n中文内容"),
+            apply(keys, "日本語テスト\nnoise\n中文内容"),
             "日本語テスト\n中文内容"
         );
     }

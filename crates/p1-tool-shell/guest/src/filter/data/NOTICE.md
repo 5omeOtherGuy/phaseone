@@ -1,5 +1,19 @@
 # Third-party notice: RTK filter definitions
 
+The `.json` files in this directory are one-off JSON conversions (Python
+`tomllib`, content unchanged) of the `.toml` filter files of the donor
+`iris-agent` (`src/tools/bash/filter/data/`), most of which Iris vendored from
+RTK. p1's shell guest may depend only on serde, serde_json and regex
+(ADR-0081), so it reads JSON rather than TOML. Of the donor's 64 files, 62 are
+here: `npm-install` (Iris-authored) and `shellcheck` are left out because p1's
+filter corpus (`crates/p1-tool-shell/tests/output_filters.rs`) requires those
+classes to pass through raw. The conversion drops TOML comments; the donor
+files marked `# modified from RTK upstream: added unless error-guards` are
+brew-install, bundle-install, composer-install, dotnet-build, poetry-install,
+pulumi-stack, quarto-render, tofu-validate and uv-sync.
+
+The donor notice follows, unchanged.
+
 Most `.toml` files in this directory are vendored from RTK
 (<https://github.com/rtk-ai/rtk>), licensed under the Apache License 2.0
 (see `LICENSE-APACHE-2.0` in this directory).
