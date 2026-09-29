@@ -77,6 +77,12 @@ and carries the frozen manifest fields above (ADR-0079).
   (`UnsupportedCapability`) are refused from the manifest entry alone. The runtime links
   `control`, `clock`, `random` and `process` today; the other capabilities arrive with the
   streams that own their native services, and until then a grant of one is refused.
+- **Installer metadata check.** `p1 modules verify` uses the loader's shared namespace,
+  manifest-field and component-header checks (magic, component version 13 and layer 1),
+  without compiling or opening user configuration. The loader refuses the first metadata
+  error; installer verification reports all independent world and protocol errors for an
+  entry. `--integrity-only` still reports but tolerates grants that the current runtime
+  cannot link.
 - **Verify, then compile the same bytes.** The component file must be a regular file (a symlink
   is refused); its bytes are read once, hashed with SHA-256 and compared with the manifest
   digest (`DigestMismatch` names both), and only then are *those* bytes compiled from memory with

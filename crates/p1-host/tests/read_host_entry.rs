@@ -59,6 +59,7 @@ fn read_environment() -> EnvironmentFile {
         provider: "fake".into(),
         model: "fake-model".into(),
         profile: None,
+        profile_text: None,
         options: ModelOptions::default(),
         tools: vec![ToolSpec {
             module: KEY.into(),

@@ -44,6 +44,7 @@ fn environment(tools: Vec<ToolSpec>) -> EnvironmentFile {
         provider: PROVIDER.into(),
         model: "test-model".into(),
         profile: None,
+        profile_text: None,
         options: ModelOptions::default(),
         tools,
         prompt_template: "tools: {{tool_names}}".into(),

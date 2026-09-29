@@ -63,6 +63,7 @@ fn environment(name: &str, modules: &[&str]) -> EnvironmentFile {
         provider: PROVIDER.into(),
         model: "test-model".into(),
         profile: None,
+        profile_text: None,
         options: ModelOptions::default(),
         tools: modules.iter().map(|module| tool_spec(module)).collect(),
         prompt_template: "tools: {{tool_names}}".into(),

@@ -21,10 +21,11 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use p1_module_protocol::PROTOCOL_VERSION;
-use p1_module_runtime::loader::OFFICIAL_NAMESPACE;
+use p1_module_runtime::loader::{
+    OFFICIAL_NAMESPACE, check_component_header, manifest_field_errors,
+};
 use p1_module_runtime::manifest::{ComponentEntry, Digest, ReleaseManifest};
-use p1_module_runtime::{LINKABLE_CAPABILITIES, Loader, ModuleKind};
+use p1_module_runtime::{LINKABLE_CAPABILITIES, Loader};
 
 use crate::HostDeps;
 use crate::cli::{ModulesAction, ModulesOptions};
@@ -368,10 +369,7 @@ fn entry_problems(
     }
 }
 
-/// The checks `Loader::load` makes from the manifest entry alone, before it reads a byte
-/// (`docs/design/modules/package.md` — the loader): the class, its world, the protocol major
-/// and the grants. `verify` may not compile, and the loader exposes these only on the way to
-/// a compile, so they are made here.
+/// The loader's shared manifest checks before reading a byte, plus its linkable grants.
 ///
 /// The grants are split out from the problems: this runtime's linkable set is the loader's
 /// `LINKABLE_CAPABILITIES` today, but a release may ship a package whose granted interface
@@ -388,44 +386,16 @@ struct ManifestProblems {
 fn manifest_problems(entry: &ComponentEntry) -> ManifestProblems {
     let mut problems = Vec::new();
     let mut unlinked = Vec::new();
-    // The class list is the runtime's (`ModuleKind::ALL`), never a copy: a class added
-    // there is one `verify` accepts here without an edit, and the drift guard
-    // `verify_and_the_loader_agree_on_every_manifest_field` still holds the two verdicts
-    // together.
-    let Some(kind) = ModuleKind::ALL
-        .into_iter()
-        .find(|class| class.name() == entry.kind)
-    else {
-        problems.push(format!(
-            "kind {} is not a module class this runtime speaks",
-            entry.kind
-        ));
-        // The linkability of a grant says nothing about a class the runtime does not speak,
-        // so the kind alone decides the entry, exactly as the loader refuses it.
+    let errors = manifest_field_errors(entry);
+    let unknown_kind = errors.iter().any(|error| {
+        matches!(
+            error,
+            p1_module_runtime::loader::LoadError::UnknownKind { .. }
+        )
+    });
+    problems.extend(errors.into_iter().map(|error| error.to_string()));
+    if unknown_kind {
         return ManifestProblems { problems, unlinked };
-    };
-    let expected = kind.world();
-    if entry.world != expected {
-        problems.push(format!(
-            "world {} is not {expected}, the {} world this runtime speaks",
-            entry.world, entry.kind
-        ));
-    }
-    // The protocol's major must be the runtime's, over the `major.minor` shape
-    // `docs/design/modules/protocol.md` fixes. This is the loader's own rule, mirrored exactly
-    // because the loader's `protocol_major` is private: both parts must be non-empty ASCII
-    // digits and the parsed major must be the runtime's. A looser rule would pass a set the
-    // loader then refuses — a signed minor such as `1.+5`, say, which `u32::parse` accepts but
-    // the loader's digits-only test does not — defeating the installer's pre-commit check.
-    let protocol_major = match entry.protocol.split_once('.') {
-        Some((major, minor)) if digits(major) && digits(minor) => major.parse::<u32>().ok(),
-        _ => None,
-    };
-    if protocol_major != Some(PROTOCOL_VERSION.major) {
-        problems.push(format!(
-            "protocol {} is refused, this runtime speaks protocol major {}",
-            entry.protocol, PROTOCOL_VERSION.major
-        ));
     }
     for capability in &entry.capabilities {
         if !LINKABLE_CAPABILITIES.contains(&capability.as_str()) {
@@ -433,12 +403,6 @@ fn manifest_problems(entry: &ComponentEntry) -> ManifestProblems {
         }
     }
     ManifestProblems { problems, unlinked }
-}
-
-/// Whether `text` is a non-empty run of ASCII digits, the loader's own test for one part of a
-/// `major.minor` protocol version.
-fn digits(text: &str) -> bool {
-    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The component file of one entry: the loader's own reading rules (a regular file, never a
@@ -461,29 +425,123 @@ fn component_file(set: &Path, entry: &ComponentEntry) -> Result<u64, String> {
             entry.digest
         ));
     }
-    component_abi(&bytes)?;
+    check_component_header(&bytes)?;
     Ok(bytes.len() as u64)
-}
-
-/// The ABI wasmtime compiles: a WebAssembly component, never a core module. The header's
-/// layer field is what `scripts/build-modules.sh` reads to tell the two apart, and package.md
-/// ships components only, so a core module beside a component manifest is a packaging error
-/// that needs no compile to see.
-fn component_abi(bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() < 8 || &bytes[0..4] != b"\0asm" {
-        return Err("the file is not a WebAssembly module: it has no wasm header".to_string());
-    }
-    let layer = u16::from_le_bytes([bytes[6], bytes[7]]);
-    if layer != 1 {
-        return Err(format!(
-            "the file is not a component: its wasm layer is {layer}, the component layer is 1"
-        ));
-    }
-    Ok(())
 }
 
 /// Report `message` on stderr and fail the process, as the other commands do.
 fn fail(deps: &HostDeps, message: &str) -> i32 {
     write_stderr(deps, &format!("{message}\n"));
     EXIT_FAILURE
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    // The loader's first-error view, only the parity cases compare against; production
+    // accumulates every field problem through `manifest_field_errors` above.
+    use p1_module_runtime::loader::check_manifest_fields;
+
+    #[test]
+    fn verify_and_loader_share_namespace_and_manifest_checks() {
+        let mut entry = ComponentEntry {
+            name: "other/read".into(),
+            digest: Digest::of(b"x"),
+            path: "read.wasm".into(),
+            kind: "tool".into(),
+            world: "p1:module/tool@1.0.0".into(),
+            protocol: "1.0".into(),
+            capabilities: vec![],
+            variant: "default".into(),
+        };
+        for name in ["other/read", "p1/read"] {
+            entry.name = name.into();
+            assert_eq!(
+                manifest_problems(&entry).problems.is_empty(),
+                check_manifest_fields(&entry).is_ok(),
+                "{name}"
+            );
+        }
+        entry.protocol = "1.+5".into();
+        assert_eq!(
+            manifest_problems(&entry).problems.is_empty(),
+            check_manifest_fields(&entry).is_ok()
+        );
+    }
+
+    #[test]
+    fn verify_reports_both_world_and_protocol_errors_without_changing_loader_first_error() {
+        let entry = ComponentEntry {
+            name: "p1/read".into(),
+            digest: Digest::of(b"x"),
+            path: "read.wasm".into(),
+            kind: "tool".into(),
+            world: "wrong".into(),
+            protocol: "2.0".into(),
+            capabilities: vec![],
+            variant: "default".into(),
+        };
+        let problems = manifest_problems(&entry).problems.join("\n");
+        assert!(problems.contains("world wrong"), "{problems}");
+        assert!(problems.contains("protocol 2.0"), "{problems}");
+        assert!(matches!(
+            check_manifest_fields(&entry),
+            Err(p1_module_runtime::loader::LoadError::WorldMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_has_explicit_namespace_and_header_version_verdicts() {
+        let mut entry = ComponentEntry {
+            name: "other/read".into(),
+            digest: Digest::of(b"x"),
+            path: "read.wasm".into(),
+            kind: "tool".into(),
+            world: "p1:module/tool@1.0.0".into(),
+            protocol: "1.0".into(),
+            capabilities: vec![],
+            variant: "default".into(),
+        };
+        assert!(
+            manifest_problems(&entry)
+                .problems
+                .iter()
+                .any(|error| error.contains("reserved p1/"))
+        );
+        entry.name = "p1/read".into();
+        assert!(manifest_problems(&entry).problems.is_empty());
+        entry.kind = "plugin".into();
+        assert!(!manifest_problems(&entry).problems.is_empty());
+        entry.kind = "tool".into();
+        entry.protocol = "1.+5".into();
+        assert!(!manifest_problems(&entry).problems.is_empty());
+        entry.protocol = "1.0".into();
+        let scratch = tempfile::tempdir().unwrap();
+        let bytes = b"\0asm\x0c\0\x01\0";
+        entry.digest = Digest::of(bytes);
+        std::fs::write(scratch.path().join(&entry.path), bytes).unwrap();
+        assert!(
+            component_file(scratch.path(), &entry)
+                .unwrap_err()
+                .contains("version")
+        );
+        let mut identities = HashMap::new();
+        assert!(
+            entry_problems(scratch.path(), &entry, &mut identities, false)
+                .size
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_component_header_version_is_refused_before_compile() {
+        let mut bytes = b"\0asm\x0d\0\x01\0".to_vec();
+        assert!(check_component_header(&bytes).is_ok());
+        bytes[4] = 12;
+        assert!(
+            check_component_header(&bytes)
+                .unwrap_err()
+                .contains("version")
+        );
+    }
 }

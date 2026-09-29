@@ -14,13 +14,25 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use p1_contracts::BoxFuture;
 use p1_workflow::{WorktreeHold, WorktreeInfo};
 
-/// The variables that would point git at another repository, index or tree than `dir`'s
-/// (a p1 started from a git hook inherits them); the child never sees them.
-const GIT_ENV_REMOVED: [&str; 4] = [
+/// Repository, object, ref and configuration redirects inherited from a git hook must
+/// not override `dir` for any child command.
+const GIT_ENV_REMOVED: [&str; 16] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
     "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_PARAMETERS",
 ];
 
 /// `git -C <dir> <args>` with stdin closed and [`GIT_ENV_REMOVED`] removed.
@@ -29,6 +41,13 @@ fn command(dir: &Path, args: &[&str]) -> Command {
     command.arg("-C").arg(dir).args(args).stdin(Stdio::null());
     for name in GIT_ENV_REMOVED {
         command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_CONFIG_KEY_")
+            || name.to_string_lossy().starts_with("GIT_CONFIG_VALUE_")
+        {
+            command.env_remove(name);
+        }
     }
     command
 }
@@ -132,6 +151,16 @@ fn prepare(run_workspace: &Path, located: &Located, base: &str) -> Result<Worktr
     let path_text = path.to_string_lossy().into_owned();
     let branch_ref = format!("refs/heads/{branch}");
     let registered = entries.iter().find(|entry| same_path(&entry.path, path));
+    // A registered path is not permission to follow an alias installed at its pathname.
+    if path
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(format!(
+            "{} is a symlink, not the worktree of {branch}",
+            path.display()
+        ));
+    }
     match registered {
         // A registration whose directory is gone — or replaced by a file or a dangling
         // symlink, which git lists as `prunable` all the same: named, and left for the
@@ -142,8 +171,10 @@ fn prepare(run_workspace: &Path, located: &Located, base: &str) -> Result<Worktr
                 path.display()
             ));
         }
-        // (a) The step's own worktree: reused untouched — a resumed or repaired step.
-        Some(entry) if entry.branch.as_deref() == Some(branch_ref.as_str()) => {}
+        // Registration alone does not prove the directory still points into this repository.
+        Some(entry) if entry.branch.as_deref() == Some(branch_ref.as_str()) => {
+            validate_checkout(run_workspace, path, &branch_ref)?;
+        }
         Some(entry) => {
             return Err(format!(
                 "{} is a worktree on {}, not on {branch}",
@@ -193,11 +224,38 @@ fn prepare(run_workspace: &Path, located: &Located, base: &str) -> Result<Worktr
             }
         }
     }
+    let current_head = head(path)?;
+    validate_checkout(run_workspace, path, &branch_ref)?;
     Ok(WorktreeInfo {
         path: path.clone(),
         branch: branch.clone(),
-        head: head(path)?,
+        head: current_head,
     })
+}
+
+/// Compare Git's live repository and branch, not just a worktree-list pathname.
+fn validate_checkout(run_workspace: &Path, path: &Path, branch_ref: &str) -> Result<(), String> {
+    let common = |dir: &Path| -> Result<PathBuf, String> {
+        let directory = git(
+            dir,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        PathBuf::from(directory)
+            .canonicalize()
+            .map_err(|error| error.to_string())
+    };
+    let expected = common(run_workspace)?;
+    let actual = common(path)?;
+    let active_branch = git(path, &["symbolic-ref", "--quiet", "HEAD"])?;
+    if actual != expected || active_branch != branch_ref {
+        return Err(format!(
+            "{} is not the registered worktree on {} in {}",
+            path.display(),
+            branch_ref.trim_start_matches("refs/heads/"),
+            run_workspace.display()
+        ));
+    }
+    Ok(())
 }
 
 fn same_path(listed: &Path, wanted: &Path) -> bool {
@@ -535,6 +593,83 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn registered_worktree_replaced_by_symlink_is_refused() {
+        let repo = Repo::new();
+        let base = repo.git(&["rev-parse", "HEAD"]);
+        let info = ensure(&repo.main(), "alias", &base).unwrap();
+        let real = repo.dir.path().join("real");
+        std::fs::rename(&info.path, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &info.path).unwrap();
+        let error = ensure(&repo.main(), "alias", &base).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(error.contains(&info.path.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn registered_worktree_with_foreign_git_pointer_is_refused() {
+        let repo = Repo::new();
+        let base = repo.git(&["rev-parse", "HEAD"]);
+        let tree = ensure(&repo.main(), "foreign-pointer", &base).unwrap().path;
+        let foreign = repo.dir.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        git(&foreign, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(foreign.join("file"), "foreign").unwrap();
+        git(&foreign, &["add", "file"]).unwrap();
+        git(
+            &foreign,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "foreign",
+            ],
+        )
+        .unwrap();
+        git(&foreign, &["checkout", "-q", "-b", "task/foreign-pointer"]).unwrap();
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}\n", foreign.join(".git").display()),
+        )
+        .unwrap();
+        let error = ensure(&repo.main(), "foreign-pointer", &base).unwrap_err();
+        assert!(error.contains("not the registered worktree"), "{error}");
+    }
+
+    #[test]
+    fn registered_worktree_replaced_by_plain_foreign_checkout_is_refused() {
+        let repo = Repo::new();
+        let base = repo.git(&["rev-parse", "HEAD"]);
+        let tree = ensure(&repo.main(), "replacement", &base).unwrap().path;
+        std::fs::rename(&tree, repo.dir.path().join("saved-tree")).unwrap();
+        std::fs::create_dir(&tree).unwrap();
+        git(&tree, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(tree.join("file"), "foreign").unwrap();
+        git(&tree, &["add", "file"]).unwrap();
+        git(
+            &tree,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "foreign",
+            ],
+        )
+        .unwrap();
+        git(&tree, &["checkout", "-q", "-b", "task/replacement"]).unwrap();
+        let error = ensure(&repo.main(), "replacement", &base).unwrap_err();
+        assert!(error.contains("not the registered worktree"), "{error}");
+    }
+
     #[test]
     fn git_runs_without_the_inherited_repository_variables() {
         let built = command(Path::new("/nowhere"), &["status"]);
@@ -548,6 +683,12 @@ mod tests {
             "GIT_WORK_TREE",
             "GIT_INDEX_FILE",
             "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_GRAFT_FILE",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_SHALLOW_FILE",
         ] {
             assert!(
                 removed.iter().any(|removed| removed == name),

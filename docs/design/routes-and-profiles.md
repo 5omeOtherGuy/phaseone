@@ -156,9 +156,12 @@ The HOST resolves, before calling `assemble`:
    data, the binding, the profile and a credential source built from `route.credential`.
 
 The catalog keeps ONE map of provider factories. `register_providers` registers, for every
-route file found, a factory under the route id whose closure captured that route's data and
-calls the compiled constructor for its adapter key. A route id that collides with a
-whole-provider key is a start-up error.
+route file found, a factory under the route id whose closure captures that route's data and
+selects a release provider component for its adapter key. `load_environment` retains the exact
+profile text it parsed beside the selected environment and passes that text through `ProviderSpec`
+to the component, even if the profile file changes before activation; lock selection still uses
+the full search path. A route id that
+collides with a whole-provider key is a start-up error.
 
 ## 3. Validation by lowering
 

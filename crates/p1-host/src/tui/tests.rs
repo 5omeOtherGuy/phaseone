@@ -502,6 +502,10 @@ const SWITCH_TOOL_MODULES: [&str; 8] = [
 
 impl SwitchFixture {
     fn new() -> Self {
+        Self::new_with_provider(Arc::new(p1_testkit::ScriptedProvider::new(vec![])))
+    }
+
+    fn new_with_provider(provider: Arc<p1_testkit::ScriptedProvider>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let environments = root.path().join("environments");
         std::fs::create_dir_all(environments.join("e-one")).unwrap();
@@ -519,9 +523,8 @@ impl SwitchFixture {
         let mut catalog = p1_assembly::Catalog::new();
         catalog.provider(
             "r-one",
-            Box::new(|_spec: &p1_assembly::ProviderSpec| {
-                Ok(Arc::new(p1_testkit::ScriptedProvider::new(vec![]))
-                    as Arc<dyn p1_contracts::Provider>)
+            Box::new(move |_spec: &p1_assembly::ProviderSpec| {
+                Ok(provider.clone() as Arc<dyn p1_contracts::Provider>)
             }),
         );
         for module in SWITCH_TOOL_MODULES {
@@ -2762,6 +2765,75 @@ fn compacted_counts(driver: &Driver) -> (u64, u64) {
 
 fn is_summary(item: &p1_contracts::Item) -> bool {
     matches!(item, p1_contracts::Item::User { text } if text.starts_with(p1_context::SUMMARY_MARKER))
+}
+
+/// A command submitted during the compaction pump must install before the already
+/// submitted next prompt starts, rather than applying only after that turn ends.
+#[tokio::test(start_paused = true)]
+async fn compaction_pump_applies_queued_model_before_submitted_turn() {
+    let records = long_session().await;
+    let switched = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        p1_testkit::text_response("new provider turn"),
+    ]));
+    let fixture = SwitchFixture::new_with_provider(switched.clone());
+    let scripted = Arc::new(p1_testkit::ScriptedProvider::new(vec![
+        p1_testkit::text_response("## Task\nsummed"),
+        p1_testkit::text_response("old provider must not run the next turn"),
+    ]));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(HeldProvider {
+        inner: scripted.clone(),
+        started: started.clone(),
+        release: release.clone(),
+        held: std::sync::atomic::AtomicBool::new(false),
+    });
+    let agent = compacting_agent(
+        provider,
+        Arc::new(p1_testkit::RecordingJournal::new()),
+        &records,
+    );
+    let mut harness =
+        IdleLoop::with_agent(ratatui::backend::TestBackend::new(96, 24), false, agent);
+    harness.driver.model_switch = Some(fixture.switch.clone());
+    harness.driver.environment_dirs = fixture.environments.clone();
+    harness.driver.pending_compact = true;
+    harness.driver.submit_pending = Some("next turn".into());
+    let keys = harness.wires.keys.clone();
+    let events = harness.wires.events.clone();
+    let script = async move {
+        started.notified().await;
+        events
+            .send(UiEvent::Agent(p1_tui::runtime::Stamped {
+                worker: None,
+                at_ms: 0,
+                event: p1_contracts::AgentEvent::TurnStarted,
+            }))
+            .unwrap();
+        for c in "/model e-one/p-one".chars() {
+            keys.send(Input::Key(key(KeyCode::Char(c)))).unwrap();
+        }
+        keys.send(Input::Key(key(KeyCode::Enter))).unwrap();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_one();
+        drop(keys);
+        drop(events);
+    };
+    let (code, driver, _agent) = run_with_own_wires(harness, script).await;
+    assert_eq!(code, 0);
+    assert_eq!(driver.model, "e-one/p-one");
+    assert_eq!(
+        scripted.requests().len(),
+        1,
+        "the old provider may summarize but must not receive the submitted turn"
+    );
+    assert_eq!(
+        switched.requests().len(),
+        1,
+        "the new provider runs the next turn"
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -1100,6 +1100,7 @@ fn host_environment(modules: &[&str]) -> EnvironmentFile {
         provider: "scripted".into(),
         model: "test-model".into(),
         profile: None,
+        profile_text: None,
         options: ModelOptions::default(),
         tools: modules
             .iter()
