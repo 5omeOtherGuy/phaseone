@@ -1,20 +1,21 @@
 # Dogfood inspection evidence
 
-`scripts/dogfood.sh` executes against a disposable clone. Its private invocation scratch
-holds the task prompt, session journal, stdout, stderr and diff numstat only until the
-invocation has generated `report.json` and `review-evidence.json`; cleanup removes the
-raw scratch. No raw prompt, model message, tool argument, stderr line, diff text or
-changed filename is exported into the retained `.run/` directory.
+`scripts/dogfood.sh` executes against a disposable clone. It retains the raw session
+journal, stdout and stderr in the run directory (`../phaseone-dogfood/<label>.run/`) so
+the independent review required by the project `AGENTS.md` can inspect them. That
+directory is created owner-only (mode 0700) and the evidence files are mode 0600; the
+task prompt file itself is never copied into the run directory. The disposable
+invocation scratch still holds only the diff numstat and is removed at exit.
 
-An independent reviewer reads `report.json` and `review-evidence.json` before deciding
-acceptance: the latter records process exit status, ordered tool outcomes and shell exit
-codes, stdout/stderr byte and error-line counts, and aggregate changed-file/insertion/
-deletion counts. Those facts identify tool and process failures without copying their
-possibly private content. If the cause requires raw stderr, journal or diff contents,
-the reviewer must inspect the disposable clone with authorization and arrange a new
-private diagnostic run; the aggregate cannot establish a textual cause on its own.
+`report.json` and `review-evidence.json` sit alongside the raw evidence.
+`review-evidence.json` records process exit status, ordered tool outcomes and shell
+exit codes, stdout/stderr byte and error-line counts, and aggregate changed-file/
+insertion/deletion counts, so a machine check can read the outcome without parsing the
+raw streams. When a failure's cause needs textual inspection, the reviewer reads the
+retained journal, stdout and stderr in the same run directory.
 
-The project `AGENTS.md` still instructs reviewers to inspect raw journal and streams;
-its instruction must be reconciled by the lead before this aggregate can serve as
-its sole acceptance evidence. This does not alter the separate `scripts/fanout.py`
-p1 runner contract, frozen by `test_run_dir_layout` pending owner disposition.
+The clone itself contains the agent's changes and remains agent-controlled and private;
+it is not part of the retained evidence and is removed with the disposable clone.
+
+This does not alter the separate `scripts/fanout.py` p1 runner contract, frozen by
+`test_run_dir_layout` pending owner disposition.

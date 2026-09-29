@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dogfood run artifacts never retain raw task, journal or output files."""
+"""Dogfood run evidence is retained owner-only; the task prompt is never copied."""
 import json
 import os
 import pathlib
@@ -55,12 +55,25 @@ class DogfoodPrivacyTest(unittest.TestCase):
             self.assertEqual((record['changed_files'], record['insertions'],
                               record['deletions']), (1, 3, 1))
 
-    def test_prompt_bearing_artifacts_are_temporary(self):
+    def test_raw_evidence_is_retained_owner_only_without_prompt(self):
         text = SCRIPT.read_text()
+        # Codex finding dogfood.sh:43 (lead decision): the session journal, stdout and
+        # stderr stay in the run directory so the independent review required by the
+        # project AGENTS.md can inspect them.
+        self.assertIn('"$run/session.jsonl"', text)
+        self.assertIn('"$run/stdout.txt"', text)
+        self.assertIn('"$run/stderr.txt"', text)
+        self.assertNotIn('"$scratch/session.jsonl"', text)
+        self.assertNotIn('"$scratch/stdout.txt"', text)
+        self.assertNotIn('"$scratch/stderr.txt"', text)
+        # The run directory is owner-only: 0700 directory, 0600 evidence files.
+        self.assertIn('umask 077', text)
+        self.assertIn('chmod 0700 "$run"', text)
+        self.assertIn('chmod 0600 "$run/session.jsonl" "$run/stdout.txt" "$run/stderr.txt"', text)
+        # The task prompt file itself is never copied into the retained directory.
         self.assertNotIn('cp "$task_file" "$run/task.txt"', text)
-        self.assertNotIn('"$run/session.jsonl"', text)
-        self.assertNotIn('"$run/stdout.txt"', text)
-        self.assertNotIn('"$run/stderr.txt"', text)
+        self.assertNotIn('"$run/task.txt"', text)
+        # Only the invocation scratch is removed on exit; the evidence is retained.
         self.assertIn("trap 'rm -rf -- \"$scratch\"' EXIT", text)
 
     def test_a_staged_deletion_is_counted(self):
