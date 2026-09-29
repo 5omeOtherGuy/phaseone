@@ -36,8 +36,8 @@ use crate::api::{
 use crate::caps::CapCounter;
 use crate::check::{self, Ask};
 use crate::decision::{
-    Action, Attempt, AttemptOutcome, CONTRACT_VERSION, Decisions, PlanRequest, RepairTurn,
-    RoleView, Snapshot, StepCost, StepProgress,
+    Action, Attempt, AttemptOutcome, CONTRACT_VERSION, Decisions, NativeDecisions, PlanRequest,
+    RepairTurn, RoleView, Snapshot, StepCost, StepProgress,
 };
 use crate::error::{parse_error, runtime_message};
 use crate::journal::{JournalWriter, Replay, call_id, canonical_json};
@@ -80,6 +80,10 @@ pub(crate) fn forbidden_tool(name: &str) -> bool {
 pub(crate) struct RunState {
     pub(crate) id: RunId,
     pub(crate) run_dir: PathBuf,
+    pub(crate) artifact_dir: PathBuf,
+    pub(crate) _run_dir_handle: std::fs::File,
+    #[cfg(windows)]
+    pub(crate) _windows_parent_pins: Vec<std::fs::File>,
     pub(crate) resumed_from: Option<RunId>,
     pub(crate) runner: Arc<dyn StepRunner>,
     /// What each step does next and what its attempts' ends mean; the rest is this state's.
@@ -95,6 +99,7 @@ pub(crate) struct RunState {
     /// The caller's runtime: `agent()` blocks a script thread on it; the crate owns none.
     pub(crate) handle: Handle,
     pub(crate) journal: JournalWriter,
+    pub(crate) journal_error: Mutex<Option<String>>,
     pub(crate) replay: Mutex<Replay>,
     /// Thread slots left; taken without ever waiting (see `fan_out`).
     pub(crate) free_threads: AtomicUsize,
@@ -153,13 +158,22 @@ impl RunState {
         }
     }
 
-    fn write(&self, record: &JournalRecord) {
-        if let Err(error) = self.journal.append(record) {
-            self.log_line(&format!("journal write failed: {error}"));
+    fn write(&self, record: &JournalRecord) -> bool {
+        if lock(&self.journal_error).is_some() {
+            return false;
         }
+        if let Err(error) = self.journal.append(record) {
+            let message = format!("journal write failed: {error}");
+            *lock(&self.journal_error) = Some(message.clone());
+            self.log_line(&message);
+            return false;
+        }
+        true
     }
 
     fn log_line(&self, text: &str) {
+        let masked = crate::redact::text(text);
+        let text = masked.as_str();
         {
             let mut record = lock(&self.record);
             if record.log.len() == LOG_LINES {
@@ -171,11 +185,10 @@ impl RunState {
     }
 
     fn set_phase(&self, name: &str) {
-        lock(&self.record).phase = Some(name.to_string());
-        self.write(&JournalRecord::Phase {
-            name: name.to_string(),
-        });
-        self.observer.phase(&self.id, name);
+        let name = crate::redact::text(name);
+        lock(&self.record).phase = Some(name.clone());
+        self.write(&JournalRecord::Phase { name: name.clone() });
+        self.observer.phase(&self.id, &name);
     }
 
     /// Drives `future` on this (non-runtime) thread; `None` when the run is cancelled
@@ -233,6 +246,9 @@ impl RunState {
         let mut work = StepWork::default();
         let mut ask = Ask::Plan;
         loop {
+            if let Some(error) = lock(&self.journal_error).clone() {
+                return Err(script_error(error));
+            }
             // The replay lock is released before the decision is called.
             let replay = lock(&self.replay).view();
             let snapshot = Snapshot {
@@ -259,8 +275,42 @@ impl RunState {
             let checked = answer
                 .map_err(|error| format!("the decision failed: {error}"))
                 .and_then(|transition| {
-                    check::transition(&snapshot, call, &ask, transition)
-                        .map_err(|error| format!("transition refused: {error}"))
+                    let action = check::transition(&snapshot, call, &ask, transition)
+                        .map_err(|error| format!("transition refused: {error}"))?;
+                    if let Action::Dispatch { tools, .. } = &action {
+                        let expected = opts.tools.as_ref().or_else(|| role.map(|r| &r.tools));
+                        check::grant(tools, expected)
+                            .map_err(|error| format!("transition refused: {error}"))?;
+                    }
+                    // Host owns the worker-derived envelope, error and provenance.
+                    // Guest policy may select a move but cannot alter its evidence.
+                    if matches!(
+                        action,
+                        Action::End { .. }
+                            | Action::MoveOn { .. }
+                            | Action::Repair { .. }
+                            | Action::Cancelled { .. }
+                    ) {
+                        let canonical = match &ask {
+                            Ask::Plan => NativeDecisions.plan_step(&snapshot, &plan),
+                            Ask::Accept(attempt) => NativeDecisions.accept_step(
+                                &snapshot,
+                                &AttemptOutcome {
+                                    version: CONTRACT_VERSION,
+                                    call: call.clone(),
+                                    label: opts.label.clone(),
+                                    attempt: attempt.clone(),
+                                },
+                            ),
+                        }
+                        .map_err(|error| format!("host decision: {error}"))?;
+                        if canonical.action != action {
+                            return Err(
+                                "transition refused: decision changes host-owned outcome".into()
+                            );
+                        }
+                    }
+                    Ok(action)
                 });
             let action = match checked {
                 Ok(action) => action,
@@ -276,11 +326,13 @@ impl RunState {
                         // snapshot: ask again with the prefix as it stands now.
                         continue;
                     };
-                    self.write(&JournalRecord::Replayed {
+                    if !self.write(&JournalRecord::Replayed {
                         call: call.clone(),
                         from,
-                    });
-                    return Ok(self.conclude(call, &line, envelope, true, &StepCost::default()));
+                    }) {
+                        return Err(script_error("journal replay write failed"));
+                    }
+                    return self.conclude(call, &line, envelope, true, &StepCost::default());
                 }
                 Action::Dispatch {
                     link,
@@ -328,7 +380,7 @@ impl RunState {
                 } => {
                     progress.route_failed |= reason == MovedOn::RouteFailed;
                     progress.walked.push(tried);
-                    progress.last_error = error;
+                    progress.last_error = crate::redact::text(&error);
                     progress.last_worker = worker;
                     progress.moved_on = true;
                     Ask::Plan
@@ -385,12 +437,16 @@ impl RunState {
         if let Some(previous) = progress.walked.last() {
             // The hop is journalled BEFORE the next model is dispatched (ADR-0054 item 4),
             // so a journal always shows why a link was left.
-            self.write(&JournalRecord::Fallback {
+            if !self.write(&JournalRecord::Fallback {
                 call: target.call.clone(),
                 from: previous.model.clone(),
                 to: model.reference.clone(),
                 error: progress.last_error.clone(),
-            });
+            }) {
+                return Attempt::JournalFailed {
+                    error: "journal fallback write failed".into(),
+                };
+            }
             progress.cost.fell_back += 1;
         }
         progress.link = Some(link);
@@ -407,8 +463,13 @@ impl RunState {
             None => Attempt::Cancelled,
             Some(Err(reason)) => Attempt::RunnerRefused { reason },
             Some(Ok(outcome)) => {
+                let mut visible_request = request.clone();
+                visible_request.prompt = crate::redact::text(&request.prompt);
+                let mut visible_worker = outcome.worker.clone();
+                visible_worker.id = crate::redact::text(&visible_worker.id);
+                visible_worker.description = crate::redact::text(&visible_worker.description);
                 self.observer
-                    .step_started(&self.id, &request, &outcome.worker);
+                    .step_started(&self.id, &visible_request, &visible_worker);
                 work.worker = Some(outcome.worker.clone());
                 Attempt::Ended {
                     worker: outcome.worker,
@@ -456,12 +517,16 @@ impl RunState {
     ) -> Option<Attempt> {
         let wire_model = &request.model.wire_model;
         if let Err((used, limit)) = self.caps.try_spend(wire_model) {
-            self.write(&JournalRecord::Capped {
+            if !self.write(&JournalRecord::Capped {
                 call: request.call.clone(),
                 wire_model: wire_model.clone(),
                 used,
                 limit,
-            });
+            }) {
+                return Some(Attempt::JournalFailed {
+                    error: "journal cap write failed".into(),
+                });
+            }
             cost.capped += 1;
             return Some(Attempt::Capped {
                 wire_model: wire_model.clone(),
@@ -481,9 +546,9 @@ impl RunState {
             prompt: request.prompt.clone(),
             opts: opts.clone(),
         };
-        if let Err(error) = self.journal.append(&dispatch) {
+        if !self.write(&dispatch) {
             return Some(Attempt::JournalFailed {
-                error: format!("journal: {error}"),
+                error: "journal dispatch write failed".into(),
             });
         }
         None
@@ -536,10 +601,10 @@ impl RunState {
             drop(hold);
         }
         if envelope.status == StepStatus::Cancelled {
-            self.conclude(call, line, envelope, false, cost);
+            self.conclude(call, line, envelope, false, cost)?;
             return Err(cancelled_error());
         }
-        Ok(self.conclude(call, line, envelope, false, cost))
+        self.conclude(call, line, envelope, false, cost)
     }
 
     /// A decision that failed, or a transition the check refused: the step fails with the
@@ -576,14 +641,30 @@ impl RunState {
         &self,
         call: &CallId,
         line: &LineContext,
-        envelope: StepEnvelope,
+        mut envelope: StepEnvelope,
         replayed: bool,
         cost: &StepCost,
-    ) -> StepEnvelope {
-        self.write(&JournalRecord::Result {
+    ) -> Result<StepEnvelope, Box<EvalAltResult>> {
+        envelope.value = crate::redact::value(&envelope.value);
+        envelope.error = envelope.error.as_deref().map(crate::redact::text);
+        envelope.evidence = envelope.evidence.as_deref().map(crate::redact::text);
+        envelope.worker = envelope.worker.as_deref().map(crate::redact::text);
+        envelope.needs = envelope.needs.as_deref().map(crate::redact::text);
+        envelope.label = envelope.label.as_deref().map(crate::redact::text);
+        for model in &mut envelope.models {
+            model.model = crate::redact::text(&model.model);
+        }
+        if let SchemaCheck::Failed(errors) = &mut envelope.schema {
+            for error in errors {
+                *error = crate::redact::text(error);
+            }
+        }
+        if !self.write(&JournalRecord::Result {
             call: call.clone(),
             envelope: envelope.clone(),
-        });
+        }) {
+            return Err(script_error("journal result write failed"));
+        }
         let step_line = StepLine {
             call: call.clone(),
             ordinal: line.ordinal,
@@ -633,43 +714,78 @@ impl RunState {
             record.steps.push(step_line.clone());
         }
         self.observer.step_ended(&self.id, &step_line);
-        envelope
+        Ok(envelope)
     }
 
-    /// Writes `result.json` and `Ended`, stores the report, THEN tells the observer — so
-    /// whoever the observer wakes finds the run ended.
+    /// Stages the report, publishes `result.json`, commits `Ended`, THEN tells the observer —
+    /// so the terminal record includes any publication failure and whoever the observer wakes
+    /// finds the run ended. A failed `Ended` removes the published artifact rather than leave a
+    /// completed `result.json` with no terminal record.
     pub(crate) fn end(&self, value: Value, error: Option<(RunOutcome, String)>) {
         let (counts, steps) = {
             let record = lock(&self.record);
             (record.counts, record.steps.clone())
         };
-        let (outcome, error) = match error {
+        let (mut outcome, mut error) = match error {
             Some((outcome, message)) => (outcome, Some(message)),
             None if counts.failed + counts.blocked + counts.cancelled + counts.capped == 0 => {
                 (RunOutcome::Completed, None)
             }
             None => (RunOutcome::CompletedWithIssues, None),
         };
-        let report = RunReport {
+        if let Some(reason) = lock(&self.journal_error).clone() {
+            outcome = RunOutcome::Failed;
+            error = Some(reason);
+        }
+        let mut report = RunReport {
             id: self.id.clone(),
             outcome,
-            value,
+            value: crate::redact::value(&value),
             counts,
             steps,
-            error: error.clone(),
+            error: error.as_deref().map(crate::redact::text),
             run_dir: self.run_dir.clone(),
         };
-        let written = serde_json::to_vec_pretty(&report)
+        // Stage the report privately, then publish it before the terminal record: the
+        // outcome the journal keeps must include a publication failure.
+        let result_path = self.artifact_dir.join("result.json");
+        let pending_path = self.artifact_dir.join("result.json.pending");
+        let staged = serde_json::to_vec_pretty(&report)
             .map_err(std::io::Error::other)
-            .and_then(|bytes| std::fs::write(self.run_dir.join("result.json"), bytes));
-        if let Err(error) = written {
-            self.log_line(&format!("result.json write failed: {error}"));
+            .and_then(|bytes| crate::service::create_private_file(&pending_path, &bytes));
+        if let Err(failure) = &staged {
+            report.outcome = RunOutcome::Failed;
+            report.error = Some(format!("result.json write failed: {failure}"));
         }
-        self.write(&JournalRecord::Ended {
-            outcome,
+        // hard_link is create_new for the final name, unlike rename: a swapped
+        // result.json or symlink is never overwritten by the run.
+        let mut published = false;
+        if staged.is_ok() {
+            if let Err(failure) = std::fs::hard_link(&pending_path, &result_path) {
+                report.outcome = RunOutcome::Failed;
+                report.error = Some(format!("result.json publish failed: {failure}"));
+            } else {
+                published = true;
+            }
+            if let Err(failure) = std::fs::remove_file(&pending_path) {
+                self.log_line(&format!("result.json pending cleanup failed: {failure}"));
+            }
+        }
+        let committed = self.write(&JournalRecord::Ended {
+            outcome: report.outcome,
             counts,
-            error,
+            error: report.error.clone(),
         });
+        if !committed {
+            report.outcome = RunOutcome::Failed;
+            report.error = lock(&self.journal_error).clone();
+            // Nothing terminal reached the journal; never leave a published artifact
+            // claiming the run completed.
+            if published && let Err(failure) = std::fs::remove_file(&result_path) {
+                self.log_line(&format!("result.json rollback failed: {failure}"));
+            }
+        }
+        self.journal.close();
         self.ended.send_replace(Some(report.clone()));
         self.observer.run_ended(&self.id, &report);
     }
@@ -831,28 +947,26 @@ const ENVELOPE_MAP_ENTRIES: usize = 4096;
 ///
 /// A budget that grew with the whole step cap (`max_steps` defaults to 200, a settings
 /// table may set thousands) is not a machine-safe ceiling: rhai gives every value its own
-/// three sums, so one run can hold this much per VALUE, and at most [`MAX_RUN_THREADS`]
-/// thunks may be in flight at once (`max_threads` is clamped to it). The ceiling is therefore
-/// this cap times that concurrency, not the step count.
+/// three sums, so one run can hold this much per VALUE, at most 256 variables each, and at
+/// most [`MAX_RUN_THREADS`] thunks may be in flight at once (`max_threads` is clamped to
+/// it). The gross ceiling is therefore this cap times that variable count times that
+/// concurrency, not the step count; `max_operations` charges the building of those values,
+/// so it is a ceiling a script cannot fill cheaply.
 ///
-/// The arithmetic, worst case: 64 thunks × 4 MiB of strings = 256 MiB; a thunk that also
-/// fills an array and a map holds 64 × 262,144 entries — about 6 MiB of array items and
-/// 13 MiB of map entries at roughly 24 and 50 bytes each, so a script holding a full-size
-/// value of each kind in every thunk peaks near 1.5 GiB, about a third of what an uncapped
-/// 200-step budget allowed (the review of PR #174 measured 4.5–5.5 GiB there). Filling
-/// those containers is not cheap either: the map path re-checks the WHOLE map on every
-/// insert, and that walk is not operation-counted, so filling one to the cap is 262,144²/2
-/// entry walks — tens of minutes of one thread's CPU.
+/// The arithmetic, per thunk: 4 MiB of strings, plus a full-size array and map — 262,144
+/// items each, about 6 MiB of array items and 13 MiB of map entries at roughly 24 and 50
+/// bytes each. Filling those containers is not cheap either: the map path re-checks the
+/// WHOLE map on every insert, and that walk is not operation-counted, so filling one to the
+/// cap is 262,144²/2 entry walks — tens of minutes of one thread's CPU.
 ///
 /// So a fan-out whose envelopes sum past one capped value — more than 64 full-size (64 KiB)
 /// envelopes, or about 136 at the 30 KB the issue's steps returned — must be split into
 /// several `parallel()` calls, which `max_steps` 200 still allows.
 const DATA_BUDGET_ENVELOPES: u32 = 64;
 
-/// The most thunk threads one run may use, whatever `max_threads` says: the data budget above
-/// is per value, so the run's aggregate ceiling holds only while concurrency is bounded too
-/// (review of PR #174). A thunk that finds no free thread runs inline on its caller's thread.
-pub(crate) const MAX_RUN_THREADS: usize = 64;
+/// Most thunk threads one run may use, whatever `max_threads` says. A thunk
+/// without a free slot runs inline; kept VM state multiplies per-value limits.
+pub(crate) const MAX_RUN_THREADS: usize = 8;
 
 /// The data-size limits for a run that may make `max_steps` `agent()` calls: the smaller of
 /// that cap and [`DATA_BUDGET_ENVELOPES`] envelopes' worth, in each of rhai's three sums.
@@ -900,6 +1014,10 @@ pub(crate) fn sandboxed_engine(max_steps: u32) -> Engine {
     engine.set_max_string_size(strings);
     engine.set_max_array_size(arrays);
     engine.set_max_map_size(maps);
+    // Scripts keep their own variables: the shipped audit script holds eleven of them at
+    // module scope, so the count cannot be the aggregate bound without breaking it. The
+    // gross ceiling is instead the per-value limits times this count times MAX_RUN_THREADS,
+    // and `max_operations` charges building those values.
     engine.set_max_variables(256);
     // Closures count as functions: this also bounds the thunks of one script.
     engine.set_max_functions(256);
@@ -1094,7 +1212,7 @@ impl Script {
                     script
                         .run
                         .observer
-                        .thunk_failed(&script.run.id, &error.to_string());
+                        .thunk_failed(&script.run.id, &crate::redact::text(&error.to_string()));
                 }
                 result
             });

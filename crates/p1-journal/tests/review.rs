@@ -10,6 +10,7 @@ fn review_repair_respects_active_writer_lock() {
         &TruncatedTail {
             byte_offset: 0,
             bytes: before.len() as u64,
+            fingerprint: 0,
         },
     );
     let after = std::fs::read(&path).unwrap();

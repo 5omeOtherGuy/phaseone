@@ -26,13 +26,15 @@ impl SummarizingContext {
         prompt: String,
     ) -> Result<Self, String> {
         config.validate()?;
+        let default_cap = DEFAULT_SUMMARY_OUTPUT_TOKENS.min(config.wall().saturating_sub(1));
+        config.validate_summary_output_tokens(default_cap)?;
         if prompt.is_empty() {
             return Err("the summarizer prompt must not be empty".to_string());
         }
         Ok(Self {
             summary: ProviderSummary::new(provider, options, prompt),
             config,
-            summary_output_tokens: DEFAULT_SUMMARY_OUTPUT_TOKENS,
+            summary_output_tokens: default_cap,
         })
     }
 

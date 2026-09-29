@@ -7,7 +7,7 @@ workers by ROLE under per-model caps (ADR-0053). It is an optional module like
 delegation (ADR-0026): without these crates the harness is a plain coding agent, and
 `p1-core` knows nothing of it. A script never names a model or reasoning level; it names
 roles, and settings decide what each role is. One agent level (ADR-0050): a workflow
-step is a worker, never granted the worker or workflow tools.
+step is a worker, never granted the worker or workflow tools. The substrate checks a decision component's dispatch grant against the configured call/role grant before the runner sees it. A predecessor must have a matching `Started` and terminal `Ended` before a new run resumes it; a torn final line (even valid JSON or invalid UTF-8) is never replayed. Run artifacts are owner-private on Unix; Linux and macOS artifact creation uses an open run-directory handle so renaming the pathname cannot redirect writes. Windows accepts only run roots inside the account's LOCALAPPDATA and pins plain-directory handles for every ancestor without delete sharing through artifact publication; shared or reparse-point workspace paths fail closed. Live predecessors hold an advisory journal lock through their terminal record; resumed runs persist inherited per-model charges in their leading `Started` record. Rhai scripts retain at most 256 variables and run at most eight thunk threads concurrently; the per-value limits times that variable count times that thread count is the gross allocation ceiling, and building those values is charged against `max_operations`. Credential-shaped values are masked at workflow log, phase, observer (including step-start metadata), result, script/argument artifact and journal persistence boundaries.
 
 | Crate | Owns | Must not own |
 |---|---|---|
@@ -80,10 +80,11 @@ envelopes' worth, one envelope being 64 KiB of strings, 4096 array items and 409
 entries — with the cap a constant (`engine.rs` `DATA_BUDGET_ENVELOPES`). At the default
 `max_steps = 200` the limits ARE the cap: 4 MiB of strings, 262,144 array items, 262,144
 map entries in one script value, which a run of any step cap cannot exceed. rhai gives
-each VALUE its own three sums, so the sandbox's ceiling is that cap times the concurrency:
-64 thunks × 4 MiB of strings = 256 MiB, and near 1.5 GiB for a script that fills a string,
-an array and a map in every thunk at once — the cap is what keeps the ceiling independent
-of the operator's own step cap.
+each VALUE its own three sums, so the sandbox's gross ceiling is that cap times the 256
+variables times the eight thunk threads; building those values is charged against
+`max_operations`, and filling a map to the cap costs a quadratic number of entry walks, so
+the ceiling is not reachable quickly — the cap is what keeps the ceiling independent of the
+operator's own step cap.
 
 A script's OWN strings, arrays and maps stay bounded by the same numbers (a `max_steps = 2`
 run can build a 128 KiB string, not more), and building them is still charged against
@@ -303,14 +304,16 @@ that end and is not nudged again.
 ## 6. Journal and replay
 
 Each record is one JSON line in the run's `journal.jsonl`, append-only, written with one
-`write_all` on an unbuffered file and flushed per record — a crash loses at most the line
-being written and never reorders. Reading back, a final line without its newline is
+`write_all` on an unbuffered file and synced per record; after any write/sync error its
+writer refuses further records. Reading back, a final line without its newline is
 ignored (a crash-interrupted write); any other unreadable line is an error, because
-silently skipping a `Dispatch` would under-charge the caps.
+silently skipping a `Dispatch` would under-charge the caps. Readers also reject a
+mismatched `result.step`, a done/attemptful result without a pending dispatch or replay,
+and a second result for that same pending call.
 
 | Kind | Fields | When |
 |---|---|---|
-| `started` | run, script_hash, args, resumed_from, base (only when the run has one, ADR-0073) | The first line. |
+| `started` | run, script_hash, args, resumed_from, base (when set), inherited_charges (on resume) | The first line. |
 | `phase` | name | Every `phase()`. |
 | `dispatch` | call, label, role, model, wire_model, attempt, prompt, opts | **Before the worker starts** — one per model a chain turns to. |
 | `capped` | call, wire_model, used, limit | A dispatch refused by a cap, before anything ran. |
@@ -340,7 +343,8 @@ from }` plus its own `Result` line, costs no attempt, and its step line carries
 `replayed: true`.
 
 **Run directory layout.** Each run owns `run_root/<run id>/` with `script.rhai` (the
-submitted source), `args.json`, `journal.jsonl` (above) and, at the end, `result.json`
+redacted submitted source; `started.script_hash` digests the original the run executed),
+`args.json`, `journal.jsonl` (above) and, at the end, `result.json`
 (the `RunReport`). Run ids are `wf<N>`; numbering continues after the highest `wf<N>`
 already in the run root, and the directory is taken with `create_dir` (not
 `create_dir_all`), so a number another process took fails and the next is tried — ids
@@ -410,7 +414,7 @@ returns the `WorkerRef` at the end — so it is not a start signal. `thunk_faile
 when one `parallel`/`pipeline` job returns an error — a cancelled step's error included —
 before its siblings are joined; a job that panics or never starts reports nothing (tests
 synchronise on it; the host ignores it). `run_ended` fires
-after `result.json` is written, the `Ended` line journalled and the report stored, and
+after a private pending result is written, `result.json` published with a create-new hard link, then `Ended` committed with any publication failure in its outcome and the report stored, and
 is the ONE place the host wakes the parent from: one notification at the run's end,
 never one per step.
 

@@ -217,6 +217,27 @@ async fn a_second_repair_is_refused_and_nothing_more_runs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_failure_payload_is_refused_before_it_is_journalled() {
+    let runner = ScriptedRunner::new();
+    runner.queue("first", StepEnd::Failed("actual failure".into()));
+    let run = run_with(TWO_CALLS, runner, |snapshot, _, mut transition| {
+        if snapshot.step.ordinal == 1
+            && let Action::End { envelope, .. } = &mut transition.action
+        {
+            envelope.error = Some("forged failure".into());
+        }
+        Ok(transition)
+    })
+    .await;
+    assert!(step_error(&run.report, 0).contains("host-owned outcome"));
+    assert!(
+        !serde_json::to_string(&run.records)
+            .unwrap()
+            .contains("forged failure")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_changed_counter_is_refused() {
     let run = run_with(
         TWO_CALLS,

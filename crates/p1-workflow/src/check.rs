@@ -4,6 +4,16 @@
 
 use crate::api::{CallId, MovedOn, StepEnd, StepEnvelope, StepStatus};
 use crate::decision::{Action, Attempt, Snapshot, Transition, check_version};
+use crate::engine::forbidden_tool;
+
+/// A decision cannot expand or substitute the configured per-call or role grant.
+pub(crate) fn grant(tools: &[String], expected: Option<&Vec<String>>) -> Result<(), String> {
+    if tools.iter().any(|tool| forbidden_tool(tool)) || expected.is_none_or(|grant| grant != tools)
+    {
+        return Err("the decision changes the configured tool grant".into());
+    }
+    Ok(())
+}
 
 /// What the substrate asked the decision.
 pub(crate) enum Ask {
@@ -94,12 +104,57 @@ pub(crate) fn transition(
             Action::End {
                 envelope: ended, ..
             },
-            _,
+            ask,
         ) => {
+            envelope(snapshot, call, ended)?;
+            if ended.status == StepStatus::Done {
+                let (worker, summary, evidence, result, schema) = match ask {
+                    Ask::Accept(Attempt::Ended {
+                        worker,
+                        end:
+                            StepEnd::Done {
+                                summary,
+                                evidence,
+                                result,
+                                schema,
+                            },
+                    }) => (worker, summary, evidence, result, schema),
+                    Ask::Accept(Attempt::RepairEnded {
+                        end:
+                            StepEnd::Done {
+                                summary,
+                                evidence,
+                                result,
+                                schema,
+                            },
+                    }) => {
+                        let worker = &step
+                            .repair
+                            .as_ref()
+                            .ok_or("repair finished without a worker")?
+                            .worker;
+                        (worker, summary, evidence, result, schema)
+                    }
+                    _ => return Err("it reports success without a successful worker turn".into()),
+                };
+                let value = match (schema, result) {
+                    (crate::api::SchemaCheck::Passed, Some(value)) => value.clone(),
+                    _ => serde_json::Value::String(summary.clone()),
+                };
+                if ended.value != value
+                    || ended.evidence.as_deref() != Some(evidence)
+                    || ended.schema != *schema
+                    || ended
+                        .worker
+                        .as_ref()
+                        .is_none_or(|line| !line.starts_with(&worker.id))
+                {
+                    return Err("it forges a successful worker outcome".into());
+                }
+            }
             if ended.status == StepStatus::Cancelled {
                 return Err("it ends the step cancelled without a cancellation".to_string());
             }
-            envelope(snapshot, call, ended)?;
         }
         (Action::Cancelled { envelope: ended }, _) => {
             if ended.status != StepStatus::Cancelled {
@@ -305,6 +360,49 @@ mod tests {
             envelope: envelope(1, StepStatus::Cancelled),
         };
         assert!(check(&on_link(0, 1), &Ask::Accept(Attempt::Cancelled), cancelled).is_ok());
+    }
+
+    #[test]
+    fn decision_cannot_expand_or_replace_tool_grant() {
+        let allowed = vec!["read".to_string()];
+        assert!(grant(&["shell".into()], Some(&allowed)).is_err());
+        assert!(grant(&["worker_start".into()], Some(&allowed)).is_err());
+        assert!(grant(&["read".into()], Some(&allowed)).is_ok());
+        assert!(grant(&["read".into()], None).is_err());
+    }
+
+    #[test]
+    fn decision_cannot_forge_success_on_plan_failure_or_worker_value() {
+        let done = Action::End {
+            envelope: envelope(0, StepStatus::Done),
+            latch_replay: true,
+        };
+        assert!(refused(&snapshot(), &Ask::Plan, done).contains("without a successful worker"));
+        let done = Action::End {
+            envelope: envelope(1, StepStatus::Done),
+            latch_replay: false,
+        };
+        assert!(
+            refused(&on_link(0, 1), &ended(StepEnd::Failed("no".into())), done)
+                .contains("without a successful worker")
+        );
+        let forged = Action::End {
+            envelope: envelope(1, StepStatus::Done),
+            latch_replay: false,
+        };
+        assert!(
+            refused(
+                &on_link(0, 1),
+                &ended(StepEnd::Done {
+                    summary: "actual".into(),
+                    evidence: "checked".into(),
+                    result: None,
+                    schema: SchemaCheck::NotRequested,
+                }),
+                forged
+            )
+            .contains("forges a successful")
+        );
     }
 
     #[test]

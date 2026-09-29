@@ -101,6 +101,15 @@ pub(crate) fn build_replacement(
     user_budget: u64,
     summary: Item,
 ) -> Vec<Item> {
+    let kept = kept_user_indices(items, tail_start, user_budget);
+    let mut replacement = Vec::with_capacity(kept.len() + 2);
+    replacement.push(summary);
+    replacement.extend(kept.into_iter().map(|index| items[index].clone()));
+    replacement.extend(items[tail_start..].iter().cloned());
+    replacement
+}
+
+pub(crate) fn kept_user_indices(items: &[Item], tail_start: usize, user_budget: u64) -> Vec<usize> {
     let users: Vec<usize> = (0..tail_start)
         .filter(|&index| is_plain_user(&items[index]))
         .collect();
@@ -124,11 +133,7 @@ pub(crate) fn build_replacement(
         }
     }
     kept.sort_unstable();
-    let mut replacement = Vec::with_capacity(kept.len() + 2);
-    replacement.push(summary);
-    replacement.extend(kept.into_iter().map(|index| items[index].clone()));
-    replacement.extend(items[tail_start..].iter().cloned());
-    replacement
+    kept
 }
 
 pub(crate) fn is_summary_item(item: &Item) -> bool {
@@ -142,6 +147,22 @@ fn is_plain_user(item: &Item) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_user_identity_is_by_index_not_equal_text() {
+        let items = vec![
+            Item::User {
+                text: "same".into(),
+            },
+            Item::User {
+                text: "same".into(),
+            },
+            Item::User {
+                text: "same".into(),
+            },
+        ];
+        assert_eq!(kept_user_indices(&items, 3, 0), vec![0]);
+    }
     use p1_contracts::{
         AssistantBlock, AssistantItem, InboxKind, Origin, ToolResultItem, ToolStatus,
     };
