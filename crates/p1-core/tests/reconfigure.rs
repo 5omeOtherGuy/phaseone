@@ -397,7 +397,7 @@ async fn a_switch_keeps_the_journal_the_events_and_the_authorization() {
     // The tool result of the switched turn went through the same journal.
     assert!(records.iter().any(|record| matches!(
         &record.body,
-        RecordBody::ToolFinished { result } if result.call_id == "call_2"
+        RecordBody::ToolFinished { result, .. } if result.call_id == "call_2"
     )));
 }
 

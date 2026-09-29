@@ -115,7 +115,7 @@ pub struct HostStepRunner {
     /// structured result is read from after the start AND after a repair (another turn
     /// of the same worker), the model the step ran on — the chain's fallback needs it —
     /// and the worker's last turn end (ADR-0054 item 3).
-    workers: Mutex<HashMap<String, StepWorker>>,
+    workers: Arc<Mutex<HashMap<String, StepWorker>>>,
     /// What a blocked step asked for, by worker id: the step line carries no `needs`,
     /// and the observer words the line.
     needs: Arc<Mutex<HashMap<String, String>>>,
@@ -148,6 +148,12 @@ impl HostStepRunner {
         let mut guard = CancelOnDrop {
             service: Some(self.service.clone()),
             id: id.clone(),
+            state: WorkerStateGuard {
+                workers: self.workers.clone(),
+                needs: self.needs.clone(),
+                id: id.clone(),
+                armed: true,
+            },
         };
         let status = self
             .service
@@ -163,6 +169,7 @@ impl HostStepRunner {
             self.step_end(id, status)
         };
         guard.service = None;
+        guard.state.armed = false;
         Ok(end)
     }
 
@@ -237,6 +244,26 @@ impl HostStepRunner {
             ChildStatus::Cancelled | ChildStatus::Running => StepEnd::Cancelled,
         }
     }
+
+    fn forget_terminal(
+        workers: &Mutex<HashMap<String, StepWorker>>,
+        id: &ChildId,
+        end: &StepEnd,
+        after_repair: bool,
+    ) {
+        if after_repair
+            || !matches!(
+                end,
+                StepEnd::EndedWithoutFinish { .. }
+                    | StepEnd::Done {
+                        schema: SchemaCheck::Failed(_),
+                        ..
+                    }
+            )
+        {
+            workers.lock().unwrap().remove(&id.0);
+        }
+    }
 }
 
 /// Cancels a step worker whose turn is abandoned: the engine drops a step's future
@@ -244,6 +271,47 @@ impl HostStepRunner {
 struct CancelOnDrop {
     service: Option<Arc<InProcessWorkers>>,
     id: ChildId,
+    state: WorkerStateGuard,
+}
+
+/// Removes a retained worker when its run or repair future is abandoned.
+struct WorkerStateGuard {
+    workers: Arc<Mutex<HashMap<String, StepWorker>>>,
+    needs: Arc<Mutex<HashMap<String, String>>>,
+    id: ChildId,
+    armed: bool,
+}
+
+impl Drop for WorkerStateGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.workers.lock().unwrap().remove(&self.id.0);
+            self.needs.lock().unwrap().remove(&self.id.0);
+        }
+    }
+}
+
+/// Protects the yield inside `start_prepared`: its builder announces the allocated id
+/// before that yield, so dropping the start future still cancels the started worker.
+struct CancelStarting {
+    service: Arc<InProcessWorkers>,
+    id: Arc<Mutex<Option<ChildId>>>,
+    armed: bool,
+}
+
+impl Drop for CancelStarting {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(id) = self.id.lock().unwrap().take()
+        {
+            let service = self.service.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = service.cancel(&id).await;
+                });
+            }
+        }
+    }
 }
 
 impl Drop for CancelOnDrop {
@@ -301,6 +369,12 @@ impl StepRunner for HostStepRunner {
                 // The worker's last turn end, read after the turn: a route failure is
                 // the one failure a fallback chain is for (ADR-0054 item 3).
                 let turn_end: TurnEndCell = Arc::new(Mutex::new(None));
+                let starting_id = Arc::new(Mutex::new(None));
+                let mut starting_guard = CancelStarting {
+                    service: self.service.clone(),
+                    id: starting_id.clone(),
+                    armed: true,
+                };
                 let started = self
                     .service
                     .start_prepared(
@@ -311,6 +385,7 @@ impl StepRunner for HostStepRunner {
                             notify_parent: false,
                         },
                         |id: &ChildId| {
+                            *starting_id.lock().unwrap() = Some(id.clone());
                             let (child, outcome) = self.builder.build_child(
                                 &choice.environment,
                                 Some(&choice),
@@ -328,6 +403,8 @@ impl StepRunner for HostStepRunner {
                     .await;
                 match started {
                     Ok(id) => {
+                        // No await between handoff and `turn`'s own cancel guard.
+                        starting_guard.armed = false;
                         if let Some(outcome) = built {
                             self.workers.lock().unwrap().insert(
                                 id.0.clone(),
@@ -347,11 +424,24 @@ impl StepRunner for HostStepRunner {
                         break id;
                     }
                     // A slot seen free is not reserved: a direct start took it.
-                    Err(WorkerError::LimitReached { .. }) => continue,
-                    Err(error) => return Err(error.to_string()),
+                    Err(WorkerError::LimitReached { .. }) => {
+                        starting_guard.armed = false;
+                        continue;
+                    }
+                    Err(error) => {
+                        starting_guard.armed = false;
+                        return Err(error.to_string());
+                    }
                 }
             };
-            let end = self.turn(&id, cancel).await?;
+            let end = match self.turn(&id, cancel).await {
+                Ok(end) => end,
+                Err(error) => {
+                    self.workers.lock().unwrap().remove(&id.0);
+                    return Err(error);
+                }
+            };
+            Self::forget_terminal(&self.workers, &id, &end, false);
             let description = self.service.describe(&id).await.unwrap_or_default();
             Ok(StepOutcome {
                 worker: WorkerRef {
@@ -371,11 +461,24 @@ impl StepRunner for HostStepRunner {
     ) -> BoxFuture<'a, Result<StepEnd, String>> {
         Box::pin(async move {
             let id = ChildId(worker.id.clone());
-            self.service
-                .continue_child(&id, message, Vec::new())
-                .await
-                .map_err(|error| error.to_string())?;
-            self.turn(&id, cancel).await
+            let mut cleanup = WorkerStateGuard {
+                workers: self.workers.clone(),
+                needs: self.needs.clone(),
+                id: id.clone(),
+                armed: true,
+            };
+            let result = self.service.continue_child(&id, message, Vec::new()).await;
+            let end = match result {
+                Ok(()) => self.turn(&id, cancel).await,
+                Err(error) => Err(error.to_string()),
+            };
+            self.workers.lock().unwrap().remove(&id.0);
+            if end.is_ok() {
+                // A blocked end stored its `needs` for `step_ended`, which runs after
+                // this future resolves; only an abandoned repair may drop it here.
+                cleanup.armed = false;
+            }
+            end
         })
     }
 
@@ -559,7 +662,7 @@ impl WorkflowObserver for HostWorkflowObserver {
 
     fn step_ended(&self, id: &RunId, line: &StepLine) {
         let worker = line_worker(line);
-        let needs = worker.and_then(|worker| self.needs.lock().unwrap().get(worker).cloned());
+        let needs = worker.and_then(|worker| self.needs.lock().unwrap().remove(worker));
         self.front_end
             .workflow_line(&crate::render::workflow_step_note(
                 &id.0,
@@ -782,7 +885,7 @@ pub(crate) fn compose(
     let runner = Arc::new(HostStepRunner {
         builder,
         service: workers,
-        workers: Mutex::new(HashMap::new()),
+        workers: Arc::new(Mutex::new(HashMap::new())),
         needs,
         worktrees: Arc::default(),
     });
@@ -1047,6 +1150,101 @@ mod tests {
             worktree: None,
             base: None,
         }
+    }
+
+    #[test]
+    fn consumed_step_entries_do_not_accumulate() {
+        let id = ChildId("w1".into());
+        let workers = Mutex::new(HashMap::new());
+        workers.lock().unwrap().insert(
+            id.0.clone(),
+            StepWorker {
+                outcome: FinishOutcome::default(),
+                model: "test".into(),
+                turn_end: Arc::new(Mutex::new(None)),
+            },
+        );
+        HostStepRunner::forget_terminal(
+            &workers,
+            &id,
+            &StepEnd::Done {
+                summary: "bad schema".into(),
+                evidence: "no".into(),
+                result: None,
+                schema: SchemaCheck::Failed(vec!["missing".into()]),
+            },
+            false,
+        );
+        assert!(
+            workers.lock().unwrap().contains_key(&id.0),
+            "repair needs outcome cell"
+        );
+        HostStepRunner::forget_terminal(&workers, &id, &StepEnd::Failed("done".into()), true);
+        assert!(workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn abandoned_turn_removes_worker_state() {
+        let workers = Arc::new(Mutex::new(HashMap::new()));
+        let needs = Arc::new(Mutex::new(HashMap::new()));
+        let id = ChildId("w1".into());
+        workers.lock().unwrap().insert(
+            id.0.clone(),
+            StepWorker {
+                outcome: FinishOutcome::default(),
+                model: "test".into(),
+                turn_end: Arc::new(Mutex::new(None)),
+            },
+        );
+        let guard = WorkerStateGuard {
+            workers: workers.clone(),
+            needs: needs.clone(),
+            id,
+            armed: true,
+        };
+        drop(guard);
+        assert!(workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn abandoned_repair_removes_retained_worker_state() {
+        let workers = Arc::new(Mutex::new(HashMap::new()));
+        let needs = Arc::new(Mutex::new(HashMap::new()));
+        let id = ChildId("w2".into());
+        workers.lock().unwrap().insert(
+            id.0.clone(),
+            StepWorker {
+                outcome: FinishOutcome::default(),
+                model: "test".into(),
+                turn_end: Arc::new(Mutex::new(None)),
+            },
+        );
+        needs.lock().unwrap().insert(id.0.clone(), "reason".into());
+        let guard = WorkerStateGuard {
+            workers: workers.clone(),
+            needs: needs.clone(),
+            id,
+            armed: true,
+        };
+        drop(guard);
+        assert!(workers.lock().unwrap().is_empty());
+        assert!(needs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoned_start_guard_is_armed_before_start_yields() {
+        let factory: p1_workers::AgentFactory = Arc::new(|_| Err("unused".into()));
+        let service = InProcessWorkers::new(factory, 1);
+        let allocated = Arc::new(Mutex::new(Some(ChildId("w1".into()))));
+        let guard = CancelStarting {
+            service,
+            id: allocated.clone(),
+            armed: true,
+        };
+        // `start_prepared` can suspend after allocating the worker id.
+        tokio::task::yield_now().await;
+        drop(guard);
+        assert!(allocated.lock().unwrap().is_none());
     }
 
     #[test]

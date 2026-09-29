@@ -192,6 +192,25 @@ pub trait Tool: Send + Sync {
         }
     }
 
+    /// Synthetic command result supplied by an in-memory test double, not a module.
+    /// Production tools must leave this false: guest text never proves process exit.
+    fn synthetic_command_result(&self) -> bool {
+        false
+    }
+
+    /// Host-observed command exit for a completed call, if this tool records command
+    /// evidence. Never derive this value from model-visible result text.
+    fn take_command_exit_code(&self, _call_id: &str) -> Option<i32> {
+        None
+    }
+
+    /// As [`Tool::take_command_exit_code`], but does not consume the record, so the
+    /// host can both journal the exit and hand it to the session log. Never derive
+    /// this value from model-visible result text.
+    fn command_exit_code(&self, _call_id: &str) -> Option<i32> {
+        None
+    }
+
     /// Validate the raw input and run. Invalid input is an `Error` outcome with a
     /// message the model can act on — never a panic and never a guessed repair.
     /// On cancellation return promptly with `ToolStatus::Cancelled`.

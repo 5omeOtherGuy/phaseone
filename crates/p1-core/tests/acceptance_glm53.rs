@@ -184,7 +184,13 @@ fn tool_started_record(seq: u64, call_id: &str, identity: ToolIdentity) -> Journ
 }
 
 fn tool_finished_record(seq: u64, result: ToolResultItem) -> JournalRecord {
-    rec(seq, RecordBody::ToolFinished { result })
+    rec(
+        seq,
+        RecordBody::ToolFinished {
+            result,
+            exit_code: Some(None),
+        },
+    )
 }
 
 fn user_item(text: &str) -> Item {
