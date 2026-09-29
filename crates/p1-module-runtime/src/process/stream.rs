@@ -248,9 +248,28 @@ impl ProcessStream {
         } else {
             None
         };
-        let leader_status = self.group.terminate().await;
+        // Terminate the group while watching for the deadline to fire mid-cleanup.
+        // A leader that exited normally does not let the run report its exit as a
+        // success when the group outlived it past the deadline: the design contract
+        // makes a cleanup that crosses the timeout an end of `TimedOut`, not the
+        // leader's exit. `terminate` holds the leader lock the watchdog needs for its
+        // own verdict, so this is the only place that can see the crossing.
+        let mut deadline_crossed_cleanup = self.expiry.is_cancelled();
+        let leader_status = {
+            let terminate = self.group.terminate();
+            tokio::pin!(terminate);
+            loop {
+                tokio::select! {
+                    biased;
+                    status = &mut terminate => break status,
+                    () = self.expiry.cancelled(), if !deadline_crossed_cleanup => {
+                        deadline_crossed_cleanup = true;
+                    }
+                }
+            }
+        };
         self.drain_after_termination().await;
-        let end = if self.cancel.is_cancelled() {
+        let end = if self.cancel.is_cancelled() || matches!(&end, ProcessEnd::Cancelled) {
             ProcessEnd::Cancelled
         } else if let Some(alive) = alive_at_expiry {
             if alive {
@@ -263,6 +282,8 @@ impl ProcessStream {
                     None => end,
                 }
             }
+        } else if deadline_crossed_cleanup {
+            ProcessEnd::TimedOut
         } else {
             end
         };
