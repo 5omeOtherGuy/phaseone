@@ -37,20 +37,24 @@ check and in main's `gate` run on the merge commit (`.github/workflows/ci.yml`),
 the gate before a push, and a gate run outside GitHub Actions is no evidence for a merge. The
 stream boxes are retired as build and verification machines.
 
+One exception stays, and it is ADR-0066's: while Actions cannot be used, a full local gate may
+be run as an announced extra step. It informs the author and never replaces the required
+check, so nothing merges on it.
+
 This supersedes ADR-0077's build placement. ADR-0097's decision stands; its sentences that keep
 ADR-0077's build placement and the stream boxes' full gate no longer apply. ADR-0066 stands
-unchanged: local cargo is `cargo check -p <crate>` plus the lead's deployed-binary rebuild, and
-a full local gate is run only when Actions cannot be used. Such a run is announced as an extra
-step and never replaces the required check.
+unchanged: local cargo is `cargo check -p <crate>` plus the lead's deployed-binary rebuild.
 
 ## Consequences
 
-- A change is verified once, by the run whose result merges it. The first result arrives
-  after the push, not before it.
+- No machine of ours verifies a change before its push; the first result arrives after it,
+  from the run whose result merges the change. A `task/**` push with an open pull request
+  still starts two runs of the same script on GitHub (`build.yml` for the branch, `ci.yml` for
+  the pull request); this decision does not change that.
 - A stream has no build and test loop of its own any more, which was ADR-0077's reason for
   the boxes. CI is a queue; the durations under Evidence are what a stream waits.
 - While Actions cannot be used, nothing merges: main requires the `gate` check, and the local
-  gate of ADR-0066 informs but does not merge.
+  gate of the exception above informs but does not merge.
 - The sandbox suites are proven on GitHub-hosted runners only (ADR-0097). A defect that shows
   only on another kernel or bubblewrap version is no longer seen on a second machine.
 - Scripts and settings written for the boxes are not changed by this decision; removing them
