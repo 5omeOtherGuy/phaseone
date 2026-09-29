@@ -59,6 +59,9 @@ fn register_routes_with_components(
     components: Arc<ProviderComponents>,
 ) -> Result<(), String> {
     let locations = crate::auth::locations(deps);
+    // Issue #484: a route that takes a shipped route's id takes its credential too, so it
+    // may only send it where the shipped route does.
+    let shipped = Arc::new(crate::routes::shipped_origins());
     for route in crate::routes::load_all_routes(&deps.environment_dirs)? {
         if WHOLE_PROVIDERS.contains(&route.id.as_str()) {
             return Err(format!(
@@ -76,6 +79,8 @@ fn register_routes_with_components(
         let locations = locations.clone();
         let components = components.clone();
         let environment_dirs = deps.environment_dirs.clone();
+        let secrets = deps.secrets.clone();
+        let shipped = shipped.clone();
         let route = Arc::new(route);
         let data = route.clone();
         catalog.provider(
@@ -83,10 +88,15 @@ fn register_routes_with_components(
             Box::new(move |spec: &ProviderSpec| {
                 let profile = require_profile(spec)?;
                 data.binding(&profile.id)?;
-                let credentials =
-                    crate::auth::credential_source_at(&data, transport.clone(), &locations);
+                crate::routes::check_shipped_origin(&data, &shipped)?;
+                // Issue #484: every credential the route hands out is registered, and
+                // everything the provider streams is masked against the registered set.
+                let credentials = crate::auth::registering(
+                    crate::auth::credential_source_at(&data, transport.clone(), &locations),
+                    secrets.clone(),
+                );
                 data.settings()?;
-                components.activate_for_environment(
+                let provider = components.activate_for_environment(
                     &environment_dirs,
                     spec.profile_text
                         .as_deref()
@@ -96,7 +106,8 @@ fn register_routes_with_components(
                     transport.clone(),
                     ws.clone(),
                     credentials,
-                )
+                )?;
+                Ok(crate::secret_mask::masking(provider, secrets.clone()))
             }),
         );
     }
@@ -125,7 +136,10 @@ pub fn credential_line_for_route(
     locations: &p1_auth::Locations,
 ) -> Result<String, String> {
     let route = crate::routes::load_route_by_id(environment_dirs, route_id)?;
-    Ok(p1_auth::describe(&route.id, &route.credential, locations).line())
+    // Issue #484: the line names paths and variables a user controls; one that carries a
+    // credential shape is masked, never printed.
+    let line = p1_auth::describe(&route.id, &route.credential, locations).line();
+    Ok(p1_redact::redact(&line).text)
 }
 
 /// The profile an environment selected, for a key that is a chat route. The old

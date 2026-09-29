@@ -786,7 +786,7 @@ pub async fn run_with_front_end(
     let substitutions = substitutions(deps, &workspace);
     // Issue #142: one counter per agent, shared by the tools assembled below and by
     // the notice sink the turn boundary reports through.
-    let mask = Arc::new(MaskCounter::new());
+    let mask = Arc::new(MaskCounter::with_secrets(deps.secrets.clone()));
     let _issued_guard = completion_hub.assembly_guard(&mask);
     let mut assembled = assemble_with_cache_key(
         &catalog,
@@ -3000,6 +3000,8 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         module_services: deps.module_services.clone(),
         verified_sources: Arc::new(crate::catalog::modules::VerifiedSources::default()),
         build_loaders: Arc::new(crate::catalog::modules::BuildLoaders::default()),
+        // The reload resolves the same credentials: they stay in the same set.
+        secrets: deps.secrets.clone(),
         #[cfg(test)]
         release_manifest: deps.release_manifest.clone(),
         #[cfg(feature = "delegation")]

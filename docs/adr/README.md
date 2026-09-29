@@ -117,6 +117,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0101 | [Bounded read and listing refusals for the file tools](0101-bounded-read-and-listing-refusals-for-the-file-tools.md) | proposed | 2026-09-29 | lead |
 | ADR-0102 | [Command evidence is the host's observed process exit, never component text](0102-command-evidence-is-the-host-s-observed-process-exit-never-component-text.md) | proposed | 2026-09-29 | lead |
 | ADR-0103 | [Assembled tools carry their capability snapshot, not a process-global registry](0103-assembled-tools-carry-their-capability-snapshot-not-a-process-global-registry.md) | accepted | 2026-09-29 | lead |
+| ADR-0104 | [Credentials are registered values masked everywhere, and credential files are written through a pinned directory](0104-credentials-are-registered-values-masked-everywhere-and-credential-files-are-written-through-a-pinned-directory.md) | proposed | 2026-09-29 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

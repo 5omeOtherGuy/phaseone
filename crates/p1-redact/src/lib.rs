@@ -225,6 +225,18 @@ impl SecretSet {
         redact_with(text, self)
     }
 
+    /// Mask every registered value in `text` and nothing else: no credential shape is
+    /// looked for. For text a model produced (its answer, its reasoning, the arguments
+    /// of a tool call), where a shape rule would corrupt ordinary content but an exact
+    /// credential p1 handles must still never be shown, stored or sent on.
+    pub fn mask(&self, text: &str) -> Redaction {
+        let (replaced, masked) = replace_spans(text, find_spans(text, self, Mode::Registered));
+        Redaction {
+            text: replaced.into_owned(),
+            masked,
+        }
+    }
+
     /// Whether `text` contains any registered value.
     pub fn contains_secret(&self, text: &str) -> bool {
         self.read()
@@ -283,7 +295,11 @@ pub fn redact_with(text: &str, secrets: &SecretSet) -> Redaction {
 /// value was replaced. A tool outcome can be a whole history (tens of MiB), almost always
 /// clean, and copying it only to drop the copy was most of the wrapper's cost.
 fn redact_cow<'a>(text: &'a str, secrets: &SecretSet) -> (Cow<'a, str>, usize) {
-    let spans = find_spans(text, secrets, Mode::Output);
+    replace_spans(text, find_spans(text, secrets, Mode::Output))
+}
+
+/// `text` with every span replaced by its marker; borrowed back when there is none.
+fn replace_spans(text: &str, spans: Vec<Span>) -> (Cow<'_, str>, usize) {
     if spans.is_empty() {
         return (Cow::Borrowed(text), 0);
     }
@@ -312,6 +328,8 @@ fn redact_cow<'a>(text: &'a str, secrets: &SecretSet) -> (Cow<'a, str>, usize) {
 enum Mode {
     Output,
     Declaration,
+    /// Registered values only ([`SecretSet::mask`]).
+    Registered,
 }
 
 /// One text range to replace: `[start, end)` is replaced; `[value_start, end)` is the
@@ -330,7 +348,9 @@ fn find_spans(text: &str, secrets: &SecretSet, mode: Mode) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut markers: Vec<(usize, usize)> = Vec::new();
     let long_enough = |value: &str| mode == Mode::Output || value.len() >= DECLARATION_MIN_VALUE;
-    for captures in shapes().captures_iter(text) {
+    // Registered values only: no shape is looked for.
+    let shaped = if mode == Mode::Registered { "" } else { text };
+    for captures in shapes().captures_iter(shaped) {
         if let Some(found) = captures.name("marker") {
             markers.push((found.start(), found.end()));
         } else if let Some(found) = captures.name("sk") {
@@ -1256,6 +1276,25 @@ mod tests {
         assert!(!secrets.contains_secret(&redaction.text));
         // `redact` alone knows no registered value.
         assert_eq!(redact(&text).masked, 0);
+    }
+
+    #[test]
+    fn mask_replaces_registered_values_and_no_shape() {
+        let secrets = SecretSet::new();
+        let secret = format!("{}9z", "opaque.jwt.".repeat(3));
+        secrets.register(&secret);
+        let shaped = format!(
+            "{{\"token\":\"plain-value\"}} Bearer abcdefghij {}",
+            key("sk-", 24)
+        );
+        let text = format!("{shaped} {secret}");
+        let masked = secrets.mask(&text);
+        assert_eq!(masked.masked, 1);
+        assert_eq!(
+            masked.text,
+            format!("{shaped} <redacted:secret:{} chars>", secret.len())
+        );
+        assert_eq!(secrets.mask(&shaped).text, shaped);
     }
 
     #[test]
