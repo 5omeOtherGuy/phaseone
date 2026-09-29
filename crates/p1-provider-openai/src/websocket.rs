@@ -801,6 +801,25 @@ mod tests {
     use crate::websocket_lower::{EchoedItem, Memory, echoed_item};
 
     #[test]
+    fn echo_requires_same_content_and_arguments() {
+        for (original, changed) in [
+            (
+                json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"old"}]}),
+                json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"corrected"}]}),
+            ),
+            (
+                json!({"type":"reasoning","encrypted_content":"old","summary":[]}),
+                json!({"type":"reasoning","encrypted_content":"new","summary":[]}),
+            ),
+            (
+                json!({"type":"function_call","call_id":"c","name":"read","arguments":"{}"}),
+                json!({"type":"function_call","call_id":"c","name":"read","arguments":"{\"changed\":true}"}),
+            ),
+        ] {
+            assert!(!echoed_item(&original).unwrap().answers(&changed));
+        }
+    }
+    #[test]
     fn only_the_two_connection_error_events_are_reconnectable() {
         for (code, row) in [
             (
@@ -853,6 +872,7 @@ mod tests {
             }),
             response_id: "resp_1".to_string(),
             items: vec![EchoedItem {
+                value: json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"SENTINEL"}]}),
                 kind: "message",
                 role: Some("assistant"),
                 id: Some("msg_1".to_string()),

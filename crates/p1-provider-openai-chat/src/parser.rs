@@ -17,6 +17,7 @@ pub struct ChatParser {
     finish_reason: Option<String>,
     usage: Option<Usage>,
     ended: bool,
+    decoded_bytes: usize,
 }
 impl ChatParser {
     pub fn new(origin: Origin, _dialect: ChatDialect) -> Self {
@@ -30,6 +31,7 @@ impl ChatParser {
             finish_reason: None,
             usage: None,
             ended: false,
+            decoded_bytes: 0,
         }
     }
     fn delta(&mut self, text: &str, reasoning: bool) -> StreamEvent {
@@ -159,6 +161,14 @@ impl ResponseParser for ChatParser {
         if self.ended {
             return Vec::new();
         }
+        self.decoded_bytes = self.decoded_bytes.saturating_add(event.data.len());
+        if event.data.len() > 1_048_576
+            || self.decoded_bytes > 16_777_216
+            || self.blocks.len() > 4096
+            || self.calls.len() > 4096
+        {
+            return self.fail("chat response exceeds size limit");
+        }
         if event.data.trim() == "[DONE]" {
             return self.complete();
         }
@@ -174,6 +184,15 @@ impl ResponseParser for ChatParser {
         let Some(choices) = value.get("choices").and_then(Value::as_array) else {
             return self.fail("chat chunk missing choices");
         };
+        if choices.len() > 1
+            && choices
+                .iter()
+                .filter(|choice| choice.get("index").and_then(Value::as_u64) == Some(0))
+                .count()
+                > 1
+        {
+            return self.fail("duplicate chat choice index");
+        }
         let mut events = Vec::new();
         for choice in choices {
             if choice.get("index").and_then(Value::as_u64) != Some(0) {
@@ -455,13 +474,21 @@ fn map_usage(value: &Value) -> Usage {
         .and_then(Value::as_u64)
         .or_else(|| value.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
     let total = value.get("prompt_tokens").and_then(Value::as_u64);
+    let explicit = value
+        .get("prompt_cache_miss_tokens")
+        .and_then(Value::as_u64);
+    let input_uncached = match (total, cache_read, explicit) {
+        (Some(total), Some(cached), Some(miss)) if cached.checked_add(miss) == Some(total) => {
+            Some(miss)
+        }
+        (Some(_), Some(_), Some(_)) => None,
+        (Some(total), Some(cached), None) => total.checked_sub(cached),
+        (Some(total), None, Some(miss)) if miss <= total => Some(miss),
+        (None, _, Some(miss)) => Some(miss),
+        _ => None,
+    };
     Usage {
-        input_uncached: value
-            .get("prompt_cache_miss_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                total.and_then(|total| cache_read.and_then(|cached| total.checked_sub(cached)))
-            }),
+        input_uncached,
         cache_read,
         output: value.get("completion_tokens").and_then(Value::as_u64),
         reasoning_output: value
@@ -483,6 +510,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn duplicate_choices_and_contradictory_usage_fail_safely() {
+        let mut p = parser();
+        let events = send(
+            &mut p,
+            json!({"choices":[
+            {"index":0,"delta":{"content":"A"},"finish_reason":null},
+            {"index":0,"delta":{"content":"B"},"finish_reason":"stop"}]}),
+        );
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Finished(Outcome::Failed(e))] if e.kind == ProviderErrorKind::Protocol)
+        );
+        assert_eq!(
+            map_usage(
+                &json!({"prompt_tokens":5,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":9})
+            )
+            .input_uncached,
+            None
+        );
+        assert_eq!(
+            map_usage(
+                &json!({"prompt_tokens":5,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":1})
+            )
+            .input_uncached,
+            Some(1)
+        );
+    }
     #[test]
     fn rejected_http_error_code_is_not_displayed() {
         let error = parser().on_http_error(400, &[], br#"{"error":{"code":"has spaces"}}"#);

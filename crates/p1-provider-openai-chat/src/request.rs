@@ -111,7 +111,8 @@ struct LoweredItem {
 /// no freeform shape here, so its arguments are the JSON object
 /// `{"input": <raw text>}` (ADR-0049, model-selection.md §3). Our own replay data in a
 /// layout this build does not read is refused with a sentence naming the item, its
-/// origin and both versions. `validate` and `build_request` share this, so `validate`
+/// origin and both versions. Blocks of different kinds in any order lower to the wire's
+/// fixed fields, each field concatenating its own blocks in order. `validate` and `build_request` share this, so `validate`
 /// can never accept a request the builder would reject.
 fn lower_item(origin: &Origin, item: &AssistantItem) -> Result<LoweredItem, ProviderError> {
     let mut lowered = LoweredItem {
@@ -120,6 +121,11 @@ fn lower_item(origin: &Origin, item: &AssistantItem) -> Result<LoweredItem, Prov
         has_reasoning: false,
         calls: Vec::new(),
     };
+    // The chat wire has three separate fields (`content`, `reasoning_content`,
+    // `tool_calls`) and no order between them, while the parser completes any
+    // arrival order of the three; each field keeps its own blocks' order, and
+    // refusing the cross-field order would poison a conversation after a
+    // successful response.
     for block in &item.blocks {
         match block {
             AssistantBlock::Text { text } => lowered.text.push_str(text),
@@ -260,6 +266,50 @@ mod tests {
             history: vec![],
             tools: vec![],
             options: ModelOptions::default(),
+        }
+    }
+    #[test]
+    fn parser_produced_interleaved_blocks_replay_on_the_next_turn() {
+        let route = crate::test_config::route(true);
+        let origin = route.origin("model");
+        let reasoning = |text: &str| AssistantBlock::Reasoning {
+            text: text.into(),
+            replay: Some(replay::encode(&origin, text)),
+        };
+        let text = |text: &str| AssistantBlock::Text { text: text.into() };
+        let call = AssistantBlock::ToolCall(ToolCall {
+            call_id: "c".into(),
+            name: "read".into(),
+            input: ToolInput::Json("{}".into()),
+        });
+        // reasoning -> text -> reasoning (the parser's own sequence test) and
+        // text -> call -> text: both complete in the parser, so both must replay.
+        let cases = [
+            (
+                vec![reasoning("first"), text("middle"), reasoning("last")],
+                "middle",
+                "firstlast",
+                false,
+            ),
+            (
+                vec![text("before"), call, text("after")],
+                "beforeafter",
+                "",
+                true,
+            ),
+        ];
+        for (blocks, content, reasoning_content, has_call) in cases {
+            let mut r = request();
+            r.history.push(Item::Assistant(AssistantItem {
+                origin: origin.clone(),
+                blocks,
+            }));
+            let body = build_request(&route, "model", &crate::test_config::profile(true), &r)
+                .expect("a completed parser item replays");
+            let message = &body["messages"][1];
+            assert_eq!(message["content"], content);
+            assert_eq!(message["reasoning_content"], reasoning_content);
+            assert_eq!(message.get("tool_calls").is_some(), has_call);
         }
     }
     #[test]

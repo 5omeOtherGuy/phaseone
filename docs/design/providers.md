@@ -36,6 +36,15 @@ pub struct ReqwestTransport;                                 // rustls, no defau
 pub struct SseEvent { pub event: Option<String>, pub data: String }
 pub struct SseDecoder;                                       // push(&[u8]) -> Vec<SseEvent>; finish() -> Option<SseEvent>
 ```
+The broker refuses an SSE frame above 1 MiB, including an unterminated line kept alive
+by repeated chunks; multiple valid frames in one large transport chunk are accepted
+while the chunk's decoded batch stays within the same 16 MiB bound — the decoder
+refuses a larger batch before retaining it, and charges each frame's bytes to the frame
+they belong to regardless of where the transport split the chunks (a pending bare-`\r`
+separator is resolved before the next frame is charged). Each
+adapter refuses a decoded event above 1 MiB, a response over
+16 MiB, or more than 4096 output blocks/calls; these are Protocol failures.
+
 SSE decoder rules (donor tests port over): events split by a blank line; `\n`, `\r\n` and
 `\r` line endings; several `data:` lines join with `\n`; one optional space after the colon is
 stripped; `:` comment lines ignored; a chunk may end anywhere — in the middle of a line, of a
@@ -99,7 +108,16 @@ pub struct Credential { pub bearer: String, pub account_id: Option<String> }   /
   echoed name would drop every reasoning block on the next request and break tool use with
   thinking). Found by conformance check 8 on the first adapter.
 - Usage mapping is in `routes.md`; absent fields stay `None`; `cost_micro_usd` is `None` on
-  subscription routes.
+  subscription routes. Chat rejects contradictory cache splits; Responses retains its frozen
+  saturating subtraction for contradictory totals (owner decision pending). A completed tool call
+  needs a nonempty unique identity and name;
+  truncated or refused answers do not expose executable calls. Announced Responses output
+  items must close with matching kind and identity; conflicting terminal response IDs fail.
+  Malformed block/message framing is a protocol failure, not an empty successful answer.
+  Anthropic pre-start content may emit display deltas on a truncated stream (frozen no-retry
+  behavior), but cannot become a completed message even if message_start arrives later. A Responses cache key keeps the
+  frozen Unicode/64-character clamp behavior; control characters and spaces are rejected
+  before header assembly.
 
 ## Credentials (file-based sources live in the adapter crates)
 
