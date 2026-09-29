@@ -192,9 +192,16 @@ the interactive prompt never continues on its own (the user is there). After eve
   report the parent reads.
 The host implements `SessionActivity` from the event stream it already receives
 (`ToolStarted`/`ToolFinished`), looking up each call's `effect` on the assembled tool and
-parsing the shell footer `[exit code: N]`. No new core or contract surface. On `--resume` the
-log is REBUILT from the journal's `ToolStarted`/`ToolFinished` records, so a verification run
-before the restart still counts and a file change before it still invalidates. A change a COMMAND
+taking the host's process capability exit record for that call, never the component's
+output for evidence-capable modules. Only `p1-testkit::FakeTool` explicitly marks synthetic
+in-memory results: the frozen finish-boundary suite feeds its footer into the event tee
+without executing a process. Production components cannot use that test-double path.
+On `--resume` the log is REBUILT from the journal's `ToolStarted`/`ToolFinished` records;
+the host journals the process exit it observed in `ToolFinished` (`exit_code`), so a
+verification run before the restart still counts and a later file change still invalidates.
+A component's output text can never supply that field: the core reads only the host's
+process record. File changes before the restart still invalidate runs.
+A change a COMMAND
 made before the restart is not rebuilt — the journal does not carry ADR-0055's flag, and the
 rebuilt log is never fingerprinted — so only a later command or a `write` re-applies it.
 

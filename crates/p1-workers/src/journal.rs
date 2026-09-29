@@ -25,7 +25,7 @@ pub fn workers_started_in(records: &[JournalRecord], implementations: &[&str]) -
             {
                 delegate_calls.insert(call_id.as_str());
             }
-            RecordBody::ToolFinished { result }
+            RecordBody::ToolFinished { result, .. }
                 if result.status == ToolStatus::Ok
                     && delegate_calls.contains(result.call_id.as_str()) =>
             {
@@ -71,6 +71,7 @@ mod tests {
                     status,
                     content: content.to_owned(),
                 },
+                exit_code: None,
             },
         }
     }

@@ -167,9 +167,9 @@ The schema does not change.
 ## `shell` — `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120)}`
 Runs `bash -lc <command>` with the workspace root as cwd, stdin closed, in its own process
 group. Captures stdout+stderr interleaved. On timeout or cancellation the WHOLE process group
-is killed (SIGTERM, then SIGKILL after 2 s) — no orphans. The GROUP is watched, not the
+is killed (SIGTERM, then SIGKILL after 2 s) — no orphans. A watchdog enforces the timeout even when a guest stops polling its process stream. The leader's exit is observed alongside pipe reads, so a background child inheriting the pipes does not defer group cleanup until the timeout; if cleanup crosses the timeout the run ends `TimedOut`, not successfully. Dropping a process resource sends SIGKILL to its group synchronously, then reaps its leader in the background; explicit cancellation still waits for group termination. The GROUP is watched, not the
 shell: whatever is left of it after the grace period is killed even if the shell itself exited
-at once, and the tool returns only when the group is empty. Content:
+at once, and the tool returns when the group is empty or the bounded post-SIGKILL wait expires. Content:
 `<bounded output>\n[exit code: <n>]`, or `[timed out after <s> s]`, or status `Cancelled`.
 Non-zero exit is `ToolStatus::Ok` (the command ran; the model reads the code). The timeout is a
 tool parameter the MODEL chooses — not a harness-imposed limit on the agent.
@@ -273,8 +273,10 @@ itself live under `/tmp` or under the home:
    `std::env::temp_dir()` and removed when the tool is dropped; `--setenv TMPDIR /tmp`;
 3. `--tmpfs <home>` (`<home>` CANONICAL — the same path the containment check used), then
    bind each safe existing `home_visible` entry and configured `readable` path read-only.
-   Skip sources already under the workspace, a writable path, or private `/tmp`; when the
-   configured path is an alias, recreate it with `--symlink <canonical> <configured-path>`.
+   Skip sources already under the workspace, a writable path, or private `/tmp`; recreate
+   an alias with `--symlink <canonical> <configured-path>` only when the home tmpfs hid
+   its destination (including a configured path whose parent aliases into home) and no
+   enclosing writable bind exposes it. Outside home, the root bind exposes it.
    Other sources use `--ro-bind <canonical-source> <configured-path>`;
    `--tmpfs $XDG_RUNTIME_DIR` when that
    variable names an existing directory — agent sockets and keyrings live there;

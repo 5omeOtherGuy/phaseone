@@ -231,7 +231,7 @@ pub fn bwrap_args(
             args.push(source.into());
             args.push(path.into());
         } else if path.exists() {
-            push_alias(&mut args, &path)?;
+            push_hidden_alias(&mut args, &path, home, &writable_roots)?;
         }
     }
     for readable in &sandbox.readable {
@@ -240,7 +240,7 @@ pub fn bwrap_args(
             args.push(resolved.into());
             args.push(readable.as_os_str().into());
         } else {
-            push_alias(&mut args, readable)?;
+            push_hidden_alias(&mut args, readable, home, &writable_roots)?;
         }
     }
     if let Some(runtime_dir) = &sandbox.runtime_dir
@@ -265,7 +265,7 @@ pub fn bwrap_args(
             args.push(source.into());
             args.push(writable.into());
         } else {
-            push_alias(&mut args, writable)?;
+            push_hidden_alias(&mut args, writable, home, &other_roots)?;
         }
     }
     // 5. The workspace follows mounts that could cover it; masks then follow
@@ -455,12 +455,29 @@ fn bind_source(
     Ok(Some(resolved))
 }
 
-fn push_alias(args: &mut Vec<OsString>, source: &Path) -> Result<(), SandboxError> {
-    let resolved = existing_source(source);
-    if resolved != lexical_normalize(source) {
-        args.push("--symlink".into());
-        args.push(resolved.into());
-        args.push(source.into());
+fn push_hidden_alias(
+    args: &mut Vec<OsString>,
+    source: &Path,
+    home: &Path,
+    writable_roots: &[PathBuf],
+) -> Result<(), SandboxError> {
+    // An alias outside home can still traverse a symlink into the hidden home.
+    // Resolve its parent (not its final alias): this is where bwrap creates the
+    // destination after home is hidden. An enclosing writable mount exposes it.
+    let parent = source.parent().unwrap_or(source);
+    let destination_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    let hidden_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if destination_parent.starts_with(&hidden_home)
+        && !writable_roots
+            .iter()
+            .any(|root| destination_parent.starts_with(root))
+    {
+        let resolved = existing_source(source);
+        if resolved != lexical_normalize(source) {
+            args.push("--symlink".into());
+            args.push(resolved.into());
+            args.push(source.into());
+        }
     }
     Ok(())
 }
@@ -656,9 +673,63 @@ mod tests {
                 .windows(3)
                 .any(|w| w[0] == "--bind" && w[2] == alias.as_os_str())
         );
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--symlink" && w[2] == alias.as_os_str())
+        );
+    }
+
+    #[test]
+    fn visible_redundant_alias_needs_no_symlink() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let scratch = temp.path().join("scratch");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        symlink(&scratch, &alias).unwrap();
+        let private_tmp = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox {
+            home: temp.path().join("home"),
+            home_visible: vec![],
+            readable: vec![alias.clone()],
+            writable: vec![scratch, alias.clone()],
+            runtime_dir: None,
+        };
+        let args = bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap();
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--symlink" && w[2] == alias.as_os_str())
+        );
+    }
+
+    #[test]
+    fn external_parent_alias_into_hidden_home_is_restored() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        symlink(&workspace, home.join("alias")).unwrap();
+        let external = temp.path().join("external");
+        symlink(&home, &external).unwrap();
+        let configured = external.join("alias");
+        let sandbox = Sandbox {
+            home: home.clone(),
+            home_visible: vec![],
+            readable: vec![configured.clone()],
+            writable: vec![],
+            runtime_dir: None,
+        };
+        let private_tmp = tempfile::tempdir().unwrap();
+        let args = bwrap_args(&sandbox, &workspace, private_tmp.path()).unwrap();
         assert!(args.windows(3).any(|w| w[0] == "--symlink"
-            && w[1] == scratch.as_os_str()
-            && w[2] == alias.as_os_str()));
+            && w[1] == workspace.as_os_str()
+            && w[2] == configured.as_os_str()));
     }
 
     #[test]

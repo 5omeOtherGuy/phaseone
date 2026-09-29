@@ -262,7 +262,7 @@ fn tool_results(records: &[JournalRecord]) -> Vec<(String, ToolStatus, String)> 
     records
         .iter()
         .filter_map(|record| match &record.body {
-            RecordBody::ToolFinished { result } => {
+            RecordBody::ToolFinished { result, .. } => {
                 Some((result.name.clone(), result.status, result.content.clone()))
             }
             _ => None,

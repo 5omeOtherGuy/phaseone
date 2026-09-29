@@ -626,6 +626,18 @@ impl Tool for FacedEntry {
         self.inner.effect(call)
     }
 
+    fn take_command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.inner.take_command_exit_code(call_id)
+    }
+
+    fn command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.inner.command_exit_code(call_id)
+    }
+
+    fn synthetic_command_result(&self) -> bool {
+        self.inner.synthetic_command_result()
+    }
+
     fn describe(&self, call: &ToolCall) -> CallDescription {
         self.inner.describe(call)
     }

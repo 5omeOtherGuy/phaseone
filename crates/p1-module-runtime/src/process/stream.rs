@@ -3,21 +3,20 @@
 //! event so a caller (the `process` capability of a WebAssembly guest) can read the
 //! output while the command runs.
 //!
-//! The stream is a state machine polled by [`ProcessStream::next`], not a task of its
-//! own: every wait in `next` is cancellation-safe (a pipe read, the child's wait, the
-//! timer, the token), and each step's result is recorded before `next` returns, so a
+//! The stream is a state machine polled by [`ProcessStream::next`], with a separate
+//! timeout watchdog independent of polling: every wait in `next` is cancellation-safe
+//! (a pipe read, the child's wait, the timer, the token), and each step's result is recorded before `next` returns, so a
 //! caller that drops a pending `next` loses nothing. Termination is the one step that
 //! waits across several awaits; it is recorded as decided before it starts and simply
 //! runs again (signals are idempotent, a reaped child reports its status again) when a
 //! dropped `next` or `kill` left it unfinished.
 
-use std::collections::VecDeque;
-use std::os::unix::process::ExitStatusExt;
-use std::pin::Pin;
-
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use p1_contracts::CancellationToken;
+use std::collections::VecDeque;
+use std::os::unix::process::ExitStatusExt;
+use std::pin::Pin;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout};
 
@@ -39,9 +38,8 @@ pub enum StreamEvent {
 /// A started command: [`StreamEvent::Output`] events, then exactly one
 /// [`StreamEvent::Exited`], then `None`.
 ///
-/// Dropping it while the command runs ends the whole process group (SIGTERM, grace,
-/// SIGKILL, reap) on the Tokio runtime it was dropped on, so no command outlives its
-/// handle.
+/// Dropping it sends SIGKILL to the group synchronously; only reaping runs on the
+/// Tokio runtime afterward. Call [`ProcessStream::kill`] for graceful termination.
 pub struct ProcessStream {
     group: Group,
     stdout: ChildStdout,
@@ -49,7 +47,8 @@ pub struct ProcessStream {
     out_open: bool,
     err_open: bool,
     capture: Capture,
-    expiry: Pin<Box<dyn Future<Output = ()> + Send>>,
+    expiry: CancellationToken,
+    watchdog: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
     phase: Phase,
     /// Events decided but not yet handed out.
@@ -78,6 +77,20 @@ impl ProcessStream {
         expiry: Pin<Box<dyn Future<Output = ()> + Send>>,
         cancel: CancellationToken,
     ) -> Self {
+        let expired = CancellationToken::new();
+        let notify = expired.clone();
+        let watchdog = tokio::spawn(async move {
+            expiry.await;
+            notify.cancel();
+            if pgid > 0 {
+                let group = Pid::from_raw(pgid);
+                let _ = killpg(group, Signal::SIGTERM);
+                tokio::time::sleep(super::SIGTERM_GRACE).await;
+                if super::group_exists(group) {
+                    let _ = killpg(group, Signal::SIGKILL);
+                }
+            }
+        });
         Self {
             group: Group {
                 leader: Some(child),
@@ -89,7 +102,8 @@ impl ProcessStream {
             out_open: true,
             err_open: true,
             capture: Capture::default(),
-            expiry,
+            expiry: expired,
+            watchdog,
             cancel,
             phase: Phase::Reading,
             pending: VecDeque::new(),
@@ -142,7 +156,7 @@ impl ProcessStream {
                 self.phase = Phase::Ending(ProcessEnd::Cancelled);
                 return None;
             }
-            () = &mut self.expiry => {
+            () = self.expiry.cancelled() => {
                 self.phase = Phase::Ending(ProcessEnd::TimedOut);
                 return None;
             }
@@ -160,6 +174,10 @@ impl ProcessStream {
                 }
                 Ok(count) => (false, count),
             },
+            status = self.group.wait() => {
+                self.phase = Phase::Ending(process_end(status));
+                return None;
+            }
         };
         let chunk = if from_stdout {
             &self.out_buffer[..count]
@@ -178,31 +196,13 @@ impl ProcessStream {
                 self.phase = Phase::Ending(ProcessEnd::Cancelled);
                 return;
             }
-            () = &mut self.expiry => {
+            () = self.expiry.cancelled() => {
                 self.phase = Phase::Ending(ProcessEnd::TimedOut);
                 return;
             }
             status = self.group.wait() => status,
         };
-        let end = match status {
-            Ok(status) => {
-                if let Some(code) = status.code() {
-                    ProcessEnd::Exited(code)
-                } else if let Some(signal) = status.signal() {
-                    ProcessEnd::TerminatedBySignal(signal)
-                } else {
-                    ProcessEnd::TerminatedByUnknownSignal
-                }
-            }
-            Err(error) => ProcessEnd::Failed(ProcessFailure::Wait {
-                program: "bash",
-                error: error.to_string(),
-            }),
-        };
-        // The shell was reaped (or cannot be waited for); what it left running without
-        // holding the pipes is not this run's to end, as it never was.
-        self.group.settled = true;
-        self.ended(end);
+        self.phase = Phase::Ending(process_end(status));
     }
 
     async fn finish_ending(&mut self) {
@@ -211,7 +211,55 @@ impl ProcessStream {
         };
         let end = end.clone();
         self.group.terminate().await;
+        self.drain_after_termination().await;
+        let end = if self.cancel.is_cancelled() {
+            ProcessEnd::Cancelled
+        } else if self.expiry.is_cancelled() {
+            ProcessEnd::TimedOut
+        } else {
+            end
+        };
         self.ended(end);
+    }
+
+    /// Capture bytes already in the pipes after the leader and its group end.
+    /// An unrelated writer holding a duplicated fd must not keep this call alive.
+    async fn drain_after_termination(&mut self) {
+        let until = tokio::time::Instant::now() + super::SIGKILL_WAIT;
+        while self.out_open || self.err_open {
+            let read = tokio::select! {
+                result = self.stdout.read(&mut self.out_buffer), if self.out_open => (true, result),
+                result = self.stderr.read(&mut self.err_buffer), if self.err_open => (false, result),
+                () = tokio::time::sleep_until(until) => break,
+            };
+            let (stdout, count) = read;
+            let Ok(count) = count else {
+                if stdout {
+                    self.out_open = false
+                } else {
+                    self.err_open = false
+                }
+                continue;
+            };
+            if count == 0 {
+                if stdout {
+                    self.out_open = false
+                } else {
+                    self.err_open = false
+                }
+                continue;
+            }
+            let bytes = if stdout {
+                &self.out_buffer[..count]
+            } else {
+                &self.err_buffer[..count]
+            };
+            let taken = self.capture.push(bytes);
+            if taken > 0 {
+                self.pending
+                    .push_back(StreamEvent::Output(bytes[..taken].to_vec()));
+            }
+        }
     }
 
     /// Queue what remains of the output and the exit.
@@ -222,6 +270,25 @@ impl ProcessStream {
         }
         self.pending.push_back(StreamEvent::Exited(end));
         self.phase = Phase::Ended;
+        self.watchdog.abort();
+    }
+}
+
+fn process_end(status: std::io::Result<std::process::ExitStatus>) -> ProcessEnd {
+    match status {
+        Ok(status) => {
+            if let Some(code) = status.code() {
+                ProcessEnd::Exited(code)
+            } else if let Some(signal) = status.signal() {
+                ProcessEnd::TerminatedBySignal(signal)
+            } else {
+                ProcessEnd::TerminatedByUnknownSignal
+            }
+        }
+        Err(error) => ProcessEnd::Failed(ProcessFailure::Wait {
+            program: "bash",
+            error: error.to_string(),
+        }),
     }
 }
 
@@ -232,7 +299,7 @@ struct Group {
     /// terminates the group.
     leader: Option<Child>,
     pgid: i32,
-    /// The leader was reaped by a completed wait or the group was terminated.
+    /// The whole group was terminated.
     settled: bool,
 }
 
@@ -252,6 +319,12 @@ impl Group {
     }
 }
 
+impl Drop for ProcessStream {
+    fn drop(&mut self) {
+        self.watchdog.abort();
+    }
+}
+
 impl Drop for Group {
     fn drop(&mut self) {
         if self.settled {
@@ -261,18 +334,149 @@ impl Drop for Group {
             return;
         };
         let pgid = self.pgid;
-        // Termination waits (the grace, the reaping), which a destructor cannot, so it
-        // runs on the runtime the handle was dropped on. Outside any runtime only the
-        // immediate SIGKILL of the whole group is possible; Tokio reaps the leader.
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(async move { terminate(&mut leader, pgid).await });
-            }
-            Err(_) => {
-                if pgid > 0 {
-                    let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-                }
-            }
+        // A destructor cannot await the grace period. Kill synchronously so no
+        // process remains runnable when the owning call returns; only reap later.
+        if pgid > 0 {
+            let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
         }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(super::SIGKILL_WAIT, leader.wait()).await;
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::process::{ProcessRequest, ProcessService};
+    use std::time::Duration;
+
+    // A killed orphan can remain as a zombie until its parent reaps it. It must
+    // never be runnable after the resource is dropped.
+    fn runnable(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        !matches!(
+            stat.rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next()),
+            Some('Z' | 'X')
+        )
+    }
+
+    #[tokio::test]
+    async fn resource_drop_kills_group_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProcessService::new(dir.path());
+        let mut stream = service
+            .spawn(
+                ProcessRequest {
+                    command: "trap '' TERM; echo ready; exec sleep 30",
+                    timeout: Duration::from_secs(60),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(stream.next().await, Some(StreamEvent::Output(_))));
+        let pid = stream.group.pgid;
+        drop(stream);
+        // SIGKILL is synchronous; scheduling delivery may take a turn.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runnable(pid) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped group is still runnable");
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_group_without_polling_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProcessService::new(dir.path());
+        let (fire, expiry) = tokio::sync::oneshot::channel::<()>();
+        let mut stream = service
+            .start(
+                "echo ready; exec sleep 30",
+                async move {
+                    let _ = expiry.await;
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(stream.next().await, Some(StreamEvent::Output(_))));
+        let pid = stream.group.pgid;
+        fire.send(()).unwrap();
+        // Do not call `next` until the watchdog has terminated the group.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while runnable(pid) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timeout must not depend on polling");
+        assert_eq!(
+            stream.next().await,
+            Some(StreamEvent::Exited(ProcessEnd::TimedOut))
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_pipes_do_not_delay_leader_cleanup_until_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProcessService::new(dir.path());
+        let outcome = service
+            .run(
+                ProcessRequest {
+                    command: "sleep 30 & echo ready",
+                    timeout: Duration::from_secs(10),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.end, ProcessEnd::Exited(0));
+        assert!(String::from_utf8_lossy(&outcome.output).contains("ready"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_past_timeout_cannot_report_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProcessService::new(dir.path());
+        let outcome = service
+            .run(
+                ProcessRequest {
+                    command: "trap '' TERM; sleep 30 </dev/null >/dev/null 2>&1 & echo ready",
+                    timeout: Duration::from_millis(100),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.end, ProcessEnd::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn successful_leader_exit_ends_background_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProcessService::new(dir.path());
+        let outcome = service
+            .run(
+                ProcessRequest {
+                    command: "sleep 30 </dev/null >/dev/null 2>&1 & echo $!",
+                    timeout: Duration::from_secs(10),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.end, ProcessEnd::Exited(0));
+        let pid: i32 = String::from_utf8(outcome.output)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!runnable(pid), "background group survived normal exit");
     }
 }

@@ -271,6 +271,7 @@ fn sample_records() -> Vec<JournalRecord> {
                     status: ToolStatus::Error,
                     content: "err\n✓".into(),
                 },
+                exit_code: None,
             },
         },
         JournalRecord {

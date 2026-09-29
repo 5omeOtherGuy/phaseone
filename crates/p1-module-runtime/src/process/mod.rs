@@ -27,7 +27,7 @@ use nix::unistd::Pid;
 use p1_contracts::CancellationToken;
 use tokio::process::{Child, Command};
 
-pub use capability::ProcessCapability;
+pub use capability::{ExitRecords, ProcessCapability};
 use sandbox::SandboxRuntime;
 pub use sandbox::{
     CREDENTIAL_DIRECTORIES, DEFAULT_HOME_VISIBLE, Sandbox, SandboxError, bwrap_args,
@@ -413,10 +413,16 @@ async fn terminate(child: &mut Child, pgid: i32) {
     if group_exists(group) {
         let _ = killpg(group, Signal::SIGKILL);
     }
+    let kill_end = tokio::time::Instant::now() + SIGKILL_WAIT;
     if !reaped {
-        let _ = child.wait().await;
+        let _ = bounded_reap(child.wait(), kill_end).await;
     }
-    wait_for_empty_group(group, tokio::time::Instant::now() + SIGKILL_WAIT).await;
+    wait_for_empty_group(group, kill_end).await;
+}
+
+/// Reaping cannot extend the post-SIGKILL deadline even if the leader cannot exit.
+async fn bounded_reap<F: Future>(wait: F, deadline: tokio::time::Instant) -> Option<F::Output> {
+    tokio::time::timeout_at(deadline, wait).await.ok()
 }
 
 /// Signal 0 probes without signalling: only ESRCH means no process is left in the group.
@@ -511,6 +517,13 @@ mod tests {
 
     /// The allow-list is exactly the spec's list; a later change has to update
     /// this test rather than widen the boundary silently.
+    #[tokio::test]
+    async fn post_sigkill_reap_cannot_outlive_deadline() {
+        let deadline = tokio::time::Instant::now();
+        let never = std::future::pending::<()>();
+        assert!(super::bounded_reap(never, deadline).await.is_none());
+    }
+
     #[test]
     fn env_allow_is_exactly_the_spec_list() {
         assert_eq!(

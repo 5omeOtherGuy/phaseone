@@ -750,6 +750,9 @@ impl Agent {
                 // is a child of the turn's `cancel`.
                 let child = cancel.child_token();
                 let outcome = tool.execute(call, ToolContext { cancel: child }).await;
+                // The exit the host observed for this call, read without consuming it
+                // so the session log can read the same record when the event is emitted.
+                let exit_code = tool.command_exit_code(&call.call_id);
                 let result = ToolResultItem {
                     call_id: call.call_id.clone(),
                     name: call.name.clone(),
@@ -760,6 +763,7 @@ impl Agent {
                 if let Err(error) = self
                     .commit(RecordBody::ToolFinished {
                         result: result.clone(),
+                        exit_code,
                     })
                     .await
                 {
@@ -799,6 +803,7 @@ impl Agent {
             if let Err(error) = self
                 .commit(RecordBody::ToolFinished {
                     result: result.clone(),
+                    exit_code: None,
                 })
                 .await
             {
@@ -851,6 +856,7 @@ impl Agent {
         if let Err(error) = self
             .commit(RecordBody::ToolFinished {
                 result: result.clone(),
+                exit_code: None,
             })
             .await
         {
