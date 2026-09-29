@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{CancellationToken, ToolContext, ToolStatus};
