@@ -139,7 +139,7 @@ async fn a_shell_result_with_each_pattern_family_is_masked_in_history_and_journa
         .records
         .iter()
         .filter_map(|record| match &record.body {
-            RecordBody::ToolFinished { result } => Some(result.content.as_str()),
+            RecordBody::ToolFinished { result, .. } => Some(result.content.as_str()),
             _ => None,
         })
         .collect();

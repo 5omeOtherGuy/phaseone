@@ -27,7 +27,12 @@ clock is advanced by a ticker thread the `Loader` starts (`EPOCH_TICK` in
 
 Every call gets a fresh Store and a fresh instance from the pre-linked component, with the
 limits of `ExecutionLimits` (`fuel`, `deadline`; the defaults are `DEFAULT_FUEL` and
-`DEFAULT_DEADLINE` in `executor.rs`). Three mechanisms bound it:
+`DEFAULT_DEADLINE` in `executor.rs`). `module_store` sets the same `HOSTCALL_FUEL` for
+provider, restricted, workflow-decision and execute Stores. Each Store bounds every linear
+memory it holds together to 256 MiB, so a component with several memories cannot spend that
+ceiling once per memory. Workspace reads reject files and guest-requested windows above
+`MAX_TRANSFER_BYTES` (16 MiB) with an `FsError::Io` before loading the snapshot.
+Three mechanisms bound execution:
 
 - **Fuel.** The Store starts with the call's fuel; running out is the trap `OutOfFuel`, mapped to
   `ModuleFailure::FuelExhausted`. Fuel counts guest instructions only — a host wait costs none —

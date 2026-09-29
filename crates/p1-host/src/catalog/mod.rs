@@ -139,6 +139,8 @@ pub fn build_catalog_with_workers(
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) -> Result<Catalog, String> {
+    deps.verified_sources.clear();
+    deps.build_loaders.clear();
     let mut catalog = Catalog::new();
     register_providers(&mut catalog, deps)?;
     register_standard_tools(
@@ -156,13 +158,18 @@ pub fn build_catalog_with_workers(
     // registration made it. `shell` and `finish` registered with the standard tools (S3.8),
     // through the same host-entry step.
     modules::register_host_entries(&mut catalog, deps)?;
+    // Register locked packages before the worker family snapshots grantable keys.
+    // Locked member keys are left to their family's registration below.
+    modules::register_locked_modules(&mut catalog, deps)?;
     register_delegation_tools(&mut catalog, deps, service)?;
     #[cfg(feature = "workflows")]
-    register_workflow_tools(&mut catalog, deps.workflow_service.clone())?;
-    // Module packages last among the built-ins, so a lock entry that collides with a
-    // compiled-in tool is refused rather than replacing it. A lock that selects a host entry's
-    // key already kept the host entry out (`register_host_entries`).
-    modules::register_locked_modules(&mut catalog, deps)?;
+    workflow::register_workflow_tools_with_sources(
+        &mut catalog,
+        deps.workflow_service.clone(),
+        &deps.verified_sources,
+        &deps.build_loaders,
+        modules::release_for_build(deps).as_deref(),
+    )?;
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
@@ -178,6 +185,8 @@ fn build_catalog_inner(
     env_pass: &[String],
     completion: &Arc<CompletionHub>,
 ) -> Result<Catalog, String> {
+    deps.verified_sources.clear();
+    deps.build_loaders.clear();
     let mut catalog = Catalog::new();
 
     register_providers(&mut catalog, deps)?;

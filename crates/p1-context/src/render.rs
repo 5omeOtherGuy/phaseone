@@ -13,29 +13,90 @@ use crate::plan::is_summary_item;
 
 /// How many characters of a tool call's input the transcript keeps.
 const INPUT_EXCERPT_CHARS: usize = 500;
+/// No single untrusted history item may inflate a render by arbitrary bytes. The cap
+/// rises with the transcript budget so a block the budget can hold is never shortened.
+const MAX_BLOCK_CHARS: usize = 64 * 1024;
 
 /// Render the items outside the verbatim tail. If the transcript alone would
 /// exceed `budget_tokens`, the OLDEST items after the previous summary are dropped
 /// (whole blocks) and replaced by one omission line, until it fits.
 pub(crate) fn transcript(items: &[Item], excerpt_chars: usize, budget_tokens: u64) -> String {
+    let text_limit = per_item_limit(budget_tokens);
     let mut summaries = Vec::new();
     let mut others = Vec::new();
     for item in items {
         if is_summary_item(item) {
             summaries.push(summary_block(item));
         } else {
-            others.push(block(item, excerpt_chars));
+            others.push(block(item, excerpt_chars, text_limit));
         }
     }
-    let mut dropped = 0;
-    loop {
-        let rendered = assemble(&summaries, &others, dropped);
-        if dropped >= others.len() || ceil_tokens(rendered.chars().count() as u64) <= budget_tokens
-        {
-            return rendered;
+    let lengths: Vec<u64> = others
+        .iter()
+        .map(|block| block.chars().count() as u64)
+        .collect();
+    let summary_chars: u64 = summaries
+        .iter()
+        .map(|block| block.chars().count() as u64)
+        .sum();
+    let mut other_chars: u64 = lengths.iter().sum();
+    for (dropped, length) in lengths.iter().copied().enumerate() {
+        let blocks = summaries.len() + others.len() - dropped + usize::from(dropped > 0);
+        let omission_chars = if dropped > 0 {
+            format!("[{dropped} earlier items omitted: the session was too long to summarize in one pass]").chars().count() as u64
+        } else {
+            0
+        };
+        let chars =
+            summary_chars + other_chars + omission_chars + 2 * blocks.saturating_sub(1) as u64;
+        if ceil_tokens(chars) <= budget_tokens {
+            return assemble(&summaries, &others, dropped);
         }
-        dropped += 1;
+        other_chars -= length;
     }
+    // Dropping every item is the last resort. `assemble` still adds the omission line,
+    // which can itself tip a nearly full budget; when it does, the mandatory previous
+    // summary goes without the line rather than over the budget.
+    let omitted = assemble(&summaries, &others, others.len());
+    if ceil_tokens(omitted.chars().count() as u64) <= budget_tokens {
+        return omitted;
+    }
+    summaries.join("\n\n")
+}
+
+/// A previous summary is mandatory; refuse rather than sending an over-window request.
+pub(crate) fn checked_transcript(
+    items: &[Item],
+    excerpt_chars: usize,
+    budget_tokens: u64,
+) -> Result<String, String> {
+    let mandatory_chars: u64 = items
+        .iter()
+        .filter(|item| is_summary_item(item))
+        .map(|item| match item {
+            Item::User { text } => {
+                text.strip_prefix(SUMMARY_MARKER)
+                    .map(|rest| rest.strip_prefix('\n').unwrap_or(rest))
+                    .unwrap_or(text)
+                    .chars()
+                    .count() as u64
+                    + "## Previous summary\n".chars().count() as u64
+            }
+            _ => 0,
+        })
+        .sum();
+    if ceil_tokens(mandatory_chars) > budget_tokens {
+        return Err("previous summary exceeds the summarizer transcript budget".into());
+    }
+    // `transcript` drops every non-mandatory block, and the omission line too when
+    // that line would not fit, so the returned transcript is within the budget. The
+    // final check keeps the contract even for a pathological stack of summaries whose
+    // separators the mandatory count does not include.
+    let rendered = transcript(items, excerpt_chars, budget_tokens);
+    if ceil_tokens(rendered.chars().count() as u64) > budget_tokens {
+        return Err("the summarizer transcript cannot fit the budget".into());
+    }
+    Ok(rendered)
 }
 
 fn assemble(summaries: &[String], others: &[String], dropped: usize) -> String {
@@ -52,29 +113,53 @@ fn assemble(summaries: &[String], others: &[String], dropped: usize) -> String {
     blocks.join("\n\n")
 }
 
-fn block(item: &Item, excerpt_chars: usize) -> String {
+/// The most characters one rendered item may contribute. The transcript budget is the
+/// real limit: a block that fits it is rendered whole, and a larger one is bounded here
+/// (so one item cannot force a render of arbitrary size) and then dropped by the budget
+/// loop instead of being silently shortened.
+fn per_item_limit(budget_tokens: u64) -> usize {
+    // The inverse of `ceil_tokens`: the chars that fit are at most floor(budget * 7 / 2).
+    let budget_chars = budget_tokens.saturating_mul(7) / 2;
+    usize::try_from(budget_chars.saturating_add(1))
+        .unwrap_or(usize::MAX)
+        .max(MAX_BLOCK_CHARS)
+}
+
+fn block(item: &Item, excerpt_chars: usize, text_limit: usize) -> String {
     match item {
-        Item::User { text } => format!("## User\n{text}"),
+        Item::User { text } => format!("## User\n{}", first_chars(text, text_limit)),
         Item::Inbox {
             kind: InboxKind::Notification,
             text,
-        } => format!("## Notification\n{text}"),
+        } => format!("## Notification\n{}", first_chars(text, text_limit)),
         Item::Inbox {
             kind: InboxKind::Steering,
             text,
-        } => format!("## Steering\n{text}"),
+        } => format!("## Steering\n{}", first_chars(text, text_limit)),
         Item::Assistant(assistant) => {
             let mut parts: Vec<String> = Vec::new();
+            let mut used = 0usize;
             for inner in &assistant.blocks {
+                if used >= text_limit {
+                    break;
+                }
                 match inner {
                     // Reasoning text is omitted, its replay data lives on the item.
                     AssistantBlock::Reasoning { .. } => {}
-                    AssistantBlock::Text { text } => parts.push(text.clone()),
-                    AssistantBlock::ToolCall(call) => parts.push(format!(
-                        "→ {}({})",
-                        call.name,
-                        first_chars(call.input.raw(), INPUT_EXCERPT_CHARS)
-                    )),
+                    AssistantBlock::Text { text } => {
+                        let part = first_chars(text, text_limit - used);
+                        used += part.chars().count();
+                        parts.push(part);
+                    }
+                    AssistantBlock::ToolCall(call) => {
+                        let part = format!(
+                            "→ {}({})",
+                            call.name,
+                            first_chars(call.input.raw(), INPUT_EXCERPT_CHARS)
+                        );
+                        used += part.chars().count();
+                        parts.push(part);
+                    }
                 }
             }
             if parts.is_empty() {
@@ -100,6 +185,7 @@ fn summary_block(item: &Item) -> String {
         .strip_prefix(SUMMARY_MARKER)
         .map(|rest| rest.strip_prefix('\n').unwrap_or(rest))
         .unwrap_or(text);
+    // Never silently shorten a previous summary: checked_transcript rejects it if too large.
     format!("## Previous summary\n{body}")
 }
 
@@ -151,6 +237,83 @@ mod tests {
     fn first_chars_takes_at_most_the_limit() {
         assert_eq!(first_chars("abcdef", 3), "abc");
         assert_eq!(first_chars("ab", 3), "ab");
+    }
+
+    #[test]
+    fn many_large_blocks_with_tiny_budget_only_assemble_retained_suffix() {
+        let items: Vec<Item> = (0..2_000)
+            .map(|_| Item::Inbox {
+                kind: InboxKind::Notification,
+                text: "x".repeat(2_000),
+            })
+            .collect();
+        let rendered = transcript(&items, 200, 25);
+        assert!(rendered.len() < 4_000);
+        assert!(rendered.contains("earlier items omitted"));
+    }
+
+    #[test]
+    fn a_full_summary_with_one_huge_item_never_exceeds_the_budget() {
+        let items = vec![
+            Item::User {
+                text: format!("{SUMMARY_MARKER}\nold"),
+            },
+            Item::Inbox {
+                kind: InboxKind::Notification,
+                text: "x".repeat(2_000),
+            },
+        ];
+        let budget = 10;
+        let rendered = checked_transcript(&items, 200, budget).unwrap();
+        assert!(
+            rendered.starts_with("## Previous summary\nold"),
+            "{rendered}"
+        );
+        assert!(
+            ceil_tokens(rendered.chars().count() as u64) <= budget,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("omitted"), "{rendered}");
+    }
+
+    #[test]
+    fn a_user_block_that_fits_the_transcript_budget_is_not_truncated() {
+        let tail = "the-end-of-a-long-message";
+        let long = format!("{}\n{tail}", "x".repeat(MAX_BLOCK_CHARS + 1_000));
+        let budget = ceil_tokens(long.chars().count() as u64 + 16) + 10;
+        let rendered = transcript(&[Item::User { text: long }], 200, budget);
+        assert!(
+            rendered.ends_with(tail),
+            "a block the budget can hold must not lose its suffix"
+        );
+    }
+
+    #[test]
+    fn an_assistant_text_block_that_fits_the_transcript_budget_is_not_truncated() {
+        use p1_contracts::{AssistantItem, Origin};
+        let tail = "the-end-of-a-long-answer";
+        let long = format!("{}\n{tail}", "y".repeat(MAX_BLOCK_CHARS + 1_000));
+        let assistant = Item::Assistant(AssistantItem {
+            origin: Origin {
+                route: "route".into(),
+                model: "model".into(),
+            },
+            blocks: vec![AssistantBlock::Text { text: long }],
+        });
+        let budget = ceil_tokens((MAX_BLOCK_CHARS + 1_000 + 32) as u64) + 10;
+        let rendered = transcript(&[assistant], 200, budget);
+        assert!(
+            rendered.ends_with(tail),
+            "an assistant block the budget can hold must not lose its suffix"
+        );
+    }
+
+    #[test]
+    fn oversized_previous_summary_cannot_escape_the_budget() {
+        let items = vec![Item::User {
+            text: format!("{SUMMARY_MARKER}\n{}", "x".repeat(20_000)),
+        }];
+        assert!(checked_transcript(&items, 200, 100).is_err());
     }
 
     #[test]

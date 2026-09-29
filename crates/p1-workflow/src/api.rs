@@ -275,6 +275,9 @@ pub enum JournalRecord {
         /// The run's base commit (ADR-0073): a resumed run keeps its predecessor's.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<String>,
+        /// Charges inherited from the predecessor, including its own inherited ledger.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        inherited_charges: BTreeMap<String, u32>,
     },
     Phase {
         name: String,
@@ -727,6 +730,7 @@ mod tests {
             args: Value::Null,
             resumed_from: None,
             base: Some("abc".into()),
+            inherited_charges: BTreeMap::new(),
         };
         let json = serde_json::to_string(&with).unwrap();
         assert!(json.contains(r#""base":"abc""#), "{json}");

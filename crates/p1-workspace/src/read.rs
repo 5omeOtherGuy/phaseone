@@ -333,24 +333,81 @@ impl Workspace {
     ///
     /// Snapshots larger than the mutation file-size limit are refused before
     /// allocating the complete file; the limit is also enforced during the read.
+    /// [`read_within`](Self::read_within) is the bounded form a caller that must
+    /// cap host memory further uses.
     pub fn read(
         &self,
         requested: &str,
         observed: &ObservedFiles,
     ) -> Result<Snapshot, WorkspaceError> {
+        self.read_within(requested, observed, usize::MAX)
+    }
+
+    /// Read the file `requested` once as [`read`](Self::read), but refuse a file
+    /// whose bytes exceed `limit`, itself capped at the mutation file-size limit.
+    ///
+    /// The bound is applied to the handle this call opens, not to a separate
+    /// [`stat`](Self::stat) of the path: a writer that grows or replaces the file
+    /// between such a check and this read cannot make it load more than `limit`
+    /// bytes. A file of exactly `limit` bytes is accepted; one byte more is
+    /// refused with a [`WorkspaceError::Io`] whose message names the bound.
+    pub fn read_within(
+        &self,
+        requested: &str,
+        observed: &ObservedFiles,
+        limit: usize,
+    ) -> Result<Snapshot, WorkspaceError> {
+        let limit = limit.min(usize::try_from(crate::commit::MAX_FILE_BYTES).unwrap_or(usize::MAX));
         let resolved = self.resolve(requested)?;
-        let (file, path) = self
-            .open_file_at_with_path(&resolved)
-            .map_err(|error| match error {
-                WorkspaceError::Io { path, source } => missing_or_io(requested, &path, source),
-                other => other,
-            })?;
-        let snapshot = self.snapshot_from_file(requested, file, path.clone())?;
-        // `record` stores `hash_of(contents)`: the snapshot's hash is the same value
-        // (`snapshot_from_file` computes it with the same function), so the stored
-        // observation and the snapshot agree by construction.
-        observed.record(&path, snapshot.read(0, usize::MAX));
-        Ok(snapshot)
+        let (mut file, path) =
+            self.open_file_at_with_path(&resolved)
+                .map_err(|error| match error {
+                    WorkspaceError::Io { path, source } => missing_or_io(requested, &path, source),
+                    other => other,
+                })?;
+        let display = self.display(&path);
+        // Ask the open handle, not the path: its answer is about the bytes this
+        // call would read, so a concurrent replacement cannot change it.
+        let size = file
+            .metadata()
+            .map_err(|error| missing_or_io(requested, &path, error))?
+            .len();
+        if size > u64::try_from(limit).unwrap_or(u64::MAX) {
+            return Err(WorkspaceError::Io {
+                path,
+                source: std::io::Error::other(format!(
+                    "file exceeds the file transfer limit of {limit} bytes"
+                )),
+            });
+        }
+        let mut bytes = Vec::new();
+        // Read one byte past the limit: exactly `limit` bytes fit, and the extra
+        // byte is what makes a file that grows after the metadata check visible
+        // without reading it all.
+        let bound = u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX);
+        let mut reader = std::io::Read::take(&mut file, bound);
+        std::io::Read::read_to_end(&mut reader, &mut bytes)
+            .map_err(|error| missing_or_io(requested, &path, error))?;
+        if bytes.len() > limit {
+            return Err(WorkspaceError::Io {
+                path,
+                source: std::io::Error::other(format!(
+                    "file exceeds the file transfer limit of {limit} bytes"
+                )),
+            });
+        }
+
+        // `record` stores `hash_of(contents)`: computing the same value here with
+        // the same function makes the snapshot's hash and the stored observation
+        // equal by construction, not by a second algorithm agreeing.
+        let content_hash = hash_of(&bytes);
+        observed.record(&path, &bytes);
+
+        Ok(Snapshot {
+            path: display,
+            bytes: Arc::from(bytes),
+            content_hash,
+        })
     }
 
     /// [`Workspace::read_unobserved`], proving the very handle the bytes come from is not
@@ -730,6 +787,30 @@ mod tests {
         assert!(
             format!("{error}").contains("refuses credential files"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn bounded_read_refuses_a_file_beyond_its_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("exact.txt"), b"0123456789").unwrap();
+        std::fs::write(directory.path().join("over.txt"), b"0123456789").unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+
+        // Exactly the limit is read whole.
+        let exact = workspace
+            .read_within("exact.txt", &ObservedFiles::new(), 10)
+            .unwrap();
+        assert_eq!(exact.read(0, usize::MAX), b"0123456789");
+
+        // One byte over is refused, and the refusal names the reached bound.
+        let error = match workspace.read_within("over.txt", &ObservedFiles::new(), 9) {
+            Err(error) => error,
+            Ok(_) => panic!("a ten-byte file is over a nine-byte limit"),
+        };
+        assert!(
+            error.to_string().contains("file transfer limit"),
+            "the refusal names the bound: {error}"
         );
     }
 }

@@ -169,6 +169,8 @@ pub struct TruncatedTail {
     /// Bytes from `byte_offset` to end of file (including a terminating `\n` when
     /// the line was complete but not a valid record).
     pub bytes: u64,
+    /// Hash of observed tail bytes; equal-length replacements are stale.
+    pub fingerprint: u64,
 }
 
 /// What [`load`] found: every complete valid record, plus a truncated tail if the
@@ -296,6 +298,7 @@ struct JsonlInner {
     next_seq: u64,
     /// The file's header version; decides whether assembly lines may be written.
     version: u64,
+    poisoned: bool,
 }
 
 /// JSONL commit sink over one session file.
@@ -324,6 +327,7 @@ impl JsonlJournal {
             sync,
             next_seq: 0,
             version: JOURNAL_VERSION,
+            poisoned: false,
         };
         write_header(&mut inner)?;
         Ok(Self {
@@ -343,7 +347,7 @@ impl JsonlJournal {
             .map_err(JournalError::from)?;
         lock_or_err(&file)?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(JournalError::from)?;
+        read_bounded(&mut file, &mut bytes)?;
         let loaded = parse_records(&bytes)?;
         if let Some(tail) = &loaded.truncated_tail {
             file.set_len(tail.byte_offset).map_err(JournalError::from)?;
@@ -358,6 +362,7 @@ impl JsonlJournal {
             sync,
             next_seq: loaded.records.len() as u64,
             version: loaded.version,
+            poisoned: false,
         };
         if header_lost {
             write_header(&mut inner)?;
@@ -395,7 +400,7 @@ impl JsonlJournal {
             .map_err(JournalError::from)?;
         lock_or_err(&file)?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(JournalError::from)?;
+        read_bounded(&mut file, &mut bytes)?;
         let mut version = JOURNAL_VERSION;
         if bytes.is_empty() {
             if next_seq != 0 {
@@ -424,6 +429,7 @@ impl JsonlJournal {
             sync,
             next_seq,
             version,
+            poisoned: false,
         };
         if bytes.is_empty() {
             write_header(&mut inner)?;
@@ -480,14 +486,25 @@ fn append_blocking(inner: &Mutex<JsonlInner>, record: &JournalRecord) -> Result<
 }
 
 fn write_line(inner: &mut JsonlInner, mut line: Vec<u8>) -> Result<(), JournalError> {
+    if inner.poisoned {
+        return Err(JournalError::Io(
+            "journal writer needs recovery after failed write".into(),
+        ));
+    }
     line.push(b'\n');
     // Invariant 8a: ONE `write_all` of the complete line. A crash can therefore
     // leave at most a partial last line, which `load` reports, never misreads.
-    inner.file.write_all(&line).map_err(JournalError::from)?;
-    if inner.sync == SyncPolicy::EveryRecord {
-        inner.file.sync_data().map_err(JournalError::from)?;
+    let result = inner.file.write_all(&line).and_then(|()| {
+        if inner.sync == SyncPolicy::EveryRecord {
+            inner.file.sync_data()
+        } else {
+            Ok(())
+        }
+    });
+    if result.is_err() {
+        inner.poisoned = true;
     }
-    Ok(())
+    result.map_err(JournalError::from)
 }
 
 fn write_header(inner: &mut JsonlInner) -> Result<(), JournalError> {
@@ -523,6 +540,26 @@ fn lock_or_err(file: &File) -> Result<(), JournalError> {
 
 // ------------------------------------------------------------------ loading
 
+/// Bound admission before allocation, including sparse files and files grown after stat.
+const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
+fn read_bounded(file: &mut File, bytes: &mut Vec<u8>) -> Result<(), JournalError> {
+    if file.metadata().map_err(JournalError::from)?.len() > MAX_JOURNAL_BYTES {
+        return Err(JournalError::Io(
+            "session journal exceeds size limit".into(),
+        ));
+    }
+    let count = file
+        .take(MAX_JOURNAL_BYTES + 1)
+        .read_to_end(bytes)
+        .map_err(JournalError::from)?;
+    if count as u64 > MAX_JOURNAL_BYTES {
+        return Err(JournalError::Io(
+            "session journal exceeds size limit".into(),
+        ));
+    }
+    Ok(())
+}
+
 enum Line {
     /// `start`..`end` excludes the terminating `\n`.
     Complete { start: usize, end: usize },
@@ -546,9 +583,15 @@ fn next_line(bytes: &[u8], pos: usize) -> Line {
 }
 
 fn tail_from(bytes: &[u8], start: usize) -> TruncatedTail {
+    let fingerprint = bytes[start..]
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
     TruncatedTail {
         byte_offset: start as u64,
         bytes: (bytes.len() - start) as u64,
+        fingerprint,
     }
 }
 
@@ -570,7 +613,9 @@ fn complete_lines_before(bytes: &[u8], offset: usize) -> u64 {
 /// - a zero-byte file or an invalid header → `Corrupt{line: 1}`;
 /// - a header naming a version other than 1 or 2 → `UnknownVersion`.
 pub fn load(path: &Path) -> Result<Loaded, JournalError> {
-    let bytes = std::fs::read(path).map_err(JournalError::from)?;
+    let mut file = File::open(path).map_err(JournalError::from)?;
+    let mut bytes = Vec::new();
+    read_bounded(&mut file, &mut bytes)?;
     parse_records(&bytes)
 }
 
@@ -682,11 +727,34 @@ pub fn repair_truncated_tail(path: &Path, tail: &TruncatedTail) -> Result<(), Jo
     // that is no longer true: re-read under the lock and require the same tail.
     lock_or_err(&file)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(JournalError::from)?;
+    read_bounded(&mut file, &mut bytes)?;
     if parse_records(&bytes)?.truncated_tail.as_ref() != Some(tail) {
         return Err(JournalError::StaleTail);
     }
     file.set_len(tail.byte_offset).map_err(JournalError::from)?;
     file.sync_all().map_err(JournalError::from)?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn failed_write_poison_blocks_later_sequences_and_assembly() {
+        let file = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let mut inner = JsonlInner {
+            file,
+            path: PathBuf::from("/dev/full"),
+            sync: SyncPolicy::OsBuffered,
+            next_seq: 0,
+            version: JOURNAL_VERSION,
+            poisoned: false,
+        };
+        assert!(write_line(&mut inner, b"first".to_vec()).is_err());
+        assert!(inner.poisoned);
+        let error = write_line(&mut inner, b"second".to_vec()).unwrap_err();
+        assert!(error.to_string().contains("needs recovery"));
+        assert_eq!(inner.next_seq, 0);
+    }
 }

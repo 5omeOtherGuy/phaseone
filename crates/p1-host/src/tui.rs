@@ -243,6 +243,20 @@ impl FrontEnd for TuiFrontEnd {
         Some(self.shipped.clone())
     }
 
+    fn authorization_for_shipped(
+        &self,
+        shipped: Arc<ShippedPolicy>,
+        sources: Arc<crate::catalog::modules::VerifiedSources>,
+    ) -> Arc<dyn AuthorizationPolicy> {
+        let bridge = self.policy.with_source(shipped);
+        bridge.bind_sources(sources);
+        Arc::new(bridge)
+    }
+
+    fn bind_verified_sources(&self, sources: Arc<crate::catalog::modules::VerifiedSources>) {
+        self.policy.bind_sources(sources);
+    }
+
     fn parent_assembled(&self, route: &str, model: &str, _completion: Option<Completion>) {
         *self.labels.lock().unwrap() = Some((route.to_string(), model.to_string()));
         *self.route_label.lock().unwrap() = route.to_string();

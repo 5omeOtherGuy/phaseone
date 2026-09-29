@@ -256,6 +256,14 @@ mod tests {
     use super::*;
     use crate::{Loader, ReleaseManifest};
 
+    #[test]
+    fn authorization_allocation_matches_frozen_notices_row() {
+        assert_eq!(
+            AUTHORIZATION_POLICY_ALLOCATION,
+            ["control", "clock", "notices"]
+        );
+    }
+
     const FULL_ACCESS: (&str, &str) = ("p1-module-policy-full-access", "p1/policy/full-access");
     const ASK: (&str, &str) = ("p1-module-policy-ask", "p1/policy/ask");
     const EFFECTS: [Effect; 4] = [

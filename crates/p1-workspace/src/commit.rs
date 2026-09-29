@@ -1280,8 +1280,12 @@ fn refresh_credential_index(
     if index.still_current(cancel).unwrap_or(false) {
         return Ok(());
     }
-    *index = ProtectedIndex::build(credentials, cancel)
+    let mut rebuilt = ProtectedIndex::build(credentials, cancel)
         .map_err(|_| MutationError::Io("cancelled".into()))?;
+    // A target linked to a credential whose protected name was removed since the capture is
+    // known only to the captured index; keep refusing it through its alias.
+    rebuilt.retain_identities_of(index);
+    *index = rebuilt;
     Ok(())
 }
 

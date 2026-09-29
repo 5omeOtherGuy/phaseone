@@ -427,6 +427,7 @@ impl RunningProcess for CancelledStart {
 
 /// The state of one per-call Store: everything the linked capabilities read.
 pub(crate) struct CallState {
+    pub(crate) limits: crate::executor::MemoryLimiter,
     pub(crate) cancel: CancellationToken,
     pub(crate) table: ResourceTable,
     process: Option<Arc<dyn ProcessService>>,
@@ -450,6 +451,7 @@ impl CallState {
     pub(crate) fn new(cancel: CancellationToken, services: &Services) -> Self {
         let services = &services.for_call();
         Self {
+            limits: crate::executor::store_limits(),
             cancel,
             table: ResourceTable::new(),
             process: services.process.clone(),
@@ -462,6 +464,12 @@ impl CallState {
             origin: Instant::now(),
             cancel_grace: false,
         }
+    }
+}
+
+impl crate::executor::LimitedStore for CallState {
+    fn limits(&mut self) -> &mut crate::executor::MemoryLimiter {
+        &mut self.limits
     }
 }
 
@@ -555,14 +563,28 @@ pub(crate) fn capability_linker(
                 Some(workflows) => link_workflows(&mut linker, workflows),
                 None => return Err(LinkError::MissingService(capability.clone())),
             },
-            // The loader refuses every other capability before a linker is built.
+            // Some capabilities are valid for other classes but have no linker here.
             other => Err(wasmtime::format_err!(
-                "{other} is not a capability of this runtime"
+                "{other} has no linker in this runtime"
             )),
         };
         result.map_err(wasmtime_error(capability))?;
     }
     Ok(linker)
+}
+
+/// Reject a malformed component signature before indexing dynamic parameter or result slices.
+pub(crate) fn check_arity(
+    name: &str,
+    params: &[Val],
+    results: &[Val],
+    expected_params: usize,
+    expected_results: usize,
+) -> wasmtime::Result<()> {
+    if params.len() != expected_params || results.len() != expected_results {
+        bail!("{name}: invalid host function signature");
+    }
+    Ok(())
 }
 
 fn link_control(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
@@ -575,8 +597,9 @@ fn link_control(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
 
 fn link_clock(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
     let mut clock = linker.instance(&interface_import("clock"))?;
-    clock.func_new_async("now", |_store, _ty, _params, results| {
+    clock.func_new_async("now", |_store, _ty, params, results| {
         Box::new(async move {
+            check_arity("clock.now", params, results, 0, 1)?;
             // A wall clock before 1970 is a host misconfiguration; zero says "unknown"
             // without failing the module's call.
             let since = SystemTime::now()
@@ -642,6 +665,7 @@ fn link_process(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
     )?;
     process.func_new_async("spawn", |mut store, _ty, params, results| {
         Box::new(async move {
+            check_arity("process.spawn", params, results, 1, 1)?;
             let command = process_command(&params[0])?;
             let Some(service) = store.data().process.clone() else {
                 bail!("process.spawn called without a process service");
@@ -671,6 +695,7 @@ fn link_process(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
     })?;
     process.func_new_async("[method]running.next", |mut store, _ty, params, results| {
         Box::new(async move {
+            check_arity("process.running.next", params, results, 1, 1)?;
             let Val::Resource(handle) = &params[0] else {
                 bail!("process.running.next called without its resource");
             };
@@ -750,6 +775,7 @@ fn link_workspace(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
     let mut workspace = linker.instance(&interface_import("workspace"))?;
     workspace.func_new_async("stat", |store, _ty, params, results| {
         Box::new(async move {
+            check_arity("workspace.stat", params, results, 1, 1)?;
             let path = string_param(params, 0, "workspace.stat")?;
             let Some(service) = store.data().workspace.clone() else {
                 bail!("workspace.stat called without a workspace service");
@@ -765,11 +791,18 @@ fn link_workspace(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
     })?;
     workspace.func_new_async("read", |store, _ty, params, results| {
         Box::new(async move {
+            check_arity("workspace.read", params, results, 3, 1)?;
             let path = string_param(params, 0, "workspace.read")?;
             let (Some(Val::U64(offset)), Some(Val::U64(length))) = (params.get(1), params.get(2))
             else {
                 bail!("workspace.read: offset and length are not u64");
             };
+            if *length > crate::executor::MAX_TRANSFER_BYTES as u64 {
+                results[0] = fs_result(Err(FsError::Io(
+                    "workspace.read window exceeds the file transfer limit".to_owned(),
+                )));
+                return Ok(());
+            }
             let Some(service) = store.data().workspace.clone() else {
                 bail!("workspace.read called without a workspace service");
             };
@@ -784,6 +817,7 @@ fn link_workspace(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
     })?;
     workspace.func_new_async("list-files", |store, _ty, params, results| {
         Box::new(async move {
+            check_arity("workspace.list-files", params, results, 2, 1)?;
             let path = string_param(params, 0, "workspace.list-files")?;
             let glob = option_string(params.get(1), "workspace.list-files", "glob")?;
             let Some(service) = store.data().workspace.clone() else {
@@ -800,6 +834,7 @@ fn link_workspace(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
     })?;
     workspace.func_new_async("search", |store, _ty, params, results| {
         Box::new(async move {
+            check_arity("workspace.search", params, results, 1, 1)?;
             let Some(query) = params.first() else {
                 bail!("workspace.search called without its query");
             };
@@ -909,6 +944,7 @@ fn link_snapshot(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
     let mut snapshot = linker.instance(&interface_import("snapshot"))?;
     snapshot.func_new_async("observe", |store, _ty, params, results| {
         Box::new(async move {
+            check_arity("snapshot.observe", params, results, 2, 1)?;
             let path = string_param(params, 0, "snapshot.observe")?;
             let contents = bytes_param(params, 1, "snapshot.observe")?;
             let Some(service) = store.data().snapshot.clone() else {
@@ -925,6 +961,7 @@ fn link_snapshot(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
     })?;
     snapshot.func_new_async("check", |store, _ty, params, results| {
         Box::new(async move {
+            check_arity("snapshot.check", params, results, 2, 1)?;
             let path = string_param(params, 0, "snapshot.check")?;
             let current = bytes_param(params, 1, "snapshot.check")?;
             let Some(service) = store.data().snapshot.clone() else {
@@ -989,8 +1026,9 @@ fn link_workspace_mutation(linker: &mut Linker<CallState>) -> wasmtime::Result<(
             Ok(())
         },
     )?;
-    mutation.func_new_async("begin", |mut store, _ty, _params, results| {
+    mutation.func_new_async("begin", |mut store, _ty, params, results| {
         Box::new(async move {
+            check_arity("workspace-mutation.begin", params, results, 0, 1)?;
             let Some(service) = store.data().workspace_mutation.clone() else {
                 bail!("workspace-mutation.begin called without a workspace-mutation service");
             };
@@ -1019,6 +1057,7 @@ fn link_workspace_mutation(linker: &mut Linker<CallState>) -> wasmtime::Result<(
         "[method]mutation.write",
         |mut store, _ty, params, results| {
             Box::new(async move {
+                check_arity("workspace-mutation.write", params, results, 3, 1)?;
                 let path = string_param(params, 1, "workspace-mutation.mutation.write")?;
                 let contents = bytes_param(params, 2, "workspace-mutation.mutation.write")?;
                 let cancel = store.data().cancel.clone();
@@ -1036,6 +1075,7 @@ fn link_workspace_mutation(linker: &mut Linker<CallState>) -> wasmtime::Result<(
         "[method]mutation.create",
         |mut store, _ty, params, results| {
             Box::new(async move {
+                check_arity("workspace-mutation.create", params, results, 3, 1)?;
                 let path = string_param(params, 1, "workspace-mutation.mutation.create")?;
                 let contents = bytes_param(params, 2, "workspace-mutation.mutation.create")?;
                 let cancel = store.data().cancel.clone();
@@ -1053,6 +1093,7 @@ fn link_workspace_mutation(linker: &mut Linker<CallState>) -> wasmtime::Result<(
         "[method]mutation.remove",
         |mut store, _ty, params, results| {
             Box::new(async move {
+                check_arity("workspace-mutation.remove", params, results, 2, 1)?;
                 let path = string_param(params, 1, "workspace-mutation.mutation.remove")?;
                 let cancel = store.data().cancel.clone();
                 let entry = mutation_entry(&mut store, params, "remove")?;
@@ -1069,6 +1110,7 @@ fn link_workspace_mutation(linker: &mut Linker<CallState>) -> wasmtime::Result<(
         "[method]mutation.rename",
         |mut store, _ty, params, results| {
             Box::new(async move {
+                check_arity("workspace-mutation.rename", params, results, 3, 1)?;
                 let old_path = string_param(params, 1, "workspace-mutation.mutation.rename")?;
                 let new_path = string_param(params, 2, "workspace-mutation.mutation.rename")?;
                 let cancel = store.data().cancel.clone();
@@ -1462,6 +1504,21 @@ mod tests {
             files.search(query).await,
             Err(FsError::Io(SEARCH_NOT_GRANTED.to_owned()))
         );
+    }
+
+    #[test]
+    fn unlinked_interface_is_not_described_as_loader_rejection() {
+        let engine = crate::engine().unwrap();
+        let error = capability_linker(&engine, &granted(&["notices"]), &Services::default())
+            .err()
+            .expect("notices has no linker");
+        assert!(error.to_string().contains("no linker"));
+    }
+
+    #[test]
+    fn malformed_dynamic_host_signature_is_a_error_not_a_panic() {
+        assert!(check_arity("test", &[], &[], 0, 1).is_err());
+        assert!(check_arity("test", &[], &[Val::Bool(false)], 1, 1).is_err());
     }
 
     #[test]

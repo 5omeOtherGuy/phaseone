@@ -24,7 +24,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0008 | [rustfmt and clippy installed for the gate](0008-rustfmt-and-clippy-for-the-gate.md) | accepted | 2026-09-19 | lead |
 | ADR-0009 | [New repository on a task branch with no remotes](0009-new-repo-task-branch-no-remotes.md) | superseded by ADR-0010 | 2026-09-19 | lead |
 | ADR-0010 | [Public repository, trunk-based, pushes and merges authorised](0010-public-repo-trunk-based-with-pushes-authorised.md) | accepted | 2026-09-19 | owner |
-| ADR-0011 | [The gate is the single definition of green](0011-gate-is-the-single-definition-of-green.md) | superseded by ADR-0102 | 2026-09-19 | lead |
+| ADR-0011 | [The gate is the single definition of green](0011-gate-is-the-single-definition-of-green.md) | superseded by ADR-0105 | 2026-09-19 | lead |
 | ADR-0012 | [Live provider checks are lead-only](0012-live-provider-checks-are-lead-only.md) | accepted | 2026-09-19 | lead |
 | ADR-0013 | [One shared cargo target directory across worktrees](0013-shared-cargo-target-dir.md) | superseded by ADR-0014 | 2026-09-19 | owner+lead |
 | ADR-0014 | [Per-worktree cargo targets seeded by hardlinks and a global rustc semaphore](0014-per-worktree-targets-and-rustc-semaphore.md) | accepted | 2026-09-20 | lead |
@@ -115,7 +115,10 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0099 | [Mutating tools bind their planning read and cancellation to the workspace handle](0099-mutating-tools-bind-their-planning-read-and-cancellation-to-the-workspace-handle.md) | proposed | 2026-09-29 | lead |
 | ADR-0100 | [Provider transport exposes bounded SSE and WebSocket seams](0100-provider-transport-exposes-bounded-sse-and-websocket-seams.md) | proposed | 2026-09-29 | lead |
 | ADR-0101 | [Bounded read and listing refusals for the file tools](0101-bounded-read-and-listing-refusals-for-the-file-tools.md) | proposed | 2026-09-29 | lead |
-| ADR-0102 | [Run the gate and task builds on Depot CI alongside GitHub Actions](0102-run-the-gate-and-task-builds-on-depot-ci-alongside-github-actions.md) | proposed | 2026-09-29 | owner |
+| ADR-0102 | [Command evidence is the host's observed process exit, never component text](0102-command-evidence-is-the-host-s-observed-process-exit-never-component-text.md) | proposed | 2026-09-29 | lead |
+| ADR-0103 | [Assembled tools carry their capability snapshot, not a process-global registry](0103-assembled-tools-carry-their-capability-snapshot-not-a-process-global-registry.md) | accepted | 2026-09-29 | lead |
+| ADR-0104 | [Credential index rebuilds keep earlier identities and expose a test clock](0104-credential-index-rebuilds-keep-earlier-identities-and-expose-a-test-clock.md) | proposed | 2026-09-29 | lead |
+| ADR-0105 | [Run the gate and task builds on Depot CI alongside GitHub Actions](0105-run-the-gate-and-task-builds-on-depot-ci-alongside-github-actions.md) | proposed | 2026-09-29 | owner |
 <!-- adr-index:end -->
 
 ## Writing one

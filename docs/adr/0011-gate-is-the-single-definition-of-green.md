@@ -5,7 +5,7 @@ status: superseded
 date: 2026-09-19
 deciders: lead
 supersedes: []
-superseded_by: [102]
+superseded_by: [105]
 sources: [D7, D19, scripts/gate.sh, .github/workflows/ci.yml]
 ---
 # ADR-0011: The gate is the single definition of green

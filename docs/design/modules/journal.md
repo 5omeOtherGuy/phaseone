@@ -30,7 +30,8 @@ record, and a binary that cannot check that must refuse the journal instead of r
   the only line that is neither a record nor an assembly line, and it carries nothing else.
 - **Where it sits.** Line 1, before any record; it is never rewritten. p1 still reads a
   version-1 file and appends to it as version 1, so an old session stays readable by the old
-  binaries; `record_assembly` on it is `JournalError::AssemblyNeedsVersion2`.
+  binaries; `record_assembly` on it is `JournalError::AssemblyNeedsVersion2`. Model switches
+  on a resumed version-1 file likewise skip the assembly line, without refusing the switch.
 - **How new p1 reads it.** `load`, `resume` and `open_for_append` accept 1 and 2; any other value
   is `JournalError::UnknownVersion` ("unknown journal version; refusing to guess"), never a
   guess.
@@ -81,15 +82,25 @@ Version 2 adds one line kind beside the `seq` records: `{"assembly":{…}}`, own
   commit under the store's `SyncPolicy`; `MemoryJournal::record_assembly` and `assemblies()`
   mirror it.
 - **When it is written (S1.9).** The host builds the identity in `p1_host::run` — from the
-  assembled tools, the environment's provider key, the two host policies and the `modules.lock`
-  the catalog's own module registration read — and writes it through the sink the core commits
+  assembled tools, the environment's provider key, the two host policies and the catalog build's
+  registry of verified module loads — and writes it through the sink the core commits
   through, immediately before the run's first record: the `Environment` record is first in a
   turn, so the line precedes it, and a resume whose first request the provider refuses commits
-  nothing and so writes nothing. A line is written again after every change that commits a new
+  nothing and so writes nothing. A model switch or reload arms the next identity before its
+  reconfiguration commit, so its `Environment` record cannot precede that identity. A line is written again after every change that commits a new
   `Environment` (`/model` or `/effort` through `ModelSwitch`, and `Agent::reconfigure`), and on
   a resume that names another assembly; a resume over an unchanged assembly writes nothing and
-  reports nothing. The lock's digest is the loader-verified one: the lock is checked against the
-  release manifest and the loader verifies the compiled bytes against that same manifest digest.
+  reports nothing. Package identity comes from `LoadedModule` after the loader verifies its
+  bytes; the registry records a provider when assembly activates it and records policy packages
+  when they are composed. A catalog build shares one loader, engine and epoch ticker across its
+  tool, member and provider loads; a reload uses a new loader. The journal never re-reads
+  a manifest to discover a digest after the catalog has been built. Authorization grants also
+  include the executing tool's verified digest, so a replacement with the same catalog key and
+  presentation cannot inherit an `always` answer. Package capability declarations are keyed by
+  loader identity and digest, then bound to each assembled tool object: running children keep
+  their original grants while reload constructs another generation. Reloaded policy components
+  likewise get a fresh verdict source; a child pins its old source and only the new generation
+  answers from the reloaded component.
 - **The changed-artifact report (S1.9).** On resume the host compares the journal's last identity
   with the identity it assembled now and prints one line per module whose digest, package or
   version changed, plus every module added or removed, and the host and the environment when they

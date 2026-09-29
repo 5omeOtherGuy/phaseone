@@ -201,6 +201,7 @@ struct Session {
     /// `Arc` a case can hand to two sessions.
     hub: Arc<CompletionHub>,
     completion: Completion,
+    _mask: Arc<MaskCounter>,
     tee: ActivityTee,
     tools: Vec<Arc<dyn Tool>>,
     next_call: AtomicU32,
@@ -237,7 +238,8 @@ impl Session {
 
     /// Another agent of the same run: its own record, cell and tools on the SHARED hub.
     fn on(hub: Arc<CompletionHub>, tools: Vec<Arc<dyn Tool>>) -> Self {
-        let completion = hub.issue();
+        let mask = Arc::new(MaskCounter::new());
+        let completion = hub.issue(&mask);
         let tee = ActivityTee::new(
             Arc::new(RecordingEvents::new()),
             completion.log.clone(),
@@ -246,6 +248,7 @@ impl Session {
         Self {
             hub,
             completion,
+            _mask: mask,
             tee,
             tools,
             next_call: AtomicU32::new(0),

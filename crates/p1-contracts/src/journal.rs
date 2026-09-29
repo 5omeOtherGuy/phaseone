@@ -62,6 +62,20 @@ pub enum RecordBody {
     },
     ToolFinished {
         result: ToolResultItem,
+        /// The exit status the host observed for this call, when the tool records
+        /// command evidence. Only the host writes it, so a component's output text
+        /// can never set it on replay.
+        ///
+        /// The OUTER `Option` keeps an absent field (a journal written before this
+        /// field existed, where the footer was the host's evidence format) apart
+        /// from an explicit `null` (this host observed no exit, so the footer has no
+        /// authority). `Some(Some(code))` is an observed exit.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_observed_exit"
+        )]
+        exit_code: Option<Option<i32>>,
     },
     /// The context policy replaced the model-visible history from here on.
     ContextReplaced {
@@ -71,6 +85,17 @@ pub enum RecordBody {
         #[serde(default)]
         usage: Option<Usage>,
     },
+}
+
+/// Deserialize `exit_code`, keeping an ABSENT field apart from an explicit `null`.
+/// Serde calls this only when the key is present, so a `null` becomes `Some(None)`
+/// (the host observed no exit) while an absent key keeps `#[serde(default)]`'s
+/// `None` (a journal written before the field existed).
+fn deserialize_observed_exit<'de, D>(deserializer: D) -> Result<Option<Option<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<i32> as Deserialize>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

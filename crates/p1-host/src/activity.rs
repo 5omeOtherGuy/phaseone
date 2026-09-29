@@ -5,7 +5,7 @@
 //! The tee forwards EVERY event to the renderer unchanged (the renderer keeps its
 //! exact behaviour) and records finished calls into an [`ActivityLog`]: the order
 //! of the last `WritesFiles` call and every `Executes` run with its parsed shell
-//! exit code. The log is ONE owner per agent — a worker gets its own — and nothing
+//! exit code (host-observed for evidence tools). The log is ONE owner per agent — a worker gets its own — and nothing
 //! here is global.
 //!
 //! The `finish` tool instance is built by the catalog, before the host knows the
@@ -76,6 +76,7 @@ struct Pending {
     effect: Effect,
     command: Option<String>,
     records_evidence: bool,
+    synthetic: bool,
 }
 
 /// Where a command's workspace changes are measured (ADR-0055), and what the last
@@ -124,6 +125,16 @@ impl ActivityLog {
     /// records command evidence ([`records_command_evidence`]): the host knows that from
     /// the tool's loader-built or native identity, never from the call.
     pub fn record_started_by(&self, call: &ToolCall, effect: Effect, records_evidence: bool) {
+        self.record_started_with_origin(call, effect, records_evidence, false);
+    }
+
+    fn record_started_with_origin(
+        &self,
+        call: &ToolCall,
+        effect: Effect,
+        records_evidence: bool,
+        synthetic: bool,
+    ) {
         let command = match effect {
             Effect::Executes => shell_command(call),
             _ => None,
@@ -134,6 +145,7 @@ impl ActivityLog {
                 effect,
                 command,
                 records_evidence,
+                synthetic,
             },
         );
         if effect == Effect::Executes {
@@ -143,13 +155,48 @@ impl ActivityLog {
 
     /// Record a finished call. `order` is assigned here, monotonically.
     pub fn record_finished(&self, result: &ToolResultItem) {
+        self.record_finished_with_exit(result, None);
+    }
+
+    /// `observed_exit` comes from the process capability, never guest output.
+    pub fn record_finished_with_exit(&self, result: &ToolResultItem, observed_exit: Option<i32>) {
+        self.record_finished_inner(result, observed_exit, false);
+    }
+
+    /// A `ToolFinished` replayed from a journal written before the host recorded
+    /// exits (`exit_code` absent): for a tool that records command evidence the
+    /// footer WAS the host's evidence format then, so it is read exactly as that
+    /// host read it. A current journal carries `Some(..)`, so a component footer
+    /// has no authority there.
+    fn record_finished_from_legacy_journal(&self, result: &ToolResultItem) {
+        self.record_finished_inner(result, None, true);
+    }
+
+    fn record_finished_inner(
+        &self,
+        result: &ToolResultItem,
+        observed_exit: Option<i32>,
+        legacy_footer: bool,
+    ) {
         let pending = self.pending.lock().unwrap().remove(&result.call_id);
         let effect = pending.as_ref().map_or(Effect::ReadOnly, |p| p.effect);
         let records_evidence = pending.as_ref().is_some_and(|p| p.records_evidence);
+        let synthetic = pending.as_ref().is_some_and(|p| p.synthetic);
         let command = pending.and_then(|p| p.command);
         let order = self.next_order.fetch_add(1, Ordering::SeqCst) + 1;
         let exit_code = if effect == Effect::Executes && result.status == ToolStatus::Ok {
-            parse_exit_code(&result.content)
+            if records_evidence {
+                // Only an explicit in-memory test double supplies synthetic exits,
+                // and only a journal from before host-observed exits may read the
+                // footer. Guest text has no authority when the tool is a module.
+                if synthetic || legacy_footer {
+                    observed_exit.or_else(|| parse_exit_code(&result.content))
+                } else {
+                    observed_exit
+                }
+            } else {
+                parse_exit_code(&result.content)
+            }
         } else {
             None
         };
@@ -304,9 +351,17 @@ impl ActivityLog {
                     let tool = by_name.get(call.name.as_str());
                     let effect = tool.map_or(Effect::ReadOnly, |tool| tool.effect(call));
                     let evidence = tool.is_some_and(|tool| records_command_evidence(tool.as_ref()));
-                    self.record_started_by(call, effect, evidence);
+                    let synthetic = tool.is_some_and(|tool| tool.synthetic_command_result());
+                    self.record_started_with_origin(call, effect, evidence, synthetic);
                 }
-                RecordBody::ToolFinished { result } => self.record_finished(result),
+                RecordBody::ToolFinished { result, exit_code } => match exit_code {
+                    // The host wrote an observation for this call (possibly "no
+                    // exit"): only it has authority over the footer.
+                    Some(observed) => self.record_finished_with_exit(result, *observed),
+                    // The field is absent: a journal older than host-observed exits,
+                    // where the footer was the host's evidence format.
+                    None => self.record_finished_from_legacy_journal(result),
+                },
                 _ => {}
             }
         }
@@ -446,10 +501,18 @@ impl EventSink for ActivityTee {
                 let effect = tool
                     .as_ref()
                     .map_or(Effect::ReadOnly, |tool| tool.effect(call));
-                let evidence = tool.is_some_and(|tool| records_command_evidence(tool.as_ref()));
-                self.log.record_started_by(call, effect, evidence);
+                let evidence = tool
+                    .as_ref()
+                    .is_some_and(|tool| records_command_evidence(tool.as_ref()));
+                let synthetic = tool.is_some_and(|tool| tool.synthetic_command_result());
+                self.log
+                    .record_started_with_origin(call, effect, evidence, synthetic);
             }
-            AgentEvent::ToolFinished { result } => self.log.record_finished(result),
+            AgentEvent::ToolFinished { result } => {
+                let tool = self.tools.lock().unwrap().get(&result.name).cloned();
+                let exit = tool.and_then(|tool| tool.take_command_exit_code(&result.call_id));
+                self.log.record_finished_with_exit(result, exit);
+            }
             _ => {}
         }
         self.inner.emit(event);
@@ -718,7 +781,7 @@ pub struct Completion {
 /// it reaches the accepted cell.
 #[derive(Default)]
 pub struct CompletionHub {
-    last: Mutex<Option<Completion>>,
+    issued: Mutex<HashMap<usize, Completion>>,
     /// The `p1/finish` component the finish entry assembled, so a worker's assembly
     /// boundary can rebuild the tool under the policy the hub chose (rule 7) without
     /// touching the catalog.
@@ -729,26 +792,69 @@ pub struct CompletionHub {
     shared: Arc<HubShared>,
 }
 
+/// Discard a completion issued during an assembly that aborts before it can be taken.
+/// A successful assembly takes its value before this guard drops.
+pub(crate) struct AssemblyIssueGuard<'a> {
+    hub: &'a CompletionHub,
+    mask: &'a Arc<MaskCounter>,
+}
+
+impl Drop for AssemblyIssueGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.hub.take(self.mask);
+    }
+}
+
 impl CompletionHub {
+    pub(crate) fn assembly_guard<'a>(
+        &'a self,
+        mask: &'a Arc<MaskCounter>,
+    ) -> AssemblyIssueGuard<'a> {
+        AssemblyIssueGuard { hub: self, mask }
+    }
+
+    /// The generation of the grant that is live for agent `id` (test observation).
+    #[cfg(test)]
+    pub(crate) fn live_generation_for_test(&self, id: u64) -> u64 {
+        self.shared.agent(id).state.lock().unwrap().generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_issued(&self) -> usize {
+        self.issued.lock().unwrap().len()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Build the completion for the assembly that is starting, under a fresh agent id.
-    pub fn issue(&self) -> Completion {
+    pub fn issue(&self, mask: &Arc<MaskCounter>) -> Completion {
         let completion = Completion {
             id: self.next_agent.fetch_add(1, Ordering::Relaxed) + 1,
             log: Arc::new(ActivityLog::default()),
             outcome: FinishOutcome::default(),
         };
-        *self.last.lock().unwrap() = Some(completion.clone());
+        self.issued
+            .lock()
+            .unwrap()
+            .insert(Arc::as_ptr(mask) as usize, completion.clone());
         completion
     }
 
     /// The completion issued for the assembly that just finished, if its
     /// environment assembled the `finish` tool.
-    pub fn take(&self) -> Option<Completion> {
-        self.last.lock().unwrap().take()
+    pub fn take(&self, mask: &Arc<MaskCounter>) -> Option<Completion> {
+        self.issued
+            .lock()
+            .unwrap()
+            .remove(&(Arc::as_ptr(mask) as usize))
+    }
+
+    /// Release a retired agent's stored grant state. Existing in-flight grants hold
+    /// their own Arc and can finish without changing another agent's entry.
+    pub fn retire(&self, id: u64) {
+        self.shared.agents.lock().unwrap().remove(&id);
     }
 
     /// The `p1/finish` component the finish entry assembled, registered when it builds
@@ -777,7 +883,7 @@ impl CompletionHub {
         let agent = self.shared.agent(completion.id);
         let generation = {
             let mut state = agent.state.lock().unwrap();
-            state.generation += 1;
+            state.generation = state.generation.max(state.staged) + 1;
             state.completion = Some(completion.clone());
             state.policy = policy;
             state.contract = contract.clone();
@@ -790,6 +896,49 @@ impl CompletionHub {
             policy,
             contract,
         }
+    }
+
+    /// Prepare the grant of a re-assembly that may still be refused, WITHOUT touching the
+    /// agent's live grant state: the finish tool the agent runs now stays fresh until
+    /// [`StagedFinish::activate`] runs, which the caller does once the new assembly is
+    /// installed. Dropping the staged value leaves the agent exactly as it was. The staged
+    /// grant carries a generation no earlier grant of this agent has.
+    pub fn stage_finish_for(
+        &self,
+        current: &Arc<dyn Tool>,
+        completion: &Completion,
+        tools: &[Arc<dyn Tool>],
+        role: AgentRole,
+        contract: Option<OutputContract>,
+        mask: &Arc<MaskCounter>,
+    ) -> Result<StagedFinish, String> {
+        let module = self
+            .finish_module
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no finish component was assembled for this agent".to_string())?;
+        let policy = completion_policy(tools, role);
+        let agent = self.shared.agent(completion.id);
+        let generation = {
+            let mut state = agent.state.lock().unwrap();
+            state.staged = state.staged.max(state.generation) + 1;
+            state.staged
+        };
+        let grant = CompletionGrant {
+            agent,
+            generation,
+            completion: completion.clone(),
+            policy,
+            contract,
+        };
+        let face = (
+            current.declaration().name.as_str(),
+            current.identity().variant.as_str(),
+        );
+        let (tool, name) =
+            finish_tool(&module, &grant, Some(face), mask).map_err(|error| error.to_string())?;
+        Ok(StagedFinish { tool, grant, name })
     }
 
     /// A worker's assembly boundary for the `p1/finish` component (ADR-0083 rules 6 and
@@ -819,6 +968,36 @@ impl CompletionHub {
             current.identity().variant.as_str(),
         );
         finish_component(&module, &grant, Some(face), mask).map_err(|error| error.to_string())
+    }
+}
+
+/// A finish tool built over a grant that is not yet the agent's live one
+/// ([`CompletionHub::stage_finish_for`]).
+pub struct StagedFinish {
+    tool: Arc<dyn Tool>,
+    grant: CompletionGrant,
+    name: String,
+}
+
+impl StagedFinish {
+    /// The tool to assemble; it is refused as stale until [`StagedFinish::activate`].
+    pub fn tool(&self) -> &Arc<dyn Tool> {
+        &self.tool
+    }
+
+    /// Make the staged grant the agent's live one, which voids the earlier tool's. Only
+    /// after the assembly holding [`StagedFinish::tool`] is installed.
+    pub fn activate(self) {
+        {
+            let mut state = self.grant.agent.state.lock().unwrap();
+            if self.grant.generation > state.generation {
+                state.generation = self.grant.generation;
+                state.completion = Some(self.grant.completion.clone());
+                state.policy = self.grant.policy;
+                state.contract = self.grant.contract.clone();
+            }
+        }
+        self.grant.completion.log.set_finish_name(self.name);
     }
 }
 
@@ -884,6 +1063,8 @@ struct AgentState {
     completion: Option<Completion>,
     policy: CompletionPolicy,
     contract: Option<OutputContract>,
+    /// The highest generation a staged (not yet live) grant took.
+    staged: u64,
     /// The `execute` call a candidate may belong to, if one runs.
     window: Option<Window>,
 }
@@ -895,6 +1076,7 @@ impl Default for AgentState {
             completion: None,
             policy: CompletionPolicy::RecordedCommands,
             contract: None,
+            staged: 0,
             window: None,
         }
     }
@@ -1353,6 +1535,19 @@ pub fn finish_component(
     face: Option<(&str, &str)>,
     mask: &Arc<MaskCounter>,
 ) -> Result<Arc<dyn Tool>, ToolError> {
+    let (tool, name) = finish_tool(module, grant, face, mask)?;
+    grant.completion().log.set_finish_name(name);
+    Ok(tool)
+}
+
+/// The finish tool over `grant` and the model-facing name it presents, without naming it
+/// in the log: a staged grant names it only when it becomes the live one.
+fn finish_tool(
+    module: &LoadedModule,
+    grant: &CompletionGrant,
+    face: Option<(&str, &str)>,
+    mask: &Arc<MaskCounter>,
+) -> Result<(Arc<dyn Tool>, String), ToolError> {
     let services = Services {
         completion: Some(grant.service()),
         ..Services::default()
@@ -1372,7 +1567,6 @@ pub fn finish_component(
             input_schema: p1_finish_guest::input_schema(grant.contract()),
         },
     };
-    grant.completion().log.set_finish_name(name.clone());
     let identity = ToolIdentity {
         implementation: component.identity().implementation.clone(),
         variant,
@@ -1380,7 +1574,7 @@ pub fn finish_component(
     let gate = CompletionGate::new(component, grant.clone())
         .presenting(declaration)
         .identified(identity);
-    Ok(redacted(Arc::new(gate), mask))
+    Ok((redacted(Arc::new(gate), mask), name))
 }
 
 #[cfg(test)]
@@ -1403,6 +1597,116 @@ mod tests {
             module.name().to_owned()
         })
         .clone()
+    }
+
+    #[test]
+    fn aborted_assembly_retires_issued_completion() {
+        use p1_assembly::{Catalog, EnvironmentFile, Substitutions, ToolSpec, assemble};
+        let hub = Arc::new(CompletionHub::new());
+        let mask = Arc::new(MaskCounter::new());
+        let mut catalog = Catalog::new();
+        catalog.provider(
+            "scripted",
+            Box::new(|_| {
+                Ok(Arc::new(p1_testkit::ScriptedProvider::new(Vec::new()))
+                    as Arc<dyn p1_contracts::Provider>)
+            }),
+        );
+        let issue = hub.clone();
+        let assembly_mask = mask.clone();
+        catalog.tool(
+            "finish",
+            Box::new(move |spec: &ToolSpec, _: &p1_assembly::ToolServices| {
+                issue.issue(&assembly_mask);
+                Ok(Arc::new(FakeTool::new(&spec.module)) as Arc<dyn Tool>)
+            }),
+        );
+        catalog.tool(
+            "broken",
+            Box::new(|_: &ToolSpec, _: &p1_assembly::ToolServices| Err("factory refused".into())),
+        );
+        let environment = EnvironmentFile {
+            name: "broken".into(),
+            family: "test".into(),
+            provider: "scripted".into(),
+            model: "m".into(),
+            profile: None,
+            profile_text: None,
+            options: Default::default(),
+            tools: ["finish", "broken"]
+                .into_iter()
+                .map(|module| ToolSpec {
+                    module: module.into(),
+                    name: None,
+                    description: None,
+                    variant: None,
+                })
+                .collect(),
+            prompt_template: String::new(),
+            context: None,
+            summarize_prompt: None,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        for _ in 0..3 {
+            let failed = {
+                let _assembly = hub.assembly_guard(&mask);
+                let failed = assemble(
+                    &catalog,
+                    &environment,
+                    workspace.path(),
+                    &Substitutions {
+                        workspace: "/work".into(),
+                        date: "2026-01-01".into(),
+                        os: "linux".into(),
+                    },
+                );
+                assert_eq!(hub.pending_issued(), 1);
+                failed
+            };
+            assert!(failed.is_err());
+            assert_eq!(hub.pending_issued(), 0);
+        }
+    }
+
+    fn live_generation(hub: &CompletionHub, id: u64) -> u64 {
+        hub.shared.agent(id).state.lock().unwrap().generation
+    }
+
+    #[tokio::test]
+    async fn a_staged_finish_leaves_the_live_grant_fresh_until_it_is_activated() {
+        let hub = CompletionHub::new();
+        let mask = Arc::new(MaskCounter::new());
+        let completion = hub.issue(&mask);
+        let module = Arc::new(crate::catalog::capabilities::built_package(
+            "p1-module-finish",
+        ));
+        hub.register_finish(&module);
+        let live = hub.grant(completion.clone(), &[], AgentRole::Main, None);
+        let installed = finish_component(&module, &live, None, &mask).expect("live finish");
+        let before = live_generation(&hub, completion.id);
+
+        // A reload builds its finish over the session's completion, then its install is refused:
+        // dropping the staged value must leave the installed tool's grant fresh.
+        let staged = hub
+            .stage_finish_for(&installed, &completion, &[], AgentRole::Main, None, &mask)
+            .expect("staged finish");
+        assert_eq!(live_generation(&hub, completion.id), before);
+        drop(staged);
+        assert_eq!(live_generation(&hub, completion.id), before);
+
+        // The install that succeeded makes the staged grant the live one, and only then is
+        // the earlier tool stale.
+        let staged = hub
+            .stage_finish_for(&installed, &completion, &[], AgentRole::Main, None, &mask)
+            .expect("staged finish");
+        assert_eq!(live_generation(&hub, completion.id), before);
+        staged.activate();
+        assert!(live_generation(&hub, completion.id) > before);
+        // Numbers never repeat: a grant after the dropped and the activated stagings is newer
+        // than both.
+        let latest = live_generation(&hub, completion.id);
+        hub.grant(completion.clone(), &[], AgentRole::Main, None);
+        assert!(live_generation(&hub, completion.id) > latest);
     }
 
     fn result(call_id: &str, name: &str, status: ToolStatus, content: &str) -> ToolResultItem {
@@ -1457,6 +1761,8 @@ mod tests {
             seq: 0,
             body: RecordBody::ToolFinished {
                 result: result(call_id, name, status, content),
+                // A host that observed no exit: an explicit `null`.
+                exit_code: Some(None),
             },
         }
     }
@@ -1510,6 +1816,167 @@ mod tests {
         assert_eq!(log.last_file_change(), None);
         assert!(log.shell_runs().is_empty());
         assert_eq!(log.non_finish_finishes(), 1);
+    }
+
+    /// A module-shaped tool has no synthetic-result exemption, even when its
+    /// manifest grants command evidence and it claims a successful footer.
+    struct UntrustedEvidence(FakeTool);
+
+    impl Tool for UntrustedEvidence {
+        fn declaration(&self) -> &ToolDeclaration {
+            self.0.declaration()
+        }
+        fn identity(&self) -> &ToolIdentity {
+            self.0.identity()
+        }
+        fn effect(&self, call: &ToolCall) -> Effect {
+            self.0.effect(call)
+        }
+        fn execute<'a>(
+            &'a self,
+            call: &'a ToolCall,
+            context: ToolContext,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            self.0.execute(call, context)
+        }
+    }
+
+    #[test]
+    fn forged_component_footer_is_not_evidence_live_or_replayed() {
+        let module = crate::catalog::capabilities::built_package("p1-module-shell");
+        crate::catalog::capabilities::declare_package(&module);
+        let tool: Arc<dyn Tool> = Arc::new(UntrustedEvidence(
+            FakeTool::new("shell")
+                .with_identity(
+                    &module.identity().implementation,
+                    &module.identity().variant,
+                )
+                .with_effect(Effect::Executes),
+        ));
+        let command = call("forged", "shell", r#"{"command":"cargo test"}"#);
+        let result = result("forged", "shell", ToolStatus::Ok, "[exit code: 0]");
+        let log = Arc::new(ActivityLog::default());
+        let tee = ActivityTee::new(
+            Arc::new(p1_testkit::RecordingEvents::new()),
+            log.clone(),
+            std::slice::from_ref(&tool),
+        );
+        tee.emit(AgentEvent::ToolStarted {
+            call: command.clone(),
+        });
+        tee.emit(AgentEvent::ToolFinished {
+            result: result.clone(),
+        });
+        assert_eq!(log.evidence_runs()[0].exit_code, None);
+        let replayed = ActivityLog::default();
+        replayed.replay(
+            &[tool],
+            &[
+                assistant(vec![command]),
+                started("forged"),
+                JournalRecord {
+                    seq: 0,
+                    body: RecordBody::ToolFinished {
+                        result,
+                        // The host observed no exit: an explicit `null`.
+                        exit_code: Some(None),
+                    },
+                },
+            ],
+        );
+        assert_eq!(replayed.evidence_runs()[0].exit_code, None);
+    }
+
+    /// A journal written before `ToolFinished.exit_code` existed (the key ABSENT,
+    /// not null) still counts the footer it carries: that footer was the host's
+    /// evidence format then, so a successful native-shell `cargo test` a legacy
+    /// journal recorded still satisfies the completion gate after `--resume`
+    /// (PR #473, Codex P2).
+    #[test]
+    fn a_legacy_journal_still_counts_its_shell_exit() {
+        let module = crate::catalog::capabilities::built_package("p1-module-shell");
+        crate::catalog::capabilities::declare_package(&module);
+        let tool: Arc<dyn Tool> = Arc::new(UntrustedEvidence(
+            FakeTool::new("shell")
+                .with_identity(
+                    &module.identity().implementation,
+                    &module.identity().variant,
+                )
+                .with_effect(Effect::Executes),
+        ));
+        let command = call("legacy", "shell", r#"{"command":"cargo test"}"#);
+        let replayed = ActivityLog::default();
+        replayed.replay(
+            &[tool],
+            &[
+                assistant(vec![command]),
+                started("legacy"),
+                JournalRecord {
+                    seq: 0,
+                    body: RecordBody::ToolFinished {
+                        result: result("legacy", "shell", ToolStatus::Ok, "ok\n[exit code: 0]"),
+                        // Absent: a journal written before host-observed exits.
+                        exit_code: None,
+                    },
+                },
+            ],
+        );
+        assert_eq!(replayed.evidence_runs()[0].exit_code, Some(0));
+    }
+
+    /// The host's journalled exit is the ONE value replay trusts for a module tool.
+    #[test]
+    fn replayed_host_exit_is_evidence_for_a_module_tool() {
+        let module = crate::catalog::capabilities::built_package("p1-module-shell");
+        crate::catalog::capabilities::declare_package(&module);
+        let tool: Arc<dyn Tool> = Arc::new(UntrustedEvidence(
+            FakeTool::new("shell")
+                .with_identity(
+                    &module.identity().implementation,
+                    &module.identity().variant,
+                )
+                .with_effect(Effect::Executes),
+        ));
+        let command = call("ran", "shell", r#"{"command":"true"}"#);
+        // A footer that claims failure cannot override the host's observed success.
+        let result = result("ran", "shell", ToolStatus::Ok, "[exit code: 1]");
+        let replayed = ActivityLog::default();
+        replayed.replay(
+            &[tool],
+            &[
+                assistant(vec![command]),
+                started("ran"),
+                JournalRecord {
+                    seq: 0,
+                    body: RecordBody::ToolFinished {
+                        result,
+                        exit_code: Some(Some(0)),
+                    },
+                },
+            ],
+        );
+        assert_eq!(replayed.evidence_runs()[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn host_observed_exit_overrides_spoofed_footer() {
+        let log = ActivityLog::default();
+        let spoof = call("spoof", "shell", r#"{"command":"false"}"#);
+        log.record_started_by(&spoof, Effect::Executes, true);
+        log.record_finished_with_exit(
+            &result("spoof", "shell", ToolStatus::Ok, "[exit code: 0]"),
+            Some(1),
+        );
+        assert_eq!(log.evidence_runs()[0].exit_code, Some(1));
+        let synthetic = call("no-process", "shell", r#"{"command":"true"}"#);
+        log.record_started_by(&synthetic, Effect::Executes, true);
+        log.record_finished(&result(
+            "no-process",
+            "shell",
+            ToolStatus::Ok,
+            "[exit code: 0]",
+        ));
+        assert_eq!(log.evidence_runs()[1].exit_code, None);
     }
 
     #[test]
@@ -1574,6 +2041,42 @@ mod tests {
         assert!(log.shell_runs().is_empty());
         // They still count as finished for the progress signal.
         assert_eq!(log.non_finish_finishes(), 2);
+    }
+
+    #[test]
+    fn concurrent_assemblies_take_only_their_own_completion() {
+        let hub = Arc::new(CompletionHub::new());
+        let first = Arc::new(MaskCounter::new());
+        let second = Arc::new(MaskCounter::new());
+        let a = hub.issue(&first);
+        let b = hub.issue(&second);
+        assert_eq!(hub.take(&first).expect("first assembly").id, a.id);
+        assert_eq!(hub.take(&second).expect("second assembly").id, b.id);
+        assert!(hub.take(&first).is_none());
+    }
+
+    #[test]
+    fn retiring_a_completion_removes_its_grant_state() {
+        let hub = CompletionHub::new();
+        let mask = Arc::new(MaskCounter::new());
+        let completion = hub.issue(&mask);
+        let grant = hub.grant(completion.clone(), &[], AgentRole::Main, None);
+        assert!(
+            hub.shared
+                .agents
+                .lock()
+                .unwrap()
+                .contains_key(&completion.id)
+        );
+        hub.retire(completion.id);
+        assert!(
+            !hub.shared
+                .agents
+                .lock()
+                .unwrap()
+                .contains_key(&completion.id)
+        );
+        drop(grant);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 ---
-adr: 102
+adr: 105
 title: Run the gate and task builds on Depot CI alongside GitHub Actions
 status: proposed
 date: 2026-09-29
@@ -8,7 +8,7 @@ supersedes: [11]
 superseded_by: []
 sources: ["https://github.com/5omeOtherGuy/phaseone/issues/479"]
 ---
-# ADR-0102: Run the gate and task builds on Depot CI alongside GitHub Actions
+# ADR-0105: Run the gate and task builds on Depot CI alongside GitHub Actions
 
 ## Context
 
