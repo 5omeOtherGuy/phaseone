@@ -144,6 +144,29 @@ class SecretScanTest(unittest.TestCase):
         with open(counter, encoding='utf-8') as handle:
             self.assertEqual(handle.read().count('call'), 1)
 
+    def test_credential_shaped_rejected_path_is_redacted(self) -> None:
+        # A refused symlink named with a token must not write the token to the gate log
+        # (Codex finding secret-scan.sh:25).
+        key = "sk-" + "a" * 24
+        repo = self.make_repo("clean.txt", "normal\n")
+        outside = os.path.join(self.dir, "outside")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("outside sentinel")
+        os.symlink(outside, os.path.join(repo, key))
+        subprocess.run(["git", "add", key], cwd=repo, check=True, capture_output=True)
+        done = self.scan(repo)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn(key, done.stdout + done.stderr)
+        self.assertIn("[redacted]", done.stderr)
+
+    def test_credential_shaped_match_path_is_redacted(self) -> None:
+        key = "sk-" + "b" * 24
+        repo = self.make_repo(key, key + "\n")
+        done = self.scan(repo)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn(key, done.stdout + done.stderr)
+        self.assertIn("[redacted]", done.stdout)
+
     def test_a_clean_tree_passes(self) -> None:
         clean = "a" * 24
         repo = self.make_repo("clean.txt", "this is a normal sentence.\n" + clean + "\n")

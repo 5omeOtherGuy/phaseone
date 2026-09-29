@@ -89,6 +89,10 @@ jobs:
           echo "gate_start=$(date +%s)" >> "$GITHUB_ENV"
           set -o pipefail
           scripts/gate.sh 2>&1 | tee gate.log
+          # gate.sh prints this message itself, so it reaches the log even though libtest
+          # captures a passing suite's stderr; the CI provision probe is weaker than the
+          # gate probe, so a green build must fail here when the gate skipped the suites.
+          ! grep -F 'bubblewrap: unusable on this CI runner' gate.log
           ! grep -F 'SKIP: bwrap unusable here' gate.log
 
       - name: Build p1 (debug, as deployed)

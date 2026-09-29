@@ -115,6 +115,13 @@ done
 out="$(realpath -m -- "$out")" || fail "--out $out: cannot be resolved"
 [ "$out" != "/" ] || fail "--out must name a directory, not /"
 out_parent="$(dirname -- "$out")"
+# One --out at a time: the ownership record and the directory swap below form one decision,
+# so two invocations replacing the same --out must not interleave (Codex finding
+# stage-release.sh:286). Hold the lock for the whole run; the EXIT path releases it.
+mkdir -p -- "$out_parent"
+lock_file="$out_parent/.$(basename -- "$out").p1-stage-lock"
+exec 9>"$lock_file"
+flock -x 9
 # Ownership is recorded outside the public four-asset directory so its layout stays fixed.
 owner_record="$out_parent/.$(basename -- "$out").p1-stage-owner"
 # A directory at the record path would silently swallow the record file and leave the
@@ -135,7 +142,6 @@ fi
 
 # The share tree is assembled in a scratch directory and packed into the staging directory
 # that becomes --out; both are below the caller's filesystem so the final move is a rename.
-mkdir -p -- "$out_parent"
 work="$(mktemp -d "$out_parent/.p1-release.XXXXXX")" ||
   fail "--out $out: cannot create a staging directory beside it"
 share=""

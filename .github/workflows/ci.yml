@@ -69,6 +69,10 @@ jobs:
           set -o pipefail
           export PATH="$PWD/.github/ci:$PATH"
           scripts/gate.sh 2>&1 | tee /tmp/p1-gate-checks.log
+          # gate.sh prints this message itself, so it is observable even though libtest
+          # captures a passing suite's stderr and the marker stays hidden; the ci-bwrap probe
+          # can pass while the gate probe fails.
+          ! grep -F 'bubblewrap: unusable on this CI runner' /tmp/p1-gate-checks.log
           ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-gate-checks.log
 
       - name: Save the cache (main only)

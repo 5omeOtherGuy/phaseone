@@ -90,7 +90,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0074 | [A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login](0074-a-second-claude-subscription-route-claude-code-oauth-borrows-a-named-login-directory-and-p1-login-imports-a-login.md) | proposed | 2026-09-25 | owner |
 | ADR-0075 | [The TUI shows workflow runs as a live tree through a structured FrontEnd seam](0075-the-tui-shows-workflow-runs-as-a-live-tree-through-a-structured-frontend-seam.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0076 | [Manual compaction: /compact in the TUI and --compact on resume](0076-manual-compaction-compact-in-the-tui-and-compact-on-resume.md) | proposed | 2026-09-25 | owner+lead |
-| ADR-0077 | [Builds on the stream boxes](0077-builds-on-the-stream-boxes.md) | accepted | 2026-09-25 | owner+lead |
+| ADR-0077 | [Builds on the stream boxes](0077-builds-on-the-stream-boxes.md) | superseded by ADR-0097 | 2026-09-25 | owner+lead |
 | ADR-0078 | [Connection resources and component replacement](0078-connection-resources-and-component-replacement.md) | accepted | 2026-09-25 | owner+lead |
 | ADR-0079 | [Verified module releases and installation](0079-verified-module-releases-and-installation.md) | proposed | 2026-09-25 | owner+lead |
 | ADR-0080 | [Execution manifests in journals](0080-execution-manifests-in-journals.md) | proposed | 2026-09-25 | lead |
@@ -110,6 +110,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0094 | [Resume scanner and workflow report formatter move into the foundation crates](0094-resume-scanner-and-workflow-report-formatter-move-into-the-foundation-crates.md) | proposed | 2026-09-27 | lead |
 | ADR-0095 | [File-tool capability services live in the runtime; no native file-tool fallback](0095-file-tool-capability-services-live-in-the-runtime-no-native-file-tool-fallback.md) | proposed | 2026-09-27 | lead |
 | ADR-0096 | [Bubblewrap credential masks follow workspace mounts](0096-bubblewrap-credential-masks-follow-workspace-mounts.md) | proposed | 2026-09-27 | lead |
+| ADR-0097 | [GitHub-hosted CI provisions bubblewrap and requires the sandbox suites](0097-github-hosted-ci-provisions-bubblewrap-and-requires-the-sandbox-suites.md) | proposed | 2026-09-29 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

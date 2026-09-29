@@ -8,6 +8,13 @@ set -euo pipefail
 
 pattern='sk-([A-Za-z0-9]{20,}|(ant|proj|or|svcacct|admin)-[A-Za-z0-9_-]{20,})|\bsk-[A-Za-z0-9_-]{20,}'
 
+# A tracked path can itself be credential-shaped: a refused symlink or binary can be named with
+# a token. Every diagnostic prints through this redaction, so the scanner never echoes a
+# credential value even from a filename (Codex finding secret-scan.sh:25).
+redact_path() {
+  printf '%s' "$1" | sed -E "s/$pattern/[redacted]/g"
+}
+
 tracked="$(mktemp "${TMPDIR:-/tmp}/p1-secret-scan.XXXXXX")"
 candidates="$(mktemp "${TMPDIR:-/tmp}/p1-secret-scan.XXXXXX")"
 binary="$(mktemp "${TMPDIR:-/tmp}/p1-secret-scan.XXXXXX")"
@@ -21,7 +28,7 @@ found=0
 # Candidate files (regular and readable) on their own list, refusals reported here.
 while IFS= read -r -d '' file; do
   if [ -L "$file" ] || [ ! -f "$file" ] || [ ! -r "$file" ]; then
-    printf 'secret-scan: cannot inspect tracked entry %s\n' "$file" >&2
+    printf 'secret-scan: cannot inspect tracked entry %s\n' "$(redact_path "$file")" >&2
     found=1
     continue
   fi
@@ -54,7 +61,7 @@ then
 fi
 
 while IFS= read -r -d '' file; do
-  printf 'secret-scan: binary or unreadable tracked entry %s\n' "$file" >&2
+  printf 'secret-scan: binary or unreadable tracked entry %s\n' "$(redact_path "$file")" >&2
   found=1
 done <"$binary"
 
@@ -62,7 +69,7 @@ while IFS= read -r -d '' file; do
   status=0
   matches="$(grep -nE -e "$pattern" -- "$file")" || status=$?
   if [ "$status" -gt 1 ]; then
-    printf 'secret-scan: grep failed on %s\n' "$file" >&2
+    printf 'secret-scan: grep failed on %s\n' "$(redact_path "$file")" >&2
     found=1
     continue
   fi
@@ -70,7 +77,7 @@ while IFS= read -r -d '' file; do
   lines="$(printf '%s\n' "$matches" | cut -d: -f1)"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    printf '%s:%s\n' "$file" "$line"
+    printf '%s:%s\n' "$(redact_path "$file")" "$line"
     found=1
   done <<< "$lines"
 done <"$candidates"

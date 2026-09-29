@@ -330,6 +330,28 @@ exec '{real_install}' "$@"
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(any(n.startswith('.p1-release.') for n in os.listdir(self.tmp)))
 
+    def test_publication_takes_an_exclusive_lock(self) -> None:
+        # Two invocations replacing one --out must not interleave the directory swap with the
+        # ownership-record write, or the final assets and record disagree (Codex finding
+        # stage-release.sh:286). The run holds an exclusive flock for its whole duration.
+        self.fixture()
+        tools = os.path.join(self.tmp, 'bin')
+        os.mkdir(tools)
+        calls = os.path.join(self.tmp, 'flock-calls')
+        real = shutil.which('flock') or '/usr/bin/flock'
+        stub = os.path.join(tools, 'flock')
+        with open(stub, 'w', encoding='utf-8') as output:
+            output.write('#!/bin/sh\n'
+                         f'printf \'%s\\n\' "$*" >> {calls}\n'
+                         f'exec {real} "$@"\n')
+        os.chmod(stub, 0o755)
+        with unittest.mock.patch.dict(os.environ, {'PATH': tools + ':' + os.environ['PATH']}):
+            done = self.stage()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        with open(calls, encoding='utf-8') as handle:
+            logged = handle.read()
+        self.assertIn('-x 9', logged)
+
     def test_the_share_archive_carries_the_shipped_roots_and_the_module_set(self) -> None:
         data = self.fixture()
 
