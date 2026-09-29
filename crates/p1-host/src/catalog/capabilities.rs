@@ -14,6 +14,12 @@
 //! - a still-native tool's capabilities are declared by its catalog registration
 //!   (`catalog/tools.rs`), keyed by the identity its constructor builds.
 //!
+//! An assembled tool carries the snapshot of ITS generation's verified sources
+//! ([`bind_assembled`]): the tool object handed to the agent is a wrapper holding the
+//! capabilities, so nothing shared between sessions or generations is consulted and an old
+//! generation's tool keeps its grants whatever a later one binds. The declaration lookup
+//! remains only for standalone native tools and test fixtures nobody bound.
+//!
 //! An environment's face changes a tool's model-facing name, description and variant,
 //! never its identity implementation, so a face can neither grant nor hide one.
 //!
@@ -22,10 +28,15 @@
 //! presentation variant of a verified package (the shell's `+sandbox`) carries the package's
 //! capabilities; the exact-identity lookup and the native declarations are unchanged.
 
+use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
-use p1_contracts::{Tool, ToolIdentity};
+use p1_contracts::tool::ResultDescription;
+use p1_contracts::{
+    BoxFuture, CallDescription, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
+    ToolOutcome, ToolResultItem,
+};
 use p1_module_runtime::{LoadedModule, ModuleKind};
 
 /// The capability interface whose grant lets a tool package run commands.
@@ -141,16 +152,18 @@ fn derive(kind: ModuleKind, granted: &[String]) -> Capabilities {
     Capabilities::of(&capabilities)
 }
 
-/// The package declarations made so far, keyed by the loader-built identity. Only the
-/// loader's registration writes here (through [`declare_package`]), never a module, so a
+/// Package declarations keyed by loader-built identity AND verified digest. An assembled
+/// tool binds this value at construction, so later generations cannot rewrite its grants.
+/// Only the loader's registration writes here (through [`declare_package`]), never a module, so a
 /// package reachable by [`carries`] carries no more than its verified manifest grants.
-fn package_declarations() -> &'static RwLock<HashMap<ToolIdentity, Capabilities>> {
-    static DECLARATIONS: OnceLock<RwLock<HashMap<ToolIdentity, Capabilities>>> = OnceLock::new();
+fn package_declarations() -> &'static RwLock<HashMap<(ToolIdentity, String), Capabilities>> {
+    static DECLARATIONS: OnceLock<RwLock<HashMap<(ToolIdentity, String), Capabilities>>> =
+        OnceLock::new();
     DECLARATIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Record what a loaded package's verified manifest grants, keyed by the identity the
-/// loader built, and return it. This is a package's equivalent of a [`NativeDeclaration`]:
+/// Record what a loaded package's verified manifest grants, keyed by identity and digest,
+/// and return it. This is a package's equivalent of a [`NativeDeclaration`]:
 /// the host's registration calls it for every tool package it accepts (`catalog/modules.rs`,
 /// `register_modules`), the way the native registrations list their declarations. Without
 /// it, a package tool's derived capabilities would be invisible to [`declared`] — and to
@@ -161,12 +174,15 @@ pub fn declare_package(module: &LoadedModule) -> Capabilities {
     package_declarations()
         .write()
         .expect("the package declarations lock is never held across a panic")
-        .insert(module.identity().clone(), capabilities);
+        .insert(
+            (module.identity().clone(), module.digest().to_string()),
+            capabilities,
+        );
     capabilities
 }
 
-/// The capabilities `identity` carries: what the loader declared for that package
-/// identity, else what a native registration declares for it, else none. A package is
+/// Compatibility lookup for standalone native tools and test fixtures that are not part
+/// of a host assembly. Production assemblies bind grants by verified digest. A package is
 /// keyed by its whole loader-built identity (name and variant), a native tool by its
 /// implementation alone (its registrations build one identity each).
 ///
@@ -178,7 +194,11 @@ pub fn declared(identity: &ToolIdentity) -> Capabilities {
     let declarations = package_declarations()
         .read()
         .expect("the package declarations lock is never held across a panic");
-    if let Some(capabilities) = declarations.get(identity) {
+    if let Some(capabilities) = declarations
+        .iter()
+        .find(|((declared, _digest), _)| declared == identity)
+        .map(|(_, capabilities)| capabilities)
+    {
         return *capabilities;
     }
     // A host-applied presentation variant of a declared package still carries the
@@ -186,7 +206,7 @@ pub fn declared(identity: &ToolIdentity) -> Capabilities {
     // not to the variant the host presents it under.
     if let Some(capabilities) = declarations
         .iter()
-        .find(|(declared, _)| declared.implementation == identity.implementation)
+        .find(|((declared, _digest), _)| declared.implementation == identity.implementation)
         .map(|(_, capabilities)| *capabilities)
     {
         return capabilities;
@@ -197,9 +217,120 @@ pub fn declared(identity: &ToolIdentity) -> Capabilities {
         .map_or(Capabilities::NONE, |declaration| declaration.capabilities)
 }
 
+/// A tool as one verified generation assembled it: the object itself plus the immutable
+/// capability snapshot of that generation's verified sources. The snapshot travels with the
+/// assembly's own tool object, so no table shared between sessions is involved, and an old
+/// generation's tool keeps its grants whatever a later generation binds.
+struct BoundTool {
+    inner: Arc<dyn Tool>,
+    capabilities: Capabilities,
+}
+
+impl Tool for BoundTool {
+    fn declaration(&self) -> &ToolDeclaration {
+        self.inner.declaration()
+    }
+
+    fn identity(&self) -> &ToolIdentity {
+        self.inner.identity()
+    }
+
+    fn effect(&self, call: &ToolCall) -> Effect {
+        self.inner.effect(call)
+    }
+
+    fn synthetic_command_result(&self) -> bool {
+        self.inner.synthetic_command_result()
+    }
+
+    fn take_command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.inner.take_command_exit_code(call_id)
+    }
+
+    fn command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.inner.command_exit_code(call_id)
+    }
+
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        self.inner.describe(call)
+    }
+
+    fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        self.inner.describe_result(call, result)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: ToolContext,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        self.inner.execute(call, context)
+    }
+
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
+    }
+}
+
+/// The tool object without a binding of an earlier generation, so a re-bind replaces the
+/// snapshot instead of stacking wrappers.
+fn unbound(tool: &Arc<dyn Tool>) -> Arc<dyn Tool> {
+    match tool
+        .as_any()
+        .and_then(|any| any.downcast_ref::<BoundTool>())
+    {
+        Some(bound) => bound.inner.clone(),
+        None => tool.clone(),
+    }
+}
+
+/// Bind `capabilities` to `tool`: the returned object carries them.
+fn bind(tool: &Arc<dyn Tool>, capabilities: Capabilities) -> Arc<dyn Tool> {
+    Arc::new(BoundTool {
+        inner: unbound(tool),
+        capabilities,
+    })
+}
+
+/// Snapshot capability grants for this assembly from its verified generation: the assembled
+/// tools are replaced by objects that carry them.
+pub fn bind_assembled(
+    assembled: &mut p1_assembly::Assembled,
+    sources: &super::modules::VerifiedSources,
+) {
+    bind_tools(&mut assembled.tools, &assembled.resolved.tools, sources);
+}
+
+/// Bind a tool set, also after a completion handoff replaced its finish object.
+pub fn bind_tools(
+    tools: &mut [Arc<dyn Tool>],
+    resolved: &[p1_assembly::ResolvedTool],
+    sources: &super::modules::VerifiedSources,
+) {
+    for (tool, resolved) in tools.iter_mut().zip(resolved) {
+        let capabilities = if let Some(package) = sources.resolve(&resolved.module) {
+            package.semantic
+        } else {
+            super::tools::NATIVE_CAPABILITIES
+                .iter()
+                .find(|native| native.implementation == tool.identity().implementation)
+                .map_or(Capabilities::NONE, |native| native.capabilities)
+        };
+        *tool = bind(tool, capabilities);
+    }
+}
+
 /// Whether `tool` carries `capability`. Read from the tool's identity only: the
-/// model-facing name, which a face may change, plays no part.
+/// model-facing name, which a face may change, plays no part. An assembled tool answers
+/// from the snapshot its generation bound; a standalone fixture tool falls back to the
+/// declaration lookup.
 pub fn carries(tool: &dyn Tool, capability: SemanticCapability) -> bool {
+    if let Some(bound) = tool
+        .as_any()
+        .and_then(|any| any.downcast_ref::<BoundTool>())
+    {
+        return bound.capabilities.contains(capability);
+    }
     declared(tool.identity()).contains(capability)
 }
 
@@ -254,6 +385,112 @@ mod tests {
     use p1_testkit::FakeTool;
 
     use super::*;
+
+    #[test]
+    fn same_bytes_new_grants_do_not_change_old_generation() {
+        let first = Release::with_fixture();
+        let old = first.loader().load(FIXTURE_NAME).expect("old load");
+        let mut next = Release::empty();
+        let mut entry = next.fixture_entry(FIXTURE_NAME);
+        let bytes = next.fixture().wasm.clone();
+        entry["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .push("completion".into());
+        next.add(entry, &bytes);
+        let new = next.loader().load(FIXTURE_NAME).expect("new grants load");
+        assert_eq!(old.digest(), new.digest());
+        let old_sources = super::super::modules::VerifiedSources::default();
+        let new_sources = super::super::modules::VerifiedSources::default();
+        old_sources.record("fixture", &old);
+        new_sources.record("fixture", &new);
+        declare_package(&old);
+        declare_package(&new);
+        let old_caps = old_sources.resolve("fixture").unwrap().semantic;
+        let new_caps = new_sources.resolve("fixture").unwrap().semantic;
+        assert!(!old_caps.contains(SemanticCapability::ReportsCompletion));
+        assert!(new_caps.contains(SemanticCapability::ReportsCompletion));
+    }
+
+    #[test]
+    fn package_declarations_distinguish_two_digests_of_one_identity() {
+        let identity = ToolIdentity {
+            implementation: "p1/digest-fixture".into(),
+            variant: "default".into(),
+        };
+        let mut declared = package_declarations().write().unwrap();
+        declared.insert(
+            (identity.clone(), "sha256:old".into()),
+            Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]),
+        );
+        declared.insert((identity.clone(), "sha256:new".into()), Capabilities::NONE);
+        assert_ne!(
+            declared[&(identity.clone(), "sha256:old".into())],
+            declared[&(identity, "sha256:new".into())]
+        );
+    }
+
+    #[test]
+    fn two_sessions_binding_one_tool_object_share_no_state() {
+        // The same tool object assembled into two sessions with different verified grants:
+        // each session's copy answers from its own snapshot, and the object itself, which
+        // nobody bound, answers from neither.
+        let shared: Arc<dyn Tool> =
+            Arc::new(FakeTool::new("shared").with_identity("p1/two-sessions-fixture", "default"));
+        let evidence = Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]);
+        let first = bind(&shared, evidence);
+        let second = bind(&shared, Capabilities::NONE);
+        assert!(carries(
+            first.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!carries(
+            second.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!carries(
+            shared.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+    }
+
+    #[test]
+    fn rebinding_replaces_the_snapshot_instead_of_stacking_wrappers() {
+        let base: Arc<dyn Tool> =
+            Arc::new(FakeTool::new("base").with_identity("p1/rebind-fixture", "default"));
+        let evidence = Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]);
+        let once = bind(&base, evidence);
+        let twice = bind(&once, Capabilities::NONE);
+        assert!(carries(
+            once.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!carries(
+            twice.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(Arc::ptr_eq(&unbound(&twice), &base));
+    }
+
+    #[test]
+    fn an_old_tool_keeps_its_bound_capabilities_after_a_replacement() {
+        let implementation = "p1/old-generation-fixture";
+        let old: Arc<dyn Tool> =
+            Arc::new(FakeTool::new("same").with_identity(implementation, "default"));
+        let replacement: Arc<dyn Tool> =
+            Arc::new(FakeTool::new("same").with_identity(implementation, "default"));
+        let granted = Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]);
+        let old = bind(&old, granted);
+        let replacement = bind(&replacement, Capabilities::NONE);
+        assert!(carries(
+            old.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!carries(
+            replacement.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+    }
 
     fn shell_in(dir: &std::path::Path) -> p1_tool_shell::ShellTool {
         p1_tool_shell::ShellTool::new(p1_workspace::Workspace::new(dir).expect("workspace"))

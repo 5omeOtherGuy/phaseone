@@ -8,11 +8,9 @@
 //! concurrently. It is a thread rather than a Tokio task because most callers are
 //! synchronous — `Provider::validate` and the broker's `ResponseParser`, whose `on_event`,
 //! `on_end` and `on_http_error` run inside the drive loop's poll — and a synchronous wait on
-//! a task of the caller's own current-thread runtime would never be answered. Every caller
-//! waits for its reply on its own thread, `stream`'s boxed `Send` future (ADR-0015) included:
-//! a guest call is bounded computation, as a native adapter's lowering and parsing are, and
-//! a future parked on another thread would look idle to a runtime whose clock is paused,
-//! which would then jump its timers past a wait that never ends on the runtime.
+//! a task of the caller's own current-thread runtime would never be answered. Synchronous
+//! callers wait on their thread; `stream` awaits Prepare/Lower replies without blocking
+//! Tokio's worker, and cancellation drops its reply receiver (ADR-0015).
 //!
 //! The Store is synchronous: the provider world's granted capabilities (`http`, `websocket`,
 //! `credential-control`) are type-only interfaces, so nothing asynchronous is linked and
@@ -69,7 +67,7 @@ use p1_provider_http::ws_session::{Clock, ConnectionState, WsHead, WsLease, WsSe
 use p1_provider_http::{
     CredentialScheme, CredentialSource, CredentialUse, LoweredHttpRequest, ResponseParser,
     RetryPolicy, RouteAuthority, SseEvent, Transport, WsDriveRequest, WsLowered, broker_drive,
-    ws_drive, ws_lease,
+    cancelled_stream, ws_drive, ws_lease,
 };
 use thiserror::Error;
 use wasmtime::component::{
@@ -77,8 +75,9 @@ use wasmtime::component::{
 };
 use wasmtime::{Engine, Store, Trap, UpdateDeadline};
 
-use crate::executor::ExecutionLimits;
+use crate::executor::{BareStore, ExecutionLimits, module_store};
 use crate::loader::{EPOCH_TICK, Epochs, LoadedModule, ModuleKind, interface_import};
+use crate::restricted::Restricted;
 
 /// The capabilities a provider component may be granted and this adapter links: the
 /// transport vocabulary, type-only. The rest of the provider allocation (`control`, `clock`,
@@ -214,8 +213,8 @@ pub struct WasmProvider {
 impl WasmProvider {
     /// Builds the provider for `module` configured with `settings`. The broker sends every
     /// request on `transport` to `settings.endpoint`, authenticated from `credentials`; the
-    /// component names neither. Calls `configure` and `describe` before it returns, on the
-    /// executor thread it starts; needs no Tokio runtime.
+    /// component names neither. Runs `describe` on the restricted configured instance,
+    /// then starts the executor thread with its own configured instance; needs no Tokio runtime.
     pub fn new(
         module: &LoadedModule,
         settings: ProviderSettings,
@@ -260,7 +259,7 @@ impl WasmProvider {
             name: name.clone(),
             reason,
         };
-        let mut linker: Linker<()> = Linker::new(&module.engine);
+        let mut linker: Linker<BareStore> = Linker::new(&module.engine);
         for interface in module
             .capabilities()
             .iter()
@@ -276,12 +275,49 @@ impl WasmProvider {
             .map_err(|error| instantiate(format!("{error:#}")))?;
         let exports = Exports::find(&module.component).map_err(instantiate)?;
 
+        let configured_settings = settings_val(settings);
+        let restricted = Restricted::new(&module.engine, &module.component)
+            .map_err(|error| instantiate(format!("{error:#}")))?;
+        let configured = restricted.call("configure", std::slice::from_ref(&configured_settings));
+        let configured = configured.as_deref().and_then(|values| match values {
+            [Val::Result(Ok(_))] => Some(Ok(())),
+            [Val::Result(Err(Some(error)))] => Some(Err(
+                provider_error((**error).clone()).unwrap_or_else(module_error)
+            )),
+            _ => None,
+        });
+        match configured {
+            Some(Ok(())) => {}
+            Some(Err(reason)) => return Err(ProviderError::Configure { name, reason }),
+            None => {
+                return Err(ProviderError::Configure {
+                    name,
+                    reason: ContractError::new(
+                        ProviderErrorKind::Protocol,
+                        "restricted configure failed",
+                    ),
+                });
+            }
+        }
+        let description = restricted
+            .call("describe", &[])
+            .and_then(|values| values.into_iter().next())
+            .and_then(|value| match value {
+                Val::String(text) => serde_json::from_str::<WireRouteDescription>(&text).ok(),
+                _ => None,
+            })
+            .map(RouteDescription::from)
+            .ok_or_else(|| ProviderError::Describe {
+                name: name.clone(),
+                reason: BAD_DESCRIPTION.to_owned(),
+            })?;
+
         let mut machine = Machine {
             engine: module.engine.clone(),
             pre,
             epochs: module.epochs.clone(),
             limits,
-            settings: settings_val(settings),
+            settings: configured_settings,
             exports,
             live: None,
             decoders: HashMap::new(),
@@ -301,14 +337,11 @@ impl WasmProvider {
                 name: name.clone(),
                 source,
             })?;
-        let description = match started.recv() {
-            Ok(Ok(description)) => description,
+        match started.recv() {
+            Ok(Ok(())) => {}
             Ok(Err(Start::Instantiate(reason))) => return Err(instantiate(reason)),
             Ok(Err(Start::Configure(reason))) => {
                 return Err(ProviderError::Configure { name, reason });
-            }
-            Ok(Err(Start::Describe(reason))) => {
-                return Err(ProviderError::Describe { name, reason });
             }
             Err(_) => return Err(instantiate("the executor thread ended".to_owned())),
         };
@@ -385,15 +418,17 @@ impl Provider for WasmProvider {
             let connection = lease.as_mut().map(WsLease::state).unwrap_or_default();
             let lowered = match self
                 .executor
-                .ask(|reply| Command::Prepare {
-                    request: request.clone(),
-                    connection,
-                    reply,
-                })
-                .map_err(Refusal::from)
-                .and_then(|answer| answer)
+                .prepare(request.clone(), connection, &cancel)
+                .await
             {
                 Ok(lowered) => lowered,
+                // A token that fired before `Prepare` answered is the contract's own
+                // ending: the caller gets a stream that settles as cancelled, not a setup
+                // error. Nothing was lowered and no connection was opened, so the lease is
+                // released by returning.
+                Err(Refusal::Failed(ModuleFailure::Cancelled)) => {
+                    return Ok(cancelled_stream());
+                }
                 Err(refusal) => {
                     // A failed call poisoned the instance; the next request rebuilds it and
                     // must not reuse a connection opened for this one (ADR-0078 §3).
@@ -423,21 +458,22 @@ impl Provider for WasmProvider {
                 return Err(module_error(invalid(WEBSOCKET_LOWERED)));
             };
             let lower = self.executor.clone();
+            let retry_cancel = cancel.clone();
             let parsers = self.executor.clone();
             let (authority, split) = (self.authority.clone(), self.split.clone());
             Ok(ws_drive(WsDriveRequest {
                 lease,
                 send,
                 lower: Box::new(move |connection| {
-                    lower
-                        .ask(|reply| Command::Lower {
-                            request: request.clone(),
-                            connection,
-                            reply,
-                        })
-                        .map_err(Refusal::from)
-                        .and_then(|answer| answer)
-                        .map_err(Refusal::into_error)
+                    let lower = lower.clone();
+                    let request = request.clone();
+                    let cancel = retry_cancel.clone();
+                    Box::pin(async move {
+                        lower
+                            .lower(request, connection, &cancel)
+                            .await
+                            .map_err(Refusal::into_error)
+                    })
                 }),
                 authority: Box::new(move |path| {
                     authority_for(&authority, split.as_ref(), path).clone()
@@ -545,13 +581,13 @@ enum Command {
     Prepare {
         request: Val,
         connection: ConnectionState,
-        reply: Reply<Result<WsLowered, Refusal>>,
+        reply: tokio::sync::oneshot::Sender<Result<WsLowered, Refusal>>,
     },
     /// `lower` again, for a retry after a WebSocket failure before any output.
     Lower {
         request: Val,
         connection: ConnectionState,
-        reply: Reply<Result<WsLowered, Refusal>>,
+        reply: tokio::sync::oneshot::Sender<Result<WsLowered, Refusal>>,
     },
     Classify {
         status: u16,
@@ -598,9 +634,77 @@ impl ExecutorHandle {
         answer.recv().map_err(|_| stopped())
     }
 
+    async fn prepare(
+        &self,
+        request: Val,
+        connection: ConnectionState,
+        cancel: &CancellationToken,
+    ) -> Result<WsLowered, Refusal> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(Command::Prepare {
+                request,
+                connection,
+                reply,
+            })
+            .map_err(|_| Refusal::Failed(stopped()))?;
+        await_reply(answer, cancel).await
+    }
+
+    async fn lower(
+        &self,
+        request: Val,
+        connection: ConnectionState,
+        cancel: &CancellationToken,
+    ) -> Result<WsLowered, Refusal> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(Command::Lower {
+                request,
+                connection,
+                reply,
+            })
+            .map_err(|_| Refusal::Failed(stopped()))?;
+        await_reply(answer, cancel).await
+    }
+
     fn drop_decoder(&self, key: u64) {
         let _ = self.commands.send(Command::Drop { key });
     }
+}
+
+/// Await a thread-owned guest call without blocking the caller's runtime, observing
+/// cancellation: whichever settles first ends the wait. The reply arrives on the waker the
+/// executor thread signals, so the runtime parks instead of polling in a loop.
+///
+/// A blocked wait is invisible to the runtime, so a paused test clock would otherwise
+/// auto-advance an enclosing `timeout` to its deadline before the external reply lands. Tokio
+/// suspends that auto-advance only while a blocking task is outstanding, so a guard task is
+/// spawned for the duration of the wait. It is detached, never awaited: its completion does
+/// not depend on a blocking thread being free, so a saturated blocking pool cannot stall
+/// provider setup. Dropping `stop` ends it as soon as the wait does, whether on the reply, on
+/// cancellation or on the executor's death.
+async fn await_reply<T, F>(reply: F, cancel: &CancellationToken) -> Result<T, Refusal>
+where
+    F: std::future::Future<
+            Output = Result<Result<T, Refusal>, tokio::sync::oneshot::error::RecvError>,
+        >,
+{
+    tokio::pin!(reply);
+    let (stop, inhibited) = tokio::sync::oneshot::channel::<()>();
+    let _guard = tokio::task::spawn_blocking(move || {
+        let _ = inhibited.blocking_recv();
+    });
+    let result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(Refusal::Failed(ModuleFailure::Cancelled)),
+        reply = &mut reply => match reply {
+            Ok(value) => value,
+            Err(_) => Err(Refusal::Failed(stopped())),
+        },
+    };
+    drop(stop);
+    result
 }
 
 /// One response attempt's decoder, as the broker's drive loop sees a parser.
@@ -747,7 +851,6 @@ fn through_terminal(mut events: Vec<StreamEvent>) -> (Vec<StreamEvent>, bool) {
 /// The exports this adapter calls, looked up once on the component.
 struct Exports {
     configure: ComponentExportIndex,
-    describe: ComponentExportIndex,
     validate: ComponentExportIndex,
     lower: ComponentExportIndex,
     classify: ComponentExportIndex,
@@ -772,7 +875,6 @@ impl Exports {
         };
         Ok(Self {
             configure: top("configure")?,
-            describe: top("describe")?,
             validate: top("validate")?,
             lower: top("lower")?,
             classify: top("classify")?,
@@ -788,19 +890,18 @@ impl Exports {
 enum Start {
     Instantiate(String),
     Configure(ContractError),
-    Describe(String),
 }
 
 /// The configured instance and the Store it lives in.
 struct Live {
-    store: Store<()>,
+    store: Store<BareStore>,
     instance: Instance,
 }
 
 /// The executor: the one owner of the Store, the instance and the decoders.
 struct Machine {
     engine: Engine,
-    pre: InstancePre<()>,
+    pre: InstancePre<BareStore>,
     epochs: Arc<Epochs>,
     limits: ExecutionLimits,
     settings: Val,
@@ -816,23 +917,15 @@ struct Machine {
 struct DeadlineStop;
 
 impl Machine {
-    /// Builds the instance, configures it and reads its description.
-    fn start(&mut self) -> Result<RouteDescription, Start> {
+    /// Builds and configures the executor's instance (description ran restricted already).
+    fn start(&mut self) -> Result<(), Start> {
         let live = match self.instantiate() {
             Ok(Ok(live)) => live,
             Ok(Err(refused)) => return Err(Start::Configure(refused)),
             Err(failure) => return Err(Start::Instantiate(failure.to_string())),
         };
         self.live = Some(live);
-        let results = self
-            .call(|exports| &exports.describe, &[])
-            .map_err(|failure| Start::Describe(failure.to_string()))?;
-        match results.into_iter().next() {
-            Some(Val::String(text)) => serde_json::from_str::<WireRouteDescription>(&text)
-                .map(RouteDescription::from)
-                .map_err(|_| Start::Describe(BAD_DESCRIPTION.to_owned())),
-            _ => Err(Start::Describe(BAD_DESCRIPTION.to_owned())),
-        }
+        Ok(())
     }
 
     fn serve(&mut self, commands: &mpsc::Receiver<Command>) {
@@ -854,13 +947,15 @@ impl Machine {
                 let answer = self
                     .validate(request.clone())
                     .and_then(|()| self.lower(request, &connection));
-                reply.send(answer);
+                let _ = reply.send(answer);
             }
             Command::Lower {
                 request,
                 connection,
                 reply,
-            } => reply.send(self.lower(request, &connection)),
+            } => {
+                let _ = reply.send(self.lower(request, &connection));
+            }
             Command::Classify {
                 status,
                 headers,
@@ -1044,7 +1139,7 @@ impl Machine {
     /// A fresh instance with `configure` called: the outer error is a failure, the inner
     /// one `configure`'s refusal.
     fn instantiate(&self) -> Result<Result<Live, ContractError>, ModuleFailure> {
-        let mut store = Store::new(&self.engine, ());
+        let mut store = module_store(&self.engine, BareStore::default());
         // Instantiation runs guest code too, under the same limits as a call.
         arm(&mut store, &self.epochs, self.limits)?;
         let instance = self
@@ -1070,7 +1165,7 @@ impl Machine {
 /// Gives the Store the limits of one call: full fuel, and a deadline on the engine's epoch
 /// clock that the epoch callback enforces while the guest runs.
 fn arm(
-    store: &mut Store<()>,
+    store: &mut Store<BareStore>,
     epochs: &Epochs,
     limits: ExecutionLimits,
 ) -> Result<(), ModuleFailure> {
@@ -1134,7 +1229,10 @@ fn invalid(message: &str) -> ModuleFailure {
 fn provider_error(value: Val) -> Result<ContractError, ModuleFailure> {
     match value {
         Val::String(text) => serde_json::from_str::<WireProviderError>(&text)
-            .map(ContractError::from)
+            .map(|wire| {
+                let error = ContractError::from(wire);
+                ContractError::new(error.kind, p1_redact::redact(&error.message).text)
+            })
             .map_err(|_| invalid(BAD_ERROR)),
         _ => Err(invalid(BAD_ERROR)),
     }
@@ -1427,6 +1525,129 @@ mod tests {
             failure(&wasmtime::Error::new(DeadlineStop)),
             ModuleFailure::DeadlineExceeded
         );
+    }
+
+    #[test]
+    fn provider_store_can_lift_more_than_three_megabytes_of_request_body() {
+        let store = module_store(&crate::engine().unwrap(), BareStore::default());
+        let size = 4 << 20;
+        assert!(store.hostcall_fuel() >= size * std::mem::size_of::<Val>());
+        let fields = vec![
+            ("path".to_owned(), Val::String("/v1/messages".to_owned())),
+            ("headers".to_owned(), headers_val(Vec::new())),
+            ("credential".to_owned(), credential_val(None)),
+            ("body".to_owned(), Val::List(vec![Val::U8(7); size])),
+        ];
+        // Dynamic lifting charges each byte as a Val; decoding retains the full body.
+        assert_eq!(http_request(&fields).unwrap().body.len(), size);
+    }
+
+    /// A oneshot receiver that counts how often its future is polled. A parking wait polls
+    /// it once and then waits for the waker; the removed busy-yield polled it once per
+    /// reschedule, without bound.
+    struct CountingReply {
+        inner: tokio::sync::oneshot::Receiver<Result<u8, Refusal>>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::future::Future for CountingReply {
+        type Output = Result<Result<u8, Refusal>, tokio::sync::oneshot::error::RecvError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::Future::poll(std::pin::Pin::new(&mut this.inner), cx)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn paused_current_thread_runtime_waits_for_external_provider_reply() {
+        let cancel = CancellationToken::new();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = reply.send(Ok::<_, Refusal>(42));
+        });
+        // No timer is registered before the reply, so the paused clock has nothing to
+        // advance to: the wait must end on the reply's waker, not on a poll loop.
+        let result = await_reply(answer, &cancel).await;
+        assert!(matches!(result, Ok(42)));
+        thread.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaiting_an_external_reply_parks_instead_of_polling() {
+        let wait_cancel = CancellationToken::new();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = CountingReply {
+            inner: answer,
+            polls: Arc::clone(&polls),
+        };
+        let waiter = tokio::spawn(async move { await_reply(counted, &wait_cancel).await });
+        // Yield without a reply. A parking wait is polled once and then woken by the
+        // sender; the busy-yield loop rescheduled itself on every yield, so this drove its
+        // poll count up instead of leaving it at one.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wait repolled while no reply was available"
+        );
+        reply.send(Ok(42)).unwrap();
+        assert!(matches!(waiter.await.unwrap(), Ok(42)));
+    }
+
+    /// A reply that is ready at once must return even while the blocking pool's only thread
+    /// is busy: the paused-clock guard is detached, not awaited, so a saturated pool cannot
+    /// stall provider setup.
+    #[test]
+    fn a_provider_reply_does_not_wait_for_the_blocking_guard() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .expect("a runtime");
+        let (started, started_at) = std::sync::mpsc::channel();
+        let (release, release_from) = std::sync::mpsc::channel::<()>();
+        runtime.block_on(async {
+            // Hold the blocking pool's one thread, and do not proceed until it is held.
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = release_from.recv();
+            });
+            started_at.recv().expect("the blocker started");
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            reply.send(Ok::<u8, Refusal>(7)).expect("the reply");
+            let cancel = CancellationToken::new();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                await_reply(answer, &cancel),
+            )
+            .await
+            .expect("await_reply waited for the queued blocking guard");
+            assert!(matches!(result, Ok(7)));
+            let _ = release.send(());
+            let _ = blocker.await;
+        });
+    }
+
+    #[test]
+    fn guest_provider_error_text_is_masked() {
+        let synthetic = format!("sk-{}", "a".repeat(24));
+        let wire = WireProviderError::from(ContractError::new(
+            ProviderErrorKind::RateLimited,
+            format!("provider rejected {synthetic}"),
+        ));
+        let text = serde_json::to_string(&wire).unwrap();
+        let result = provider_error(Val::String(text)).unwrap();
+        assert_eq!(result.kind, ProviderErrorKind::RateLimited);
+        assert!(!result.message.contains(&synthetic));
+        assert!(result.message.contains("provider rejected"));
     }
 
     #[test]

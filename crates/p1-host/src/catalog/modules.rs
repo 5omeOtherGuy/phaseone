@@ -57,6 +57,10 @@ use crate::HostDeps;
 #[cfg(debug_assertions)]
 use crate::run::write_stderr;
 
+/// The callback a worker-registration path uses to announce an assembled host entry's face
+/// (its declared tool name) to the worker service (`worker_result`, #448).
+type ResultAnnouncement = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The release manifest's file name inside the module set (ADR-0079).
 pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
 
@@ -264,7 +268,7 @@ pub struct ModulePackage {
 /// version the release pins, the digest the loader verified in the manifest's `sha256:` spelling
 /// and the `<world>+<protocol>` ABI. A `modules.lock` resolution and a release host entry both
 /// resolve to this, so the identity builder never reads either source itself.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PackageIdentity {
     /// The package's manifest name, `<namespace>/<name>`.
     pub name: String,
@@ -274,6 +278,9 @@ pub struct PackageIdentity {
     pub digest: String,
     /// `<world>+<protocol>`, the ABI the package speaks.
     pub abi: String,
+    /// Semantic grants derived from this exact verified load's manifest, not a later
+    /// declaration for another generation with identical component bytes.
+    pub(crate) semantic: super::capabilities::Capabilities,
 }
 
 /// Where p1's own release keeps its module set: `<exe dir>/../share/p1/modules/manifest.json`
@@ -301,6 +308,18 @@ pub fn official_release_manifest() -> Option<PathBuf> {
     Some(choose_release_manifest(share, built))
 }
 
+/// A catalog build's release path. A test can substitute a scratch release without touching
+/// the installed tree; production always resolves the executable's own release.
+pub(crate) fn release_for_build(deps: &HostDeps) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(release) = &deps.release_manifest {
+        return Some(release.clone());
+    }
+    #[cfg(not(test))]
+    let _ = deps;
+    official_release_manifest()
+}
+
 /// The manifest to load modules from: the share tree's when it is there, else — in a debug
 /// build only — the built set's when the share tree has none, else the share path, so the
 /// loader's error names the release it looked for.
@@ -320,7 +339,7 @@ pub fn load_locked_modules(
     lock: &ModulesLock,
     release_manifest: &Path,
 ) -> Result<Vec<ModulePackage>, ModulesError> {
-    load_locked_modules_except(lock, release_manifest, &[])
+    load_locked_modules_except(lock, release_manifest, &[], None)
 }
 
 /// [`load_locked_modules`] without the keys in `skip`: the [`HOST_COMPOSED_ENTRIES`] a lock
@@ -329,21 +348,35 @@ fn load_locked_modules_except(
     lock: &ModulesLock,
     release_manifest: &Path,
     skip: &[&str],
+    loaders: Option<&BuildLoaders>,
 ) -> Result<Vec<ModulePackage>, ModulesError> {
     let release_error = |source| ModulesError::Release {
         path: release_manifest.to_owned(),
         source: Box::new(source),
     };
-    let manifest = ReleaseManifest::read(release_manifest).map_err(release_error)?;
+    let manifest = match loaders {
+        Some(loaders) => loaders.manifest_for(release_manifest),
+        None => ReleaseManifest::read(release_manifest),
+    }
+    .map_err(release_error)?;
     manifest.check_unique_digests().map_err(release_error)?;
     let mut packages = Vec::new();
     // The loader starts an epoch thread; a release nothing selects needs none.
     if lock.iter().all(|(module, _)| skip.contains(&module)) {
         return Ok(packages);
     }
-    let root = release_manifest.parent().unwrap_or(Path::new("."));
-    let loader = Loader::new(manifest.clone(), root)
-        .map_err(|error| ModulesError::Runtime(Box::new(error)))?;
+    let loader = match loaders {
+        Some(loaders) => loaders
+            .for_release(release_manifest, manifest.clone())
+            .map_err(|error| ModulesError::Runtime(Box::new(error)))?,
+        None => {
+            let root = release_manifest.parent().unwrap_or(Path::new("."));
+            Arc::new(
+                Loader::new(manifest.clone(), root)
+                    .map_err(|error| ModulesError::Runtime(Box::new(error)))?,
+            )
+        }
+    };
     for (module, locked) in lock.iter() {
         if skip.contains(&module) {
             continue;
@@ -459,6 +492,17 @@ pub fn register_modules(
     packages: Vec<ModulePackage>,
     services: ModuleServices,
 ) -> Result<(), ModulesError> {
+    register_modules_with_announcement(catalog, packages, services, None)
+}
+
+fn register_modules_with_announcement(
+    catalog: &mut Catalog,
+    packages: Vec<ModulePackage>,
+    services: ModuleServices,
+    announce_result: Option<ResultAnnouncement>,
+) -> Result<(), ModulesError> {
+    #[cfg(not(feature = "delegation"))]
+    let _ = &announce_result;
     let existing = catalog.tool_keys();
     for package in packages {
         let kind = package.loaded.kind();
@@ -493,7 +537,15 @@ pub fn register_modules(
         // (ADR-0083 rule 7).
         super::capabilities::declare_package(&package.loaded);
         let key = package.module.clone();
-        register_locked_entry(catalog, &key, Arc::new(package.loaded), services.clone());
+        let loaded = Arc::new(package.loaded);
+        #[cfg(feature = "delegation")]
+        if key == "worker_result"
+            && let Some(announce) = &announce_result
+        {
+            register_named_host_entry(catalog, &key, loaded, services.clone(), announce.clone());
+            continue;
+        }
+        register_locked_entry(catalog, &key, loaded, services.clone());
     }
     Ok(())
 }
@@ -512,6 +564,26 @@ pub fn register_host_entry(
     services: ModuleServices,
 ) {
     register_entry(catalog, module, loaded, services, true);
+}
+
+/// Register a host entry whose assembled face must be announced to a service.
+#[cfg(feature = "delegation")]
+pub(crate) fn register_named_host_entry(
+    catalog: &mut Catalog,
+    module: &str,
+    loaded: Arc<LoadedModule>,
+    services: ModuleServices,
+    announce: ResultAnnouncement,
+) {
+    let key = module.to_owned();
+    catalog.tool(
+        module,
+        Box::new(move |spec: &ToolSpec, tool_services: &ToolServices| {
+            let tool = instantiate(&key, &loaded, spec, &services, tool_services, true)?;
+            announce(&tool.declaration().name);
+            Ok(tool)
+        }),
+    );
 }
 
 /// Registers a package an installation selected through `modules.lock` ([`register_modules`]).
@@ -626,6 +698,18 @@ impl Tool for FacedEntry {
         self.inner.effect(call)
     }
 
+    fn take_command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.inner.take_command_exit_code(call_id)
+    }
+
+    fn command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.inner.command_exit_code(call_id)
+    }
+
+    fn synthetic_command_result(&self) -> bool {
+        self.inner.synthetic_command_result()
+    }
+
     fn describe(&self, call: &ToolCall) -> CallDescription {
         self.inner.describe(call)
     }
@@ -649,6 +733,7 @@ impl Tool for FacedEntry {
 /// loading step of every host entry, whichever registration takes the package
 /// ([`register_entries_from`]): the class allocation check is applied to every entry here, so an
 /// entry the host composes itself is checked exactly as a shared one.
+#[cfg(test)]
 fn load_host_entry(
     module: &str,
     package: &str,
@@ -681,6 +766,7 @@ fn load_host_entry(
 
 /// Reads the release manifest at `release` and refuses one that claims an identity twice: the
 /// step both the host-entry registration and an assembly identity's package rows take.
+#[cfg(test)]
 fn read_release(
     module: &str,
     package: &str,
@@ -704,7 +790,7 @@ pub(super) fn register_locked_modules(
     catalog: &mut Catalog,
     deps: &HostDeps,
 ) -> Result<(), String> {
-    register_locked_modules_from(catalog, deps, official_release_manifest())
+    register_locked_modules_from(catalog, deps, release_for_build(deps))
 }
 
 /// [`register_locked_modules`] over the release whose manifest is `release`.
@@ -722,19 +808,43 @@ fn register_locked_modules_from(
     // A lock-selected shell or finish still needs the host's process service or completion hub,
     // so the host-entry step hands it to the host's registration instead
     // ([`register_composed_host_entries`]).
-    let packages = load_locked_modules_except(&lock, &release, &HOST_COMPOSED_ENTRIES)
-        .map_err(|error| error.to_string())?;
+    let packages = load_locked_modules_except(
+        &lock,
+        &release,
+        &HOST_COMPOSED_ENTRIES,
+        Some(&deps.build_loaders),
+    )
+    .map_err(|error| error.to_string())?;
     // A member a lock selects is a member of its family all the same: it takes the host's
     // lists and grant check, as a host entry does, not only the family's scopes
     // (`catalog/delegation.rs`, D084).
     #[cfg(feature = "delegation")]
     let services = super::delegation::with_member_lists(
         locked_module_services(deps),
-        super::delegation::worker_lists(catalog, deps)?,
+        super::delegation::worker_lists_with_keys(
+            catalog
+                .tool_keys()
+                .into_iter()
+                .chain(packages.iter().map(|package| package.module.clone()))
+                .collect(),
+            deps,
+        )?,
     );
     #[cfg(not(feature = "delegation"))]
     let services = locked_module_services(deps);
-    register_modules(catalog, packages, services).map_err(|error| error.to_string())
+    for package in &packages {
+        deps.verified_sources
+            .record(&package.module, &package.loaded);
+    }
+    #[cfg(feature = "delegation")]
+    let announce: Option<ResultAnnouncement> = deps.worker_service.as_ref().map(|service| {
+        let service = service.clone();
+        Arc::new(move |name: &str| service.set_result_tool_name(name)) as ResultAnnouncement
+    });
+    #[cfg(not(feature = "delegation"))]
+    let announce = None;
+    register_modules_with_announcement(catalog, packages, services, announce)
+        .map_err(|error| error.to_string())
 }
 
 /// The catalog build path's step for the official-release host entries (D083b 2,
@@ -744,7 +854,7 @@ fn register_locked_modules_from(
 /// tool for are the host's step's ([`register_composed_host_entries`], S3.8), loaded through this
 /// same path.
 pub(super) fn register_host_entries(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
-    register_host_entries_from(catalog, deps, &HOST_ENTRIES, official_release_manifest())
+    register_host_entries_from(catalog, deps, &HOST_ENTRIES, release_for_build(deps))
 }
 
 /// [`register_host_entries`] over `entries`, loaded from the release whose manifest is
@@ -780,13 +890,7 @@ pub(crate) fn register_composed_host_entries(
         .copied()
         .filter(|(key, _)| composed.iter().any(|(registered, _)| registered == key))
         .collect();
-    register_entries_from(
-        catalog,
-        deps,
-        &entries,
-        official_release_manifest(),
-        composed,
-    )
+    register_entries_from(catalog, deps, &entries, release_for_build(deps), composed)
 }
 
 /// The step every host-entry registration takes: each of `entries` that no user lock selects is
@@ -804,6 +908,10 @@ fn register_entries_from(
     composed: &[(&str, HostEntryRegistration)],
 ) -> Result<(), String> {
     let mut packages = Vec::new();
+    // A catalog batch shares one loader and its epoch ticker. The same verified
+    // manifest decides every entry in the batch, even if an installation swaps the
+    // on-disk manifest while the batch is being registered.
+    let mut release_loader: Option<(ReleaseManifest, Arc<Loader>)> = None;
     for (key, package) in entries {
         let registration = composed
             .iter()
@@ -816,6 +924,7 @@ fn register_entries_from(
             // any other key is the locked-module registration's.
             if let Some(registration) = registration {
                 let locked = load_locked_host_entry(deps, key, release.as_deref())?;
+                deps.verified_sources.record(key, &locked.loaded);
                 registration(catalog, Arc::new(locked.loaded))?;
             }
             continue;
@@ -834,7 +943,41 @@ fn register_entries_from(
         })?;
         // The release is loaded, so a debug build says so exactly as the locked path does.
         announce_release(deps, release);
-        let loaded = load_host_entry(key, package, release).map_err(|error| error.to_string())?;
+        if release_loader.is_none() {
+            let manifest = match deps.build_loaders.manifest_for(release) {
+                Ok(manifest) => {
+                    manifest
+                        .check_unique_digests()
+                        .map_err(|error| error.to_string())?;
+                    manifest
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let loader = deps
+                .build_loaders
+                .for_release(release, manifest.clone())
+                .map_err(|error| ModulesError::Runtime(Box::new(error)).to_string())?;
+            release_loader = Some((manifest, loader));
+        }
+        let (manifest, loader) = release_loader.as_ref().expect("loader initialized above");
+        if let Some(entry) = manifest.entry(package) {
+            check_allocation(key, entry).map_err(|error| error.to_string())?;
+        }
+        let loaded = loader.load(package).map_err(|source| {
+            ModulesError::HostEntryLoad {
+                module: (*key).to_owned(),
+                package: (*package).to_owned(),
+                path: release.to_owned(),
+                source: Box::new(source),
+            }
+            .to_string()
+        })?;
+        let loaded = ModulePackage {
+            module: (*key).to_owned(),
+            lock: release.to_owned(),
+            loaded,
+        };
+        deps.verified_sources.record(key, &loaded.loaded);
         match registration {
             Some(registration) => registration(catalog, Arc::new(loaded.loaded))?,
             None => packages.push(loaded),
@@ -867,42 +1010,161 @@ fn load_locked_host_entry(
         }
         .to_string()
     };
-    let manifest = ReleaseManifest::read(release).map_err(release_error)?;
+    let manifest = deps
+        .build_loaders
+        .manifest_for(release)
+        .map_err(release_error)?;
     manifest.check_unique_digests().map_err(release_error)?;
-    let root = release.parent().unwrap_or(Path::new("."));
-    let loader = Loader::new(manifest.clone(), root)
+    let loader = deps
+        .build_loaders
+        .for_release(release, manifest.clone())
         .map_err(|error| ModulesError::Runtime(Box::new(error)).to_string())?;
     load_locked_entry(&loader, &manifest, key, locked).map_err(|error| error.to_string())
 }
 
-/// The package sources an assembly identity names (ADR-0080): the `modules.lock` the catalog's
-/// module registration read, and the official-release host entries it registered (D083b 2). A
-/// key is resolved by the lock first — a user lock's package is what runs — then by a host
-/// entry; a key neither names is a native module.
+/// One release loader per catalog build. Every retained module holds the loader's engine
+/// and epoch clock, so a later build can read the same path without replacing running bytes.
+#[derive(Default)]
+pub struct BuildLoaders(
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (ReleaseManifest, Arc<Loader>)>>,
+);
+
+impl BuildLoaders {
+    pub fn for_release(
+        &self,
+        path: &Path,
+        manifest: ReleaseManifest,
+    ) -> Result<Arc<Loader>, LoadError> {
+        let mut loaders = self.0.lock().expect("build loaders");
+        if let Some((_, loader)) = loaders.get(path) {
+            return Ok(loader.clone());
+        }
+        let root = path.parent().unwrap_or(Path::new("."));
+        let loader = Arc::new(Loader::new(manifest.clone(), root)?);
+        loaders.insert(path.to_owned(), (manifest, loader.clone()));
+        Ok(loader)
+    }
+
+    /// Read once per build; a later install at this path cannot change validation for
+    /// packages loaded by the already-created loader.
+    pub fn manifest_for(&self, path: &Path) -> Result<ReleaseManifest, ManifestError> {
+        if let Some((manifest, _)) = self.0.lock().expect("build loaders").get(path) {
+            return Ok(manifest.clone());
+        }
+        ReleaseManifest::read(path)
+    }
+
+    /// The build's loader for the release at `path`, created from the build's own manifest
+    /// snapshot when nothing loaded from it yet.
+    pub(crate) fn build_release(&self, path: &Path) -> Result<crate::policy::BuildRelease, String> {
+        let unreadable =
+            |error: String| format!("cannot load the release {}: {error}", path.display());
+        let manifest = self
+            .manifest_for(path)
+            .map_err(|error| unreadable(error.to_string()))?;
+        let loader = self
+            .for_release(path, manifest)
+            .map_err(|error| unreadable(error.to_string()))?;
+        Ok(crate::policy::BuildRelease {
+            path: path.to_owned(),
+            loader,
+        })
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().expect("build loaders").clear();
+    }
+}
+
+/// Verified package identities for one catalog build. A snapshot is taken after provider
+/// activation so the journal never consults a mutable release manifest for provenance.
+#[derive(Default)]
+pub struct VerifiedSources(std::sync::Mutex<std::collections::HashMap<String, PackageIdentity>>);
+
+impl VerifiedSources {
+    pub fn record(&self, key: &str, loaded: &LoadedModule) {
+        self.0.lock().expect("verified sources").insert(
+            key.to_owned(),
+            PackageIdentity {
+                name: loaded.name().to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                digest: loaded.digest().to_string(),
+                abi: loaded.abi().to_owned(),
+                semantic: super::capabilities::package_capabilities(loaded),
+            },
+        );
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().expect("verified sources").clear();
+    }
+
+    pub fn resolve(&self, key: &str) -> Option<PackageIdentity> {
+        self.0.lock().expect("verified sources").get(key).cloned()
+    }
+
+    /// Resolve a tool's loader-built implementation even if its catalog key is a face.
+    #[cfg(test)]
+    pub(crate) fn set_digest_for_test(&self, key: &str, name: &str, digest: &str) {
+        self.0.lock().expect("verified sources").insert(
+            key.to_owned(),
+            PackageIdentity {
+                name: name.to_owned(),
+                version: "test".to_owned(),
+                digest: digest.to_owned(),
+                abi: "test".to_owned(),
+                semantic: super::capabilities::Capabilities::NONE,
+            },
+        );
+    }
+
+    pub fn digest_for_implementation(&self, implementation: &str) -> Option<String> {
+        self.0
+            .lock()
+            .expect("verified sources")
+            .values()
+            .find(|package| package.name == implementation)
+            .map(|package| package.digest.clone())
+    }
+}
+
+/// Package sources used by the identity writer. Production takes a snapshot of verified
+/// loads; `of_lock` remains available for fixture identity tests.
 #[derive(Clone)]
 pub struct ModuleSources {
     lock: ModulesLock,
     host: Vec<(String, PackageIdentity)>,
+    live: Option<std::sync::Arc<VerifiedSources>>,
 }
 
 impl ModuleSources {
+    /// Registry used by the running catalog, if this is not a fixture lock snapshot.
+    pub fn verified(&self) -> Option<&VerifiedSources> {
+        self.live.as_deref()
+    }
+
     /// Only the lock's resolutions: an assembly of a release without host entries, and the
     /// journal-identity cases that drive the identity builder over a fixture lock.
     pub fn of_lock(lock: ModulesLock) -> Self {
         Self {
             lock,
             host: Vec::new(),
+            live: None,
         }
     }
 
     /// What `key` resolves to, or `None` for a native module.
     pub fn resolve(&self, key: &str) -> Option<PackageIdentity> {
+        if let Some(live) = &self.live {
+            return live.resolve(key);
+        }
         if let Some(locked) = self.lock.resolve(key) {
             return Some(PackageIdentity {
                 name: locked.package.clone(),
                 version: locked.version.clone(),
                 digest: locked.digest.clone(),
                 abi: format!("{}+{}", locked.world, locked.protocol),
+                semantic: super::capabilities::Capabilities::NONE,
             });
         }
         self.host
@@ -913,6 +1175,7 @@ impl ModuleSources {
                 version: package.version.clone(),
                 digest: package.digest.clone(),
                 abi: package.abi.clone(),
+                semantic: package.semantic,
             })
     }
 }
@@ -922,7 +1185,11 @@ impl ModuleSources {
 /// catalog build, a `/modules reload` included, load the release of that build, so the identity
 /// names what that build registered.
 pub fn module_sources(deps: &HostDeps) -> Result<ModuleSources, String> {
-    module_sources_from(deps, &HOST_ENTRIES, official_release_manifest())
+    Ok(ModuleSources {
+        lock: ModulesLock::default(),
+        host: Vec::new(),
+        live: Some(deps.verified_sources.clone()),
+    })
 }
 
 /// [`module_sources`] over `entries`, resolved against the release whose manifest is `release`.
@@ -932,6 +1199,7 @@ pub fn module_sources(deps: &HostDeps) -> Result<ModuleSources, String> {
 /// release missing an entry it must hold is refused ([`register_entries_from`] names the key and
 /// the package), so an identity asked for after a successful build always finds the entries that
 /// build registered; this step answers for the caller's list, not for the release's completeness.
+#[cfg(test)]
 fn module_sources_from(
     deps: &HostDeps,
     entries: &[(&str, &str)],
@@ -958,7 +1226,11 @@ fn module_sources_from(
             host.push(((*key).to_owned(), identity));
         }
     }
-    Ok(ModuleSources { lock, host })
+    Ok(ModuleSources {
+        lock,
+        host,
+        live: None,
+    })
 }
 
 /// What the release states of the package `package`, for the identity of the catalog key
@@ -972,6 +1244,7 @@ fn module_sources_from(
 /// digest, exactly as the lock's digest is for a lock-selected package. The version is the
 /// host's own, because the release manifest is built with the binary in one pass (D083b 2) and a
 /// package manifest carries no version of its own; the digest is what pins the bytes.
+#[cfg(test)]
 fn host_entry_identity(
     module: &str,
     package: &str,
@@ -987,6 +1260,7 @@ fn host_entry_identity(
         version: env!("CARGO_PKG_VERSION").to_string(),
         digest: entry.digest.to_string(),
         abi: format!("{}+{}", entry.world, entry.protocol),
+        semantic: super::capabilities::Capabilities::NONE,
     }))
 }
 
@@ -1283,6 +1557,136 @@ mod tests {
             "variant": manifest["variant"],
         });
         (entry, wasm)
+    }
+
+    #[cfg(feature = "delegation")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn named_host_entry_announces_assembled_face_not_catalog_key() {
+        let release = Release::with_fixture();
+        let module = Arc::new(
+            release
+                .loader()
+                .load(FIXTURE_NAME)
+                .expect("verified fixture"),
+        );
+        let mut catalog = Catalog::new();
+        let provider = ScriptedProvider::new(Vec::new());
+        catalog.provider(
+            "scripted",
+            Box::new(move |_| Ok(Arc::new(provider.clone()) as Arc<dyn Provider>)),
+        );
+        let (process, _processes) = fake_processes();
+        let process: Arc<dyn ProcessService> = process;
+        let services: ModuleServices = Arc::new(move |_, _| Services {
+            process: Some(process.clone()),
+            ..Services::default()
+        });
+        let names = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let capture = names.clone();
+        register_named_host_entry(
+            &mut catalog,
+            "worker_result",
+            module,
+            services,
+            Arc::new(move |name| capture.lock().unwrap().push(name.to_owned())),
+        );
+        let environment = EnvironmentFile {
+            name: "face-test".into(),
+            family: "test".into(),
+            provider: "scripted".into(),
+            model: "test-model".into(),
+            profile: None,
+            profile_text: None,
+            options: ModelOptions::default(),
+            tools: vec![ToolSpec {
+                module: "worker_result".into(),
+                name: Some("read_worker_report".into()),
+                description: None,
+                variant: None,
+            }],
+            prompt_template: String::new(),
+            context: None,
+            summarize_prompt: None,
+        };
+        let workspace = tempfile::tempdir().expect("scratch");
+        let assembled = assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &Substitutions {
+                workspace: "/work".into(),
+                date: "2026-01-01".into(),
+                os: "linux".into(),
+            },
+        )
+        .expect("host entry assembles");
+        assert_eq!(assembled.tools[0].declaration().name, "read_worker_report");
+        assert_eq!(*names.lock().unwrap(), ["read_worker_report"]);
+    }
+
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn lock_selected_worker_result_announces_its_assembled_face() {
+        let release = Release::with_fixture();
+        let loaded = release.loader().load(FIXTURE_NAME).expect("fixture");
+        let (process, _processes) = fake_processes();
+        let process: Arc<dyn ProcessService> = process;
+        let services: ModuleServices = Arc::new(move |_, _| Services {
+            process: Some(process.clone()),
+            ..Services::default()
+        });
+        let announced = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let capture = announced.clone();
+        let mut catalog = Catalog::new();
+        catalog.provider(
+            "scripted",
+            Box::new(|_| Ok(Arc::new(ScriptedProvider::new(Vec::new())) as Arc<dyn Provider>)),
+        );
+        register_modules_with_announcement(
+            &mut catalog,
+            vec![ModulePackage {
+                module: "worker_result".into(),
+                lock: "scratch/modules.lock".into(),
+                loaded,
+            }],
+            services,
+            Some(Arc::new(move |name| {
+                capture.lock().unwrap().push(name.to_owned())
+            })),
+        )
+        .expect("lock-selected registration");
+        let environment = EnvironmentFile {
+            name: "selected-result".into(),
+            family: "test".into(),
+            provider: "scripted".into(),
+            model: "test-model".into(),
+            profile: None,
+            profile_text: None,
+            options: ModelOptions::default(),
+            tools: vec![ToolSpec {
+                module: "worker_result".into(),
+                name: Some("read_worker_report".into()),
+                description: None,
+                variant: None,
+            }],
+            prompt_template: String::new(),
+            context: None,
+            summarize_prompt: None,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let assembled = assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &Substitutions {
+                workspace: "/work".into(),
+                date: "2026-01-01".into(),
+                os: "linux".into(),
+            },
+        )
+        .expect("selected result assembles with face");
+        assert_eq!(assembled.tools[0].declaration().name, "read_worker_report");
+        assert_eq!(*announced.lock().unwrap(), ["read_worker_report"]);
     }
 
     /// S1.5.1: the real registration declares a tool package's verified grants under the
@@ -1655,6 +2059,274 @@ mod tests {
                 "{}+{}",
                 entry["world"].as_str().expect("world"),
                 entry["protocol"].as_str().expect("protocol")
+            )
+        );
+    }
+
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn lock_selected_worker_member_keeps_its_selected_package_identity() {
+        let manifest = official_release_manifest().expect("official release");
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+        let entry = value["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "p1/read")
+            .unwrap();
+        let (config, dirs) = config_without_lock();
+        std::fs::write(
+            config.path().join("modules.lock"),
+            lock_text("worker_start", entry),
+        )
+        .unwrap();
+        let mut deps = quiet_deps(dirs);
+        deps.worker_service = Some(p1_workers::InProcessWorkers::new(
+            Arc::new(|_| Err("unused worker factory".to_owned())),
+            1,
+        ));
+        let completion = Arc::new(crate::activity::CompletionHub::new());
+        let catalog = super::super::build_catalog(
+            &deps,
+            crate::cli::SandboxMode::Off,
+            &[],
+            &[],
+            &[],
+            &completion,
+        )
+        .expect("selected member catalog");
+        assert!(catalog.tool_keys().contains(&"worker_start".to_owned()));
+        let source = deps
+            .verified_sources
+            .resolve("worker_start")
+            .expect("selected source");
+        assert_eq!(source.name, "p1/read");
+        assert_eq!(source.digest, entry["digest"].as_str().unwrap());
+    }
+
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn catalog_worker_schema_includes_a_real_lock_selected_tool() {
+        let path = official_release_manifest().expect("official release path");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("release")).expect("manifest JSON");
+        let entry = manifest["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .find(|entry| entry["name"] == "p1/read")
+            .expect("released read");
+        let (config, dirs) = config_without_lock();
+        std::fs::write(
+            config.path().join("modules.lock"),
+            lock_text("extra_locked_tool", entry),
+        )
+        .expect("real modules.lock");
+        let mut deps = quiet_deps(dirs);
+        deps.worker_service = Some(p1_workers::InProcessWorkers::new(
+            Arc::new(|_| Err("unused worker factory".to_owned())),
+            1,
+        ));
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        deps.catalog_hook = Some(Box::new(move |catalog| {
+            let provider = provider.clone();
+            catalog.provider(
+                "scripted",
+                Box::new(move |_| Ok(provider.clone() as Arc<dyn Provider>)),
+            );
+        }));
+        let completion = Arc::new(crate::activity::CompletionHub::new());
+        let catalog = super::super::build_catalog(
+            &deps,
+            crate::cli::SandboxMode::Off,
+            &[],
+            &[],
+            &[],
+            &completion,
+        )
+        .expect("catalog with locked tool and worker member");
+        let assembled = assemble_modules(&catalog, &["worker_start"])
+            .expect("worker_start assembles with its grant list");
+        let p1_contracts::DeclarationKind::Function { input_schema } =
+            &assembled.tools[0].declaration().kind
+        else {
+            panic!("worker_start has a function schema")
+        };
+        let tools = &input_schema["properties"]["tools"]["items"]["enum"];
+        assert!(
+            tools
+                .as_array()
+                .expect("grantable schema enum")
+                .iter()
+                .any(|tool| tool == "extra_locked_tool"),
+            "locked key missing: {tools}"
+        );
+    }
+
+    #[cfg(feature = "delegation")]
+    #[test]
+    fn a_real_lock_selected_tool_enters_worker_grantable_keys() {
+        let mut release = Release::empty();
+        let (entry, bytes) = built_package("p1-module-read", "p1/read");
+        release.add(entry.clone(), &bytes);
+        let (config, dirs) = config_without_lock();
+        std::fs::write(
+            config.path().join("modules.lock"),
+            lock_text("extra_locked_tool", &entry),
+        )
+        .expect("real modules.lock entry");
+        let deps = quiet_deps(dirs);
+        let mut catalog = Catalog::new();
+        register_locked_modules_from(&mut catalog, &deps, Some(release.manifest_file()))
+            .expect("locked package is registered before worker lists");
+        let lists = super::super::delegation::worker_lists(&catalog, &deps).expect("worker lists");
+        assert!(lists.grantable.contains(&"extra_locked_tool".to_owned()));
+    }
+
+    #[test]
+    fn replacing_release_in_place_loads_new_bytes_in_new_generation() {
+        let release = tempfile::tempdir().expect("release dir");
+        let first_entry = read_entry();
+        let manifest = write_read_release(release.path(), &[first_entry]);
+        let (_config, dirs) = config_without_lock();
+        let old = quiet_deps(dirs.clone());
+        register_host_entries_from(
+            &mut Catalog::new(),
+            &old,
+            &[("read", "p1/read")],
+            Some(manifest.clone()),
+        )
+        .expect("first generation");
+        let before = module_sources(&old)
+            .unwrap()
+            .resolve("read")
+            .unwrap()
+            .digest;
+
+        let mut next_entry = built_entry("p1-module-write");
+        next_entry["name"] = "p1/read".into();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/target/p1-modules/p1-module-write/p1-module-write.wasm");
+        let target = release.path().join(next_entry["path"].as_str().unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(source, target).expect("replacement bytes");
+        write_release_manifest(release.path(), &[next_entry.clone()]);
+        let new = quiet_deps(dirs);
+        register_host_entries_from(
+            &mut Catalog::new(),
+            &new,
+            &[("read", "p1/read")],
+            Some(manifest),
+        )
+        .expect("new generation");
+        let after = module_sources(&new)
+            .unwrap()
+            .resolve("read")
+            .unwrap()
+            .digest;
+        assert_ne!(before, after);
+        assert_eq!(after, next_entry["digest"].as_str().unwrap());
+        assert_eq!(
+            module_sources(&old)
+                .unwrap()
+                .resolve("read")
+                .unwrap()
+                .digest,
+            before
+        );
+    }
+
+    #[test]
+    fn same_build_rejects_a_lock_from_a_replaced_manifest_snapshot() {
+        let release = tempfile::tempdir().expect("scratch release");
+        let old = read_entry();
+        let path = write_read_release(release.path(), &[old]);
+        let loaders = BuildLoaders::default();
+        let snapshot = loaders.manifest_for(&path).expect("first snapshot");
+        let loader = loaders
+            .for_release(&path, snapshot.clone())
+            .expect("first loader");
+        let mut replacement = built_entry("p1-module-write");
+        replacement["name"] = "p1/read".into();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/target/p1-modules/p1-module-write/p1-module-write.wasm");
+        let target = release.path().join(replacement["path"].as_str().unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(source, target).unwrap();
+        write_release_manifest(release.path(), &[replacement.clone()]);
+        let lock = ModulesLock::parse(
+            &release.path().join("modules.lock"),
+            &lock_text("read", &replacement),
+        )
+        .unwrap();
+        let pinned = loaders.manifest_for(&path).expect("same build snapshot");
+        assert_eq!(pinned, snapshot);
+        assert!(
+            matches!(
+                load_locked_entry(&loader, &pinned, "read", lock.resolve("read").unwrap()),
+                Err(ModulesError::LockMismatch { .. })
+            ),
+            "B lock cannot validate against A loader"
+        );
+    }
+
+    #[test]
+    fn a_build_reuses_one_loader_but_a_new_build_gets_new_engine() {
+        let entry = read_entry();
+        let release = tempfile::tempdir().expect("release dir");
+        let manifest = write_read_release(release.path(), &[entry]);
+        let parsed = ReleaseManifest::read(&manifest).expect("manifest");
+        let build = BuildLoaders::default();
+        let first = build
+            .for_release(&manifest, parsed.clone())
+            .expect("loader");
+        let second = build
+            .for_release(&manifest, parsed.clone())
+            .expect("reused loader");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "one ticker and engine for this build"
+        );
+        let old = first.load("p1/read").expect("old module");
+        let next = BuildLoaders::default();
+        let replacement = next
+            .for_release(&manifest, parsed)
+            .expect("next build loader");
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        assert_eq!(
+            old.digest(),
+            replacement.load("p1/read").expect("next module").digest()
+        );
+    }
+
+    #[test]
+    fn verified_identity_survives_manifest_replacement_after_load() {
+        let entry = read_entry();
+        let release = tempfile::tempdir().expect("release dir");
+        let manifest = write_read_release(release.path(), std::slice::from_ref(&entry));
+        let (_config, dirs) = config_without_lock();
+        let deps = quiet_deps(dirs);
+        let mut catalog = Catalog::new();
+        register_host_entries_from(
+            &mut catalog,
+            &deps,
+            &[("read", "p1/read")],
+            Some(manifest.clone()),
+        )
+        .expect("verified load");
+        std::fs::write(&manifest, "{\"components\":[]}").expect("replace manifest");
+        let resolved = module_sources(&deps)
+            .expect("verified sources")
+            .resolve("read")
+            .expect("loaded read");
+        assert_eq!(resolved.digest, entry["digest"].as_str().expect("digest"));
+        assert_eq!(
+            resolved.abi,
+            format!(
+                "{}+{}",
+                entry["world"].as_str().unwrap(),
+                entry["protocol"].as_str().unwrap()
             )
         );
     }

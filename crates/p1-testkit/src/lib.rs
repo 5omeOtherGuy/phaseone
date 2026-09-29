@@ -308,6 +308,10 @@ fn serde_json_object() -> p1_contracts::serde_json::Value {
 }
 
 impl Tool for FakeTool {
+    fn synthetic_command_result(&self) -> bool {
+        true
+    }
+
     fn declaration(&self) -> &ToolDeclaration {
         &self.declaration
     }

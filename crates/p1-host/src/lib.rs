@@ -199,6 +199,13 @@ pub struct HostDeps {
     /// package gets (the agent's workspace read side and observations, S1.8) fills what it
     /// leaves empty, and alone links every package when it is `None`.
     pub(crate) module_services: Option<catalog::modules::ModuleServices>,
+    /// Loads verified by this catalog build, shared with lazy provider activation.
+    pub(crate) verified_sources: Arc<catalog::modules::VerifiedSources>,
+    /// Cached runtime loader for each release manifest of this catalog build.
+    pub(crate) build_loaders: Arc<catalog::modules::BuildLoaders>,
+    /// Scratch release for host integration tests; production always uses executable's release.
+    #[cfg(test)]
+    pub(crate) release_manifest: Option<std::path::PathBuf>,
     /// The main agent's generation of worker-member scopes (B-S6-9, D068), set with the
     /// worker service; `run.rs` retires it when the agent's assembly is dropped.
     #[cfg(feature = "delegation")]
@@ -245,6 +252,10 @@ impl HostDeps {
             workflow_observer: None,
             model_switch: None,
             module_services: None,
+            verified_sources: Arc::new(catalog::modules::VerifiedSources::default()),
+            build_loaders: Arc::new(catalog::modules::BuildLoaders::default()),
+            #[cfg(test)]
+            release_manifest: None,
             #[cfg(feature = "delegation")]
             member_scopes: None,
         }

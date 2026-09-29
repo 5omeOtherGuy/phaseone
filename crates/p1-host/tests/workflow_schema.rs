@@ -9,7 +9,8 @@ mod workflow_common;
 use std::time::Duration;
 
 use common::run_args;
-use workflow_common::{Fakes, Scratch, done_with, history_text, read_json};
+use p1_testkit::{json_call, text_response, tool_call_response};
+use workflow_common::{Fakes, Scratch, done_with, history_text, read_json, step_lines};
 
 const SCRIPT: &str = r#"
 let schema = #{ type: "object", required: ["n"], properties: #{ n: #{ type: "integer" } } };
@@ -133,4 +134,63 @@ async fn invalid_output_body() {
         "{envelope}"
     );
     assert_eq!(result["counts"]["invalid_output"], 1, "{result}");
+}
+
+/// A repair turn that ends `blocked` stores `needs`, and the observer must still see
+/// it when it renders the step line: the repair's cleanup guard must not drop a need
+/// that a successful repair left for `step_ended`.
+#[tokio::test]
+async fn a_repair_that_ends_blocked_keeps_its_needs() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        blocked_repair_body().await;
+    })
+    .await
+    .expect("blocked repair workflow hung");
+}
+
+async fn blocked_repair_body() {
+    let scratch = Scratch::new();
+    let fakes = Fakes::new(
+        Vec::new(),
+        [
+            done_with("first", r#"{"n":"many"}"#),
+            vec![
+                tool_call_response(vec![json_call(
+                    "f1",
+                    "finish",
+                    r#"{"status":"blocked","summary":"cannot count","needs":"a countable list"}"#,
+                )]),
+                text_response("blocked"),
+            ],
+        ]
+        .concat(),
+        Vec::new(),
+    );
+    let script = scratch.script("blocked.rhai", SCRIPT);
+    let out = scratch.root.path().join("runs");
+    let mut harness = scratch.harness();
+    harness.deps.catalog_hook = Some(fakes.hook());
+    let code = run_args(
+        &mut harness,
+        &[
+            "workflow",
+            "run",
+            script.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--workspace",
+            scratch.workspace.path().to_str().unwrap(),
+            "--yes",
+        ],
+    )
+    .await;
+    let stderr = harness.stderr.text();
+    assert_eq!(code, 2, "completed with issues: {stderr}");
+    let lines = step_lines(&stderr, "wf1");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("blocked: needs a countable list")),
+        "the blocked step must still name its need: {lines:?}\n{stderr}"
+    );
 }

@@ -1,5 +1,5 @@
 ---
-adr: 102
+adr: 104
 title: Credential index rebuilds keep earlier identities and expose a test clock
 status: proposed
 date: 2026-09-29
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: ["https://github.com/5omeOtherGuy/phaseone/issues/481", "https://github.com/5omeOtherGuy/phaseone/pull/483"]
 ---
-# ADR-0102: Credential index rebuilds keep earlier identities and expose a test clock
+# ADR-0104: Credential index rebuilds keep earlier identities and expose a test clock
 
 ## Context
 

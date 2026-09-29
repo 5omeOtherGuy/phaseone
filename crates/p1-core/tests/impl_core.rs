@@ -382,7 +382,7 @@ async fn tool_result_status_and_content_are_verbatim() {
         .records()
         .into_iter()
         .find_map(|record| match record.body {
-            RecordBody::ToolFinished { result } => Some(result),
+            RecordBody::ToolFinished { result, .. } => Some(result),
             _ => None,
         })
         .expect("a ToolFinished record");

@@ -169,6 +169,9 @@ pub struct Summarization<'h, G: Goal> {
     segments: plan::Segments,
     keep_recent_tokens: u64,
     user_verbatim_tokens: u64,
+    wall: u64,
+    excerpt_chars: usize,
+    tail_start: usize,
     summarize_at_tokens: u64,
     request: SummaryRequest,
     /// The cap the engine starts from, and doubles once.
@@ -210,17 +213,23 @@ fn summarize<'h, G: Goal>(
     let cap = caps.summary_output_tokens;
     let limit = u32::try_from(cap).unwrap_or(u32::MAX);
     let render_budget = wall.saturating_sub(cap);
-    let transcript = render::transcript(
+    let transcript = match render::checked_transcript(
         &history[..tail_start],
         config.tool_result_excerpt_chars,
         render_budget,
-    );
+    ) {
+        Ok(transcript) => transcript,
+        Err(reason) => return Step::Done(goal.finish(Summarized::Failed(reason))),
+    };
     Step::Summarize(Box::new(Summarization {
         goal,
         history,
         segments,
         keep_recent_tokens: config.keep_recent_tokens,
         user_verbatim_tokens: config.user_verbatim_tokens,
+        wall,
+        excerpt_chars: config.tool_result_excerpt_chars,
+        tail_start,
         summarize_at_tokens: config.summarize_at_tokens,
         request: SummaryRequest {
             transcript,
@@ -285,7 +294,22 @@ impl<'h, G: Goal> Summarization<'h, G> {
             // be sent again unchanged.
             StopReason::MaxOutputTokens if self.attempts == 1 && self.capped => {
                 let sent = self.request.max_output_tokens.unwrap_or(self.limit);
-                self.request.max_output_tokens = Some(sent.saturating_mul(2));
+                let doubled = sent.saturating_mul(2);
+                // The doubled cap leaves the transcript less room, so it is rendered
+                // against the smaller budget before the retry. When the cap alone
+                // reaches the wall no transcript can fit; the retry keeps the
+                // transcript the first attempt sent, and the route's verdict decides.
+                if let Some(budget) = self.wall.checked_sub(u64::from(doubled)) {
+                    match render::checked_transcript(
+                        &self.history[..self.tail_start],
+                        self.excerpt_chars,
+                        budget,
+                    ) {
+                        Ok(transcript) => self.request.transcript = transcript,
+                        Err(reason) => return self.fail(reason),
+                    }
+                }
+                self.request.max_output_tokens = Some(doubled);
                 Step::Summarize(Box::new(self))
             }
             StopReason::MaxOutputTokens if !self.capped => self.fail(

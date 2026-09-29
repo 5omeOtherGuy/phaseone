@@ -152,7 +152,7 @@ limits, time estimates or instructions that are not in the transcript (owner fai
 **Failure and cancellation.**
 - `input.cancel` fires → the provider stream is dropped, `Err(ContextError::Cancelled)`. No partial summary is ever returned.
 - **Nothing to summarize** — outside the tail and the kept user messages there is nothing, or
-  only a previous summary: NO request is made. Below the wall → `Ok(None)`; at the wall →
+  only a previous summary: NO request is made. A mandatory previous-summary block that cannot fit the transcript budget fails preparation rather than reaching the provider; a truncated-response retry rerenders against its doubled output cap. Below the wall → `Ok(None)`; at the wall →
   `Err(Failed("context is full (<next_input> of <window> tokens) and nothing is left to summarize"))`.
   Without this rule one oversized unit would buy a useless summarization before every request.
 - The summarization fails (provider error, empty answer): if `next_input < window_tokens - output_headroom_tokens` → `Ok(None)`

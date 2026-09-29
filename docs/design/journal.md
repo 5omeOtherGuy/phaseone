@@ -66,6 +66,8 @@ valid JSON. `load` returns every complete valid record before it plus `truncated
 it never drops a complete line and never "repairs" silently. An invalid line that is NOT the
 last line is `JournalError::Corrupt{line}` — that file is not resumed.
 
+Session JSONL readers refuse files above 256 MiB before allocation, including sparse files and files grown during a read. Tail repair requires the same offset, length and observed-byte fingerprint under the writer lock; a same-length replacement is stale.
+
 ## Projection and resume — in `p1-core`
 
 ```rust

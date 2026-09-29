@@ -132,7 +132,7 @@ async fn crash_after_tool_started_resumes_as_unknown() {
     assert_eq!(committed[1].seq, 5);
     assert_eq!(committed[2].seq, 6);
     match &committed[0].body {
-        RecordBody::ToolFinished { result } => {
+        RecordBody::ToolFinished { result, .. } => {
             assert_eq!(result.call_id, "c1");
             assert_eq!(result.status, ToolStatus::Unknown);
             assert_eq!(result.content, UNKNOWN_OUTCOME);
@@ -188,7 +188,7 @@ async fn crash_after_assistant_completed_resumes_as_cancelled() {
     run(&mut resumed, "next", CancellationToken::new()).await;
 
     match &resumed_journal.records()[0].body {
-        RecordBody::ToolFinished { result } => {
+        RecordBody::ToolFinished { result, .. } => {
             assert_eq!(result.status, ToolStatus::Cancelled);
             assert_eq!(result.content, CANCELLED_CONTENT);
         }
@@ -406,6 +406,7 @@ fn project_rejects_a_result_for_an_unknown_call() {
                     status: ToolStatus::Ok,
                     content: "x".into(),
                 },
+                exit_code: None,
             },
         },
     ];

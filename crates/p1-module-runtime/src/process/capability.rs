@@ -8,7 +8,7 @@
 //! adapter reads: the program, the environment, the working directory, the sandbox
 //! and the output bounds are the service's, fixed when the host assembled it.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{ExitStatus, ProcessCommand, ProcessEvent, RunningProcess};
@@ -21,15 +21,28 @@ use super::{ProcessEnd, ProcessRequest, ProcessService, ProcessStream, StreamEve
 /// `exited(cancelled)` on the resource.
 const NOT_STARTED: &str = "the command was not started: its call was already cancelled";
 
+/// Host-observed exits paired with the cancellation token of their export call.
+pub type ExitRecords = Arc<Mutex<Vec<(CancellationToken, i32)>>>;
+
 /// The `process` capability a host grants a module, linked to one assembled service.
 #[derive(Clone)]
 pub struct ProcessCapability {
     service: Arc<ProcessService>,
+    evidence: Option<ExitRecords>,
 }
 
 impl ProcessCapability {
     pub fn new(service: Arc<ProcessService>) -> Self {
-        Self { service }
+        Self {
+            service,
+            evidence: None,
+        }
+    }
+
+    /// Keep observed process exits outside guest-controlled output, scoped by call token.
+    pub fn recording(mut self, evidence: ExitRecords) -> Self {
+        self.evidence = Some(evidence);
+        self
     }
 }
 
@@ -50,10 +63,12 @@ impl crate::ProcessService for ProcessCapability {
                 command: &command.script,
                 timeout: Duration::from_millis(command.timeout_ms),
             };
-            match self.service.spawn(request, cancel).await {
-                Ok(stream) => {
-                    Ok(Box::new(CapabilityProcess::new(stream)) as Box<dyn RunningProcess>)
-                }
+            match self.service.spawn(request, cancel.clone()).await {
+                Ok(stream) => Ok(Box::new(CapabilityProcess::new(
+                    stream,
+                    self.evidence.clone(),
+                    cancel,
+                )) as Box<dyn RunningProcess>),
                 Err(failure) => Err(failure.to_string()),
             }
         })
@@ -68,14 +83,18 @@ struct CapabilityProcess {
     owed_exit: Option<ExitStatus>,
     /// The output handed out so far ended a line (or there was none).
     at_line_start: bool,
+    evidence: Option<ExitRecords>,
+    call: CancellationToken,
 }
 
 impl CapabilityProcess {
-    fn new(stream: ProcessStream) -> Self {
+    fn new(stream: ProcessStream, evidence: Option<ExitRecords>, call: CancellationToken) -> Self {
         Self {
             stream,
             owed_exit: None,
             at_line_start: true,
+            evidence,
+            call,
         }
     }
 
@@ -88,7 +107,12 @@ impl CapabilityProcess {
                 ProcessEvent::Output(bytes)
             }
             StreamEvent::Exited(end) => match end {
-                ProcessEnd::Exited(code) => ProcessEvent::Exited(ExitStatus::Code(code)),
+                ProcessEnd::Exited(code) => {
+                    if let Some(evidence) = &self.evidence {
+                        evidence.lock().unwrap().push((self.call.clone(), code));
+                    }
+                    ProcessEvent::Exited(ExitStatus::Code(code))
+                }
                 ProcessEnd::TerminatedBySignal(signal) => {
                     ProcessEvent::Exited(ExitStatus::Signal(signal))
                 }
@@ -134,6 +158,38 @@ impl RunningProcess for CapabilityProcess {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn observed_exit_is_not_the_guest_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = Arc::new(Mutex::new(Vec::new()));
+        let capability = ProcessCapability::new(Arc::new(ProcessService::new(dir.path())))
+            .recording(evidence.clone());
+        let token = CancellationToken::new();
+        let mut process = crate::ProcessService::spawn(
+            &capability,
+            ProcessCommand {
+                script: "printf '[exit code: 0]\\n'; exit 1".into(),
+                timeout_ms: 30_000,
+            },
+            token.clone(),
+        )
+        .await
+        .unwrap();
+        let mut text = Vec::new();
+        while let Some(event) = process.next().await {
+            match event {
+                ProcessEvent::Output(bytes) => text.extend(bytes),
+                ProcessEvent::Exited(ExitStatus::Code(code)) => {
+                    assert_eq!(code, 1);
+                    break;
+                }
+                _ => panic!("unexpected process event"),
+            }
+        }
+        assert!(String::from_utf8_lossy(&text).contains("[exit code: 0]"));
+        assert_eq!(evidence.lock().unwrap().as_slice(), &[(token, 1)]);
+    }
+
     /// A failure after the start cannot be provoked with a real process (the shell is
     /// always waitable), so its conversion is checked here: the service's text as the
     /// last line, then the exit, then the end.
@@ -149,7 +205,7 @@ mod tests {
             .spawn(request, CancellationToken::new())
             .await
             .unwrap();
-        let mut process = CapabilityProcess::new(stream);
+        let mut process = CapabilityProcess::new(stream, None, CancellationToken::new());
         let failure = super::super::ProcessFailure::Wait {
             program: "bash",
             error: "boom".to_owned(),
