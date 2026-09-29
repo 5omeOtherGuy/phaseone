@@ -755,18 +755,22 @@ pub async fn run_with_front_end(
         // Generation 0: the start's catalog and policy. The child builder already
         // shares `generations`, so a child started from now on pins this one until
         // a reload replaces it (ADR-0084 §3).
-        generations
-            .install(catalog.clone(), front_end.authorization())
-            .bind_sources(deps.verified_sources.clone());
+        generations.install_with_sources(
+            catalog.clone(),
+            front_end.authorization(),
+            deps.verified_sources.clone(),
+        );
     }
     // Without delegation nothing else reads the generations; the session still has
     // generation 0 so a `/modules reload` has a current one to replace.
     #[cfg(not(feature = "delegation"))]
-    let generations = Arc::new(Generations::new(catalog.clone(), front_end.authorization()));
+    let generations = Arc::new(Generations::empty());
     #[cfg(not(feature = "delegation"))]
-    generations
-        .current()
-        .bind_sources(deps.verified_sources.clone());
+    generations.install_with_sources(
+        catalog.clone(),
+        front_end.authorization(),
+        deps.verified_sources.clone(),
+    );
 
     // The chosen model (ADR-0049 stage 1): the environment the reference or
     // `default_model` named, with the selected profile applied on top of it. The
@@ -784,7 +788,7 @@ pub async fn run_with_front_end(
     // the notice sink the turn boundary reports through.
     let mask = Arc::new(MaskCounter::new());
     let _issued_guard = completion_hub.assembly_guard(&mask);
-    let assembled = assemble_with_cache_key(
+    let mut assembled = assemble_with_cache_key(
         &catalog,
         &environment,
         &workspace,
@@ -792,7 +796,7 @@ pub async fn run_with_front_end(
         PARENT_ORDINAL,
         &mask,
     )?;
-    crate::catalog::capabilities::bind_assembled(&assembled, &deps.verified_sources);
+    crate::catalog::capabilities::bind_assembled(&mut assembled, &deps.verified_sources);
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
     let completion = completion_hub.take(&mask);
@@ -1015,7 +1019,9 @@ pub async fn run_with_front_end(
             sandbox_write: options.sandbox_write.clone(),
             sandbox_read: options.sandbox_read.clone(),
             env_pass: options.env_pass.clone(),
-            policy: Box::new(move |sources| reload_policy_of(reload_policy.as_ref(), sources)),
+            policy: Box::new(move |sources, release: &crate::policy::BuildRelease| {
+                reload_policy_of(reload_policy.as_ref(), sources, release)
+            }),
             queue: ReloadQueue::default(),
         },
         completion: completion_hub.clone(),
@@ -1148,9 +1154,11 @@ async fn workflow_run(
     // Generation 0 of this standalone run: the child builder shares it, so every
     // step worker pins the catalog the run loaded (ADR-0084 §3).
     front_end.bind_verified_sources(deps.verified_sources.clone());
-    generations
-        .install(catalog, front_end.authorization())
-        .bind_sources(deps.verified_sources.clone());
+    generations.install_with_sources(
+        catalog,
+        front_end.authorization(),
+        deps.verified_sources.clone(),
+    );
 
     // The run's base commit (ADR-0073): what its steps' new worktrees branch from.
     let base = crate::worktree::run_base_async(workspace.clone()).await;
@@ -1310,6 +1318,15 @@ pub struct AssemblyLines {
     version: u64,
     /// The assembly the file still has to name before the record being committed now.
     owed: Mutex<Option<AssemblyIdentity>>,
+    /// The assembly that really executes the session's records, and whether a candidate's
+    /// line has reached the file before the candidate was installed.
+    trail: Mutex<AssemblyTrail>,
+}
+
+#[derive(Default)]
+struct AssemblyTrail {
+    active: Option<AssemblyIdentity>,
+    written_line: bool,
 }
 
 impl AssemblyLines {
@@ -1320,6 +1337,37 @@ impl AssemblyLines {
             store,
             version,
             owed: Mutex::new(None),
+            trail: Mutex::new(AssemblyTrail::default()),
+        }
+    }
+
+    fn trail(&self) -> std::sync::MutexGuard<'_, AssemblyTrail> {
+        self.trail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `identity` is the assembly that executes the session's records now: the one a
+    /// failed reconfiguration must put back in the file.
+    pub fn adopt(&self, identity: AssemblyIdentity) {
+        self.trail().active = Some(identity);
+    }
+
+    /// A reconfiguration was refused. The candidate's line may already be in the file,
+    /// written ahead of the `Environment` record that failed, and a file cannot unwrite
+    /// it: name the assembly that is still running before the next record.
+    fn reject(&self) {
+        self.slot().take();
+        let restore = {
+            let mut trail = self.trail();
+            if std::mem::take(&mut trail.written_line) {
+                trail.active.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(active) = restore {
+            self.owe(active);
         }
     }
 
@@ -1337,6 +1385,7 @@ impl AssemblyLines {
     fn owe(&self, identity: AssemblyIdentity) {
         if self.version == JOURNAL_VERSION {
             *self.slot() = Some(identity);
+            self.trail().written_line = false;
         }
     }
 
@@ -1345,7 +1394,11 @@ impl AssemblyLines {
     fn settle(&self) -> Result<(), String> {
         let owed = self.slot().take();
         match owed {
-            Some(identity) => self.write_line(&identity),
+            Some(identity) => {
+                self.write_line(&identity)?;
+                self.trail().written_line = true;
+                Ok(())
+            }
             None => Ok(()),
         }
     }
@@ -1357,8 +1410,11 @@ impl AssemblyLines {
         if self.version != JOURNAL_VERSION {
             return Ok(());
         }
-        let _ = identity;
-        self.settle()
+        self.settle()?;
+        let mut trail = self.trail();
+        trail.active = Some(identity.clone());
+        trail.written_line = false;
+        Ok(())
     }
 
     fn write_line(&self, identity: &AssemblyIdentity) -> Result<(), String> {
@@ -1538,6 +1594,7 @@ pub fn arm_assembly(
     entries: &[AssemblyEntry],
     current: &AssemblyIdentity,
 ) -> Vec<String> {
+    lines.adopt(current.clone());
     match entries.last() {
         // The file already names the assembly running now: nothing to write, nothing to say.
         Some(last) if last.identity == *current => Vec::new(),
@@ -2198,7 +2255,9 @@ pub(crate) fn model_switch_for_test(
             env_pass: Vec::new(),
             policy: {
                 let front_end = front_end.clone();
-                Box::new(move |sources| reload_policy_of(front_end.as_ref(), sources))
+                Box::new(move |sources, release: &crate::policy::BuildRelease| {
+                    reload_policy_of(front_end.as_ref(), sources, release)
+                })
             },
             queue: ReloadQueue::default(),
         },
@@ -2260,6 +2319,12 @@ impl ModelSwitch {
             .expect("installed sources")
     }
 
+    /// The generation of the completion grant the session's `finish` runs under.
+    pub(crate) fn finish_generation_for_test(&self) -> Option<u64> {
+        let id = self.session.lock().unwrap().completion.as_ref()?.id;
+        Some(self.completion.live_generation_for_test(id))
+    }
+
     pub(crate) fn finish_for_test(&self) -> Option<Arc<dyn Tool>> {
         self.session.lock().unwrap().finish.clone()
     }
@@ -2310,7 +2375,9 @@ impl ModelSwitch {
                 sandbox_write: Vec::new(),
                 sandbox_read: Vec::new(),
                 env_pass: Vec::new(),
-                policy: Box::new(move |_sources| Ok((policy.clone(), None))),
+                policy: Box::new(move |_sources, _release: &crate::policy::BuildRelease| {
+                    Ok((policy.clone(), None))
+                }),
                 queue: ReloadQueue::default(),
             },
             completion: Arc::new(CompletionHub::new()),
@@ -2419,7 +2486,7 @@ pub(crate) async fn switch_model(
         })
         .await;
     if let Err(error) = installed {
-        switch.lines.slot().take();
+        switch.lines.reject();
         return Err(error.to_string());
     }
     // The journal names the assembly that executes the records after this point. A store
@@ -2442,6 +2509,8 @@ struct SessionCandidate {
     route: String,
     /// The completion the switched `finish` writes, when the session adopts it.
     adopted: Option<Completion>,
+    /// A reload's rebuilt `finish` grant, live only once the candidate is installed.
+    staged: Option<crate::activity::StagedFinish>,
     finish_at: Option<usize>,
     /// ADR-0080: the candidate's execution manifest, built before `reconfigure`
     /// consumes the assembly and written only once the agent installed it.
@@ -2468,7 +2537,7 @@ fn session_candidate(
     crate::models::apply(&mut environment, choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
     let _issued_guard = switch.completion.assembly_guard(&switch.mask);
-    let assembled = assemble_with_cache_key(
+    let mut assembled = assemble_with_cache_key(
         catalog,
         &environment,
         &switch.workspace,
@@ -2477,7 +2546,7 @@ fn session_candidate(
         &switch.mask,
     )?;
     if let Some(verified) = sources.verified() {
-        crate::catalog::capabilities::bind_assembled(&assembled, verified);
+        crate::catalog::capabilities::bind_assembled(&mut assembled, verified);
     }
     // The catalog's `finish` factory issued this assembly its own completion. Take
     // it, so the hub cannot hand a stale one to a later worker assembly, and so it
@@ -2506,10 +2575,13 @@ fn session_candidate(
     // otherwise the switched tool set's own is the session's from now on, and the
     // plumbing follows the completion the catalog just issued it (which the `finish`
     // factory always does).
+    let mut staged = None;
     let adopted = match (current_finish, finish_at) {
         (_, Some(index)) if reload && current_completion.is_some() => {
             let completion = current_completion.expect("checked above").clone();
-            let rebuilt = switch.completion.finish_for(
+            // Staged, not granted: the session's live finish tool stays fresh if the
+            // install below is refused, and the grant goes live only in `adopt_candidate`.
+            let rebuilt = switch.completion.stage_finish_for(
                 &tools[index],
                 &completion,
                 &tools,
@@ -2517,7 +2589,8 @@ fn session_candidate(
                 None,
                 &switch.mask,
             )?;
-            tools[index] = rebuilt;
+            tools[index] = rebuilt.tool().clone();
+            staged = Some(rebuilt);
             Some(completion)
         }
         (Some(kept), Some(index)) if kept.declaration().name == tools[index].declaration().name => {
@@ -2535,7 +2608,7 @@ fn session_candidate(
         switch.completion.retire(issued_id);
     }
     if let Some(verified) = sources.verified() {
-        crate::catalog::capabilities::bind_tools(&tools, &assembled.resolved.tools, verified);
+        crate::catalog::capabilities::bind_tools(&mut tools, &assembled.resolved.tools, verified);
     }
     Ok(SessionCandidate {
         parts: CandidateParts {
@@ -2548,6 +2621,7 @@ fn session_candidate(
         environment,
         route,
         adopted,
+        staged,
         finish_at,
         identity,
     })
@@ -2562,10 +2636,14 @@ fn adopt_candidate(switch: &ModelSwitch, candidate: SessionCandidate) -> String 
         environment,
         route,
         adopted,
+        staged,
         finish_at,
         identity: _,
     } = candidate;
     let tools = parts.tools;
+    if let Some(staged) = staged {
+        staged.activate();
+    }
     let mut session = switch.session.lock().unwrap();
     if let Some(completion) = adopted {
         if let Some(previous) = session.completion.as_ref()
@@ -2647,6 +2725,9 @@ impl Generation {
         self.sources.lock().unwrap().clone()
     }
 
+    /// A generation is published with its sources already attached
+    /// ([`Generations::install_with_sources`]); only a fixture without a build binds late.
+    #[cfg(test)]
     fn bind_sources(&self, sources: Arc<crate::catalog::modules::VerifiedSources>) {
         *self.sources.lock().unwrap() = Some(sources);
     }
@@ -2690,6 +2771,27 @@ impl Generations {
         catalog: Arc<Catalog>,
         authorization: Arc<dyn AuthorizationPolicy>,
     ) -> Arc<Generation> {
+        self.install_generation(catalog, authorization, None)
+    }
+
+    /// As [`Generations::install`], for a generation built from a verified load: its
+    /// sources are part of the generation from the moment it is published, so no child or
+    /// workflow step can pin it and find them missing.
+    pub(crate) fn install_with_sources(
+        &self,
+        catalog: Arc<Catalog>,
+        authorization: Arc<dyn AuthorizationPolicy>,
+        sources: Arc<crate::catalog::modules::VerifiedSources>,
+    ) -> Arc<Generation> {
+        self.install_generation(catalog, authorization, Some(sources))
+    }
+
+    fn install_generation(
+        &self,
+        catalog: Arc<Catalog>,
+        authorization: Arc<dyn AuthorizationPolicy>,
+        sources: Option<Arc<crate::catalog::modules::VerifiedSources>>,
+    ) -> Arc<Generation> {
         let mut current = self.current.lock().unwrap();
         let generation = Arc::new(Generation {
             number: current
@@ -2697,7 +2799,7 @@ impl Generations {
                 .map_or(0, |generation| generation.number + 1),
             catalog,
             authorization,
-            sources: Mutex::new(None),
+            sources: Mutex::new(sources),
             context_module: crate::policy::host_entry(crate::summary::CONTEXT_POLICY),
         });
         *current = Some(generation.clone());
@@ -2746,6 +2848,17 @@ pub async fn install_candidate(
     agent: &mut Agent,
     candidate: Candidate,
 ) -> Result<Arc<Generation>, ReconfigureError> {
+    install_candidate_from(generations, agent, candidate, None).await
+}
+
+/// [`install_candidate`] for a candidate built from a verified load: the generation is
+/// published with the load's `sources` attached.
+pub(crate) async fn install_candidate_from(
+    generations: &Generations,
+    agent: &mut Agent,
+    candidate: Candidate,
+    sources: Option<Arc<crate::catalog::modules::VerifiedSources>>,
+) -> Result<Arc<Generation>, ReconfigureError> {
     let Candidate {
         catalog,
         authorization,
@@ -2761,7 +2874,10 @@ pub async fn install_candidate(
             authorization: Some(authorization.clone()),
         })
         .await?;
-    Ok(generations.install(catalog, authorization))
+    Ok(match sources {
+        Some(sources) => generations.install_with_sources(catalog, authorization, sources),
+        None => generations.install(catalog, authorization),
+    })
 }
 
 /// What a `/modules reload` request did.
@@ -2811,13 +2927,17 @@ pub(crate) struct ReloadInputs {
     /// the shipped policy package it asks loaded again from the release
     /// ([`reload_policy_of`]).
     // notice: S5.11 (#357): fallible, and the reloaded package answers once installed.
-    policy: Box<
-        dyn Fn(Arc<crate::catalog::modules::VerifiedSources>) -> Result<ReloadedPolicy, String>
-            + Send
-            + Sync,
-    >,
+    policy: Box<ReloadPolicyFn>,
     queue: ReloadQueue,
 }
+
+/// Builds a reload's policy from the catalog build's verified sources and its release.
+type ReloadPolicyFn = dyn Fn(
+        Arc<crate::catalog::modules::VerifiedSources>,
+        &crate::policy::BuildRelease,
+    ) -> Result<ReloadedPolicy, String>
+    + Send
+    + Sync;
 
 /// A reload candidate's independent bridge and verified shipped policy module. The module
 /// is retained for journal identity; old generations keep their original verdict source.
@@ -2835,10 +2955,13 @@ type ReloadedPolicy = (
 fn reload_policy_of(
     front_end: &dyn FrontEnd,
     sources: Arc<crate::catalog::modules::VerifiedSources>,
+    release: &crate::policy::BuildRelease,
 ) -> Result<ReloadedPolicy, String> {
+    // Through the loader of the catalog build of this same reload: the policy is verified
+    // against the manifest snapshot the catalog's packages were, not a second read of the path.
     let reloaded = front_end
         .shipped_policy()
-        .map(|shipped| shipped.reload())
+        .map(|shipped| shipped.reload_from(release))
         .transpose()?;
     let authorization = reloaded.as_ref().map_or_else(
         || front_end.authorization(),
@@ -2930,7 +3053,10 @@ pub(crate) async fn reload_modules(
     // release host entries, `module_sources`), and the session's policy comes from the front
     // end's reload bridge, which loads the shipped policy package again (S5.11): a reload
     // keeps both behaviours.
-    let (authorization, reloaded) = (inputs.policy)(deps.verified_sources.clone())?;
+    let release = crate::catalog::modules::release_for_build(&deps)
+        .ok_or_else(|| crate::catalog::modules::ModulesError::NoRelease.to_string())?;
+    let release = deps.build_loaders.build_release(&release)?;
+    let (authorization, reloaded) = (inputs.policy)(deps.verified_sources.clone(), &release)?;
     if let Some(policy) = &reloaded {
         let module = policy.loaded_module();
         deps.verified_sources.record(module.name(), &module);
@@ -2945,7 +3071,7 @@ pub(crate) async fn reload_modules(
         true,
     )?;
     switch.lines.owe(candidate.identity.clone());
-    let installed = install_candidate(
+    let installed = install_candidate_from(
         &switch.generations,
         agent,
         Candidate {
@@ -2959,16 +3085,18 @@ pub(crate) async fn reload_modules(
                 context: candidate.parts.context.clone(),
             },
         },
+        // Published with its verified sources: a workflow step pinning it in the same
+        // instant finds its grants, not a half-built generation.
+        Some(deps.verified_sources.clone()),
     )
     .await;
     let generation = match installed {
         Ok(generation) => generation,
         Err(error) => {
-            switch.lines.slot().take();
+            switch.lines.reject();
             return Err(error.to_string());
         }
     };
-    generation.bind_sources(deps.verified_sources.clone());
     // The candidate owns a fresh policy object. Installing this generation never mutates
     // the verdict source held by workers pinned to the previous generation.
     drop(reloaded);
@@ -3771,6 +3899,99 @@ mod tests {
             Some(module.digest().to_string().trim_start_matches("sha256:"))
         );
         assert_eq!(row.abi.as_deref(), Some(module.abi()));
+    }
+
+    fn named_assembly(environment: &str) -> AssemblyIdentity {
+        AssemblyIdentity {
+            environment: environment.into(),
+            host: host_identity(),
+            modules: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_environment_commit_restores_the_active_assembly_line() {
+        let journal = session::memory();
+        let lines = Arc::new(AssemblyLines::new(
+            AssemblyStore::Memory(journal.clone()),
+            JOURNAL_VERSION,
+        ));
+        let active = named_assembly("active");
+        let candidate = named_assembly("candidate");
+        lines.owe(active.clone());
+        lines
+            .switched(&active)
+            .expect("the running assembly is named");
+        // The reconfiguration owes the candidate's line; the sink writes it ahead of the
+        // `Environment` record, whose commit the store then refuses (a sequence gap here).
+        lines.owe(candidate.clone());
+        let sink = lines.sink();
+        let refused = JournalRecord {
+            seq: 41,
+            body: p1_contracts::RecordBody::UserInput { text: "x".into() },
+        };
+        assert!(sink.commit(&refused).await.is_err());
+        assert_eq!(
+            journal.assemblies().last().unwrap().identity,
+            candidate,
+            "the file cannot unwrite the candidate's line"
+        );
+        lines.reject();
+        let next = JournalRecord {
+            seq: 0,
+            body: p1_contracts::RecordBody::UserInput { text: "y".into() },
+        };
+        sink.commit(&next)
+            .await
+            .expect("the store accepts the next record");
+        assert_eq!(
+            journal.assemblies().last().unwrap().identity,
+            active,
+            "the record after a refused switch runs under the assembly that is still installed"
+        );
+        assert_eq!(journal.records().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_before_any_line_was_written_owes_nothing() {
+        let journal = session::memory();
+        let lines = Arc::new(AssemblyLines::new(
+            AssemblyStore::Memory(journal.clone()),
+            JOURNAL_VERSION,
+        ));
+        let active = named_assembly("active");
+        lines.owe(active.clone());
+        lines.switched(&active).expect("named");
+        lines.owe(named_assembly("candidate"));
+        lines.reject();
+        let next = JournalRecord {
+            seq: 0,
+            body: p1_contracts::RecordBody::UserInput { text: "y".into() },
+        };
+        lines.sink().commit(&next).await.expect("commit");
+        assert_eq!(journal.assemblies().len(), 1);
+        assert_eq!(journal.assemblies()[0].identity, active);
+    }
+
+    #[test]
+    fn a_generation_is_published_with_its_verified_sources() {
+        let generations = Generations::empty();
+        let authorization: Arc<dyn AuthorizationPolicy> =
+            Arc::new(p1_testkit::ScriptedAuthorization::permit_all());
+        let sources = Arc::new(crate::catalog::modules::VerifiedSources::default());
+        let installed = generations.install_with_sources(
+            Arc::new(Catalog::new()),
+            authorization,
+            sources.clone(),
+        );
+        // What a workflow step pinning the current generation the instant it is published
+        // observes: the sources are there, never a generation still to be bound.
+        let pinned = generations.current();
+        assert!(Arc::ptr_eq(&pinned, &installed));
+        assert!(Arc::ptr_eq(
+            &pinned.sources().expect("bound at publication"),
+            &sources
+        ));
     }
 
     #[test]

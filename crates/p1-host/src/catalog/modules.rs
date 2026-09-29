@@ -1042,6 +1042,23 @@ impl BuildLoaders {
         ReleaseManifest::read(path)
     }
 
+    /// The build's loader for the release at `path`, created from the build's own manifest
+    /// snapshot when nothing loaded from it yet.
+    pub(crate) fn build_release(&self, path: &Path) -> Result<crate::policy::BuildRelease, String> {
+        let unreadable =
+            |error: String| format!("cannot load the release {}: {error}", path.display());
+        let manifest = self
+            .manifest_for(path)
+            .map_err(|error| unreadable(error.to_string()))?;
+        let loader = self
+            .for_release(path, manifest)
+            .map_err(|error| unreadable(error.to_string()))?;
+        Ok(crate::policy::BuildRelease {
+            path: path.to_owned(),
+            loader,
+        })
+    }
+
     pub fn clear(&self) {
         self.0.lock().expect("build loaders").clear();
     }

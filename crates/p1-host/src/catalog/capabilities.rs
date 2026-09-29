@@ -14,6 +14,12 @@
 //! - a still-native tool's capabilities are declared by its catalog registration
 //!   (`catalog/tools.rs`), keyed by the identity its constructor builds.
 //!
+//! An assembled tool carries the snapshot of ITS generation's verified sources
+//! ([`bind_assembled`]): the tool object handed to the agent is a wrapper holding the
+//! capabilities, so nothing shared between sessions or generations is consulted and an old
+//! generation's tool keeps its grants whatever a later one binds. The declaration lookup
+//! remains only for standalone native tools and test fixtures nobody bound.
+//!
 //! An environment's face changes a tool's model-facing name, description and variant,
 //! never its identity implementation, so a face can neither grant nor hide one.
 //!
@@ -22,10 +28,15 @@
 //! presentation variant of a verified package (the shell's `+sandbox`) carries the package's
 //! capabilities; the exact-identity lookup and the native declarations are unchanged.
 
+use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{Arc, OnceLock, RwLock};
 
-use p1_contracts::{Tool, ToolIdentity};
+use p1_contracts::tool::ResultDescription;
+use p1_contracts::{
+    BoxFuture, CallDescription, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
+    ToolOutcome, ToolResultItem,
+};
 use p1_module_runtime::{LoadedModule, ModuleKind};
 
 /// The capability interface whose grant lets a tool package run commands.
@@ -206,48 +217,85 @@ pub fn declared(identity: &ToolIdentity) -> Capabilities {
         .map_or(Capabilities::NONE, |declaration| declaration.capabilities)
 }
 
-/// Whether `tool` carries `capability`. Read from the tool's identity only: the
-/// model-facing name, which a face may change, plays no part.
-type BoundTool = (Weak<dyn Tool>, Capabilities);
-
-fn tool_key(tool: &dyn Tool) -> usize {
-    tool as *const dyn Tool as *const () as usize
+/// A tool as one verified generation assembled it: the object itself plus the immutable
+/// capability snapshot of that generation's verified sources. The snapshot travels with the
+/// assembly's own tool object, so no table shared between sessions is involved, and an old
+/// generation's tool keeps its grants whatever a later generation binds.
+struct BoundTool {
+    inner: Arc<dyn Tool>,
+    capabilities: Capabilities,
 }
 
-fn bound_tools() -> &'static RwLock<HashMap<usize, BoundTool>> {
-    static BOUND: OnceLock<RwLock<HashMap<usize, BoundTool>>> = OnceLock::new();
-    BOUND.get_or_init(|| RwLock::new(HashMap::new()))
+impl Tool for BoundTool {
+    fn declaration(&self) -> &ToolDeclaration {
+        self.inner.declaration()
+    }
+
+    fn identity(&self) -> &ToolIdentity {
+        self.inner.identity()
+    }
+
+    fn effect(&self, call: &ToolCall) -> Effect {
+        self.inner.effect(call)
+    }
+
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        self.inner.describe(call)
+    }
+
+    fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        self.inner.describe_result(call, result)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: ToolContext,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        self.inner.execute(call, context)
+    }
+
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
+    }
 }
 
-/// Bind the verified grant to the assembled tool object, not a process-global name that a
-/// reload may redeclare while an old child is still running.
-fn bind(tool: &Arc<dyn Tool>, capabilities: Capabilities) {
-    bound_tools().write().expect("bound tool lock").insert(
-        tool_key(tool.as_ref()),
-        (Arc::downgrade(tool), capabilities),
-    );
+/// The tool object without a binding of an earlier generation, so a re-bind replaces the
+/// snapshot instead of stacking wrappers.
+fn unbound(tool: &Arc<dyn Tool>) -> Arc<dyn Tool> {
+    match tool
+        .as_any()
+        .and_then(|any| any.downcast_ref::<BoundTool>())
+    {
+        Some(bound) => bound.inner.clone(),
+        None => tool.clone(),
+    }
 }
 
-/// Snapshot capability grants for this assembly from its verified generation.
+/// Bind `capabilities` to `tool`: the returned object carries them.
+fn bind(tool: &Arc<dyn Tool>, capabilities: Capabilities) -> Arc<dyn Tool> {
+    Arc::new(BoundTool {
+        inner: unbound(tool),
+        capabilities,
+    })
+}
+
+/// Snapshot capability grants for this assembly from its verified generation: the assembled
+/// tools are replaced by objects that carry them.
 pub fn bind_assembled(
-    assembled: &p1_assembly::Assembled,
+    assembled: &mut p1_assembly::Assembled,
     sources: &super::modules::VerifiedSources,
 ) {
-    bind_tools(&assembled.tools, &assembled.resolved.tools, sources);
+    bind_tools(&mut assembled.tools, &assembled.resolved.tools, sources);
 }
 
-/// Bind a tool set after a completion handoff replaces its finish object.
+/// Bind a tool set, also after a completion handoff replaced its finish object.
 pub fn bind_tools(
-    tools: &[Arc<dyn Tool>],
+    tools: &mut [Arc<dyn Tool>],
     resolved: &[p1_assembly::ResolvedTool],
     sources: &super::modules::VerifiedSources,
 ) {
-    // Sweep once per assembly, not once per tool. Lookups below remain constant-time.
-    bound_tools()
-        .write()
-        .expect("bound tool lock")
-        .retain(|_, (tool, _)| tool.strong_count() > 0);
-    for (tool, resolved) in tools.iter().zip(resolved) {
+    for (tool, resolved) in tools.iter_mut().zip(resolved) {
         let capabilities = if let Some(package) = sources.resolve(&resolved.module) {
             package.semantic
         } else {
@@ -256,20 +304,20 @@ pub fn bind_tools(
                 .find(|native| native.implementation == tool.identity().implementation)
                 .map_or(Capabilities::NONE, |native| native.capabilities)
         };
-        bind(tool, capabilities);
+        *tool = bind(tool, capabilities);
     }
 }
 
-/// Whether `tool` carries `capability`. Assembled tools use their immutable verified
-/// generation binding; standalone fixture tools retain the declaration lookup.
+/// Whether `tool` carries `capability`. Read from the tool's identity only: the
+/// model-facing name, which a face may change, plays no part. An assembled tool answers
+/// from the snapshot its generation bound; a standalone fixture tool falls back to the
+/// declaration lookup.
 pub fn carries(tool: &dyn Tool, capability: SemanticCapability) -> bool {
-    let bound = bound_tools().read().expect("bound tool lock");
-    if let Some((weak, capabilities)) = bound.get(&tool_key(tool))
-        && weak
-            .upgrade()
-            .is_some_and(|held| std::ptr::eq(held.as_ref(), tool))
+    if let Some(bound) = tool
+        .as_any()
+        .and_then(|any| any.downcast_ref::<BoundTool>())
     {
-        return capabilities.contains(capability);
+        return bound.capabilities.contains(capability);
     }
     declared(tool.identity()).contains(capability)
 }
@@ -371,27 +419,45 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_tool_bindings_use_direct_pointer_lookup() {
-        let tools: Vec<Arc<dyn Tool>> = (0..128)
-            .map(|index| Arc::new(FakeTool::new(&format!("tool-{index}"))) as Arc<dyn Tool>)
-            .collect();
-        for tool in &tools {
-            bind(
-                tool,
-                Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]),
-            );
-        }
-        let bound = bound_tools().read().unwrap();
-        for tool in &tools {
-            assert!(bound.contains_key(&tool_key(tool.as_ref())));
-        }
-        drop(bound);
-        for tool in &tools {
-            assert!(carries(
-                tool.as_ref(),
-                SemanticCapability::RecordsCommandEvidence
-            ));
-        }
+    fn two_sessions_binding_one_tool_object_share_no_state() {
+        // The same tool object assembled into two sessions with different verified grants:
+        // each session's copy answers from its own snapshot, and the object itself, which
+        // nobody bound, answers from neither.
+        let shared: Arc<dyn Tool> =
+            Arc::new(FakeTool::new("shared").with_identity("p1/two-sessions-fixture", "default"));
+        let evidence = Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]);
+        let first = bind(&shared, evidence);
+        let second = bind(&shared, Capabilities::NONE);
+        assert!(carries(
+            first.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!carries(
+            second.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!carries(
+            shared.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+    }
+
+    #[test]
+    fn rebinding_replaces_the_snapshot_instead_of_stacking_wrappers() {
+        let base: Arc<dyn Tool> =
+            Arc::new(FakeTool::new("base").with_identity("p1/rebind-fixture", "default"));
+        let evidence = Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]);
+        let once = bind(&base, evidence);
+        let twice = bind(&once, Capabilities::NONE);
+        assert!(carries(
+            once.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!carries(
+            twice.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(Arc::ptr_eq(&unbound(&twice), &base));
     }
 
     #[test]
@@ -402,8 +468,8 @@ mod tests {
         let replacement: Arc<dyn Tool> =
             Arc::new(FakeTool::new("same").with_identity(implementation, "default"));
         let granted = Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]);
-        bind(&old, granted);
-        bind(&replacement, Capabilities::NONE);
+        let old = bind(&old, granted);
+        let replacement = bind(&replacement, Capabilities::NONE);
         assert!(carries(
             old.as_ref(),
             SemanticCapability::RecordsCommandEvidence

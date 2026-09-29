@@ -157,6 +157,14 @@ pub fn shipped_package(ask: bool) -> &'static str {
 
 // ------------------------------------------------------------------ the shipped policy
 
+/// The release one catalog build loaded from: its manifest path and the build's own loader,
+/// which holds the manifest snapshot every package of that build was verified against.
+#[derive(Clone)]
+pub(crate) struct BuildRelease {
+    pub(crate) path: PathBuf,
+    pub(crate) loader: Arc<Loader>,
+}
+
 /// One loaded authorization-policy component and the id grants are keyed by.
 struct PolicyComponent {
     id: PolicyId,
@@ -254,9 +262,27 @@ impl ShippedPolicy {
     /// answering.
     pub fn reload(self: &Arc<Self>) -> Result<PolicyReload, String> {
         let release = official_manifest()?;
-        let current = self.current();
         let loader = host_entry_loader(&release)?;
-        let module = load_with(&loader, &release, &current.id.package)?;
+        self.reload_through(&loader, &release)
+    }
+
+    /// As [`ShippedPolicy::reload`], but through the loader (and so the manifest snapshot)
+    /// the catalog build of the same reload used, so one generation never mixes packages of
+    /// two states of one installation.
+    pub(crate) fn reload_from(
+        self: &Arc<Self>,
+        release: &BuildRelease,
+    ) -> Result<PolicyReload, String> {
+        self.reload_through(&release.loader, &release.path)
+    }
+
+    fn reload_through(
+        self: &Arc<Self>,
+        loader: &Loader,
+        release: &Path,
+    ) -> Result<PolicyReload, String> {
+        let current = self.current();
+        let module = load_with(loader, release, &current.id.package)?;
         Ok(PolicyReload {
             policy: self.clone(),
             component: Arc::new(PolicyComponent::new(Arc::new(module), current.limits)?),

@@ -3179,6 +3179,105 @@ async fn successive_reloads_keep_prior_generation_sources_unchanged() {
     assert!(!Arc::ptr_eq(&first, &second));
 }
 
+/// A journal that refuses `Environment` records while `refuse` is set.
+struct EnvironmentRefusal {
+    inner: p1_journal::MemoryJournal,
+    refuse: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl p1_contracts::CommitSink for EnvironmentRefusal {
+    fn commit<'a>(
+        &'a self,
+        record: &'a p1_contracts::JournalRecord,
+    ) -> p1_contracts::BoxFuture<'a, Result<(), p1_contracts::CommitError>> {
+        Box::pin(async move {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst)
+                && matches!(record.body, p1_contracts::RecordBody::Environment { .. })
+            {
+                return Err(p1_contracts::CommitError(
+                    "the journal refuses the environment".into(),
+                ));
+            }
+            p1_contracts::CommitSink::commit(&self.inner, record).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_refused_reload_keeps_the_sessions_finish_tool_fresh() {
+    let release = scratch_release();
+    let (_driver, switch, dir) =
+        driver_with_reload_from(Some(release.path().join("manifest.json")));
+    std::fs::write(
+        dir.path().join("reload-session/environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n\n[[tools]]\nmodule = \"finish\"\n",
+    )
+    .unwrap();
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut agent = Agent::new(p1_core::AgentParts {
+        provider: Arc::new(p1_testkit::ScriptedProvider::new(vec![])),
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+        journal: Arc::new(EnvironmentRefusal {
+            inner: p1_journal::MemoryJournal::new(),
+            refuse: refuse.clone(),
+        }),
+        events: Arc::new(p1_tui::runtime::TuiSink::new().0),
+    })
+    .expect("agent builds");
+    crate::run::reload_modules(&switch, &mut agent)
+        .await
+        .expect("the first reload installs the session's finish");
+    let installed = switch.finish_for_test().expect("installed finish");
+    let generation = switch.finish_generation_for_test().expect("live grant");
+
+    refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = crate::run::reload_modules(&switch, &mut agent)
+        .await
+        .expect_err("the journal refuses the reload's Environment record");
+    assert!(error.contains("refuses"), "{error}");
+    // The old assembly was kept, so its finish tool must still be the fresh one.
+    assert!(Arc::ptr_eq(
+        &installed,
+        &switch.finish_for_test().expect("kept finish")
+    ));
+    assert_eq!(switch.finish_generation_for_test(), Some(generation));
+
+    refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+    crate::run::reload_modules(&switch, &mut agent)
+        .await
+        .expect("the retry installs");
+    assert!(switch.finish_generation_for_test().unwrap() > generation);
+}
+
+#[tokio::test]
+async fn a_policy_reload_uses_the_build_snapshot_not_the_live_manifest() {
+    let release = scratch_release();
+    let manifest_path = release.path().join("manifest.json");
+    let loaders = crate::catalog::modules::BuildLoaders::default();
+    let snapshot = loaders
+        .build_release(&manifest_path)
+        .expect("build snapshot");
+    // The installation changes under the build: the policy package leaves the manifest.
+    let mut manifest: p1_contracts::serde_json::Value =
+        p1_contracts::serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["components"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["name"] != crate::policy::FULL_ACCESS_POLICY);
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+    let policy = crate::policy::ShippedPolicy::official(false).expect("release policy");
+    let reloaded = policy
+        .reload_from(&snapshot)
+        .expect("the build's own snapshot still names the policy");
+    assert_eq!(reloaded.policy().package, crate::policy::FULL_ACCESS_POLICY);
+    assert_eq!(reloaded.policy(), policy.policy());
+}
+
 #[test]
 fn modules_takes_only_reload() {
     let (mut d, _auth) = driver();

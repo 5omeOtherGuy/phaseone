@@ -550,7 +550,7 @@ impl ChildBuilder {
             &mask,
         )?;
         if let Some(sources) = generation.sources() {
-            super::capabilities::bind_assembled(&assembled, &sources);
+            super::capabilities::bind_assembled(&mut assembled, &sources);
         }
         // The session file is numbered like the id the service hands out.
         let id: usize = worker_id
@@ -579,7 +579,7 @@ impl ChildBuilder {
             )?;
         }
         if let Some(sources) = generation.sources() {
-            super::capabilities::bind_assembled(&assembled, &sources);
+            super::capabilities::bind_assembled(&mut assembled, &sources);
         }
         let context =
             agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
@@ -700,7 +700,7 @@ impl ChildBuilder {
                     &mask,
                 )?;
                 if let Some(sources) = &sources {
-                    super::capabilities::bind_assembled(&assembled, sources);
+                    super::capabilities::bind_assembled(&mut assembled, sources);
                 }
                 // The catalog's `finish` factory issued THIS assembly its own
                 // completion: take it, so the hub cannot hand a stale one to a later
@@ -718,7 +718,7 @@ impl ChildBuilder {
                     )?;
                 }
                 if let Some(sources) = &sources {
-                    super::capabilities::bind_assembled(&assembled, sources);
+                    super::capabilities::bind_assembled(&mut assembled, sources);
                 }
                 let context =
                     agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
