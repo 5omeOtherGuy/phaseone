@@ -6,7 +6,7 @@ date: 2026-09-30
 deciders: owner+lead
 supersedes: [66]
 superseded_by: []
-sources: [AGENTS.md, docs/adr/0105-the-gate-runs-on-github-hosted-runners-only-the-stream-boxes-are-retired.md, .github/workflows/ci.yml, scripts/gate.sh, scripts/pre-push.sh, scripts/review-pr.sh, "PR #487"]
+sources: [AGENTS.md, scripts/adr.py, docs/adr/0105-the-gate-runs-on-github-hosted-runners-only-the-stream-boxes-are-retired.md, .github/workflows/ci.yml, scripts/gate.sh, scripts/pre-push.sh, scripts/review-pr.sh, "PR #487"]
 ---
 # ADR-0107: p1 builds and tests locally; GitHub Actions keeps only the required gate
 
@@ -57,6 +57,10 @@ hours in a fix / review loop for every PR!!!"
   failures and the confirmed P0/P1 findings together; nothing is reviewed again; lesser
   findings go into one follow-up issue. Auto-merge is set once no P0/P1 is open, so the merge
   follows the green gate without a wait for the lead.
+- ADR numbers are unique, not dense: `scripts/adr.py check` still refuses a duplicate number but
+  no longer a gap. Each change reserves its number on the board before `adr.py new`, and ADR
+  pull requests merge in any order; under the dense rule a pull request could not merge before
+  every lower number had, and a clash cost its second holder one more push and gate run.
 
 ## Consequences
 
@@ -71,6 +75,9 @@ hours in a fix / review loop for every PR!!!"
   2026-09-30; the global order file is updated by its maintainer.
 
 ## Alternatives considered
+
+- Keep dense numbering and merge ADR pull requests in number order: on 2026-09-30 numbers 0105
+  and 0106 were each carried by two open pull requests, and each clash cost one more push.
 
 - Keep the build farm and add local tests: two GitHub gate runs per push remain for no gain.
 - Keep CI only: one full run per defect, which is what this decision removes.

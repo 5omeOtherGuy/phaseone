@@ -1,7 +1,8 @@
 # Architecture Decision Records
 
-One file per settled decision: `NNNN-kebab-case-title.md`, numbered densely from
-`0001`. The front matter records who decided and where it came from; the body records
+One file per settled decision: `NNNN-kebab-case-title.md`, numbered from `0001`; a
+number is unique and reserved on the board before the file is written, and pull requests
+merge in any order, so a number not merged yet leaves a gap (ADR-0107). The front matter records who decided and where it came from; the body records
 the context, the decision, its consequences, the alternatives and the evidence.
 `DECISIONS.md` is the frozen ledger of the first slice; these ADRs are the record
 from here on.
