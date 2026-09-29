@@ -118,6 +118,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0102 | [Command evidence is the host's observed process exit, never component text](0102-command-evidence-is-the-host-s-observed-process-exit-never-component-text.md) | proposed | 2026-09-29 | lead |
 | ADR-0103 | [Assembled tools carry their capability snapshot, not a process-global registry](0103-assembled-tools-carry-their-capability-snapshot-not-a-process-global-registry.md) | accepted | 2026-09-29 | lead |
 | ADR-0104 | [Credential index rebuilds keep earlier identities and expose a test clock](0104-credential-index-rebuilds-keep-earlier-identities-and-expose-a-test-clock.md) | proposed | 2026-09-29 | lead |
+| ADR-0106 | [Edit falls back to a whitespace-tolerant match and shows the closest region](0106-edit-falls-back-to-a-whitespace-tolerant-match-and-shows-the-closest-region.md) | proposed | 2026-09-30 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
