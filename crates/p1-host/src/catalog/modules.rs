@@ -1596,6 +1596,7 @@ mod tests {
             provider: "scripted".into(),
             model: "test-model".into(),
             profile: None,
+            profile_text: None,
             options: ModelOptions::default(),
             tools: vec![ToolSpec {
                 module: "worker_result".into(),
@@ -1660,6 +1661,7 @@ mod tests {
             provider: "scripted".into(),
             model: "test-model".into(),
             profile: None,
+            profile_text: None,
             options: ModelOptions::default(),
             tools: vec![ToolSpec {
                 module: "worker_result".into(),

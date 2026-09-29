@@ -805,7 +805,7 @@ mod tests {
         let (mut state, _) = state(ProviderErrorKind::Transport).await;
         state.fallback_reason = Some("connection failed".into());
         state.lease().fail_before_output();
-        let result = lower(state);
+        let result = lower(state).await;
         assert!(matches!(result.phase, Phase::Done));
         assert!(
             matches!(result.pending.back(), Some(StreamEvent::Finished(Outcome::Failed(error))) if error.kind == ProviderErrorKind::Protocol)

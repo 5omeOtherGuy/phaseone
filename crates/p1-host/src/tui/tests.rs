@@ -1,7 +1,7 @@
 //! Driver tests: no TTY, no terminal — the driver over plain method calls.
 
 use super::*;
-use crate::policy::{PolicyId, Verdict};
+use crate::policy::{PolicyId, Verdict, VerdictSource};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use p1_contracts::Decision;
 

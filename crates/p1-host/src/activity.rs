@@ -1631,6 +1631,7 @@ mod tests {
             provider: "scripted".into(),
             model: "m".into(),
             profile: None,
+            profile_text: None,
             options: Default::default(),
             tools: ["finish", "broken"]
                 .into_iter()

@@ -345,10 +345,7 @@ fn context_result(value: Option<Val>, export: &str) -> Answer<Val> {
         Some(Val::Result(Err(Some(error)))) => match *error {
             Val::Variant(case, None) if case == "cancelled" => Ok(Err(ContextError::Cancelled)),
             Val::Variant(case, Some(reason)) if case == "failed" => match *reason {
-                Val::String(reason) if reason == "full" => Ok(Err(ContextError::Failed(reason))),
-                Val::String(_) => Ok(Err(ContextError::Failed(
-                    "context policy failed".to_owned(),
-                ))),
+                Val::String(reason) => Ok(Err(ContextError::Failed(reason))),
                 _ => Err(invalid(&format!("{export} failed without a text reason"))),
             },
             _ => Err(invalid(&format!(
@@ -683,23 +680,6 @@ mod tests {
         assert_eq!(
             CONTEXT_POLICY_ALLOCATION,
             ["control", "clock", "notices", "summary", "completion"]
-        );
-    }
-
-    #[test]
-    fn guest_failure_reason_is_not_echoed_to_diagnostics() {
-        let result = context_result(
-            Some(Val::Result(Err(Some(Box::new(Val::Variant(
-                "failed".to_owned(),
-                Some(Box::new(Val::String("guest-owned data".to_owned()))),
-            )))))),
-            "prepare",
-        );
-        assert_eq!(
-            result,
-            Ok(Err(ContextError::Failed(
-                "context policy failed".to_owned()
-            )))
         );
     }
 
