@@ -722,6 +722,49 @@ fn account_refusal(component: &str, code: u16, body: &str) -> Option<ProviderErr
     }
 }
 
+/// #474 review: a token already cancelled when `stream` is called must start a cancelled
+/// stream, not return the `Protocol` setup error `module_error` builds for
+/// `ModuleFailure::Cancelled`. `Prepare` is where an HTTP-only provider sees the token, so
+/// this pins the setup-cancellation branch.
+#[test]
+fn a_cancelled_prepare_starts_a_cancelled_stream() {
+    for case in cases() {
+        let provider = case.component(ScriptedTransport::new(Vec::new()));
+        let request = canonical_request(case);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let events = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .start_paused(true)
+                        .build()
+                        .expect("a runtime");
+                    runtime.block_on(async {
+                        let mut stream = provider
+                            .stream(request.clone(), cancel)
+                            .await
+                            .expect("a cancelled call starts a stream, not a setup error");
+                        let mut events = Vec::new();
+                        while let Some(event) = stream.next().await {
+                            events.push(event);
+                        }
+                        events
+                    })
+                })
+                .join()
+                .expect("the cancellation thread")
+        });
+        assert_eq!(
+            events,
+            vec![StreamEvent::Finished(Outcome::Cancelled)],
+            "[{}] a cancelled setup must settle as cancelled",
+            case.name
+        );
+    }
+}
+
 #[test]
 fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_or_retried() {
     let responses: [(u16, &str); 9] = [

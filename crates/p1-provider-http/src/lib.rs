@@ -78,7 +78,7 @@ pub use retry::RetryPolicy;
 pub use sse::{SSE_EVENT_LIMIT, SSE_LINE_LIMIT, SseDecoder, SseEvent, SseLimitExceeded};
 pub use status::{HttpClass, classify_status, reset_after, retry_after};
 #[cfg(feature = "native")]
-pub use ws_drive::{WsDriveRequest, WsLower, WsLowered, ws_drive, ws_lease};
+pub use ws_drive::{WsDriveRequest, WsLower, WsLowered, cancelled_stream, ws_drive, ws_lease};
 
 /// Test doubles for the transport seam. Enabled by the `testing` feature, and
 /// always available to this crate's own tests.

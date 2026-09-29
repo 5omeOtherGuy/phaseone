@@ -24,6 +24,7 @@ pub mod decision;
 mod engine;
 mod error;
 mod journal;
+mod redact;
 pub mod report;
 mod service;
 

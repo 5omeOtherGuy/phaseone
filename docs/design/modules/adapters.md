@@ -72,8 +72,8 @@ executor and restricted path, on the streaming-resource contract of item 10
 | Adapter | Contract | World | Owner |
 |---|---|---|---|
 | `WasmTool` | `p1_contracts::Tool` | `tool` | S0 (this document) |
-| `WasmProvider` | `p1_contracts::Provider` | `provider` | S4: one Store-owning executor behind a channel, boxed `Send` futures (ADR-0015); the transport broker sends (freeze item 9, [`wit.md`](wit.md#transport-retry-backoff-and-the-one-refresh-stay-native-freeze-item-9)) |
-| the context policy adapter | `p1_contracts::ContextPolicy` | `context-policy` | S5 |
+| `WasmProvider` | `p1_contracts::Provider` | `provider` | S4: one Store-owning executor behind a channel, boxed `Send` futures (ADR-0015); configured `describe` runs under Restricted fuel; stream setup and WebSocket retries await executor answers and cancellation; the transport broker sends (freeze item 9, [`wit.md`](wit.md#transport-retry-backoff-and-the-one-refresh-stay-native-freeze-item-9)) |
+| the context policy adapter | `p1_contracts::ContextPolicy` | `context-policy` | S5; frozen allocation lists `completion`, but this adapter has no session record: loader rejects a manifest granting it before assembly. Loader likewise rejects `notices` imports where no host notice service exists. |
 | the authorization policy adapter | `p1_contracts::AuthorizationPolicy` | `authorization-policy` | S5, through the native ask bridge |
 
 None of these three exists yet; this table fixes where each lives and what it is built on, not

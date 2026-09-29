@@ -102,6 +102,26 @@ fn transcript(provider: &ScriptedProvider) -> String {
     }
 }
 
+#[test]
+fn default_summary_cap_is_below_a_small_valid_wall() {
+    let provider = ScriptedProvider::new(vec![]);
+    let cfg = ContextConfig {
+        window_tokens: 6_000,
+        output_headroom_tokens: 3_000,
+        summarize_at_tokens: 2_000,
+        ..config()
+    };
+    assert!(
+        SummarizingContext::new(
+            Arc::new(provider),
+            ModelOptions::default(),
+            cfg,
+            "summary prompt".into()
+        )
+        .is_ok()
+    );
+}
+
 // ---------------------------------------------------------------- estimator
 
 #[test]
@@ -522,6 +542,28 @@ async fn an_unset_summary_effort_keeps_the_effort_the_options_carry() {
     assert_eq!(
         provider.requests()[0].options.reasoning_effort,
         Some(Effort::Max)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn doubled_cap_rerenders_transcript_inside_window() {
+    let history = vec![assistant_text("x".repeat(8_000)), assistant_text("tail")];
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        truncated(),
+        text_response("whole"),
+    ]));
+    let policy = policy(provider.clone(), effort_config());
+    let _ = prepare(&policy, &history).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let second = match &requests[1].history[0] {
+        Item::User { text } => text,
+        _ => panic!("transcript"),
+    };
+    assert!(
+        second.chars().count() as u64 / 4
+            + u64::from(requests[1].options.max_output_tokens.unwrap())
+            <= 9_000
     );
 }
 

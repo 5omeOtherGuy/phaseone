@@ -23,8 +23,9 @@
 //! `p1_module_runtime::file_services`). A release that does not carry one of them fails the
 //! catalog build naming the module, and nothing compiled in answers for the key.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use p1_assembly::{Catalog, ToolServices, ToolSpec};
 use p1_contracts::Tool;
@@ -33,7 +34,7 @@ use p1_contracts::{
     BoxFuture, CallDescription, Effect, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
     ToolOutcome, ToolResultItem,
 };
-use p1_module_runtime::process::{ProcessCapability, ProcessService, Sandbox};
+use p1_module_runtime::process::{ExitRecords, ProcessCapability, ProcessService, Sandbox};
 use p1_module_runtime::{ExecutionLimits, LoadedModule, Services, wasm_tool};
 use p1_workspace::{MutationPolicy, ObservedFiles, Workspace};
 
@@ -199,14 +200,20 @@ fn shell_entry(
                         )
                     }
                 };
+                let observed = Arc::new(Mutex::new(Vec::new()));
                 let linked = Services {
-                    process: Some(Arc::new(ProcessCapability::new(Arc::new(process)))),
+                    process: Some(Arc::new(
+                        ProcessCapability::new(Arc::new(process)).recording(observed.clone()),
+                    )),
                     ..Services::default()
                 };
                 let component =
                     wasm_tool(&loaded, linked, ExecutionLimits::default(), &services.mask)
                         .map_err(|error| error.to_string())?;
-                Ok(apply_face!(FacedTool::new(component, sandboxed), spec))
+                Ok(apply_face!(
+                    FacedTool::new(component, sandboxed).recording(observed),
+                    spec
+                ))
             }),
         );
         Ok(())
@@ -233,7 +240,7 @@ fn finish_entry(completion: &Arc<CompletionHub>) -> HostEntryRegistration {
             FINISH,
             Box::new(move |spec: &ToolSpec, services: &ToolServices| {
                 hub.register_finish(&loaded);
-                let completion = hub.issue();
+                let completion = hub.issue(&services.mask);
                 let grant = hub.grant(completion, &[], AgentRole::Main, None);
                 let tool = finish_component(&loaded, &grant, None, &services.mask)
                     .map_err(|error| error.to_string())?;
@@ -266,6 +273,8 @@ struct FacedTool {
     sandboxed: bool,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
+    observed: Option<ExitRecords>,
+    completed: Mutex<HashMap<String, i32>>,
 }
 
 impl FacedTool {
@@ -277,9 +286,16 @@ impl FacedTool {
             sandboxed,
             declaration,
             identity: inner.identity().clone(),
+            observed: None,
+            completed: Mutex::new(HashMap::new()),
             inner,
         }
         .composed()
+    }
+
+    fn recording(mut self, observed: ExitRecords) -> Self {
+        self.observed = Some(observed);
+        self
     }
 
     /// Replace the presentation's name, description and variant; the sandbox paragraph and
@@ -337,6 +353,14 @@ impl Tool for FacedTool {
         self.inner.effect(call)
     }
 
+    fn take_command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.completed.lock().unwrap().remove(call_id)
+    }
+
+    fn command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.completed.lock().unwrap().get(call_id).copied()
+    }
+
     fn describe(&self, call: &ToolCall) -> CallDescription {
         self.inner.describe(call)
     }
@@ -350,7 +374,29 @@ impl Tool for FacedTool {
         call: &'a ToolCall,
         context: ToolContext,
     ) -> BoxFuture<'a, ToolOutcome> {
-        self.inner.execute(call, context)
+        Box::pin(async move {
+            let token = context.cancel.clone();
+            let result = self.inner.execute(call, context).await;
+            if let Some(observed) = &self.observed {
+                let mut records = observed.lock().unwrap();
+                let mut exit = None;
+                records.retain(|(owner, code)| {
+                    if *owner == token {
+                        exit = Some(*code);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if let Some(exit) = exit {
+                    self.completed
+                        .lock()
+                        .unwrap()
+                        .insert(call.call_id.clone(), exit);
+                }
+            }
+            result
+        })
     }
 }
 

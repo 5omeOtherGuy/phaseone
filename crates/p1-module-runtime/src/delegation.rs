@@ -149,13 +149,27 @@ fn define<S: ?Sized + Send + Sync + 'static>(
     service: Arc<S>,
     call: fn(Arc<S>, &[Val], CancellationToken) -> Answer,
 ) -> wasmtime::Result<()> {
+    let expected = wit_parameter_count(name);
     instance.func_new_async(name, move |store, _ty, params, results| {
-        let answer = call(service.clone(), params, store.data().cancel.clone());
+        let answer = if results.len() == 1 && params.len() == expected {
+            Some(call(service.clone(), params, store.data().cancel.clone()))
+        } else {
+            None
+        };
         Box::new(async move {
+            let Some(answer) = answer else {
+                bail!("invalid delegation host function signature");
+            };
             results[0] = answer.await?;
             Ok(())
         })
     })
+}
+
+/// Parameter counts from modules/wit/delegation.wit. Only `continue-child` has three;
+/// all other dynamically linked worker/workflow imports have one.
+fn wit_parameter_count(name: &str) -> usize {
+    if name == "continue-child" { 3 } else { 1 }
 }
 
 /// Opens the interface `interface`, linking the empty `worker-types` first: the worker
@@ -316,10 +330,11 @@ fn run_status(observe: Arc<dyn ObserveRuns>, params: &[Val], _: CancellationToke
     let id = run_id(params, "status");
     Box::pin(async move {
         let id = id?;
-        let answer = observe.status(&id).await;
-        Ok(workflow_result(
-            answer.map(|status| Some(run_status_val(&status))),
-        ))
+        let answer = match observe.status(&id).await {
+            Ok(status) => Ok(Some(run_status_val(&status)?)),
+            Err(error) => Err(error),
+        };
+        Ok(workflow_result(answer))
     })
 }
 
@@ -334,9 +349,11 @@ fn wait_run(observe: Arc<dyn ObserveRuns>, params: &[Val], cancel: CancellationT
             answer = observe.wait(&id, cancel.clone()) => answer,
             () = cancel.cancelled() => observe.status(&id).await,
         };
-        Ok(workflow_result(
-            answer.map(|status| Some(run_status_val(&status))),
-        ))
+        let answer = match answer {
+            Ok(status) => Ok(Some(run_status_val(&status)?)),
+            Err(error) => Err(error),
+        };
+        Ok(workflow_result(answer))
     })
 }
 
@@ -520,10 +537,10 @@ fn workflow_error_val(error: WorkflowError) -> Val {
 }
 
 /// `workflows.run-status`: `RunStatus` in its serde form, the schema `p1-workflow` owns.
-fn run_status_val(status: &RunStatus) -> Val {
-    // The status holds only strings, numbers, paths and JSON values, so it always
-    // serializes; an empty text would be the guest's invalid input, never a trap here.
-    Val::String(serde_json::to_string(status).unwrap_or_default())
+fn run_status_val(status: &RunStatus) -> wasmtime::Result<Val> {
+    serde_json::to_string(status)
+        .map(Val::String)
+        .map_err(|_| wasmtime::format_err!("run status cannot be serialized"))
 }
 
 /// `worker-types.child-status`.
@@ -662,6 +679,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dynamic_worker_arity_matches_the_frozen_wit() {
+        let wit = include_str!("../../../modules/wit/delegation.wit");
+        assert!(wit.contains("continue-child: func(id: string, message: string, add-tools: list<string>) -> result<_, worker-error>;"));
+        assert_eq!(wit_parameter_count("continue-child"), 3);
+        for name in ["start", "describe", "status", "wait", "cancel"] {
+            assert_eq!(wit_parameter_count(name), 1);
+        }
+    }
+
     #[tokio::test]
     async fn a_cancelled_wait_answers_running_whatever_the_service_does() {
         let cancel = CancellationToken::new();
@@ -670,6 +697,25 @@ mod tests {
             .await
             .expect("the wait answers");
         assert_eq!(answer, ok(Some(case("running", None))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_run_directory_is_a_serialization_error() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let status = RunStatus::Ended(p1_workflow::RunReport {
+            id: RunId("test".to_owned()),
+            outcome: p1_workflow::RunOutcome::Completed,
+            value: Value::Null,
+            counts: p1_workflow::Counts::default(),
+            steps: Vec::new(),
+            error: None,
+            run_dir: PathBuf::from(OsString::from_vec(vec![0xff])),
+        });
+        assert!(run_status_val(&status).is_err());
     }
 
     #[test]
@@ -866,6 +912,41 @@ mod tests {
         0x0f, 0x67, 0x72, 0x61, 0x6e, 0x74, 0x61, 0x62, 0x6c, 0x65, 0x2d, 0x63, 0x6f, 0x75, 0x6e,
         0x74, 0x01, 0x03, 0x00,
     ];
+
+    #[tokio::test]
+    async fn misdeclared_dynamic_component_import_traps_without_panicking() {
+        let engine = crate::engine().expect("engine");
+        let component = wasmtime::component::Component::new(&engine, OBSERVE_PROBE).unwrap();
+        let mut linker = Linker::<CallState>::new(&engine);
+        let mut imports = linker
+            .instance(&interface_import("workers-observe"))
+            .unwrap();
+        imports
+            .func_new_async("grantable", |_store, _ty, params, results| {
+                Box::new(async move {
+                    crate::capabilities::check_arity("grantable", params, results, 0, 0)?;
+                    Ok(())
+                })
+            })
+            .unwrap();
+        linker.define_unknown_imports_as_traps(&component).unwrap();
+        let pre = linker.instantiate_pre(&component).unwrap();
+        let mut store = crate::executor::module_store(
+            &engine,
+            CallState::new(
+                CancellationToken::new(),
+                &crate::capabilities::Services::default(),
+            ),
+        );
+        let instance = pre.instantiate_async(&mut store).await.unwrap();
+        let call = instance.get_func(&mut store, "grantable-count").unwrap();
+        let mut results = [Val::U32(0)];
+        assert!(
+            call.call_async(&mut store, &[], &mut results)
+                .await
+                .is_err()
+        );
+    }
 
     /// D085: on the restricted path `declaration` runs on, the two list functions answer and
     /// every other `workers-observe` import still traps, here `status` during `declaration`;
