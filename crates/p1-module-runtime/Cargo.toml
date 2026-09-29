@@ -39,7 +39,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync", "ma
 # The bounded set of ORCHESTRATION-PLAN §2 (owner, Q7). No `cache`: the loader compiles the
 # verified bytes itself, so a compiled-code cache would be a second, unverified source of
 # code. No `wat` or WASI: modules arrive as binary components and get only p1's own imports.
-wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "async", "std"] }
+wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "async", "std", "parallel-compilation"] }
 
 [dev-dependencies]
 # The moved file-service cases (`src/file_services.rs`) build scratch workspaces.
