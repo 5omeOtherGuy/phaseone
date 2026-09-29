@@ -207,10 +207,7 @@ impl CodexRotation {
                     serde_json::to_vec_pretty(&kept).is_ok_and(|bytes| staging.keep(&bytes))
                 });
                 return match usable {
-                    Ok(access) => Ok(Credential {
-                        account_id: jwt_account_id(&access),
-                        bearer: access,
-                    }),
+                    Ok(access) => Ok(self.own_credential(access)),
                     Err(_) if kept => Err(ProviderError::new(
                         reason.kind,
                         format!(
@@ -228,14 +225,9 @@ impl CodexRotation {
             .is_ok_and(|tokens| tokens.refresh_token.as_deref() == Some(&self.refresh_token));
         if !unchanged {
             return match usable {
-                // This rotation's access token is valid; the file keeps the other one.
-                Ok(access) => Ok(Credential {
-                    account_id: tokens_from(&document)
-                        .ok()
-                        .and_then(|tokens| tokens.account_id)
-                        .or_else(|| jwt_account_id(&access)),
-                    bearer: access,
-                }),
+                // This rotation's access token is valid; the file keeps the other one,
+                // which may be another account's: the account goes with this token.
+                Ok(access) => Ok(self.own_credential(access)),
                 Err(_) => Err(ProviderError::new(
                     ProviderErrorKind::Authentication,
                     "the Codex auth file changed while it was being refreshed; it was left as \
@@ -289,6 +281,21 @@ impl CodexRotation {
         let tokens = tokens_from(&document)?;
         debug_assert_eq!(tokens.access_token, access);
         Ok(credential_from(&tokens))
+    }
+}
+
+impl CodexRotation {
+    /// This rotation's access token with ITS account — the account of the login the
+    /// rotation started from, as a successful write-back would record it, else the
+    /// token's own claim — never the account of a login written meanwhile.
+    fn own_credential(&self, access: String) -> Credential {
+        Credential {
+            account_id: tokens_from(&self.baseline)
+                .ok()
+                .and_then(|tokens| tokens.account_id)
+                .or_else(|| jwt_account_id(&access)),
+            bearer: access,
+        }
     }
 }
 

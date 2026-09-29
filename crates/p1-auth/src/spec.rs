@@ -196,8 +196,8 @@ impl CredentialSpec {
             }
             if components.is_empty() {
                 return Err(format!(
-                    "`[credential]` login_dir \"{dir}\" names the home or the root directory, not \
-                     a Claude Code config directory below it"
+                    "`[credential]` login_dir \"{dir}\" names the home or the root directory; \
+                     write an absolute Claude Code config directory or one below the home"
                 ));
             }
         }

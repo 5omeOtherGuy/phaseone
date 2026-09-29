@@ -80,6 +80,42 @@ async fn a_refresh_never_rotates_a_source_that_did_not_issue_the_credential() {
     assert_eq!(scratch.read(CLAUDE), login);
 }
 
+/// The same bearer is handed out by the store and then, once the store entry is gone,
+/// by the Claude Code login: which copy a rejection refers to is unknown, so neither
+/// source is rotated.
+#[tokio::test]
+async fn a_bearer_two_sources_handed_out_is_never_rotated() {
+    let scratch = Scratch::new();
+    scratch.write(
+        STORE,
+        &store_oauth(json!({ "access": "FAKE-SHARED", "expires": NEVER_EXPIRES_MS })),
+    );
+    let login = claude_login("FAKE-SHARED", "FAKE-LOGIN-REFRESH", NEVER_EXPIRES_MS);
+    scratch.write(CLAUDE, &login);
+    let transport = ScriptedTransport::new(vec![token_response(json!({
+        "access_token": "FAKE-ROTATED", "refresh_token": "FAKE-R2", "expires_in": 3600,
+    }))]);
+    let source = resolve(
+        ROUTE,
+        &spec(r#"{"kind":"claude-code-oauth"}"#),
+        Arc::new(transport.clone()),
+        &scratch.locations(),
+    );
+    let from_store = source.access().await.unwrap();
+    assert!(remove(ROUTE, &scratch.locations()).await.unwrap());
+    let from_login = source.access().await.unwrap();
+    assert_eq!(from_store.bearer, from_login.bearer);
+
+    let error = source.refresh(&from_store).await.unwrap_err();
+    assert!(
+        error.message.contains("more than one source"),
+        "{}",
+        error.message
+    );
+    assert!(transport.requests().is_empty(), "nothing was rotated");
+    assert_eq!(scratch.read(CLAUDE), login);
+}
+
 // ---------------------------------------------------------------- finding 36
 
 /// The variable is usable when the chain picks it and changes to something a header

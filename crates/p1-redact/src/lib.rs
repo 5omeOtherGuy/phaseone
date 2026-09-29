@@ -216,7 +216,7 @@ impl SecretSet {
             return;
         }
         values.push(value.to_owned());
-        values.sort_by(|a, b| b.len().cmp(&a.len()));
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     }
 
     pub fn is_empty(&self) -> bool {

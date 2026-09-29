@@ -332,6 +332,40 @@ async fn a_login_unreadable_after_the_request_keeps_the_rotation() {
     }
 }
 
+/// The Codex CLI writes a login for ANOTHER account while the refresh request is out:
+/// its file is left alone, and the rotated token goes out with the account it belongs
+/// to, never with the new file's account.
+#[tokio::test]
+async fn a_codex_login_replaced_during_the_request_never_mixes_accounts() {
+    let scratch = Scratch::new();
+    scratch.write(CODEX, &codex_login(&jwt(1), "FAKE-OLD-REFRESH"));
+    let gated = Gated::new(ScriptedTransport::new(vec![token_response(json!({
+        "access_token": "FAKE-NEW", "refresh_token": "FAKE-NEW-REFRESH", "expires_in": 3600,
+    }))]));
+    let login = CodexCliCredentials::at(scratch.path(CODEX), Arc::new(gated.clone()));
+    let refresh = login.access();
+    tokio::pin!(refresh);
+    tokio::select! {
+        _ = &mut refresh => panic!("the refresh cannot finish before the gate opens"),
+        () = gated.entered.notified() => {}
+    }
+    let other = serde_json::to_string_pretty(&json!({
+        "tokens": {
+            "access_token": "FAKE-OTHER",
+            "refresh_token": "FAKE-OTHER-REFRESH",
+            "account_id": "FAKE-OTHER-ACCOUNT",
+        },
+    }))
+    .unwrap();
+    scratch.write(CODEX, &other);
+    gated.gate.notify_one();
+
+    let credential = refresh.await.unwrap();
+    assert_eq!(credential.bearer, "FAKE-NEW");
+    assert_eq!(credential.account_id.as_deref(), Some("FAKE-ACCOUNT"));
+    assert_eq!(scratch.read(CODEX), other);
+}
+
 // ---------------------------------------------------------------- finding 40
 
 static SLOW_CLOCK: AtomicU64 = AtomicU64::new(0);

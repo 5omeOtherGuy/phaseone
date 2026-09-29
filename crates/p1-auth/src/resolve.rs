@@ -508,8 +508,9 @@ struct Resolved {
     entries: Vec<Box<dyn Entry>>,
     /// Which source issued each recent credential, by a fingerprint of its bearer:
     /// a refresh rotates the source whose credential was REJECTED, even when the
-    /// chain would pick another one now (issue #484).
-    issued: Mutex<VecDeque<(u64, usize)>>,
+    /// chain would pick another one now (issue #484). `None` marks a bearer more than
+    /// one source handed out: which copy was rejected is unknown.
+    issued: Mutex<VecDeque<(u64, Option<usize>)>>,
 }
 
 /// A fingerprint of a bearer, so the chain remembers who issued it without keeping
@@ -525,15 +526,23 @@ impl Resolved {
     fn remember(&self, index: usize, credential: &Credential) {
         if let Ok(mut issued) = self.issued.lock() {
             let print = fingerprint(&credential.bearer);
+            // The same bearer from another source makes every copy ambiguous: neither
+            // source may be rotated on its behalf.
+            let issuer = match issued.iter().find(|(known, _)| *known == print) {
+                Some((_, earlier)) if *earlier != Some(index) => None,
+                _ => Some(index),
+            };
             issued.retain(|(known, _)| *known != print);
-            issued.push_back((print, index));
+            issued.push_back((print, issuer));
             while issued.len() > ISSUED_MEMORY {
                 issued.pop_front();
             }
         }
     }
 
-    fn issuer(&self, rejected: &Credential) -> Option<usize> {
+    /// `None`: this chain never issued the credential; `Some(None)`: more than one
+    /// source issued it.
+    fn issuer(&self, rejected: &Credential) -> Option<Option<usize>> {
         let print = fingerprint(&rejected.bearer);
         self.issued.lock().ok().and_then(|issued| {
             issued
@@ -587,11 +596,22 @@ impl CredentialSource for Resolved {
             // every call), that source's current credential is the replacement, and it
             // is asked for nothing more. A credential this chain never issued goes to the
             // source it would use now.
-            let Some(issuer) = self.issuer(rejected) else {
-                let (index, entry) = self.select()?;
-                let credential = entry.rotated(rejected).await?;
-                self.remember(index, &credential);
-                return Ok(credential);
+            let issuer = match self.issuer(rejected) {
+                Some(Some(issuer)) => issuer,
+                Some(None) => {
+                    return Err(auth(
+                        "the rejected credential was handed out by more than one source, so it \
+                         is not known which one to refresh; nothing was rotated — retry the \
+                         request"
+                            .to_string(),
+                    ));
+                }
+                None => {
+                    let (index, entry) = self.select()?;
+                    let credential = entry.rotated(rejected).await?;
+                    self.remember(index, &credential);
+                    return Ok(credential);
+                }
             };
             if let Ok((index, entry)) = self.select()
                 && index != issuer

@@ -729,7 +729,7 @@ pub fn refuse_credentials(
 /// `$PI_CODING_AGENT_DIR/auth.json` and the `$XDG_CONFIG_HOME/keys` directory. A home-based
 /// path in [`CredentialPolicy::new`] covers each default. Unset or empty variables add nothing.
 pub fn xdg_credentials() -> Vec<PathBuf> {
-    xdg_credentials_from(|name| env_path(name))
+    xdg_credentials_from(env_path)
 }
 
 /// [`xdg_credentials`] over an explicit lookup, so the rule is testable without the process
