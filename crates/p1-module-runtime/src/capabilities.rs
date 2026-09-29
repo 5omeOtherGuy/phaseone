@@ -169,7 +169,7 @@ pub struct FileMatches {
 /// What a search found (`workspace.search-result`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResult {
-    /// In walk order.
+    /// In bytewise displayed-path order (the listing's order).
     pub files: Vec<FileMatches>,
     /// The search stopped at `max_lines` before the walk ended.
     pub truncated: bool,

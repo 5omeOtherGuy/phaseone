@@ -149,7 +149,10 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
   expansion at a command position (`!`, `bash`, `sh`, `node`, `python`, `eval`, `source`, `.`,
   `$(…)`, backticks, `${…}`) never counts, because `( ! cargo test )`, `cat <(cargo test)`
   and `time ! cargo test` exit 0 when the check fails; a `!` after a wrapper such as `time`,
-  `timeout` or `sudo` is still a command position.
+  `timeout` or `sudo` is still a command position. A quoted word at a command position
+  (`'bash' -c 'cargo test; true'`, `sudo 'bash' …`) is refused too: the shell strips the
+  quotes, so it is still the interpreter that runs, and the quoted body hides its status
+  from the outer scan.
 - **Every rejection shows what WOULD be accepted.** Errors 1–3 end with a blank line and
   `Runs that count right now (successful, not piped, after the last file change):` followed by
   up to 5 normalised commands, newest last, one per line prefixed `- `; or

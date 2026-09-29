@@ -84,7 +84,7 @@ pub struct FileMatches {
 /// The WIT `search-result`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResult {
-    /// In walk order.
+    /// In bytewise displayed-path order (the listing's order).
     pub files: Vec<FileMatches>,
     /// Whether the search stopped at `max-lines` before the walk ended.
     pub truncated: bool,
@@ -232,11 +232,11 @@ fn matching_files<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String
             }
             Err(error) => return Err(scope_error(caps, error, input)),
         };
-        // The initial search and the listing need not share one order (the walk and the
-        // bytewise display order can differ), so skip every path already carried by value
-        // rather than resuming after the last one; a lookup by value that misses (the file
-        // was deleted or renamed between the search and the listing) must not restart at the
-        // top, or files already in `matched` would be searched and appended a second time.
+        // The initial search and the listing now share the bytewise display order, but skip
+        // every path already carried by value rather than resuming after the last one: a
+        // lookup by value that misses (the file was deleted or renamed between the search and
+        // the listing) must not restart at the top, or files already in `matched` would be
+        // searched and appended a second time.
         let mut seen: std::collections::HashSet<String> = matched.iter().cloned().collect();
         for path in &listed {
             if matched.len() >= wanted {

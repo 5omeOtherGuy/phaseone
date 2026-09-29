@@ -76,7 +76,7 @@ interface workspace {
     }
 
     record search-result {
-        /// In walk order.
+        /// In bytewise displayed-path order (the listing's order).
         files: list<file-matches>,
         /// Whether the search stopped at `max-lines` before the walk ended.
         truncated: bool,

@@ -160,8 +160,8 @@ struct Block<'a> {
 
 /// The model-facing text of a content-mode search, bounded.
 ///
-/// `result.files` are the matching files in walk order and `result.omitted_files` the
-/// matching files after them. A result the host stopped at its line cap renders exactly as
+/// `result.files` are the matching files in displayed-path order and `result.omitted_files`
+/// the matching files after them. A result the host stopped at its line cap renders exactly as
 /// the complete one would as long as the cap is at least [`MAX_OUTPUT_LINES`]: whole blocks
 /// are kept only while fewer than that many newlines are shown, so the block the host cut is
 /// never kept whole, and a first block over the bound shows fewer lines than the cap.
@@ -193,7 +193,7 @@ pub fn render_content(result: &SearchResult) -> String {
 }
 
 /// The model-facing text of a files-mode search, bounded: `matched` are the first matching
-/// paths in walk order and `total` how many paths match in all.
+/// paths in displayed-path order and `total` how many paths match in all.
 ///
 /// `matched` must hold at least `min(total, MAX_OUTPUT_LINES)` paths: no more than
 /// `MAX_OUTPUT_LINES - 1` of them can be shown, and only the count of the rest is.
@@ -262,9 +262,9 @@ pub fn within_bound(bytes: usize, newlines: usize) -> bool {
     bytes <= MAX_OUTPUT_BYTES && newlines < MAX_OUTPUT_LINES
 }
 
-/// Keep whole blocks, in walk order, while each one still leaves room for the footer that
-/// replaces everything after it; `total` counts the matching files the footer accounts for.
-/// `None` when not even the first block fits.
+/// Keep whole blocks, in displayed-path order, while each one still leaves room for the
+/// footer that replaces everything after it; `total` counts the matching files the footer
+/// accounts for. `None` when not even the first block fits.
 fn keep_whole_blocks(blocks: &[Block<'_>], separator: &str, total: usize) -> Option<String> {
     let separator_newlines = newlines(separator);
     let mut kept = String::new();

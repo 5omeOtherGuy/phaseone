@@ -891,6 +891,12 @@ pub fn is_unprovable(command: &str) -> bool {
     if command.contains("$(") || command.contains('`') || command.contains("${") {
         return true;
     }
+    // A quoted executable at a command position (`'bash' -c '…'`) is the command the shell
+    // runs, but `unquoted_text` blanks it and the interpreter scan cannot see it. Refuse the
+    // quoted word rather than re-scan its text, which would read a quoted argument as syntax.
+    if quoted_command_position(command) {
+        return true;
+    }
     let masked = unquoted_text(command);
     // A subshell/group or a process substitution (`( … )`, `<(...)`) runs a command whose
     // status a segment scan cannot see behind; `( ! cargo test )` exits 0 when the check
@@ -924,6 +930,71 @@ fn unquoted_text(command: &str) -> String {
         }
     }
     out
+}
+
+/// True when a quoted word sits at a command position. An executable the shell would run
+/// (`'bash' -c '…'`, `sudo 'bash' …`) is still a command word after the shell strips the
+/// quotes; the conservative answer is to refuse it rather than read the quoted text as
+/// syntax. Only command positions count, so a quoted argument (`cargo test 'foo'`) is fine.
+fn quoted_command_position(command: &str) -> bool {
+    fn push_word(segment: &mut Vec<(bool, String)>, word: &mut String, quoted: &mut bool) {
+        if !word.is_empty() || *quoted {
+            segment.push((*quoted, std::mem::take(word)));
+        }
+        *quoted = false;
+    }
+
+    let mut segments: Vec<Vec<(bool, String)>> = vec![Vec::new()];
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut quote: Option<char> = None;
+    for character in command.chars() {
+        match quote {
+            Some(open) if character == open => {
+                quote = None;
+                quoted = true;
+            }
+            Some(_) => quoted = true,
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    quoted = true;
+                }
+                ';' | '\n' | '|' | '&' | '(' | ')' | '{' | '}' => {
+                    push_word(
+                        segments.last_mut().expect("one segment"),
+                        &mut word,
+                        &mut quoted,
+                    );
+                    segments.push(Vec::new());
+                }
+                character if character.is_whitespace() => push_word(
+                    segments.last_mut().expect("one segment"),
+                    &mut word,
+                    &mut quoted,
+                ),
+                _ => word.push(character),
+            },
+        }
+    }
+    push_word(
+        segments.last_mut().expect("one segment"),
+        &mut word,
+        &mut quoted,
+    );
+    segments.into_iter().any(segment_has_quoted_command)
+}
+
+/// True when the first word of a segment is quoted, or when a quoted word follows a wrapper
+/// (`sudo 'bash' …`), where that later word is still at a command position.
+fn segment_has_quoted_command(segment: Vec<(bool, String)>) -> bool {
+    let mut words = segment
+        .into_iter()
+        .filter(|(_, word)| !is_variable_assignment(word));
+    let Some((quoted, first)) = words.next() else {
+        return false;
+    };
+    quoted || (is_wrapper(&first) && words.any(|(quoted, _)| quoted))
 }
 
 /// True when an opaque interpreter is named at a command position. The first word of each
@@ -1304,6 +1375,33 @@ mod tests {
             "timeout 5 bash -c 'cargo test; true'",
         ] {
             assert!(is_unprovable(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn quoted_executables_are_unprovable() {
+        // The shell strips the quotes, so `'bash'` runs bash; blanking the quoted word
+        // would leave neither interpreter nor command body visible to the scan.
+        for command in [
+            "'bash' -c 'cargo test; true'",
+            "\"sh\" -c 'cargo test; true'",
+            "cd w && 'bash' -c 'cargo test'",
+            "sudo 'bash' -c 'cargo test; true'",
+            "env 'python3' -c 'print(1)'",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+        // A quoted word that is not at a command position stays a quoted argument.
+        for command in [
+            "cargo test 'foo bar'",
+            "echo \"hello\"",
+            "cargo test --features='a b'",
+        ] {
+            assert!(!is_unprovable(command), "{command}");
         }
     }
 

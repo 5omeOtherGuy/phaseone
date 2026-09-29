@@ -40,12 +40,13 @@ pub(crate) fn workspace_error(error: WorkspaceError) -> FsError {
 /// The host side of `workspace.search`: search file contents under `query.path` (the root
 /// when absent) with the walk of [`list_files`].
 ///
-/// Matching files come in walk order, each with its match and context lines; binary files are
-/// skipped. At most `query.max_lines` lines are carried: when one more would not fit, the
-/// result is `truncated`, the rest of that file is dropped, and the walk goes on only to
-/// count the matching files after it (`omitted_files`, which also counts a file the cap left
-/// without a line). Every file is still searched whole, exactly as when nothing is cut, so a
-/// file is a match here exactly when it would be one in a complete result.
+/// Matching files come in bytewise displayed-path order (the listing's order), each with its
+/// match and context lines; binary files are skipped. At most `query.max_lines` lines are
+/// carried: when one more would not fit, the result is `truncated`, the rest of that file is
+/// dropped, and the walk goes on only to count the matching files after it (`omitted_files`,
+/// which also counts a file the cap left without a line). Every file is still searched whole,
+/// exactly as when nothing is cut, so a file is a match here exactly when it would be one in
+/// a complete result.
 ///
 /// The failures are the frozen `fs-error`: `outside-workspace`, `not-found` for a missing
 /// path, `invalid-pattern` with the model-facing text for a regex or glob that does not parse
@@ -316,9 +317,13 @@ fn collect_files(
 /// `sort_by_file_path` is deliberately not used: it makes `walkdir` collect every entry
 /// of a directory before yielding the first, so one directory with very many entries
 /// would exhaust memory and hide cancellation until the collection finished. Paths are
-/// instead buffered in chunks of at most [`MAX_WALK_FILES`] / [`MAX_WALK_PATH_BYTES`],
-/// each sorted by the displayed path so the carried files keep the listing's bytewise
-/// order within the chunk, and searched as it fills.
+/// instead buffered in chunks of at most [`MAX_WALK_FILES`] / [`MAX_WALK_PATH_BYTES`].
+/// Each chunk is sorted by displayed path and searched with the whole line budget; its
+/// matches are then merged into an accumulator that keeps only the smallest `max_lines`
+/// lines by displayed path. The carried files are therefore the listing's bytewise prefix
+/// even when the walk spans several chunks, and every buffer stays bounded: the path chunk
+/// by [`MAX_WALK_FILES`] / [`MAX_WALK_PATH_BYTES`], a chunk's lines and the accumulator by
+/// the line budget.
 fn search_streaming(
     workspace: &Workspace,
     search_path: &Path,
@@ -334,13 +339,11 @@ fn search_streaming(
     if let Some(overrides) = overrides {
         walk.overrides(overrides);
     }
+    let budget = query.max_lines as usize;
     let mut searcher = content_searcher(query.context as usize);
-    let mut result = SearchResult {
-        files: Vec::new(),
-        truncated: false,
-        omitted_files: 0,
-    };
-    let mut room = query.max_lines as usize;
+    let mut files: Vec<FileMatches> = Vec::new();
+    let mut matching: u64 = 0;
+    let mut partial = false;
     let mut chunk: Vec<PathBuf> = Vec::new();
     let mut chunk_bytes = 0usize;
     for entry in walk.build() {
@@ -364,9 +367,11 @@ fn search_streaming(
                 cancel,
                 excluded,
                 opened_excluded,
-                &mut room,
-                &mut result,
+                budget,
                 &mut chunk,
+                &mut files,
+                &mut matching,
+                &mut partial,
             )?;
             chunk_bytes = 0;
         }
@@ -378,17 +383,25 @@ fn search_streaming(
         cancel,
         excluded,
         opened_excluded,
-        &mut room,
-        &mut result,
+        budget,
         &mut chunk,
+        &mut files,
+        &mut matching,
+        &mut partial,
     )?;
-    Ok(result)
+    let omitted_files = matching.saturating_sub(files.len() as u64);
+    Ok(SearchResult {
+        files,
+        truncated: partial || omitted_files > 0,
+        omitted_files,
+    })
 }
 
 /// Search one bounded chunk of paths, sorted by displayed path (the key `collect_files`
 /// sorts by, so a non-UTF-8 name cannot order the stream differently from the listing),
-/// then drop it. The chunk holds at most [`MAX_WALK_FILES`] paths / [`MAX_WALK_PATH_BYTES`]
-/// bytes, so a single wide directory is streamed rather than collected whole.
+/// then merge its matches into the running bytewise prefix. The chunk holds at most
+/// [`MAX_WALK_FILES`] paths / [`MAX_WALK_PATH_BYTES`] bytes, so a single wide directory is
+/// streamed rather than collected whole.
 #[allow(clippy::too_many_arguments)]
 fn search_chunk(
     workspace: &Workspace,
@@ -397,9 +410,11 @@ fn search_chunk(
     cancel: &CancellationToken,
     excluded: &impl Fn(&Path) -> Result<bool, FsError>,
     opened_excluded: &impl Fn(&Path, &std::fs::File) -> Result<bool, FsError>,
-    room: &mut usize,
-    result: &mut SearchResult,
+    budget: usize,
     chunk: &mut Vec<PathBuf>,
+    files: &mut Vec<FileMatches>,
+    matching: &mut u64,
+    partial: &mut bool,
 ) -> Result<(), FsError> {
     chunk.sort_by(|left, right| {
         workspace
@@ -407,6 +422,8 @@ fn search_chunk(
             .as_bytes()
             .cmp(workspace.display(right.as_path()).as_bytes())
     });
+    let mut found: Vec<FileMatches> = Vec::new();
+    let mut room = budget;
     for path in chunk.drain(..) {
         if cancel.is_cancelled() {
             return Err(FsError::Cancelled);
@@ -423,25 +440,62 @@ fn search_chunk(
         if opened_excluded(&opened_path, &file)? {
             continue;
         }
-        let mut sink = MatchSink::with_room(*room);
+        let mut sink = MatchSink::with_room(room);
         if searcher.search_file(matcher, &file, &mut sink).is_err() || sink.binary || !sink.seen {
             continue;
         }
+        *matching = (*matching).saturating_add(1);
         if sink.overflowed {
-            result.truncated = true;
+            *partial = true;
         }
         if sink.lines.is_empty() {
-            result.omitted_files = result.omitted_files.saturating_add(1);
-            result.truncated = true;
             continue;
         }
-        *room -= sink.lines.len();
-        result.files.push(FileMatches {
+        room -= sink.lines.len();
+        found.push(FileMatches {
             path: workspace.display(path.as_path()),
             lines: sink.lines,
         });
     }
+    merge_prefix(files, found, budget, partial);
     Ok(())
+}
+
+/// Merge `found` (one chunk's matches, sorted by displayed path) into `files` and keep only
+/// the smallest `budget` lines by displayed path, cutting the boundary file and dropping
+/// the rest. The result is the bytewise prefix of every match seen so far, so a later chunk
+/// cannot insert a path before an earlier one; `files` never holds more than `budget` lines.
+fn merge_prefix(
+    files: &mut Vec<FileMatches>,
+    mut found: Vec<FileMatches>,
+    budget: usize,
+    partial: &mut bool,
+) {
+    if found.is_empty() {
+        return;
+    }
+    files.append(&mut found);
+    files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    let mut lines = 0usize;
+    let mut keep = 0usize;
+    for file in files.iter_mut() {
+        let count = file.lines.len();
+        if lines + count <= budget {
+            lines += count;
+            keep += 1;
+            continue;
+        }
+        let room = budget.saturating_sub(lines);
+        if room > 0 {
+            file.lines.truncate(room);
+            *partial = true;
+            keep += 1;
+        } else {
+            *partial = true;
+        }
+        break;
+    }
+    files.truncate(keep);
 }
 
 #[cfg(test)]
@@ -651,6 +705,38 @@ mod tests {
         let expected: Vec<String> = (0..count).map(|i| format!("f{i:05}")).collect();
         assert_eq!(
             found,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(!result.truncated);
+        assert_eq!(result.omitted_files, 0);
+    }
+
+    #[test]
+    fn chunked_search_keeps_one_global_bytewise_order() {
+        // More files than one chunk holds, created in an order unrelated to the sorted
+        // names, so the walk's chunks cannot already be in bytewise order: the result must
+        // be the listing's global prefix, not each chunk's sorted run concatenated. The two
+        // files left for the last chunk would have to be the two largest for the old
+        // chunk-local sort to pass by chance.
+        let dir = tempfile::tempdir().unwrap();
+        let count = super::MAX_WALK_FILES + 2;
+        for index in (0..count).rev() {
+            fs::write(dir.path().join(format!("f{index:05}")), "needle\n").unwrap();
+        }
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: count as u32,
+        };
+        let result = super::search(&workspace, &query, &CancellationToken::new()).unwrap();
+        let paths: Vec<&str> = result.files.iter().map(|file| file.path.as_str()).collect();
+        let expected: Vec<String> = (0..count).map(|index| format!("f{index:05}")).collect();
+        assert_eq!(
+            paths,
             expected.iter().map(String::as_str).collect::<Vec<_>>()
         );
         assert!(!result.truncated);
