@@ -13,6 +13,7 @@ use p1_contracts::{BoxFuture, ProviderError};
 use p1_provider_http::{Credential, CredentialSource};
 use serde_json::Value;
 
+use crate::credential_file::{CredentialDir, DirKind, FileError};
 use crate::resolve::{Entry, Presence, SourceName};
 use crate::{BorrowStore, auth};
 
@@ -81,10 +82,26 @@ pub(crate) fn presence_at(path: &Path, key: &str, store: BorrowStore) -> Presenc
 /// The key this login holds, `None` when the file or the entry is absent, and the
 /// reason when the entry exists but cannot be used.
 fn load_at(path: &Path, key: &str, store: BorrowStore) -> Result<Option<String>, String> {
-    let bytes = match std::fs::read(path) {
+    // Through the checked login directory (issue #484): no symlinked, foreign,
+    // special or oversized file is read.
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let bytes = match CredentialDir::open(dir, DirKind::Borrowed).and_then(|dir| dir.read(&name)) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
+        Err(FileError::Missing) => return Ok(None),
+        Err(FileError::Refused(reason)) => {
+            return Err(format!(
+                "the {} credential file is not used: {reason}",
+                store_name(store)
+            ));
+        }
+        Err(FileError::Io) => {
             return Err(format!(
                 "cannot read the {} credential file",
                 store_name(store)

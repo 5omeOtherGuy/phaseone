@@ -143,9 +143,15 @@ impl Locations {
     /// `login_dir` with a leading `~` expanded against the home directory, else
     /// `$CLAUDE_CONFIG_DIR`, else `~/.claude`. `None` when the directory needs a home
     /// and the host has none.
+    /// A named directory that is the home itself (an absolute path equal to it) is
+    /// no Claude Code directory: `None`, as for a directory that needs a missing home.
     pub fn claude_code_dir(&self, login_dir: Option<&str>) -> Option<PathBuf> {
         match login_dir {
-            Some(dir) => self.expand_home(dir),
+            Some(dir) => self.expand_home(dir).filter(|dir| {
+                self.home
+                    .as_ref()
+                    .is_none_or(|home| dir.components().ne(home.components()))
+            }),
             None => self
                 .tool_dir("CLAUDE_CONFIG_DIR")
                 .or_else(|| self.home.as_ref().map(|home| home.join(".claude"))),

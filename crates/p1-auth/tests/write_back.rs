@@ -144,3 +144,65 @@ async fn a_rejected_store_token_is_rotated_in_the_store() {
     assert_eq!(credential.bearer, "FAKE-ROTATED");
     assert!(scratch.read(STORE).contains("FAKE-ROTATED-REFRESH"));
 }
+
+/// Issue #484: a refresh preserves every field it does not own BY VALUE — beside the
+/// refreshed fields, inside the OAuth object and in other entries — whatever layout
+/// the file had (compact, any key order). p1 writes its own pretty layout back, so
+/// the contract is semantic, not byte-for-byte (credentials.md must-pass (c)).
+#[tokio::test]
+async fn every_field_a_refresh_does_not_own_is_preserved_by_value() {
+    // Claude Code's login, compact, with unknown fields before, inside and after.
+    let scratch = Scratch::new();
+    let original = serde_json::json!({
+        "aFirst": [1, 2, { "x": null }],
+        "claudeAiOauth": {
+            "zInside": { "k": "v" },
+            "accessToken": "FAKE-OLD-ACCESS",
+            "subscriptionType": "max",
+            "refreshToken": "FAKE-OLD-REFRESH",
+            "expiresAt": LONG_EXPIRED_MS,
+            "rateLimitTier": "tier",
+        },
+        "zz": "last",
+    });
+    scratch.write(CLAUDE, &original.to_string());
+    let transport = ScriptedTransport::new(vec![refreshed("FAKE-NEW-ACCESS", "FAKE-NEW-REFRESH")]);
+    source(&claude_oauth(), &scratch.locations(), transport)
+        .access()
+        .await
+        .unwrap();
+    let written: serde_json::Value = serde_json::from_str(&scratch.read(CLAUDE)).unwrap();
+    let mut expected = original.clone();
+    let oauth = &mut expected["claudeAiOauth"];
+    oauth["accessToken"] = "FAKE-NEW-ACCESS".into();
+    oauth["refreshToken"] = "FAKE-NEW-REFRESH".into();
+    oauth["expiresAt"] = written["claudeAiOauth"]["expiresAt"].clone();
+    oauth["scopes"] = serde_json::json!(["user:inference"]);
+    assert_eq!(written, expected);
+
+    // p1's store, compact, with unknown fields in the refreshed entry and another one.
+    let scratch = Scratch::new();
+    let original = serde_json::json!({
+        "aa-other": { "type": "api_key", "key": "FAKE-OTHER", "note": ["kept", 1] },
+        ROUTE: {
+            "type": "oauth",
+            "note": { "kept": true },
+            "access": "FAKE-OLD-ACCESS",
+            "refresh": "FAKE-OLD-REFRESH",
+            "expires": LONG_EXPIRED_MS,
+            "account_id": "FAKE-ACCOUNT",
+        },
+    });
+    scratch.write(STORE, &original.to_string());
+    let transport = ScriptedTransport::new(vec![refreshed("FAKE-NEW-ACCESS", "FAKE-NEW-REFRESH")]);
+    source(&claude_oauth(), &scratch.locations(), transport)
+        .access()
+        .await
+        .unwrap();
+    let written: serde_json::Value = serde_json::from_str(&scratch.read(STORE)).unwrap();
+    let mut expected = original.clone();
+    expected[ROUTE]["access"] = "FAKE-NEW-ACCESS".into();
+    expected[ROUTE]["refresh"] = "FAKE-NEW-REFRESH".into();
+    expected[ROUTE]["expires"] = written[ROUTE]["expires"].clone();
+    assert_eq!(written, expected);
+}

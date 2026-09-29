@@ -38,7 +38,8 @@ source beside it is a contradiction, so `env`, a nonempty `borrow` or `store_onl
 
 `login_dir` (ADR-0074, §10) is allowed ONLY on `claude-code-oauth`: the same field on any other
 kind is a load error, and so is a directory that is neither absolute nor below the home
-(`~/<dir>`; the home itself, `~` or `~/`, is refused).
+(`~/<dir>`; the home itself, `~` or `~/`, is refused), one with a `.` or `..` component, and
+`/` itself. An absolute `login_dir` that is the home names no login directory.
 
 `p1_auth::resolve(route_id, &spec, transport, &Locations) -> Arc<dyn CredentialSource>`.
 `Locations` carries every directory the chain may touch (home, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
@@ -71,10 +72,35 @@ the real home or the real environment; `Locations::from_process()` is the produc
   reads, from `p1-provider-http`, applied by one helper (`p1-auth/src/refresh_http.rs`) for the
   Claude Code login, the Codex login and p1's store `oauth` entries. Expiry is an
   `Authentication` error `token refresh got no response within <n> s` — never a body, token or
-  header; nothing is written, so the file stays byte-identical, and the lock is released. A
-  peer waits up to `LOCK_PATIENCE` (360 s), longer than the longest bounded refresh (first
-  byte 120 s, then up to 300 s of body idle), so a peer queued behind a holder that times
-  out gets its turn and refreshes itself.
+  header; nothing is written, so the file stays byte-identical, and the lock is released. The
+  whole exchange also ends by `REFRESH_DEADLINE` (300 s) however slowly the body trickles, its
+  body is capped at 64 KiB, and a non-success status is reported without reading its body
+  (issue #484). A peer waits up to `LOCK_PATIENCE` (360 s), longer than the longest bounded
+  refresh (`REFRESH_DEADLINE`, asserted at compile time), so a peer queued behind a holder
+  that times out gets its turn and refreshes itself.
+- **Credential files are handled through a checked, pinned directory** (issue #484,
+  `p1-auth/src/credential_file.rs`). Before a store or login file is read or written, its
+  directory and every directory above it (as spelled and as resolved) must be owned by the
+  user or root and writable by nobody else (sticky directories and the user's own primary
+  group excepted); p1's store directory must also be 0700. The directory is opened once and
+  every later step uses that handle. A file is opened without following a symlink, must be a
+  regular file owned by the user (in p1's store also 0600 with one link) and at most 1 MiB. The
+  lock is the directory itself plus the legacy sibling `.lock` file. A replacement is staged in
+  a new `O_EXCL` 0600 file `.<name>.p1-<pid>-<nanos>-<n>.tmp`, reserved BEFORE the refresh
+  request, synced, re-checked, renamed and the directory synced.
+- **A rotation the server performed is never lost** (issue #484). Once the refresh request is
+  sent, the rotation runs to its write-back in its own task even when the caller is
+  cancelled. A response whose access token is unusable (missing, not header-safe, a zero
+  lifetime, or the rejected token) still keeps a rotated refresh token, with the access token
+  marked expired, and then fails. A publication that fails keeps the rotated file as
+  `.<name>.p1-unsaved`, which the next refresh adopts under the lock unless the file changed
+  since. A login another writer replaced while the request was out is never overwritten.
+  Lifetimes count from when the request was sent.
+- **What a source accepts** (issue #484): access tokens and account ids must be header-safe
+  (printable ASCII, no spaces); an expiry must be a millisecond timestamp (absent or `null`
+  means none); a Codex JWT whose `exp` is not a timestamp is refused; a changed variable is
+  held to the same rule on refresh; and a refresh rotates only the source that issued the
+  rejected credential.
 - A `store_only` route never CONSTRUCTS a borrowed source (§8): the CLI's login is not in the
   chain, so it is not opened even when the store is absent, unusable or has just been rejected.
   Absent means an error that names p1's store; the CLI login is not a fall-through.
@@ -103,8 +129,11 @@ a. Precedence for each kind: env beats store beats borrowed; absent sources are 
    unusable earlier source is an error, not a skip.
 b. Rotation: a changed file value / a newly set variable is seen by the next `access()`.
 c. Write-back: a refreshed borrowed OAuth token lands in the file it came from; a refreshed p1
-   store entry lands in p1's store; nothing else in either file changes (byte-compare the rest);
-   the two existing refresh-contention tests move with the code and pass unchanged.
+   store entry lands in p1's store; nothing else in either file changes BY VALUE — every other
+   key, inside the OAuth object and in other entries, compares equal as JSON (p1 writes its own
+   pretty layout, so the bytes of a compact file change; issue #484 made this the stated
+   contract); the two existing refresh-contention tests move with the code and pass unchanged,
+   and a two-process test holds the lock across processes.
 d. Store permissions: 0644 file or 0755 directory → refused with the chmod message; 0600/0700 ok.
 e. `describe` never contains a value (seed every source with a sentinel and assert its absence in
    `Debug`, `Display` and the `env show` output) and names the chosen source correctly for every

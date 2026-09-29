@@ -3,23 +3,24 @@
 //!
 //! p1 builds no login flow: it reuses the auth file [`crate::Locations`] points at,
 //! exactly as the donor reused the CLI login. The refresh token rotates, so a
-//! refresh is single-flight: an advisory lock on a sibling `.lock` file, a re-read
-//! under the lock, an atomic 0600 write-back and an untouched file when the refresh
-//! fails. `docs/design/providers.md` "Credentials" is the spec. This source never
-//! reads the process environment.
+//! refresh is single-flight: the directory lock plus an advisory lock on a sibling
+//! `.lock` file, a re-read under the lock, a staged 0600 write-back through the
+//! checked, pinned directory ([`crate::credential_file`], issue #484) and an untouched
+//! file when the refresh fails. A rotation that has sent its request runs to its
+//! write-back even when the caller is cancelled, and never overwrites a login the
+//! Codex CLI rotated meanwhile. `docs/design/providers.md` "Credentials" is the spec.
+//! This source never reads the process environment.
 
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
-use p1_provider_http::{
-    Credential, CredentialSource, HttpRequest, LOCK_PATIENCE, Transport, lock_exclusive,
-};
+use p1_provider_http::{Credential, CredentialSource, HttpRequest, Transport};
 use serde_json::Value;
 
+use crate::api_key::usable_key;
+use crate::credential_file::{CredentialDir, CredentialLock, DirKind, FileError, PublishError};
 use crate::refresh_http::{self, RefreshIoError};
 use crate::resolve::{Entry, Presence, SourceName};
 
@@ -66,133 +67,240 @@ impl CodexCliCredentials {
         self
     }
 
-    async fn lock_file(&self) -> Result<fs::File, ProviderError> {
-        let lock_path = self.path.with_extension("lock");
-        if let Some(parent) = lock_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|_| lock_error())?;
-        }
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&lock_path).map_err(|_| lock_error())?;
-        // Advisory exclusive lock; released when the handle drops. Never a blocking
-        // lock: the holder keeps it across its refresh request, and on a
-        // current-thread runtime a blocked thread would stop that request (and
-        // cancellation) for good.
-        lock_exclusive(file, LOCK_PATIENCE)
-            .await
-            .map_err(|_| lock_error())
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "auth.json".to_string())
+    }
+
+    /// The lock file older p1 processes take: `auth.json` → `auth.lock`.
+    fn lock_name(&self) -> String {
+        self.path
+            .with_extension("lock")
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "auth.lock".to_string())
+    }
+
+    fn open_dir(&self) -> Result<CredentialDir, ProviderError> {
+        open_login_dir(&self.path).map_err(|error| file_error(&self.path, error))
+    }
+
+    fn now(&self) -> u64 {
+        epoch_seconds(self.clock.now())
     }
 
     /// Refresh under the cross-process lock. `stale` is the rejected bearer on
     /// the 401/403 path; `None` on the expiry path.
     async fn refresh_locked(&self, stale: Option<&str>) -> Result<Credential, ProviderError> {
-        let _lock = self.lock_file().await?;
-        let mut document = read_document(&self.path)?;
+        let dir = self.open_dir()?;
+        let name = self.name();
+        let lock = dir
+            .lock(&self.lock_name())
+            .await
+            .map_err(|error| match error {
+                FileError::Refused(reason) => refused(&reason),
+                FileError::Missing | FileError::Io => lock_error(),
+            })?;
+        dir.recover(&name, |bytes| {
+            serde_json::from_slice::<Value>(bytes)
+                .is_ok_and(|document| tokens_from(&document).is_ok())
+        });
+        let raw = dir
+            .read(&name)
+            .map_err(|error| file_error(&self.path, error))?;
+        let document = parse_document(&raw, &self.path)?;
         let tokens = tokens_from(&document)?;
-        match stale {
-            // A peer already rotated the rejected token: use its replacement and
-            // never refresh the same rejected token twice.
-            Some(stale) if tokens.access_token != stale => return Ok(credential_from(&tokens)),
-            Some(_) => {}
-            None => {
-                if !token_expired(&tokens.access_token, epoch_seconds(self.clock.now())) {
-                    return Ok(credential_from(&tokens));
-                }
-            }
+        let expired = token_expired(&tokens.access_token, self.now())?;
+        // A peer already rotated the rejected token: use its replacement when it is
+        // still fresh, and never refresh the same rejected token twice.
+        let reusable = !expired && stale.is_none_or(|stale| tokens.access_token != stale);
+        if reusable {
+            return Ok(credential_from(&tokens));
         }
-        let refresh_token = tokens.refresh_token.as_deref().ok_or_else(|| {
+        let refresh_token = tokens.refresh_token.clone().ok_or_else(|| {
             ProviderError::new(
                 ProviderErrorKind::Authentication,
                 "the Codex auth file has no refresh token; run `codex login`",
             )
         })?;
-        let refreshed = self.request_refresh(refresh_token).await?;
-        if stale.is_some_and(|stale| stale == refreshed.access_token) {
+        let rotation = CodexRotation {
+            dir,
+            _lock: lock,
+            name,
+            path: self.path.clone(),
+            transport: self.transport.clone(),
+            clock: self.clock.clone(),
+            reserve: raw.len(),
+            refresh_token,
+            stale: stale.map(str::to_string),
+        };
+        refresh_http::detached(rotation.run()).await
+    }
+}
+
+/// One started rotation of the Codex login. It owns the opened directory and the
+/// held lock, so it runs to its write-back even when the caller is cancelled.
+struct CodexRotation {
+    dir: CredentialDir,
+    /// Held until the rotation is written back.
+    _lock: CredentialLock,
+    name: String,
+    path: PathBuf,
+    transport: Arc<dyn Transport>,
+    clock: Arc<dyn Clock>,
+    reserve: usize,
+    refresh_token: String,
+    stale: Option<String>,
+}
+
+impl CodexRotation {
+    async fn run(self) -> Result<Credential, ProviderError> {
+        // Staged, with its space reserved, before the refresh token is spent.
+        let mut staging = self
+            .dir
+            .stage(&self.name, self.reserve * 2 + 4096)
+            .map_err(|_| write_error())?;
+        let refreshed = request_refresh(self.transport.as_ref(), &self.refresh_token).await?;
+
+        // The Codex CLI shares this file and does not take p1's lock: when it rotated
+        // the login while this request was out, its file is left alone.
+        let latest = self
+            .dir
+            .read(&self.name)
+            .map_err(|error| file_error(&self.path, error))?;
+        let mut document = parse_document(&latest, &self.path)?;
+        let unchanged = tokens_from(&document)
+            .is_ok_and(|tokens| tokens.refresh_token.as_deref() == Some(&self.refresh_token));
+        let usable = match &refreshed.access_token {
+            Ok(access) if self.stale.as_deref() == Some(access.as_str()) => {
+                Err("the token refresh returned the rejected token")
+            }
+            Ok(access) => Ok(access.clone()),
+            Err(problem) => Err(*problem),
+        };
+        if !unchanged {
+            return match usable {
+                // This rotation's access token is valid; the file keeps the other one.
+                Ok(access) => Ok(Credential {
+                    account_id: tokens_from(&document)
+                        .ok()
+                        .and_then(|tokens| tokens.account_id)
+                        .or_else(|| jwt_account_id(&access)),
+                    bearer: access,
+                }),
+                Err(_) => Err(ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    "the Codex auth file changed while it was being refreshed; it was left as \
+                     it is — retry",
+                )),
+            };
+        }
+        let Some(refresh_token) = refreshed.refresh_token.clone() else {
+            // Nothing was rotated: nothing is written, the file stays byte-identical.
             return Err(ProviderError::new(
                 ProviderErrorKind::Authentication,
-                "the token refresh returned the rejected token",
+                usable
+                    .err()
+                    .unwrap_or("token refresh response had no refresh token"),
+            ));
+        };
+        apply_refresh(
+            &mut document,
+            usable.as_deref().ok(),
+            &refresh_token,
+            refreshed.id_token.as_deref(),
+            self.clock.now(),
+        );
+        let bytes = serde_json::to_vec_pretty(&document).map_err(|_| write_error())?;
+        if let Err(error) = staging.publish(&bytes) {
+            let kept = !matches!(error, PublishError::NotDurable) && staging.keep_for_recovery();
+            let reason = match error {
+                PublishError::NotPublished(Some(reason)) => {
+                    format!("failed to write the Codex auth file: {reason}")
+                }
+                PublishError::NotPublished(None) => "failed to write the Codex auth file".into(),
+                PublishError::NotDurable => {
+                    "the Codex auth file was written but could not be flushed to disk".into()
+                }
+            };
+            return Err(ProviderError::new(
+                ProviderErrorKind::Authentication,
+                if kept {
+                    format!(
+                        "{reason}; the refreshed login was kept beside it and is used by the \
+                         next refresh"
+                    )
+                } else {
+                    reason
+                },
             ));
         }
-        apply_refresh(&mut document, &refreshed, self.clock.now());
-        atomic_write(&self.path, &document)?;
+        let access = usable
+            .map_err(|problem| ProviderError::new(ProviderErrorKind::Authentication, problem))?;
         let tokens = tokens_from(&document)?;
+        debug_assert_eq!(tokens.access_token, access);
         Ok(credential_from(&tokens))
     }
+}
 
-    async fn request_refresh(&self, refresh_token: &str) -> Result<RefreshedTokens, ProviderError> {
-        let body = format!(
-            "grant_type=refresh_token&refresh_token={}&client_id={}",
-            percent_encode(refresh_token),
-            percent_encode(CLIENT_ID),
-        );
-        let request = HttpRequest {
-            url: TOKEN_URL.to_string(),
-            headers: vec![
-                (
-                    "Content-Type".to_string(),
-                    "application/x-www-form-urlencoded".to_string(),
-                ),
-                ("Accept".to_string(), "application/json".to_string()),
-            ],
-            body: body.into_bytes(),
-        };
-        let response = refresh_http::post(self.transport.as_ref(), request)
-            .await
-            .map_err(|error| match error {
-                RefreshIoError::TimedOut(error) => error,
-                RefreshIoError::Transport(error) => ProviderError::new(
-                    ProviderErrorKind::Authentication,
-                    format!("token refresh request failed: {}", error.0),
-                ),
-            })?;
-        let status = response.status;
-        let body = refresh_http::drain(response.body)
-            .await
-            .map_err(|error| match error {
-                RefreshIoError::TimedOut(error) => error,
-                RefreshIoError::Transport(error) => ProviderError::new(
-                    ProviderErrorKind::Authentication,
-                    format!("token refresh body failed: {}", error.0),
-                ),
-            })?;
-        if !(200..=299).contains(&status) {
-            return Err(ProviderError::new(
+async fn request_refresh(
+    transport: &dyn Transport,
+    refresh_token: &str,
+) -> Result<RefreshedTokens, ProviderError> {
+    let body = format!(
+        "grant_type=refresh_token&refresh_token={}&client_id={}",
+        percent_encode(refresh_token),
+        percent_encode(CLIENT_ID),
+    );
+    let request = HttpRequest {
+        url: TOKEN_URL.to_string(),
+        headers: vec![
+            (
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("Accept".to_string(), "application/json".to_string()),
+        ],
+        body: body.into_bytes(),
+    };
+    // A failed status is reported at once; its body is never read.
+    let body = refresh_http::exchange(transport, request)
+        .await
+        .map_err(|error| match error {
+            RefreshIoError::TimedOut(error) => error,
+            RefreshIoError::Status(status) => ProviderError::new(
                 ProviderErrorKind::Authentication,
                 format!("token refresh failed with http {status}"),
-            ));
+            ),
+            RefreshIoError::TooLarge => ProviderError::new(
+                ProviderErrorKind::Authentication,
+                "token refresh response is too large to be one",
+            ),
+            RefreshIoError::Transport(error) => ProviderError::new(
+                ProviderErrorKind::Authentication,
+                format!("token refresh request failed: {}", error.0),
+            ),
+        })?;
+    let value: Value = serde_json::from_slice(&body).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::Authentication,
+            "token refresh response was not valid JSON",
+        )
+    })?;
+    let access_token = match non_empty_str(value.get("access_token")) {
+        None => Err("token refresh response had no access token"),
+        Some(access) if !usable_key(&access) => {
+            Err("token refresh response had an access token that is not a header-safe token")
         }
-        let value: Value = serde_json::from_slice(&body).map_err(|_| {
-            ProviderError::new(
-                ProviderErrorKind::Authentication,
-                "token refresh response was not valid JSON",
-            )
-        })?;
-        let access_token = non_empty_str(value.get("access_token")).ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::Authentication,
-                "token refresh response had no access token",
-            )
-        })?;
-        let refresh_token = non_empty_str(value.get("refresh_token")).ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::Authentication,
-                "token refresh response had no refresh token",
-            )
-        })?;
-        Ok(RefreshedTokens {
-            access_token,
-            refresh_token,
-            id_token: non_empty_str(value.get("id_token")),
-        })
-    }
+        Some(access) => Ok(access),
+    };
+    Ok(RefreshedTokens {
+        access_token,
+        refresh_token: non_empty_str(value.get("refresh_token")),
+        id_token: non_empty_str(value.get("id_token")),
+    })
 }
 
 impl CredentialSource for CodexCliCredentials {
@@ -201,7 +309,7 @@ impl CredentialSource for CodexCliCredentials {
             // Read fresh every time: another program may have rotated the file.
             let document = read_document(&self.path)?;
             let tokens = tokens_from(&document)?;
-            if token_expired(&tokens.access_token, epoch_seconds(self.clock.now())) {
+            if token_expired(&tokens.access_token, self.now())? {
                 return self.refresh_locked(None).await;
             }
             Ok(credential_from(&tokens))
@@ -215,7 +323,9 @@ impl CredentialSource for CodexCliCredentials {
         Box::pin(async move {
             let document = read_document(&self.path)?;
             let tokens = tokens_from(&document)?;
-            if tokens.access_token != rejected.bearer {
+            if tokens.access_token != rejected.bearer
+                && !token_expired(&tokens.access_token, self.now())?
+            {
                 // Someone else refreshed between the rejection and this call.
                 return Ok(credential_from(&tokens));
             }
@@ -227,21 +337,31 @@ impl CredentialSource for CodexCliCredentials {
 /// Whether the Codex auth file has an entry the chain can use. Reading the file is
 /// unavoidable (a route's entry may be absent); no value is kept.
 pub(crate) fn presence_at(path: &Path) -> Presence {
-    match fs::read(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "auth.json".to_string());
+    let bytes = match open_login_dir(path).and_then(|dir| dir.read(&name)) {
+        Ok(bytes) => bytes,
+        Err(FileError::Missing) => return Presence::Absent,
+        Err(FileError::Refused(reason)) => return Presence::Unusable(reason),
+        Err(FileError::Io) => {
+            return Presence::Unusable(format!(
+                "the Codex auth file {} could not be read; run `codex login`",
+                path.display()
+            ));
+        }
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
         Err(_) => Presence::Unusable(format!(
-            "the Codex auth file {} could not be read; run `codex login`",
+            "the Codex auth file {} is not valid JSON; run `codex login`",
             path.display()
         )),
-        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Err(_) => Presence::Unusable(format!(
-                "the Codex auth file {} is not valid JSON; run `codex login`",
-                path.display()
-            )),
-            Ok(document) => match tokens_from(&document) {
-                Ok(_) => Presence::Present,
-                Err(error) => Presence::Unusable(error.message),
-            },
+        Ok(document) => match tokens_from(&document)
+            .and_then(|tokens| token_expired(&tokens.access_token, 0).map(|_| tokens))
+        {
+            Ok(_) => Presence::Present,
+            Err(error) => Presence::Unusable(error.message),
         },
     }
 }
@@ -275,23 +395,55 @@ struct Tokens {
     account_id: Option<String>,
 }
 
+/// A refresh response, each field checked on its own.
 struct RefreshedTokens {
-    access_token: String,
-    refresh_token: String,
+    access_token: Result<String, &'static str>,
+    refresh_token: Option<String>,
     id_token: Option<String>,
 }
 
-fn read_document(path: &Path) -> Result<Value, ProviderError> {
-    let bytes = fs::read(path).map_err(|_| {
-        ProviderError::new(
+/// The login directory of `path`, checked and opened.
+fn open_login_dir(path: &Path) -> Result<CredentialDir, FileError> {
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    CredentialDir::open(dir, DirKind::Borrowed)
+}
+
+fn file_error(path: &Path, error: FileError) -> ProviderError {
+    match error {
+        FileError::Refused(reason) => refused(&reason),
+        FileError::Missing | FileError::Io => ProviderError::new(
             ProviderErrorKind::Authentication,
             format!(
                 "cannot read the Codex auth file {}; run `codex login`",
                 path.display()
             ),
-        )
-    })?;
-    serde_json::from_slice(&bytes).map_err(|_| {
+        ),
+    }
+}
+
+fn refused(reason: &str) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Authentication,
+        format!("the Codex auth file is not used: {reason}"),
+    )
+}
+
+fn read_document(path: &Path) -> Result<Value, ProviderError> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "auth.json".to_string());
+    let bytes = open_login_dir(path)
+        .and_then(|dir| dir.read(&name))
+        .map_err(|error| file_error(path, error))?;
+    parse_document(&bytes, path)
+}
+
+fn parse_document(bytes: &[u8], path: &Path) -> Result<Value, ProviderError> {
+    serde_json::from_slice(bytes).map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::Authentication,
             format!(
@@ -308,8 +460,23 @@ fn tokens_from(value: &Value) -> Result<Tokens, ProviderError> {
         .and_then(Value::as_object)
         .ok_or_else(login_error)?;
     let access_token = non_empty_str(tokens.get("access_token")).ok_or_else(login_error)?;
+    // Both values go into headers: anything a header cannot carry is refused here.
+    if !usable_key(&access_token) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Authentication,
+            "the Codex auth file holds an access token that is not a header-safe token; run \
+             `codex login`",
+        ));
+    }
     let account_id =
         non_empty_str(tokens.get("account_id")).or_else(|| jwt_account_id(&access_token));
+    if account_id.as_deref().is_some_and(|id| !usable_key(id)) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Authentication,
+            "the Codex auth file holds an account id that is not a header-safe token; run \
+             `codex login`",
+        ));
+    }
     Ok(Tokens {
         access_token,
         refresh_token: non_empty_str(tokens.get("refresh_token")),
@@ -332,26 +499,40 @@ fn credential_from(tokens: &Tokens) -> Credential {
     }
 }
 
+/// A non-empty string after trimming; whitespace alone is no token.
 fn non_empty_str(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_string)
 }
 
-fn apply_refresh(document: &mut Value, refreshed: &RefreshedTokens, now: SystemTime) {
+/// Write the rotation into the document: the rotated refresh token always, the new
+/// access (and id) token when the response had a usable one. Without one, the old
+/// access token stays: it is expired or rejected, so the next access refreshes again
+/// with the rotated refresh token instead of losing the login.
+fn apply_refresh(
+    document: &mut Value,
+    access: Option<&str>,
+    refresh: &str,
+    id_token: Option<&str>,
+    now: SystemTime,
+) {
     if let Some(tokens) = document.get_mut("tokens").and_then(Value::as_object_mut) {
-        tokens.insert(
-            "access_token".to_string(),
-            Value::String(refreshed.access_token.clone()),
-        );
+        if let Some(access) = access {
+            tokens.insert(
+                "access_token".to_string(),
+                Value::String(access.to_string()),
+            );
+            if let Some(id_token) = id_token {
+                tokens.insert("id_token".to_string(), Value::String(id_token.to_string()));
+            }
+        }
         tokens.insert(
             "refresh_token".to_string(),
-            Value::String(refreshed.refresh_token.clone()),
+            Value::String(refresh.to_string()),
         );
-        if let Some(id_token) = &refreshed.id_token {
-            tokens.insert("id_token".to_string(), Value::String(id_token.clone()));
-        }
     }
     if let Some(object) = document.as_object_mut() {
         object.insert(
@@ -359,41 +540,6 @@ fn apply_refresh(document: &mut Value, refreshed: &RefreshedTokens, now: SystemT
             Value::String(format_rfc3339_utc(now)),
         );
     }
-}
-
-/// Write the document atomically: a sibling temp file in mode 0600, then a
-/// rename. A failure removes the temp file and leaves the original untouched.
-fn atomic_write(path: &Path, value: &Value) -> Result<(), ProviderError> {
-    let bytes = serde_json::to_vec_pretty(value).map_err(|_| write_error())?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|_| write_error())?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("auth.json");
-    let temp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let write = (|| -> std::io::Result<()> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, path)?;
-        Ok(())
-    })();
-    if write.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    write.map_err(|_| write_error())
 }
 
 fn write_error() -> ProviderError {
@@ -435,12 +581,18 @@ fn epoch_seconds(time: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-/// The `exp` claim in seconds, if the token payload is decodable. Unparsable
-/// tokens are treated as not expired; the 401 path is the backstop.
-fn token_expired(token: &str, now: u64) -> bool {
+/// Whether the token's `exp` claim is past (with the margin). An opaque token — no
+/// decodable JWT payload, or a payload without `exp` — is treated as not expired;
+/// the 401 path is the backstop. A payload whose `exp` is not a timestamp is an
+/// error, never a silently fresh token.
+fn token_expired(token: &str, now: u64) -> Result<bool, ProviderError> {
     match jwt_exp(token) {
-        Some(exp) => exp <= now.saturating_add(EXPIRY_MARGIN_SECS),
-        None => false,
+        Ok(Some(exp)) => Ok(exp <= now.saturating_add(EXPIRY_MARGIN_SECS)),
+        Ok(None) => Ok(false),
+        Err(()) => Err(ProviderError::new(
+            ProviderErrorKind::Authentication,
+            "the Codex access token has an invalid expiry claim; run `codex login`",
+        )),
     }
 }
 
@@ -450,8 +602,14 @@ fn jwt_payload(token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn jwt_exp(token: &str) -> Option<u64> {
-    jwt_payload(token)?.get("exp")?.as_u64()
+fn jwt_exp(token: &str) -> Result<Option<u64>, ()> {
+    let Some(payload) = jwt_payload(token) else {
+        return Ok(None);
+    };
+    match payload.get("exp") {
+        None | Some(Value::Null) => Ok(None),
+        Some(exp) => exp.as_u64().map(Some).ok_or(()),
+    }
 }
 
 fn jwt_account_id(token: &str) -> Option<String> {
@@ -526,6 +684,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 

@@ -26,9 +26,10 @@
 //! adapter may send, as [`p1_provider_http::CredentialSource::proxy_injected`]
 //! declares.
 //!
-//! Linux-only today: the store's permission check uses
-//! `std::os::unix::fs::PermissionsExt`, and there is no cfg scaffolding for other
-//! systems (spec §3).
+//! Linux-only today: every credential file is read, locked and replaced through a
+//! checked, pinned directory handle ([`credential_file`], issue #484) built on
+//! `std::os::unix` and `rustix`, and there is no cfg scaffolding for other systems
+//! (spec §3).
 //!
 //! No credential value ever reaches a `Debug`, a `Display`, an error message or a
 //! [`SourceReport`]: the report's fields cannot hold one.
@@ -36,6 +37,7 @@
 mod api_key;
 mod claude_code;
 mod codex;
+mod credential_file;
 mod locations;
 mod refresh_http;
 mod resolve;
