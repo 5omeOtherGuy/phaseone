@@ -470,7 +470,7 @@ fn push_hidden_alias(
     // The tmpfs hides every LEXICAL path under home, even when a symlink makes the
     // configured path resolve elsewhere (a writable root, say): such a path needs
     // its alias back too, so a lexical destination under home counts as hidden.
-    let lexical_hidden = lexical_normalize(parent).starts_with(&lexical_normalize(home));
+    let lexical_hidden = lexical_normalize(parent).starts_with(lexical_normalize(home));
     let resolved_hidden = destination_parent.starts_with(&hidden_home)
         && !writable_roots
             .iter()
