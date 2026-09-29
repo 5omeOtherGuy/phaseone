@@ -240,7 +240,7 @@ fn finish_entry(completion: &Arc<CompletionHub>) -> HostEntryRegistration {
             FINISH,
             Box::new(move |spec: &ToolSpec, services: &ToolServices| {
                 hub.register_finish(&loaded);
-                let completion = hub.issue();
+                let completion = hub.issue(&services.mask);
                 let grant = hub.grant(completion, &[], AgentRole::Main, None);
                 let tool = finish_component(&loaded, &grant, None, &services.mask)
                     .map_err(|error| error.to_string())?;

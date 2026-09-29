@@ -3019,6 +3019,12 @@ fn reload_environment() -> tempfile::TempDir {
 /// `/modules reload` really installs the next generation and leaves the run's own
 /// note. The scratch directory comes back with it: the caller keeps it alive.
 fn driver_with_reload() -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::TempDir) {
+    driver_with_reload_from(None)
+}
+
+fn driver_with_reload_from(
+    manifest: Option<std::path::PathBuf>,
+) -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::TempDir) {
     let dir = reload_environment();
     let writer = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
     let mut deps = HostDeps::new(
@@ -3033,6 +3039,7 @@ fn driver_with_reload() -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::Temp
     );
     // No test reads the process environment.
     deps.shell_env = Some(Vec::new());
+    deps.release_manifest = manifest;
     let provider = Arc::new(p1_testkit::ScriptedProvider::new(Vec::new()));
     deps.catalog_hook = Some(Box::new(move |catalog: &mut p1_assembly::Catalog| {
         let provider = provider.clone();
@@ -3065,6 +3072,210 @@ fn driver_with_reload() -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::Temp
     let (mut d, _auth) = driver();
     d.model_switch = Some(switch.clone());
     (d, switch, dir)
+}
+
+/// Copy every released package into a scratch release; no test changes the installed tree.
+fn scratch_release() -> tempfile::TempDir {
+    let source = crate::catalog::modules::official_release_manifest().expect("release path");
+    let root = source.parent().expect("release root");
+    let scratch = tempfile::tempdir().expect("scratch release");
+    let manifest: p1_contracts::serde_json::Value =
+        p1_contracts::serde_json::from_slice(&std::fs::read(&source).expect("release manifest"))
+            .expect("manifest JSON");
+    for entry in manifest["components"].as_array().expect("components") {
+        let relative = entry["path"].as_str().expect("package path");
+        let target = scratch.path().join(relative);
+        std::fs::create_dir_all(target.parent().expect("package directory")).unwrap();
+        std::fs::copy(root.join(relative), target).expect("copy component");
+    }
+    std::fs::write(scratch.path().join("manifest.json"), manifest.to_string()).unwrap();
+    scratch
+}
+
+/// Append a legal WebAssembly custom section, preserving the component's behaviour while
+/// changing its verified bytes and digest. The loader must compile the replacement afresh.
+fn replace_component_bytes(release: &std::path::Path, name: &str) -> String {
+    let path = release.join("manifest.json");
+    let mut manifest: p1_contracts::serde_json::Value =
+        p1_contracts::serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let entry = manifest["components"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["name"] == name)
+        .expect("shipped package");
+    let file = release.join(entry["path"].as_str().unwrap());
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes.extend_from_slice(&[0, 6, 5, b'f', b'r', b'e', b's', b'h']);
+    std::fs::write(&file, &bytes).unwrap();
+    let digest = p1_module_runtime::Digest::of(&bytes).to_string();
+    entry["digest"] = digest.clone().into();
+    std::fs::write(path, manifest.to_string()).unwrap();
+    digest
+}
+
+#[tokio::test]
+async fn reload_after_in_place_install_runs_new_finish_component() {
+    let release = scratch_release();
+    let manifest = release.path().join("manifest.json");
+    let (mut driver, switch, dir) = driver_with_reload_from(Some(manifest));
+    std::fs::write(
+        dir.path().join("reload-session/environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n\n[[tools]]\nmodule = \"finish\"\n",
+    ).unwrap();
+    let mut agent = test_agent();
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    let old = switch.finish_for_test().expect("first installed finish");
+    let digest = replace_component_bytes(release.path(), "p1/finish");
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    let new = switch.finish_for_test().expect("reloaded finish");
+    assert!(
+        !Arc::ptr_eq(&old, &new),
+        "reload must rebuild finish, not retain old tool"
+    );
+    let lines = switch.assemblies_for_test();
+    let last = &lines.last().expect("identity after reload").identity;
+    assert_eq!(
+        last.modules
+            .iter()
+            .find(|module| module.package == "finish")
+            .and_then(|module| module.digest.as_deref()),
+        Some(digest.trim_start_matches("sha256:"))
+    );
+    assert_ne!(lines.first().unwrap().identity, *last);
+}
+
+#[tokio::test]
+async fn successive_reloads_keep_prior_generation_sources_unchanged() {
+    let release = scratch_release();
+    let manifest = release.path().join("manifest.json");
+    let (mut driver, switch, dir) = driver_with_reload_from(Some(manifest));
+    std::fs::write(
+        dir.path().join("reload-session/environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n\n[[tools]]\nmodule = \"finish\"\n",
+    ).unwrap();
+    let mut agent = test_agent();
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    let first = switch.sources_for_test();
+    let first_digest = first.resolve("finish").unwrap().digest;
+    let second_digest = replace_component_bytes(release.path(), "p1/finish");
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    let second = switch.sources_for_test();
+    assert_eq!(second.resolve("finish").unwrap().digest, second_digest);
+    assert_eq!(first.resolve("finish").unwrap().digest, first_digest);
+    let third_digest = replace_component_bytes(release.path(), "p1/finish");
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    assert_eq!(
+        switch.sources_for_test().resolve("finish").unwrap().digest,
+        third_digest
+    );
+    assert_eq!(second.resolve("finish").unwrap().digest, second_digest);
+    assert_eq!(first.resolve("finish").unwrap().digest, first_digest);
+    assert!(!Arc::ptr_eq(&first, &second));
+}
+
+/// A journal that refuses `Environment` records while `refuse` is set.
+struct EnvironmentRefusal {
+    inner: p1_journal::MemoryJournal,
+    refuse: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl p1_contracts::CommitSink for EnvironmentRefusal {
+    fn commit<'a>(
+        &'a self,
+        record: &'a p1_contracts::JournalRecord,
+    ) -> p1_contracts::BoxFuture<'a, Result<(), p1_contracts::CommitError>> {
+        Box::pin(async move {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst)
+                && matches!(record.body, p1_contracts::RecordBody::Environment { .. })
+            {
+                return Err(p1_contracts::CommitError(
+                    "the journal refuses the environment".into(),
+                ));
+            }
+            p1_contracts::CommitSink::commit(&self.inner, record).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_refused_reload_keeps_the_sessions_finish_tool_fresh() {
+    let release = scratch_release();
+    let (_driver, switch, dir) =
+        driver_with_reload_from(Some(release.path().join("manifest.json")));
+    std::fs::write(
+        dir.path().join("reload-session/environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n\n[[tools]]\nmodule = \"finish\"\n",
+    )
+    .unwrap();
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut agent = Agent::new(p1_core::AgentParts {
+        provider: Arc::new(p1_testkit::ScriptedProvider::new(vec![])),
+        tools: vec![],
+        system_prompt: String::new(),
+        options: p1_contracts::ModelOptions::default(),
+        context: Arc::new(crate::run::DefaultContext),
+        authorization: Arc::new(p1_testkit::ScriptedAuthorization::permit_all()),
+        journal: Arc::new(EnvironmentRefusal {
+            inner: p1_journal::MemoryJournal::new(),
+            refuse: refuse.clone(),
+        }),
+        events: Arc::new(p1_tui::runtime::TuiSink::new().0),
+    })
+    .expect("agent builds");
+    crate::run::reload_modules(&switch, &mut agent)
+        .await
+        .expect("the first reload installs the session's finish");
+    let installed = switch.finish_for_test().expect("installed finish");
+    let generation = switch.finish_generation_for_test().expect("live grant");
+
+    refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = crate::run::reload_modules(&switch, &mut agent)
+        .await
+        .expect_err("the journal refuses the reload's Environment record");
+    assert!(error.contains("refuses"), "{error}");
+    // The old assembly was kept, so its finish tool must still be the fresh one.
+    assert!(Arc::ptr_eq(
+        &installed,
+        &switch.finish_for_test().expect("kept finish")
+    ));
+    assert_eq!(switch.finish_generation_for_test(), Some(generation));
+
+    refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+    crate::run::reload_modules(&switch, &mut agent)
+        .await
+        .expect("the retry installs");
+    assert!(switch.finish_generation_for_test().unwrap() > generation);
+}
+
+#[tokio::test]
+async fn a_policy_reload_uses_the_build_snapshot_not_the_live_manifest() {
+    let release = scratch_release();
+    let manifest_path = release.path().join("manifest.json");
+    let loaders = crate::catalog::modules::BuildLoaders::default();
+    let snapshot = loaders
+        .build_release(&manifest_path)
+        .expect("build snapshot");
+    // The installation changes under the build: the policy package leaves the manifest.
+    let mut manifest: p1_contracts::serde_json::Value =
+        p1_contracts::serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["components"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["name"] != crate::policy::FULL_ACCESS_POLICY);
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+    let policy = crate::policy::ShippedPolicy::official(false).expect("release policy");
+    let reloaded = policy
+        .reload_from(&snapshot)
+        .expect("the build's own snapshot still names the policy");
+    assert_eq!(reloaded.policy().package, crate::policy::FULL_ACCESS_POLICY);
+    assert_eq!(reloaded.policy(), policy.policy());
 }
 
 #[test]

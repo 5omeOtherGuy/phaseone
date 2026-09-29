@@ -29,8 +29,8 @@ use crate::activity::{ActivityLog, ActivityTee, Completion, CompletionHub, Worke
 use crate::cli::Options;
 use crate::frontend::FrontEnd;
 use crate::run::{
-    FINISH_MODULE, Generations, MaskNoticeSink, agent_context, assemble_with_cache_key,
-    config_for_route, session_journals, stall_message, write_stderr,
+    FINISH_MODULE, Generations, MaskNoticeSink, agent_context_in_generation,
+    assemble_with_cache_key, config_for_route, session_journals, stall_message, write_stderr,
 };
 #[cfg(feature = "shadow-hook")]
 use crate::run::{ShadowJournal, ShadowOrigin};
@@ -442,6 +442,19 @@ pub(crate) struct ChildBuilder {
 }
 
 #[cfg(feature = "delegation")]
+struct RetireCompletion {
+    hub: Arc<CompletionHub>,
+    id: u64,
+}
+
+#[cfg(feature = "delegation")]
+impl Drop for RetireCompletion {
+    fn drop(&mut self) {
+        self.hub.retire(self.id);
+    }
+}
+
+#[cfg(feature = "delegation")]
 impl ChildBuilder {
     /// Every argument is a separate composition seam, so the list is long by nature.
     #[allow(clippy::too_many_arguments)]
@@ -524,6 +537,7 @@ impl ChildBuilder {
         // Issue #142: the child's own mask counter, shared by its assembled tools and
         // by its notice sink below (a child is its own agent).
         let mask = Arc::new(MaskCounter::new());
+        let _issued_guard = completion_hub.assembly_guard(&mask);
         let (mut assembled, child_profile) = assemble_child(
             environment_dirs,
             &catalog,
@@ -535,6 +549,9 @@ impl ChildBuilder {
             ordinal,
             &mask,
         )?;
+        if let Some(sources) = generation.sources() {
+            super::capabilities::bind_assembled(&mut assembled, &sources);
+        }
         // The session file is numbered like the id the service hands out.
         let id: usize = worker_id
             .strip_prefix('w')
@@ -544,7 +561,7 @@ impl ChildBuilder {
         // The child gets its OWN activity log and outcome, issued by the shared
         // catalog for this assembly. The worker service does not read the outcome:
         // a child's turn end is its completion, the parent verifies.
-        let child_completion = completion_hub.take();
+        let child_completion = completion_hub.take(&mask);
         let outcome = child_completion
             .as_ref()
             .map(|completion| completion.outcome.clone())
@@ -561,7 +578,11 @@ impl ChildBuilder {
                 &mask,
             )?;
         }
-        let context = agent_context(&assembled, child_profile.as_deref())?;
+        if let Some(sources) = generation.sources() {
+            super::capabilities::bind_assembled(&mut assembled, &sources);
+        }
+        let context =
+            agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
         let route = assembled.resolved.route.origin.route.clone();
         let model = assembled.resolved.route.origin.model.clone();
         let description = format!("{route}/{model}");
@@ -664,7 +685,9 @@ impl ChildBuilder {
             // rebuilds the component, so a re-grant with `add_tools: ["shell"]` puts the
             // worker back on the strict rule from the next turn on (ADR-0083 rule 7).
             let completion = child_completion.clone();
+            let sources = generation.sources();
             Arc::new(move |grant: &[String]| -> Result<Reconfiguration, String> {
+                let _issued_guard = completion_hub.assembly_guard(&mask);
                 let (mut assembled, child_profile) = assemble_child(
                     &environment_dirs,
                     &catalog,
@@ -676,10 +699,13 @@ impl ChildBuilder {
                     ordinal,
                     &mask,
                 )?;
+                if let Some(sources) = &sources {
+                    super::capabilities::bind_assembled(&mut assembled, sources);
+                }
                 // The catalog's `finish` factory issued THIS assembly its own
                 // completion: take it, so the hub cannot hand a stale one to a later
                 // worker assembly.
-                let _issued = completion_hub.take();
+                let _issued = completion_hub.take(&mask);
                 // A re-grant is a new tool set, so the hub chooses the policy again from
                 // it and rebuilds the `finish` component under the new grant.
                 if let Some(completion) = &completion {
@@ -691,7 +717,11 @@ impl ChildBuilder {
                         &mask,
                     )?;
                 }
-                let context = agent_context(&assembled, child_profile.as_deref())?;
+                if let Some(sources) = &sources {
+                    super::capabilities::bind_assembled(&mut assembled, sources);
+                }
+                let context =
+                    agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
                 let tools = assembled.tools;
                 // The report's `tools` becomes the new assembly's names, its `finish`
                 // tool is found again by identity, and the child's activity records
@@ -778,8 +808,14 @@ impl ChildBuilder {
         front_end.child_started(&worker_id);
         // The service snapshots this when a child's turn ends; it reads the SAME cell
         // the tap just filled and the front end was told about.
-        let report: Arc<dyn Fn() -> WorkerReport + Send + Sync> =
-            Arc::new(move || report.lock().unwrap().clone());
+        let retire = child_completion.map(|completion| RetireCompletion {
+            hub: completion_hub.clone(),
+            id: completion.id,
+        });
+        let report: Arc<dyn Fn() -> WorkerReport + Send + Sync> = Arc::new(move || {
+            let _keep_retirement_until_child_drops = &retire;
+            report.lock().unwrap().clone()
+        });
         Ok((
             ChildAgent {
                 agent,

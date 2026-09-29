@@ -113,6 +113,18 @@ pub trait FrontEnd: Send + Sync {
         None
     }
 
+    /// Build a generation-scoped authorization bridge over the reloaded package. A custom
+    /// front end with no shipped policy keeps its own authorization unchanged.
+    fn authorization_for_shipped(
+        &self,
+        _shipped: Arc<ShippedPolicy>,
+        _sources: Arc<crate::catalog::modules::VerifiedSources>,
+    ) -> Arc<dyn AuthorizationPolicy> {
+        self.authorization()
+    }
+
+    fn bind_verified_sources(&self, _sources: Arc<crate::catalog::modules::VerifiedSources>) {}
+
     /// The host announces the assembled parent once, before the agent is built
     /// and before any event: its resolved route/model and its `finish` state
     /// (`None` when the environment does not assemble `finish`).
@@ -297,6 +309,20 @@ impl FrontEnd for LineFrontEnd {
 
     fn shipped_policy(&self) -> Option<Arc<ShippedPolicy>> {
         Some(self.policy.shipped().clone())
+    }
+
+    fn authorization_for_shipped(
+        &self,
+        shipped: Arc<ShippedPolicy>,
+        sources: Arc<crate::catalog::modules::VerifiedSources>,
+    ) -> Arc<dyn AuthorizationPolicy> {
+        let policy = self.policy.with_shipped(shipped);
+        policy.bind_sources(sources);
+        Arc::new(policy)
+    }
+
+    fn bind_verified_sources(&self, sources: Arc<crate::catalog::modules::VerifiedSources>) {
+        self.policy.bind_sources(sources);
     }
 
     fn parent_assembled(&self, route: &str, model: &str, completion: Option<Completion>) {

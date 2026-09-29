@@ -219,6 +219,14 @@ pub trait Tool: Send + Sync {
         call: &'a ToolCall,
         context: ToolContext,
     ) -> BoxFuture<'a, ToolOutcome>;
+
+    /// Lets a host wrapper that carries data of its own — the verified capability
+    /// snapshot of the assembly that built it — be recognised behind `dyn Tool` without
+    /// a process-wide table keyed by address. Every tool that is not such a wrapper
+    /// keeps the default.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 #[cfg(test)]

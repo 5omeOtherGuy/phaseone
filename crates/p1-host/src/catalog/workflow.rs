@@ -990,6 +990,17 @@ pub(crate) fn register_workflow_tools(
     register_workflow_tools_from(catalog, service, None)
 }
 
+#[cfg(feature = "workflows")]
+pub(crate) fn register_workflow_tools_with_sources(
+    catalog: &mut Catalog,
+    service: Option<Arc<dyn p1_workflow::WorkflowService>>,
+    sources: &super::modules::VerifiedSources,
+    loaders: &super::modules::BuildLoaders,
+    release: Option<&Path>,
+) -> Result<(), String> {
+    register_workflow_tools_impl(catalog, service, release, Some(sources), Some(loaders))
+}
+
 /// [`register_workflow_tools`] over the release whose manifest is `release`, or the official
 /// installation's release when it is `None`. The seam exists so a caller — the host's own
 /// tests among them — can name the release whose member entries are read.
@@ -999,19 +1010,27 @@ pub fn register_workflow_tools_from(
     service: Option<Arc<dyn p1_workflow::WorkflowService>>,
     release: Option<&Path>,
 ) -> Result<(), String> {
+    register_workflow_tools_impl(catalog, service, release, None, None)
+}
+
+#[cfg(feature = "workflows")]
+fn register_workflow_tools_impl(
+    catalog: &mut Catalog,
+    service: Option<Arc<dyn p1_workflow::WorkflowService>>,
+    release: Option<&Path>,
+    sources: Option<&super::modules::VerifiedSources>,
+    loaders: Option<&super::modules::BuildLoaders>,
+) -> Result<(), String> {
     let Some(service) = service else {
         return Ok(());
     };
-    if catalog
-        .tool_keys()
-        .iter()
-        .any(|key| key == WORKFLOW_TOOLS[0])
-    {
-        return Ok(());
-    }
     let entries = match release {
-        Some(release) => super::delegation::load_member_entries(release)?,
-        None => super::delegation::official_member_entries()?,
+        Some(release) => super::delegation::load_member_entries_with_loader(release, loaders)?,
+        None => {
+            let release =
+                super::modules::official_release_manifest().ok_or("no release modules")?;
+            super::delegation::load_member_entries_with_loader(&release, loaders)?
+        }
     };
     let hook: ModuleServices = Arc::new(move |module: &str, _services: &ToolServices| {
         if WORKFLOW_MODULES.contains(&module) {
@@ -1021,7 +1040,15 @@ pub fn register_workflow_tools_from(
         }
     });
     for (module, key) in WORKFLOW_MODULES.into_iter().zip(WORKFLOW_TOOLS) {
-        if let Some(loaded) = entries.get(module) {
+        if !catalog
+            .tool_keys()
+            .iter()
+            .any(|registered| registered == key)
+            && let Some(loaded) = entries.get(module)
+        {
+            if let Some(sources) = sources {
+                sources.record(key, loaded);
+            }
             register_host_entry(catalog, key, loaded.clone(), hook.clone());
         }
     }
