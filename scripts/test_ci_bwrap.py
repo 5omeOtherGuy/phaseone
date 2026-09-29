@@ -66,6 +66,14 @@ class CiBwrapTest(unittest.TestCase):
         self.assertEqual(len(superseding), 1, [path.name for path in superseding])
         self.assertIn(f'superseded_by: [{int(superseding[0].name[:4])}]', old)
 
+    def test_root_rule_matches_the_ci_sandbox_reversal(self):
+        # Codex finding ci.yml:66: after ADR-0097 provisions bubblewrap on GitHub-hosted
+        # runners, the root rule must not still claim CI lacks it, or workers and reviewers
+        # expect the sandbox suites to skip there.
+        agents = (ROOT / 'AGENTS.md').read_text()
+        self.assertNotIn('CI lacks bubblewrap', agents)
+        self.assertIn('CI provisions bubblewrap', agents)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -38,7 +38,7 @@ Run `scripts/gate.sh` before merge: fmt check, clippy with `-D warnings`, all te
 Before a merge, the PR's CI (which runs exactly this script) and an independent review must both be green.
 Intermediate commits need not run the full gate.
 After a PR merges, verify main's own `gate` run for exactly the merge commit; direct pushes to main (`scripts/push-main.sh`) are refused.
-Do not equate a green workstation gate with green CI; CI lacks bubblewrap and can start more slowly.
+Do not equate a green workstation gate with green CI; CI provisions bubblewrap too (ADR-0097) and can start more slowly.
 Create an ADR for changed interfaces, dependency/workflow rules or reversed decisions using `scripts/adr.py new "Title"`.
 Keep it proposed until merged, then accepted or rejected.
 Change accepted ADRs only in `status` and `superseded_by`; reverse a decision with a new ADR using `--supersedes N`.
