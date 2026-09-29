@@ -99,7 +99,10 @@ impl SseDecoder {
         }
         self.frame_bytes += bytes.len();
         let produced = self.push(bytes);
-        *batch_bytes += produced.iter().map(|event| event.data.len()).sum::<usize>();
+        *batch_bytes += produced
+            .iter()
+            .map(|event| event.data.len() + event.event.as_ref().map_or(0, String::len))
+            .sum::<usize>();
         if *batch_bytes > MAX_BATCH {
             return Err("provider SSE batch exceeds byte limit");
         }
@@ -249,6 +252,19 @@ mod tests {
         assert_eq!(decoder.try_push(under.as_bytes()).unwrap().len(), 16);
         // 17 × 1,000,000 = 17,000,000 > 16,777,216: the batch is refused
         // before all of it is retained, instead of reaching the parser whole.
+        let mut decoder = SseDecoder::new();
+        let over = frame.repeat(17);
+        assert!(decoder.try_push(over.as_bytes()).is_err());
+    }
+
+    /// Codex: the batch bound counts the retained `event:` names too — frames
+    /// with tiny data but near-1 MiB event names must not slip past it.
+    #[test]
+    fn a_batch_of_large_event_names_is_refused_before_retention() {
+        let frame = format!("event: {}\ndata: 1\n\n", "e".repeat(1_000_000));
+        let mut decoder = SseDecoder::new();
+        let under = frame.repeat(16);
+        assert_eq!(decoder.try_push(under.as_bytes()).unwrap().len(), 16);
         let mut decoder = SseDecoder::new();
         let over = frame.repeat(17);
         assert!(decoder.try_push(over.as_bytes()).is_err());

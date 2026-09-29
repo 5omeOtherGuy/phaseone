@@ -462,6 +462,8 @@ impl ResponseParser for AnthropicParser {
                     self.fail(ProviderErrorKind::Protocol, "content before message start");
                 } else if self.message_started {
                     self.fail(ProviderErrorKind::Protocol, "duplicate message start");
+                } else if !value.get("message").is_some_and(Value::is_object) {
+                    self.fail(ProviderErrorKind::Protocol, "message start without message");
                 } else {
                     self.message_started = true;
                     self.on_message_start(&value);
@@ -712,6 +714,17 @@ mod regression_tests {
             json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name}}),
         );
         send(p, json!({"type":"content_block_stop","index":index}));
+    }
+    #[test]
+    fn message_start_requires_a_message_object() {
+        for event in [
+            json!({"type":"message_start"}),
+            json!({"type":"message_start","message":null}),
+            json!({"type":"message_start","message":"x"}),
+            json!({"type":"message_start","message":[]}),
+        ] {
+            failed(&send(&mut parser(), event));
+        }
     }
     #[test]
     fn malformed_lifecycle_and_blocks_fail() {

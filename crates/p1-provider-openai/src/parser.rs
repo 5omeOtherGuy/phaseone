@@ -92,6 +92,12 @@ impl CodexResponseParser {
         {
             return self.fail(ProviderErrorKind::Protocol, "conflicting response id");
         }
+        if stop != StopReason::EndTurn {
+            // A truncated response legitimately ends between an item's `added` and
+            // `done`; the unfinished item never becomes a block, so nothing
+            // executable survives.
+            self.open_items.clear();
+        }
         if !self.open_items.is_empty() {
             return self.fail(ProviderErrorKind::Protocol, "unfinished output items");
         }
@@ -616,6 +622,28 @@ mod tests {
         assert!(
             matches!(terminal(&feed(&mut p, done)), Outcome::Failed(error) if error.kind == ProviderErrorKind::Protocol)
         );
+    }
+    #[test]
+    fn a_truncated_response_discards_unfinished_items() {
+        for (reason, stop) in [
+            ("max_output_tokens", StopReason::MaxOutputTokens),
+            ("context_window", StopReason::ContextWindowExceeded),
+        ] {
+            let mut p = CodexResponseParser::new(crate::ROUTE, "m");
+            feed(
+                &mut p,
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"c","name":"read"}}"#,
+            );
+            let events = feed(
+                &mut p,
+                &format!(
+                    r#"{{"type":"response.incomplete","response":{{"incomplete_details":{{"reason":"{reason}"}}}}}}"#
+                ),
+            );
+            let done = completed(&events);
+            assert_eq!(done.stop, stop);
+            assert!(done.item.tool_calls().next().is_none());
+        }
     }
     #[test]
     fn incomplete_envelope_cannot_change_response_id() {
