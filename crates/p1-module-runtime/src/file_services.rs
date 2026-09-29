@@ -2139,6 +2139,15 @@ mod tests {
         let reused = cached_index(&cap.index, &policy, &cancel).unwrap();
         assert!(Arc::ptr_eq(&first, &reused));
         std::fs::write(keys.join("new.key"), "fixture").unwrap();
+        // The clock above claims the first read was an hour later, so a same-tick write on a
+        // coarse filesystem clock would leave an equal, "settled" stamp; give the directory a
+        // distinct mtime so the change is visible whatever the timestamp granularity.
+        std::fs::File::open(&keys)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+            ))
+            .unwrap();
         let rebuilt = cached_index(&cap.index, &policy, &cancel).unwrap();
         assert!(!Arc::ptr_eq(&first, &rebuilt));
         assert!(rebuilt.refuses_path(&keys.join("new.key")));
