@@ -200,18 +200,8 @@ fn summarize<'h, G: Goal>(
     // "Nothing to summarize": when everything outside the kept tail units is a previous
     // summary, a request could only buy the same summary back (context.md "Nothing to
     // summarize"). Unit-less histories (a lone user message) still count as material.
-    let kept = plan::kept_user_indices(history, tail_start, config.user_verbatim_tokens);
-    // The tail's units are kept verbatim, so they are not material; of the items
-    // outside them, a plain user the replacement keeps anyway is not material
-    // either. A history with no units has no tail units to speak of, so any
-    // non-summary item in it is still material (a lone user message is summarized,
-    // not treated as a no-op). Trailing user/inbox items after the last unit are
-    // outside every unit and so count as material too.
     let has_material = history.iter().enumerate().any(|(index, item)| {
-        if plan::is_summary_item(item) || plan::in_tail_unit(index, tail_start, &segments) {
-            return false;
-        }
-        segments.units.is_empty() || kept.binary_search(&index).is_err()
+        !plan::in_tail_unit(index, tail_start, &segments) && !plan::is_summary_item(item)
     });
     if !has_material {
         return Step::Done(goal.finish(Summarized::NothingToSummarize));

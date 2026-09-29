@@ -122,21 +122,6 @@ fn default_summary_cap_is_below_a_small_valid_wall() {
     );
 }
 
-#[tokio::test]
-async fn kept_task_and_previous_summary_make_no_request() {
-    let provider = ScriptedProvider::new(vec![]);
-    let history = [
-        user("task"),
-        user(format!("{SUMMARY_MARKER}\nprior")),
-        assistant_text("tail"),
-    ];
-    let mut cfg = force_config(&history);
-    cfg.keep_recent_tokens = 10_000;
-    let policy = policy(Arc::new(provider.clone()), cfg);
-    assert!(prepare(&policy, &history).await.unwrap().is_none());
-    assert!(provider.requests().is_empty());
-}
-
 // ---------------------------------------------------------------- estimator
 
 #[test]
