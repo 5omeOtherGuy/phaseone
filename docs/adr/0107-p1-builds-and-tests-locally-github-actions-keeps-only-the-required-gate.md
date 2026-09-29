@@ -6,7 +6,7 @@ date: 2026-09-30
 deciders: owner+lead
 supersedes: [66]
 superseded_by: []
-sources: [AGENTS.md, .github/workflows/ci.yml, scripts/gate.sh, scripts/pre-push.sh, "PR #487"]
+sources: [AGENTS.md, .github/workflows/ci.yml, scripts/gate.sh, scripts/pre-push.sh, scripts/review-pr.sh, "PR #487"]
 ---
 # ADR-0107: p1 builds and tests locally; GitHub Actions keeps only the required gate
 
@@ -46,8 +46,9 @@ hours in a fix / review loop for every PR!!!"
 - The gate reports every failure of a run: `cargo test --no-fail-fast` in `gate.sh` and in
   every test job, `cargo clippy --keep-going`. Its jobs build with four jobs, the runner's
   four processors (`CARGO_BUILD_JOBS`).
-- Review: the lead decides per pull request. At most one review, run locally (`codex exec`,
-  read-only) with a brief that names what to check and what to leave; none when the diff is
+- Review: the lead decides per pull request. At most one review, run locally with
+  `scripts/review-pr.sh <pr> <focus-file>` (read-only `codex exec`), whose focus file names what
+  to check and what to leave; none when the diff is
   small or already reviewed by the lead or another agent. One repair round takes the gate's
   failures and the confirmed P0/P1 findings together; nothing is reviewed again; lesser
   findings go into one follow-up issue. Auto-merge is set once no P0/P1 is open, so the merge
