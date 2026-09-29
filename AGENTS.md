@@ -34,7 +34,7 @@ Follow model-cards for briefing, nonblocking supervision, repairs and evidence.
 
 ## Gate and decisions
 
-The gate is `scripts/gate.sh`, and CI runs it: fmt check, clippy with `-D warnings`, all tests and core isolation; run it on no workstation or build box before pushing.
+The gate is `scripts/gate.sh`, and CI runs it: fmt check, clippy with `-D warnings`, all tests and core isolation; run it on no workstation or build box before pushing (ADR-0105).
 Before a merge, the PR's CI (which runs exactly this script) and an independent review must both be green.
 Intermediate commits need not run the full gate.
 After a PR merges, verify main's own `gate` run for exactly the merge commit; direct pushes to main (`scripts/push-main.sh`) are refused.
