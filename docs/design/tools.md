@@ -197,13 +197,21 @@ land on an unrelated group whose ID was reused. Content:
 Non-zero exit is `ToolStatus::Ok` (the command ran; the model reads the code). The timeout is a
 tool parameter the MODEL chooses — not a harness-imposed limit on the agent.
 
-### `shell` output filters (research #42, donor `iris-agent` `src/tools/bash/filter/structured/`)
+### `shell` output filters (research #42, donor `iris-agent` `src/tools/bash/filter/`)
 
 The schema gains `"raw"?: bool` (default false). With `raw` false, the captured output of a
 RECOGNISED command is summarised after the command exits and before the byte bound: passing
 `cargo test`/`cargo build`/`cargo check`/`cargo clippy` logs lose their progress lines and keep
 results, warnings and errors; `git status`, `git log`, `git diff` and `npm`/`pnpm test` get the
-donor's summaries. Recognition works on the effective command (a leading `cd <path> &&`, env
+donor's summaries. Behind them, the donor's declarative tier also runs: all 64 vendored TOML
+filter files (`crates/p1-tool-shell/guest/src/filter/data/*.toml`, mostly from RTK, Apache-2.0 —
+see `data/NOTICE.md`) cover the long tail of tool classes (`shellcheck`, `npm install`, `make`,
+`docker`-adjacent build tools, `terraform`/`tofu`, cloud CLIs, linters). They are embedded with
+`include_str!` — the guest is WebAssembly and has no filesystem — parsed once into a `OnceLock`
+registry, and applied by the donor's eight-stage engine (ANSI strip, `replace`, `match_output`
+short-circuit, strip/keep lines, line truncation, head/tail, `max_lines`, `on_empty`). A TOML
+filter applies only when no structured filter matched; a structured decline never falls through to
+one. Recognition works on the effective command (a leading `cd <path> &&`, env
 assignments and wrappers are looked through, as the donor's `effective_command` does).
 Fail-safe contract — every line is a test:
 - an unrecognised command, a filter that declines, errors or panics, a filter result that is not
@@ -215,10 +223,14 @@ Fail-safe contract — every line is a test:
   host head/tail capture may already have omitted middle bytes even in raw mode. In that
   case the omission marker explicitly warns that diagnostics may be missing;
 - the head/tail byte bound stays as the backstop after the filter.
-Filters are pure `(&str, bool) -> Option<String>` functions in a private module of
-`p1-tool-shell`: no provider or UI type, no global registry, no build script, no usage
-accounting. The donor's declarative TOML engine and its vendored third-party filter files are
-NOT taken. `regex` becomes a direct dependency of `p1-tool-shell` (already in the lock tree).
+Structured filters are pure `(&str, bool) -> Option<String>` functions in a private module of
+`p1-shell-guest`: no provider or UI type, no global registry, no build script, no usage
+accounting. The TOML tier keeps the same fail-safe contract: an error-guard regex keeps
+error/failure lines from being stripped, the lossy stages and a success-flavored `on_empty` are
+skipped on a non-zero exit, and a filter that empties non-empty output yields the RAW output. One
+test runs every inline `[[tests.<name>]]` case of all 64 files; another proves every file parses
+and every definition compiles. `regex` and `toml` are direct dependencies of `p1-shell-guest`
+(both already in the lock tree).
 
 ### `shell` environment — an allow-list, always
 
