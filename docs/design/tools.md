@@ -157,7 +157,7 @@ Creates or replaces a file atomically (parents created). Existing target → rea
 applies. Native queued calls recheck cancellation after acquiring the write gate and before
 replacing the file. Success: `Wrote <path> (<bytes> bytes).`
 
-## `grep` — `{"pattern": string, "path"?: string, "glob"?: string, "mode"?: "content"|"files", "case_insensitive"?: bool, "context"?: int 0..=10}`
+## `grep` — `{"pattern": string, "path"?: string, "glob"?: string, "mode"?: "content"|"files"|"count", "case_insensitive"?: bool, "context"?: int 0..=10, "offset"?: int >=0, "head_limit"?: int >=1, "max_per_file"?: int >=1}`
 Regex search honouring `.gitignore` (ripgrep library crates, as the donor). `mode:"content"`
 (default): grouped by file — one block per file, the path on its own line, then `<line>:<text>`
 for a match and `<line>-<text>` for a context line, blocks separated by a blank line, files in
@@ -180,7 +180,18 @@ listing refuses
 above 4,096 paths or 512 KiB retained path names and asks to narrow path/glob
 (ADR-0101), while a patterned `mode:"files"` search keeps the paths its first bounded
 search carried and counts the rest.
-The schema does not change.
+**Count, paging and per-file cap (issue #493, donor `tools/grep.rs`, `tools/find.rs`).**
+`mode:"count"`: one `<path>:<n>` line per matching file, then `[total: <m> matches in <f> files]`,
+exact past the line cap (the walk resumes file by file, each searched whole).
+`offset` skips that many output entries and `head_limit` keeps at most that many; an entry is
+a match line (`content`), a path (`files`) or a count line (`count`). When entries remain the
+last line reads `[showing <matches|files> <a>-<b>[ of <total>]; continue with offset=<b>]`; an
+offset past the end reads `[showing no <noun>: offset <n> is past the last of <total>]`.
+`max_per_file` (content mode) shows a file's first N matches, then `… <k> more matches in this
+file`. A paged `files` result that leaves paths out (by `head_limit` or the output bound) ends
+with `[<total> matching files, <shown> shown, <omitted> omitted; omitted by directory: <top 5>]`.
+A call that names none of these (or only `offset:0`) renders exactly as above; the summary is
+therefore not added to an unpaged `files` result, whose footer the acceptance tests fix.
 
 ## `shell` — `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120)}`
 Runs `bash -lc <command>` with the workspace root as cwd, stdin closed, in its own process

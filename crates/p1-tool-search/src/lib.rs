@@ -27,7 +27,7 @@ use p1_tool_search_logic::exec::{
     CallInput, Capabilities, Entry, EntryKind, FileMatches, FsError, Outcome, SearchLine,
     SearchQuery, SearchResult,
 };
-use p1_tool_search_logic::{self as logic, GrepInput, Mode};
+use p1_tool_search_logic::{self as logic, GrepInput};
 use p1_workspace::{ToolFace, Workspace};
 
 #[cfg(test)]
@@ -118,10 +118,13 @@ impl Tool for GrepTool {
         call: &ToolCall,
         result: &p1_contracts::ToolResultItem,
     ) -> ResultDescription {
-        let files_mode =
-            parse_input(&self.declaration.name, call).is_ok_and(|input| input.mode == Mode::Files);
+        // An input that did not parse describes as the default mode: a best-effort answer,
+        // never a failure, as every other tool.
+        let mode = parse_input(&self.declaration.name, call)
+            .map(|input| input.mode)
+            .unwrap_or_default();
         let described =
-            logic::describe_result(files_mode, result.status == ToolStatus::Ok, &result.content);
+            logic::describe_result(mode, result.status == ToolStatus::Ok, &result.content);
         ResultDescription {
             summary: described.summary,
             detail: described.matches.map(|matches| ResultDetail::Matches {
@@ -577,7 +580,7 @@ mod tests {
         assert_eq!(schema["properties"]["glob"]["type"], "string");
         assert_eq!(
             schema["properties"]["mode"]["enum"],
-            serde_json::json!(["content", "files"])
+            serde_json::json!(["content", "files", "count"])
         );
         assert_eq!(schema["properties"]["mode"]["default"], "content");
         assert_eq!(schema["properties"]["case_insensitive"]["default"], false);
