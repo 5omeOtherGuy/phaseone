@@ -31,6 +31,7 @@ use wasmtime::component::{Component, Func, Instance, InstancePre, Linker, Val};
 use wasmtime::{Engine, Store};
 
 use crate::delegation::{WorkerLists, link_worker_lists};
+use crate::executor::{BareStore, module_store};
 
 /// The fuel of one restricted call: enough for a module to parse its input and write a
 /// description, far too little to hide real work behind "inspection".
@@ -43,12 +44,12 @@ pub const RESTRICTED_DEADLINE_TICKS: u64 = 200;
 
 pub(crate) struct Restricted {
     engine: Engine,
-    pre: InstancePre<()>,
+    pre: InstancePre<BareStore>,
     live: Mutex<Option<Live>>,
 }
 
 struct Live {
-    store: Store<()>,
+    store: Store<BareStore>,
     instance: Instance,
 }
 
@@ -67,7 +68,7 @@ impl Restricted {
         component: &Component,
         lists: Option<&WorkerLists>,
     ) -> wasmtime::Result<Self> {
-        let mut linker: Linker<()> = Linker::new(engine);
+        let mut linker: Linker<BareStore> = Linker::new(engine);
         if let Some(lists) = lists {
             link_worker_lists(&mut linker, lists)?;
         }
@@ -105,7 +106,7 @@ impl Restricted {
         let live = match live {
             Some(live) => live,
             None => {
-                let mut store = Store::new(&self.engine, ());
+                let mut store = module_store(&self.engine, BareStore::default());
                 limit(&mut store)?;
                 let instance = self.pre.instantiate(&mut store)?;
                 live.insert(Live { store, instance })
@@ -124,7 +125,7 @@ impl Restricted {
 
 /// Every restricted call starts with the full budget, so one inspection cannot starve the
 /// next.
-fn limit(store: &mut Store<()>) -> wasmtime::Result<()> {
+fn limit(store: &mut Store<BareStore>) -> wasmtime::Result<()> {
     store.set_fuel(RESTRICTED_FUEL)?;
     store.epoch_deadline_trap();
     store.set_epoch_deadline(RESTRICTED_DEADLINE_TICKS);

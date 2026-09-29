@@ -325,6 +325,14 @@ pub struct Loader {
     epochs: Arc<Epochs>,
 }
 
+fn unsupported_kind_capability(kind: ModuleKind, capabilities: &[String]) -> Option<&'static str> {
+    if kind == ModuleKind::ContextPolicy && capabilities.iter().any(|name| name == "completion") {
+        Some("completion")
+    } else {
+        None
+    }
+}
+
 impl Loader {
     /// A loader over `manifest`, whose entry paths are relative to `root` (the directory the
     /// manifest file is in). Its epochs advance on the production ticker.
@@ -369,6 +377,15 @@ impl Loader {
             })?;
 
         let kind = check_manifest_fields(entry)?;
+        // The frozen class allocation permits completion, but this context adapter has
+        // no session completion record: refuse it before component construction rather
+        // than leave a granted import without a service at assembly time.
+        if unsupported_kind_capability(kind, &entry.capabilities) == Some("completion") {
+            return Err(LoadError::UnsupportedCapability {
+                name: name.to_owned(),
+                capability: "completion".to_owned(),
+            });
+        }
         if let Some(capability) = entry
             .capabilities
             .iter()
@@ -584,6 +601,18 @@ mod tests {
         for bad in ["1", "1.", ".0", "1.0.0", "a.0", "+1.0", ""] {
             assert_eq!(protocol_major(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn context_completion_is_refused_before_assembly() {
+        assert_eq!(
+            unsupported_kind_capability(ModuleKind::ContextPolicy, &["completion".to_owned()]),
+            Some("completion")
+        );
+        assert_eq!(
+            unsupported_kind_capability(ModuleKind::Tool, &["completion".to_owned()]),
+            None
+        );
     }
 
     #[test]

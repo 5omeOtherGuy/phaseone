@@ -76,6 +76,44 @@ pub const MAX_TRANSFER_BYTES: usize = 16 << 20;
 /// it still bounds what one import call can make the host allocate.
 pub const HOSTCALL_FUEL: usize = MAX_TRANSFER_BYTES * size_of::<Val>() + (128 << 20);
 
+/// Limit dynamic lifting and guest linear memory at every Store construction site.
+pub(crate) const MAX_GUEST_MEMORY: usize = 256 << 20;
+
+pub(crate) fn store_limits() -> wasmtime::StoreLimits {
+    wasmtime::StoreLimitsBuilder::new()
+        .memory_size(MAX_GUEST_MEMORY)
+        .build()
+}
+
+pub(crate) trait LimitedStore {
+    fn limits(&mut self) -> &mut wasmtime::StoreLimits;
+}
+
+pub(crate) struct BareStore {
+    limits: wasmtime::StoreLimits,
+}
+
+impl Default for BareStore {
+    fn default() -> Self {
+        Self {
+            limits: store_limits(),
+        }
+    }
+}
+
+impl LimitedStore for BareStore {
+    fn limits(&mut self) -> &mut wasmtime::StoreLimits {
+        &mut self.limits
+    }
+}
+
+pub(crate) fn module_store<T: LimitedStore + 'static>(engine: &Engine, data: T) -> Store<T> {
+    let mut store = Store::new(engine, data);
+    store.set_hostcall_fuel(HOSTCALL_FUEL);
+    store.limiter(|data| data.limits());
+    store
+}
+
 /// The per-call limits of `execute`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionLimits {
@@ -263,14 +301,13 @@ async fn one_call(
     if cancel.is_cancelled() {
         return Err(ModuleFailure::Cancelled);
     }
-    let mut store = Store::new(&setup.engine, CallState::new(cancel, &setup.services));
+    let mut store = module_store(&setup.engine, CallState::new(cancel, &setup.services));
     store
         .set_fuel(setup.limits.fuel)
         .map_err(|error| failure(&error))?;
     store
         .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
         .map_err(|error| failure(&error))?;
-    store.set_hostcall_fuel(HOSTCALL_FUEL);
     // Called at every epoch tick while guest code runs, and at once after a cancellation
     // interrupts the engine's epoch.
     let clock = setup.epochs.subscribe();
@@ -355,6 +392,20 @@ fn failure(error: &wasmtime::Error) -> ModuleFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_store_constructor_enforces_linear_memory_limit() {
+        let engine = Engine::default();
+        let data = BareStore {
+            limits: wasmtime::StoreLimitsBuilder::new()
+                .memory_size(65536)
+                .build(),
+        };
+        let mut store = module_store(&engine, data);
+        let memory = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, None))
+            .expect("one page fits");
+        assert!(memory.grow(&mut store, 1).is_err());
+    }
 
     #[test]
     fn stops_and_traps_map_to_the_closed_failures() {

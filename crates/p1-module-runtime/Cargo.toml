@@ -35,7 +35,7 @@ thiserror = "2"
 nix = { version = "0.29", default-features = false, features = ["signal"] }
 tempfile = "3"
 # The executor task, its request channel and the per-call tasks it owns.
-tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "process", "io-util", "time"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "process", "io-util", "time", "test-util"] }
 # The bounded set of ORCHESTRATION-PLAN §2 (owner, Q7). No `cache`: the loader compiles the
 # verified bytes itself, so a compiled-code cache would be a second, unverified source of
 # code. No `wat` or WASI: modules arrive as binary components and get only p1's own imports.

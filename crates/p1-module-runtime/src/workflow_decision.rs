@@ -39,8 +39,8 @@ use p1_contracts::serde_json;
 use p1_workflow::Decisions;
 use p1_workflow::decision::{AttemptOutcome, PlanRequest, Snapshot, Transition};
 use thiserror::Error;
+use wasmtime::Engine;
 use wasmtime::component::{Func, InstancePre, Linker, Val};
-use wasmtime::{Engine, Store};
 
 use crate::executor::ExecutionLimits;
 use crate::loader::{EPOCH_TICK, Epochs, LoadedModule, ModuleKind, interface_import};
@@ -83,6 +83,13 @@ pub enum WorkflowDecisionError {
 /// `clock` documents.
 struct CallData {
     origin: Instant,
+    limits: wasmtime::StoreLimits,
+}
+
+impl crate::executor::LimitedStore for CallData {
+    fn limits(&mut self) -> &mut wasmtime::StoreLimits {
+        &mut self.limits
+    }
 }
 
 /// The adapter over one loaded workflow-decision component.
@@ -191,10 +198,11 @@ impl WasmWorkflowDecisions {
     }
 
     fn call(&self, export: &str, first: String, second: String) -> wasmtime::Result<Val> {
-        let mut store = Store::new(
+        let mut store = crate::executor::module_store(
             &self.engine,
             CallData {
                 origin: Instant::now(),
+                limits: crate::executor::store_limits(),
             },
         );
         store.set_fuel(self.fuel)?;
@@ -255,7 +263,8 @@ fn linker(engine: &Engine, granted: &[String]) -> wasmtime::Result<Linker<CallDa
             }
             "clock" => {
                 let mut clock = linker.instance(&interface_import("clock"))?;
-                clock.func_new("now", |_store, _ty, _params, results| {
+                clock.func_new("now", |_store, _ty, params, results| {
+                    crate::capabilities::check_arity("clock.now", params, results, 0, 1)?;
                     // A wall clock before 1970 is a host misconfiguration; zero says
                     // "unknown" without failing the decision.
                     let since = SystemTime::now()

@@ -38,7 +38,7 @@ use tokio::task::JoinHandle;
 use wasmtime::bail;
 use wasmtime::component::{Linker, Val};
 
-use crate::capabilities::{CallState, LinkError, Services, capability_linker};
+use crate::capabilities::{CallState, LinkError, Services, capability_linker, check_arity};
 use crate::executor::{ExecutionLimits, Executor, Prelude};
 use crate::loader::{Epochs, LoadedModule, ModuleKind, interface_import};
 use crate::manifest::Digest;
@@ -345,7 +345,10 @@ fn context_result(value: Option<Val>, export: &str) -> Answer<Val> {
         Some(Val::Result(Err(Some(error)))) => match *error {
             Val::Variant(case, None) if case == "cancelled" => Ok(Err(ContextError::Cancelled)),
             Val::Variant(case, Some(reason)) if case == "failed" => match *reason {
-                Val::String(reason) => Ok(Err(ContextError::Failed(reason))),
+                Val::String(reason) if reason == "full" => Ok(Err(ContextError::Failed(reason))),
+                Val::String(_) => Ok(Err(ContextError::Failed(
+                    "context policy failed".to_owned(),
+                ))),
                 _ => Err(invalid(&format!("{export} failed without a text reason"))),
             },
             _ => Err(invalid(&format!(
@@ -385,7 +388,7 @@ fn compaction_answer(value: Option<Val>) -> Answer<Compaction> {
                     ("prepared", value) => prepared = Some(prepared_of(value)?),
                     ("tokens-before", Val::U64(tokens)) => tokens_before = Some(tokens),
                     ("tokens-after", Val::U64(tokens)) => tokens_after = Some(tokens),
-                    _ => return Err(invalid(&format!("compact-now: unexpected field {name}"))),
+                    _ => return Err(invalid("compact-now: unexpected field")),
                 }
             }
             match (prepared, tokens_before, tokens_after) {
@@ -420,9 +423,7 @@ fn prepared_of(value: Val) -> Result<Prepared, ModuleFailure> {
                     .map(|(index, item)| match item {
                         Val::String(text) => serde_json::from_str::<WireItem>(&text)
                             .map(Item::from)
-                            .map_err(|error| {
-                                invalid(&format!("replacement item {index}: {error}"))
-                            }),
+                            .map_err(|_| invalid(&format!("replacement item {index} is invalid"))),
                         _ => Err(invalid(&format!("replacement item {index} is not text"))),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -434,12 +435,12 @@ fn prepared_of(value: Val) -> Result<Prepared, ModuleFailure> {
                     Some(Val::String(text)) => Some(
                         serde_json::from_str::<WireUsage>(&text)
                             .map(Usage::from)
-                            .map_err(|error| invalid(&format!("the usage: {error}")))?,
+                            .map_err(|_| invalid("the usage is invalid"))?,
                     ),
                     Some(_) => return Err(invalid("the usage is not text")),
                 });
             }
-            _ => return Err(invalid(&format!("prepared: unexpected field {name}"))),
+            _ => return Err(invalid("prepared: unexpected field")),
         }
     }
     match (items, usage) {
@@ -454,6 +455,7 @@ pub(crate) fn link_summary(linker: &mut Linker<CallState>) -> wasmtime::Result<(
     let mut summary = linker.instance(&interface_import("summary"))?;
     summary.func_new_async("summarize", |store, _ty, params, results| {
         Box::new(async move {
+            check_arity("summary.summarize", params, results, 1, 1)?;
             let request = summary_request(&params[0])?;
             let Some(service) = store.data().summary.clone() else {
                 bail!("summary.summarize called without a summary service");
@@ -674,6 +676,31 @@ mod tests {
                 .expect("prepare runs");
             assert!(prepared.is_none());
         }
+    }
+
+    #[test]
+    fn context_allocation_matches_frozen_completion_row() {
+        assert_eq!(
+            CONTEXT_POLICY_ALLOCATION,
+            ["control", "clock", "notices", "summary", "completion"]
+        );
+    }
+
+    #[test]
+    fn guest_failure_reason_is_not_echoed_to_diagnostics() {
+        let result = context_result(
+            Some(Val::Result(Err(Some(Box::new(Val::Variant(
+                "failed".to_owned(),
+                Some(Box::new(Val::String("guest-owned data".to_owned()))),
+            )))))),
+            "prepare",
+        );
+        assert_eq!(
+            result,
+            Ok(Err(ContextError::Failed(
+                "context policy failed".to_owned()
+            )))
+        );
     }
 
     #[tokio::test]
