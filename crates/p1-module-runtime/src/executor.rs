@@ -76,21 +76,100 @@ pub const MAX_TRANSFER_BYTES: usize = 16 << 20;
 /// it still bounds what one import call can make the host allocate.
 pub const HOSTCALL_FUEL: usize = MAX_TRANSFER_BYTES * size_of::<Val>() + (128 << 20);
 
-/// Limit dynamic lifting and guest linear memory at every Store construction site.
+/// Limit dynamic lifting and guest linear memory at every Store construction site: the
+/// per-memory ceiling below, and the ceiling on what all of a Store's memories total.
 pub(crate) const MAX_GUEST_MEMORY: usize = 256 << 20;
 
-pub(crate) fn store_limits() -> wasmtime::StoreLimits {
-    wasmtime::StoreLimitsBuilder::new()
-        .memory_size(MAX_GUEST_MEMORY)
-        .build()
+/// The Store limits of one module call: the [`wasmtime::StoreLimits`] defaults for
+/// instances, tables and memory count, a per-memory ceiling of `limit`, and the same ceiling
+/// on the total of every linear memory in the Store.
+///
+/// [`wasmtime::StoreLimitsBuilder::memory_size`] bounds each memory on its own, so a
+/// component with several core instances could spend the ceiling once per memory. This
+/// limiter keeps the running total, so a Store's guest memory never exceeds `limit` however
+/// many memories hold it.
+pub(crate) struct MemoryLimiter {
+    inner: wasmtime::StoreLimits,
+    /// The ceiling on each memory and on the total.
+    limit: usize,
+    /// The total bytes this Store's linear memories hold. A growth the inner limiter
+    /// permitted but the allocator then failed stays counted, so the bound is only ever seen
+    /// as stricter, never looser.
+    total: usize,
+}
+
+impl MemoryLimiter {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            inner: wasmtime::StoreLimitsBuilder::new()
+                .memory_size(limit)
+                .build(),
+            limit,
+            total: 0,
+        }
+    }
+}
+
+impl wasmtime::ResourceLimiter for MemoryLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        // `total` already counts `current`: what the whole Store holds after this growth.
+        let aggregated = self.total.saturating_sub(current).saturating_add(desired);
+        if aggregated > self.limit {
+            return Ok(false);
+        }
+        if wasmtime::ResourceLimiter::memory_growing(&mut self.inner, current, desired, maximum)? {
+            self.total = aggregated;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        wasmtime::ResourceLimiter::memory_grow_failed(&mut self.inner, error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        wasmtime::ResourceLimiter::table_growing(&mut self.inner, current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        wasmtime::ResourceLimiter::table_grow_failed(&mut self.inner, error)
+    }
+
+    fn instances(&self) -> usize {
+        wasmtime::ResourceLimiter::instances(&self.inner)
+    }
+
+    fn tables(&self) -> usize {
+        wasmtime::ResourceLimiter::tables(&self.inner)
+    }
+
+    fn memories(&self) -> usize {
+        wasmtime::ResourceLimiter::memories(&self.inner)
+    }
+}
+
+pub(crate) fn store_limits() -> MemoryLimiter {
+    MemoryLimiter::new(MAX_GUEST_MEMORY)
 }
 
 pub(crate) trait LimitedStore {
-    fn limits(&mut self) -> &mut wasmtime::StoreLimits;
+    fn limits(&mut self) -> &mut MemoryLimiter;
 }
 
 pub(crate) struct BareStore {
-    limits: wasmtime::StoreLimits,
+    limits: MemoryLimiter,
 }
 
 impl Default for BareStore {
@@ -102,7 +181,7 @@ impl Default for BareStore {
 }
 
 impl LimitedStore for BareStore {
-    fn limits(&mut self) -> &mut wasmtime::StoreLimits {
+    fn limits(&mut self) -> &mut MemoryLimiter {
         &mut self.limits
     }
 }
@@ -397,14 +476,30 @@ mod tests {
     fn shared_store_constructor_enforces_linear_memory_limit() {
         let engine = Engine::default();
         let data = BareStore {
-            limits: wasmtime::StoreLimitsBuilder::new()
-                .memory_size(65536)
-                .build(),
+            limits: MemoryLimiter::new(65536),
         };
         let mut store = module_store(&engine, data);
         let memory = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, None))
             .expect("one page fits");
         assert!(memory.grow(&mut store, 1).is_err());
+    }
+
+    #[test]
+    fn shared_store_constructor_bounds_total_memory_across_memories() {
+        let engine = Engine::default();
+        let data = BareStore {
+            limits: MemoryLimiter::new(100_000),
+        };
+        let mut store = module_store(&engine, data);
+        // One 64 KiB memory is inside the ceiling; a second is not, though each memory on
+        // its own would pass the per-memory bound (the pre-fix behaviour). The first handle
+        // stays alive so the refusal is the total, not a freed slot.
+        let _first = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, None))
+            .expect("the first memory fits");
+        assert!(
+            wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, None)).is_err(),
+            "a second memory passed the Store's total limit"
+        );
     }
 
     #[test]

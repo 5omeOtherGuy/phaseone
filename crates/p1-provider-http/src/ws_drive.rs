@@ -146,6 +146,14 @@ fn cancelled_lease_stream() -> ProviderStream {
     }))
 }
 
+/// The stream of a request cancelled before it lowered anything: exactly one terminal
+/// `Cancelled`, which the `Provider::stream` contract requires of a cancelling token.
+pub fn cancelled_stream() -> ProviderStream {
+    Box::pin(futures_util::stream::once(async {
+        StreamEvent::Finished(Outcome::Cancelled)
+    }))
+}
+
 /// Drive one request over WebSocket, falling back to HTTP when the component chooses it.
 /// The stream obeys the five stream rules of `p1-contracts/src/provider.rs`.
 pub fn ws_drive(request: WsDriveRequest) -> ProviderStream {

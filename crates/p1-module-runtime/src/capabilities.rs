@@ -427,7 +427,7 @@ impl RunningProcess for CancelledStart {
 
 /// The state of one per-call Store: everything the linked capabilities read.
 pub(crate) struct CallState {
-    pub(crate) limits: wasmtime::StoreLimits,
+    pub(crate) limits: crate::executor::MemoryLimiter,
     pub(crate) cancel: CancellationToken,
     pub(crate) table: ResourceTable,
     process: Option<Arc<dyn ProcessService>>,
@@ -468,7 +468,7 @@ impl CallState {
 }
 
 impl crate::executor::LimitedStore for CallState {
-    fn limits(&mut self) -> &mut wasmtime::StoreLimits {
+    fn limits(&mut self) -> &mut crate::executor::MemoryLimiter {
         &mut self.limits
     }
 }

@@ -83,11 +83,11 @@ pub enum WorkflowDecisionError {
 /// `clock` documents.
 struct CallData {
     origin: Instant,
-    limits: wasmtime::StoreLimits,
+    limits: crate::executor::MemoryLimiter,
 }
 
 impl crate::executor::LimitedStore for CallData {
-    fn limits(&mut self) -> &mut wasmtime::StoreLimits {
+    fn limits(&mut self) -> &mut crate::executor::MemoryLimiter {
         &mut self.limits
     }
 }

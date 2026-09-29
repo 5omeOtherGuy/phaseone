@@ -67,7 +67,7 @@ use p1_provider_http::ws_session::{Clock, ConnectionState, WsHead, WsLease, WsSe
 use p1_provider_http::{
     CredentialScheme, CredentialSource, CredentialUse, LoweredHttpRequest, ResponseParser,
     RetryPolicy, RouteAuthority, SseEvent, Transport, WsDriveRequest, WsLowered, broker_drive,
-    ws_drive, ws_lease,
+    cancelled_stream, ws_drive, ws_lease,
 };
 use thiserror::Error;
 use wasmtime::component::{
@@ -422,6 +422,13 @@ impl Provider for WasmProvider {
                 .await
             {
                 Ok(lowered) => lowered,
+                // A token that fired before `Prepare` answered is the contract's own
+                // ending: the caller gets a stream that settles as cancelled, not a setup
+                // error. Nothing was lowered and no connection was opened, so the lease is
+                // released by returning.
+                Err(Refusal::Failed(ModuleFailure::Cancelled)) => {
+                    return Ok(cancelled_stream());
+                }
                 Err(refusal) => {
                     // A failed call poisoned the instance; the next request rebuilds it and
                     // must not reuse a connection opened for this one (ADR-0078 §3).
@@ -672,9 +679,11 @@ impl ExecutorHandle {
 ///
 /// A blocked wait is invisible to the runtime, so a paused test clock would otherwise
 /// auto-advance an enclosing `timeout` to its deadline before the external reply lands. Tokio
-/// suspends that auto-advance only while a blocking task runs, so a guard task is kept alive
-/// for the duration of the wait; dropping `stop` ends it as soon as the wait does, whether on
-/// the reply, on cancellation or on the executor's death.
+/// suspends that auto-advance only while a blocking task is outstanding, so a guard task is
+/// spawned for the duration of the wait. It is detached, never awaited: its completion does
+/// not depend on a blocking thread being free, so a saturated blocking pool cannot stall
+/// provider setup. Dropping `stop` ends it as soon as the wait does, whether on the reply, on
+/// cancellation or on the executor's death.
 async fn await_reply<T, F>(reply: F, cancel: &CancellationToken) -> Result<T, Refusal>
 where
     F: std::future::Future<
@@ -683,7 +692,7 @@ where
 {
     tokio::pin!(reply);
     let (stop, inhibited) = tokio::sync::oneshot::channel::<()>();
-    let guard = tokio::task::spawn_blocking(move || {
+    let _guard = tokio::task::spawn_blocking(move || {
         let _ = inhibited.blocking_recv();
     });
     let result = tokio::select! {
@@ -695,7 +704,6 @@ where
         },
     };
     drop(stop);
-    let _ = guard.await;
     result
 }
 
@@ -1592,6 +1600,40 @@ mod tests {
         );
         reply.send(Ok(42)).unwrap();
         assert!(matches!(waiter.await.unwrap(), Ok(42)));
+    }
+
+    /// A reply that is ready at once must return even while the blocking pool's only thread
+    /// is busy: the paused-clock guard is detached, not awaited, so a saturated pool cannot
+    /// stall provider setup.
+    #[test]
+    fn a_provider_reply_does_not_wait_for_the_blocking_guard() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .expect("a runtime");
+        let (started, started_at) = std::sync::mpsc::channel();
+        let (release, release_from) = std::sync::mpsc::channel::<()>();
+        runtime.block_on(async {
+            // Hold the blocking pool's one thread, and do not proceed until it is held.
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = release_from.recv();
+            });
+            started_at.recv().expect("the blocker started");
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            reply.send(Ok::<u8, Refusal>(7)).expect("the reply");
+            let cancel = CancellationToken::new();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                await_reply(answer, &cancel),
+            )
+            .await
+            .expect("await_reply waited for the queued blocking guard");
+            assert!(matches!(result, Ok(7)));
+            let _ = release.send(());
+            let _ = blocker.await;
+        });
     }
 
     #[test]
