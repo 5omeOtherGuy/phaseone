@@ -309,6 +309,21 @@ impl ProtectedIndex {
             && self.protected_exact_paths == policy.exact_paths
     }
 
+    /// Keep refusing the protected identities an earlier index of the same policy captured.
+    /// A rebuild replaces an index that can no longer prove the tree unchanged, but a
+    /// credential linked onto an ordinary path whose protected name was then removed exists
+    /// only in the earlier index; dropping it would let the alias read or mutate its bytes.
+    pub fn retain_identities_of(&mut self, earlier: &ProtectedIndex) {
+        #[cfg(unix)]
+        if earlier.protected_directories == self.protected_directories
+            && earlier.protected_exact_paths == self.protected_exact_paths
+        {
+            self.files.extend(earlier.files.iter().copied());
+        }
+        #[cfg(not(unix))]
+        let _ = earlier;
+    }
+
     /// A cached directory index is safe to reuse only while every traversed directory is
     /// unchanged *and* settled: a stamp whose mtime or ctime sits inside
     /// `DIRECTORY_STAMP_SAFETY_MARGIN` of the recorded read time cannot prove a same-tick
@@ -914,6 +929,26 @@ mod tests {
         let settled =
             ProtectedIndex::build_with_clock(&policy, &cancel, move || settled_at).unwrap();
         assert!(settled.still_current(&cancel).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rebuild_keeps_refusing_a_credential_whose_protected_name_was_removed() {
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join(".config/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("secret.key"), "marker").unwrap();
+        let policy = CredentialPolicy::new(Some(home.path()), &[]);
+        let cancel = CancellationToken::new();
+        let earlier = ProtectedIndex::build(&policy, &cancel).unwrap();
+        let alias = home.path().join("alias.txt");
+        std::fs::hard_link(keys.join("secret.key"), &alias).unwrap();
+        std::fs::remove_file(keys.join("secret.key")).unwrap();
+        let mut rebuilt = ProtectedIndex::build(&policy, &cancel).unwrap();
+        // The alias is now a single-link ordinary file the fresh walk never sees.
+        assert!(!rebuilt.refuses_path(&alias));
+        rebuilt.retain_identities_of(&earlier);
+        assert!(rebuilt.refuses_path(&alias));
     }
 
     #[test]

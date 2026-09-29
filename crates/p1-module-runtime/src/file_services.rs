@@ -540,10 +540,14 @@ fn cached_index_with_clock(
             return Ok(index.clone());
         }
     }
-    let index = Arc::new(
-        ProtectedIndex::build_with_clock(policy, cancel, now)
-            .map_err(|IndexCancelled| FsError::Cancelled)?,
-    );
+    let mut rebuilt = ProtectedIndex::build_with_clock(policy, cancel, now)
+        .map_err(|IndexCancelled| FsError::Cancelled)?;
+    // A request that captured the replaced index may still open through an alias of a
+    // credential whose protected name is gone by now; the rebuilt index must refuse it too.
+    if let Some(earlier) = guard.as_ref() {
+        rebuilt.retain_identities_of(earlier);
+    }
+    let index = Arc::new(rebuilt);
     *guard = Some(index.clone());
     Ok(index)
 }
