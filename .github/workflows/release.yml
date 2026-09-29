@@ -32,7 +32,11 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # An exact toolchain, never the rolling `stable`: scripts/release-manifest.py embeds
+      # the rustc/cargo versions in p1-share.tar.gz, so a rerun of a complete release after
+      # stable advances would otherwise rebuild different bytes and fail the byte-identical
+      # comparison in "Publish the release" instead of being the documented no-op.
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           # The guest target the module build compiles for (WASM_TARGET in
           # modules/toolchain.pins: D-XO-4 on S0-Q9, wasm32-unknown-unknown componentized
@@ -118,7 +122,18 @@ jobs:
               grep -Fxq "$asset" <<<"$assets" || complete=0
             done
             if [ "$complete" -eq 1 ]; then
-              echo "release $tag is complete — nothing to publish"
+              compare="$(mktemp -d)"
+              trap 'rm -rf -- "$compare"' EXIT
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$compare" \
+                --pattern 'p1-linux-x86_64*' --pattern 'p1-share.tar.gz*'
+              for asset in "${required[@]}"; do
+                [ -f "$compare/$asset" ] || { echo "missing published $asset" >&2; exit 1; }
+                cmp -s "dist/$asset" "$compare/$asset" || {
+                  echo "published $asset differs from staged build; refusing no-op" >&2
+                  exit 1
+                }
+              done
+              echo "release $tag is complete and byte-identical — nothing to publish"
               exit 0
             fi
             # Repair a partial publication. --clobber also repairs an asset left from an

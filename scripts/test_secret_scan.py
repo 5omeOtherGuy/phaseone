@@ -11,6 +11,7 @@ scripts/secret-scan.sh with that repo as the current working directory.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -58,6 +59,113 @@ class SecretScanTest(unittest.TestCase):
         self.assertIn("leaked.txt:1", done.stdout)
         self.assertNotIn(key, done.stdout)
         self.assertNotIn(key, done.stderr)
+
+    def test_failed_git_enumeration_is_not_clean(self) -> None:
+        repo = self.make_repo('clean.txt', 'ordinary text')
+        tools = os.path.join(self.dir, 'git-failure')
+        os.mkdir(tools)
+        stub = os.path.join(tools, 'git')
+        with open(stub, 'w', encoding='utf-8') as output:
+            output.write('#!/bin/sh\nexit 9\n')
+        os.chmod(stub, 0o755)
+        done = subprocess.run([BASH, SECRET_SCAN], cwd=repo,
+                              env=dict(os.environ, PATH=tools + ':' + os.environ['PATH']),
+                              capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn('secret-scan: clean', done.stdout)
+
+    def test_grep_failure_is_not_a_clean_scan(self) -> None:
+        repo = self.make_repo('clean.txt', 'ordinary text')
+        tools = os.path.join(self.dir, 'bin')
+        os.mkdir(tools)
+        grep = os.path.join(tools, 'grep')
+        with open(grep, 'w', encoding='utf-8') as output:
+            output.write('#!/bin/sh\nexit 2\n')
+        os.chmod(grep, 0o755)
+        done = subprocess.run([BASH, SECRET_SCAN], cwd=repo,
+                              env=dict(os.environ, PATH=tools + ':' + os.environ['PATH']),
+                              capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn('clean', done.stdout)
+
+    def test_tracked_symlink_refused_without_reading_outside_checkout(self) -> None:
+        repo = self.make_repo('clean.txt', 'normal\n')
+        outside = os.path.join(self.dir, 'outside')
+        with open(outside, 'w', encoding='utf-8') as handle:
+            handle.write('outside sentinel')
+        os.symlink(outside, os.path.join(repo, 'link'))
+        subprocess.run(['git', 'add', 'link'], cwd=repo, check=True, capture_output=True)
+        done = self.scan(repo)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn('outside sentinel', done.stdout + done.stderr)
+
+    def test_tracked_binary_refused_without_printing_contents(self) -> None:
+        repo = self.make_repo('binary', 'normal\n')
+        with open(os.path.join(repo, 'binary'), 'wb') as handle:
+            handle.write(b'fixture\\x00value'.replace(b'\\x00', b'\x00'))
+        done = self.scan(repo)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn('fixture', done.stdout + done.stderr)
+
+    def test_binary_checks_use_one_interpreter_for_the_whole_tree(self) -> None:
+        # The NUL-byte check must not start an interpreter per tracked file.
+        repo = tempfile.mkdtemp(prefix='repo-', dir=self.dir)
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', HOME=repo)
+
+        def run(*args: str) -> None:
+            subprocess.run(
+                ['git', '-c', 'user.email=t@example.com', '-c', 'user.name=t',
+                 '-c', 'commit.gpgsign=false', *args],
+                cwd=repo, env=env, check=True, capture_output=True, text=True)
+
+        run('init', '-q')
+        for index in range(5):
+            name = f'clean{index}.txt'
+            with open(os.path.join(repo, name), 'w', encoding='utf-8') as handle:
+                handle.write('ordinary text')
+            run('add', name)
+        run('commit', '-q', '-m', 'fixture')
+        tools = os.path.join(self.dir, 'tools')
+        os.mkdir(tools)
+        counter = os.path.join(self.dir, 'python-calls')
+        real = shutil.which('python3') or '/usr/bin/python3'
+        wrapper = os.path.join(tools, 'python3')
+        newline = chr(10)
+        with open(wrapper, 'w', encoding='utf-8') as output:
+            output.write('#!/bin/sh' + newline)
+            output.write('echo call >> "$PYTHON_CALLS"' + newline)
+            output.write(f'exec {shlex.quote(real)} "$@"' + newline)
+        os.chmod(wrapper, 0o755)
+        done = subprocess.run([BASH, SECRET_SCAN], cwd=repo,
+                              env=dict(os.environ, PATH=tools + ':' + os.environ['PATH'],
+                                       PYTHON_CALLS=counter),
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        with open(counter, encoding='utf-8') as handle:
+            self.assertEqual(handle.read().count('call'), 1)
+
+    def test_credential_shaped_rejected_path_is_redacted(self) -> None:
+        # A refused symlink named with a token must not write the token to the gate log
+        # (Codex finding secret-scan.sh:25).
+        key = "sk-" + "a" * 24
+        repo = self.make_repo("clean.txt", "normal\n")
+        outside = os.path.join(self.dir, "outside")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("outside sentinel")
+        os.symlink(outside, os.path.join(repo, key))
+        subprocess.run(["git", "add", key], cwd=repo, check=True, capture_output=True)
+        done = self.scan(repo)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn(key, done.stdout + done.stderr)
+        self.assertIn("[redacted]", done.stderr)
+
+    def test_credential_shaped_match_path_is_redacted(self) -> None:
+        key = "sk-" + "b" * 24
+        repo = self.make_repo(key, key + "\n")
+        done = self.scan(repo)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn(key, done.stdout + done.stderr)
+        self.assertIn("[redacted]", done.stdout)
 
     def test_a_clean_tree_passes(self) -> None:
         clean = "a" * 24

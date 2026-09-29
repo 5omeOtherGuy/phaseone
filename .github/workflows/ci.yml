@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
@@ -62,10 +62,18 @@ jobs:
             cargo-${{ runner.os }}-checks-
             cargo-${{ runner.os }}-
 
+      - name: Provision sandbox
+        run: bash scripts/ci-bwrap.sh
       - name: scripts/gate.sh (workspace tests handed to the test jobs)
         run: |
+          set -o pipefail
           export PATH="$PWD/.github/ci:$PATH"
-          scripts/gate.sh
+          scripts/gate.sh 2>&1 | tee /tmp/p1-gate-checks.log
+          # gate.sh prints this message itself, so it is observable even though libtest
+          # captures a passing suite's stderr and the marker stays hidden; the ci-bwrap probe
+          # can pass while the gate probe fails.
+          ! grep -F 'bubblewrap: unusable on this CI runner' /tmp/p1-gate-checks.log
+          ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-gate-checks.log
 
       - name: Save the cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
@@ -85,7 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
@@ -121,8 +129,13 @@ jobs:
         run: |
           cargo build --locked -p p1-host --bin p1
           echo "P1_BIN=$(cargo metadata --no-deps --format-version 1 --locked | jq -r .target_directory)/debug/p1" >> "$GITHUB_ENV"
+      - name: Provision sandbox
+        run: bash scripts/ci-bwrap.sh
       - name: cargo test -p p1-module-tests (its heaviest test binaries)
-        run: timeout --foreground 3600 cargo test --locked -p p1-module-tests --test installed_release --test provider_conformance
+        run: |
+          set -o pipefail
+          timeout --foreground 3600 cargo test --locked -p p1-module-tests --test installed_release --test provider_conformance -- --nocapture 2>&1 | tee /tmp/p1-installed-release-test.log
+          ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-installed-release-test.log
 
       - name: Save the cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
@@ -142,7 +155,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
@@ -182,9 +195,13 @@ jobs:
         run: |
           cargo build --locked -p p1-host --bin p1
           echo "P1_BIN=$(cargo metadata --no-deps --format-version 1 --locked | jq -r .target_directory)/debug/p1" >> "$GITHUB_ENV"
+      - name: Provision sandbox
+        run: bash scripts/ci-bwrap.sh
       - name: cargo test -p p1-module-tests (every other target)
         shell: bash
         run: |
+          set -o pipefail
+          : > /tmp/p1-modules-b.log
           heavy="installed_release provider_conformance"
           targets=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "p1-module-tests") | .targets[] | select(.kind | index("test")) | .name')
           # test-modules-a names these two; a rename must fail here, never drop a binary.
@@ -195,8 +212,13 @@ jobs:
           done
           [ "${#args[@]}" -gt 0 ] || { echo "no other test targets found" >&2; exit 1; }
           echo "test targets: ${args[*]}"
-          timeout --foreground 3600 cargo test --locked -p p1-module-tests --lib --bins "${args[@]}"
+          timeout --foreground 3600 cargo test --locked -p p1-module-tests --lib --bins "${args[@]}" -- --nocapture 2>&1 | tee -a /tmp/p1-modules-b.log
+          examples=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "p1-module-tests") | .targets[] | select(.kind | index("example")) | .name')
+          for example in $examples; do
+            timeout --foreground 3600 cargo test --locked -p p1-module-tests --example "$example" -- --nocapture 2>&1 | tee -a /tmp/p1-modules-b.log
+          done
           timeout --foreground 3600 cargo test --locked -p p1-module-tests --doc
+          ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-modules-b.log
 
       - name: Save the cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
@@ -216,7 +238,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
@@ -247,8 +269,13 @@ jobs:
 
       - name: Build the modules the tests load (scripts/gate.sh's modules step)
         run: scripts/build-modules.sh --all
+      - name: Provision sandbox
+        run: bash scripts/ci-bwrap.sh
       - name: cargo test --workspace --exclude p1-module-tests
-        run: timeout --foreground 3600 cargo test --workspace --locked --exclude p1-module-tests
+        run: |
+          set -o pipefail
+          timeout --foreground 3600 cargo test --workspace --locked --exclude p1-module-tests -- --nocapture 2>&1 | tee /tmp/p1-workspace-test.log
+          ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-workspace-test.log
 
       - name: Save the cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'

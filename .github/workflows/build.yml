@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
@@ -77,12 +77,23 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
+      - name: Provision sandbox
+        # gate.sh permits unusable bubblewrap on CI (ADR-0077) and its boundary suites then
+        # skip, so a green build must not be accepted while they skipped. Install bubblewrap
+        # and reject the skip marker, exactly as the ci.yml jobs do (#381).
+        run: bash scripts/ci-bwrap.sh
+
       - name: Gate
         id: gate
         run: |
           echo "gate_start=$(date +%s)" >> "$GITHUB_ENV"
           set -o pipefail
           scripts/gate.sh 2>&1 | tee gate.log
+          # gate.sh prints this message itself, so it reaches the log even though libtest
+          # captures a passing suite's stderr; the CI provision probe is weaker than the
+          # gate probe, so a green build must fail here when the gate skipped the suites.
+          ! grep -F 'bubblewrap: unusable on this CI runner' gate.log
+          ! grep -F 'SKIP: bwrap unusable here' gate.log
 
       - name: Build p1 (debug, as deployed)
         id: build

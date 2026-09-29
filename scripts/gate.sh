@@ -190,11 +190,16 @@ python3 scripts/test_bench_modules.py -q
 python3 scripts/test_build_modules.py -q
 python3 scripts/test_check_module_boundaries.py -q
 python3 scripts/test_ci_build.py -q
+python3 scripts/test_ci_bwrap.py -q
+python3 scripts/test_dogfood_privacy.py -q
 python3 scripts/test_fanout.py -q
 python3 scripts/test_gate.py -q
 python3 scripts/test_install.py -q
 python3 scripts/test_local_cargo_config.py -q
+python3 scripts/test_module_toolchain_hash.py -q
+python3 scripts/test_push_main.py -q
 python3 scripts/test_release_manifest.py -q
+python3 scripts/test_release_publication.py -q
 python3 scripts/test_run_report.py -q
 python3 scripts/test_rustc_serial.py -q
 python3 scripts/test_secret_scan.py -q
@@ -212,10 +217,23 @@ echo "== gate: release candidate"
 cargo build --locked -p p1-host --bin p1
 commit="$(git rev-parse HEAD)"
 short="${commit:0:12}"
-# No --tag: the manifest names the commit and a null tag, so this is a candidate.
-# stage-release.sh stages in a temporary directory and moves it into place, so a
-# stale p1-candidate from an earlier run is replaced, never merged into.
-scripts/stage-release.sh --native "$target_dir/debug/p1" --out "$target_dir/p1-candidate" --commit "$commit"
+# This one path is gate-owned scratch, unlike arbitrary stage-release --out values.
+# CI caches may restore a pre-ownership-record candidate; clear it explicitly rather
+# than weakening stage-release's refusal of unowned directories.
+case "$target_dir" in
+  /*) [ "$target_dir" != / ] || { echo "release candidate: unsafe target root" >&2; exit 1; } ;;
+  *) echo "release candidate: expected an absolute cargo target directory" >&2; exit 1 ;;
+esac
+candidate="$target_dir/p1-candidate"
+if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+  [ -d "$candidate" ] && [ ! -L "$candidate" ] || {
+    echo "release candidate: refusing a non-directory or symlink at $candidate" >&2
+    exit 1
+  }
+  rm -rf -- "${candidate:?}"
+fi
+# No --tag: the manifest names the commit and a null tag.
+scripts/stage-release.sh --native "$target_dir/debug/p1" --out "$candidate" --commit "$commit"
 
 echo "== gate: release smoke"
 # The four staged assets are served over file:// as download/candidate-<12 hex>/,
@@ -230,7 +248,7 @@ smoke_farm="$smoke_root/bin"
 mkdir -p -- "$smoke_farm" "$smoke_root/home" "$smoke_root/config" "$smoke_root/tmp"
 # Only the tools scripts/install.sh runs reach the installer, so its PATH cannot
 # carry gh and the public file:// path is the one the smoke test exercises.
-for tool in bash mktemp sha256sum cut awk basename dirname cp mv mkdir rm chmod cat tar python3 curl; do
+for tool in bash mktemp sha256sum cut awk basename dirname cp mv mkdir rm chmod cat tar python3 curl stat flock; do
   tool_path="$(command -v "$tool" 2>/dev/null || true)"
   if [ -z "$tool_path" ]; then
     echo "release smoke: $tool is not on PATH" >&2

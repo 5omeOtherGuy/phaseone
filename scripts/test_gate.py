@@ -158,11 +158,16 @@ PY_TESTS = [
     "test_build_modules.py",
     "test_check_module_boundaries.py",
     "test_ci_build.py",
+    "test_ci_bwrap.py",
+    "test_dogfood_privacy.py",
     "test_fanout.py",
     "test_gate.py",
     "test_install.py",
     "test_local_cargo_config.py",
+    "test_module_toolchain_hash.py",
+    "test_push_main.py",
     "test_release_manifest.py",
+    "test_release_publication.py",
     "test_run_report.py",
     "test_rustc_serial.py",
     "test_secret_scan.py",
@@ -477,6 +482,16 @@ class GateTests(unittest.TestCase):
         self.assertLess(steps.index("module validation"), steps.index("tests"))
         self.assertLess(steps.index("import check"), steps.index("tests"))
 
+    def test_new_regression_suite_failure_stops_required_gate(self) -> None:
+        for name in ('test_ci_bwrap.py', 'test_dogfood_privacy.py',
+                     'test_module_toolchain_hash.py', 'test_push_main.py',
+                     'test_release_publication.py'):
+            with self.subTest(name=name):
+                h = self.harness()
+                result = h.run(STUB_FAIL='^' + re.escape(name) + r' -q$')
+                self.assert_red(result)
+                self.assertIn(name + ' -q', '\n'.join(h.calls()))
+
     def test_every_step_failing_stops_the_gate_red(self) -> None:
         names = [name for name, _ in ORDER]
         for index, (name, pattern) in enumerate(ORDER):
@@ -643,6 +658,41 @@ class GateTests(unittest.TestCase):
         install = [call for call in h.calls() if call.startswith("install.sh ")]
         self.assertEqual(len(install), 1, h.calls())
         self.assertIn(f"--from-release candidate-{SHORT_SHA}", install[0])
+
+    def test_cached_candidate_without_owner_record_is_replaced_by_gate(self) -> None:
+        h = self.harness()
+        candidate = h.repo / 'target' / 'p1-candidate'
+        candidate.mkdir(parents=True)
+        for asset in ('p1-linux-x86_64', 'p1-linux-x86_64.sha256',
+                      'p1-share.tar.gz', 'p1-share.tar.gz.sha256'):
+            (candidate / asset).write_text('cached before ownership records')
+        stage = h.repo / 'scripts' / 'stage-release.sh'
+        source = stage.read_text(encoding='utf-8')
+        stage.write_text(source.replace(
+            '#!/usr/bin/env bash\n',
+            '#!/usr/bin/env bash\n'
+            'for arg in "$@"; do\n'
+            '  if [ "$arg" = "' + str(candidate) + '" ] && [ -d "$arg" ]; then\n'
+            '    echo "stage-release: no matching prior stage ownership record" >&2\n'
+            '    exit 85\n'
+            '  fi\n'
+            'done\n', 1), encoding='utf-8')
+        done = h.run()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotEqual((candidate / 'p1-share.tar.gz').read_bytes(),
+                            b'cached before ownership records')
+
+    def test_smoke_installer_path_contains_transaction_commands(self) -> None:
+        h = self.harness()
+        installer = h.repo / 'scripts' / 'install.sh'
+        original = installer.read_text(encoding='utf-8')
+        installer.write_text(original.replace(
+            '#!/usr/bin/env bash\n',
+            '#!/usr/bin/env bash\n'
+            'command -v stat >/dev/null || exit 88\n'
+            'command -v flock >/dev/null || exit 89\n', 1), encoding='utf-8')
+        done = h.run()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     def test_a_stale_candidate_is_replaced(self) -> None:
         h = self.harness()

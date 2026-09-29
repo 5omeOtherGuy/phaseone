@@ -389,12 +389,19 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
 
     packages: list[dict[str, object]] = []
     seen: set[str] = set()
-    for rel, full, size in walk_packages(os.path.join(modules_dir, "packages")):
+    for rel, full, _ in walk_packages(os.path.join(modules_dir, "packages")):
         path = check_relpath(rel, "packages entry")
         if path in seen:
             raise ManifestError(f"{path}: duplicate path under packages/")
         seen.add(path)
-        packages.append({"path": path, "sha256": sha256_file(full), "size": size})
+        # Hash and count from the same descriptor, not separate lstat/open snapshots.
+        digest = hashlib.sha256()
+        size = 0
+        with open(full, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                size += len(chunk)
+                digest.update(chunk)
+        packages.append({"path": path, "sha256": digest.hexdigest(), "size": size})
     packages.sort(key=lambda entry: str(entry["path"]))
 
     components: list[dict[str, object]] = []

@@ -118,6 +118,13 @@ The installer
   your logins and local overrides stay yours, and a prefix whose `bin` or `share` resolves
   into that tree is refused.
 
+The archive rejects duplicate or colliding entries and bounds extracted size and member
+count before extraction. An explicit `main-<sha>` install requires the module manifest's
+tag and commit to match. An already installed module set must pass the runtime's integrity
+check before a matching tag can be treated as a no-op. Installer provenance records
+whether modules were required, independently of the module directory itself; missing
+or unverified provenance forces a reinstall rather than claiming an intact release.
+
 Installing the release already present is a no-op; pass `--force` to reinstall it. An
 explicit `--from-release TAG` may install any published tag, including an older one, so
 a downgrade is allowed. `p1-update` follows the release marked latest.

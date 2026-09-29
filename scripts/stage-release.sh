@@ -111,24 +111,73 @@ done
   fail "--commit $commit: expected 40 lowercase hex characters"
 [ -d "$modules" ] || fail "--modules $modules: not a directory"
 
+[ ! -L "$out" ] || fail "--out is a symlink"
 out="$(realpath -m -- "$out")" || fail "--out $out: cannot be resolved"
 [ "$out" != "/" ] || fail "--out must name a directory, not /"
 out_parent="$(dirname -- "$out")"
-if [ -e "$out" ] && [ ! -d "$out" ]; then
-  fail "--out $out: exists and is not a directory"
+# One --out at a time: the ownership record and the directory swap below form one decision,
+# so two invocations replacing the same --out must not interleave (Codex finding
+# stage-release.sh:286). Hold the lock for the whole run; the EXIT path releases it.
+mkdir -p -- "$out_parent"
+lock_file="$out_parent/.$(basename -- "$out").p1-stage-lock"
+exec 9>"$lock_file"
+flock -x 9
+# Ownership is recorded outside the public four-asset directory so its layout stays fixed.
+owner_record="$out_parent/.$(basename -- "$out").p1-stage-owner"
+# A directory at the record path would silently swallow the record file and leave the
+# published stage unowned, so refuse it before anything is staged.
+[ ! -d "$owner_record" ] || fail "$owner_record: an ownership record cannot be a directory"
+if [ -e "$out" ]; then
+  [ -d "$out" ] && [ ! -L "$out" ] || fail "--out $out: not a regular directory"
+  # Never remove a directory unless its complete asset set identifies an earlier stage.
+  for asset in p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256; do
+    [ -f "$out/$asset" ] && [ ! -L "$out/$asset" ] || fail "--out $out: not a staged release"
+  done
+  [ "$(find "$out" -mindepth 1 -maxdepth 1 | wc -l)" -eq 4 ] ||
+    fail "--out $out: contains unrelated entries"
+  [ -f "$owner_record" ] && [ ! -L "$owner_record" ] &&
+    (cd "$out" && sha256sum -c "$owner_record" >/dev/null 2>&1) ||
+    fail "--out $out: no matching prior stage ownership record"
 fi
 
 # The share tree is assembled in a scratch directory and packed into the staging directory
 # that becomes --out; both are below the caller's filesystem so the final move is a rename.
-mkdir -p -- "$out_parent"
 work="$(mktemp -d "$out_parent/.p1-release.XXXXXX")" ||
   fail "--out $out: cannot create a staging directory beside it"
-share="$(mktemp -d "${TMPDIR:-/tmp}/p1-share.XXXXXX")" ||
-  fail "cannot create a scratch share directory"
+share=""
+backup=""
+published=0
+owner_temp=""
 cleanup() {
-  rm -rf -- "$work" "$share"
+  # Disable errexit: this runs from the EXIT trap, and one failing best-effort step
+  # must not skip the restore below.
+  set +e
+  # Only a directory this process renamed into --out may be removed. A foreign or
+  # concurrent process can create --out at any time (the initial check cannot see it),
+  # and its directory must never be deleted merely because it lacks this run's record
+  # (Codex finding stage-release.sh:152).
+  if [ "$published" -eq 1 ]; then
+    # Until the new ownership record is in place, a stage in --out is not an owned
+    # release: remove our incomplete stage. A stage whose record still verifies is
+    # left exactly as it is.
+    if [ ! -d "$out" ] || [ -L "$out" ] ||
+      ! (cd "$out" 2>/dev/null && sha256sum -c "$owner_record" >/dev/null 2>&1); then
+      rm -rf -- "$out"
+    fi
+  fi
+  # Put a prior complete stage moved aside back once --out is free, so a failure or an
+  # interrupt never loses a valid release to an unfinished replacement.
+  if [ -n "$backup" ] && [ -d "$backup" ] && [ ! -e "$out" ] && [ ! -L "$out" ]; then
+    mv -T -- "$backup" "$out" || echo "stage-release: restore failed: $backup" >&2
+    backup=""
+  fi
+  rm -rf -- "$work"
+  [ -z "$share" ] || rm -rf -- "$share"
+  [ -z "$owner_temp" ] || rm -f -- "$owner_temp"
 }
 trap cleanup EXIT
+share="$(mktemp -d "${TMPDIR:-/tmp}/p1-share.XXXXXX")" ||
+  fail "cannot create a scratch share directory"
 # An interrupt kills the shell without running the EXIT trap, so clean up explicitly.
 trap 'cleanup; exit 130' INT TERM
 
@@ -199,11 +248,51 @@ manifest_args=(--root "$root" --commit "$commit" --native "$work/p1-linux-x86_64
 [ -z "$tag" ] || manifest_args+=(--tag "$tag")
 python3 "$root/scripts/release-manifest.py" "${manifest_args[@]}"
 
-tar -czf "$work/p1-share.tar.gz" -C "$share" environments routes profiles modules
+# Normalize tar headers and gzip metadata: a rerun of one source commit must
+# produce identical bytes before the release workflow compares remote assets.
+tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+  -cf - -C "$share" environments routes profiles modules | gzip -n >"$work/p1-share.tar.gz"
+# Reconcile the packed bytes, not just the source tree read by the manifest generator.
+python3 - "$work/p1-share.tar.gz" <<'PY' || fail "packed package bytes do not match release manifest"
+import hashlib
+import json
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], 'r:gz') as archive:
+    manifest = json.load(archive.extractfile('modules/manifest.json'))
+    for package in manifest['packages']:
+        member = archive.getmember('modules/' + package['path'])
+        digest = hashlib.sha256()
+        size = 0
+        with archive.extractfile(member) as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                size += len(chunk)
+                digest.update(chunk)
+        if size != package['size'] or digest.hexdigest() != package['sha256']:
+            raise SystemExit('package changed between manifest and archive')
+PY
 (cd "$work" && sha256sum p1-linux-x86_64 >p1-linux-x86_64.sha256)
 (cd "$work" && sha256sum p1-share.tar.gz >p1-share.tar.gz.sha256)
 
-# The four assets are complete, so the old --out (if any) is replaced in one step.
-rm -rf -- "$out"
-mv -- "$work" "$out"
+# The ownership record names the four assets; compute it from the staging directory
+# before anything is swapped, so no failure during publication can leave --out without a
+# record that matches it (or clobber the record of a stage that is still in place).
+owner_temp="$(mktemp "$out_parent/.p1-owner.XXXXXX")"
+(cd "$work" && sha256sum p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256) >"$owner_temp"
+
+# Preserve the prior complete stage until the replacement has succeeded.
+if [ -d "$out" ]; then
+  backup="$(mktemp -d "$out_parent/.p1-release-backup.XXXXXX")"
+  rmdir -- "$backup"
+  mv -T -- "$out" "$backup"
+fi
+mv -T -- "$work" "$out"
+published=1
+mv -fT -- "$owner_temp" "$owner_record"
+owner_temp=""
+if [ -n "$backup" ]; then
+  rm -rf -- "$backup" || echo "stage-release: old stage retained at $backup" >&2
+  backup=""
+fi
 echo "stage-release: $out (p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz, p1-share.tar.gz.sha256)"

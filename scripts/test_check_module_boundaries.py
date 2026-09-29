@@ -521,6 +521,14 @@ class ShippingModeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("imports: tool p1-module-demo (p1/demo): p1:module/control@1.0.0", result.stdout)
 
+    def test_extracted_exports_disagree_with_saved_wit(self) -> None:
+        h = self.harness()
+        write_exec(h.bin / 'wasm-tools', WASM_TOOLS_STUB.replace(
+            TOOL_WORLD, TOOL_WORLD.replace('export demo:', 'export forged:')))
+        done = h.run()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn('exports', done.stdout + done.stderr)
+
     def test_a_build_output_without_its_imports_is_a_finding(self) -> None:
         h = self.harness("p1-contracts", "p1-core")
         (h.repo / "modules" / "target" / "p1-modules" / TOOL / f"{TOOL}.imports").unlink()

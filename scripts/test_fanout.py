@@ -392,6 +392,12 @@ class FanoutTest(unittest.TestCase):
     def test_duplicate_labels(self) -> None:
         self.assert_rejected([self.p1_job(), self.p1_job()], "duplicate job labels")
 
+    def test_dependency_cycle_refused_before_launch(self) -> None:
+        jobs = [self.p1_job(), self.p1_job()]
+        jobs[0]['label'], jobs[1]['label'] = 'a', 'b'
+        jobs[0]['after'], jobs[1]['after'] = ['b'], ['a']
+        self.assert_rejected(jobs, 'dependency cycle')
+
     # --- pi-worker is untouched -------------------------------------------
 
     def test_pi_worker_command_is_unchanged(self) -> None:

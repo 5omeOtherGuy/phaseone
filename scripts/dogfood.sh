@@ -7,17 +7,21 @@
 #   is outside it, a clone's is not), so the shell sandbox can confine the agent to it.
 # - The agent runs with --yes inside the workspace sandbox; cargo's registry and the rustc
 #   semaphore directory stay writable so builds work and stay serialized machine-wide.
-# - Afterwards: the session journal, the agent's output, the diff and one evidence record
-#   (scripts/run-report.py) are in ../phaseone-dogfood/<label>.run/. NOTHING is merged and
-#   acceptance is NOT decided here: verify independently, then append the record with
-#   --accepted yes|no to docs/dogfood/runs.jsonl.
+# - Afterwards: the raw session journal, stdout and stderr are retained in the
+#   owner-only run directory (mode 0700, files 0600) so the independent reviewer
+#   required by the project AGENTS.md can inspect them; the task prompt file itself is
+#   never copied there. report.json and review-evidence.json are written alongside.
+#   NOTHING is merged; acceptance is NOT decided here.
 set -euo pipefail
+# Owner-only by default: every file this script creates is 0600 and every directory 0700.
+umask 077
 label=$1 env=$2 repo=$(realpath "$3") task_file=$(realpath "$4") base=${5:-HEAD}
 here=$(cd "$(dirname "$0")/.." && pwd)
 root=$(realpath "$here/..")/phaseone-dogfood
 clone=$root/$label run=$root/$label.run
 [ -e "$clone" ] && { echo "exists: $clone — pick another label or remove it" >&2; exit 2; }
 mkdir -p "$run"
+chmod 0700 "$run"
 git clone -q --local "$repo" "$clone"
 git -C "$clone" checkout -q --detach "$base"
 # A p1 clone builds into its OWN target/ (inside the sandbox's writable area), seeded with
@@ -40,6 +44,8 @@ read_args=()
 if [ "$common" != "$clone" ] && [[ "$common" != "$clone"/* ]]; then
   read_args=(--sandbox-read "$common")
 fi
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/p1-dogfood.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
 start=$(date +%s)
 set +e
 "$p1" --env "$env" --workspace "$clone" --session "$run/session.jsonl" --yes \
@@ -47,11 +53,16 @@ set +e
   --sandbox-write "$locks" "${read_args[@]}" "$(cat "$task_file")" >"$run/stdout.txt" 2>"$run/stderr.txt"
 code=$?
 set -e
+chmod 0600 "$run/session.jsonl" "$run/stdout.txt" "$run/stderr.txt" 2>/dev/null || true
 elapsed=$(( $(date +%s) - start ))
 git -C "$clone" add -A -N . >/dev/null 2>&1 || true
-git -C "$clone" diff >"$run/changes.diff" || true
-cp "$task_file" "$run/task.txt"
+# HEAD, not the index: `git add -A -N .` records deletions in the index, so a plain
+# `git diff` would report an empty numstat for a deletion-only run.
+git -C "$clone" diff HEAD --numstat -z >"$scratch/diff.numstat" || true
 "$here/scripts/run-report.py" "$run/session.jsonl" --label "$label" --elapsed "$elapsed" \
   --exit-code "$code" >"$run/report.json"
+python3 "$here/scripts/dogfood-review.py" "$run/report.json" \
+  "$run/stdout.txt" "$run/stderr.txt" "$run/session.jsonl" \
+  "$scratch/diff.numstat" "$run/review-evidence.json"
 echo "exit=$code elapsed=${elapsed}s clone=$clone run=$run"
-tail -n 3 "$run/stderr.txt" || true
+echo "dogfood: raw journal, stdout and stderr retained (0600) in $run"
