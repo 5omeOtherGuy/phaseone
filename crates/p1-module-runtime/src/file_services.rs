@@ -430,17 +430,17 @@ fn refuses_at_open(
     policy: &CredentialPolicy,
     cancel: &CancellationToken,
     metadata: &std::fs::Metadata,
-) -> bool {
+) -> Result<bool, FsError> {
     #[cfg(unix)]
     let index = if may_alias_a_protected_inode(metadata) {
-        cached_index(cache, policy, cancel)
+        cached_index(cache, policy, cancel)?
     } else {
-        cached_index_reused(cache, policy, cancel)
+        cached_index_reused(cache, policy, cancel)?
     };
     // Without Unix link counts every candidate must revalidate.
     #[cfg(not(unix))]
-    let index = cached_index(cache, policy, cancel);
-    index.map_or(true, |index| index.refuses_current_exact(policy, metadata))
+    let index = cached_index(cache, policy, cancel)?;
+    Ok(index.refuses_current_exact(policy, metadata))
 }
 
 /// Whether `metadata` can share an inode with a protected file: only a multiply-linked file
@@ -479,7 +479,7 @@ impl WorkspaceService for SearchCapability {
                     file_walk::opened_object_path(&file, checked.path()).map_err(|_| refused())?;
                 let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
                 if current.refuses(&opened_path)
-                    || refuses_at_open(&cache, &current, cancel, &metadata)
+                    || refuses_at_open(&cache, &current, cancel, &metadata)?
                 {
                     return Err(refused());
                 }
@@ -532,10 +532,13 @@ impl WorkspaceService for SearchCapability {
                 length,
                 &|candidate, file| {
                     let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-                    current.refuses(candidate)
-                        || file.metadata().map_or(true, |metadata| {
-                            refuses_at_open(&cache, &current, cancel, &metadata)
-                        })
+                    if current.refuses(candidate) {
+                        return Ok(true);
+                    }
+                    match file.metadata() {
+                        Ok(metadata) => refuses_at_open(&cache, &current, cancel, &metadata),
+                        Err(_) => Ok(true),
+                    }
                 },
             )
         })
@@ -562,10 +565,13 @@ impl WorkspaceService for SearchCapability {
                 cancel,
                 |candidate| {
                     let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-                    current.refuses(candidate)
-                        || std::fs::metadata(candidate).is_ok_and(|metadata| {
-                            refuses_at_open(&cache, &current, cancel, &metadata)
-                        })
+                    if current.refuses(candidate) {
+                        return Ok(true);
+                    }
+                    match std::fs::metadata(candidate) {
+                        Ok(metadata) => refuses_at_open(&cache, &current, cancel, &metadata),
+                        Err(_) => Ok(true),
+                    }
                 },
             )
         })
@@ -595,17 +601,23 @@ impl WorkspaceService for SearchCapability {
                 cancel,
                 |candidate| {
                     let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-                    current.refuses(candidate)
-                        || std::fs::metadata(candidate).is_ok_and(|metadata| {
-                            refuses_at_open(&cache, &current, cancel, &metadata)
-                        })
+                    if current.refuses(candidate) {
+                        return Ok(true);
+                    }
+                    match std::fs::metadata(candidate) {
+                        Ok(metadata) => refuses_at_open(&cache, &current, cancel, &metadata),
+                        Err(_) => Ok(true),
+                    }
                 },
                 |candidate, file| {
                     let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-                    current.refuses(candidate)
-                        || file.metadata().map_or(true, |metadata| {
-                            refuses_at_open(&cache, &current, cancel, &metadata)
-                        })
+                    if current.refuses(candidate) {
+                        return Ok(true);
+                    }
+                    match file.metadata() {
+                        Ok(metadata) => refuses_at_open(&cache, &current, cancel, &metadata),
+                        Err(_) => Ok(true),
+                    }
                 },
             )
         })
@@ -1353,8 +1365,31 @@ mod tests {
 
         let result = file_walk::list_files_excluding(&workspace, ".", None, &cancel, |_| {
             cancel.cancel();
-            false
+            Ok(false)
         });
+
+        assert_eq!(result, Err(FsError::Cancelled));
+    }
+
+    /// A cancellation observed while a multiply linked candidate's index is revalidated
+    /// must surface as cancellation, not be folded into a credential refusal (or, on the
+    /// last file of a search, into a successful empty result).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_during_an_index_refresh_returns_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("candidate");
+        std::fs::write(&file, b"content").unwrap();
+        std::fs::hard_link(&file, dir.path().join("candidate-link")).unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let mut capability = SearchCapability::new(Workspace::new(dir.path()).unwrap(), None);
+        capability.after_index = Some(Arc::new(move || trigger.cancel()));
+        let capability = capability.with_cancel(cancel.clone());
+
+        // The candidate is multiply linked, so its open-time check revalidates the index
+        // with the now-cancelled child token.
+        let result = capability.read("candidate".into(), 0, 32).await;
 
         assert_eq!(result, Err(FsError::Cancelled));
     }
@@ -1692,12 +1727,9 @@ mod tests {
         std::fs::remove_file(&config).unwrap();
         symlink(home.path().join("new"), &config).unwrap();
         let current = CredentialPolicy::new(Some(home.path()), &[]);
-        assert!(super::refuses_at_open(
-            &cache,
-            &current,
-            &cancel,
-            &opened.metadata().unwrap()
-        ));
+        assert!(
+            super::refuses_at_open(&cache, &current, &cancel, &opened.metadata().unwrap()).unwrap()
+        );
     }
 
     #[cfg(unix)]

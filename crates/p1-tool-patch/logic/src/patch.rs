@@ -41,6 +41,10 @@ pub struct UpdateGroup {
     old: Vec<String>,
     /// Lines the group leaves behind (context and `+` lines).
     new: Vec<String>,
+    /// For each `new` line, the index in `old` of the context line it retains, or `None`
+    /// for a `+` line. Provenance, not text, decides which source ending a retained line
+    /// keeps when identical lines are removed and kept in one group.
+    new_from_old: Vec<Option<usize>>,
 }
 
 /// The paths a parsed patch touches, in patch order (the source path of an
@@ -291,6 +295,7 @@ fn parse_update_groups(
                 line: line_number,
                 old: Vec::new(),
                 new: Vec::new(),
+                new_from_old: Vec::new(),
             });
             *index += 1;
             continue;
@@ -307,11 +312,17 @@ fn parse_update_groups(
             line: line_number,
             old: Vec::new(),
             new: Vec::new(),
+            new_from_old: Vec::new(),
         });
+        let old_index = group.old.len();
         if prefix != '+' {
             group.old.push(content.to_string());
         }
         if prefix != '-' {
+            // A context line retains the old line at `old_index`; a `+` line is new.
+            group
+                .new_from_old
+                .push((prefix == ' ').then_some(old_index));
             group.new.push(content.to_string());
         }
         *index += 1;
@@ -718,6 +729,13 @@ fn apply_groups(
             .iter()
             .enumerate()
             .map(|(index, line)| {
+                // A retained context line keeps the ending of the exact old line it came
+                // from, even when an earlier removed line has the same text. Only a `+`
+                // line, which has no source, falls back to the greedy match.
+                if let Some(old_index) = group.new_from_old.get(index).copied().flatten() {
+                    next_old = old_index + 1;
+                    return previous_endings[old_index].clone();
+                }
                 if let Some(relative) = previous[next_old..].iter().position(|old| old == line) {
                     next_old += relative + 1;
                     previous_endings[next_old - 1].clone()
@@ -1036,6 +1054,26 @@ mod tests {
         .unwrap();
         assert_eq!(success_output(&ops), "A a\nM a");
         assert_eq!(coalesce(&ops), [create("a", "two\n")]);
+    }
+
+    #[test]
+    fn a_retained_duplicate_context_line_keeps_its_own_ending() {
+        // The first of two identical adjacent lines is removed; the retained context
+        // line must keep its own LF, not inherit the removed line's CRLF.
+        let mut files = memory(&[("dup", "x\r\nx\n")]);
+        let ops = planned(
+            &mut files,
+            "*** Begin Patch\n*** Update File: dup\n-x\n x\n*** End Patch",
+        )
+        .unwrap();
+        assert_eq!(
+            ops[0],
+            Op::Modify {
+                path: "dup".into(),
+                display: "dup".into(),
+                contents: b"x\n".to_vec()
+            }
+        );
     }
 
     #[test]

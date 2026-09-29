@@ -72,7 +72,10 @@ host puts into that store's data:
   through its held parent directory immediately before apply. This catches substitutions
   and same-inode rewrites during staging, not writes by an ungated actor in the last
   interval after that comparison (no atomic leaf CAS is available).
-  Stat and directory listing open their objects through no-follow descriptor walks.
+  Stat and directory listing open their objects through no-follow descriptor walks. A path
+  whose leaf does not exist under an in-workspace directory symlink is walked from the
+  canonical verified ancestor, so a dangling leaf is still reported as a link rather than the
+  ancestor being refused as a non-directory.
   Search's protected-file index opens exact stores by descriptor and enumerates
   protected directories from opened handles (including nested directories), then
   refreshes the index against current policy at each candidate open so a retargeted
@@ -154,10 +157,15 @@ component-facing form (BLOCKERS.md S2-B4, option a). For one change `commit`:
    staleness case; the message is the host's and safe to show the model.
 4. **Stages** the new contents in a uniquely named sibling temporary file in the target's
    directory, synced, with the target's permission bits (today's `write_atomic`).
-5. **Applies** atomically per file: the temporary file is renamed over the target
+5. **Applies** atomically per file: before the first replacement, every staged step's
+   checked-leaf identity and inspected contents are compared again through its held parent
+   directory, so a substitution or in-place change to a later target refuses without leaving
+   an earlier one applied. Then the temporary file is renamed over the target
    (`write`), linked only if nothing is there (`create`, else `already-exists`), the target is
    unlinked (`remove`), or the source is moved only if nothing is at the destination
-   (`rename`, else `already-exists`).
+   (`rename`, else `already-exists`). A rename destination's credential check reads only its
+   metadata, never its contents, so an unreadable or oversized occupied destination is still
+   `already-exists`.
 6. **Records** the result in the agent's `ObservedFiles` (the written contents; a removed or
    renamed-away path is forgotten), so consecutive edits need no re-read, exactly as the native
    tools record after writing. Patch-authorized writes are recorded too (ADR-0025: patch "still

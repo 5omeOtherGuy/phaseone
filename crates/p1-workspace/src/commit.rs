@@ -631,15 +631,17 @@ impl Workspace {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(MutationError::Io("cancelled".into()));
         }
-        for step in &mut staged {
+        // Prove every step before replacing any target: a substitution or in-place change
+        // to a later step must refuse without leaving an earlier file already changed. The
+        // window after this pass is the one documented on `verify_unchanged_contents`.
+        for step in &staged {
             match step {
                 Staged::Replace {
                     file,
                     target,
-                    contents,
-                    create_only,
                     inspected,
                     inspected_bytes,
+                    ..
                 } => {
                     if let Some(identity) = inspected {
                         verify_leaf(&file.dir, &file.leaf, *identity, target)?;
@@ -647,6 +649,41 @@ impl Workspace {
                     if let Some(inspected_bytes) = inspected_bytes {
                         verify_unchanged_contents(&file.dir, &file.leaf, inspected_bytes, target)?;
                     }
+                }
+                Staged::Remove {
+                    dir,
+                    leaf,
+                    target,
+                    inspected,
+                    inspected_bytes,
+                } => {
+                    verify_leaf(dir, leaf, *inspected, target)?;
+                    verify_unchanged_contents(dir, leaf, inspected_bytes, target)?;
+                }
+                Staged::Rename {
+                    from_dir,
+                    from_leaf,
+                    from,
+                    bytes,
+                    inspected,
+                    ..
+                } => {
+                    verify_leaf(from_dir, from_leaf, *inspected, from)?;
+                    // `bytes` are the source's inspected contents; reusing them refuses a
+                    // same-inode rewrite of the source between staging and the rename.
+                    verify_unchanged_contents(from_dir, from_leaf, bytes, from)?;
+                }
+            }
+        }
+        for step in &mut staged {
+            match step {
+                Staged::Replace {
+                    file,
+                    target,
+                    contents,
+                    create_only,
+                    ..
+                } => {
                     // A create-only target is refused atomically by the rename, not
                     // only by the staged `exists` check: an ungated writer that fills
                     // it in between cannot be silently overwritten.
@@ -665,14 +702,8 @@ impl Workspace {
                     observed.record(&target.canonical, contents);
                 }
                 Staged::Remove {
-                    dir,
-                    leaf,
-                    target,
-                    inspected,
-                    inspected_bytes,
+                    dir, leaf, target, ..
                 } => {
-                    verify_leaf(dir, leaf, *inspected, target)?;
-                    verify_unchanged_contents(dir, leaf, inspected_bytes, target)?;
                     rustix::fs::unlinkat(&*dir, leaf.as_os_str(), AtFlags::empty()).map_err(
                         |error| {
                             MutationError::Io(format!(
@@ -692,12 +723,8 @@ impl Workspace {
                     to_leaf,
                     to,
                     bytes,
-                    inspected,
+                    ..
                 } => {
-                    verify_leaf(from_dir, from_leaf, *inspected, from)?;
-                    // `bytes` are the source's inspected contents; reusing them refuses a
-                    // same-inode rewrite of the source between staging and the rename.
-                    verify_unchanged_contents(from_dir, from_leaf, bytes, from)?;
                     rename_noreplace(
                         &*from_dir,
                         from_leaf.as_os_str(),
@@ -820,18 +847,21 @@ impl Workspace {
                 recheck.check(from, &existing.bytes, *computed_from)?;
                 let to_dir = open_parent(to_parent, to, true)?;
                 let to_leaf = leaf_of(to);
-                // An occupied destination refuses as AlreadyExists even when it is
-                // a dangling symlink; inspect only regular-file aliases for policy.
-                let destination =
-                    match rustix::fs::statat(&to_dir, to_leaf, AtFlags::SYMLINK_NOFOLLOW) {
-                        Ok(stat)
-                            if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile =>
-                        {
-                            inspect(&to_dir, to_leaf, to)?
-                        }
-                        _ => None,
-                    };
-                refuse_credential(credentials, index, to, destination.as_ref())?;
+                // An occupied destination refuses as AlreadyExists even when it is a
+                // dangling symlink, unreadable, or larger than the mutation limit; a
+                // no-replace rename never reads its bytes. O_PATH opens the entry without
+                // needing read permission, so its identity can be checked for a credential
+                // alias without materializing it.
+                let destination = rustix::fs::openat(
+                    &to_dir,
+                    to_leaf,
+                    OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .ok()
+                .and_then(|fd| File::from(fd).metadata().ok())
+                .filter(std::fs::Metadata::is_file);
+                refuse_credential_destination(credentials, index, to, destination)?;
                 if exists(&to_dir, to_leaf, to)? {
                     return Err(MutationError::AlreadyExists {
                         requested: to.requested.clone(),
@@ -1231,6 +1261,23 @@ fn refuse_credential(
     Ok(())
 }
 
+/// [`refuse_credential`] for a rename destination, whose bytes a no-replace rename never
+/// reads: only its metadata is needed for the credential-identity check, so an unreadable
+/// or oversized destination is still refused as `AlreadyExists` rather than by a read.
+fn refuse_credential_destination(
+    policy: &CredentialPolicy,
+    index: &ProtectedIndex,
+    target: &Target,
+    metadata: Option<std::fs::Metadata>,
+) -> Result<(), MutationError> {
+    let existing = metadata.map(|metadata| Existing {
+        bytes: Vec::new(),
+        mode: metadata.permissions().mode() & 0o7777,
+        metadata,
+    });
+    refuse_credential(policy, index, target, existing.as_ref())
+}
+
 /// A staged temporary beside its target, removed on drop unless it replaced it.
 struct StagedFile {
     dir: OwnedFd,
@@ -1607,7 +1654,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::future::Future;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::Path;
     use std::pin::pin;
     use std::sync::Arc;
@@ -1839,6 +1886,69 @@ mod tests {
             assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"old");
             assert!(!dir.path().join("b").exists());
         }
+    }
+
+    #[test]
+    fn apply_verifies_every_step_before_replacing_any_target() {
+        let (dir, workspace) = workspace(&[("a", "original"), ("b", "original")]);
+        let changes = [Change::write("a", b"new"), Change::write("b", b"new")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        // The ungated change hits the second target after staging: the first must not
+        // already be replaced when the second's check refuses.
+        let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+            fs::write(dir.path().join("b"), b"external").unwrap();
+        });
+        assert_eq!(
+            result,
+            Err(io(
+                "b changed on disk since you last read it; read it again."
+            ))
+        );
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"original");
+        assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"external");
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn renaming_onto_an_unreadable_or_large_file_refuses_as_already_exists() {
+        let (dir, workspace) = workspace(&[("from", "content")]);
+        // Larger than the mutation limit: the destination's size is irrelevant to a
+        // no-replace rename, which must still refuse as an ordinary occupied path.
+        let large = fs::File::create(dir.path().join("large")).unwrap();
+        large.set_len(super::MAX_FILE_BYTES + 1).unwrap();
+        let error = workspace
+            .commit(
+                &[Change::rename("from", "large")],
+                &ObservedFiles::new(),
+                PATCH,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, MutationError::AlreadyExists { .. }),
+            "{error}"
+        );
+        // An unreadable destination is occupied too. As root the mode is not enforced.
+        if dir.path().metadata().unwrap().uid() != 0 {
+            let unreadable = dir.path().join("unreadable");
+            fs::write(&unreadable, b"x").unwrap();
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+            let error = workspace
+                .commit(
+                    &[Change::rename("from", "unreadable")],
+                    &ObservedFiles::new(),
+                    PATCH,
+                )
+                .unwrap_err();
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                matches!(error, MutationError::AlreadyExists { .. }),
+                "{error}"
+            );
+        }
+        assert!(dir.path().join("from").exists());
+        no_temporaries(dir.path());
     }
 
     #[test]

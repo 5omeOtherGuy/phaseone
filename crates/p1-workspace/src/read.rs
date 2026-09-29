@@ -343,6 +343,38 @@ impl Workspace {
     }
 }
 
+/// The path the `O_NOFOLLOW` walk below opens. [`Workspace::resolve`] returns a lexical
+/// path when the leaf does not exist, so an in-workspace directory symlink can remain in
+/// an intermediate component and the walk, which refuses a symlink on the way, would
+/// report it as `NotADirectory`. Canonicalize the deepest existing directory ancestor
+/// (the one `resolve` verified stays inside) and re-join the rest as names to open: a
+/// dangling leaf under such a link is then reached and reported as the link it is.
+fn canonical_walk_path(workspace: &Workspace, path: &Path) -> Result<PathBuf, WorkspaceError> {
+    let root = workspace.root();
+    if path == root {
+        return Ok(root.to_path_buf());
+    }
+    let mut ancestor = path.parent().unwrap_or(root);
+    while ancestor != root && !std::fs::metadata(ancestor).is_ok_and(|metadata| metadata.is_dir()) {
+        ancestor = ancestor.parent().unwrap_or(root);
+    }
+    let canonical = ancestor
+        .canonicalize()
+        .map_err(|source| WorkspaceError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !canonical.starts_with(root) {
+        return Err(WorkspaceError::OutsideWorkspace {
+            requested: path.display().to_string(),
+        });
+    }
+    let suffix = path
+        .strip_prefix(ancestor)
+        .unwrap_or_else(|_| Path::new(""));
+    Ok(canonical.join(suffix))
+}
+
 /// Walk a resolved path from the canonical root, holding every directory fd
 /// and refusing a swapped symlink in any component. The final link is opened as
 /// a link for stat; list requires a directory and therefore rejects it.
@@ -352,8 +384,9 @@ fn open_checked_path(
     path: &Path,
     final_flags: OFlags,
 ) -> Result<OwnedFd, WorkspaceError> {
+    let walk = canonical_walk_path(workspace, path)?;
     let relative =
-        path.strip_prefix(workspace.root())
+        walk.strip_prefix(workspace.root())
             .map_err(|_| WorkspaceError::OutsideWorkspace {
                 requested: path.display().to_string(),
             })?;
@@ -530,6 +563,24 @@ mod tests {
             !workspace
                 .list("sub")
                 .is_ok_and(|entries| entries.iter().any(|entry| entry.name == "sentinel"))
+        );
+    }
+
+    #[test]
+    fn a_dangling_leaf_under_a_directory_symlink_reports_the_link() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        symlink(dir.path().join("real"), dir.path().join("alias")).unwrap();
+        symlink("missing", dir.path().join("real/leaf")).unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+
+        // `resolve` verifies `alias` but leaves the lexical path (the leaf does not
+        // exist); the walk must follow the verified ancestor and reach the leaf as the
+        // dangling link it is, not refuse the intermediate symlink.
+        assert_eq!(
+            workspace.stat("alias/leaf").unwrap().kind,
+            FileKind::Symlink
         );
     }
 

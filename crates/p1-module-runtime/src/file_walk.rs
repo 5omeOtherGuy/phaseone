@@ -55,7 +55,7 @@ pub fn search(
     query: &SearchQuery,
     cancel: &CancellationToken,
 ) -> Result<SearchResult, FsError> {
-    search_excluding(workspace, query, cancel, |_| false)
+    search_excluding(workspace, query, cancel, |_| Ok(false))
 }
 
 /// Search like [`search`], omitting paths selected by the caller before reading their contents.
@@ -63,7 +63,7 @@ pub(crate) fn search_excluding(
     workspace: &Workspace,
     query: &SearchQuery,
     cancel: &CancellationToken,
-    excluded: impl Fn(&Path) -> bool,
+    excluded: impl Fn(&Path) -> Result<bool, FsError>,
 ) -> Result<SearchResult, FsError> {
     let search_path = scope(workspace, query.path.as_deref())?;
     let matcher = RegexMatcherBuilder::new()
@@ -83,8 +83,8 @@ pub(crate) fn search_excluding_opened(
     workspace: &Workspace,
     query: &SearchQuery,
     cancel: &CancellationToken,
-    excluded: impl Fn(&Path) -> bool,
-    opened_excluded: impl Fn(&Path, &std::fs::File) -> bool,
+    excluded: impl Fn(&Path) -> Result<bool, FsError>,
+    opened_excluded: impl Fn(&Path, &std::fs::File) -> Result<bool, FsError>,
 ) -> Result<SearchResult, FsError> {
     let search_path = scope(workspace, query.path.as_deref())?;
     let matcher = RegexMatcherBuilder::new()
@@ -106,7 +106,7 @@ pub fn list_files(
     glob: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<Vec<String>, FsError> {
-    list_files_excluding(workspace, path, glob, cancel, |_| false)
+    list_files_excluding(workspace, path, glob, cancel, |_| Ok(false))
 }
 
 /// List like [`list_files`], omitting paths selected by the caller.
@@ -115,7 +115,7 @@ pub(crate) fn list_files_excluding(
     path: &str,
     glob: Option<&str>,
     cancel: &CancellationToken,
-    excluded: impl Fn(&Path) -> bool,
+    excluded: impl Fn(&Path) -> Result<bool, FsError>,
 ) -> Result<Vec<String>, FsError> {
     let search_path = scope(workspace, Some(path))?;
     let overrides = build_overrides(&search_path, glob)?;
@@ -128,14 +128,14 @@ pub(crate) fn list_files_excluding(
 fn exclude_files(
     files: Vec<(String, PathBuf)>,
     cancel: &CancellationToken,
-    excluded: &impl Fn(&Path) -> bool,
+    excluded: &impl Fn(&Path) -> Result<bool, FsError>,
 ) -> Result<Vec<(String, PathBuf)>, FsError> {
     let mut included = Vec::with_capacity(files.len());
     for file in files {
         if cancel.is_cancelled() {
             return Err(FsError::Cancelled);
         }
-        let exclude = excluded(&file.1);
+        let exclude = excluded(&file.1)?;
         if cancel.is_cancelled() {
             return Err(FsError::Cancelled);
         }
@@ -164,13 +164,13 @@ pub(crate) fn read_window_excluding(
     path: &str,
     offset: u64,
     length: u64,
-    excluded: &impl Fn(&Path, &std::fs::File) -> bool,
+    excluded: &impl Fn(&Path, &std::fs::File) -> Result<bool, FsError>,
 ) -> Result<Vec<u8>, FsError> {
     read_window_inner(workspace, path, offset, length, Some(excluded))
 }
 
 /// A check of an opened file: its real path and the open handle.
-type OpenedCheck<'a> = &'a dyn Fn(&Path, &std::fs::File) -> bool;
+type OpenedCheck<'a> = &'a dyn Fn(&Path, &std::fs::File) -> Result<bool, FsError>;
 
 fn read_window_inner(
     workspace: &Workspace,
@@ -191,7 +191,7 @@ fn read_window_inner(
             ))
         };
         let opened_path = opened_object_path(&file, checked.path()).map_err(|_| refusal())?;
-        if excluded(&opened_path, &file) {
+        if excluded(&opened_path, &file)? {
             return Err(refusal());
         }
     }
@@ -291,7 +291,7 @@ fn search_content(
     query: &SearchQuery,
     files: &[(String, PathBuf)],
     cancel: &CancellationToken,
-    excluded: impl Fn(&Path, &std::fs::File) -> bool,
+    excluded: impl Fn(&Path, &std::fs::File) -> Result<bool, FsError>,
 ) -> Result<SearchResult, FsError> {
     let mut searcher = content_searcher(query.context as usize);
     let mut result = SearchResult {
@@ -311,7 +311,7 @@ fn search_content(
         let Ok(opened_path) = opened_object_path(&file, path) else {
             continue;
         };
-        if excluded(&opened_path, &file) {
+        if excluded(&opened_path, &file)? {
             continue;
         }
         if searcher.search_file(matcher, &file, &mut sink).is_err() {
@@ -538,10 +538,10 @@ mod tests {
                     fs::remove_file(home.path().join(".config")).unwrap();
                     symlink(&new, home.path().join(".config")).unwrap();
                 }
-                old_policy.refuses(candidate)
+                Ok(old_policy.refuses(candidate))
             },
             |candidate, file| {
-                CredentialPolicy::new(Some(home.path()), &[]).refuses_opened(candidate, file)
+                Ok(CredentialPolicy::new(Some(home.path()), &[]).refuses_opened(candidate, file))
             },
         )
         .unwrap();
