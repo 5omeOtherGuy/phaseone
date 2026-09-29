@@ -174,7 +174,10 @@ fn read_whole_with(
         if cancelled() {
             return Err(Failure::Cancelled);
         }
-        observe(&[])?;
+        // A skim shows no content of an empty file, so it observes nothing either.
+        if !input.skim {
+            observe(&[])?;
+        }
         return Ok(p1_read_guest::empty(display));
     }
     let Some(render) = render else {
@@ -186,11 +189,14 @@ fn read_whole_with(
     };
     let output = render.finish()?;
     // A read always observes the FULL file, even when offset/limit windows the returned
-    // lines: a later edit compares against the whole file.
+    // lines: a later edit compares against the whole file. A skimmed read observes nothing:
+    // it showed filtered content, so it never satisfies read-before-mutate (issue #491).
     if cancelled() {
         return Err(Failure::Cancelled);
     }
-    observe(&contents)?;
+    if !input.skim {
+        observe(&contents)?;
+    }
     Ok(output)
 }
 
@@ -212,6 +218,7 @@ mod tests {
             file_path: "a".into(),
             offset: None,
             limit: None,
+            skim: false,
         };
         let result = read_whole_with(
             "a",
@@ -239,6 +246,7 @@ mod tests {
             file_path: "a".into(),
             offset: None,
             limit: None,
+            skim: false,
         };
         let contents = Cell::new(Vec::new());
         let result = read_whole_with(
@@ -268,6 +276,7 @@ mod tests {
             file_path: "bin".into(),
             offset: None,
             limit: None,
+            skim: false,
         };
         let observed = Cell::new(false);
         let outcome = read_whole_with(
@@ -299,6 +308,7 @@ mod tests {
             file_path: "large".into(),
             offset: None,
             limit: Some(1),
+            skim: false,
         };
         let observed = Cell::new(false);
         let outcome = read_whole_with(
