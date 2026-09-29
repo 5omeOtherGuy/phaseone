@@ -249,6 +249,35 @@ exec /usr/bin/mv "$@"
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual({asset: self.read(os.path.join(self.out, asset)) for asset in ASSETS}, before)
 
+    def test_failed_owner_record_restores_the_prior_owned_stage(self) -> None:
+        # A failure after the new assets are in place but before the new ownership record is
+        # committed must not strand the old stage in a backup: the prior complete stage is
+        # restored, so a later run does not refuse it as unowned.
+        self.fixture()
+        first = self.stage()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = {asset: self.read(os.path.join(self.out, asset)) for asset in ASSETS}
+        # The replacement must differ, so a newly published stage is distinguishable.
+        write_file(self.binary, b"replacement p1 binary bytes\n", 0o755)
+        tools = os.path.join(self.tmp, 'bin')
+        os.mkdir(tools)
+        stub = os.path.join(tools, 'mv')
+        with open(stub, 'w', encoding='utf-8') as output:
+            output.write('''#!/bin/sh
+case "$4" in
+  *.p1-stage-owner) exit 71 ;;
+esac
+exec /usr/bin/mv "$@"
+''')
+        os.chmod(stub, 0o755)
+        with unittest.mock.patch.dict(os.environ, {'PATH': tools + ':' + os.environ['PATH']}):
+            failed = self.stage()
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual({asset: self.read(os.path.join(self.out, asset)) for asset in ASSETS}, before)
+        # The restored stage still carries its matching record: a later stage is not refused.
+        third = self.stage()
+        self.assertEqual(third.returncode, 0, third.stderr)
+
     def test_bad_tmpdir_leaves_no_release_scratch(self) -> None:
         self.fixture()
         with unittest.mock.patch.dict(os.environ, {'TMPDIR': os.path.join(self.tmp, 'missing')}):

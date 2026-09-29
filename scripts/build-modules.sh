@@ -288,8 +288,13 @@ build_package() {
   mkdir -p "${published%/*}"
   out="$(mktemp -d "${published}.new.XXXXXX")"
   wasm="$out/$pkg.wasm"
-  # A failed conversion must leave the published component untouched.
-  trap 'if [ -n "${out:-}" ] && [[ "$out" == *.new.* ]]; then rm -rf -- "$out"; fi' EXIT
+  # A failed conversion must leave the published component untouched. If the process is
+  # interrupted after the published directory was moved aside but before the replacement
+  # is renamed into place, put the old directory back too.
+  trap 'if [ -n "${out:-}" ] && [[ "$out" == *.new.* ]]; then rm -rf -- "$out"; fi
+        if [ -n "${previous:-}" ] && [ -d "$previous" ] && [ ! -e "$published" ]; then
+          mv -T -- "$previous" "$published" || echo "build-modules: restore failed: $previous" >&2
+        fi' EXIT
   case "$(wasm_layer "$core")" in
     component) cp "$core" "$wasm" ;;
     core)

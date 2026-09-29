@@ -139,8 +139,22 @@ share=""
 backup=""
 owner_temp=""
 cleanup() {
-  if [ -n "$backup" ] && [ -d "$backup" ] && [ ! -e "$out" ]; then
-    mv -T -- "$backup" "$out" || echo "stage-release: restore failed: $backup" >&2
+  # Disable errexit: this runs from the EXIT trap, and one failing best-effort step
+  # must not skip the restore below.
+  set +e
+  # Until the new ownership record is in place, a stage in --out is not an owned release.
+  # Remove it and put the prior complete stage back, so a failure or an interrupt inside
+  # that window never leaves an unowned stage or loses a valid one. A stage whose record
+  # still verifies is left exactly as it is.
+  if [ -n "$backup" ] || [ -d "$out" ]; then
+    if [ ! -d "$out" ] || [ -L "$out" ] ||
+      ! (cd "$out" 2>/dev/null && sha256sum -c "$owner_record" >/dev/null 2>&1); then
+      [ ! -e "$out" ] || rm -rf -- "$out"
+      if [ -n "$backup" ] && [ -d "$backup" ]; then
+        mv -T -- "$backup" "$out" || echo "stage-release: restore failed: $backup" >&2
+        backup=""
+      fi
+    fi
   fi
   rm -rf -- "$work"
   [ -z "$share" ] || rm -rf -- "$share"
@@ -246,6 +260,12 @@ PY
 (cd "$work" && sha256sum p1-linux-x86_64 >p1-linux-x86_64.sha256)
 (cd "$work" && sha256sum p1-share.tar.gz >p1-share.tar.gz.sha256)
 
+# The ownership record names the four assets; compute it from the staging directory
+# before anything is swapped, so no failure during publication can leave --out without a
+# record that matches it (or clobber the record of a stage that is still in place).
+owner_temp="$(mktemp "$out_parent/.p1-owner.XXXXXX")"
+(cd "$work" && sha256sum p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256) >"$owner_temp"
+
 # Preserve the prior complete stage until the replacement has succeeded.
 if [ -d "$out" ]; then
   backup="$(mktemp -d "$out_parent/.p1-release-backup.XXXXXX")"
@@ -253,8 +273,6 @@ if [ -d "$out" ]; then
   mv -T -- "$out" "$backup"
 fi
 mv -T -- "$work" "$out"
-owner_temp="$(mktemp "$out_parent/.p1-owner.XXXXXX")"
-(cd "$out" && sha256sum p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256) >"$owner_temp"
 mv -f -- "$owner_temp" "$owner_record"
 owner_temp=""
 if [ -n "$backup" ]; then

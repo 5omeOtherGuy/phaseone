@@ -287,6 +287,28 @@ class RemapTests(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual({p.name: p.read_bytes() for p in out.iterdir()}, before)
 
+    def test_interrupted_publish_restores_the_published_package(self) -> None:
+        h = self.harness()
+        self.assertEqual(h.run('--package', PACKAGE).returncode, 0)
+        out = h.repo / 'modules' / 'target' / 'p1-modules' / PACKAGE
+        before = {p.name: p.read_bytes() for p in out.iterdir()}
+        # Interrupt after the published directory is moved aside but before the
+        # replacement is renamed into place: the EXIT trap must put the old one back.
+        write_exec(h.bin / 'mv', '''#!/usr/bin/env bash
+case "$4" in
+  *.previous.*)
+    /usr/bin/mv "$@"
+    kill -TERM "$PPID"
+    exit 0 ;;
+esac
+exec /usr/bin/mv "$@"
+''')
+        interrupted = h.run('--package', PACKAGE)
+        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertTrue(out.is_dir(), 'the published package was left missing')
+        self.assertEqual({p.name: p.read_bytes() for p in out.iterdir()}, before)
+        self.assertEqual([p.name for p in out.parent.iterdir() if 'previous' in p.name], [])
+
     def test_the_fixture_package_builds_and_publishes_its_outputs(self) -> None:
         h = self.harness()
         result = h.run("--package", PACKAGE)

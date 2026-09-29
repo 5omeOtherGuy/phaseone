@@ -50,7 +50,9 @@ code=$?
 set -e
 elapsed=$(( $(date +%s) - start ))
 git -C "$clone" add -A -N . >/dev/null 2>&1 || true
-git -C "$clone" diff --numstat -z >"$scratch/diff.numstat" || true
+# HEAD, not the index: `git add -A -N .` records deletions in the index, so a plain
+# `git diff` would report an empty numstat for a deletion-only run.
+git -C "$clone" diff HEAD --numstat -z >"$scratch/diff.numstat" || true
 "$here/scripts/run-report.py" "$scratch/session.jsonl" --label "$label" --elapsed "$elapsed" \
   --exit-code "$code" >"$run/report.json"
 python3 "$here/scripts/dogfood-review.py" "$run/report.json" \

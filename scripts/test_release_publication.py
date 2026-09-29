@@ -12,6 +12,15 @@ ASSETS = ('p1-linux-x86_64', 'p1-linux-x86_64.sha256',
 
 
 class ReleasePublicationTest(unittest.TestCase):
+    def test_release_build_pins_an_exact_toolchain(self):
+        # release-manifest.py embeds the rustc/cargo versions in p1-share.tar.gz, so the
+        # byte-identical rerun comparison only holds when release builds use one exact
+        # toolchain; the rolling `stable` ref would drift once stable advances.
+        text = WORKFLOW.read_text()
+        self.assertNotIn('dtolnay/rust-toolchain@stable', text)
+        self.assertRegex(text, r'dtolnay/rust-toolchain@1\.\d+\.\d+')
+        self.assertIn('targets: wasm32-unknown-unknown', text)
+
     def test_complete_but_altered_asset_refuses_noop(self):
         text = WORKFLOW.read_text()
         step = text.split('      - name: Publish the release\n', 1)[1]

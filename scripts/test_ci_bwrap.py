@@ -29,6 +29,13 @@ class CiBwrapTest(unittest.TestCase):
                                   env=env, capture_output=True, text=True)
             self.assertEqual(done.returncode, 73)
 
+    def test_task_branch_build_provisions_and_rejects_the_skip_marker(self):
+        # build.yml runs the same gate.sh, which permits unusable bubblewrap on CI; the
+        # task-branch build must provision it and refuse a skipped boundary suite too.
+        workflow = (ROOT / '.github/workflows/build.yml').read_text()
+        self.assertIn('run: bash scripts/ci-bwrap.sh', workflow)
+        self.assertIn("! grep -F 'SKIP: bwrap unusable here'", workflow)
+
 
 if __name__ == '__main__':
     unittest.main()

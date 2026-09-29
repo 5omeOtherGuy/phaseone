@@ -32,7 +32,11 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # An exact toolchain, never the rolling `stable`: scripts/release-manifest.py embeds
+      # the rustc/cargo versions in p1-share.tar.gz, so a rerun of a complete release after
+      # stable advances would otherwise rebuild different bytes and fail the byte-identical
+      # comparison in "Publish the release" instead of being the documented no-op.
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           # The guest target the module build compiles for (WASM_TARGET in
           # modules/toolchain.pins: D-XO-4 on S0-Q9, wasm32-unknown-unknown componentized
