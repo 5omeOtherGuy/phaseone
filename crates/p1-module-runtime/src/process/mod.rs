@@ -389,6 +389,60 @@ fn failed(failure: ProcessFailure) -> ProcessOutcome {
     }
 }
 
+/// The leader's state observed WITHOUT reaping it, so its process-group ID stays
+/// reserved while the group is signalled.
+#[allow(dead_code)]
+enum LeaderExit {
+    /// Still running.
+    Running,
+    /// Exited; its zombie is left in place and still reserves the group ID.
+    Exited(std::process::ExitStatus),
+    /// Already reaped, so this run no longer reserves the group ID.
+    Reaped,
+    /// The platform cannot observe without reaping.
+    Unknown,
+}
+
+/// Observe the leader without reaping it where the platform allows. `WNOWAIT`
+/// leaves the zombie, which keeps the group ID reserved for signalling; macOS has
+/// no `waitid` in `nix`, so it reports [`LeaderExit::Unknown`] and the caller keeps
+/// the reap-then-probe behaviour.
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    all(target_os = "linux", not(target_env = "uclibc")),
+))]
+fn observe_leader(pid: i32) -> LeaderExit {
+    use nix::errno::Errno;
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+    use std::os::unix::process::ExitStatusExt;
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    match waitid(Id::Pid(Pid::from_raw(pid)), flags) {
+        Ok(WaitStatus::StillAlive) => LeaderExit::Running,
+        Ok(WaitStatus::Exited(_, code)) => {
+            LeaderExit::Exited(std::process::ExitStatus::from_raw(code << 8))
+        }
+        Ok(WaitStatus::Signaled(_, signal, core)) => {
+            let raw = signal as i32 | if core { 0x80 } else { 0 };
+            LeaderExit::Exited(std::process::ExitStatus::from_raw(raw))
+        }
+        Ok(_) => LeaderExit::Running,
+        Err(Errno::ECHILD) => LeaderExit::Reaped,
+        Err(_) => LeaderExit::Unknown,
+    }
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    all(target_os = "linux", not(target_env = "uclibc")),
+)))]
+fn observe_leader(_pid: i32) -> LeaderExit {
+    LeaderExit::Unknown
+}
+
 /// Terminate the child's whole process group and reap the child, returning the
 /// status it observed within its deadlines.
 ///
@@ -401,6 +455,12 @@ fn failed(failure: ProcessFailure) -> ProcessOutcome {
 /// exit and must not block the caller forever. `None` means the leader could not
 /// be reaped within the deadlines (or there was no group to signal), and the
 /// caller must not wait for it again without a bound.
+///
+/// While the leader is still running it is deliberately NOT reaped before the
+/// final signal: an unreaped leader (live, or a zombie left by `WNOWAIT`) reserves
+/// this run's group ID, so SIGTERM and SIGKILL cannot land on an unrelated group
+/// whose ID was reused. The signal-zero probe is used only when the leader was
+/// already reaped and the group is therefore pinned by descendants alone.
 async fn terminate(
     child: &mut Child,
     pgid: i32,
@@ -412,21 +472,29 @@ async fn terminate(
         return bounded_reap(child.wait(), tokio::time::Instant::now() + SIGKILL_WAIT).await;
     }
     let group = Pid::from_raw(pgid);
-    signal_group_if_present(group, Signal::SIGTERM);
     let grace_end = tokio::time::Instant::now() + SIGTERM_GRACE;
-    // Reap the shell first: an unreaped group leader keeps the group alive.
-    let reaped = tokio::time::timeout_at(grace_end, child.wait()).await;
-    wait_for_empty_group(group, grace_end).await;
-    signal_group_if_present(group, Signal::SIGKILL);
+    if matches!(observe_leader(pgid), LeaderExit::Running) {
+        // The leader keeps `pgid` reserved across the grace, whether it stays
+        // running or becomes a zombie, so both signals below reach THIS run's group
+        // and cannot reach a reused one.
+        let _ = killpg(group, Signal::SIGTERM);
+        while matches!(observe_leader(pgid), LeaderExit::Running)
+            && tokio::time::Instant::now() < grace_end
+        {
+            tokio::time::sleep(GROUP_POLL).await;
+        }
+        let _ = killpg(group, Signal::SIGKILL);
+    } else {
+        // The leader was already reaped (or the platform cannot observe without
+        // reaping), so the group is pinned by descendants alone: reap a zombie so
+        // `group_exists` sees real membership, and probe before each signal.
+        let _ = child.try_wait();
+        signal_group_if_present(group, Signal::SIGTERM);
+        wait_for_empty_group(group, grace_end).await;
+        signal_group_if_present(group, Signal::SIGKILL);
+    }
     let kill_end = tokio::time::Instant::now() + SIGKILL_WAIT;
-    let status = match reaped {
-        // The shell exited within the grace period: this is its status.
-        Ok(status) => Some(status),
-        // A leader stuck in uninterruptible kernel work cannot be reaped by the
-        // deadline. The bounded wait gives up and reports no status; the caller
-        // must not start a second, unbounded wait for the same child.
-        Err(_) => bounded_reap(child.wait(), kill_end).await,
-    };
+    let status = bounded_reap(child.wait(), kill_end).await;
     wait_for_empty_group(group, kill_end).await;
     status
 }
@@ -586,6 +654,48 @@ mod tests {
             nix::sys::signal::Signal::SIGTERM,
         ));
         let _ = child.wait().await.unwrap();
+    }
+
+    /// PR #473 Codex P1: the leader is observed WITHOUT reaping it, so its group ID
+    /// stays reserved for the signal that follows. Reaping it frees the ID, which is
+    /// exactly the state that let `killpg` reach a reused group.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc")),
+    ))]
+    #[tokio::test]
+    async fn observing_the_leader_leaves_its_group_id_reserved() {
+        let mut child = tokio::process::Command::new("true")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pgid = child.id().unwrap() as i32;
+        let group = nix::unistd::Pid::from_raw(pgid);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if matches!(super::observe_leader(pgid), super::LeaderExit::Exited(_)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the leader never exited"
+            );
+            tokio::time::sleep(super::GROUP_POLL).await;
+        }
+        assert!(
+            super::group_exists(group),
+            "an unreaped zombie must still reserve its group ID"
+        );
+        let _ = child.wait().await.unwrap();
+        assert!(
+            !super::group_exists(group),
+            "reaping the last member must free the group ID"
+        );
     }
 
     #[test]

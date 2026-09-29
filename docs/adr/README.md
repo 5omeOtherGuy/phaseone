@@ -110,6 +110,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0094 | [Resume scanner and workflow report formatter move into the foundation crates](0094-resume-scanner-and-workflow-report-formatter-move-into-the-foundation-crates.md) | proposed | 2026-09-27 | lead |
 | ADR-0095 | [File-tool capability services live in the runtime; no native file-tool fallback](0095-file-tool-capability-services-live-in-the-runtime-no-native-file-tool-fallback.md) | proposed | 2026-09-27 | lead |
 | ADR-0096 | [Bubblewrap credential masks follow workspace mounts](0096-bubblewrap-credential-masks-follow-workspace-mounts.md) | proposed | 2026-09-27 | lead |
+| ADR-0097 | [Command evidence is the host's observed process exit, never component text](0097-command-evidence-is-the-host-s-observed-process-exit-never-component-text.md) | proposed | 2026-09-29 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

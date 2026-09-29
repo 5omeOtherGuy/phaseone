@@ -18,7 +18,6 @@ use std::collections::VecDeque;
 use std::os::unix::process::ExitStatusExt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout};
 
@@ -51,6 +50,10 @@ pub struct ProcessStream {
     capture: Capture,
     expiry: CancellationToken,
     watchdog: tokio::task::JoinHandle<()>,
+    /// The watchdog's verdict on the deadline: `0` not decided, `1` the group was
+    /// still running, `2` it had already finished. `finish_ending` waits for the
+    /// verdict before it terminates, so a reap can never erase the deadline's state.
+    expiry_decision: tokio::sync::watch::Receiver<u8>,
     cancel: CancellationToken,
     phase: Phase,
     /// Events decided but not yet handed out.
@@ -82,34 +85,34 @@ impl ProcessStream {
         let expired = CancellationToken::new();
         let notify = expired.clone();
         let leader = Arc::new(tokio::sync::Mutex::new(Some(child)));
-        // Whether the deadline found the process group still running. A group that
-        // already finished keeps the exit it had; only a group still alive at the
-        // deadline is a timeout.
-        let alive_at_expiry = Arc::new(AtomicBool::new(false));
+        // The watchdog publishes its deadline verdict here. A pending `next()` holds
+        // the leader lock while it awaits the child, so a `try_lock` probe could miss
+        // a child that exited just before the deadline; `finish_ending` instead waits
+        // for this verdict, taken only after the deadline cancelled the wait.
+        let (decision, expiry_decision) = tokio::sync::watch::channel(0u8);
         let watched = leader.clone();
-        let alive = alive_at_expiry.clone();
         let watchdog = tokio::spawn(async move {
             expiry.await;
-            // Reap the leader here when it already exited: a zombie still answers
-            // signal 0, so only the reaped status can tell a finished run from one
-            // still running at its deadline. `try_wait` caches the status, so the
-            // stream's own later wait observes that same exit.
-            let locked = watched.try_lock();
-            let leader_exited = match locked {
-                Ok(mut leader) => match leader.as_mut() {
-                    Some(child) => matches!(child.try_wait(), Ok(Some(_))),
-                    None => true,
-                },
-                // The stream is awaiting the leader: it has not exited.
-                Err(_) => false,
+            // Wake a pending `next()` first: it holds the leader lock while it awaits
+            // the child, and cancelling the deadline makes it drop that wait and
+            // release the lock. Only then is the leader observable here.
+            notify.cancel();
+            let mut leader = watched.lock().await;
+            // Reap the leader when it already exited: a zombie still answers signal
+            // 0, so only the reaped status can tell a finished run from one still
+            // running at its deadline. `try_wait` caches the status, so the stream's
+            // own later wait observes that same exit.
+            let leader_exited = match leader.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                None => true,
             };
             let group_alive = if leader_exited {
                 pgid > 0 && super::group_exists(Pid::from_raw(pgid))
             } else {
                 true
             };
-            alive.store(group_alive, Ordering::SeqCst);
-            notify.cancel();
+            drop(leader);
+            let _ = decision.send(if group_alive { 1 } else { 2 });
             if pgid > 0 && group_alive {
                 let group = Pid::from_raw(pgid);
                 super::signal_group_if_present(group, Signal::SIGTERM);
@@ -122,7 +125,6 @@ impl ProcessStream {
                 leader,
                 pgid,
                 settled: false,
-                alive_at_expiry,
             },
             stdout,
             stderr,
@@ -131,6 +133,7 @@ impl ProcessStream {
             capture: Capture::default(),
             expiry: expired,
             watchdog,
+            expiry_decision,
             cancel,
             phase: Phase::Reading,
             pending: VecDeque::new(),
@@ -237,12 +240,20 @@ impl ProcessStream {
             return;
         };
         let end = end.clone();
+        // Wait for the watchdog's deadline verdict BEFORE terminating: terminating
+        // first would reap the leader and empty the group, so a group that was still
+        // running at the deadline would look like a command that had finished.
+        let alive_at_expiry = if !self.cancel.is_cancelled() && self.expiry.is_cancelled() {
+            Some(self.await_expiry_decision().await)
+        } else {
+            None
+        };
         let leader_status = self.group.terminate().await;
         self.drain_after_termination().await;
         let end = if self.cancel.is_cancelled() {
             ProcessEnd::Cancelled
-        } else if self.expiry.is_cancelled() {
-            if self.group.alive_at_expiry.load(Ordering::SeqCst) {
+        } else if let Some(alive) = alive_at_expiry {
+            if alive {
                 ProcessEnd::TimedOut
             } else {
                 // The group had already finished when its deadline arrived: report
@@ -256,6 +267,22 @@ impl ProcessStream {
             end
         };
         self.ended(end);
+    }
+
+    /// Await the watchdog's deadline verdict: `true` when the group was still
+    /// running. Only called once `expiry` is cancelled, so the watchdog has fired.
+    async fn await_expiry_decision(&mut self) -> bool {
+        let mut decision = self.expiry_decision.clone();
+        loop {
+            let value = *decision.borrow_and_update();
+            if value != 0 {
+                return value == 1;
+            }
+            if decision.changed().await.is_err() {
+                // The watchdog ended without a verdict; a deadline is a timeout.
+                return true;
+            }
+        }
     }
 
     /// Capture bytes already in the pipes after the leader and its group end.
@@ -342,9 +369,6 @@ struct Group {
     pgid: i32,
     /// The whole group was terminated.
     settled: bool,
-    /// The deadline found the group still running (set by the watchdog before it
-    /// cancels `expiry`).
-    alive_at_expiry: Arc<AtomicBool>,
 }
 
 impl Group {
@@ -562,6 +586,48 @@ mod lifecycle_tests {
         })
         .await
         .expect("the deadline never fired");
+        assert_eq!(
+            stream.next().await,
+            Some(StreamEvent::Exited(ProcessEnd::Exited(7)))
+        );
+        assert_eq!(stream.next().await, None);
+    }
+
+    /// PR #473 Codex P2: the watchdog must not read a completed command as still
+    /// running just because a pending `next()` holds the leader lock while it awaits
+    /// the child. Holding that lock here (exactly what the pending wait does) at the
+    /// deadline must still report the command's own exit, never `TimedOut`.
+    #[tokio::test]
+    async fn a_held_leader_lock_does_not_turn_a_completed_command_into_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProcessService::new(dir.path());
+        let (fire, expiry) = tokio::sync::oneshot::channel::<()>();
+        let mut stream = service
+            .start(
+                "exit 7",
+                async move {
+                    let _ = expiry.await;
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let pid = stream.group.pgid;
+        // A pending `next()` holds the leader lock across its await of the child.
+        let held = stream.group.leader.clone();
+        let guard = held.lock().await;
+        // The command exits while the lock is held, so the watchdog cannot reap it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runnable(pid) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the command never exited");
+        fire.send(()).unwrap();
+        // Let the watchdog cancel and queue on the lock, then release it.
+        tokio::task::yield_now().await;
+        drop(guard);
         assert_eq!(
             stream.next().await,
             Some(StreamEvent::Exited(ProcessEnd::Exited(7)))
