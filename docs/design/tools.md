@@ -171,8 +171,10 @@ footer says what is missing and how to get it:
 `[truncated after <last path shown>; <n> more matching files not shown; narrow with path or glob]`.
 If even the first block does not fit, that block is cut at a line boundary and the footer reads
 `[truncated inside <path> after line <line>; <n> more matching files not shown; narrow with path, glob or a stricter pattern]`.
-Content searches stream the sorted walk and keep only bounded match lines plus omitted
-counts, even in large workspaces. `mode:"files"` with an empty pattern still requires a
+Content searches stream the walk in bounded chunks (at most 4,096 paths / 512 KiB per
+chunk, each sorted by displayed path) and keep only bounded match lines plus omitted
+counts, even in large workspaces; a single very wide directory is therefore never
+collected whole. `mode:"files"` with an empty pattern still requires a
 file listing; until the workspace interface supports pagination, that listing refuses
 above 4,096 paths or 512 KiB retained path names and asks to narrow path/glob
 (ADR-0101), while a patterned `mode:"files"` search keeps the paths its first bounded

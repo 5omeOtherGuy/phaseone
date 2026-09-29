@@ -40,8 +40,10 @@ unboundedly, and every refusal is an explicit model-facing error.
 2. A `workspace.list-files` walk (including the listing behind an empty-pattern
    `mode:"files"` search) refuses once it would retain more than 4,096 paths or more than
    512 KiB of displayed and absolute path bytes, with `workspace listing exceeds the
-   bounded search budget; narrow with path or glob`. Content searches stream the sorted
-   walk and keep only bounded match lines, so they are not subject to the listing budget.
+   bounded search budget; narrow with path or glob`. Content searches stream the walk in
+   bounded chunks (at most the same 4,096-path / 512 KiB buffer per chunk, each chunk
+   sorted by displayed path) and keep only bounded match lines, so a single very wide
+   directory is never collected whole and the search is not subject to the listing refusal.
 3. A patterned `mode:"files"` search that needs a top-up listing treats that same refusal
    as "no more paths are available": it renders the paths its first bounded search already
    carried, with the exact omitted count, instead of failing the call.
@@ -75,8 +77,11 @@ unboundedly, and every refusal is an explicit model-facing error.
 ## Evidence
 
 * `crates/p1-module-runtime/src/file_walk.rs`: `MAX_WALK_FILES`, `MAX_WALK_PATH_BYTES`,
-  `collect_files`; tests `listing_refuses_before_collecting_unbounded_paths` and
-  `broad_content_search_streams_past_listing_budget`.
+  `collect_files`, `search_streaming`/`search_chunk`; tests
+  `listing_refuses_before_collecting_unbounded_paths`,
+  `broad_content_search_streams_past_listing_budget`,
+  `a_single_wide_directory_is_searched_in_bounded_chunks` and
+  `streaming_search_orders_names_by_displayed_path`.
 * `crates/p1-module-runtime/src/file_services.rs`: `MAX_COMPONENT_READ_BYTES`,
   `snapshot_from_open_file`; test `bounded_host_snapshot_refuses_growth_after_stat`.
 * `modules/p1-module-read/src/lib.rs`: `MAX_GUEST_READ_BYTES`; tests

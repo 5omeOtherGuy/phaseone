@@ -147,8 +147,9 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
 - **A compound form whose outer status is not the check's is not a verification.** An unquoted
   `(`/`)` (a subshell or group, or a process substitution `<(…)`) or an opaque interpreter or
   expansion at a command position (`!`, `bash`, `sh`, `node`, `python`, `eval`, `source`, `.`,
-  `$(…)`, backticks, `${…}`) never counts, because `( ! cargo test )` and `cat <(cargo test)`
-  exit 0 when the check fails.
+  `$(…)`, backticks, `${…}`) never counts, because `( ! cargo test )`, `cat <(cargo test)`
+  and `time ! cargo test` exit 0 when the check fails; a `!` after a wrapper such as `time`,
+  `timeout` or `sudo` is still a command position.
 - **Every rejection shows what WOULD be accepted.** Errors 1–3 end with a blank line and
   `Runs that count right now (successful, not piped, after the last file change):` followed by
   up to 5 normalised commands, newest last, one per line prefixed `- `; or

@@ -310,8 +310,15 @@ fn collect_files(
     Ok(files)
 }
 
-/// Search in a sorted streaming walk, keeping only the bounded match lines and
+/// Search in a bounded streaming walk, keeping only the bounded match lines and
 /// counting omitted matching files without retaining the complete path listing.
+///
+/// `sort_by_file_path` is deliberately not used: it makes `walkdir` collect every entry
+/// of a directory before yielding the first, so one directory with very many entries
+/// would exhaust memory and hide cancellation until the collection finished. Paths are
+/// instead buffered in chunks of at most [`MAX_WALK_FILES`] / [`MAX_WALK_PATH_BYTES`],
+/// each sorted by the displayed path so the carried files keep the listing's bytewise
+/// order within the chunk, and searched as it fills.
 fn search_streaming(
     workspace: &Workspace,
     search_path: &Path,
@@ -327,15 +334,6 @@ fn search_streaming(
     if let Some(overrides) = overrides {
         walk.overrides(overrides);
     }
-    // Sort by the displayed (lossy UTF-8, `/`-separated) path, the key `collect_files`
-    // sorts by, so a non-UTF-8 name cannot order the stream differently from the listing.
-    let display_workspace = workspace.clone();
-    walk.sort_by_file_path(move |left, right| {
-        display_workspace
-            .display(left)
-            .as_bytes()
-            .cmp(display_workspace.display(right).as_bytes())
-    });
     let mut searcher = content_searcher(query.context as usize);
     let mut result = SearchResult {
         files: Vec::new(),
@@ -343,6 +341,8 @@ fn search_streaming(
         omitted_files: 0,
     };
     let mut room = query.max_lines as usize;
+    let mut chunk: Vec<PathBuf> = Vec::new();
+    let mut chunk_bytes = 0usize;
     for entry in walk.build() {
         if cancel.is_cancelled() {
             return Err(FsError::Cancelled);
@@ -351,20 +351,79 @@ fn search_streaming(
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        let path = entry.path();
-        if excluded(path)? {
+        let path = entry.into_path();
+        chunk_bytes = chunk_bytes
+            .saturating_add(workspace.display(&path).len())
+            .saturating_add(path.as_os_str().len());
+        chunk.push(path);
+        if chunk.len() >= MAX_WALK_FILES || chunk_bytes > MAX_WALK_PATH_BYTES {
+            search_chunk(
+                workspace,
+                matcher,
+                &mut searcher,
+                cancel,
+                excluded,
+                opened_excluded,
+                &mut room,
+                &mut result,
+                &mut chunk,
+            )?;
+            chunk_bytes = 0;
+        }
+    }
+    search_chunk(
+        workspace,
+        matcher,
+        &mut searcher,
+        cancel,
+        excluded,
+        opened_excluded,
+        &mut room,
+        &mut result,
+        &mut chunk,
+    )?;
+    Ok(result)
+}
+
+/// Search one bounded chunk of paths, sorted by displayed path (the key `collect_files`
+/// sorts by, so a non-UTF-8 name cannot order the stream differently from the listing),
+/// then drop it. The chunk holds at most [`MAX_WALK_FILES`] paths / [`MAX_WALK_PATH_BYTES`]
+/// bytes, so a single wide directory is streamed rather than collected whole.
+#[allow(clippy::too_many_arguments)]
+fn search_chunk(
+    workspace: &Workspace,
+    matcher: &RegexMatcher,
+    searcher: &mut Searcher,
+    cancel: &CancellationToken,
+    excluded: &impl Fn(&Path) -> Result<bool, FsError>,
+    opened_excluded: &impl Fn(&Path, &std::fs::File) -> Result<bool, FsError>,
+    room: &mut usize,
+    result: &mut SearchResult,
+    chunk: &mut Vec<PathBuf>,
+) -> Result<(), FsError> {
+    chunk.sort_by(|left, right| {
+        workspace
+            .display(left.as_path())
+            .as_bytes()
+            .cmp(workspace.display(right.as_path()).as_bytes())
+    });
+    for path in chunk.drain(..) {
+        if cancel.is_cancelled() {
+            return Err(FsError::Cancelled);
+        }
+        if excluded(path.as_path())? {
             continue;
         }
-        let Ok(file) = workspace.open_file_at(path) else {
+        let Ok(file) = workspace.open_file_at(path.as_path()) else {
             continue;
         };
-        let Ok(opened_path) = opened_object_path(&file, path) else {
+        let Ok(opened_path) = opened_object_path(&file, path.as_path()) else {
             continue;
         };
         if opened_excluded(&opened_path, &file)? {
             continue;
         }
-        let mut sink = MatchSink::with_room(room);
+        let mut sink = MatchSink::with_room(*room);
         if searcher.search_file(matcher, &file, &mut sink).is_err() || sink.binary || !sink.seen {
             continue;
         }
@@ -376,13 +435,13 @@ fn search_streaming(
             result.truncated = true;
             continue;
         }
-        room -= sink.lines.len();
+        *room -= sink.lines.len();
         result.files.push(FileMatches {
-            path: workspace.display(path),
+            path: workspace.display(path.as_path()),
             lines: sink.lines,
         });
     }
-    Ok(result)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -564,6 +623,60 @@ mod tests {
         // Files mode starts with this same capped host search; no full listing is
         // needed when its one matching path already fits in the carried prefix.
         assert_eq!(result.omitted_files, 0);
+    }
+
+    #[test]
+    fn a_single_wide_directory_is_searched_in_bounded_chunks() {
+        // More files in ONE directory than the chunk buffer: the search streams the
+        // directory in bounded chunks instead of a listing, so every match is found
+        // without a listing refusal. `sort_by_file_path` would have collected the whole
+        // directory, and the whole path list, before yielding the first entry.
+        let dir = tempfile::tempdir().unwrap();
+        let count = super::MAX_WALK_FILES + 2;
+        for i in 0..count {
+            fs::write(dir.path().join(format!("f{i:05}")), "needle\n").unwrap();
+        }
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: count as u32,
+        };
+        let result = super::search(&workspace, &query, &CancellationToken::new()).unwrap();
+        let mut found: Vec<&str> = result.files.iter().map(|file| file.path.as_str()).collect();
+        found.sort_unstable();
+        let expected: Vec<String> = (0..count).map(|i| format!("f{i:05}")).collect();
+        assert_eq!(
+            found,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(!result.truncated);
+        assert_eq!(result.omitted_files, 0);
+    }
+
+    #[test]
+    fn streaming_search_orders_names_by_displayed_path() {
+        // `\xff` lossy-displays as U+FFFD (bytes `ef bf bd`), which sorts after `z`
+        // (`7a`); sorting the raw `OsStr` (`ff`) would put it first. The displayed path
+        // is the key `collect_files` sorts by and the order the guest sees.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(OsStr::from_bytes(b"\xff.txt")), "needle\n").unwrap();
+        fs::write(dir.path().join("z.txt"), "needle\n").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 10,
+        };
+        let result = super::search(&workspace, &query, &CancellationToken::new()).unwrap();
+        let paths: Vec<&str> = result.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["z.txt", "\u{fffd}.txt"]);
     }
 
     #[test]

@@ -947,7 +947,9 @@ fn segment_has_interpreter(segment: &str) -> bool {
     if first == "!" || is_interpreter(first) {
         return true;
     }
-    is_wrapper(first) && words.any(is_interpreter)
+    // A wrapper (`time ! cargo test`) hands the pipeline to a later word, so a status
+    // inversion there is still at a command position and still hides the check's status.
+    is_wrapper(first) && words.any(|word| word == "!" || is_interpreter(word))
 }
 
 fn is_interpreter(word: &str) -> bool {
@@ -1254,6 +1256,31 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn negation_after_a_wrapper_is_unprovable() {
+        // `time` (and every wrapper a command position can hide behind) returns the
+        // pipeline's status, which `!` inverts: `time ! cargo test` exits 0 when the
+        // tests fail.
+        for command in [
+            "time ! cargo test",
+            "cd w && time ! cargo test",
+            "time -p ! cargo test",
+            "timeout 5 ! cargo test",
+            "sudo ! cargo test",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+        // A wrapper running the check itself keeps the check's own status.
+        assert!(!is_unprovable("time cargo test"));
+        assert!(
+            command_failure("time cargo test", &[run("time cargo test", 0, 8)], None).is_none()
+        );
     }
 
     #[test]
