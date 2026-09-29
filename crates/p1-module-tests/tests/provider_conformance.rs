@@ -25,14 +25,17 @@
 #[path = "../../p1-host/tests/native_routes/mod.rs"]
 mod native_routes;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+
+thread_local! { static REFRESHES: Cell<usize> = const { Cell::new(0) }; }
 
 use futures_util::StreamExt;
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{
     BoxFuture, CancellationToken, DeclarationKind, Item, ModelOptions, Outcome, Provider,
-    ProviderError, ProviderRequest, StreamEvent, ToolDeclaration,
+    ProviderError, ProviderErrorKind, ProviderRequest, StreamEvent, ToolDeclaration,
 };
 use p1_host::routes::{AdapterSettings, RouteFile, load_route};
 use p1_model_profile::ModelProfile;
@@ -149,6 +152,7 @@ impl CredentialSource for FixedCredentials {
         &'a self,
         _rejected: &'a Credential,
     ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        REFRESHES.with(|count| count.set(count.get() + 1));
         Box::pin(async {
             Ok(Credential {
                 bearer: format!("{BEARER}-refreshed"),
@@ -442,7 +446,7 @@ fn build<const N: usize>(transport: ScriptedTransport) -> Arc<dyn Provider> {
 }
 
 fn follow_up<const N: usize>(request: &ProviderRequest) -> Value {
-    let (_, sent) = exchange(&cases()[N].component_factory(), request, vec![status(400)]);
+    let (_, sent, _) = exchange(&cases()[N].component_factory(), request, vec![status(400)]);
     let first = sent.first().expect("the follow-up request was sent");
     serde_json::from_slice(&first.body).expect("a JSON request body")
 }
@@ -488,7 +492,7 @@ fn exchange(
     make: &(dyn Fn(ScriptedTransport) -> Arc<dyn Provider> + Sync),
     request: &ProviderRequest,
     script: Vec<ScriptedResponse>,
-) -> (Result<Outcome, ProviderError>, Vec<HttpRequest>) {
+) -> (Result<Outcome, ProviderError>, Vec<HttpRequest>, usize) {
     let transport = ScriptedTransport::new(script);
     let recorded = transport.clone();
     let outcome = std::thread::scope(|scope| {
@@ -499,7 +503,8 @@ fn exchange(
                     .start_paused(true)
                     .build()
                     .expect("a runtime");
-                runtime.block_on(async {
+                REFRESHES.with(|count| count.set(0));
+                let result = runtime.block_on(async {
                     let provider = make(transport);
                     let mut stream = provider
                         .stream(request.clone(), CancellationToken::new())
@@ -511,12 +516,13 @@ fn exchange(
                         }
                     }
                     Ok(last.expect("a terminal event"))
-                })
+                });
+                (result, REFRESHES.with(Cell::get))
             })
             .join()
             .expect("the exchange thread")
     });
-    (outcome, recorded.requests())
+    (outcome.0, recorded.requests(), outcome.1)
 }
 
 fn run_case<const N: usize>() {
@@ -663,9 +669,9 @@ fn header_view(request: &HttpRequest) -> (Vec<(String, String)>, Vec<String>) {
 fn the_component_sends_what_the_native_adapter_sends() {
     for case in cases() {
         let request = canonical_request(case);
-        let (native_outcome, native) =
+        let (native_outcome, native, _) =
             exchange(&case.native_factory(), &request, vec![status(400)]);
-        let (component_outcome, component) =
+        let (component_outcome, component, _) =
             exchange(&case.component_factory(), &request, vec![status(400)]);
         assert!(native_outcome.is_ok(), "[{}] native setup", case.name);
         assert!(component_outcome.is_ok(), "[{}] component setup", case.name);
@@ -732,9 +738,23 @@ fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_
                     })
                     .collect::<Vec<_>>()
             };
-            let (native_outcome, native) = exchange(&case.native_factory(), &request, script());
-            let (component_outcome, component) =
+            let (native_outcome, native, native_refreshes) =
+                exchange(&case.native_factory(), &request, script());
+            let (component_outcome, component, component_refreshes) =
                 exchange(&case.component_factory(), &request, script());
+            // Only an adapter that diagnoses an account refusal owes the no-refresh
+            // guarantee. Messages and Responses classify unfamiliar 401/403 bodies by
+            // status alone; an Authentication diagnosis is allowed one credential refresh.
+            let account_diagnosis = matches!(
+                &native_outcome,
+                Ok(Outcome::Failed(error))
+                    if matches!(
+                        error.kind,
+                        ProviderErrorKind::InsufficientBalance
+                            | ProviderErrorKind::NotEntitled
+                            | ProviderErrorKind::UsageLimitExhausted
+                    )
+            );
             let failure = |outcome: Result<Outcome, ProviderError>| match outcome {
                 Ok(Outcome::Failed(error)) => (error.kind, error.message),
                 other => panic!(
@@ -754,6 +774,30 @@ fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_
                 "[{}] HTTP {code} {body}: attempts",
                 case.name
             );
+            if account_diagnosis {
+                assert_eq!(
+                    native.len(),
+                    1,
+                    "[{}] HTTP {code}: native retried account refusal",
+                    case.name
+                );
+                assert_eq!(
+                    component.len(),
+                    1,
+                    "[{}] HTTP {code}: component retried account refusal",
+                    case.name
+                );
+                assert_eq!(
+                    native_refreshes, 0,
+                    "[{}] HTTP {code}: native refreshed",
+                    case.name
+                );
+                assert_eq!(
+                    component_refreshes, 0,
+                    "[{}] HTTP {code}: component refreshed",
+                    case.name
+                );
+            }
         }
     }
 }

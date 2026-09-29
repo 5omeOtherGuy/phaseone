@@ -330,6 +330,184 @@ fn assert_dense(records: &[JournalRecord]) {
 
 // ------------------------------------------------------------------ the cases
 
+#[tokio::test]
+async fn opaque_key_shaped_replay_survives_agent_journal_and_next_request() {
+    within_deadline(
+        "opaque_key_shaped_replay_survives_agent_journal_and_next_request",
+        async {
+            let secret = format!("sk-{}", "a".repeat(24));
+            let origin = origin();
+            let replay = ReplayData {
+                origin: origin.clone(),
+                version: RECORDED_VERSION,
+                payload: json!({ "signature": secret }),
+            };
+            let first = Step::Events(vec![StreamEvent::Finished(Outcome::Completed(
+                CompletedResponse {
+                    item: AssistantItem {
+                        origin: origin.clone(),
+                        blocks: vec![AssistantBlock::Reasoning {
+                            text: "thinking".into(),
+                            replay: Some(replay.clone()),
+                        }],
+                    },
+                    stop: StopReason::EndTurn,
+                    usage: None,
+                },
+            ))]);
+            let provider = Arc::new(ScriptedProvider::new(vec![first, text_response("done")]));
+            let journal = Arc::new(RecordingJournal::new());
+            let mut agent = Agent::new(AgentParts {
+                provider: provider.clone(),
+                tools: Vec::new(),
+                system_prompt: "prompt".into(),
+                options: ModelOptions::default(),
+                context: Arc::new(PassthroughContext),
+                authorization: Arc::new(ScriptedAuthorization::permit_all()),
+                journal: journal.clone(),
+                events: Arc::new(RecordingEvents::new()),
+            })
+            .expect("assemble agent");
+            assert!(matches!(
+                turn(&mut agent, "first").await,
+                TurnEnd::Completed { .. }
+            ));
+            let recorded = journal.records();
+            let stored = recorded
+                .iter()
+                .find_map(|record| match &record.body {
+                    RecordBody::AssistantCompleted { item, .. } => Some(item),
+                    _ => None,
+                })
+                .expect("journalled assistant");
+            fn reasoning(blocks: &[AssistantBlock]) -> Option<&ReplayData> {
+                blocks.iter().find_map(|block| match block {
+                    AssistantBlock::Reasoning { replay, .. } => replay.as_ref(),
+                    _ => None,
+                })
+            }
+            assert_eq!(reasoning(&stored.blocks), Some(&replay));
+            assert!(matches!(
+                turn(&mut agent, "next").await,
+                TurnEnd::Completed { .. }
+            ));
+            let requests = provider.requests();
+            let history = &requests[1].history;
+            let carried = history.iter().find_map(|item| match item {
+                Item::Assistant(item) => reasoning(&item.blocks),
+                _ => None,
+            });
+            assert_eq!(carried, Some(&replay));
+        },
+    )
+    .await;
+}
+
+/// The same key-shaped replay, but through the PRODUCTION journal: the file store writes it, a
+/// fresh agent resumes from the persisted records, and its next request carries the payload. The
+/// in-process case above reads the live agent's in-memory journal, so it cannot catch a journal
+/// serializer or a resume projection that drops or masks the signature; this one reads the bytes
+/// back from disk.
+#[tokio::test]
+async fn opaque_key_shaped_replay_survives_the_persisted_journal_and_a_resumed_session() {
+    within_deadline(
+        "opaque_key_shaped_replay_survives_the_persisted_journal_and_a_resumed_session",
+        async {
+            let secret = format!("sk-{}", "a".repeat(24));
+            let origin = origin();
+            let replay = ReplayData {
+                origin: origin.clone(),
+                version: RECORDED_VERSION,
+                payload: json!({ "signature": secret }),
+            };
+            let first = Step::Events(vec![StreamEvent::Finished(Outcome::Completed(
+                CompletedResponse {
+                    item: AssistantItem {
+                        origin: origin.clone(),
+                        blocks: vec![AssistantBlock::Reasoning {
+                            text: "thinking".into(),
+                            replay: Some(replay.clone()),
+                        }],
+                    },
+                    stop: StopReason::EndTurn,
+                    usage: None,
+                },
+            ))]);
+            let dir = tempfile::tempdir().expect("a session directory");
+            let path = dir.path().join("session.jsonl");
+            let store = p1_host::session::create(&path).expect("create the session file");
+            let recording = Arc::new(ScriptedProvider::new(vec![first]));
+            let mut agent = Agent::new(AgentParts {
+                provider: recording as Arc<dyn Provider>,
+                tools: Vec::new(),
+                system_prompt: "prompt".into(),
+                options: ModelOptions::default(),
+                context: Arc::new(PassthroughContext),
+                authorization: Arc::new(ScriptedAuthorization::permit_all()),
+                journal: p1_host::session::sink(&store),
+                events: Arc::new(RecordingEvents::new()),
+            })
+            .expect("assemble the recording agent");
+            assert!(matches!(
+                turn(&mut agent, "first").await,
+                TurnEnd::Completed { .. }
+            ));
+            drop(agent);
+            drop(store);
+
+            // Read the PERSISTED records back, then resume a NEW agent from them.
+            let (store, resumed) = p1_host::session::resume(&path).expect("resume the session");
+            let persisted = resumed.records;
+            let stored = persisted
+                .iter()
+                .find_map(|record| match &record.body {
+                    RecordBody::AssistantCompleted { item, .. } => Some(item),
+                    _ => None,
+                })
+                .expect("the persisted journal holds the assistant answer");
+            fn reasoning(blocks: &[AssistantBlock]) -> Option<&ReplayData> {
+                blocks.iter().find_map(|block| match block {
+                    AssistantBlock::Reasoning { replay, .. } => replay.as_ref(),
+                    _ => None,
+                })
+            }
+            assert_eq!(reasoning(&stored.blocks), Some(&replay));
+
+            let resumed_provider = Arc::new(ReplayReader::new(
+                ScriptedProvider::new(vec![text_response("done")]),
+                origin.clone(),
+                vec![RECORDED_VERSION],
+            ));
+            let (mut resumed_agent, _report) = Agent::resume(
+                AgentParts {
+                    provider: resumed_provider.clone() as Arc<dyn Provider>,
+                    tools: Vec::new(),
+                    system_prompt: "prompt".into(),
+                    options: ModelOptions::default(),
+                    context: Arc::new(PassthroughContext),
+                    authorization: Arc::new(ScriptedAuthorization::permit_all()),
+                    journal: p1_host::session::sink(&store),
+                    events: Arc::new(RecordingEvents::new()),
+                },
+                &persisted,
+            )
+            .expect("resume the agent from the persisted journal");
+            assert!(matches!(
+                turn(&mut resumed_agent, "next").await,
+                TurnEnd::Completed { .. }
+            ));
+            let requests = resumed_provider.requests();
+            let history = &requests[0].history;
+            let carried = history.iter().find_map(|item| match item {
+                Item::Assistant(item) => reasoning(&item.blocks),
+                _ => None,
+            });
+            assert_eq!(carried, Some(&replay));
+        },
+    )
+    .await;
+}
+
 /// A compatible upgrade: the replacement declares the recorded layout version (and the next
 /// one) and its `validate` passes over the current history. The switch commits ONE
 /// `Environment`, and the turn after it carries the recorded replay to the new build

@@ -195,6 +195,64 @@ async fn a_heredoc_wrapped_crlf_patch_without_final_newline_still_applies() {
     assert_eq!(fs::read(dir.path().join("w.txt")).unwrap(), b"a\r\nB\r\n");
 }
 
+/// The complete, newline-terminated PID records in a readiness file. `lines()` also counts an
+/// unterminated final line, so a partially written PID would otherwise look like a ready child;
+/// only a record the writer finished with a newline, and that parses to a positive PID, names
+/// one.
+fn complete_child_pids(text: &str) -> Vec<u32> {
+    text.split_inclusive('\n')
+        .filter_map(|record| record.strip_suffix('\n'))
+        .filter_map(|record| record.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .collect()
+}
+
+async fn await_child_pids(pids: &std::path::Path) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if fs::read_to_string(pids)
+                .map(|s| complete_child_pids(&s).len() >= 3)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("shell children did not report readiness before cancellation");
+}
+
+#[test]
+fn child_readiness_needs_three_complete_positive_pid_records() {
+    // A partial third write is not a child, though `lines()` would count it.
+    assert_eq!(complete_child_pids("100\n200\n30"), vec![100, 200]);
+    assert_eq!(complete_child_pids("100\n200\n300\n"), vec![100, 200, 300]);
+    // A finished but unusable record names no child either.
+    assert_eq!(
+        complete_child_pids("100\n200\n\n300\n"),
+        vec![100, 200, 300]
+    );
+    assert_eq!(complete_child_pids("100\n0\n-2\n300\n"), vec![100, 300]);
+}
+
+#[tokio::test]
+async fn cancellation_waits_until_all_child_pids_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let pids = dir.path().join("pids");
+    let waiter = tokio::spawn({
+        let pids = pids.clone();
+        async move { await_child_pids(&pids).await }
+    });
+    fs::write(&pids, "1\n2\n").unwrap();
+    assert!(
+        !waiter.is_finished(),
+        "cancelled before third child was ready"
+    );
+    fs::write(&pids, "1\n2\n3\n").unwrap();
+    waiter.await.unwrap();
+}
+
 #[tokio::test]
 async fn shell_kills_the_whole_process_tree_on_cancel_and_on_timeout() {
     let dir = tempfile::tempdir().unwrap();
@@ -211,15 +269,7 @@ async fn shell_kills_the_whole_process_tree_on_cancel_and_on_timeout() {
     let waiter = {
         let pids = pids.clone();
         tokio::spawn(async move {
-            for _ in 0..200 {
-                if fs::read_to_string(&pids)
-                    .map(|s| s.lines().count() >= 3)
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
+            await_child_pids(&pids).await;
             trigger.cancel();
         })
     };

@@ -39,7 +39,7 @@ use p1_contracts::{CancellationToken, ToolContext, ToolStatus};
 use p1_module_runtime::{
     Digest, ExecutionLimits, LoadError, Loader, ReleaseManifest, Services, wasm_tool,
 };
-use p1_module_tests::{FIXTURE_NAME, call, fake_processes};
+use p1_module_tests::{FIXTURE_NAME, binary_names_checkout, call, fake_processes};
 use p1_redact::MaskCounter;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -550,8 +550,7 @@ fn p1_binary(root: &Path) -> PathBuf {
     static BUILD: Mutex<()> = Mutex::new(());
     let _build = BUILD.lock().unwrap_or_else(PoisonError::into_inner);
     let candidate = profile_dir().join("p1");
-    let sources = root.join("crates/p1-host");
-    if fresh(&candidate, &sources) {
+    if fresh(&candidate, root) && binary_names_checkout(&candidate, root) {
         return candidate;
     }
     // `CARGO` is the toolchain cargo set for this test process, so the nested build uses the
@@ -559,7 +558,7 @@ fn p1_binary(root: &Path) -> PathBuf {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     if let Err(reason) = run_locked(root, &cargo, &build_p1_args()) {
         assert!(
-            fresh(&candidate, &sources),
+            fresh(&candidate, root) && binary_names_checkout(&candidate, root),
             "no usable p1 binary at {}: {reason}; run `cargo build --locked -p p1-host --bin p1`",
             candidate.display()
         );
@@ -577,15 +576,39 @@ fn build_p1_args() -> [&'static str; 6] {
     ["build", "--locked", "-p", "p1-host", "--bin", "p1"]
 }
 
-/// Whether `candidate` exists and is at least as new as every file under `sources`.
-fn fresh(candidate: &Path, sources: &Path) -> bool {
+/// Reject a binary older than any workspace source or build input, not just host sources.
+fn fresh(candidate: &Path, root: &Path) -> bool {
     let Ok(built) = fs::metadata(candidate).and_then(|meta| meta.modified()) else {
         return false;
     };
-    match newest_mtime(sources, None) {
-        Some(source) => source <= built,
-        None => true,
-    }
+    [
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "crates",
+        "routes",
+        "profiles",
+    ]
+    .iter()
+    .filter_map(|part| newest_mtime(&root.join(part), Some("target")))
+    .all(|source| source <= built)
+}
+
+#[test]
+fn binary_freshness_covers_dependency_crates() {
+    let dir = tempfile::tempdir().unwrap();
+    let candidate = dir.path().join("p1");
+    fs::write(&candidate, b"old binary").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&candidate)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+    let dependency = dir.path().join("crates/p1-contracts/src/lib.rs");
+    fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+    fs::write(&dependency, b"new dependency").unwrap();
+    assert!(!fresh(&candidate, dir.path()));
 }
 
 /// The newest modification time below `path`, ignoring a directory named `skip` (the build
@@ -1317,10 +1340,46 @@ fn resolve_commit(root: &Path, short: &str) -> String {
             return full;
         }
     }
+    // Build boxes can export the source tree without its Git object database. The module
+    // generator writes the same checkout's full commit to the built development manifest;
+    // accept that provenance only when it matches the binary's version prefix.
+    if let Some(full) = built_manifest_commit(root, short) {
+        return full;
+    }
     panic!(
         "the p1 binary names commit {short}, which this checkout cannot resolve; build it here \
          with `cargo build --locked -p p1-host --bin p1`"
     );
+}
+
+fn built_manifest_commit(root: &Path, short: &str) -> Option<String> {
+    let manifest = fs::read(root.join("modules/target/p1-modules/manifest.json")).ok()?;
+    let manifest: Value = serde_json::from_slice(&manifest).ok()?;
+    let full = manifest.get("commit")?.as_str()?;
+    (full.len() == 40
+        && full
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && full.starts_with(short))
+    .then(|| full.to_owned())
+}
+
+#[test]
+fn an_exported_build_manifest_resolves_only_its_matching_binary_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let modules = root.path().join("modules/target/p1-modules");
+    fs::create_dir_all(&modules).unwrap();
+    let full = "2c7a6fbd88bab6777b338de6ce6cad36f27fc430";
+    fs::write(
+        modules.join("manifest.json"),
+        serde_json::json!({ "commit": full }).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        built_manifest_commit(root.path(), "2c7a6fbd88ba"),
+        Some(full.to_owned())
+    );
+    assert_eq!(built_manifest_commit(root.path(), "123456789012"), None);
 }
 
 /// `sha256:<hex>` of the bytes at `path`, through the runtime's own digest.

@@ -514,3 +514,115 @@ impl Drop for Watchdog {
         let _ = self.done.send(());
     }
 }
+
+// ---------------------------------------------------------------- install identity
+
+/// Whether the `p1` binary at `candidate` names the revision this checkout is at.
+///
+/// An mtime is not build identity: a binary carried over from another checkout, or from an
+/// earlier commit in a shared target directory, can be newer than every source here, so an
+/// mtime-only freshness check would run the suite against the wrong code. The binary's
+/// `--version` names its commit; it must be a prefix of this checkout's, taken from Git HEAD
+/// when the tree has a Git database, else from the development module manifest built from the
+/// same checkout. A tree that can name neither keeps the mtime-only rule (see the callers).
+pub fn binary_names_checkout(candidate: &Path, root: &Path) -> bool {
+    revision_matches(
+        &binary_short_sha(candidate),
+        checkout_commit(root).as_deref(),
+    )
+}
+
+/// Whether the binary's short commit is a prefix of the checkout's full commit. `None` is a
+/// tree that cannot name its own revision.
+fn revision_matches(short: &str, commit: Option<&str>) -> bool {
+    commit.is_none_or(|commit| commit.starts_with(short))
+}
+
+/// This checkout's full commit: Git HEAD when the tree has a Git database, else the commit the
+/// development module build recorded for the same tree.
+fn checkout_commit(root: &Path) -> Option<String> {
+    git_head(root).or_else(|| manifest_commit(root))
+}
+
+/// This worktree's full HEAD commit, when Git can name it here.
+fn git_head(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let full = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (out.status.success() && is_full_commit(&full)).then_some(full)
+}
+
+/// The commit `scripts/build-modules.sh` recorded in the development manifest it writes into
+/// the checkout, for a build box that exported the tree without its Git object database.
+fn manifest_commit(root: &Path) -> Option<String> {
+    let manifest = std::fs::read(root.join("modules/target/p1-modules/manifest.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
+    let full = manifest.get("commit")?.as_str()?;
+    is_full_commit(full).then(|| full.to_owned())
+}
+
+fn is_full_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// The short commit token of `p1 --version`, `deadbeef0000` in
+/// `p1 0.0.1 (deadbeef0000 2026-09-24)`.
+fn binary_short_sha(p1: &Path) -> String {
+    let out = std::process::Command::new(p1)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {} --version: {error}", p1.display()));
+    assert!(
+        out.status.success(),
+        "{} --version exited {}",
+        p1.display(),
+        out.status
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    for token in text.split_whitespace() {
+        if let Some(rest) = token.strip_prefix('(') {
+            let sha: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+            if !sha.is_empty() {
+                return sha;
+            }
+        }
+    }
+    panic!("{} --version names no commit: {text}", p1.display());
+}
+
+#[test]
+fn binary_identity_requires_the_checkout_commit() {
+    let head = "2c7a6fbd88bab6777b338de6ce6cad36f27fc430";
+    assert!(revision_matches("2c7a6fbd88ba", Some(head)));
+    assert!(!revision_matches("deadbeef0000", Some(head)));
+    assert!(revision_matches("deadbeef0000", None));
+}
+
+#[test]
+fn a_module_manifest_names_only_a_full_lowercase_commit() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let modules = dir.path().join("modules/target/p1-modules");
+    std::fs::create_dir_all(&modules).expect("the manifest directory");
+    let full = "2c7a6fbd88bab6777b338de6ce6cad36f27fc430";
+    std::fs::write(
+        modules.join("manifest.json"),
+        json!({ "commit": full }).to_string(),
+    )
+    .expect("the manifest");
+    assert_eq!(manifest_commit(dir.path()).as_deref(), Some(full));
+    std::fs::write(
+        modules.join("manifest.json"),
+        json!({ "commit": full.to_ascii_uppercase() }).to_string(),
+    )
+    .expect("the manifest");
+    assert_eq!(manifest_commit(dir.path()), None);
+}

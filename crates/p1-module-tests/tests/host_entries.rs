@@ -31,17 +31,18 @@
 //! the build-directory lock); a missing binary fails the case naming the command to run.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use p1_contracts::serde_json::{self, Value};
 use p1_module_runtime::{Digest, ReleaseManifest};
+use p1_module_tests::binary_names_checkout;
 use tempfile::TempDir;
 
 /// How long one scratch run may take before the case kills it. A run here is bounded by its own
@@ -344,33 +345,53 @@ fn headless_turn(release: &Release, run: Run) -> Output {
 struct RefusingEndpoint {
     port: u16,
     count: Arc<AtomicUsize>,
-    stop: Arc<AtomicBool>,
     acceptor: Option<thread::JoinHandle<()>>,
 }
 
 impl RefusingEndpoint {
     /// Binds an ephemeral loopback port and starts accepting.
     fn start() -> Self {
+        Self::spawn(None)
+    }
+
+    /// The same endpoint with a test seam: the acceptor signals every accepted connection on
+    /// the returned receiver and blocks until the test sends on the returned sender before it
+    /// decides whether the connection was the fence. A test can therefore hold a connection
+    /// between `accept` and that decision, fence while it is held, and prove the held connection
+    /// is still counted — the ordering issue #417 is about, without a timing race.
+    fn held() -> (Self, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        (
+            Self::spawn(Some((accepted_tx, release_rx))),
+            accepted_rx,
+            release_tx,
+        )
+    }
+
+    fn spawn(gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a loopback endpoint");
         let port = listener
             .local_addr()
             .expect("the endpoint's address")
             .port();
         let count = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
         let acceptor = {
             let listener = listener;
             let count = Arc::clone(&count);
-            let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 loop {
                     match listener.accept() {
-                        Ok((stream, _)) => {
-                            // `accept` returns queued connections in order, and the wake
-                            // connection [`RefusingEndpoint::requests`] queues is queued after
-                            // every connection the run made: once the flag is seen, everything
-                            // the run made has been counted.
-                            if stop.load(Ordering::SeqCst) {
+                        Ok((mut stream, _)) => {
+                            if let Some((accepted, release)) = &gate {
+                                let _ = accepted.send(());
+                                let _ = release.recv();
+                            }
+                            // A stop flag can discard queued provider connections; only the
+                            // explicitly marked fence ends the accept loop.
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                            let mut first = [0];
+                            if stream.read(&mut first).ok() == Some(1) && first[0] == b'F' {
                                 return;
                             }
                             count.fetch_add(1, Ordering::SeqCst);
@@ -384,7 +405,6 @@ impl RefusingEndpoint {
         Self {
             port,
             count,
-            stop,
             acceptor: Some(acceptor),
         }
     }
@@ -393,14 +413,28 @@ impl RefusingEndpoint {
         self.port
     }
 
+    fn fence(&self) {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", self.port)).expect("connect the endpoint fence");
+        stream.write_all(b"F").expect("send the endpoint fence");
+    }
+
     /// How many connections reached the endpoint, once the run has ended: the acceptor is woken
     /// by the fence connection this queues, and a blocking `accept` returns connections in
     /// order, so a woken acceptor has counted every connection the run made.
     fn requests(&mut self) -> usize {
         if let Some(acceptor) = self.acceptor.take() {
-            self.stop.store(true, Ordering::SeqCst);
-            let _ = TcpStream::connect(("127.0.0.1", self.port));
-            let _ = acceptor.join();
+            self.fence();
+            acceptor.join().expect("endpoint acceptor");
+        }
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// Join the acceptor without fencing again, for a case whose fence the acceptor already
+    /// consumed through a seam.
+    fn finish(mut self) -> usize {
+        if let Some(acceptor) = self.acceptor.take() {
+            acceptor.join().expect("endpoint acceptor");
         }
         self.count.load(Ordering::SeqCst)
     }
@@ -409,11 +443,40 @@ impl RefusingEndpoint {
 impl Drop for RefusingEndpoint {
     fn drop(&mut self) {
         if let Some(acceptor) = self.acceptor.take() {
-            self.stop.store(true, Ordering::SeqCst);
-            let _ = TcpStream::connect(("127.0.0.1", self.port));
+            self.fence();
             let _ = acceptor.join();
         }
     }
+}
+
+#[test]
+fn refusing_endpoint_drains_connections_before_the_fence() {
+    let mut endpoint = RefusingEndpoint::start();
+    let first = TcpStream::connect(("127.0.0.1", endpoint.port())).unwrap();
+    let second = TcpStream::connect(("127.0.0.1", endpoint.port())).unwrap();
+    drop((first, second));
+    assert_eq!(endpoint.requests(), 2);
+}
+
+#[test]
+fn a_connection_held_before_the_fence_is_still_counted() {
+    let (endpoint, accepted, release) = RefusingEndpoint::held();
+    let queued = TcpStream::connect(("127.0.0.1", endpoint.port())).unwrap();
+    // The acceptor has taken the queued connection and holds it before the fence decision.
+    accepted
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the queued connection was accepted");
+    drop(queued);
+    // Fence while the acceptor is held: a stop flag set here would discard the queued
+    // connection, which is exactly the #417 false green.
+    endpoint.fence();
+    release.send(()).expect("release the held connection");
+    // The fence connection reaches the same seam; release it to end the accept loop.
+    accepted
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the fence connection was accepted");
+    release.send(()).expect("release the fence connection");
+    assert_eq!(endpoint.finish(), 1);
 }
 
 // --- the scratch release ------------------------------------------------------
@@ -631,8 +694,7 @@ fn p1() -> PathBuf {
             return path;
         }
         let candidate = profile_dir().join("p1");
-        let sources = root.join("crates/p1-host");
-        if fresh(&candidate, &sources) {
+        if fresh(&candidate, &root) && binary_names_checkout(&candidate, &root) {
             return candidate;
         }
         // `CARGO` is the toolchain cargo set for this test process, so the nested build uses
@@ -640,7 +702,7 @@ fn p1() -> PathBuf {
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         if let Err(reason) = run_locked(&root, &cargo, &build_p1_args()) {
             assert!(
-                fresh(&candidate, &sources),
+                fresh(&candidate, &root) && binary_names_checkout(&candidate, &root),
                 "no usable p1 binary at {}: {reason}; run `cargo build --locked -p p1-host --bin p1`",
                 candidate.display()
             );
@@ -740,15 +802,39 @@ fn profile_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Whether `candidate` exists and is at least as new as every file under `sources`.
-fn fresh(candidate: &Path, sources: &Path) -> bool {
+/// Reject a binary older than any workspace source or build input, not just host sources.
+fn fresh(candidate: &Path, root: &Path) -> bool {
     let Ok(built) = fs::metadata(candidate).and_then(|meta| meta.modified()) else {
         return false;
     };
-    match newest_mtime(sources, None) {
-        Some(source) => source <= built,
-        None => true,
-    }
+    [
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "crates",
+        "routes",
+        "profiles",
+    ]
+    .iter()
+    .filter_map(|part| newest_mtime(&root.join(part), Some("target")))
+    .all(|source| source <= built)
+}
+
+#[test]
+fn binary_freshness_covers_dependency_crates() {
+    let dir = tempfile::tempdir().unwrap();
+    let candidate = dir.path().join("p1");
+    fs::write(&candidate, b"old binary").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&candidate)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+    let dependency = dir.path().join("crates/p1-contracts/src/lib.rs");
+    fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+    fs::write(&dependency, b"new dependency").unwrap();
+    assert!(!fresh(&candidate, dir.path()));
 }
 
 /// The newest modification time below `path`, ignoring a directory named `skip` (the build
