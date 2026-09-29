@@ -8,6 +8,7 @@
 //! The fixture is built by `scripts/build-modules.sh` (the gate runs it before the tests).
 //! When it is missing the harness fails with that instruction; it never skips a case.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -625,4 +626,180 @@ fn a_module_manifest_names_only_a_full_lowercase_commit() {
     )
     .expect("the manifest");
     assert_eq!(manifest_commit(dir.path()), None);
+}
+
+// ---------------------------------------------------------------- binary inputs
+
+/// The files and directories the `p1` binary is built from: the workspace manifests, the
+/// runtime data trees, and each crate in `p1-host`'s normal dependency closure — its
+/// `Cargo.toml`, `build.rs` and `src/`.
+///
+/// Scanning every crate, or a whole crate directory, treats a test or a test-only crate as an
+/// input to the executable: editing one leaves it newer than the binary, while `cargo build -p
+/// p1-host` does not relink the binary, so a caller that insists on freshness rejects a usable
+/// artefact. Test and bench sources are not part of the binary and are skipped for the same
+/// reason. A tree that names no `p1-host` manifest is read conservatively, as every crate
+/// directory.
+pub fn p1_binary_inputs(root: &Path) -> Vec<PathBuf> {
+    let mut inputs: Vec<PathBuf> = ["Cargo.toml", "Cargo.lock", "build.rs", "routes", "profiles"]
+        .iter()
+        .map(|part| root.join(part))
+        .collect();
+    for dir in p1_binary_crates(root) {
+        inputs.push(dir.join("Cargo.toml"));
+        inputs.push(dir.join("build.rs"));
+        inputs.push(dir.join("src"));
+    }
+    inputs
+}
+
+/// The crate directories `p1-host` links: its path-dependency closure, or every crate directory
+/// when its manifest cannot be read.
+fn p1_binary_crates(root: &Path) -> Vec<PathBuf> {
+    let host = root.join("crates/p1-host");
+    if host.join("Cargo.toml").is_file() {
+        path_dependency_closure(&host)
+    } else {
+        crate_directories(&root.join("crates"))
+    }
+}
+
+/// Every directory reachable from `start` through `[dependencies]` and `[build-dependencies]`
+/// path entries, `start` included. A `[dev-dependencies]` entry is not followed: a test-only
+/// crate is not linked into a normal build.
+fn path_dependency_closure(start: &Path) -> Vec<PathBuf> {
+    let mut crates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending = vec![start.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        crates.push(key);
+        let Ok(manifest) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+            continue;
+        };
+        for relative in dependency_paths(&manifest) {
+            pending.push(dir.join(relative));
+        }
+    }
+    crates
+}
+
+/// The immediate directory children of a `crates/` directory.
+fn crate_directories(crates: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(crates) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    dirs
+}
+
+/// The `path` of every dependency in a manifest's `[dependencies]` and
+/// `[build-dependencies]` sections, relative to the manifest's directory. `[dev-dependencies]`
+/// is skipped.
+fn dependency_paths(manifest: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut in_dependencies = false;
+    for line in manifest.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(section) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            in_dependencies = is_dependency_section(section);
+            continue;
+        }
+        if in_dependencies && let Some(path) = inline_path(line) {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    paths
+}
+
+/// Whether a section header holds normal or build dependencies, not dev dependencies:
+/// `dependencies`, `build-dependencies`, and their `target.'cfg(...)'.` forms. `[[bin]]`'s
+/// `[bin]` and every other section are not dependency tables.
+fn is_dependency_section(section: &str) -> bool {
+    matches!(
+        section.rsplit('.').next().unwrap_or(section),
+        "dependencies" | "build-dependencies"
+    )
+}
+
+/// The `path = "..."` value of an inline dependency table (`name = { path = "../crate" }`),
+/// or `None` for a line that is not one.
+fn inline_path(line: &str) -> Option<String> {
+    let (_, value) = line.split_once('=')?;
+    let table = value.trim().strip_prefix('{')?;
+    let start = table.find("path")?;
+    let after = table[start + "path".len()..].trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    let after = after.strip_prefix('"')?;
+    let (path, _) = after.split_once('"')?;
+    Some(path.to_owned())
+}
+
+#[test]
+fn a_dependency_manifest_reads_normal_and_build_paths_but_not_dev_paths() {
+    let manifest = "[package]\nname = \"p1-host\"\n\n[dependencies]\n\
+                    a = { path = \"../a\", features = [\"x\"] }\nb = { version = \"1\", path = \"../b\" }\n\
+                    c = { workspace = true }\n\n[build-dependencies]\nd = { path = \"../d\" }\n\n\
+                    [dev-dependencies]\ne = { path = \"../e\" }\n";
+    assert_eq!(
+        dependency_paths(manifest),
+        vec![
+            PathBuf::from("../a"),
+            PathBuf::from("../b"),
+            PathBuf::from("../d")
+        ]
+    );
+}
+
+#[test]
+fn a_crate_closure_follows_only_the_paths_it_links() {
+    let dir = tempfile::tempdir().expect("a scratch workspace");
+    let host = dir.path().join("crates/p1-host");
+    std::fs::create_dir_all(&host).expect("host dir");
+    std::fs::write(
+        host.join("Cargo.toml"),
+        "[package]\nname = \"p1-host\"\n\n[dependencies]\n\
+         p1-lib = { path = \"../p1-lib\" }\n\n[dev-dependencies]\n\
+         p1-tests = { path = \"../p1-tests\" }\n",
+    )
+    .expect("host manifest");
+    let lib = dir.path().join("crates/p1-lib");
+    std::fs::create_dir_all(&lib).expect("lib dir");
+    std::fs::write(
+        lib.join("Cargo.toml"),
+        "[package]\nname = \"p1-lib\"\n\n[dependencies]\n\
+         p1-base = { path = \"../p1-base\" }\n",
+    )
+    .expect("lib manifest");
+    let base = dir.path().join("crates/p1-base");
+    std::fs::create_dir_all(&base).expect("base dir");
+    std::fs::write(base.join("Cargo.toml"), "[package]\nname = \"p1-base\"\n")
+        .expect("base manifest");
+    let tests = dir.path().join("crates/p1-tests");
+    std::fs::create_dir_all(&tests).expect("tests dir");
+    std::fs::write(tests.join("Cargo.toml"), "[package]\nname = \"p1-tests\"\n")
+        .expect("tests manifest");
+
+    let mut closure = p1_binary_crates(dir.path());
+    closure.sort();
+    let mut expected = vec![
+        std::fs::canonicalize(&host).unwrap(),
+        std::fs::canonicalize(&lib).unwrap(),
+        std::fs::canonicalize(&base).unwrap(),
+    ];
+    expected.sort();
+    assert_eq!(closure, expected);
 }

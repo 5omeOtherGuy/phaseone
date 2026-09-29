@@ -2,8 +2,10 @@
 //! (docs/design/tools.md).
 
 use std::fs;
+use std::future::Future;
 use std::os::unix::fs::symlink;
 use std::path::Path;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use p1_contracts::{
@@ -240,17 +242,20 @@ fn child_readiness_needs_three_complete_positive_pid_records() {
 async fn cancellation_waits_until_all_child_pids_exist() {
     let dir = tempfile::tempdir().unwrap();
     let pids = dir.path().join("pids");
-    let waiter = tokio::spawn({
-        let pids = pids.clone();
-        async move { await_child_pids(&pids).await }
-    });
-    fs::write(&pids, "1\n2\n").unwrap();
+    // Two complete records and a torn third: `lines()` counts the torn one, so an early
+    // readiness check reads three children here.
+    fs::write(&pids, "1\n2\n3").unwrap();
+    let mut waiter = Box::pin(await_child_pids(&pids));
+    // Polling the waiter once proves it read that file and stayed blocked. A spawned task was
+    // never polled before a synchronous `is_finished()`, so a waiter that returned early still
+    // passed that check.
+    let mut context = Context::from_waker(Waker::noop());
     assert!(
-        !waiter.is_finished(),
-        "cancelled before third child was ready"
+        matches!(waiter.as_mut().poll(&mut context), Poll::Pending),
+        "cancelled before the third PID was complete"
     );
     fs::write(&pids, "1\n2\n3\n").unwrap();
-    waiter.await.unwrap();
+    waiter.await;
 }
 
 #[tokio::test]

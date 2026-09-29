@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use p1_assembly::load_modules_lock;
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{
     AssistantBlock, AssistantItem, BoxFuture, CancellationToken, Compaction, ContextInput,
@@ -223,16 +224,18 @@ async fn cancel_guest() {
 
 /// PLAN §10 "Warm installed CLI startup": two real headless host starts against one
 /// scratch release, distinguished by whether the environment selects the fixture module.
-/// Readiness is the first connection to the offline refusing provider: the host must have
-/// assembled its environment and tools before sending a request.
+/// Each variant has its own config root; only the module-enabled one locks the fixture, so
+/// the baseline pays no fixture verification or compilation and `added-p95` is the module
+/// path itself. Readiness is the first connection to the offline refusing provider: the host
+/// must have assembled its environment and tools before sending a request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "a benchmark: scripts/bench-modules.sh --suite acceptance runs it"]
 async fn cli_startup() {
     within_deadline("cli-startup", async {
         let p1 = p1_binary();
         let staged = StartupRelease::new(&p1);
-        let start_with_modules = || staged.ready_time("bench-enabled");
-        let start_native = || staged.ready_time("bench-base");
+        let start_with_modules = || staged.ready_time(staged.module_config(), "bench-enabled");
+        let start_native = || staged.ready_time(staged.base_config(), "bench-base");
 
         for _ in 0..STARTUP_WARM_UP {
             start_native();
@@ -1113,11 +1116,15 @@ fn p1_binary() -> PathBuf {
     p1
 }
 
-/// A staged CLI binary and real release module set. Both variants use the same provider
-/// and profile; only the fixture tool selection differs.
+/// A staged CLI binary and real release module set. Both variants use the same provider,
+/// profile and module tree; only the fixture tool selection and the module lock differ.
 struct StartupRelease {
     _dir: tempfile::TempDir,
     root: PathBuf,
+    /// The config root whose lock selects the fixture: the module-enabled start.
+    module_config: PathBuf,
+    /// The config root with no lock: the baseline start pays no fixture module cost.
+    base_config: PathBuf,
 }
 
 impl StartupRelease {
@@ -1151,39 +1158,29 @@ impl StartupRelease {
             fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
             entry
         };
-        let config = root.join("config");
-        fs::create_dir_all(&config).unwrap();
-        fs::write(
-            config.join("modules.lock"),
-            p1_module_tests::lock_text("fixture", &entry),
-        )
-        .unwrap();
-        for (name, enabled) in [("bench-base", false), ("bench-enabled", true)] {
-            let environment = config.join("environments").join(name);
-            fs::create_dir_all(&environment).unwrap();
-            fs::write(
-                environment.join("environment.toml"),
-                format!(
-                    "route = \"bench-loopback\"\nprofile = \"deepseek-v4.1-flash\"\n{}",
-                    if enabled {
-                        "\n[[tools]]\nmodule = \"fixture\"\n"
-                    } else {
-                        ""
-                    },
-                ),
-            )
-            .unwrap();
-            fs::write(environment.join("prompt.md"), "Bench: {{tool_names}}\n").unwrap();
+        let (base_config, module_config) = write_startup_configs(&root, &entry);
+        Self {
+            _dir: dir,
+            root,
+            base_config,
+            module_config,
         }
-        Self { _dir: dir, root }
     }
 
-    fn ready_time(&self, environment: &str) -> f64 {
+    fn module_config(&self) -> &Path {
+        &self.module_config
+    }
+
+    fn base_config(&self) -> &Path {
+        &self.base_config
+    }
+
+    fn ready_time(&self, config: &Path, environment: &str) -> f64 {
         // A fresh port prevents a previous child from supplying the next sample's signal.
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("offline provider");
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let routes = self.root.join("config/routes");
+        let routes = config.join("routes");
         fs::create_dir_all(&routes).unwrap();
         fs::write(routes.join("bench-loopback.toml"), format!(
             "id = \"bench-loopback\"\norigin_route = \"openai-chat/bench-loopback\"\n\
@@ -1199,8 +1196,9 @@ impl StartupRelease {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.root.join("home"))
-            .env("P1_CONFIG_DIR", self.root.join("config"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("P1_CONFIG_DIR", config)
+            .env("P1_ENVIRONMENTS_DIR", config.join("environments"))
+            .env("XDG_CONFIG_HOME", config)
             .env("XDG_DATA_HOME", self.root.join("data"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1227,6 +1225,68 @@ impl StartupRelease {
         child.wait().expect("reap benchmark child");
         ready
     }
+}
+
+/// Writes the two benchmark config roots. The module-enabled root locks the fixture; the
+/// baseline root has no lock, so its start pays no fixture verification or compilation and the
+/// row's `added-p95` measures the module path itself rather than a cost both sides pay.
+fn write_startup_configs(root: &Path, entry: &Value) -> (PathBuf, PathBuf) {
+    let base = root.join("config-base");
+    let modules = root.join("config-modules");
+    write_startup_environment(&base, "bench-base", false);
+    write_startup_environment(&modules, "bench-enabled", true);
+    fs::write(
+        modules.join("modules.lock"),
+        p1_module_tests::lock_text("fixture", entry),
+    )
+    .unwrap();
+    (base, modules)
+}
+
+/// Writes one benchmark environment under `<config>/environments/<name>`, selecting the
+/// fixture tool only when `enabled`.
+fn write_startup_environment(config: &Path, name: &str, enabled: bool) {
+    let environment = config.join("environments").join(name);
+    fs::create_dir_all(&environment).unwrap();
+    fs::write(
+        environment.join("environment.toml"),
+        format!(
+            "route = \"bench-loopback\"\nprofile = \"deepseek-v4.1-flash\"\n{}",
+            if enabled {
+                "\n[[tools]]\nmodule = \"fixture\"\n"
+            } else {
+                ""
+            },
+        ),
+    )
+    .unwrap();
+    fs::write(environment.join("prompt.md"), "Bench: {{tool_names}}\n").unwrap();
+}
+
+/// The baseline must resolve no module lock. A lock beside the shared environment search
+/// directory makes `bench-base` verify and compile the fixture too, so the startup row no
+/// longer measures the module path; a regression that puts the lock back where both
+/// environments see it fails this case.
+#[test]
+fn the_startup_baseline_config_resolves_an_empty_module_lock() {
+    let dir = tempfile::tempdir().expect("a scratch config root");
+    let entry = json!({
+        "name": FIXTURE_NAME,
+        "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "world": "p1:module/tool@1.0.0",
+        "protocol": "1.0",
+    });
+    let (base, modules) = write_startup_configs(dir.path(), &entry);
+    let base_lock = load_modules_lock(&[base.join("environments")]).expect("the baseline lock");
+    assert!(
+        base_lock.is_empty(),
+        "the baseline must not resolve the fixture module"
+    );
+    let module_lock = load_modules_lock(&[modules.join("environments")]).expect("the module lock");
+    assert!(
+        module_lock.resolve("fixture").is_some(),
+        "the module-enabled config locks the fixture"
+    );
 }
 
 fn copy_startup_tree(source: &Path, destination: &Path) {

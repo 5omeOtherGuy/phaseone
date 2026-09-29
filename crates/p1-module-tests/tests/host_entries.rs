@@ -42,7 +42,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use p1_contracts::serde_json::{self, Value};
 use p1_module_runtime::{Digest, ReleaseManifest};
-use p1_module_tests::binary_names_checkout;
+use p1_module_tests::{binary_names_checkout, p1_binary_inputs};
 use tempfile::TempDir;
 
 /// How long one scratch run may take before the case kills it. A run here is bounded by its own
@@ -802,22 +802,27 @@ fn profile_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Reject a binary older than any workspace source or build input, not just host sources.
+/// Reject a binary older than any input the `p1` binary is built from: the workspace manifests,
+/// the runtime data trees and `p1-host`'s dependency closure (`p1_binary_inputs`), not every
+/// workspace crate. A test-only or unrelated crate is not linked into the binary, so editing it
+/// must not reject a binary that is newer than every real input.
 fn fresh(candidate: &Path, root: &Path) -> bool {
     let Ok(built) = fs::metadata(candidate).and_then(|meta| meta.modified()) else {
         return false;
     };
-    [
-        "Cargo.toml",
-        "Cargo.lock",
-        "build.rs",
-        "crates",
-        "routes",
-        "profiles",
-    ]
-    .iter()
-    .filter_map(|part| newest_mtime(&root.join(part), Some("target")))
-    .all(|source| source <= built)
+    p1_binary_inputs(root)
+        .iter()
+        .filter_map(|path| newest_mtime(path, Some("target")))
+        .all(|source| source <= built)
+}
+
+fn set_mtime(path: &Path, at: SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(at))
+        .unwrap();
 }
 
 #[test]
@@ -835,6 +840,44 @@ fn binary_freshness_covers_dependency_crates() {
     fs::create_dir_all(dependency.parent().unwrap()).unwrap();
     fs::write(&dependency, b"new dependency").unwrap();
     assert!(!fresh(&candidate, dir.path()));
+}
+
+#[test]
+fn binary_freshness_ignores_crates_outside_the_binarys_dependency_closure() {
+    let dir = tempfile::tempdir().unwrap();
+    let candidate = dir.path().join("p1");
+    fs::write(&candidate, b"binary").unwrap();
+    let host_manifest = dir.path().join("crates/p1-host/Cargo.toml");
+    fs::create_dir_all(host_manifest.parent().unwrap()).unwrap();
+    fs::write(
+        &host_manifest,
+        "[package]\nname = \"p1-host\"\n\n[dependencies]\n\
+         p1-contracts = { path = \"../p1-contracts\" }\n\n[dev-dependencies]\n\
+         p1-module-tests = { path = \"../p1-module-tests\" }\n",
+    )
+    .unwrap();
+    let dependency = dir.path().join("crates/p1-contracts/src/lib.rs");
+    fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+    fs::write(&dependency, b"dependency").unwrap();
+    let test_only = dir.path().join("crates/p1-module-tests/src/lib.rs");
+    fs::create_dir_all(test_only.parent().unwrap()).unwrap();
+    fs::write(&test_only, b"test only").unwrap();
+
+    let built = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    set_mtime(&candidate, built);
+    set_mtime(&host_manifest, built - Duration::from_secs(100));
+    set_mtime(&dependency, built - Duration::from_secs(100));
+    set_mtime(&test_only, built + Duration::from_secs(100));
+
+    assert!(
+        fresh(&candidate, dir.path()),
+        "a test-only crate is not an input to the binary"
+    );
+    set_mtime(&dependency, built + Duration::from_secs(200));
+    assert!(
+        !fresh(&candidate, dir.path()),
+        "a crate the binary links is an input"
+    );
 }
 
 /// The newest modification time below `path`, ignoring a directory named `skip` (the build
